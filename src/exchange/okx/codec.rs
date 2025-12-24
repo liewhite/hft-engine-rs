@@ -227,6 +227,7 @@ impl OrderPushData {
 
         OrderUpdate {
             order_id: self.ord_id.clone(),
+            client_order_id: self.cl_ord_id.clone(),
             exchange: Exchange::OKX,
             symbol,
             status,

@@ -178,6 +178,7 @@ pub struct OrderTradeUpdate {
 #[allow(dead_code)]
 pub struct OrderData {
     pub s: String,
+    pub c: String,  // client_order_id
     pub i: i64,
     #[serde(rename = "X")]
     pub status: String,
@@ -210,6 +211,7 @@ impl OrderTradeUpdate {
 
         OrderUpdate {
             order_id: self.o.i.to_string(),
+            client_order_id: if self.o.c.is_empty() { None } else { Some(self.o.c.clone()) },
             exchange: Exchange::Binance,
             symbol,
             status,

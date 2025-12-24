@@ -273,6 +273,7 @@ pub struct Order {
 #[derive(Debug, Clone)]
 pub struct OrderUpdate {
     pub order_id: OrderId,
+    pub client_order_id: Option<String>,
     pub exchange: Exchange,
     pub symbol: Symbol,
     pub status: OrderStatus,

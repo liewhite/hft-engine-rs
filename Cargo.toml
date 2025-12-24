@@ -42,3 +42,6 @@ url = "2"
 
 # Config parsing
 toml = "0.8"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }

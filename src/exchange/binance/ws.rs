@@ -547,6 +547,9 @@ fn handle_binance_private_message(
             tracing::warn!("Binance ListenKey expired, will reconnect");
             return false;
         }
+        Some("TRADE_LITE") => {
+
+        }
         Some(unknown) => {
             tracing::warn!("Received unknown Binance private event type: {}\nRaw: {}", unknown, text);
         }

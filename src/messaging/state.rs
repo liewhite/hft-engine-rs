@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, FundingRate, OrderId, OrderStatus, Position, Rate, Symbol, BBO};
+use crate::domain::{Exchange, FundingRate, OrderStatus, Position, Rate, Symbol, BBO};
 use crate::messaging::event::ExchangeEvent;
 use std::collections::{HashMap, HashSet};
 
@@ -9,9 +9,8 @@ pub struct SymbolState {
     pub funding_rates: HashMap<Exchange, FundingRate>,
     pub bbos: HashMap<Exchange, BBO>,
     pub positions: HashMap<Exchange, Position>,
-    pub pending_orders: HashSet<(Exchange, OrderId)>,
-    /// 开仓进行中标记 (信号已发出但订单状态未确认)
-    opening_in_progress: bool,
+    /// 待处理订单 (以 client_order_id 为 key)
+    pending_orders: HashSet<String>,
 }
 
 impl SymbolState {
@@ -22,13 +21,12 @@ impl SymbolState {
             bbos: HashMap::new(),
             positions: HashMap::new(),
             pending_orders: HashSet::new(),
-            opening_in_progress: false,
         }
     }
 
-    /// 标记开仓进行中
-    pub fn set_opening(&mut self) {
-        self.opening_in_progress = true;
+    /// 添加待处理订单 (发送订单信号时调用)
+    pub fn add_pending_order(&mut self, client_order_id: String) {
+        self.pending_orders.insert(client_order_id);
     }
 
     /// 获取日化费率最高的交易所 (适合做空)
@@ -69,9 +67,9 @@ impl SymbolState {
         self.bbos.get(&exchange)
     }
 
-    /// 是否有未完成订单或开仓进行中
+    /// 是否有未完成订单
     pub fn has_pending_orders(&self) -> bool {
-        self.opening_in_progress || !self.pending_orders.is_empty()
+        !self.pending_orders.is_empty()
     }
 
     /// 检查持仓是否对冲 (多空持仓量是否匹配)
@@ -172,20 +170,21 @@ impl SymbolState {
                 tracing::info!(
                     exchange = %exchange,
                     order_id = %update.order_id,
+                    client_order_id = ?update.client_order_id,
                     status = ?update.status,
                     "Updating order status"
                 );
-                let key = (exchange, update.order_id.clone());
-                match update.status {
-                    OrderStatus::Filled
-                    | OrderStatus::Cancelled
-                    | OrderStatus::Rejected { .. } => {
-                        self.pending_orders.remove(&key);
-                        // 订单结束，重置开仓标记
-                        self.opening_in_progress = false;
-                    }
-                    OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
-                        self.pending_orders.insert(key);
+                // 使用 client_order_id 跟踪订单状态
+                if let Some(ref client_id) = update.client_order_id {
+                    match update.status {
+                        OrderStatus::Filled
+                        | OrderStatus::Cancelled
+                        | OrderStatus::Rejected { .. } => {
+                            self.pending_orders.remove(client_id);
+                        }
+                        OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
+                            // 订单已在发送时加入 pending，这里不需要再加
+                        }
                     }
                 }
             }

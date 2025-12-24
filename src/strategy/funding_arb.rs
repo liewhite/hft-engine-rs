@@ -2,6 +2,7 @@ use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Sym
 use crate::messaging::{ExchangeEvent, SymbolState};
 use crate::strategy::{MarketDataType, Signal, Strategy};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 /// 资金费率套利策略配置
 #[derive(Debug, Clone)]
@@ -229,7 +230,7 @@ impl FundingArbStrategy {
                 },
                 quantity: qty,
                 reduce_only: false,
-                client_order_id: None,
+                client_order_id: Some(Uuid::new_v4().to_string()),
             }),
             Signal::PlaceOrder(Order {
                 id: String::new(),
@@ -242,7 +243,7 @@ impl FundingArbStrategy {
                 },
                 quantity: qty,
                 reduce_only: false,
-                client_order_id: None,
+                client_order_id: Some(Uuid::new_v4().to_string()),
             }),
         ]
     }
@@ -379,8 +380,7 @@ impl Strategy for FundingArbStrategy {
 
         // 优先级 3: 检查开仓条件
         if let Some(cond) = Self::check_open_condition(&self.state, &self.config) {
-            self.state.set_opening();
-            return Self::make_open_signals(
+            let signals = Self::make_open_signals(
                 &self.symbol,
                 cond.short_ex,
                 &cond.short_bbo,
@@ -389,6 +389,14 @@ impl Strategy for FundingArbStrategy {
                 &self.config,
                 self.total_usdt_balance(),
             );
+            // 将订单的 client_order_id 加入 pending_orders
+            for signal in &signals {
+                let Signal::PlaceOrder(order) = signal;
+                if let Some(ref client_id) = order.client_order_id {
+                    self.state.add_pending_order(client_id.clone());
+                }
+            }
+            return signals;
         }
 
         vec![]
