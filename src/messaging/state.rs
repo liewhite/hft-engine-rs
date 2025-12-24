@@ -149,11 +149,24 @@ impl SymbolState {
             ExchangeEvent::PositionUpdate {
                 exchange, position, ..
             } => {
+                tracing::info!(
+                    exchange = %exchange,
+                    symbol = %self.symbol,
+                    side = ?position.side,
+                    size = position.size,
+                    "Updating position"
+                );
                 self.positions.insert(exchange, position);
             }
             ExchangeEvent::OrderStatusUpdate {
                 exchange, update, ..
             } => {
+                tracing::info!(
+                    exchange = %exchange,
+                    order_id = %update.order_id,
+                    status = ?update.status,
+                    "Updating order status"
+                );
                 let key = (exchange, update.order_id.clone());
                 match update.status {
                     OrderStatus::Filled

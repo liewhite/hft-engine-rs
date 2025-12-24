@@ -548,7 +548,7 @@ fn handle_binance_private_message(
             return false;
         }
         Some(unknown) => {
-            panic!("Received unknown Binance private event type: {}\nRaw: {}", unknown, text);
+            tracing::warn!("Received unknown Binance private event type: {}\nRaw: {}", unknown, text);
         }
         None => {
             panic!("Binance private message missing event type 'e'\nRaw: {}", text);

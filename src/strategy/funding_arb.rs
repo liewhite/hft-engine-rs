@@ -348,6 +348,12 @@ impl Strategy for FundingArbStrategy {
         // 处理 BalanceUpdate (全局状态，不走 SymbolState)
         if let ExchangeEvent::BalanceUpdate { exchange, balance, .. } = &event {
             if balance.asset == "USDT" {
+                tracing::info!(
+                    exchange = %exchange,
+                    available = balance.available,
+                    frozen = balance.frozen,
+                    "Received USDT balance update"
+                );
                 self.usdt_balances.insert(*exchange, balance.available);
                 tracing::debug!(
                     exchange = %exchange,
