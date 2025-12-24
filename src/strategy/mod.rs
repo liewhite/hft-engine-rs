@@ -3,8 +3,7 @@ mod funding_arb;
 pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
 
 use crate::domain::{Exchange, Order, Symbol};
-use crate::messaging::ExchangeEvent;
-use tokio::sync::mpsc;
+use crate::messaging::{ExchangeEvent, StateManager};
 
 /// 策略需要的市场数据类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,9 +40,11 @@ pub trait Strategy: Send + Sync {
     /// 策略需要的市场数据类型
     fn market_data_types(&self) -> Vec<MarketDataType>;
 
-    /// 处理事件，通过 signal_tx 发送交易信号
+    /// 订单超时时间 (毫秒)
+    fn order_timeout_ms(&self) -> u64;
+
+    /// 处理事件
     ///
-    /// 框架会根据 exchanges/symbols/market_data_types 过滤事件，
-    /// 只有匹配的事件才会传入此方法
-    fn on_event(&mut self, event: ExchangeEvent, signal_tx: &mpsc::Sender<Signal>);
+    /// state: 状态管理器，提供状态查询和下单接口
+    fn on_event(&mut self, event: &ExchangeEvent, state: &mut StateManager);
 }

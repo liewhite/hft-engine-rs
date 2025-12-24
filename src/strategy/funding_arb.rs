@@ -1,9 +1,6 @@
-use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, now_ms, BBO};
-use crate::messaging::{ExchangeEvent, SymbolState};
-use crate::strategy::{MarketDataType, Signal, Strategy};
-use std::collections::HashMap;
-use tokio::sync::mpsc;
-use uuid::Uuid;
+use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO};
+use crate::messaging::{ExchangeEvent, StateManager, SymbolState};
+use crate::strategy::{MarketDataType, Strategy};
 
 /// 资金费率套利策略配置
 #[derive(Debug, Clone)]
@@ -48,9 +45,6 @@ pub struct FundingArbStrategy {
     config: FundingArbConfig,
     exchanges: Vec<Exchange>,
     symbol: Symbol,
-    state: SymbolState,
-    /// 各交易所 USDT 可用余额 (用于风控)
-    usdt_balances: HashMap<Exchange, f64>,
 }
 
 impl FundingArbStrategy {
@@ -58,27 +52,12 @@ impl FundingArbStrategy {
         Self {
             config,
             exchanges,
-            state: SymbolState::new(symbol.clone()),
             symbol,
-            usdt_balances: HashMap::new(),
         }
     }
 
-    /// 获取指定交易所的 USDT 可用余额
-    pub fn usdt_balance(&self, exchange: Exchange) -> f64 {
-        self.usdt_balances.get(&exchange).copied().unwrap_or(0.0)
-    }
-
-    /// 获取所有交易所的 USDT 总可用余额
-    pub fn total_usdt_balance(&self) -> f64 {
-        self.usdt_balances.values().sum()
-    }
-
-    /// 检查开仓条件 (静态方法，避免借用冲突)
-    fn check_open_condition(
-        state: &SymbolState,
-        config: &FundingArbConfig,
-    ) -> Option<OpenCondition> {
+    /// 检查开仓条件
+    fn check_open_condition(state: &SymbolState, config: &FundingArbConfig) -> Option<OpenCondition> {
         let spread = state.funding_spread()?;
 
         if spread.abs() < config.min_spread {
@@ -129,7 +108,7 @@ impl FundingArbStrategy {
         })
     }
 
-    /// 检查平仓条件 (静态方法)
+    /// 检查平仓条件
     fn check_close_condition(state: &SymbolState, config: &FundingArbConfig) -> bool {
         if !state.has_positions() {
             return false;
@@ -147,7 +126,7 @@ impl FundingArbStrategy {
     /// 单币种最大持仓占比 (20%)
     const MAX_POSITION_RATIO: f64 = 0.2;
 
-    /// 计算下单数量: min(max_notional/price, 对手挂单数量/2, max_quantity, 余额限制)
+    /// 计算下单数量
     fn calculate_quantity(
         config: &FundingArbConfig,
         price: Price,
@@ -159,7 +138,6 @@ impl FundingArbStrategy {
         }
         let qty_by_notional = config.max_notional / price;
         let qty_by_book = counter_qty / 2.0;
-        // 仓位价值限制: 持仓数量 * 价格 <= max_position_value
         let qty_by_balance = max_position_value / price;
         qty_by_notional
             .min(qty_by_book)
@@ -168,8 +146,6 @@ impl FundingArbStrategy {
     }
 
     /// 生成开仓订单
-    /// 做空方: 挂 bid_price 卖单 (taker 成交)
-    /// 做多方: 挂 ask_price 买单 (taker 成交)
     fn make_open_orders(
         symbol: &Symbol,
         short_ex: Exchange,
@@ -179,7 +155,6 @@ impl FundingArbStrategy {
         config: &FundingArbConfig,
         total_balance: f64,
     ) -> Vec<Order> {
-        // 单币种最大持仓价值 = 总余额 * 20%
         let max_position_value = total_balance * Self::MAX_POSITION_RATIO;
 
         if max_position_value <= 0.0 {
@@ -191,15 +166,12 @@ impl FundingArbStrategy {
             return vec![];
         }
 
-        // 做空方: 以对手 bid 价格卖出
         let short_price = short_bbo.bid_price;
         let short_qty = Self::calculate_quantity(config, short_price, short_bbo.bid_qty, max_position_value);
 
-        // 做多方: 以对手 ask 价格买入
         let long_price = long_bbo.ask_price;
         let long_qty = Self::calculate_quantity(config, long_price, long_bbo.ask_qty, max_position_value);
 
-        // 取两边最小数量，保证对冲
         let qty = short_qty.min(long_qty);
 
         if qty <= 0.0 {
@@ -252,15 +224,13 @@ impl FundingArbStrategy {
         ]
     }
 
-    /// 生成平仓订单 (使用限价单保护)
+    /// 生成平仓订单
     fn make_close_orders(state: &SymbolState) -> Vec<Order> {
         let mut orders = Vec::new();
 
         for (exchange, pos) in &state.positions {
             if !pos.is_empty() {
-                // 获取 BBO 用于限价单价格
                 let order_type = if let Some(bbo) = state.bbo(*exchange) {
-                    // 平多头 (卖出) 用 bid_price，平空头 (买入) 用 ask_price
                     let price = match pos.side {
                         Side::Long => bbo.bid_price,
                         Side::Short => bbo.ask_price,
@@ -270,7 +240,6 @@ impl FundingArbStrategy {
                         tif: TimeInForce::IOC,
                     }
                 } else {
-                    // 无 BBO 时回退到市价单
                     OrderType::Market
                 };
 
@@ -290,29 +259,7 @@ impl FundingArbStrategy {
         orders
     }
 
-    /// 下单：生成 client_order_id，添加到 pending_orders，发送信号
-    fn place_order(&mut self, mut order: Order, signal_tx: &mpsc::Sender<Signal>) {
-        // 生成 client_order_id
-        let client_order_id = Uuid::new_v4().to_string();
-        order.client_order_id = Some(client_order_id.clone());
-
-        // 添加到 pending_orders
-        self.state.add_pending_order(client_order_id, order.exchange, now_ms());
-
-        // 发送信号
-        if let Err(e) = signal_tx.try_send(Signal::PlaceOrder(order)) {
-            tracing::error!(error = %e, "Failed to send order signal");
-        }
-    }
-
-    /// 批量下单
-    fn place_orders(&mut self, orders: Vec<Order>, signal_tx: &mpsc::Sender<Signal>) {
-        for order in orders {
-            self.place_order(order, signal_tx);
-        }
-    }
-
-    /// 生成敞口修复订单 (平掉不平衡的持仓)
+    /// 生成敞口修复订单
     fn make_hedge_repair_orders(state: &SymbolState) -> Vec<Order> {
         if let Some((exchange, side, qty)) = state.unhedged_exposure() {
             tracing::warn!(
@@ -323,11 +270,10 @@ impl FundingArbStrategy {
                 "Detected unhedged exposure, generating repair order"
             );
 
-            // 获取 BBO 用于限价单
             let order_type = if let Some(bbo) = state.bbo(exchange) {
                 let price = match side {
-                    Side::Long => bbo.bid_price,  // 平多用 bid
-                    Side::Short => bbo.ask_price, // 平空用 ask
+                    Side::Long => bbo.bid_price,
+                    Side::Short => bbo.ask_price,
                 };
                 OrderType::Limit {
                     price,
@@ -371,62 +317,48 @@ impl Strategy for FundingArbStrategy {
         ]
     }
 
-    fn on_event(&mut self, event: ExchangeEvent, signal_tx: &mpsc::Sender<Signal>) {
-        // 区分全局事件和 Symbol 事件
-        match &event {
-            // 全局事件: Balance (策略层处理余额追踪)
-            ExchangeEvent::BalanceUpdate { exchange, balance, .. } => {
-                if balance.asset == "USDT" {
-                    tracing::info!(
-                        exchange = %exchange,
-                        available = balance.available,
-                        frozen = balance.frozen,
-                        "Received USDT balance update"
-                    );
-                    self.usdt_balances.insert(*exchange, balance.available);
-                }
-                return;
-            }
-            // 全局事件: Clock (定时检查订单超时)
-            ExchangeEvent::Clock { timestamp } => {
-                self.state.remove_timed_out_orders(*timestamp, self.config.order_timeout_ms);
-                return;
-            }
-            // Symbol 事件: 委托 SymbolState 处理
-            _ => self.state.apply(event),
-        }
+    fn order_timeout_ms(&self) -> u64 {
+        self.config.order_timeout_ms
+    }
+
+    fn on_event(&mut self, _event: &ExchangeEvent, state: &mut StateManager) {
+        // 获取本策略关注的 symbol 状态
+        let symbol_state = match state.symbol_state(&self.symbol) {
+            Some(s) => s,
+            None => return,
+        };
 
         // 有未完成订单时等待
-        if self.state.has_pending_orders() {
+        if symbol_state.has_pending_orders() {
             return;
         }
 
         // 优先级 1: 检测并修复持仓不平衡
-        if let Some(false) = self.state.is_hedged() {
-            self.place_orders(Self::make_hedge_repair_orders(&self.state), signal_tx);
+        if let Some(false) = symbol_state.is_hedged() {
+            let orders = Self::make_hedge_repair_orders(symbol_state);
+            state.place_orders(orders);
             return;
         }
 
         // 优先级 2: 检查平仓条件
-        if Self::check_close_condition(&self.state, &self.config) {
-            self.place_orders(Self::make_close_orders(&self.state), signal_tx);
+        if Self::check_close_condition(symbol_state, &self.config) {
+            let orders = Self::make_close_orders(symbol_state);
+            state.place_orders(orders);
             return;
         }
 
         // 优先级 3: 检查开仓条件
-        if let Some(cond) = Self::check_open_condition(&self.state, &self.config) {
-            self.place_orders(
-                Self::make_open_orders(
-                    &self.symbol,
-                    cond.short_ex,
-                    &cond.short_bbo,
-                    cond.long_ex,
-                    &cond.long_bbo,
-                    &self.config,
-                    self.total_usdt_balance(),
-                ),
-                signal_tx,
+        if let Some(cond) = Self::check_open_condition(symbol_state, &self.config) {
+            let orders = Self::make_open_orders(
+                &self.symbol,
+                cond.short_ex,
+                &cond.short_bbo,
+                cond.long_ex,
+                &cond.long_bbo,
+                &self.config,
+                state.total_usdt_balance(),
             );
+            state.place_orders(orders);
         }
     }
 }

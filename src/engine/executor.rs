@@ -1,6 +1,6 @@
 use crate::domain::{Exchange, Symbol};
 use crate::exchange::{PrivateSinks, PublicSinks};
-use crate::messaging::ExchangeEvent;
+use crate::messaging::{ExchangeEvent, StateManager};
 use crate::strategy::{MarketDataType, Signal, Strategy};
 use std::collections::HashSet;
 use crate::domain::now_ms;
@@ -11,14 +11,14 @@ use tokio_util::sync::CancellationToken;
 pub struct Executor {
     strategy: Box<dyn Strategy>,
     exchanges: HashSet<Exchange>,
-    symbols: HashSet<Symbol>,
+    symbols: Vec<Symbol>,
     data_types: HashSet<MarketDataType>,
 }
 
 impl Executor {
     pub fn new(strategy: Box<dyn Strategy>) -> Self {
         let exchanges: HashSet<_> = strategy.exchanges().into_iter().collect();
-        let symbols: HashSet<_> = strategy.symbols().into_iter().collect();
+        let symbols = strategy.symbols();
         let data_types: HashSet<_> = strategy.market_data_types().into_iter().collect();
 
         Self {
@@ -30,9 +30,6 @@ impl Executor {
     }
 
     /// 启动执行器
-    ///
-    /// 从 per-(exchange, symbol) 的 sinks 订阅数据，
-    /// 过滤后调用策略的 on_event，将信号发送到 signal_tx
     pub fn run(
         mut self,
         public_sinks: &[(Exchange, PublicSinks)],
@@ -41,15 +38,20 @@ impl Executor {
         signal_tx: mpsc::Sender<Signal>,
         cancel_token: CancellationToken,
     ) {
+        // 创建 StateManager
+        let order_timeout_ms = self.strategy.order_timeout_ms();
+        let mut state_manager = StateManager::new(&self.symbols, signal_tx, order_timeout_ms);
+
         // 收集需要订阅的 receivers
         let mut receivers: Vec<tokio::sync::broadcast::Receiver<ExchangeEvent>> = Vec::new();
+        let symbols_set: HashSet<_> = self.symbols.iter().cloned().collect();
 
         for (exchange, sinks) in public_sinks {
             if !self.exchanges.contains(exchange) {
                 continue;
             }
 
-            for symbol in &self.symbols {
+            for symbol in &symbols_set {
                 if self.data_types.contains(&MarketDataType::BBO) {
                     if let Some(rx) = sinks.subscribe_bbo(symbol) {
                         receivers.push(wrap_bbo_receiver(*exchange, symbol.clone(), rx));
@@ -68,7 +70,7 @@ impl Executor {
                 continue;
             }
 
-            for symbol in &self.symbols {
+            for symbol in &symbols_set {
                 if self.data_types.contains(&MarketDataType::Position) {
                     if let Some(rx) = sinks.subscribe_position(symbol) {
                         receivers.push(wrap_position_receiver(*exchange, symbol.clone(), rx));
@@ -114,9 +116,9 @@ impl Executor {
                 }
             });
         }
-        drop(event_tx); // 关闭发送端，让 event_rx 在所有任务结束后关闭
+        drop(event_tx);
 
-        // 主循环：接收事件并调用策略
+        // 主循环：接收事件，更新状态，调用策略
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -124,7 +126,10 @@ impl Executor {
                     event = event_rx.recv() => {
                         match event {
                             Some(evt) => {
-                                self.strategy.on_event(evt, &signal_tx);
+                                // 1. 更新 StateManager 状态
+                                state_manager.apply(&evt);
+                                // 2. 调用策略处理事件
+                                self.strategy.on_event(&evt, &mut state_manager);
                             }
                             None => break,
                         }
