@@ -1,0 +1,191 @@
+use crate::domain::Symbol;
+use crate::strategy::FundingArbConfig;
+use rust_decimal::Decimal;
+use serde::Deserialize;
+use std::fs;
+use std::path::Path;
+
+/// 应用配置
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppConfig {
+    pub exchanges: ExchangesConfig,
+    pub strategy: StrategyConfig,
+    pub engine: EngineConfig,
+}
+
+/// 交易所凭证配置
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExchangeCredentials {
+    pub api_key: String,
+    pub secret: String,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+}
+
+/// 交易所配置集合
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExchangesConfig {
+    pub binance: ExchangeCredentials,
+    pub okx: OkxCredentials,
+}
+
+/// OKX 特定凭证 (需要 passphrase)
+#[derive(Debug, Clone, Deserialize)]
+pub struct OkxCredentials {
+    pub api_key: String,
+    pub secret: String,
+    pub passphrase: String,
+}
+
+/// 策略配置
+#[derive(Debug, Clone, Deserialize)]
+pub struct StrategyConfig {
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub funding_arb: FundingArbStrategyConfig,
+}
+
+/// 资金费率套利策略配置
+#[derive(Debug, Clone, Deserialize)]
+pub struct FundingArbStrategyConfig {
+    #[serde(default = "default_min_spread")]
+    pub min_spread: Decimal,
+    #[serde(default = "default_max_spread")]
+    pub max_spread: Decimal,
+    #[serde(default = "default_close_spread")]
+    pub close_spread: Decimal,
+    #[serde(default = "default_base_quantity")]
+    pub base_quantity: Decimal,
+    #[serde(default = "default_max_quantity")]
+    pub max_quantity: Decimal,
+}
+
+fn default_min_spread() -> Decimal {
+    Decimal::new(5, 4)
+}
+fn default_max_spread() -> Decimal {
+    Decimal::new(20, 4)
+}
+fn default_close_spread() -> Decimal {
+    Decimal::new(2, 4)
+}
+fn default_base_quantity() -> Decimal {
+    Decimal::new(1, 2)
+}
+fn default_max_quantity() -> Decimal {
+    Decimal::new(1, 0)
+}
+
+impl Default for FundingArbStrategyConfig {
+    fn default() -> Self {
+        Self {
+            min_spread: default_min_spread(),
+            max_spread: default_max_spread(),
+            close_spread: default_close_spread(),
+            base_quantity: default_base_quantity(),
+            max_quantity: default_max_quantity(),
+        }
+    }
+}
+
+impl From<FundingArbStrategyConfig> for FundingArbConfig {
+    fn from(cfg: FundingArbStrategyConfig) -> Self {
+        use crate::domain::{Quantity, Rate};
+        Self {
+            min_spread: Rate(cfg.min_spread),
+            max_spread: Rate(cfg.max_spread),
+            close_spread: Rate(cfg.close_spread),
+            base_quantity: Quantity(cfg.base_quantity),
+            max_quantity: Quantity(cfg.max_quantity),
+        }
+    }
+}
+
+/// 引擎配置
+#[derive(Debug, Clone, Deserialize)]
+pub struct EngineConfig {
+    #[serde(default = "default_queue_capacity")]
+    pub queue_capacity: usize,
+}
+
+fn default_queue_capacity() -> usize {
+    256
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: default_queue_capacity(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// 从 TOML 文件加载配置
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
+        let content = fs::read_to_string(path).map_err(ConfigError::Io)?;
+        toml::from_str(&content).map_err(ConfigError::Parse)
+    }
+
+    /// 从环境变量加载配置
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let binance = ExchangeCredentials {
+            api_key: std::env::var("BINANCE_API_KEY")
+                .map_err(|_| ConfigError::MissingEnv("BINANCE_API_KEY"))?,
+            secret: std::env::var("BINANCE_SECRET")
+                .map_err(|_| ConfigError::MissingEnv("BINANCE_SECRET"))?,
+            passphrase: None,
+        };
+
+        let okx = OkxCredentials {
+            api_key: std::env::var("OKX_API_KEY")
+                .map_err(|_| ConfigError::MissingEnv("OKX_API_KEY"))?,
+            secret: std::env::var("OKX_SECRET")
+                .map_err(|_| ConfigError::MissingEnv("OKX_SECRET"))?,
+            passphrase: std::env::var("OKX_PASSPHRASE")
+                .map_err(|_| ConfigError::MissingEnv("OKX_PASSPHRASE"))?,
+        };
+
+        let symbols_str =
+            std::env::var("SYMBOLS").unwrap_or_else(|_| "BTC_USDT,ETH_USDT".to_string());
+        let symbols: Vec<String> = symbols_str.split(',').map(|s| s.trim().to_string()).collect();
+
+        Ok(Self {
+            exchanges: ExchangesConfig { binance, okx },
+            strategy: StrategyConfig {
+                symbols,
+                funding_arb: FundingArbStrategyConfig::default(),
+            },
+            engine: EngineConfig::default(),
+        })
+    }
+
+    /// 解析 symbols 字符串为 Symbol 列表
+    pub fn parse_symbols(&self) -> Vec<Symbol> {
+        self.strategy
+            .symbols
+            .iter()
+            .filter_map(|s| Symbol::from_canonical(s))
+            .collect()
+    }
+}
+
+/// 配置错误
+#[derive(Debug)]
+pub enum ConfigError {
+    Io(std::io::Error),
+    Parse(toml::de::Error),
+    MissingEnv(&'static str),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Io(e) => write!(f, "IO error: {}", e),
+            ConfigError::Parse(e) => write!(f, "Parse error: {}", e),
+            ConfigError::MissingEnv(var) => write!(f, "Missing environment variable: {}", var),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}

@@ -1,0 +1,103 @@
+use crate::domain::{Exchange, FundingRate, OrderId, OrderStatus, Position, Rate, Symbol, BBO};
+use crate::messaging::event::SymbolEvent;
+use std::collections::HashMap;
+
+/// 单个交易对在所有交易所的聚合状态
+#[derive(Debug, Clone)]
+pub struct SymbolState {
+    pub symbol: Symbol,
+    pub funding_rates: HashMap<Exchange, FundingRate>,
+    pub bbos: HashMap<Exchange, BBO>,
+    pub positions: HashMap<Exchange, Position>,
+    pub pending_orders: HashMap<(Exchange, OrderId), ()>,
+}
+
+impl SymbolState {
+    pub fn new(symbol: Symbol) -> Self {
+        Self {
+            symbol,
+            funding_rates: HashMap::new(),
+            bbos: HashMap::new(),
+            positions: HashMap::new(),
+            pending_orders: HashMap::new(),
+        }
+    }
+
+    /// 获取费率最高的交易所 (适合做空)
+    pub fn best_short_exchange(&self) -> Option<(Exchange, &FundingRate)> {
+        self.funding_rates
+            .iter()
+            .max_by(|a, b| a.1.rate.0.cmp(&b.1.rate.0))
+            .map(|(e, r)| (*e, r))
+    }
+
+    /// 获取费率最低的交易所 (适合做多)
+    pub fn best_long_exchange(&self) -> Option<(Exchange, &FundingRate)> {
+        self.funding_rates
+            .iter()
+            .min_by(|a, b| a.1.rate.0.cmp(&b.1.rate.0))
+            .map(|(e, r)| (*e, r))
+    }
+
+    /// 计算费率差
+    pub fn funding_spread(&self) -> Option<Rate> {
+        let (_, high) = self.best_short_exchange()?;
+        let (_, low) = self.best_long_exchange()?;
+        Some(high.rate - low.rate)
+    }
+
+    /// 是否有持仓
+    pub fn has_positions(&self) -> bool {
+        self.positions.values().any(|p| !p.is_empty())
+    }
+
+    /// 获取某个交易所的仓位
+    pub fn position(&self, exchange: Exchange) -> Option<&Position> {
+        self.positions.get(&exchange)
+    }
+
+    /// 获取某个交易所的 BBO
+    pub fn bbo(&self, exchange: Exchange) -> Option<&BBO> {
+        self.bbos.get(&exchange)
+    }
+
+    /// 是否有未完成订单
+    pub fn has_pending_orders(&self) -> bool {
+        !self.pending_orders.is_empty()
+    }
+
+    /// 更新状态
+    pub fn apply(&mut self, event: SymbolEvent) {
+        match event {
+            SymbolEvent::FundingRateUpdate { exchange, rate, .. } => {
+                self.funding_rates.insert(exchange, rate);
+            }
+            SymbolEvent::BBOUpdate { exchange, bbo, .. } => {
+                self.bbos.insert(exchange, bbo);
+            }
+            SymbolEvent::PositionUpdate {
+                exchange, position, ..
+            } => {
+                self.positions.insert(exchange, position);
+            }
+            SymbolEvent::OrderStatusUpdate {
+                exchange, update, ..
+            } => {
+                let key = (exchange, update.order_id.clone());
+                match update.status {
+                    OrderStatus::Filled
+                    | OrderStatus::Cancelled
+                    | OrderStatus::Rejected { .. } => {
+                        self.pending_orders.remove(&key);
+                    }
+                    OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
+                        self.pending_orders.insert(key, ());
+                    }
+                }
+            }
+            SymbolEvent::BalanceUpdate { .. } => {
+                // Balance 在全局追踪，不在 per-symbol 状态中
+            }
+        }
+    }
+}

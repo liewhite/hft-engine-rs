@@ -1,0 +1,16 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+config.toml
+
+# OS
+.DS_Store
