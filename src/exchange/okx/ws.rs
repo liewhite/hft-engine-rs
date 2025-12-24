@@ -290,7 +290,7 @@ fn handle_okx_public_message(
     // 检查是否是事件响应 (subscribe 确认等)
     if let Some(event) = value.get("event").and_then(|e| e.as_str()) {
         match event {
-            "subscribe" | "unsubscribe" => {
+            "subscribe" | "unsubscribe" | "channel-conn-count" => {
                 tracing::debug!(event = %event, "OKX event response");
                 return;
             }
@@ -360,7 +360,7 @@ fn handle_okx_private_message(
     // 检查是否是事件响应
     if let Some(event) = value.get("event").and_then(|e| e.as_str()) {
         match event {
-            "subscribe" | "unsubscribe" | "login" => {
+            "subscribe" | "unsubscribe" | "login" | "channel-conn-count" => {
                 tracing::debug!(event = %event, "OKX event response");
                 return;
             }
