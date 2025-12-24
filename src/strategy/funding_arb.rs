@@ -139,20 +139,27 @@ impl FundingArbStrategy {
         spread.abs() < config.close_spread
     }
 
-    /// 计算下单数量: min(max_notional/price, 对手挂单数量/2, max_quantity)
+    /// 单币种最大持仓占比 (20%)
+    const MAX_POSITION_RATIO: f64 = 0.2;
+
+    /// 计算下单数量: min(max_notional/price, 对手挂单数量/2, max_quantity, 余额限制)
     fn calculate_quantity(
         config: &FundingArbConfig,
         price: Price,
         counter_qty: Quantity,
+        max_position_value: f64,
     ) -> Quantity {
         if price <= 0.0 {
             return 0.0;
         }
         let qty_by_notional = config.max_notional / price;
         let qty_by_book = counter_qty / 2.0;
+        // 仓位价值限制: 持仓数量 * 价格 <= max_position_value
+        let qty_by_balance = max_position_value / price;
         qty_by_notional
             .min(qty_by_book)
             .min(config.max_quantity)
+            .min(qty_by_balance)
     }
 
     /// 生成开仓信号
@@ -165,14 +172,27 @@ impl FundingArbStrategy {
         long_ex: Exchange,
         long_bbo: &BBO,
         config: &FundingArbConfig,
+        total_balance: f64,
     ) -> Vec<Signal> {
+        // 单币种最大持仓价值 = 总余额 * 20%
+        let max_position_value = total_balance * Self::MAX_POSITION_RATIO;
+
+        if max_position_value <= 0.0 {
+            tracing::warn!(
+                symbol = %symbol,
+                total_balance = total_balance,
+                "Insufficient balance for opening position"
+            );
+            return vec![];
+        }
+
         // 做空方: 以对手 bid 价格卖出
         let short_price = short_bbo.bid_price;
-        let short_qty = Self::calculate_quantity(config, short_price, short_bbo.bid_qty);
+        let short_qty = Self::calculate_quantity(config, short_price, short_bbo.bid_qty, max_position_value);
 
         // 做多方: 以对手 ask 价格买入
         let long_price = long_bbo.ask_price;
-        let long_qty = Self::calculate_quantity(config, long_price, long_bbo.ask_qty);
+        let long_qty = Self::calculate_quantity(config, long_price, long_bbo.ask_qty, max_position_value);
 
         // 取两边最小数量，保证对冲
         let qty = short_qty.min(long_qty);
@@ -365,6 +385,7 @@ impl Strategy for FundingArbStrategy {
                 cond.long_ex,
                 &cond.long_bbo,
                 &self.config,
+                self.total_usdt_balance(),
             );
         }
 
