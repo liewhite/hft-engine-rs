@@ -63,10 +63,10 @@ where
     O: ExchangeAdapter + 'static,
     S: Strategy + Clone + Send + Sync + 'static,
 {
-    pub fn new(binance: B, okx: O, strategy: S, symbols: Vec<Symbol>) -> Self {
+    pub fn new(binance: Arc<B>, okx: Arc<O>, strategy: S, symbols: Vec<Symbol>) -> Self {
         Self {
-            binance: Arc::new(binance),
-            okx: Arc::new(okx),
+            binance,
+            okx,
             strategy: Arc::new(strategy),
             symbols,
             lifecycle: ComponentLifecycle::new(),

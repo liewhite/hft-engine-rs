@@ -43,11 +43,8 @@ impl From<tokio_tungstenite::tungstenite::Error> for ExchangeError {
     }
 }
 
-impl From<reqwest::Error> for ExchangeError {
-    fn from(e: reqwest::Error) -> Self {
-        ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string())
-    }
-}
+// reqwest::Error 不实现 From，需要在各交易所 REST 客户端中显式处理
+// 以确保正确标记交易所来源
 
 impl From<serde_json::Error> for ExchangeError {
     fn from(e: serde_json::Error) -> Self {

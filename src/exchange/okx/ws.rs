@@ -18,10 +18,10 @@ pub struct OkxWebSocket {
 }
 
 impl OkxWebSocket {
-    pub fn new(api_key: String, secret: String, passphrase: String) -> Self {
-        Self {
-            rest_client: Arc::new(OkxRestClient::new(api_key, secret, passphrase)),
-        }
+    pub fn new(api_key: String, secret: String, passphrase: String) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            rest_client: Arc::new(OkxRestClient::new(api_key, secret, passphrase)?),
+        })
     }
 }
 

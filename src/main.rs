@@ -35,33 +35,26 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // Create exchange adapters
-    let binance = BinanceWebSocket::new(
+    // Create shared exchange adapters
+    let binance = Arc::new(BinanceWebSocket::new(
         config.exchanges.binance.api_key.clone(),
         config.exchanges.binance.secret.clone(),
-    );
+    )?);
 
-    let okx = OkxWebSocket::new(
+    let okx = Arc::new(OkxWebSocket::new(
         config.exchanges.okx.api_key.clone(),
         config.exchanges.okx.secret.clone(),
         config.exchanges.okx.passphrase.clone(),
-    );
+    )?);
 
-    // Create strategy
+    // Create strategy with shared exchange instances
     let strategy = FundingArbStrategy::new(
         config.strategy.funding_arb.clone().into(),
-        Arc::new(BinanceWebSocket::new(
-            config.exchanges.binance.api_key.clone(),
-            config.exchanges.binance.secret.clone(),
-        )),
-        Arc::new(OkxWebSocket::new(
-            config.exchanges.okx.api_key.clone(),
-            config.exchanges.okx.secret.clone(),
-            config.exchanges.okx.passphrase.clone(),
-        )),
+        binance.clone(),
+        okx.clone(),
     );
 
-    // Create and start coordinator
+    // Create and start coordinator with shared exchange instances
     let mut coordinator = Coordinator::new(binance, okx, strategy, symbols);
 
     coordinator.start().await?;

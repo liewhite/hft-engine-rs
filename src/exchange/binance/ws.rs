@@ -19,11 +19,11 @@ pub struct BinanceWebSocket {
 }
 
 impl BinanceWebSocket {
-    pub fn new(api_key: String, secret: String) -> Self {
-        Self {
-            rest_client: Arc::new(BinanceRestClient::new(api_key, secret)),
+    pub fn new(api_key: String, secret: String) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            rest_client: Arc::new(BinanceRestClient::new(api_key, secret)?),
             listen_key: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     /// 启动 ListenKey 保活任务

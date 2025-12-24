@@ -19,17 +19,24 @@ pub struct OkxRestClient {
 }
 
 impl OkxRestClient {
-    pub fn new(api_key: String, secret: String, passphrase: String) -> Self {
-        Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+    pub fn new(api_key: String, secret: String, passphrase: String) -> Result<Self, ExchangeError> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
+
+        Ok(Self {
+            client,
             api_key,
             secret,
             passphrase,
             base_url: REST_BASE_URL.to_string(),
-        }
+        })
+    }
+
+    /// reqwest 错误转换
+    fn map_reqwest_error(e: reqwest::Error) -> ExchangeError {
+        ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string())
     }
 
     /// 获取 API Key
@@ -151,9 +158,10 @@ impl OkxRestClient {
             .headers(headers)
             .body(body)
             .send()
-            .await?;
+            .await
+            .map_err(Self::map_reqwest_error)?;
 
-        let data: Response = resp.json().await?;
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
 
         if data.code != "0" {
             return Err(map_okx_error(&data.code, &data.msg));
@@ -209,9 +217,10 @@ impl OkxRestClient {
             .headers(headers)
             .body(body)
             .send()
-            .await?;
+            .await
+            .map_err(Self::map_reqwest_error)?;
 
-        let data: Response = resp.json().await?;
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
 
         if data.code != "0" {
             return Err(map_okx_error(&data.code, &data.msg));

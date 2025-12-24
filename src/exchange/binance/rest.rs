@@ -15,16 +15,23 @@ pub struct BinanceRestClient {
 }
 
 impl BinanceRestClient {
-    pub fn new(api_key: String, secret: String) -> Self {
-        Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .unwrap(),
+    pub fn new(api_key: String, secret: String) -> Result<Self, ExchangeError> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
+
+        Ok(Self {
+            client,
             api_key,
             secret,
             base_url: REST_BASE_URL.to_string(),
-        }
+        })
+    }
+
+    /// reqwest 错误转换
+    fn map_reqwest_error(e: reqwest::Error) -> ExchangeError {
+        ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string())
     }
 
     /// 签名
@@ -68,7 +75,8 @@ impl BinanceRestClient {
             .post(format!("{}/fapi/v1/listenKey", self.base_url))
             .header("X-MBX-APIKEY", &self.api_key)
             .send()
-            .await?;
+            .await
+            .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -80,7 +88,7 @@ impl BinanceRestClient {
             )));
         }
 
-        let data: Response = resp.json().await?;
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
         Ok(data.listen_key)
     }
 
@@ -91,7 +99,8 @@ impl BinanceRestClient {
             .put(format!("{}/fapi/v1/listenKey", self.base_url))
             .header("X-MBX-APIKEY", &self.api_key)
             .send()
-            .await?;
+            .await
+            .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -148,7 +157,8 @@ impl BinanceRestClient {
             .post(format!("{}/fapi/v1/order?{}", self.base_url, query))
             .header("X-MBX-APIKEY", &self.api_key)
             .send()
-            .await?;
+            .await
+            .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -158,7 +168,7 @@ impl BinanceRestClient {
             )));
         }
 
-        let data: Response = resp.json().await?;
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
         Ok(OrderId::from(data.order_id))
     }
 
@@ -174,7 +184,8 @@ impl BinanceRestClient {
             .post(format!("{}/fapi/v1/leverage?{}", self.base_url, query))
             .header("X-MBX-APIKEY", &self.api_key)
             .send()
-            .await?;
+            .await
+            .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
