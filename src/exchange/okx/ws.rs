@@ -40,19 +40,25 @@ impl ExchangeWebSocket for OkxWebSocket {
         sinks: PublicSinks,
         cancel_token: CancellationToken,
     ) -> Result<(), ExchangeError> {
-        let symbols = sinks.symbols();
-        if symbols.is_empty() {
+        let has_funding = !sinks.funding_rates.is_empty();
+        let has_bbo = !sinks.bbos.is_empty();
+
+        // 如果没有任何数据类型需要订阅，直接返回
+        if !has_funding && !has_bbo {
             return Ok(());
         }
 
-        // 构建订阅消息
+        // 构建订阅消息 - 根据 sinks 内容选择性订阅
         let mut args = Vec::new();
-        for symbol in &symbols {
+        for symbol in sinks.funding_rates.keys() {
             let inst_id = symbol.to_okx();
             args.push(json!({
                 "channel": "funding-rate",
                 "instId": inst_id
             }));
+        }
+        for symbol in sinks.bbos.keys() {
+            let inst_id = symbol.to_okx();
             args.push(json!({
                 "channel": "bbo-tbt",
                 "instId": inst_id

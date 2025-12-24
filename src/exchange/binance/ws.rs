@@ -137,38 +137,49 @@ impl ExchangeWebSocket for BinanceWebSocket {
         sinks: PublicSinks,
         cancel_token: CancellationToken,
     ) -> Result<(), ExchangeError> {
-        let symbols = sinks.symbols();
-        if symbols.is_empty() {
+        let has_funding = !sinks.funding_rates.is_empty();
+        let has_bbo = !sinks.bbos.is_empty();
+
+        // 如果没有任何数据类型需要订阅，直接返回
+        if !has_funding && !has_bbo {
             return Ok(());
         }
 
         // 获取各合约最近一次结算时间 (用于计算初始间隔)
-        let last_funding_times = match self.rest_client.get_last_funding_times(&symbols).await {
-            Ok(times) => {
-                tracing::info!(count = times.len(), "Fetched Binance last funding times");
-                times
+        let funding_symbols: Vec<Symbol> = sinks.funding_rates.keys().cloned().collect();
+        let last_funding_times = if has_funding {
+            match self.rest_client.get_last_funding_times(&funding_symbols).await {
+                Ok(times) => {
+                    tracing::info!(count = times.len(), "Fetched Binance last funding times");
+                    times
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to fetch last funding times");
+                    HashMap::new()
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to fetch last funding times");
-                HashMap::new()
-            }
+        } else {
+            HashMap::new()
         };
 
         // 初始化 funding 状态
         let funding_states: FundingStates = {
             let mut states = HashMap::new();
-            for symbol in &symbols {
+            for symbol in &funding_symbols {
                 let last_time = last_funding_times.get(symbol).copied().unwrap_or(0);
                 states.insert(symbol.clone(), SymbolFundingState::new(last_time));
             }
             Arc::new(RwLock::new(states))
         };
 
-        // 构建订阅参数
+        // 构建订阅参数 - 根据 sinks 内容选择性订阅
         let mut streams: Vec<String> = Vec::new();
-        for symbol in &symbols {
+        for symbol in sinks.funding_rates.keys() {
             let s = symbol.to_binance().to_lowercase();
             streams.push(format!("{}@markPrice@1s", s));
+        }
+        for symbol in sinks.bbos.keys() {
+            let s = symbol.to_binance().to_lowercase();
             streams.push(format!("{}@bookTicker", s));
         }
 
