@@ -92,7 +92,7 @@ impl FundingEngine {
 
             let symbols_vec: Vec<Symbol> = symbols.iter().cloned().collect();
 
-            let pub_sinks = PublicSinks::new(&symbols_vec, SINK_CAPACITY);
+            let pub_sinks = PublicSinks::full(&symbols_vec, SINK_CAPACITY);
             let priv_sinks = PrivateSinks::new(&symbols_vec, SINK_CAPACITY);
 
             // 连接 WebSocket

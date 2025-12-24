@@ -7,6 +7,22 @@ use std::collections::HashMap;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+/// 公共数据类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PublicDataType {
+    /// 资金费率
+    FundingRate,
+    /// Best Bid/Offer
+    BBO,
+}
+
+impl PublicDataType {
+    /// 返回所有数据类型
+    pub fn all() -> &'static [PublicDataType] {
+        &[PublicDataType::FundingRate, PublicDataType::BBO]
+    }
+}
+
 /// 公共数据 Sink - 由消费者创建，按 Symbol 拆分
 ///
 /// 消费者创建所需的 sender，生产者只负责推送数据
@@ -19,20 +35,35 @@ pub struct PublicSinks {
 }
 
 impl PublicSinks {
-    /// 创建指定 symbols 的 sinks
-    pub fn new(symbols: &[Symbol], capacity: usize) -> Self {
+    /// 创建指定 symbols 和数据类型的 sinks
+    ///
+    /// symbols 与 data_types 做笛卡尔积，生成对应的 sinks
+    pub fn select(symbols: &[Symbol], data_types: &[PublicDataType], capacity: usize) -> Self {
         let mut funding_rates = HashMap::new();
         let mut bbos = HashMap::new();
 
         for symbol in symbols {
-            funding_rates.insert(symbol.clone(), broadcast::channel(capacity).0);
-            bbos.insert(symbol.clone(), broadcast::channel(capacity).0);
+            for data_type in data_types {
+                match data_type {
+                    PublicDataType::FundingRate => {
+                        funding_rates.insert(symbol.clone(), broadcast::channel(capacity).0);
+                    }
+                    PublicDataType::BBO => {
+                        bbos.insert(symbol.clone(), broadcast::channel(capacity).0);
+                    }
+                }
+            }
         }
 
         Self {
             funding_rates,
             bbos,
         }
+    }
+
+    /// 创建指定 symbols 的全量 sinks (订阅所有数据类型)
+    pub fn full(symbols: &[Symbol], capacity: usize) -> Self {
+        Self::select(symbols, PublicDataType::all(), capacity)
     }
 
     /// 获取订阅的 symbols
