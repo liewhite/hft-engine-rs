@@ -1,6 +1,6 @@
 use crate::domain::{Exchange, FundingRate, OrderId, OrderStatus, Position, Rate, Symbol, BBO};
 use crate::messaging::event::ExchangeEvent;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 单个交易对在所有交易所的聚合状态
 #[derive(Debug, Clone)]
@@ -9,7 +9,7 @@ pub struct SymbolState {
     pub funding_rates: HashMap<Exchange, FundingRate>,
     pub bbos: HashMap<Exchange, BBO>,
     pub positions: HashMap<Exchange, Position>,
-    pub pending_orders: HashMap<(Exchange, OrderId), ()>,
+    pub pending_orders: HashSet<(Exchange, OrderId)>,
 }
 
 impl SymbolState {
@@ -19,7 +19,7 @@ impl SymbolState {
             funding_rates: HashMap::new(),
             bbos: HashMap::new(),
             positions: HashMap::new(),
-            pending_orders: HashMap::new(),
+            pending_orders: HashSet::new(),
         }
     }
 
@@ -91,7 +91,7 @@ impl SymbolState {
                         self.pending_orders.remove(&key);
                     }
                     OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
-                        self.pending_orders.insert(key, ());
+                        self.pending_orders.insert(key);
                     }
                 }
             }

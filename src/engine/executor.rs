@@ -8,15 +8,15 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// 策略执行器 - 为单个策略订阅数据并执行
-pub struct Executor<S: Strategy> {
-    strategy: S,
+pub struct Executor {
+    strategy: Box<dyn Strategy>,
     exchanges: HashSet<Exchange>,
     symbols: HashSet<Symbol>,
     data_types: HashSet<MarketDataType>,
 }
 
-impl<S: Strategy + 'static> Executor<S> {
-    pub fn new(strategy: S) -> Self {
+impl Executor {
+    pub fn new(strategy: Box<dyn Strategy>) -> Self {
         let exchanges: HashSet<_> = strategy.exchanges().into_iter().collect();
         let symbols: HashSet<_> = strategy.symbols().into_iter().collect();
         let data_types: HashSet<_> = strategy.market_data_types().into_iter().collect();

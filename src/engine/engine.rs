@@ -4,8 +4,7 @@ use crate::engine::executor::Executor;
 use crate::exchange::binance::BinanceWebSocket;
 use crate::exchange::okx::OkxWebSocket;
 use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicSinks};
-use crate::messaging::ExchangeEvent;
-use crate::strategy::{MarketDataType, Signal, Strategy};
+use crate::strategy::{Signal, Strategy};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -102,13 +101,9 @@ impl Engine {
         let (signal_tx, mut signal_rx) = mpsc::channel::<Signal>(256);
 
         // 4. 为每个策略创建 Executor 并启动
-        // 注意：这里需要 take ownership of strategies
         let strategies = std::mem::take(&mut self.strategies);
         for strategy in strategies {
-            // 由于 Strategy 是 trait object，需要特殊处理
-            // 这里我们用 StrategyWrapper 来包装
-            let wrapper = StrategyWrapper(strategy);
-            let executor = Executor::new(wrapper);
+            let executor = Executor::new(strategy);
             executor.run(&public_sinks, &private_sinks, signal_tx.clone(), token.clone());
         }
 
@@ -151,23 +146,3 @@ impl Engine {
     }
 }
 
-/// 包装 Box<dyn Strategy> 以实现 Strategy trait
-struct StrategyWrapper(Box<dyn Strategy>);
-
-impl Strategy for StrategyWrapper {
-    fn exchanges(&self) -> Vec<Exchange> {
-        self.0.exchanges()
-    }
-
-    fn symbols(&self) -> Vec<Symbol> {
-        self.0.symbols()
-    }
-
-    fn market_data_types(&self) -> Vec<MarketDataType> {
-        self.0.market_data_types()
-    }
-
-    fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
-        self.0.on_event(event)
-    }
-}

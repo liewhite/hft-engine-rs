@@ -22,9 +22,9 @@ pub struct FundingArbConfig {
 impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
-            min_spread: Rate(Decimal::new(5, 4)),       // 0.0005 = 0.05%
-            max_spread: Rate(Decimal::new(20, 4)),     // 0.002 = 0.2%
-            close_spread: Rate(Decimal::new(2, 4)),    // 0.0002 = 0.02%
+            min_spread: Rate(Decimal::new(5, 4)),        // 0.0005 = 0.05%
+            max_spread: Rate(Decimal::new(20, 4)),       // 0.002 = 0.2%
+            close_spread: Rate(Decimal::new(2, 4)),      // 0.0002 = 0.02%
             base_quantity: Quantity(Decimal::new(1, 2)), // 0.01
             max_quantity: Quantity(Decimal::new(1, 0)),  // 1.0
         }
@@ -56,7 +56,10 @@ impl FundingArbStrategy {
     }
 
     /// 检查开仓条件 (静态方法，避免借用冲突)
-    fn check_open_condition(state: &SymbolState, config: &FundingArbConfig) -> Option<(Exchange, Exchange)> {
+    fn check_open_condition(
+        state: &SymbolState,
+        config: &FundingArbConfig,
+    ) -> Option<(Exchange, Exchange)> {
         let spread = state.funding_spread()?;
 
         if spread.0.abs() < config.min_spread.0 {
@@ -186,13 +189,6 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
-        tracing::info!(
-            symbol = ?event.symbol(),
-            exchange = %event.exchange(),
-            event = ?event,
-            "Received event"
-        );
-        return vec![];
         // 获取事件关联的 symbol
         let symbol = match event.symbol() {
             Some(s) => s.clone(),

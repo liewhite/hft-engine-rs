@@ -124,11 +124,11 @@ impl AppConfig {
     /// 从配置文件加载 (支持 JSON 和 TOML)
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let content = fs::read_to_string(path).map_err(ConfigError::Io)?;
+        let content = fs::read_to_string(path)?;
 
         match path.extension().and_then(|e| e.to_str()) {
-            Some("json") => serde_json::from_str(&content).map_err(ConfigError::ParseJson),
-            Some("toml") => toml::from_str(&content).map_err(ConfigError::ParseToml),
+            Some("json") => Ok(serde_json::from_str(&content)?),
+            Some("toml") => Ok(toml::from_str(&content)?),
             Some(ext) => Err(ConfigError::UnsupportedFormat(ext.to_string())),
             None => Err(ConfigError::UnsupportedFormat("unknown".to_string())),
         }
@@ -178,25 +178,20 @@ impl AppConfig {
 }
 
 /// 配置错误
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    Io(std::io::Error),
-    ParseToml(toml::de::Error),
-    ParseJson(serde_json::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("TOML parse error: {0}")]
+    ParseToml(#[from] toml::de::Error),
+
+    #[error("JSON parse error: {0}")]
+    ParseJson(#[from] serde_json::Error),
+
+    #[error("Missing environment variable: {0}")]
     MissingEnv(&'static str),
+
+    #[error("Unsupported config format: {0}")]
     UnsupportedFormat(String),
 }
-
-impl std::fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConfigError::Io(e) => write!(f, "IO error: {}", e),
-            ConfigError::ParseToml(e) => write!(f, "TOML parse error: {}", e),
-            ConfigError::ParseJson(e) => write!(f, "JSON parse error: {}", e),
-            ConfigError::MissingEnv(var) => write!(f, "Missing environment variable: {}", var),
-            ConfigError::UnsupportedFormat(ext) => write!(f, "Unsupported config format: {}", ext),
-        }
-    }
-}
-
-impl std::error::Error for ConfigError {}
