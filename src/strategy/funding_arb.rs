@@ -167,10 +167,10 @@ impl FundingArbStrategy {
             .min(qty_by_balance)
     }
 
-    /// 生成开仓信号
+    /// 生成开仓订单
     /// 做空方: 挂 bid_price 卖单 (taker 成交)
     /// 做多方: 挂 ask_price 买单 (taker 成交)
-    fn make_open_signals(
+    fn make_open_orders(
         symbol: &Symbol,
         short_ex: Exchange,
         short_bbo: &BBO,
@@ -178,7 +178,7 @@ impl FundingArbStrategy {
         long_bbo: &BBO,
         config: &FundingArbConfig,
         total_balance: f64,
-    ) -> Vec<Signal> {
+    ) -> Vec<Order> {
         // 单币种最大持仓价值 = 总余额 * 20%
         let max_position_value = total_balance * Self::MAX_POSITION_RATIO;
 
@@ -223,7 +223,7 @@ impl FundingArbStrategy {
         );
 
         vec![
-            Signal::PlaceOrder(Order {
+            Order {
                 id: String::new(),
                 exchange: short_ex,
                 symbol: symbol.clone(),
@@ -234,9 +234,9 @@ impl FundingArbStrategy {
                 },
                 quantity: qty,
                 reduce_only: false,
-                client_order_id: Some(Uuid::new_v4().to_string()),
-            }),
-            Signal::PlaceOrder(Order {
+                client_order_id: None,
+            },
+            Order {
                 id: String::new(),
                 exchange: long_ex,
                 symbol: symbol.clone(),
@@ -247,14 +247,14 @@ impl FundingArbStrategy {
                 },
                 quantity: qty,
                 reduce_only: false,
-                client_order_id: Some(Uuid::new_v4().to_string()),
-            }),
+                client_order_id: None,
+            },
         ]
     }
 
-    /// 生成平仓信号 (使用限价单保护)
-    fn make_close_signals(state: &SymbolState) -> Vec<Signal> {
-        let mut signals = Vec::new();
+    /// 生成平仓订单 (使用限价单保护)
+    fn make_close_orders(state: &SymbolState) -> Vec<Order> {
+        let mut orders = Vec::new();
 
         for (exchange, pos) in &state.positions {
             if !pos.is_empty() {
@@ -274,7 +274,7 @@ impl FundingArbStrategy {
                     OrderType::Market
                 };
 
-                signals.push(Signal::PlaceOrder(Order {
+                orders.push(Order {
                     id: String::new(),
                     exchange: *exchange,
                     symbol: state.symbol.clone(),
@@ -283,31 +283,44 @@ impl FundingArbStrategy {
                     quantity: pos.size,
                     reduce_only: true,
                     client_order_id: None,
-                }));
+                });
             }
         }
 
-        signals
+        orders
     }
 
-    /// 发送信号到 signal_tx
-    fn send_signals(&self, signals: Vec<Signal>, signal_tx: &mpsc::Sender<Signal>) {
-        for signal in signals {
-            if let Err(e) = signal_tx.try_send(signal) {
-                tracing::error!(error = %e, "Failed to send signal");
-            }
+    /// 下单：生成 client_order_id，添加到 pending_orders，发送信号
+    fn place_order(&mut self, mut order: Order, signal_tx: &mpsc::Sender<Signal>) {
+        // 生成 client_order_id
+        let client_order_id = Uuid::new_v4().to_string();
+        order.client_order_id = Some(client_order_id.clone());
+
+        // 添加到 pending_orders
+        self.state.add_pending_order(client_order_id, order.exchange, now_ms());
+
+        // 发送信号
+        if let Err(e) = signal_tx.try_send(Signal::PlaceOrder(order)) {
+            tracing::error!(error = %e, "Failed to send order signal");
         }
     }
 
-    /// 生成敞口修复信号 (平掉不平衡的持仓)
-    fn make_hedge_repair_signal(state: &SymbolState) -> Vec<Signal> {
+    /// 批量下单
+    fn place_orders(&mut self, orders: Vec<Order>, signal_tx: &mpsc::Sender<Signal>) {
+        for order in orders {
+            self.place_order(order, signal_tx);
+        }
+    }
+
+    /// 生成敞口修复订单 (平掉不平衡的持仓)
+    fn make_hedge_repair_orders(state: &SymbolState) -> Vec<Order> {
         if let Some((exchange, side, qty)) = state.unhedged_exposure() {
             tracing::warn!(
                 symbol = %state.symbol,
                 exchange = %exchange,
                 side = %side,
                 qty = qty,
-                "Detected unhedged exposure, generating repair signal"
+                "Detected unhedged exposure, generating repair order"
             );
 
             // 获取 BBO 用于限价单
@@ -324,7 +337,7 @@ impl FundingArbStrategy {
                 OrderType::Market
             };
 
-            return vec![Signal::PlaceOrder(Order {
+            return vec![Order {
                 id: String::new(),
                 exchange,
                 symbol: state.symbol.clone(),
@@ -333,7 +346,7 @@ impl FundingArbStrategy {
                 quantity: qty,
                 reduce_only: true,
                 client_order_id: None,
-            })];
+            }];
         }
         vec![]
     }
@@ -383,43 +396,37 @@ impl Strategy for FundingArbStrategy {
             _ => self.state.apply(event),
         }
 
-        // 有未完成订单或开仓进行中时等待
+        // 有未完成订单时等待
         if self.state.has_pending_orders() {
             return;
         }
 
         // 优先级 1: 检测并修复持仓不平衡
         if let Some(false) = self.state.is_hedged() {
-            self.send_signals(Self::make_hedge_repair_signal(&self.state), signal_tx);
+            self.place_orders(Self::make_hedge_repair_orders(&self.state), signal_tx);
             return;
         }
 
         // 优先级 2: 检查平仓条件
         if Self::check_close_condition(&self.state, &self.config) {
-            self.send_signals(Self::make_close_signals(&self.state), signal_tx);
+            self.place_orders(Self::make_close_orders(&self.state), signal_tx);
             return;
         }
 
         // 优先级 3: 检查开仓条件
         if let Some(cond) = Self::check_open_condition(&self.state, &self.config) {
-            let signals = Self::make_open_signals(
-                &self.symbol,
-                cond.short_ex,
-                &cond.short_bbo,
-                cond.long_ex,
-                &cond.long_bbo,
-                &self.config,
-                self.total_usdt_balance(),
+            self.place_orders(
+                Self::make_open_orders(
+                    &self.symbol,
+                    cond.short_ex,
+                    &cond.short_bbo,
+                    cond.long_ex,
+                    &cond.long_bbo,
+                    &self.config,
+                    self.total_usdt_balance(),
+                ),
+                signal_tx,
             );
-            // 将订单的 client_order_id 加入 pending_orders
-            let now = now_ms();
-            for signal in &signals {
-                let Signal::PlaceOrder(order) = signal;
-                if let Some(ref client_id) = order.client_order_id {
-                    self.state.add_pending_order(client_id.clone(), order.exchange, now);
-                }
-            }
-            self.send_signals(signals, signal_tx);
         }
     }
 }
