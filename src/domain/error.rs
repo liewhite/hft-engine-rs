@@ -35,6 +35,9 @@ pub enum ExchangeError {
 
     #[error("Timeout: {0}")]
     Timeout(String),
+
+    #[error("{0}")]
+    Other(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ExchangeError {

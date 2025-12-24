@@ -1,10 +1,8 @@
-use crate::domain::{Exchange, ExchangeError, OrderType, Quantity, Rate, Side};
-use crate::exchange::ExchangeExecutor;
-use crate::messaging::SymbolState;
-use crate::strategy::api::{Signal, Strategy, TradeAction};
-use async_trait::async_trait;
+use crate::domain::{Exchange, Order, OrderId, OrderType, Quantity, Rate, Side, Symbol};
+use crate::messaging::{ExchangeEvent, SymbolState};
+use crate::strategy::{MarketDataType, Signal, Strategy};
 use rust_decimal::Decimal;
-use std::sync::Arc;
+use std::collections::HashMap;
 
 /// 资金费率套利策略配置
 #[derive(Debug, Clone)]
@@ -24,7 +22,7 @@ pub struct FundingArbConfig {
 impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
-            min_spread: Rate(Decimal::new(5, 4)),      // 0.0005 = 0.05%
+            min_spread: Rate(Decimal::new(5, 4)),       // 0.0005 = 0.05%
             max_spread: Rate(Decimal::new(20, 4)),     // 0.002 = 0.2%
             close_spread: Rate(Decimal::new(2, 4)),    // 0.0002 = 0.02%
             base_quantity: Quantity(Decimal::new(1, 2)), // 0.01
@@ -34,38 +32,38 @@ impl Default for FundingArbConfig {
 }
 
 /// 资金费率套利策略
-pub struct FundingArbStrategy<B, O>
-where
-    B: ExchangeExecutor,
-    O: ExchangeExecutor,
-{
+pub struct FundingArbStrategy {
     config: FundingArbConfig,
-    binance: Arc<B>,
-    okx: Arc<O>,
+    exchanges: Vec<Exchange>,
+    symbols: Vec<Symbol>,
+    /// Per-symbol 状态
+    states: HashMap<Symbol, SymbolState>,
 }
 
-impl<B, O> FundingArbStrategy<B, O>
-where
-    B: ExchangeExecutor,
-    O: ExchangeExecutor,
-{
-    pub fn new(config: FundingArbConfig, binance: Arc<B>, okx: Arc<O>) -> Self {
+impl FundingArbStrategy {
+    pub fn new(config: FundingArbConfig, exchanges: Vec<Exchange>, symbols: Vec<Symbol>) -> Self {
+        let mut states = HashMap::new();
+        for symbol in &symbols {
+            states.insert(symbol.clone(), SymbolState::new(symbol.clone()));
+        }
+
         Self {
             config,
-            binance,
-            okx,
+            exchanges,
+            symbols,
+            states,
         }
     }
 
-    /// 判断是否满足开仓条件
-    fn should_open(&self, state: &SymbolState) -> Option<(Exchange, Exchange)> {
+    /// 检查开仓条件 (静态方法，避免借用冲突)
+    fn check_open_condition(state: &SymbolState, config: &FundingArbConfig) -> Option<(Exchange, Exchange)> {
         let spread = state.funding_spread()?;
 
-        if spread.0.abs() < self.config.min_spread.0 {
+        if spread.0.abs() < config.min_spread.0 {
             return None;
         }
 
-        if spread.0.abs() > self.config.max_spread.0 {
+        if spread.0.abs() > config.max_spread.0 {
             tracing::warn!(
                 symbol = %state.symbol,
                 spread = %spread,
@@ -100,8 +98,8 @@ where
         Some((short_ex, long_ex))
     }
 
-    /// 判断是否满足平仓条件
-    fn should_close(&self, state: &SymbolState) -> bool {
+    /// 检查平仓条件 (静态方法)
+    fn check_close_condition(state: &SymbolState, config: &FundingArbConfig) -> bool {
         if !state.has_positions() {
             return false;
         }
@@ -112,112 +110,108 @@ where
         };
 
         // 费率差收窄到阈值以下，平仓
-        spread.0.abs() < self.config.close_spread.0
+        spread.0.abs() < config.close_spread.0
     }
-}
 
-impl<B, O> Clone for FundingArbStrategy<B, O>
-where
-    B: ExchangeExecutor,
-    O: ExchangeExecutor,
-{
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            binance: self.binance.clone(),
-            okx: self.okx.clone(),
+    /// 生成开仓信号 (静态方法)
+    fn make_open_signals(
+        symbol: &Symbol,
+        short_ex: Exchange,
+        long_ex: Exchange,
+        qty: Quantity,
+    ) -> Vec<Signal> {
+        vec![
+            Signal::PlaceOrder(Order {
+                id: OrderId::from(""),
+                exchange: short_ex,
+                symbol: symbol.clone(),
+                side: Side::Short,
+                order_type: OrderType::Market,
+                quantity: qty,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+            Signal::PlaceOrder(Order {
+                id: OrderId::from(""),
+                exchange: long_ex,
+                symbol: symbol.clone(),
+                side: Side::Long,
+                order_type: OrderType::Market,
+                quantity: qty,
+                reduce_only: false,
+                client_order_id: None,
+            }),
+        ]
+    }
+
+    /// 生成平仓信号 (静态方法)
+    fn make_close_signals(state: &SymbolState) -> Vec<Signal> {
+        let mut signals = Vec::new();
+
+        for (exchange, pos) in &state.positions {
+            if !pos.is_empty() {
+                signals.push(Signal::PlaceOrder(Order {
+                    id: OrderId::from(""),
+                    exchange: *exchange,
+                    symbol: state.symbol.clone(),
+                    side: pos.side.opposite(),
+                    order_type: OrderType::Market,
+                    quantity: pos.size,
+                    reduce_only: true,
+                    client_order_id: None,
+                }));
+            }
         }
+
+        signals
     }
 }
 
-#[async_trait]
-impl<B, O> Strategy for FundingArbStrategy<B, O>
-where
-    B: ExchangeExecutor + 'static,
-    O: ExchangeExecutor + 'static,
-{
-    fn evaluate(&self, state: &SymbolState) -> Option<Signal> {
+impl Strategy for FundingArbStrategy {
+    fn exchanges(&self) -> Vec<Exchange> {
+        self.exchanges.clone()
+    }
+
+    fn symbols(&self) -> Vec<Symbol> {
+        self.symbols.clone()
+    }
+
+    fn market_data_types(&self) -> Vec<MarketDataType> {
+        vec![
+            MarketDataType::FundingRate,
+            MarketDataType::BBO,
+            MarketDataType::Position,
+            MarketDataType::OrderUpdate,
+        ]
+    }
+
+    fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
+        // 获取事件关联的 symbol
+        let symbol = match event.symbol() {
+            Some(s) => s.clone(),
+            None => return vec![], // Balance 事件暂不处理
+        };
+
+        // 更新状态
+        if let Some(state) = self.states.get_mut(&symbol) {
+            state.apply(event);
+        } else {
+            return vec![];
+        }
+
+        // 重新获取不可变引用进行检查
+        let state = self.states.get(&symbol).unwrap();
+
         // 检查开仓条件
-        if let Some((short_ex, long_ex)) = self.should_open(state) {
-            let qty = self.config.base_quantity;
-            return Some(Signal {
-                symbol: state.symbol.clone(),
-                actions: vec![
-                    TradeAction::open(short_ex, Side::Short, qty, OrderType::Market),
-                    TradeAction::open(long_ex, Side::Long, qty, OrderType::Market),
-                ],
-            });
+        if let Some((short_ex, long_ex)) = Self::check_open_condition(state, &self.config) {
+            return Self::make_open_signals(&symbol, short_ex, long_ex, self.config.base_quantity);
         }
 
         // 检查平仓条件
-        if self.should_close(state) {
-            let mut actions = Vec::new();
-
-            for (exchange, pos) in &state.positions {
-                if !pos.is_empty() {
-                    actions.push(TradeAction::close(
-                        *exchange,
-                        pos.side,
-                        pos.size,
-                        OrderType::Market,
-                    ));
-                }
-            }
-
-            if !actions.is_empty() {
-                return Some(Signal {
-                    symbol: state.symbol.clone(),
-                    actions,
-                });
-            }
+        if Self::check_close_condition(state, &self.config) {
+            return Self::make_close_signals(state);
         }
 
-        None
-    }
-
-    async fn execute(&self, signal: Signal) -> Result<(), ExchangeError> {
-        use crate::domain::{Order, OrderId};
-
-        for action in signal.actions {
-            let order = Order {
-                id: OrderId::from(""),
-                exchange: action.exchange,
-                symbol: signal.symbol.clone(),
-                side: action.side,
-                order_type: action.order_type,
-                quantity: action.quantity,
-                reduce_only: action.reduce_only,
-                client_order_id: None,
-            };
-
-            let result = match action.exchange {
-                Exchange::Binance => self.binance.place_order(order).await,
-                Exchange::OKX => self.okx.place_order(order).await,
-            };
-
-            match result {
-                Ok(order_id) => {
-                    tracing::info!(
-                        symbol = %signal.symbol,
-                        exchange = %action.exchange,
-                        order_id = %order_id,
-                        side = %action.side,
-                        quantity = %action.quantity,
-                        "Order placed successfully"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        symbol = %signal.symbol,
-                        exchange = %action.exchange,
-                        error = %e,
-                        "Failed to place order"
-                    );
-                    return Err(e);
-                }
-            }
-        }
-
-        Ok(())
+        vec![]
     }
 }

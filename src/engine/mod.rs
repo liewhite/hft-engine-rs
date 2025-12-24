@@ -1,5 +1,4 @@
-mod coordinator;
-mod processor;
+mod engine;
+mod executor;
 
-pub use coordinator::Coordinator;
-pub use processor::SymbolProcessor;
+pub use engine::Engine;

@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 /// 公共数据 Sink - 由消费者创建，按 Symbol 拆分
 ///
 /// 消费者创建所需的 sender，生产者只负责推送数据
+#[derive(Clone)]
 pub struct PublicSinks {
     /// FundingRate per symbol
     pub funding_rates: HashMap<Symbol, broadcast::Sender<FundingRate>>,
@@ -51,6 +52,7 @@ impl PublicSinks {
 }
 
 /// 私有数据 Sink - 由消费者创建，按 Symbol 拆分
+#[derive(Clone)]
 pub struct PrivateSinks {
     /// Position per symbol
     pub positions: HashMap<Symbol, broadcast::Sender<Position>>,
