@@ -17,16 +17,19 @@ pub struct FundingArbConfig {
     pub max_notional: f64,
     /// 最大持仓数量
     pub max_quantity: Quantity,
+    /// 订单超时时间 (毫秒)
+    pub order_timeout_ms: u64,
 }
 
 impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
-            min_spread: 0.0005,   // 0.05%
-            max_spread: 0.002,    // 0.2%
-            close_spread: 0.0002, // 0.02%
-            max_notional: 1000.0, // 1000 USDT
+            min_spread: 0.0005,     // 0.05%
+            max_spread: 0.002,      // 0.2%
+            close_spread: 0.0002,   // 0.02%
+            max_notional: 1000.0,   // 1000 USDT
             max_quantity: 1.0,
+            order_timeout_ms: 10_000, // 10 seconds
         }
     }
 }
@@ -346,28 +349,29 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
-        // 处理 BalanceUpdate (全局状态，不走 SymbolState)
-        if let ExchangeEvent::BalanceUpdate { exchange, balance, .. } = &event {
-            if balance.asset == "USDT" {
-                tracing::info!(
-                    exchange = %exchange,
-                    available = balance.available,
-                    frozen = balance.frozen,
-                    "Received USDT balance update"
-                );
-                self.usdt_balances.insert(*exchange, balance.available);
+        // 区分全局事件和 Symbol 事件
+        match &event {
+            // 全局事件: Balance (策略层处理余额追踪)
+            ExchangeEvent::BalanceUpdate { exchange, balance, .. } => {
+                if balance.asset == "USDT" {
+                    tracing::info!(
+                        exchange = %exchange,
+                        available = balance.available,
+                        frozen = balance.frozen,
+                        "Received USDT balance update"
+                    );
+                    self.usdt_balances.insert(*exchange, balance.available);
+                }
+                return vec![];
             }
-            return vec![];
+            // 全局事件: Clock (定时检查订单超时)
+            ExchangeEvent::Clock { timestamp } => {
+                self.state.remove_timed_out_orders(*timestamp, self.config.order_timeout_ms);
+                return vec![];
+            }
+            // Symbol 事件: 委托 SymbolState 处理
+            _ => self.state.apply(event),
         }
-
-        // 处理 Clock 事件 (检查订单超时)
-        if let ExchangeEvent::Clock { timestamp } = &event {
-            self.state.remove_timed_out_orders(*timestamp);
-            return vec![];
-        }
-
-        // 更新 per-symbol 状态
-        self.state.apply(event);
 
         // 有未完成订单或开仓进行中时等待
         if self.state.has_pending_orders() {

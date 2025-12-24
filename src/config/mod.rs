@@ -65,6 +65,8 @@ pub struct FundingArbStrategyConfig {
     pub max_notional: f64,
     #[serde(default = "default_max_quantity")]
     pub max_quantity: f64,
+    #[serde(default = "default_order_timeout_ms")]
+    pub order_timeout_ms: u64,
 }
 
 fn default_min_spread() -> f64 {
@@ -82,6 +84,9 @@ fn default_max_notional() -> f64 {
 fn default_max_quantity() -> f64 {
     1.0
 }
+fn default_order_timeout_ms() -> u64 {
+    10_000
+}
 
 impl Default for FundingArbStrategyConfig {
     fn default() -> Self {
@@ -91,6 +96,7 @@ impl Default for FundingArbStrategyConfig {
             close_spread: default_close_spread(),
             max_notional: default_max_notional(),
             max_quantity: default_max_quantity(),
+            order_timeout_ms: default_order_timeout_ms(),
         }
     }
 }
@@ -103,6 +109,7 @@ impl From<FundingArbStrategyConfig> for FundingArbConfig {
             close_spread: cfg.close_spread,
             max_notional: cfg.max_notional,
             max_quantity: cfg.max_quantity,
+            order_timeout_ms: cfg.order_timeout_ms,
         }
     }
 }

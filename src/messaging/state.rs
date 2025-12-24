@@ -19,8 +19,6 @@ pub struct PendingOrder {
     pub created_at: Timestamp,
 }
 
-/// 订单超时时间 (毫秒)
-const ORDER_TIMEOUT_MS: u64 = 10_000;
 
 /// 单个交易对在所有交易所的聚合状态
 #[derive(Debug, Clone)]
@@ -54,11 +52,11 @@ impl SymbolState {
     }
 
     /// 检查并移除超时订单，返回被移除的订单数量
-    pub fn remove_timed_out_orders(&mut self, now: Timestamp) -> usize {
+    pub fn remove_timed_out_orders(&mut self, now: Timestamp, timeout_ms: u64) -> usize {
         let before = self.pending_orders.len();
         self.pending_orders.retain(|client_id, order| {
             let elapsed = now.saturating_sub(order.created_at);
-            if elapsed > ORDER_TIMEOUT_MS && order.status == PendingOrderStatus::Created {
+            if elapsed > timeout_ms && order.status == PendingOrderStatus::Created {
                 tracing::warn!(
                     client_order_id = %client_id,
                     exchange = %order.exchange,
