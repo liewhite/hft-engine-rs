@@ -1,6 +1,7 @@
 use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO};
 use crate::messaging::{ExchangeEvent, SymbolState};
 use crate::strategy::{MarketDataType, Signal, Strategy};
+use std::collections::HashMap;
 
 /// 资金费率套利策略配置
 #[derive(Debug, Clone)]
@@ -43,6 +44,8 @@ pub struct FundingArbStrategy {
     exchanges: Vec<Exchange>,
     symbol: Symbol,
     state: SymbolState,
+    /// 各交易所 USDT 可用余额 (用于风控)
+    usdt_balances: HashMap<Exchange, f64>,
 }
 
 impl FundingArbStrategy {
@@ -52,7 +55,18 @@ impl FundingArbStrategy {
             exchanges,
             state: SymbolState::new(symbol.clone()),
             symbol,
+            usdt_balances: HashMap::new(),
         }
+    }
+
+    /// 获取指定交易所的 USDT 可用余额
+    pub fn usdt_balance(&self, exchange: Exchange) -> f64 {
+        self.usdt_balances.get(&exchange).copied().unwrap_or(0.0)
+    }
+
+    /// 获取所有交易所的 USDT 总可用余额
+    pub fn total_usdt_balance(&self) -> f64 {
+        self.usdt_balances.values().sum()
     }
 
     /// 检查开仓条件 (静态方法，避免借用冲突)
@@ -306,11 +320,25 @@ impl Strategy for FundingArbStrategy {
             MarketDataType::BBO,
             MarketDataType::Position,
             MarketDataType::OrderUpdate,
+            MarketDataType::Balance,
         ]
     }
 
     fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
-        // 更新状态
+        // 处理 BalanceUpdate (全局状态，不走 SymbolState)
+        if let ExchangeEvent::BalanceUpdate { exchange, balance, .. } = &event {
+            if balance.asset == "USDT" {
+                self.usdt_balances.insert(*exchange, balance.available);
+                tracing::debug!(
+                    exchange = %exchange,
+                    available = balance.available,
+                    "USDT balance updated"
+                );
+            }
+            return vec![];
+        }
+
+        // 更新 per-symbol 状态
         self.state.apply(event);
 
         // 有未完成订单时等待
