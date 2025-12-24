@@ -43,14 +43,21 @@ impl FundingRateData {
             .unwrap_or_else(|| panic!("Failed to parse OKX inst_id: {}", self.inst_id));
         let rate = f64::from_str(&self.funding_rate)
             .unwrap_or_else(|e| panic!("Failed to parse funding rate '{}': {}", self.funding_rate, e));
+        let funding_time_ms: u64 = self.funding_time.parse()
+            .unwrap_or_else(|e| panic!("Failed to parse funding_time '{}': {}", self.funding_time, e));
         let next_settle_ms: u64 = self.next_funding_time.parse()
             .unwrap_or_else(|e| panic!("Failed to parse next_funding_time '{}': {}", self.next_funding_time, e));
+
+        // 计算结算间隔 (毫秒转小时)
+        let interval_ms = next_settle_ms.saturating_sub(funding_time_ms);
+        let settle_interval_hours = (interval_ms as f64) / (1000.0 * 60.0 * 60.0);
 
         FundingRate {
             exchange: Exchange::OKX,
             symbol,
             rate,
             next_settle_time: next_settle_ms,
+            settle_interval_hours,
         }
     }
 }

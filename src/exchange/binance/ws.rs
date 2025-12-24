@@ -74,6 +74,18 @@ impl ExchangeWebSocket for BinanceWebSocket {
             return Ok(());
         }
 
+        // 获取各合约的结算间隔信息 (用于日化费率计算)
+        let funding_intervals = match self.rest_client.get_funding_info().await {
+            Ok(info) => {
+                tracing::info!(count = info.len(), "Fetched Binance funding intervals");
+                Arc::new(info)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to fetch funding info, using default 8h");
+                Arc::new(HashMap::new())
+            }
+        };
+
         // 构建订阅参数
         let mut streams: Vec<String> = Vec::new();
         for symbol in &symbols {
@@ -89,6 +101,7 @@ impl ExchangeWebSocket for BinanceWebSocket {
         });
 
         // 启动带重连的消息处理任务
+        let intervals = funding_intervals.clone();
         tokio::spawn(async move {
             let mut backoff = ExponentialBackoff::new(RetryConfig::default());
 
@@ -179,6 +192,7 @@ impl ExchangeWebSocket for BinanceWebSocket {
                                                 &text,
                                                 &sinks.funding_rates,
                                                 &sinks.bbos,
+                                                &intervals,
                                             );
                                         }
                                         Some(Ok(Message::Ping(data))) => {
@@ -338,6 +352,7 @@ fn handle_binance_public_message(
     text: &str,
     funding_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::FundingRate>>,
     bbo_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::BBO>>,
+    funding_intervals: &HashMap<Symbol, f64>,
 ) {
     // 先解析为 Value 获取事件类型
     let value: serde_json::Value = parse_or_panic!(text, serde_json::Value, "Binance public base");
@@ -346,7 +361,11 @@ fn handle_binance_public_message(
     match event_type {
         Some("markPriceUpdate") => {
             let update: MarkPriceUpdate = parse_or_panic!(text, MarkPriceUpdate, "markPriceUpdate");
-            let rate = update.to_funding_rate();
+            // 获取该 symbol 的结算间隔，默认 8 小时
+            let interval = update.symbol()
+                .and_then(|s| funding_intervals.get(&s).copied())
+                .unwrap_or(8.0);
+            let rate = update.to_funding_rate(interval);
             // 按 symbol 路由到对应的 sink (未订阅的 symbol 忽略)
             if let Some(tx) = funding_sinks.get(&rate.symbol) {
                 let _ = tx.send(rate);

@@ -19,7 +19,9 @@ pub struct MarkPriceUpdate {
 }
 
 impl MarkPriceUpdate {
-    pub fn to_funding_rate(&self) -> FundingRate {
+    /// 转换为 FundingRate
+    /// settle_interval_hours: 结算间隔小时数 (从 fundingInfo API 获取，默认 8)
+    pub fn to_funding_rate(&self, settle_interval_hours: f64) -> FundingRate {
         let symbol = Symbol::from_binance(&self.s)
             .unwrap_or_else(|| panic!("Failed to parse Binance symbol: {}", self.s));
         let rate = f64::from_str(&self.r)
@@ -30,7 +32,13 @@ impl MarkPriceUpdate {
             symbol,
             rate,
             next_settle_time: self.t as u64,
+            settle_interval_hours,
         }
+    }
+
+    /// 获取 symbol (用于查询结算间隔)
+    pub fn symbol(&self) -> Option<Symbol> {
+        Symbol::from_binance(&self.s)
     }
 }
 

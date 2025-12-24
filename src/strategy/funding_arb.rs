@@ -6,11 +6,11 @@ use std::collections::HashMap;
 /// 资金费率套利策略配置
 #[derive(Debug, Clone)]
 pub struct FundingArbConfig {
-    /// 最小费率差 (开仓阈值)
+    /// 最小日化费率差 (开仓阈值)
     pub min_spread: Rate,
-    /// 最大费率差 (限制风险)
+    /// 最大日化费率差 (限制风险)
     pub max_spread: Rate,
-    /// 平仓费率差阈值
+    /// 平仓日化费率差阈值
     pub close_spread: Rate,
     /// 单笔最大下单金额 (USDT)
     pub max_notional: f64,
