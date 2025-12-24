@@ -1,11 +1,7 @@
 use fee_arb::config::AppConfig;
 use fee_arb::domain::Exchange;
 use fee_arb::engine::Engine;
-use fee_arb::exchange::binance::BinanceWebSocket;
-use fee_arb::exchange::okx::OkxWebSocket;
-use fee_arb::exchange::ExchangeWebSocket;
 use fee_arb::strategy::FundingArbStrategy;
-use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
@@ -37,18 +33,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // Create WebSocket clients
-    let binance_ws: Arc<dyn ExchangeWebSocket> = Arc::new(BinanceWebSocket::new(
-        config.exchanges.binance.api_key.clone(),
-        config.exchanges.binance.secret.clone(),
-    )?);
-
-    let okx_ws: Arc<dyn ExchangeWebSocket> = Arc::new(OkxWebSocket::new(
-        config.exchanges.okx.api_key.clone(),
-        config.exchanges.okx.secret.clone(),
-        config.exchanges.okx.passphrase.clone(),
-    )?);
-
     // Create strategy
     let strategy = FundingArbStrategy::new(
         config.strategy.funding_arb.clone().into(),
@@ -56,8 +40,8 @@ async fn main() -> anyhow::Result<()> {
         symbols,
     );
 
-    // Create and configure engine
-    let mut engine = Engine::new(vec![binance_ws, okx_ws]);
+    // Create and configure engine (auto-registers all supported exchanges)
+    let mut engine = Engine::new(&config.exchanges)?;
     engine.add_strategy(strategy);
 
     // Start engine

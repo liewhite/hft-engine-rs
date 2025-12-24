@@ -1,5 +1,8 @@
+use crate::config::ExchangesConfig;
 use crate::domain::{Exchange, ExchangeError, Symbol};
 use crate::engine::executor::Executor;
+use crate::exchange::binance::BinanceWebSocket;
+use crate::exchange::okx::OkxWebSocket;
 use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicSinks};
 use crate::messaging::ExchangeEvent;
 use crate::strategy::{MarketDataType, Signal, Strategy};
@@ -16,17 +19,30 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(exchanges: Vec<Arc<dyn ExchangeWebSocket>>) -> Self {
-        let exchanges_map: HashMap<_, _> = exchanges
-            .into_iter()
-            .map(|ws| (ws.exchange(), ws))
-            .collect();
+    /// 创建引擎，自动注册所有支持的交易所
+    pub fn new(config: &ExchangesConfig) -> Result<Self, ExchangeError> {
+        let mut exchanges: HashMap<Exchange, Arc<dyn ExchangeWebSocket>> = HashMap::new();
 
-        Self {
-            exchanges: exchanges_map,
+        // 注册 Binance
+        let binance_ws: Arc<dyn ExchangeWebSocket> = Arc::new(BinanceWebSocket::new(
+            config.binance.api_key.clone(),
+            config.binance.secret.clone(),
+        )?);
+        exchanges.insert(Exchange::Binance, binance_ws);
+
+        // 注册 OKX
+        let okx_ws: Arc<dyn ExchangeWebSocket> = Arc::new(OkxWebSocket::new(
+            config.okx.api_key.clone(),
+            config.okx.secret.clone(),
+            config.okx.passphrase.clone(),
+        )?);
+        exchanges.insert(Exchange::OKX, okx_ws);
+
+        Ok(Self {
+            exchanges,
             strategies: Vec::new(),
             cancel_token: CancellationToken::new(),
-        }
+        })
     }
 
     /// 添加策略
@@ -134,7 +150,6 @@ impl Engine {
         tracing::info!("Received shutdown signal");
     }
 }
-
 
 /// 包装 Box<dyn Strategy> 以实现 Strategy trait
 struct StrategyWrapper(Box<dyn Strategy>);
