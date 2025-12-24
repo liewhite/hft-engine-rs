@@ -1,12 +1,15 @@
 use crate::domain::{Exchange, ExchangeError, Symbol};
 use crate::exchange::api::{ExchangeWebSocket, PrivateSinks, PublicSinks};
-use crate::exchange::binance::codec::{AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate};
+use crate::exchange::binance::codec::{
+    AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
+};
 use crate::exchange::binance::rest::BinanceRestClient;
 use crate::exchange::binance::WS_PUBLIC_URL;
 use crate::exchange::ws_util::{ExponentialBackoff, RetryConfig};
 use crate::parse_or_panic;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,7 +82,11 @@ impl ExchangeWebSocket for BinanceWebSocket {
             streams.push(format!("{}@bookTicker", s));
         }
 
-        let url = format!("{}/{}", WS_PUBLIC_URL, streams.join("/"));
+        let subscribe_msg = json!({
+            "method": "SUBSCRIBE",
+            "params": streams,
+            "id": 1
+        });
 
         // 启动带重连的消息处理任务
         tokio::spawn(async move {
@@ -90,12 +97,73 @@ impl ExchangeWebSocket for BinanceWebSocket {
                     break;
                 }
 
-                tracing::info!(url = %url, "Connecting to Binance public WebSocket");
+                tracing::info!(url = %WS_PUBLIC_URL, "Connecting to Binance public WebSocket");
 
-                match connect_async(&url).await {
+                match connect_async(WS_PUBLIC_URL).await {
                     Ok((ws_stream, _)) => {
-                        backoff.reset();
                         let (mut write, mut read) = ws_stream.split();
+
+                        // 发送订阅消息
+                        if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
+                            tracing::error!(error = %e, "Failed to send subscribe message");
+                            backoff.wait().await;
+                            continue;
+                        }
+
+                        // 等待订阅响应
+                        let subscribe_ok = match read.next().await {
+                            Some(Ok(Message::Text(text))) => {
+                                match serde_json::from_str::<WsResponse>(&text) {
+                                    Ok(resp) if resp.id == 1 => {
+                                        if let Some(err) = resp.error {
+                                            tracing::error!(
+                                                code = err.code,
+                                                msg = %err.msg,
+                                                "Binance subscribe failed"
+                                            );
+                                            false
+                                        } else {
+                                            tracing::info!("Binance public subscribe successful");
+                                            true
+                                        }
+                                    }
+                                    Ok(resp) => {
+                                        tracing::error!(
+                                            id = resp.id,
+                                            "Unexpected response id while waiting for subscribe"
+                                        );
+                                        false
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            raw = %text,
+                                            "Failed to parse subscribe response"
+                                        );
+                                        false
+                                    }
+                                }
+                            }
+                            Some(Ok(other)) => {
+                                tracing::error!(msg = ?other, "Unexpected message type while waiting for subscribe");
+                                false
+                            }
+                            Some(Err(e)) => {
+                                tracing::error!(error = %e, "WebSocket error while waiting for subscribe");
+                                false
+                            }
+                            None => {
+                                tracing::error!("WebSocket closed while waiting for subscribe");
+                                false
+                            }
+                        };
+
+                        if !subscribe_ok {
+                            backoff.wait().await;
+                            continue;
+                        }
+
+                        backoff.reset();
 
                         // 消息处理循环
                         loop {

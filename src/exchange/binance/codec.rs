@@ -212,27 +212,18 @@ impl OrderTradeUpdate {
     }
 }
 
-/// WebSocket 通用消息 (保留用于未来扩展)
+/// WebSocket 订阅响应
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
-#[allow(dead_code)]
-pub enum WsMessage {
-    MarkPrice(MarkPriceUpdate),
-    BookTicker(BookTicker),
-    AccountUpdate(AccountUpdate),
-    OrderUpdate(OrderTradeUpdate),
-    Other(serde_json::Value),
+pub struct WsResponse {
+    pub id: i64,
+    #[allow(dead_code)]
+    pub result: Option<serde_json::Value>,
+    pub error: Option<WsError>,
 }
 
-#[allow(dead_code)]
-impl WsMessage {
-    pub fn event_type(&self) -> &str {
-        match self {
-            WsMessage::MarkPrice(m) => &m.e,
-            WsMessage::BookTicker(m) => &m.e,
-            WsMessage::AccountUpdate(m) => &m.e,
-            WsMessage::OrderUpdate(m) => &m.e,
-            WsMessage::Other(v) => v.get("e").and_then(|e| e.as_str()).unwrap_or("unknown"),
-        }
-    }
+/// WebSocket 错误
+#[derive(Debug, Deserialize)]
+pub struct WsError {
+    pub code: i32,
+    pub msg: String,
 }

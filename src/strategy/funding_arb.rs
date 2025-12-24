@@ -21,9 +21,9 @@ pub struct FundingArbConfig {
 impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
-            min_spread: 0.0005,       // 0.05%
-            max_spread: 0.002,        // 0.2%
-            close_spread: 0.0002,     // 0.02%
+            min_spread: 0.0005,   // 0.05%
+            max_spread: 0.002,    // 0.2%
+            close_spread: 0.0002, // 0.02%
             base_quantity: 0.01,
             max_quantity: 1.0,
         }
@@ -189,7 +189,26 @@ impl Strategy for FundingArbStrategy {
 
     fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
         // TODO: 测试阶段，仅打印事件
-        tracing::info!(event = ?event, "Received event");
+        match event {
+            ExchangeEvent::FundingRateUpdate {
+                exchange,
+                symbol,
+                rate,
+                timestamp,
+            } => {
+                tracing::info!(
+                    "FundingRateUpdate - exchange: {}, symbol: {}, rate: {}, timestamp: {}",
+                    exchange,
+                    symbol,
+                    rate.rate,
+                    timestamp
+                );
+            }
+            ExchangeEvent::BBOUpdate { .. } => {}
+            ExchangeEvent::PositionUpdate { .. } => {}
+            ExchangeEvent::OrderStatusUpdate { .. } => {}
+            ExchangeEvent::BalanceUpdate { .. } => {},
+        }
         return vec![];
 
         // 获取事件关联的 symbol
