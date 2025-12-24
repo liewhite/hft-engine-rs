@@ -35,7 +35,9 @@ impl BinanceWebSocket {
         let client = self.rest_client.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30 * 60)); // 30分钟
+            // 首次延迟 30 分钟后再开始保活，避免在 listen key 创建前就调用
+            let start = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+            let mut interval = tokio::time::interval_at(start, Duration::from_secs(30 * 60));
 
             loop {
                 tokio::select! {
@@ -43,6 +45,8 @@ impl BinanceWebSocket {
                     _ = interval.tick() => {
                         if let Err(e) = client.keep_alive_listen_key().await {
                             tracing::error!(error = %e, "Failed to keep alive listen key");
+                        } else {
+                            tracing::debug!("Binance listen key kept alive");
                         }
                     }
                 }
