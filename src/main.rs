@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
     // Create and configure engine (auto-registers all supported exchanges)
-    let mut engine = Engine::new(&config.exchanges)?;
+    let mut engine = Engine::new(&config.exchanges, config.engine.metrics.clone())?;
 
     // Create per-symbol strategies
     let exchanges = config.exchanges.enabled_exchanges();

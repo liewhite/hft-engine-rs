@@ -45,3 +45,6 @@ toml = "0.8"
 
 # UUID generation
 uuid = { version = "1", features = ["v4"] }
+
+# Metrics
+prometheus = "0.13"

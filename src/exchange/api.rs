@@ -49,6 +49,22 @@ impl PublicSinks {
     pub fn subscribe_bbo(&self, symbol: &Symbol) -> Option<broadcast::Receiver<BBO>> {
         self.bbos.get(symbol).map(|tx| tx.subscribe())
     }
+
+    /// 获取所有 funding rate receivers (用于 metrics 订阅)
+    pub fn funding_rate_receivers(&self) -> Vec<(Symbol, broadcast::Receiver<FundingRate>)> {
+        self.funding_rates
+            .iter()
+            .map(|(s, tx)| (s.clone(), tx.subscribe()))
+            .collect()
+    }
+
+    /// 获取所有 BBO receivers (用于 metrics 订阅)
+    pub fn bbo_receivers(&self) -> Vec<(Symbol, broadcast::Receiver<BBO>)> {
+        self.bbos
+            .iter()
+            .map(|(s, tx)| (s.clone(), tx.subscribe()))
+            .collect()
+    }
 }
 
 /// 私有数据 Sink - 由消费者创建，按 Symbol 拆分
@@ -98,6 +114,14 @@ impl PrivateSinks {
     /// 订阅指定 symbol 的 OrderUpdate
     pub fn subscribe_order_update(&self, symbol: &Symbol) -> Option<broadcast::Receiver<OrderUpdate>> {
         self.order_updates.get(symbol).map(|tx| tx.subscribe())
+    }
+
+    /// 获取所有 position receivers (用于 metrics 订阅)
+    pub fn position_receivers(&self) -> Vec<(Symbol, broadcast::Receiver<Position>)> {
+        self.positions
+            .iter()
+            .map(|(s, tx)| (s.clone(), tx.subscribe()))
+            .collect()
     }
 }
 
