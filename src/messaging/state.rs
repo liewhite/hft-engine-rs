@@ -1,6 +1,26 @@
-use crate::domain::{Exchange, FundingRate, OrderStatus, Position, Rate, Symbol, BBO};
+use crate::domain::{Exchange, FundingRate, OrderStatus, Position, Rate, Symbol, Timestamp, BBO};
 use crate::messaging::event::ExchangeEvent;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+/// 待处理订单状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingOrderStatus {
+    /// 已创建信号，等待交易所确认
+    Created,
+    /// 交易所已确认
+    Confirmed,
+}
+
+/// 待处理订单信息
+#[derive(Debug, Clone)]
+pub struct PendingOrder {
+    pub exchange: Exchange,
+    pub status: PendingOrderStatus,
+    pub created_at: Timestamp,
+}
+
+/// 订单超时时间 (毫秒)
+const ORDER_TIMEOUT_MS: u64 = 10_000;
 
 /// 单个交易对在所有交易所的聚合状态
 #[derive(Debug, Clone)]
@@ -10,7 +30,7 @@ pub struct SymbolState {
     pub bbos: HashMap<Exchange, BBO>,
     pub positions: HashMap<Exchange, Position>,
     /// 待处理订单 (以 client_order_id 为 key)
-    pending_orders: HashSet<String>,
+    pending_orders: HashMap<String, PendingOrder>,
 }
 
 impl SymbolState {
@@ -20,13 +40,37 @@ impl SymbolState {
             funding_rates: HashMap::new(),
             bbos: HashMap::new(),
             positions: HashMap::new(),
-            pending_orders: HashSet::new(),
+            pending_orders: HashMap::new(),
         }
     }
 
     /// 添加待处理订单 (发送订单信号时调用)
-    pub fn add_pending_order(&mut self, client_order_id: String) {
-        self.pending_orders.insert(client_order_id);
+    pub fn add_pending_order(&mut self, client_order_id: String, exchange: Exchange, created_at: Timestamp) {
+        self.pending_orders.insert(client_order_id, PendingOrder {
+            exchange,
+            status: PendingOrderStatus::Created,
+            created_at,
+        });
+    }
+
+    /// 检查并移除超时订单，返回被移除的订单数量
+    pub fn remove_timed_out_orders(&mut self, now: Timestamp) -> usize {
+        let before = self.pending_orders.len();
+        self.pending_orders.retain(|client_id, order| {
+            let elapsed = now.saturating_sub(order.created_at);
+            if elapsed > ORDER_TIMEOUT_MS && order.status == PendingOrderStatus::Created {
+                tracing::warn!(
+                    client_order_id = %client_id,
+                    exchange = %order.exchange,
+                    elapsed_ms = elapsed,
+                    "Order timed out, removing from pending"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        before - self.pending_orders.len()
     }
 
     /// 获取日化费率最高的交易所 (适合做空)
@@ -180,13 +224,20 @@ impl SymbolState {
                         OrderStatus::Filled
                         | OrderStatus::Cancelled
                         | OrderStatus::Rejected { .. } => {
+                            // 订单结束，移除
                             self.pending_orders.remove(client_id);
                         }
                         OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
-                            // 订单已在发送时加入 pending，这里不需要再加
+                            // 交易所已确认订单，更新状态
+                            if let Some(order) = self.pending_orders.get_mut(client_id) {
+                                order.status = PendingOrderStatus::Confirmed;
+                            }
                         }
                     }
                 }
+            }
+            ExchangeEvent::Clock { .. } => {
+                // Clock 事件由策略层处理，这里不需要处理
             }
             ExchangeEvent::BalanceUpdate { .. } => {
                 // 已在上面提前返回，这里不会执行

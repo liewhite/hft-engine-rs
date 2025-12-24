@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO};
+use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, now_ms, BBO};
 use crate::messaging::{ExchangeEvent, SymbolState};
 use crate::strategy::{MarketDataType, Signal, Strategy};
 use std::collections::HashMap;
@@ -360,6 +360,12 @@ impl Strategy for FundingArbStrategy {
             return vec![];
         }
 
+        // 处理 Clock 事件 (检查订单超时)
+        if let ExchangeEvent::Clock { timestamp } = &event {
+            self.state.remove_timed_out_orders(*timestamp);
+            return vec![];
+        }
+
         // 更新 per-symbol 状态
         self.state.apply(event);
 
@@ -390,10 +396,11 @@ impl Strategy for FundingArbStrategy {
                 self.total_usdt_balance(),
             );
             // 将订单的 client_order_id 加入 pending_orders
+            let now = now_ms();
             for signal in &signals {
                 let Signal::PlaceOrder(order) = signal;
                 if let Some(ref client_id) = order.client_order_id {
-                    self.state.add_pending_order(client_id.clone());
+                    self.state.add_pending_order(client_id.clone(), order.exchange, now);
                 }
             }
             return signals;

@@ -1,13 +1,15 @@
 use crate::config::ExchangesConfig;
-use crate::domain::{Exchange, ExchangeError, Symbol};
+use crate::domain::{Exchange, ExchangeError, Symbol, now_ms};
 use crate::engine::executor::Executor;
 use crate::exchange::binance::BinanceWebSocket;
 use crate::exchange::okx::OkxWebSocket;
 use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicSinks};
+use crate::messaging::ExchangeEvent;
 use crate::strategy::{Signal, Strategy};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// 引擎 - 管理多个策略的执行
@@ -100,11 +102,27 @@ impl Engine {
         // 3. 创建 SignalQueue
         let (signal_tx, mut signal_rx) = mpsc::channel::<Signal>(256);
 
-        // 4. 为每个策略创建 Executor 并启动
+        // 4. 创建 Clock broadcast 并启动定时推送
+        let (clock_tx, _) = broadcast::channel::<ExchangeEvent>(16);
+        let clock_tx_clone = clock_tx.clone();
+        let clock_token = token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = clock_token.cancelled() => break,
+                    _ = interval.tick() => {
+                        let _ = clock_tx_clone.send(ExchangeEvent::Clock { timestamp: now_ms() });
+                    }
+                }
+            }
+        });
+
+        // 5. 为每个策略创建 Executor 并启动
         let strategies = std::mem::take(&mut self.strategies);
         for strategy in strategies {
             let executor = Executor::new(strategy);
-            executor.run(&public_sinks, &private_sinks, signal_tx.clone(), token.clone());
+            executor.run(&public_sinks, &private_sinks, clock_tx.subscribe(), signal_tx.clone(), token.clone());
         }
 
         // 5. 处理信号

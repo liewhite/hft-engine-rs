@@ -32,28 +32,33 @@ pub enum ExchangeEvent {
         balance: Balance,
         timestamp: Timestamp,
     },
+    /// 时钟事件 (用于超时检测等定时任务)
+    Clock {
+        timestamp: Timestamp,
+    },
 }
 
 impl ExchangeEvent {
-    /// 获取事件关联的 Symbol (BalanceUpdate 返回 None)
+    /// 获取事件关联的 Symbol (BalanceUpdate/Clock 返回 None)
     pub fn symbol(&self) -> Option<&Symbol> {
         match self {
             Self::FundingRateUpdate { symbol, .. } => Some(symbol),
             Self::BBOUpdate { symbol, .. } => Some(symbol),
             Self::PositionUpdate { symbol, .. } => Some(symbol),
             Self::OrderStatusUpdate { symbol, .. } => Some(symbol),
-            Self::BalanceUpdate { .. } => None,
+            Self::BalanceUpdate { .. } | Self::Clock { .. } => None,
         }
     }
 
-    /// 获取事件来源交易所
-    pub fn exchange(&self) -> Exchange {
+    /// 获取事件来源交易所 (Clock 返回 None)
+    pub fn exchange(&self) -> Option<Exchange> {
         match self {
-            Self::FundingRateUpdate { exchange, .. } => *exchange,
-            Self::BBOUpdate { exchange, .. } => *exchange,
-            Self::PositionUpdate { exchange, .. } => *exchange,
-            Self::OrderStatusUpdate { exchange, .. } => *exchange,
-            Self::BalanceUpdate { exchange, .. } => *exchange,
+            Self::FundingRateUpdate { exchange, .. } => Some(*exchange),
+            Self::BBOUpdate { exchange, .. } => Some(*exchange),
+            Self::PositionUpdate { exchange, .. } => Some(*exchange),
+            Self::OrderStatusUpdate { exchange, .. } => Some(*exchange),
+            Self::BalanceUpdate { exchange, .. } => Some(*exchange),
+            Self::Clock { .. } => None,
         }
     }
 
@@ -65,6 +70,7 @@ impl ExchangeEvent {
             Self::PositionUpdate { timestamp, .. } => *timestamp,
             Self::OrderStatusUpdate { timestamp, .. } => *timestamp,
             Self::BalanceUpdate { timestamp, .. } => *timestamp,
+            Self::Clock { timestamp } => *timestamp,
         }
     }
 }

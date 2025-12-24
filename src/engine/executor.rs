@@ -4,7 +4,7 @@ use crate::messaging::ExchangeEvent;
 use crate::strategy::{MarketDataType, Signal, Strategy};
 use std::collections::HashSet;
 use crate::domain::now_ms;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// 策略执行器 - 为单个策略订阅数据并执行
@@ -37,6 +37,7 @@ impl Executor {
         mut self,
         public_sinks: &[(Exchange, PublicSinks)],
         private_sinks: &[(Exchange, PrivateSinks)],
+        clock_rx: broadcast::Receiver<ExchangeEvent>,
         signal_tx: mpsc::Sender<Signal>,
         cancel_token: CancellationToken,
     ) {
@@ -84,6 +85,9 @@ impl Executor {
                 receivers.push(wrap_balance_receiver(*exchange, sinks.subscribe_balance()));
             }
         }
+
+        // 添加 clock receiver
+        receivers.push(clock_rx);
 
         // 使用 mpsc 聚合所有 broadcast receivers
         let (event_tx, mut event_rx) = mpsc::channel::<ExchangeEvent>(256);
