@@ -1,5 +1,7 @@
 use crate::domain::{Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, TimeInForce};
+use crate::exchange::api::ExchangeExecutor;
 use crate::exchange::binance::REST_BASE_URL;
+use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::Deserialize;
@@ -249,5 +251,20 @@ fn order_type_to_binance(order_type: &OrderType) -> (&'static str, Option<String
             };
             ("LIMIT", Some(price.0.to_string()), Some(tif_str))
         }
+    }
+}
+
+#[async_trait]
+impl ExchangeExecutor for BinanceRestClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::Binance
+    }
+
+    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
+        BinanceRestClient::place_order(self, order).await
+    }
+
+    async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
+        BinanceRestClient::set_leverage(self, symbol, leverage).await
     }
 }

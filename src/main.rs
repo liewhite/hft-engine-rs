@@ -1,7 +1,7 @@
 use fee_arb::config::AppConfig;
 use fee_arb::engine::Coordinator;
-use fee_arb::exchange::binance::BinanceWebSocket;
-use fee_arb::exchange::okx::OkxWebSocket;
+use fee_arb::exchange::binance::{BinanceRestClient, BinanceWebSocket};
+use fee_arb::exchange::okx::{OkxRestClient, OkxWebSocket};
 use fee_arb::strategy::FundingArbStrategy;
 use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -35,27 +35,39 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // Create shared exchange adapters
-    let binance = Arc::new(BinanceWebSocket::new(
+    // Create WebSocket clients for Coordinator (market data subscription)
+    let binance_ws = Arc::new(BinanceWebSocket::new(
         config.exchanges.binance.api_key.clone(),
         config.exchanges.binance.secret.clone(),
     )?);
 
-    let okx = Arc::new(OkxWebSocket::new(
+    let okx_ws = Arc::new(OkxWebSocket::new(
         config.exchanges.okx.api_key.clone(),
         config.exchanges.okx.secret.clone(),
         config.exchanges.okx.passphrase.clone(),
     )?);
 
-    // Create strategy with shared exchange instances
+    // Create REST clients for Strategy (order execution)
+    let binance_rest = Arc::new(BinanceRestClient::new(
+        config.exchanges.binance.api_key.clone(),
+        config.exchanges.binance.secret.clone(),
+    )?);
+
+    let okx_rest = Arc::new(OkxRestClient::new(
+        config.exchanges.okx.api_key.clone(),
+        config.exchanges.okx.secret.clone(),
+        config.exchanges.okx.passphrase.clone(),
+    )?);
+
+    // Create strategy with REST clients
     let strategy = FundingArbStrategy::new(
         config.strategy.funding_arb.clone().into(),
-        binance.clone(),
-        okx.clone(),
+        binance_rest,
+        okx_rest,
     );
 
-    // Create and start coordinator with shared exchange instances
-    let mut coordinator = Coordinator::new(binance, okx, strategy, symbols);
+    // Create and start coordinator with WebSocket clients
+    let mut coordinator = Coordinator::new(binance_ws, okx_ws, strategy, symbols);
 
     coordinator.start().await?;
 

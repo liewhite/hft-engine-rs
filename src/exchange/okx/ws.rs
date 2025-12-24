@@ -1,5 +1,5 @@
-use crate::domain::{Exchange, ExchangeError, Order, OrderId, Symbol};
-use crate::exchange::api::{ExchangeExecutor, ExchangeWebSocket, PrivateHubs, PublicHubs};
+use crate::domain::{Exchange, ExchangeError, Symbol};
+use crate::exchange::api::{ExchangeWebSocket, PrivateHubs, PublicHubs};
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsEvent, WsPush,
 };
@@ -275,17 +275,3 @@ impl ExchangeWebSocket for OkxWebSocket {
     }
 }
 
-#[async_trait]
-impl ExchangeExecutor for OkxWebSocket {
-    fn exchange(&self) -> Exchange {
-        Exchange::OKX
-    }
-
-    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
-        self.rest_client.place_order(order).await
-    }
-
-    async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
-        self.rest_client.set_leverage(symbol, leverage).await
-    }
-}

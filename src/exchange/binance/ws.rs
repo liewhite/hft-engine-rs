@@ -1,5 +1,5 @@
-use crate::domain::{Exchange, ExchangeError, Order, OrderId, Symbol};
-use crate::exchange::api::{ExchangeExecutor, ExchangeWebSocket, PrivateHubs, PublicHubs};
+use crate::domain::{Exchange, ExchangeError, Symbol};
+use crate::exchange::api::{ExchangeWebSocket, PrivateHubs, PublicHubs};
 use crate::exchange::binance::codec::{AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate};
 use crate::exchange::binance::rest::BinanceRestClient;
 use crate::exchange::binance::WS_PUBLIC_URL;
@@ -219,17 +219,3 @@ impl ExchangeWebSocket for BinanceWebSocket {
     }
 }
 
-#[async_trait]
-impl ExchangeExecutor for BinanceWebSocket {
-    fn exchange(&self) -> Exchange {
-        Exchange::Binance
-    }
-
-    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
-        self.rest_client.place_order(order).await
-    }
-
-    async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
-        self.rest_client.set_leverage(symbol, leverage).await
-    }
-}

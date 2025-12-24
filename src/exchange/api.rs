@@ -69,7 +69,3 @@ pub trait ExchangeExecutor: Send + Sync {
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError>;
 }
 
-/// 组合接口
-pub trait ExchangeAdapter: ExchangeWebSocket + ExchangeExecutor {}
-
-impl<T: ExchangeWebSocket + ExchangeExecutor> ExchangeAdapter for T {}

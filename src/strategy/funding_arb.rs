@@ -1,5 +1,5 @@
 use crate::domain::{Exchange, ExchangeError, OrderType, Quantity, Rate, Side};
-use crate::exchange::ExchangeAdapter;
+use crate::exchange::ExchangeExecutor;
 use crate::messaging::SymbolState;
 use crate::strategy::api::{Signal, Strategy, TradeAction};
 use async_trait::async_trait;
@@ -36,8 +36,8 @@ impl Default for FundingArbConfig {
 /// 资金费率套利策略
 pub struct FundingArbStrategy<B, O>
 where
-    B: ExchangeAdapter,
-    O: ExchangeAdapter,
+    B: ExchangeExecutor,
+    O: ExchangeExecutor,
 {
     config: FundingArbConfig,
     binance: Arc<B>,
@@ -46,8 +46,8 @@ where
 
 impl<B, O> FundingArbStrategy<B, O>
 where
-    B: ExchangeAdapter,
-    O: ExchangeAdapter,
+    B: ExchangeExecutor,
+    O: ExchangeExecutor,
 {
     pub fn new(config: FundingArbConfig, binance: Arc<B>, okx: Arc<O>) -> Self {
         Self {
@@ -118,8 +118,8 @@ where
 
 impl<B, O> Clone for FundingArbStrategy<B, O>
 where
-    B: ExchangeAdapter,
-    O: ExchangeAdapter,
+    B: ExchangeExecutor,
+    O: ExchangeExecutor,
 {
     fn clone(&self) -> Self {
         Self {
@@ -133,8 +133,8 @@ where
 #[async_trait]
 impl<B, O> Strategy for FundingArbStrategy<B, O>
 where
-    B: ExchangeAdapter + 'static,
-    O: ExchangeAdapter + 'static,
+    B: ExchangeExecutor + 'static,
+    O: ExchangeExecutor + 'static,
 {
     fn evaluate(&self, state: &SymbolState) -> Option<Signal> {
         // 检查开仓条件

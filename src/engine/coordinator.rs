@@ -1,5 +1,5 @@
 use crate::domain::{Exchange, ExchangeError, Symbol};
-use crate::exchange::ExchangeAdapter;
+use crate::exchange::ExchangeWebSocket;
 use crate::messaging::{EventDispatcher, SymbolEventBus};
 use crate::strategy::Strategy;
 use crate::engine::processor::SymbolProcessor;
@@ -45,8 +45,8 @@ impl ComponentLifecycle {
 /// 系统协调器 - 管理所有组件的生命周期
 pub struct Coordinator<B, O, S>
 where
-    B: ExchangeAdapter,
-    O: ExchangeAdapter,
+    B: ExchangeWebSocket,
+    O: ExchangeWebSocket,
     S: Strategy + Clone,
 {
     binance: Arc<B>,
@@ -59,8 +59,8 @@ where
 
 impl<B, O, S> Coordinator<B, O, S>
 where
-    B: ExchangeAdapter + 'static,
-    O: ExchangeAdapter + 'static,
+    B: ExchangeWebSocket + 'static,
+    O: ExchangeWebSocket + 'static,
     S: Strategy + Clone + Send + Sync + 'static,
 {
     pub fn new(binance: Arc<B>, okx: Arc<O>, strategy: S, symbols: Vec<Symbol>) -> Self {

@@ -1,5 +1,7 @@
 use crate::domain::{Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, TimeInForce};
+use crate::exchange::api::ExchangeExecutor;
 use crate::exchange::okx::REST_BASE_URL;
+use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -269,5 +271,20 @@ fn order_type_to_okx(order_type: &OrderType) -> (&'static str, Option<String>) {
             };
             (ord_type, Some(price.0.to_string()))
         }
+    }
+}
+
+#[async_trait]
+impl ExchangeExecutor for OkxRestClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::OKX
+    }
+
+    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
+        OkxRestClient::place_order(self, order).await
+    }
+
+    async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
+        OkxRestClient::set_leverage(self, symbol, leverage).await
     }
 }
