@@ -10,6 +10,8 @@ pub struct SymbolState {
     pub bbos: HashMap<Exchange, BBO>,
     pub positions: HashMap<Exchange, Position>,
     pub pending_orders: HashSet<(Exchange, OrderId)>,
+    /// 开仓进行中标记 (信号已发出但订单状态未确认)
+    opening_in_progress: bool,
 }
 
 impl SymbolState {
@@ -20,7 +22,13 @@ impl SymbolState {
             bbos: HashMap::new(),
             positions: HashMap::new(),
             pending_orders: HashSet::new(),
+            opening_in_progress: false,
         }
+    }
+
+    /// 标记开仓进行中
+    pub fn set_opening(&mut self) {
+        self.opening_in_progress = true;
     }
 
     /// 获取日化费率最高的交易所 (适合做空)
@@ -61,9 +69,9 @@ impl SymbolState {
         self.bbos.get(&exchange)
     }
 
-    /// 是否有未完成订单
+    /// 是否有未完成订单或开仓进行中
     pub fn has_pending_orders(&self) -> bool {
-        !self.pending_orders.is_empty()
+        self.opening_in_progress || !self.pending_orders.is_empty()
     }
 
     /// 检查持仓是否对冲 (多空持仓量是否匹配)
@@ -173,6 +181,8 @@ impl SymbolState {
                     | OrderStatus::Cancelled
                     | OrderStatus::Rejected { .. } => {
                         self.pending_orders.remove(&key);
+                        // 订单结束，重置开仓标记
+                        self.opening_in_progress = false;
                     }
                     OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
                         self.pending_orders.insert(key);
