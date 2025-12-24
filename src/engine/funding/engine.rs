@@ -2,7 +2,7 @@ use crate::config::{ExchangesConfig, MetricsConfig};
 use crate::domain::{Exchange, ExchangeError, Symbol, now_ms};
 use crate::exchange::binance::BinanceWebSocket;
 use crate::exchange::okx::OkxWebSocket;
-use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicSinks};
+use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicDataType, PublicSinks};
 use crate::messaging::ExchangeEvent;
 use crate::strategy::{Signal, Strategy};
 use super::executor::Executor;
@@ -92,7 +92,11 @@ impl FundingEngine {
 
             let symbols_vec: Vec<Symbol> = symbols.iter().cloned().collect();
 
-            let pub_sinks = PublicSinks::full(&symbols_vec, SINK_CAPACITY);
+            let pub_sinks = PublicSinks::select(
+                &symbols_vec,
+                &[PublicDataType::FundingRate, PublicDataType::BBO],
+                SINK_CAPACITY,
+            );
             let priv_sinks = PrivateSinks::new(&symbols_vec, SINK_CAPACITY);
 
             // 连接 WebSocket
