@@ -1,27 +1,27 @@
 use crate::config::{ExchangesConfig, MetricsConfig};
 use crate::domain::{Exchange, ExchangeError, Symbol, now_ms};
-use crate::engine::executor::Executor;
-use crate::engine::metrics::Metrics;
 use crate::exchange::binance::BinanceWebSocket;
 use crate::exchange::okx::OkxWebSocket;
 use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicSinks};
 use crate::messaging::ExchangeEvent;
 use crate::strategy::{Signal, Strategy};
+use super::executor::Executor;
+use super::metrics::Metrics;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-/// 引擎 - 管理多个策略的执行
-pub struct Engine {
+/// 资金费率套利引擎 - 管理多个策略的执行
+pub struct FundingEngine {
     exchanges: HashMap<Exchange, Arc<dyn ExchangeWebSocket>>,
     strategies: Vec<Box<dyn Strategy>>,
     metrics_config: MetricsConfig,
     cancel_token: CancellationToken,
 }
 
-impl Engine {
+impl FundingEngine {
     /// 创建引擎，自动注册所有支持的交易所
     pub fn new(
         exchanges_config: &ExchangesConfig,
