@@ -90,13 +90,13 @@ impl Default for FundingArbStrategyConfig {
 
 impl From<FundingArbStrategyConfig> for FundingArbConfig {
     fn from(cfg: FundingArbStrategyConfig) -> Self {
-        use crate::domain::{Quantity, Rate};
+        use rust_decimal::prelude::ToPrimitive;
         Self {
-            min_spread: Rate(cfg.min_spread),
-            max_spread: Rate(cfg.max_spread),
-            close_spread: Rate(cfg.close_spread),
-            base_quantity: Quantity(cfg.base_quantity),
-            max_quantity: Quantity(cfg.max_quantity),
+            min_spread: cfg.min_spread.to_f64().unwrap_or(0.0),
+            max_spread: cfg.max_spread.to_f64().unwrap_or(0.0),
+            close_spread: cfg.close_spread.to_f64().unwrap_or(0.0),
+            base_quantity: cfg.base_quantity.to_f64().unwrap_or(0.0),
+            max_quantity: cfg.max_quantity.to_f64().unwrap_or(0.0),
         }
     }
 }

@@ -1,11 +1,11 @@
 use crate::domain::{
-    Balance, Exchange, FundingRate, OrderId, OrderStatus, OrderUpdate, Position, Price, Quantity,
-    Rate, Side, Symbol, BBO,
+    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position,
+    Side, Symbol, now_ms, BBO,
 };
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
 
 /// WebSocket 推送通用格式
 #[derive(Debug, Deserialize)]
@@ -42,23 +42,14 @@ pub struct FundingRateData {
 impl FundingRateData {
     pub fn to_funding_rate(&self) -> Option<FundingRate> {
         let symbol = Symbol::from_okx(&self.inst_id)?;
-        let rate = Decimal::from_str(&self.funding_rate).ok()?;
+        let rate = f64::from_str(&self.funding_rate).ok()?;
         let next_settle_ms: u64 = self.next_funding_time.parse().ok()?;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let settle_in = if next_settle_ms > now_ms {
-            Duration::from_millis(next_settle_ms - now_ms)
-        } else {
-            Duration::ZERO
-        };
 
         Some(FundingRate {
             exchange: Exchange::OKX,
             symbol,
-            rate: Rate(rate),
-            next_settle_time: Instant::now() + settle_in,
+            rate,
+            next_settle_time: next_settle_ms,
         })
     }
 }
@@ -81,9 +72,9 @@ impl BboData {
 
         let (ask_price, ask_qty) = self.asks.first().and_then(|a| {
             if a.len() >= 2 {
-                let price = Decimal::from_str(&a[0]).ok()?;
-                let qty = Decimal::from_str(&a[1]).ok()?;
-                Some((Price(price), Quantity(qty)))
+                let price = f64::from_str(&a[0]).ok()?;
+                let qty = f64::from_str(&a[1]).ok()?;
+                Some((price, qty))
             } else {
                 None
             }
@@ -91,9 +82,9 @@ impl BboData {
 
         let (bid_price, bid_qty) = self.bids.first().and_then(|b| {
             if b.len() >= 2 {
-                let price = Decimal::from_str(&b[0]).ok()?;
-                let qty = Decimal::from_str(&b[1]).ok()?;
-                Some((Price(price), Quantity(qty)))
+                let price = f64::from_str(&b[0]).ok()?;
+                let qty = f64::from_str(&b[1]).ok()?;
+                Some((price, qty))
             } else {
                 None
             }
@@ -106,7 +97,7 @@ impl BboData {
             bid_qty,
             ask_price,
             ask_qty,
-            timestamp: Instant::now(),
+            timestamp: now_ms(),
         })
     }
 }
@@ -133,19 +124,19 @@ impl PositionData {
     pub fn to_position(&self) -> Option<Position> {
         let symbol = Symbol::from_okx(&self.inst_id)?;
         let pos_amount = Decimal::from_str(&self.pos).ok()?;
-        let avg_price = Decimal::from_str(&self.avg_px).ok().unwrap_or(Decimal::ZERO);
+        let avg_price = f64::from_str(&self.avg_px).ok().unwrap_or(0.0);
         let unrealized_pnl = Decimal::from_str(&self.upl).ok().unwrap_or(Decimal::ZERO);
         let leverage: u32 = self.lever.parse().ok().unwrap_or(1);
         let mark_price = self
             .mark_px
             .as_ref()
-            .and_then(|p| Decimal::from_str(p).ok())
-            .unwrap_or(Decimal::ZERO);
+            .and_then(|p| f64::from_str(p).ok())
+            .unwrap_or(0.0);
 
         let (side, size) = if pos_amount >= Decimal::ZERO {
-            (Side::Long, Quantity(pos_amount))
+            (Side::Long, pos_amount.to_f64().unwrap_or(0.0))
         } else {
-            (Side::Short, Quantity(pos_amount.abs()))
+            (Side::Short, pos_amount.abs().to_f64().unwrap_or(0.0))
         };
 
         Some(Position {
@@ -153,10 +144,10 @@ impl PositionData {
             symbol,
             side,
             size,
-            entry_price: Price(avg_price),
+            entry_price: avg_price,
             leverage,
             unrealized_pnl,
-            mark_price: Price(mark_price),
+            mark_price,
         })
     }
 }
@@ -218,34 +209,28 @@ pub struct OrderPushData {
 impl OrderPushData {
     pub fn to_order_update(&self) -> Option<OrderUpdate> {
         let symbol = Symbol::from_okx(&self.inst_id)?;
-        let filled_qty = Decimal::from_str(&self.fill_sz).ok()?;
-        let avg_price = Decimal::from_str(&self.avg_px).ok();
+        let filled_qty = f64::from_str(&self.fill_sz).ok()?;
+        let avg_price = f64::from_str(&self.avg_px).ok();
 
-        let status = map_okx_order_state(&self.state, &self.fill_sz);
+        let status = map_okx_order_state(&self.state, filled_qty);
 
         Some(OrderUpdate {
-            order_id: OrderId::from(self.ord_id.clone()),
+            order_id: self.ord_id.clone(),
             exchange: Exchange::OKX,
             symbol,
             status,
-            filled_quantity: Quantity(filled_qty),
-            avg_price: avg_price.map(Price),
-            timestamp: Instant::now(),
+            filled_quantity: filled_qty,
+            avg_price,
+            timestamp: now_ms(),
         })
     }
 }
 
 /// OKX 订单状态映射
-fn map_okx_order_state(state: &str, fill_sz: &str) -> OrderStatus {
-    let filled = fill_sz
-        .parse::<Decimal>()
-        .unwrap_or(Decimal::ZERO);
-
+fn map_okx_order_state(state: &str, filled: f64) -> OrderStatus {
     match state {
         "live" => OrderStatus::Pending,
-        "partially_filled" => OrderStatus::PartiallyFilled {
-            filled: Quantity(filled),
-        },
+        "partially_filled" => OrderStatus::PartiallyFilled { filled },
         "filled" => OrderStatus::Filled,
         "canceled" | "cancelled" => OrderStatus::Cancelled,
         other => OrderStatus::Rejected {

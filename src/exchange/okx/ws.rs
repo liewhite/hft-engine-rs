@@ -180,28 +180,56 @@ impl ExchangeWebSocket for OkxWebSocket {
                         }
 
                         // 等待登录响应
-                        match read.next().await {
+                        let login_ok = match read.next().await {
                             Some(Ok(Message::Text(text))) => {
-                                if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
-                                    if event.event == "login" {
-                                        if event.code.as_deref() != Some("0") {
+                                match serde_json::from_str::<WsEvent>(&text) {
+                                    Ok(event) if event.event == "login" => {
+                                        if event.code.as_deref() == Some("0") {
+                                            tracing::info!("OKX login successful");
+                                            true
+                                        } else {
                                             tracing::error!(
                                                 code = ?event.code,
                                                 msg = ?event.msg,
                                                 "OKX login failed"
                                             );
-                                            backoff.wait().await;
-                                            continue;
+                                            false
                                         }
-                                        tracing::info!("OKX login successful");
+                                    }
+                                    Ok(event) => {
+                                        tracing::error!(
+                                            event = %event.event,
+                                            "Unexpected event while waiting for login response"
+                                        );
+                                        false
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            raw = %text,
+                                            "Failed to parse login response"
+                                        );
+                                        false
                                     }
                                 }
                             }
-                            _ => {
-                                tracing::error!("Failed to receive login response");
-                                backoff.wait().await;
-                                continue;
+                            Some(Ok(other)) => {
+                                tracing::error!(msg = ?other, "Unexpected message type while waiting for login");
+                                false
                             }
+                            Some(Err(e)) => {
+                                tracing::error!(error = %e, "WebSocket error while waiting for login");
+                                false
+                            }
+                            None => {
+                                tracing::error!("WebSocket closed while waiting for login");
+                                false
+                            }
+                        };
+
+                        if !login_ok {
+                            backoff.wait().await;
+                            continue;
                         }
 
                         // 订阅私有频道

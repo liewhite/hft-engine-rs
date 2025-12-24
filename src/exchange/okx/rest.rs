@@ -135,7 +135,7 @@ fn order_type_to_okx(order_type: &OrderType) -> (&'static str, Option<String>) {
                 TimeInForce::FOK => "fok",
                 TimeInForce::PostOnly => "post_only",
             };
-            (ord_type, Some(price.0.to_string()))
+            (ord_type, Some(price.to_string()))
         }
     }
 }
@@ -151,7 +151,7 @@ impl ExchangeExecutor for OkxRestClient {
         let inst_id = order.symbol.to_okx();
         let side = side_to_okx(order.side);
         let (ord_type, price) = order_type_to_okx(&order.order_type);
-        let sz = order.quantity.0.to_string();
+        let sz = order.quantity.to_string();
         let reduce_only = order.reduce_only;
 
         #[derive(Serialize)]

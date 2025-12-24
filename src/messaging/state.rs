@@ -27,7 +27,7 @@ impl SymbolState {
     pub fn best_short_exchange(&self) -> Option<(Exchange, &FundingRate)> {
         self.funding_rates
             .iter()
-            .max_by(|a, b| a.1.rate.0.cmp(&b.1.rate.0))
+            .max_by(|a, b| a.1.rate.total_cmp(&b.1.rate))
             .map(|(e, r)| (*e, r))
     }
 
@@ -35,7 +35,7 @@ impl SymbolState {
     pub fn best_long_exchange(&self) -> Option<(Exchange, &FundingRate)> {
         self.funding_rates
             .iter()
-            .min_by(|a, b| a.1.rate.0.cmp(&b.1.rate.0))
+            .min_by(|a, b| a.1.rate.total_cmp(&b.1.rate))
             .map(|(e, r)| (*e, r))
     }
 

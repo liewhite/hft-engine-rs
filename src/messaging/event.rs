@@ -1,5 +1,4 @@
-use crate::domain::{Balance, Exchange, FundingRate, OrderUpdate, Position, Symbol, BBO};
-use std::time::Instant;
+use crate::domain::{Balance, Exchange, FundingRate, OrderUpdate, Position, Symbol, Timestamp, BBO};
 
 /// 统一的交易所事件类型
 #[derive(Debug, Clone)]
@@ -8,30 +7,30 @@ pub enum ExchangeEvent {
         symbol: Symbol,
         exchange: Exchange,
         rate: FundingRate,
-        timestamp: Instant,
+        timestamp: Timestamp,
     },
     BBOUpdate {
         symbol: Symbol,
         exchange: Exchange,
         bbo: BBO,
-        timestamp: Instant,
+        timestamp: Timestamp,
     },
     PositionUpdate {
         symbol: Symbol,
         exchange: Exchange,
         position: Position,
-        timestamp: Instant,
+        timestamp: Timestamp,
     },
     OrderStatusUpdate {
         symbol: Symbol,
         exchange: Exchange,
         update: OrderUpdate,
-        timestamp: Instant,
+        timestamp: Timestamp,
     },
     BalanceUpdate {
         exchange: Exchange,
         balance: Balance,
-        timestamp: Instant,
+        timestamp: Timestamp,
     },
 }
 
@@ -59,7 +58,7 @@ impl ExchangeEvent {
     }
 
     /// 获取事件时间戳
-    pub fn timestamp(&self) -> Instant {
+    pub fn timestamp(&self) -> Timestamp {
         match self {
             Self::FundingRateUpdate { timestamp, .. } => *timestamp,
             Self::BBOUpdate { timestamp, .. } => *timestamp,

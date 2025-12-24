@@ -3,7 +3,7 @@ use crate::exchange::{PrivateSinks, PublicSinks};
 use crate::messaging::ExchangeEvent;
 use crate::strategy::{MarketDataType, Signal, Strategy};
 use std::collections::HashSet;
-use std::time::Instant;
+use crate::domain::now_ms;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -149,7 +149,7 @@ fn wrap_bbo_receiver(
                 symbol: symbol.clone(),
                 exchange,
                 bbo,
-                timestamp: Instant::now(),
+                timestamp: now_ms(),
             };
             if tx.send(event).is_err() {
                 break;
@@ -171,7 +171,7 @@ fn wrap_funding_receiver(
                 symbol: symbol.clone(),
                 exchange,
                 rate,
-                timestamp: Instant::now(),
+                timestamp: now_ms(),
             };
             if tx.send(event).is_err() {
                 break;
@@ -193,7 +193,7 @@ fn wrap_position_receiver(
                 symbol: symbol.clone(),
                 exchange,
                 position,
-                timestamp: Instant::now(),
+                timestamp: now_ms(),
             };
             if tx.send(event).is_err() {
                 break;
@@ -215,7 +215,7 @@ fn wrap_order_receiver(
                 symbol: symbol.clone(),
                 exchange,
                 update,
-                timestamp: Instant::now(),
+                timestamp: now_ms(),
             };
             if tx.send(event).is_err() {
                 break;
@@ -235,7 +235,7 @@ fn wrap_balance_receiver(
             let event = ExchangeEvent::BalanceUpdate {
                 exchange,
                 balance,
-                timestamp: Instant::now(),
+                timestamp: now_ms(),
             };
             if tx.send(event).is_err() {
                 break;

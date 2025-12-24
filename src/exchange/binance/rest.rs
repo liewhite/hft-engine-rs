@@ -164,7 +164,7 @@ fn order_type_to_binance(order_type: &OrderType) -> (&'static str, Option<String
                 TimeInForce::FOK => "FOK",
                 TimeInForce::PostOnly => "GTX",
             };
-            ("LIMIT", Some(price.0.to_string()), Some(tif_str))
+            ("LIMIT", Some(price.to_string()), Some(tif_str))
         }
     }
 }
@@ -179,7 +179,7 @@ impl ExchangeExecutor for BinanceRestClient {
         let symbol = order.symbol.to_binance();
         let side = side_to_binance(order.side);
         let (order_type, price, tif) = order_type_to_binance(&order.order_type);
-        let qty = order.quantity.0.to_string();
+        let qty = order.quantity.to_string();
         let reduce_only = if order.reduce_only { "true" } else { "false" };
 
         let mut params: Vec<(&str, &str)> = vec![
@@ -229,7 +229,7 @@ impl ExchangeExecutor for BinanceRestClient {
         }
 
         let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
-        Ok(OrderId::from(data.order_id))
+        Ok(data.order_id.to_string())
     }
 
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {

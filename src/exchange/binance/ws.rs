@@ -200,12 +200,15 @@ impl ExchangeWebSocket for BinanceWebSocket {
                                 msg = read.next() => {
                                     match msg {
                                         Some(Ok(Message::Text(text))) => {
-                                            handle_binance_private_message(
+                                            if !handle_binance_private_message(
                                                 &text,
                                                 &sinks.positions,
                                                 &sinks.balances,
                                                 &sinks.order_updates,
-                                            );
+                                            ) {
+                                                // 需要重连
+                                                break;
+                                            }
                                         }
                                         Some(Ok(Message::Ping(data))) => {
                                             if let Err(e) = write.send(Message::Pong(data)).await {
@@ -287,12 +290,13 @@ fn handle_binance_public_message(
 /// 处理 Binance 私有消息
 ///
 /// 解析失败时 panic，因为这表示代码逻辑漏洞
+/// 返回 false 表示需要重连
 fn handle_binance_private_message(
     text: &str,
     position_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::Position>>,
     balance_sink: &broadcast::Sender<crate::domain::Balance>,
     order_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::OrderUpdate>>,
-) {
+) -> bool {
     // 先解析为 Value 获取事件类型
     let value: serde_json::Value = parse_or_panic!(text, serde_json::Value, "Binance private base");
     let event_type = value.get("e").and_then(|e| e.as_str());
@@ -325,8 +329,9 @@ fn handle_binance_private_message(
             }
         }
         Some("listenKeyExpired") => {
-            // ListenKey 过期，触发重连
-            panic!("Binance ListenKey expired, should reconnect\nRaw: {}", text);
+            // ListenKey 过期，返回 false 触发重连
+            tracing::warn!("Binance ListenKey expired, will reconnect");
+            return false;
         }
         Some(unknown) => {
             panic!("Received unknown Binance private event type: {}\nRaw: {}", unknown, text);
@@ -335,4 +340,6 @@ fn handle_binance_private_message(
             panic!("Binance private message missing event type 'e'\nRaw: {}", text);
         }
     }
+
+    true
 }

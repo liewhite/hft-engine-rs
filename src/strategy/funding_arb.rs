@@ -1,7 +1,6 @@
-use crate::domain::{Exchange, Order, OrderId, OrderType, Quantity, Rate, Side, Symbol};
+use crate::domain::{Exchange, Order, OrderType, Quantity, Rate, Side, Symbol};
 use crate::messaging::{ExchangeEvent, SymbolState};
 use crate::strategy::{MarketDataType, Signal, Strategy};
-use rust_decimal::Decimal;
 use std::collections::HashMap;
 
 /// 资金费率套利策略配置
@@ -22,11 +21,11 @@ pub struct FundingArbConfig {
 impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
-            min_spread: Rate(Decimal::new(5, 4)),        // 0.0005 = 0.05%
-            max_spread: Rate(Decimal::new(20, 4)),       // 0.002 = 0.2%
-            close_spread: Rate(Decimal::new(2, 4)),      // 0.0002 = 0.02%
-            base_quantity: Quantity(Decimal::new(1, 2)), // 0.01
-            max_quantity: Quantity(Decimal::new(1, 0)),  // 1.0
+            min_spread: 0.0005,       // 0.05%
+            max_spread: 0.002,        // 0.2%
+            close_spread: 0.0002,     // 0.02%
+            base_quantity: 0.01,
+            max_quantity: 1.0,
         }
     }
 }
@@ -62,14 +61,14 @@ impl FundingArbStrategy {
     ) -> Option<(Exchange, Exchange)> {
         let spread = state.funding_spread()?;
 
-        if spread.0.abs() < config.min_spread.0 {
+        if spread.abs() < config.min_spread {
             return None;
         }
 
-        if spread.0.abs() > config.max_spread.0 {
+        if spread.abs() > config.max_spread {
             tracing::warn!(
                 symbol = %state.symbol,
-                spread = %spread,
+                spread = spread,
                 "Spread exceeds max threshold"
             );
             return None;
@@ -90,11 +89,11 @@ impl FundingArbStrategy {
 
         tracing::info!(
             symbol = %state.symbol,
-            spread = %spread,
+            spread = spread,
             short_exchange = %short_ex,
-            short_rate = %short_rate.rate,
+            short_rate = short_rate.rate,
             long_exchange = %long_ex,
-            long_rate = %long_rate.rate,
+            long_rate = long_rate.rate,
             "Opening condition met"
         );
 
@@ -113,7 +112,7 @@ impl FundingArbStrategy {
         };
 
         // 费率差收窄到阈值以下，平仓
-        spread.0.abs() < config.close_spread.0
+        spread.abs() < config.close_spread
     }
 
     /// 生成开仓信号 (静态方法)
@@ -125,7 +124,7 @@ impl FundingArbStrategy {
     ) -> Vec<Signal> {
         vec![
             Signal::PlaceOrder(Order {
-                id: OrderId::from(""),
+                id: String::new(),
                 exchange: short_ex,
                 symbol: symbol.clone(),
                 side: Side::Short,
@@ -135,7 +134,7 @@ impl FundingArbStrategy {
                 client_order_id: None,
             }),
             Signal::PlaceOrder(Order {
-                id: OrderId::from(""),
+                id: String::new(),
                 exchange: long_ex,
                 symbol: symbol.clone(),
                 side: Side::Long,
@@ -154,7 +153,7 @@ impl FundingArbStrategy {
         for (exchange, pos) in &state.positions {
             if !pos.is_empty() {
                 signals.push(Signal::PlaceOrder(Order {
-                    id: OrderId::from(""),
+                    id: String::new(),
                     exchange: *exchange,
                     symbol: state.symbol.clone(),
                     side: pos.side.opposite(),
@@ -189,7 +188,12 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
+        // TODO: 测试阶段，仅打印事件
+        tracing::info!(event = ?event, "Received event");
+        return vec![];
+
         // 获取事件关联的 symbol
+        #[allow(unreachable_code)]
         let symbol = match event.symbol() {
             Some(s) => s.clone(),
             None => return vec![], // Balance 事件暂不处理

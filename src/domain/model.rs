@@ -1,8 +1,7 @@
-use crate::domain::types::{OrderId, Price, Quantity, Rate};
+use crate::domain::types::{OrderId, Price, Quantity, Rate, Timestamp};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::time::Instant;
 
 /// 交易所枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -160,13 +159,13 @@ pub struct FundingRate {
     pub exchange: Exchange,
     pub symbol: Symbol,
     pub rate: Rate,
-    pub next_settle_time: Instant,
+    pub next_settle_time: Timestamp,
 }
 
 impl FundingRate {
-    /// 年化费率
+    /// 年化费率 (假设每天3次结算)
     pub fn annualized_rate(&self) -> Rate {
-        self.rate.annualized()
+        self.rate * 3.0 * 365.0
     }
 }
 
@@ -185,13 +184,13 @@ pub struct Position {
 
 impl Position {
     /// 计算持仓名义价值
-    pub fn notional_value(&self) -> Decimal {
-        self.mark_price.0 * self.size.0.abs()
+    pub fn notional_value(&self) -> f64 {
+        self.mark_price * self.size.abs()
     }
 
     /// 判断是否空仓
     pub fn is_empty(&self) -> bool {
-        self.size.is_zero()
+        self.size == 0.0
     }
 
     /// 创建空仓位
@@ -200,11 +199,11 @@ impl Position {
             exchange,
             symbol,
             side: Side::Long,
-            size: Quantity::ZERO,
-            entry_price: Price::ZERO,
+            size: 0.0,
+            entry_price: 0.0,
             leverage: 1,
             unrealized_pnl: Decimal::ZERO,
-            mark_price: Price::ZERO,
+            mark_price: 0.0,
         }
     }
 }
@@ -233,7 +232,7 @@ pub struct BBO {
     pub bid_qty: Quantity,
     pub ask_price: Price,
     pub ask_qty: Quantity,
-    pub timestamp: Instant,
+    pub timestamp: Timestamp,
 }
 
 impl BBO {
@@ -244,7 +243,7 @@ impl BBO {
 
     /// 计算中间价
     pub fn mid_price(&self) -> Price {
-        (self.bid_price + self.ask_price) / Decimal::from(2)
+        (self.bid_price + self.ask_price) / 2.0
     }
 }
 
@@ -270,5 +269,5 @@ pub struct OrderUpdate {
     pub status: OrderStatus,
     pub filled_quantity: Quantity,
     pub avg_price: Option<Price>,
-    pub timestamp: Instant,
+    pub timestamp: Timestamp,
 }

@@ -1,11 +1,11 @@
 use crate::domain::{
-    Balance, Exchange, FundingRate, OrderId, OrderStatus, OrderUpdate, Position, Price, Quantity,
-    Rate, Side, Symbol, BBO,
+    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position,
+    Side, Symbol, now_ms, BBO,
 };
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
 
 /// Mark Price 更新 (包含资金费率)
 #[derive(Debug, Deserialize)]
@@ -23,23 +23,13 @@ pub struct MarkPriceUpdate {
 impl MarkPriceUpdate {
     pub fn to_funding_rate(&self) -> Option<FundingRate> {
         let symbol = Symbol::from_binance(&self.s)?;
-        let rate = Decimal::from_str(&self.r).ok()?;
-        let next_settle_ms = self.t as u64;
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let settle_in = if next_settle_ms > now_ms {
-            Duration::from_millis(next_settle_ms - now_ms)
-        } else {
-            Duration::ZERO
-        };
+        let rate = f64::from_str(&self.r).ok()?;
 
         Some(FundingRate {
             exchange: Exchange::Binance,
             symbol,
-            rate: Rate(rate),
-            next_settle_time: Instant::now() + settle_in,
+            rate,
+            next_settle_time: self.t as u64,
         })
     }
 }
@@ -63,19 +53,19 @@ pub struct BookTicker {
 impl BookTicker {
     pub fn to_bbo(&self) -> Option<BBO> {
         let symbol = Symbol::from_binance(&self.s)?;
-        let bid_price = Decimal::from_str(&self.b).ok()?;
-        let bid_qty = Decimal::from_str(&self.bid_qty).ok()?;
-        let ask_price = Decimal::from_str(&self.a).ok()?;
-        let ask_qty = Decimal::from_str(&self.ask_qty).ok()?;
+        let bid_price = f64::from_str(&self.b).ok()?;
+        let bid_qty = f64::from_str(&self.bid_qty).ok()?;
+        let ask_price = f64::from_str(&self.a).ok()?;
+        let ask_qty = f64::from_str(&self.ask_qty).ok()?;
 
         Some(BBO {
             exchange: Exchange::Binance,
             symbol,
-            bid_price: Price(bid_price),
-            bid_qty: Quantity(bid_qty),
-            ask_price: Price(ask_price),
-            ask_qty: Quantity(ask_qty),
-            timestamp: Instant::now(),
+            bid_price,
+            bid_qty,
+            ask_price,
+            ask_qty,
+            timestamp: now_ms(),
         })
     }
 }
@@ -132,15 +122,16 @@ pub struct AccountPosition {
 
 impl AccountPosition {
     pub fn to_position(&self) -> Option<Position> {
+        use rust_decimal::Decimal;
         let symbol = Symbol::from_binance(&self.s)?;
         let pos_amount = Decimal::from_str(&self.pa).ok()?;
-        let entry_price = Decimal::from_str(&self.ep).ok()?;
+        let entry_price = f64::from_str(&self.ep).ok()?;
         let unrealized_pnl = Decimal::from_str(&self.up).ok()?;
 
         let (side, size) = if pos_amount >= Decimal::ZERO {
-            (Side::Long, Quantity(pos_amount))
+            (Side::Long, pos_amount.to_f64().unwrap_or(0.0))
         } else {
-            (Side::Short, Quantity(pos_amount.abs()))
+            (Side::Short, pos_amount.abs().to_f64().unwrap_or(0.0))
         };
 
         Some(Position {
@@ -148,10 +139,10 @@ impl AccountPosition {
             symbol,
             side,
             size,
-            entry_price: Price(entry_price),
+            entry_price,
             leverage: 1, // 需要从其他接口获取
             unrealized_pnl,
-            mark_price: Price::ZERO, // 需要从 mark price 更新
+            mark_price: 0.0, // 需要从 mark price 更新
         })
     }
 }
@@ -180,14 +171,12 @@ pub struct OrderData {
 impl OrderTradeUpdate {
     pub fn to_order_update(&self) -> Option<OrderUpdate> {
         let symbol = Symbol::from_binance(&self.o.s)?;
-        let filled_qty = Decimal::from_str(&self.o.z).ok()?;
-        let avg_price = Decimal::from_str(&self.o.ap).ok();
+        let filled_qty = f64::from_str(&self.o.z).ok()?;
+        let avg_price = f64::from_str(&self.o.ap).ok();
 
         let status = match self.o.status.as_str() {
             "NEW" => OrderStatus::Pending,
-            "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled {
-                filled: Quantity(filled_qty),
-            },
+            "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled { filled: filled_qty },
             "FILLED" => OrderStatus::Filled,
             "CANCELED" | "CANCELLED" => OrderStatus::Cancelled,
             "REJECTED" | "EXPIRED" => OrderStatus::Rejected {
@@ -199,13 +188,13 @@ impl OrderTradeUpdate {
         };
 
         Some(OrderUpdate {
-            order_id: OrderId::from(self.o.i),
+            order_id: self.o.i.to_string(),
             exchange: Exchange::Binance,
             symbol,
             status,
-            filled_quantity: Quantity(filled_qty),
-            avg_price: avg_price.map(Price),
-            timestamp: Instant::now(),
+            filled_quantity: filled_qty,
+            avg_price,
+            timestamp: now_ms(),
         })
     }
 }
