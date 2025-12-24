@@ -186,6 +186,13 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
+        tracing::info!(
+            symbol = ?event.symbol(),
+            exchange = %event.exchange(),
+            event = ?event,
+            "Received event"
+        );
+        return vec![];
         // 获取事件关联的 symbol
         let symbol = match event.symbol() {
             Some(s) => s.clone(),

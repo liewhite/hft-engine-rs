@@ -16,18 +16,17 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new() -> Self {
+    pub fn new(exchanges: Vec<Arc<dyn ExchangeWebSocket>>) -> Self {
+        let exchanges_map: HashMap<_, _> = exchanges
+            .into_iter()
+            .map(|ws| (ws.exchange(), ws))
+            .collect();
+
         Self {
-            exchanges: HashMap::new(),
+            exchanges: exchanges_map,
             strategies: Vec::new(),
             cancel_token: CancellationToken::new(),
         }
-    }
-
-    /// 注册交易所
-    pub fn register_exchange(&mut self, ws: Arc<dyn ExchangeWebSocket>) {
-        let exchange = ws.exchange();
-        self.exchanges.insert(exchange, ws);
     }
 
     /// 添加策略
@@ -136,11 +135,6 @@ impl Engine {
     }
 }
 
-impl Default for Engine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// 包装 Box<dyn Strategy> 以实现 Strategy trait
 struct StrategyWrapper(Box<dyn Strategy>);

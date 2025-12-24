@@ -57,9 +57,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Create and configure engine
-    let mut engine = Engine::new();
-    engine.register_exchange(binance_ws);
-    engine.register_exchange(okx_ws);
+    let mut engine = Engine::new(vec![binance_ws, okx_ws]);
     engine.add_strategy(strategy);
 
     // Start engine
