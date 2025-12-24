@@ -4,6 +4,7 @@ pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
 
 use crate::domain::{Exchange, Order, Symbol};
 use crate::messaging::ExchangeEvent;
+use tokio::sync::mpsc;
 
 /// 策略需要的市场数据类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,9 +41,9 @@ pub trait Strategy: Send + Sync {
     /// 策略需要的市场数据类型
     fn market_data_types(&self) -> Vec<MarketDataType>;
 
-    /// 处理事件，返回交易信号
+    /// 处理事件，通过 signal_tx 发送交易信号
     ///
     /// 框架会根据 exchanges/symbols/market_data_types 过滤事件，
     /// 只有匹配的事件才会传入此方法
-    fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal>;
+    fn on_event(&mut self, event: ExchangeEvent, signal_tx: &mpsc::Sender<Signal>);
 }

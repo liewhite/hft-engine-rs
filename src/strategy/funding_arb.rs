@@ -2,6 +2,7 @@ use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Sym
 use crate::messaging::{ExchangeEvent, SymbolState};
 use crate::strategy::{MarketDataType, Signal, Strategy};
 use std::collections::HashMap;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// 资金费率套利策略配置
@@ -289,6 +290,15 @@ impl FundingArbStrategy {
         signals
     }
 
+    /// 发送信号到 signal_tx
+    fn send_signals(&self, signals: Vec<Signal>, signal_tx: &mpsc::Sender<Signal>) {
+        for signal in signals {
+            if let Err(e) = signal_tx.try_send(signal) {
+                tracing::error!(error = %e, "Failed to send signal");
+            }
+        }
+    }
+
     /// 生成敞口修复信号 (平掉不平衡的持仓)
     fn make_hedge_repair_signal(state: &SymbolState) -> Vec<Signal> {
         if let Some((exchange, side, qty)) = state.unhedged_exposure() {
@@ -348,7 +358,7 @@ impl Strategy for FundingArbStrategy {
         ]
     }
 
-    fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
+    fn on_event(&mut self, event: ExchangeEvent, signal_tx: &mpsc::Sender<Signal>) {
         // 区分全局事件和 Symbol 事件
         match &event {
             // 全局事件: Balance (策略层处理余额追踪)
@@ -362,12 +372,12 @@ impl Strategy for FundingArbStrategy {
                     );
                     self.usdt_balances.insert(*exchange, balance.available);
                 }
-                return vec![];
+                return;
             }
             // 全局事件: Clock (定时检查订单超时)
             ExchangeEvent::Clock { timestamp } => {
                 self.state.remove_timed_out_orders(*timestamp, self.config.order_timeout_ms);
-                return vec![];
+                return;
             }
             // Symbol 事件: 委托 SymbolState 处理
             _ => self.state.apply(event),
@@ -375,17 +385,19 @@ impl Strategy for FundingArbStrategy {
 
         // 有未完成订单或开仓进行中时等待
         if self.state.has_pending_orders() {
-            return vec![];
+            return;
         }
 
         // 优先级 1: 检测并修复持仓不平衡
         if let Some(false) = self.state.is_hedged() {
-            return Self::make_hedge_repair_signal(&self.state);
+            self.send_signals(Self::make_hedge_repair_signal(&self.state), signal_tx);
+            return;
         }
 
         // 优先级 2: 检查平仓条件
         if Self::check_close_condition(&self.state, &self.config) {
-            return Self::make_close_signals(&self.state);
+            self.send_signals(Self::make_close_signals(&self.state), signal_tx);
+            return;
         }
 
         // 优先级 3: 检查开仓条件
@@ -407,9 +419,7 @@ impl Strategy for FundingArbStrategy {
                     self.state.add_pending_order(client_id.clone(), order.exchange, now);
                 }
             }
-            return signals;
+            self.send_signals(signals, signal_tx);
         }
-
-        vec![]
     }
 }

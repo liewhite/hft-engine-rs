@@ -124,12 +124,7 @@ impl Executor {
                     event = event_rx.recv() => {
                         match event {
                             Some(evt) => {
-                                let signals = self.strategy.on_event(evt);
-                                for signal in signals {
-                                    if signal_tx.send(signal).await.is_err() {
-                                        return;
-                                    }
-                                }
+                                self.strategy.on_event(evt, &signal_tx);
                             }
                             None => break,
                         }
