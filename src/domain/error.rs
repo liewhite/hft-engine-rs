@@ -1,5 +1,4 @@
 use crate::domain::model::Exchange;
-use rust_decimal::Decimal;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -19,7 +18,7 @@ pub enum ExchangeError {
     OrderRejected(Exchange, String),
 
     #[error("Insufficient balance on {0}: need {1}, have {2}")]
-    InsufficientBalance(Exchange, Decimal, Decimal),
+    InsufficientBalance(Exchange, f64, f64),
 
     #[error("Symbol not found on {0}: {1}")]
     SymbolNotFound(Exchange, String),

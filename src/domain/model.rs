@@ -1,5 +1,4 @@
 use crate::domain::types::{OrderId, Price, Quantity, Rate, Timestamp};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -178,7 +177,7 @@ pub struct Position {
     pub size: Quantity,
     pub entry_price: Price,
     pub leverage: u32,
-    pub unrealized_pnl: Decimal,
+    pub unrealized_pnl: f64,
     pub mark_price: Price,
 }
 
@@ -202,7 +201,7 @@ impl Position {
             size: 0.0,
             entry_price: 0.0,
             leverage: 1,
-            unrealized_pnl: Decimal::ZERO,
+            unrealized_pnl: 0.0,
             mark_price: 0.0,
         }
     }
@@ -213,12 +212,12 @@ impl Position {
 pub struct Balance {
     pub exchange: Exchange,
     pub asset: String,
-    pub available: Decimal,
-    pub frozen: Decimal,
+    pub available: f64,
+    pub frozen: f64,
 }
 
 impl Balance {
-    pub fn total(&self) -> Decimal {
+    pub fn total(&self) -> f64 {
         self.available + self.frozen
     }
 }

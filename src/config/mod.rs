@@ -1,6 +1,5 @@
 use crate::domain::Symbol;
 use crate::strategy::FundingArbConfig;
-use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -49,31 +48,31 @@ pub struct StrategyConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FundingArbStrategyConfig {
     #[serde(default = "default_min_spread")]
-    pub min_spread: Decimal,
+    pub min_spread: f64,
     #[serde(default = "default_max_spread")]
-    pub max_spread: Decimal,
+    pub max_spread: f64,
     #[serde(default = "default_close_spread")]
-    pub close_spread: Decimal,
+    pub close_spread: f64,
     #[serde(default = "default_base_quantity")]
-    pub base_quantity: Decimal,
+    pub base_quantity: f64,
     #[serde(default = "default_max_quantity")]
-    pub max_quantity: Decimal,
+    pub max_quantity: f64,
 }
 
-fn default_min_spread() -> Decimal {
-    Decimal::new(5, 4)
+fn default_min_spread() -> f64 {
+    0.0005
 }
-fn default_max_spread() -> Decimal {
-    Decimal::new(20, 4)
+fn default_max_spread() -> f64 {
+    0.002
 }
-fn default_close_spread() -> Decimal {
-    Decimal::new(2, 4)
+fn default_close_spread() -> f64 {
+    0.0002
 }
-fn default_base_quantity() -> Decimal {
-    Decimal::new(1, 2)
+fn default_base_quantity() -> f64 {
+    0.01
 }
-fn default_max_quantity() -> Decimal {
-    Decimal::new(1, 0)
+fn default_max_quantity() -> f64 {
+    1.0
 }
 
 impl Default for FundingArbStrategyConfig {
@@ -90,13 +89,12 @@ impl Default for FundingArbStrategyConfig {
 
 impl From<FundingArbStrategyConfig> for FundingArbConfig {
     fn from(cfg: FundingArbStrategyConfig) -> Self {
-        use rust_decimal::prelude::ToPrimitive;
         Self {
-            min_spread: cfg.min_spread.to_f64().unwrap_or(0.0),
-            max_spread: cfg.max_spread.to_f64().unwrap_or(0.0),
-            close_spread: cfg.close_spread.to_f64().unwrap_or(0.0),
-            base_quantity: cfg.base_quantity.to_f64().unwrap_or(0.0),
-            max_quantity: cfg.max_quantity.to_f64().unwrap_or(0.0),
+            min_spread: cfg.min_spread,
+            max_spread: cfg.max_spread,
+            close_spread: cfg.close_spread,
+            base_quantity: cfg.base_quantity,
+            max_quantity: cfg.max_quantity,
         }
     }
 }

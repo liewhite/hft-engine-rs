@@ -134,7 +134,7 @@ fn map_binance_error(code: i32, msg: &str) -> ExchangeError {
     match code {
         -1003 => ExchangeError::RateLimited(Exchange::Binance, Duration::from_secs(60)),
         -2010 | -2019 => {
-            ExchangeError::InsufficientBalance(Exchange::Binance, rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO)
+            ExchangeError::InsufficientBalance(Exchange::Binance, 0.0, 0.0)
         }
         -4028 => ExchangeError::ApiError(
             Exchange::Binance,

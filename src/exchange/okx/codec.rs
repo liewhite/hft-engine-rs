@@ -2,8 +2,6 @@ use crate::domain::{
     Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position,
     Side, Symbol, now_ms, BBO,
 };
-use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -123,9 +121,9 @@ pub struct PositionData {
 impl PositionData {
     pub fn to_position(&self) -> Option<Position> {
         let symbol = Symbol::from_okx(&self.inst_id)?;
-        let pos_amount = Decimal::from_str(&self.pos).ok()?;
+        let pos_amount = f64::from_str(&self.pos).ok()?;
         let avg_price = f64::from_str(&self.avg_px).ok().unwrap_or(0.0);
-        let unrealized_pnl = Decimal::from_str(&self.upl).ok().unwrap_or(Decimal::ZERO);
+        let unrealized_pnl = f64::from_str(&self.upl).ok().unwrap_or(0.0);
         let leverage: u32 = self.lever.parse().ok().unwrap_or(1);
         let mark_price = self
             .mark_px
@@ -133,10 +131,10 @@ impl PositionData {
             .and_then(|p| f64::from_str(p).ok())
             .unwrap_or(0.0);
 
-        let (side, size) = if pos_amount >= Decimal::ZERO {
-            (Side::Long, pos_amount.to_f64().unwrap_or(0.0))
+        let (side, size) = if pos_amount >= 0.0 {
+            (Side::Long, pos_amount)
         } else {
-            (Side::Short, pos_amount.abs().to_f64().unwrap_or(0.0))
+            (Side::Short, pos_amount.abs())
         };
 
         Some(Position {
@@ -175,8 +173,8 @@ pub struct AccountDetail {
 
 impl AccountDetail {
     pub fn to_balance(&self) -> Option<Balance> {
-        let available = Decimal::from_str(&self.avail_bal).ok()?;
-        let frozen = Decimal::from_str(&self.frozen_bal).ok()?;
+        let available = f64::from_str(&self.avail_bal).ok()?;
+        let frozen = f64::from_str(&self.frozen_bal).ok()?;
 
         Some(Balance {
             exchange: Exchange::OKX,
