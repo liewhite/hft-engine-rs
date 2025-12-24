@@ -100,43 +100,72 @@ impl BinanceRestClient {
         &self,
         symbols: &[Symbol],
     ) -> Result<std::collections::HashMap<Symbol, u64>, ExchangeError> {
+        use futures_util::future::join_all;
+
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct FundingRateRecord {
             funding_time: i64,
         }
 
-        let mut result = std::collections::HashMap::new();
+        // 并行请求所有 symbols
+        let futures: Vec<_> = symbols
+            .iter()
+            .map(|symbol| {
+                let client = &self.client;
+                let base_url = &self.base_url;
+                let binance_symbol = symbol.to_binance();
+                let symbol = symbol.clone();
 
-        for symbol in symbols {
-            let binance_symbol = symbol.to_binance();
-            let resp = self
-                .client
-                .get(format!(
-                    "{}/fapi/v1/fundingRate?symbol={}&limit=1",
-                    self.base_url, binance_symbol
-                ))
-                .send()
-                .await
-                .map_err(Self::map_reqwest_error)?;
+                async move {
+                    let resp = client
+                        .get(format!(
+                            "{}/fapi/v1/fundingRate?symbol={}&limit=1",
+                            base_url, binance_symbol
+                        ))
+                        .send()
+                        .await;
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                tracing::warn!(
-                    symbol = %binance_symbol,
-                    status = status.as_u16(),
-                    error = %text,
-                    "Failed to get funding rate for symbol"
-                );
-                continue;
-            }
+                    match resp {
+                        Ok(r) if r.status().is_success() => {
+                            match r.json::<Vec<FundingRateRecord>>().await {
+                                Ok(data) => data
+                                    .first()
+                                    .map(|record| (symbol, record.funding_time as u64)),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        symbol = %binance_symbol,
+                                        error = %e,
+                                        "Failed to parse funding rate"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Ok(r) => {
+                            tracing::warn!(
+                                symbol = %binance_symbol,
+                                status = r.status().as_u16(),
+                                "Failed to get funding rate"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                symbol = %binance_symbol,
+                                error = %e,
+                                "Request failed for funding rate"
+                            );
+                            None
+                        }
+                    }
+                }
+            })
+            .collect();
 
-            let data: Vec<FundingRateRecord> = resp.json().await.map_err(Self::map_reqwest_error)?;
-            if let Some(record) = data.first() {
-                result.insert(symbol.clone(), record.funding_time as u64);
-            }
-        }
+        let results = join_all(futures).await;
+        let result: std::collections::HashMap<_, _> =
+            results.into_iter().flatten().collect();
 
         Ok(result)
     }
