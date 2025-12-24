@@ -94,44 +94,47 @@ impl BinanceRestClient {
         Ok(data.listen_key)
     }
 
-    /// 获取资金费率信息 (包含结算间隔)
-    /// 返回 HashMap<Symbol, 结算间隔小时数>
-    pub async fn get_funding_info(&self) -> Result<std::collections::HashMap<Symbol, f64>, ExchangeError> {
+    /// 获取最近一次资金费率的结算时间
+    /// 返回 HashMap<Symbol, last_funding_time_ms>
+    pub async fn get_last_funding_times(
+        &self,
+        symbols: &[Symbol],
+    ) -> Result<std::collections::HashMap<Symbol, u64>, ExchangeError> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
-        struct FundingInfo {
-            symbol: String,
-            #[serde(default = "default_interval")]
-            funding_interval_hours: i32,
+        struct FundingRateRecord {
+            funding_time: i64,
         }
-
-        fn default_interval() -> i32 {
-            8 // 默认 8 小时
-        }
-
-        let resp = self
-            .client
-            .get(format!("{}/fapi/v1/fundingInfo", self.base_url))
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-
-        let data: Vec<FundingInfo> = resp.json().await.map_err(Self::map_reqwest_error)?;
 
         let mut result = std::collections::HashMap::new();
-        for info in data {
-            if let Some(symbol) = Symbol::from_binance(&info.symbol) {
-                result.insert(symbol, info.funding_interval_hours as f64);
+
+        for symbol in symbols {
+            let binance_symbol = symbol.to_binance();
+            let resp = self
+                .client
+                .get(format!(
+                    "{}/fapi/v1/fundingRate?symbol={}&limit=1",
+                    self.base_url, binance_symbol
+                ))
+                .send()
+                .await
+                .map_err(Self::map_reqwest_error)?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    symbol = %binance_symbol,
+                    status = status.as_u16(),
+                    error = %text,
+                    "Failed to get funding rate for symbol"
+                );
+                continue;
+            }
+
+            let data: Vec<FundingRateRecord> = resp.json().await.map_err(Self::map_reqwest_error)?;
+            if let Some(record) = data.first() {
+                result.insert(symbol.clone(), record.funding_time as u64);
             }
         }
 

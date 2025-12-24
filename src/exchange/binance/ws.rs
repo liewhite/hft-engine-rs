@@ -14,10 +14,78 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
+
+/// 单个 symbol 的 funding 状态 (用于动态计算间隔)
+#[derive(Debug, Clone)]
+struct SymbolFundingState {
+    /// 上一次结算时间 (毫秒)
+    last_funding_time: u64,
+    /// 下一次结算时间 (毫秒)
+    next_funding_time: u64,
+    /// 结算间隔 (小时)
+    interval_hours: f64,
+}
+
+impl SymbolFundingState {
+    fn new(last_funding_time: u64) -> Self {
+        Self {
+            last_funding_time,
+            next_funding_time: 0,
+            interval_hours: 8.0, // 默认 8 小时
+        }
+    }
+
+    /// 更新状态并返回计算出的间隔
+    /// 返回 true 表示间隔发生变化
+    fn update(&mut self, new_next_funding_time: u64) -> bool {
+        // 首次收到推送，初始化 next_funding_time
+        if self.next_funding_time == 0 {
+            self.next_funding_time = new_next_funding_time;
+            // 计算初始间隔
+            if self.last_funding_time > 0 {
+                let interval_ms = new_next_funding_time.saturating_sub(self.last_funding_time);
+                self.interval_hours = round_to_hour(interval_ms);
+            }
+            return true;
+        }
+
+        // next_funding_time 变化说明发生了结算事件
+        if new_next_funding_time != self.next_funding_time {
+            let interval_ms = new_next_funding_time.saturating_sub(self.next_funding_time);
+            let new_interval = round_to_hour(interval_ms);
+
+            let changed = (new_interval - self.interval_hours).abs() > 0.1;
+            if changed {
+                tracing::info!(
+                    old_interval = self.interval_hours,
+                    new_interval = new_interval,
+                    "Funding interval changed"
+                );
+            }
+
+            self.last_funding_time = self.next_funding_time;
+            self.next_funding_time = new_next_funding_time;
+            self.interval_hours = new_interval;
+            return changed;
+        }
+
+        false
+    }
+}
+
+/// 将毫秒间隔对齐到小时
+fn round_to_hour(interval_ms: u64) -> f64 {
+    let hours = (interval_ms as f64) / (1000.0 * 60.0 * 60.0);
+    // 对齐到 0.5 小时粒度
+    (hours * 2.0).round() / 2.0
+}
+
+/// 全局 funding 状态管理
+type FundingStates = Arc<RwLock<HashMap<Symbol, SymbolFundingState>>>;
 
 /// Binance WebSocket 客户端
 pub struct BinanceWebSocket {
@@ -74,16 +142,26 @@ impl ExchangeWebSocket for BinanceWebSocket {
             return Ok(());
         }
 
-        // 获取各合约的结算间隔信息 (用于日化费率计算)
-        let funding_intervals = match self.rest_client.get_funding_info().await {
-            Ok(info) => {
-                tracing::info!(count = info.len(), "Fetched Binance funding intervals");
-                Arc::new(info)
+        // 获取各合约最近一次结算时间 (用于计算初始间隔)
+        let last_funding_times = match self.rest_client.get_last_funding_times(&symbols).await {
+            Ok(times) => {
+                tracing::info!(count = times.len(), "Fetched Binance last funding times");
+                times
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to fetch funding info, using default 8h");
-                Arc::new(HashMap::new())
+                tracing::warn!(error = %e, "Failed to fetch last funding times");
+                HashMap::new()
             }
+        };
+
+        // 初始化 funding 状态
+        let funding_states: FundingStates = {
+            let mut states = HashMap::new();
+            for symbol in &symbols {
+                let last_time = last_funding_times.get(symbol).copied().unwrap_or(0);
+                states.insert(symbol.clone(), SymbolFundingState::new(last_time));
+            }
+            Arc::new(RwLock::new(states))
         };
 
         // 构建订阅参数
@@ -101,7 +179,7 @@ impl ExchangeWebSocket for BinanceWebSocket {
         });
 
         // 启动带重连的消息处理任务
-        let intervals = funding_intervals.clone();
+        let states = funding_states.clone();
         tokio::spawn(async move {
             let mut backoff = ExponentialBackoff::new(RetryConfig::default());
 
@@ -192,8 +270,8 @@ impl ExchangeWebSocket for BinanceWebSocket {
                                                 &text,
                                                 &sinks.funding_rates,
                                                 &sinks.bbos,
-                                                &intervals,
-                                            );
+                                                &states,
+                                            ).await;
                                         }
                                         Some(Ok(Message::Ping(data))) => {
                                             if let Err(e) = write.send(Message::Pong(data)).await {
@@ -348,11 +426,11 @@ impl ExchangeWebSocket for BinanceWebSocket {
 /// 处理 Binance 公共消息
 ///
 /// 解析失败时 panic，因为这表示代码逻辑漏洞
-fn handle_binance_public_message(
+async fn handle_binance_public_message(
     text: &str,
     funding_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::FundingRate>>,
     bbo_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::BBO>>,
-    funding_intervals: &HashMap<Symbol, f64>,
+    funding_states: &FundingStates,
 ) {
     // 先解析为 Value 获取事件类型
     let value: serde_json::Value = parse_or_panic!(text, serde_json::Value, "Binance public base");
@@ -361,10 +439,22 @@ fn handle_binance_public_message(
     match event_type {
         Some("markPriceUpdate") => {
             let update: MarkPriceUpdate = parse_or_panic!(text, MarkPriceUpdate, "markPriceUpdate");
-            // 获取该 symbol 的结算间隔，默认 8 小时
-            let interval = update.symbol()
-                .and_then(|s| funding_intervals.get(&s).copied())
-                .unwrap_or(8.0);
+            let symbol = match update.symbol() {
+                Some(s) => s,
+                None => return,
+            };
+
+            // 获取并更新该 symbol 的 funding 状态
+            let interval = {
+                let mut states = funding_states.write().await;
+                if let Some(state) = states.get_mut(&symbol) {
+                    state.update(update.t as u64);
+                    state.interval_hours
+                } else {
+                    8.0 // 默认 8 小时
+                }
+            };
+
             let rate = update.to_funding_rate(interval);
             // 按 symbol 路由到对应的 sink (未订阅的 symbol 忽略)
             if let Some(tx) = funding_sinks.get(&rate.symbol) {
