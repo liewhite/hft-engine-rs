@@ -96,8 +96,57 @@ impl OkxRestClient {
         headers
     }
 
-    /// 下单
-    pub async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
+}
+
+/// 错误码映射
+fn map_okx_error(code: &str, msg: &str) -> ExchangeError {
+    match code {
+        "50013" => ExchangeError::RateLimited(Exchange::OKX, Duration::from_secs(60)),
+        "51020" => ExchangeError::ApiError(
+            Exchange::OKX,
+            code.parse().unwrap_or(-1),
+            format!("Position limit exceeded: {}", msg),
+        ),
+        "51121" => ExchangeError::ApiError(
+            Exchange::OKX,
+            code.parse().unwrap_or(-1),
+            format!("Order quantity exceeded: {}", msg),
+        ),
+        _ => ExchangeError::ApiError(Exchange::OKX, code.parse().unwrap_or(-1), msg.to_string()),
+    }
+}
+
+/// Side 转换
+fn side_to_okx(side: Side) -> &'static str {
+    match side {
+        Side::Long => "buy",
+        Side::Short => "sell",
+    }
+}
+
+/// OrderType 转换
+fn order_type_to_okx(order_type: &OrderType) -> (&'static str, Option<String>) {
+    match order_type {
+        OrderType::Market => ("market", None),
+        OrderType::Limit { price, tif } => {
+            let ord_type = match tif {
+                TimeInForce::GTC => "limit",
+                TimeInForce::IOC => "ioc",
+                TimeInForce::FOK => "fok",
+                TimeInForce::PostOnly => "post_only",
+            };
+            (ord_type, Some(price.0.to_string()))
+        }
+    }
+}
+
+#[async_trait]
+impl ExchangeExecutor for OkxRestClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::OKX
+    }
+
+    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
         let path = "/api/v5/trade/order";
         let inst_id = order.symbol.to_okx();
         let side = side_to_okx(order.side);
@@ -183,8 +232,7 @@ impl OkxRestClient {
         Ok(OrderId::from(order_data.ord_id.clone()))
     }
 
-    /// 设置杠杆
-    pub async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
+    async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
         let path = "/api/v5/account/set-leverage";
         let inst_id = symbol.to_okx();
 
@@ -229,62 +277,5 @@ impl OkxRestClient {
         }
 
         Ok(())
-    }
-}
-
-/// 错误码映射
-fn map_okx_error(code: &str, msg: &str) -> ExchangeError {
-    match code {
-        "50013" => ExchangeError::RateLimited(Exchange::OKX, Duration::from_secs(60)),
-        "51020" => ExchangeError::ApiError(
-            Exchange::OKX,
-            code.parse().unwrap_or(-1),
-            format!("Position limit exceeded: {}", msg),
-        ),
-        "51121" => ExchangeError::ApiError(
-            Exchange::OKX,
-            code.parse().unwrap_or(-1),
-            format!("Order quantity exceeded: {}", msg),
-        ),
-        _ => ExchangeError::ApiError(Exchange::OKX, code.parse().unwrap_or(-1), msg.to_string()),
-    }
-}
-
-/// Side 转换
-fn side_to_okx(side: Side) -> &'static str {
-    match side {
-        Side::Long => "buy",
-        Side::Short => "sell",
-    }
-}
-
-/// OrderType 转换
-fn order_type_to_okx(order_type: &OrderType) -> (&'static str, Option<String>) {
-    match order_type {
-        OrderType::Market => ("market", None),
-        OrderType::Limit { price, tif } => {
-            let ord_type = match tif {
-                TimeInForce::GTC => "limit",
-                TimeInForce::IOC => "ioc",
-                TimeInForce::FOK => "fok",
-                TimeInForce::PostOnly => "post_only",
-            };
-            (ord_type, Some(price.0.to_string()))
-        }
-    }
-}
-
-#[async_trait]
-impl ExchangeExecutor for OkxRestClient {
-    fn exchange(&self) -> Exchange {
-        Exchange::OKX
-    }
-
-    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
-        OkxRestClient::place_order(self, order).await
-    }
-
-    async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
-        OkxRestClient::set_leverage(self, symbol, leverage).await
     }
 }

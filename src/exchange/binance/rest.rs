@@ -116,91 +116,6 @@ impl BinanceRestClient {
         Ok(())
     }
 
-    /// 下单
-    pub async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
-        let symbol = order.symbol.to_binance();
-        let side = side_to_binance(order.side);
-        let (order_type, price, tif) = order_type_to_binance(&order.order_type);
-        let qty = order.quantity.0.to_string();
-        let reduce_only = if order.reduce_only { "true" } else { "false" };
-
-        let mut params: Vec<(&str, &str)> = vec![
-            ("symbol", &symbol),
-            ("side", side),
-            ("type", order_type),
-            ("quantity", &qty),
-            ("reduceOnly", reduce_only),
-        ];
-
-        let price_str;
-        if let Some(p) = price {
-            price_str = p;
-            params.push(("price", &price_str));
-        }
-
-        if let Some(t) = tif {
-            params.push(("timeInForce", t));
-        }
-
-        if let Some(ref coid) = order.client_order_id {
-            params.push(("newClientOrderId", coid));
-        }
-
-        let query = self.build_signed_query(&params);
-
-        #[derive(Deserialize)]
-        struct Response {
-            #[serde(rename = "orderId")]
-            order_id: i64,
-        }
-
-        let resp = self
-            .client
-            .post(format!("{}/fapi/v1/order?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::OrderRejected(
-                Exchange::Binance,
-                text,
-            )));
-        }
-
-        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
-        Ok(OrderId::from(data.order_id))
-    }
-
-    /// 设置杠杆
-    pub async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
-        let symbol_str = symbol.to_binance();
-        let leverage_str = leverage.to_string();
-        let params = [("symbol", symbol_str.as_str()), ("leverage", &leverage_str)];
-        let query = self.build_signed_query(&params);
-
-        let resp = self
-            .client
-            .post(format!("{}/fapi/v1/leverage?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
-                Exchange::Binance,
-                -1,
-                text,
-            )));
-        }
-
-        Ok(())
-    }
-
     /// 解析错误响应
     fn parse_error(&self, text: &str) -> Option<ExchangeError> {
         #[derive(Deserialize)]
@@ -261,10 +176,85 @@ impl ExchangeExecutor for BinanceRestClient {
     }
 
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
-        BinanceRestClient::place_order(self, order).await
+        let symbol = order.symbol.to_binance();
+        let side = side_to_binance(order.side);
+        let (order_type, price, tif) = order_type_to_binance(&order.order_type);
+        let qty = order.quantity.0.to_string();
+        let reduce_only = if order.reduce_only { "true" } else { "false" };
+
+        let mut params: Vec<(&str, &str)> = vec![
+            ("symbol", &symbol),
+            ("side", side),
+            ("type", order_type),
+            ("quantity", &qty),
+            ("reduceOnly", reduce_only),
+        ];
+
+        let price_str;
+        if let Some(p) = price {
+            price_str = p;
+            params.push(("price", &price_str));
+        }
+
+        if let Some(t) = tif {
+            params.push(("timeInForce", t));
+        }
+
+        if let Some(ref coid) = order.client_order_id {
+            params.push(("newClientOrderId", coid));
+        }
+
+        let query = self.build_signed_query(&params);
+
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "orderId")]
+            order_id: i64,
+        }
+
+        let resp = self
+            .client
+            .post(format!("{}/fapi/v1/order?{}", self.base_url, query))
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::OrderRejected(
+                Exchange::Binance,
+                text,
+            )));
+        }
+
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
+        Ok(OrderId::from(data.order_id))
     }
 
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
-        BinanceRestClient::set_leverage(self, symbol, leverage).await
+        let symbol_str = symbol.to_binance();
+        let leverage_str = leverage.to_string();
+        let params = [("symbol", symbol_str.as_str()), ("leverage", &leverage_str)];
+        let query = self.build_signed_query(&params);
+
+        let resp = self
+            .client
+            .post(format!("{}/fapi/v1/leverage?{}", self.base_url, query))
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                -1,
+                text,
+            )));
+        }
+
+        Ok(())
     }
 }
