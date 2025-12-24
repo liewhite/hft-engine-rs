@@ -116,7 +116,15 @@ impl ExchangeWebSocket for OkxWebSocket {
                                             tracing::error!(error = %e, "OKX WebSocket error, will reconnect");
                                             break;
                                         }
-                                        _ => {}
+                                        Some(Ok(Message::Pong(_))) => {
+                                            // Pong 响应，正常忽略
+                                        }
+                                        Some(Ok(Message::Binary(data))) => {
+                                            panic!("Unexpected binary message from OKX public WebSocket: {} bytes", data.len());
+                                        }
+                                        Some(Ok(Message::Frame(_))) => {
+                                            panic!("Unexpected raw frame from OKX public WebSocket");
+                                        }
                                     }
                                 }
                             }
@@ -281,7 +289,15 @@ impl ExchangeWebSocket for OkxWebSocket {
                                             tracing::error!(error = %e, "OKX private WebSocket error, will reconnect");
                                             break;
                                         }
-                                        _ => {}
+                                        Some(Ok(Message::Pong(_))) => {
+                                            // Pong 响应，正常忽略
+                                        }
+                                        Some(Ok(Message::Binary(data))) => {
+                                            panic!("Unexpected binary message from OKX private WebSocket: {} bytes", data.len());
+                                        }
+                                        Some(Ok(Message::Frame(_))) => {
+                                            panic!("Unexpected raw frame from OKX private WebSocket");
+                                        }
                                     }
                                 }
                             }
@@ -343,24 +359,22 @@ fn handle_okx_public_message(
         Some("funding-rate") => {
             let push: WsPush<FundingRateData> = parse_or_panic!(text, WsPush<FundingRateData>, "funding-rate");
             for data in push.data {
-                if let Some(rate) = data.to_funding_rate() {
-                    // 按 symbol 路由
-                    if let Some(tx) = funding_sinks.get(&rate.symbol) {
-                        let _ = tx.send(rate);
-                    }
+                let rate = data.to_funding_rate();
+                // 按 symbol 路由 (未订阅的 symbol 忽略)
+                if let Some(tx) = funding_sinks.get(&rate.symbol) {
+                    let _ = tx.send(rate);
                 }
             }
         }
         Some("bbo-tbt") => {
             let push: WsPush<BboData> = parse_or_panic!(text, WsPush<BboData>, "bbo-tbt");
-            if let Some(inst_id) = &push.arg.inst_id {
-                for data in push.data {
-                    if let Some(bbo) = data.to_bbo(inst_id) {
-                        // 按 symbol 路由
-                        if let Some(tx) = bbo_sinks.get(&bbo.symbol) {
-                            let _ = tx.send(bbo);
-                        }
-                    }
+            let inst_id = push.arg.inst_id.as_ref()
+                .unwrap_or_else(|| panic!("bbo-tbt push missing inst_id\nRaw: {}", text));
+            for data in push.data {
+                let bbo = data.to_bbo(inst_id);
+                // 按 symbol 路由 (未订阅的 symbol 忽略)
+                if let Some(tx) = bbo_sinks.get(&bbo.symbol) {
+                    let _ = tx.send(bbo);
                 }
             }
         }
@@ -413,11 +427,10 @@ fn handle_okx_private_message(
         Some("positions") => {
             let push: WsPush<PositionData> = parse_or_panic!(text, WsPush<PositionData>, "positions");
             for data in push.data {
-                if let Some(pos) = data.to_position() {
-                    // 按 symbol 路由
-                    if let Some(tx) = position_sinks.get(&pos.symbol) {
-                        let _ = tx.send(pos);
-                    }
+                let pos = data.to_position();
+                // 按 symbol 路由 (未订阅的 symbol 忽略)
+                if let Some(tx) = position_sinks.get(&pos.symbol) {
+                    let _ = tx.send(pos);
                 }
             }
         }
@@ -425,21 +438,19 @@ fn handle_okx_private_message(
             let push: WsPush<AccountData> = parse_or_panic!(text, WsPush<AccountData>, "account");
             for acct in push.data {
                 for detail in acct.details {
-                    if let Some(balance) = detail.to_balance() {
-                        // 不按 symbol 分
-                        let _ = balance_sink.send(balance);
-                    }
+                    let balance = detail.to_balance();
+                    // 不按 symbol 分
+                    let _ = balance_sink.send(balance);
                 }
             }
         }
         Some("orders") => {
             let push: WsPush<OrderPushData> = parse_or_panic!(text, WsPush<OrderPushData>, "orders");
             for data in push.data {
-                if let Some(update) = data.to_order_update() {
-                    // 按 symbol 路由
-                    if let Some(tx) = order_sinks.get(&update.symbol) {
-                        let _ = tx.send(update);
-                    }
+                let update = data.to_order_update();
+                // 按 symbol 路由 (未订阅的 symbol 忽略)
+                if let Some(tx) = order_sinks.get(&update.symbol) {
+                    let _ = tx.send(update);
                 }
             }
         }

@@ -127,7 +127,15 @@ impl ExchangeWebSocket for BinanceWebSocket {
                                             tracing::error!(error = %e, "Binance WebSocket error, will reconnect");
                                             break;
                                         }
-                                        _ => {}
+                                        Some(Ok(Message::Pong(_))) => {
+                                            // Pong 响应，正常忽略
+                                        }
+                                        Some(Ok(Message::Binary(data))) => {
+                                            panic!("Unexpected binary message from Binance public WebSocket: {} bytes", data.len());
+                                        }
+                                        Some(Ok(Message::Frame(_))) => {
+                                            panic!("Unexpected raw frame from Binance public WebSocket");
+                                        }
                                     }
                                 }
                             }
@@ -224,7 +232,15 @@ impl ExchangeWebSocket for BinanceWebSocket {
                                             tracing::error!(error = %e, "Binance private WebSocket error, will reconnect");
                                             break;
                                         }
-                                        _ => {}
+                                        Some(Ok(Message::Pong(_))) => {
+                                            // Pong 响应，正常忽略
+                                        }
+                                        Some(Ok(Message::Binary(data))) => {
+                                            panic!("Unexpected binary message from Binance private WebSocket: {} bytes", data.len());
+                                        }
+                                        Some(Ok(Message::Frame(_))) => {
+                                            panic!("Unexpected raw frame from Binance private WebSocket");
+                                        }
                                     }
                                 }
                             }
@@ -262,20 +278,18 @@ fn handle_binance_public_message(
     match event_type {
         Some("markPriceUpdate") => {
             let update: MarkPriceUpdate = parse_or_panic!(text, MarkPriceUpdate, "markPriceUpdate");
-            if let Some(rate) = update.to_funding_rate() {
-                // 按 symbol 路由到对应的 sink
-                if let Some(tx) = funding_sinks.get(&rate.symbol) {
-                    let _ = tx.send(rate);
-                }
+            let rate = update.to_funding_rate();
+            // 按 symbol 路由到对应的 sink (未订阅的 symbol 忽略)
+            if let Some(tx) = funding_sinks.get(&rate.symbol) {
+                let _ = tx.send(rate);
             }
         }
         Some("bookTicker") => {
             let ticker: BookTicker = parse_or_panic!(text, BookTicker, "bookTicker");
-            if let Some(bbo) = ticker.to_bbo() {
-                // 按 symbol 路由到对应的 sink
-                if let Some(tx) = bbo_sinks.get(&bbo.symbol) {
-                    let _ = tx.send(bbo);
-                }
+            let bbo = ticker.to_bbo();
+            // 按 symbol 路由到对应的 sink (未订阅的 symbol 忽略)
+            if let Some(tx) = bbo_sinks.get(&bbo.symbol) {
+                let _ = tx.send(bbo);
             }
         }
         Some(unknown) => {
@@ -304,28 +318,25 @@ fn handle_binance_private_message(
     match event_type {
         Some("ACCOUNT_UPDATE") => {
             let update: AccountUpdate = parse_or_panic!(text, AccountUpdate, "ACCOUNT_UPDATE");
-            // 发送仓位更新 - 按 symbol 路由
+            // 发送仓位更新 - 按 symbol 路由 (未订阅的 symbol 忽略)
             for pos in &update.a.positions {
-                if let Some(position) = pos.to_position() {
-                    if let Some(tx) = position_sinks.get(&position.symbol) {
-                        let _ = tx.send(position);
-                    }
+                let position = pos.to_position();
+                if let Some(tx) = position_sinks.get(&position.symbol) {
+                    let _ = tx.send(position);
                 }
             }
             // 发送余额更新 - 不按 symbol 分
             for bal in &update.a.balances {
-                if let Some(balance) = bal.to_balance() {
-                    let _ = balance_sink.send(balance);
-                }
+                let balance = bal.to_balance();
+                let _ = balance_sink.send(balance);
             }
         }
         Some("ORDER_TRADE_UPDATE") => {
             let update: OrderTradeUpdate = parse_or_panic!(text, OrderTradeUpdate, "ORDER_TRADE_UPDATE");
-            if let Some(order_update) = update.to_order_update() {
-                // 按 symbol 路由
-                if let Some(tx) = order_sinks.get(&order_update.symbol) {
-                    let _ = tx.send(order_update);
-                }
+            let order_update = update.to_order_update();
+            // 按 symbol 路由 (未订阅的 symbol 忽略)
+            if let Some(tx) = order_sinks.get(&order_update.symbol) {
+                let _ = tx.send(order_update);
             }
         }
         Some("listenKeyExpired") => {
