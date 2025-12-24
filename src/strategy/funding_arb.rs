@@ -46,6 +46,8 @@ pub struct FundingArbStrategy {
     state: SymbolState,
     /// 各交易所 USDT 可用余额 (用于风控)
     usdt_balances: HashMap<Exchange, f64>,
+    /// 开仓进行中标记 (防止异步下单期间重复触发)
+    opening_in_progress: bool,
 }
 
 impl FundingArbStrategy {
@@ -56,6 +58,7 @@ impl FundingArbStrategy {
             state: SymbolState::new(symbol.clone()),
             symbol,
             usdt_balances: HashMap::new(),
+            opening_in_progress: false,
         }
     }
 
@@ -355,13 +358,42 @@ impl Strategy for FundingArbStrategy {
                     "Received USDT balance update"
                 );
                 self.usdt_balances.insert(*exchange, balance.available);
-                tracing::debug!(
-                    exchange = %exchange,
-                    available = balance.available,
-                    "USDT balance updated"
-                );
             }
             return vec![];
+        }
+
+        // 检查是否需要重置 opening_in_progress
+        if self.opening_in_progress {
+            match &event {
+                ExchangeEvent::PositionUpdate { position, .. } => {
+                    // 有持仓了，说明开仓成功
+                    if !position.is_empty() {
+                        tracing::info!(
+                            symbol = %self.symbol,
+                            "Opening completed, position received"
+                        );
+                        self.opening_in_progress = false;
+                    }
+                }
+                ExchangeEvent::OrderStatusUpdate { update, .. } => {
+                    // 订单终结状态，重置标记
+                    use crate::domain::OrderStatus;
+                    match &update.status {
+                        OrderStatus::Filled
+                        | OrderStatus::Cancelled
+                        | OrderStatus::Rejected { .. } => {
+                            tracing::info!(
+                                symbol = %self.symbol,
+                                status = ?update.status,
+                                "Opening order completed"
+                            );
+                            self.opening_in_progress = false;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
         }
 
         // 更新 per-symbol 状态
@@ -369,6 +401,11 @@ impl Strategy for FundingArbStrategy {
 
         // 有未完成订单时等待
         if self.state.has_pending_orders() {
+            return vec![];
+        }
+
+        // 开仓进行中，等待完成
+        if self.opening_in_progress {
             return vec![];
         }
 
@@ -384,6 +421,11 @@ impl Strategy for FundingArbStrategy {
 
         // 优先级 3: 检查开仓条件
         if let Some(cond) = Self::check_open_condition(&self.state, &self.config) {
+            self.opening_in_progress = true;
+            tracing::info!(
+                symbol = %self.symbol,
+                "Opening position, setting opening_in_progress=true"
+            );
             return Self::make_open_signals(
                 &self.symbol,
                 cond.short_ex,
