@@ -11,6 +11,7 @@ Cargo.lock
 # Environment
 .env
 config.toml
+config.json
 
 # OS
 .DS_Store

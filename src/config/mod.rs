@@ -121,10 +121,17 @@ impl Default for EngineConfig {
 }
 
 impl AppConfig {
-    /// 从 TOML 文件加载配置
+    /// 从配置文件加载 (支持 JSON 和 TOML)
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
         let content = fs::read_to_string(path).map_err(ConfigError::Io)?;
-        toml::from_str(&content).map_err(ConfigError::Parse)
+
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("json") => serde_json::from_str(&content).map_err(ConfigError::ParseJson),
+            Some("toml") => toml::from_str(&content).map_err(ConfigError::ParseToml),
+            Some(ext) => Err(ConfigError::UnsupportedFormat(ext.to_string())),
+            None => Err(ConfigError::UnsupportedFormat("unknown".to_string())),
+        }
     }
 
     /// 从环境变量加载配置
@@ -174,16 +181,20 @@ impl AppConfig {
 #[derive(Debug)]
 pub enum ConfigError {
     Io(std::io::Error),
-    Parse(toml::de::Error),
+    ParseToml(toml::de::Error),
+    ParseJson(serde_json::Error),
     MissingEnv(&'static str),
+    UnsupportedFormat(String),
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::Io(e) => write!(f, "IO error: {}", e),
-            ConfigError::Parse(e) => write!(f, "Parse error: {}", e),
+            ConfigError::ParseToml(e) => write!(f, "TOML parse error: {}", e),
+            ConfigError::ParseJson(e) => write!(f, "JSON parse error: {}", e),
             ConfigError::MissingEnv(var) => write!(f, "Missing environment variable: {}", var),
+            ConfigError::UnsupportedFormat(ext) => write!(f, "Unsupported config format: {}", ext),
         }
     }
 }

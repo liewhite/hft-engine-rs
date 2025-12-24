@@ -1,0 +1,26 @@
+{
+  "exchanges": {
+    "binance": {
+      "api_key": "YOUR_BINANCE_API_KEY",
+      "secret": "YOUR_BINANCE_SECRET"
+    },
+    "okx": {
+      "api_key": "YOUR_OKX_API_KEY",
+      "secret": "YOUR_OKX_SECRET",
+      "passphrase": "YOUR_OKX_PASSPHRASE"
+    }
+  },
+  "strategy": {
+    "symbols": ["BTC_USDT", "ETH_USDT"],
+    "funding_arb": {
+      "min_spread": "0.0005",
+      "max_spread": "0.002",
+      "close_spread": "0.0002",
+      "base_quantity": "0.01",
+      "max_quantity": "1.0"
+    }
+  },
+  "engine": {
+    "queue_capacity": 256
+  }
+}

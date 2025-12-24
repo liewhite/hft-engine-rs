@@ -14,17 +14,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Fee arbitrage system starting...");
 
-    // Load configuration
-    let config = match std::env::args().nth(1) {
-        Some(path) => {
-            tracing::info!(path = %path, "Loading config from file");
-            AppConfig::from_file(&path)?
-        }
-        None => {
-            tracing::info!("Loading config from environment variables");
-            AppConfig::from_env()?
-        }
-    };
+    // Load configuration from config.json (or specified path)
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.json".to_string());
+    tracing::info!(path = %config_path, "Loading config from file");
+    let config = AppConfig::from_file(&config_path)?;
 
     let symbols = config.parse_symbols();
     if symbols.is_empty() {
