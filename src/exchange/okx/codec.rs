@@ -17,6 +17,7 @@ pub struct WsPush<T> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WsArg {
+    #[allow(dead_code)]
     pub channel: String,
     pub inst_id: Option<String>,
     #[allow(dead_code)]
