@@ -1,5 +1,5 @@
 use crate::domain::{Exchange, ExchangeError, Symbol};
-use crate::exchange::api::{ExchangeWebSocket, PrivateHubs, PublicHubs};
+use crate::exchange::api::{ExchangeWebSocket, PrivateSinks, PublicSinks};
 use crate::exchange::binance::codec::{AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate};
 use crate::exchange::binance::rest::BinanceRestClient;
 use crate::exchange::binance::WS_PUBLIC_URL;
@@ -7,8 +7,10 @@ use crate::exchange::ws_util::{ExponentialBackoff, RetryConfig};
 use crate::parse_or_panic;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -57,22 +59,23 @@ impl ExchangeWebSocket for BinanceWebSocket {
 
     async fn connect_public(
         &self,
-        symbols: &[Symbol],
+        sinks: PublicSinks,
         cancel_token: CancellationToken,
-    ) -> Result<PublicHubs, ExchangeError> {
-        let hubs = PublicHubs::new(1024);
+    ) -> Result<(), ExchangeError> {
+        let symbols = sinks.symbols();
+        if symbols.is_empty() {
+            return Ok(());
+        }
 
         // 构建订阅参数
         let mut streams: Vec<String> = Vec::new();
-        for symbol in symbols {
+        for symbol in &symbols {
             let s = symbol.to_binance().to_lowercase();
             streams.push(format!("{}@markPrice@1s", s));
             streams.push(format!("{}@bookTicker", s));
         }
 
         let url = format!("{}/{}", WS_PUBLIC_URL, streams.join("/"));
-        let funding_tx = hubs.funding_rates.clone();
-        let bbo_tx = hubs.bbos.clone();
 
         // 启动带重连的消息处理任务
         tokio::spawn(async move {
@@ -100,7 +103,11 @@ impl ExchangeWebSocket for BinanceWebSocket {
                                 msg = read.next() => {
                                     match msg {
                                         Some(Ok(Message::Text(text))) => {
-                                            handle_binance_public_message(&text, &funding_tx, &bbo_tx);
+                                            handle_binance_public_message(
+                                                &text,
+                                                &sinks.funding_rates,
+                                                &sinks.bbos,
+                                            );
                                         }
                                         Some(Ok(Message::Ping(data))) => {
                                             if let Err(e) = write.send(Message::Pong(data)).await {
@@ -135,23 +142,19 @@ impl ExchangeWebSocket for BinanceWebSocket {
             }
         });
 
-        Ok(hubs)
+        Ok(())
     }
 
     async fn connect_private(
         &self,
+        sinks: PrivateSinks,
         cancel_token: CancellationToken,
-    ) -> Result<PrivateHubs, ExchangeError> {
-        let hubs = PrivateHubs::new(256);
-
+    ) -> Result<(), ExchangeError> {
         // 启动保活
         self.start_keepalive(cancel_token.clone());
 
         let rest_client = self.rest_client.clone();
         let listen_key_holder = self.listen_key.clone();
-        let position_tx = hubs.positions.clone();
-        let balance_tx = hubs.balances.clone();
-        let order_tx = hubs.order_updates.clone();
 
         // 启动带重连的消息处理任务
         tokio::spawn(async move {
@@ -193,7 +196,12 @@ impl ExchangeWebSocket for BinanceWebSocket {
                                 msg = read.next() => {
                                     match msg {
                                         Some(Ok(Message::Text(text))) => {
-                                            handle_binance_private_message(&text, &position_tx, &balance_tx, &order_tx);
+                                            handle_binance_private_message(
+                                                &text,
+                                                &sinks.positions,
+                                                &sinks.balances,
+                                                &sinks.order_updates,
+                                            );
                                         }
                                         Some(Ok(Message::Ping(data))) => {
                                             if let Err(e) = write.send(Message::Pong(data)).await {
@@ -228,7 +236,7 @@ impl ExchangeWebSocket for BinanceWebSocket {
             }
         });
 
-        Ok(hubs)
+        Ok(())
     }
 }
 
@@ -237,8 +245,8 @@ impl ExchangeWebSocket for BinanceWebSocket {
 /// 解析失败时 panic，因为这表示代码逻辑漏洞
 fn handle_binance_public_message(
     text: &str,
-    funding_tx: &tokio::sync::broadcast::Sender<crate::domain::FundingRate>,
-    bbo_tx: &tokio::sync::broadcast::Sender<crate::domain::BBO>,
+    funding_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::FundingRate>>,
+    bbo_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::BBO>>,
 ) {
     // 先解析为 Value 获取事件类型
     let value: serde_json::Value = parse_or_panic!(text, serde_json::Value, "Binance public base");
@@ -248,13 +256,19 @@ fn handle_binance_public_message(
         Some("markPriceUpdate") => {
             let update: MarkPriceUpdate = parse_or_panic!(text, MarkPriceUpdate, "markPriceUpdate");
             if let Some(rate) = update.to_funding_rate() {
-                let _ = funding_tx.send(rate);
+                // 按 symbol 路由到对应的 sink
+                if let Some(tx) = funding_sinks.get(&rate.symbol) {
+                    let _ = tx.send(rate);
+                }
             }
         }
         Some("bookTicker") => {
             let ticker: BookTicker = parse_or_panic!(text, BookTicker, "bookTicker");
             if let Some(bbo) = ticker.to_bbo() {
-                let _ = bbo_tx.send(bbo);
+                // 按 symbol 路由到对应的 sink
+                if let Some(tx) = bbo_sinks.get(&bbo.symbol) {
+                    let _ = tx.send(bbo);
+                }
             }
         }
         Some(unknown) => {
@@ -271,9 +285,9 @@ fn handle_binance_public_message(
 /// 解析失败时 panic，因为这表示代码逻辑漏洞
 fn handle_binance_private_message(
     text: &str,
-    position_tx: &tokio::sync::broadcast::Sender<crate::domain::Position>,
-    balance_tx: &tokio::sync::broadcast::Sender<crate::domain::Balance>,
-    order_tx: &tokio::sync::broadcast::Sender<crate::domain::OrderUpdate>,
+    position_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::Position>>,
+    balance_sink: &broadcast::Sender<crate::domain::Balance>,
+    order_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::OrderUpdate>>,
 ) {
     // 先解析为 Value 获取事件类型
     let value: serde_json::Value = parse_or_panic!(text, serde_json::Value, "Binance private base");
@@ -282,23 +296,28 @@ fn handle_binance_private_message(
     match event_type {
         Some("ACCOUNT_UPDATE") => {
             let update: AccountUpdate = parse_or_panic!(text, AccountUpdate, "ACCOUNT_UPDATE");
-            // 发送仓位更新
+            // 发送仓位更新 - 按 symbol 路由
             for pos in &update.a.positions {
                 if let Some(position) = pos.to_position() {
-                    let _ = position_tx.send(position);
+                    if let Some(tx) = position_sinks.get(&position.symbol) {
+                        let _ = tx.send(position);
+                    }
                 }
             }
-            // 发送余额更新
+            // 发送余额更新 - 不按 symbol 分
             for bal in &update.a.balances {
                 if let Some(balance) = bal.to_balance() {
-                    let _ = balance_tx.send(balance);
+                    let _ = balance_sink.send(balance);
                 }
             }
         }
         Some("ORDER_TRADE_UPDATE") => {
             let update: OrderTradeUpdate = parse_or_panic!(text, OrderTradeUpdate, "ORDER_TRADE_UPDATE");
             if let Some(order_update) = update.to_order_update() {
-                let _ = order_tx.send(order_update);
+                // 按 symbol 路由
+                if let Some(tx) = order_sinks.get(&order_update.symbol) {
+                    let _ = tx.send(order_update);
+                }
             }
         }
         Some("listenKeyExpired") => {

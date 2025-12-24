@@ -3,38 +3,99 @@ use crate::domain::{
     BBO,
 };
 use async_trait::async_trait;
+use std::collections::HashMap;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-/// Public 市场数据 Hub
-pub struct PublicHubs {
-    pub funding_rates: broadcast::Sender<FundingRate>,
-    pub bbos: broadcast::Sender<BBO>,
+/// 公共数据 Sink - 由消费者创建，按 Symbol 拆分
+///
+/// 消费者创建所需的 sender，生产者只负责推送数据
+pub struct PublicSinks {
+    /// FundingRate per symbol
+    pub funding_rates: HashMap<Symbol, broadcast::Sender<FundingRate>>,
+    /// BBO per symbol
+    pub bbos: HashMap<Symbol, broadcast::Sender<BBO>>,
 }
 
-impl PublicHubs {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            funding_rates: broadcast::channel(capacity).0,
-            bbos: broadcast::channel(capacity).0,
+impl PublicSinks {
+    /// 创建指定 symbols 的 sinks
+    pub fn new(symbols: &[Symbol], capacity: usize) -> Self {
+        let mut funding_rates = HashMap::new();
+        let mut bbos = HashMap::new();
+
+        for symbol in symbols {
+            funding_rates.insert(symbol.clone(), broadcast::channel(capacity).0);
+            bbos.insert(symbol.clone(), broadcast::channel(capacity).0);
         }
+
+        Self {
+            funding_rates,
+            bbos,
+        }
+    }
+
+    /// 获取订阅的 symbols
+    pub fn symbols(&self) -> Vec<Symbol> {
+        self.funding_rates.keys().cloned().collect()
+    }
+
+    /// 订阅指定 symbol 的 FundingRate
+    pub fn subscribe_funding_rate(&self, symbol: &Symbol) -> Option<broadcast::Receiver<FundingRate>> {
+        self.funding_rates.get(symbol).map(|tx| tx.subscribe())
+    }
+
+    /// 订阅指定 symbol 的 BBO
+    pub fn subscribe_bbo(&self, symbol: &Symbol) -> Option<broadcast::Receiver<BBO>> {
+        self.bbos.get(symbol).map(|tx| tx.subscribe())
     }
 }
 
-/// Private 账户数据 Hub
-pub struct PrivateHubs {
-    pub positions: broadcast::Sender<Position>,
+/// 私有数据 Sink - 由消费者创建，按 Symbol 拆分
+pub struct PrivateSinks {
+    /// Position per symbol
+    pub positions: HashMap<Symbol, broadcast::Sender<Position>>,
+    /// Balance (per asset, 不按 symbol 拆分)
     pub balances: broadcast::Sender<Balance>,
-    pub order_updates: broadcast::Sender<OrderUpdate>,
+    /// OrderUpdate per symbol
+    pub order_updates: HashMap<Symbol, broadcast::Sender<OrderUpdate>>,
 }
 
-impl PrivateHubs {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            positions: broadcast::channel(capacity).0,
-            balances: broadcast::channel(capacity).0,
-            order_updates: broadcast::channel(capacity).0,
+impl PrivateSinks {
+    /// 创建指定 symbols 的 sinks
+    pub fn new(symbols: &[Symbol], capacity: usize) -> Self {
+        let mut positions = HashMap::new();
+        let mut order_updates = HashMap::new();
+
+        for symbol in symbols {
+            positions.insert(symbol.clone(), broadcast::channel(capacity).0);
+            order_updates.insert(symbol.clone(), broadcast::channel(capacity).0);
         }
+
+        Self {
+            positions,
+            balances: broadcast::channel(capacity).0,
+            order_updates,
+        }
+    }
+
+    /// 获取订阅的 symbols
+    pub fn symbols(&self) -> Vec<Symbol> {
+        self.positions.keys().cloned().collect()
+    }
+
+    /// 订阅指定 symbol 的 Position
+    pub fn subscribe_position(&self, symbol: &Symbol) -> Option<broadcast::Receiver<Position>> {
+        self.positions.get(symbol).map(|tx| tx.subscribe())
+    }
+
+    /// 订阅 Balance (不按 symbol 拆分)
+    pub fn subscribe_balance(&self) -> broadcast::Receiver<Balance> {
+        self.balances.subscribe()
+    }
+
+    /// 订阅指定 symbol 的 OrderUpdate
+    pub fn subscribe_order_update(&self, symbol: &Symbol) -> Option<broadcast::Receiver<OrderUpdate>> {
+        self.order_updates.get(symbol).map(|tx| tx.subscribe())
     }
 }
 
@@ -44,17 +105,22 @@ pub trait ExchangeWebSocket: Send + Sync {
     fn exchange(&self) -> Exchange;
 
     /// 连接公共 WebSocket 并订阅市场数据
+    ///
+    /// sinks 由消费者创建，生产者只负责推送数据到对应的 sender
     async fn connect_public(
         &self,
-        symbols: &[Symbol],
+        sinks: PublicSinks,
         cancel_token: CancellationToken,
-    ) -> Result<PublicHubs, ExchangeError>;
+    ) -> Result<(), ExchangeError>;
 
     /// 连接私有 WebSocket 并订阅账户数据
+    ///
+    /// sinks 由消费者创建，生产者只负责推送数据到对应的 sender
     async fn connect_private(
         &self,
+        sinks: PrivateSinks,
         cancel_token: CancellationToken,
-    ) -> Result<PrivateHubs, ExchangeError>;
+    ) -> Result<(), ExchangeError>;
 }
 
 /// 交易所执行器 trait
@@ -68,4 +134,3 @@ pub trait ExchangeExecutor: Send + Sync {
     /// 设置杠杆
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError>;
 }
-

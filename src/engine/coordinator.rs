@@ -1,5 +1,5 @@
 use crate::domain::{Exchange, ExchangeError, Symbol};
-use crate::exchange::ExchangeWebSocket;
+use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicSinks};
 use crate::messaging::{EventDispatcher, SymbolEventBus};
 use crate::strategy::Strategy;
 use crate::engine::processor::SymbolProcessor;
@@ -77,43 +77,67 @@ where
     /// 启动系统
     pub async fn start(&mut self) -> Result<(), ExchangeError> {
         let token = self.lifecycle.token();
+        const SINK_CAPACITY: usize = 256;
 
         tracing::info!("Starting coordinator...");
 
         // 1. 创建 SymbolEventBus
-        let (event_bus, receivers) = SymbolEventBus::new(&self.symbols, 256);
+        let (event_bus, receivers) = SymbolEventBus::new(&self.symbols, SINK_CAPACITY);
         self.event_bus = Some(event_bus.clone());
 
-        // 2. 连接交易所 Public WebSocket
-        tracing::info!("Connecting to exchanges...");
-        let binance_public = self
-            .binance
-            .connect_public(&self.symbols, token.clone())
-            .await?;
-        let okx_public = self
-            .okx
-            .connect_public(&self.symbols, token.clone())
-            .await?;
+        // 2. 创建 per-exchange Sinks (消费者创建 sender)
+        let binance_public_sinks = PublicSinks::new(&self.symbols, SINK_CAPACITY);
+        let binance_private_sinks = PrivateSinks::new(&self.symbols, SINK_CAPACITY);
+        let okx_public_sinks = PublicSinks::new(&self.symbols, SINK_CAPACITY);
+        let okx_private_sinks = PrivateSinks::new(&self.symbols, SINK_CAPACITY);
 
-        // 3. 连接交易所 Private WebSocket
-        let binance_private = self.binance.connect_private(token.clone()).await?;
-        let okx_private = self.okx.connect_private(token.clone()).await?;
-
-        // 4. 启动事件分发器
+        // 3. 启动事件分发器 (从 sinks 订阅，转发到 EventBus)
+        //    必须在 WebSocket 连接之前启动，避免丢失初始消息
         tracing::info!("Starting event dispatchers...");
-        let binance_public_handles =
-            EventDispatcher::dispatch_public(Exchange::Binance, &binance_public, event_bus.clone(), token.clone());
-        let okx_public_handles =
-            EventDispatcher::dispatch_public(Exchange::OKX, &okx_public, event_bus.clone(), token.clone());
-        let binance_private_handles =
-            EventDispatcher::dispatch_private(Exchange::Binance, &binance_private, event_bus.clone(), token.clone());
-        let okx_private_handles =
-            EventDispatcher::dispatch_private(Exchange::OKX, &okx_private, event_bus.clone(), token.clone());
+        let binance_public_handles = EventDispatcher::dispatch_public(
+            Exchange::Binance,
+            &binance_public_sinks,
+            event_bus.clone(),
+            token.clone(),
+        );
+        let okx_public_handles = EventDispatcher::dispatch_public(
+            Exchange::OKX,
+            &okx_public_sinks,
+            event_bus.clone(),
+            token.clone(),
+        );
+        let binance_private_handles = EventDispatcher::dispatch_private(
+            Exchange::Binance,
+            &binance_private_sinks,
+            event_bus.clone(),
+            token.clone(),
+        );
+        let okx_private_handles = EventDispatcher::dispatch_private(
+            Exchange::OKX,
+            &okx_private_sinks,
+            event_bus.clone(),
+            token.clone(),
+        );
 
         self.lifecycle.register_all(binance_public_handles);
         self.lifecycle.register_all(okx_public_handles);
         self.lifecycle.register_all(binance_private_handles);
         self.lifecycle.register_all(okx_private_handles);
+
+        // 4. 连接交易所 WebSocket (传入 sinks，WebSocket 只负责推送数据)
+        tracing::info!("Connecting to exchanges...");
+        self.binance
+            .connect_public(binance_public_sinks, token.clone())
+            .await?;
+        self.binance
+            .connect_private(binance_private_sinks, token.clone())
+            .await?;
+        self.okx
+            .connect_public(okx_public_sinks, token.clone())
+            .await?;
+        self.okx
+            .connect_private(okx_private_sinks, token.clone())
+            .await?;
 
         // 5. 启动 per-symbol 处理器
         tracing::info!("Starting symbol processors...");
