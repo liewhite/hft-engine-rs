@@ -1,7 +1,6 @@
 use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO};
 use crate::messaging::{ExchangeEvent, SymbolState};
 use crate::strategy::{MarketDataType, Signal, Strategy};
-use std::collections::HashMap;
 
 /// 资金费率套利策略配置
 #[derive(Debug, Clone)]
@@ -38,27 +37,21 @@ struct OpenCondition {
     long_bbo: BBO,
 }
 
-/// 资金费率套利策略
+/// 资金费率套利策略 (单 symbol)
 pub struct FundingArbStrategy {
     config: FundingArbConfig,
     exchanges: Vec<Exchange>,
-    symbols: Vec<Symbol>,
-    /// Per-symbol 状态
-    states: HashMap<Symbol, SymbolState>,
+    symbol: Symbol,
+    state: SymbolState,
 }
 
 impl FundingArbStrategy {
-    pub fn new(config: FundingArbConfig, exchanges: Vec<Exchange>, symbols: Vec<Symbol>) -> Self {
-        let mut states = HashMap::new();
-        for symbol in &symbols {
-            states.insert(symbol.clone(), SymbolState::new(symbol.clone()));
-        }
-
+    pub fn new(config: FundingArbConfig, exchanges: Vec<Exchange>, symbol: Symbol) -> Self {
         Self {
             config,
             exchanges,
-            symbols,
-            states,
+            state: SymbolState::new(symbol.clone()),
+            symbol,
         }
     }
 
@@ -304,7 +297,7 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn symbols(&self) -> Vec<Symbol> {
-        self.symbols.clone()
+        vec![self.symbol.clone()]
     }
 
     fn market_data_types(&self) -> Vec<MarketDataType> {
@@ -317,40 +310,28 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
-        // 获取事件关联的 symbol
-        let symbol = match event.symbol() {
-            Some(s) => s.clone(),
-            None => return vec![], // Balance 事件暂不处理
-        };
-
         // 更新状态
-        let state = match self.states.get_mut(&symbol) {
-            Some(s) => {
-                s.apply(event);
-                s as &SymbolState
-            }
-            None => return vec![],
-        };
+        self.state.apply(event);
 
         // 有未完成订单时等待
-        if state.has_pending_orders() {
+        if self.state.has_pending_orders() {
             return vec![];
         }
 
         // 优先级 1: 检测并修复持仓不平衡
-        if let Some(false) = state.is_hedged() {
-            return Self::make_hedge_repair_signal(state);
+        if let Some(false) = self.state.is_hedged() {
+            return Self::make_hedge_repair_signal(&self.state);
         }
 
         // 优先级 2: 检查平仓条件
-        if Self::check_close_condition(state, &self.config) {
-            return Self::make_close_signals(state);
+        if Self::check_close_condition(&self.state, &self.config) {
+            return Self::make_close_signals(&self.state);
         }
 
         // 优先级 3: 检查开仓条件
-        if let Some(cond) = Self::check_open_condition(state, &self.config) {
+        if let Some(cond) = Self::check_open_condition(&self.state, &self.config) {
             return Self::make_open_signals(
-                &symbol,
+                &self.symbol,
                 cond.short_ex,
                 &cond.short_bbo,
                 cond.long_ex,

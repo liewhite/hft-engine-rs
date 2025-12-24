@@ -26,16 +26,19 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // Create strategy
-    let strategy = FundingArbStrategy::new(
-        config.strategy.funding_arb.clone().into(),
-        vec![Exchange::Binance, Exchange::OKX],
-        symbols,
-    );
-
     // Create and configure engine (auto-registers all supported exchanges)
     let mut engine = Engine::new(&config.exchanges)?;
-    engine.add_strategy(strategy);
+
+    // Create per-symbol strategies
+    let exchanges = vec![Exchange::Binance, Exchange::OKX];
+    for symbol in symbols {
+        let strategy = FundingArbStrategy::new(
+            config.strategy.funding_arb.clone().into(),
+            exchanges.clone(),
+            symbol,
+        );
+        engine.add_strategy(strategy);
+    }
 
     // Start engine
     engine.run().await?;
