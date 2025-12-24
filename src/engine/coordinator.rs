@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, ExchangeError, Symbol};
+use crate::domain::{ExchangeError, Symbol};
 use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicSinks};
 use crate::messaging::{EventDispatcher, SymbolEventBus};
 use crate::strategy::Strategy;
@@ -8,30 +8,28 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// 系统协调器 - 管理所有组件的生命周期
-pub struct Coordinator<B, O, S>
+pub struct Coordinator<S>
 where
-    B: ExchangeWebSocket,
-    O: ExchangeWebSocket,
     S: Strategy + Clone,
 {
-    binance: Arc<B>,
-    okx: Arc<O>,
+    exchanges: Vec<Arc<dyn ExchangeWebSocket>>,
     strategy: Arc<S>,
     symbols: Vec<Symbol>,
     cancel_token: CancellationToken,
     event_bus: Option<Arc<SymbolEventBus>>,
 }
 
-impl<B, O, S> Coordinator<B, O, S>
+impl<S> Coordinator<S>
 where
-    B: ExchangeWebSocket + 'static,
-    O: ExchangeWebSocket + 'static,
     S: Strategy + Clone + Send + Sync + 'static,
 {
-    pub fn new(binance: Arc<B>, okx: Arc<O>, strategy: S, symbols: Vec<Symbol>) -> Self {
+    pub fn new(
+        exchanges: Vec<Arc<dyn ExchangeWebSocket>>,
+        strategy: S,
+        symbols: Vec<Symbol>,
+    ) -> Self {
         Self {
-            binance,
-            okx,
+            exchanges,
             strategy: Arc::new(strategy),
             symbols,
             cancel_token: CancellationToken::new(),
@@ -50,56 +48,45 @@ where
         let (event_bus, receivers) = SymbolEventBus::new(&self.symbols, SINK_CAPACITY);
         self.event_bus = Some(event_bus.clone());
 
-        // 2. 创建 per-exchange Sinks (消费者创建 sender)
-        let binance_public_sinks = PublicSinks::new(&self.symbols, SINK_CAPACITY);
-        let binance_private_sinks = PrivateSinks::new(&self.symbols, SINK_CAPACITY);
-        let okx_public_sinks = PublicSinks::new(&self.symbols, SINK_CAPACITY);
-        let okx_private_sinks = PrivateSinks::new(&self.symbols, SINK_CAPACITY);
-
-        // 3. 启动事件分发器 (从 sinks 订阅，转发到 EventBus)
-        //    必须在 WebSocket 连接之前启动，避免丢失初始消息
-        tracing::info!("Starting event dispatchers...");
-        EventDispatcher::dispatch_public(
-            Exchange::Binance,
-            &binance_public_sinks,
-            event_bus.clone(),
-            token.clone(),
-        );
-        EventDispatcher::dispatch_public(
-            Exchange::OKX,
-            &okx_public_sinks,
-            event_bus.clone(),
-            token.clone(),
-        );
-        EventDispatcher::dispatch_private(
-            Exchange::Binance,
-            &binance_private_sinks,
-            event_bus.clone(),
-            token.clone(),
-        );
-        EventDispatcher::dispatch_private(
-            Exchange::OKX,
-            &okx_private_sinks,
-            event_bus.clone(),
-            token.clone(),
+        // 2. 为每个交易所创建 sinks 并启动连接
+        tracing::info!(
+            exchanges = self.exchanges.len(),
+            "Connecting to exchanges..."
         );
 
-        // 4. 连接交易所 WebSocket (传入 sinks，WebSocket 只负责推送数据)
-        tracing::info!("Connecting to exchanges...");
-        self.binance
-            .connect_public(binance_public_sinks, token.clone())
-            .await?;
-        self.binance
-            .connect_private(binance_private_sinks, token.clone())
-            .await?;
-        self.okx
-            .connect_public(okx_public_sinks, token.clone())
-            .await?;
-        self.okx
-            .connect_private(okx_private_sinks, token.clone())
-            .await?;
+        for exchange_ws in &self.exchanges {
+            let exchange = exchange_ws.exchange();
 
-        // 5. 启动 per-symbol 处理器
+            // 创建 per-exchange Sinks
+            let public_sinks = PublicSinks::new(&self.symbols, SINK_CAPACITY);
+            let private_sinks = PrivateSinks::new(&self.symbols, SINK_CAPACITY);
+
+            // 启动事件分发器 (必须在 WebSocket 连接之前启动)
+            EventDispatcher::dispatch_public(
+                exchange,
+                &public_sinks,
+                event_bus.clone(),
+                token.clone(),
+            );
+            EventDispatcher::dispatch_private(
+                exchange,
+                &private_sinks,
+                event_bus.clone(),
+                token.clone(),
+            );
+
+            // 连接交易所 WebSocket
+            exchange_ws
+                .connect_public(public_sinks, token.clone())
+                .await?;
+            exchange_ws
+                .connect_private(private_sinks, token.clone())
+                .await?;
+
+            tracing::info!(exchange = %exchange, "Exchange connected");
+        }
+
+        // 3. 启动 per-symbol 处理器
         tracing::info!("Starting symbol processors...");
         for (symbol, rx) in receivers {
             let processor = SymbolProcessor::new(symbol.clone(), self.strategy.clone());
@@ -108,6 +95,7 @@ where
 
         tracing::info!(
             symbols = self.symbols.len(),
+            exchanges = self.exchanges.len(),
             "Coordinator started successfully"
         );
 
