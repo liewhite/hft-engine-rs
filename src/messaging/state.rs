@@ -121,7 +121,24 @@ impl SymbolState {
     }
 
     /// 更新状态
+    ///
+    /// 如果事件的 symbol 与 state 的 symbol 不一致，则忽略该事件
     pub fn apply(&mut self, event: ExchangeEvent) {
+        // 校验 symbol 一致性 (BalanceUpdate 无 symbol，直接忽略)
+        if let Some(event_symbol) = event.symbol() {
+            if event_symbol != &self.symbol {
+                tracing::warn!(
+                    expected = %self.symbol,
+                    actual = %event_symbol,
+                    "Event symbol mismatch, ignoring"
+                );
+                return;
+            }
+        } else {
+            // BalanceUpdate 无 symbol，在 per-symbol 状态中不处理
+            return;
+        }
+
         match event {
             ExchangeEvent::FundingRateUpdate { exchange, rate, .. } => {
                 self.funding_rates.insert(exchange, rate);
@@ -150,7 +167,8 @@ impl SymbolState {
                 }
             }
             ExchangeEvent::BalanceUpdate { .. } => {
-                // Balance 在全局追踪，不在 per-symbol 状态中
+                // 已在上面提前返回，这里不会执行
+                unreachable!()
             }
         }
     }

@@ -1,4 +1,4 @@
-use crate::domain::Symbol;
+use crate::domain::{Exchange, Symbol};
 use crate::strategy::FundingArbConfig;
 use serde::Deserialize;
 use std::fs;
@@ -34,6 +34,14 @@ pub struct OkxCredentials {
     pub api_key: String,
     pub secret: String,
     pub passphrase: String,
+}
+
+impl ExchangesConfig {
+    /// 获取已配置的交易所列表
+    pub fn enabled_exchanges(&self) -> Vec<Exchange> {
+        // 当前配置中 binance 和 okx 都是必填，所以都启用
+        vec![Exchange::Binance, Exchange::OKX]
+    }
 }
 
 /// 策略配置

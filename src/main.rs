@@ -1,5 +1,4 @@
 use fee_arb::config::AppConfig;
-use fee_arb::domain::Exchange;
 use fee_arb::engine::Engine;
 use fee_arb::strategy::FundingArbStrategy;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -30,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let mut engine = Engine::new(&config.exchanges)?;
 
     // Create per-symbol strategies
-    let exchanges = vec![Exchange::Binance, Exchange::OKX];
+    let exchanges = config.exchanges.enabled_exchanges();
     for symbol in symbols {
         let strategy = FundingArbStrategy::new(
             config.strategy.funding_arb.clone().into(),
