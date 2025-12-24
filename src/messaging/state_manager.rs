@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, Order, Symbol, now_ms};
+use crate::domain::{Exchange, Order, Symbol, now_ms, USDT};
 use crate::messaging::{ExchangeEvent, SymbolState};
 use crate::strategy::Signal;
 use std::collections::HashMap;
@@ -47,12 +47,20 @@ impl StateManager {
 
         // 添加到对应 symbol 的 pending_orders
         if let Some(state) = self.states.get_mut(&order.symbol) {
-            state.add_pending_order(client_order_id, order.exchange, now_ms());
+            state.add_pending_order(client_order_id.clone(), order.exchange, now_ms());
         }
 
-        // 发送信号
-        if let Err(e) = self.signal_tx.try_send(Signal::PlaceOrder(order)) {
-            tracing::error!(error = %e, "Failed to send order signal");
+        // 发送信号，失败时移除 pending_order 保持状态一致性
+        if let Err(e) = self.signal_tx.try_send(Signal::PlaceOrder(order.clone())) {
+            tracing::error!(
+                error = %e,
+                client_order_id = %client_order_id,
+                symbol = %order.symbol,
+                "Failed to send order signal, removing pending order"
+            );
+            if let Some(state) = self.states.get_mut(&order.symbol) {
+                state.remove_pending_order(&client_order_id);
+            }
         }
     }
 
@@ -95,7 +103,7 @@ impl StateManager {
         match event {
             // 全局事件: Balance
             ExchangeEvent::BalanceUpdate { exchange, balance, .. } => {
-                if balance.asset == "USDT" {
+                if balance.asset == USDT {
                     tracing::debug!(
                         exchange = %exchange,
                         available = balance.available,
@@ -114,7 +122,7 @@ impl StateManager {
             _ => {
                 if let Some(symbol) = event.symbol() {
                     if let Some(state) = self.states.get_mut(symbol) {
-                        state.apply(event.clone());
+                        state.apply(event);
                     }
                 }
             }

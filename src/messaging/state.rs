@@ -171,7 +171,7 @@ impl SymbolState {
     /// 更新状态
     ///
     /// 如果事件的 symbol 与 state 的 symbol 不一致，则忽略该事件
-    pub fn apply(&mut self, event: ExchangeEvent) {
+    pub fn apply(&mut self, event: &ExchangeEvent) {
         // 校验 symbol 一致性 (BalanceUpdate 无 symbol，直接忽略)
         if let Some(event_symbol) = event.symbol() {
             if event_symbol != &self.symbol {
@@ -189,10 +189,10 @@ impl SymbolState {
 
         match event {
             ExchangeEvent::FundingRateUpdate { exchange, rate, .. } => {
-                self.funding_rates.insert(exchange, rate);
+                self.funding_rates.insert(*exchange, rate.clone());
             }
             ExchangeEvent::BBOUpdate { exchange, bbo, .. } => {
-                self.bbos.insert(exchange, bbo);
+                self.bbos.insert(*exchange, bbo.clone());
             }
             ExchangeEvent::PositionUpdate {
                 exchange, position, ..
@@ -204,7 +204,7 @@ impl SymbolState {
                     size = position.size,
                     "Updating position"
                 );
-                self.positions.insert(exchange, position);
+                self.positions.insert(*exchange, position.clone());
             }
             ExchangeEvent::OrderStatusUpdate {
                 exchange, update, ..
@@ -242,5 +242,10 @@ impl SymbolState {
                 unreachable!()
             }
         }
+    }
+
+    /// 移除指定的待处理订单
+    pub fn remove_pending_order(&mut self, client_order_id: &str) {
+        self.pending_orders.remove(client_order_id);
     }
 }

@@ -1,3 +1,6 @@
+/// 资产常量
+pub const USDT: &str = "USDT";
+
 /// 数量类型 (持仓数量、订单数量)
 pub type Quantity = f64;
 
