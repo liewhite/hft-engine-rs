@@ -138,6 +138,9 @@ impl FundingArbStrategy {
         price: Price,
         counter_qty: Quantity,
     ) -> Quantity {
+        if price <= 0.0 {
+            return 0.0;
+        }
         let qty_by_notional = config.max_notional / price;
         let qty_by_book = counter_qty / 2.0;
         qty_by_notional
@@ -217,18 +220,34 @@ impl FundingArbStrategy {
         ]
     }
 
-    /// 生成平仓信号 (静态方法)
+    /// 生成平仓信号 (使用限价单保护)
     fn make_close_signals(state: &SymbolState) -> Vec<Signal> {
         let mut signals = Vec::new();
 
         for (exchange, pos) in &state.positions {
             if !pos.is_empty() {
+                // 获取 BBO 用于限价单价格
+                let order_type = if let Some(bbo) = state.bbo(*exchange) {
+                    // 平多头 (卖出) 用 bid_price，平空头 (买入) 用 ask_price
+                    let price = match pos.side {
+                        Side::Long => bbo.bid_price,
+                        Side::Short => bbo.ask_price,
+                    };
+                    OrderType::Limit {
+                        price,
+                        tif: TimeInForce::IOC,
+                    }
+                } else {
+                    // 无 BBO 时回退到市价单
+                    OrderType::Market
+                };
+
                 signals.push(Signal::PlaceOrder(Order {
                     id: String::new(),
                     exchange: *exchange,
                     symbol: state.symbol.clone(),
                     side: pos.side.opposite(),
-                    order_type: OrderType::Market,
+                    order_type,
                     quantity: pos.size,
                     reduce_only: true,
                     client_order_id: None,
@@ -237,6 +256,45 @@ impl FundingArbStrategy {
         }
 
         signals
+    }
+
+    /// 生成敞口修复信号 (平掉不平衡的持仓)
+    fn make_hedge_repair_signal(state: &SymbolState) -> Vec<Signal> {
+        if let Some((exchange, side, qty)) = state.unhedged_exposure() {
+            tracing::warn!(
+                symbol = %state.symbol,
+                exchange = %exchange,
+                side = %side,
+                qty = qty,
+                "Detected unhedged exposure, generating repair signal"
+            );
+
+            // 获取 BBO 用于限价单
+            let order_type = if let Some(bbo) = state.bbo(exchange) {
+                let price = match side {
+                    Side::Long => bbo.bid_price,  // 平多用 bid
+                    Side::Short => bbo.ask_price, // 平空用 ask
+                };
+                OrderType::Limit {
+                    price,
+                    tif: TimeInForce::IOC,
+                }
+            } else {
+                OrderType::Market
+            };
+
+            return vec![Signal::PlaceOrder(Order {
+                id: String::new(),
+                exchange,
+                symbol: state.symbol.clone(),
+                side: side.opposite(),
+                order_type,
+                quantity: qty,
+                reduce_only: true,
+                client_order_id: None,
+            })];
+        }
+        vec![]
     }
 }
 
@@ -266,16 +324,30 @@ impl Strategy for FundingArbStrategy {
         };
 
         // 更新状态
-        if let Some(state) = self.states.get_mut(&symbol) {
-            state.apply(event);
-        } else {
+        let state = match self.states.get_mut(&symbol) {
+            Some(s) => {
+                s.apply(event);
+                s as &SymbolState
+            }
+            None => return vec![],
+        };
+
+        // 有未完成订单时等待
+        if state.has_pending_orders() {
             return vec![];
         }
 
-        // 重新获取不可变引用进行检查
-        let state = self.states.get(&symbol).unwrap();
+        // 优先级 1: 检测并修复持仓不平衡
+        if let Some(false) = state.is_hedged() {
+            return Self::make_hedge_repair_signal(state);
+        }
 
-        // 检查开仓条件
+        // 优先级 2: 检查平仓条件
+        if Self::check_close_condition(state, &self.config) {
+            return Self::make_close_signals(state);
+        }
+
+        // 优先级 3: 检查开仓条件
         if let Some(cond) = Self::check_open_condition(state, &self.config) {
             return Self::make_open_signals(
                 &symbol,
@@ -285,11 +357,6 @@ impl Strategy for FundingArbStrategy {
                 &cond.long_bbo,
                 &self.config,
             );
-        }
-
-        // 检查平仓条件
-        if Self::check_close_condition(state, &self.config) {
-            return Self::make_close_signals(state);
         }
 
         vec![]

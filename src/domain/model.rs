@@ -187,9 +187,9 @@ impl Position {
         self.mark_price * self.size.abs()
     }
 
-    /// 判断是否空仓
+    /// 判断是否空仓 (使用 epsilon 比较避免浮点精度问题)
     pub fn is_empty(&self) -> bool {
-        self.size == 0.0
+        self.size.abs() < 1e-10
     }
 
     /// 创建空仓位
