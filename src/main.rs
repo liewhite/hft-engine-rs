@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     coordinator.wait_for_shutdown().await;
 
     // Graceful shutdown
-    coordinator.stop().await;
+    coordinator.stop();
 
     tracing::info!("System stopped.");
 

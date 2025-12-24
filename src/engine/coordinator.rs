@@ -5,42 +5,7 @@ use crate::strategy::Strategy;
 use crate::engine::processor::SymbolProcessor;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
-/// 生命周期管理
-struct ComponentLifecycle {
-    token: CancellationToken,
-    handles: Vec<JoinHandle<()>>,
-}
-
-impl ComponentLifecycle {
-    fn new() -> Self {
-        Self {
-            token: CancellationToken::new(),
-            handles: Vec::new(),
-        }
-    }
-
-    fn token(&self) -> CancellationToken {
-        self.token.clone()
-    }
-
-    fn register(&mut self, handle: JoinHandle<()>) {
-        self.handles.push(handle);
-    }
-
-    fn register_all(&mut self, handles: Vec<JoinHandle<()>>) {
-        self.handles.extend(handles);
-    }
-
-    async fn shutdown(&self) {
-        self.token.cancel();
-        for handle in &self.handles {
-            handle.abort();
-        }
-    }
-}
 
 /// 系统协调器 - 管理所有组件的生命周期
 pub struct Coordinator<B, O, S>
@@ -53,7 +18,7 @@ where
     okx: Arc<O>,
     strategy: Arc<S>,
     symbols: Vec<Symbol>,
-    lifecycle: ComponentLifecycle,
+    cancel_token: CancellationToken,
     event_bus: Option<Arc<SymbolEventBus>>,
 }
 
@@ -69,14 +34,14 @@ where
             okx,
             strategy: Arc::new(strategy),
             symbols,
-            lifecycle: ComponentLifecycle::new(),
+            cancel_token: CancellationToken::new(),
             event_bus: None,
         }
     }
 
     /// 启动系统
     pub async fn start(&mut self) -> Result<(), ExchangeError> {
-        let token = self.lifecycle.token();
+        let token = self.cancel_token.clone();
         const SINK_CAPACITY: usize = 256;
 
         tracing::info!("Starting coordinator...");
@@ -94,35 +59,30 @@ where
         // 3. 启动事件分发器 (从 sinks 订阅，转发到 EventBus)
         //    必须在 WebSocket 连接之前启动，避免丢失初始消息
         tracing::info!("Starting event dispatchers...");
-        let binance_public_handles = EventDispatcher::dispatch_public(
+        EventDispatcher::dispatch_public(
             Exchange::Binance,
             &binance_public_sinks,
             event_bus.clone(),
             token.clone(),
         );
-        let okx_public_handles = EventDispatcher::dispatch_public(
+        EventDispatcher::dispatch_public(
             Exchange::OKX,
             &okx_public_sinks,
             event_bus.clone(),
             token.clone(),
         );
-        let binance_private_handles = EventDispatcher::dispatch_private(
+        EventDispatcher::dispatch_private(
             Exchange::Binance,
             &binance_private_sinks,
             event_bus.clone(),
             token.clone(),
         );
-        let okx_private_handles = EventDispatcher::dispatch_private(
+        EventDispatcher::dispatch_private(
             Exchange::OKX,
             &okx_private_sinks,
             event_bus.clone(),
             token.clone(),
         );
-
-        self.lifecycle.register_all(binance_public_handles);
-        self.lifecycle.register_all(okx_public_handles);
-        self.lifecycle.register_all(binance_private_handles);
-        self.lifecycle.register_all(okx_private_handles);
 
         // 4. 连接交易所 WebSocket (传入 sinks，WebSocket 只负责推送数据)
         tracing::info!("Connecting to exchanges...");
@@ -143,8 +103,7 @@ where
         tracing::info!("Starting symbol processors...");
         for (symbol, rx) in receivers {
             let processor = SymbolProcessor::new(symbol.clone(), self.strategy.clone());
-            let handle = processor.run(rx, token.clone());
-            self.lifecycle.register(handle);
+            processor.run(rx, token.clone());
         }
 
         tracing::info!(
@@ -156,9 +115,9 @@ where
     }
 
     /// 停止系统
-    pub async fn stop(&self) {
+    pub fn stop(&self) {
         tracing::info!("Stopping coordinator...");
-        self.lifecycle.shutdown().await;
+        self.cancel_token.cancel();
         tracing::info!("Coordinator stopped");
     }
 
