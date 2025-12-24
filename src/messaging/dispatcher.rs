@@ -1,6 +1,6 @@
 use crate::domain::Exchange;
 use crate::exchange::{PrivateSinks, PublicSinks};
-use crate::messaging::event::SymbolEvent;
+use crate::messaging::event::ExchangeEvent;
 use crate::messaging::event_bus::SymbolEventBus;
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,7 +37,7 @@ impl EventDispatcher {
                             result = rx.recv() => {
                                 match result {
                                     Ok(rate) => {
-                                        let event = SymbolEvent::FundingRateUpdate {
+                                        let event = ExchangeEvent::FundingRateUpdate {
                                             symbol: sym.clone(),
                                             exchange,
                                             rate,
@@ -74,7 +74,7 @@ impl EventDispatcher {
                             result = rx.recv() => {
                                 match result {
                                     Ok(bbo) => {
-                                        let event = SymbolEvent::BBOUpdate {
+                                        let event = ExchangeEvent::BBOUpdate {
                                             symbol: sym.clone(),
                                             exchange,
                                             bbo,
@@ -127,7 +127,7 @@ impl EventDispatcher {
                             result = rx.recv() => {
                                 match result {
                                     Ok(pos) => {
-                                        let event = SymbolEvent::PositionUpdate {
+                                        let event = ExchangeEvent::PositionUpdate {
                                             symbol: sym.clone(),
                                             exchange,
                                             position: pos,
@@ -164,7 +164,7 @@ impl EventDispatcher {
                             result = rx.recv() => {
                                 match result {
                                     Ok(update) => {
-                                        let event = SymbolEvent::OrderStatusUpdate {
+                                        let event = ExchangeEvent::OrderStatusUpdate {
                                             symbol: sym.clone(),
                                             exchange,
                                             update,

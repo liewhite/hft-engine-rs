@@ -1,9 +1,9 @@
 use crate::domain::{Balance, Exchange, FundingRate, OrderUpdate, Position, Symbol, BBO};
 use std::time::Instant;
 
-/// 统一的 Symbol 事件类型
+/// 统一的交易所事件类型
 #[derive(Debug, Clone)]
-pub enum SymbolEvent {
+pub enum ExchangeEvent {
     FundingRateUpdate {
         symbol: Symbol,
         exchange: Exchange,
@@ -35,7 +35,7 @@ pub enum SymbolEvent {
     },
 }
 
-impl SymbolEvent {
+impl ExchangeEvent {
     /// 获取事件关联的 Symbol (BalanceUpdate 返回 None)
     pub fn symbol(&self) -> Option<&Symbol> {
         match self {

@@ -1,5 +1,5 @@
 use crate::domain::{Exchange, FundingRate, OrderId, OrderStatus, Position, Rate, Symbol, BBO};
-use crate::messaging::event::SymbolEvent;
+use crate::messaging::event::ExchangeEvent;
 use std::collections::HashMap;
 
 /// 单个交易对在所有交易所的聚合状态
@@ -67,20 +67,20 @@ impl SymbolState {
     }
 
     /// 更新状态
-    pub fn apply(&mut self, event: SymbolEvent) {
+    pub fn apply(&mut self, event: ExchangeEvent) {
         match event {
-            SymbolEvent::FundingRateUpdate { exchange, rate, .. } => {
+            ExchangeEvent::FundingRateUpdate { exchange, rate, .. } => {
                 self.funding_rates.insert(exchange, rate);
             }
-            SymbolEvent::BBOUpdate { exchange, bbo, .. } => {
+            ExchangeEvent::BBOUpdate { exchange, bbo, .. } => {
                 self.bbos.insert(exchange, bbo);
             }
-            SymbolEvent::PositionUpdate {
+            ExchangeEvent::PositionUpdate {
                 exchange, position, ..
             } => {
                 self.positions.insert(exchange, position);
             }
-            SymbolEvent::OrderStatusUpdate {
+            ExchangeEvent::OrderStatusUpdate {
                 exchange, update, ..
             } => {
                 let key = (exchange, update.order_id.clone());
@@ -95,7 +95,7 @@ impl SymbolState {
                     }
                 }
             }
-            SymbolEvent::BalanceUpdate { .. } => {
+            ExchangeEvent::BalanceUpdate { .. } => {
                 // Balance 在全局追踪，不在 per-symbol 状态中
             }
         }

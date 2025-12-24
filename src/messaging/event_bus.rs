@@ -1,5 +1,5 @@
 use crate::domain::Symbol;
-use crate::messaging::event::SymbolEvent;
+use crate::messaging::event::ExchangeEvent;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ pub struct QueueStats {
 
 /// 单个 Symbol 的事件队列
 struct SymbolQueue {
-    sender: mpsc::Sender<SymbolEvent>,
+    sender: mpsc::Sender<ExchangeEvent>,
     dropped_counter: AtomicU64,
 }
 
@@ -29,7 +29,7 @@ impl SymbolEventBus {
     pub fn new(
         symbols: &[Symbol],
         capacity: usize,
-    ) -> (Arc<Self>, HashMap<Symbol, mpsc::Receiver<SymbolEvent>>) {
+    ) -> (Arc<Self>, HashMap<Symbol, mpsc::Receiver<ExchangeEvent>>) {
         let mut queues = HashMap::new();
         let mut receivers = HashMap::new();
 
@@ -49,7 +49,7 @@ impl SymbolEventBus {
     }
 
     /// 发布事件到对应 symbol 的队列 (非阻塞，满时丢弃)
-    pub fn publish(&self, event: SymbolEvent) {
+    pub fn publish(&self, event: ExchangeEvent) {
         if let Some(symbol) = event.symbol() {
             if let Some(queue) = self.queues.get(symbol) {
                 // 使用 try_send 实现 sliding window 语义

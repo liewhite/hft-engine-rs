@@ -1,5 +1,5 @@
 use crate::domain::Symbol;
-use crate::messaging::{SymbolEvent, SymbolState};
+use crate::messaging::{ExchangeEvent, SymbolState};
 use crate::strategy::Strategy;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -24,7 +24,7 @@ impl<S: Strategy + 'static> SymbolProcessor<S> {
     /// 启动处理循环
     pub fn run(
         mut self,
-        mut event_rx: mpsc::Receiver<SymbolEvent>,
+        mut event_rx: mpsc::Receiver<ExchangeEvent>,
         cancel_token: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -53,7 +53,7 @@ impl<S: Strategy + 'static> SymbolProcessor<S> {
     }
 
     /// 处理单个事件
-    async fn handle_event(&mut self, event: SymbolEvent) {
+    async fn handle_event(&mut self, event: ExchangeEvent) {
         // 1. 更新状态
         self.state.apply(event.clone());
 
