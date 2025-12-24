@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, Order, OrderType, Quantity, Rate, Side, Symbol};
+use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO};
 use crate::messaging::{ExchangeEvent, SymbolState};
 use crate::strategy::{MarketDataType, Signal, Strategy};
 use std::collections::HashMap;
@@ -12,8 +12,8 @@ pub struct FundingArbConfig {
     pub max_spread: Rate,
     /// 平仓费率差阈值
     pub close_spread: Rate,
-    /// 基础下单数量
-    pub base_quantity: Quantity,
+    /// 单笔最大下单金额 (USDT)
+    pub max_notional: f64,
     /// 最大持仓数量
     pub max_quantity: Quantity,
 }
@@ -24,10 +24,18 @@ impl Default for FundingArbConfig {
             min_spread: 0.0005,   // 0.05%
             max_spread: 0.002,    // 0.2%
             close_spread: 0.0002, // 0.02%
-            base_quantity: 0.01,
+            max_notional: 1000.0, // 1000 USDT
             max_quantity: 1.0,
         }
     }
+}
+
+/// 开仓条件检查结果
+struct OpenCondition {
+    short_ex: Exchange,
+    short_bbo: BBO,
+    long_ex: Exchange,
+    long_bbo: BBO,
 }
 
 /// 资金费率套利策略
@@ -58,7 +66,7 @@ impl FundingArbStrategy {
     fn check_open_condition(
         state: &SymbolState,
         config: &FundingArbConfig,
-    ) -> Option<(Exchange, Exchange)> {
+    ) -> Option<OpenCondition> {
         let spread = state.funding_spread()?;
 
         if spread.abs() < config.min_spread {
@@ -87,6 +95,10 @@ impl FundingArbStrategy {
         let (short_ex, short_rate) = state.best_short_exchange()?;
         let (long_ex, long_rate) = state.best_long_exchange()?;
 
+        // 检查两个交易所的 BBO 是否都存在
+        let short_bbo = state.bbo(short_ex)?.clone();
+        let long_bbo = state.bbo(long_ex)?.clone();
+
         tracing::info!(
             symbol = %state.symbol,
             spread = spread,
@@ -97,7 +109,12 @@ impl FundingArbStrategy {
             "Opening condition met"
         );
 
-        Some((short_ex, long_ex))
+        Some(OpenCondition {
+            short_ex,
+            short_bbo,
+            long_ex,
+            long_bbo,
+        })
     }
 
     /// 检查平仓条件 (静态方法)
@@ -115,20 +132,71 @@ impl FundingArbStrategy {
         spread.abs() < config.close_spread
     }
 
-    /// 生成开仓信号 (静态方法)
+    /// 计算下单数量: min(max_notional/price, 对手挂单数量/2, max_quantity)
+    fn calculate_quantity(
+        config: &FundingArbConfig,
+        price: Price,
+        counter_qty: Quantity,
+    ) -> Quantity {
+        let qty_by_notional = config.max_notional / price;
+        let qty_by_book = counter_qty / 2.0;
+        qty_by_notional
+            .min(qty_by_book)
+            .min(config.max_quantity)
+    }
+
+    /// 生成开仓信号
+    /// 做空方: 挂 bid_price 卖单 (taker 成交)
+    /// 做多方: 挂 ask_price 买单 (taker 成交)
     fn make_open_signals(
         symbol: &Symbol,
         short_ex: Exchange,
+        short_bbo: &BBO,
         long_ex: Exchange,
-        qty: Quantity,
+        long_bbo: &BBO,
+        config: &FundingArbConfig,
     ) -> Vec<Signal> {
+        // 做空方: 以对手 bid 价格卖出
+        let short_price = short_bbo.bid_price;
+        let short_qty = Self::calculate_quantity(config, short_price, short_bbo.bid_qty);
+
+        // 做多方: 以对手 ask 价格买入
+        let long_price = long_bbo.ask_price;
+        let long_qty = Self::calculate_quantity(config, long_price, long_bbo.ask_qty);
+
+        // 取两边最小数量，保证对冲
+        let qty = short_qty.min(long_qty);
+
+        if qty <= 0.0 {
+            tracing::warn!(
+                symbol = %symbol,
+                short_qty = short_qty,
+                long_qty = long_qty,
+                "Calculated quantity is zero or negative"
+            );
+            return vec![];
+        }
+
+        tracing::info!(
+            symbol = %symbol,
+            short_ex = %short_ex,
+            short_price = short_price,
+            long_ex = %long_ex,
+            long_price = long_price,
+            qty = qty,
+            "Opening positions"
+        );
+
         vec![
             Signal::PlaceOrder(Order {
                 id: String::new(),
                 exchange: short_ex,
                 symbol: symbol.clone(),
                 side: Side::Short,
-                order_type: OrderType::Market,
+                order_type: OrderType::Limit {
+                    price: short_price,
+                    tif: TimeInForce::IOC,
+                },
                 quantity: qty,
                 reduce_only: false,
                 client_order_id: None,
@@ -138,7 +206,10 @@ impl FundingArbStrategy {
                 exchange: long_ex,
                 symbol: symbol.clone(),
                 side: Side::Long,
-                order_type: OrderType::Market,
+                order_type: OrderType::Limit {
+                    price: long_price,
+                    tif: TimeInForce::IOC,
+                },
                 quantity: qty,
                 reduce_only: false,
                 client_order_id: None,
@@ -188,31 +259,7 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: ExchangeEvent) -> Vec<Signal> {
-        // TODO: 测试阶段，仅打印事件
-        match event {
-            ExchangeEvent::FundingRateUpdate {
-                exchange,
-                symbol,
-                rate,
-                timestamp,
-            } => {
-                tracing::info!(
-                    "FundingRateUpdate - exchange: {}, symbol: {}, rate: {}, timestamp: {}",
-                    exchange,
-                    symbol,
-                    rate.rate,
-                    timestamp
-                );
-            }
-            ExchangeEvent::BBOUpdate { .. } => {}
-            ExchangeEvent::PositionUpdate { .. } => {}
-            ExchangeEvent::OrderStatusUpdate { .. } => {}
-            ExchangeEvent::BalanceUpdate { .. } => {},
-        }
-        return vec![];
-
         // 获取事件关联的 symbol
-        #[allow(unreachable_code)]
         let symbol = match event.symbol() {
             Some(s) => s.clone(),
             None => return vec![], // Balance 事件暂不处理
@@ -229,8 +276,15 @@ impl Strategy for FundingArbStrategy {
         let state = self.states.get(&symbol).unwrap();
 
         // 检查开仓条件
-        if let Some((short_ex, long_ex)) = Self::check_open_condition(state, &self.config) {
-            return Self::make_open_signals(&symbol, short_ex, long_ex, self.config.base_quantity);
+        if let Some(cond) = Self::check_open_condition(state, &self.config) {
+            return Self::make_open_signals(
+                &symbol,
+                cond.short_ex,
+                &cond.short_bbo,
+                cond.long_ex,
+                &cond.long_bbo,
+                &self.config,
+            );
         }
 
         // 检查平仓条件

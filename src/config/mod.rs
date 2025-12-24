@@ -53,8 +53,8 @@ pub struct FundingArbStrategyConfig {
     pub max_spread: f64,
     #[serde(default = "default_close_spread")]
     pub close_spread: f64,
-    #[serde(default = "default_base_quantity")]
-    pub base_quantity: f64,
+    #[serde(default = "default_max_notional")]
+    pub max_notional: f64,
     #[serde(default = "default_max_quantity")]
     pub max_quantity: f64,
 }
@@ -68,8 +68,8 @@ fn default_max_spread() -> f64 {
 fn default_close_spread() -> f64 {
     0.0002
 }
-fn default_base_quantity() -> f64 {
-    0.01
+fn default_max_notional() -> f64 {
+    1000.0
 }
 fn default_max_quantity() -> f64 {
     1.0
@@ -81,7 +81,7 @@ impl Default for FundingArbStrategyConfig {
             min_spread: default_min_spread(),
             max_spread: default_max_spread(),
             close_spread: default_close_spread(),
-            base_quantity: default_base_quantity(),
+            max_notional: default_max_notional(),
             max_quantity: default_max_quantity(),
         }
     }
@@ -93,7 +93,7 @@ impl From<FundingArbStrategyConfig> for FundingArbConfig {
             min_spread: cfg.min_spread,
             max_spread: cfg.max_spread,
             close_spread: cfg.close_spread,
-            base_quantity: cfg.base_quantity,
+            max_notional: cfg.max_notional,
             max_quantity: cfg.max_quantity,
         }
     }
