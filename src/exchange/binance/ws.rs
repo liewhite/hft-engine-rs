@@ -350,6 +350,32 @@ impl ExchangeWebSocket for BinanceWebSocket {
                     }
                 };
 
+                // 查询初始账户状态并推送
+                match rest_client.get_account_info().await {
+                    Ok((balances, positions)) => {
+                        tracing::info!(
+                            balances = balances.len(),
+                            positions = positions.len(),
+                            "Fetched Binance initial account state"
+                        );
+                        // 推送初始 balances
+                        for balance in balances {
+                            let _ = sinks.balances.send(balance);
+                        }
+                        // 推送初始 positions (按 symbol 路由)
+                        for position in positions {
+                            if let Some(tx) = sinks.positions.get(&position.symbol) {
+                                let _ = tx.send(position);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to fetch initial account state");
+                        backoff.wait().await;
+                        continue;
+                    }
+                }
+
                 let url = format!("wss://fstream.binance.com/ws/{}", listen_key);
                 tracing::info!(url = %url, "Connecting to Binance private WebSocket");
 

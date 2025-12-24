@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, TimeInForce};
+use crate::domain::{Balance, Exchange, ExchangeError, Order, OrderId, OrderType, Position, Side, Symbol, TimeInForce};
 use crate::exchange::api::ExchangeExecutor;
 use crate::exchange::binance::REST_BASE_URL;
 use async_trait::async_trait;
@@ -168,6 +168,110 @@ impl BinanceRestClient {
             results.into_iter().flatten().collect();
 
         Ok(result)
+    }
+
+    /// 查询账户信息 (balances + positions)
+    /// 返回 (balances, positions)
+    pub async fn get_account_info(&self) -> Result<(Vec<Balance>, Vec<Position>), ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AccountInfo {
+            assets: Vec<AssetInfo>,
+            positions: Vec<PositionInfo>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AssetInfo {
+            asset: String,
+            available_balance: String,
+            wallet_balance: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PositionInfo {
+            symbol: String,
+            position_amt: String,
+            entry_price: String,
+            unrealized_profit: String,
+        }
+
+        let query = self.build_signed_query(&[]);
+        let resp = self
+            .client
+            .get(format!("{}/fapi/v2/account?{}", self.base_url, query))
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
+        }
+
+        let account: AccountInfo = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        // 转换 balances
+        let balances: Vec<Balance> = account
+            .assets
+            .iter()
+            .filter_map(|a| {
+                let available: f64 = a.available_balance.parse().ok()?;
+                let wallet: f64 = a.wallet_balance.parse().ok()?;
+                // 只返回有余额的资产
+                if wallet > 0.0 || available > 0.0 {
+                    Some(Balance {
+                        exchange: Exchange::Binance,
+                        asset: a.asset.clone(),
+                        available,
+                        frozen: (wallet - available).max(0.0),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // 转换 positions (只返回有持仓的)
+        let positions: Vec<Position> = account
+            .positions
+            .iter()
+            .filter_map(|p| {
+                let pos_amt: f64 = p.position_amt.parse().ok()?;
+                if pos_amt.abs() < 1e-10 {
+                    return None; // 无持仓
+                }
+                let symbol = Symbol::from_binance(&p.symbol)?;
+                let entry_price: f64 = p.entry_price.parse().ok()?;
+                let unrealized_pnl: f64 = p.unrealized_profit.parse().ok()?;
+
+                let (side, size) = if pos_amt >= 0.0 {
+                    (Side::Long, pos_amt)
+                } else {
+                    (Side::Short, pos_amt.abs())
+                };
+
+                Some(Position {
+                    exchange: Exchange::Binance,
+                    symbol,
+                    side,
+                    size,
+                    entry_price,
+                    leverage: 1,
+                    unrealized_pnl,
+                    mark_price: 0.0,
+                })
+            })
+            .collect();
+
+        Ok((balances, positions))
     }
 
     /// 续期 ListenKey
