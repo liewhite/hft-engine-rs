@@ -48,3 +48,6 @@ uuid = { version = "1", features = ["v4"] }
 
 # Metrics
 prometheus = "0.13"
+
+# Decimal for precise financial calculations
+rust_decimal = "1"

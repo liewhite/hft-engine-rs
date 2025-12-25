@@ -1,4 +1,6 @@
 use crate::domain::types::{OrderId, Price, Quantity, Rate, Timestamp};
+use rust_decimal::prelude::*;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -311,24 +313,33 @@ impl SymbolMeta {
     }
 
     /// 将价格调整到合法精度 (向下取整)
-    ///
-    /// 注意: 由于浮点精度限制，结果可能有微小误差
     pub fn round_price_down(&self, price: f64) -> f64 {
-        (price / self.price_step).floor() * self.price_step
+        Self::round_to_step(price, self.price_step, RoundingStrategy::ToNegativeInfinity)
     }
 
     /// 将价格调整到合法精度 (向上取整)
-    ///
-    /// 注意: 由于浮点精度限制，结果可能有微小误差
     pub fn round_price_up(&self, price: f64) -> f64 {
-        (price / self.price_step).ceil() * self.price_step
+        Self::round_to_step(price, self.price_step, RoundingStrategy::ToPositiveInfinity)
     }
 
     /// 将数量调整到合法精度 (向下取整)
-    ///
-    /// 注意: 由于浮点精度限制，结果可能有微小误差
     pub fn round_size_down(&self, size: f64) -> f64 {
-        (size / self.size_step).floor() * self.size_step
+        Self::round_to_step(size, self.size_step, RoundingStrategy::ToNegativeInfinity)
+    }
+
+    /// 使用 Decimal 精确计算，按 step 取整
+    fn round_to_step(value: f64, step: f64, strategy: RoundingStrategy) -> f64 {
+        // 转换为 Decimal 进行精确计算
+        let value_dec = Decimal::from_f64(value).unwrap_or_default();
+        let step_dec = Decimal::from_f64(step).unwrap_or(Decimal::ONE);
+
+        // 计算 tick 数 (value / step)，然后取整
+        let ticks = value_dec / step_dec;
+        let rounded_ticks = ticks.round_dp_with_strategy(0, strategy);
+
+        // 乘回 step 得到结果
+        let result = rounded_ticks * step_dec;
+        result.to_f64().unwrap_or(value)
     }
 }
 
