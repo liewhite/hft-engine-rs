@@ -162,6 +162,15 @@ impl Executor {
                         timestamp: now_ms(),
                     }
                 }));
+
+                // 订阅 Equity (只有 OKX 通过 WebSocket 推送)
+                receivers.push(wrap_receiver(sinks.subscribe_equity(), move |equity| {
+                    ExchangeEvent::EquityUpdate {
+                        exchange: ex,
+                        equity,
+                        timestamp: now_ms(),
+                    }
+                }));
             }
         }
 

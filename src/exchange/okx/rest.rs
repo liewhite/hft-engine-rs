@@ -346,4 +346,49 @@ impl ExchangeExecutor for OkxRestClient {
 
         Ok(())
     }
+
+    async fn fetch_equity(&self) -> Result<f64, ExchangeError> {
+        let path = "/api/v5/account/balance";
+        let timestamp = Self::iso_timestamp();
+        let sign = self.sign(&timestamp, "GET", path, "");
+        let headers = self.build_headers(&sign, &timestamp);
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct BalanceData {
+            total_eq: String,
+        }
+
+        #[derive(Deserialize)]
+        struct Response {
+            code: String,
+            msg: String,
+            data: Vec<BalanceData>,
+        }
+
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        if data.code != "0" {
+            return Err(map_okx_error(&data.code, &data.msg));
+        }
+
+        let balance_data = data.data.first().ok_or_else(|| {
+            ExchangeError::Other("No balance data in response".to_string())
+        })?;
+
+        let equity: f64 = balance_data
+            .total_eq
+            .parse()
+            .map_err(|_| ExchangeError::Other("Failed to parse totalEq".to_string()))?;
+
+        Ok(equity)
+    }
 }

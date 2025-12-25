@@ -153,13 +153,36 @@ impl Engine {
         let (clock_tx, _) = broadcast::channel::<ExchangeEvent>(16);
         let clock_tx_clone = clock_tx.clone();
         let clock_token = token.clone();
+        // 只有 Binance 需要通过 REST 查询 equity (OKX 通过 WebSocket 推送)
+        let binance_executor = self.rests.get(&Exchange::Binance).cloned();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tokio::select! {
                     _ = clock_token.cancelled() => break,
                     _ = interval.tick() => {
-                        let _ = clock_tx_clone.send(ExchangeEvent::Clock { timestamp: now_ms() });
+                        let timestamp = now_ms();
+                        // 查询 Binance equity 并广播
+                        if let Some(ref executor) = binance_executor {
+                            match executor.fetch_equity().await {
+                                Ok(equity) => {
+                                    let _ = clock_tx_clone.send(ExchangeEvent::EquityUpdate {
+                                        exchange: Exchange::Binance,
+                                        equity,
+                                        timestamp,
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        exchange = %Exchange::Binance,
+                                        error = %e,
+                                        "Failed to fetch equity"
+                                    );
+                                }
+                            }
+                        }
+                        // 最后发送 Clock 事件
+                        let _ = clock_tx_clone.send(ExchangeEvent::Clock { timestamp });
                     }
                 }
             }

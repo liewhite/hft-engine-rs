@@ -178,6 +178,8 @@ impl BinanceRestClient {
         struct AccountInfo {
             assets: Vec<AssetInfo>,
             positions: Vec<PositionInfo>,
+            #[allow(dead_code)]
+            total_margin_balance: String,
         }
 
         #[derive(Deserialize)]
@@ -265,6 +267,42 @@ impl BinanceRestClient {
             .collect();
 
         Ok((balances, positions))
+    }
+
+    /// 查询账户净值 (totalMarginBalance)
+    pub async fn get_equity(&self) -> Result<f64, ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AccountInfo {
+            total_margin_balance: String,
+        }
+
+        let query = self.build_signed_query(&[]);
+        let resp = self
+            .client
+            .get(format!("{}/fapi/v2/account?{}", self.base_url, query))
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
+        }
+
+        let account: AccountInfo = resp.json().await.map_err(Self::map_reqwest_error)?;
+        let equity: f64 = account
+            .total_margin_balance
+            .parse()
+            .map_err(|_| ExchangeError::Other("Failed to parse totalMarginBalance".to_string()))?;
+
+        Ok(equity)
     }
 
     /// 续期 ListenKey
@@ -532,5 +570,9 @@ impl ExchangeExecutor for BinanceRestClient {
         }
 
         Ok(())
+    }
+
+    async fn fetch_equity(&self) -> Result<f64, ExchangeError> {
+        self.get_equity().await
     }
 }

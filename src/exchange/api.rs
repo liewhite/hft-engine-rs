@@ -120,6 +120,8 @@ pub struct PrivateSinks {
     pub balances: broadcast::Sender<Balance>,
     /// OrderUpdate per symbol
     pub order_updates: HashMap<Symbol, broadcast::Sender<OrderUpdate>>,
+    /// Equity (账户总权益, 由交易所 WebSocket 推送)
+    pub equity: broadcast::Sender<f64>,
 }
 
 impl PrivateSinks {
@@ -137,6 +139,7 @@ impl PrivateSinks {
             positions,
             balances: broadcast::channel(capacity).0,
             order_updates,
+            equity: broadcast::channel(capacity).0,
         }
     }
 
@@ -153,6 +156,11 @@ impl PrivateSinks {
     /// 订阅 Balance (不按 symbol 拆分)
     pub fn subscribe_balance(&self) -> broadcast::Receiver<Balance> {
         self.balances.subscribe()
+    }
+
+    /// 订阅 Equity (账户总权益)
+    pub fn subscribe_equity(&self) -> broadcast::Receiver<f64> {
+        self.equity.subscribe()
     }
 
     /// 订阅指定 symbol 的 OrderUpdate
@@ -206,4 +214,7 @@ pub trait ExchangeExecutor: Send + Sync {
 
     /// 设置杠杆
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError>;
+
+    /// 获取账户净值 (balance + unrealized_pnl)
+    async fn fetch_equity(&self) -> Result<f64, ExchangeError>;
 }

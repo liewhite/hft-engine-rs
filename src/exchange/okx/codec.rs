@@ -157,7 +157,16 @@ impl PositionData {
 pub struct AccountData {
     #[allow(dead_code)]
     pub u_time: String,
+    /// 账户总权益 (USDT)
+    pub total_eq: String,
     pub details: Vec<AccountDetail>,
+}
+
+impl AccountData {
+    pub fn to_equity(&self) -> f64 {
+        f64::from_str(&self.total_eq)
+            .unwrap_or_else(|e| panic!("Failed to parse total_eq '{}': {}", self.total_eq, e))
+    }
 }
 
 #[derive(Debug, Deserialize)]

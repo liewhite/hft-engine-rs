@@ -279,6 +279,7 @@ impl ExchangeWebSocket for OkxWebSocket {
                                                 &sinks.positions,
                                                 &sinks.balances,
                                                 &sinks.order_updates,
+                                                &sinks.equity,
                                             );
                                         }
                                         Some(Ok(Message::Ping(data))) => {
@@ -401,6 +402,7 @@ fn handle_okx_private_message(
     position_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::Position>>,
     balance_sink: &broadcast::Sender<crate::domain::Balance>,
     order_sinks: &HashMap<Symbol, broadcast::Sender<crate::domain::OrderUpdate>>,
+    equity_sink: &broadcast::Sender<f64>,
 ) {
     // 先解析为 Value 判断消息类型
     let value: serde_json::Value = parse_or_panic!(text, serde_json::Value, "OKX private base");
@@ -443,9 +445,12 @@ fn handle_okx_private_message(
         Some("account") => {
             let push: WsPush<AccountData> = parse_or_panic!(text, WsPush<AccountData>, "account");
             for acct in push.data {
+                // 发送 equity (账户总权益)
+                let equity = acct.to_equity();
+                let _ = equity_sink.send(equity);
+                // 发送各币种余额
                 for detail in acct.details {
                     let balance = detail.to_balance();
-                    // 不按 symbol 分
                     let _ = balance_sink.send(balance);
                 }
             }

@@ -32,6 +32,12 @@ pub enum ExchangeEvent {
         balance: Balance,
         timestamp: Timestamp,
     },
+    /// 账户净值更新 (balance + unrealized_pnl)
+    EquityUpdate {
+        exchange: Exchange,
+        equity: f64,
+        timestamp: Timestamp,
+    },
     /// 时钟事件 (用于超时检测等定时任务)
     Clock {
         timestamp: Timestamp,
@@ -39,14 +45,14 @@ pub enum ExchangeEvent {
 }
 
 impl ExchangeEvent {
-    /// 获取事件关联的 Symbol (BalanceUpdate/Clock 返回 None)
+    /// 获取事件关联的 Symbol (BalanceUpdate/EquityUpdate/Clock 返回 None)
     pub fn symbol(&self) -> Option<&Symbol> {
         match self {
             Self::FundingRateUpdate { symbol, .. } => Some(symbol),
             Self::BBOUpdate { symbol, .. } => Some(symbol),
             Self::PositionUpdate { symbol, .. } => Some(symbol),
             Self::OrderStatusUpdate { symbol, .. } => Some(symbol),
-            Self::BalanceUpdate { .. } | Self::Clock { .. } => None,
+            Self::BalanceUpdate { .. } | Self::EquityUpdate { .. } | Self::Clock { .. } => None,
         }
     }
 
@@ -58,6 +64,7 @@ impl ExchangeEvent {
             Self::PositionUpdate { exchange, .. } => Some(*exchange),
             Self::OrderStatusUpdate { exchange, .. } => Some(*exchange),
             Self::BalanceUpdate { exchange, .. } => Some(*exchange),
+            Self::EquityUpdate { exchange, .. } => Some(*exchange),
             Self::Clock { .. } => None,
         }
     }
@@ -70,6 +77,7 @@ impl ExchangeEvent {
             Self::PositionUpdate { timestamp, .. } => *timestamp,
             Self::OrderStatusUpdate { timestamp, .. } => *timestamp,
             Self::BalanceUpdate { timestamp, .. } => *timestamp,
+            Self::EquityUpdate { timestamp, .. } => *timestamp,
             Self::Clock { timestamp } => *timestamp,
         }
     }

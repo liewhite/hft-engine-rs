@@ -331,6 +331,24 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, _event: &ExchangeEvent, state: &mut StateManager) {
+        match _event {
+            ExchangeEvent::BalanceUpdate {
+                exchange,
+                balance,
+                timestamp,
+            } => {
+                if balance.asset == "USDT" {
+                    tracing::info!(
+                        "Balance update: exchange={}, asset={}, available={}, timestamp={}",
+                        exchange,
+                        balance.asset,
+                        balance.available,
+                        timestamp
+                    );
+                }
+            }
+            _ => {}
+        }
         // 获取本策略关注的 symbol 状态
         let symbol_state = match state.symbol_state(&self.symbol) {
             Some(s) => s,
