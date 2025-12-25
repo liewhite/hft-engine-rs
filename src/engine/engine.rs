@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// 资金费率套利引擎 - 管理多个策略的执行
-pub struct FundingEngine {
+pub struct Engine {
     exchanges_config: ExchangesConfig,
     wss: HashMap<Exchange, Arc<dyn ExchangeWebSocket>>,
     rests: HashMap<Exchange, Arc<dyn ExchangeExecutor>>,
@@ -24,7 +24,7 @@ pub struct FundingEngine {
     cancel_token: CancellationToken,
 }
 
-impl FundingEngine {
+impl Engine {
     /// 创建引擎，不初始化交易所客户端
     pub fn new(exchanges_config: ExchangesConfig, metrics_config: MetricsConfig) -> Self {
         Self {

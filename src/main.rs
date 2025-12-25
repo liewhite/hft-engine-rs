@@ -1,5 +1,5 @@
 use fee_arb::config::AppConfig;
-use fee_arb::engine::FundingEngine;
+use fee_arb::engine::Engine;
 use fee_arb::strategy::FundingArbStrategy;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
     // Create and configure engine (exchanges will be initialized on run based on strategy requirements)
-    let mut engine = FundingEngine::new(config.exchanges.clone(), config.engine.metrics.clone());
+    let mut engine = Engine::new(config.exchanges.clone(), config.engine.metrics.clone());
 
     // Create per-symbol strategies
     let exchanges = config.exchanges.enabled_exchanges();
