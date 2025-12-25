@@ -44,8 +44,8 @@ impl StateManager {
 
     /// 下单：生成 client_order_id，添加到 pending_orders，发送信号
     pub fn place_order(&mut self, mut order: Order) {
-        // 生成 client_order_id
-        let client_order_id = Uuid::new_v4().to_string();
+        // 生成 client_order_id (去掉 `-`，OKX 只允许字母数字)
+        let client_order_id = Uuid::new_v4().simple().to_string();
         order.client_order_id = Some(client_order_id.clone());
 
         // 添加到对应 symbol 的 pending_orders
