@@ -1,6 +1,5 @@
 use super::executor::{Executor, SymbolMetas};
-use super::metrics::MetricsManager;
-use crate::config::{ExchangesConfig, MetricsConfig};
+use crate::config::ExchangesConfig;
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{BinanceRestClient, BinanceWebSocket};
 use crate::exchange::okx::{OkxRestClient, OkxWebSocket};
@@ -20,20 +19,18 @@ pub struct Engine {
     rests: HashMap<Exchange, Arc<dyn ExchangeExecutor>>,
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
     strategies: Vec<Box<dyn Strategy>>,
-    metrics_config: MetricsConfig,
     cancel_token: CancellationToken,
 }
 
 impl Engine {
     /// 创建引擎，不初始化交易所客户端
-    pub fn new(exchanges_config: ExchangesConfig, metrics_config: MetricsConfig) -> Self {
+    pub fn new(exchanges_config: ExchangesConfig) -> Self {
         Self {
             exchanges_config,
             wss: HashMap::new(),
             rests: HashMap::new(),
             symbol_metas: HashMap::new(),
             strategies: Vec::new(),
-            metrics_config,
             cancel_token: CancellationToken::new(),
         }
     }
@@ -149,13 +146,10 @@ impl Engine {
             tracing::info!(exchange = %exchange, symbols = symbols_vec.len(), "Exchange connected");
         }
 
-        // 5. 启动 Metrics
-        self.start_metrics(&public_sinks, &private_sinks, token.clone());
-
-        // 6. 创建 SignalQueue
+        // 5. 创建 SignalQueue
         let (signal_tx, mut signal_rx) = mpsc::channel::<Signal>(256);
 
-        // 7. 创建 Clock broadcast 并启动定时推送
+        // 6. 创建 Clock broadcast 并启动定时推送
         let (clock_tx, _) = broadcast::channel::<ExchangeEvent>(16);
         let clock_tx_clone = clock_tx.clone();
         let clock_token = token.clone();
@@ -171,7 +165,7 @@ impl Engine {
             }
         });
 
-        // 8. 为每个策略创建 Executor 并启动
+        // 7. 为每个策略创建 Executor 并启动
         let symbol_metas: SymbolMetas = Arc::new(self.symbol_metas.clone());
         let strategies = std::mem::take(&mut self.strategies);
         for strategy in strategies {
@@ -186,7 +180,7 @@ impl Engine {
             );
         }
 
-        // 9. 处理信号
+        // 8. 处理信号
         tokio::spawn(async move {
             while let Some(signal) = signal_rx.recv().await {
                 match signal {
@@ -225,22 +219,6 @@ impl Engine {
         }
 
         aggregated
-    }
-
-    /// 启动 Metrics 订阅和 push
-    fn start_metrics(
-        &self,
-        public_sinks: &[(Exchange, PublicSinks)],
-        private_sinks: &[(Exchange, PrivateSinks)],
-        cancel_token: CancellationToken,
-    ) {
-        let metrics = MetricsManager::new();
-        metrics.start(
-            &self.metrics_config,
-            public_sinks,
-            private_sinks,
-            cancel_token,
-        );
     }
 
     /// 停止引擎

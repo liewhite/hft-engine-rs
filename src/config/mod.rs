@@ -119,52 +119,16 @@ impl From<FundingArbStrategyConfig> for FundingArbConfig {
 pub struct EngineConfig {
     #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
-    #[serde(default)]
-    pub metrics: MetricsConfig,
-}
-
-/// Metrics 配置
-#[derive(Debug, Clone, Deserialize)]
-pub struct MetricsConfig {
-    /// 是否启用 metrics
-    #[serde(default = "default_metrics_enabled")]
-    pub enabled: bool,
-    /// Pushgateway URL
-    #[serde(default = "default_pushgateway_url")]
-    pub pushgateway_url: String,
-    /// Push 间隔 (秒)
-    #[serde(default = "default_push_interval_secs")]
-    pub push_interval_secs: u64,
 }
 
 fn default_queue_capacity() -> usize {
     256
-}
-fn default_metrics_enabled() -> bool {
-    false
-}
-fn default_pushgateway_url() -> String {
-    "http://localhost:9091".to_string()
-}
-fn default_push_interval_secs() -> u64 {
-    15
-}
-
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_metrics_enabled(),
-            pushgateway_url: default_pushgateway_url(),
-            push_interval_secs: default_push_interval_secs(),
-        }
-    }
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             queue_capacity: default_queue_capacity(),
-            metrics: MetricsConfig::default(),
         }
     }
 }
