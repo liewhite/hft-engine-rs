@@ -291,6 +291,11 @@ pub struct SymbolMeta {
 }
 
 impl SymbolMeta {
+    /// 检查元数据是否有效 (所有精度值 > 0)
+    pub fn is_valid(&self) -> bool {
+        self.price_step > 0.0 && self.size_step > 0.0 && self.contract_size > 0.0
+    }
+
     /// 将币本位数量转换为下单数量
     ///
     /// 例如: 想下 0.5 ETH, OKX cval=0.1, 则返回 5 (张)
@@ -306,16 +311,22 @@ impl SymbolMeta {
     }
 
     /// 将价格调整到合法精度 (向下取整)
+    ///
+    /// 注意: 由于浮点精度限制，结果可能有微小误差
     pub fn round_price_down(&self, price: f64) -> f64 {
         (price / self.price_step).floor() * self.price_step
     }
 
     /// 将价格调整到合法精度 (向上取整)
+    ///
+    /// 注意: 由于浮点精度限制，结果可能有微小误差
     pub fn round_price_up(&self, price: f64) -> f64 {
         (price / self.price_step).ceil() * self.price_step
     }
 
     /// 将数量调整到合法精度 (向下取整)
+    ///
+    /// 注意: 由于浮点精度限制，结果可能有微小误差
     pub fn round_size_down(&self, size: f64) -> f64 {
         (size / self.size_step).floor() * self.size_step
     }

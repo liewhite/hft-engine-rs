@@ -364,22 +364,27 @@ impl BinanceRestClient {
             .filter(|s| symbol_set.contains(&s.symbol))
             .filter_map(|s| {
                 let symbol = Symbol::from_binance(&s.symbol)?;
-                let mut price_step = 0.0;
-                let mut size_step = 0.0;
-                let mut min_order_size = 0.0;
+                let mut price_step: Option<f64> = None;
+                let mut size_step: Option<f64> = None;
+                let mut min_order_size: Option<f64> = None;
 
                 for filter in s.filters {
                     match filter {
                         Filter::PriceFilter { tick_size } => {
-                            price_step = tick_size.parse().unwrap_or(0.0);
+                            price_step = tick_size.parse().ok();
                         }
                         Filter::LotSize { step_size, min_qty } => {
-                            size_step = step_size.parse().unwrap_or(0.0);
-                            min_order_size = min_qty.parse().unwrap_or(0.0);
+                            size_step = step_size.parse().ok();
+                            min_order_size = min_qty.parse().ok();
                         }
                         Filter::Other => {}
                     }
                 }
+
+                // 跳过解析失败或无效值的 symbol
+                let price_step = price_step.filter(|&v| v > 0.0)?;
+                let size_step = size_step.filter(|&v| v > 0.0)?;
+                let min_order_size = min_order_size.unwrap_or(0.0);
 
                 Some(SymbolMeta {
                     exchange: Exchange::Binance,
