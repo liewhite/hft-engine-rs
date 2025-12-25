@@ -250,6 +250,16 @@ impl ExchangeExecutor for OkxRestClient {
         };
 
         let body = serde_json::to_string(&request)?;
+        tracing::debug!(
+            inst_id = %request.inst_id,
+            side = %request.side,
+            ord_type = %request.ord_type,
+            sz = %request.sz,
+            px = ?request.px,
+            reduce_only = request.reduce_only,
+            body = %body,
+            "OKX place_order request"
+        );
         let timestamp = Self::iso_timestamp();
         let sign = self.sign(&timestamp, "POST", path, &body);
         let headers = self.build_headers(&sign, &timestamp);
@@ -282,22 +292,23 @@ impl ExchangeExecutor for OkxRestClient {
 
         let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
 
+        // 先检查 data 中的具体错误信息（更详细）
+        if let Some(order_data) = data.data.first() {
+            if order_data.s_code != "0" {
+                return Err(ExchangeError::OrderRejected(
+                    Exchange::OKX,
+                    format!("code={}, msg={}", order_data.s_code, order_data.s_msg),
+                ));
+            }
+            return Ok(OrderId::from(order_data.ord_id.clone()));
+        }
+
+        // 如果没有 data，检查顶层错误
         if data.code != "0" {
             return Err(map_okx_error(&data.code, &data.msg));
         }
 
-        let order_data = data.data.first().ok_or_else(|| {
-            ExchangeError::OrderRejected(Exchange::OKX, "No order data in response".to_string())
-        })?;
-
-        if order_data.s_code != "0" {
-            return Err(ExchangeError::OrderRejected(
-                Exchange::OKX,
-                order_data.s_msg.clone(),
-            ));
-        }
-
-        Ok(OrderId::from(order_data.ord_id.clone()))
+        Err(ExchangeError::OrderRejected(Exchange::OKX, "No order data in response".to_string()))
     }
 
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
