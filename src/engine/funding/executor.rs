@@ -66,7 +66,12 @@ impl Executor {
             }
         }
 
-        // 订阅私有数据 (Balance, Position, OrderUpdate 始终订阅)
+        // 订阅私有数据 (Balance, Position, OrderUpdate)
+        //
+        // 私有数据的订阅范围由 public_streams 决定：
+        // - 只为 public_streams 中存在的 exchange 订阅私有数据
+        // - 只为 public_streams 中存在的 (exchange, symbol) 对订阅 Position/OrderUpdate
+        // - Balance 按 exchange 订阅，不区分 symbol
         for (exchange, sinks) in private_sinks {
             if let Some(symbol_streams) = self.public_streams.get(exchange) {
                 for symbol in symbol_streams.keys() {

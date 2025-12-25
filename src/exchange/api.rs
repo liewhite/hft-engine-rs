@@ -73,9 +73,15 @@ impl PublicSinks {
         Self::from_streams(&streams, capacity)
     }
 
-    /// 获取订阅的 symbols
+    /// 获取订阅的 symbols (funding_rates 和 bbos 的并集)
     pub fn symbols(&self) -> Vec<Symbol> {
-        self.funding_rates.keys().cloned().collect()
+        self.funding_rates
+            .keys()
+            .chain(self.bbos.keys())
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// 订阅指定 symbol 的 FundingRate
