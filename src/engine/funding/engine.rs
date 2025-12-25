@@ -5,7 +5,7 @@ use crate::exchange::okx::{OkxRestClient, OkxWebSocket};
 use crate::exchange::{ExchangeExecutor, ExchangeWebSocket, PrivateSinks, PublicSinks};
 use crate::messaging::ExchangeEvent;
 use crate::strategy::{PublicStreams, Signal, Strategy};
-use super::executor::Executor;
+use super::executor::{Executor, SymbolMetas};
 use super::metrics::MetricsManager;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -156,10 +156,18 @@ impl FundingEngine {
         });
 
         // 7. 为每个策略创建 Executor 并启动
+        let symbol_metas: SymbolMetas = Arc::new(self.symbol_metas.clone());
         let strategies = std::mem::take(&mut self.strategies);
         for strategy in strategies {
             let executor = Executor::new(strategy);
-            executor.run(&public_sinks, &private_sinks, clock_tx.subscribe(), signal_tx.clone(), token.clone());
+            executor.run(
+                &public_sinks,
+                &private_sinks,
+                symbol_metas.clone(),
+                clock_tx.subscribe(),
+                signal_tx.clone(),
+                token.clone(),
+            );
         }
 
         // 8. 处理信号

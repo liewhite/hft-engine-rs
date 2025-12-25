@@ -1,11 +1,15 @@
-use crate::domain::{Exchange, Symbol};
+use crate::domain::{Exchange, Order, OrderType, Side, Symbol, SymbolMeta};
 use crate::exchange::{PrivateSinks, PublicDataType, PublicSinks};
 use crate::messaging::{ExchangeEvent, StateManager};
 use crate::strategy::{PublicStreams, Signal, Strategy};
-use std::collections::HashSet;
 use crate::domain::now_ms;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
+
+/// Symbol 元数据映射 (按交易所和 symbol 索引)
+pub type SymbolMetas = Arc<HashMap<(Exchange, Symbol), SymbolMeta>>;
 
 /// 策略执行器 - 为单个策略订阅数据并执行
 pub struct Executor {
@@ -28,6 +32,7 @@ impl Executor {
         mut self,
         public_sinks: &[(Exchange, PublicSinks)],
         private_sinks: &[(Exchange, PrivateSinks)],
+        symbol_metas: SymbolMetas,
         clock_rx: broadcast::Receiver<ExchangeEvent>,
         signal_tx: mpsc::Sender<Signal>,
         cancel_token: CancellationToken,
@@ -41,9 +46,34 @@ impl Executor {
             .into_iter()
             .collect();
 
-        // 创建 StateManager
+        // 创建内部 signal channel 用于转换
+        let (internal_signal_tx, mut internal_signal_rx) = mpsc::channel::<Signal>(256);
+
+        // 创建 StateManager (使用内部 signal_tx)
         let order_timeout_ms = self.strategy.order_timeout_ms();
-        let mut state_manager = StateManager::new(&symbols, signal_tx, order_timeout_ms);
+        let mut state_manager = StateManager::new(&symbols, internal_signal_tx, order_timeout_ms);
+
+        // 启动 Signal 转换任务：coin_to_qty + round
+        let metas_for_signal = symbol_metas.clone();
+        let signal_token = cancel_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = signal_token.cancelled() => break,
+                    signal = internal_signal_rx.recv() => {
+                        match signal {
+                            Some(Signal::PlaceOrder(order)) => {
+                                let converted = convert_order_signal(&order, &metas_for_signal);
+                                if signal_tx.send(Signal::PlaceOrder(converted)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
 
         // 收集需要订阅的 receivers
         let mut receivers: Vec<tokio::sync::broadcast::Receiver<ExchangeEvent>> = Vec::new();
@@ -76,7 +106,9 @@ impl Executor {
             if let Some(symbol_streams) = self.public_streams.get(exchange) {
                 for symbol in symbol_streams.keys() {
                     if let Some(rx) = sinks.subscribe_position(symbol) {
-                        receivers.push(wrap_position_receiver(*exchange, symbol.clone(), rx));
+                        // 获取 symbol_meta 用于转换 position size
+                        let meta = symbol_metas.get(&(*exchange, symbol.clone())).cloned();
+                        receivers.push(wrap_position_receiver(*exchange, symbol.clone(), rx, meta));
                     }
                     if let Some(rx) = sinks.subscribe_order_update(symbol) {
                         receivers.push(wrap_order_receiver(*exchange, symbol.clone(), rx));
@@ -188,10 +220,15 @@ fn wrap_position_receiver(
     exchange: Exchange,
     symbol: Symbol,
     mut rx: tokio::sync::broadcast::Receiver<crate::domain::Position>,
+    symbol_meta: Option<SymbolMeta>,
 ) -> tokio::sync::broadcast::Receiver<ExchangeEvent> {
     let (tx, out_rx) = tokio::sync::broadcast::channel(256);
     tokio::spawn(async move {
-        while let Ok(position) = rx.recv().await {
+        while let Ok(mut position) = rx.recv().await {
+            // 将 position size 从张数转换为币数量
+            if let Some(ref meta) = symbol_meta {
+                position.size = meta.qty_to_coin(position.size);
+            }
             let event = ExchangeEvent::PositionUpdate {
                 symbol: symbol.clone(),
                 exchange,
@@ -246,4 +283,57 @@ fn wrap_balance_receiver(
         }
     });
     out_rx
+}
+
+/// 转换订单信号：coin_to_qty + round
+///
+/// - quantity: 从币数量转换为张数并向下取整
+/// - price (Limit): 买单向上取整，卖单向下取整
+fn convert_order_signal(
+    order: &Order,
+    symbol_metas: &HashMap<(Exchange, Symbol), SymbolMeta>,
+) -> Order {
+    let key = (order.exchange, order.symbol.clone());
+    let meta = match symbol_metas.get(&key) {
+        Some(m) => m,
+        None => {
+            tracing::warn!(
+                exchange = %order.exchange,
+                symbol = %order.symbol,
+                "SymbolMeta not found, order not converted"
+            );
+            return order.clone();
+        }
+    };
+
+    // 转换并取整 quantity
+    let qty_in_contracts = meta.coin_to_qty(order.quantity);
+    let rounded_qty = meta.round_size_down(qty_in_contracts);
+
+    // 转换 price (仅 Limit 订单)
+    let converted_order_type = match &order.order_type {
+        OrderType::Market => OrderType::Market,
+        OrderType::Limit { price, tif } => {
+            // 买单向上取整确保能成交，卖单向下取整确保能成交
+            let rounded_price = match order.side {
+                Side::Long => meta.round_price_up(*price),
+                Side::Short => meta.round_price_down(*price),
+            };
+            OrderType::Limit {
+                price: rounded_price,
+                tif: *tif,
+            }
+        }
+    };
+
+    Order {
+        id: order.id.clone(),
+        exchange: order.exchange,
+        symbol: order.symbol.clone(),
+        side: order.side,
+        order_type: converted_order_type,
+        quantity: rounded_qty,
+        reduce_only: order.reduce_only,
+        client_order_id: order.client_order_id.clone(),
+    }
 }
