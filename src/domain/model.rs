@@ -194,6 +194,9 @@ pub struct Position {
 }
 
 impl Position {
+    /// 仓位比较的浮点精度阈值
+    pub const EPSILON: f64 = 1e-10;
+
     /// 计算持仓名义价值
     pub fn notional_value(&self) -> f64 {
         self.mark_price * self.size.abs()
@@ -201,10 +204,12 @@ impl Position {
 
     /// 判断是否空仓 (使用 epsilon 比较避免浮点精度问题)
     pub fn is_empty(&self) -> bool {
-        self.size.abs() < 1e-10
+        self.size.abs() < Self::EPSILON
     }
 
     /// 获取持仓方向 (根据 size 符号)
+    ///
+    /// 注意: 空仓 (size == 0) 时返回 Side::Long，调用前应先检查 is_empty()
     pub fn side(&self) -> Side {
         if self.size >= 0.0 {
             Side::Long

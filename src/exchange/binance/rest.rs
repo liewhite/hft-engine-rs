@@ -245,7 +245,7 @@ impl BinanceRestClient {
             .iter()
             .filter_map(|p| {
                 let pos_amt: f64 = p.position_amt.parse().ok()?;
-                if pos_amt.abs() < 1e-10 {
+                if pos_amt.abs() < Position::EPSILON {
                     return None; // 无持仓
                 }
                 let symbol = Symbol::from_binance(&p.symbol)?;

@@ -1,4 +1,7 @@
 use crate::domain::{Exchange, FundingRate, OrderStatus, Position, Rate, Symbol, Timestamp, BBO};
+
+/// 复用 Position 的 epsilon 常量
+const POSITION_EPSILON: f64 = Position::EPSILON;
 use crate::messaging::event::ExchangeEvent;
 use std::collections::HashMap;
 
@@ -129,7 +132,7 @@ impl SymbolState {
         let net_position: f64 = positions.iter().map(|p| p.size).sum();
 
         // 净持仓接近 0 视为对冲
-        Some(net_position.abs() < 1e-10)
+        Some(net_position.abs() < POSITION_EPSILON)
     }
 
     /// 获取不平衡的敞口持仓 (返回需要平仓的交易所、方向和数量)
@@ -157,7 +160,7 @@ impl SymbolState {
         // 计算净持仓 (size 带符号)
         let net_position: f64 = positions.iter().map(|(_, p)| p.size).sum();
 
-        if net_position.abs() < 1e-10 {
+        if net_position.abs() < POSITION_EPSILON {
             return None; // 已对冲
         }
 
