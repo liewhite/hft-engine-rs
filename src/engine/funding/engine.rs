@@ -2,12 +2,12 @@ use crate::config::{ExchangesConfig, MetricsConfig};
 use crate::domain::{Exchange, ExchangeError, Symbol, now_ms};
 use crate::exchange::binance::BinanceWebSocket;
 use crate::exchange::okx::OkxWebSocket;
-use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicDataType, PublicSinks};
+use crate::exchange::{ExchangeWebSocket, PrivateSinks, PublicSinks};
 use crate::messaging::ExchangeEvent;
-use crate::strategy::{Signal, Strategy};
+use crate::strategy::{PublicStreams, Signal, Strategy};
 use super::executor::Executor;
-use super::metrics::Metrics;
-use std::collections::{HashMap, HashSet};
+use super::metrics::MetricsManager;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -62,21 +62,11 @@ impl FundingEngine {
         const SINK_CAPACITY: usize = 256;
         let token = self.cancel_token.clone();
 
-        // 1. 收集所有策略需要的 (exchange, symbols)
-        let mut required: HashMap<Exchange, HashSet<Symbol>> = HashMap::new();
-        for strategy in &self.strategies {
-            for exchange in strategy.exchanges() {
-                for symbol in strategy.symbols() {
-                    required
-                        .entry(exchange)
-                        .or_default()
-                        .insert(symbol);
-                }
-            }
-        }
+        // 1. 聚合所有策略需要的 public streams
+        let aggregated = Self::aggregate_public_streams(&self.strategies);
 
         tracing::info!(
-            exchanges = required.len(),
+            exchanges = aggregated.len(),
             strategies = self.strategies.len(),
             "Starting engine"
         );
@@ -85,18 +75,14 @@ impl FundingEngine {
         let mut public_sinks: Vec<(Exchange, PublicSinks)> = Vec::new();
         let mut private_sinks: Vec<(Exchange, PrivateSinks)> = Vec::new();
 
-        for (exchange, symbols) in &required {
+        for (exchange, symbol_streams) in &aggregated {
             let ws = self.exchanges.get(exchange).ok_or_else(|| {
                 ExchangeError::Other(format!("Exchange {:?} not registered", exchange))
             })?;
 
-            let symbols_vec: Vec<Symbol> = symbols.iter().cloned().collect();
+            let symbols_vec: Vec<Symbol> = symbol_streams.keys().cloned().collect();
 
-            let pub_sinks = PublicSinks::select(
-                &symbols_vec,
-                &[PublicDataType::FundingRate, PublicDataType::BBO],
-                SINK_CAPACITY,
-            );
+            let pub_sinks = PublicSinks::from_streams(symbol_streams, SINK_CAPACITY);
             let priv_sinks = PrivateSinks::new(&symbols_vec, SINK_CAPACITY);
 
             // 连接 WebSocket
@@ -106,7 +92,7 @@ impl FundingEngine {
             public_sinks.push((*exchange, pub_sinks));
             private_sinks.push((*exchange, priv_sinks));
 
-            tracing::info!(exchange = %exchange, symbols = symbols.len(), "Exchange connected");
+            tracing::info!(exchange = %exchange, symbols = symbols_vec.len(), "Exchange connected");
         }
 
         // 3. 启动 Metrics
@@ -161,6 +147,27 @@ impl FundingEngine {
         Ok(())
     }
 
+    /// 聚合所有策略需要的 public streams
+    ///
+    /// 将多个策略的 PublicStreams 合并为一个，同一 (exchange, symbol) 的 data_types 取并集
+    fn aggregate_public_streams(strategies: &[Box<dyn Strategy>]) -> PublicStreams {
+        let mut aggregated: PublicStreams = HashMap::new();
+
+        for strategy in strategies {
+            for (exchange, symbol_streams) in strategy.public_streams() {
+                let exchange_entry = aggregated.entry(exchange).or_default();
+                for (symbol, data_types) in symbol_streams {
+                    exchange_entry
+                        .entry(symbol)
+                        .or_default()
+                        .extend(data_types);
+                }
+            }
+        }
+
+        aggregated
+    }
+
     /// 启动 Metrics 订阅和 push
     fn start_metrics(
         &self,
@@ -168,7 +175,7 @@ impl FundingEngine {
         private_sinks: &[(Exchange, PrivateSinks)],
         cancel_token: CancellationToken,
     ) {
-        let metrics = Metrics::new();
+        let metrics = MetricsManager::new();
         metrics.start(
             &self.metrics_config,
             public_sinks,

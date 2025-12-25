@@ -1,6 +1,8 @@
 use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO};
+use crate::exchange::PublicDataType;
 use crate::messaging::{ExchangeEvent, StateManager, SymbolState};
-use crate::strategy::{MarketDataType, Strategy};
+use crate::strategy::{PublicStreams, Strategy};
+use std::collections::{HashMap, HashSet};
 
 /// 资金费率套利策略配置
 #[derive(Debug, Clone)]
@@ -299,22 +301,23 @@ impl FundingArbStrategy {
 }
 
 impl Strategy for FundingArbStrategy {
-    fn exchanges(&self) -> Vec<Exchange> {
-        self.exchanges.clone()
-    }
-
-    fn symbols(&self) -> Vec<Symbol> {
-        vec![self.symbol.clone()]
-    }
-
-    fn market_data_types(&self) -> Vec<MarketDataType> {
-        vec![
-            MarketDataType::FundingRate,
-            MarketDataType::BBO,
-            MarketDataType::Position,
-            MarketDataType::OrderUpdate,
-            MarketDataType::Balance,
+    fn public_streams(&self) -> PublicStreams {
+        let data_types: HashSet<PublicDataType> = [
+            PublicDataType::FundingRate,
+            PublicDataType::BBO,
         ]
+        .into_iter()
+        .collect();
+
+        let mut symbol_streams = HashMap::new();
+        symbol_streams.insert(self.symbol.clone(), data_types);
+
+        let mut streams = HashMap::new();
+        for exchange in &self.exchanges {
+            streams.insert(*exchange, symbol_streams.clone());
+        }
+
+        streams
     }
 
     fn order_timeout_ms(&self) -> u64 {

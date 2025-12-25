@@ -1,7 +1,7 @@
 use crate::domain::{Exchange, Symbol};
-use crate::exchange::{PrivateSinks, PublicSinks};
+use crate::exchange::{PrivateSinks, PublicDataType, PublicSinks};
 use crate::messaging::{ExchangeEvent, StateManager};
-use crate::strategy::{MarketDataType, Signal, Strategy};
+use crate::strategy::{PublicStreams, Signal, Strategy};
 use std::collections::HashSet;
 use crate::domain::now_ms;
 use tokio::sync::{broadcast, mpsc};
@@ -10,22 +10,16 @@ use tokio_util::sync::CancellationToken;
 /// 策略执行器 - 为单个策略订阅数据并执行
 pub struct Executor {
     strategy: Box<dyn Strategy>,
-    exchanges: HashSet<Exchange>,
-    symbols: Vec<Symbol>,
-    data_types: HashSet<MarketDataType>,
+    public_streams: PublicStreams,
 }
 
 impl Executor {
     pub fn new(strategy: Box<dyn Strategy>) -> Self {
-        let exchanges: HashSet<_> = strategy.exchanges().into_iter().collect();
-        let symbols = strategy.symbols();
-        let data_types: HashSet<_> = strategy.market_data_types().into_iter().collect();
+        let public_streams = strategy.public_streams();
 
         Self {
             strategy,
-            exchanges,
-            symbols,
-            data_types,
+            public_streams,
         }
     }
 
@@ -38,52 +32,52 @@ impl Executor {
         signal_tx: mpsc::Sender<Signal>,
         cancel_token: CancellationToken,
     ) {
+        // 收集所有涉及的 symbols (用于 StateManager)
+        let symbols: Vec<Symbol> = self
+            .public_streams
+            .values()
+            .flat_map(|m| m.keys().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
         // 创建 StateManager
         let order_timeout_ms = self.strategy.order_timeout_ms();
-        let mut state_manager = StateManager::new(&self.symbols, signal_tx, order_timeout_ms);
+        let mut state_manager = StateManager::new(&symbols, signal_tx, order_timeout_ms);
 
         // 收集需要订阅的 receivers
         let mut receivers: Vec<tokio::sync::broadcast::Receiver<ExchangeEvent>> = Vec::new();
-        let symbols_set: HashSet<_> = self.symbols.iter().cloned().collect();
 
+        // 根据 public_streams 订阅公共数据
         for (exchange, sinks) in public_sinks {
-            if !self.exchanges.contains(exchange) {
-                continue;
-            }
-
-            for symbol in &symbols_set {
-                if self.data_types.contains(&MarketDataType::BBO) {
-                    if let Some(rx) = sinks.subscribe_bbo(symbol) {
-                        receivers.push(wrap_bbo_receiver(*exchange, symbol.clone(), rx));
+            if let Some(symbol_streams) = self.public_streams.get(exchange) {
+                for (symbol, data_types) in symbol_streams {
+                    if data_types.contains(&PublicDataType::BBO) {
+                        if let Some(rx) = sinks.subscribe_bbo(symbol) {
+                            receivers.push(wrap_bbo_receiver(*exchange, symbol.clone(), rx));
+                        }
                     }
-                }
-                if self.data_types.contains(&MarketDataType::FundingRate) {
-                    if let Some(rx) = sinks.subscribe_funding_rate(symbol) {
-                        receivers.push(wrap_funding_receiver(*exchange, symbol.clone(), rx));
+                    if data_types.contains(&PublicDataType::FundingRate) {
+                        if let Some(rx) = sinks.subscribe_funding_rate(symbol) {
+                            receivers.push(wrap_funding_receiver(*exchange, symbol.clone(), rx));
+                        }
                     }
                 }
             }
         }
 
+        // 订阅私有数据 (Balance, Position, OrderUpdate 始终订阅)
         for (exchange, sinks) in private_sinks {
-            if !self.exchanges.contains(exchange) {
-                continue;
-            }
-
-            for symbol in &symbols_set {
-                if self.data_types.contains(&MarketDataType::Position) {
+            if let Some(symbol_streams) = self.public_streams.get(exchange) {
+                for symbol in symbol_streams.keys() {
                     if let Some(rx) = sinks.subscribe_position(symbol) {
                         receivers.push(wrap_position_receiver(*exchange, symbol.clone(), rx));
                     }
-                }
-                if self.data_types.contains(&MarketDataType::OrderUpdate) {
                     if let Some(rx) = sinks.subscribe_order_update(symbol) {
                         receivers.push(wrap_order_receiver(*exchange, symbol.clone(), rx));
                     }
                 }
-            }
 
-            if self.data_types.contains(&MarketDataType::Balance) {
                 receivers.push(wrap_balance_receiver(*exchange, sinks.subscribe_balance()));
             }
         }

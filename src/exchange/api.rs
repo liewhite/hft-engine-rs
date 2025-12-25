@@ -3,7 +3,7 @@ use crate::domain::{
     BBO,
 };
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -35,14 +35,17 @@ pub struct PublicSinks {
 }
 
 impl PublicSinks {
-    /// 创建指定 symbols 和数据类型的 sinks
+    /// 从 Symbol -> DataTypes 映射创建 sinks
     ///
-    /// symbols 与 data_types 做笛卡尔积，生成对应的 sinks
-    pub fn select(symbols: &[Symbol], data_types: &[PublicDataType], capacity: usize) -> Self {
+    /// 每个 symbol 可以订阅不同的数据类型
+    pub fn from_streams(
+        streams: &HashMap<Symbol, HashSet<PublicDataType>>,
+        capacity: usize,
+    ) -> Self {
         let mut funding_rates = HashMap::new();
         let mut bbos = HashMap::new();
 
-        for symbol in symbols {
+        for (symbol, data_types) in streams {
             for data_type in data_types {
                 match data_type {
                     PublicDataType::FundingRate => {
@@ -63,7 +66,11 @@ impl PublicSinks {
 
     /// 创建指定 symbols 的全量 sinks (订阅所有数据类型)
     pub fn full(symbols: &[Symbol], capacity: usize) -> Self {
-        Self::select(symbols, PublicDataType::all(), capacity)
+        let streams: HashMap<Symbol, HashSet<PublicDataType>> = symbols
+            .iter()
+            .map(|s| (s.clone(), PublicDataType::all().iter().cloned().collect()))
+            .collect();
+        Self::from_streams(&streams, capacity)
     }
 
     /// 获取订阅的 symbols
