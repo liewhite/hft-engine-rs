@@ -137,7 +137,7 @@ impl FundingArbStrategy {
     }
 
     /// 单币种最大持仓占比 (20%)
-    const MAX_POSITION_RATIO: f64 = 0.2;
+    const MAX_POSITION_RATIO: f64 = 1.0;
 
     /// 计算下单数量
     fn calculate_quantity(

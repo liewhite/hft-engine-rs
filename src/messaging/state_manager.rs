@@ -11,6 +11,8 @@ pub struct StateManager {
     states: HashMap<Symbol, SymbolState>,
     /// 全局 USDT 余额 (per exchange)
     balances: HashMap<Exchange, f64>,
+    /// 账户净值 (per exchange)
+    equities: HashMap<Exchange, f64>,
     /// 信号发送通道
     signal_tx: mpsc::Sender<Signal>,
     /// 订单超时时间 (毫秒)
@@ -32,6 +34,7 @@ impl StateManager {
         Self {
             states,
             balances: HashMap::new(),
+            equities: HashMap::new(),
             signal_tx,
             order_timeout_ms,
         }
@@ -88,6 +91,16 @@ impl StateManager {
         self.balances.values().sum()
     }
 
+    /// 获取指定交易所的账户净值
+    pub fn equity(&self, exchange: Exchange) -> f64 {
+        self.equities.get(&exchange).copied().unwrap_or(0.0)
+    }
+
+    /// 获取所有交易所的总净值
+    pub fn total_equity(&self) -> f64 {
+        self.equities.values().sum()
+    }
+
     /// 检查指定 symbol 是否有未完成订单
     pub fn has_pending_orders(&self, symbol: &Symbol) -> bool {
         self.states
@@ -111,6 +124,15 @@ impl StateManager {
                     );
                     self.balances.insert(*exchange, balance.available);
                 }
+            }
+            // 全局事件: Equity
+            ExchangeEvent::EquityUpdate { exchange, equity, .. } => {
+                tracing::debug!(
+                    exchange = %exchange,
+                    equity = equity,
+                    "Equity updated"
+                );
+                self.equities.insert(*exchange, *equity);
             }
             // 全局事件: Clock (检查订单超时)
             ExchangeEvent::Clock { timestamp } => {
