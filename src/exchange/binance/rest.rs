@@ -1,4 +1,4 @@
-use crate::domain::{Balance, Exchange, ExchangeError, Order, OrderId, OrderType, Position, Side, Symbol, TimeInForce};
+use crate::domain::{Balance, Exchange, ExchangeError, Order, OrderId, OrderType, Position, Side, Symbol, SymbolMeta, TimeInForce};
 use crate::exchange::api::ExchangeExecutor;
 use crate::exchange::binance::REST_BASE_URL;
 use async_trait::async_trait;
@@ -300,6 +300,100 @@ impl BinanceRestClient {
         let err: ErrorResponse = serde_json::from_str(text).ok()?;
         Some(map_binance_error(err.code, &err.msg))
     }
+
+    /// 获取交易所交易对信息
+    pub async fn get_exchange_info(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+        #[derive(Deserialize)]
+        struct ExchangeInfo {
+            symbols: Vec<SymbolInfo>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SymbolInfo {
+            symbol: String,
+            filters: Vec<Filter>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(tag = "filterType")]
+        enum Filter {
+            #[serde(rename = "PRICE_FILTER")]
+            PriceFilter {
+                #[serde(rename = "tickSize")]
+                tick_size: String,
+            },
+            #[serde(rename = "LOT_SIZE")]
+            LotSize {
+                #[serde(rename = "stepSize")]
+                step_size: String,
+                #[serde(rename = "minQty")]
+                min_qty: String,
+            },
+            #[serde(other)]
+            Other,
+        }
+
+        let resp = self
+            .client
+            .get(format!("{}/fapi/v1/exchangeInfo", self.base_url))
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
+        }
+
+        let info: ExchangeInfo = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        // 构建需要查询的 symbol 集合
+        let symbol_set: std::collections::HashSet<_> = symbols.iter()
+            .map(|s| s.to_binance())
+            .collect();
+
+        let metas: Vec<SymbolMeta> = info
+            .symbols
+            .into_iter()
+            .filter(|s| symbol_set.contains(&s.symbol))
+            .filter_map(|s| {
+                let symbol = Symbol::from_binance(&s.symbol)?;
+                let mut price_step = 0.0;
+                let mut size_step = 0.0;
+                let mut min_order_size = 0.0;
+
+                for filter in s.filters {
+                    match filter {
+                        Filter::PriceFilter { tick_size } => {
+                            price_step = tick_size.parse().unwrap_or(0.0);
+                        }
+                        Filter::LotSize { step_size, min_qty } => {
+                            size_step = step_size.parse().unwrap_or(0.0);
+                            min_order_size = min_qty.parse().unwrap_or(0.0);
+                        }
+                        Filter::Other => {}
+                    }
+                }
+
+                Some(SymbolMeta {
+                    exchange: Exchange::Binance,
+                    symbol,
+                    price_step,
+                    size_step,
+                    min_order_size,
+                    contract_size: 1.0, // Binance 按币的数量下单
+                })
+            })
+            .collect();
+
+        Ok(metas)
+    }
 }
 
 /// 错误码映射
@@ -346,6 +440,10 @@ fn order_type_to_binance(order_type: &OrderType) -> (&'static str, Option<String
 impl ExchangeExecutor for BinanceRestClient {
     fn exchange(&self) -> Exchange {
         Exchange::Binance
+    }
+
+    async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+        self.get_exchange_info(symbols).await
     }
 
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {

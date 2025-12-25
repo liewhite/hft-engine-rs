@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, TimeInForce};
+use crate::domain::{Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce};
 use crate::exchange::api::ExchangeExecutor;
 use crate::exchange::okx::REST_BASE_URL;
 use async_trait::async_trait;
@@ -96,6 +96,70 @@ impl OkxRestClient {
         headers
     }
 
+    /// 获取交易所交易对信息 (公开接口)
+    pub async fn get_instruments(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+        #[derive(Deserialize)]
+        struct Response {
+            code: String,
+            msg: String,
+            data: Vec<InstrumentData>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct InstrumentData {
+            inst_id: String,
+            tick_sz: String,
+            lot_sz: String,
+            min_sz: String,
+            ct_val: String,
+        }
+
+        let resp = self
+            .client
+            .get(format!(
+                "{}/api/v5/public/instruments?instType=SWAP",
+                self.base_url
+            ))
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        if data.code != "0" {
+            return Err(map_okx_error(&data.code, &data.msg));
+        }
+
+        // 构建需要查询的 symbol 集合
+        let symbol_set: std::collections::HashSet<_> = symbols.iter()
+            .map(|s| s.to_okx())
+            .collect();
+
+        let metas: Vec<SymbolMeta> = data
+            .data
+            .into_iter()
+            .filter(|d| symbol_set.contains(&d.inst_id))
+            .filter_map(|d| {
+                let symbol = Symbol::from_okx(&d.inst_id)?;
+                let price_step: f64 = d.tick_sz.parse().unwrap_or(0.0);
+                let size_step: f64 = d.lot_sz.parse().unwrap_or(0.0);
+                let min_order_size: f64 = d.min_sz.parse().unwrap_or(0.0);
+                let contract_size: f64 = d.ct_val.parse().unwrap_or(1.0);
+
+                Some(SymbolMeta {
+                    exchange: Exchange::OKX,
+                    symbol,
+                    price_step,
+                    size_step,
+                    min_order_size,
+                    contract_size,
+                })
+            })
+            .collect();
+
+        Ok(metas)
+    }
 }
 
 /// 错误码映射
@@ -144,6 +208,10 @@ fn order_type_to_okx(order_type: &OrderType) -> (&'static str, Option<String>) {
 impl ExchangeExecutor for OkxRestClient {
     fn exchange(&self) -> Exchange {
         Exchange::OKX
+    }
+
+    async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+        self.get_instruments(symbols).await
     }
 
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {

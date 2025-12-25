@@ -1,6 +1,6 @@
 use crate::domain::{
     Balance, Exchange, ExchangeError, FundingRate, Order, OrderId, OrderUpdate, Position, Symbol,
-    BBO,
+    SymbolMeta, BBO,
 };
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -197,6 +197,9 @@ pub trait ExchangeWebSocket: Send + Sync {
 #[async_trait]
 pub trait ExchangeExecutor: Send + Sync {
     fn exchange(&self) -> Exchange;
+
+    /// 获取交易对元数据
+    async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError>;
 
     /// 下单
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError>;

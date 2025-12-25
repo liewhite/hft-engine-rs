@@ -271,6 +271,56 @@ impl BBO {
     }
 }
 
+/// 交易对元数据
+#[derive(Debug, Clone)]
+pub struct SymbolMeta {
+    pub exchange: Exchange,
+    pub symbol: Symbol,
+    /// 价格精度 (最小价格变动单位)
+    pub price_step: f64,
+    /// 数量精度 (最小数量变动单位)
+    pub size_step: f64,
+    /// 最小下单数量
+    pub min_order_size: f64,
+    /// 合约乘数 (OKX: cval, Binance: 1.0)
+    ///
+    /// 表示每张合约对应的币本位数量
+    /// - OKX ETH: cval=0.1, 下单 qty=1 表示 0.1 ETH
+    /// - Binance: 直接按币的数量下单, 等效于 cval=1.0
+    pub contract_size: f64,
+}
+
+impl SymbolMeta {
+    /// 将币本位数量转换为下单数量
+    ///
+    /// 例如: 想下 0.5 ETH, OKX cval=0.1, 则返回 5 (张)
+    pub fn coin_to_qty(&self, coin_amount: f64) -> f64 {
+        coin_amount / self.contract_size
+    }
+
+    /// 将下单数量转换为币本位数量
+    ///
+    /// 例如: 下单 5 张, OKX cval=0.1, 则返回 0.5 ETH
+    pub fn qty_to_coin(&self, qty: f64) -> f64 {
+        qty * self.contract_size
+    }
+
+    /// 将价格调整到合法精度 (向下取整)
+    pub fn round_price_down(&self, price: f64) -> f64 {
+        (price / self.price_step).floor() * self.price_step
+    }
+
+    /// 将价格调整到合法精度 (向上取整)
+    pub fn round_price_up(&self, price: f64) -> f64 {
+        (price / self.price_step).ceil() * self.price_step
+    }
+
+    /// 将数量调整到合法精度 (向下取整)
+    pub fn round_size_down(&self, size: f64) -> f64 {
+        (size / self.size_step).floor() * self.size_step
+    }
+}
+
 /// 订单
 #[derive(Debug, Clone)]
 pub struct Order {
