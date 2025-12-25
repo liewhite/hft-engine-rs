@@ -204,18 +204,52 @@ impl Engine {
         }
 
         // 8. 处理信号
+        let signal_executors = self.rests.clone();
         tokio::spawn(async move {
             while let Some(signal) = signal_rx.recv().await {
                 match signal {
                     Signal::PlaceOrder(order) => {
+                        let executor = match signal_executors.get(&order.exchange) {
+                            Some(e) => e.clone(),
+                            None => {
+                                tracing::error!(
+                                    exchange = %order.exchange,
+                                    "No executor found for exchange"
+                                );
+                                continue;
+                            }
+                        };
+
                         tracing::info!(
                             exchange = %order.exchange,
                             symbol = %order.symbol,
                             side = %order.side,
-                            quantity = %order.quantity,
-                            "Signal received: PlaceOrder"
+                            order_type = ?order.order_type,
+                            quantity = order.quantity,
+                            client_order_id = ?order.client_order_id,
+                            "Placing order"
                         );
-                        // TODO: 执行下单逻辑
+
+                        match executor.place_order(order.clone()).await {
+                            Ok(order_id) => {
+                                tracing::info!(
+                                    exchange = %order.exchange,
+                                    symbol = %order.symbol,
+                                    order_id = %order_id,
+                                    client_order_id = ?order.client_order_id,
+                                    "Order placed successfully"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    exchange = %order.exchange,
+                                    symbol = %order.symbol,
+                                    client_order_id = ?order.client_order_id,
+                                    error = %e,
+                                    "Failed to place order"
+                                );
+                            }
+                        }
                     }
                 }
             }
