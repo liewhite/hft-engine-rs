@@ -21,6 +21,10 @@ pub struct FundingArbConfig {
     pub max_quantity: Quantity,
     /// 订单超时时间 (毫秒)
     pub order_timeout_ms: u64,
+    /// 不平衡修复阈值 - 相对比例 (超过较大仓位的该比例视为不平衡)
+    pub unhedge_ratio_threshold: f64,
+    /// 不平衡修复阈值 - 绝对价值 (USD, 超过该价值视为不平衡)
+    pub unhedge_value_threshold: f64,
 }
 
 impl Default for FundingArbConfig {
@@ -32,6 +36,8 @@ impl Default for FundingArbConfig {
             max_notional: 1000.0, // 1000 USDT
             max_quantity: 1.0,
             order_timeout_ms: 10_000, // 10 seconds
+            unhedge_ratio_threshold: 0.01, // 1%
+            unhedge_value_threshold: 50.0, // 50 USD
         }
     }
 }
@@ -269,6 +275,58 @@ impl FundingArbStrategy {
         orders
     }
 
+    /// 检查是否存在显著的持仓不平衡
+    ///
+    /// 不平衡需满足以下任一条件:
+    /// - 净敞口超过较大仓位的 ratio_threshold (默认 1%)
+    /// - 净敞口价值超过 value_threshold (默认 50 USD)
+    fn is_significantly_unhedged(
+        state: &SymbolState,
+        ratio_threshold: f64,
+        value_threshold: f64,
+    ) -> bool {
+        let positions: Vec<_> = state.positions.values()
+            .filter(|p| !p.is_empty())
+            .collect();
+
+        if positions.is_empty() {
+            return false;
+        }
+
+        // 计算净持仓
+        let net_position: f64 = positions.iter().map(|p| p.size).sum();
+        let net_abs = net_position.abs();
+
+        if net_abs < 1e-10 {
+            return false; // 完全对冲
+        }
+
+        // 获取较大仓位的绝对值
+        let max_position = positions.iter()
+            .map(|p| p.size.abs())
+            .fold(0.0_f64, |a, b| a.max(b));
+
+        // 条件1: 净敞口超过较大仓位的比例阈值
+        if max_position > 0.0 && net_abs / max_position > ratio_threshold {
+            return true;
+        }
+
+        // 条件2: 净敞口价值超过绝对阈值
+        // 使用任意一个仓位的 mark_price 估算价值
+        if let Some(pos) = positions.first() {
+            let price = if pos.mark_price > 0.0 {
+                pos.mark_price
+            } else {
+                pos.entry_price
+            };
+            if price > 0.0 && net_abs * price > value_threshold {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// 生成敞口修复订单
     fn make_hedge_repair_orders(state: &SymbolState) -> Vec<Order> {
         if let Some((exchange, side, qty)) = state.unhedged_exposure() {
@@ -331,24 +389,6 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, _event: &ExchangeEvent, state: &mut StateManager) {
-        match _event {
-            ExchangeEvent::BalanceUpdate {
-                exchange,
-                balance,
-                timestamp,
-            } => {
-                if balance.asset == "USDT" {
-                    tracing::info!(
-                        "Balance update: exchange={}, asset={}, available={}, timestamp={}",
-                        exchange,
-                        balance.asset,
-                        balance.available,
-                        timestamp
-                    );
-                }
-            }
-            _ => {}
-        }
         // 获取本策略关注的 symbol 状态
         let symbol_state = match state.symbol_state(&self.symbol) {
             Some(s) => s,
@@ -360,14 +400,15 @@ impl Strategy for FundingArbStrategy {
             return;
         }
 
-        // 优先级 1: 检测并修复持仓不平衡
-        if let Some(false) = symbol_state.is_hedged() {
-            // 持仓不平衡，且没有未完成订单时，生成修复订单
-            if !symbol_state.has_pending_orders() {
-                let orders = Self::make_hedge_repair_orders(symbol_state);
-                state.place_orders(orders);
-                return;
-            }
+        // 优先级 1: 检测并修复显著的持仓不平衡
+        if Self::is_significantly_unhedged(
+            symbol_state,
+            self.config.unhedge_ratio_threshold,
+            self.config.unhedge_value_threshold,
+        ) {
+            let orders = Self::make_hedge_repair_orders(symbol_state);
+            state.place_orders(orders);
+            return;
         }
 
         // 优先级 2: 检查平仓条件
