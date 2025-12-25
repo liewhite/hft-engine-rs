@@ -82,14 +82,31 @@ impl Executor {
         for (exchange, sinks) in public_sinks {
             if let Some(symbol_streams) = self.public_streams.get(exchange) {
                 for (symbol, data_types) in symbol_streams {
+                    let ex = *exchange;
+                    let sym = symbol.clone();
+
                     if data_types.contains(&PublicDataType::BBO) {
                         if let Some(rx) = sinks.subscribe_bbo(symbol) {
-                            receivers.push(wrap_bbo_receiver(*exchange, symbol.clone(), rx));
+                            let sym = sym.clone();
+                            receivers.push(wrap_receiver(rx, move |bbo| ExchangeEvent::BBOUpdate {
+                                symbol: sym.clone(),
+                                exchange: ex,
+                                bbo,
+                                timestamp: now_ms(),
+                            }));
                         }
                     }
                     if data_types.contains(&PublicDataType::FundingRate) {
                         if let Some(rx) = sinks.subscribe_funding_rate(symbol) {
-                            receivers.push(wrap_funding_receiver(*exchange, symbol.clone(), rx));
+                            let sym = sym.clone();
+                            receivers.push(wrap_receiver(rx, move |rate| {
+                                ExchangeEvent::FundingRateUpdate {
+                                    symbol: sym.clone(),
+                                    exchange: ex,
+                                    rate,
+                                    timestamp: now_ms(),
+                                }
+                            }));
                         }
                     }
                 }
@@ -104,18 +121,47 @@ impl Executor {
         // - Balance 按 exchange 订阅，不区分 symbol
         for (exchange, sinks) in private_sinks {
             if let Some(symbol_streams) = self.public_streams.get(exchange) {
+                let ex = *exchange;
+
                 for symbol in symbol_streams.keys() {
+                    let sym = symbol.clone();
+
                     if let Some(rx) = sinks.subscribe_position(symbol) {
-                        // 获取 symbol_meta 用于转换 position size
-                        let meta = symbol_metas.get(&(*exchange, symbol.clone())).cloned();
-                        receivers.push(wrap_position_receiver(*exchange, symbol.clone(), rx, meta));
+                        let sym = sym.clone();
+                        let meta = symbol_metas.get(&(ex, sym.clone())).cloned();
+                        receivers.push(wrap_receiver(rx, move |mut position| {
+                            // 将 position size 从张数转换为币数量
+                            if let Some(ref m) = meta {
+                                position.size = m.qty_to_coin(position.size);
+                            }
+                            ExchangeEvent::PositionUpdate {
+                                symbol: sym.clone(),
+                                exchange: ex,
+                                position,
+                                timestamp: now_ms(),
+                            }
+                        }));
                     }
                     if let Some(rx) = sinks.subscribe_order_update(symbol) {
-                        receivers.push(wrap_order_receiver(*exchange, symbol.clone(), rx));
+                        let sym = sym.clone();
+                        receivers.push(wrap_receiver(rx, move |update| {
+                            ExchangeEvent::OrderStatusUpdate {
+                                symbol: sym.clone(),
+                                exchange: ex,
+                                update,
+                                timestamp: now_ms(),
+                            }
+                        }));
                     }
                 }
 
-                receivers.push(wrap_balance_receiver(*exchange, sinks.subscribe_balance()));
+                receivers.push(wrap_receiver(sinks.subscribe_balance(), move |balance| {
+                    ExchangeEvent::BalanceUpdate {
+                        exchange: ex,
+                        balance,
+                        timestamp: now_ms(),
+                    }
+                }));
             }
         }
 
@@ -171,113 +217,21 @@ impl Executor {
     }
 }
 
-// 辅助函数：将具体类型的 receiver 转换为 ExchangeEvent receiver
-fn wrap_bbo_receiver(
-    exchange: Exchange,
-    symbol: Symbol,
-    mut rx: tokio::sync::broadcast::Receiver<crate::domain::BBO>,
-) -> tokio::sync::broadcast::Receiver<ExchangeEvent> {
-    let (tx, out_rx) = tokio::sync::broadcast::channel(256);
+/// 通用 receiver 包装器：将具体类型的 receiver 转换为 ExchangeEvent receiver
+///
+/// 使用闭包处理转换逻辑，消除重复的 channel 创建和 spawn 代码
+fn wrap_receiver<T, F>(
+    mut rx: broadcast::Receiver<T>,
+    transform: F,
+) -> broadcast::Receiver<ExchangeEvent>
+where
+    T: Clone + Send + 'static,
+    F: Fn(T) -> ExchangeEvent + Send + 'static,
+{
+    let (tx, out_rx) = broadcast::channel(256);
     tokio::spawn(async move {
-        while let Ok(bbo) = rx.recv().await {
-            let event = ExchangeEvent::BBOUpdate {
-                symbol: symbol.clone(),
-                exchange,
-                bbo,
-                timestamp: now_ms(),
-            };
-            if tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
-    out_rx
-}
-
-fn wrap_funding_receiver(
-    exchange: Exchange,
-    symbol: Symbol,
-    mut rx: tokio::sync::broadcast::Receiver<crate::domain::FundingRate>,
-) -> tokio::sync::broadcast::Receiver<ExchangeEvent> {
-    let (tx, out_rx) = tokio::sync::broadcast::channel(256);
-    tokio::spawn(async move {
-        while let Ok(rate) = rx.recv().await {
-            let event = ExchangeEvent::FundingRateUpdate {
-                symbol: symbol.clone(),
-                exchange,
-                rate,
-                timestamp: now_ms(),
-            };
-            if tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
-    out_rx
-}
-
-fn wrap_position_receiver(
-    exchange: Exchange,
-    symbol: Symbol,
-    mut rx: tokio::sync::broadcast::Receiver<crate::domain::Position>,
-    symbol_meta: Option<SymbolMeta>,
-) -> tokio::sync::broadcast::Receiver<ExchangeEvent> {
-    let (tx, out_rx) = tokio::sync::broadcast::channel(256);
-    tokio::spawn(async move {
-        while let Ok(mut position) = rx.recv().await {
-            // 将 position size 从张数转换为币数量
-            if let Some(ref meta) = symbol_meta {
-                position.size = meta.qty_to_coin(position.size);
-            }
-            let event = ExchangeEvent::PositionUpdate {
-                symbol: symbol.clone(),
-                exchange,
-                position,
-                timestamp: now_ms(),
-            };
-            if tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
-    out_rx
-}
-
-fn wrap_order_receiver(
-    exchange: Exchange,
-    symbol: Symbol,
-    mut rx: tokio::sync::broadcast::Receiver<crate::domain::OrderUpdate>,
-) -> tokio::sync::broadcast::Receiver<ExchangeEvent> {
-    let (tx, out_rx) = tokio::sync::broadcast::channel(256);
-    tokio::spawn(async move {
-        while let Ok(update) = rx.recv().await {
-            let event = ExchangeEvent::OrderStatusUpdate {
-                symbol: symbol.clone(),
-                exchange,
-                update,
-                timestamp: now_ms(),
-            };
-            if tx.send(event).is_err() {
-                break;
-            }
-        }
-    });
-    out_rx
-}
-
-fn wrap_balance_receiver(
-    exchange: Exchange,
-    mut rx: tokio::sync::broadcast::Receiver<crate::domain::Balance>,
-) -> tokio::sync::broadcast::Receiver<ExchangeEvent> {
-    let (tx, out_rx) = tokio::sync::broadcast::channel(256);
-    tokio::spawn(async move {
-        while let Ok(balance) = rx.recv().await {
-            let event = ExchangeEvent::BalanceUpdate {
-                exchange,
-                balance,
-                timestamp: now_ms(),
-            };
-            if tx.send(event).is_err() {
+        while let Ok(item) = rx.recv().await {
+            if tx.send(transform(item)).is_err() {
                 break;
             }
         }
