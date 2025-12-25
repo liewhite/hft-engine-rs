@@ -1,4 +1,6 @@
-use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO};
+use crate::domain::{
+    Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO,
+};
 use crate::exchange::PublicDataType;
 use crate::messaging::{ExchangeEvent, StateManager, SymbolState};
 use crate::strategy::{PublicStreams, Strategy};
@@ -24,10 +26,10 @@ pub struct FundingArbConfig {
 impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
-            min_spread: 0.0005,     // 0.05%
-            max_spread: 0.002,      // 0.2%
-            close_spread: 0.0002,   // 0.02%
-            max_notional: 1000.0,   // 1000 USDT
+            min_spread: 0.0005,   // 0.05%
+            max_spread: 0.002,    // 0.2%
+            close_spread: 0.0002, // 0.02%
+            max_notional: 1000.0, // 1000 USDT
             max_quantity: 1.0,
             order_timeout_ms: 10_000, // 10 seconds
         }
@@ -59,7 +61,10 @@ impl FundingArbStrategy {
     }
 
     /// 检查开仓条件
-    fn check_open_condition(state: &SymbolState, config: &FundingArbConfig) -> Option<OpenCondition> {
+    fn check_open_condition(
+        state: &SymbolState,
+        config: &FundingArbConfig,
+    ) -> Option<OpenCondition> {
         let spread = state.funding_spread()?;
 
         if spread.abs() < config.min_spread {
@@ -169,10 +174,12 @@ impl FundingArbStrategy {
         }
 
         let short_price = short_bbo.bid_price;
-        let short_qty = Self::calculate_quantity(config, short_price, short_bbo.bid_qty, max_position_value);
+        let short_qty =
+            Self::calculate_quantity(config, short_price, short_bbo.bid_qty, max_position_value);
 
         let long_price = long_bbo.ask_price;
-        let long_qty = Self::calculate_quantity(config, long_price, long_bbo.ask_qty, max_position_value);
+        let long_qty =
+            Self::calculate_quantity(config, long_price, long_bbo.ask_qty, max_position_value);
 
         let qty = short_qty.min(long_qty);
 
@@ -232,8 +239,9 @@ impl FundingArbStrategy {
 
         for (exchange, pos) in &state.positions {
             if !pos.is_empty() {
+                let pos_side = pos.side();
                 let order_type = if let Some(bbo) = state.bbo(*exchange) {
-                    let price = match pos.side {
+                    let price = match pos_side {
                         Side::Long => bbo.bid_price,
                         Side::Short => bbo.ask_price,
                     };
@@ -249,9 +257,9 @@ impl FundingArbStrategy {
                     id: String::new(),
                     exchange: *exchange,
                     symbol: state.symbol.clone(),
-                    side: pos.side.opposite(),
+                    side: pos_side.opposite(),
                     order_type,
-                    quantity: pos.size,
+                    quantity: pos.size.abs(),
                     reduce_only: true,
                     client_order_id: None,
                 });
@@ -302,12 +310,10 @@ impl FundingArbStrategy {
 
 impl Strategy for FundingArbStrategy {
     fn public_streams(&self) -> PublicStreams {
-        let data_types: HashSet<PublicDataType> = [
-            PublicDataType::FundingRate,
-            PublicDataType::BBO,
-        ]
-        .into_iter()
-        .collect();
+        let data_types: HashSet<PublicDataType> =
+            [PublicDataType::FundingRate, PublicDataType::BBO]
+                .into_iter()
+                .collect();
 
         let mut symbol_streams = HashMap::new();
         symbol_streams.insert(self.symbol.clone(), data_types);
@@ -338,9 +344,12 @@ impl Strategy for FundingArbStrategy {
 
         // 优先级 1: 检测并修复持仓不平衡
         if let Some(false) = symbol_state.is_hedged() {
-            let orders = Self::make_hedge_repair_orders(symbol_state);
-            state.place_orders(orders);
-            return;
+            // 持仓不平衡，且没有未完成订单时，生成修复订单
+            if !symbol_state.has_pending_orders() {
+                let orders = Self::make_hedge_repair_orders(symbol_state);
+                state.place_orders(orders);
+                return;
+            }
         }
 
         // 优先级 2: 检查平仓条件

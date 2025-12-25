@@ -252,17 +252,10 @@ impl BinanceRestClient {
                 let entry_price: f64 = p.entry_price.parse().ok()?;
                 let unrealized_pnl: f64 = p.unrealized_profit.parse().ok()?;
 
-                let (side, size) = if pos_amt >= 0.0 {
-                    (Side::Long, pos_amt)
-                } else {
-                    (Side::Short, pos_amt.abs())
-                };
-
                 Some(Position {
                     exchange: Exchange::Binance,
                     symbol,
-                    side,
-                    size,
+                    size: pos_amt, // 正数多头，负数空头
                     entry_price,
                     leverage: 1,
                     unrealized_pnl,

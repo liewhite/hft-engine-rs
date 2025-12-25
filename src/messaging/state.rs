@@ -125,47 +125,60 @@ impl SymbolState {
             return None;
         }
 
-        // 计算净持仓 (多头为正，空头为负)
-        let net_position: f64 = positions.iter()
-            .map(|p| match p.side {
-                crate::domain::Side::Long => p.size,
-                crate::domain::Side::Short => -p.size,
-            })
-            .sum();
+        // 计算净持仓 (size 本身带符号：正数多头，负数空头)
+        let net_position: f64 = positions.iter().map(|p| p.size).sum();
 
         // 净持仓接近 0 视为对冲
         Some(net_position.abs() < 1e-10)
     }
 
-    /// 获取不平衡的敞口持仓 (返回需要平仓的交易所和数量)
+    /// 获取不平衡的敞口持仓 (返回需要平仓的交易所、方向和数量)
+    ///
+    /// 计算净持仓，找出需要平仓的交易所和方向：
+    /// - 如果净持仓为正（净多头），在持仓为正的交易所平多头
+    /// - 如果净持仓为负（净空头），在持仓为负的交易所平空头
     pub fn unhedged_exposure(&self) -> Option<(Exchange, crate::domain::Side, f64)> {
+        use crate::domain::Side;
+
         let positions: Vec<_> = self.positions.iter()
             .filter(|(_, p)| !p.is_empty())
             .collect();
 
-        if positions.len() != 2 {
-            // 非双腿持仓暂不处理
-            if let Some((ex, pos)) = positions.first() {
-                return Some((**ex, pos.side, pos.size));
-            }
+        if positions.is_empty() {
             return None;
         }
 
-        let (ex1, pos1) = positions[0];
-        let (ex2, pos2) = positions[1];
+        // 单腿持仓直接返回
+        if positions.len() == 1 {
+            let (ex, pos) = positions[0];
+            return Some((*ex, pos.side(), pos.size.abs()));
+        }
 
-        // 计算两边持仓差
-        let diff = (pos1.size - pos2.size).abs();
-        if diff < 1e-10 {
+        // 计算净持仓 (size 带符号)
+        let net_position: f64 = positions.iter().map(|(_, p)| p.size).sum();
+
+        if net_position.abs() < 1e-10 {
             return None; // 已对冲
         }
 
-        // 返回持仓较大一方的超额部分
-        if pos1.size > pos2.size {
-            Some((*ex1, pos1.side, diff))
+        // 找出需要平仓的交易所：
+        // - 净多头 (net > 0)：在持仓为正的交易所平多头
+        // - 净空头 (net < 0)：在持仓为负的交易所平空头
+        let (exchange, side) = if net_position > 0.0 {
+            // 找持仓最大的多头交易所
+            positions.iter()
+                .filter(|(_, p)| p.size > 0.0)
+                .max_by(|a, b| a.1.size.total_cmp(&b.1.size))
+                .map(|(ex, _)| (*ex, Side::Long))?
         } else {
-            Some((*ex2, pos2.side, diff))
-        }
+            // 找持仓最大的空头交易所
+            positions.iter()
+                .filter(|(_, p)| p.size < 0.0)
+                .min_by(|a, b| a.1.size.total_cmp(&b.1.size))
+                .map(|(ex, _)| (*ex, Side::Short))?
+        };
+
+        Some((*exchange, side, net_position.abs()))
     }
 
     /// 更新状态
@@ -200,7 +213,6 @@ impl SymbolState {
                 tracing::info!(
                     exchange = %exchange,
                     symbol = %self.symbol,
-                    side = ?position.side,
                     size = position.size,
                     "Updating position"
                 );

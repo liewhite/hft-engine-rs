@@ -1,6 +1,5 @@
 use crate::domain::{
-    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position,
-    Side, Symbol, now_ms, BBO,
+    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position, Symbol, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -140,17 +139,10 @@ impl PositionData {
             .and_then(|p| f64::from_str(p).ok())
             .unwrap_or(0.0);
 
-        let (side, size) = if pos_amount >= 0.0 {
-            (Side::Long, pos_amount)
-        } else {
-            (Side::Short, pos_amount.abs())
-        };
-
         Position {
             exchange: Exchange::OKX,
             symbol,
-            side,
-            size,
+            size: pos_amount, // 正数多头，负数空头
             entry_price: avg_price,
             leverage,
             unrealized_pnl,

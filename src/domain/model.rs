@@ -179,11 +179,13 @@ impl FundingRate {
 }
 
 /// 仓位信息
+///
+/// size 为正表示多头，为负表示空头
 #[derive(Debug, Clone)]
 pub struct Position {
     pub exchange: Exchange,
     pub symbol: Symbol,
-    pub side: Side,
+    /// 仓位数量：正数为多头，负数为空头
     pub size: Quantity,
     pub entry_price: Price,
     pub leverage: u32,
@@ -202,12 +204,20 @@ impl Position {
         self.size.abs() < 1e-10
     }
 
+    /// 获取持仓方向 (根据 size 符号)
+    pub fn side(&self) -> Side {
+        if self.size >= 0.0 {
+            Side::Long
+        } else {
+            Side::Short
+        }
+    }
+
     /// 创建空仓位
     pub fn empty(exchange: Exchange, symbol: Symbol) -> Self {
         Self {
             exchange,
             symbol,
-            side: Side::Long,
             size: 0.0,
             entry_price: 0.0,
             leverage: 1,

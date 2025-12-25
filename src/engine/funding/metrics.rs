@@ -9,7 +9,7 @@ const METRIC_PREFIX: &str = "funding_arb";
 
 /// Prometheus metrics 集合
 #[derive(Clone)]
-pub struct Metrics {
+pub struct MetricsManager {
     registry: Registry,
     /// 资金费率 (labels: exchange, symbol)
     funding_rate: GaugeVec,
@@ -19,7 +19,7 @@ pub struct Metrics {
     position_size: GaugeVec,
 }
 
-impl Metrics {
+impl MetricsManager {
     /// 创建 metrics
     pub fn new() -> Self {
         let registry = Registry::new();
@@ -190,11 +190,11 @@ impl Metrics {
                             result = rx.recv() => {
                                 match result {
                                     Ok(position) => {
-                                        let side = match position.side {
+                                        let side = match position.side() {
                                             crate::domain::Side::Long => "long",
                                             crate::domain::Side::Short => "short",
                                         };
-                                        metrics.set_position_size(exchange, &symbol.to_string(), side, position.size);
+                                        metrics.set_position_size(exchange, &symbol.to_string(), side, position.size.abs());
                                     }
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

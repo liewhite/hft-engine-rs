@@ -1,6 +1,5 @@
 use crate::domain::{
-    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position,
-    Side, Symbol, now_ms, BBO,
+    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position, Symbol, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -147,17 +146,10 @@ impl AccountPosition {
         let unrealized_pnl = f64::from_str(&self.up)
             .unwrap_or_else(|e| panic!("Failed to parse unrealized pnl '{}': {}", self.up, e));
 
-        let (side, size) = if pos_amount >= 0.0 {
-            (Side::Long, pos_amount)
-        } else {
-            (Side::Short, pos_amount.abs())
-        };
-
         Position {
             exchange: Exchange::Binance,
             symbol,
-            side,
-            size,
+            size: pos_amount, // 正数多头，负数空头
             entry_price,
             leverage: 1, // 需要从其他接口获取
             unrealized_pnl,
