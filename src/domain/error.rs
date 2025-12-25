@@ -1,4 +1,4 @@
-use crate::domain::model::Exchange;
+use crate::domain::models::Exchange;
 use std::time::Duration;
 use thiserror::Error;
 

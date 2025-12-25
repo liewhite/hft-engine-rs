@@ -1,7 +1,7 @@
 mod error;
-mod model;
+pub mod models;
 mod types;
 
 pub use error::ExchangeError;
-pub use model::*;
+pub use models::*;
 pub use types::*;
