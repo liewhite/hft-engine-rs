@@ -159,6 +159,8 @@ impl FundingArbStrategy {
     }
 
     /// 生成开仓订单
+    ///
+    /// 根据两边交易所的净值计算开仓大小，取较小的那个
     fn make_open_orders(
         symbol: &Symbol,
         short_ex: Exchange,
@@ -166,15 +168,19 @@ impl FundingArbStrategy {
         long_ex: Exchange,
         long_bbo: &BBO,
         config: &FundingArbConfig,
-        total_balance: f64,
+        short_equity: f64,
+        long_equity: f64,
     ) -> Vec<Order> {
-        let max_position_value = total_balance * Self::MAX_POSITION_RATIO;
+        // 取两边净值较小的那个来计算最大仓位
+        let min_equity = short_equity.min(long_equity);
+        let max_position_value = min_equity * Self::MAX_POSITION_RATIO;
 
         if max_position_value <= 0.0 {
             tracing::warn!(
                 symbol = %symbol,
-                total_balance = total_balance,
-                "Insufficient balance for opening position"
+                short_equity = short_equity,
+                long_equity = long_equity,
+                "Insufficient equity for opening position"
             );
             return vec![];
         }
@@ -427,7 +433,8 @@ impl Strategy for FundingArbStrategy {
                 cond.long_ex,
                 &cond.long_bbo,
                 &self.config,
-                state.total_usdt_balance(),
+                state.equity(cond.short_ex),
+                state.equity(cond.long_ex),
             );
             state.place_orders(orders);
         }
