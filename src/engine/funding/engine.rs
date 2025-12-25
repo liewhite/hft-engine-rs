@@ -1,13 +1,13 @@
+use super::executor::{Executor, SymbolMetas};
+use super::metrics::MetricsManager;
 use crate::config::{ExchangesConfig, MetricsConfig};
-use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta, now_ms};
+use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{BinanceRestClient, BinanceWebSocket};
 use crate::exchange::okx::{OkxRestClient, OkxWebSocket};
 use crate::exchange::{ExchangeExecutor, ExchangeWebSocket, PrivateSinks, PublicSinks};
 use crate::messaging::ExchangeEvent;
 use crate::strategy::{PublicStreams, Signal, Strategy};
-use super::executor::{Executor, SymbolMetas};
-use super::metrics::MetricsManager;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -15,8 +15,9 @@ use tokio_util::sync::CancellationToken;
 
 /// 资金费率套利引擎 - 管理多个策略的执行
 pub struct FundingEngine {
-    exchanges: HashMap<Exchange, Arc<dyn ExchangeWebSocket>>,
-    executors: HashMap<Exchange, Arc<dyn ExchangeExecutor>>,
+    exchanges_config: ExchangesConfig,
+    wss: HashMap<Exchange, Arc<dyn ExchangeWebSocket>>,
+    rests: HashMap<Exchange, Arc<dyn ExchangeExecutor>>,
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
     strategies: Vec<Box<dyn Strategy>>,
     metrics_config: MetricsConfig,
@@ -24,48 +25,59 @@ pub struct FundingEngine {
 }
 
 impl FundingEngine {
-    /// 创建引擎，自动注册所有支持的交易所
-    pub fn new(
-        exchanges_config: &ExchangesConfig,
-        metrics_config: MetricsConfig,
-    ) -> Result<Self, ExchangeError> {
-        let mut exchanges: HashMap<Exchange, Arc<dyn ExchangeWebSocket>> = HashMap::new();
-        let mut executors: HashMap<Exchange, Arc<dyn ExchangeExecutor>> = HashMap::new();
-
-        // 注册 Binance
-        let binance_ws: Arc<dyn ExchangeWebSocket> = Arc::new(BinanceWebSocket::new(
-            exchanges_config.binance.api_key.clone(),
-            exchanges_config.binance.secret.clone(),
-        )?);
-        let binance_rest: Arc<dyn ExchangeExecutor> = Arc::new(BinanceRestClient::new(
-            exchanges_config.binance.api_key.clone(),
-            exchanges_config.binance.secret.clone(),
-        )?);
-        exchanges.insert(Exchange::Binance, binance_ws);
-        executors.insert(Exchange::Binance, binance_rest);
-
-        // 注册 OKX
-        let okx_ws: Arc<dyn ExchangeWebSocket> = Arc::new(OkxWebSocket::new(
-            exchanges_config.okx.api_key.clone(),
-            exchanges_config.okx.secret.clone(),
-            exchanges_config.okx.passphrase.clone(),
-        )?);
-        let okx_rest: Arc<dyn ExchangeExecutor> = Arc::new(OkxRestClient::new(
-            exchanges_config.okx.api_key.clone(),
-            exchanges_config.okx.secret.clone(),
-            exchanges_config.okx.passphrase.clone(),
-        )?);
-        exchanges.insert(Exchange::OKX, okx_ws);
-        executors.insert(Exchange::OKX, okx_rest);
-
-        Ok(Self {
-            exchanges,
-            executors,
+    /// 创建引擎，不初始化交易所客户端
+    pub fn new(exchanges_config: ExchangesConfig, metrics_config: MetricsConfig) -> Self {
+        Self {
+            exchanges_config,
+            wss: HashMap::new(),
+            rests: HashMap::new(),
             symbol_metas: HashMap::new(),
             strategies: Vec::new(),
             metrics_config,
             cancel_token: CancellationToken::new(),
-        })
+        }
+    }
+
+    /// 按需初始化交易所客户端
+    fn init_exchanges(&mut self, exchanges: &HashSet<Exchange>) -> Result<(), ExchangeError> {
+        for exchange in exchanges {
+            if self.wss.contains_key(exchange) {
+                continue;
+            }
+
+            match exchange {
+                Exchange::Binance => {
+                    let ws: Arc<dyn ExchangeWebSocket> = Arc::new(BinanceWebSocket::new(
+                        self.exchanges_config.binance.api_key.clone(),
+                        self.exchanges_config.binance.secret.clone(),
+                    )?);
+                    let rest: Arc<dyn ExchangeExecutor> = Arc::new(BinanceRestClient::new(
+                        self.exchanges_config.binance.api_key.clone(),
+                        self.exchanges_config.binance.secret.clone(),
+                    )?);
+                    self.wss.insert(Exchange::Binance, ws);
+                    self.rests.insert(Exchange::Binance, rest);
+                }
+                Exchange::OKX => {
+                    let ws: Arc<dyn ExchangeWebSocket> = Arc::new(OkxWebSocket::new(
+                        self.exchanges_config.okx.api_key.clone(),
+                        self.exchanges_config.okx.secret.clone(),
+                        self.exchanges_config.okx.passphrase.clone(),
+                    )?);
+                    let rest: Arc<dyn ExchangeExecutor> = Arc::new(OkxRestClient::new(
+                        self.exchanges_config.okx.api_key.clone(),
+                        self.exchanges_config.okx.secret.clone(),
+                        self.exchanges_config.okx.passphrase.clone(),
+                    )?);
+                    self.wss.insert(Exchange::OKX, ws);
+                    self.rests.insert(Exchange::OKX, rest);
+                }
+            }
+
+            tracing::info!(exchange = %exchange, "Exchange client initialized");
+        }
+
+        Ok(())
     }
 
     /// 添加策略
@@ -81,15 +93,19 @@ impl FundingEngine {
         // 1. 聚合所有策略需要的 public streams
         let aggregated = Self::aggregate_public_streams(&self.strategies);
 
+        // 2. 根据策略需求初始化交易所客户端
+        let required_exchanges: HashSet<Exchange> = aggregated.keys().cloned().collect();
+        self.init_exchanges(&required_exchanges)?;
+
         tracing::info!(
             exchanges = aggregated.len(),
             strategies = self.strategies.len(),
             "Starting engine"
         );
 
-        // 2. 获取并缓存 SymbolMeta
+        // 3. 获取并缓存 SymbolMeta
         for (exchange, symbol_streams) in &aggregated {
-            let executor = self.executors.get(exchange).ok_or_else(|| {
+            let executor = self.rests.get(exchange).ok_or_else(|| {
                 ExchangeError::Other(format!("Exchange {:?} executor not registered", exchange))
             })?;
 
@@ -108,13 +124,12 @@ impl FundingEngine {
                 "Fetched symbol metas"
             );
         }
-
-        // 3. 为每个交易所创建 sinks 并连接
+        // 4. 为每个交易所创建 sinks 并连接
         let mut public_sinks: Vec<(Exchange, PublicSinks)> = Vec::new();
         let mut private_sinks: Vec<(Exchange, PrivateSinks)> = Vec::new();
 
         for (exchange, symbol_streams) in &aggregated {
-            let ws = self.exchanges.get(exchange).ok_or_else(|| {
+            let ws = self.wss.get(exchange).ok_or_else(|| {
                 ExchangeError::Other(format!("Exchange {:?} not registered", exchange))
             })?;
 
@@ -125,7 +140,8 @@ impl FundingEngine {
 
             // 连接 WebSocket
             ws.connect_public(pub_sinks.clone(), token.clone()).await?;
-            ws.connect_private(priv_sinks.clone(), token.clone()).await?;
+            ws.connect_private(priv_sinks.clone(), token.clone())
+                .await?;
 
             public_sinks.push((*exchange, pub_sinks));
             private_sinks.push((*exchange, priv_sinks));
@@ -133,13 +149,13 @@ impl FundingEngine {
             tracing::info!(exchange = %exchange, symbols = symbols_vec.len(), "Exchange connected");
         }
 
-        // 4. 启动 Metrics
+        // 5. 启动 Metrics
         self.start_metrics(&public_sinks, &private_sinks, token.clone());
 
-        // 5. 创建 SignalQueue
+        // 6. 创建 SignalQueue
         let (signal_tx, mut signal_rx) = mpsc::channel::<Signal>(256);
 
-        // 6. 创建 Clock broadcast 并启动定时推送
+        // 7. 创建 Clock broadcast 并启动定时推送
         let (clock_tx, _) = broadcast::channel::<ExchangeEvent>(16);
         let clock_tx_clone = clock_tx.clone();
         let clock_token = token.clone();
@@ -155,7 +171,7 @@ impl FundingEngine {
             }
         });
 
-        // 7. 为每个策略创建 Executor 并启动
+        // 8. 为每个策略创建 Executor 并启动
         let symbol_metas: SymbolMetas = Arc::new(self.symbol_metas.clone());
         let strategies = std::mem::take(&mut self.strategies);
         for strategy in strategies {
@@ -170,7 +186,7 @@ impl FundingEngine {
             );
         }
 
-        // 8. 处理信号
+        // 9. 处理信号
         tokio::spawn(async move {
             while let Some(signal) = signal_rx.recv().await {
                 match signal {
@@ -203,10 +219,7 @@ impl FundingEngine {
             for (exchange, symbol_streams) in strategy.public_streams() {
                 let exchange_entry = aggregated.entry(exchange).or_default();
                 for (symbol, data_types) in symbol_streams {
-                    exchange_entry
-                        .entry(symbol)
-                        .or_default()
-                        .extend(data_types);
+                    exchange_entry.entry(symbol).or_default().extend(data_types);
                 }
             }
         }
@@ -245,4 +258,3 @@ impl FundingEngine {
         tracing::info!("Received shutdown signal");
     }
 }
-
