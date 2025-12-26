@@ -172,7 +172,11 @@ impl ExchangeConfig for OkxConfig {
                 let data = push.data.first()?;
                 let rate = data.to_funding_rate();
                 let symbol = rate.symbol.clone();
-                Some(ParsedMessage::FundingRate { symbol, rate })
+                Some(ParsedMessage::FundingRate {
+                    symbol,
+                    rate,
+                    next_funding_time: None, // OKX 使用固定 8h 间隔
+                })
             }
             "bbo-tbt" => {
                 let push: WsPush<BboData> = serde_json::from_str(raw).ok()?;

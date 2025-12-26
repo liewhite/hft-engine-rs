@@ -84,7 +84,12 @@ pub enum SubscribeError {
 /// 解析后的 WebSocket 消息
 #[derive(Debug)]
 pub enum ParsedMessage {
-    FundingRate { symbol: Symbol, rate: FundingRate },
+    FundingRate {
+        symbol: Symbol,
+        rate: FundingRate,
+        /// 下次结算时间戳 (ms)，用于动态计算结算间隔 (Binance 专用)
+        next_funding_time: Option<u64>,
+    },
     BBO { symbol: Symbol, bbo: BBO },
     Position { symbol: Symbol, position: Position },
     Balance(Balance),

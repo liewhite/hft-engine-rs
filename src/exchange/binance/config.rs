@@ -1,14 +1,12 @@
 //! Binance 交易所配置实现
 
-use crate::domain::{Exchange, Symbol};
+use crate::domain::Exchange;
 use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
 use crate::exchange::binance::WS_PUBLIC_URL;
 use crate::exchange::subscriber::{ExchangeConfig, ParsedMessage, SubscriptionKind};
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::RwLock;
 
 /// Binance 凭证
 #[derive(Clone)]
@@ -21,53 +19,6 @@ pub struct BinanceCredentials {
 
 /// Binance 交易所配置
 pub struct BinanceConfig;
-
-/// 单个 symbol 的 funding 状态 (用于动态计算间隔)
-#[derive(Debug, Clone)]
-struct SymbolFundingState {
-    last_funding_time: u64,
-    next_funding_time: u64,
-    interval_hours: f64,
-}
-
-impl SymbolFundingState {
-    fn new() -> Self {
-        Self {
-            last_funding_time: 0,
-            next_funding_time: 0,
-            interval_hours: 8.0, // 默认 8 小时
-        }
-    }
-
-    fn update(&mut self, new_next_funding_time: u64) -> f64 {
-        if self.next_funding_time == 0 {
-            self.next_funding_time = new_next_funding_time;
-            return self.interval_hours;
-        }
-
-        if new_next_funding_time != self.next_funding_time {
-            let interval_ms = new_next_funding_time.saturating_sub(self.next_funding_time);
-            self.interval_hours = round_to_hour(interval_ms);
-            self.last_funding_time = self.next_funding_time;
-            self.next_funding_time = new_next_funding_time;
-        }
-
-        self.interval_hours
-    }
-}
-
-fn round_to_hour(interval_ms: u64) -> f64 {
-    let hours = (interval_ms as f64) / (1000.0 * 60.0 * 60.0);
-    (hours * 2.0).round() / 2.0
-}
-
-/// 全局 funding 状态 (thread-safe)
-static FUNDING_STATES: std::sync::OnceLock<RwLock<HashMap<Symbol, SymbolFundingState>>> =
-    std::sync::OnceLock::new();
-
-fn get_funding_states() -> &'static RwLock<HashMap<Symbol, SymbolFundingState>> {
-    FUNDING_STATES.get_or_init(|| RwLock::new(HashMap::new()))
-}
 
 impl ExchangeConfig for BinanceConfig {
     const EXCHANGE: Exchange = Exchange::Binance;
@@ -164,16 +115,15 @@ impl ExchangeConfig for BinanceConfig {
             "markPriceUpdate" => {
                 let update: MarkPriceUpdate = serde_json::from_str(raw).ok()?;
                 let symbol = update.symbol()?;
+                let next_funding_time = update.t as u64;
 
-                // 更新 funding 状态并获取间隔
-                let interval_hours = {
-                    let mut states = get_funding_states().write().ok()?;
-                    let state = states.entry(symbol.clone()).or_insert_with(SymbolFundingState::new);
-                    state.update(update.t as u64)
-                };
-
-                let rate = update.to_funding_rate(interval_hours);
-                Some(ParsedMessage::FundingRate { symbol, rate })
+                // 使用默认 8h 间隔，SubscriberActor 会根据状态更新
+                let rate = update.to_funding_rate(8.0);
+                Some(ParsedMessage::FundingRate {
+                    symbol,
+                    rate,
+                    next_funding_time: Some(next_funding_time),
+                })
             }
             "bookTicker" => {
                 let ticker: BookTicker = serde_json::from_str(raw).ok()?;

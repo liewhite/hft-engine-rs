@@ -5,7 +5,6 @@ use super::{
     SubscriptionKind, Unsubscribe,
 };
 use crate::domain::SymbolMeta;
-use crate::exchange::ws_util::{ExponentialBackoff, RetryConfig};
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -14,7 +13,6 @@ use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
@@ -37,6 +35,40 @@ struct Connection {
     write_tx: mpsc::Sender<String>,
 }
 
+/// 单个 symbol 的 funding 状态 (用于动态计算结算间隔)
+#[derive(Debug, Clone, Default)]
+struct FundingState {
+    /// 上次看到的 next_funding_time
+    last_next_funding_time: u64,
+    /// 计算出的间隔 (小时)
+    interval_hours: f64,
+}
+
+impl FundingState {
+    /// 更新状态并返回间隔
+    fn update(&mut self, next_funding_time: u64) -> f64 {
+        if self.last_next_funding_time == 0 {
+            self.last_next_funding_time = next_funding_time;
+            self.interval_hours = 8.0; // 默认 8 小时
+            return self.interval_hours;
+        }
+
+        if next_funding_time != self.last_next_funding_time {
+            let interval_ms = next_funding_time.saturating_sub(self.last_next_funding_time);
+            self.interval_hours = Self::round_to_hour(interval_ms);
+            self.last_next_funding_time = next_funding_time;
+        }
+
+        self.interval_hours
+    }
+
+    /// 将毫秒转换为小时并四舍五入到 0.5
+    fn round_to_hour(interval_ms: u64) -> f64 {
+        let hours = (interval_ms as f64) / (1000.0 * 60.0 * 60.0);
+        (hours * 2.0).round() / 2.0
+    }
+}
+
 /// SubscriberActor - 交易所 WebSocket 订阅器
 pub struct SubscriberActor<C: ExchangeConfig> {
     /// Symbol 元数据 (用于 qty 归一化)
@@ -52,6 +84,9 @@ pub struct SubscriberActor<C: ExchangeConfig> {
     subscription_to_conn: HashMap<SubscriptionKind, ConnectionId>,
     /// 下一个连接 ID
     next_conn_id: u64,
+
+    /// Funding 状态追踪 (用于动态计算结算间隔)
+    funding_states: HashMap<crate::domain::Symbol, FundingState>,
 
     /// Actor 自身引用 (在 on_start 中设置)
     self_ref: Option<WeakActorRef<Self>>,
@@ -69,6 +104,7 @@ impl<C: ExchangeConfig> SubscriberActor<C> {
             connections: HashMap::new(),
             subscription_to_conn: HashMap::new(),
             next_conn_id: 0,
+            funding_states: HashMap::new(),
             self_ref: None,
             _marker: std::marker::PhantomData,
         }
@@ -178,13 +214,25 @@ impl<C: ExchangeConfig> SubscriberActor<C> {
     }
 
     /// 处理解析后的消息，进行 qty 归一化并发送到 data_sink
-    async fn handle_parsed_message(&self, msg: ParsedMessage) {
+    async fn handle_parsed_message(&mut self, msg: ParsedMessage) {
         let market_data = match msg {
-            ParsedMessage::FundingRate { symbol, rate } => MarketData::FundingRate {
-                exchange: C::EXCHANGE,
+            ParsedMessage::FundingRate {
                 symbol,
-                rate,
-            },
+                mut rate,
+                next_funding_time,
+            } => {
+                // 如果有 next_funding_time，更新状态并设置正确的间隔
+                if let Some(nft) = next_funding_time {
+                    let state = self.funding_states.entry(symbol.clone()).or_default();
+                    let interval = state.update(nft);
+                    rate.settle_interval_hours = interval;
+                }
+                MarketData::FundingRate {
+                    exchange: C::EXCHANGE,
+                    symbol,
+                    rate,
+                }
+            }
             ParsedMessage::BBO { symbol, bbo } => MarketData::BBO {
                 exchange: C::EXCHANGE,
                 symbol,
@@ -359,12 +407,6 @@ async fn run_connection_loop<C: ExchangeConfig>(
     mut write_rx: mpsc::Receiver<String>,
     actor_ref: ActorRef<SubscriberActor<C>>,
 ) {
-    let _backoff = ExponentialBackoff::new(RetryConfig {
-        initial_interval: Duration::from_secs(1),
-        max_interval: Duration::from_secs(60),
-        multiplier: 2.0,
-    });
-
     loop {
         match connect_and_run::<C>(
             &url,
