@@ -1,7 +1,9 @@
 mod codec;
+mod config;
 mod rest;
 mod ws;
 
+pub use config::{OkxConfig, OkxCredentials};
 pub use rest::OkxRestClient;
 pub use ws::OkxWebSocket;
 

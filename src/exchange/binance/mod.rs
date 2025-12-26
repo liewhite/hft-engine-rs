@@ -1,7 +1,9 @@
 mod codec;
+mod config;
 mod rest;
 mod ws;
 
+pub use config::{BinanceConfig, BinanceCredentials};
 pub use rest::BinanceRestClient;
 pub use ws::BinanceWebSocket;
 

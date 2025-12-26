@@ -33,6 +33,9 @@ anyhow = "1"
 # Async trait
 async-trait = "0.1"
 
+# Actor framework
+kameo = "0.14"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
