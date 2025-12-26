@@ -21,12 +21,17 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// 用于停止 Actor 的句柄
+type StopHandle = Box<dyn Fn() + Send + Sync>;
+
 /// ActorEngine - 基于 Actor 的引擎
 pub struct ActorEngine {
     exchanges_config: ExchangesConfig,
     strategies: Vec<Box<dyn Strategy>>,
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
     rests: HashMap<Exchange, Arc<dyn ExchangeExecutor>>,
+    /// Actor 停止句柄
+    stop_handles: Vec<StopHandle>,
 }
 
 impl ActorEngine {
@@ -37,6 +42,7 @@ impl ActorEngine {
             strategies: Vec::new(),
             symbol_metas: HashMap::new(),
             rests: HashMap::new(),
+            stop_handles: Vec::new(),
         }
     }
 
@@ -108,7 +114,7 @@ impl ActorEngine {
         }));
 
         // 启动 signal 转发任务
-        Self::spawn_signal_forwarder(signal_rx, signal_processor);
+        Self::spawn_signal_forwarder(signal_rx, signal_processor.clone());
 
         // 8. Spawn ExecutorActors
         let symbol_metas = Arc::new(self.symbol_metas.clone());
@@ -141,7 +147,39 @@ impl ActorEngine {
                 .await;
         }
 
-        // 10. 启动 MarketData 分发任务
+        // 10. 存储 stop 句柄
+        if let Some(subscriber) = binance_subscriber {
+            let s = subscriber.clone();
+            self.stop_handles.push(Box::new(move || {
+                let _ = s.stop_gracefully();
+            }));
+        }
+        if let Some(subscriber) = okx_subscriber {
+            let s = subscriber.clone();
+            self.stop_handles.push(Box::new(move || {
+                let _ = s.stop_gracefully();
+            }));
+        }
+        {
+            let s = signal_processor.clone();
+            self.stop_handles.push(Box::new(move || {
+                let _ = s.stop_gracefully();
+            }));
+        }
+        {
+            let c = clock.clone();
+            self.stop_handles.push(Box::new(move || {
+                let _ = c.stop_gracefully();
+            }));
+        }
+        for executor in &executor_refs {
+            let e = executor.clone();
+            self.stop_handles.push(Box::new(move || {
+                let _ = e.stop_gracefully();
+            }));
+        }
+
+        // 11. 启动 MarketData 分发任务
         Self::spawn_market_data_dispatcher(data_rx, executor_refs);
 
         tracing::info!("ActorEngine started");
@@ -349,5 +387,14 @@ impl ActorEngine {
             .await
             .expect("Failed to listen for ctrl-c");
         tracing::info!("Received shutdown signal");
+    }
+
+    /// 停止引擎
+    pub fn stop(&self) {
+        tracing::info!("Stopping ActorEngine...");
+        for handle in &self.stop_handles {
+            handle();
+        }
+        tracing::info!("ActorEngine stopped");
     }
 }
