@@ -15,15 +15,128 @@ use crate::exchange::subscriber::{MarketData, Subscribe, SubscriptionKind};
 use crate::exchange::ExchangeConfig;
 use crate::exchange::{ExchangeExecutor, PublicDataType};
 use crate::strategy::{PublicStreams, Signal, Strategy};
+use async_trait::async_trait;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message};
-use kameo::request::MessageSend;
 use kameo::Actor;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+// === ExchangeActorHandle trait - 消除 match exchange 分发 ===
+
+/// ExchangeActor 的类型擦除句柄
+#[async_trait]
+trait ExchangeActorHandle: Send + Sync {
+    /// 发送订阅请求
+    async fn subscribe(&self, kind: SubscriptionKind);
+    /// 停止 Actor
+    async fn stop(&self);
+}
+
+/// 为 ActorRef<ExchangeActor<C>> 实现 ExchangeActorHandle
+#[async_trait]
+impl<C: ExchangeConfig> ExchangeActorHandle for ActorRef<ExchangeActor<C>> {
+    async fn subscribe(&self, kind: SubscriptionKind) {
+        if let Err(e) = self.tell(Subscribe { kind }).await {
+            tracing::error!(error = %e, "Failed to send Subscribe message");
+        }
+    }
+
+    async fn stop(&self) {
+        self.stop_gracefully().await.ok();
+    }
+}
+
+// === ExchangeFactory trait - 创建交易所 Actor 的工厂 ===
+
+/// 交易所工厂 trait
+trait ExchangeFactory {
+    /// 创建 REST 客户端
+    fn create_rest_client(&self) -> Result<Arc<dyn ExchangeExecutor>, ExchangeError>;
+    /// 创建 ExchangeActor
+    fn create_actor(
+        &self,
+        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+        data_sink: mpsc::Sender<MarketData>,
+    ) -> Arc<dyn ExchangeActorHandle>;
+}
+
+/// Binance 工厂
+struct BinanceFactory {
+    api_key: String,
+    secret: String,
+}
+
+impl ExchangeFactory for BinanceFactory {
+    fn create_rest_client(&self) -> Result<Arc<dyn ExchangeExecutor>, ExchangeError> {
+        Ok(Arc::new(BinanceRestClient::new(
+            self.api_key.clone(),
+            self.secret.clone(),
+        )?))
+    }
+
+    fn create_actor(
+        &self,
+        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+        data_sink: mpsc::Sender<MarketData>,
+    ) -> Arc<dyn ExchangeActorHandle> {
+        let credentials = BinanceCredentials {
+            api_key: self.api_key.clone(),
+            secret: self.secret.clone(),
+            listen_key: None,
+        };
+
+        let actor = kameo::spawn(ExchangeActor::<BinanceConfig>::new(ExchangeActorArgs {
+            symbol_metas,
+            credentials,
+            data_sink,
+        }));
+
+        Arc::new(actor)
+    }
+}
+
+/// OKX 工厂
+struct OkxFactory {
+    api_key: String,
+    secret: String,
+    passphrase: String,
+}
+
+impl ExchangeFactory for OkxFactory {
+    fn create_rest_client(&self) -> Result<Arc<dyn ExchangeExecutor>, ExchangeError> {
+        Ok(Arc::new(OkxRestClient::new(
+            self.api_key.clone(),
+            self.secret.clone(),
+            self.passphrase.clone(),
+        )?))
+    }
+
+    fn create_actor(
+        &self,
+        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+        data_sink: mpsc::Sender<MarketData>,
+    ) -> Arc<dyn ExchangeActorHandle> {
+        let credentials = OkxCredentials {
+            api_key: self.api_key.clone(),
+            secret: self.secret.clone(),
+            passphrase: self.passphrase.clone(),
+        };
+
+        let actor = kameo::spawn(ExchangeActor::<OkxConfig>::new(ExchangeActorArgs {
+            symbol_metas,
+            credentials,
+            data_sink,
+        }));
+
+        Arc::new(actor)
+    }
+}
+
+// === EngineActor ===
 
 /// EngineActor 初始化参数
 pub struct EngineActorArgs {
@@ -32,8 +145,8 @@ pub struct EngineActorArgs {
 
 /// EngineActor - 顶层管理 Actor
 pub struct EngineActor {
-    /// 交易所配置
-    exchanges_config: ExchangesConfig,
+    /// 交易所工厂
+    factories: HashMap<Exchange, Box<dyn ExchangeFactory + Send + Sync>>,
     /// 策略列表
     strategies: Vec<Box<dyn Strategy>>,
     /// Symbol 元数据
@@ -41,10 +154,8 @@ pub struct EngineActor {
     /// REST 客户端
     rests: HashMap<Exchange, Arc<dyn ExchangeExecutor>>,
 
-    /// Binance ExchangeActor
-    binance_actor: Option<ActorRef<ExchangeActor<BinanceConfig>>>,
-    /// OKX ExchangeActor
-    okx_actor: Option<ActorRef<ExchangeActor<OkxConfig>>>,
+    /// ExchangeActors (类型擦除)
+    exchange_actors: HashMap<Exchange, Arc<dyn ExchangeActorHandle>>,
     /// ExecutorActors
     executor_actors: Vec<ActorRef<ExecutorActor>>,
     /// SignalProcessorActor
@@ -58,13 +169,33 @@ pub struct EngineActor {
 
 impl EngineActor {
     pub fn new(args: EngineActorArgs) -> Self {
+        // 创建工厂
+        let mut factories: HashMap<Exchange, Box<dyn ExchangeFactory + Send + Sync>> =
+            HashMap::new();
+
+        factories.insert(
+            Exchange::Binance,
+            Box::new(BinanceFactory {
+                api_key: args.exchanges_config.binance.api_key.clone(),
+                secret: args.exchanges_config.binance.secret.clone(),
+            }),
+        );
+
+        factories.insert(
+            Exchange::OKX,
+            Box::new(OkxFactory {
+                api_key: args.exchanges_config.okx.api_key.clone(),
+                secret: args.exchanges_config.okx.secret.clone(),
+                passphrase: args.exchanges_config.okx.passphrase.clone(),
+            }),
+        );
+
         Self {
-            exchanges_config: args.exchanges_config,
+            factories,
             strategies: Vec::new(),
             symbol_metas: HashMap::new(),
             rests: HashMap::new(),
-            binance_actor: None,
-            okx_actor: None,
+            exchange_actors: HashMap::new(),
             executor_actors: Vec::new(),
             signal_processor: None,
             clock: None,
@@ -72,7 +203,7 @@ impl EngineActor {
         }
     }
 
-    /// 初始化 REST 客户端
+    /// 初始化 REST 客户端 (无 match 分发)
     fn init_rest_clients(
         &mut self,
         exchanges: &HashSet<Exchange>,
@@ -82,23 +213,12 @@ impl EngineActor {
                 continue;
             }
 
-            match exchange {
-                Exchange::Binance => {
-                    let rest: Arc<dyn ExchangeExecutor> = Arc::new(BinanceRestClient::new(
-                        self.exchanges_config.binance.api_key.clone(),
-                        self.exchanges_config.binance.secret.clone(),
-                    )?);
-                    self.rests.insert(Exchange::Binance, rest);
-                }
-                Exchange::OKX => {
-                    let rest: Arc<dyn ExchangeExecutor> = Arc::new(OkxRestClient::new(
-                        self.exchanges_config.okx.api_key.clone(),
-                        self.exchanges_config.okx.secret.clone(),
-                        self.exchanges_config.okx.passphrase.clone(),
-                    )?);
-                    self.rests.insert(Exchange::OKX, rest);
-                }
-            }
+            let factory = self.factories.get(exchange).ok_or_else(|| {
+                ExchangeError::Other(format!("No factory for exchange {:?}", exchange))
+            })?;
+
+            let rest = factory.create_rest_client()?;
+            self.rests.insert(*exchange, rest);
 
             tracing::info!(exchange = %exchange, "REST client initialized");
         }
@@ -135,91 +255,51 @@ impl EngineActor {
         Ok(())
     }
 
-    /// 创建 Binance ExchangeActor
-    fn create_binance_actor(
+    /// 创建 ExchangeActor (无 match 分发)
+    fn create_exchange_actor(
         &self,
+        exchange: Exchange,
         data_tx: mpsc::Sender<MarketData>,
-    ) -> ActorRef<ExchangeActor<BinanceConfig>> {
+    ) -> Result<Arc<dyn ExchangeActorHandle>, ExchangeError> {
+        let factory = self.factories.get(&exchange).ok_or_else(|| {
+            ExchangeError::Other(format!("No factory for exchange {:?}", exchange))
+        })?;
+
+        // 提取该交易所的 symbol metas
         let symbol_metas: HashMap<Symbol, SymbolMeta> = self
             .symbol_metas
             .iter()
-            .filter(|((e, _), _)| *e == Exchange::Binance)
+            .filter(|((e, _), _)| *e == exchange)
             .map(|((_, s), m)| (s.clone(), m.clone()))
             .collect();
 
-        let credentials = BinanceCredentials {
-            api_key: self.exchanges_config.binance.api_key.clone(),
-            secret: self.exchanges_config.binance.secret.clone(),
-            listen_key: None,
-        };
-
-        kameo::spawn(ExchangeActor::<BinanceConfig>::new(ExchangeActorArgs {
-            symbol_metas: Arc::new(symbol_metas),
-            credentials,
-            data_sink: data_tx,
-        }))
+        Ok(factory.create_actor(Arc::new(symbol_metas), data_tx))
     }
 
-    /// 创建 OKX ExchangeActor
-    fn create_okx_actor(
-        &self,
-        data_tx: mpsc::Sender<MarketData>,
-    ) -> ActorRef<ExchangeActor<OkxConfig>> {
-        let symbol_metas: HashMap<Symbol, SymbolMeta> = self
-            .symbol_metas
-            .iter()
-            .filter(|((e, _), _)| *e == Exchange::OKX)
-            .map(|((_, s), m)| (s.clone(), m.clone()))
-            .collect();
-
-        let credentials = OkxCredentials {
-            api_key: self.exchanges_config.okx.api_key.clone(),
-            secret: self.exchanges_config.okx.secret.clone(),
-            passphrase: self.exchanges_config.okx.passphrase.clone(),
-        };
-
-        kameo::spawn(ExchangeActor::<OkxConfig>::new(ExchangeActorArgs {
-            symbol_metas: Arc::new(symbol_metas),
-            credentials,
-            data_sink: data_tx,
-        }))
-    }
-
-    /// 发送订阅请求
-    async fn send_subscriptions<C: ExchangeConfig>(
-        actor: &ActorRef<ExchangeActor<C>>,
+    /// 发送订阅请求 (无 match 分发)
+    async fn send_subscriptions(
+        actor: &dyn ExchangeActorHandle,
         symbol_streams: &HashMap<Symbol, HashSet<PublicDataType>>,
     ) {
         for (symbol, data_types) in symbol_streams {
             if data_types.contains(&PublicDataType::FundingRate) {
                 let _ = actor
-                    .ask(Subscribe {
-                        kind: SubscriptionKind::FundingRate {
-                            symbol: symbol.clone(),
-                        },
+                    .subscribe(SubscriptionKind::FundingRate {
+                        symbol: symbol.clone(),
                     })
-                    .send()
                     .await;
             }
             if data_types.contains(&PublicDataType::BBO) {
                 let _ = actor
-                    .ask(Subscribe {
-                        kind: SubscriptionKind::BBO {
-                            symbol: symbol.clone(),
-                        },
+                    .subscribe(SubscriptionKind::BBO {
+                        symbol: symbol.clone(),
                     })
-                    .send()
                     .await;
             }
         }
 
         // 订阅 private 数据
-        let _ = actor
-            .ask(Subscribe {
-                kind: SubscriptionKind::Private,
-            })
-            .send()
-            .await;
+        let _ = actor.subscribe(SubscriptionKind::Private).await;
     }
 
     /// 聚合所有策略需要的 public streams
@@ -283,13 +363,12 @@ impl Actor for EngineActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), BoxError> {
-        // 停止所有子 Actor
-        if let Some(ref actor) = self.binance_actor {
-            actor.stop_gracefully().await.ok();
+        // 停止所有 ExchangeActors (无 match 分发)
+        for (_, actor) in &self.exchange_actors {
+            actor.stop().await;
         }
-        if let Some(ref actor) = self.okx_actor {
-            actor.stop_gracefully().await.ok();
-        }
+
+        // 停止其他 Actors
         for executor in &self.executor_actors {
             executor.stop_gracefully().await.ok();
         }
@@ -351,35 +430,22 @@ impl EngineActor {
         // 3. 创建数据聚合 channel
         let (data_tx, data_rx) = mpsc::channel::<MarketData>(1024);
 
-        // 4. 创建 ExchangeActors
-        if required_exchanges.contains(&Exchange::Binance) {
-            self.binance_actor = Some(self.create_binance_actor(data_tx.clone()));
+        // 4. 创建 ExchangeActors (无 match 分发)
+        for exchange in &required_exchanges {
+            let actor = self.create_exchange_actor(*exchange, data_tx.clone())?;
+            self.exchange_actors.insert(*exchange, actor);
         }
 
-        if required_exchanges.contains(&Exchange::OKX) {
-            self.okx_actor = Some(self.create_okx_actor(data_tx.clone()));
-        }
-
-        // 5. 发送订阅请求
+        // 5. 发送订阅请求 (无 match 分发)
         for (exchange, symbol_streams) in &aggregated {
-            match exchange {
-                Exchange::Binance => {
-                    if let Some(ref actor) = self.binance_actor {
-                        Self::send_subscriptions(actor, symbol_streams).await;
-                    }
-                }
-                Exchange::OKX => {
-                    if let Some(ref actor) = self.okx_actor {
-                        Self::send_subscriptions(actor, symbol_streams).await;
-                    }
-                }
+            if let Some(actor) = self.exchange_actors.get(exchange) {
+                Self::send_subscriptions(actor.as_ref(), symbol_streams).await;
+                tracing::info!(
+                    exchange = %exchange,
+                    symbols = symbol_streams.len(),
+                    "Subscriptions sent"
+                );
             }
-
-            tracing::info!(
-                exchange = %exchange,
-                symbols = symbol_streams.len(),
-                "Subscriptions sent"
-            );
         }
 
         // 6. 创建 Signal channel

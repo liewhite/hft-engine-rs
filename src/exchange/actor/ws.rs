@@ -55,6 +55,8 @@ pub struct WebSocketActor<C: ExchangeConfig> {
     upstream: mpsc::Sender<UpstreamEvent>,
     /// WebSocket 写端
     write_tx: Option<mpsc::Sender<String>>,
+    /// WebSocket 任务句柄
+    ws_task: Option<tokio::task::JoinHandle<()>>,
     _marker: std::marker::PhantomData<C>,
 }
 
@@ -67,12 +69,21 @@ impl<C: ExchangeConfig> WebSocketActor<C> {
             credentials: args.credentials,
             upstream: args.upstream,
             write_tx: None,
+            ws_task: None,
             _marker: std::marker::PhantomData,
         }
     }
 
     pub fn conn_id(&self) -> ConnectionId {
         self.conn_id
+    }
+
+    /// 停止 WebSocket 任务
+    fn stop_ws_task(&mut self) {
+        self.write_tx = None;
+        if let Some(handle) = self.ws_task.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -98,6 +109,7 @@ impl<C: ExchangeConfig> Actor for WebSocketActor<C> {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), BoxError> {
+        self.stop_ws_task();
         tracing::debug!(
             exchange = %C::EXCHANGE,
             conn_id = self.conn_id.0,
@@ -120,6 +132,9 @@ impl<C: ExchangeConfig> Message<Connect> for WebSocketActor<C> {
         _msg: Connect,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
+        // 如果已有连接，先停止
+        self.stop_ws_task();
+
         let (write_tx, write_rx) = mpsc::channel::<String>(64);
 
         let url = self.url.clone();
@@ -128,12 +143,13 @@ impl<C: ExchangeConfig> Message<Connect> for WebSocketActor<C> {
         let conn_id = self.conn_id;
         let upstream = self.upstream.clone();
 
-        // 启动连接任务
-        tokio::spawn(async move {
+        // 启动连接任务并保存 JoinHandle
+        let handle = tokio::spawn(async move {
             run_ws_loop::<C>(url, credentials, is_private, write_rx, upstream, conn_id).await;
         });
 
         self.write_tx = Some(write_tx);
+        self.ws_task = Some(handle);
     }
 }
 
@@ -163,41 +179,7 @@ impl<C: ExchangeConfig> Message<Disconnect> for WebSocketActor<C> {
     type Reply = ();
 
     async fn handle(&mut self, _msg: Disconnect, _ctx: Context<'_, Self, Self::Reply>) {
-        // Drop write_tx 会导致连接任务退出
-        self.write_tx = None;
-    }
-}
-
-/// WebSocket 收到数据 (保留用于外部通知，但主要数据流通过 upstream channel)
-pub struct WsMessageReceived(pub String);
-
-impl<C: ExchangeConfig> Message<WsMessageReceived> for WebSocketActor<C> {
-    type Reply = ();
-
-    async fn handle(&mut self, _msg: WsMessageReceived, _ctx: Context<'_, Self, Self::Reply>) {
-        // 数据已通过 upstream channel 发送到 ExchangeActor
-        // 这个 handler 保留用于可能的日志或调试目的
-    }
-}
-
-/// 连接断开 (保留用于外部通知)
-pub struct WsDisconnected {
-    pub error: Option<String>,
-}
-
-impl<C: ExchangeConfig> Message<WsDisconnected> for WebSocketActor<C> {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: WsDisconnected, _ctx: Context<'_, Self, Self::Reply>) {
-        self.write_tx = None;
-        if let Some(ref err) = msg.error {
-            tracing::warn!(
-                exchange = %C::EXCHANGE,
-                conn_id = self.conn_id.0,
-                error = %err,
-                "WebSocket disconnected with error"
-            );
-        }
+        self.stop_ws_task();
     }
 }
 
@@ -277,10 +259,18 @@ async fn run_ws_loop<C: ExchangeConfig>(
             ws_msg = read.next() => {
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
-                        let _ = upstream.send(UpstreamEvent::Data {
+                        // 如果 upstream 关闭，退出循环
+                        if upstream.send(UpstreamEvent::Data {
                             conn_id,
                             data: text,
-                        }).await;
+                        }).await.is_err() {
+                            tracing::debug!(
+                                exchange = %C::EXCHANGE,
+                                conn_id = conn_id.0,
+                                "Upstream channel closed, exiting ws loop"
+                            );
+                            return;
+                        }
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
                         let _ = write.send(WsMessage::Pong(data)).await;

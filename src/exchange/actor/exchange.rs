@@ -19,6 +19,7 @@ use kameo::request::MessageSend;
 use kameo::Actor;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// ExchangeActor 初始化参数
@@ -92,11 +93,19 @@ pub struct ExchangeActor<C: ExchangeConfig> {
     /// Funding 状态追踪 (用于动态计算结算间隔)
     funding_states: HashMap<Symbol, FundingState>,
 
+    /// 重连退避状态 (当前退避时间，毫秒)
+    reconnect_backoff_ms: u64,
+
     /// Actor 自身引用
     self_ref: Option<WeakActorRef<Self>>,
 
     _marker: std::marker::PhantomData<C>,
 }
+
+/// 重连退避常量
+const RECONNECT_BACKOFF_INITIAL_MS: u64 = 1000; // 1 秒
+const RECONNECT_BACKOFF_MAX_MS: u64 = 60_000; // 60 秒
+const RECONNECT_BACKOFF_MULTIPLIER: u64 = 2;
 
 impl<C: ExchangeConfig> ExchangeActor<C> {
     pub fn new(args: ExchangeActorArgs<C>) -> Self {
@@ -114,9 +123,23 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
             upstream_tx,
             upstream_rx: Some(upstream_rx),
             funding_states: HashMap::new(),
+            reconnect_backoff_ms: RECONNECT_BACKOFF_INITIAL_MS,
             self_ref: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// 重置重连退避 (连接成功时调用)
+    fn reset_backoff(&mut self) {
+        self.reconnect_backoff_ms = RECONNECT_BACKOFF_INITIAL_MS;
+    }
+
+    /// 增加重连退避
+    fn increase_backoff(&mut self) -> Duration {
+        let current = self.reconnect_backoff_ms;
+        self.reconnect_backoff_ms =
+            (current * RECONNECT_BACKOFF_MULTIPLIER).min(RECONNECT_BACKOFF_MAX_MS);
+        Duration::from_millis(current)
     }
 
     /// 分配新的连接 ID
@@ -235,6 +258,8 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
     async fn handle_upstream_event(&mut self, event: UpstreamEvent) {
         match event {
             UpstreamEvent::Data { data, .. } => {
+                // 收到数据说明连接正常，重置退避
+                self.reset_backoff();
                 if let Some(parsed) = C::parse_message(&data) {
                     self.handle_parsed_message(parsed).await;
                 }
@@ -247,11 +272,15 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
 
     /// 处理连接断开
     async fn handle_disconnection(&mut self, conn_id: ConnectionId, error: Option<String>) {
+        // 计算退避延迟
+        let backoff = self.increase_backoff();
+
         tracing::warn!(
             exchange = %C::EXCHANGE,
             conn_id = conn_id.0,
             error = ?error,
-            "WebSocket connection lost, will reconnect"
+            backoff_ms = backoff.as_millis(),
+            "WebSocket connection lost, reconnecting with backoff"
         );
 
         // 获取该连接的订阅列表
@@ -269,13 +298,19 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
         self.conn_subscriptions.remove(&conn_id);
         self.conn_types.remove(&conn_id);
 
-        // 重新订阅 (会创建新连接)
-        for kind in subscriptions {
-            self.subscription_to_conn.remove(&kind);
-            // 发送订阅消息给自己
-            if let Some(actor_ref) = self.self_ref.as_ref().and_then(|r| r.upgrade()) {
-                let _ = actor_ref.tell(Subscribe { kind }).await;
-            }
+        // 清除订阅映射
+        for kind in &subscriptions {
+            self.subscription_to_conn.remove(kind);
+        }
+
+        // 延迟重连: 启动后台任务等待 backoff 后再发送 Subscribe 消息
+        if let Some(actor_ref) = self.self_ref.as_ref().and_then(|r| r.upgrade()) {
+            tokio::spawn(async move {
+                tokio::time::sleep(backoff).await;
+                for kind in subscriptions {
+                    let _ = actor_ref.tell(Subscribe { kind }).await;
+                }
+            });
         }
     }
 
@@ -383,24 +418,41 @@ impl<C: ExchangeConfig> Actor for ExchangeActor<C> {
 // === Message Handlers ===
 
 impl<C: ExchangeConfig> Message<Subscribe> for ExchangeActor<C> {
-    type Reply = Result<(), SubscribeError>;
+    type Reply = ();
 
-    async fn handle(
-        &mut self,
-        msg: Subscribe,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
+    async fn handle(&mut self, msg: Subscribe, _ctx: Context<'_, Self, Self::Reply>) {
         // 检查是否已订阅
         if self.subscription_to_conn.contains_key(&msg.kind) {
-            return Ok(());
+            return;
         }
 
         // 惰性创建连接
         let conn_id = match &msg.kind {
             SubscriptionKind::FundingRate { .. } | SubscriptionKind::BBO { .. } => {
-                self.ensure_public_connection().await?
+                match self.ensure_public_connection().await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!(
+                            exchange = %C::EXCHANGE,
+                            kind = ?msg.kind,
+                            error = %e,
+                            "Failed to create public connection"
+                        );
+                        return;
+                    }
+                }
             }
-            SubscriptionKind::Private => self.ensure_private_connection().await?,
+            SubscriptionKind::Private => match self.ensure_private_connection().await {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(
+                        exchange = %C::EXCHANGE,
+                        error = %e,
+                        "Failed to create private connection"
+                    );
+                    return;
+                }
+            },
         };
 
         // 发送订阅消息
@@ -411,8 +463,6 @@ impl<C: ExchangeConfig> Message<Subscribe> for ExchangeActor<C> {
             subs.insert(msg.kind.clone());
         }
         self.subscription_to_conn.insert(msg.kind, conn_id);
-
-        Ok(())
     }
 }
 
