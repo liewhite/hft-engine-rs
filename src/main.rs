@@ -1,6 +1,7 @@
 use fee_arb::config::AppConfig;
-use fee_arb::engine::Engine;
+use fee_arb::engine::{AddStrategy, EngineActor, EngineActorArgs, Start};
 use fee_arb::strategy::FundingArbStrategy;
+use kameo::request::MessageSend;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
@@ -25,10 +26,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // Create and configure engine (exchanges will be initialized on run based on strategy requirements)
-    let mut engine = Engine::new(config.exchanges.clone());
+    // Create EngineActor
+    let engine = kameo::spawn(EngineActor::new(EngineActorArgs {
+        exchanges_config: config.exchanges.clone(),
+    }));
 
-    // Create per-symbol strategies
+    // Add strategies
     let exchanges = config.exchanges.enabled_exchanges();
     for symbol in symbols {
         let strategy = FundingArbStrategy::new(
@@ -36,19 +39,29 @@ async fn main() -> anyhow::Result<()> {
             exchanges.clone(),
             symbol,
         );
-        engine.add_strategy(strategy);
+        let _ = engine.tell(AddStrategy(Box::new(strategy))).await;
     }
 
     // Start engine
-    engine.run().await?;
+    engine
+        .ask(Start)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
 
     tracing::info!("System running. Press Ctrl+C to stop.");
 
     // Wait for shutdown signal
-    engine.wait_for_shutdown().await;
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for ctrl-c");
+
+    tracing::info!("Received shutdown signal");
 
     // Graceful shutdown
-    engine.stop();
+    engine.stop_gracefully().await.ok();
+
+    tracing::info!("Engine stopped");
 
     tracing::info!("System stopped.");
 

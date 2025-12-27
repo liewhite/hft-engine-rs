@@ -1,8 +1,13 @@
+pub mod actor;
 pub mod api;
 pub mod binance;
 pub mod okx;
 pub mod subscriber;
 pub mod ws_util;
 
+pub use actor::{ExchangeActor, ExchangeActorArgs};
 pub use api::*;
-pub use subscriber::{ExchangeConfig, MarketData, Subscribe, SubscribeError, SubscriberActor, SubscriberArgs, SubscriptionKind, Unsubscribe};
+pub use subscriber::{
+    ExchangeConfig, MarketData, Subscribe, SubscribeError, SubscriberActor, SubscriberArgs,
+    SubscriptionKind, Unsubscribe,
+};
