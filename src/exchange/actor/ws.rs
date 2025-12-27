@@ -172,17 +172,6 @@ impl<C: ExchangeConfig> Message<SendMessage> for WebSocketActor<C> {
     }
 }
 
-/// 断开连接
-pub struct Disconnect;
-
-impl<C: ExchangeConfig> Message<Disconnect> for WebSocketActor<C> {
-    type Reply = ();
-
-    async fn handle(&mut self, _msg: Disconnect, _ctx: Context<'_, Self, Self::Reply>) {
-        self.stop_ws_task();
-    }
-}
-
 // === WebSocket 连接循环 ===
 
 async fn run_ws_loop<C: ExchangeConfig>(

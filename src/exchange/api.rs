@@ -1,4 +1,5 @@
 use crate::domain::{Exchange, ExchangeError, Order, OrderId, Symbol, SymbolMeta};
+use crate::exchange::subscriber::SubscriptionKind;
 use async_trait::async_trait;
 
 /// 公共数据类型
@@ -14,6 +15,14 @@ impl PublicDataType {
     /// 返回所有数据类型
     pub fn all() -> &'static [PublicDataType] {
         &[PublicDataType::FundingRate, PublicDataType::BBO]
+    }
+
+    /// 转换为 SubscriptionKind
+    pub fn to_subscription_kind(self, symbol: Symbol) -> SubscriptionKind {
+        match self {
+            PublicDataType::FundingRate => SubscriptionKind::FundingRate { symbol },
+            PublicDataType::BBO => SubscriptionKind::BBO { symbol },
+        }
     }
 }
 

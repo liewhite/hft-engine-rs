@@ -8,6 +8,6 @@ mod ws;
 
 pub use exchange::{ExchangeActor, ExchangeActorArgs};
 pub use ws::{
-    Connect, ConnectionId, ConnectionType, Disconnect, SendMessage, UpstreamEvent,
-    WebSocketActor, WebSocketActorArgs,
+    Connect, ConnectionId, ConnectionType, SendMessage, UpstreamEvent, WebSocketActor,
+    WebSocketActorArgs,
 };

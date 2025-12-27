@@ -163,6 +163,11 @@ pub struct EngineActor {
     /// ClockActor
     clock: Option<ActorRef<ClockActor>>,
 
+    /// MarketData 分发任务
+    dispatcher_task: Option<tokio::task::JoinHandle<()>>,
+    /// Signal 转发任务
+    forwarder_task: Option<tokio::task::JoinHandle<()>>,
+
     /// Actor 自身引用
     self_ref: Option<WeakActorRef<Self>>,
 }
@@ -199,6 +204,8 @@ impl EngineActor {
             executor_actors: Vec::new(),
             signal_processor: None,
             clock: None,
+            dispatcher_task: None,
+            forwarder_task: None,
             self_ref: None,
         }
     }
@@ -276,30 +283,20 @@ impl EngineActor {
         Ok(factory.create_actor(Arc::new(symbol_metas), data_tx))
     }
 
-    /// 发送订阅请求 (无 match 分发)
+    /// 发送订阅请求 (通过 PublicDataType::to_subscription_kind 消除 if 分发)
     async fn send_subscriptions(
         actor: &dyn ExchangeActorHandle,
         symbol_streams: &HashMap<Symbol, HashSet<PublicDataType>>,
     ) {
         for (symbol, data_types) in symbol_streams {
-            if data_types.contains(&PublicDataType::FundingRate) {
-                let _ = actor
-                    .subscribe(SubscriptionKind::FundingRate {
-                        symbol: symbol.clone(),
-                    })
-                    .await;
-            }
-            if data_types.contains(&PublicDataType::BBO) {
-                let _ = actor
-                    .subscribe(SubscriptionKind::BBO {
-                        symbol: symbol.clone(),
-                    })
-                    .await;
+            for data_type in data_types {
+                let kind = data_type.to_subscription_kind(symbol.clone());
+                actor.subscribe(kind).await;
             }
         }
 
         // 订阅 private 数据
-        let _ = actor.subscribe(SubscriptionKind::Private).await;
+        actor.subscribe(SubscriptionKind::Private).await;
     }
 
     /// 聚合所有策略需要的 public streams
@@ -322,26 +319,26 @@ impl EngineActor {
     fn spawn_market_data_dispatcher(
         mut data_rx: mpsc::Receiver<MarketData>,
         executors: Vec<ActorRef<ExecutorActor>>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(data) = data_rx.recv().await {
                 for executor in &executors {
                     let _ = executor.tell(data.clone()).await;
                 }
             }
-        });
+        })
     }
 
     /// 启动 Signal 转发任务
     fn spawn_signal_forwarder(
         mut signal_rx: mpsc::Receiver<Signal>,
         processor: ActorRef<SignalProcessorActor>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(signal) = signal_rx.recv().await {
                 let _ = processor.tell(signal).await;
             }
-        });
+        })
     }
 }
 
@@ -363,6 +360,14 @@ impl Actor for EngineActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), BoxError> {
+        // 停止后台任务
+        if let Some(task) = self.dispatcher_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.forwarder_task.take() {
+            task.abort();
+        }
+
         // 停止所有 ExchangeActors (无 match 分发)
         for (_, actor) in &self.exchange_actors {
             actor.stop().await;
@@ -458,7 +463,7 @@ impl EngineActor {
         self.signal_processor = Some(signal_processor.clone());
 
         // 启动 signal 转发任务
-        Self::spawn_signal_forwarder(signal_rx, signal_processor);
+        self.forwarder_task = Some(Self::spawn_signal_forwarder(signal_rx, signal_processor));
 
         // 8. 创建 ExecutorActors
         let symbol_metas = Arc::new(self.symbol_metas.clone());
@@ -492,7 +497,8 @@ impl EngineActor {
         }
 
         // 10. 启动 MarketData 分发任务
-        Self::spawn_market_data_dispatcher(data_rx, self.executor_actors.clone());
+        self.dispatcher_task =
+            Some(Self::spawn_market_data_dispatcher(data_rx, self.executor_actors.clone()));
 
         tracing::info!("Engine started successfully");
         Ok(())
