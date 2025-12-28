@@ -120,6 +120,8 @@ impl<C: ExchangeConfig, S: WsDataSink> Actor for WebSocketActor<C, S> {
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+        use crate::exchange::subscriber::ParsedMessage;
+
         tracing::debug!(
             exchange = %C::EXCHANGE,
             conn_id = self.conn_id.0,
@@ -132,7 +134,7 @@ impl<C: ExchangeConfig, S: WsDataSink> Actor for WebSocketActor<C, S> {
             WsError::Network(format!("Connect failed: {}", e))
         })?;
 
-        let (mut write, read) = ws_stream.0.split();
+        let (mut write, mut read) = ws_stream.0.split();
 
         // Private 连接需要认证
         if self.conn_type == ConnectionType::Private {
@@ -142,6 +144,50 @@ impl<C: ExchangeConfig, S: WsDataSink> Actor for WebSocketActor<C, S> {
                     write.send(WsMessage::Text(auth_msg)).await.map_err(|e| {
                         WsError::AuthFailed(format!("Auth send failed: {}", e))
                     })?;
+
+                    // 等待 login 成功响应
+                    tracing::debug!(
+                        exchange = %C::EXCHANGE,
+                        conn_id = self.conn_id.0,
+                        "Waiting for login response..."
+                    );
+
+                    loop {
+                        match read.next().await {
+                            Some(Ok(WsMessage::Text(text))) => {
+                                if let Some(parsed) = C::parse_message(&text) {
+                                    match parsed {
+                                        ParsedMessage::Subscribed => {
+                                            tracing::info!(
+                                                exchange = %C::EXCHANGE,
+                                                conn_id = self.conn_id.0,
+                                                "Login successful"
+                                            );
+                                            break;
+                                        }
+                                        _ => {
+                                            // 其他消息忽略，继续等待
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Ok(WsMessage::Ping(data))) => {
+                                let _ = write.send(WsMessage::Pong(data)).await;
+                            }
+                            Some(Ok(WsMessage::Close(_))) | None => {
+                                return Err(WsError::AuthFailed(
+                                    "Connection closed before login success".to_string(),
+                                )
+                                .into());
+                            }
+                            Some(Err(e)) => {
+                                return Err(
+                                    WsError::AuthFailed(format!("WebSocket error: {}", e)).into()
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -150,7 +196,7 @@ impl<C: ExchangeConfig, S: WsDataSink> Actor for WebSocketActor<C, S> {
             exchange = %C::EXCHANGE,
             conn_id = self.conn_id.0,
             conn_type = ?self.conn_type,
-            "WebSocket connected"
+            "WebSocket connected and ready"
         );
 
         // 创建写入通道
