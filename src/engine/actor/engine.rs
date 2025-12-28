@@ -1,6 +1,10 @@
 //! EngineActor - 顶层 Actor，管理所有子 Actor
 //!
 //! 职责：生命周期编排、策略管理、数据分发
+//!
+//! Supervisor 职责：
+//! - 使用 spawn_link 创建所有子 Actor
+//! - on_link_died 时根据 Actor 类型决定处理方式
 
 use super::{
     ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, RegisterExecutor, SignalProcessorActor,
@@ -16,7 +20,7 @@ use crate::exchange::ExchangeConfig;
 use crate::exchange::{ExchangeExecutor, PublicDataType};
 use crate::strategy::{PublicStreams, Signal, Strategy};
 use async_trait::async_trait;
-use kameo::actor::{ActorRef, WeakActorRef};
+use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message};
@@ -30,6 +34,8 @@ use tokio::sync::mpsc;
 /// ExchangeActor 的类型擦除句柄
 #[async_trait]
 trait ExchangeActorHandle: Send + Sync {
+    /// 获取 Actor ID
+    fn actor_id(&self) -> ActorID;
     /// 发送订阅请求
     async fn subscribe(&self, kind: SubscriptionKind);
     /// 停止 Actor
@@ -39,6 +45,10 @@ trait ExchangeActorHandle: Send + Sync {
 /// 为 ActorRef<ExchangeActor<C>> 实现 ExchangeActorHandle
 #[async_trait]
 impl<C: ExchangeConfig> ExchangeActorHandle for ActorRef<ExchangeActor<C>> {
+    fn actor_id(&self) -> ActorID {
+        self.id()
+    }
+
     async fn subscribe(&self, kind: SubscriptionKind) {
         if let Err(e) = self.tell(Subscribe { kind }).await {
             tracing::error!(error = %e, "Failed to send Subscribe message");
@@ -53,12 +63,14 @@ impl<C: ExchangeConfig> ExchangeActorHandle for ActorRef<ExchangeActor<C>> {
 // === ExchangeFactory trait - 创建交易所 Actor 的工厂 ===
 
 /// 交易所工厂 trait
-trait ExchangeFactory {
+#[async_trait]
+trait ExchangeFactory: Send + Sync {
     /// 创建 REST 客户端
     fn create_rest_client(&self) -> Result<Arc<dyn ExchangeExecutor>, ExchangeError>;
-    /// 创建 ExchangeActor
-    fn create_actor(
+    /// 使用 spawn_link 创建 ExchangeActor
+    async fn create_actor_linked(
         &self,
+        engine_ref: &ActorRef<EngineActor>,
         symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
         data_sink: mpsc::Sender<MarketData>,
     ) -> Arc<dyn ExchangeActorHandle>;
@@ -70,6 +82,7 @@ struct BinanceFactory {
     secret: String,
 }
 
+#[async_trait]
 impl ExchangeFactory for BinanceFactory {
     fn create_rest_client(&self) -> Result<Arc<dyn ExchangeExecutor>, ExchangeError> {
         Ok(Arc::new(BinanceRestClient::new(
@@ -78,8 +91,9 @@ impl ExchangeFactory for BinanceFactory {
         )?))
     }
 
-    fn create_actor(
+    async fn create_actor_linked(
         &self,
+        engine_ref: &ActorRef<EngineActor>,
         symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
         data_sink: mpsc::Sender<MarketData>,
     ) -> Arc<dyn ExchangeActorHandle> {
@@ -89,11 +103,15 @@ impl ExchangeFactory for BinanceFactory {
             listen_key: None,
         };
 
-        let actor = kameo::spawn(ExchangeActor::<BinanceConfig>::new(ExchangeActorArgs {
-            symbol_metas,
-            credentials,
-            data_sink,
-        }));
+        let actor = spawn_link(
+            engine_ref,
+            ExchangeActor::<BinanceConfig>::new(ExchangeActorArgs {
+                symbol_metas,
+                credentials,
+                data_sink,
+            }),
+        )
+        .await;
 
         Arc::new(actor)
     }
@@ -106,6 +124,7 @@ struct OkxFactory {
     passphrase: String,
 }
 
+#[async_trait]
 impl ExchangeFactory for OkxFactory {
     fn create_rest_client(&self) -> Result<Arc<dyn ExchangeExecutor>, ExchangeError> {
         Ok(Arc::new(OkxRestClient::new(
@@ -115,8 +134,9 @@ impl ExchangeFactory for OkxFactory {
         )?))
     }
 
-    fn create_actor(
+    async fn create_actor_linked(
         &self,
+        engine_ref: &ActorRef<EngineActor>,
         symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
         data_sink: mpsc::Sender<MarketData>,
     ) -> Arc<dyn ExchangeActorHandle> {
@@ -126,14 +146,29 @@ impl ExchangeFactory for OkxFactory {
             passphrase: self.passphrase.clone(),
         };
 
-        let actor = kameo::spawn(ExchangeActor::<OkxConfig>::new(ExchangeActorArgs {
-            symbol_metas,
-            credentials,
-            data_sink,
-        }));
+        let actor = spawn_link(
+            engine_ref,
+            ExchangeActor::<OkxConfig>::new(ExchangeActorArgs {
+                symbol_metas,
+                credentials,
+                data_sink,
+            }),
+        )
+        .await;
 
         Arc::new(actor)
     }
+}
+
+// === 子 Actor 类型标识 ===
+
+/// 子 Actor 类型（用于 on_link_died 中识别）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildActorKind {
+    Exchange(Exchange),
+    Executor(usize), // index
+    SignalProcessor,
+    Clock,
 }
 
 // === EngineActor ===
@@ -146,7 +181,7 @@ pub struct EngineActorArgs {
 /// EngineActor - 顶层管理 Actor
 pub struct EngineActor {
     /// 交易所工厂
-    factories: HashMap<Exchange, Box<dyn ExchangeFactory + Send + Sync>>,
+    factories: HashMap<Exchange, Box<dyn ExchangeFactory>>,
     /// 策略列表
     strategies: Vec<Box<dyn Strategy>>,
     /// Symbol 元数据
@@ -163,20 +198,22 @@ pub struct EngineActor {
     /// ClockActor
     clock: Option<ActorRef<ClockActor>>,
 
-    /// MarketData 分发任务
+    /// ActorID -> ChildActorKind 映射（用于 on_link_died）
+    actor_kinds: HashMap<ActorID, ChildActorKind>,
+
+    /// MarketData 分发任务（临时保留，Phase 4 会移除）
     dispatcher_task: Option<tokio::task::JoinHandle<()>>,
-    /// Signal 转发任务
+    /// Signal 转发任务（临时保留，Phase 4 会移除）
     forwarder_task: Option<tokio::task::JoinHandle<()>>,
 
     /// Actor 自身引用
-    self_ref: Option<WeakActorRef<Self>>,
+    self_ref: Option<ActorRef<Self>>,
 }
 
 impl EngineActor {
     pub fn new(args: EngineActorArgs) -> Self {
         // 创建工厂
-        let mut factories: HashMap<Exchange, Box<dyn ExchangeFactory + Send + Sync>> =
-            HashMap::new();
+        let mut factories: HashMap<Exchange, Box<dyn ExchangeFactory>> = HashMap::new();
 
         factories.insert(
             Exchange::Binance,
@@ -204,6 +241,7 @@ impl EngineActor {
             executor_actors: Vec::new(),
             signal_processor: None,
             clock: None,
+            actor_kinds: HashMap::new(),
             dispatcher_task: None,
             forwarder_task: None,
             self_ref: None,
@@ -211,10 +249,7 @@ impl EngineActor {
     }
 
     /// 初始化 REST 客户端 (无 match 分发)
-    fn init_rest_clients(
-        &mut self,
-        exchanges: &HashSet<Exchange>,
-    ) -> Result<(), ExchangeError> {
+    fn init_rest_clients(&mut self, exchanges: &HashSet<Exchange>) -> Result<(), ExchangeError> {
         for exchange in exchanges {
             if self.rests.contains_key(exchange) {
                 continue;
@@ -262,12 +297,13 @@ impl EngineActor {
         Ok(())
     }
 
-    /// 创建 ExchangeActor (无 match 分发)
-    fn create_exchange_actor(
-        &self,
+    /// 使用 spawn_link 创建 ExchangeActor
+    async fn create_exchange_actor_linked(
+        &mut self,
+        actor_ref: &ActorRef<Self>,
         exchange: Exchange,
         data_tx: mpsc::Sender<MarketData>,
-    ) -> Result<Arc<dyn ExchangeActorHandle>, ExchangeError> {
+    ) -> Result<(), ExchangeError> {
         let factory = self.factories.get(&exchange).ok_or_else(|| {
             ExchangeError::Other(format!("No factory for exchange {:?}", exchange))
         })?;
@@ -280,7 +316,16 @@ impl EngineActor {
             .map(|((_, s), m)| (s.clone(), m.clone()))
             .collect();
 
-        Ok(factory.create_actor(Arc::new(symbol_metas), data_tx))
+        let actor = factory
+            .create_actor_linked(actor_ref, Arc::new(symbol_metas), data_tx)
+            .await;
+
+        // 记录 ActorID -> Kind 映射
+        self.actor_kinds
+            .insert(actor.actor_id(), ChildActorKind::Exchange(exchange));
+
+        self.exchange_actors.insert(exchange, actor);
+        Ok(())
     }
 
     /// 发送订阅请求 (通过 PublicDataType::to_subscription_kind 消除 if 分发)
@@ -315,7 +360,7 @@ impl EngineActor {
         aggregated
     }
 
-    /// 启动 MarketData 分发任务
+    /// 启动 MarketData 分发任务（临时保留）
     fn spawn_market_data_dispatcher(
         mut data_rx: mpsc::Receiver<MarketData>,
         executors: Vec<ActorRef<ExecutorActor>>,
@@ -329,7 +374,7 @@ impl EngineActor {
         })
     }
 
-    /// 启动 Signal 转发任务
+    /// 启动 Signal 转发任务（临时保留）
     fn spawn_signal_forwarder(
         mut signal_rx: mpsc::Receiver<Signal>,
         processor: ActorRef<SignalProcessorActor>,
@@ -350,7 +395,7 @@ impl Actor for EngineActor {
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        self.self_ref = Some(actor_ref.downgrade());
+        self.self_ref = Some(actor_ref.clone());
         tracing::info!("EngineActor started");
         Ok(())
     }
@@ -358,7 +403,7 @@ impl Actor for EngineActor {
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
+        reason: ActorStopReason,
     ) -> Result<(), BoxError> {
         // 停止后台任务
         if let Some(task) = self.dispatcher_task.take() {
@@ -368,24 +413,81 @@ impl Actor for EngineActor {
             task.abort();
         }
 
-        // 停止所有 ExchangeActors (无 match 分发)
-        for (_, actor) in &self.exchange_actors {
-            actor.stop().await;
-        }
-
-        // 停止其他 Actors
-        for executor in &self.executor_actors {
-            executor.stop_gracefully().await.ok();
-        }
-        if let Some(ref processor) = self.signal_processor {
-            processor.stop_gracefully().await.ok();
-        }
-        if let Some(ref clock) = self.clock {
-            clock.stop_gracefully().await.ok();
-        }
-
-        tracing::info!("EngineActor stopped");
+        // 链接的子 Actor 会自动收到通知并停止
+        tracing::info!(reason = ?reason, "EngineActor stopped");
         Ok(())
+    }
+
+    /// 处理链接的 Actor 死亡
+    async fn on_link_died(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        id: ActorID,
+        reason: ActorStopReason,
+    ) -> Result<Option<ActorStopReason>, BoxError> {
+        // 查找死掉的 Actor 类型
+        let kind = self.actor_kinds.remove(&id);
+
+        match kind {
+            Some(ChildActorKind::Exchange(exchange)) => {
+                // Exchange 死亡是致命的，级联停止整个引擎
+                tracing::error!(
+                    exchange = %exchange,
+                    reason = ?reason,
+                    "ExchangeActor died, shutting down engine"
+                );
+                self.exchange_actors.remove(&exchange);
+                Ok(Some(ActorStopReason::LinkDied {
+                    id,
+                    reason: Box::new(reason),
+                }))
+            }
+            Some(ChildActorKind::Executor(idx)) => {
+                // Executor 死亡是致命的
+                tracing::error!(
+                    executor_idx = idx,
+                    reason = ?reason,
+                    "ExecutorActor died, shutting down engine"
+                );
+                Ok(Some(ActorStopReason::LinkDied {
+                    id,
+                    reason: Box::new(reason),
+                }))
+            }
+            Some(ChildActorKind::SignalProcessor) => {
+                // SignalProcessor 死亡是致命的
+                tracing::error!(
+                    reason = ?reason,
+                    "SignalProcessorActor died, shutting down engine"
+                );
+                self.signal_processor = None;
+                Ok(Some(ActorStopReason::LinkDied {
+                    id,
+                    reason: Box::new(reason),
+                }))
+            }
+            Some(ChildActorKind::Clock) => {
+                // Clock 死亡是致命的
+                tracing::error!(
+                    reason = ?reason,
+                    "ClockActor died, shutting down engine"
+                );
+                self.clock = None;
+                Ok(Some(ActorStopReason::LinkDied {
+                    id,
+                    reason: Box::new(reason),
+                }))
+            }
+            None => {
+                // 未知的 Actor
+                tracing::warn!(
+                    actor_id = ?id,
+                    reason = ?reason,
+                    "Unknown linked actor died"
+                );
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -418,6 +520,10 @@ impl Message<Start> for EngineActor {
 impl EngineActor {
     /// 实际启动逻辑
     async fn do_start(&mut self) -> Result<(), ExchangeError> {
+        let actor_ref = self.self_ref.clone().ok_or_else(|| {
+            ExchangeError::Other("self_ref not set".to_string())
+        })?;
+
         // 1. 聚合所有策略需要的 public streams
         let aggregated = Self::aggregate_public_streams(&self.strategies);
         let required_exchanges: HashSet<Exchange> = aggregated.keys().cloned().collect();
@@ -432,13 +538,13 @@ impl EngineActor {
         self.init_rest_clients(&required_exchanges)?;
         self.fetch_symbol_metas(&aggregated).await?;
 
-        // 3. 创建数据聚合 channel
+        // 3. 创建数据聚合 channel（临时保留）
         let (data_tx, data_rx) = mpsc::channel::<MarketData>(1024);
 
-        // 4. 创建 ExchangeActors (无 match 分发)
+        // 4. 使用 spawn_link 创建 ExchangeActors
         for exchange in &required_exchanges {
-            let actor = self.create_exchange_actor(*exchange, data_tx.clone())?;
-            self.exchange_actors.insert(*exchange, actor);
+            self.create_exchange_actor_linked(&actor_ref, *exchange, data_tx.clone())
+                .await?;
         }
 
         // 5. 发送订阅请求 (无 match 分发)
@@ -453,38 +559,55 @@ impl EngineActor {
             }
         }
 
-        // 6. 创建 Signal channel
+        // 6. 创建 Signal channel（临时保留）
         let (signal_tx, signal_rx) = mpsc::channel::<Signal>(256);
 
-        // 7. 创建 SignalProcessorActor
-        let signal_processor = kameo::spawn(SignalProcessorActor::new(SignalProcessorArgs {
-            executors: self.rests.clone(),
-        }));
+        // 7. 使用 spawn_link 创建 SignalProcessorActor
+        let signal_processor = spawn_link(
+            &actor_ref,
+            SignalProcessorActor::new(SignalProcessorArgs {
+                executors: self.rests.clone(),
+            }),
+        )
+        .await;
+        self.actor_kinds
+            .insert(signal_processor.id(), ChildActorKind::SignalProcessor);
         self.signal_processor = Some(signal_processor.clone());
 
-        // 启动 signal 转发任务
+        // 启动 signal 转发任务（临时保留）
         self.forwarder_task = Some(Self::spawn_signal_forwarder(signal_rx, signal_processor));
 
-        // 8. 创建 ExecutorActors
+        // 8. 使用 spawn_link 创建 ExecutorActors
         let symbol_metas = Arc::new(self.symbol_metas.clone());
         let strategies = std::mem::take(&mut self.strategies);
 
-        for strategy in strategies {
-            let executor = kameo::spawn(ExecutorActor::new(ExecutorArgs {
-                strategy,
-                symbol_metas: symbol_metas.clone(),
-                signal_tx: signal_tx.clone(),
-            }));
+        for (idx, strategy) in strategies.into_iter().enumerate() {
+            let executor = spawn_link(
+                &actor_ref,
+                ExecutorActor::new(ExecutorArgs {
+                    strategy,
+                    symbol_metas: symbol_metas.clone(),
+                    signal_tx: signal_tx.clone(),
+                }),
+            )
+            .await;
+            self.actor_kinds
+                .insert(executor.id(), ChildActorKind::Executor(idx));
             self.executor_actors.push(executor);
         }
 
-        // 9. 创建 ClockActor
+        // 9. 使用 spawn_link 创建 ClockActor
         let binance_executor = self.rests.get(&Exchange::Binance).cloned();
-        let clock = kameo::spawn(ClockActor::new(ClockArgs {
-            interval_ms: 1000,
-            binance_executor,
-            data_tx: data_tx.clone(),
-        }));
+        let clock = spawn_link(
+            &actor_ref,
+            ClockActor::new(ClockArgs {
+                interval_ms: 1000,
+                binance_executor,
+                data_tx: data_tx.clone(),
+            }),
+        )
+        .await;
+        self.actor_kinds.insert(clock.id(), ChildActorKind::Clock);
         self.clock = Some(clock.clone());
 
         // 注册所有 Executor 到 Clock
@@ -496,11 +619,13 @@ impl EngineActor {
                 .await;
         }
 
-        // 10. 启动 MarketData 分发任务
-        self.dispatcher_task =
-            Some(Self::spawn_market_data_dispatcher(data_rx, self.executor_actors.clone()));
+        // 10. 启动 MarketData 分发任务（临时保留）
+        self.dispatcher_task = Some(Self::spawn_market_data_dispatcher(
+            data_rx,
+            self.executor_actors.clone(),
+        ));
 
-        tracing::info!("Engine started successfully");
+        tracing::info!("Engine started successfully with spawn_link");
         Ok(())
     }
 }
