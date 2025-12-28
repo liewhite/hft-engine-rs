@@ -109,14 +109,20 @@ impl ExchangeFactory for BinanceFactory {
         let credentials = BinanceCredentials {
             api_key: self.api_key.clone(),
             secret: self.secret.clone(),
-            listen_key: None,
         };
+
+        // Create typed REST client for ExchangeActor
+        let rest_client = Arc::new(
+            BinanceRestClient::new(self.api_key.clone(), self.secret.clone())
+                .expect("Failed to create BinanceRestClient"),
+        );
 
         let actor = spawn_link(
             engine_ref,
             ExchangeActor::<BinanceConfig, EngineDataSink>::new(ExchangeActorArgs {
                 symbol_metas,
                 credentials,
+                rest_client,
                 data_sink,
             }),
         )
@@ -155,11 +161,22 @@ impl ExchangeFactory for OkxFactory {
             passphrase: self.passphrase.clone(),
         };
 
+        // Create typed REST client for ExchangeActor
+        let rest_client = Arc::new(
+            OkxRestClient::new(
+                self.api_key.clone(),
+                self.secret.clone(),
+                self.passphrase.clone(),
+            )
+            .expect("Failed to create OkxRestClient"),
+        );
+
         let actor = spawn_link(
             engine_ref,
             ExchangeActor::<OkxConfig, EngineDataSink>::new(ExchangeActorArgs {
                 symbol_metas,
                 credentials,
+                rest_client,
                 data_sink,
             }),
         )

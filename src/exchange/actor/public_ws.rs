@@ -1,13 +1,9 @@
-//! WebSocketActor - 管理单个 WebSocket 连接
+//! PublicWsActor - 公共 WebSocket 连接
 //!
 //! 职责：连接建立、消息收发、错误即死亡
-//!
-//! 生命周期：
-//! - on_start: 建立 WebSocket 连接，失败则 Actor die
-//! - 内部 tokio::spawn: 处理 ws 读取循环，stream 结束时触发 Actor die
-//! - 父 Actor (ExchangeActor) 通过 spawn_link 创建，收到 on_link_died 时重启
+//! 只处理 Public 连接，无认证逻辑
 
-use crate::exchange::subscriber::ExchangeConfig;
+use crate::domain::Exchange;
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -21,13 +17,6 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 /// 连接 ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId(pub u64);
-
-/// 连接类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionType {
-    Public,
-    Private,
-}
 
 /// WebSocket 错误类型
 #[derive(Debug, Clone, thiserror::Error)]
@@ -59,7 +48,7 @@ impl WsError {
     }
 }
 
-/// WebSocket 数据消息 - 从 WebSocketActor 发送到 ExchangeActor
+/// WebSocket 数据消息
 #[derive(Debug, Clone)]
 pub struct WsData {
     pub conn_id: ConnectionId,
@@ -72,38 +61,31 @@ pub trait WsDataSink: Send + Sync + 'static {
     async fn send_data(&self, data: WsData);
 }
 
-/// WebSocketActor 初始化参数
-pub struct WebSocketActorArgs<S: WsDataSink> {
+/// PublicWsActor 初始化参数
+pub struct PublicWsActorArgs<S: WsDataSink> {
     pub conn_id: ConnectionId,
-    pub conn_type: ConnectionType,
     pub url: String,
-    /// 数据接收器 (父 Actor 的弱引用)
+    pub exchange: Exchange,
     pub data_sink: Arc<S>,
 }
 
-/// WebSocketActor - 管理单个 WebSocket 连接
-pub struct WebSocketActor<C: ExchangeConfig, S: WsDataSink> {
+/// PublicWsActor - 公共 WebSocket 连接 Actor
+pub struct PublicWsActor<S: WsDataSink> {
     conn_id: ConnectionId,
-    conn_type: ConnectionType,
     url: String,
-    credentials: Option<C::Credentials>,
-    /// 数据接收器 (父 Actor)
+    exchange: Exchange,
     data_sink: Arc<S>,
-    /// WebSocket 写端
     write_tx: Option<mpsc::Sender<String>>,
-    _marker: std::marker::PhantomData<C>,
 }
 
-impl<C: ExchangeConfig, S: WsDataSink> WebSocketActor<C, S> {
-    pub fn new(args: WebSocketActorArgs<S>, credentials: Option<C::Credentials>) -> Self {
+impl<S: WsDataSink> PublicWsActor<S> {
+    pub fn new(args: PublicWsActorArgs<S>) -> Self {
         Self {
             conn_id: args.conn_id,
-            conn_type: args.conn_type,
             url: args.url,
-            credentials,
+            exchange: args.exchange,
             data_sink: args.data_sink,
             write_tx: None,
-            _marker: std::marker::PhantomData,
         }
     }
 
@@ -112,21 +94,18 @@ impl<C: ExchangeConfig, S: WsDataSink> WebSocketActor<C, S> {
     }
 }
 
-impl<C: ExchangeConfig, S: WsDataSink> Actor for WebSocketActor<C, S> {
+impl<S: WsDataSink> Actor for PublicWsActor<S> {
     type Mailbox = UnboundedMailbox<Self>;
 
     fn name() -> &'static str {
-        "WebSocketActor"
+        "PublicWsActor"
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        use crate::exchange::subscriber::ParsedMessage;
-
         tracing::debug!(
-            exchange = %C::EXCHANGE,
+            exchange = %self.exchange,
             conn_id = self.conn_id.0,
-            conn_type = ?self.conn_type,
-            "WebSocketActor starting, connecting..."
+            "PublicWsActor starting, connecting..."
         );
 
         // 建立 WebSocket 连接
@@ -134,82 +113,26 @@ impl<C: ExchangeConfig, S: WsDataSink> Actor for WebSocketActor<C, S> {
             WsError::Network(format!("Connect failed: {}", e))
         })?;
 
-        let (mut write, mut read) = ws_stream.0.split();
-
-        // Private 连接需要认证
-        if self.conn_type == ConnectionType::Private {
-            if let Some(ref credentials) = self.credentials {
-                let auth_msg = C::build_auth_msg(credentials);
-                if !auth_msg.is_empty() {
-                    write.send(WsMessage::Text(auth_msg)).await.map_err(|e| {
-                        WsError::AuthFailed(format!("Auth send failed: {}", e))
-                    })?;
-
-                    // 等待 login 成功响应
-                    tracing::debug!(
-                        exchange = %C::EXCHANGE,
-                        conn_id = self.conn_id.0,
-                        "Waiting for login response..."
-                    );
-
-                    loop {
-                        match read.next().await {
-                            Some(Ok(WsMessage::Text(text))) => {
-                                if let Some(parsed) = C::parse_message(&text) {
-                                    match parsed {
-                                        ParsedMessage::Subscribed => {
-                                            tracing::info!(
-                                                exchange = %C::EXCHANGE,
-                                                conn_id = self.conn_id.0,
-                                                "Login successful"
-                                            );
-                                            break;
-                                        }
-                                        _ => {
-                                            // 其他消息忽略，继续等待
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Ok(WsMessage::Ping(data))) => {
-                                let _ = write.send(WsMessage::Pong(data)).await;
-                            }
-                            Some(Ok(WsMessage::Close(_))) | None => {
-                                return Err(WsError::AuthFailed(
-                                    "Connection closed before login success".to_string(),
-                                )
-                                .into());
-                            }
-                            Some(Err(e)) => {
-                                return Err(
-                                    WsError::AuthFailed(format!("WebSocket error: {}", e)).into()
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
+        let (write, read) = ws_stream.0.split();
 
         tracing::info!(
-            exchange = %C::EXCHANGE,
+            exchange = %self.exchange,
             conn_id = self.conn_id.0,
-            conn_type = ?self.conn_type,
-            "WebSocket connected and ready"
+            "Public WebSocket connected"
         );
 
         // 创建写入通道
-        let (write_tx, mut write_rx) = mpsc::channel::<String>(64);
+        let (write_tx, write_rx) = mpsc::channel::<String>(64);
         self.write_tx = Some(write_tx);
 
-        // 启动内部 ws_loop 任务
+        // 启动 ws_loop 任务
         let weak_ref = actor_ref.downgrade();
         let data_sink = self.data_sink.clone();
         let conn_id = self.conn_id;
+        let exchange = self.exchange;
 
         tokio::spawn(async move {
-            run_ws_loop::<C, S>(read, write, &mut write_rx, data_sink, conn_id, weak_ref).await;
+            run_ws_loop(read, write, write_rx, data_sink, conn_id, exchange, weak_ref).await;
         });
 
         Ok(())
@@ -220,14 +143,13 @@ impl<C: ExchangeConfig, S: WsDataSink> Actor for WebSocketActor<C, S> {
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> Result<(), BoxError> {
-        // 关闭写入通道，触发 ws_loop 退出
         self.write_tx = None;
 
         tracing::debug!(
-            exchange = %C::EXCHANGE,
+            exchange = %self.exchange,
             conn_id = self.conn_id.0,
             reason = ?reason,
-            "WebSocketActor stopped"
+            "PublicWsActor stopped"
         );
         Ok(())
     }
@@ -238,7 +160,7 @@ impl<C: ExchangeConfig, S: WsDataSink> Actor for WebSocketActor<C, S> {
 /// 发送消息到 WebSocket
 pub struct SendMessage(pub String);
 
-impl<C: ExchangeConfig, S: WsDataSink> Message<SendMessage> for WebSocketActor<C, S> {
+impl<S: WsDataSink> Message<SendMessage> for PublicWsActor<S> {
     type Reply = bool;
 
     async fn handle(
@@ -254,27 +176,27 @@ impl<C: ExchangeConfig, S: WsDataSink> Message<SendMessage> for WebSocketActor<C
     }
 }
 
-// === WebSocket 连接循环 ===
+// === WebSocket Loop ===
 
-async fn run_ws_loop<C: ExchangeConfig, S: WsDataSink>(
+async fn run_ws_loop<S: WsDataSink>(
     mut read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
         + Unpin
         + Send,
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
-    write_rx: &mut mpsc::Receiver<String>,
+    mut write_rx: mpsc::Receiver<String>,
     data_sink: Arc<S>,
     conn_id: ConnectionId,
-    weak_ref: WeakActorRef<WebSocketActor<C, S>>,
+    exchange: Exchange,
+    weak_ref: WeakActorRef<PublicWsActor<S>>,
 ) {
     loop {
         tokio::select! {
-            // 发送请求
             msg = write_rx.recv() => {
                 match msg {
                     Some(text) => {
                         if write.send(WsMessage::Text(text)).await.is_err() {
                             tracing::warn!(
-                                exchange = %C::EXCHANGE,
+                                exchange = %exchange,
                                 conn_id = conn_id.0,
                                 "WebSocket send failed, exiting loop"
                             );
@@ -282,14 +204,12 @@ async fn run_ws_loop<C: ExchangeConfig, S: WsDataSink>(
                         }
                     }
                     None => {
-                        // write_rx 关闭 (Actor 停止)，正常退出
                         let _ = write.close().await;
-                        return; // 不触发 stop，因为 Actor 已经在停止
+                        return;
                     }
                 }
             }
 
-            // 接收 WebSocket 消息
             ws_msg = read.next() => {
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
@@ -300,7 +220,7 @@ async fn run_ws_loop<C: ExchangeConfig, S: WsDataSink>(
                     }
                     Some(Ok(WsMessage::Close(_))) => {
                         tracing::warn!(
-                            exchange = %C::EXCHANGE,
+                            exchange = %exchange,
                             conn_id = conn_id.0,
                             "WebSocket closed by server"
                         );
@@ -308,7 +228,7 @@ async fn run_ws_loop<C: ExchangeConfig, S: WsDataSink>(
                     }
                     Some(Err(e)) => {
                         tracing::warn!(
-                            exchange = %C::EXCHANGE,
+                            exchange = %exchange,
                             conn_id = conn_id.0,
                             error = %e,
                             "WebSocket error"
@@ -317,7 +237,7 @@ async fn run_ws_loop<C: ExchangeConfig, S: WsDataSink>(
                     }
                     None => {
                         tracing::warn!(
-                            exchange = %C::EXCHANGE,
+                            exchange = %exchange,
                             conn_id = conn_id.0,
                             "WebSocket stream ended"
                         );
@@ -329,7 +249,6 @@ async fn run_ws_loop<C: ExchangeConfig, S: WsDataSink>(
         }
     }
 
-    // stream 结束或错误，触发 Actor die
     if let Some(actor_ref) = weak_ref.upgrade() {
         actor_ref.stop_gracefully().await.ok();
     }

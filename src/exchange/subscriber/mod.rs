@@ -3,6 +3,11 @@
 //! 定义订阅类型、市场数据、解析消息等核心类型
 
 use crate::domain::{Balance, Exchange, FundingRate, OrderUpdate, Position, Symbol, BBO};
+use crate::exchange::actor::private_ws::PrivateConnectionHandle;
+use crate::exchange::actor::public_ws::{ConnectionId, WsDataSink, WsError};
+use async_trait::async_trait;
+use kameo::actor::ActorRef;
+use std::sync::Arc;
 
 /// 订阅类型
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -100,6 +105,7 @@ pub enum ParsedMessage {
 /// 交易所配置 trait
 ///
 /// 通过泛型参数化交易所差异，避免 if 分发
+#[async_trait]
 pub trait ExchangeConfig: Send + Sync + 'static {
     /// 交易所标识
     const EXCHANGE: Exchange;
@@ -107,26 +113,36 @@ pub trait ExchangeConfig: Send + Sync + 'static {
     /// Public WebSocket URL
     const PUBLIC_WS_URL: &'static str;
 
-    /// Private WebSocket URL
-    const PRIVATE_WS_URL: &'static str;
-
     /// 单个 WebSocket 连接的最大订阅数
     const MAX_SUBSCRIPTIONS_PER_CONN: usize;
 
     /// 凭证类型
     type Credentials: Send + Sync + Clone;
 
-    /// 构建订阅消息 JSON
+    /// REST 客户端类型 (用于私有连接)
+    type RestClient: Send + Sync + 'static;
+
+    /// 构建订阅消息 JSON (仅用于 Public 连接)
     fn build_subscribe_msg(kinds: &[SubscriptionKind]) -> String;
 
-    /// 构建取消订阅消息 JSON
+    /// 构建取消订阅消息 JSON (仅用于 Public 连接)
     fn build_unsubscribe_msg(kinds: &[SubscriptionKind]) -> String;
 
     /// 解析 WebSocket 消息
     fn parse_message(raw: &str) -> Option<ParsedMessage>;
 
-    /// 构建认证消息 (用于 private WebSocket)
-    fn build_auth_msg(credentials: &Self::Credentials) -> String;
+    /// 创建私有连接
+    ///
+    /// 各交易所实现自己的私有连接逻辑：
+    /// - Binance: 获取 ListenKey，连接带 key 的 URL，启动续期定时器
+    /// - OKX: 连接固定 URL，发送 login 消息，等待响应
+    async fn create_private_connection<S: WsDataSink>(
+        credentials: &Self::Credentials,
+        rest_client: Arc<Self::RestClient>,
+        data_sink: Arc<S>,
+        conn_id: ConnectionId,
+        link_to: ActorRef<impl kameo::Actor>,
+    ) -> Result<Box<dyn PrivateConnectionHandle>, WsError>;
 
     /// 是否需要定期发送 ping 保活
     fn needs_ping() -> bool {

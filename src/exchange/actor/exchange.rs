@@ -6,9 +6,9 @@
 //! - 使用 spawn_link 创建 WebSocketActor
 //! - on_link_died 时根据错误类型决定重启或级联 die
 
-use super::ws::{
-    ConnectionId, ConnectionType, SendMessage, WebSocketActor, WebSocketActorArgs, WsData,
-    WsDataSink,
+use super::private_ws::PrivateConnectionHandle;
+use super::public_ws::{
+    ConnectionId, PublicWsActor, PublicWsActorArgs, SendMessage, WsData, WsDataSink,
 };
 use crate::domain::{Symbol, SymbolMeta};
 use crate::exchange::subscriber::{
@@ -37,6 +37,8 @@ pub struct ExchangeActorArgs<C: ExchangeConfig, S: MarketDataSink> {
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 认证凭证
     pub credentials: C::Credentials,
+    /// REST 客户端
+    pub rest_client: Arc<C::RestClient>,
     /// 数据接收器 (父 Actor)
     pub data_sink: Arc<S>,
 }
@@ -75,6 +77,13 @@ impl FundingState {
     }
 }
 
+/// 连接类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionType {
+    Public,
+    Private,
+}
+
 /// 连接信息 (用于重启)
 #[derive(Debug, Clone)]
 struct ConnectionInfo {
@@ -102,11 +111,15 @@ pub struct ExchangeActor<C: ExchangeConfig, S: MarketDataSink> {
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 认证凭证
     credentials: C::Credentials,
+    /// REST 客户端
+    rest_client: Arc<C::RestClient>,
     /// 数据接收器 (父 Actor)
     data_sink: Arc<S>,
 
-    /// WebSocket actors (ConnectionId -> ActorRef)
-    ws_actors: HashMap<ConnectionId, ActorRef<WebSocketActor<C, ExchangeDataSink<C, S>>>>,
+    /// Public WebSocket actors (ConnectionId -> ActorRef)
+    public_actors: HashMap<ConnectionId, ActorRef<PublicWsActor<ExchangeDataSink<C, S>>>>,
+    /// Private connection handle (最多一个)
+    private_handle: Option<Box<dyn PrivateConnectionHandle>>,
     /// ActorID -> ConnectionId 映射 (用于 on_link_died)
     actor_to_conn: HashMap<ActorID, ConnectionId>,
     /// 连接信息 (用于重启)
@@ -138,8 +151,10 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
         Self {
             symbol_metas: args.symbol_metas,
             credentials: args.credentials,
+            rest_client: args.rest_client,
             data_sink: args.data_sink,
-            ws_actors: HashMap::new(),
+            public_actors: HashMap::new(),
+            private_handle: None,
             actor_to_conn: HashMap::new(),
             conn_info: HashMap::new(),
             subscription_to_conn: HashMap::new(),
@@ -192,8 +207,7 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
         }
 
         // 创建新的 public 连接
-        self.create_ws_actor(actor_ref, ConnectionType::Public, C::PUBLIC_WS_URL)
-            .await
+        self.create_public_actor(actor_ref).await
     }
 
     /// 确保 private 连接存在
@@ -201,59 +215,47 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
         &mut self,
         actor_ref: &ActorRef<Self>,
     ) -> Result<ConnectionId, SubscribeError> {
-        // 查找已有的 private 连接
-        for (id, info) in &self.conn_info {
-            if info.conn_type == ConnectionType::Private {
-                return Ok(*id);
-            }
+        // 如果已有 private 连接，返回其 conn_id
+        if let Some(handle) = &self.private_handle {
+            return Ok(handle.conn_id());
         }
 
         // 创建新的 private 连接
-        self.create_ws_actor(actor_ref, ConnectionType::Private, C::PRIVATE_WS_URL)
-            .await
+        self.create_private_connection(actor_ref).await
     }
 
-    /// 使用 spawn_link 创建 WebSocketActor
-    async fn create_ws_actor(
+    /// 使用 spawn_link 创建 PublicWsActor
+    async fn create_public_actor(
         &mut self,
         actor_ref: &ActorRef<Self>,
-        conn_type: ConnectionType,
-        url: &str,
     ) -> Result<ConnectionId, SubscribeError> {
         let conn_id = self.alloc_conn_id();
 
-        // 创建 ws_data_sink (WebSocketActor → ExchangeActor)
+        // 创建 ws_data_sink (PublicWsActor → ExchangeActor)
         let ws_data_sink = Arc::new(ExchangeDataSink::<C, S> {
             actor_ref: actor_ref.downgrade(),
         });
 
-        // 创建 WebSocketActor 参数
-        let ws_args = WebSocketActorArgs {
+        // 创建 PublicWsActor 参数
+        let ws_args = PublicWsActorArgs {
             conn_id,
-            conn_type,
-            url: url.to_string(),
+            url: C::PUBLIC_WS_URL.to_string(),
+            exchange: C::EXCHANGE,
             data_sink: ws_data_sink,
         };
 
-        // 准备凭证
-        let credentials = if conn_type == ConnectionType::Private {
-            Some(self.credentials.clone())
-        } else {
-            None
-        };
-
-        // 使用 spawn_link 创建并链接 WebSocketActor
-        let ws_actor = spawn_link(actor_ref, WebSocketActor::<C, _>::new(ws_args, credentials)).await;
+        // 使用 spawn_link 创建并链接 PublicWsActor
+        let ws_actor = spawn_link(actor_ref, PublicWsActor::new(ws_args)).await;
 
         // 记录 ActorID -> ConnectionId 映射
         self.actor_to_conn.insert(ws_actor.id(), conn_id);
 
         // 记录连接信息
-        self.ws_actors.insert(conn_id, ws_actor);
+        self.public_actors.insert(conn_id, ws_actor);
         self.conn_info.insert(
             conn_id,
             ConnectionInfo {
-                conn_type,
+                conn_type: ConnectionType::Public,
                 subscriptions: HashSet::new(),
             },
         );
@@ -261,15 +263,60 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
         tracing::info!(
             exchange = %C::EXCHANGE,
             conn_id = conn_id.0,
-            conn_type = ?conn_type,
-            "WebSocketActor created with spawn_link"
+            "PublicWsActor created with spawn_link"
         );
 
         Ok(conn_id)
     }
 
-    /// 重启 WebSocketActor (在 on_link_died 中调用)
-    async fn restart_ws_actor(
+    /// 使用 ExchangeConfig::create_private_connection 创建私有连接
+    async fn create_private_connection(
+        &mut self,
+        actor_ref: &ActorRef<Self>,
+    ) -> Result<ConnectionId, SubscribeError> {
+        let conn_id = self.alloc_conn_id();
+
+        // 创建 ws_data_sink (PrivateWsActor → ExchangeActor)
+        let ws_data_sink = Arc::new(ExchangeDataSink::<C, S> {
+            actor_ref: actor_ref.downgrade(),
+        });
+
+        // 调用交易所特定的创建方法
+        let handle = C::create_private_connection(
+            &self.credentials,
+            self.rest_client.clone(),
+            ws_data_sink,
+            conn_id,
+            actor_ref.clone(),
+        )
+        .await
+        .map_err(|e| SubscribeError::ConnectionFailed(e.to_string()))?;
+
+        // 记录 ActorID -> ConnectionId 映射
+        self.actor_to_conn.insert(handle.actor_id(), conn_id);
+
+        // 记录连接信息
+        self.conn_info.insert(
+            conn_id,
+            ConnectionInfo {
+                conn_type: ConnectionType::Private,
+                subscriptions: HashSet::new(),
+            },
+        );
+
+        self.private_handle = Some(handle);
+
+        tracing::info!(
+            exchange = %C::EXCHANGE,
+            conn_id = conn_id.0,
+            "Private connection created with spawn_link"
+        );
+
+        Ok(conn_id)
+    }
+
+    /// 重启 PublicWsActor (在 on_link_died 中调用)
+    async fn restart_public_actor(
         &mut self,
         actor_ref: &ActorRef<Self>,
         conn_id: ConnectionId,
@@ -279,40 +326,27 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
             SubscribeError::ConnectionFailed(format!("Connection {} not found", conn_id.0))
         })?;
 
-        // 创建 ws_data_sink (WebSocketActor → ExchangeActor)
+        // 创建 ws_data_sink (PublicWsActor → ExchangeActor)
         let ws_data_sink = Arc::new(ExchangeDataSink::<C, S> {
             actor_ref: actor_ref.downgrade(),
         });
 
-        // 确定 URL
-        let url = match info.conn_type {
-            ConnectionType::Public => C::PUBLIC_WS_URL,
-            ConnectionType::Private => C::PRIVATE_WS_URL,
-        };
-
-        // 创建 WebSocketActor 参数
-        let ws_args = WebSocketActorArgs {
+        // 创建 PublicWsActor 参数
+        let ws_args = PublicWsActorArgs {
             conn_id,
-            conn_type: info.conn_type,
-            url: url.to_string(),
+            url: C::PUBLIC_WS_URL.to_string(),
+            exchange: C::EXCHANGE,
             data_sink: ws_data_sink,
         };
 
-        // 准备凭证
-        let credentials = if info.conn_type == ConnectionType::Private {
-            Some(self.credentials.clone())
-        } else {
-            None
-        };
-
-        // 使用 spawn_link 创建新的 WebSocketActor
-        let ws_actor = spawn_link(actor_ref, WebSocketActor::<C, _>::new(ws_args, credentials)).await;
+        // 使用 spawn_link 创建新的 PublicWsActor
+        let ws_actor = spawn_link(actor_ref, PublicWsActor::new(ws_args)).await;
 
         // 更新 ActorID -> ConnectionId 映射
         self.actor_to_conn.insert(ws_actor.id(), conn_id);
 
-        // 更新 ws_actors
-        self.ws_actors.insert(conn_id, ws_actor.clone());
+        // 更新 public_actors
+        self.public_actors.insert(conn_id, ws_actor.clone());
 
         // 重新发送订阅
         for kind in &info.subscriptions {
@@ -326,7 +360,57 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
             exchange = %C::EXCHANGE,
             conn_id = conn_id.0,
             subscriptions = info.subscriptions.len(),
-            "WebSocketActor restarted"
+            "PublicWsActor restarted"
+        );
+
+        Ok(())
+    }
+
+    /// 重启 Private 连接 (在 on_link_died 中调用)
+    async fn restart_private_connection(
+        &mut self,
+        actor_ref: &ActorRef<Self>,
+        conn_id: ConnectionId,
+    ) -> Result<(), SubscribeError> {
+        // 获取连接信息
+        let info = self.conn_info.get(&conn_id).cloned().ok_or_else(|| {
+            SubscribeError::ConnectionFailed(format!("Connection {} not found", conn_id.0))
+        })?;
+
+        // 创建 ws_data_sink
+        let ws_data_sink = Arc::new(ExchangeDataSink::<C, S> {
+            actor_ref: actor_ref.downgrade(),
+        });
+
+        // 调用交易所特定的创建方法
+        let handle = C::create_private_connection(
+            &self.credentials,
+            self.rest_client.clone(),
+            ws_data_sink,
+            conn_id,
+            actor_ref.clone(),
+        )
+        .await
+        .map_err(|e| SubscribeError::ConnectionFailed(e.to_string()))?;
+
+        // 更新 ActorID -> ConnectionId 映射
+        self.actor_to_conn.insert(handle.actor_id(), conn_id);
+
+        // 重新发送订阅
+        for kind in &info.subscriptions {
+            let msg = C::build_subscribe_msg(&[kind.clone()]);
+            if !msg.is_empty() {
+                handle.send_message(msg).await;
+            }
+        }
+
+        self.private_handle = Some(handle);
+
+        tracing::info!(
+            exchange = %C::EXCHANGE,
+            conn_id = conn_id.0,
+            subscriptions = info.subscriptions.len(),
+            "Private connection restarted"
         );
 
         Ok(())
@@ -334,20 +418,48 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
 
     /// 发送订阅消息到 WebSocket
     async fn send_subscribe(&self, conn_id: ConnectionId, kind: &SubscriptionKind) {
-        if let Some(ws_actor) = self.ws_actors.get(&conn_id) {
-            let msg = C::build_subscribe_msg(&[kind.clone()]);
-            if !msg.is_empty() {
-                let _ = ws_actor.tell(SendMessage(msg)).await;
+        let msg = C::build_subscribe_msg(&[kind.clone()]);
+        if msg.is_empty() {
+            return;
+        }
+
+        // 检查连接类型
+        if let Some(info) = self.conn_info.get(&conn_id) {
+            match info.conn_type {
+                ConnectionType::Public => {
+                    if let Some(actor) = self.public_actors.get(&conn_id) {
+                        let _ = actor.tell(SendMessage(msg)).await;
+                    }
+                }
+                ConnectionType::Private => {
+                    if let Some(handle) = &self.private_handle {
+                        handle.send_message(msg).await;
+                    }
+                }
             }
         }
     }
 
     /// 发送取消订阅消息到 WebSocket
     async fn send_unsubscribe(&self, conn_id: ConnectionId, kind: &SubscriptionKind) {
-        if let Some(ws_actor) = self.ws_actors.get(&conn_id) {
-            let msg = C::build_unsubscribe_msg(&[kind.clone()]);
-            if !msg.is_empty() {
-                let _ = ws_actor.tell(SendMessage(msg)).await;
+        let msg = C::build_unsubscribe_msg(&[kind.clone()]);
+        if msg.is_empty() {
+            return;
+        }
+
+        // 检查连接类型
+        if let Some(info) = self.conn_info.get(&conn_id) {
+            match info.conn_type {
+                ConnectionType::Public => {
+                    if let Some(actor) = self.public_actors.get(&conn_id) {
+                        let _ = actor.tell(SendMessage(msg)).await;
+                    }
+                }
+                ConnectionType::Private => {
+                    if let Some(handle) = &self.private_handle {
+                        handle.send_message(msg).await;
+                    }
+                }
             }
         }
     }
@@ -356,10 +468,17 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
     fn cleanup_empty_connection(&mut self, conn_id: ConnectionId) {
         if let Some(info) = self.conn_info.get(&conn_id) {
             if info.subscriptions.is_empty() {
-                // 移除连接
-                if let Some(ws_actor) = self.ws_actors.remove(&conn_id) {
-                    self.actor_to_conn.remove(&ws_actor.id());
-                    // 不调用 stop_gracefully，因为我们是链接的，它会收到通知
+                match info.conn_type {
+                    ConnectionType::Public => {
+                        if let Some(ws_actor) = self.public_actors.remove(&conn_id) {
+                            self.actor_to_conn.remove(&ws_actor.id());
+                        }
+                    }
+                    ConnectionType::Private => {
+                        if let Some(handle) = self.private_handle.take() {
+                            self.actor_to_conn.remove(&handle.actor_id());
+                        }
+                    }
                 }
                 self.conn_info.remove(&conn_id);
                 self.reconnect_backoff.remove(&conn_id);
@@ -497,14 +616,24 @@ impl<C: ExchangeConfig, S: MarketDataSink> Actor for ExchangeActor<C, S> {
             }
         };
 
-        // 从 ws_actors 中移除
-        self.ws_actors.remove(&conn_id);
+        // 从对应的 map 中移除
+        let conn_type = self.conn_info.get(&conn_id).map(|i| i.conn_type);
+        match conn_type {
+            Some(ConnectionType::Public) => {
+                self.public_actors.remove(&conn_id);
+            }
+            Some(ConnectionType::Private) => {
+                self.private_handle = None;
+            }
+            None => {}
+        }
 
         tracing::warn!(
             exchange = %C::EXCHANGE,
             conn_id = conn_id.0,
+            conn_type = ?conn_type,
             reason = ?reason,
-            "WebSocketActor died"
+            "WebSocket actor died"
         );
 
         // 判断是否可恢复
@@ -516,20 +645,32 @@ impl<C: ExchangeConfig, S: MarketDataSink> Actor for ExchangeActor<C, S> {
                 exchange = %C::EXCHANGE,
                 conn_id = conn_id.0,
                 backoff_ms = backoff.as_millis(),
-                "Will restart WebSocketActor after backoff"
+                "Will restart WebSocket actor after backoff"
             );
 
             // 等待退避时间
             tokio::time::sleep(backoff).await;
 
-            // 重启 WebSocketActor
+            // 根据连接类型重启
             if let Some(ar) = actor_ref.upgrade() {
-                if let Err(e) = self.restart_ws_actor(&ar, conn_id).await {
+                let result = match conn_type {
+                    Some(ConnectionType::Public) => {
+                        self.restart_public_actor(&ar, conn_id).await
+                    }
+                    Some(ConnectionType::Private) => {
+                        self.restart_private_connection(&ar, conn_id).await
+                    }
+                    None => Err(SubscribeError::ConnectionFailed(
+                        "Connection type unknown".to_string(),
+                    )),
+                };
+
+                if let Err(e) = result {
                     tracing::error!(
                         exchange = %C::EXCHANGE,
                         conn_id = conn_id.0,
                         error = %e,
-                        "Failed to restart WebSocketActor"
+                        "Failed to restart WebSocket actor"
                     );
                     // 重启失败，继续尝试...可以选择级联 die
                 }

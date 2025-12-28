@@ -395,6 +395,11 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, _event: &ExchangeEvent, state: &mut StateManager) {
+        tracing::info!(
+            symbol = %self.symbol,
+            event  = ?_event,
+            "Processing event for FundingArbStrategy"
+        );
         // 获取本策略关注的 symbol 状态
         let symbol_state = match state.symbol_state(&self.symbol) {
             Some(s) => s,

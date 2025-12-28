@@ -1,36 +1,39 @@
 //! Binance 交易所配置实现
 
 use crate::domain::Exchange;
+use crate::exchange::actor::public_ws::{ConnectionId, WsDataSink, WsError};
+use crate::exchange::actor::private_ws::PrivateConnectionHandle;
+use crate::exchange::actor::{BinancePrivateHandle, BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
-use crate::exchange::binance::WS_PUBLIC_URL;
+use crate::exchange::binance::{BinanceRestClient, WS_PUBLIC_URL};
 use crate::exchange::subscriber::{ExchangeConfig, ParsedMessage, SubscriptionKind};
+use async_trait::async_trait;
+use kameo::actor::ActorRef;
 use serde_json::json;
+use std::sync::Arc;
 
 /// Binance 凭证
 #[derive(Clone)]
 pub struct BinanceCredentials {
     pub api_key: String,
     pub secret: String,
-    /// ListenKey (由 REST API 获取，用于 private WebSocket)
-    pub listen_key: Option<String>,
 }
 
 /// Binance 交易所配置
 pub struct BinanceConfig;
 
+#[async_trait]
 impl ExchangeConfig for BinanceConfig {
     const EXCHANGE: Exchange = Exchange::Binance;
 
     const PUBLIC_WS_URL: &'static str = WS_PUBLIC_URL;
 
-    // Binance private 使用 ListenKey URL
-    const PRIVATE_WS_URL: &'static str = "wss://fstream.binance.com/ws";
-
     const MAX_SUBSCRIPTIONS_PER_CONN: usize = 200;
 
     type Credentials = BinanceCredentials;
+    type RestClient = BinanceRestClient;
 
     fn build_subscribe_msg(kinds: &[SubscriptionKind]) -> String {
         let mut streams: Vec<String> = Vec::new();
@@ -163,17 +166,20 @@ impl ExchangeConfig for BinanceConfig {
         }
     }
 
-    fn build_auth_msg(_credentials: &Self::Credentials) -> String {
-        // Binance 不需要发送认证消息，使用 ListenKey URL
-        // 但我们需要在 URL 中包含 ListenKey
-        // 这里返回空字符串，实际的 URL 构建在连接时处理
-        String::new()
-    }
-}
+    async fn create_private_connection<S: WsDataSink>(
+        _credentials: &Self::Credentials,
+        rest_client: Arc<Self::RestClient>,
+        data_sink: Arc<S>,
+        conn_id: ConnectionId,
+        link_to: ActorRef<impl kameo::Actor>,
+    ) -> Result<Box<dyn PrivateConnectionHandle>, WsError> {
+        let actor = BinancePrivateWsActor::new(BinancePrivateWsActorArgs {
+            conn_id,
+            rest_client,
+            data_sink,
+        });
 
-impl BinanceConfig {
-    /// 构建 private WebSocket URL (包含 ListenKey)
-    pub fn build_private_ws_url(listen_key: &str) -> String {
-        format!("{}/{}", Self::PRIVATE_WS_URL, listen_key)
+        let actor_ref = kameo::actor::spawn_link(&link_to, actor).await;
+        Ok(Box::new(BinancePrivateHandle::new(actor_ref, conn_id)))
     }
 }

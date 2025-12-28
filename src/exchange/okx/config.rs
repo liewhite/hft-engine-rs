@@ -1,15 +1,18 @@
 //! OKX 交易所配置实现
 
 use crate::domain::Exchange;
+use crate::exchange::actor::public_ws::{ConnectionId, WsDataSink, WsError};
+use crate::exchange::actor::private_ws::PrivateConnectionHandle;
+use crate::exchange::actor::{OkxPrivateHandle, OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsPush,
 };
-use crate::exchange::okx::{WS_PRIVATE_URL, WS_PUBLIC_URL};
+use crate::exchange::okx::{OkxRestClient, WS_PUBLIC_URL};
 use crate::exchange::subscriber::{ExchangeConfig, ParsedMessage, SubscriptionKind};
-use base64::{engine::general_purpose, Engine as _};
-use hmac::{Hmac, Mac};
+use async_trait::async_trait;
+use kameo::actor::ActorRef;
 use serde_json::json;
-use sha2::Sha256;
+use std::sync::Arc;
 
 /// OKX 凭证
 #[derive(Clone)]
@@ -19,40 +22,19 @@ pub struct OkxCredentials {
     pub passphrase: String,
 }
 
-impl OkxCredentials {
-    /// WebSocket 登录签名
-    fn sign_ws_login(&self, timestamp: &str) -> String {
-        let message = format!("{}GET/users/self/verify", timestamp);
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(self.secret.as_bytes()).expect("HMAC accepts any size");
-        mac.update(message.as_bytes());
-        let result = mac.finalize();
-        general_purpose::STANDARD.encode(result.into_bytes())
-    }
-
-    /// Unix 时间戳 (秒)
-    fn unix_timestamp() -> String {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string()
-    }
-}
-
 /// OKX 交易所配置
 pub struct OkxConfig;
 
+#[async_trait]
 impl ExchangeConfig for OkxConfig {
     const EXCHANGE: Exchange = Exchange::OKX;
 
     const PUBLIC_WS_URL: &'static str = WS_PUBLIC_URL;
 
-    const PRIVATE_WS_URL: &'static str = WS_PRIVATE_URL;
-
     const MAX_SUBSCRIPTIONS_PER_CONN: usize = 100;
 
     type Credentials = OkxCredentials;
+    type RestClient = OkxRestClient;
 
     fn build_subscribe_msg(kinds: &[SubscriptionKind]) -> String {
         let mut args = Vec::new();
@@ -213,19 +195,20 @@ impl ExchangeConfig for OkxConfig {
         }
     }
 
-    fn build_auth_msg(credentials: &Self::Credentials) -> String {
-        let timestamp = OkxCredentials::unix_timestamp();
-        let sign = credentials.sign_ws_login(&timestamp);
+    async fn create_private_connection<S: WsDataSink>(
+        credentials: &Self::Credentials,
+        _rest_client: Arc<Self::RestClient>,
+        data_sink: Arc<S>,
+        conn_id: ConnectionId,
+        link_to: ActorRef<impl kameo::Actor>,
+    ) -> Result<Box<dyn PrivateConnectionHandle>, WsError> {
+        let actor = OkxPrivateWsActor::new(OkxPrivateWsActorArgs {
+            conn_id,
+            credentials: credentials.clone(),
+            data_sink,
+        });
 
-        json!({
-            "op": "login",
-            "args": [{
-                "apiKey": credentials.api_key,
-                "passphrase": credentials.passphrase,
-                "timestamp": timestamp,
-                "sign": sign
-            }]
-        })
-        .to_string()
+        let actor_ref = kameo::actor::spawn_link(&link_to, actor).await;
+        Ok(Box::new(OkxPrivateHandle::new(actor_ref, conn_id)))
     }
 }
