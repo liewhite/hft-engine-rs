@@ -117,7 +117,7 @@ impl ExchangeConfig for BinanceConfig {
                 let symbol = update.symbol()?;
                 let next_funding_time = update.t as u64;
 
-                // 使用默认 8h 间隔，SubscriberActor 会根据状态更新
+                // 使用默认 8h 间隔，ExchangeActor 会根据状态更新
                 let rate = update.to_funding_rate(8.0);
                 Some(ParsedMessage::FundingRate {
                     symbol,

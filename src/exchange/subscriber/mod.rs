@@ -1,14 +1,8 @@
-//! WebSocket 订阅器 Actor 模块
+//! WebSocket 订阅模块
 //!
-//! 基于 kameo 框架实现的统一订阅器，合并 public 和 private WebSocket 连接。
+//! 定义订阅类型、市场数据、解析消息等核心类型
 
-mod actor;
-
-pub use actor::SubscriberActor;
-
-use crate::domain::{Balance, Exchange, FundingRate, OrderUpdate, Position, Symbol, SymbolMeta, BBO};
-use std::collections::HashMap;
-use std::sync::Arc;
+use crate::domain::{Balance, Exchange, FundingRate, OrderUpdate, Position, Symbol, BBO};
 
 /// 订阅类型
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -143,14 +137,4 @@ pub trait ExchangeConfig: Send + Sync + 'static {
     fn ping_msg() -> Option<String> {
         None
     }
-}
-
-/// SubscriberActor 的初始化参数
-pub struct SubscriberArgs<C: ExchangeConfig> {
-    /// Symbol 元数据 (用于 qty 归一化)
-    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 认证凭证 (用于 private WebSocket)
-    pub credentials: C::Credentials,
-    /// 数据输出 channel
-    pub data_sink: tokio::sync::mpsc::Sender<MarketData>,
 }

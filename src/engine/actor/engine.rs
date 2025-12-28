@@ -51,8 +51,6 @@ trait ExchangeActorHandle: Send + Sync {
     fn actor_id(&self) -> ActorID;
     /// 发送订阅请求
     async fn subscribe(&self, kind: SubscriptionKind);
-    /// 停止 Actor
-    async fn stop(&self);
 }
 
 /// 为 ActorRef<ExchangeActor<C, S>> 实现 ExchangeActorHandle
@@ -68,10 +66,6 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActorHandle
         if let Err(e) = self.tell(Subscribe { kind }).await {
             tracing::error!(error = %e, "Failed to send Subscribe message");
         }
-    }
-
-    async fn stop(&self) {
-        self.stop_gracefully().await.ok();
     }
 }
 
