@@ -2,6 +2,7 @@
 //!
 //! 接收 MarketData，转换为 ExchangeEvent，调用 Strategy.on_event()
 
+use super::SignalProcessorActor;
 use crate::domain::{now_ms, Exchange, Order, Symbol, SymbolMeta};
 use crate::exchange::MarketData;
 use crate::messaging::{ExchangeEvent, StateManager};
@@ -21,8 +22,8 @@ pub struct ExecutorArgs {
     pub strategy: Box<dyn Strategy>,
     /// Symbol 元数据 (用于 qty 转换)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// Signal 输出 channel
-    pub signal_tx: mpsc::Sender<Signal>,
+    /// Signal 处理器 Actor (用于发送 Signal)
+    pub signal_processor: ActorRef<SignalProcessorActor>,
 }
 
 /// ExecutorActor - 执行策略的 Actor
@@ -31,6 +32,12 @@ pub struct ExecutorActor {
     strategy: Box<dyn Strategy>,
     /// 状态管理器
     state_manager: StateManager,
+    /// Signal 处理器 Actor
+    signal_processor: ActorRef<SignalProcessorActor>,
+    /// Symbol 元数据 (用于 qty 转换)
+    symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+    /// 内部 Signal 接收器 (用于收集 StateManager 产生的 Signal)
+    signal_rx: mpsc::Receiver<Signal>,
 }
 
 impl ExecutorActor {
@@ -43,15 +50,8 @@ impl ExecutorActor {
             .flat_map(|m| m.keys().cloned())
             .collect();
 
-        // 创建内部 signal channel (用于 qty 转换)
-        let (internal_tx, internal_rx) = mpsc::channel::<Signal>(256);
-
-        // 启动 qty 转换任务
-        let metas = args.symbol_metas.clone();
-        let external_tx = args.signal_tx.clone();
-        tokio::spawn(async move {
-            signal_converter(internal_rx, external_tx, metas).await;
-        });
+        // 创建内部 signal channel (StateManager 将 Signal 发送到这里)
+        let (internal_tx, signal_rx) = mpsc::channel::<Signal>(256);
 
         // 创建状态管理器
         let order_timeout_ms = args.strategy.order_timeout_ms();
@@ -60,21 +60,48 @@ impl ExecutorActor {
         Self {
             strategy: args.strategy,
             state_manager,
+            signal_processor: args.signal_processor,
+            symbol_metas: args.symbol_metas,
+            signal_rx,
         }
     }
 
     /// 处理 MarketData，转换为 ExchangeEvent 并调用策略
-    fn handle_market_data(&mut self, data: MarketData) {
+    async fn handle_market_data(&mut self, data: MarketData) {
         let event = market_data_to_event(data);
         self.state_manager.apply(&event);
         self.strategy.on_event(&event, &mut self.state_manager);
+
+        // 收集并处理产生的 Signal
+        self.process_pending_signals().await;
     }
 
     /// 处理 Clock 事件
-    fn handle_clock(&mut self, timestamp: u64) {
+    async fn handle_clock(&mut self, timestamp: u64) {
         let event = ExchangeEvent::Clock { timestamp };
         self.state_manager.apply(&event);
         self.strategy.on_event(&event, &mut self.state_manager);
+
+        // 收集并处理产生的 Signal
+        self.process_pending_signals().await;
+    }
+
+    /// 处理内部 channel 中待处理的 Signal
+    async fn process_pending_signals(&mut self) {
+        // 非阻塞地从 channel 中读取所有待处理的 signal
+        while let Ok(signal) = self.signal_rx.try_recv() {
+            // 转换 Signal (qty 转换)
+            let converted = match signal {
+                Signal::PlaceOrder(order) => {
+                    Signal::PlaceOrder(convert_order(&order, &self.symbol_metas))
+                }
+            };
+
+            // 发送到 SignalProcessorActor
+            if let Err(e) = self.signal_processor.tell(converted).await {
+                tracing::error!(error = %e, "Failed to send signal to SignalProcessorActor");
+            }
+        }
     }
 }
 
@@ -102,12 +129,12 @@ impl Actor for ExecutorActor {
 
 // === Messages ===
 
-/// MarketData 消息 - 从 SubscriberActor 接收
+/// MarketData 消息 - 从 EngineActor 接收
 impl Message<MarketData> for ExecutorActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: MarketData, _ctx: Context<'_, Self, Self::Reply>) {
-        self.handle_market_data(msg);
+        self.handle_market_data(msg).await;
     }
 }
 
@@ -121,7 +148,7 @@ impl Message<ClockTick> for ExecutorActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: ClockTick, _ctx: Context<'_, Self, Self::Reply>) {
-        self.handle_clock(msg.timestamp);
+        self.handle_clock(msg.timestamp).await;
     }
 }
 
@@ -182,24 +209,6 @@ fn market_data_to_event(data: MarketData) -> ExchangeEvent {
             equity: value,
             timestamp,
         },
-    }
-}
-
-/// Signal 转换任务：coin_to_qty + round
-async fn signal_converter(
-    mut rx: mpsc::Receiver<Signal>,
-    tx: mpsc::Sender<Signal>,
-    metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-) {
-    while let Some(signal) = rx.recv().await {
-        match signal {
-            Signal::PlaceOrder(order) => {
-                let converted = convert_order(&order, &metas);
-                if tx.send(Signal::PlaceOrder(converted)).await.is_err() {
-                    break;
-                }
-            }
-        }
     }
 }
 

@@ -24,16 +24,21 @@ use kameo::Actor;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+
+/// MarketData 接收器 trait (用于类型擦除)
+#[async_trait::async_trait]
+pub trait MarketDataSink: Send + Sync + 'static {
+    async fn send_market_data(&self, data: MarketData);
+}
 
 /// ExchangeActor 初始化参数
-pub struct ExchangeActorArgs<C: ExchangeConfig> {
+pub struct ExchangeActorArgs<C: ExchangeConfig, S: MarketDataSink> {
     /// Symbol 元数据 (用于 qty 归一化)
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 认证凭证
     pub credentials: C::Credentials,
-    /// 数据输出 channel (临时保留，Phase 4 会移除)
-    pub data_sink: mpsc::Sender<MarketData>,
+    /// 数据接收器 (父 Actor)
+    pub data_sink: Arc<S>,
 }
 
 /// 单个 symbol 的 funding 状态 (用于动态计算结算间隔)
@@ -78,12 +83,12 @@ struct ConnectionInfo {
 }
 
 /// ExchangeActor 的数据接收器 (实现 WsDataSink)
-struct ExchangeDataSink<C: ExchangeConfig> {
-    actor_ref: WeakActorRef<ExchangeActor<C>>,
+struct ExchangeDataSink<C: ExchangeConfig, S: MarketDataSink> {
+    actor_ref: WeakActorRef<ExchangeActor<C, S>>,
 }
 
 #[async_trait::async_trait]
-impl<C: ExchangeConfig> WsDataSink for ExchangeDataSink<C> {
+impl<C: ExchangeConfig, S: MarketDataSink> WsDataSink for ExchangeDataSink<C, S> {
     async fn send_data(&self, data: WsData) {
         if let Some(actor) = self.actor_ref.upgrade() {
             let _ = actor.tell(InternalWsData(data)).await;
@@ -92,16 +97,16 @@ impl<C: ExchangeConfig> WsDataSink for ExchangeDataSink<C> {
 }
 
 /// ExchangeActor - 管理单个交易所的所有 WebSocket 连接
-pub struct ExchangeActor<C: ExchangeConfig> {
+pub struct ExchangeActor<C: ExchangeConfig, S: MarketDataSink> {
     /// Symbol 元数据 (用于 qty 归一化)
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 认证凭证
     credentials: C::Credentials,
-    /// 数据输出 channel (临时保留)
-    data_sink: mpsc::Sender<MarketData>,
+    /// 数据接收器 (父 Actor)
+    data_sink: Arc<S>,
 
     /// WebSocket actors (ConnectionId -> ActorRef)
-    ws_actors: HashMap<ConnectionId, ActorRef<WebSocketActor<C, ExchangeDataSink<C>>>>,
+    ws_actors: HashMap<ConnectionId, ActorRef<WebSocketActor<C, ExchangeDataSink<C, S>>>>,
     /// ActorID -> ConnectionId 映射 (用于 on_link_died)
     actor_to_conn: HashMap<ActorID, ConnectionId>,
     /// 连接信息 (用于重启)
@@ -117,7 +122,7 @@ pub struct ExchangeActor<C: ExchangeConfig> {
     /// 重连退避状态 (ConnectionId -> 当前退避时间毫秒)
     reconnect_backoff: HashMap<ConnectionId, u64>,
 
-    /// Actor 自身引用 (用于创建 data_sink)
+    /// Actor 自身引用
     self_ref: Option<ActorRef<Self>>,
 
     _marker: std::marker::PhantomData<C>,
@@ -128,8 +133,8 @@ const RECONNECT_BACKOFF_INITIAL_MS: u64 = 1000; // 1 秒
 const RECONNECT_BACKOFF_MAX_MS: u64 = 60_000; // 60 秒
 const RECONNECT_BACKOFF_MULTIPLIER: u64 = 2;
 
-impl<C: ExchangeConfig> ExchangeActor<C> {
-    pub fn new(args: ExchangeActorArgs<C>) -> Self {
+impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
+    pub fn new(args: ExchangeActorArgs<C, S>) -> Self {
         Self {
             symbol_metas: args.symbol_metas,
             credentials: args.credentials,
@@ -217,8 +222,8 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
     ) -> Result<ConnectionId, SubscribeError> {
         let conn_id = self.alloc_conn_id();
 
-        // 创建 data_sink
-        let data_sink = Arc::new(ExchangeDataSink {
+        // 创建 ws_data_sink (WebSocketActor → ExchangeActor)
+        let ws_data_sink = Arc::new(ExchangeDataSink::<C, S> {
             actor_ref: actor_ref.downgrade(),
         });
 
@@ -227,7 +232,7 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
             conn_id,
             conn_type,
             url: url.to_string(),
-            data_sink,
+            data_sink: ws_data_sink,
         };
 
         // 准备凭证
@@ -274,8 +279,8 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
             SubscribeError::ConnectionFailed(format!("Connection {} not found", conn_id.0))
         })?;
 
-        // 创建 data_sink
-        let data_sink = Arc::new(ExchangeDataSink {
+        // 创建 ws_data_sink (WebSocketActor → ExchangeActor)
+        let ws_data_sink = Arc::new(ExchangeDataSink::<C, S> {
             actor_ref: actor_ref.downgrade(),
         });
 
@@ -290,7 +295,7 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
             conn_id,
             conn_type: info.conn_type,
             url: url.to_string(),
-            data_sink,
+            data_sink: ws_data_sink,
         };
 
         // 准备凭证
@@ -428,7 +433,7 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
             ParsedMessage::Subscribed | ParsedMessage::Pong | ParsedMessage::Ignored => return,
         };
 
-        let _ = self.data_sink.send(market_data).await;
+        self.data_sink.send_market_data(market_data).await;
     }
 
     /// 判断错误是否可恢复
@@ -445,7 +450,7 @@ impl<C: ExchangeConfig> ExchangeActor<C> {
     }
 }
 
-impl<C: ExchangeConfig> Actor for ExchangeActor<C> {
+impl<C: ExchangeConfig, S: MarketDataSink> Actor for ExchangeActor<C, S> {
     type Mailbox = UnboundedMailbox<Self>;
 
     fn name() -> &'static str {
@@ -566,7 +571,7 @@ impl<C: ExchangeConfig> Actor for ExchangeActor<C> {
 /// 内部消息: WebSocket 数据
 struct InternalWsData(WsData);
 
-impl<C: ExchangeConfig> Message<InternalWsData> for ExchangeActor<C> {
+impl<C: ExchangeConfig, S: MarketDataSink> Message<InternalWsData> for ExchangeActor<C, S> {
     type Reply = ();
 
     async fn handle(&mut self, msg: InternalWsData, _ctx: Context<'_, Self, Self::Reply>) {
@@ -574,7 +579,7 @@ impl<C: ExchangeConfig> Message<InternalWsData> for ExchangeActor<C> {
     }
 }
 
-impl<C: ExchangeConfig> Message<Subscribe> for ExchangeActor<C> {
+impl<C: ExchangeConfig, S: MarketDataSink> Message<Subscribe> for ExchangeActor<C, S> {
     type Reply = ();
 
     async fn handle(&mut self, msg: Subscribe, _ctx: Context<'_, Self, Self::Reply>) {
@@ -628,7 +633,7 @@ impl<C: ExchangeConfig> Message<Subscribe> for ExchangeActor<C> {
     }
 }
 
-impl<C: ExchangeConfig> Message<Unsubscribe> for ExchangeActor<C> {
+impl<C: ExchangeConfig, S: MarketDataSink> Message<Unsubscribe> for ExchangeActor<C, S> {
     type Reply = ();
 
     async fn handle(&mut self, msg: Unsubscribe, _ctx: Context<'_, Self, Self::Reply>) {

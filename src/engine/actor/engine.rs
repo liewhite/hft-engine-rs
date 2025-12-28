@@ -12,13 +12,13 @@ use super::{
 };
 use crate::config::ExchangesConfig;
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::actor::{ExchangeActor, ExchangeActorArgs};
+use crate::exchange::actor::{ExchangeActor, ExchangeActorArgs, MarketDataSink};
 use crate::exchange::binance::{BinanceConfig, BinanceCredentials, BinanceRestClient};
 use crate::exchange::okx::{OkxConfig, OkxCredentials, OkxRestClient};
 use crate::exchange::subscriber::{MarketData, Subscribe, SubscriptionKind};
 use crate::exchange::ExchangeConfig;
 use crate::exchange::{ExchangeExecutor, PublicDataType};
-use crate::strategy::{PublicStreams, Signal, Strategy};
+use crate::strategy::{PublicStreams, Strategy};
 use async_trait::async_trait;
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -27,7 +27,20 @@ use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+
+/// EngineActor 的数据接收器 (实现 MarketDataSink)
+struct EngineDataSink {
+    engine_ref: WeakActorRef<EngineActor>,
+}
+
+#[async_trait]
+impl MarketDataSink for EngineDataSink {
+    async fn send_market_data(&self, data: MarketData) {
+        if let Some(actor) = self.engine_ref.upgrade() {
+            let _ = actor.tell(data).await;
+        }
+    }
+}
 
 // === ExchangeActorHandle trait - 消除 match exchange 分发 ===
 
@@ -42,9 +55,11 @@ trait ExchangeActorHandle: Send + Sync {
     async fn stop(&self);
 }
 
-/// 为 ActorRef<ExchangeActor<C>> 实现 ExchangeActorHandle
+/// 为 ActorRef<ExchangeActor<C, S>> 实现 ExchangeActorHandle
 #[async_trait]
-impl<C: ExchangeConfig> ExchangeActorHandle for ActorRef<ExchangeActor<C>> {
+impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActorHandle
+    for ActorRef<ExchangeActor<C, S>>
+{
     fn actor_id(&self) -> ActorID {
         self.id()
     }
@@ -72,7 +87,7 @@ trait ExchangeFactory: Send + Sync {
         &self,
         engine_ref: &ActorRef<EngineActor>,
         symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-        data_sink: mpsc::Sender<MarketData>,
+        data_sink: Arc<EngineDataSink>,
     ) -> Arc<dyn ExchangeActorHandle>;
 }
 
@@ -95,7 +110,7 @@ impl ExchangeFactory for BinanceFactory {
         &self,
         engine_ref: &ActorRef<EngineActor>,
         symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-        data_sink: mpsc::Sender<MarketData>,
+        data_sink: Arc<EngineDataSink>,
     ) -> Arc<dyn ExchangeActorHandle> {
         let credentials = BinanceCredentials {
             api_key: self.api_key.clone(),
@@ -105,7 +120,7 @@ impl ExchangeFactory for BinanceFactory {
 
         let actor = spawn_link(
             engine_ref,
-            ExchangeActor::<BinanceConfig>::new(ExchangeActorArgs {
+            ExchangeActor::<BinanceConfig, EngineDataSink>::new(ExchangeActorArgs {
                 symbol_metas,
                 credentials,
                 data_sink,
@@ -138,7 +153,7 @@ impl ExchangeFactory for OkxFactory {
         &self,
         engine_ref: &ActorRef<EngineActor>,
         symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-        data_sink: mpsc::Sender<MarketData>,
+        data_sink: Arc<EngineDataSink>,
     ) -> Arc<dyn ExchangeActorHandle> {
         let credentials = OkxCredentials {
             api_key: self.api_key.clone(),
@@ -148,7 +163,7 @@ impl ExchangeFactory for OkxFactory {
 
         let actor = spawn_link(
             engine_ref,
-            ExchangeActor::<OkxConfig>::new(ExchangeActorArgs {
+            ExchangeActor::<OkxConfig, EngineDataSink>::new(ExchangeActorArgs {
                 symbol_metas,
                 credentials,
                 data_sink,
@@ -196,15 +211,10 @@ pub struct EngineActor {
     /// SignalProcessorActor
     signal_processor: Option<ActorRef<SignalProcessorActor>>,
     /// ClockActor
-    clock: Option<ActorRef<ClockActor>>,
+    clock: Option<ActorRef<ClockActor<EngineDataSink>>>,
 
     /// ActorID -> ChildActorKind 映射（用于 on_link_died）
     actor_kinds: HashMap<ActorID, ChildActorKind>,
-
-    /// MarketData 分发任务（临时保留，Phase 4 会移除）
-    dispatcher_task: Option<tokio::task::JoinHandle<()>>,
-    /// Signal 转发任务（临时保留，Phase 4 会移除）
-    forwarder_task: Option<tokio::task::JoinHandle<()>>,
 
     /// Actor 自身引用
     self_ref: Option<ActorRef<Self>>,
@@ -242,8 +252,6 @@ impl EngineActor {
             signal_processor: None,
             clock: None,
             actor_kinds: HashMap::new(),
-            dispatcher_task: None,
-            forwarder_task: None,
             self_ref: None,
         }
     }
@@ -302,7 +310,6 @@ impl EngineActor {
         &mut self,
         actor_ref: &ActorRef<Self>,
         exchange: Exchange,
-        data_tx: mpsc::Sender<MarketData>,
     ) -> Result<(), ExchangeError> {
         let factory = self.factories.get(&exchange).ok_or_else(|| {
             ExchangeError::Other(format!("No factory for exchange {:?}", exchange))
@@ -316,8 +323,13 @@ impl EngineActor {
             .map(|((_, s), m)| (s.clone(), m.clone()))
             .collect();
 
+        // 创建 EngineDataSink (ExchangeActor → EngineActor)
+        let data_sink = Arc::new(EngineDataSink {
+            engine_ref: actor_ref.downgrade(),
+        });
+
         let actor = factory
-            .create_actor_linked(actor_ref, Arc::new(symbol_metas), data_tx)
+            .create_actor_linked(actor_ref, Arc::new(symbol_metas), data_sink)
             .await;
 
         // 记录 ActorID -> Kind 映射
@@ -360,31 +372,6 @@ impl EngineActor {
         aggregated
     }
 
-    /// 启动 MarketData 分发任务（临时保留）
-    fn spawn_market_data_dispatcher(
-        mut data_rx: mpsc::Receiver<MarketData>,
-        executors: Vec<ActorRef<ExecutorActor>>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            while let Some(data) = data_rx.recv().await {
-                for executor in &executors {
-                    let _ = executor.tell(data.clone()).await;
-                }
-            }
-        })
-    }
-
-    /// 启动 Signal 转发任务（临时保留）
-    fn spawn_signal_forwarder(
-        mut signal_rx: mpsc::Receiver<Signal>,
-        processor: ActorRef<SignalProcessorActor>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            while let Some(signal) = signal_rx.recv().await {
-                let _ = processor.tell(signal).await;
-            }
-        })
-    }
 }
 
 impl Actor for EngineActor {
@@ -405,14 +392,6 @@ impl Actor for EngineActor {
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> Result<(), BoxError> {
-        // 停止后台任务
-        if let Some(task) = self.dispatcher_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.forwarder_task.take() {
-            task.abort();
-        }
-
         // 链接的子 Actor 会自动收到通知并停止
         tracing::info!(reason = ?reason, "EngineActor stopped");
         Ok(())
@@ -538,16 +517,12 @@ impl EngineActor {
         self.init_rest_clients(&required_exchanges)?;
         self.fetch_symbol_metas(&aggregated).await?;
 
-        // 3. 创建数据聚合 channel（临时保留）
-        let (data_tx, data_rx) = mpsc::channel::<MarketData>(1024);
-
-        // 4. 使用 spawn_link 创建 ExchangeActors
+        // 3. 使用 spawn_link 创建 ExchangeActors (数据通过 EngineDataSink 发送到 EngineActor)
         for exchange in &required_exchanges {
-            self.create_exchange_actor_linked(&actor_ref, *exchange, data_tx.clone())
-                .await?;
+            self.create_exchange_actor_linked(&actor_ref, *exchange).await?;
         }
 
-        // 5. 发送订阅请求 (无 match 分发)
+        // 4. 发送订阅请求 (无 match 分发)
         for (exchange, symbol_streams) in &aggregated {
             if let Some(actor) = self.exchange_actors.get(exchange) {
                 Self::send_subscriptions(actor.as_ref(), symbol_streams).await;
@@ -559,10 +534,7 @@ impl EngineActor {
             }
         }
 
-        // 6. 创建 Signal channel（临时保留）
-        let (signal_tx, signal_rx) = mpsc::channel::<Signal>(256);
-
-        // 7. 使用 spawn_link 创建 SignalProcessorActor
+        // 5. 使用 spawn_link 创建 SignalProcessorActor
         let signal_processor = spawn_link(
             &actor_ref,
             SignalProcessorActor::new(SignalProcessorArgs {
@@ -574,10 +546,7 @@ impl EngineActor {
             .insert(signal_processor.id(), ChildActorKind::SignalProcessor);
         self.signal_processor = Some(signal_processor.clone());
 
-        // 启动 signal 转发任务（临时保留）
-        self.forwarder_task = Some(Self::spawn_signal_forwarder(signal_rx, signal_processor));
-
-        // 8. 使用 spawn_link 创建 ExecutorActors
+        // 6. 使用 spawn_link 创建 ExecutorActors (Signal 直接发送到 SignalProcessorActor)
         let symbol_metas = Arc::new(self.symbol_metas.clone());
         let strategies = std::mem::take(&mut self.strategies);
 
@@ -587,7 +556,7 @@ impl EngineActor {
                 ExecutorActor::new(ExecutorArgs {
                     strategy,
                     symbol_metas: symbol_metas.clone(),
-                    signal_tx: signal_tx.clone(),
+                    signal_processor: signal_processor.clone(),
                 }),
             )
             .await;
@@ -596,21 +565,24 @@ impl EngineActor {
             self.executor_actors.push(executor);
         }
 
-        // 9. 使用 spawn_link 创建 ClockActor
+        // 7. 使用 spawn_link 创建 ClockActor (Equity 数据通过 EngineDataSink 发送到 EngineActor)
         let binance_executor = self.rests.get(&Exchange::Binance).cloned();
+        let data_sink = Arc::new(EngineDataSink {
+            engine_ref: actor_ref.downgrade(),
+        });
         let clock = spawn_link(
             &actor_ref,
             ClockActor::new(ClockArgs {
                 interval_ms: 1000,
                 binance_executor,
-                data_tx: data_tx.clone(),
+                data_sink,
             }),
         )
         .await;
         self.actor_kinds.insert(clock.id(), ChildActorKind::Clock);
         self.clock = Some(clock.clone());
 
-        // 注册所有 Executor 到 Clock
+        // 8. 注册所有 Executor 到 Clock
         for executor in &self.executor_actors {
             let _ = clock
                 .tell(RegisterExecutor {
@@ -619,13 +591,7 @@ impl EngineActor {
                 .await;
         }
 
-        // 10. 启动 MarketData 分发任务（临时保留）
-        self.dispatcher_task = Some(Self::spawn_market_data_dispatcher(
-            data_rx,
-            self.executor_actors.clone(),
-        ));
-
-        tracing::info!("Engine started successfully with spawn_link");
+        tracing::info!("Engine started successfully");
         Ok(())
     }
 }
@@ -639,5 +605,17 @@ impl Message<Stop> for EngineActor {
     async fn handle(&mut self, _msg: Stop, ctx: Context<'_, Self, Self::Reply>) {
         tracing::info!("Stopping engine...");
         ctx.actor_ref().stop_gracefully().await.ok();
+    }
+}
+
+/// MarketData 处理 - 广播到所有 ExecutorActor
+impl Message<MarketData> for EngineActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: MarketData, _ctx: Context<'_, Self, Self::Reply>) {
+        // 广播到所有 ExecutorActor
+        for executor in &self.executor_actors {
+            let _ = executor.tell(msg.clone()).await;
+        }
     }
 }

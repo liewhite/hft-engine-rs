@@ -6,7 +6,7 @@
 mod exchange;
 mod ws;
 
-pub use exchange::{ExchangeActor, ExchangeActorArgs};
+pub use exchange::{ExchangeActor, ExchangeActorArgs, MarketDataSink};
 pub use ws::{
     ConnectionId, ConnectionType, SendMessage, WebSocketActor, WebSocketActorArgs, WsData,
     WsDataSink, WsError,

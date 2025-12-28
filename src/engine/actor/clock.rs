@@ -5,6 +5,7 @@
 
 use super::executor::{ClockTick, ExecutorActor};
 use crate::domain::{now_ms, Exchange};
+use crate::exchange::actor::MarketDataSink;
 use crate::exchange::MarketData;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -13,39 +14,38 @@ use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 /// ClockActor 初始化参数
-pub struct ClockArgs {
+pub struct ClockArgs<S: MarketDataSink> {
     /// 时钟间隔 (毫秒)
     pub interval_ms: u64,
     /// Binance executor (用于查询 equity)
     pub binance_executor: Option<Arc<dyn crate::exchange::ExchangeExecutor>>,
-    /// MarketData 输出 channel (用于发送 Equity 更新)
-    pub data_tx: mpsc::Sender<MarketData>,
+    /// 数据接收器 (父 Actor)
+    pub data_sink: Arc<S>,
 }
 
 /// ClockActor - 时钟信号广播器
-pub struct ClockActor {
+pub struct ClockActor<S: MarketDataSink> {
     /// 时钟间隔
     interval: Duration,
     /// Binance executor
     binance_executor: Option<Arc<dyn crate::exchange::ExchangeExecutor>>,
-    /// 数据输出
-    data_tx: mpsc::Sender<MarketData>,
+    /// 数据接收器 (父 Actor)
+    data_sink: Arc<S>,
     /// 已注册的 ExecutorActor 列表
     executors: Vec<ActorRef<ExecutorActor>>,
     /// 自身引用
     self_ref: Option<WeakActorRef<Self>>,
 }
 
-impl ClockActor {
+impl<S: MarketDataSink> ClockActor<S> {
     /// 创建 ClockActor
-    pub fn new(args: ClockArgs) -> Self {
+    pub fn new(args: ClockArgs<S>) -> Self {
         Self {
             interval: Duration::from_millis(args.interval_ms),
             binance_executor: args.binance_executor,
-            data_tx: args.data_tx,
+            data_sink: args.data_sink,
             executors: Vec::new(),
             self_ref: None,
         }
@@ -59,9 +59,8 @@ impl ClockActor {
         if let Some(ref executor) = self.binance_executor {
             match executor.fetch_equity().await {
                 Ok(equity) => {
-                    let _ = self
-                        .data_tx
-                        .send(MarketData::Equity {
+                    self.data_sink
+                        .send_market_data(MarketData::Equity {
                             exchange: Exchange::Binance,
                             value: equity,
                         })
@@ -85,7 +84,7 @@ impl ClockActor {
     }
 }
 
-impl Actor for ClockActor {
+impl<S: MarketDataSink> Actor for ClockActor<S> {
     type Mailbox = UnboundedMailbox<Self>;
 
     fn name() -> &'static str {
@@ -133,7 +132,7 @@ pub struct RegisterExecutor {
     pub executor: ActorRef<ExecutorActor>,
 }
 
-impl Message<RegisterExecutor> for ClockActor {
+impl<S: MarketDataSink> Message<RegisterExecutor> for ClockActor<S> {
     type Reply = ();
 
     async fn handle(&mut self, msg: RegisterExecutor, _ctx: Context<'_, Self, Self::Reply>) {
@@ -144,7 +143,7 @@ impl Message<RegisterExecutor> for ClockActor {
 /// 内部消息: 触发 tick
 struct DoTick;
 
-impl Message<DoTick> for ClockActor {
+impl<S: MarketDataSink> Message<DoTick> for ClockActor<S> {
     type Reply = ();
 
     async fn handle(&mut self, _msg: DoTick, _ctx: Context<'_, Self, Self::Reply>) {
