@@ -3,7 +3,7 @@
 //! 接收 Signal 消息，调用交易所 REST API 执行订单
 
 use crate::domain::Exchange;
-use crate::exchange::ExchangeExecutor;
+use crate::exchange::ExchangeClient;
 use crate::strategy::Signal;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -15,14 +15,14 @@ use std::sync::Arc;
 
 /// SignalProcessorActor 初始化参数
 pub struct SignalProcessorArgs {
-    /// 交易所执行器映射
-    pub executors: HashMap<Exchange, Arc<dyn ExchangeExecutor>>,
+    /// 交易所客户端映射
+    pub executors: HashMap<Exchange, Arc<dyn ExchangeClient>>,
 }
 
 /// SignalProcessorActor - 处理交易信号
 pub struct SignalProcessorActor {
-    /// 交易所执行器
-    executors: HashMap<Exchange, Arc<dyn ExchangeExecutor>>,
+    /// 交易所客户端
+    executors: HashMap<Exchange, Arc<dyn ExchangeClient>>,
 }
 
 impl SignalProcessorActor {
@@ -64,12 +64,12 @@ impl Message<Signal> for SignalProcessorActor {
     async fn handle(&mut self, msg: Signal, _ctx: Context<'_, Self, Self::Reply>) {
         match msg {
             Signal::PlaceOrder(order) => {
-                let executor = match self.executors.get(&order.exchange) {
+                let client = match self.executors.get(&order.exchange) {
                     Some(e) => e.clone(),
                     None => {
                         tracing::error!(
                             exchange = %order.exchange,
-                            "No executor found for exchange"
+                            "No client found for exchange"
                         );
                         return;
                     }
@@ -88,7 +88,7 @@ impl Message<Signal> for SignalProcessorActor {
                 // 异步执行下单 (spawn 避免阻塞 actor)
                 let order_clone = order.clone();
                 tokio::spawn(async move {
-                    match executor.place_order(order_clone.clone()).await {
+                    match client.place_order(order_clone.clone()).await {
                         Ok(order_id) => {
                             tracing::info!(
                                 exchange = %order_clone.exchange,

@@ -1,9 +1,9 @@
 pub(crate) mod codec;
-mod ws;
-mod rest;
+mod actor;
+mod client;
 
-pub use ws::{OkxWsProtocol, OkxCredentials};
-pub use rest::OkxRestClient;
+pub use actor::OkxCredentials;
+pub use client::OkxClient;
 
 /// OKX REST API 地址
 pub const REST_BASE_URL: &str = "https://www.okx.com";

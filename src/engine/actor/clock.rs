@@ -5,8 +5,7 @@
 
 use super::executor::{ClockTick, ExecutorActor};
 use crate::domain::{now_ms, Exchange};
-use crate::exchange::actor::MarketDataSink;
-use crate::exchange::MarketData;
+use crate::exchange::{ExchangeClient, MarketData, MarketDataSink};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -19,8 +18,8 @@ use std::time::Duration;
 pub struct ClockArgs<S: MarketDataSink> {
     /// 时钟间隔 (毫秒)
     pub interval_ms: u64,
-    /// Binance executor (用于查询 equity)
-    pub binance_executor: Option<Arc<dyn crate::exchange::ExchangeExecutor>>,
+    /// Binance client (用于查询 equity)
+    pub binance_client: Option<Arc<dyn ExchangeClient>>,
     /// 数据接收器 (父 Actor)
     pub data_sink: Arc<S>,
 }
@@ -29,8 +28,8 @@ pub struct ClockArgs<S: MarketDataSink> {
 pub struct ClockActor<S: MarketDataSink> {
     /// 时钟间隔
     interval: Duration,
-    /// Binance executor
-    binance_executor: Option<Arc<dyn crate::exchange::ExchangeExecutor>>,
+    /// Binance client
+    binance_client: Option<Arc<dyn ExchangeClient>>,
     /// 数据接收器 (父 Actor)
     data_sink: Arc<S>,
     /// 已注册的 ExecutorActor 列表
@@ -44,7 +43,7 @@ impl<S: MarketDataSink> ClockActor<S> {
     pub fn new(args: ClockArgs<S>) -> Self {
         Self {
             interval: Duration::from_millis(args.interval_ms),
-            binance_executor: args.binance_executor,
+            binance_client: args.binance_client,
             data_sink: args.data_sink,
             executors: Vec::new(),
             self_ref: None,
@@ -55,9 +54,9 @@ impl<S: MarketDataSink> ClockActor<S> {
     async fn tick(&mut self) {
         let timestamp = now_ms();
 
-        // 查询 Binance equity (如果有 executor)
-        if let Some(ref executor) = self.binance_executor {
-            match executor.fetch_equity().await {
+        // 查询 Binance equity (如果有 client)
+        if let Some(ref client) = self.binance_client {
+            match client.fetch_equity().await {
                 Ok(equity) => {
                     self.data_sink
                         .send_market_data(MarketData::Equity {

@@ -10,15 +10,10 @@ use super::{
     ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, RegisterExecutor, SignalProcessorActor,
     SignalProcessorArgs,
 };
-use crate::config::ExchangesConfig;
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::actor::{ExchangeActor, ExchangeActorArgs, MarketDataSink};
-use crate::exchange::binance::{BinanceWsProtocol, BinanceCredentials, BinanceRestClient};
-use crate::exchange::okx::{OkxWsProtocol, OkxCredentials, OkxRestClient};
-use crate::exchange::subscriber::{MarketData, Subscribe, SubscriptionKind};
-use crate::exchange::ExchangeWsProtocol;
-use crate::exchange::{ExchangeExecutor, PublicDataType};
-use crate::strategy::{PublicStreams, Strategy};
+use crate::exchange::{
+    ExchangeClient, ExchangeClientHandle, MarketData, MarketDataSink, PublicDataType,
+};
 use async_trait::async_trait;
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -28,8 +23,10 @@ use kameo::Actor;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::strategy::{PublicStreams, Strategy};
+
 /// EngineActor 的数据接收器 (实现 MarketDataSink)
-struct EngineDataSink {
+pub struct EngineDataSink {
     engine_ref: WeakActorRef<EngineActor>,
 }
 
@@ -39,150 +36,6 @@ impl MarketDataSink for EngineDataSink {
         if let Some(actor) = self.engine_ref.upgrade() {
             let _ = actor.tell(data).await;
         }
-    }
-}
-
-// === ExchangeActorHandle trait - 消除 match exchange 分发 ===
-
-/// ExchangeActor 的类型擦除句柄
-#[async_trait]
-trait ExchangeActorHandle: Send + Sync {
-    /// 获取 Actor ID
-    fn actor_id(&self) -> ActorID;
-    /// 发送订阅请求
-    async fn subscribe(&self, kind: SubscriptionKind);
-}
-
-/// 为 ActorRef<ExchangeActor<C, S>> 实现 ExchangeActorHandle
-#[async_trait]
-impl<C: ExchangeWsProtocol, S: MarketDataSink> ExchangeActorHandle
-    for ActorRef<ExchangeActor<C, S>>
-{
-    fn actor_id(&self) -> ActorID {
-        self.id()
-    }
-
-    async fn subscribe(&self, kind: SubscriptionKind) {
-        if let Err(e) = self.tell(Subscribe { kind }).await {
-            tracing::error!(error = %e, "Failed to send Subscribe message");
-        }
-    }
-}
-
-// === ExchangeFactory trait - 创建交易所 Actor 的工厂 ===
-
-/// 交易所工厂 trait
-#[async_trait]
-trait ExchangeFactory: Send + Sync {
-    /// 创建 REST 客户端
-    fn create_rest_client(&self) -> Result<Arc<dyn ExchangeExecutor>, ExchangeError>;
-    /// 使用 spawn_link 创建 ExchangeActor
-    async fn create_actor_linked(
-        &self,
-        engine_ref: &ActorRef<EngineActor>,
-        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-        data_sink: Arc<EngineDataSink>,
-    ) -> Arc<dyn ExchangeActorHandle>;
-}
-
-/// Binance 工厂
-struct BinanceFactory {
-    api_key: String,
-    secret: String,
-}
-
-#[async_trait]
-impl ExchangeFactory for BinanceFactory {
-    fn create_rest_client(&self) -> Result<Arc<dyn ExchangeExecutor>, ExchangeError> {
-        Ok(Arc::new(BinanceRestClient::new(
-            self.api_key.clone(),
-            self.secret.clone(),
-        )?))
-    }
-
-    async fn create_actor_linked(
-        &self,
-        engine_ref: &ActorRef<EngineActor>,
-        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-        data_sink: Arc<EngineDataSink>,
-    ) -> Arc<dyn ExchangeActorHandle> {
-        let credentials = BinanceCredentials {
-            api_key: self.api_key.clone(),
-            secret: self.secret.clone(),
-        };
-
-        // Create typed REST client for ExchangeActor
-        let rest_client = Arc::new(
-            BinanceRestClient::new(self.api_key.clone(), self.secret.clone())
-                .expect("Failed to create BinanceRestClient"),
-        );
-
-        let actor = spawn_link(
-            engine_ref,
-            ExchangeActor::<BinanceWsProtocol, EngineDataSink>::new(ExchangeActorArgs {
-                symbol_metas,
-                credentials,
-                rest_client,
-                data_sink,
-            }),
-        )
-        .await;
-
-        Arc::new(actor)
-    }
-}
-
-/// OKX 工厂
-struct OkxFactory {
-    api_key: String,
-    secret: String,
-    passphrase: String,
-}
-
-#[async_trait]
-impl ExchangeFactory for OkxFactory {
-    fn create_rest_client(&self) -> Result<Arc<dyn ExchangeExecutor>, ExchangeError> {
-        Ok(Arc::new(OkxRestClient::new(
-            self.api_key.clone(),
-            self.secret.clone(),
-            self.passphrase.clone(),
-        )?))
-    }
-
-    async fn create_actor_linked(
-        &self,
-        engine_ref: &ActorRef<EngineActor>,
-        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-        data_sink: Arc<EngineDataSink>,
-    ) -> Arc<dyn ExchangeActorHandle> {
-        let credentials = OkxCredentials {
-            api_key: self.api_key.clone(),
-            secret: self.secret.clone(),
-            passphrase: self.passphrase.clone(),
-        };
-
-        // Create typed REST client for ExchangeActor
-        let rest_client = Arc::new(
-            OkxRestClient::new(
-                self.api_key.clone(),
-                self.secret.clone(),
-                self.passphrase.clone(),
-            )
-            .expect("Failed to create OkxRestClient"),
-        );
-
-        let actor = spawn_link(
-            engine_ref,
-            ExchangeActor::<OkxWsProtocol, EngineDataSink>::new(ExchangeActorArgs {
-                symbol_metas,
-                credentials,
-                rest_client,
-                data_sink,
-            }),
-        )
-        .await;
-
-        Arc::new(actor)
     }
 }
 
@@ -201,22 +54,21 @@ enum ChildActorKind {
 
 /// EngineActor 初始化参数
 pub struct EngineActorArgs {
-    pub exchanges_config: ExchangesConfig,
+    /// 交易所客户端
+    pub exchanges: HashMap<Exchange, Arc<dyn ExchangeClient>>,
 }
 
 /// EngineActor - 顶层管理 Actor
 pub struct EngineActor {
-    /// 交易所工厂
-    factories: HashMap<Exchange, Box<dyn ExchangeFactory>>,
+    /// 交易所客户端
+    exchanges: HashMap<Exchange, Arc<dyn ExchangeClient>>,
     /// 策略列表
     strategies: Vec<Box<dyn Strategy>>,
     /// Symbol 元数据
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
-    /// REST 客户端
-    rests: HashMap<Exchange, Arc<dyn ExchangeExecutor>>,
 
-    /// ExchangeActors (类型擦除)
-    exchange_actors: HashMap<Exchange, Arc<dyn ExchangeActorHandle>>,
+    /// ExchangeClientHandle (类型擦除)
+    exchange_handles: HashMap<Exchange, Arc<dyn ExchangeClientHandle>>,
     /// ExecutorActors
     executor_actors: Vec<ActorRef<ExecutorActor>>,
     /// SignalProcessorActor
@@ -233,32 +85,11 @@ pub struct EngineActor {
 
 impl EngineActor {
     pub fn new(args: EngineActorArgs) -> Self {
-        // 创建工厂
-        let mut factories: HashMap<Exchange, Box<dyn ExchangeFactory>> = HashMap::new();
-
-        factories.insert(
-            Exchange::Binance,
-            Box::new(BinanceFactory {
-                api_key: args.exchanges_config.binance.api_key.clone(),
-                secret: args.exchanges_config.binance.secret.clone(),
-            }),
-        );
-
-        factories.insert(
-            Exchange::OKX,
-            Box::new(OkxFactory {
-                api_key: args.exchanges_config.okx.api_key.clone(),
-                secret: args.exchanges_config.okx.secret.clone(),
-                passphrase: args.exchanges_config.okx.passphrase.clone(),
-            }),
-        );
-
         Self {
-            factories,
+            exchanges: args.exchanges,
             strategies: Vec::new(),
             symbol_metas: HashMap::new(),
-            rests: HashMap::new(),
-            exchange_actors: HashMap::new(),
+            exchange_handles: HashMap::new(),
             executor_actors: Vec::new(),
             signal_processor: None,
             clock: None,
@@ -267,38 +98,18 @@ impl EngineActor {
         }
     }
 
-    /// 初始化 REST 客户端 (无 match 分发)
-    fn init_rest_clients(&mut self, exchanges: &HashSet<Exchange>) -> Result<(), ExchangeError> {
-        for exchange in exchanges {
-            if self.rests.contains_key(exchange) {
-                continue;
-            }
-
-            let factory = self.factories.get(exchange).ok_or_else(|| {
-                ExchangeError::Other(format!("No factory for exchange {:?}", exchange))
-            })?;
-
-            let rest = factory.create_rest_client()?;
-            self.rests.insert(*exchange, rest);
-
-            tracing::info!(exchange = %exchange, "REST client initialized");
-        }
-
-        Ok(())
-    }
-
     /// 获取 SymbolMeta
     async fn fetch_symbol_metas(
         &mut self,
         aggregated: &PublicStreams,
     ) -> Result<(), ExchangeError> {
         for (exchange, symbol_streams) in aggregated {
-            let executor = self.rests.get(exchange).ok_or_else(|| {
-                ExchangeError::Other(format!("Exchange {:?} executor not registered", exchange))
+            let client = self.exchanges.get(exchange).ok_or_else(|| {
+                ExchangeError::Other(format!("Exchange {:?} client not registered", exchange))
             })?;
 
             let symbols: Vec<Symbol> = symbol_streams.keys().cloned().collect();
-            let metas = executor.fetch_symbol_meta(&symbols).await?;
+            let metas = client.fetch_symbol_meta(&symbols).await?;
 
             for meta in metas {
                 self.symbol_metas
@@ -316,14 +127,14 @@ impl EngineActor {
         Ok(())
     }
 
-    /// 使用 spawn_link 创建 ExchangeActor
-    async fn create_exchange_actor_linked(
+    /// 启动 ExchangeClient 并获取 Handle
+    async fn start_exchange_client(
         &mut self,
         actor_ref: &ActorRef<Self>,
         exchange: Exchange,
     ) -> Result<(), ExchangeError> {
-        let factory = self.factories.get(&exchange).ok_or_else(|| {
-            ExchangeError::Other(format!("No factory for exchange {:?}", exchange))
+        let client = self.exchanges.get(&exchange).ok_or_else(|| {
+            ExchangeError::Other(format!("Exchange {:?} client not found", exchange))
         })?;
 
         // 提取该交易所的 symbol metas
@@ -335,36 +146,34 @@ impl EngineActor {
             .collect();
 
         // 创建 EngineDataSink (ExchangeActor → EngineActor)
-        let data_sink = Arc::new(EngineDataSink {
+        let data_sink: Arc<dyn MarketDataSink> = Arc::new(EngineDataSink {
             engine_ref: actor_ref.downgrade(),
         });
 
-        let actor = factory
-            .create_actor_linked(actor_ref, Arc::new(symbol_metas), data_sink)
-            .await;
+        let handle = client
+            .clone()
+            .start(Arc::new(symbol_metas), data_sink)
+            .await?;
 
         // 记录 ActorID -> Kind 映射
         self.actor_kinds
-            .insert(actor.actor_id(), ChildActorKind::Exchange(exchange));
+            .insert(handle.actor_id(), ChildActorKind::Exchange(exchange));
 
-        self.exchange_actors.insert(exchange, actor);
+        self.exchange_handles.insert(exchange, handle);
         Ok(())
     }
 
-    /// 发送订阅请求 (通过 PublicDataType::to_subscription_kind 消除 if 分发)
+    /// 发送订阅请求
     async fn send_subscriptions(
-        actor: &dyn ExchangeActorHandle,
+        handle: &dyn ExchangeClientHandle,
         symbol_streams: &HashMap<Symbol, HashSet<PublicDataType>>,
     ) {
         for (symbol, data_types) in symbol_streams {
             for data_type in data_types {
                 let kind = data_type.to_subscription_kind(symbol.clone());
-                actor.subscribe(kind).await;
+                handle.subscribe(kind).await;
             }
         }
-
-        // 订阅 private 数据
-        actor.subscribe(SubscriptionKind::Private).await;
     }
 
     /// 聚合所有策略需要的 public streams
@@ -382,7 +191,6 @@ impl EngineActor {
 
         aggregated
     }
-
 }
 
 impl Actor for EngineActor {
@@ -426,7 +234,7 @@ impl Actor for EngineActor {
                     reason = ?reason,
                     "ExchangeActor died, shutting down engine"
                 );
-                self.exchange_actors.remove(&exchange);
+                self.exchange_handles.remove(&exchange);
                 Ok(Some(ActorStopReason::LinkDied {
                     id,
                     reason: Box::new(reason),
@@ -510,9 +318,10 @@ impl Message<Start> for EngineActor {
 impl EngineActor {
     /// 实际启动逻辑
     async fn do_start(&mut self) -> Result<(), ExchangeError> {
-        let actor_ref = self.self_ref.clone().ok_or_else(|| {
-            ExchangeError::Other("self_ref not set".to_string())
-        })?;
+        let actor_ref = self
+            .self_ref
+            .clone()
+            .ok_or_else(|| ExchangeError::Other("self_ref not set".to_string()))?;
 
         // 1. 聚合所有策略需要的 public streams
         let aggregated = Self::aggregate_public_streams(&self.strategies);
@@ -524,19 +333,18 @@ impl EngineActor {
             "Starting engine"
         );
 
-        // 2. 初始化 REST 客户端并获取 SymbolMeta
-        self.init_rest_clients(&required_exchanges)?;
+        // 2. 获取 SymbolMeta
         self.fetch_symbol_metas(&aggregated).await?;
 
-        // 3. 使用 spawn_link 创建 ExchangeActors (数据通过 EngineDataSink 发送到 EngineActor)
+        // 3. 启动 ExchangeClient (数据通过 EngineDataSink 发送到 EngineActor)
         for exchange in &required_exchanges {
-            self.create_exchange_actor_linked(&actor_ref, *exchange).await?;
+            self.start_exchange_client(&actor_ref, *exchange).await?;
         }
 
-        // 4. 发送订阅请求 (无 match 分发)
+        // 4. 发送订阅请求
         for (exchange, symbol_streams) in &aggregated {
-            if let Some(actor) = self.exchange_actors.get(exchange) {
-                Self::send_subscriptions(actor.as_ref(), symbol_streams).await;
+            if let Some(handle) = self.exchange_handles.get(exchange) {
+                Self::send_subscriptions(handle.as_ref(), symbol_streams).await;
                 tracing::info!(
                     exchange = %exchange,
                     symbols = symbol_streams.len(),
@@ -549,7 +357,7 @@ impl EngineActor {
         let signal_processor = spawn_link(
             &actor_ref,
             SignalProcessorActor::new(SignalProcessorArgs {
-                executors: self.rests.clone(),
+                executors: self.exchanges.clone(),
             }),
         )
         .await;
@@ -577,7 +385,7 @@ impl EngineActor {
         }
 
         // 7. 使用 spawn_link 创建 ClockActor (Equity 数据通过 EngineDataSink 发送到 EngineActor)
-        let binance_executor = self.rests.get(&Exchange::Binance).cloned();
+        let binance_client = self.exchanges.get(&Exchange::Binance).cloned();
         let data_sink = Arc::new(EngineDataSink {
             engine_ref: actor_ref.downgrade(),
         });
@@ -585,7 +393,7 @@ impl EngineActor {
             &actor_ref,
             ClockActor::new(ClockArgs {
                 interval_ms: 1000,
-                binance_executor,
+                binance_client,
                 data_sink,
             }),
         )

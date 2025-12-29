@@ -1,9 +1,9 @@
 pub(crate) mod codec;
-mod ws;
-mod rest;
+mod actor;
+mod client;
 
-pub use ws::{BinanceWsProtocol, BinanceCredentials};
-pub use rest::BinanceRestClient;
+pub use actor::BinanceCredentials;
+pub use client::BinanceClient;
 
 /// Binance 永续合约 REST API 地址
 pub const REST_BASE_URL: &str = "https://fapi.binance.com";

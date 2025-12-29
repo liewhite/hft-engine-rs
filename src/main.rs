@@ -1,7 +1,13 @@
 use fee_arb::config::AppConfig;
+use fee_arb::domain::Exchange;
 use fee_arb::engine::{AddStrategy, EngineActor, EngineActorArgs, Start};
+use fee_arb::exchange::binance::{BinanceClient, BinanceCredentials};
+use fee_arb::exchange::okx::{OkxClient, OkxCredentials};
+use fee_arb::exchange::ExchangeClient;
 use fee_arb::strategy::FundingArbStrategy;
 use kameo::request::MessageSend;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
@@ -26,17 +32,36 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
+    // Create exchange clients from config
+    let mut exchanges: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
+
+    // Binance client
+    let binance_credentials = BinanceCredentials {
+        api_key: config.exchanges.binance.api_key.clone(),
+        secret: config.exchanges.binance.secret.clone(),
+    };
+    let binance_client: Arc<dyn ExchangeClient> =
+        Arc::new(BinanceClient::new(Some(binance_credentials))?);
+    exchanges.insert(Exchange::Binance, binance_client);
+
+    // OKX client
+    let okx_credentials = OkxCredentials {
+        api_key: config.exchanges.okx.api_key.clone(),
+        secret: config.exchanges.okx.secret.clone(),
+        passphrase: config.exchanges.okx.passphrase.clone(),
+    };
+    let okx_client: Arc<dyn ExchangeClient> = Arc::new(OkxClient::new(Some(okx_credentials))?);
+    exchanges.insert(Exchange::OKX, okx_client);
+
     // Create EngineActor
-    let engine = kameo::spawn(EngineActor::new(EngineActorArgs {
-        exchanges_config: config.exchanges.clone(),
-    }));
+    let engine = kameo::spawn(EngineActor::new(EngineActorArgs { exchanges }));
 
     // Add strategies
-    let exchanges = config.exchanges.enabled_exchanges();
+    let enabled_exchanges = config.exchanges.enabled_exchanges();
     for symbol in symbols {
         let strategy = FundingArbStrategy::new(
             config.strategy.funding_arb.clone().into(),
-            exchanges.clone(),
+            enabled_exchanges.clone(),
             symbol,
         );
         let _ = engine.tell(AddStrategy(Box::new(strategy))).await;
