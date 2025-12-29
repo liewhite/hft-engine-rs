@@ -106,7 +106,7 @@ pub enum ParsedMessage {
 ///
 /// 通过泛型参数化交易所差异，避免 if 分发
 #[async_trait]
-pub trait ExchangeConfig: Send + Sync + 'static {
+pub trait ExchangeWsProtocol: Send + Sync + 'static {
     /// 交易所标识
     const EXCHANGE: Exchange;
 

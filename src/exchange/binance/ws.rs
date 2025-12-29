@@ -8,7 +8,7 @@ use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
 use crate::exchange::binance::{BinanceRestClient, WS_PUBLIC_URL};
-use crate::exchange::subscriber::{ExchangeConfig, ParsedMessage, SubscriptionKind};
+use crate::exchange::subscriber::{ExchangeWsProtocol, ParsedMessage, SubscriptionKind};
 use async_trait::async_trait;
 use kameo::actor::ActorRef;
 use serde_json::json;
@@ -22,10 +22,10 @@ pub struct BinanceCredentials {
 }
 
 /// Binance 交易所配置
-pub struct BinanceConfig;
+pub struct BinanceWsProtocol;
 
 #[async_trait]
-impl ExchangeConfig for BinanceConfig {
+impl ExchangeWsProtocol for BinanceWsProtocol {
     const EXCHANGE: Exchange = Exchange::Binance;
 
     const PUBLIC_WS_URL: &'static str = WS_PUBLIC_URL;

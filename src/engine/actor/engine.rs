@@ -13,10 +13,10 @@ use super::{
 use crate::config::ExchangesConfig;
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::actor::{ExchangeActor, ExchangeActorArgs, MarketDataSink};
-use crate::exchange::binance::{BinanceConfig, BinanceCredentials, BinanceRestClient};
-use crate::exchange::okx::{OkxConfig, OkxCredentials, OkxRestClient};
+use crate::exchange::binance::{BinanceWsProtocol, BinanceCredentials, BinanceRestClient};
+use crate::exchange::okx::{OkxWsProtocol, OkxCredentials, OkxRestClient};
 use crate::exchange::subscriber::{MarketData, Subscribe, SubscriptionKind};
-use crate::exchange::ExchangeConfig;
+use crate::exchange::ExchangeWsProtocol;
 use crate::exchange::{ExchangeExecutor, PublicDataType};
 use crate::strategy::{PublicStreams, Strategy};
 use async_trait::async_trait;
@@ -55,7 +55,7 @@ trait ExchangeActorHandle: Send + Sync {
 
 /// 为 ActorRef<ExchangeActor<C, S>> 实现 ExchangeActorHandle
 #[async_trait]
-impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActorHandle
+impl<C: ExchangeWsProtocol, S: MarketDataSink> ExchangeActorHandle
     for ActorRef<ExchangeActor<C, S>>
 {
     fn actor_id(&self) -> ActorID {
@@ -119,7 +119,7 @@ impl ExchangeFactory for BinanceFactory {
 
         let actor = spawn_link(
             engine_ref,
-            ExchangeActor::<BinanceConfig, EngineDataSink>::new(ExchangeActorArgs {
+            ExchangeActor::<BinanceWsProtocol, EngineDataSink>::new(ExchangeActorArgs {
                 symbol_metas,
                 credentials,
                 rest_client,
@@ -173,7 +173,7 @@ impl ExchangeFactory for OkxFactory {
 
         let actor = spawn_link(
             engine_ref,
-            ExchangeActor::<OkxConfig, EngineDataSink>::new(ExchangeActorArgs {
+            ExchangeActor::<OkxWsProtocol, EngineDataSink>::new(ExchangeActorArgs {
                 symbol_metas,
                 credentials,
                 rest_client,

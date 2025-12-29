@@ -8,5 +8,5 @@ pub mod ws_util;
 pub use actor::{ExchangeActor, ExchangeActorArgs};
 pub use api::*;
 pub use subscriber::{
-    ExchangeConfig, MarketData, Subscribe, SubscribeError, SubscriptionKind, Unsubscribe,
+    ExchangeWsProtocol, MarketData, Subscribe, SubscribeError, SubscriptionKind, Unsubscribe,
 };

@@ -1,8 +1,8 @@
 pub(crate) mod codec;
-mod config;
+mod ws;
 mod rest;
 
-pub use config::{BinanceConfig, BinanceCredentials};
+pub use ws::{BinanceWsProtocol, BinanceCredentials};
 pub use rest::BinanceRestClient;
 
 /// Binance 永续合约 REST API 地址

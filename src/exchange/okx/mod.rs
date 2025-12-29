@@ -1,8 +1,8 @@
 pub(crate) mod codec;
-mod config;
+mod ws;
 mod rest;
 
-pub use config::{OkxConfig, OkxCredentials};
+pub use ws::{OkxWsProtocol, OkxCredentials};
 pub use rest::OkxRestClient;
 
 /// OKX REST API 地址

@@ -12,7 +12,7 @@ use super::public_ws::{
 };
 use crate::domain::{Symbol, SymbolMeta};
 use crate::exchange::subscriber::{
-    ExchangeConfig, MarketData, ParsedMessage, Subscribe, SubscribeError, SubscriptionKind,
+    ExchangeWsProtocol, MarketData, ParsedMessage, Subscribe, SubscribeError, SubscriptionKind,
     Unsubscribe,
 };
 use kameo::actor::spawn_link;
@@ -32,7 +32,7 @@ pub trait MarketDataSink: Send + Sync + 'static {
 }
 
 /// ExchangeActor 初始化参数
-pub struct ExchangeActorArgs<C: ExchangeConfig, S: MarketDataSink> {
+pub struct ExchangeActorArgs<C: ExchangeWsProtocol, S: MarketDataSink> {
     /// Symbol 元数据 (用于 qty 归一化)
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 认证凭证
@@ -92,12 +92,12 @@ struct ConnectionInfo {
 }
 
 /// ExchangeActor 的数据接收器 (实现 WsDataSink)
-struct ExchangeDataSink<C: ExchangeConfig, S: MarketDataSink> {
+struct ExchangeDataSink<C: ExchangeWsProtocol, S: MarketDataSink> {
     actor_ref: WeakActorRef<ExchangeActor<C, S>>,
 }
 
 #[async_trait::async_trait]
-impl<C: ExchangeConfig, S: MarketDataSink> WsDataSink for ExchangeDataSink<C, S> {
+impl<C: ExchangeWsProtocol, S: MarketDataSink> WsDataSink for ExchangeDataSink<C, S> {
     async fn send_data(&self, data: WsData) {
         if let Some(actor) = self.actor_ref.upgrade() {
             let _ = actor.tell(InternalWsData(data)).await;
@@ -106,7 +106,7 @@ impl<C: ExchangeConfig, S: MarketDataSink> WsDataSink for ExchangeDataSink<C, S>
 }
 
 /// ExchangeActor - 管理单个交易所的所有 WebSocket 连接
-pub struct ExchangeActor<C: ExchangeConfig, S: MarketDataSink> {
+pub struct ExchangeActor<C: ExchangeWsProtocol, S: MarketDataSink> {
     /// Symbol 元数据 (用于 qty 归一化)
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 认证凭证
@@ -146,7 +146,7 @@ const RECONNECT_BACKOFF_INITIAL_MS: u64 = 1000; // 1 秒
 const RECONNECT_BACKOFF_MAX_MS: u64 = 60_000; // 60 秒
 const RECONNECT_BACKOFF_MULTIPLIER: u64 = 2;
 
-impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
+impl<C: ExchangeWsProtocol, S: MarketDataSink> ExchangeActor<C, S> {
     pub fn new(args: ExchangeActorArgs<C, S>) -> Self {
         Self {
             symbol_metas: args.symbol_metas,
@@ -569,7 +569,7 @@ impl<C: ExchangeConfig, S: MarketDataSink> ExchangeActor<C, S> {
     }
 }
 
-impl<C: ExchangeConfig, S: MarketDataSink> Actor for ExchangeActor<C, S> {
+impl<C: ExchangeWsProtocol, S: MarketDataSink> Actor for ExchangeActor<C, S> {
     type Mailbox = UnboundedMailbox<Self>;
 
     fn name() -> &'static str {
@@ -712,7 +712,7 @@ impl<C: ExchangeConfig, S: MarketDataSink> Actor for ExchangeActor<C, S> {
 /// 内部消息: WebSocket 数据
 struct InternalWsData(WsData);
 
-impl<C: ExchangeConfig, S: MarketDataSink> Message<InternalWsData> for ExchangeActor<C, S> {
+impl<C: ExchangeWsProtocol, S: MarketDataSink> Message<InternalWsData> for ExchangeActor<C, S> {
     type Reply = ();
 
     async fn handle(&mut self, msg: InternalWsData, _ctx: Context<'_, Self, Self::Reply>) {
@@ -720,7 +720,7 @@ impl<C: ExchangeConfig, S: MarketDataSink> Message<InternalWsData> for ExchangeA
     }
 }
 
-impl<C: ExchangeConfig, S: MarketDataSink> Message<Subscribe> for ExchangeActor<C, S> {
+impl<C: ExchangeWsProtocol, S: MarketDataSink> Message<Subscribe> for ExchangeActor<C, S> {
     type Reply = ();
 
     async fn handle(&mut self, msg: Subscribe, _ctx: Context<'_, Self, Self::Reply>) {
@@ -774,7 +774,7 @@ impl<C: ExchangeConfig, S: MarketDataSink> Message<Subscribe> for ExchangeActor<
     }
 }
 
-impl<C: ExchangeConfig, S: MarketDataSink> Message<Unsubscribe> for ExchangeActor<C, S> {
+impl<C: ExchangeWsProtocol, S: MarketDataSink> Message<Unsubscribe> for ExchangeActor<C, S> {
     type Reply = ();
 
     async fn handle(&mut self, msg: Unsubscribe, _ctx: Context<'_, Self, Self::Reply>) {

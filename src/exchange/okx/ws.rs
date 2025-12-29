@@ -8,7 +8,7 @@ use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsPush,
 };
 use crate::exchange::okx::{OkxRestClient, WS_PUBLIC_URL};
-use crate::exchange::subscriber::{ExchangeConfig, ParsedMessage, SubscriptionKind};
+use crate::exchange::subscriber::{ExchangeWsProtocol, ParsedMessage, SubscriptionKind};
 use async_trait::async_trait;
 use kameo::actor::ActorRef;
 use serde_json::json;
@@ -23,10 +23,10 @@ pub struct OkxCredentials {
 }
 
 /// OKX 交易所配置
-pub struct OkxConfig;
+pub struct OkxWsProtocol;
 
 #[async_trait]
-impl ExchangeConfig for OkxConfig {
+impl ExchangeWsProtocol for OkxWsProtocol {
     const EXCHANGE: Exchange = Exchange::OKX;
 
     const PUBLIC_WS_URL: &'static str = WS_PUBLIC_URL;
