@@ -85,30 +85,27 @@ impl Message<Signal> for SignalProcessorActor {
                     "Placing order"
                 );
 
-                // 异步执行下单 (spawn 避免阻塞 actor)
-                let order_clone = order.clone();
-                tokio::spawn(async move {
-                    match client.place_order(order_clone.clone()).await {
-                        Ok(order_id) => {
-                            tracing::info!(
-                                exchange = %order_clone.exchange,
-                                symbol = %order_clone.symbol,
-                                order_id = %order_id,
-                                client_order_id = ?order_clone.client_order_id,
-                                "Order placed successfully"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                exchange = %order_clone.exchange,
-                                symbol = %order_clone.symbol,
-                                client_order_id = ?order_clone.client_order_id,
-                                error = %e,
-                                "Failed to place order"
-                            );
-                        }
+                // 直接 await 下单请求
+                match client.place_order(order.clone()).await {
+                    Ok(order_id) => {
+                        tracing::info!(
+                            exchange = %order.exchange,
+                            symbol = %order.symbol,
+                            order_id = %order_id,
+                            client_order_id = ?order.client_order_id,
+                            "Order placed successfully"
+                        );
                     }
-                });
+                    Err(e) => {
+                        tracing::error!(
+                            exchange = %order.exchange,
+                            symbol = %order.symbol,
+                            client_order_id = ?order.client_order_id,
+                            error = %e,
+                            "Failed to place order"
+                        );
+                    }
+                }
             }
         }
     }
