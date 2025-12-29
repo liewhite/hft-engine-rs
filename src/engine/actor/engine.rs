@@ -54,9 +54,6 @@ pub struct ManagerActor {
     // === Symbol Metas 缓存 ===
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
 
-    // === 订阅记录（用于 ExchangeActor 重启后恢复订阅）===
-    exchange_subscriptions: HashMap<Exchange, HashSet<SubscriptionKind>>,
-
     // === 子 Actors ===
     /// SignalProcessorActor (on_start 创建)
     signal_processor: Option<ActorRef<SignalProcessorActor>>,
@@ -82,7 +79,6 @@ impl ManagerActor {
             binance_client: args.binance_client,
             okx_client: args.okx_client,
             symbol_metas: HashMap::new(),
-            exchange_subscriptions: HashMap::new(),
             signal_processor: None,
             processor: None,
             binance_actor: None,
@@ -226,43 +222,6 @@ impl ManagerActor {
         Ok(())
     }
 
-    /// 重启 ExchangeActor 并恢复订阅
-    async fn restart_exchange_actor(
-        &mut self,
-        exchange: Exchange,
-        actor_ref: &ActorRef<Self>,
-    ) -> Result<(), ExchangeError> {
-        // 1. 创建新的 ExchangeActor
-        self.create_exchange_actor(exchange, actor_ref).await?;
-
-        // 2. 恢复订阅
-        if let Some(subscriptions) = self.exchange_subscriptions.get(&exchange).cloned() {
-            match exchange {
-                Exchange::Binance => {
-                    if let Some(actor) = &self.binance_actor {
-                        for kind in &subscriptions {
-                            let _ = actor.tell(Subscribe { kind: kind.clone() }).await;
-                        }
-                    }
-                }
-                Exchange::OKX => {
-                    if let Some(actor) = &self.okx_actor {
-                        for kind in &subscriptions {
-                            let _ = actor.tell(Subscribe { kind: kind.clone() }).await;
-                        }
-                    }
-                }
-            }
-            tracing::info!(
-                exchange = %exchange,
-                count = subscriptions.len(),
-                "Restored subscriptions after restart"
-            );
-        }
-
-        Ok(())
-    }
-
     /// 添加策略的内部实现
     async fn do_add_strategy(&mut self, strategy: Box<dyn Strategy>) -> Result<(), ExchangeError> {
         let actor_ref = self.self_ref.clone().ok_or_else(|| {
@@ -327,15 +286,8 @@ impl ManagerActor {
 
         self.executors.push(executor_ref);
 
-        // 7. 向 ExchangeActors 发送订阅请求，并记录订阅（用于重启恢复）
+        // 7. 向 ExchangeActors 发送订阅请求
         for (exchange, kind) in subscriptions {
-            // 记录订阅
-            self.exchange_subscriptions
-                .entry(exchange)
-                .or_default()
-                .insert(kind.clone());
-
-            // 发送订阅请求
             match exchange {
                 Exchange::Binance => {
                     if let Some(actor) = &self.binance_actor {
@@ -421,44 +373,19 @@ impl Actor for ManagerActor {
 
         match kind {
             Some(ChildActorKind::Exchange(exchange)) => {
-                tracing::warn!(
+                tracing::error!(
                     exchange = %exchange,
                     reason = ?reason,
-                    "ExchangeActor died, attempting restart"
+                    "ExchangeActor died, shutting down"
                 );
-
-                // 清除旧的 actor 引用
                 match exchange {
                     Exchange::Binance => self.binance_actor = None,
                     Exchange::OKX => self.okx_actor = None,
                 }
-
-                // 尝试重启
-                if let Some(actor_ref) = &self.self_ref.clone() {
-                    match self.restart_exchange_actor(exchange, actor_ref).await {
-                        Ok(()) => {
-                            tracing::info!(exchange = %exchange, "ExchangeActor restarted successfully");
-                            Ok(None) // 不级联停止
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                exchange = %exchange,
-                                error = %e,
-                                "Failed to restart ExchangeActor, shutting down"
-                            );
-                            Ok(Some(ActorStopReason::LinkDied {
-                                id,
-                                reason: Box::new(reason),
-                            }))
-                        }
-                    }
-                } else {
-                    tracing::error!("self_ref not available, cannot restart");
-                    Ok(Some(ActorStopReason::LinkDied {
-                        id,
-                        reason: Box::new(reason),
-                    }))
-                }
+                Ok(Some(ActorStopReason::LinkDied {
+                    id,
+                    reason: Box::new(reason),
+                }))
             }
             Some(ChildActorKind::Executor(idx)) => {
                 tracing::error!(

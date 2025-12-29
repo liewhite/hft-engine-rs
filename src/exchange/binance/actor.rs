@@ -22,6 +22,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+/// 重连延迟 (3 秒)
+const RECONNECT_DELAY_SECS: u64 = 3;
+
 /// 单个 WebSocket 连接的最大订阅数
 const MAX_SUBSCRIPTIONS_PER_CONN: usize = 200;
 
@@ -131,10 +134,12 @@ impl BinanceActor {
         let (write, read) = ws_stream.split();
         let (tx, rx) = mpsc::channel::<String>(100);
 
+        let conn_idx = self.public_conns.len();
+
         // 启动 ws_loop
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_public_ws_loop(read, write, rx, self_ref).await {
-                tracing::warn!(error = %e, "Binance public ws_loop ended with error");
+            if let Err(e) = run_public_ws_loop(read, write, rx, self_ref, conn_idx).await {
+                tracing::warn!(conn_idx, error = %e, "Binance public ws_loop ended with error");
             }
         });
 
@@ -236,6 +241,48 @@ impl BinanceActor {
             }
         }
     }
+
+    /// 重新连接指定的 public 连接 (替换原有连接)
+    async fn reconnect_public_connection(&mut self, conn_idx: usize) -> Result<(), WsError> {
+        let self_ref = self
+            .self_ref
+            .as_ref()
+            .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
+            .clone();
+
+        let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PUBLIC_URL)
+            .await
+            .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
+
+        let (write, read) = ws_stream.split();
+        let (tx, rx) = mpsc::channel::<String>(100);
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = run_public_ws_loop(read, write, rx, self_ref, conn_idx).await {
+                tracing::warn!(conn_idx, error = %e, "Binance public ws_loop ended with error");
+            }
+        });
+
+        // 获取该连接之前的订阅数量
+        let subscription_count = self
+            .subscriptions
+            .iter()
+            .filter(|(_, &idx)| idx == conn_idx)
+            .count();
+
+        // 替换连接
+        if conn_idx < self.public_conns.len() {
+            // 中止旧连接
+            self.public_conns[conn_idx]._handle.abort();
+            self.public_conns[conn_idx] = WsConnection {
+                tx,
+                subscription_count,
+                _handle: handle,
+            };
+        }
+
+        Ok(())
+    }
 }
 
 impl Actor for BinanceActor {
@@ -274,6 +321,18 @@ impl Actor for BinanceActor {
         if let Some(handle) = self.listen_key_refresh_handle.take() {
             handle.abort();
         }
+
+        // 中止所有 public 连接的任务
+        for conn in self.public_conns.drain(..) {
+            conn._handle.abort();
+        }
+
+        // 中止 private 连接的任务
+        if let Some(conn) = self.private_conn.take() {
+            conn._handle.abort();
+        }
+
+        tracing::info!("BinanceActor stopped");
         Ok(())
     }
 }
@@ -332,6 +391,84 @@ impl Message<Unsubscribe> for BinanceActor {
 /// 内部 WebSocket 数据消息
 pub struct WsData {
     pub data: String,
+}
+
+/// 重连 public 连接消息
+struct ReconnectPublic {
+    conn_idx: usize,
+}
+
+/// 重连 private 连接消息
+struct ReconnectPrivate;
+
+impl Message<ReconnectPublic> for BinanceActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: ReconnectPublic,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        tracing::info!(conn_idx = msg.conn_idx, "Reconnecting Binance public connection...");
+
+        // 等待 3 秒
+        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+
+        // 收集该连接上的订阅
+        let subs_to_restore: Vec<SubscriptionKind> = self
+            .subscriptions
+            .iter()
+            .filter(|(_, &idx)| idx == msg.conn_idx)
+            .map(|(kind, _)| kind.clone())
+            .collect();
+
+        // 重新创建连接
+        match self.reconnect_public_connection(msg.conn_idx).await {
+            Ok(()) => {
+                // 重新订阅
+                for kind in subs_to_restore {
+                    self.send_subscribe(msg.conn_idx, &kind).await;
+                }
+                tracing::info!(conn_idx = msg.conn_idx, "Binance public connection reconnected");
+            }
+            Err(e) => {
+                tracing::error!(conn_idx = msg.conn_idx, error = %e, "Failed to reconnect Binance public connection, retrying...");
+                // 再次尝试重连
+                if let Some(actor) = self.self_ref.as_ref().and_then(|r| r.upgrade()) {
+                    let _ = actor.tell(ReconnectPublic { conn_idx: msg.conn_idx }).await;
+                }
+            }
+        }
+    }
+}
+
+impl Message<ReconnectPrivate> for BinanceActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: ReconnectPrivate,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        tracing::info!("Reconnecting Binance private connection...");
+
+        // 等待 3 秒
+        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+
+        // 重新创建 private 连接 (包含 ListenKey 获取)
+        match self.create_private_connection().await {
+            Ok(()) => {
+                tracing::info!("Binance private connection reconnected");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to reconnect Binance private connection, retrying...");
+                // 再次尝试重连
+                if let Some(actor) = self.self_ref.as_ref().and_then(|r| r.upgrade()) {
+                    let _ = actor.tell(ReconnectPrivate).await;
+                }
+            }
+        }
+    }
 }
 
 impl Message<WsData> for BinanceActor {
@@ -398,46 +535,18 @@ async fn run_public_ws_loop(
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
     mut rx: mpsc::Receiver<String>,
     actor_ref: WeakActorRef<BinanceActor>,
+    conn_idx: usize,
 ) -> Result<(), WsError> {
-    loop {
-        tokio::select! {
-            // 发送消息
-            msg = rx.recv() => {
-                match msg {
-                    Some(text) => {
-                        if write.send(WsMessage::Text(text)).await.is_err() {
-                            return Err(WsError::Network("Send failed".to_string()));
-                        }
-                    }
-                    None => return Ok(()),
-                }
-            }
+    let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
 
-            // 接收消息
-            ws_msg = read.next() => {
-                match ws_msg {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        if let Some(actor) = actor_ref.upgrade() {
-                            let _ = actor.tell(WsData { data: text }).await;
-                        }
-                    }
-                    Some(Ok(WsMessage::Ping(data))) => {
-                        let _ = write.send(WsMessage::Pong(data)).await;
-                    }
-                    Some(Ok(WsMessage::Close(_))) => {
-                        return Err(WsError::ServerClosed);
-                    }
-                    Some(Err(e)) => {
-                        return Err(WsError::Network(e.to_string()));
-                    }
-                    None => {
-                        return Err(WsError::ServerClosed);
-                    }
-                    _ => {}
-                }
-            }
+    // 出错时通知 Actor 重连
+    if result.is_err() {
+        if let Some(actor) = actor_ref.upgrade() {
+            let _ = actor.tell(ReconnectPublic { conn_idx }).await;
         }
     }
+
+    result
 }
 
 async fn run_private_ws_loop(
@@ -447,6 +556,26 @@ async fn run_private_ws_loop(
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
     mut rx: mpsc::Receiver<String>,
     actor_ref: WeakActorRef<BinanceActor>,
+) -> Result<(), WsError> {
+    let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
+
+    // 出错时通知 Actor 重连
+    if result.is_err() {
+        if let Some(actor) = actor_ref.upgrade() {
+            let _ = actor.tell(ReconnectPrivate).await;
+        }
+    }
+
+    result
+}
+
+async fn run_ws_loop_inner(
+    read: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+              + Unpin
+              + Send),
+    write: &mut (impl SinkExt<WsMessage> + Unpin + Send),
+    rx: &mut mpsc::Receiver<String>,
+    actor_ref: &WeakActorRef<BinanceActor>,
 ) -> Result<(), WsError> {
     loop {
         tokio::select! {
