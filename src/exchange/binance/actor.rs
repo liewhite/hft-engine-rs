@@ -6,9 +6,7 @@ use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
-use crate::exchange::client::{
-    EventSink, ParsedMessage, Subscribe, SubscriptionKind, Unsubscribe, WsError,
-};
+use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
 use crate::messaging::ExchangeEvent;
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -531,59 +529,10 @@ impl Message<WsData> for BinanceActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
-        // 解析消息
-        let parsed = match parse_message(&msg.data) {
-            Some(p) => p,
-            None => return,
-        };
-
         let timestamp = now_ms();
-        // 转换为 ExchangeEvent 并发送
-        let event = match parsed {
-            ParsedMessage::FundingRate { symbol, rate } => ExchangeEvent::FundingRateUpdate {
-                symbol,
-                exchange: Exchange::Binance,
-                rate,
-                timestamp,
-            },
-            ParsedMessage::BBO { symbol, bbo } => ExchangeEvent::BBOUpdate {
-                symbol,
-                exchange: Exchange::Binance,
-                bbo,
-                timestamp,
-            },
-            ParsedMessage::Position { symbol, mut position } => {
-                // qty 归一化: 张 -> 币
-                if let Some(meta) = self.symbol_metas.get(&symbol) {
-                    position.size = meta.qty_to_coin(position.size);
-                }
-                ExchangeEvent::PositionUpdate {
-                    symbol,
-                    exchange: Exchange::Binance,
-                    position,
-                    timestamp,
-                }
-            }
-            ParsedMessage::Balance(balance) => ExchangeEvent::BalanceUpdate {
-                exchange: Exchange::Binance,
-                balance,
-                timestamp,
-            },
-            ParsedMessage::OrderUpdate { symbol, update } => ExchangeEvent::OrderStatusUpdate {
-                symbol,
-                exchange: Exchange::Binance,
-                update,
-                timestamp,
-            },
-            ParsedMessage::Equity(value) => ExchangeEvent::EquityUpdate {
-                exchange: Exchange::Binance,
-                equity: value,
-                timestamp,
-            },
-            ParsedMessage::Subscribed | ParsedMessage::Pong | ParsedMessage::Ignored => return,
-        };
-
-        self.event_sink.send_event(event).await;
+        if let Some(event) = parse_message(&msg.data, timestamp, &self.symbol_metas) {
+            self.event_sink.send_event(event).await;
+        }
     }
 }
 
@@ -804,18 +753,22 @@ fn build_unsubscribe_msg(kinds: &[SubscriptionKind]) -> String {
     .to_string()
 }
 
-fn parse_message(raw: &str) -> Option<ParsedMessage> {
+fn parse_message(
+    raw: &str,
+    timestamp: u64,
+    symbol_metas: &HashMap<Symbol, SymbolMeta>,
+) -> Option<ExchangeEvent> {
     // 尝试解析为 JSON
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
 
-    // 检查是否是订阅响应
+    // 检查是否是订阅响应（控制消息，返回 None）
     if value.get("id").is_some() {
         if let Ok(resp) = serde_json::from_str::<WsResponse>(raw) {
             if resp.error.is_some() {
                 tracing::error!(raw = %raw, "Binance subscribe error");
             }
-            return Some(ParsedMessage::Subscribed);
         }
+        return None;
     }
 
     // 根据事件类型解析
@@ -825,45 +778,69 @@ fn parse_message(raw: &str) -> Option<ParsedMessage> {
         "markPriceUpdate" => {
             let update: MarkPriceUpdate = serde_json::from_str(raw).ok()?;
             let symbol = update.symbol()?;
-            // 使用默认 8h 间隔
             let rate = update.to_funding_rate(8.0)?;
-            Some(ParsedMessage::FundingRate { symbol, rate })
+            Some(ExchangeEvent::FundingRateUpdate {
+                symbol,
+                exchange: Exchange::Binance,
+                rate,
+                timestamp,
+            })
         }
         "bookTicker" => {
             let ticker: BookTicker = serde_json::from_str(raw).ok()?;
             let bbo = ticker.to_bbo()?;
             let symbol = bbo.symbol.clone();
-            Some(ParsedMessage::BBO { symbol, bbo })
+            Some(ExchangeEvent::BBOUpdate {
+                symbol,
+                exchange: Exchange::Binance,
+                bbo,
+                timestamp,
+            })
         }
         "ACCOUNT_UPDATE" => {
             let update: AccountUpdate = serde_json::from_str(raw).ok()?;
 
             // 返回第一个 position 更新 (简化处理)
             if let Some(pos_data) = update.a.positions.first() {
-                if let Some(position) = pos_data.to_position() {
+                if let Some(mut position) = pos_data.to_position() {
                     let symbol = position.symbol.clone();
-                    return Some(ParsedMessage::Position { symbol, position });
+                    // qty 归一化: 张 -> 币
+                    if let Some(meta) = symbol_metas.get(&symbol) {
+                        position.size = meta.qty_to_coin(position.size);
+                    }
+                    return Some(ExchangeEvent::PositionUpdate {
+                        symbol,
+                        exchange: Exchange::Binance,
+                        position,
+                        timestamp,
+                    });
                 }
             }
 
             // 返回第一个 balance 更新
             if let Some(bal_data) = update.a.balances.first() {
                 if let Some(balance) = bal_data.to_balance() {
-                    return Some(ParsedMessage::Balance(balance));
+                    return Some(ExchangeEvent::BalanceUpdate {
+                        exchange: Exchange::Binance,
+                        balance,
+                        timestamp,
+                    });
                 }
             }
 
-            Some(ParsedMessage::Ignored)
+            None
         }
         "ORDER_TRADE_UPDATE" => {
             let update: OrderTradeUpdate = serde_json::from_str(raw).ok()?;
             let order_update = update.to_order_update()?;
             let symbol = order_update.symbol.clone();
-            Some(ParsedMessage::OrderUpdate {
+            Some(ExchangeEvent::OrderStatusUpdate {
                 symbol,
+                exchange: Exchange::Binance,
                 update: order_update,
+                timestamp,
             })
         }
-        _ => Some(ParsedMessage::Ignored),
+        _ => None,
     }
 }

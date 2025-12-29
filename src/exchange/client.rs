@@ -3,10 +3,7 @@
 //! ExchangeClient trait 封装交易所 REST 交互
 //! Sink traits 用于解耦 Actor 之间的数据流
 
-use crate::domain::{
-    Balance, Exchange, ExchangeError, FundingRate, Order, OrderId, OrderUpdate, Position, Symbol,
-    SymbolMeta, BBO,
-};
+use crate::domain::{Exchange, ExchangeError, Order, OrderId, Symbol, SymbolMeta};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -87,39 +84,6 @@ impl<T: SignalSink + ?Sized> SignalSink for Arc<T> {
     async fn send_signal(&self, signal: Signal) {
         self.as_ref().send_signal(signal).await;
     }
-}
-
-// ============================================================================
-// 解析后的消息（内部使用）
-// ============================================================================
-
-/// 解析后的 WebSocket 消息
-#[derive(Debug)]
-pub enum ParsedMessage {
-    FundingRate {
-        symbol: Symbol,
-        rate: FundingRate,
-    },
-    BBO {
-        symbol: Symbol,
-        bbo: BBO,
-    },
-    Position {
-        symbol: Symbol,
-        position: Position,
-    },
-    Balance(Balance),
-    OrderUpdate {
-        symbol: Symbol,
-        update: OrderUpdate,
-    },
-    Equity(f64),
-    /// 订阅确认
-    Subscribed,
-    /// Ping/Pong
-    Pong,
-    /// 其他忽略的消息
-    Ignored,
 }
 
 // ============================================================================

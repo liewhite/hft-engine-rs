@@ -1,9 +1,7 @@
 //! OKX WebSocket Actor
 
 use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{
-    EventSink, ParsedMessage, Subscribe, SubscriptionKind, Unsubscribe, WsError,
-};
+use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
 use crate::messaging::ExchangeEvent;
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsEvent, WsPush,
@@ -549,56 +547,10 @@ impl Message<WsData> for OkxActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
-        let parsed = match parse_message(&msg.data) {
-            Some(p) => p,
-            None => return,
-        };
-
         let timestamp = now_ms();
-        let event = match parsed {
-            ParsedMessage::FundingRate { symbol, rate } => ExchangeEvent::FundingRateUpdate {
-                symbol,
-                exchange: Exchange::OKX,
-                rate,
-                timestamp,
-            },
-            ParsedMessage::BBO { symbol, bbo } => ExchangeEvent::BBOUpdate {
-                symbol,
-                exchange: Exchange::OKX,
-                bbo,
-                timestamp,
-            },
-            ParsedMessage::Position { symbol, mut position } => {
-                if let Some(meta) = self.symbol_metas.get(&symbol) {
-                    position.size = meta.qty_to_coin(position.size);
-                }
-                ExchangeEvent::PositionUpdate {
-                    symbol,
-                    exchange: Exchange::OKX,
-                    position,
-                    timestamp,
-                }
-            }
-            ParsedMessage::Balance(balance) => ExchangeEvent::BalanceUpdate {
-                exchange: Exchange::OKX,
-                balance,
-                timestamp,
-            },
-            ParsedMessage::OrderUpdate { symbol, update } => ExchangeEvent::OrderStatusUpdate {
-                symbol,
-                exchange: Exchange::OKX,
-                update,
-                timestamp,
-            },
-            ParsedMessage::Equity(value) => ExchangeEvent::EquityUpdate {
-                exchange: Exchange::OKX,
-                equity: value,
-                timestamp,
-            },
-            ParsedMessage::Subscribed | ParsedMessage::Pong | ParsedMessage::Ignored => return,
-        };
-
-        self.event_sink.send_event(event).await;
+        if let Some(event) = parse_message(&msg.data, timestamp, &self.symbol_metas) {
+            self.event_sink.send_event(event).await;
+        }
     }
 }
 
@@ -760,18 +712,22 @@ fn build_unsubscribe_msg(kinds: &[SubscriptionKind]) -> String {
     .to_string()
 }
 
-fn parse_message(raw: &str) -> Option<ParsedMessage> {
+fn parse_message(
+    raw: &str,
+    timestamp: u64,
+    symbol_metas: &HashMap<Symbol, SymbolMeta>,
+) -> Option<ExchangeEvent> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
 
-    // 检查是否是事件响应
+    // 检查是否是事件响应（控制消息，返回 None）
     if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
         match event {
-            "subscribe" | "unsubscribe" => return Some(ParsedMessage::Subscribed),
+            "subscribe" | "unsubscribe" => return None,
             "error" => {
                 tracing::error!(raw = %raw, "OKX error");
-                return Some(ParsedMessage::Ignored);
+                return None;
             }
-            _ => return Some(ParsedMessage::Ignored),
+            _ => return None,
         }
     }
 
@@ -787,7 +743,12 @@ fn parse_message(raw: &str) -> Option<ParsedMessage> {
             let data = push.data.first()?;
             let rate = data.to_funding_rate()?;
             let symbol = rate.symbol.clone();
-            Some(ParsedMessage::FundingRate { symbol, rate })
+            Some(ExchangeEvent::FundingRateUpdate {
+                symbol,
+                exchange: Exchange::OKX,
+                rate,
+                timestamp,
+            })
         }
         "bbo-tbt" => {
             let push: WsPush<BboData> = serde_json::from_str(raw).ok()?;
@@ -795,28 +756,51 @@ fn parse_message(raw: &str) -> Option<ParsedMessage> {
             let data = push.data.first()?;
             let bbo = data.to_bbo(inst_id)?;
             let symbol = bbo.symbol.clone();
-            Some(ParsedMessage::BBO { symbol, bbo })
+            Some(ExchangeEvent::BBOUpdate {
+                symbol,
+                exchange: Exchange::OKX,
+                bbo,
+                timestamp,
+            })
         }
         "positions" => {
             let push: WsPush<PositionData> = serde_json::from_str(raw).ok()?;
             let data = push.data.first()?;
-            let position = data.to_position()?;
+            let mut position = data.to_position()?;
             let symbol = position.symbol.clone();
-            Some(ParsedMessage::Position { symbol, position })
+            // qty 归一化: 张 -> 币
+            if let Some(meta) = symbol_metas.get(&symbol) {
+                position.size = meta.qty_to_coin(position.size);
+            }
+            Some(ExchangeEvent::PositionUpdate {
+                symbol,
+                exchange: Exchange::OKX,
+                position,
+                timestamp,
+            })
         }
         "account" => {
             let push: WsPush<AccountData> = serde_json::from_str(raw).ok()?;
             let data = push.data.first()?;
             let equity = data.to_equity()?;
-            Some(ParsedMessage::Equity(equity))
+            Some(ExchangeEvent::EquityUpdate {
+                exchange: Exchange::OKX,
+                equity,
+                timestamp,
+            })
         }
         "orders" => {
             let push: WsPush<OrderPushData> = serde_json::from_str(raw).ok()?;
             let data = push.data.first()?;
             let update = data.to_order_update()?;
             let symbol = update.symbol.clone();
-            Some(ParsedMessage::OrderUpdate { symbol, update })
+            Some(ExchangeEvent::OrderStatusUpdate {
+                symbol,
+                exchange: Exchange::OKX,
+                update,
+                timestamp,
+            })
         }
-        _ => Some(ParsedMessage::Ignored),
+        _ => None,
     }
 }
