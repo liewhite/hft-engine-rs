@@ -23,12 +23,6 @@ pub trait PrivateConnectionHandle: Send + Sync {
     async fn send_message(&self, msg: String) -> bool;
 }
 
-/// 私有连接创建结果
-pub struct PrivateConnectionResult {
-    pub handle: Box<dyn PrivateConnectionHandle>,
-    pub actor_id: ActorID,
-}
-
 // === 通用的私有连接 ws_loop ===
 
 use futures_util::{SinkExt, StreamExt};
