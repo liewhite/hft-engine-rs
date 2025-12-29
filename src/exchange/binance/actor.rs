@@ -155,6 +155,16 @@ impl BinanceActor {
 
     /// 创建 private WebSocket 连接
     async fn create_private_connection(&mut self) -> Result<(), WsError> {
+        // 先中止旧的 ListenKey 刷新任务 (M1 fix: 防止重连时任务泄漏)
+        if let Some(handle) = self.listen_key_refresh_handle.take() {
+            handle.abort();
+        }
+
+        // 中止旧的 private 连接任务
+        if let Some(conn) = self.private_conn.take() {
+            conn._handle.abort();
+        }
+
         let credentials = self
             .credentials
             .as_ref()
@@ -393,13 +403,21 @@ pub struct WsData {
     pub data: String,
 }
 
-/// 重连 public 连接消息
+/// 触发 public 连接重连 (延迟后执行)
 struct ReconnectPublic {
     conn_idx: usize,
 }
 
-/// 重连 private 连接消息
+/// 触发 private 连接重连 (延迟后执行)
 struct ReconnectPrivate;
+
+/// 执行 public 连接重连
+struct DoReconnectPublic {
+    conn_idx: usize,
+}
+
+/// 执行 private 连接重连
+struct DoReconnectPrivate;
 
 impl Message<ReconnectPublic> for BinanceActor {
     type Reply = ();
@@ -409,10 +427,29 @@ impl Message<ReconnectPublic> for BinanceActor {
         msg: ReconnectPublic,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        tracing::info!(conn_idx = msg.conn_idx, "Reconnecting Binance public connection...");
+        tracing::info!(conn_idx = msg.conn_idx, "Binance public connection lost, will reconnect in {}s", RECONNECT_DELAY_SECS);
 
-        // 等待 3 秒
-        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+        // 非阻塞：spawn 延迟任务，延迟后发送 DoReconnectPublic
+        let self_ref = self.self_ref.clone();
+        let conn_idx = msg.conn_idx;
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+            if let Some(actor) = self_ref.and_then(|r| r.upgrade()) {
+                let _ = actor.tell(DoReconnectPublic { conn_idx }).await;
+            }
+        });
+    }
+}
+
+impl Message<DoReconnectPublic> for BinanceActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: DoReconnectPublic,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        tracing::info!(conn_idx = msg.conn_idx, "Reconnecting Binance public connection...");
 
         // 收集该连接上的订阅
         let subs_to_restore: Vec<SubscriptionKind> = self
@@ -433,7 +470,7 @@ impl Message<ReconnectPublic> for BinanceActor {
             }
             Err(e) => {
                 tracing::error!(conn_idx = msg.conn_idx, error = %e, "Failed to reconnect Binance public connection, retrying...");
-                // 再次尝试重连
+                // 再次尝试重连 (通过 ReconnectPublic 触发延迟)
                 if let Some(actor) = self.self_ref.as_ref().and_then(|r| r.upgrade()) {
                     let _ = actor.tell(ReconnectPublic { conn_idx: msg.conn_idx }).await;
                 }
@@ -450,10 +487,28 @@ impl Message<ReconnectPrivate> for BinanceActor {
         _msg: ReconnectPrivate,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        tracing::info!("Reconnecting Binance private connection...");
+        tracing::info!("Binance private connection lost, will reconnect in {}s", RECONNECT_DELAY_SECS);
 
-        // 等待 3 秒
-        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+        // 非阻塞：spawn 延迟任务，延迟后发送 DoReconnectPrivate
+        let self_ref = self.self_ref.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+            if let Some(actor) = self_ref.and_then(|r| r.upgrade()) {
+                let _ = actor.tell(DoReconnectPrivate).await;
+            }
+        });
+    }
+}
+
+impl Message<DoReconnectPrivate> for BinanceActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        _msg: DoReconnectPrivate,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        tracing::info!("Reconnecting Binance private connection...");
 
         // 重新创建 private 连接 (包含 ListenKey 获取)
         match self.create_private_connection().await {
@@ -462,7 +517,7 @@ impl Message<ReconnectPrivate> for BinanceActor {
             }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to reconnect Binance private connection, retrying...");
-                // 再次尝试重连
+                // 再次尝试重连 (通过 ReconnectPrivate 触发延迟)
                 if let Some(actor) = self.self_ref.as_ref().and_then(|r| r.upgrade()) {
                     let _ = actor.tell(ReconnectPrivate).await;
                 }
