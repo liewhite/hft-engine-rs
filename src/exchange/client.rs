@@ -67,26 +67,6 @@ impl<T: EventSink + ?Sized> EventSink for Arc<T> {
 }
 
 // ============================================================================
-// 信号接收器 (ExecutorActor → SignalProcessorActor)
-// ============================================================================
-
-use crate::strategy::Signal;
-
-/// 信号接收器
-#[async_trait]
-pub trait SignalSink: Send + Sync + 'static {
-    async fn send_signal(&self, signal: Signal);
-}
-
-/// 为 Arc<T> 实现 SignalSink (blanket impl)
-#[async_trait]
-impl<T: SignalSink + ?Sized> SignalSink for Arc<T> {
-    async fn send_signal(&self, signal: Signal) {
-        self.as_ref().send_signal(signal).await;
-    }
-}
-
-// ============================================================================
 // ExchangeClient trait (仅 REST)
 // ============================================================================
 

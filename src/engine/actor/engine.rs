@@ -9,7 +9,7 @@ use super::{ExecutorActor, ExecutorArgs, ProcessorActor, RegisterExecutor, Signa
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient};
-use crate::exchange::{EventSink, ExchangeClient, SignalSink, Subscribe, SubscriptionKind};
+use crate::exchange::{EventSink, ExchangeClient, Subscribe, SubscriptionKind};
 use crate::messaging::ExchangeEvent;
 use crate::strategy::Strategy;
 use async_trait::async_trait;
@@ -262,15 +262,10 @@ impl ManagerActor {
         // 5. 创建 ExecutorActor
         let executor_idx = self.executors.len();
 
-        // 创建 SignalSink（发送到 SignalProcessorActor）
-        let signal_sink: Arc<dyn SignalSink> = Arc::new(SignalProcessorSink {
-            signal_processor: signal_processor.clone(),
-        });
-
         let executor = ExecutorActor::new(ExecutorArgs {
             strategy,
             symbol_metas: Arc::new(self.symbol_metas.clone()),
-            signal_sink,
+            signal_processor: signal_processor.clone(),
         });
 
         let executor_ref = spawn_link(&actor_ref, executor).await;
@@ -467,18 +462,6 @@ struct ProcessorEventSink {
 impl EventSink for ProcessorEventSink {
     async fn send_event(&self, event: ExchangeEvent) {
         let _ = self.processor.tell(event).await;
-    }
-}
-
-/// SignalProcessorActor 的信号接收器
-struct SignalProcessorSink {
-    signal_processor: ActorRef<SignalProcessorActor>,
-}
-
-#[async_trait]
-impl SignalSink for SignalProcessorSink {
-    async fn send_signal(&self, signal: crate::strategy::Signal) {
-        let _ = self.signal_processor.tell(signal).await;
     }
 }
 
