@@ -358,7 +358,6 @@ impl Message<Unsubscribe> for OkxActor {
 
 pub struct WsData {
     pub data: String,
-    pub is_private: bool,
 }
 
 impl Message<WsData> for OkxActor {
@@ -442,7 +441,7 @@ async fn run_public_ws_loop(
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Some(actor) = actor_ref.upgrade() {
-                            let _ = actor.tell(WsData { data: text, is_private: false }).await;
+                            let _ = actor.tell(WsData { data: text }).await;
                         }
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
@@ -491,7 +490,7 @@ async fn run_private_ws_loop(
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Some(actor) = actor_ref.upgrade() {
-                            let _ = actor.tell(WsData { data: text, is_private: true }).await;
+                            let _ = actor.tell(WsData { data: text }).await;
                         }
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
@@ -604,7 +603,7 @@ fn parse_message(raw: &str) -> Option<ParsedMessage> {
         "funding-rate" => {
             let push: WsPush<FundingRateData> = serde_json::from_str(raw).ok()?;
             let data = push.data.first()?;
-            let rate = data.to_funding_rate();
+            let rate = data.to_funding_rate()?;
             let symbol = rate.symbol.clone();
             Some(ParsedMessage::FundingRate { symbol, rate })
         }
@@ -612,27 +611,27 @@ fn parse_message(raw: &str) -> Option<ParsedMessage> {
             let push: WsPush<BboData> = serde_json::from_str(raw).ok()?;
             let inst_id = push.arg.inst_id.as_ref()?;
             let data = push.data.first()?;
-            let bbo = data.to_bbo(inst_id);
+            let bbo = data.to_bbo(inst_id)?;
             let symbol = bbo.symbol.clone();
             Some(ParsedMessage::BBO { symbol, bbo })
         }
         "positions" => {
             let push: WsPush<PositionData> = serde_json::from_str(raw).ok()?;
             let data = push.data.first()?;
-            let position = data.to_position();
+            let position = data.to_position()?;
             let symbol = position.symbol.clone();
             Some(ParsedMessage::Position { symbol, position })
         }
         "account" => {
             let push: WsPush<AccountData> = serde_json::from_str(raw).ok()?;
             let data = push.data.first()?;
-            let equity = data.to_equity();
+            let equity = data.to_equity()?;
             Some(ParsedMessage::Equity(equity))
         }
         "orders" => {
             let push: WsPush<OrderPushData> = serde_json::from_str(raw).ok()?;
             let data = push.data.first()?;
-            let update = data.to_order_update();
+            let update = data.to_order_update()?;
             let symbol = update.symbol.clone();
             Some(ParsedMessage::OrderUpdate { symbol, update })
         }

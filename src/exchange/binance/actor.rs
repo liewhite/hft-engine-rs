@@ -62,8 +62,6 @@ pub struct BinanceActorArgs {
     pub data_sink: Arc<dyn MarketDataSink>,
     /// REST 基础 URL（用于 ListenKey）
     pub rest_base_url: String,
-    /// API Key（用于 REST 请求）
-    pub api_key: Option<String>,
 }
 
 /// Binance 凭证
@@ -83,8 +81,6 @@ pub struct BinanceActor {
     data_sink: Arc<dyn MarketDataSink>,
     /// REST 基础 URL
     rest_base_url: String,
-    /// API Key
-    api_key: Option<String>,
 
     // 连接管理
     /// Public 连接列表
@@ -111,7 +107,6 @@ impl BinanceActor {
             symbol_metas: args.symbol_metas,
             data_sink: args.data_sink,
             rest_base_url: args.rest_base_url,
-            api_key: args.api_key,
             public_conns: Vec::new(),
             private_conn: None,
             subscriptions: HashMap::new(),
@@ -337,7 +332,6 @@ impl Message<Unsubscribe> for BinanceActor {
 /// 内部 WebSocket 数据消息
 pub struct WsData {
     pub data: String,
-    pub is_private: bool,
 }
 
 impl Message<WsData> for BinanceActor {
@@ -424,7 +418,7 @@ async fn run_public_ws_loop(
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Some(actor) = actor_ref.upgrade() {
-                            let _ = actor.tell(WsData { data: text, is_private: false }).await;
+                            let _ = actor.tell(WsData { data: text }).await;
                         }
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
@@ -473,7 +467,7 @@ async fn run_private_ws_loop(
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         if let Some(actor) = actor_ref.upgrade() {
-                            let _ = actor.tell(WsData { data: text, is_private: true }).await;
+                            let _ = actor.tell(WsData { data: text }).await;
                         }
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
@@ -640,12 +634,12 @@ fn parse_message(raw: &str) -> Option<ParsedMessage> {
             let update: MarkPriceUpdate = serde_json::from_str(raw).ok()?;
             let symbol = update.symbol()?;
             // 使用默认 8h 间隔
-            let rate = update.to_funding_rate(8.0);
+            let rate = update.to_funding_rate(8.0)?;
             Some(ParsedMessage::FundingRate { symbol, rate })
         }
         "bookTicker" => {
             let ticker: BookTicker = serde_json::from_str(raw).ok()?;
-            let bbo = ticker.to_bbo();
+            let bbo = ticker.to_bbo()?;
             let symbol = bbo.symbol.clone();
             Some(ParsedMessage::BBO { symbol, bbo })
         }
@@ -654,22 +648,24 @@ fn parse_message(raw: &str) -> Option<ParsedMessage> {
 
             // 返回第一个 position 更新 (简化处理)
             if let Some(pos_data) = update.a.positions.first() {
-                let position = pos_data.to_position();
-                let symbol = position.symbol.clone();
-                return Some(ParsedMessage::Position { symbol, position });
+                if let Some(position) = pos_data.to_position() {
+                    let symbol = position.symbol.clone();
+                    return Some(ParsedMessage::Position { symbol, position });
+                }
             }
 
             // 返回第一个 balance 更新
             if let Some(bal_data) = update.a.balances.first() {
-                let balance = bal_data.to_balance();
-                return Some(ParsedMessage::Balance(balance));
+                if let Some(balance) = bal_data.to_balance() {
+                    return Some(ParsedMessage::Balance(balance));
+                }
             }
 
             Some(ParsedMessage::Ignored)
         }
         "ORDER_TRADE_UPDATE" => {
             let update: OrderTradeUpdate = serde_json::from_str(raw).ok()?;
-            let order_update = update.to_order_update();
+            let order_update = update.to_order_update()?;
             let symbol = order_update.symbol.clone();
             Some(ParsedMessage::OrderUpdate {
                 symbol,

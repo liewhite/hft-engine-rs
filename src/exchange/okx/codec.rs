@@ -1,5 +1,5 @@
 use crate::domain::{
-    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position, Symbol, now_ms, BBO,
+    Exchange, FundingRate, OrderStatus, OrderUpdate, Position, Symbol, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -37,29 +37,25 @@ pub struct FundingRateData {
 }
 
 impl FundingRateData {
-    pub fn to_funding_rate(&self) -> FundingRate {
-        let symbol = Symbol::from_okx(&self.inst_id)
-            .unwrap_or_else(|| panic!("Failed to parse OKX inst_id: {}", self.inst_id));
-        let rate = f64::from_str(&self.funding_rate)
-            .unwrap_or_else(|e| panic!("Failed to parse funding rate '{}': {}", self.funding_rate, e));
+    pub fn to_funding_rate(&self) -> Option<FundingRate> {
+        let symbol = Symbol::from_okx(&self.inst_id)?;
+        let rate = f64::from_str(&self.funding_rate).ok()?;
         // funding_time: 下次收取时间
         // next_funding_time: 下下次收取时间 (用于计算间隔)
-        let next_settle_ms: u64 = self.funding_time.parse()
-            .unwrap_or_else(|e| panic!("Failed to parse funding_time '{}': {}", self.funding_time, e));
-        let next_next_settle_ms: u64 = self.next_funding_time.parse()
-            .unwrap_or_else(|e| panic!("Failed to parse next_funding_time '{}': {}", self.next_funding_time, e));
+        let next_settle_ms: u64 = self.funding_time.parse().ok()?;
+        let next_next_settle_ms: u64 = self.next_funding_time.parse().ok()?;
 
         // 计算结算间隔 (毫秒转小时)
         let interval_ms = next_next_settle_ms.saturating_sub(next_settle_ms);
         let settle_interval_hours = (interval_ms as f64) / (1000.0 * 60.0 * 60.0);
 
-        FundingRate {
+        Some(FundingRate {
             exchange: Exchange::OKX,
             symbol,
             rate,
             next_settle_time: next_settle_ms,
             settle_interval_hours,
-        }
+        })
     }
 }
 
@@ -76,27 +72,24 @@ pub struct BboData {
 }
 
 impl BboData {
-    pub fn to_bbo(&self, inst_id: &str) -> BBO {
-        let symbol = Symbol::from_okx(inst_id)
-            .unwrap_or_else(|| panic!("Failed to parse OKX inst_id: {}", inst_id));
+    pub fn to_bbo(&self, inst_id: &str) -> Option<BBO> {
+        let symbol = Symbol::from_okx(inst_id)?;
 
-        let ask = self.asks.first()
-            .unwrap_or_else(|| panic!("BBO missing asks for {}", inst_id));
-        assert!(ask.len() >= 2, "BBO ask array too short for {}: {:?}", inst_id, ask);
-        let ask_price = f64::from_str(&ask[0])
-            .unwrap_or_else(|e| panic!("Failed to parse ask price '{}': {}", ask[0], e));
-        let ask_qty = f64::from_str(&ask[1])
-            .unwrap_or_else(|e| panic!("Failed to parse ask qty '{}': {}", ask[1], e));
+        let ask = self.asks.first()?;
+        if ask.len() < 2 {
+            return None;
+        }
+        let ask_price = f64::from_str(&ask[0]).ok()?;
+        let ask_qty = f64::from_str(&ask[1]).ok()?;
 
-        let bid = self.bids.first()
-            .unwrap_or_else(|| panic!("BBO missing bids for {}", inst_id));
-        assert!(bid.len() >= 2, "BBO bid array too short for {}: {:?}", inst_id, bid);
-        let bid_price = f64::from_str(&bid[0])
-            .unwrap_or_else(|e| panic!("Failed to parse bid price '{}': {}", bid[0], e));
-        let bid_qty = f64::from_str(&bid[1])
-            .unwrap_or_else(|e| panic!("Failed to parse bid qty '{}': {}", bid[1], e));
+        let bid = self.bids.first()?;
+        if bid.len() < 2 {
+            return None;
+        }
+        let bid_price = f64::from_str(&bid[0]).ok()?;
+        let bid_qty = f64::from_str(&bid[1]).ok()?;
 
-        BBO {
+        Some(BBO {
             exchange: Exchange::OKX,
             symbol,
             bid_price,
@@ -104,7 +97,7 @@ impl BboData {
             ask_price,
             ask_qty,
             timestamp: now_ms(),
-        }
+        })
     }
 }
 
@@ -127,11 +120,9 @@ pub struct PositionData {
 }
 
 impl PositionData {
-    pub fn to_position(&self) -> Position {
-        let symbol = Symbol::from_okx(&self.inst_id)
-            .unwrap_or_else(|| panic!("Failed to parse OKX inst_id: {}", self.inst_id));
-        let pos_amount = f64::from_str(&self.pos)
-            .unwrap_or_else(|e| panic!("Failed to parse position '{}': {}", self.pos, e));
+    pub fn to_position(&self) -> Option<Position> {
+        let symbol = Symbol::from_okx(&self.inst_id)?;
+        let pos_amount = f64::from_str(&self.pos).ok()?;
         let avg_price = f64::from_str(&self.avg_px).unwrap_or(0.0);
         let unrealized_pnl = f64::from_str(&self.upl).unwrap_or(0.0);
         let leverage: u32 = self.lever.parse().unwrap_or(1);
@@ -141,7 +132,7 @@ impl PositionData {
             .and_then(|p| f64::from_str(p).ok())
             .unwrap_or(0.0);
 
-        Position {
+        Some(Position {
             exchange: Exchange::OKX,
             symbol,
             size: pos_amount, // 正数多头，负数空头
@@ -149,7 +140,7 @@ impl PositionData {
             leverage,
             unrealized_pnl,
             mark_price,
-        }
+        })
     }
 }
 
@@ -161,42 +152,25 @@ pub struct AccountData {
     pub u_time: String,
     /// 账户总权益 (USDT)
     pub total_eq: String,
+    #[allow(dead_code)]
     pub details: Vec<AccountDetail>,
 }
 
 impl AccountData {
-    pub fn to_equity(&self) -> f64 {
-        f64::from_str(&self.total_eq)
-            .unwrap_or_else(|e| panic!("Failed to parse total_eq '{}': {}", self.total_eq, e))
+    pub fn to_equity(&self) -> Option<f64> {
+        f64::from_str(&self.total_eq).ok()
     }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct AccountDetail {
     pub ccy: String,
-    #[allow(dead_code)]
     pub eq: String,
-    #[allow(dead_code)]
     pub avail_eq: String,
     pub avail_bal: String,
     pub frozen_bal: String,
-}
-
-impl AccountDetail {
-    pub fn to_balance(&self) -> Balance {
-        let available = f64::from_str(&self.avail_bal)
-            .unwrap_or_else(|e| panic!("Failed to parse avail_bal '{}': {}", self.avail_bal, e));
-        let frozen = f64::from_str(&self.frozen_bal)
-            .unwrap_or_else(|e| panic!("Failed to parse frozen_bal '{}': {}", self.frozen_bal, e));
-
-        Balance {
-            exchange: Exchange::OKX,
-            asset: self.ccy.clone(),
-            available,
-            frozen,
-        }
-    }
 }
 
 /// Order 推送数据
@@ -219,16 +193,14 @@ pub struct OrderPushData {
 }
 
 impl OrderPushData {
-    pub fn to_order_update(&self) -> OrderUpdate {
-        let symbol = Symbol::from_okx(&self.inst_id)
-            .unwrap_or_else(|| panic!("Failed to parse OKX inst_id: {}", self.inst_id));
-        let filled_qty = f64::from_str(&self.fill_sz)
-            .unwrap_or_else(|e| panic!("Failed to parse fill_sz '{}': {}", self.fill_sz, e));
+    pub fn to_order_update(&self) -> Option<OrderUpdate> {
+        let symbol = Symbol::from_okx(&self.inst_id)?;
+        let filled_qty = f64::from_str(&self.fill_sz).ok()?;
         let avg_price = f64::from_str(&self.avg_px).ok();
 
         let status = map_okx_order_state(&self.state, filled_qty);
 
-        OrderUpdate {
+        Some(OrderUpdate {
             order_id: self.ord_id.clone(),
             client_order_id: self.cl_ord_id.clone(),
             exchange: Exchange::OKX,
@@ -237,7 +209,7 @@ impl OrderPushData {
             filled_quantity: filled_qty,
             avg_price,
             timestamp: now_ms(),
-        }
+        })
     }
 }
 

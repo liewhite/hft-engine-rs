@@ -356,7 +356,6 @@ impl ExchangeClient for BinanceClient {
             symbol_metas,
             data_sink,
             rest_base_url: self.base_url.clone(),
-            api_key: self.api_key().map(|s| s.to_string()),
         });
 
         let actor_ref = kameo::spawn(actor);
