@@ -79,8 +79,8 @@ impl OkxClient {
         Some(headers)
     }
 
-    /// 获取交易所交易对信息 (公开接口)
-    async fn get_instruments(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+    /// 获取所有交易对信息 (公开接口)
+    async fn get_all_instruments(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         #[derive(Deserialize)]
         struct Response {
             code: String,
@@ -114,14 +114,9 @@ impl OkxClient {
             return Err(map_okx_error(&data.code, &data.msg));
         }
 
-        // 构建需要查询的 symbol 集合
-        let symbol_set: std::collections::HashSet<_> =
-            symbols.iter().map(|s| s.to_okx()).collect();
-
         let metas: Vec<SymbolMeta> = data
             .data
             .into_iter()
-            .filter(|d| symbol_set.contains(&d.inst_id))
             .filter_map(|d| {
                 let symbol = Symbol::from_okx(&d.inst_id)?;
                 let price_step: f64 = d.tick_sz.parse().ok().filter(|&v| v > 0.0)?;
@@ -201,8 +196,14 @@ impl ExchangeClient for OkxClient {
         Exchange::OKX
     }
 
+    async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
+        self.get_all_instruments().await
+    }
+
     async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        self.get_instruments(symbols).await
+        let all = self.get_all_instruments().await?;
+        let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
+        Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
     }
 
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {

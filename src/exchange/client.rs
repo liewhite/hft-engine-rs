@@ -165,7 +165,10 @@ pub trait ExchangeClient: Send + Sync + 'static {
     /// 获取交易所标识
     fn exchange(&self) -> Exchange;
 
-    /// 获取交易对元数据
+    /// 获取所有交易对元数据
+    async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError>;
+
+    /// 获取指定交易对元数据
     async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError>;
 
     /// 下单

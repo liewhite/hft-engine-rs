@@ -89,46 +89,44 @@ impl ManagerActor {
         }
     }
 
-    /// 获取交易所客户端
-    fn get_exchange_client(&self, exchange: Exchange) -> Option<Arc<dyn ExchangeClient>> {
-        match exchange {
-            Exchange::Binance => self.binance_client.clone().map(|c| c as Arc<dyn ExchangeClient>),
-            Exchange::OKX => self.okx_client.clone().map(|c| c as Arc<dyn ExchangeClient>),
+    /// 预加载所有交易所的 symbol metas
+    async fn preload_symbol_metas(&mut self) -> Result<(), ExchangeError> {
+        // Binance
+        if let Some(client) = &self.binance_client {
+            let metas = client.fetch_all_symbol_metas().await?;
+            let count = metas.len();
+            for meta in metas {
+                self.symbol_metas.insert((Exchange::Binance, meta.symbol.clone()), meta);
+            }
+            tracing::info!(exchange = %Exchange::Binance, count, "Preloaded symbol metas");
         }
+
+        // OKX
+        if let Some(client) = &self.okx_client {
+            let metas = client.fetch_all_symbol_metas().await?;
+            let count = metas.len();
+            for meta in metas {
+                self.symbol_metas.insert((Exchange::OKX, meta.symbol.clone()), meta);
+            }
+            tracing::info!(exchange = %Exchange::OKX, count, "Preloaded symbol metas");
+        }
+
+        Ok(())
     }
 
-    /// 获取或获取 SymbolMetas
-    async fn ensure_symbol_metas(
-        &mut self,
-        exchange: Exchange,
-        symbols: &[Symbol],
-    ) -> Result<(), ExchangeError> {
-        // 检查哪些 symbols 需要获取
-        let missing: Vec<Symbol> = symbols
-            .iter()
-            .filter(|s| !self.symbol_metas.contains_key(&(exchange, (*s).clone())))
-            .cloned()
-            .collect();
-
-        if missing.is_empty() {
-            return Ok(());
+    /// 检查策略所需的 symbols 是否都已缓存
+    fn check_required_symbols(&self, strategy: &dyn Strategy) -> Result<(), ExchangeError> {
+        let public_streams = strategy.public_streams();
+        for (exchange, symbol_streams) in &public_streams {
+            for symbol in symbol_streams.keys() {
+                if !self.symbol_metas.contains_key(&(*exchange, symbol.clone())) {
+                    return Err(ExchangeError::Other(format!(
+                        "Symbol {:?} not found on {:?}. May be newly listed, please restart.",
+                        symbol, exchange
+                    )));
+                }
+            }
         }
-
-        let client = self.get_exchange_client(exchange).ok_or_else(|| {
-            ExchangeError::Other(format!("Exchange {:?} client not registered", exchange))
-        })?;
-
-        let metas = client.fetch_symbol_meta(&missing).await?;
-        for meta in metas {
-            self.symbol_metas.insert((exchange, meta.symbol.clone()), meta);
-        }
-
-        tracing::info!(
-            exchange = %exchange,
-            fetched = missing.len(),
-            "Fetched symbol metas"
-        );
-
         Ok(())
     }
 
@@ -221,14 +219,11 @@ impl ManagerActor {
             ExchangeError::Other("SignalProcessorActor not initialized".to_string())
         })?;
 
-        // 1. 获取策略需要的 public streams
-        let public_streams = strategy.public_streams();
+        // 1. 检查策略所需的 symbols 是否都已缓存（启动时已预加载）
+        self.check_required_symbols(strategy.as_ref())?;
 
-        // 2. 获取所需的 SymbolMetas
-        for (exchange, symbol_streams) in &public_streams {
-            let symbols: Vec<Symbol> = symbol_streams.keys().cloned().collect();
-            self.ensure_symbol_metas(*exchange, &symbols).await?;
-        }
+        // 2. 获取策略需要的 public streams
+        let public_streams = strategy.public_streams();
 
         // 3. 启动缺失的 ExchangeActors
         for exchange in public_streams.keys() {
@@ -309,7 +304,10 @@ impl Actor for ManagerActor {
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         self.self_ref = Some(actor_ref.clone());
 
-        // 1. 创建 SignalProcessorActor
+        // 1. 预加载所有交易所的 symbol metas
+        self.preload_symbol_metas().await?;
+
+        // 2. 创建 SignalProcessorActor
         let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = [
             self.binance_client.clone().map(|c| (Exchange::Binance, c as Arc<dyn ExchangeClient>)),
             self.okx_client.clone().map(|c| (Exchange::OKX, c as Arc<dyn ExchangeClient>)),
@@ -329,7 +327,7 @@ impl Actor for ManagerActor {
             .insert(signal_processor.id(), ChildActorKind::SignalProcessor);
         self.signal_processor = Some(signal_processor);
 
-        // 2. 创建 ProcessorActor
+        // 3. 创建 ProcessorActor
         let processor = spawn_link(&actor_ref, ProcessorActor::new()).await;
         self.actor_kinds
             .insert(processor.id(), ChildActorKind::Processor);

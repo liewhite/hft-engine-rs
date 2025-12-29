@@ -103,8 +103,8 @@ impl BinanceClient {
         Some(map_binance_error(err.code, &err.msg))
     }
 
-    /// 获取交易所交易对信息
-    async fn get_exchange_info(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+    /// 获取所有交易对信息
+    async fn get_all_exchange_info(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         #[derive(Deserialize)]
         struct ExchangeInfo {
             symbols: Vec<SymbolInfo>,
@@ -155,14 +155,9 @@ impl BinanceClient {
 
         let info: ExchangeInfo = resp.json().await.map_err(Self::map_reqwest_error)?;
 
-        // 构建需要查询的 symbol 集合
-        let symbol_set: std::collections::HashSet<_> =
-            symbols.iter().map(|s| s.to_binance()).collect();
-
         let metas: Vec<SymbolMeta> = info
             .symbols
             .into_iter()
-            .filter(|s| symbol_set.contains(&s.symbol))
             .filter_map(|s| {
                 let symbol = Symbol::from_binance(&s.symbol)?;
                 let mut price_step: Option<f64> = None;
@@ -250,8 +245,14 @@ impl ExchangeClient for BinanceClient {
         Exchange::Binance
     }
 
+    async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
+        self.get_all_exchange_info().await
+    }
+
     async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        self.get_exchange_info(symbols).await
+        let all = self.get_all_exchange_info().await?;
+        let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
+        Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
     }
 
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
