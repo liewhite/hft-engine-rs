@@ -1,8 +1,8 @@
 pub(crate) mod codec;
-mod actor;
+pub(crate) mod actor;
 mod client;
 
-pub use actor::BinanceCredentials;
+pub use actor::{BinanceActor, BinanceActorArgs, BinanceCredentials};
 pub use client::BinanceClient;
 
 /// Binance 永续合约 REST API 地址

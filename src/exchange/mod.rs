@@ -3,6 +3,6 @@ pub mod client;
 pub mod okx;
 
 pub use client::{
-    ExchangeClient, ExchangeClientHandle, MarketData, MarketDataSink, PublicDataType,
+    ExchangeClient, MarketData, MarketDataSink, PublicDataType, SignalSink,
     Subscribe, SubscriptionKind, Unsubscribe,
 };

@@ -2,5 +2,6 @@ pub mod actor;
 
 pub use actor::{
     AddStrategy, ClockActor, ClockArgs, ClockTick, EngineActor, EngineActorArgs, ExecutorActor,
-    ExecutorArgs, RegisterExecutor, SignalProcessorActor, SignalProcessorArgs, Start, Stop,
+    ExecutorArgs, ManagerActor, ManagerActorArgs, ProcessorActor, RegisterExecutor,
+    SignalProcessorActor, SignalProcessorArgs, Stop,
 };

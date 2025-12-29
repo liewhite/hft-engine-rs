@@ -1,8 +1,8 @@
 pub(crate) mod codec;
-mod actor;
+pub(crate) mod actor;
 mod client;
 
-pub use actor::OkxCredentials;
+pub use actor::{OkxActor, OkxActorArgs, OkxCredentials};
 pub use client::OkxClient;
 
 /// OKX REST API 地址

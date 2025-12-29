@@ -2,9 +2,8 @@
 //!
 //! 接收 MarketData，转换为 ExchangeEvent，调用 Strategy.on_event()
 
-use super::SignalProcessorActor;
 use crate::domain::{now_ms, Exchange, Order, Symbol, SymbolMeta};
-use crate::exchange::MarketData;
+use crate::exchange::{MarketData, SignalSink};
 use crate::messaging::{ExchangeEvent, StateManager};
 use crate::strategy::{Signal, Strategy};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -22,8 +21,8 @@ pub struct ExecutorArgs {
     pub strategy: Box<dyn Strategy>,
     /// Symbol 元数据 (用于 qty 转换)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// Signal 处理器 Actor (用于发送 Signal)
-    pub signal_processor: ActorRef<SignalProcessorActor>,
+    /// Signal 接收器 (发送到 SignalProcessorActor)
+    pub signal_sink: Arc<dyn SignalSink>,
 }
 
 /// ExecutorActor - 执行策略的 Actor
@@ -32,8 +31,8 @@ pub struct ExecutorActor {
     strategy: Box<dyn Strategy>,
     /// 状态管理器
     state_manager: StateManager,
-    /// Signal 处理器 Actor
-    signal_processor: ActorRef<SignalProcessorActor>,
+    /// Signal 接收器
+    signal_sink: Arc<dyn SignalSink>,
     /// Symbol 元数据 (用于 qty 转换)
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 内部 Signal 接收器 (用于收集 StateManager 产生的 Signal)
@@ -60,7 +59,7 @@ impl ExecutorActor {
         Self {
             strategy: args.strategy,
             state_manager,
-            signal_processor: args.signal_processor,
+            signal_sink: args.signal_sink,
             symbol_metas: args.symbol_metas,
             signal_rx,
         }
@@ -97,10 +96,8 @@ impl ExecutorActor {
                 }
             };
 
-            // 发送到 SignalProcessorActor
-            if let Err(e) = self.signal_processor.tell(converted).await {
-                tracing::error!(error = %e, "Failed to send signal to SignalProcessorActor");
-            }
+            // 发送到 SignalSink
+            self.signal_sink.send_signal(converted).await;
         }
     }
 }

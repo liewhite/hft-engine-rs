@@ -1,12 +1,9 @@
 use fee_arb::config::AppConfig;
-use fee_arb::domain::Exchange;
-use fee_arb::engine::{AddStrategy, EngineActor, EngineActorArgs, Start};
+use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs};
 use fee_arb::exchange::binance::{BinanceClient, BinanceCredentials};
 use fee_arb::exchange::okx::{OkxClient, OkxCredentials};
-use fee_arb::exchange::ExchangeClient;
 use fee_arb::strategy::FundingArbStrategy;
 use kameo::request::MessageSend;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -32,49 +29,46 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // Create exchange clients from config
-    let mut exchanges: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
-
-    // Binance client
+    // Create Binance client
     let binance_credentials = BinanceCredentials {
         api_key: config.exchanges.binance.api_key.clone(),
         secret: config.exchanges.binance.secret.clone(),
     };
-    let binance_client: Arc<dyn ExchangeClient> =
-        Arc::new(BinanceClient::new(Some(binance_credentials))?);
-    exchanges.insert(Exchange::Binance, binance_client);
+    let binance_client = Arc::new(BinanceClient::new(Some(binance_credentials))?);
 
-    // OKX client
+    // Create OKX client
     let okx_credentials = OkxCredentials {
         api_key: config.exchanges.okx.api_key.clone(),
         secret: config.exchanges.okx.secret.clone(),
         passphrase: config.exchanges.okx.passphrase.clone(),
     };
-    let okx_client: Arc<dyn ExchangeClient> = Arc::new(OkxClient::new(Some(okx_credentials))?);
-    exchanges.insert(Exchange::OKX, okx_client);
+    let okx_client = Arc::new(OkxClient::new(Some(okx_credentials))?);
 
-    // Create EngineActor
-    let engine = kameo::spawn(EngineActor::new(EngineActorArgs { exchanges }));
+    // Create ManagerActor
+    let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs {
+        binance_client: Some(binance_client),
+        okx_client: Some(okx_client),
+    }));
 
-    // Add strategies
+    // Add strategies (this will automatically create ExchangeActors as needed)
     let enabled_exchanges = config.exchanges.enabled_exchanges();
     for symbol in symbols {
         let strategy = FundingArbStrategy::new(
             config.strategy.funding_arb.clone().into(),
             enabled_exchanges.clone(),
-            symbol,
+            symbol.clone(),
         );
-        let _ = engine.tell(AddStrategy(Box::new(strategy))).await;
+
+        manager
+            .ask(AddStrategy(Box::new(strategy)))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
+
+        tracing::info!(symbol = %symbol, "Strategy added");
     }
 
-    // Start engine
-    engine
-        .ask(Start)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
-
-    tracing::info!("System running. Press Ctrl+C to stop.");
+    tracing::info!("All strategies added. System running. Press Ctrl+C to stop.");
 
     // Wait for shutdown signal
     tokio::signal::ctrl_c()
@@ -84,11 +78,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Received shutdown signal");
 
     // Graceful shutdown
-    engine.stop_gracefully().await.ok();
+    manager.stop_gracefully().await.ok();
 
-    tracing::info!("Engine stopped");
-
-    tracing::info!("System stopped.");
+    tracing::info!("Manager stopped");
 
     Ok(())
 }

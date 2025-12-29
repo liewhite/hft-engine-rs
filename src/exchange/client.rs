@@ -1,14 +1,13 @@
 //! 交易所客户端统一抽象
 //!
-//! ExchangeClient trait 封装交易所所有交互（REST + WebSocket）
+//! ExchangeClient trait 封装交易所 REST 交互
+//! Sink traits 用于解耦 Actor 之间的数据流
 
 use crate::domain::{
     Balance, Exchange, ExchangeError, FundingRate, Order, OrderId, OrderUpdate, Position, Symbol,
     SymbolMeta, BBO,
 };
 use async_trait::async_trait;
-use kameo::actor::ActorID;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 // ============================================================================
@@ -17,7 +16,7 @@ use std::sync::Arc;
 
 /// 订阅类型（仅 public 数据需要订阅）
 ///
-/// Private 数据（Position/Balance/OrderUpdate/Equity）在 start() 时自动处理
+/// Private 数据（Position/Balance/OrderUpdate/Equity）在 create_actor() 时自动处理
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SubscriptionKind {
     /// 资金费率
@@ -102,6 +101,26 @@ impl<T: MarketDataSink + ?Sized> MarketDataSink for Arc<T> {
 }
 
 // ============================================================================
+// 信号接收器 (ExecutorActor → SignalProcessorActor)
+// ============================================================================
+
+use crate::strategy::Signal;
+
+/// 信号接收器
+#[async_trait]
+pub trait SignalSink: Send + Sync + 'static {
+    async fn send_signal(&self, signal: Signal);
+}
+
+/// 为 Arc<T> 实现 SignalSink (blanket impl)
+#[async_trait]
+impl<T: SignalSink + ?Sized> SignalSink for Arc<T> {
+    async fn send_signal(&self, signal: Signal) {
+        self.as_ref().send_signal(signal).await;
+    }
+}
+
+// ============================================================================
 // 解析后的消息（内部使用）
 // ============================================================================
 
@@ -135,16 +154,14 @@ pub enum ParsedMessage {
 }
 
 // ============================================================================
-// ExchangeClient trait
+// ExchangeClient trait (仅 REST)
 // ============================================================================
 
 /// 交易所客户端统一接口
 ///
-/// 封装交易所的 REST 和 WebSocket 交互
+/// 仅封装交易所的 REST 交互，WebSocket Actor 由 ManagerActor 直接创建
 #[async_trait]
 pub trait ExchangeClient: Send + Sync + 'static {
-    // === REST 方法 ===
-
     /// 获取交易所标识
     fn exchange(&self) -> Exchange;
 
@@ -159,37 +176,6 @@ pub trait ExchangeClient: Send + Sync + 'static {
 
     /// 获取账户净值 (balance + unrealized_pnl)
     async fn fetch_equity(&self) -> Result<f64, ExchangeError>;
-
-    // === WebSocket 方法 ===
-
-    /// 启动 WebSocket Actor
-    ///
-    /// 内部流程：
-    /// 1. 创建 public 连接
-    /// 2. 如果有 credentials，创建 private 连接并完成认证
-    /// 3. 启动消息处理循环
-    ///
-    /// 返回句柄用于订阅管理
-    async fn start(
-        self: Arc<Self>,
-        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-        data_sink: Arc<dyn MarketDataSink>,
-    ) -> Result<Arc<dyn ExchangeClientHandle>, ExchangeError>;
-}
-
-/// 交易所客户端句柄（类型擦除）
-///
-/// 用于在 EngineActor 中统一管理不同交易所的 Actor
-#[async_trait]
-pub trait ExchangeClientHandle: Send + Sync {
-    /// 获取 Actor ID (用于 on_link_died)
-    fn actor_id(&self) -> ActorID;
-
-    /// 订阅 public 数据
-    async fn subscribe(&self, kind: SubscriptionKind);
-
-    /// 取消订阅
-    async fn unsubscribe(&self, kind: SubscriptionKind);
 }
 
 // ============================================================================

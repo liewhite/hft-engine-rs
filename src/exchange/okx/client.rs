@@ -1,24 +1,19 @@
-//! OKX ExchangeClient 实现
+//! OKX ExchangeClient 实现 (仅 REST)
 
 use crate::domain::{
     Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
-use crate::exchange::client::{
-    ExchangeClient, ExchangeClientHandle, MarketDataSink, Subscribe, SubscriptionKind, Unsubscribe,
-};
-use crate::exchange::okx::actor::{OkxActor, OkxActorArgs, OkxCredentials};
+use crate::exchange::client::ExchangeClient;
+pub use crate::exchange::okx::actor::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use kameo::actor::{ActorID, ActorRef};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// OKX 交易所客户端
@@ -44,6 +39,11 @@ impl OkxClient {
             credentials,
             base_url: REST_BASE_URL.to_string(),
         })
+    }
+
+    /// 获取凭证（供 ManagerActor 创建 OkxActor 使用）
+    pub fn credentials(&self) -> Option<&OkxCredentials> {
+        self.credentials.as_ref()
     }
 
     /// reqwest 错误转换
@@ -350,41 +350,6 @@ impl ExchangeClient for OkxClient {
 
     async fn fetch_equity(&self) -> Result<f64, ExchangeError> {
         self.get_equity().await
-    }
-
-    async fn start(
-        self: Arc<Self>,
-        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-        data_sink: Arc<dyn MarketDataSink>,
-    ) -> Result<Arc<dyn ExchangeClientHandle>, ExchangeError> {
-        let actor = OkxActor::new(OkxActorArgs {
-            credentials: self.credentials.clone(),
-            symbol_metas,
-            data_sink,
-        });
-
-        let actor_ref = kameo::spawn(actor);
-        Ok(Arc::new(OkxClientHandle { actor_ref }))
-    }
-}
-
-/// OKX 客户端句柄
-struct OkxClientHandle {
-    actor_ref: ActorRef<OkxActor>,
-}
-
-#[async_trait]
-impl ExchangeClientHandle for OkxClientHandle {
-    fn actor_id(&self) -> ActorID {
-        self.actor_ref.id()
-    }
-
-    async fn subscribe(&self, kind: SubscriptionKind) {
-        let _ = self.actor_ref.tell(Subscribe { kind }).await;
-    }
-
-    async fn unsubscribe(&self, kind: SubscriptionKind) {
-        let _ = self.actor_ref.tell(Unsubscribe { kind }).await;
     }
 }
 

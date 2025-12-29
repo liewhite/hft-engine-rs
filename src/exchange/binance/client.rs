@@ -1,20 +1,16 @@
-//! Binance ExchangeClient 实现
+//! Binance ExchangeClient 实现 (仅 REST)
 
 use crate::domain::{
     Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
-use crate::exchange::binance::actor::{BinanceActor, BinanceActorArgs};
 pub use crate::exchange::binance::actor::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
-use crate::exchange::client::{ExchangeClient, ExchangeClientHandle, MarketDataSink, Subscribe, SubscriptionKind, Unsubscribe};
+use crate::exchange::client::ExchangeClient;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
-use kameo::actor::{ActorID, ActorRef};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::Sha256;
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Binance 交易所客户端
@@ -40,6 +36,16 @@ impl BinanceClient {
             credentials,
             base_url: REST_BASE_URL.to_string(),
         })
+    }
+
+    /// 获取凭证（供 ManagerActor 创建 BinanceActor 使用）
+    pub fn credentials(&self) -> Option<&BinanceCredentials> {
+        self.credentials.as_ref()
+    }
+
+    /// 获取 REST API 基础 URL
+    pub fn rest_base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// 获取 API Key（如果有）
@@ -344,42 +350,6 @@ impl ExchangeClient for BinanceClient {
 
     async fn fetch_equity(&self) -> Result<f64, ExchangeError> {
         self.get_equity().await
-    }
-
-    async fn start(
-        self: Arc<Self>,
-        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-        data_sink: Arc<dyn MarketDataSink>,
-    ) -> Result<Arc<dyn ExchangeClientHandle>, ExchangeError> {
-        let actor = BinanceActor::new(BinanceActorArgs {
-            credentials: self.credentials.clone(),
-            symbol_metas,
-            data_sink,
-            rest_base_url: self.base_url.clone(),
-        });
-
-        let actor_ref = kameo::spawn(actor);
-        Ok(Arc::new(BinanceClientHandle { actor_ref }))
-    }
-}
-
-/// Binance 客户端句柄
-struct BinanceClientHandle {
-    actor_ref: ActorRef<BinanceActor>,
-}
-
-#[async_trait]
-impl ExchangeClientHandle for BinanceClientHandle {
-    fn actor_id(&self) -> ActorID {
-        self.actor_ref.id()
-    }
-
-    async fn subscribe(&self, kind: SubscriptionKind) {
-        let _ = self.actor_ref.tell(Subscribe { kind }).await;
-    }
-
-    async fn unsubscribe(&self, kind: SubscriptionKind) {
-        let _ = self.actor_ref.tell(Unsubscribe { kind }).await;
     }
 }
 
