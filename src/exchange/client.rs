@@ -50,53 +50,22 @@ impl PublicDataType {
 }
 
 // ============================================================================
-// 市场数据
+// 事件接收器
 // ============================================================================
 
-/// 市场数据（从交易所推送）
-#[derive(Debug, Clone)]
-pub enum MarketData {
-    /// 资金费率更新
-    FundingRate {
-        exchange: Exchange,
-        symbol: Symbol,
-        rate: FundingRate,
-    },
-    /// BBO 更新
-    BBO {
-        exchange: Exchange,
-        symbol: Symbol,
-        bbo: BBO,
-    },
-    /// 仓位更新 (size 已转为 coin 单位)
-    Position {
-        exchange: Exchange,
-        symbol: Symbol,
-        position: Position,
-    },
-    /// 余额更新
-    Balance { exchange: Exchange, balance: Balance },
-    /// 订单状态更新
-    OrderUpdate {
-        exchange: Exchange,
-        symbol: Symbol,
-        update: OrderUpdate,
-    },
-    /// 账户权益更新
-    Equity { exchange: Exchange, value: f64 },
+use crate::messaging::ExchangeEvent;
+
+/// 交易所事件接收器
+#[async_trait]
+pub trait EventSink: Send + Sync + 'static {
+    async fn send_event(&self, event: ExchangeEvent);
 }
 
-/// 市场数据接收器
+/// 为 Arc<T> 实现 EventSink (blanket impl)
 #[async_trait]
-pub trait MarketDataSink: Send + Sync + 'static {
-    async fn send_market_data(&self, data: MarketData);
-}
-
-/// 为 Arc<T> 实现 MarketDataSink (blanket impl)
-#[async_trait]
-impl<T: MarketDataSink + ?Sized> MarketDataSink for Arc<T> {
-    async fn send_market_data(&self, data: MarketData) {
-        self.as_ref().send_market_data(data).await;
+impl<T: EventSink + ?Sized> EventSink for Arc<T> {
+    async fn send_event(&self, event: ExchangeEvent) {
+        self.as_ref().send_event(event).await;
     }
 }
 

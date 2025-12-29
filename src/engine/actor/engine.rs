@@ -9,7 +9,8 @@ use super::{ExecutorActor, ExecutorArgs, ProcessorActor, RegisterExecutor, Signa
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient};
-use crate::exchange::{ExchangeClient, MarketDataSink, SignalSink, Subscribe, SubscriptionKind};
+use crate::exchange::{EventSink, ExchangeClient, SignalSink, Subscribe, SubscriptionKind};
+use crate::messaging::ExchangeEvent;
 use crate::strategy::Strategy;
 use async_trait::async_trait;
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
@@ -140,8 +141,8 @@ impl ManagerActor {
             ExchangeError::Other("ProcessorActor not initialized".to_string())
         })?;
 
-        // 创建 ProcessorDataSink（实现 MarketDataSink，发送到 ProcessorActor）
-        let data_sink: Arc<dyn MarketDataSink> = Arc::new(ProcessorDataSink {
+        // 创建 ProcessorEventSink（实现 EventSink，发送到 ProcessorActor）
+        let event_sink: Arc<dyn EventSink> = Arc::new(ProcessorEventSink {
             processor: processor.clone(),
         });
 
@@ -162,7 +163,7 @@ impl ManagerActor {
                 let actor = BinanceActor::new(BinanceActorArgs {
                     credentials: client.credentials().cloned(),
                     symbol_metas: Arc::new(symbol_metas),
-                    data_sink,
+                    event_sink,
                     rest_base_url: client.rest_base_url().to_string(),
                 });
 
@@ -189,7 +190,7 @@ impl ManagerActor {
                 let actor = OkxActor::new(OkxActorArgs {
                     credentials: client.credentials().cloned(),
                     symbol_metas: Arc::new(symbol_metas),
-                    data_sink,
+                    event_sink,
                 });
 
                 let okx_ref = spawn_link(actor_ref, actor).await;
@@ -457,15 +458,15 @@ impl Message<Stop> for ManagerActor {
 // Sink 实现
 // ============================================================================
 
-/// ProcessorActor 的数据接收器
-struct ProcessorDataSink {
+/// ProcessorActor 的事件接收器
+struct ProcessorEventSink {
     processor: ActorRef<ProcessorActor>,
 }
 
 #[async_trait]
-impl MarketDataSink for ProcessorDataSink {
-    async fn send_market_data(&self, data: crate::exchange::MarketData) {
-        let _ = self.processor.tell(data).await;
+impl EventSink for ProcessorEventSink {
+    async fn send_event(&self, event: ExchangeEvent) {
+        let _ = self.processor.tell(event).await;
     }
 }
 

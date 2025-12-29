@@ -1,12 +1,13 @@
-//! ProcessorActor - 市场数据分发 Actor
+//! ProcessorActor - 事件分发 Actor
 //!
 //! 职责：
-//! - 接收来自 ExchangeActor 的 MarketData
+//! - 接收来自 ExchangeActor 的 ExchangeEvent
 //! - 根据订阅关系分发到对应的 ExecutorActor
 
 use super::ExecutorActor;
 use crate::domain::Exchange;
-use crate::exchange::{MarketData, SubscriptionKind};
+use crate::exchange::SubscriptionKind;
+use crate::messaging::ExchangeEvent;
 use kameo::actor::{ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -20,7 +21,7 @@ struct ExecutorSubscription {
     subscriptions: HashSet<(Exchange, SubscriptionKind)>,
 }
 
-/// ProcessorActor - 市场数据分发
+/// ProcessorActor - 事件分发
 pub struct ProcessorActor {
     /// ActorID -> Executor 订阅信息
     executors: HashMap<ActorID, ExecutorSubscription>,
@@ -33,20 +34,21 @@ impl ProcessorActor {
         }
     }
 
-    /// 将 MarketData 转换为 SubscriptionKind
-    fn market_data_to_key(data: &MarketData) -> Option<(Exchange, SubscriptionKind)> {
-        match data {
-            MarketData::FundingRate { exchange, symbol, .. } => {
+    /// 将 ExchangeEvent 转换为 SubscriptionKind
+    fn event_to_key(event: &ExchangeEvent) -> Option<(Exchange, SubscriptionKind)> {
+        match event {
+            ExchangeEvent::FundingRateUpdate { exchange, symbol, .. } => {
                 Some((*exchange, SubscriptionKind::FundingRate { symbol: symbol.clone() }))
             }
-            MarketData::BBO { exchange, symbol, .. } => {
+            ExchangeEvent::BBOUpdate { exchange, symbol, .. } => {
                 Some((*exchange, SubscriptionKind::BBO { symbol: symbol.clone() }))
             }
-            // Private 数据广播给所有 executor
-            MarketData::Position { .. }
-            | MarketData::Balance { .. }
-            | MarketData::OrderUpdate { .. }
-            | MarketData::Equity { .. } => None,
+            // Private 数据和 Clock 广播给所有 executor
+            ExchangeEvent::PositionUpdate { .. }
+            | ExchangeEvent::BalanceUpdate { .. }
+            | ExchangeEvent::OrderStatusUpdate { .. }
+            | ExchangeEvent::EquityUpdate { .. }
+            | ExchangeEvent::Clock { .. } => None,
         }
     }
 }
@@ -106,12 +108,12 @@ impl Message<RegisterExecutor> for ProcessorActor {
     }
 }
 
-/// MarketData 消息 - 从 ExchangeActor 接收
-impl Message<MarketData> for ProcessorActor {
+/// ExchangeEvent 消息 - 从 ExchangeActor 接收
+impl Message<ExchangeEvent> for ProcessorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: MarketData, _ctx: Context<'_, Self, Self::Reply>) {
-        let key = Self::market_data_to_key(&msg);
+    async fn handle(&mut self, msg: ExchangeEvent, _ctx: Context<'_, Self, Self::Reply>) {
+        let key = Self::event_to_key(&msg);
 
         match key {
             Some(key) => {
@@ -123,7 +125,7 @@ impl Message<MarketData> for ProcessorActor {
                 }
             }
             None => {
-                // Private 数据：广播给所有 executor
+                // Private 数据 / Clock：广播给所有 executor
                 for sub in self.executors.values() {
                     let _ = sub.executor.tell(msg.clone()).await;
                 }

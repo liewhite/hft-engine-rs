@@ -1,9 +1,9 @@
 //! ExecutorActor - 包装 Strategy 的 Actor
 //!
-//! 接收 MarketData，转换为 ExchangeEvent，调用 Strategy.on_event()
+//! 接收 ExchangeEvent，调用 Strategy.on_event()
 
-use crate::domain::{now_ms, Exchange, Order, Symbol, SymbolMeta};
-use crate::exchange::{MarketData, SignalSink};
+use crate::domain::{Exchange, Order, Symbol, SymbolMeta};
+use crate::exchange::SignalSink;
 use crate::messaging::{ExchangeEvent, StateManager};
 use crate::strategy::{Signal, Strategy};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -65,19 +65,8 @@ impl ExecutorActor {
         }
     }
 
-    /// 处理 MarketData，转换为 ExchangeEvent 并调用策略
-    async fn handle_market_data(&mut self, data: MarketData) {
-        let event = market_data_to_event(data);
-        self.state_manager.apply(&event);
-        self.strategy.on_event(&event, &mut self.state_manager);
-
-        // 收集并处理产生的 Signal
-        self.process_pending_signals().await;
-    }
-
-    /// 处理 Clock 事件
-    async fn handle_clock(&mut self, timestamp: u64) {
-        let event = ExchangeEvent::Clock { timestamp };
+    /// 处理 ExchangeEvent，调用策略
+    async fn handle_event(&mut self, event: ExchangeEvent) {
         self.state_manager.apply(&event);
         self.strategy.on_event(&event, &mut self.state_manager);
 
@@ -126,88 +115,16 @@ impl Actor for ExecutorActor {
 
 // === Messages ===
 
-/// MarketData 消息 - 从 ProcessorActor 接收
-impl Message<MarketData> for ExecutorActor {
+/// ExchangeEvent 消息 - 从 ProcessorActor 接收 (包含所有事件类型，含 Clock)
+impl Message<ExchangeEvent> for ExecutorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: MarketData, _ctx: Context<'_, Self, Self::Reply>) {
-        self.handle_market_data(msg).await;
-    }
-}
-
-/// Clock 消息 - 定时时钟
-#[derive(Clone)]
-pub struct ClockTick {
-    pub timestamp: u64,
-}
-
-impl Message<ClockTick> for ExecutorActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: ClockTick, _ctx: Context<'_, Self, Self::Reply>) {
-        self.handle_clock(msg.timestamp).await;
+    async fn handle(&mut self, msg: ExchangeEvent, _ctx: Context<'_, Self, Self::Reply>) {
+        self.handle_event(msg).await;
     }
 }
 
 // === Helper Functions ===
-
-/// 将 MarketData 转换为 ExchangeEvent
-fn market_data_to_event(data: MarketData) -> ExchangeEvent {
-    let timestamp = now_ms();
-
-    match data {
-        MarketData::FundingRate {
-            exchange,
-            symbol,
-            rate,
-        } => ExchangeEvent::FundingRateUpdate {
-            symbol,
-            exchange,
-            rate,
-            timestamp,
-        },
-        MarketData::BBO {
-            exchange,
-            symbol,
-            bbo,
-        } => ExchangeEvent::BBOUpdate {
-            symbol,
-            exchange,
-            bbo,
-            timestamp,
-        },
-        MarketData::Position {
-            exchange,
-            symbol,
-            position,
-        } => ExchangeEvent::PositionUpdate {
-            symbol,
-            exchange,
-            position,
-            timestamp,
-        },
-        MarketData::Balance { exchange, balance } => ExchangeEvent::BalanceUpdate {
-            exchange,
-            balance,
-            timestamp,
-        },
-        MarketData::OrderUpdate {
-            exchange,
-            symbol,
-            update,
-        } => ExchangeEvent::OrderStatusUpdate {
-            symbol,
-            exchange,
-            update,
-            timestamp,
-        },
-        MarketData::Equity { exchange, value } => ExchangeEvent::EquityUpdate {
-            exchange,
-            equity: value,
-            timestamp,
-        },
-    }
-}
 
 /// 转换订单：coin_to_qty + round
 fn convert_order(order: &Order, metas: &HashMap<(Exchange, Symbol), SymbolMeta>) -> Order {

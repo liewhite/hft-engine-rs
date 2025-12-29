@@ -2,13 +2,14 @@
 //!
 //! 处理 Binance 的公共和私有 WebSocket 连接
 
-use crate::domain::{Exchange, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
 use crate::exchange::client::{
-    MarketData, MarketDataSink, ParsedMessage, Subscribe, SubscriptionKind, Unsubscribe, WsError,
+    EventSink, ParsedMessage, Subscribe, SubscriptionKind, Unsubscribe, WsError,
 };
+use crate::messaging::ExchangeEvent;
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -61,8 +62,8 @@ pub struct BinanceActorArgs {
     pub credentials: Option<BinanceCredentials>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 数据接收器
-    pub data_sink: Arc<dyn MarketDataSink>,
+    /// 事件接收器
+    pub event_sink: Arc<dyn EventSink>,
     /// REST 基础 URL（用于 ListenKey）
     pub rest_base_url: String,
 }
@@ -80,8 +81,8 @@ pub struct BinanceActor {
     credentials: Option<BinanceCredentials>,
     /// Symbol 元数据
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 数据接收器
-    data_sink: Arc<dyn MarketDataSink>,
+    /// 事件接收器
+    event_sink: Arc<dyn EventSink>,
     /// REST 基础 URL
     rest_base_url: String,
 
@@ -108,7 +109,7 @@ impl BinanceActor {
         Self {
             credentials: args.credentials,
             symbol_metas: args.symbol_metas,
-            data_sink: args.data_sink,
+            event_sink: args.event_sink,
             rest_base_url: args.rest_base_url,
             public_conns: Vec::new(),
             private_conn: None,
@@ -536,46 +537,53 @@ impl Message<WsData> for BinanceActor {
             None => return,
         };
 
-        // 转换为 MarketData 并发送
-        let market_data = match parsed {
-            ParsedMessage::FundingRate { symbol, rate } => MarketData::FundingRate {
-                exchange: Exchange::Binance,
+        let timestamp = now_ms();
+        // 转换为 ExchangeEvent 并发送
+        let event = match parsed {
+            ParsedMessage::FundingRate { symbol, rate } => ExchangeEvent::FundingRateUpdate {
                 symbol,
+                exchange: Exchange::Binance,
                 rate,
+                timestamp,
             },
-            ParsedMessage::BBO { symbol, bbo } => MarketData::BBO {
-                exchange: Exchange::Binance,
+            ParsedMessage::BBO { symbol, bbo } => ExchangeEvent::BBOUpdate {
                 symbol,
+                exchange: Exchange::Binance,
                 bbo,
+                timestamp,
             },
             ParsedMessage::Position { symbol, mut position } => {
                 // qty 归一化: 张 -> 币
                 if let Some(meta) = self.symbol_metas.get(&symbol) {
                     position.size = meta.qty_to_coin(position.size);
                 }
-                MarketData::Position {
-                    exchange: Exchange::Binance,
+                ExchangeEvent::PositionUpdate {
                     symbol,
+                    exchange: Exchange::Binance,
                     position,
+                    timestamp,
                 }
             }
-            ParsedMessage::Balance(balance) => MarketData::Balance {
+            ParsedMessage::Balance(balance) => ExchangeEvent::BalanceUpdate {
                 exchange: Exchange::Binance,
                 balance,
+                timestamp,
             },
-            ParsedMessage::OrderUpdate { symbol, update } => MarketData::OrderUpdate {
-                exchange: Exchange::Binance,
+            ParsedMessage::OrderUpdate { symbol, update } => ExchangeEvent::OrderStatusUpdate {
                 symbol,
-                update,
-            },
-            ParsedMessage::Equity(value) => MarketData::Equity {
                 exchange: Exchange::Binance,
-                value,
+                update,
+                timestamp,
+            },
+            ParsedMessage::Equity(value) => ExchangeEvent::EquityUpdate {
+                exchange: Exchange::Binance,
+                equity: value,
+                timestamp,
             },
             ParsedMessage::Subscribed | ParsedMessage::Pong | ParsedMessage::Ignored => return,
         };
 
-        self.data_sink.send_market_data(market_data).await;
+        self.event_sink.send_event(event).await;
     }
 }
 

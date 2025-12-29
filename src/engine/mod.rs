@@ -1,7 +1,7 @@
 pub mod actor;
 
 pub use actor::{
-    AddStrategy, ClockActor, ClockArgs, ClockTick, ExecutorActor, ExecutorArgs, ManagerActor,
+    AddStrategy, ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, ManagerActor,
     ManagerActorArgs, ProcessorActor, RegisterExecutor, SignalProcessorActor, SignalProcessorArgs,
     Stop,
 };

@@ -1,9 +1,10 @@
 //! OKX WebSocket Actor
 
-use crate::domain::{Exchange, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use crate::exchange::client::{
-    MarketData, MarketDataSink, ParsedMessage, Subscribe, SubscriptionKind, Unsubscribe, WsError,
+    EventSink, ParsedMessage, Subscribe, SubscriptionKind, Unsubscribe, WsError,
 };
+use crate::messaging::ExchangeEvent;
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsEvent, WsPush,
 };
@@ -53,7 +54,7 @@ struct WsConnection {
 pub struct OkxActorArgs {
     pub credentials: Option<OkxCredentials>,
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    pub data_sink: Arc<dyn MarketDataSink>,
+    pub event_sink: Arc<dyn EventSink>,
 }
 
 /// OKX 凭证
@@ -76,11 +77,11 @@ impl OkxCredentials {
     }
 }
 
-/// OKX Actor (无泛型，使用 Arc<dyn MarketDataSink>)
+/// OKX Actor (无泛型，使用 Arc<dyn EventSink>)
 pub struct OkxActor {
     credentials: Option<OkxCredentials>,
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    data_sink: Arc<dyn MarketDataSink>,
+    event_sink: Arc<dyn EventSink>,
 
     // 连接管理
     public_conns: Vec<WsConnection>,
@@ -95,7 +96,7 @@ impl OkxActor {
         Self {
             credentials: args.credentials,
             symbol_metas: args.symbol_metas,
-            data_sink: args.data_sink,
+            event_sink: args.event_sink,
             public_conns: Vec::new(),
             private_conn: None,
             subscriptions: HashMap::new(),
@@ -117,15 +118,10 @@ impl OkxActor {
         let (write, read) = ws_stream.split();
         let (tx, rx) = mpsc::channel::<String>(100);
 
-        let data_sink = self.data_sink.clone();
-        let symbol_metas = self.symbol_metas.clone();
         let conn_idx = self.public_conns.len();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                run_public_ws_loop(read, write, rx, data_sink, symbol_metas, self_ref, conn_idx)
-                    .await
-            {
+            if let Err(e) = run_public_ws_loop(read, write, rx, self_ref, conn_idx).await {
                 tracing::warn!(conn_idx, error = %e, "OKX public ws_loop ended with error");
             }
         });
@@ -237,13 +233,8 @@ impl OkxActor {
             .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
             .clone();
 
-        let data_sink = self.data_sink.clone();
-        let symbol_metas = self.symbol_metas.clone();
-
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                run_private_ws_loop(read, write, rx, data_sink, symbol_metas, self_ref).await
-            {
+            if let Err(e) = run_private_ws_loop(read, write, rx, self_ref).await {
                 tracing::warn!(error = %e, "OKX private ws_loop ended with error");
             }
         });
@@ -307,14 +298,8 @@ impl OkxActor {
         let (write, read) = ws_stream.split();
         let (tx, rx) = mpsc::channel::<String>(100);
 
-        let data_sink = self.data_sink.clone();
-        let symbol_metas = self.symbol_metas.clone();
-
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                run_public_ws_loop(read, write, rx, data_sink, symbol_metas, self_ref, conn_idx)
-                    .await
-            {
+            if let Err(e) = run_public_ws_loop(read, write, rx, self_ref, conn_idx).await {
                 tracing::warn!(conn_idx, error = %e, "OKX public ws_loop ended with error");
             }
         });
@@ -569,44 +554,51 @@ impl Message<WsData> for OkxActor {
             None => return,
         };
 
-        let market_data = match parsed {
-            ParsedMessage::FundingRate { symbol, rate } => MarketData::FundingRate {
-                exchange: Exchange::OKX,
+        let timestamp = now_ms();
+        let event = match parsed {
+            ParsedMessage::FundingRate { symbol, rate } => ExchangeEvent::FundingRateUpdate {
                 symbol,
+                exchange: Exchange::OKX,
                 rate,
+                timestamp,
             },
-            ParsedMessage::BBO { symbol, bbo } => MarketData::BBO {
-                exchange: Exchange::OKX,
+            ParsedMessage::BBO { symbol, bbo } => ExchangeEvent::BBOUpdate {
                 symbol,
+                exchange: Exchange::OKX,
                 bbo,
+                timestamp,
             },
             ParsedMessage::Position { symbol, mut position } => {
                 if let Some(meta) = self.symbol_metas.get(&symbol) {
                     position.size = meta.qty_to_coin(position.size);
                 }
-                MarketData::Position {
-                    exchange: Exchange::OKX,
+                ExchangeEvent::PositionUpdate {
                     symbol,
+                    exchange: Exchange::OKX,
                     position,
+                    timestamp,
                 }
             }
-            ParsedMessage::Balance(balance) => MarketData::Balance {
+            ParsedMessage::Balance(balance) => ExchangeEvent::BalanceUpdate {
                 exchange: Exchange::OKX,
                 balance,
+                timestamp,
             },
-            ParsedMessage::OrderUpdate { symbol, update } => MarketData::OrderUpdate {
-                exchange: Exchange::OKX,
+            ParsedMessage::OrderUpdate { symbol, update } => ExchangeEvent::OrderStatusUpdate {
                 symbol,
-                update,
-            },
-            ParsedMessage::Equity(value) => MarketData::Equity {
                 exchange: Exchange::OKX,
-                value,
+                update,
+                timestamp,
+            },
+            ParsedMessage::Equity(value) => ExchangeEvent::EquityUpdate {
+                exchange: Exchange::OKX,
+                equity: value,
+                timestamp,
             },
             ParsedMessage::Subscribed | ParsedMessage::Pong | ParsedMessage::Ignored => return,
         };
 
-        self.data_sink.send_market_data(market_data).await;
+        self.event_sink.send_event(event).await;
     }
 }
 
@@ -620,8 +612,6 @@ async fn run_public_ws_loop(
         + Send,
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
     mut rx: mpsc::Receiver<String>,
-    _data_sink: Arc<dyn MarketDataSink>,
-    _symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     actor_ref: WeakActorRef<OkxActor>,
     conn_idx: usize,
 ) -> Result<(), WsError> {
@@ -690,8 +680,6 @@ async fn run_private_ws_loop(
         + Send,
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
     mut rx: mpsc::Receiver<String>,
-    _data_sink: Arc<dyn MarketDataSink>,
-    _symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     actor_ref: WeakActorRef<OkxActor>,
 ) -> Result<(), WsError> {
     let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;

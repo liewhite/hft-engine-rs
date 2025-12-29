@@ -1,11 +1,12 @@
 //! ClockActor - 定时广播时钟信号
 //!
-//! 每秒发送 ClockTick 给所有注册的 ExecutorActor
+//! 每秒发送 Clock 事件给所有注册的 ExecutorActor
 //! 同时负责查询不支持 WebSocket 推送 equity 的交易所 (如 Binance)
 
-use super::executor::{ClockTick, ExecutorActor};
+use super::executor::ExecutorActor;
 use crate::domain::{now_ms, Exchange};
-use crate::exchange::{ExchangeClient, MarketData, MarketDataSink};
+use crate::exchange::{EventSink, ExchangeClient};
+use crate::messaging::ExchangeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -15,36 +16,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// ClockActor 初始化参数
-pub struct ClockArgs<S: MarketDataSink> {
+pub struct ClockArgs<S: EventSink> {
     /// 时钟间隔 (毫秒)
     pub interval_ms: u64,
     /// Binance client (用于查询 equity)
     pub binance_client: Option<Arc<dyn ExchangeClient>>,
-    /// 数据接收器 (父 Actor)
-    pub data_sink: Arc<S>,
+    /// 事件接收器 (父 Actor)
+    pub event_sink: Arc<S>,
 }
 
 /// ClockActor - 时钟信号广播器
-pub struct ClockActor<S: MarketDataSink> {
+pub struct ClockActor<S: EventSink> {
     /// 时钟间隔
     interval: Duration,
     /// Binance client
     binance_client: Option<Arc<dyn ExchangeClient>>,
-    /// 数据接收器 (父 Actor)
-    data_sink: Arc<S>,
+    /// 事件接收器 (父 Actor)
+    event_sink: Arc<S>,
     /// 已注册的 ExecutorActor 列表
     executors: Vec<ActorRef<ExecutorActor>>,
     /// 自身引用
     self_ref: Option<WeakActorRef<Self>>,
 }
 
-impl<S: MarketDataSink> ClockActor<S> {
+impl<S: EventSink> ClockActor<S> {
     /// 创建 ClockActor
     pub fn new(args: ClockArgs<S>) -> Self {
         Self {
             interval: Duration::from_millis(args.interval_ms),
             binance_client: args.binance_client,
-            data_sink: args.data_sink,
+            event_sink: args.event_sink,
             executors: Vec::new(),
             self_ref: None,
         }
@@ -58,10 +59,11 @@ impl<S: MarketDataSink> ClockActor<S> {
         if let Some(ref client) = self.binance_client {
             match client.fetch_equity().await {
                 Ok(equity) => {
-                    self.data_sink
-                        .send_market_data(MarketData::Equity {
+                    self.event_sink
+                        .send_event(ExchangeEvent::EquityUpdate {
                             exchange: Exchange::Binance,
-                            value: equity,
+                            equity,
+                            timestamp,
                         })
                         .await;
                 }
@@ -75,15 +77,15 @@ impl<S: MarketDataSink> ClockActor<S> {
             }
         }
 
-        // 向所有 executor 发送 ClockTick
-        let tick = ClockTick { timestamp };
+        // 向所有 executor 发送 Clock 事件
+        let clock_event = ExchangeEvent::Clock { timestamp };
         for executor in &self.executors {
-            let _ = executor.tell(tick.clone()).await;
+            let _ = executor.tell(clock_event.clone()).await;
         }
     }
 }
 
-impl<S: MarketDataSink> Actor for ClockActor<S> {
+impl<S: EventSink> Actor for ClockActor<S> {
     type Mailbox = UnboundedMailbox<Self>;
 
     fn name() -> &'static str {
@@ -131,7 +133,7 @@ pub struct RegisterExecutor {
     pub executor: ActorRef<ExecutorActor>,
 }
 
-impl<S: MarketDataSink> Message<RegisterExecutor> for ClockActor<S> {
+impl<S: EventSink> Message<RegisterExecutor> for ClockActor<S> {
     type Reply = ();
 
     async fn handle(&mut self, msg: RegisterExecutor, _ctx: Context<'_, Self, Self::Reply>) {
@@ -142,7 +144,7 @@ impl<S: MarketDataSink> Message<RegisterExecutor> for ClockActor<S> {
 /// 内部消息: 触发 tick
 struct DoTick;
 
-impl<S: MarketDataSink> Message<DoTick> for ClockActor<S> {
+impl<S: EventSink> Message<DoTick> for ClockActor<S> {
     type Reply = ();
 
     async fn handle(&mut self, _msg: DoTick, _ctx: Context<'_, Self, Self::Reply>) {
