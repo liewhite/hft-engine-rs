@@ -554,6 +554,3 @@ impl SignalSink for SignalProcessorSink {
     }
 }
 
-// 为了向后兼容，保留旧名称的别名
-pub type EngineActor = ManagerActor;
-pub type EngineActorArgs = ManagerActorArgs;

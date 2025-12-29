@@ -126,7 +126,7 @@ impl Actor for ExecutorActor {
 
 // === Messages ===
 
-/// MarketData 消息 - 从 EngineActor 接收
+/// MarketData 消息 - 从 ProcessorActor 接收
 impl Message<MarketData> for ExecutorActor {
     type Reply = ();
 

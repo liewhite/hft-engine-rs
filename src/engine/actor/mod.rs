@@ -9,7 +9,7 @@ mod processor;
 mod signal_processor;
 
 pub use clock::{ClockActor, ClockArgs};
-pub use engine::{AddStrategy, EngineActor, EngineActorArgs, ManagerActor, ManagerActorArgs, Stop};
+pub use engine::{AddStrategy, ManagerActor, ManagerActorArgs, Stop};
 pub use executor::{ClockTick, ExecutorActor, ExecutorArgs};
 pub use processor::{ProcessorActor, RegisterExecutor};
 pub use signal_processor::{SignalProcessorActor, SignalProcessorArgs};

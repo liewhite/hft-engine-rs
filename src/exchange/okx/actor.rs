@@ -11,7 +11,7 @@ use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::BoxError;
+use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
@@ -307,6 +307,25 @@ impl Actor for OkxActor {
             "OkxActor started"
         );
 
+        Ok(())
+    }
+
+    async fn on_stop(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        _reason: ActorStopReason,
+    ) -> Result<(), BoxError> {
+        // 中止所有 public 连接的任务
+        for conn in self.public_conns.drain(..) {
+            conn._handle.abort();
+        }
+
+        // 中止 private 连接的任务
+        if let Some(conn) = self.private_conn.take() {
+            conn._handle.abort();
+        }
+
+        tracing::info!("OkxActor stopped");
         Ok(())
     }
 }
