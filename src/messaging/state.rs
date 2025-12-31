@@ -1,21 +1,12 @@
 use crate::domain::{Exchange, FundingRate, OrderStatus, Position, Rate, Symbol, Timestamp, BBO};
-use crate::messaging::event::{IncomeEvent, ExchangeEventData};
+use crate::messaging::event::{ExchangeEventData, IncomeEvent};
 use std::collections::HashMap;
-
-/// 待处理订单状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingOrderStatus {
-    /// 已创建信号，等待交易所确认
-    Created,
-    /// 交易所已确认
-    Confirmed,
-}
 
 /// 待处理订单信息
 #[derive(Debug, Clone)]
 pub struct PendingOrder {
     pub exchange: Exchange,
-    pub status: PendingOrderStatus,
+    pub status: OrderStatus,
     pub created_at: Timestamp,
 }
 
@@ -46,22 +37,24 @@ impl SymbolState {
     pub fn add_pending_order(&mut self, client_order_id: String, exchange: Exchange, created_at: Timestamp) {
         self.pending_orders.insert(client_order_id, PendingOrder {
             exchange,
-            status: PendingOrderStatus::Created,
+            status: OrderStatus::Created,
             created_at,
         });
     }
 
     /// 检查并移除超时订单，返回被移除的订单数量
+    ///
+    /// 只移除 Created 状态的订单（交易所未确认）
     pub fn remove_timed_out_orders(&mut self, now: Timestamp, timeout_ms: u64) -> usize {
         let before = self.pending_orders.len();
         self.pending_orders.retain(|client_id, order| {
             let elapsed = now.saturating_sub(order.created_at);
-            if elapsed > timeout_ms && order.status == PendingOrderStatus::Created {
+            if elapsed > timeout_ms && order.status == OrderStatus::Created {
                 tracing::warn!(
                     client_order_id = %client_id,
                     exchange = %order.exchange,
                     elapsed_ms = elapsed,
-                    "Order timed out, removing from pending"
+                    "Order timed out (no exchange confirmation), removing from pending"
                 );
                 false
             } else {
@@ -204,8 +197,13 @@ impl SymbolState {
                         OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
                             // 交易所已确认订单，更新状态
                             if let Some(order) = self.pending_orders.get_mut(client_id) {
-                                order.status = PendingOrderStatus::Confirmed;
+                                order.status = update.status.clone();
                             }
+                        }
+                        OrderStatus::Created => {
+                            // 交易所不会推送 Created 状态，这是本地状态
+                            // 如果收到说明有 bug
+                            unreachable!("Exchange should never push Created status")
                         }
                     }
                 }
