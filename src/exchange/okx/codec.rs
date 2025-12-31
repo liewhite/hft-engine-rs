@@ -37,25 +37,29 @@ pub struct FundingRateData {
 }
 
 impl FundingRateData {
-    pub fn to_funding_rate(&self) -> Option<FundingRate> {
-        let symbol = Symbol::from_okx(&self.inst_id)?;
-        let rate = f64::from_str(&self.funding_rate).ok()?;
+    pub fn to_funding_rate(&self) -> FundingRate {
+        let symbol = Symbol::from_okx(&self.inst_id)
+            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+        let rate = f64::from_str(&self.funding_rate)
+            .unwrap_or_else(|_| panic!("Failed to parse funding rate: {}", self.funding_rate));
         // funding_time: 下次收取时间
         // next_funding_time: 下下次收取时间 (用于计算间隔)
-        let next_settle_ms: u64 = self.funding_time.parse().ok()?;
-        let next_next_settle_ms: u64 = self.next_funding_time.parse().ok()?;
+        let next_settle_ms: u64 = self.funding_time.parse()
+            .unwrap_or_else(|_| panic!("Failed to parse funding time: {}", self.funding_time));
+        let next_next_settle_ms: u64 = self.next_funding_time.parse()
+            .unwrap_or_else(|_| panic!("Failed to parse next funding time: {}", self.next_funding_time));
 
         // 计算结算间隔 (毫秒转小时)
         let interval_ms = next_next_settle_ms.saturating_sub(next_settle_ms);
         let settle_interval_hours = (interval_ms as f64) / (1000.0 * 60.0 * 60.0);
 
-        Some(FundingRate {
+        FundingRate {
             exchange: Exchange::OKX,
             symbol,
             rate,
             next_settle_time: next_settle_ms,
             settle_interval_hours,
-        })
+        }
     }
 }
 
@@ -71,26 +75,30 @@ pub struct BboData {
 }
 
 impl BboData {
-    pub fn to_bbo(&self, inst_id: &str) -> Option<BBO> {
-        let symbol = Symbol::from_okx(inst_id)?;
+    pub fn to_bbo(&self, inst_id: &str) -> BBO {
+        let symbol = Symbol::from_okx(inst_id)
+            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", inst_id));
 
-        let ask = self.asks.first()?;
-        if ask.len() < 2 {
-            return None;
-        }
-        let ask_price = f64::from_str(&ask[0]).ok()?;
-        let ask_qty = f64::from_str(&ask[1]).ok()?;
+        let ask = self.asks.first()
+            .expect("BBO asks is empty");
+        assert!(ask.len() >= 2, "BBO ask data incomplete");
+        let ask_price = f64::from_str(&ask[0])
+            .unwrap_or_else(|_| panic!("Failed to parse ask price: {}", ask[0]));
+        let ask_qty = f64::from_str(&ask[1])
+            .unwrap_or_else(|_| panic!("Failed to parse ask qty: {}", ask[1]));
 
-        let bid = self.bids.first()?;
-        if bid.len() < 2 {
-            return None;
-        }
-        let bid_price = f64::from_str(&bid[0]).ok()?;
-        let bid_qty = f64::from_str(&bid[1]).ok()?;
+        let bid = self.bids.first()
+            .expect("BBO bids is empty");
+        assert!(bid.len() >= 2, "BBO bid data incomplete");
+        let bid_price = f64::from_str(&bid[0])
+            .unwrap_or_else(|_| panic!("Failed to parse bid price: {}", bid[0]));
+        let bid_qty = f64::from_str(&bid[1])
+            .unwrap_or_else(|_| panic!("Failed to parse bid qty: {}", bid[1]));
 
-        let timestamp = self.ts.parse::<u64>().unwrap_or(0);
+        let timestamp = self.ts.parse::<u64>()
+            .unwrap_or_else(|_| panic!("Failed to parse timestamp: {}", self.ts));
 
-        Some(BBO {
+        BBO {
             exchange: Exchange::OKX,
             symbol,
             bid_price,
@@ -98,7 +106,7 @@ impl BboData {
             ask_price,
             ask_qty,
             timestamp,
-        })
+        }
     }
 }
 
@@ -121,9 +129,12 @@ pub struct PositionData {
 }
 
 impl PositionData {
-    pub fn to_position(&self) -> Option<Position> {
-        let symbol = Symbol::from_okx(&self.inst_id)?;
-        let pos_amount = f64::from_str(&self.pos).ok()?;
+    pub fn to_position(&self) -> Position {
+        let symbol = Symbol::from_okx(&self.inst_id)
+            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+        let pos_amount = f64::from_str(&self.pos)
+            .unwrap_or_else(|_| panic!("Failed to parse position amount: {}", self.pos));
+        // 以下字段可能为空字符串，使用默认值
         let avg_price = f64::from_str(&self.avg_px).unwrap_or(0.0);
         let unrealized_pnl = f64::from_str(&self.upl).unwrap_or(0.0);
         let leverage: u32 = self.lever.parse().unwrap_or(1);
@@ -133,7 +144,7 @@ impl PositionData {
             .and_then(|p| f64::from_str(p).ok())
             .unwrap_or(0.0);
 
-        Some(Position {
+        Position {
             exchange: Exchange::OKX,
             symbol,
             size: pos_amount, // 正数多头，负数空头
@@ -141,7 +152,7 @@ impl PositionData {
             leverage,
             unrealized_pnl,
             mark_price,
-        })
+        }
     }
 }
 
@@ -158,8 +169,9 @@ pub struct AccountData {
 }
 
 impl AccountData {
-    pub fn to_equity(&self) -> Option<f64> {
-        f64::from_str(&self.total_eq).ok()
+    pub fn to_equity(&self) -> f64 {
+        f64::from_str(&self.total_eq)
+            .unwrap_or_else(|_| panic!("Failed to parse total equity: {}", self.total_eq))
     }
 }
 
@@ -194,14 +206,17 @@ pub struct OrderPushData {
 }
 
 impl OrderPushData {
-    pub fn to_order_update(&self) -> Option<OrderUpdate> {
-        let symbol = Symbol::from_okx(&self.inst_id)?;
-        let filled_qty = f64::from_str(&self.fill_sz).ok()?;
+    pub fn to_order_update(&self) -> OrderUpdate {
+        let symbol = Symbol::from_okx(&self.inst_id)
+            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+        let filled_qty = f64::from_str(&self.fill_sz)
+            .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.fill_sz));
+        // avg_price 可能为空字符串（未成交时）
         let avg_price = f64::from_str(&self.avg_px).ok();
 
         let status = map_okx_order_state(&self.state, filled_qty);
 
-        Some(OrderUpdate {
+        OrderUpdate {
             order_id: self.ord_id.clone(),
             client_order_id: self.cl_ord_id.clone(),
             exchange: Exchange::OKX,
@@ -210,7 +225,7 @@ impl OrderPushData {
             filled_quantity: filled_qty,
             avg_price,
             timestamp: now_ms(),
-        })
+        }
     }
 }
 

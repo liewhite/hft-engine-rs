@@ -496,17 +496,19 @@ fn parse_message(
             let push: WsPush<FundingRateData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("funding-rate parse: {}", e)))?;
 
-            let mut events = Vec::new();
-            for data in &push.data {
-                if let Some(rate) = data.to_funding_rate() {
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let rate = data.to_funding_rate();
                     // funding-rate 没有事件时间戳，使用本地时间
-                    events.push(IncomeEvent {
+                    IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
                         data: ExchangeEventData::FundingRate(rate),
-                    });
-                }
-            }
+                    }
+                })
+                .collect();
             Ok(events)
         }
         "bbo-tbt" => {
@@ -518,78 +520,88 @@ fn parse_message(
                 .as_ref()
                 .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
 
-            let mut events = Vec::new();
-            for data in &push.data {
-                // 提取交易所时间戳 (data.ts 是字符串)
-                let exchange_ts = data.ts.parse::<u64>().unwrap_or(local_ts);
-                if let Some(bbo) = data.to_bbo(inst_id) {
-                    events.push(IncomeEvent {
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    // 提取交易所时间戳 (data.ts 是字符串)
+                    let exchange_ts = data.ts.parse::<u64>()
+                        .unwrap_or_else(|_| panic!("Failed to parse BBO timestamp: {}", data.ts));
+                    let bbo = data.to_bbo(inst_id);
+                    IncomeEvent {
                         exchange_ts,
                         local_ts,
                         data: ExchangeEventData::BBO(bbo),
-                    });
-                }
-            }
+                    }
+                })
+                .collect();
             Ok(events)
         }
         "positions" => {
             let push: WsPush<PositionData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("positions parse: {}", e)))?;
 
-            let mut events = Vec::new();
-            for data in &push.data {
-                if let Some(mut position) = data.to_position() {
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let mut position = data.to_position();
                     // qty 归一化: 张 -> 币
                     let meta = symbol_metas
                         .get(&position.symbol)
                         .expect("SymbolMeta not found for position symbol");
                     position.size = meta.qty_to_coin(position.size);
                     // positions 没有暴露时间戳字段，使用本地时间
-                    events.push(IncomeEvent {
+                    IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
                         data: ExchangeEventData::Position(position),
-                    });
-                }
-            }
+                    }
+                })
+                .collect();
             Ok(events)
         }
         "account" => {
             let push: WsPush<AccountData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;
 
-            let mut events = Vec::new();
-            for data in &push.data {
-                // 提取交易所时间戳 (u_time 是字符串)
-                let exchange_ts = data.u_time.parse::<u64>().unwrap_or(local_ts);
-                if let Some(equity) = data.to_equity() {
-                    events.push(IncomeEvent {
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    // 提取交易所时间戳 (u_time 是字符串)
+                    let exchange_ts = data.u_time.parse::<u64>()
+                        .unwrap_or_else(|_| panic!("Failed to parse account timestamp: {}", data.u_time));
+                    let equity = data.to_equity();
+                    IncomeEvent {
                         exchange_ts,
                         local_ts,
                         data: ExchangeEventData::Equity {
                             exchange: Exchange::OKX,
                             equity,
                         },
-                    });
-                }
-            }
+                    }
+                })
+                .collect();
             Ok(events)
         }
         "orders" => {
             let push: WsPush<OrderPushData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("orders parse: {}", e)))?;
 
-            let mut events = Vec::new();
-            for data in &push.data {
-                if let Some(update) = data.to_order_update() {
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let update = data.to_order_update();
                     // orders 没有暴露时间戳字段，使用本地时间
-                    events.push(IncomeEvent {
+                    IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
                         data: ExchangeEventData::OrderUpdate(update),
-                    });
-                }
-            }
+                    }
+                })
+                .collect();
             Ok(events)
         }
         _ => {

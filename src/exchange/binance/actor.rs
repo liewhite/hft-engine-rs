@@ -521,9 +521,7 @@ fn parse_message(
         "markPriceUpdate" => {
             let update: MarkPriceUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
-            let rate = update
-                .to_funding_rate(8.0)
-                .ok_or_else(|| WsError::ParseError("Invalid funding rate".into()))?;
+            let rate = update.to_funding_rate(8.0);
             Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,
@@ -533,9 +531,7 @@ fn parse_message(
         "bookTicker" => {
             let ticker: BookTicker = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
-            let bbo = ticker
-                .to_bbo()
-                .ok_or_else(|| WsError::ParseError("Invalid BBO data".into()))?;
+            let bbo = ticker.to_bbo();
             Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,
@@ -550,29 +546,27 @@ fn parse_message(
 
             // 处理所有 position 更新
             for pos_data in &update.a.positions {
-                if let Some(mut position) = pos_data.to_position() {
-                    // qty 归一化: 张 -> 币
-                    let meta = symbol_metas
-                        .get(&position.symbol)
-                        .expect("SymbolMeta not found for position symbol");
-                    position.size = meta.qty_to_coin(position.size);
-                    events.push(IncomeEvent {
-                        exchange_ts,
-                        local_ts,
-                        data: ExchangeEventData::Position(position),
-                    });
-                }
+                let mut position = pos_data.to_position();
+                // qty 归一化: 张 -> 币
+                let meta = symbol_metas
+                    .get(&position.symbol)
+                    .expect("SymbolMeta not found for position symbol");
+                position.size = meta.qty_to_coin(position.size);
+                events.push(IncomeEvent {
+                    exchange_ts,
+                    local_ts,
+                    data: ExchangeEventData::Position(position),
+                });
             }
 
             // 处理所有 balance 更新
             for bal_data in &update.a.balances {
-                if let Some(balance) = bal_data.to_balance() {
-                    events.push(IncomeEvent {
-                        exchange_ts,
-                        local_ts,
-                        data: ExchangeEventData::Balance(balance),
-                    });
-                }
+                let balance = bal_data.to_balance();
+                events.push(IncomeEvent {
+                    exchange_ts,
+                    local_ts,
+                    data: ExchangeEventData::Balance(balance),
+                });
             }
 
             Ok(events)
@@ -580,9 +574,7 @@ fn parse_message(
         "ORDER_TRADE_UPDATE" => {
             let update: OrderTradeUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("ORDER_TRADE_UPDATE parse: {}", e)))?;
-            let order_update = update
-                .to_order_update()
-                .ok_or_else(|| WsError::ParseError("Invalid order update".into()))?;
+            let order_update = update.to_order_update();
             Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,

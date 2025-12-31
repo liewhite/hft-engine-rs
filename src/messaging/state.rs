@@ -191,6 +191,7 @@ impl SymbolState {
                     "Updating order status"
                 );
                 // 使用 client_order_id 跟踪订单状态
+                // 如果没有返回client_order_id说明不是我们发起的订单，忽略
                 if let Some(ref client_id) = update.client_order_id {
                     match update.status {
                         OrderStatus::Filled
