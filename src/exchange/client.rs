@@ -104,6 +104,12 @@ pub struct Subscribe {
     pub kind: SubscriptionKind,
 }
 
+/// 取消订阅消息
+#[derive(Debug, Clone)]
+pub struct Unsubscribe {
+    pub kind: SubscriptionKind,
+}
+
 /// WebSocket 错误
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum WsError {

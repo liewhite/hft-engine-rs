@@ -1,7 +1,7 @@
 //! OKX WebSocket Actor
 
 use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, WsError};
+use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsEvent, WsPush,
 };
@@ -227,6 +227,19 @@ impl OkxActor {
             let _ = conn.tx.send(msg).await;
         }
     }
+
+    async fn send_unsubscribe(&self, kind: &SubscriptionKind) {
+        let arg = kind_to_arg(kind);
+        let msg = json!({
+            "op": "unsubscribe",
+            "args": [arg]
+        })
+        .to_string();
+
+        if let Some(conn) = &self.public_conn {
+            let _ = conn.tx.send(msg).await;
+        }
+    }
 }
 
 impl Actor for OkxActor {
@@ -294,6 +307,22 @@ impl Message<Subscribe> for OkxActor {
 
         self.send_subscribe(&msg.kind).await;
         self.subscribed.insert(msg.kind);
+    }
+}
+
+impl Message<Unsubscribe> for OkxActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: Unsubscribe,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        if !self.subscribed.remove(&msg.kind) {
+            return;
+        }
+
+        self.send_unsubscribe(&msg.kind).await;
     }
 }
 

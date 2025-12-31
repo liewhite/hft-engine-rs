@@ -6,7 +6,7 @@ use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
-use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, WsError};
+use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
 use crate::messaging::ExchangeEvent;
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -181,6 +181,21 @@ impl BinanceActor {
             let _ = conn.tx.send(msg).await;
         }
     }
+
+    /// 发送取消订阅消息
+    async fn send_unsubscribe(&self, kind: &SubscriptionKind) {
+        let stream = kind_to_stream(kind);
+        let msg = json!({
+            "method": "UNSUBSCRIBE",
+            "params": [stream],
+            "id": 2
+        })
+        .to_string();
+
+        if let Some(conn) = &self.public_conn {
+            let _ = conn.tx.send(msg).await;
+        }
+    }
 }
 
 impl Actor for BinanceActor {
@@ -254,6 +269,23 @@ impl Message<Subscribe> for BinanceActor {
 
         self.send_subscribe(&msg.kind).await;
         self.subscribed.insert(msg.kind);
+    }
+}
+
+impl Message<Unsubscribe> for BinanceActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: Unsubscribe,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        // 检查是否已订阅
+        if !self.subscribed.remove(&msg.kind) {
+            return;
+        }
+
+        self.send_unsubscribe(&msg.kind).await;
     }
 }
 
