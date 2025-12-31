@@ -552,9 +552,10 @@ fn parse_message(
             for pos_data in &update.a.positions {
                 if let Some(mut position) = pos_data.to_position() {
                     // qty 归一化: 张 -> 币
-                    if let Some(meta) = symbol_metas.get(&position.symbol) {
-                        position.size = meta.qty_to_coin(position.size);
-                    }
+                    let meta = symbol_metas
+                        .get(&position.symbol)
+                        .expect("SymbolMeta not found for position symbol");
+                    position.size = meta.qty_to_coin(position.size);
                     events.push(IncomeEvent {
                         exchange_ts,
                         local_ts,

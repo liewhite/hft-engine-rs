@@ -540,9 +540,10 @@ fn parse_message(
             for data in &push.data {
                 if let Some(mut position) = data.to_position() {
                     // qty 归一化: 张 -> 币
-                    if let Some(meta) = symbol_metas.get(&position.symbol) {
-                        position.size = meta.qty_to_coin(position.size);
-                    }
+                    let meta = symbol_metas
+                        .get(&position.symbol)
+                        .expect("SymbolMeta not found for position symbol");
+                    position.size = meta.qty_to_coin(position.size);
                     // positions 没有暴露时间戳字段，使用本地时间
                     events.push(IncomeEvent {
                         exchange_ts: local_ts,

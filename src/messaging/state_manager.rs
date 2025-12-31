@@ -117,11 +117,13 @@ impl StateManager {
             }
             // Symbol 事件: 委托对应 SymbolState 处理
             _ => {
-                if let Some(symbol) = event.symbol() {
-                    if let Some(state) = self.states.get_mut(symbol) {
-                        state.apply(event);
-                    }
-                }
+                let symbol = event
+                    .symbol()
+                    .expect("Symbol event must have symbol");
+                self.states
+                    .get_mut(symbol)
+                    .expect("Symbol not found in StateManager")
+                    .apply(event);
             }
         }
     }

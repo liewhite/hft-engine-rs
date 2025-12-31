@@ -5,9 +5,9 @@
 //! - 根据订阅关系分发到对应的 ExecutorActor
 
 use super::ExecutorActor;
-use crate::domain::Exchange;
+use crate::domain::{Exchange, Symbol};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{IncomeEvent, ExchangeEventData};
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -15,10 +15,19 @@ use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::{HashMap, HashSet};
 
+/// 事件路由类型
+enum EventRouting {
+    /// 按 (exchange, symbol) 路由到订阅了该 symbol 的 executor
+    BySymbol { exchange: Exchange, symbol: Symbol },
+    /// 广播给所有 executor
+    Broadcast,
+}
+
 /// Executor 订阅信息
 struct ExecutorSubscription {
     executor: ActorRef<ExecutorActor>,
-    subscriptions: HashSet<(Exchange, SubscriptionKind)>,
+    /// 订阅的 (exchange, symbol) 集合
+    symbols: HashSet<(Exchange, Symbol)>,
 }
 
 /// ProcessorActor - 事件分发
@@ -34,21 +43,31 @@ impl ProcessorActor {
         }
     }
 
-    /// 将 ExchangeEvent 转换为 SubscriptionKind
-    fn event_to_key(event: &IncomeEvent) -> Option<(Exchange, SubscriptionKind)> {
+    /// 确定事件的路由方式
+    fn event_routing(event: &IncomeEvent) -> EventRouting {
         match &event.data {
-            ExchangeEventData::FundingRate(rate) => {
-                Some((rate.exchange, SubscriptionKind::FundingRate { symbol: rate.symbol.clone() }))
-            }
-            ExchangeEventData::BBO(bbo) => {
-                Some((bbo.exchange, SubscriptionKind::BBO { symbol: bbo.symbol.clone() }))
-            }
-            // Private 数据和 Clock 广播给所有 executor
-            ExchangeEventData::Position(_)
-            | ExchangeEventData::Balance(_)
-            | ExchangeEventData::OrderUpdate(_)
+            // Public 数据：按 (exchange, symbol) 路由
+            ExchangeEventData::FundingRate(rate) => EventRouting::BySymbol {
+                exchange: rate.exchange,
+                symbol: rate.symbol.clone(),
+            },
+            ExchangeEventData::BBO(bbo) => EventRouting::BySymbol {
+                exchange: bbo.exchange,
+                symbol: bbo.symbol.clone(),
+            },
+            // Private 数据：Position 和 OrderUpdate 按 symbol 路由
+            ExchangeEventData::Position(pos) => EventRouting::BySymbol {
+                exchange: pos.exchange,
+                symbol: pos.symbol.clone(),
+            },
+            ExchangeEventData::OrderUpdate(update) => EventRouting::BySymbol {
+                exchange: update.exchange,
+                symbol: update.symbol.clone(),
+            },
+            // 账户级别数据和 Clock：广播
+            ExchangeEventData::Balance(_)
             | ExchangeEventData::Equity { .. }
-            | ExchangeEventData::Clock => None,
+            | ExchangeEventData::Clock => EventRouting::Broadcast,
         }
     }
 }
@@ -96,15 +115,27 @@ impl Message<RegisterExecutor> for ProcessorActor {
 
     async fn handle(&mut self, msg: RegisterExecutor, _ctx: Context<'_, Self, Self::Reply>) {
         let actor_id = msg.executor.id();
+
+        // 从 subscriptions 提取 (exchange, symbol) 集合
+        let symbols: HashSet<(Exchange, Symbol)> = msg
+            .subscriptions
+            .iter()
+            .map(|(ex, kind)| (*ex, kind.symbol().clone()))
+            .collect();
+
         tracing::info!(
             executor_id = ?actor_id,
-            subscriptions = msg.subscriptions.len(),
+            symbols = ?symbols,
             "Executor registered"
         );
-        self.executors.insert(actor_id, ExecutorSubscription {
-            executor: msg.executor,
-            subscriptions: msg.subscriptions,
-        });
+
+        self.executors.insert(
+            actor_id,
+            ExecutorSubscription {
+                executor: msg.executor,
+                symbols,
+            },
+        );
     }
 }
 
@@ -113,19 +144,17 @@ impl Message<IncomeEvent> for ProcessorActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: IncomeEvent, _ctx: Context<'_, Self, Self::Reply>) {
-        let key = Self::event_to_key(&msg);
-
-        match key {
-            Some(key) => {
-                // Public 数据：只发送给订阅了该数据的 executor
+        match Self::event_routing(&msg) {
+            EventRouting::BySymbol { exchange, symbol } => {
+                // 按 symbol 路由：只发送给订阅了该 (exchange, symbol) 的 executor
                 for sub in self.executors.values() {
-                    if sub.subscriptions.contains(&key) {
+                    if sub.symbols.contains(&(exchange, symbol.clone())) {
                         let _ = sub.executor.tell(msg.clone()).await;
                     }
                 }
             }
-            None => {
-                // Private 数据 / Clock：广播给所有 executor
+            EventRouting::Broadcast => {
+                // 广播给所有 executor
                 for sub in self.executors.values() {
                     let _ = sub.executor.tell(msg.clone()).await;
                 }
