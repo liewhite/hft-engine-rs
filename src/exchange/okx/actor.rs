@@ -22,9 +22,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// 重连延迟 (3 秒)
-const RECONNECT_DELAY_SECS: u64 = 3;
-
 /// 单个 WebSocket 连接的最大订阅数
 const MAX_SUBSCRIPTIONS_PER_CONN: usize = 100;
 
@@ -280,48 +277,6 @@ impl OkxActor {
             }
         }
     }
-
-    /// 重新连接指定的 public 连接 (替换原有连接)
-    async fn reconnect_public_connection(&mut self, conn_idx: usize) -> Result<(), WsError> {
-        let self_ref = self
-            .self_ref
-            .as_ref()
-            .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
-            .clone();
-
-        let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PUBLIC_URL)
-            .await
-            .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
-
-        let (write, read) = ws_stream.split();
-        let (tx, rx) = mpsc::channel::<String>(100);
-
-        let handle = tokio::spawn(async move {
-            if let Err(e) = run_public_ws_loop(read, write, rx, self_ref, conn_idx).await {
-                tracing::warn!(conn_idx, error = %e, "OKX public ws_loop ended with error");
-            }
-        });
-
-        // 获取该连接之前的订阅数量
-        let subscription_count = self
-            .subscriptions
-            .iter()
-            .filter(|(_, &idx)| idx == conn_idx)
-            .count();
-
-        // 替换连接
-        if conn_idx < self.public_conns.len() {
-            // 中止旧连接
-            self.public_conns[conn_idx]._handle.abort();
-            self.public_conns[conn_idx] = WsConnection {
-                tx,
-                subscription_count,
-                _handle: handle,
-            };
-        }
-
-        Ok(())
-    }
 }
 
 impl Actor for OkxActor {
@@ -420,126 +375,27 @@ pub struct WsData {
     pub data: String,
 }
 
-/// 触发 public 连接重连 (延迟后执行)
-struct ReconnectPublic {
-    conn_idx: usize,
+/// WebSocket 连接断开消息 (触发 Actor 停止)
+struct WsDisconnected {
+    error: WsError,
+    is_private: bool,
 }
 
-/// 触发 private 连接重连 (延迟后执行)
-struct ReconnectPrivate;
-
-/// 执行 public 连接重连
-struct DoReconnectPublic {
-    conn_idx: usize,
-}
-
-/// 执行 private 连接重连
-struct DoReconnectPrivate;
-
-impl Message<ReconnectPublic> for OkxActor {
+impl Message<WsDisconnected> for OkxActor {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        msg: ReconnectPublic,
-        _ctx: Context<'_, Self, Self::Reply>,
+        msg: WsDisconnected,
+        ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        tracing::info!(conn_idx = msg.conn_idx, "OKX public connection lost, will reconnect in {}s", RECONNECT_DELAY_SECS);
-
-        // 非阻塞：spawn 延迟任务，延迟后发送 DoReconnectPublic
-        let self_ref = self.self_ref.clone();
-        let conn_idx = msg.conn_idx;
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-            if let Some(actor) = self_ref.and_then(|r| r.upgrade()) {
-                let _ = actor.tell(DoReconnectPublic { conn_idx }).await;
-            }
-        });
-    }
-}
-
-impl Message<DoReconnectPublic> for OkxActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: DoReconnectPublic,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        tracing::info!(conn_idx = msg.conn_idx, "Reconnecting OKX public connection...");
-
-        // 收集该连接上的订阅
-        let subs_to_restore: Vec<SubscriptionKind> = self
-            .subscriptions
-            .iter()
-            .filter(|(_, &idx)| idx == msg.conn_idx)
-            .map(|(kind, _)| kind.clone())
-            .collect();
-
-        // 重新创建连接
-        match self.reconnect_public_connection(msg.conn_idx).await {
-            Ok(()) => {
-                // 重新订阅
-                for kind in subs_to_restore {
-                    self.send_subscribe(msg.conn_idx, &kind).await;
-                }
-                tracing::info!(conn_idx = msg.conn_idx, "OKX public connection reconnected");
-            }
-            Err(e) => {
-                tracing::error!(conn_idx = msg.conn_idx, error = %e, "Failed to reconnect OKX public connection, retrying...");
-                // 再次尝试重连 (通过 ReconnectPublic 触发延迟)
-                if let Some(actor) = self.self_ref.as_ref().and_then(|r| r.upgrade()) {
-                    let _ = actor.tell(ReconnectPublic { conn_idx: msg.conn_idx }).await;
-                }
-            }
-        }
-    }
-}
-
-impl Message<ReconnectPrivate> for OkxActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        _msg: ReconnectPrivate,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        tracing::info!("OKX private connection lost, will reconnect in {}s", RECONNECT_DELAY_SECS);
-
-        // 非阻塞：spawn 延迟任务，延迟后发送 DoReconnectPrivate
-        let self_ref = self.self_ref.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-            if let Some(actor) = self_ref.and_then(|r| r.upgrade()) {
-                let _ = actor.tell(DoReconnectPrivate).await;
-            }
-        });
-    }
-}
-
-impl Message<DoReconnectPrivate> for OkxActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        _msg: DoReconnectPrivate,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        tracing::info!("Reconnecting OKX private connection...");
-
-        // 重新创建 private 连接 (包含 login 和私有频道订阅)
-        match self.create_private_connection().await {
-            Ok(()) => {
-                tracing::info!("OKX private connection reconnected");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to reconnect OKX private connection, retrying...");
-                // 再次尝试重连 (通过 ReconnectPrivate 触发延迟)
-                if let Some(actor) = self.self_ref.as_ref().and_then(|r| r.upgrade()) {
-                    let _ = actor.tell(ReconnectPrivate).await;
-                }
-            }
-        }
+        let conn_type = if msg.is_private { "private" } else { "public" };
+        tracing::error!(
+            error = %msg.error,
+            conn_type,
+            "OKX WebSocket disconnected, stopping actor"
+        );
+        ctx.actor_ref().stop_gracefully().await.ok();
     }
 }
 
@@ -565,14 +421,17 @@ async fn run_public_ws_loop(
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
     mut rx: mpsc::Receiver<String>,
     actor_ref: WeakActorRef<OkxActor>,
-    conn_idx: usize,
+    _conn_idx: usize,
 ) -> Result<(), WsError> {
     let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
 
-    // 出错时通知 Actor 重连
-    if result.is_err() {
+    // 出错时通知 Actor 停止
+    if let Err(ref e) = result {
         if let Some(actor) = actor_ref.upgrade() {
-            let _ = actor.tell(ReconnectPublic { conn_idx }).await;
+            let _ = actor.tell(WsDisconnected {
+                error: e.clone(),
+                is_private: false,
+            }).await;
         }
     }
 
@@ -636,10 +495,13 @@ async fn run_private_ws_loop(
 ) -> Result<(), WsError> {
     let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
 
-    // 出错时通知 Actor 重连
-    if result.is_err() {
+    // 出错时通知 Actor 停止
+    if let Err(ref e) = result {
         if let Some(actor) = actor_ref.upgrade() {
-            let _ = actor.tell(ReconnectPrivate).await;
+            let _ = actor.tell(WsDisconnected {
+                error: e.clone(),
+                is_private: true,
+            }).await;
         }
     }
 
