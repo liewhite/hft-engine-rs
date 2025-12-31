@@ -359,8 +359,15 @@ impl Message<WsData> for OkxActor {
 
     async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
         let timestamp = now_ms();
-        if let Some(event) = parse_message(&msg.data, timestamp, &self.symbol_metas) {
-            self.event_sink.send_event(event).await;
+        match parse_message(&msg.data, timestamp, &self.symbol_metas) {
+            Ok(events) => {
+                for event in events {
+                    self.event_sink.send_event(event).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, raw = %msg.data, "Failed to parse OKX message");
+            }
         }
     }
 }
@@ -460,18 +467,20 @@ fn parse_message(
     raw: &str,
     timestamp: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
-) -> Option<ExchangeEvent> {
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+) -> Result<Vec<ExchangeEvent>, WsError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
-    // 检查是否是事件响应（控制消息，返回 None）
+    // 检查是否是事件响应（控制消息，返回空 Vec）
     if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
         match event {
-            "subscribe" | "unsubscribe" => return None,
+            "subscribe" | "unsubscribe" => return Ok(Vec::new()),
             "error" => {
-                tracing::error!(raw = %raw, "OKX error");
-                return None;
+                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                return Err(WsError::ParseError(format!("OKX error: code={}, msg={}", code, msg)));
             }
-            _ => return None,
+            _ => return Ok(Vec::new()),
         }
     }
 
@@ -479,72 +488,111 @@ fn parse_message(
     let channel = value
         .get("arg")
         .and_then(|a| a.get("channel"))
-        .and_then(|c| c.as_str())?;
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| WsError::ParseError(format!("Missing channel: {}", raw)))?;
 
     match channel {
         "funding-rate" => {
-            let push: WsPush<FundingRateData> = serde_json::from_str(raw).ok()?;
-            let data = push.data.first()?;
-            let rate = data.to_funding_rate()?;
-            let symbol = rate.symbol.clone();
-            Some(ExchangeEvent::FundingRateUpdate {
-                symbol,
-                exchange: Exchange::OKX,
-                rate,
-                timestamp,
-            })
+            let push: WsPush<FundingRateData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("funding-rate parse: {}", e)))?;
+
+            let mut events = Vec::new();
+            for data in &push.data {
+                if let Some(rate) = data.to_funding_rate() {
+                    let symbol = rate.symbol.clone();
+                    events.push(ExchangeEvent::FundingRateUpdate {
+                        symbol,
+                        exchange: Exchange::OKX,
+                        rate,
+                        timestamp,
+                    });
+                }
+            }
+            Ok(events)
         }
         "bbo-tbt" => {
-            let push: WsPush<BboData> = serde_json::from_str(raw).ok()?;
-            let inst_id = push.arg.inst_id.as_ref()?;
-            let data = push.data.first()?;
-            let bbo = data.to_bbo(inst_id)?;
-            let symbol = bbo.symbol.clone();
-            Some(ExchangeEvent::BBOUpdate {
-                symbol,
-                exchange: Exchange::OKX,
-                bbo,
-                timestamp,
-            })
+            let push: WsPush<BboData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("bbo-tbt parse: {}", e)))?;
+            let inst_id = push
+                .arg
+                .inst_id
+                .as_ref()
+                .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
+
+            let mut events = Vec::new();
+            for data in &push.data {
+                if let Some(bbo) = data.to_bbo(inst_id) {
+                    let symbol = bbo.symbol.clone();
+                    events.push(ExchangeEvent::BBOUpdate {
+                        symbol,
+                        exchange: Exchange::OKX,
+                        bbo,
+                        timestamp,
+                    });
+                }
+            }
+            Ok(events)
         }
         "positions" => {
-            let push: WsPush<PositionData> = serde_json::from_str(raw).ok()?;
-            let data = push.data.first()?;
-            let mut position = data.to_position()?;
-            let symbol = position.symbol.clone();
-            // qty 归一化: 张 -> 币
-            if let Some(meta) = symbol_metas.get(&symbol) {
-                position.size = meta.qty_to_coin(position.size);
+            let push: WsPush<PositionData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("positions parse: {}", e)))?;
+
+            let mut events = Vec::new();
+            for data in &push.data {
+                if let Some(mut position) = data.to_position() {
+                    let symbol = position.symbol.clone();
+                    // qty 归一化: 张 -> 币
+                    if let Some(meta) = symbol_metas.get(&symbol) {
+                        position.size = meta.qty_to_coin(position.size);
+                    }
+                    events.push(ExchangeEvent::PositionUpdate {
+                        symbol,
+                        exchange: Exchange::OKX,
+                        position,
+                        timestamp,
+                    });
+                }
             }
-            Some(ExchangeEvent::PositionUpdate {
-                symbol,
-                exchange: Exchange::OKX,
-                position,
-                timestamp,
-            })
+            Ok(events)
         }
         "account" => {
-            let push: WsPush<AccountData> = serde_json::from_str(raw).ok()?;
-            let data = push.data.first()?;
-            let equity = data.to_equity()?;
-            Some(ExchangeEvent::EquityUpdate {
-                exchange: Exchange::OKX,
-                equity,
-                timestamp,
-            })
+            let push: WsPush<AccountData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;
+
+            let mut events = Vec::new();
+            for data in &push.data {
+                if let Some(equity) = data.to_equity() {
+                    events.push(ExchangeEvent::EquityUpdate {
+                        exchange: Exchange::OKX,
+                        equity,
+                        timestamp,
+                    });
+                }
+            }
+            Ok(events)
         }
         "orders" => {
-            let push: WsPush<OrderPushData> = serde_json::from_str(raw).ok()?;
-            let data = push.data.first()?;
-            let update = data.to_order_update()?;
-            let symbol = update.symbol.clone();
-            Some(ExchangeEvent::OrderStatusUpdate {
-                symbol,
-                exchange: Exchange::OKX,
-                update,
-                timestamp,
-            })
+            let push: WsPush<OrderPushData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("orders parse: {}", e)))?;
+
+            let mut events = Vec::new();
+            for data in &push.data {
+                if let Some(update) = data.to_order_update() {
+                    let symbol = update.symbol.clone();
+                    events.push(ExchangeEvent::OrderStatusUpdate {
+                        symbol,
+                        exchange: Exchange::OKX,
+                        update,
+                        timestamp,
+                    });
+                }
+            }
+            Ok(events)
         }
-        _ => None,
+        _ => {
+            // 未知频道，记录警告但不报错
+            tracing::warn!(channel, raw, "Unknown OKX channel");
+            Ok(Vec::new())
+        }
     }
 }

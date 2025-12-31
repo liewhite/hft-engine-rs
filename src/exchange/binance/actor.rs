@@ -323,8 +323,15 @@ impl Message<WsData> for BinanceActor {
 
     async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
         let timestamp = now_ms();
-        if let Some(event) = parse_message(&msg.data, timestamp, &self.symbol_metas) {
-            self.event_sink.send_event(event).await;
+        match parse_message(&msg.data, timestamp, &self.symbol_metas) {
+            Ok(events) => {
+                for event in events {
+                    self.event_sink.send_event(event).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, raw = %msg.data, "Failed to parse Binance message");
+            }
         }
     }
 }
@@ -481,57 +488,75 @@ fn parse_message(
     raw: &str,
     timestamp: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
-) -> Option<ExchangeEvent> {
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+) -> Result<Vec<ExchangeEvent>, WsError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
-    // 检查是否是订阅响应（控制消息，返回 None）
+    // 检查是否是订阅响应（控制消息，返回空 Vec）
     if value.get("id").is_some() {
         if let Ok(resp) = serde_json::from_str::<WsResponse>(raw) {
-            if resp.error.is_some() {
-                tracing::error!(raw = %raw, "Binance subscribe error");
+            if let Some(err) = resp.error {
+                return Err(WsError::ParseError(format!(
+                    "Subscribe error: code={}, msg={}",
+                    err.code, err.msg
+                )));
             }
         }
-        return None;
+        return Ok(Vec::new());
     }
 
     // 根据事件类型解析
-    let event_type = value.get("e")?.as_str()?;
+    let event_type = value
+        .get("e")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| WsError::ParseError(format!("Missing event type: {}", raw)))?;
 
     match event_type {
         "markPriceUpdate" => {
-            let update: MarkPriceUpdate = serde_json::from_str(raw).ok()?;
-            let symbol = update.symbol()?;
-            let rate = update.to_funding_rate(8.0)?;
-            Some(ExchangeEvent::FundingRateUpdate {
+            let update: MarkPriceUpdate = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
+            let symbol = update
+                .symbol()
+                .ok_or_else(|| WsError::ParseError("Unknown symbol in markPriceUpdate".into()))?;
+            let rate = update
+                .to_funding_rate(8.0)
+                .ok_or_else(|| WsError::ParseError("Invalid funding rate".into()))?;
+            Ok(vec![ExchangeEvent::FundingRateUpdate {
                 symbol,
                 exchange: Exchange::Binance,
                 rate,
                 timestamp,
-            })
+            }])
         }
         "bookTicker" => {
-            let ticker: BookTicker = serde_json::from_str(raw).ok()?;
-            let bbo = ticker.to_bbo()?;
+            let ticker: BookTicker = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
+            let bbo = ticker
+                .to_bbo()
+                .ok_or_else(|| WsError::ParseError("Invalid BBO data".into()))?;
             let symbol = bbo.symbol.clone();
-            Some(ExchangeEvent::BBOUpdate {
+            Ok(vec![ExchangeEvent::BBOUpdate {
                 symbol,
                 exchange: Exchange::Binance,
                 bbo,
                 timestamp,
-            })
+            }])
         }
         "ACCOUNT_UPDATE" => {
-            let update: AccountUpdate = serde_json::from_str(raw).ok()?;
+            let update: AccountUpdate = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("ACCOUNT_UPDATE parse: {}", e)))?;
 
-            // 返回第一个 position 更新 (简化处理)
-            if let Some(pos_data) = update.a.positions.first() {
+            let mut events = Vec::new();
+
+            // 处理所有 position 更新
+            for pos_data in &update.a.positions {
                 if let Some(mut position) = pos_data.to_position() {
                     let symbol = position.symbol.clone();
                     // qty 归一化: 张 -> 币
                     if let Some(meta) = symbol_metas.get(&symbol) {
                         position.size = meta.qty_to_coin(position.size);
                     }
-                    return Some(ExchangeEvent::PositionUpdate {
+                    events.push(ExchangeEvent::PositionUpdate {
                         symbol,
                         exchange: Exchange::Binance,
                         position,
@@ -540,10 +565,10 @@ fn parse_message(
                 }
             }
 
-            // 返回第一个 balance 更新
-            if let Some(bal_data) = update.a.balances.first() {
+            // 处理所有 balance 更新
+            for bal_data in &update.a.balances {
                 if let Some(balance) = bal_data.to_balance() {
-                    return Some(ExchangeEvent::BalanceUpdate {
+                    events.push(ExchangeEvent::BalanceUpdate {
                         exchange: Exchange::Binance,
                         balance,
                         timestamp,
@@ -551,19 +576,26 @@ fn parse_message(
                 }
             }
 
-            None
+            Ok(events)
         }
         "ORDER_TRADE_UPDATE" => {
-            let update: OrderTradeUpdate = serde_json::from_str(raw).ok()?;
-            let order_update = update.to_order_update()?;
+            let update: OrderTradeUpdate = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("ORDER_TRADE_UPDATE parse: {}", e)))?;
+            let order_update = update
+                .to_order_update()
+                .ok_or_else(|| WsError::ParseError("Invalid order update".into()))?;
             let symbol = order_update.symbol.clone();
-            Some(ExchangeEvent::OrderStatusUpdate {
+            Ok(vec![ExchangeEvent::OrderStatusUpdate {
                 symbol,
                 exchange: Exchange::Binance,
                 update: order_update,
                 timestamp,
-            })
+            }])
         }
-        _ => None,
+        _ => {
+            // 未知事件类型，记录警告但不报错
+            tracing::warn!(event_type, raw, "Unknown Binance event type");
+            Ok(Vec::new())
+        }
     }
 }

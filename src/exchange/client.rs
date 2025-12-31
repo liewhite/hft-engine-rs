@@ -107,4 +107,6 @@ pub enum WsError {
     AuthFailed(String),
     #[error("Server closed connection")]
     ServerClosed,
+    #[error("Parse error: {0}")]
+    ParseError(String),
 }
