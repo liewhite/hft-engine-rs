@@ -284,8 +284,8 @@ impl ExchangeClient for BinanceClient {
             params.push(("timeInForce", t));
         }
 
-        if let Some(ref coid) = order.client_order_id {
-            params.push(("newClientOrderId", coid));
+        if !order.client_order_id.is_empty() {
+            params.push(("newClientOrderId", &order.client_order_id));
         }
 
         let query = self

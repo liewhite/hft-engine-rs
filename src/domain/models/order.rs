@@ -11,5 +11,5 @@ pub struct Order {
     pub order_type: OrderType,
     pub quantity: Quantity,
     pub reduce_only: bool,
-    pub client_order_id: Option<String>,
+    pub client_order_id: String,
 }

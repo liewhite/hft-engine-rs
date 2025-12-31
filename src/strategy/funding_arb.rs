@@ -240,7 +240,7 @@ impl FundingArbStrategy {
                 },
                 quantity: qty,
                 reduce_only: false,
-                client_order_id: None,
+                client_order_id: String::new(),
             },
             Order {
                 id: String::new(),
@@ -253,7 +253,7 @@ impl FundingArbStrategy {
                 },
                 quantity: qty,
                 reduce_only: false,
-                client_order_id: None,
+                client_order_id: String::new(),
             },
         ]
     }
@@ -286,7 +286,7 @@ impl FundingArbStrategy {
                     order_type,
                     quantity: pos.size.abs(),
                     reduce_only: true,
-                    client_order_id: None,
+                    client_order_id: String::new(),
                 });
             }
         }
@@ -365,7 +365,7 @@ impl FundingArbStrategy {
             order_type,
             quantity: qty,
             reduce_only: false,
-            client_order_id: None,
+            client_order_id: String::new(),
         }]
     }
 }

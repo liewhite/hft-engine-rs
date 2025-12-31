@@ -238,7 +238,11 @@ impl ExchangeClient for OkxClient {
             sz,
             px: price,
             reduce_only,
-            cl_ord_id: order.client_order_id,
+            cl_ord_id: if order.client_order_id.is_empty() {
+                None
+            } else {
+                Some(order.client_order_id)
+            },
         };
 
         let body = serde_json::to_string(&request)?;

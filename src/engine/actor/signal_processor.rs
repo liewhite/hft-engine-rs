@@ -129,7 +129,7 @@ impl SignalProcessorActor {
         let local_ts = now_ms();
         let update = OrderUpdate {
             order_id: String::new(),
-            client_order_id: order.client_order_id.clone(),
+            client_order_id: Some(order.client_order_id.clone()),
             exchange: order.exchange,
             symbol: order.symbol.clone(),
             status: OrderStatus::Error { reason },

@@ -64,8 +64,7 @@ impl ExecutorActor {
     /// 转换订单：生成 client_order_id，coin_to_qty + round price/size
     fn convert_order(&self, mut order: Order) -> Order {
         // 生成 client_order_id (去掉 `-`，OKX 只允许字母数字)
-        let client_order_id = Uuid::new_v4().simple().to_string();
-        order.client_order_id = Some(client_order_id);
+        order.client_order_id = Uuid::new_v4().simple().to_string();
 
         let key = (order.exchange, order.symbol.clone());
         let meta = match self.symbol_metas.get(&key) {
@@ -128,7 +127,7 @@ impl ExecutorActor {
                     // 添加到 pending_orders
                     self.state_manager.add_pending_order(
                         &converted_order.symbol,
-                        converted_order.client_order_id.clone().unwrap_or_default(),
+                        converted_order.client_order_id.clone(),
                         converted_order.exchange,
                     );
                     // 发送到 SignalProcessor
