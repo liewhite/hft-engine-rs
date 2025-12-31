@@ -33,15 +33,19 @@ impl StateManager {
     // ==================== 下单接口 ====================
 
     /// 添加 pending order (由 Executor 调用，client_order_id 已生成)
+    ///
+    /// # Panics
+    /// symbol 不存在时 panic（表示配置错误）
     pub fn add_pending_order(
         &mut self,
         symbol: &Symbol,
         client_order_id: String,
         exchange: Exchange,
     ) {
-        if let Some(state) = self.states.get_mut(symbol) {
-            state.add_pending_order(client_order_id, exchange, now_ms());
-        }
+        self.states
+            .get_mut(symbol)
+            .expect("Symbol not found in StateManager")
+            .add_pending_order(client_order_id, exchange, now_ms());
     }
 
     // ==================== 状态查询 ====================
