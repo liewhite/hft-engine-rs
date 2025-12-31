@@ -7,7 +7,7 @@
 use super::ExecutorActor;
 use crate::domain::Exchange;
 use crate::exchange::SubscriptionKind;
-use crate::messaging::ExchangeEvent;
+use crate::messaging::{ExchangeEvent, ExchangeEventData};
 use kameo::actor::{ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -36,19 +36,19 @@ impl ProcessorActor {
 
     /// 将 ExchangeEvent 转换为 SubscriptionKind
     fn event_to_key(event: &ExchangeEvent) -> Option<(Exchange, SubscriptionKind)> {
-        match event {
-            ExchangeEvent::FundingRateUpdate { exchange, symbol, .. } => {
-                Some((*exchange, SubscriptionKind::FundingRate { symbol: symbol.clone() }))
+        match &event.data {
+            ExchangeEventData::FundingRate(rate) => {
+                Some((rate.exchange, SubscriptionKind::FundingRate { symbol: rate.symbol.clone() }))
             }
-            ExchangeEvent::BBOUpdate { exchange, symbol, .. } => {
-                Some((*exchange, SubscriptionKind::BBO { symbol: symbol.clone() }))
+            ExchangeEventData::BBO(bbo) => {
+                Some((bbo.exchange, SubscriptionKind::BBO { symbol: bbo.symbol.clone() }))
             }
             // Private 数据和 Clock 广播给所有 executor
-            ExchangeEvent::PositionUpdate { .. }
-            | ExchangeEvent::BalanceUpdate { .. }
-            | ExchangeEvent::OrderStatusUpdate { .. }
-            | ExchangeEvent::EquityUpdate { .. }
-            | ExchangeEvent::Clock { .. } => None,
+            ExchangeEventData::Position(_)
+            | ExchangeEventData::Balance(_)
+            | ExchangeEventData::OrderUpdate(_)
+            | ExchangeEventData::Equity { .. }
+            | ExchangeEventData::Clock => None,
         }
     }
 }

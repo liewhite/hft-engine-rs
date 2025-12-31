@@ -2,7 +2,7 @@ use crate::domain::{Exchange, FundingRate, OrderStatus, Position, Rate, Symbol, 
 
 /// 复用 Position 的 epsilon 常量
 const POSITION_EPSILON: f64 = Position::EPSILON;
-use crate::messaging::event::ExchangeEvent;
+use crate::messaging::event::{ExchangeEvent, ExchangeEventData};
 use std::collections::HashMap;
 
 /// 待处理订单状态
@@ -188,7 +188,7 @@ impl SymbolState {
     ///
     /// 如果事件的 symbol 与 state 的 symbol 不一致，则忽略该事件
     pub fn apply(&mut self, event: &ExchangeEvent) {
-        // 校验 symbol 一致性 (BalanceUpdate 无 symbol，直接忽略)
+        // 校验 symbol 一致性 (Balance/Equity/Clock 无 symbol，直接忽略)
         if let Some(event_symbol) = event.symbol() {
             if event_symbol != &self.symbol {
                 tracing::warn!(
@@ -199,33 +199,29 @@ impl SymbolState {
                 return;
             }
         } else {
-            // BalanceUpdate 无 symbol，在 per-symbol 状态中不处理
+            // Balance/Equity/Clock 无 symbol，在 per-symbol 状态中不处理
             return;
         }
 
-        match event {
-            ExchangeEvent::FundingRateUpdate { exchange, rate, .. } => {
-                self.funding_rates.insert(*exchange, rate.clone());
+        match &event.data {
+            ExchangeEventData::FundingRate(rate) => {
+                self.funding_rates.insert(rate.exchange, rate.clone());
             }
-            ExchangeEvent::BBOUpdate { exchange, bbo, .. } => {
-                self.bbos.insert(*exchange, bbo.clone());
+            ExchangeEventData::BBO(bbo) => {
+                self.bbos.insert(bbo.exchange, bbo.clone());
             }
-            ExchangeEvent::PositionUpdate {
-                exchange, position, ..
-            } => {
+            ExchangeEventData::Position(position) => {
                 tracing::info!(
-                    exchange = %exchange,
+                    exchange = %position.exchange,
                     symbol = %self.symbol,
                     size = position.size,
                     "Updating position"
                 );
-                self.positions.insert(*exchange, position.clone());
+                self.positions.insert(position.exchange, position.clone());
             }
-            ExchangeEvent::OrderStatusUpdate {
-                exchange, update, ..
-            } => {
+            ExchangeEventData::OrderUpdate(update) => {
                 tracing::info!(
-                    exchange = %exchange,
+                    exchange = %update.exchange,
                     order_id = %update.order_id,
                     client_order_id = ?update.client_order_id,
                     status = ?update.status,
@@ -250,10 +246,10 @@ impl SymbolState {
                     }
                 }
             }
-            ExchangeEvent::Clock { .. } => {
+            ExchangeEventData::Clock => {
                 // Clock 事件由策略层处理，这里不需要处理
             }
-            ExchangeEvent::BalanceUpdate { .. } | ExchangeEvent::EquityUpdate { .. } => {
+            ExchangeEventData::Balance(_) | ExchangeEventData::Equity { .. } => {
                 // 已在上面提前返回，这里不会执行
                 unreachable!()
             }

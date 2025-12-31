@@ -2,12 +2,12 @@
 //!
 //! 处理 Binance 的公共和私有 WebSocket 连接
 
-use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Symbol, SymbolMeta};
 use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
 use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use crate::messaging::ExchangeEvent;
+use crate::messaging::{ExchangeEvent, ExchangeEventData};
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -486,7 +486,7 @@ fn kind_to_stream(kind: &SubscriptionKind) -> String {
 
 fn parse_message(
     raw: &str,
-    timestamp: u64,
+    local_ts: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
 ) -> Result<Vec<ExchangeEvent>, WsError> {
     let value: serde_json::Value =
@@ -505,6 +505,12 @@ fn parse_message(
         return Ok(Vec::new());
     }
 
+    // 提取交易所事件时间 (E 字段，毫秒)
+    let exchange_ts = value
+        .get("E")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(local_ts);
+
     // 根据事件类型解析
     let event_type = value
         .get("e")
@@ -515,17 +521,13 @@ fn parse_message(
         "markPriceUpdate" => {
             let update: MarkPriceUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
-            let symbol = update
-                .symbol()
-                .ok_or_else(|| WsError::ParseError("Unknown symbol in markPriceUpdate".into()))?;
             let rate = update
                 .to_funding_rate(8.0)
                 .ok_or_else(|| WsError::ParseError("Invalid funding rate".into()))?;
-            Ok(vec![ExchangeEvent::FundingRateUpdate {
-                symbol,
-                exchange: Exchange::Binance,
-                rate,
-                timestamp,
+            Ok(vec![ExchangeEvent {
+                exchange_ts,
+                local_ts,
+                data: ExchangeEventData::FundingRate(rate),
             }])
         }
         "bookTicker" => {
@@ -534,12 +536,10 @@ fn parse_message(
             let bbo = ticker
                 .to_bbo()
                 .ok_or_else(|| WsError::ParseError("Invalid BBO data".into()))?;
-            let symbol = bbo.symbol.clone();
-            Ok(vec![ExchangeEvent::BBOUpdate {
-                symbol,
-                exchange: Exchange::Binance,
-                bbo,
-                timestamp,
+            Ok(vec![ExchangeEvent {
+                exchange_ts,
+                local_ts,
+                data: ExchangeEventData::BBO(bbo),
             }])
         }
         "ACCOUNT_UPDATE" => {
@@ -551,16 +551,14 @@ fn parse_message(
             // 处理所有 position 更新
             for pos_data in &update.a.positions {
                 if let Some(mut position) = pos_data.to_position() {
-                    let symbol = position.symbol.clone();
                     // qty 归一化: 张 -> 币
-                    if let Some(meta) = symbol_metas.get(&symbol) {
+                    if let Some(meta) = symbol_metas.get(&position.symbol) {
                         position.size = meta.qty_to_coin(position.size);
                     }
-                    events.push(ExchangeEvent::PositionUpdate {
-                        symbol,
-                        exchange: Exchange::Binance,
-                        position,
-                        timestamp,
+                    events.push(ExchangeEvent {
+                        exchange_ts,
+                        local_ts,
+                        data: ExchangeEventData::Position(position),
                     });
                 }
             }
@@ -568,10 +566,10 @@ fn parse_message(
             // 处理所有 balance 更新
             for bal_data in &update.a.balances {
                 if let Some(balance) = bal_data.to_balance() {
-                    events.push(ExchangeEvent::BalanceUpdate {
-                        exchange: Exchange::Binance,
-                        balance,
-                        timestamp,
+                    events.push(ExchangeEvent {
+                        exchange_ts,
+                        local_ts,
+                        data: ExchangeEventData::Balance(balance),
                     });
                 }
             }
@@ -584,12 +582,10 @@ fn parse_message(
             let order_update = update
                 .to_order_update()
                 .ok_or_else(|| WsError::ParseError("Invalid order update".into()))?;
-            let symbol = order_update.symbol.clone();
-            Ok(vec![ExchangeEvent::OrderStatusUpdate {
-                symbol,
-                exchange: Exchange::Binance,
-                update: order_update,
-                timestamp,
+            Ok(vec![ExchangeEvent {
+                exchange_ts,
+                local_ts,
+                data: ExchangeEventData::OrderUpdate(order_update),
             }])
         }
         _ => {

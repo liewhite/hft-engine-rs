@@ -5,7 +5,7 @@ use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscrib
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsEvent, WsPush,
 };
-use crate::messaging::ExchangeEvent;
+use crate::messaging::{ExchangeEvent, ExchangeEventData};
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
@@ -465,7 +465,7 @@ fn kind_to_arg(kind: &SubscriptionKind) -> serde_json::Value {
 
 fn parse_message(
     raw: &str,
-    timestamp: u64,
+    local_ts: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
 ) -> Result<Vec<ExchangeEvent>, WsError> {
     let value: serde_json::Value =
@@ -499,12 +499,11 @@ fn parse_message(
             let mut events = Vec::new();
             for data in &push.data {
                 if let Some(rate) = data.to_funding_rate() {
-                    let symbol = rate.symbol.clone();
-                    events.push(ExchangeEvent::FundingRateUpdate {
-                        symbol,
-                        exchange: Exchange::OKX,
-                        rate,
-                        timestamp,
+                    // funding-rate 没有事件时间戳，使用本地时间
+                    events.push(ExchangeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::FundingRate(rate),
                     });
                 }
             }
@@ -521,13 +520,13 @@ fn parse_message(
 
             let mut events = Vec::new();
             for data in &push.data {
+                // 提取交易所时间戳 (data.ts 是字符串)
+                let exchange_ts = data.ts.parse::<u64>().unwrap_or(local_ts);
                 if let Some(bbo) = data.to_bbo(inst_id) {
-                    let symbol = bbo.symbol.clone();
-                    events.push(ExchangeEvent::BBOUpdate {
-                        symbol,
-                        exchange: Exchange::OKX,
-                        bbo,
-                        timestamp,
+                    events.push(ExchangeEvent {
+                        exchange_ts,
+                        local_ts,
+                        data: ExchangeEventData::BBO(bbo),
                     });
                 }
             }
@@ -540,16 +539,15 @@ fn parse_message(
             let mut events = Vec::new();
             for data in &push.data {
                 if let Some(mut position) = data.to_position() {
-                    let symbol = position.symbol.clone();
                     // qty 归一化: 张 -> 币
-                    if let Some(meta) = symbol_metas.get(&symbol) {
+                    if let Some(meta) = symbol_metas.get(&position.symbol) {
                         position.size = meta.qty_to_coin(position.size);
                     }
-                    events.push(ExchangeEvent::PositionUpdate {
-                        symbol,
-                        exchange: Exchange::OKX,
-                        position,
-                        timestamp,
+                    // positions 没有暴露时间戳字段，使用本地时间
+                    events.push(ExchangeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::Position(position),
                     });
                 }
             }
@@ -561,11 +559,16 @@ fn parse_message(
 
             let mut events = Vec::new();
             for data in &push.data {
+                // 提取交易所时间戳 (u_time 是字符串)
+                let exchange_ts = data.u_time.parse::<u64>().unwrap_or(local_ts);
                 if let Some(equity) = data.to_equity() {
-                    events.push(ExchangeEvent::EquityUpdate {
-                        exchange: Exchange::OKX,
-                        equity,
-                        timestamp,
+                    events.push(ExchangeEvent {
+                        exchange_ts,
+                        local_ts,
+                        data: ExchangeEventData::Equity {
+                            exchange: Exchange::OKX,
+                            equity,
+                        },
                     });
                 }
             }
@@ -578,12 +581,11 @@ fn parse_message(
             let mut events = Vec::new();
             for data in &push.data {
                 if let Some(update) = data.to_order_update() {
-                    let symbol = update.symbol.clone();
-                    events.push(ExchangeEvent::OrderStatusUpdate {
-                        symbol,
-                        exchange: Exchange::OKX,
-                        update,
-                        timestamp,
+                    // orders 没有暴露时间戳字段，使用本地时间
+                    events.push(ExchangeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::OrderUpdate(update),
                     });
                 }
             }

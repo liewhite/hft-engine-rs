@@ -1,6 +1,6 @@
 use crate::domain::{now_ms, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, USDT};
 use crate::engine::SignalProcessorActor;
-use crate::messaging::{ExchangeEvent, SymbolState};
+use crate::messaging::{ExchangeEvent, ExchangeEventData, SymbolState};
 use crate::strategy::Signal;
 use kameo::actor::ActorRef;
 use std::collections::HashMap;
@@ -161,20 +161,20 @@ impl StateManager {
 
     /// 处理事件，更新状态
     pub fn apply(&mut self, event: &ExchangeEvent) {
-        match event {
+        match &event.data {
             // 全局事件: Balance
-            ExchangeEvent::BalanceUpdate { exchange, balance, .. } => {
+            ExchangeEventData::Balance(balance) => {
                 if balance.asset == USDT {
                     tracing::debug!(
-                        exchange = %exchange,
+                        exchange = %balance.exchange,
                         available = balance.available,
                         "USDT balance updated"
                     );
-                    self.balances.insert(*exchange, balance.available);
+                    self.balances.insert(balance.exchange, balance.available);
                 }
             }
             // 全局事件: Equity
-            ExchangeEvent::EquityUpdate { exchange, equity, .. } => {
+            ExchangeEventData::Equity { exchange, equity } => {
                 tracing::debug!(
                     exchange = %exchange,
                     equity = equity,
@@ -183,9 +183,10 @@ impl StateManager {
                 self.equities.insert(*exchange, *equity);
             }
             // 全局事件: Clock (检查订单超时)
-            ExchangeEvent::Clock { timestamp } => {
+            ExchangeEventData::Clock => {
+                let now = event.local_ts;
                 for state in self.states.values_mut() {
-                    state.remove_timed_out_orders(*timestamp, self.order_timeout_ms);
+                    state.remove_timed_out_orders(now, self.order_timeout_ms);
                 }
             }
             // Symbol 事件: 委托对应 SymbolState 处理

@@ -4,7 +4,7 @@
 
 use crate::domain::{now_ms, Exchange, OrderStatus, OrderUpdate};
 use crate::exchange::{EventSink, ExchangeClient};
-use crate::messaging::ExchangeEvent;
+use crate::messaging::{ExchangeEvent, ExchangeEventData};
 use crate::strategy::Signal;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -126,7 +126,7 @@ impl Message<Signal> for SignalProcessorActor {
 impl SignalProcessorActor {
     /// 发送订单错误事件
     async fn send_order_error(&self, order: &crate::domain::Order, reason: String) {
-        let timestamp = now_ms();
+        let local_ts = now_ms();
         let update = OrderUpdate {
             order_id: String::new(),
             client_order_id: order.client_order_id.clone(),
@@ -135,15 +135,14 @@ impl SignalProcessorActor {
             status: OrderStatus::Error { reason },
             filled_quantity: 0.0,
             avg_price: None,
-            timestamp,
+            timestamp: local_ts,
         };
 
         self.event_sink
-            .send_event(ExchangeEvent::OrderStatusUpdate {
-                symbol: order.symbol.clone(),
-                exchange: order.exchange,
-                update,
-                timestamp,
+            .send_event(ExchangeEvent {
+                exchange_ts: local_ts, // 本地错误，没有交易所时间戳
+                local_ts,
+                data: ExchangeEventData::OrderUpdate(update),
             })
             .await;
     }

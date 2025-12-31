@@ -6,7 +6,7 @@
 use super::executor::ExecutorActor;
 use crate::domain::{now_ms, Exchange};
 use crate::exchange::{EventSink, ExchangeClient};
-use crate::messaging::ExchangeEvent;
+use crate::messaging::{ExchangeEvent, ExchangeEventData};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -53,17 +53,20 @@ impl<S: EventSink> ClockActor<S> {
 
     /// 执行一次 tick
     async fn tick(&mut self) {
-        let timestamp = now_ms();
+        let local_ts = now_ms();
 
         // 查询 Binance equity (如果有 client)
         if let Some(ref client) = self.binance_client {
             match client.fetch_equity().await {
                 Ok(equity) => {
                     self.event_sink
-                        .send_event(ExchangeEvent::EquityUpdate {
-                            exchange: Exchange::Binance,
-                            equity,
-                            timestamp,
+                        .send_event(ExchangeEvent {
+                            exchange_ts: local_ts, // REST API 没有交易所时间戳，用本地时间
+                            local_ts,
+                            data: ExchangeEventData::Equity {
+                                exchange: Exchange::Binance,
+                                equity,
+                            },
                         })
                         .await;
                 }
@@ -78,7 +81,11 @@ impl<S: EventSink> ClockActor<S> {
         }
 
         // 向所有 executor 发送 Clock 事件
-        let clock_event = ExchangeEvent::Clock { timestamp };
+        let clock_event = ExchangeEvent {
+            exchange_ts: local_ts,
+            local_ts,
+            data: ExchangeEventData::Clock,
+        };
         for executor in &self.executors {
             let _ = executor.tell(clock_event.clone()).await;
         }
