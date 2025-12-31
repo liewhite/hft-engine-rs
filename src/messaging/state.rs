@@ -236,8 +236,9 @@ impl SymbolState {
                     match update.status {
                         OrderStatus::Filled
                         | OrderStatus::Cancelled
-                        | OrderStatus::Rejected { .. } => {
-                            // 订单结束，移除
+                        | OrderStatus::Rejected { .. }
+                        | OrderStatus::Error { .. } => {
+                            // 订单结束或失败，移除
                             self.pending_orders.remove(client_id);
                         }
                         OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {

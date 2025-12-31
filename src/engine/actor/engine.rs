@@ -332,7 +332,18 @@ impl Actor for ManagerActor {
         // 1. 预加载所有交易所的 symbol metas
         self.preload_symbol_metas().await?;
 
-        // 2. 创建 SignalProcessorActor
+        // 2. 创建 ProcessorActor（先创建，因为其他 Actor 需要它的引用）
+        let processor = spawn_link(&actor_ref, ProcessorActor::new()).await;
+        self.actor_kinds
+            .insert(processor.id(), ChildActorKind::Processor);
+        self.processor = Some(processor.clone());
+
+        // 创建 ProcessorEventSink（供其他 Actor 发送事件）
+        let event_sink: Arc<dyn EventSink> = Arc::new(ProcessorEventSink {
+            processor: processor.clone(),
+        });
+
+        // 3. 创建 SignalProcessorActor
         let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = [
             self.binance_client.clone().map(|c| (Exchange::Binance, c as Arc<dyn ExchangeClient>)),
             self.okx_client.clone().map(|c| (Exchange::OKX, c as Arc<dyn ExchangeClient>)),
@@ -344,7 +355,8 @@ impl Actor for ManagerActor {
         let signal_processor = spawn_link(
             &actor_ref,
             SignalProcessorActor::new(super::SignalProcessorArgs {
-                executors: clients,
+                clients,
+                event_sink: event_sink.clone(),
             }),
         )
         .await;
@@ -352,13 +364,7 @@ impl Actor for ManagerActor {
             .insert(signal_processor.id(), ChildActorKind::SignalProcessor);
         self.signal_processor = Some(signal_processor);
 
-        // 3. 创建 ProcessorActor
-        let processor = spawn_link(&actor_ref, ProcessorActor::new()).await;
-        self.actor_kinds
-            .insert(processor.id(), ChildActorKind::Processor);
-        self.processor = Some(processor.clone());
-
-        // 4. 创建 ClockActor
+        // 4. 创建 ClockActor（使用具体类型 ProcessorEventSink）
         let clock_event_sink = Arc::new(ProcessorEventSink {
             processor: processor.clone(),
         });
