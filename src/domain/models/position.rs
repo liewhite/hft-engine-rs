@@ -32,12 +32,14 @@ impl Position {
 
     /// 获取持仓方向 (根据 size 符号)
     ///
-    /// 注意: 空仓 (size == 0) 时返回 Side::Long，调用前应先检查 is_empty()
-    pub fn side(&self) -> Side {
-        if self.size >= 0.0 {
-            Side::Long
+    /// 返回 `None` 表示空仓
+    pub fn side(&self) -> Option<Side> {
+        if self.is_empty() {
+            None
+        } else if self.size > 0.0 {
+            Some(Side::Long)
         } else {
-            Side::Short
+            Some(Side::Short)
         }
     }
 

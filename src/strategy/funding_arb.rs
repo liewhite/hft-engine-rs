@@ -247,8 +247,8 @@ impl FundingArbStrategy {
         let mut orders = Vec::new();
 
         for (exchange, pos) in &state.positions {
-            if !pos.is_empty() {
-                let pos_side = pos.side();
+            // pos.side() 返回 None 表示空仓，跳过
+            if let Some(pos_side) = pos.side() {
                 let order_type = if let Some(bbo) = state.bbo(*exchange) {
                     let price = match pos_side {
                         Side::Long => bbo.bid_price,
