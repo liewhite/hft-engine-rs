@@ -6,7 +6,7 @@ use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
-use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, WsError};
 use crate::messaging::ExchangeEvent;
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -15,14 +15,12 @@ use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use serde_json::json;
+use std::collections::HashSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-
-/// 单个 WebSocket 连接的最大订阅数
-const MAX_SUBSCRIPTIONS_PER_CONN: usize = 200;
 
 /// Public WebSocket URL
 const WS_PUBLIC_URL: &str = "wss://fstream.binance.com/ws";
@@ -41,8 +39,6 @@ const LISTEN_KEY_REFRESH_INTERVAL_SECS: u64 = 30 * 60;
 struct WsConnection {
     /// 发送消息的 channel
     tx: mpsc::Sender<String>,
-    /// 订阅数量
-    subscription_count: usize,
     /// ws_loop 任务句柄
     _handle: JoinHandle<()>,
 }
@@ -82,16 +78,14 @@ pub struct BinanceActor {
     rest_base_url: String,
 
     // 连接管理
-    /// Public 连接列表
-    public_conns: Vec<WsConnection>,
+    /// Public 连接
+    public_conn: Option<WsConnection>,
     /// Private 连接
     private_conn: Option<WsConnection>,
-    /// 订阅到连接的映射 (kind -> public_conn index)
-    subscriptions: HashMap<SubscriptionKind, usize>,
+    /// 已订阅的 kinds (用于去重)
+    subscribed: HashSet<SubscriptionKind>,
 
     // Binance 特有
-    /// ListenKey
-    listen_key: Option<String>,
     /// ListenKey 刷新任务
     listen_key_refresh_handle: Option<JoinHandle<()>>,
 
@@ -106,17 +100,16 @@ impl BinanceActor {
             symbol_metas: args.symbol_metas,
             event_sink: args.event_sink,
             rest_base_url: args.rest_base_url,
-            public_conns: Vec::new(),
+            public_conn: None,
             private_conn: None,
-            subscriptions: HashMap::new(),
-            listen_key: None,
+            subscribed: HashSet::new(),
             listen_key_refresh_handle: None,
             self_ref: None,
         }
     }
 
     /// 创建 public WebSocket 连接
-    async fn create_public_connection(&mut self) -> Result<usize, WsError> {
+    async fn create_public_connection(&mut self) -> Result<(), WsError> {
         let self_ref = self
             .self_ref
             .as_ref()
@@ -130,23 +123,10 @@ impl BinanceActor {
         let (write, read) = ws_stream.split();
         let (tx, rx) = mpsc::channel::<String>(100);
 
-        let conn_idx = self.public_conns.len();
+        let handle = tokio::spawn(run_ws_loop(read, write, rx, self_ref, false));
 
-        // 启动 ws_loop
-        let handle = tokio::spawn(async move {
-            if let Err(e) = run_public_ws_loop(read, write, rx, self_ref, conn_idx).await {
-                tracing::warn!(conn_idx, error = %e, "Binance public ws_loop ended with error");
-            }
-        });
-
-        let conn = WsConnection {
-            tx,
-            subscription_count: 0,
-            _handle: handle,
-        };
-
-        self.public_conns.push(conn);
-        Ok(self.public_conns.len() - 1)
+        self.public_conn = Some(WsConnection { tx, _handle: handle });
+        Ok(())
     }
 
     /// 创建 private WebSocket 连接
@@ -173,23 +153,13 @@ impl BinanceActor {
             .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
             .clone();
 
-        // 启动 ws_loop
-        let handle = tokio::spawn(async move {
-            if let Err(e) = run_private_ws_loop(read, write, rx, self_ref).await {
-                tracing::warn!(error = %e, "Binance private ws_loop ended with error");
-            }
-        });
+        let handle = tokio::spawn(run_ws_loop(read, write, rx, self_ref, true));
 
-        self.private_conn = Some(WsConnection {
-            tx,
-            subscription_count: 0,
-            _handle: handle,
-        });
+        self.private_conn = Some(WsConnection { tx, _handle: handle });
 
         // 启动 ListenKey 刷新任务
         let api_key = credentials.api_key.clone();
         let rest_base_url = self.rest_base_url.clone();
-        self.listen_key = Some(listen_key);
         self.listen_key_refresh_handle = Some(tokio::spawn(async move {
             listen_key_refresh_loop(&rest_base_url, &api_key).await;
         }));
@@ -197,44 +167,18 @@ impl BinanceActor {
         Ok(())
     }
 
-    /// 查找或创建有空位的 public 连接
-    async fn ensure_public_connection(&mut self) -> Result<usize, WsError> {
-        // 查找有空位的连接
-        for (idx, conn) in self.public_conns.iter().enumerate() {
-            if conn.subscription_count < MAX_SUBSCRIPTIONS_PER_CONN {
-                return Ok(idx);
-            }
-        }
-
-        // 创建新连接
-        self.create_public_connection().await
-    }
-
     /// 发送订阅消息
-    async fn send_subscribe(&mut self, conn_idx: usize, kind: &SubscriptionKind) {
-        let msg = build_subscribe_msg(&[kind.clone()]);
-        if msg.is_empty() {
-            return;
-        }
+    async fn send_subscribe(&self, kind: &SubscriptionKind) {
+        let stream = kind_to_stream(kind);
+        let msg = json!({
+            "method": "SUBSCRIBE",
+            "params": [stream],
+            "id": 1
+        })
+        .to_string();
 
-        if let Some(conn) = self.public_conns.get_mut(conn_idx) {
-            if conn.tx.send(msg).await.is_ok() {
-                conn.subscription_count += 1;
-            }
-        }
-    }
-
-    /// 发送取消订阅消息
-    async fn send_unsubscribe(&mut self, conn_idx: usize, kind: &SubscriptionKind) {
-        let msg = build_unsubscribe_msg(&[kind.clone()]);
-        if msg.is_empty() {
-            return;
-        }
-
-        if let Some(conn) = self.public_conns.get_mut(conn_idx) {
-            if conn.tx.send(msg).await.is_ok() {
-                conn.subscription_count = conn.subscription_count.saturating_sub(1);
-            }
+        if let Some(conn) = &self.public_conn {
+            let _ = conn.tx.send(msg).await;
         }
     }
 }
@@ -249,7 +193,7 @@ impl Actor for BinanceActor {
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         self.self_ref = Some(actor_ref.downgrade());
 
-        // 1. 创建第一个 public 连接
+        // 1. 创建 public 连接
         self.create_public_connection().await?;
 
         // 2. 如果有凭证，创建 private 连接
@@ -276,8 +220,8 @@ impl Actor for BinanceActor {
             handle.abort();
         }
 
-        // 中止所有 public 连接的任务
-        for conn in self.public_conns.drain(..) {
+        // 中止 public 连接的任务
+        if let Some(conn) = self.public_conn.take() {
             conn._handle.abort();
         }
 
@@ -304,41 +248,12 @@ impl Message<Subscribe> for BinanceActor {
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         // 检查是否已订阅
-        if self.subscriptions.contains_key(&msg.kind) {
+        if self.subscribed.contains(&msg.kind) {
             return;
         }
 
-        // 获取或创建连接
-        let conn_idx = match self.ensure_public_connection().await {
-            Ok(idx) => idx,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to ensure public connection");
-                return;
-            }
-        };
-
-        // 发送订阅
-        self.send_subscribe(conn_idx, &msg.kind).await;
-        self.subscriptions.insert(msg.kind, conn_idx);
-    }
-}
-
-impl Message<Unsubscribe> for BinanceActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Unsubscribe,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        // 查找订阅
-        let conn_idx = match self.subscriptions.remove(&msg.kind) {
-            Some(idx) => idx,
-            None => return,
-        };
-
-        // 发送取消订阅
-        self.send_unsubscribe(conn_idx, &msg.kind).await;
+        self.send_subscribe(&msg.kind).await;
+        self.subscribed.insert(msg.kind);
     }
 }
 
@@ -386,51 +301,23 @@ impl Message<WsData> for BinanceActor {
 // WebSocket 循环
 // ============================================================================
 
-async fn run_public_ws_loop(
+async fn run_ws_loop(
     mut read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
         + Unpin
         + Send,
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
     mut rx: mpsc::Receiver<String>,
     actor_ref: WeakActorRef<BinanceActor>,
-    _conn_idx: usize,
-) -> Result<(), WsError> {
+    is_private: bool,
+) {
     let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
 
     // 出错时通知 Actor 停止
-    if let Err(ref e) = result {
+    if let Err(e) = result {
         if let Some(actor) = actor_ref.upgrade() {
-            let _ = actor.tell(WsDisconnected {
-                error: e.clone(),
-                is_private: false,
-            }).await;
+            let _ = actor.tell(WsDisconnected { error: e, is_private }).await;
         }
     }
-
-    result
-}
-
-async fn run_private_ws_loop(
-    mut read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
-        + Unpin
-        + Send,
-    mut write: impl SinkExt<WsMessage> + Unpin + Send,
-    mut rx: mpsc::Receiver<String>,
-    actor_ref: WeakActorRef<BinanceActor>,
-) -> Result<(), WsError> {
-    let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
-
-    // 出错时通知 Actor 停止
-    if let Err(ref e) = result {
-        if let Some(actor) = actor_ref.upgrade() {
-            let _ = actor.tell(WsDisconnected {
-                error: e.clone(),
-                is_private: true,
-            }).await;
-        }
-    }
-
-    result
 }
 
 async fn run_ws_loop_inner(
@@ -443,7 +330,6 @@ async fn run_ws_loop_inner(
 ) -> Result<(), WsError> {
     loop {
         tokio::select! {
-            // 发送消息
             msg = rx.recv() => {
                 match msg {
                     Some(text) => {
@@ -455,7 +341,6 @@ async fn run_ws_loop_inner(
                 }
             }
 
-            // 接收消息
             ws_msg = read.next() => {
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
@@ -546,63 +431,18 @@ async fn listen_key_refresh_loop(rest_base_url: &str, api_key: &str) {
 }
 
 // ============================================================================
-// 消息构建和解析
+// 辅助函数
 // ============================================================================
 
-fn build_subscribe_msg(kinds: &[SubscriptionKind]) -> String {
-    let mut streams: Vec<String> = Vec::new();
-
-    for kind in kinds {
-        match kind {
-            SubscriptionKind::FundingRate { symbol } => {
-                let s = symbol.to_binance().to_lowercase();
-                streams.push(format!("{}@markPrice@1s", s));
-            }
-            SubscriptionKind::BBO { symbol } => {
-                let s = symbol.to_binance().to_lowercase();
-                streams.push(format!("{}@bookTicker", s));
-            }
+fn kind_to_stream(kind: &SubscriptionKind) -> String {
+    match kind {
+        SubscriptionKind::FundingRate { symbol } => {
+            format!("{}@markPrice@1s", symbol.to_binance().to_lowercase())
+        }
+        SubscriptionKind::BBO { symbol } => {
+            format!("{}@bookTicker", symbol.to_binance().to_lowercase())
         }
     }
-
-    if streams.is_empty() {
-        return String::new();
-    }
-
-    json!({
-        "method": "SUBSCRIBE",
-        "params": streams,
-        "id": 1
-    })
-    .to_string()
-}
-
-fn build_unsubscribe_msg(kinds: &[SubscriptionKind]) -> String {
-    let mut streams: Vec<String> = Vec::new();
-
-    for kind in kinds {
-        match kind {
-            SubscriptionKind::FundingRate { symbol } => {
-                let s = symbol.to_binance().to_lowercase();
-                streams.push(format!("{}@markPrice@1s", s));
-            }
-            SubscriptionKind::BBO { symbol } => {
-                let s = symbol.to_binance().to_lowercase();
-                streams.push(format!("{}@bookTicker", s));
-            }
-        }
-    }
-
-    if streams.is_empty() {
-        return String::new();
-    }
-
-    json!({
-        "method": "UNSUBSCRIBE",
-        "params": streams,
-        "id": 2
-    })
-    .to_string()
 }
 
 fn parse_message(
@@ -610,7 +450,6 @@ fn parse_message(
     timestamp: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
 ) -> Option<ExchangeEvent> {
-    // 尝试解析为 JSON
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
 
     // 检查是否是订阅响应（控制消息，返回 None）

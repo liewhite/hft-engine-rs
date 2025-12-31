@@ -1,11 +1,11 @@
 //! OKX WebSocket Actor
 
 use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use crate::messaging::ExchangeEvent;
+use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, WsError};
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsEvent, WsPush,
 };
+use crate::messaging::ExchangeEvent;
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
@@ -16,14 +16,11 @@ use kameo::message::{Context, Message};
 use kameo::Actor;
 use serde_json::json;
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-
-/// 单个 WebSocket 连接的最大订阅数
-const MAX_SUBSCRIPTIONS_PER_CONN: usize = 100;
 
 /// Public WebSocket URL
 const WS_PUBLIC_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
@@ -37,7 +34,6 @@ const WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
 
 struct WsConnection {
     tx: mpsc::Sender<String>,
-    subscription_count: usize,
     _handle: JoinHandle<()>,
 }
 
@@ -72,16 +68,17 @@ impl OkxCredentials {
     }
 }
 
-/// OKX Actor (无泛型，使用 Arc<dyn EventSink>)
+/// OKX Actor
 pub struct OkxActor {
     credentials: Option<OkxCredentials>,
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     event_sink: Arc<dyn EventSink>,
 
     // 连接管理
-    public_conns: Vec<WsConnection>,
+    public_conn: Option<WsConnection>,
     private_conn: Option<WsConnection>,
-    subscriptions: HashMap<SubscriptionKind, usize>,
+    /// 已订阅的 kinds (用于去重)
+    subscribed: HashSet<SubscriptionKind>,
 
     self_ref: Option<WeakActorRef<Self>>,
 }
@@ -92,14 +89,14 @@ impl OkxActor {
             credentials: args.credentials,
             symbol_metas: args.symbol_metas,
             event_sink: args.event_sink,
-            public_conns: Vec::new(),
+            public_conn: None,
             private_conn: None,
-            subscriptions: HashMap::new(),
+            subscribed: HashSet::new(),
             self_ref: None,
         }
     }
 
-    async fn create_public_connection(&mut self) -> Result<usize, WsError> {
+    async fn create_public_connection(&mut self) -> Result<(), WsError> {
         let self_ref = self
             .self_ref
             .as_ref()
@@ -113,22 +110,10 @@ impl OkxActor {
         let (write, read) = ws_stream.split();
         let (tx, rx) = mpsc::channel::<String>(100);
 
-        let conn_idx = self.public_conns.len();
+        let handle = tokio::spawn(run_ws_loop(read, write, rx, self_ref, false));
 
-        let handle = tokio::spawn(async move {
-            if let Err(e) = run_public_ws_loop(read, write, rx, self_ref, conn_idx).await {
-                tracing::warn!(conn_idx, error = %e, "OKX public ws_loop ended with error");
-            }
-        });
-
-        let conn = WsConnection {
-            tx,
-            subscription_count: 0,
-            _handle: handle,
-        };
-
-        self.public_conns.push(conn);
-        Ok(self.public_conns.len() - 1)
+        self.public_conn = Some(WsConnection { tx, _handle: handle });
+        Ok(())
     }
 
     async fn create_private_connection(&mut self) -> Result<(), WsError> {
@@ -223,53 +208,23 @@ impl OkxActor {
             .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
             .clone();
 
-        let handle = tokio::spawn(async move {
-            if let Err(e) = run_private_ws_loop(read, write, rx, self_ref).await {
-                tracing::warn!(error = %e, "OKX private ws_loop ended with error");
-            }
-        });
+        let handle = tokio::spawn(run_ws_loop(read, write, rx, self_ref, true));
 
-        self.private_conn = Some(WsConnection {
-            tx,
-            subscription_count: 0,
-            _handle: handle,
-        });
+        self.private_conn = Some(WsConnection { tx, _handle: handle });
 
         Ok(())
     }
 
-    async fn ensure_public_connection(&mut self) -> Result<usize, WsError> {
-        for (idx, conn) in self.public_conns.iter().enumerate() {
-            if conn.subscription_count < MAX_SUBSCRIPTIONS_PER_CONN {
-                return Ok(idx);
-            }
-        }
-        self.create_public_connection().await
-    }
+    async fn send_subscribe(&self, kind: &SubscriptionKind) {
+        let arg = kind_to_arg(kind);
+        let msg = json!({
+            "op": "subscribe",
+            "args": [arg]
+        })
+        .to_string();
 
-    async fn send_subscribe(&mut self, conn_idx: usize, kind: &SubscriptionKind) {
-        let msg = build_subscribe_msg(&[kind.clone()]);
-        if msg.is_empty() {
-            return;
-        }
-
-        if let Some(conn) = self.public_conns.get_mut(conn_idx) {
-            if conn.tx.send(msg).await.is_ok() {
-                conn.subscription_count += 1;
-            }
-        }
-    }
-
-    async fn send_unsubscribe(&mut self, conn_idx: usize, kind: &SubscriptionKind) {
-        let msg = build_unsubscribe_msg(&[kind.clone()]);
-        if msg.is_empty() {
-            return;
-        }
-
-        if let Some(conn) = self.public_conns.get_mut(conn_idx) {
-            if conn.tx.send(msg).await.is_ok() {
-                conn.subscription_count = conn.subscription_count.saturating_sub(1);
-            }
+        if let Some(conn) = &self.public_conn {
+            let _ = conn.tx.send(msg).await;
         }
     }
 }
@@ -284,7 +239,7 @@ impl Actor for OkxActor {
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         self.self_ref = Some(actor_ref.downgrade());
 
-        // 1. 创建第一个 public 连接
+        // 1. 创建 public 连接
         self.create_public_connection().await?;
 
         // 2. 如果有凭证，创建 private 连接
@@ -306,8 +261,8 @@ impl Actor for OkxActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), BoxError> {
-        // 中止所有 public 连接的任务
-        for conn in self.public_conns.drain(..) {
+        // 中止 public 连接的任务
+        if let Some(conn) = self.public_conn.take() {
             conn._handle.abort();
         }
 
@@ -333,36 +288,12 @@ impl Message<Subscribe> for OkxActor {
         msg: Subscribe,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        if self.subscriptions.contains_key(&msg.kind) {
+        if self.subscribed.contains(&msg.kind) {
             return;
         }
 
-        let conn_idx = match self.ensure_public_connection().await {
-            Ok(idx) => idx,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to ensure public connection");
-                return;
-            }
-        };
-
-        self.send_subscribe(conn_idx, &msg.kind).await;
-        self.subscriptions.insert(msg.kind, conn_idx);
-    }
-}
-
-impl Message<Unsubscribe> for OkxActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Unsubscribe,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        let conn_idx = match self.subscriptions.remove(&msg.kind) {
-            Some(idx) => idx,
-            None => return,
-        };
-        self.send_unsubscribe(conn_idx, &msg.kind).await;
+        self.send_subscribe(&msg.kind).await;
+        self.subscribed.insert(msg.kind);
     }
 }
 
@@ -409,28 +340,23 @@ impl Message<WsData> for OkxActor {
 // WebSocket 循环
 // ============================================================================
 
-async fn run_public_ws_loop(
+async fn run_ws_loop(
     mut read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
         + Unpin
         + Send,
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
     mut rx: mpsc::Receiver<String>,
     actor_ref: WeakActorRef<OkxActor>,
-    _conn_idx: usize,
-) -> Result<(), WsError> {
+    is_private: bool,
+) {
     let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
 
     // 出错时通知 Actor 停止
-    if let Err(ref e) = result {
+    if let Err(e) = result {
         if let Some(actor) = actor_ref.upgrade() {
-            let _ = actor.tell(WsDisconnected {
-                error: e.clone(),
-                is_private: false,
-            }).await;
+            let _ = actor.tell(WsDisconnected { error: e, is_private }).await;
         }
     }
-
-    result
 }
 
 async fn run_ws_loop_inner(
@@ -480,93 +406,25 @@ async fn run_ws_loop_inner(
     }
 }
 
-async fn run_private_ws_loop(
-    mut read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
-        + Unpin
-        + Send,
-    mut write: impl SinkExt<WsMessage> + Unpin + Send,
-    mut rx: mpsc::Receiver<String>,
-    actor_ref: WeakActorRef<OkxActor>,
-) -> Result<(), WsError> {
-    let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
-
-    // 出错时通知 Actor 停止
-    if let Err(ref e) = result {
-        if let Some(actor) = actor_ref.upgrade() {
-            let _ = actor.tell(WsDisconnected {
-                error: e.clone(),
-                is_private: true,
-            }).await;
-        }
-    }
-
-    result
-}
-
 // ============================================================================
-// 消息构建和解析
+// 辅助函数
 // ============================================================================
 
-fn build_subscribe_msg(kinds: &[SubscriptionKind]) -> String {
-    let mut args: Vec<serde_json::Value> = Vec::new();
-
-    for kind in kinds {
-        match kind {
-            SubscriptionKind::FundingRate { symbol } => {
-                args.push(json!({
-                    "channel": "funding-rate",
-                    "instId": symbol.to_okx()
-                }));
-            }
-            SubscriptionKind::BBO { symbol } => {
-                args.push(json!({
-                    "channel": "bbo-tbt",
-                    "instId": symbol.to_okx()
-                }));
-            }
+fn kind_to_arg(kind: &SubscriptionKind) -> serde_json::Value {
+    match kind {
+        SubscriptionKind::FundingRate { symbol } => {
+            json!({
+                "channel": "funding-rate",
+                "instId": symbol.to_okx()
+            })
+        }
+        SubscriptionKind::BBO { symbol } => {
+            json!({
+                "channel": "bbo-tbt",
+                "instId": symbol.to_okx()
+            })
         }
     }
-
-    if args.is_empty() {
-        return String::new();
-    }
-
-    json!({
-        "op": "subscribe",
-        "args": args
-    })
-    .to_string()
-}
-
-fn build_unsubscribe_msg(kinds: &[SubscriptionKind]) -> String {
-    let mut args: Vec<serde_json::Value> = Vec::new();
-
-    for kind in kinds {
-        match kind {
-            SubscriptionKind::FundingRate { symbol } => {
-                args.push(json!({
-                    "channel": "funding-rate",
-                    "instId": symbol.to_okx()
-                }));
-            }
-            SubscriptionKind::BBO { symbol } => {
-                args.push(json!({
-                    "channel": "bbo-tbt",
-                    "instId": symbol.to_okx()
-                }));
-            }
-        }
-    }
-
-    if args.is_empty() {
-        return String::new();
-    }
-
-    json!({
-        "op": "unsubscribe",
-        "args": args
-    })
-    .to_string()
 }
 
 fn parse_message(

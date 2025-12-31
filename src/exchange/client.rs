@@ -104,20 +104,6 @@ pub struct Subscribe {
     pub kind: SubscriptionKind,
 }
 
-/// 取消订阅消息
-#[derive(Debug, Clone)]
-pub struct Unsubscribe {
-    pub kind: SubscriptionKind,
-}
-
-// ============================================================================
-// WebSocket 连接相关
-// ============================================================================
-
-/// 连接 ID
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConnectionId(pub u64);
-
 /// WebSocket 错误
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum WsError {
