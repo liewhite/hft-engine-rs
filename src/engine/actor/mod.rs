@@ -8,7 +8,7 @@ mod executor;
 mod processor;
 mod signal_processor;
 
-pub use clock::{ClockActor, ClockArgs};
+pub use clock::{ClockActor, ClockArgs, RegisterExecutor as RegisterClockExecutor};
 pub use engine::{AddStrategy, ManagerActor, ManagerActorArgs, Stop};
 pub use executor::{ExecutorActor, ExecutorArgs};
 pub use processor::{ProcessorActor, RegisterExecutor};

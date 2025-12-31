@@ -5,7 +5,10 @@
 //! - 通过 add_strategy 动态添加策略和相关 Actor
 //! - 子 Actor 失败时级联退出
 
-use super::{ExecutorActor, ExecutorArgs, ProcessorActor, RegisterExecutor, SignalProcessorActor};
+use super::{
+    ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, ProcessorActor, RegisterClockExecutor,
+    RegisterExecutor, SignalProcessorActor,
+};
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient};
@@ -32,6 +35,7 @@ enum ChildActorKind {
     Executor(usize),
     SignalProcessor,
     Processor,
+    Clock,
 }
 
 // ============================================================================
@@ -60,6 +64,8 @@ pub struct ManagerActor {
     signal_processor: Option<ActorRef<SignalProcessorActor>>,
     /// ProcessorActor (on_start 创建)
     processor: Option<ActorRef<ProcessorActor>>,
+    /// ClockActor (on_start 创建)
+    clock_actor: Option<ActorRef<ClockActor<ProcessorEventSink>>>,
     /// BinanceActor (按需创建)
     binance_actor: Option<ActorRef<BinanceActor>>,
     /// OkxActor (按需创建)
@@ -82,6 +88,7 @@ impl ManagerActor {
             symbol_metas: HashMap::new(),
             signal_processor: None,
             processor: None,
+            clock_actor: None,
             binance_actor: None,
             okx_actor: None,
             executors: Vec::new(),
@@ -276,9 +283,18 @@ impl ManagerActor {
             })
             .await;
 
+        // 7. 向 ClockActor 注册 Executor（用于接收 Clock 事件）
+        if let Some(clock_actor) = &self.clock_actor {
+            let _ = clock_actor
+                .tell(RegisterClockExecutor {
+                    executor: executor_ref.clone(),
+                })
+                .await;
+        }
+
         self.executors.push(executor_ref);
 
-        // 7. 向 ExchangeActors 发送订阅请求
+        // 8. 向 ExchangeActors 发送订阅请求
         for (exchange, kind) in subscriptions {
             match exchange {
                 Exchange::Binance => {
@@ -340,7 +356,24 @@ impl Actor for ManagerActor {
         let processor = spawn_link(&actor_ref, ProcessorActor::new()).await;
         self.actor_kinds
             .insert(processor.id(), ChildActorKind::Processor);
-        self.processor = Some(processor);
+        self.processor = Some(processor.clone());
+
+        // 4. 创建 ClockActor
+        let clock_event_sink = Arc::new(ProcessorEventSink {
+            processor: processor.clone(),
+        });
+        let clock_actor = spawn_link(
+            &actor_ref,
+            ClockActor::new(ClockArgs {
+                interval_ms: 1000, // 1 秒
+                binance_client: self.binance_client.clone().map(|c| c as Arc<dyn ExchangeClient>),
+                event_sink: clock_event_sink,
+            }),
+        )
+        .await;
+        self.actor_kinds
+            .insert(clock_actor.id(), ChildActorKind::Clock);
+        self.clock_actor = Some(clock_actor);
 
         tracing::info!("ManagerActor started");
         Ok(())
@@ -401,6 +434,14 @@ impl Actor for ManagerActor {
             Some(ChildActorKind::Processor) => {
                 tracing::error!(reason = ?reason, "ProcessorActor died, shutting down");
                 self.processor = None;
+                Ok(Some(ActorStopReason::LinkDied {
+                    id,
+                    reason: Box::new(reason),
+                }))
+            }
+            Some(ChildActorKind::Clock) => {
+                tracing::error!(reason = ?reason, "ClockActor died, shutting down");
+                self.clock_actor = None;
                 Ok(Some(ActorStopReason::LinkDied {
                     id,
                     reason: Box::new(reason),
