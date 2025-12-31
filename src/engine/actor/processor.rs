@@ -7,7 +7,7 @@
 use super::ExecutorActor;
 use crate::domain::Exchange;
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{ExchangeEvent, ExchangeEventData};
+use crate::messaging::{IncomeEvent, ExchangeEventData};
 use kameo::actor::{ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -35,7 +35,7 @@ impl ProcessorActor {
     }
 
     /// 将 ExchangeEvent 转换为 SubscriptionKind
-    fn event_to_key(event: &ExchangeEvent) -> Option<(Exchange, SubscriptionKind)> {
+    fn event_to_key(event: &IncomeEvent) -> Option<(Exchange, SubscriptionKind)> {
         match &event.data {
             ExchangeEventData::FundingRate(rate) => {
                 Some((rate.exchange, SubscriptionKind::FundingRate { symbol: rate.symbol.clone() }))
@@ -109,10 +109,10 @@ impl Message<RegisterExecutor> for ProcessorActor {
 }
 
 /// ExchangeEvent 消息 - 从 ExchangeActor 接收
-impl Message<ExchangeEvent> for ProcessorActor {
+impl Message<IncomeEvent> for ProcessorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: ExchangeEvent, _ctx: Context<'_, Self, Self::Reply>) {
+    async fn handle(&mut self, msg: IncomeEvent, _ctx: Context<'_, Self, Self::Reply>) {
         let key = Self::event_to_key(&msg);
 
         match key {

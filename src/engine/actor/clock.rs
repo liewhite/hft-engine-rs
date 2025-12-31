@@ -6,7 +6,7 @@
 use super::executor::ExecutorActor;
 use crate::domain::{now_ms, Exchange};
 use crate::exchange::{EventSink, ExchangeClient};
-use crate::messaging::{ExchangeEvent, ExchangeEventData};
+use crate::messaging::{IncomeEvent, ExchangeEventData};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -60,7 +60,7 @@ impl<S: EventSink> ClockActor<S> {
             match client.fetch_equity().await {
                 Ok(equity) => {
                     self.event_sink
-                        .send_event(ExchangeEvent {
+                        .send_event(IncomeEvent {
                             exchange_ts: local_ts, // REST API 没有交易所时间戳，用本地时间
                             local_ts,
                             data: ExchangeEventData::Equity {
@@ -81,7 +81,7 @@ impl<S: EventSink> ClockActor<S> {
         }
 
         // 向所有 executor 发送 Clock 事件
-        let clock_event = ExchangeEvent {
+        let clock_event = IncomeEvent {
             exchange_ts: local_ts,
             local_ts,
             data: ExchangeEventData::Clock,

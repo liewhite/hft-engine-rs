@@ -4,8 +4,8 @@
 
 use crate::domain::{now_ms, Exchange, OrderStatus, OrderUpdate};
 use crate::exchange::{EventSink, ExchangeClient};
-use crate::messaging::{ExchangeEvent, ExchangeEventData};
-use crate::strategy::Signal;
+use crate::messaging::{IncomeEvent, ExchangeEventData};
+use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -64,12 +64,12 @@ impl Actor for SignalProcessorActor {
 
 // === Message Handlers ===
 
-impl Message<Signal> for SignalProcessorActor {
+impl Message<OutcomeEvent> for SignalProcessorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: Signal, _ctx: Context<'_, Self, Self::Reply>) {
+    async fn handle(&mut self, msg: OutcomeEvent, _ctx: Context<'_, Self, Self::Reply>) {
         match msg {
-            Signal::PlaceOrder(order) => {
+            OutcomeEvent::PlaceOrder(order) => {
                 let client = match self.clients.get(&order.exchange) {
                     Some(e) => e.clone(),
                     None => {
@@ -139,7 +139,7 @@ impl SignalProcessorActor {
         };
 
         self.event_sink
-            .send_event(ExchangeEvent {
+            .send_event(IncomeEvent {
                 exchange_ts: local_ts, // 本地错误，没有交易所时间戳
                 local_ts,
                 data: ExchangeEventData::OrderUpdate(update),

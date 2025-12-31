@@ -2,7 +2,7 @@ use crate::domain::{Exchange, FundingRate, OrderStatus, Position, Rate, Symbol, 
 
 /// 复用 Position 的 epsilon 常量
 const POSITION_EPSILON: f64 = Position::EPSILON;
-use crate::messaging::event::{ExchangeEvent, ExchangeEventData};
+use crate::messaging::event::{IncomeEvent, ExchangeEventData};
 use std::collections::HashMap;
 
 /// 待处理订单状态
@@ -187,7 +187,7 @@ impl SymbolState {
     /// 更新状态
     ///
     /// 如果事件的 symbol 与 state 的 symbol 不一致，则忽略该事件
-    pub fn apply(&mut self, event: &ExchangeEvent) {
+    pub fn apply(&mut self, event: &IncomeEvent) {
         // 校验 symbol 一致性 (Balance/Equity/Clock 无 symbol，直接忽略)
         if let Some(event_symbol) = event.symbol() {
             if event_symbol != &self.symbol {

@@ -2,8 +2,8 @@ use crate::domain::{
     Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO,
 };
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{ExchangeEvent, StateManager, SymbolState};
-use crate::strategy::{PublicStreams, Strategy};
+use crate::messaging::{IncomeEvent, StateManager, SymbolState};
+use crate::strategy::Strategy;
 use std::collections::{HashMap, HashSet};
 
 /// 资金费率套利策略配置
@@ -373,7 +373,7 @@ impl FundingArbStrategy {
 }
 
 impl Strategy for FundingArbStrategy {
-    fn public_streams(&self) -> PublicStreams {
+    fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
         let kinds: HashSet<SubscriptionKind> = [
             SubscriptionKind::FundingRate { symbol: self.symbol.clone() },
             SubscriptionKind::BBO { symbol: self.symbol.clone() },
@@ -393,7 +393,7 @@ impl Strategy for FundingArbStrategy {
         self.config.order_timeout_ms
     }
 
-    fn on_event(&mut self, _event: &ExchangeEvent, state: &mut StateManager) {
+    fn on_event(&mut self, _event: &IncomeEvent, state: &mut StateManager) {
         tracing::info!(
             symbol = %self.symbol,
             event  = ?_event,

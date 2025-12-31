@@ -13,7 +13,7 @@ use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient};
 use crate::exchange::{EventSink, ExchangeClient, Subscribe, SubscriptionKind};
-use crate::messaging::ExchangeEvent;
+use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
 use async_trait::async_trait;
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
@@ -503,7 +503,7 @@ struct ProcessorEventSink {
 
 #[async_trait]
 impl EventSink for ProcessorEventSink {
-    async fn send_event(&self, event: ExchangeEvent) {
+    async fn send_event(&self, event: IncomeEvent) {
         let _ = self.processor.tell(event).await;
     }
 }

@@ -36,18 +36,18 @@ impl SubscriptionKind {
 // 事件接收器
 // ============================================================================
 
-use crate::messaging::ExchangeEvent;
+use crate::messaging::IncomeEvent;
 
 /// 交易所事件接收器
 #[async_trait]
 pub trait EventSink: Send + Sync + 'static {
-    async fn send_event(&self, event: ExchangeEvent);
+    async fn send_event(&self, event: IncomeEvent);
 }
 
 /// 为 Arc<T> 实现 EventSink (blanket impl)
 #[async_trait]
 impl<T: EventSink + ?Sized> EventSink for Arc<T> {
-    async fn send_event(&self, event: ExchangeEvent) {
+    async fn send_event(&self, event: IncomeEvent) {
         self.as_ref().send_event(event).await;
     }
 }

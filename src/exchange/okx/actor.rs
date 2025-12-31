@@ -5,7 +5,7 @@ use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscrib
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsEvent, WsPush,
 };
-use crate::messaging::{ExchangeEvent, ExchangeEventData};
+use crate::messaging::{IncomeEvent, ExchangeEventData};
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
@@ -467,7 +467,7 @@ fn parse_message(
     raw: &str,
     local_ts: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
-) -> Result<Vec<ExchangeEvent>, WsError> {
+) -> Result<Vec<IncomeEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -500,7 +500,7 @@ fn parse_message(
             for data in &push.data {
                 if let Some(rate) = data.to_funding_rate() {
                     // funding-rate 没有事件时间戳，使用本地时间
-                    events.push(ExchangeEvent {
+                    events.push(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
                         data: ExchangeEventData::FundingRate(rate),
@@ -523,7 +523,7 @@ fn parse_message(
                 // 提取交易所时间戳 (data.ts 是字符串)
                 let exchange_ts = data.ts.parse::<u64>().unwrap_or(local_ts);
                 if let Some(bbo) = data.to_bbo(inst_id) {
-                    events.push(ExchangeEvent {
+                    events.push(IncomeEvent {
                         exchange_ts,
                         local_ts,
                         data: ExchangeEventData::BBO(bbo),
@@ -544,7 +544,7 @@ fn parse_message(
                         position.size = meta.qty_to_coin(position.size);
                     }
                     // positions 没有暴露时间戳字段，使用本地时间
-                    events.push(ExchangeEvent {
+                    events.push(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
                         data: ExchangeEventData::Position(position),
@@ -562,7 +562,7 @@ fn parse_message(
                 // 提取交易所时间戳 (u_time 是字符串)
                 let exchange_ts = data.u_time.parse::<u64>().unwrap_or(local_ts);
                 if let Some(equity) = data.to_equity() {
-                    events.push(ExchangeEvent {
+                    events.push(IncomeEvent {
                         exchange_ts,
                         local_ts,
                         data: ExchangeEventData::Equity {
@@ -582,7 +582,7 @@ fn parse_message(
             for data in &push.data {
                 if let Some(update) = data.to_order_update() {
                     // orders 没有暴露时间戳字段，使用本地时间
-                    events.push(ExchangeEvent {
+                    events.push(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
                         data: ExchangeEventData::OrderUpdate(update),

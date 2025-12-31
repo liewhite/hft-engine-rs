@@ -4,15 +4,14 @@ pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
 
 use crate::domain::{Exchange, Order};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{ExchangeEvent, StateManager};
+use crate::messaging::{IncomeEvent, StateManager};
 use std::collections::{HashMap, HashSet};
 
 /// 公共数据流订阅配置
-pub type PublicStreams = HashMap<Exchange, HashSet<SubscriptionKind>>;
 
 /// 策略输出的信号
 #[derive(Debug, Clone)]
-pub enum Signal {
+pub enum OutcomeEvent {
     /// 下单信号
     PlaceOrder(Order),
 }
@@ -22,7 +21,7 @@ pub enum Signal {
 /// 用户实现此 trait 来定义自己的策略逻辑
 pub trait Strategy: Send + Sync {
     /// 策略需要订阅的公共数据流
-    fn public_streams(&self) -> PublicStreams;
+    fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>>;
 
     /// 订单超时时间 (毫秒)
     fn order_timeout_ms(&self) -> u64;
@@ -30,5 +29,5 @@ pub trait Strategy: Send + Sync {
     /// 处理事件
     ///
     /// state: 状态管理器，提供状态查询和下单接口
-    fn on_event(&mut self, event: &ExchangeEvent, state: &mut StateManager);
+    fn on_event(&mut self, event: &IncomeEvent, state: &mut StateManager);
 }

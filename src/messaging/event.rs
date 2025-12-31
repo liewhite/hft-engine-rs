@@ -7,7 +7,7 @@ use crate::domain::{Balance, Exchange, FundingRate, OrderUpdate, Position, Symbo
 /// - local_ts: 本地接收时间戳
 /// - data: 具体的事件数据
 #[derive(Debug, Clone)]
-pub struct ExchangeEvent {
+pub struct IncomeEvent {
     /// 交易所时间戳
     pub exchange_ts: Timestamp,
     /// 本地接收时间戳
@@ -30,7 +30,7 @@ pub enum ExchangeEventData {
     Clock,
 }
 
-impl ExchangeEvent {
+impl IncomeEvent {
     /// 获取事件关联的 Symbol
     pub fn symbol(&self) -> Option<&Symbol> {
         match &self.data {

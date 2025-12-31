@@ -1,7 +1,7 @@
 use crate::domain::{now_ms, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, USDT};
 use crate::engine::SignalProcessorActor;
-use crate::messaging::{ExchangeEvent, ExchangeEventData, SymbolState};
-use crate::strategy::Signal;
+use crate::messaging::{IncomeEvent, ExchangeEventData, SymbolState};
+use crate::strategy::OutcomeEvent;
 use kameo::actor::ActorRef;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -65,7 +65,7 @@ impl StateManager {
         // 发送到 SignalProcessorActor
         let signal_processor = self.signal_processor.clone();
         tokio::spawn(async move {
-            let _ = signal_processor.tell(Signal::PlaceOrder(converted_order)).await;
+            let _ = signal_processor.tell(OutcomeEvent::PlaceOrder(converted_order)).await;
         });
     }
 
@@ -160,7 +160,7 @@ impl StateManager {
     // ==================== 事件处理 ====================
 
     /// 处理事件，更新状态
-    pub fn apply(&mut self, event: &ExchangeEvent) {
+    pub fn apply(&mut self, event: &IncomeEvent) {
         match &event.data {
             // 全局事件: Balance
             ExchangeEventData::Balance(balance) => {

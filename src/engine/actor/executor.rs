@@ -4,7 +4,7 @@
 
 use crate::domain::{Exchange, Symbol, SymbolMeta};
 use crate::engine::SignalProcessorActor;
-use crate::messaging::{ExchangeEvent, StateManager};
+use crate::messaging::{IncomeEvent, StateManager};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -60,7 +60,7 @@ impl ExecutorActor {
     }
 
     /// 处理 ExchangeEvent，调用策略
-    fn handle_event(&mut self, event: ExchangeEvent) {
+    fn handle_event(&mut self, event: IncomeEvent) {
         self.state_manager.apply(&event);
         self.strategy.on_event(&event, &mut self.state_manager);
     }
@@ -91,10 +91,10 @@ impl Actor for ExecutorActor {
 // === Messages ===
 
 /// ExchangeEvent 消息 - 从 ProcessorActor 接收 (包含所有事件类型，含 Clock)
-impl Message<ExchangeEvent> for ExecutorActor {
+impl Message<IncomeEvent> for ExecutorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: ExchangeEvent, _ctx: Context<'_, Self, Self::Reply>) {
+    async fn handle(&mut self, msg: IncomeEvent, _ctx: Context<'_, Self, Self::Reply>) {
         self.handle_event(msg);
     }
 }

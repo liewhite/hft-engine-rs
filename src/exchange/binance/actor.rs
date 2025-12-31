@@ -7,7 +7,7 @@ use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
 use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use crate::messaging::{ExchangeEvent, ExchangeEventData};
+use crate::messaging::{IncomeEvent, ExchangeEventData};
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -488,7 +488,7 @@ fn parse_message(
     raw: &str,
     local_ts: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
-) -> Result<Vec<ExchangeEvent>, WsError> {
+) -> Result<Vec<IncomeEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -524,7 +524,7 @@ fn parse_message(
             let rate = update
                 .to_funding_rate(8.0)
                 .ok_or_else(|| WsError::ParseError("Invalid funding rate".into()))?;
-            Ok(vec![ExchangeEvent {
+            Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,
                 data: ExchangeEventData::FundingRate(rate),
@@ -536,7 +536,7 @@ fn parse_message(
             let bbo = ticker
                 .to_bbo()
                 .ok_or_else(|| WsError::ParseError("Invalid BBO data".into()))?;
-            Ok(vec![ExchangeEvent {
+            Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,
                 data: ExchangeEventData::BBO(bbo),
@@ -555,7 +555,7 @@ fn parse_message(
                     if let Some(meta) = symbol_metas.get(&position.symbol) {
                         position.size = meta.qty_to_coin(position.size);
                     }
-                    events.push(ExchangeEvent {
+                    events.push(IncomeEvent {
                         exchange_ts,
                         local_ts,
                         data: ExchangeEventData::Position(position),
@@ -566,7 +566,7 @@ fn parse_message(
             // 处理所有 balance 更新
             for bal_data in &update.a.balances {
                 if let Some(balance) = bal_data.to_balance() {
-                    events.push(ExchangeEvent {
+                    events.push(IncomeEvent {
                         exchange_ts,
                         local_ts,
                         data: ExchangeEventData::Balance(balance),
@@ -582,7 +582,7 @@ fn parse_message(
             let order_update = update
                 .to_order_update()
                 .ok_or_else(|| WsError::ParseError("Invalid order update".into()))?;
-            Ok(vec![ExchangeEvent {
+            Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,
                 data: ExchangeEventData::OrderUpdate(order_update),
