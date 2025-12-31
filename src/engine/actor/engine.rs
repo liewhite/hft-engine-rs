@@ -118,8 +118,9 @@ impl ManagerActor {
     /// 检查策略所需的 symbols 是否都已缓存
     fn check_required_symbols(&self, strategy: &dyn Strategy) -> Result<(), ExchangeError> {
         let public_streams = strategy.public_streams();
-        for (exchange, symbol_streams) in &public_streams {
-            for symbol in symbol_streams.keys() {
+        for (exchange, kinds) in &public_streams {
+            for kind in kinds {
+                let symbol = kind.symbol();
                 if !self.symbol_metas.contains_key(&(*exchange, symbol.clone())) {
                     return Err(ExchangeError::Other(format!(
                         "Symbol {:?} not found on {:?}. May be newly listed, please restart.",
@@ -249,15 +250,10 @@ impl ManagerActor {
         }
 
         // 4. 收集策略需要的订阅
-        let mut subscriptions: HashSet<(Exchange, SubscriptionKind)> = HashSet::new();
-        for (exchange, symbol_streams) in &public_streams {
-            for (symbol, data_types) in symbol_streams {
-                for data_type in data_types {
-                    let kind = data_type.to_subscription_kind(symbol.clone());
-                    subscriptions.insert((*exchange, kind));
-                }
-            }
-        }
+        let subscriptions: HashSet<(Exchange, SubscriptionKind)> = public_streams
+            .iter()
+            .flat_map(|(exchange, kinds)| kinds.iter().map(move |kind| (*exchange, kind.clone())))
+            .collect();
 
         // 5. 创建 ExecutorActor
         let executor_idx = self.executors.len();

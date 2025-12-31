@@ -1,7 +1,7 @@
 use crate::domain::{
     Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO,
 };
-use crate::exchange::PublicDataType;
+use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEvent, StateManager, SymbolState};
 use crate::strategy::{PublicStreams, Strategy};
 use std::collections::{HashMap, HashSet};
@@ -374,17 +374,16 @@ impl FundingArbStrategy {
 
 impl Strategy for FundingArbStrategy {
     fn public_streams(&self) -> PublicStreams {
-        let data_types: HashSet<PublicDataType> =
-            [PublicDataType::FundingRate, PublicDataType::BBO]
-                .into_iter()
-                .collect();
-
-        let mut symbol_streams = HashMap::new();
-        symbol_streams.insert(self.symbol.clone(), data_types);
+        let kinds: HashSet<SubscriptionKind> = [
+            SubscriptionKind::FundingRate { symbol: self.symbol.clone() },
+            SubscriptionKind::BBO { symbol: self.symbol.clone() },
+        ]
+        .into_iter()
+        .collect();
 
         let mut streams = HashMap::new();
         for exchange in &self.exchanges {
-            streams.insert(*exchange, symbol_streams.clone());
+            streams.insert(*exchange, kinds.clone());
         }
 
         streams

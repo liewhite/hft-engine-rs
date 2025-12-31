@@ -2,15 +2,13 @@ mod funding_arb;
 
 pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
 
-use crate::domain::{Exchange, Order, Symbol};
-use crate::exchange::PublicDataType;
+use crate::domain::{Exchange, Order};
+use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEvent, StateManager};
 use std::collections::{HashMap, HashSet};
 
 /// 公共数据流订阅配置
-///
-/// 两层 Map 结构: Exchange -> Symbol -> DataTypes
-pub type PublicStreams = HashMap<Exchange, HashMap<Symbol, HashSet<PublicDataType>>>;
+pub type PublicStreams = HashMap<Exchange, HashSet<SubscriptionKind>>;
 
 /// 策略输出的信号
 #[derive(Debug, Clone)]
@@ -24,8 +22,6 @@ pub enum Signal {
 /// 用户实现此 trait 来定义自己的策略逻辑
 pub trait Strategy: Send + Sync {
     /// 策略需要订阅的公共数据流
-    ///
-    /// 返回 Exchange -> Symbol -> DataTypes 的两层 Map
     fn public_streams(&self) -> PublicStreams;
 
     /// 订单超时时间 (毫秒)

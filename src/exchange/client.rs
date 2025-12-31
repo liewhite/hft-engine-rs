@@ -22,26 +22,12 @@ pub enum SubscriptionKind {
     BBO { symbol: Symbol },
 }
 
-/// 公共数据类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PublicDataType {
-    /// 资金费率
-    FundingRate,
-    /// Best Bid/Offer
-    BBO,
-}
-
-impl PublicDataType {
-    /// 返回所有数据类型
-    pub fn all() -> &'static [PublicDataType] {
-        &[PublicDataType::FundingRate, PublicDataType::BBO]
-    }
-
-    /// 转换为 SubscriptionKind
-    pub fn to_subscription_kind(self, symbol: Symbol) -> SubscriptionKind {
+impl SubscriptionKind {
+    /// 获取订阅的 symbol
+    pub fn symbol(&self) -> &Symbol {
         match self {
-            PublicDataType::FundingRate => SubscriptionKind::FundingRate { symbol },
-            PublicDataType::BBO => SubscriptionKind::BBO { symbol },
+            SubscriptionKind::FundingRate { symbol } => symbol,
+            SubscriptionKind::BBO { symbol } => symbol,
         }
     }
 }

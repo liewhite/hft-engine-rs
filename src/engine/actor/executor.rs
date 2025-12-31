@@ -35,11 +35,13 @@ pub struct ExecutorActor {
 impl ExecutorActor {
     /// 创建 ExecutorActor
     pub fn new(args: ExecutorArgs) -> Self {
-        // 从策略获取订阅的 symbols
+        // 从策略获取订阅的 symbols (去重)
         let public_streams = args.strategy.public_streams();
         let symbols: Vec<Symbol> = public_streams
             .values()
-            .flat_map(|m| m.keys().cloned())
+            .flat_map(|kinds| kinds.iter().map(|k| k.symbol().clone()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
             .collect();
 
         // 创建状态管理器
