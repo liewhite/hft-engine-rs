@@ -3,7 +3,7 @@ use crate::domain::{
 };
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{IncomeEvent, StateManager, SymbolState};
-use crate::strategy::Strategy;
+use crate::strategy::{OutcomeEvent, Strategy};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -391,7 +391,7 @@ impl Strategy for FundingArbStrategy {
         self.config.order_timeout_ms
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &mut StateManager) {
+    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
         tracing::info!(
             symbol = %self.symbol,
             event  = ?event,
@@ -400,12 +400,12 @@ impl Strategy for FundingArbStrategy {
         // 获取本策略关注的 symbol 状态
         let symbol_state = match state.symbol_state(&self.symbol) {
             Some(s) => s,
-            None => return,
+            None => return vec![],
         };
 
         // 有未完成订单时等待
         if symbol_state.has_pending_orders() {
-            return;
+            return vec![];
         }
 
         // 计算净敞口
@@ -418,15 +418,13 @@ impl Strategy for FundingArbStrategy {
             self.config.unhedge_value_threshold,
         ) {
             let orders = Self::make_hedge_repair_orders(net_exposure, symbol_state);
-            state.place_orders(orders);
-            return;
+            return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
         }
 
         // 优先级 2: 检查平仓条件
         if Self::check_close_condition(symbol_state, &self.config) {
             let orders = Self::make_close_orders(symbol_state);
-            state.place_orders(orders);
-            return;
+            return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
         }
 
         // 优先级 3: 检查开仓条件
@@ -441,7 +439,9 @@ impl Strategy for FundingArbStrategy {
                 state.equity(cond.short_ex),
                 state.equity(cond.long_ex),
             );
-            state.place_orders(orders);
+            return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
         }
+
+        vec![]
     }
 }

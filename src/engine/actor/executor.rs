@@ -5,7 +5,7 @@
 use crate::domain::{Exchange, Symbol, SymbolMeta};
 use crate::engine::SignalProcessorActor;
 use crate::messaging::{IncomeEvent, StateManager};
-use crate::strategy::Strategy;
+use crate::strategy::{OutcomeEvent, Strategy};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -30,6 +30,8 @@ pub struct ExecutorActor {
     strategy: Box<dyn Strategy>,
     /// 状态管理器
     state_manager: StateManager,
+    /// SignalProcessorActor 引用 (用于下单)
+    signal_processor: ActorRef<SignalProcessorActor>,
 }
 
 impl ExecutorActor {
@@ -46,23 +48,37 @@ impl ExecutorActor {
 
         // 创建状态管理器
         let order_timeout_ms = args.strategy.order_timeout_ms();
-        let state_manager = StateManager::new(
-            &symbols,
-            args.symbol_metas,
-            args.signal_processor,
-            order_timeout_ms,
-        );
+        let state_manager = StateManager::new(&symbols, args.symbol_metas, order_timeout_ms);
 
         Self {
             strategy: args.strategy,
             state_manager,
+            signal_processor: args.signal_processor,
         }
     }
 
-    /// 处理 ExchangeEvent，调用策略
-    fn handle_event(&mut self, event: IncomeEvent) {
+    /// 处理 ExchangeEvent，调用策略并处理返回的信号
+    async fn handle_event(&mut self, event: IncomeEvent) {
+        // 先更新状态
         self.state_manager.apply(&event);
-        self.strategy.on_event(&event, &mut self.state_manager);
+
+        // 调用策略，获取信号
+        let signals = self.strategy.on_event(&event, &self.state_manager);
+
+        // 处理每个信号
+        for signal in signals {
+            match signal {
+                OutcomeEvent::PlaceOrder(order) => {
+                    // 转换订单并添加到 pending_orders
+                    let converted_order = self.state_manager.place_order(order);
+                    // 发送到 SignalProcessor
+                    let _ = self
+                        .signal_processor
+                        .tell(OutcomeEvent::PlaceOrder(converted_order))
+                        .await;
+                }
+            }
+        }
     }
 }
 
@@ -95,6 +111,6 @@ impl Message<IncomeEvent> for ExecutorActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: IncomeEvent, _ctx: Context<'_, Self, Self::Reply>) {
-        self.handle_event(msg);
+        self.handle_event(msg).await;
     }
 }

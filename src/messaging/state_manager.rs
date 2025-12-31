@@ -1,8 +1,5 @@
 use crate::domain::{now_ms, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, USDT};
-use crate::engine::SignalProcessorActor;
-use crate::messaging::{IncomeEvent, ExchangeEventData, SymbolState};
-use crate::strategy::OutcomeEvent;
-use kameo::actor::ActorRef;
+use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -17,8 +14,6 @@ pub struct StateManager {
     equities: HashMap<Exchange, f64>,
     /// Symbol 元数据 (用于订单转换)
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// SignalProcessorActor 引用
-    signal_processor: ActorRef<SignalProcessorActor>,
     /// 订单超时时间 (毫秒)
     order_timeout_ms: u64,
 }
@@ -28,7 +23,6 @@ impl StateManager {
     pub fn new(
         symbols: &[Symbol],
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-        signal_processor: ActorRef<SignalProcessorActor>,
         order_timeout_ms: u64,
     ) -> Self {
         let mut states = HashMap::new();
@@ -41,15 +35,14 @@ impl StateManager {
             balances: HashMap::new(),
             equities: HashMap::new(),
             symbol_metas,
-            signal_processor,
             order_timeout_ms,
         }
     }
 
     // ==================== 下单接口 ====================
 
-    /// 下单：生成 client_order_id，转换订单，添加到 pending_orders，发送到 SignalProcessor
-    pub fn place_order(&mut self, mut order: Order) {
+    /// 下单：生成 client_order_id，转换订单，添加到 pending_orders，返回转换后的订单
+    pub fn place_order(&mut self, mut order: Order) -> Order {
         // 生成 client_order_id (去掉 `-`，OKX 只允许字母数字)
         let client_order_id = Uuid::new_v4().simple().to_string();
         order.client_order_id = Some(client_order_id.clone());
@@ -62,18 +55,7 @@ impl StateManager {
             state.add_pending_order(client_order_id, order.exchange, now_ms());
         }
 
-        // 发送到 SignalProcessorActor
-        let signal_processor = self.signal_processor.clone();
-        tokio::spawn(async move {
-            let _ = signal_processor.tell(OutcomeEvent::PlaceOrder(converted_order)).await;
-        });
-    }
-
-    /// 批量下单
-    pub fn place_orders(&mut self, orders: Vec<Order>) {
-        for order in orders {
-            self.place_order(order);
-        }
+        converted_order
     }
 
     /// 转换订单：coin_to_qty + round price/size
