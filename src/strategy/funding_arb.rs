@@ -4,37 +4,53 @@ use crate::domain::{
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{IncomeEvent, StateManager, SymbolState};
 use crate::strategy::Strategy;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
 /// 资金费率套利策略配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct FundingArbConfig {
     /// 最小日化费率差 (开仓阈值)
+    #[serde(default = "default_min_spread")]
     pub min_spread: Rate,
     /// 最大日化费率差 (限制风险)
+    #[serde(default = "default_max_spread")]
     pub max_spread: Rate,
     /// 平仓日化费率差阈值
+    #[serde(default = "default_close_spread")]
     pub close_spread: Rate,
     /// 单笔最大下单金额 (USDT)
+    #[serde(default = "default_max_notional")]
     pub max_notional: f64,
     /// 最大持仓数量
+    #[serde(default = "default_max_quantity")]
     pub max_quantity: Quantity,
     /// 订单超时时间 (毫秒)
+    #[serde(default = "default_order_timeout_ms")]
     pub order_timeout_ms: u64,
     /// 不平衡修复阈值 - 敞口价值 (USD, 超过该价值视为不平衡)
+    #[serde(default = "default_unhedge_value_threshold")]
     pub unhedge_value_threshold: f64,
 }
+
+fn default_min_spread() -> Rate { 0.0005 }
+fn default_max_spread() -> Rate { 0.002 }
+fn default_close_spread() -> Rate { 0.0002 }
+fn default_max_notional() -> f64 { 1000.0 }
+fn default_max_quantity() -> Quantity { 1.0 }
+fn default_order_timeout_ms() -> u64 { 10_000 }
+fn default_unhedge_value_threshold() -> f64 { 50.0 }
 
 impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
-            min_spread: 0.0005,   // 0.05%
-            max_spread: 0.002,    // 0.2%
-            close_spread: 0.0002, // 0.02%
-            max_notional: 1000.0, // 1000 USDT
-            max_quantity: 1.0,
-            order_timeout_ms: 10_000, // 10 seconds
-            unhedge_value_threshold: 50.0, // 50 USD
+            min_spread: default_min_spread(),
+            max_spread: default_max_spread(),
+            close_spread: default_close_spread(),
+            max_notional: default_max_notional(),
+            max_quantity: default_max_quantity(),
+            order_timeout_ms: default_order_timeout_ms(),
+            unhedge_value_threshold: default_unhedge_value_threshold(),
         }
     }
 }

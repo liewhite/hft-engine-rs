@@ -49,76 +49,7 @@ impl ExchangesConfig {
 pub struct StrategyConfig {
     pub symbols: Vec<String>,
     #[serde(default)]
-    pub funding_arb: FundingArbStrategyConfig,
-}
-
-/// 资金费率套利策略配置
-#[derive(Debug, Clone, Deserialize)]
-pub struct FundingArbStrategyConfig {
-    #[serde(default = "default_min_spread")]
-    pub min_spread: f64,
-    #[serde(default = "default_max_spread")]
-    pub max_spread: f64,
-    #[serde(default = "default_close_spread")]
-    pub close_spread: f64,
-    #[serde(default = "default_max_notional")]
-    pub max_notional: f64,
-    #[serde(default = "default_max_quantity")]
-    pub max_quantity: f64,
-    #[serde(default = "default_order_timeout_ms")]
-    pub order_timeout_ms: u64,
-    #[serde(default = "default_unhedge_value_threshold")]
-    pub unhedge_value_threshold: f64,
-}
-
-fn default_min_spread() -> f64 {
-    0.0005
-}
-fn default_max_spread() -> f64 {
-    0.002
-}
-fn default_close_spread() -> f64 {
-    0.0002
-}
-fn default_max_notional() -> f64 {
-    1000.0
-}
-fn default_max_quantity() -> f64 {
-    1.0
-}
-fn default_order_timeout_ms() -> u64 {
-    10_000
-}
-fn default_unhedge_value_threshold() -> f64 {
-    50.0 // 50 USD
-}
-
-impl Default for FundingArbStrategyConfig {
-    fn default() -> Self {
-        Self {
-            min_spread: default_min_spread(),
-            max_spread: default_max_spread(),
-            close_spread: default_close_spread(),
-            max_notional: default_max_notional(),
-            max_quantity: default_max_quantity(),
-            order_timeout_ms: default_order_timeout_ms(),
-            unhedge_value_threshold: default_unhedge_value_threshold(),
-        }
-    }
-}
-
-impl From<FundingArbStrategyConfig> for FundingArbConfig {
-    fn from(cfg: FundingArbStrategyConfig) -> Self {
-        Self {
-            min_spread: cfg.min_spread,
-            max_spread: cfg.max_spread,
-            close_spread: cfg.close_spread,
-            max_notional: cfg.max_notional,
-            max_quantity: cfg.max_quantity,
-            order_timeout_ms: cfg.order_timeout_ms,
-            unhedge_value_threshold: cfg.unhedge_value_threshold,
-        }
-    }
+    pub funding_arb: FundingArbConfig,
 }
 
 /// 引擎配置
@@ -181,7 +112,7 @@ impl AppConfig {
             exchanges: ExchangesConfig { binance, okx },
             strategy: StrategyConfig {
                 symbols,
-                funding_arb: FundingArbStrategyConfig::default(),
+                funding_arb: FundingArbConfig::default(),
             },
             engine: EngineConfig::default(),
         })
