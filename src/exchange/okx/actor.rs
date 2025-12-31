@@ -132,11 +132,6 @@ impl OkxActor {
     }
 
     async fn create_private_connection(&mut self) -> Result<(), WsError> {
-        // 中止旧的 private 连接任务 (防止重连时任务泄漏)
-        if let Some(conn) = self.private_conn.take() {
-            conn._handle.abort();
-        }
-
         let credentials = self
             .credentials
             .as_ref()

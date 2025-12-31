@@ -151,16 +151,6 @@ impl BinanceActor {
 
     /// 创建 private WebSocket 连接
     async fn create_private_connection(&mut self) -> Result<(), WsError> {
-        // 先中止旧的 ListenKey 刷新任务 (M1 fix: 防止重连时任务泄漏)
-        if let Some(handle) = self.listen_key_refresh_handle.take() {
-            handle.abort();
-        }
-
-        // 中止旧的 private 连接任务
-        if let Some(conn) = self.private_conn.take() {
-            conn._handle.abort();
-        }
-
         let credentials = self
             .credentials
             .as_ref()
