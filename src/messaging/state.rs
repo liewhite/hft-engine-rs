@@ -1,7 +1,4 @@
 use crate::domain::{Exchange, FundingRate, OrderStatus, Position, Rate, Symbol, Timestamp, BBO};
-
-/// 复用 Position 的 epsilon 常量
-const POSITION_EPSILON: f64 = Position::EPSILON;
 use crate::messaging::event::{IncomeEvent, ExchangeEventData};
 use std::collections::HashMap;
 
@@ -117,71 +114,37 @@ impl SymbolState {
         !self.pending_orders.is_empty()
     }
 
-    /// 检查持仓是否对冲 (多空持仓量是否匹配)
-    /// 返回 None 表示无持仓，Some(true) 表示对冲，Some(false) 表示存在敞口
-    pub fn is_hedged(&self) -> Option<bool> {
+    /// 计算净敞口 (net exposure)
+    ///
+    /// 返回 (净持仓量, 估算价格):
+    /// - 净持仓量: 正数表示净多头，负数表示净空头，0 表示完全对冲或无持仓
+    /// - 估算价格: 用于计算敞口价值
+    pub fn net_exposure(&self) -> (f64, f64) {
         let positions: Vec<_> = self.positions.values()
             .filter(|p| !p.is_empty())
             .collect();
 
         if positions.is_empty() {
-            return None;
+            return (0.0, 0.0);
         }
 
         // 计算净持仓 (size 本身带符号：正数多头，负数空头)
         let net_position: f64 = positions.iter().map(|p| p.size).sum();
 
-        // 净持仓接近 0 视为对冲
-        Some(net_position.abs() < POSITION_EPSILON)
-    }
+        // 估算价格：优先用 mark_price，否则用 entry_price
+        let price = positions.iter()
+            .find_map(|p| {
+                if p.mark_price > 0.0 {
+                    Some(p.mark_price)
+                } else if p.entry_price > 0.0 {
+                    Some(p.entry_price)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0);
 
-    /// 获取不平衡的敞口持仓 (返回需要平仓的交易所、方向和数量)
-    ///
-    /// 计算净持仓，找出需要平仓的交易所和方向：
-    /// - 如果净持仓为正（净多头），在持仓为正的交易所平多头
-    /// - 如果净持仓为负（净空头），在持仓为负的交易所平空头
-    pub fn unhedged_exposure(&self) -> Option<(Exchange, crate::domain::Side, f64)> {
-        use crate::domain::Side;
-
-        let positions: Vec<_> = self.positions.iter()
-            .filter(|(_, p)| !p.is_empty())
-            .collect();
-
-        if positions.is_empty() {
-            return None;
-        }
-
-        // 单腿持仓直接返回
-        if positions.len() == 1 {
-            let (ex, pos) = positions[0];
-            return Some((*ex, pos.side(), pos.size.abs()));
-        }
-
-        // 计算净持仓 (size 带符号)
-        let net_position: f64 = positions.iter().map(|(_, p)| p.size).sum();
-
-        if net_position.abs() < POSITION_EPSILON {
-            return None; // 已对冲
-        }
-
-        // 找出需要平仓的交易所：
-        // - 净多头 (net > 0)：在持仓为正的交易所平多头
-        // - 净空头 (net < 0)：在持仓为负的交易所平空头
-        let (exchange, side) = if net_position > 0.0 {
-            // 找持仓最大的多头交易所
-            positions.iter()
-                .filter(|(_, p)| p.size > 0.0)
-                .max_by(|a, b| a.1.size.total_cmp(&b.1.size))
-                .map(|(ex, _)| (*ex, Side::Long))?
-        } else {
-            // 找持仓最大的空头交易所
-            positions.iter()
-                .filter(|(_, p)| p.size < 0.0)
-                .min_by(|a, b| a.1.size.total_cmp(&b.1.size))
-                .map(|(ex, _)| (*ex, Side::Short))?
-        };
-
-        Some((*exchange, side, net_position.abs()))
+        (net_position, price)
     }
 
     /// 更新状态

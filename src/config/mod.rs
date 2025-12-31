@@ -67,8 +67,6 @@ pub struct FundingArbStrategyConfig {
     pub max_quantity: f64,
     #[serde(default = "default_order_timeout_ms")]
     pub order_timeout_ms: u64,
-    #[serde(default = "default_unhedge_ratio_threshold")]
-    pub unhedge_ratio_threshold: f64,
     #[serde(default = "default_unhedge_value_threshold")]
     pub unhedge_value_threshold: f64,
 }
@@ -91,9 +89,6 @@ fn default_max_quantity() -> f64 {
 fn default_order_timeout_ms() -> u64 {
     10_000
 }
-fn default_unhedge_ratio_threshold() -> f64 {
-    0.01 // 1%
-}
 fn default_unhedge_value_threshold() -> f64 {
     50.0 // 50 USD
 }
@@ -107,7 +102,6 @@ impl Default for FundingArbStrategyConfig {
             max_notional: default_max_notional(),
             max_quantity: default_max_quantity(),
             order_timeout_ms: default_order_timeout_ms(),
-            unhedge_ratio_threshold: default_unhedge_ratio_threshold(),
             unhedge_value_threshold: default_unhedge_value_threshold(),
         }
     }
@@ -122,7 +116,6 @@ impl From<FundingArbStrategyConfig> for FundingArbConfig {
             max_notional: cfg.max_notional,
             max_quantity: cfg.max_quantity,
             order_timeout_ms: cfg.order_timeout_ms,
-            unhedge_ratio_threshold: cfg.unhedge_ratio_threshold,
             unhedge_value_threshold: cfg.unhedge_value_threshold,
         }
     }
