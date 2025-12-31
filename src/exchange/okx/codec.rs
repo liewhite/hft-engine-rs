@@ -65,7 +65,6 @@ impl FundingRateData {
 pub struct BboData {
     pub asks: Vec<Vec<String>>,
     pub bids: Vec<Vec<String>>,
-    #[allow(dead_code)]
     pub ts: String,
     #[allow(dead_code)]
     pub seq_id: Option<i64>,
@@ -89,6 +88,8 @@ impl BboData {
         let bid_price = f64::from_str(&bid[0]).ok()?;
         let bid_qty = f64::from_str(&bid[1]).ok()?;
 
+        let timestamp = self.ts.parse::<u64>().unwrap_or(0);
+
         Some(BBO {
             exchange: Exchange::OKX,
             symbol,
@@ -96,7 +97,7 @@ impl BboData {
             bid_qty,
             ask_price,
             ask_qty,
-            timestamp: now_ms(),
+            timestamp,
         })
     }
 }

@@ -70,7 +70,7 @@ impl BookTicker {
             bid_qty,
             ask_price,
             ask_qty,
-            timestamp: now_ms(),
+            timestamp: self.t as u64,
         })
     }
 }
