@@ -169,7 +169,7 @@ impl BinanceActor {
     }
 
     /// 发送订阅消息
-    async fn send_subscribe(&self, kind: &SubscriptionKind) {
+    async fn send_subscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
         let stream = kind_to_stream(kind);
         let msg = json!({
             "method": "SUBSCRIBE",
@@ -178,13 +178,18 @@ impl BinanceActor {
         })
         .to_string();
 
-        if let Some(conn) = &self.public_conn {
-            let _ = conn.tx.send(msg).await;
-        }
+        let conn = self
+            .public_conn
+            .as_ref()
+            .expect("public_conn must exist after on_start");
+        conn.tx
+            .send(msg)
+            .await
+            .map_err(|_| WsError::Network("Channel closed".to_string()))
     }
 
     /// 发送取消订阅消息
-    async fn send_unsubscribe(&self, kind: &SubscriptionKind) {
+    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
         let stream = kind_to_stream(kind);
         let msg = json!({
             "method": "UNSUBSCRIBE",
@@ -193,9 +198,14 @@ impl BinanceActor {
         })
         .to_string();
 
-        if let Some(conn) = &self.public_conn {
-            let _ = conn.tx.send(msg).await;
-        }
+        let conn = self
+            .public_conn
+            .as_ref()
+            .expect("public_conn must exist after on_start");
+        conn.tx
+            .send(msg)
+            .await
+            .map_err(|_| WsError::Network("Channel closed".to_string()))
     }
 }
 
@@ -261,14 +271,18 @@ impl Message<Subscribe> for BinanceActor {
     async fn handle(
         &mut self,
         msg: Subscribe,
-        _ctx: Context<'_, Self, Self::Reply>,
+        ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         // 检查是否已订阅
         if self.subscribed.contains(&msg.kind) {
             return;
         }
 
-        self.send_subscribe(&msg.kind).await;
+        if let Err(e) = self.send_subscribe(&msg.kind).await {
+            tracing::error!(error = %e, "Failed to send subscribe, killing actor");
+            ctx.actor_ref().kill();
+            return;
+        }
         self.subscribed.insert(msg.kind);
     }
 }
@@ -279,14 +293,17 @@ impl Message<Unsubscribe> for BinanceActor {
     async fn handle(
         &mut self,
         msg: Unsubscribe,
-        _ctx: Context<'_, Self, Self::Reply>,
+        ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         // 检查是否已订阅
         if !self.subscribed.remove(&msg.kind) {
             return;
         }
 
-        self.send_unsubscribe(&msg.kind).await;
+        if let Err(e) = self.send_unsubscribe(&msg.kind).await {
+            tracing::error!(error = %e, "Failed to send unsubscribe, killing actor");
+            ctx.actor_ref().kill();
+        }
     }
 }
 
@@ -354,8 +371,11 @@ async fn run_ws_loop(
 
     // 出错时通知 Actor 停止
     if let Err(e) = result {
-        if let Some(actor) = actor_ref.upgrade() {
-            let _ = actor.tell(WsDisconnected { error: e, is_private }).await;
+        let Some(actor) = actor_ref.upgrade() else {
+            return;
+        };
+        if let Err(tell_err) = actor.tell(WsDisconnected { error: e, is_private }).await {
+            tracing::warn!(error = %tell_err, "Failed to notify actor of disconnect");
         }
     }
 }
@@ -384,12 +404,18 @@ async fn run_ws_loop_inner(
             ws_msg = read.next() => {
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
-                        if let Some(actor) = actor_ref.upgrade() {
-                            let _ = actor.tell(WsData { data: text }).await;
-                        }
+                        let Some(actor) = actor_ref.upgrade() else {
+                            // Actor 已死，正常退出
+                            return Ok(());
+                        };
+                        actor.tell(WsData { data: text }).await.map_err(|e| {
+                            WsError::Network(format!("Failed to tell actor: {}", e))
+                        })?;
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
-                        let _ = write.send(WsMessage::Pong(data)).await;
+                        write.send(WsMessage::Pong(data)).await.map_err(|_| {
+                            WsError::Network("Failed to send pong".to_string())
+                        })?;
                     }
                     Some(Ok(WsMessage::Close(_))) => {
                         return Err(WsError::ServerClosed);
@@ -472,13 +498,17 @@ async fn listen_key_refresh_loop(
         };
 
         tracing::error!(error = %error, "ListenKey refresh failed, notifying actor");
-        if let Some(actor) = actor_ref.upgrade() {
-            let _ = actor
-                .tell(WsDisconnected {
-                    error: WsError::AuthFailed(format!("ListenKey refresh failed: {}", error)),
-                    is_private: true,
-                })
-                .await;
+        let Some(actor) = actor_ref.upgrade() else {
+            return;
+        };
+        if let Err(tell_err) = actor
+            .tell(WsDisconnected {
+                error: WsError::AuthFailed(format!("ListenKey refresh failed: {}", error)),
+                is_private: true,
+            })
+            .await
+        {
+            tracing::warn!(error = %tell_err, "Failed to notify actor of ListenKey refresh failure");
         }
         return;
     }
