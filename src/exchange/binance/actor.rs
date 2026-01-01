@@ -164,7 +164,14 @@ impl BinanceActor {
 
         let weak_ref = actor_ref.downgrade();
         let ws_exit_tx = task_exit_tx.clone();
-        tokio::spawn(run_ws_loop(read, write, rx, weak_ref, ws_exit_tx, true));
+        tokio::spawn(run_ws_loop(
+            read,
+            write,
+            rx,
+            weak_ref.clone(),
+            ws_exit_tx,
+            true,
+        ));
 
         self.private_conn = Some(WsConnection { tx });
 
@@ -174,6 +181,7 @@ impl BinanceActor {
         tokio::spawn(listen_key_refresh_loop(
             rest_base_url,
             api_key,
+            weak_ref,
             task_exit_tx,
         ));
 
@@ -492,6 +500,7 @@ async fn create_listen_key(rest_base_url: &str, api_key: &str) -> Result<String,
 async fn listen_key_refresh_loop(
     rest_base_url: String,
     api_key: String,
+    actor_ref: WeakActorRef<BinanceActor>,
     task_exit_tx: mpsc::Sender<TaskExit>,
 ) {
     let client = reqwest::Client::new();
@@ -499,6 +508,11 @@ async fn listen_key_refresh_loop(
 
     loop {
         tokio::time::sleep(interval).await;
+
+        // Actor 已停止，退出协程
+        if actor_ref.upgrade().is_none() {
+            return;
+        }
 
         let result = client
             .put(format!("{}/fapi/v1/listenKey", rest_base_url))
