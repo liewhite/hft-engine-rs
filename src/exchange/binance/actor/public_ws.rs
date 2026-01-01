@@ -7,7 +7,8 @@
 
 use super::binance_actor::BinanceActor;
 use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use futures_util::{SinkExt, StreamExt};
+use crate::exchange::ws_loop::{self, WsIncoming};
+use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -17,16 +18,9 @@ use serde_json::json;
 use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Public WebSocket URL
 const WS_PUBLIC_URL: &str = "wss://fstream.binance.com/ws";
-
-/// 协程退出信号
-#[derive(Debug)]
-enum WsExit {
-    Error(WsError),
-}
 
 /// BinancePublicWsActor 初始化参数
 pub struct BinancePublicWsActorArgs {
@@ -102,20 +96,19 @@ impl Actor for BinancePublicWsActor {
 
         let (write, read) = ws_stream.split();
 
-        // 创建消息发送 channel
-        let (ws_tx, ws_rx) = mpsc::channel::<String>(100);
-        self.ws_tx = Some(ws_tx);
+        // 创建出站消息 channel (Subscribe/Unsubscribe)
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
+        self.ws_tx = Some(outgoing_tx);
 
-        // 创建退出信号 channel
-        let (exit_tx, exit_rx) = mpsc::channel::<WsExit>(1);
+        // 创建入站消息 channel (收到的数据/错误)
+        let (incoming_tx, incoming_rx) = mpsc::channel::<WsIncoming>(100);
 
-        // attach_stream 监控退出信号
-        let exit_stream = ReceiverStream::new(exit_rx);
-        actor_ref.attach_stream(exit_stream, (), ());
+        // attach_stream 监控入站消息
+        let incoming_stream = ReceiverStream::new(incoming_rx);
+        actor_ref.attach_stream(incoming_stream, (), ());
 
         // 启动 ws_loop
-        let weak_ref = actor_ref.downgrade();
-        tokio::spawn(run_ws_loop(read, write, ws_rx, weak_ref, exit_tx));
+        tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
 
         tracing::info!("BinancePublicWsActor started");
         Ok(())
@@ -145,7 +138,6 @@ impl Message<Subscribe> for BinancePublicWsActor {
         msg: Subscribe,
         ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        // 检查是否已订阅
         if self.subscribed.contains(&msg.kind) {
             return;
         }
@@ -167,7 +159,6 @@ impl Message<Unsubscribe> for BinancePublicWsActor {
         msg: Unsubscribe,
         ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        // 检查是否已订阅
         if !self.subscribed.remove(&msg.kind) {
             return;
         }
@@ -179,118 +170,39 @@ impl Message<Unsubscribe> for BinancePublicWsActor {
     }
 }
 
-/// WebSocket 数据消息 (从 ws_loop 收到)
-pub struct WsData {
-    pub data: String,
-}
-
-impl Message<WsData> for BinancePublicWsActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
-        // 转发给父 Actor
-        if let Some(parent) = self.parent.upgrade() {
-            parent
-                .tell(super::WsData { data: msg.data })
-                .await
-                .expect("Failed to forward WsData to parent");
-        }
-    }
-}
-
-/// 协程退出信号处理
-impl Message<StreamMessage<WsExit, (), ()>> for BinancePublicWsActor {
+/// WebSocket 入站消息处理
+impl Message<StreamMessage<WsIncoming, (), ()>> for BinancePublicWsActor {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        msg: StreamMessage<WsExit, (), ()>,
+        msg: StreamMessage<WsIncoming, (), ()>,
         ctx: Context<'_, Self, Self::Reply>,
     ) {
         match msg {
-            StreamMessage::Next(WsExit::Error(e)) => {
-                tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
-                ctx.actor_ref().kill();
-            }
+            StreamMessage::Next(incoming) => match incoming {
+                WsIncoming::Data(data) => {
+                    // 转发给父 Actor
+                    let parent = self
+                        .parent
+                        .upgrade()
+                        .expect("Parent actor must be alive while child is running");
+                    parent
+                        .tell(super::WsData { data })
+                        .await
+                        .expect("Failed to forward WsData to parent");
+                }
+                WsIncoming::Error(e) => {
+                    tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
+                    ctx.actor_ref().kill();
+                }
+            },
             StreamMessage::Started(_) => {
-                tracing::debug!("WsExit stream started");
+                tracing::debug!("WsIncoming stream started");
             }
             StreamMessage::Finished(_) => {
-                // Sender drop 了，说明 ws_loop 正常退出
-                tracing::debug!("WsExit stream finished");
-            }
-        }
-    }
-}
-
-// ============================================================================
-// WebSocket 循环
-// ============================================================================
-
-async fn run_ws_loop(
-    mut read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
-        + Unpin
-        + Send,
-    mut write: impl SinkExt<WsMessage> + Unpin + Send,
-    mut rx: mpsc::Receiver<String>,
-    actor_ref: WeakActorRef<BinancePublicWsActor>,
-    exit_tx: mpsc::Sender<WsExit>,
-) {
-    let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
-
-    // 出错时发送退出信号
-    if let Err(e) = result {
-        let _ = exit_tx.send(WsExit::Error(e)).await;
-    }
-}
-
-async fn run_ws_loop_inner(
-    read: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
-              + Unpin
-              + Send),
-    write: &mut (impl SinkExt<WsMessage> + Unpin + Send),
-    rx: &mut mpsc::Receiver<String>,
-    actor_ref: &WeakActorRef<BinancePublicWsActor>,
-) -> Result<(), WsError> {
-    loop {
-        tokio::select! {
-            msg = rx.recv() => {
-                match msg {
-                    Some(text) => {
-                        if write.send(WsMessage::Text(text)).await.is_err() {
-                            return Err(WsError::Network("Send failed".to_string()));
-                        }
-                    }
-                    None => return Ok(()),
-                }
-            }
-
-            ws_msg = read.next() => {
-                match ws_msg {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        let Some(actor) = actor_ref.upgrade() else {
-                            return Ok(());
-                        };
-                        actor.tell(WsData { data: text }).await.map_err(|e| {
-                            WsError::Network(format!("Failed to tell actor: {}", e))
-                        })?;
-                    }
-                    Some(Ok(WsMessage::Ping(data))) => {
-                        write.send(WsMessage::Pong(data)).await.map_err(|_| {
-                            WsError::Network("Failed to send pong".to_string())
-                        })?;
-                    }
-                    Some(Ok(WsMessage::Close(_))) => {
-                        return Err(WsError::ServerClosed);
-                    }
-                    Some(Err(e)) => {
-                        return Err(WsError::Network(e.to_string()));
-                    }
-                    None => {
-                        return Err(WsError::ServerClosed);
-                    }
-                    _ => {}
-                }
+                // ws_loop 正常退出（outgoing_tx 被 drop）
+                tracing::debug!("WsIncoming stream finished");
             }
         }
     }
