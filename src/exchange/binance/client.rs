@@ -3,7 +3,7 @@
 use crate::domain::{
     Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
-pub use crate::exchange::binance::actor::BinanceCredentials;
+pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
 use crate::exchange::client::ExchangeClient;
 use async_trait::async_trait;

@@ -4,7 +4,7 @@ use crate::domain::{
     Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
 use crate::exchange::client::ExchangeClient;
-pub use crate::exchange::okx::actor::OkxCredentials;
+pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
