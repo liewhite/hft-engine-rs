@@ -7,19 +7,19 @@ use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
 use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use crate::messaging::{IncomeEvent, ExchangeEventData};
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
-use kameo::message::{Context, Message};
+use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use serde_json::json;
-use std::collections::HashSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Public WebSocket URL
@@ -32,6 +32,18 @@ const WS_PRIVATE_BASE: &str = "wss://fstream.binance.com/ws";
 const LISTEN_KEY_REFRESH_INTERVAL_SECS: u64 = 30 * 60;
 
 // ============================================================================
+// 协程退出信号
+// ============================================================================
+
+/// 协程退出信号
+#[derive(Debug)]
+enum TaskExit {
+    PublicWs(WsError),
+    PrivateWs(WsError),
+    ListenKeyRefresh(WsError),
+}
+
+// ============================================================================
 // WebSocket 连接
 // ============================================================================
 
@@ -39,8 +51,6 @@ const LISTEN_KEY_REFRESH_INTERVAL_SECS: u64 = 30 * 60;
 struct WsConnection {
     /// 发送消息的 channel
     tx: mpsc::Sender<String>,
-    /// ws_loop 任务句柄
-    _handle: JoinHandle<()>,
 }
 
 // ============================================================================
@@ -85,12 +95,8 @@ pub struct BinanceActor {
     /// 已订阅的 kinds (用于去重)
     subscribed: HashSet<SubscriptionKind>,
 
-    // Binance 特有
-    /// ListenKey 刷新任务
-    listen_key_refresh_handle: Option<JoinHandle<()>>,
-
-    /// 自身弱引用
-    self_ref: Option<WeakActorRef<Self>>,
+    /// 协程退出信号发送器
+    task_exit_tx: Option<mpsc::Sender<TaskExit>>,
 }
 
 impl BinanceActor {
@@ -103,19 +109,16 @@ impl BinanceActor {
             public_conn: None,
             private_conn: None,
             subscribed: HashSet::new(),
-            listen_key_refresh_handle: None,
-            self_ref: None,
+            task_exit_tx: None,
         }
     }
 
     /// 创建 public WebSocket 连接
-    async fn create_public_connection(&mut self) -> Result<(), WsError> {
-        let self_ref = self
-            .self_ref
-            .as_ref()
-            .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
-            .clone();
-
+    async fn create_public_connection(
+        &mut self,
+        actor_ref: &ActorRef<Self>,
+        task_exit_tx: mpsc::Sender<TaskExit>,
+    ) -> Result<(), WsError> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PUBLIC_URL)
             .await
             .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
@@ -123,14 +126,26 @@ impl BinanceActor {
         let (write, read) = ws_stream.split();
         let (tx, rx) = mpsc::channel::<String>(100);
 
-        let handle = tokio::spawn(run_ws_loop(read, write, rx, self_ref, false));
+        let weak_ref = actor_ref.downgrade();
+        tokio::spawn(run_ws_loop(
+            read,
+            write,
+            rx,
+            weak_ref,
+            task_exit_tx,
+            false,
+        ));
 
-        self.public_conn = Some(WsConnection { tx, _handle: handle });
+        self.public_conn = Some(WsConnection { tx });
         Ok(())
     }
 
     /// 创建 private WebSocket 连接
-    async fn create_private_connection(&mut self) -> Result<(), WsError> {
+    async fn create_private_connection(
+        &mut self,
+        actor_ref: &ActorRef<Self>,
+        task_exit_tx: mpsc::Sender<TaskExit>,
+    ) -> Result<(), WsError> {
         let credentials = self
             .credentials
             .as_ref()
@@ -147,23 +162,20 @@ impl BinanceActor {
         let (write, read) = ws_stream.split();
         let (tx, rx) = mpsc::channel::<String>(100);
 
-        let self_ref = self
-            .self_ref
-            .as_ref()
-            .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
-            .clone();
+        let weak_ref = actor_ref.downgrade();
+        let ws_exit_tx = task_exit_tx.clone();
+        tokio::spawn(run_ws_loop(read, write, rx, weak_ref, ws_exit_tx, true));
 
-        let refresh_actor_ref = self_ref.clone();
-        let handle = tokio::spawn(run_ws_loop(read, write, rx, self_ref, true));
-
-        self.private_conn = Some(WsConnection { tx, _handle: handle });
+        self.private_conn = Some(WsConnection { tx });
 
         // 启动 ListenKey 刷新任务
         let api_key = credentials.api_key.clone();
         let rest_base_url = self.rest_base_url.clone();
-        self.listen_key_refresh_handle = Some(tokio::spawn(async move {
-            listen_key_refresh_loop(&rest_base_url, &api_key, refresh_actor_ref).await;
-        }));
+        tokio::spawn(listen_key_refresh_loop(
+            rest_base_url,
+            api_key,
+            task_exit_tx,
+        ));
 
         Ok(())
     }
@@ -217,14 +229,22 @@ impl Actor for BinanceActor {
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        self.self_ref = Some(actor_ref.downgrade());
+        // 创建协程退出信号 channel
+        let (task_exit_tx, task_exit_rx) = mpsc::channel::<TaskExit>(8);
+        self.task_exit_tx = Some(task_exit_tx.clone());
+
+        // 使用 attach_stream 管理协程生命周期
+        let task_exit_stream = ReceiverStream::new(task_exit_rx);
+        actor_ref.attach_stream(task_exit_stream, (), ());
 
         // 1. 创建 public 连接
-        self.create_public_connection().await?;
+        self.create_public_connection(&actor_ref, task_exit_tx.clone())
+            .await?;
 
         // 2. 如果有凭证，创建 private 连接
         if self.credentials.is_some() {
-            self.create_private_connection().await?;
+            self.create_private_connection(&actor_ref, task_exit_tx)
+                .await?;
         }
 
         tracing::info!(
@@ -241,21 +261,8 @@ impl Actor for BinanceActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), BoxError> {
-        // 取消 ListenKey 刷新任务
-        if let Some(handle) = self.listen_key_refresh_handle.take() {
-            handle.abort();
-        }
-
-        // 中止 public 连接的任务
-        if let Some(conn) = self.public_conn.take() {
-            conn._handle.abort();
-        }
-
-        // 中止 private 连接的任务
-        if let Some(conn) = self.private_conn.take() {
-            conn._handle.abort();
-        }
-
+        // Drop task_exit_tx 会导致 stream 结束
+        self.task_exit_tx.take();
         tracing::info!("BinanceActor stopped");
         Ok(())
     }
@@ -312,30 +319,6 @@ pub struct WsData {
     pub data: String,
 }
 
-/// WebSocket 连接断开消息 (触发 Actor 停止)
-struct WsDisconnected {
-    error: WsError,
-    is_private: bool,
-}
-
-impl Message<WsDisconnected> for BinanceActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: WsDisconnected,
-        ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        let conn_type = if msg.is_private { "private" } else { "public" };
-        tracing::error!(
-            error = %msg.error,
-            conn_type,
-            "Binance WebSocket disconnected, killing actor"
-        );
-        ctx.actor_ref().kill();
-    }
-}
-
 impl Message<WsData> for BinanceActor {
     type Reply = ();
 
@@ -354,6 +337,42 @@ impl Message<WsData> for BinanceActor {
     }
 }
 
+/// 协程退出信号处理
+impl Message<StreamMessage<TaskExit, (), ()>> for BinanceActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: StreamMessage<TaskExit, (), ()>,
+        ctx: Context<'_, Self, Self::Reply>,
+    ) {
+        match msg {
+            StreamMessage::Next(exit) => {
+                // 任何协程退出都 kill actor
+                match exit {
+                    TaskExit::PublicWs(e) => {
+                        tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
+                    }
+                    TaskExit::PrivateWs(e) => {
+                        tracing::error!(error = %e, "Private WebSocket loop exited, killing actor");
+                    }
+                    TaskExit::ListenKeyRefresh(e) => {
+                        tracing::error!(error = %e, "ListenKey refresh loop exited, killing actor");
+                    }
+                }
+                ctx.actor_ref().kill();
+            }
+            StreamMessage::Started(_) => {
+                tracing::debug!("Task exit stream started");
+            }
+            StreamMessage::Finished(_) => {
+                // 所有 sender 都 drop 了，说明 actor 正在停止
+                tracing::debug!("Task exit stream finished");
+            }
+        }
+    }
+}
+
 // ============================================================================
 // WebSocket 循环
 // ============================================================================
@@ -365,20 +384,20 @@ async fn run_ws_loop(
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
     mut rx: mpsc::Receiver<String>,
     actor_ref: WeakActorRef<BinanceActor>,
+    task_exit_tx: mpsc::Sender<TaskExit>,
     is_private: bool,
 ) {
     let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
 
-    // 出错时通知 Actor 停止
+    // 出错时发送退出信号
     if let Err(e) = result {
-        let Some(actor) = actor_ref.upgrade() else {
-            // Actor 已死，正常退出
-            return;
+        let exit = if is_private {
+            TaskExit::PrivateWs(e)
+        } else {
+            TaskExit::PublicWs(e)
         };
-        actor
-            .tell(WsDisconnected { error: e, is_private })
-            .await
-            .expect("Failed to notify actor of WsDisconnected");
+        // 发送失败说明 actor 已停止，无需处理
+        let _ = task_exit_tx.send(exit).await;
     }
 }
 
@@ -471,9 +490,9 @@ async fn create_listen_key(rest_base_url: &str, api_key: &str) -> Result<String,
 }
 
 async fn listen_key_refresh_loop(
-    rest_base_url: &str,
-    api_key: &str,
-    actor_ref: WeakActorRef<BinanceActor>,
+    rest_base_url: String,
+    api_key: String,
+    task_exit_tx: mpsc::Sender<TaskExit>,
 ) {
     let client = reqwest::Client::new();
     let interval = std::time::Duration::from_secs(LISTEN_KEY_REFRESH_INTERVAL_SECS);
@@ -483,7 +502,7 @@ async fn listen_key_refresh_loop(
 
         let result = client
             .put(format!("{}/fapi/v1/listenKey", rest_base_url))
-            .header("X-MBX-APIKEY", api_key)
+            .header("X-MBX-APIKEY", &api_key)
             .send()
             .await;
 
@@ -499,18 +518,13 @@ async fn listen_key_refresh_loop(
             Err(e) => e.to_string(),
         };
 
-        tracing::error!(error = %error, "ListenKey refresh failed, notifying actor");
-        let Some(actor) = actor_ref.upgrade() else {
-            // Actor 已死，正常退出
-            return;
-        };
-        actor
-            .tell(WsDisconnected {
-                error: WsError::AuthFailed(format!("ListenKey refresh failed: {}", error)),
-                is_private: true,
-            })
-            .await
-            .expect("Failed to notify actor of ListenKey refresh failure");
+        tracing::error!(error = %error, "ListenKey refresh failed");
+        let _ = task_exit_tx
+            .send(TaskExit::ListenKeyRefresh(WsError::AuthFailed(format!(
+                "ListenKey refresh failed: {}",
+                error
+            ))))
+            .await;
         return;
     }
 }

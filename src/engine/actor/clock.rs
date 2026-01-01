@@ -6,14 +6,16 @@
 use super::executor::ExecutorActor;
 use crate::domain::{now_ms, Exchange};
 use crate::exchange::{EventSink, ExchangeClient};
-use crate::messaging::{IncomeEvent, ExchangeEventData};
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
-use kameo::message::{Context, Message};
+use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
+use tokio_stream::wrappers::IntervalStream;
 
 /// ClockActor 初始化参数
 pub struct ClockArgs<S: EventSink> {
@@ -35,8 +37,6 @@ pub struct ClockActor<S: EventSink> {
     event_sink: Arc<S>,
     /// 已注册的 ExecutorActor 列表
     executors: Vec<ActorRef<ExecutorActor>>,
-    /// 自身引用
-    self_ref: Option<WeakActorRef<Self>>,
 }
 
 impl<S: EventSink> ClockActor<S> {
@@ -47,7 +47,6 @@ impl<S: EventSink> ClockActor<S> {
             binance_client: args.binance_client,
             event_sink: args.event_sink,
             executors: Vec::new(),
-            self_ref: None,
         }
     }
 
@@ -103,25 +102,9 @@ impl<S: EventSink> Actor for ClockActor<S> {
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        self.self_ref = Some(actor_ref.downgrade());
-
-        // 启动定时任务
-        let interval = self.interval;
-        let weak_ref = actor_ref.downgrade();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                let Some(actor_ref) = weak_ref.upgrade() else {
-                    // Actor 已死，正常退出
-                    return;
-                };
-                actor_ref
-                    .tell(DoTick)
-                    .await
-                    .expect("Failed to tell ClockActor DoTick");
-            }
-        });
+        // 使用 attach_stream 管理 ticker 生命周期
+        let interval_stream = IntervalStream::new(tokio::time::interval(self.interval));
+        actor_ref.attach_stream(interval_stream, (), ());
 
         tracing::info!("ClockActor started");
         Ok(())
@@ -152,13 +135,27 @@ impl<S: EventSink> Message<RegisterExecutor> for ClockActor<S> {
     }
 }
 
-/// 内部消息: 触发 tick
-struct DoTick;
-
-impl<S: EventSink> Message<DoTick> for ClockActor<S> {
+/// Ticker stream 消息处理
+impl<S: EventSink> Message<StreamMessage<Instant, (), ()>> for ClockActor<S> {
     type Reply = ();
 
-    async fn handle(&mut self, _msg: DoTick, _ctx: Context<'_, Self, Self::Reply>) {
-        self.tick().await;
+    async fn handle(
+        &mut self,
+        msg: StreamMessage<Instant, (), ()>,
+        ctx: Context<'_, Self, Self::Reply>,
+    ) {
+        match msg {
+            StreamMessage::Next(_) => {
+                self.tick().await;
+            }
+            StreamMessage::Started(_) => {
+                tracing::debug!("Clock ticker stream started");
+            }
+            StreamMessage::Finished(_) => {
+                // Ticker stream 不应该结束，如果结束了就 kill actor
+                tracing::error!("Clock ticker stream unexpectedly finished, killing actor");
+                ctx.actor_ref().kill();
+            }
+        }
     }
 }

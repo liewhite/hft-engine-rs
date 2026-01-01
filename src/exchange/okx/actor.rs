@@ -5,21 +5,21 @@ use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscrib
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsEvent, WsPush,
 };
-use crate::messaging::{IncomeEvent, ExchangeEventData};
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
-use kameo::message::{Context, Message};
+use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use serde_json::json;
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Public WebSocket URL
@@ -29,12 +29,22 @@ const WS_PUBLIC_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 const WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
 
 // ============================================================================
+// 协程退出信号
+// ============================================================================
+
+/// 协程退出信号
+#[derive(Debug)]
+enum TaskExit {
+    PublicWs(WsError),
+    PrivateWs(WsError),
+}
+
+// ============================================================================
 // WebSocket 连接
 // ============================================================================
 
 struct WsConnection {
     tx: mpsc::Sender<String>,
-    _handle: JoinHandle<()>,
 }
 
 // ============================================================================
@@ -80,7 +90,8 @@ pub struct OkxActor {
     /// 已订阅的 kinds (用于去重)
     subscribed: HashSet<SubscriptionKind>,
 
-    self_ref: Option<WeakActorRef<Self>>,
+    /// 协程退出信号发送器
+    task_exit_tx: Option<mpsc::Sender<TaskExit>>,
 }
 
 impl OkxActor {
@@ -92,17 +103,15 @@ impl OkxActor {
             public_conn: None,
             private_conn: None,
             subscribed: HashSet::new(),
-            self_ref: None,
+            task_exit_tx: None,
         }
     }
 
-    async fn create_public_connection(&mut self) -> Result<(), WsError> {
-        let self_ref = self
-            .self_ref
-            .as_ref()
-            .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
-            .clone();
-
+    async fn create_public_connection(
+        &mut self,
+        actor_ref: &ActorRef<Self>,
+        task_exit_tx: mpsc::Sender<TaskExit>,
+    ) -> Result<(), WsError> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PUBLIC_URL)
             .await
             .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
@@ -110,13 +119,18 @@ impl OkxActor {
         let (write, read) = ws_stream.split();
         let (tx, rx) = mpsc::channel::<String>(100);
 
-        let handle = tokio::spawn(run_ws_loop(read, write, rx, self_ref, false));
+        let weak_ref = actor_ref.downgrade();
+        tokio::spawn(run_ws_loop(read, write, rx, weak_ref, task_exit_tx, false));
 
-        self.public_conn = Some(WsConnection { tx, _handle: handle });
+        self.public_conn = Some(WsConnection { tx });
         Ok(())
     }
 
-    async fn create_private_connection(&mut self) -> Result<(), WsError> {
+    async fn create_private_connection(
+        &mut self,
+        actor_ref: &ActorRef<Self>,
+        task_exit_tx: mpsc::Sender<TaskExit>,
+    ) -> Result<(), WsError> {
         let credentials = self
             .credentials
             .as_ref()
@@ -205,15 +219,10 @@ impl OkxActor {
 
         let (tx, rx) = mpsc::channel::<String>(100);
 
-        let self_ref = self
-            .self_ref
-            .as_ref()
-            .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
-            .clone();
+        let weak_ref = actor_ref.downgrade();
+        tokio::spawn(run_ws_loop(read, write, rx, weak_ref, task_exit_tx, true));
 
-        let handle = tokio::spawn(run_ws_loop(read, write, rx, self_ref, true));
-
-        self.private_conn = Some(WsConnection { tx, _handle: handle });
+        self.private_conn = Some(WsConnection { tx });
 
         Ok(())
     }
@@ -263,14 +272,22 @@ impl Actor for OkxActor {
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        self.self_ref = Some(actor_ref.downgrade());
+        // 创建协程退出信号 channel
+        let (task_exit_tx, task_exit_rx) = mpsc::channel::<TaskExit>(8);
+        self.task_exit_tx = Some(task_exit_tx.clone());
+
+        // 使用 attach_stream 管理协程生命周期
+        let task_exit_stream = ReceiverStream::new(task_exit_rx);
+        actor_ref.attach_stream(task_exit_stream, (), ());
 
         // 1. 创建 public 连接
-        self.create_public_connection().await?;
+        self.create_public_connection(&actor_ref, task_exit_tx.clone())
+            .await?;
 
         // 2. 如果有凭证，创建 private 连接
         if self.credentials.is_some() {
-            self.create_private_connection().await?;
+            self.create_private_connection(&actor_ref, task_exit_tx)
+                .await?;
         }
 
         tracing::info!(
@@ -287,16 +304,8 @@ impl Actor for OkxActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), BoxError> {
-        // 中止 public 连接的任务
-        if let Some(conn) = self.public_conn.take() {
-            conn._handle.abort();
-        }
-
-        // 中止 private 连接的任务
-        if let Some(conn) = self.private_conn.take() {
-            conn._handle.abort();
-        }
-
+        // Drop task_exit_tx 会导致 stream 结束
+        self.task_exit_tx.take();
         tracing::info!("OkxActor stopped");
         Ok(())
     }
@@ -350,30 +359,6 @@ pub struct WsData {
     pub data: String,
 }
 
-/// WebSocket 连接断开消息 (触发 Actor 停止)
-struct WsDisconnected {
-    error: WsError,
-    is_private: bool,
-}
-
-impl Message<WsDisconnected> for OkxActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: WsDisconnected,
-        ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        let conn_type = if msg.is_private { "private" } else { "public" };
-        tracing::error!(
-            error = %msg.error,
-            conn_type,
-            "OKX WebSocket disconnected, killing actor"
-        );
-        ctx.actor_ref().kill();
-    }
-}
-
 impl Message<WsData> for OkxActor {
     type Reply = ();
 
@@ -392,6 +377,39 @@ impl Message<WsData> for OkxActor {
     }
 }
 
+/// 协程退出信号处理
+impl Message<StreamMessage<TaskExit, (), ()>> for OkxActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: StreamMessage<TaskExit, (), ()>,
+        ctx: Context<'_, Self, Self::Reply>,
+    ) {
+        match msg {
+            StreamMessage::Next(exit) => {
+                // 任何协程退出都 kill actor
+                match exit {
+                    TaskExit::PublicWs(e) => {
+                        tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
+                    }
+                    TaskExit::PrivateWs(e) => {
+                        tracing::error!(error = %e, "Private WebSocket loop exited, killing actor");
+                    }
+                }
+                ctx.actor_ref().kill();
+            }
+            StreamMessage::Started(_) => {
+                tracing::debug!("Task exit stream started");
+            }
+            StreamMessage::Finished(_) => {
+                // 所有 sender 都 drop 了，说明 actor 正在停止
+                tracing::debug!("Task exit stream finished");
+            }
+        }
+    }
+}
+
 // ============================================================================
 // WebSocket 循环
 // ============================================================================
@@ -403,20 +421,20 @@ async fn run_ws_loop(
     mut write: impl SinkExt<WsMessage> + Unpin + Send,
     mut rx: mpsc::Receiver<String>,
     actor_ref: WeakActorRef<OkxActor>,
+    task_exit_tx: mpsc::Sender<TaskExit>,
     is_private: bool,
 ) {
     let result = run_ws_loop_inner(&mut read, &mut write, &mut rx, &actor_ref).await;
 
-    // 出错时通知 Actor 停止
+    // 出错时发送退出信号
     if let Err(e) = result {
-        let Some(actor) = actor_ref.upgrade() else {
-            // Actor 已死，正常退出
-            return;
+        let exit = if is_private {
+            TaskExit::PrivateWs(e)
+        } else {
+            TaskExit::PublicWs(e)
         };
-        actor
-            .tell(WsDisconnected { error: e, is_private })
-            .await
-            .expect("Failed to notify actor of WsDisconnected");
+        // 发送失败说明 actor 已停止，无需处理
+        let _ = task_exit_tx.send(exit).await;
     }
 }
 
@@ -509,7 +527,10 @@ fn parse_message(
             "error" => {
                 let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
                 let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
-                return Err(WsError::ParseError(format!("OKX error: code={}, msg={}", code, msg)));
+                return Err(WsError::ParseError(format!(
+                    "OKX error: code={}, msg={}",
+                    code, msg
+                )));
             }
             _ => return Ok(Vec::new()),
         }
@@ -556,7 +577,9 @@ fn parse_message(
                 .iter()
                 .map(|data| {
                     // 提取交易所时间戳 (data.ts 是字符串)
-                    let exchange_ts = data.ts.parse::<u64>()
+                    let exchange_ts = data
+                        .ts
+                        .parse::<u64>()
                         .unwrap_or_else(|_| panic!("Failed to parse BBO timestamp: {}", data.ts));
                     let bbo = data.to_bbo(inst_id);
                     IncomeEvent {
@@ -601,8 +624,9 @@ fn parse_message(
                 .iter()
                 .map(|data| {
                     // 提取交易所时间戳 (u_time 是字符串)
-                    let exchange_ts = data.u_time.parse::<u64>()
-                        .unwrap_or_else(|_| panic!("Failed to parse account timestamp: {}", data.u_time));
+                    let exchange_ts = data.u_time.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("Failed to parse account timestamp: {}", data.u_time)
+                    });
                     let equity = data.to_equity();
                     IncomeEvent {
                         exchange_ts,
