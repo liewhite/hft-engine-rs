@@ -149,14 +149,20 @@ impl Message<IncomeEvent> for ProcessorActor {
                 // 按 symbol 路由：只发送给订阅了该 (exchange, symbol) 的 executor
                 for sub in self.executors.values() {
                     if sub.symbols.contains(&(exchange, symbol.clone())) {
-                        let _ = sub.executor.tell(msg.clone()).await;
+                        sub.executor
+                            .tell(msg.clone())
+                            .await
+                            .expect("Failed to tell ExecutorActor");
                     }
                 }
             }
             EventRouting::Broadcast => {
                 // 广播给所有 executor
                 for sub in self.executors.values() {
-                    let _ = sub.executor.tell(msg.clone()).await;
+                    sub.executor
+                        .tell(msg.clone())
+                        .await
+                        .expect("Failed to tell ExecutorActor");
                 }
             }
         }

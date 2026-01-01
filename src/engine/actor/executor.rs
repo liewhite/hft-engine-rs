@@ -131,10 +131,10 @@ impl ExecutorActor {
                         converted_order.exchange,
                     );
                     // 发送到 SignalProcessor
-                    let _ = self
-                        .signal_processor
+                    self.signal_processor
                         .tell(OutcomeEvent::PlaceOrder(converted_order))
-                        .await;
+                        .await
+                        .expect("Failed to send order to SignalProcessorActor");
                 }
             }
         }

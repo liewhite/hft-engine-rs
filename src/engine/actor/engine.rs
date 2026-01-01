@@ -276,20 +276,22 @@ impl ManagerActor {
             .insert(executor_ref.id(), ChildActorKind::Executor(executor_idx));
 
         // 6. 向 ProcessorActor 注册 Executor 的订阅
-        let _ = processor
+        processor
             .tell(RegisterExecutor {
                 executor: executor_ref.clone(),
                 subscriptions: subscriptions.clone(),
             })
-            .await;
+            .await
+            .expect("Failed to register executor to ProcessorActor");
 
         // 7. 向 ClockActor 注册 Executor（用于接收 Clock 事件）
         if let Some(clock_actor) = &self.clock_actor {
-            let _ = clock_actor
+            clock_actor
                 .tell(RegisterClockExecutor {
                     executor: executor_ref.clone(),
                 })
-                .await;
+                .await
+                .expect("Failed to register executor to ClockActor");
         }
 
         self.executors.push(executor_ref);
@@ -299,12 +301,18 @@ impl ManagerActor {
             match exchange {
                 Exchange::Binance => {
                     if let Some(actor) = &self.binance_actor {
-                        let _ = actor.tell(Subscribe { kind }).await;
+                        actor
+                            .tell(Subscribe { kind })
+                            .await
+                            .expect("Failed to subscribe to BinanceActor");
                     }
                 }
                 Exchange::OKX => {
                     if let Some(actor) = &self.okx_actor {
-                        let _ = actor.tell(Subscribe { kind }).await;
+                        actor
+                            .tell(Subscribe { kind })
+                            .await
+                            .expect("Failed to subscribe to OkxActor");
                     }
                 }
             }
@@ -504,7 +512,10 @@ struct ProcessorEventSink {
 #[async_trait]
 impl EventSink for ProcessorEventSink {
     async fn send_event(&self, event: IncomeEvent) {
-        let _ = self.processor.tell(event).await;
+        self.processor
+            .tell(event)
+            .await
+            .expect("Failed to send event to ProcessorActor");
     }
 }
 
