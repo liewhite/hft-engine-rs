@@ -153,6 +153,7 @@ impl BinanceActor {
             .ok_or_else(|| WsError::ConnectionFailed("Actor not started".to_string()))?
             .clone();
 
+        let refresh_actor_ref = self_ref.clone();
         let handle = tokio::spawn(run_ws_loop(read, write, rx, self_ref, true));
 
         self.private_conn = Some(WsConnection { tx, _handle: handle });
@@ -161,7 +162,7 @@ impl BinanceActor {
         let api_key = credentials.api_key.clone();
         let rest_base_url = self.rest_base_url.clone();
         self.listen_key_refresh_handle = Some(tokio::spawn(async move {
-            listen_key_refresh_loop(&rest_base_url, &api_key).await;
+            listen_key_refresh_loop(&rest_base_url, &api_key, refresh_actor_ref).await;
         }));
 
         Ok(())
@@ -312,9 +313,9 @@ impl Message<WsDisconnected> for BinanceActor {
         tracing::error!(
             error = %msg.error,
             conn_type,
-            "Binance WebSocket disconnected, stopping actor"
+            "Binance WebSocket disconnected, killing actor"
         );
-        ctx.actor_ref().stop_gracefully().await.ok();
+        ctx.actor_ref().kill();
     }
 }
 
@@ -441,7 +442,11 @@ async fn create_listen_key(rest_base_url: &str, api_key: &str) -> Result<String,
     Ok(data.listen_key)
 }
 
-async fn listen_key_refresh_loop(rest_base_url: &str, api_key: &str) {
+async fn listen_key_refresh_loop(
+    rest_base_url: &str,
+    api_key: &str,
+    actor_ref: WeakActorRef<BinanceActor>,
+) {
     let client = reqwest::Client::new();
     let interval = std::time::Duration::from_secs(LISTEN_KEY_REFRESH_INTERVAL_SECS);
 
@@ -454,18 +459,28 @@ async fn listen_key_refresh_loop(rest_base_url: &str, api_key: &str) {
             .send()
             .await;
 
-        match result {
+        let error = match result {
             Ok(resp) if resp.status().is_success() => {
                 tracing::debug!("Binance ListenKey refreshed");
+                continue;
             }
             Ok(resp) => {
                 let text = resp.text().await.unwrap_or_default();
-                tracing::warn!(error = %text, "Failed to refresh Binance ListenKey");
+                format!("HTTP error: {}", text)
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to refresh Binance ListenKey");
-            }
+            Err(e) => e.to_string(),
+        };
+
+        tracing::error!(error = %error, "ListenKey refresh failed, notifying actor");
+        if let Some(actor) = actor_ref.upgrade() {
+            let _ = actor
+                .tell(WsDisconnected {
+                    error: WsError::AuthFailed(format!("ListenKey refresh failed: {}", error)),
+                    is_private: true,
+                })
+                .await;
         }
+        return;
     }
 }
 
