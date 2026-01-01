@@ -372,11 +372,13 @@ async fn run_ws_loop(
     // 出错时通知 Actor 停止
     if let Err(e) = result {
         let Some(actor) = actor_ref.upgrade() else {
+            // Actor 已死，正常退出
             return;
         };
-        if let Err(tell_err) = actor.tell(WsDisconnected { error: e, is_private }).await {
-            tracing::warn!(error = %tell_err, "Failed to notify actor of disconnect");
-        }
+        actor
+            .tell(WsDisconnected { error: e, is_private })
+            .await
+            .expect("Failed to notify actor of WsDisconnected");
     }
 }
 
@@ -499,17 +501,16 @@ async fn listen_key_refresh_loop(
 
         tracing::error!(error = %error, "ListenKey refresh failed, notifying actor");
         let Some(actor) = actor_ref.upgrade() else {
+            // Actor 已死，正常退出
             return;
         };
-        if let Err(tell_err) = actor
+        actor
             .tell(WsDisconnected {
                 error: WsError::AuthFailed(format!("ListenKey refresh failed: {}", error)),
                 is_private: true,
             })
             .await
-        {
-            tracing::warn!(error = %tell_err, "Failed to notify actor of ListenKey refresh failure");
-        }
+            .expect("Failed to notify actor of ListenKey refresh failure");
         return;
     }
 }

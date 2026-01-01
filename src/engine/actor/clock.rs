@@ -87,7 +87,10 @@ impl<S: EventSink> ClockActor<S> {
             data: ExchangeEventData::Clock,
         };
         for executor in &self.executors {
-            let _ = executor.tell(clock_event.clone()).await;
+            executor
+                .tell(clock_event.clone())
+                .await
+                .expect("Failed to tell ExecutorActor clock event");
         }
     }
 }
@@ -109,13 +112,14 @@ impl<S: EventSink> Actor for ClockActor<S> {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
-                if let Some(actor_ref) = weak_ref.upgrade() {
-                    if actor_ref.tell(DoTick).await.is_err() {
-                        break;
-                    }
-                } else {
-                    break;
-                }
+                let Some(actor_ref) = weak_ref.upgrade() else {
+                    // Actor 已死，正常退出
+                    return;
+                };
+                actor_ref
+                    .tell(DoTick)
+                    .await
+                    .expect("Failed to tell ClockActor DoTick");
             }
         });
 
