@@ -197,10 +197,6 @@ impl ExchangeClient for OkxClient {
         Exchange::OKX
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         self.get_all_instruments().await
     }

@@ -10,9 +10,9 @@ use super::{
     RegisterExecutor, SignalProcessorActor,
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::binance::{BinanceActor, BinanceActorArgs, REST_BASE_URL};
-use crate::exchange::hyperliquid::{HyperliquidActor, HyperliquidActorArgs};
-use crate::exchange::okx::{OkxActor, OkxActorArgs};
+use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceCredentials, REST_BASE_URL};
+use crate::exchange::hyperliquid::{HyperliquidActor, HyperliquidActorArgs, HyperliquidCredentials};
+use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxCredentials};
 use crate::exchange::{EventSink, ExchangeActorOps, ExchangeClient, ExchangeModule, SubscriptionKind};
 use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
@@ -47,12 +47,23 @@ enum ChildActorKind {
 pub struct ManagerActorArgs {
     /// 交易所模块列表（用于 REST 客户端访问和创建 Actor）
     pub modules: Vec<Arc<dyn ExchangeModule>>,
+    /// Binance 凭证（可选）
+    pub binance_credentials: Option<BinanceCredentials>,
+    /// OKX 凭证（可选）
+    pub okx_credentials: Option<OkxCredentials>,
+    /// Hyperliquid 凭证（可选）
+    pub hyperliquid_credentials: Option<HyperliquidCredentials>,
 }
 
 /// ManagerActor - 顶层管理 Actor
 pub struct ManagerActor {
     // === Exchange Modules ===
     modules: HashMap<Exchange, Arc<dyn ExchangeModule>>,
+
+    // === Credentials ===
+    binance_credentials: Option<BinanceCredentials>,
+    okx_credentials: Option<OkxCredentials>,
+    hyperliquid_credentials: Option<HyperliquidCredentials>,
 
     // === Symbol Metas 缓存 ===
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
@@ -86,6 +97,9 @@ impl ManagerActor {
 
         Self {
             modules,
+            binance_credentials: args.binance_credentials,
+            okx_credentials: args.okx_credentials,
+            hyperliquid_credentials: args.hyperliquid_credentials,
             symbol_metas: HashMap::new(),
             signal_processor: None,
             processor: None,
@@ -147,6 +161,9 @@ impl ManagerActor {
     }
 
     /// 惰性创建 ExchangeActor（如不存在则 spawn_link）
+    ///
+    /// # Panics
+    /// 如果对应交易所的 credentials 未配置则 panic
     async fn ensure_exchange_actor(
         &mut self,
         exchange: Exchange,
@@ -161,19 +178,16 @@ impl ManagerActor {
         })?;
 
         let symbol_metas = self.get_symbol_metas_for(exchange);
-        let module = self.modules.get(&exchange).ok_or_else(|| {
-            ExchangeError::Other(format!("{} module not configured", exchange))
-        })?;
 
-        // 根据交易所类型创建对应的 Actor (通过 downcast 获取 credentials)
+        // 根据交易所类型创建对应的 Actor（直接使用 credentials，未配置则 panic）
         let (actor_id, boxed_actor): (ActorID, Box<dyn ExchangeActorOps>) = match exchange {
             Exchange::Binance => {
+                let credentials = self
+                    .binance_credentials
+                    .clone()
+                    .expect("Binance credentials not configured");
                 let actor = BinanceActor::new(BinanceActorArgs {
-                    credentials: module
-                        .client()
-                        .as_any()
-                        .downcast_ref::<crate::exchange::binance::BinanceClient>()
-                        .and_then(|c| c.credentials().cloned()),
+                    credentials: Some(credentials),
                     symbol_metas: symbol_metas.clone(),
                     rest_base_url: REST_BASE_URL.to_string(),
                     event_sink: event_sink.clone(),
@@ -182,11 +196,12 @@ impl ManagerActor {
                 (actor_ref.id(), Box::new(actor_ref))
             }
             Exchange::OKX => {
+                let credentials = self
+                    .okx_credentials
+                    .clone()
+                    .expect("OKX credentials not configured");
                 let actor = OkxActor::new(OkxActorArgs {
-                    credentials: module.client()
-                        .as_any()
-                        .downcast_ref::<crate::exchange::okx::OkxClient>()
-                        .and_then(|c| c.credentials().cloned()),
+                    credentials: Some(credentials),
                     symbol_metas: symbol_metas.clone(),
                     event_sink: event_sink.clone(),
                 });
@@ -194,11 +209,12 @@ impl ManagerActor {
                 (actor_ref.id(), Box::new(actor_ref))
             }
             Exchange::Hyperliquid => {
+                let credentials = self
+                    .hyperliquid_credentials
+                    .clone()
+                    .expect("Hyperliquid credentials not configured");
                 let actor = HyperliquidActor::new(HyperliquidActorArgs {
-                    credentials: module.client()
-                        .as_any()
-                        .downcast_ref::<crate::exchange::hyperliquid::HyperliquidClient>()
-                        .and_then(|c| c.credentials().cloned()),
+                    credentials: Some(credentials),
                     symbol_metas: symbol_metas.clone(),
                     event_sink: event_sink.clone(),
                 });

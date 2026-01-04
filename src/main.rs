@@ -33,25 +33,30 @@ async fn main() -> anyhow::Result<()> {
     // Create exchange modules (for REST client access)
     let mut modules: Vec<Arc<dyn ExchangeModule>> = Vec::new();
 
-    // Binance module
+    // Binance
     let binance_credentials = BinanceCredentials {
         api_key: config.exchanges.binance.api_key.clone(),
         secret: config.exchanges.binance.secret.clone(),
     };
-    let binance_module = BinanceModule::new(Some(binance_credentials))?;
+    let binance_module = BinanceModule::new(Some(binance_credentials.clone()))?;
     modules.push(Arc::new(binance_module));
 
-    // OKX module
+    // OKX
     let okx_credentials = OkxCredentials {
         api_key: config.exchanges.okx.api_key.clone(),
         secret: config.exchanges.okx.secret.clone(),
         passphrase: config.exchanges.okx.passphrase.clone(),
     };
-    let okx_module = OkxModule::new(Some(okx_credentials))?;
+    let okx_module = OkxModule::new(Some(okx_credentials.clone()))?;
     modules.push(Arc::new(okx_module));
 
     // Create ManagerActor (ExchangeActors will be lazy spawned with spawn_link)
-    let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs { modules }));
+    let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs {
+        modules,
+        binance_credentials: Some(binance_credentials),
+        okx_credentials: Some(okx_credentials),
+        hyperliquid_credentials: None, // Hyperliquid 暂未配置
+    }));
 
     // Add strategies
     let enabled_exchanges = config.exchanges.enabled_exchanges();
