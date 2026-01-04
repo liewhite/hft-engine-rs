@@ -6,7 +6,7 @@ mod symbol;
 
 pub use actor::{HyperliquidActor, HyperliquidActorArgs};
 pub use client::HyperliquidClient;
-pub use symbol::{parse_hyperliquid_symbol, HyperliquidSymbol};
+pub use symbol::{from_hyperliquid, to_hyperliquid};
 
 /// Hyperliquid REST API 地址
 pub const REST_BASE_URL: &str = "https://api.hyperliquid.xyz";

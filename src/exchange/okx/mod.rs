@@ -5,7 +5,7 @@ mod symbol;
 
 pub use actor::{OkxActor, OkxActorArgs};
 pub use client::OkxClient;
-pub use symbol::{parse_okx_symbol, OkxSymbol};
+pub use symbol::{from_okx, to_okx};
 
 use base64::{engine::general_purpose, Engine as _};
 use hmac::{Hmac, Mac};

@@ -1,6 +1,6 @@
 //! Binance ExchangeClient 实现 (仅 REST)
 
-use super::{parse_binance_symbol, BinanceSymbol};
+use super::symbol::{from_binance, to_binance};
 use crate::domain::{
     Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
@@ -160,7 +160,7 @@ impl BinanceClient {
             .symbols
             .into_iter()
             .filter_map(|s| {
-                let symbol = parse_binance_symbol(&s.symbol)?;
+                let symbol = from_binance(&s.symbol)?;
                 let mut price_step: Option<f64> = None;
                 let mut size_step: Option<f64> = None;
                 let mut min_order_size: Option<f64> = None;
@@ -261,7 +261,7 @@ impl ExchangeClient for BinanceClient {
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
 
-        let symbol = order.symbol.to_binance();
+        let symbol = to_binance(&order.symbol);
         let side = side_to_binance(order.side);
         let (order_type, price, tif) = order_type_to_binance(&order.order_type);
         let qty = order.quantity.to_string();
@@ -323,7 +323,7 @@ impl ExchangeClient for BinanceClient {
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
 
-        let symbol_str = symbol.to_binance();
+        let symbol_str = to_binance(symbol);
         let leverage_str = leverage.to_string();
         let params = [("symbol", symbol_str.as_str()), ("leverage", &leverage_str)];
         let query = self

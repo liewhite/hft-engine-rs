@@ -8,7 +8,7 @@
 use super::hyperliquid_actor::HyperliquidActor;
 use super::WsData;
 use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::hyperliquid::{HyperliquidSymbol, WS_URL};
+use crate::exchange::hyperliquid::{to_hyperliquid, WS_URL};
 use crate::exchange::ws_loop;
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -214,14 +214,14 @@ fn kind_to_subscription(kind: &SubscriptionKind) -> serde_json::Value {
             // 使用 activeAssetCtx 获取资金费率
             json!({
                 "type": "activeAssetCtx",
-                "coin": symbol.to_hyperliquid()
+                "coin": to_hyperliquid(symbol)
             })
         }
         SubscriptionKind::BBO { symbol } => {
             // 使用 bbo 获取最优买卖价
             json!({
                 "type": "bbo",
-                "coin": symbol.to_hyperliquid()
+                "coin": to_hyperliquid(symbol)
             })
         }
     }

@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use super::{parse_hyperliquid_symbol, HyperliquidSymbol};
+use super::symbol::{from_hyperliquid, to_hyperliquid};
 use crate::domain::{now_ms, Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta};
 use crate::exchange::client::ExchangeClient;
 use crate::exchange::hyperliquid::codec::{price_step, size_step, AssetCtx, AssetInfo, MetaResponse};
@@ -190,7 +190,7 @@ impl HyperliquidClient {
 
     /// 将 domain Order 转换为 OrderWire
     async fn order_to_wire(&self, order: &Order) -> Result<OrderWire, ExchangeError> {
-        let coin = order.symbol.to_hyperliquid();
+        let coin = to_hyperliquid(&order.symbol);
         let asset = self.get_asset_index(&coin).await?;
 
         let is_buy = matches!(order.side, Side::Long);
@@ -381,7 +381,7 @@ impl ExchangeClient for HyperliquidClient {
 
 /// 将 AssetInfo 转换为 SymbolMeta
 fn asset_info_to_symbol_meta(info: &AssetInfo) -> SymbolMeta {
-    let symbol = parse_hyperliquid_symbol(&info.name);
+    let symbol = from_hyperliquid(&info.name);
 
     SymbolMeta {
         exchange: Exchange::Hyperliquid,

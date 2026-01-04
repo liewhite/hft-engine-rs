@@ -7,7 +7,7 @@
 
 use super::okx_actor::OkxActor;
 use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::okx::OkxSymbol;
+use crate::exchange::okx::to_okx;
 use crate::exchange::ws_loop;
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -213,13 +213,13 @@ fn kind_to_arg(kind: &SubscriptionKind) -> serde_json::Value {
         SubscriptionKind::FundingRate { symbol } => {
             json!({
                 "channel": "funding-rate",
-                "instId": symbol.to_okx()
+                "instId": to_okx(symbol)
             })
         }
         SubscriptionKind::BBO { symbol } => {
             json!({
                 "channel": "bbo-tbt",
-                "instId": symbol.to_okx()
+                "instId": to_okx(symbol)
             })
         }
     }

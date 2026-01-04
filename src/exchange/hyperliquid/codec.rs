@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use super::parse_hyperliquid_symbol;
+use super::from_hyperliquid;
 use crate::domain::{now_ms, Exchange, FundingRate, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
@@ -92,7 +92,7 @@ pub struct WsLevel {
 
 impl WsBbo {
     pub fn to_bbo(&self) -> BBO {
-        let symbol = parse_hyperliquid_symbol(&self.coin);
+        let symbol = from_hyperliquid(&self.coin);
 
         let bid = self.bbo[0].as_ref()
             .expect("BBO bid must exist for liquid symbols");
@@ -131,7 +131,7 @@ impl WsActiveAssetCtx {
     /// 转换为 FundingRate
     /// Hyperliquid 每小时结算一次资金费率
     pub fn to_funding_rate(&self) -> FundingRate {
-        let symbol = parse_hyperliquid_symbol(&self.coin);
+        let symbol = from_hyperliquid(&self.coin);
         let rate = f64::from_str(&self.ctx.funding)
             .expect("funding rate must be valid float from Hyperliquid API");
 
@@ -153,7 +153,7 @@ impl WsActiveAssetCtx {
             return None;
         }
 
-        let symbol = parse_hyperliquid_symbol(&self.coin);
+        let symbol = from_hyperliquid(&self.coin);
         let bid_price = f64::from_str(&impact_pxs[0])
             .expect("impact bid price must be valid float from Hyperliquid API");
         let ask_price = f64::from_str(&impact_pxs[1])

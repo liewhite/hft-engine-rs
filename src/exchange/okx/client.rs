@@ -1,6 +1,6 @@
 //! OKX ExchangeClient 实现 (仅 REST)
 
-use super::{parse_okx_symbol, OkxSymbol};
+use super::symbol::{from_okx, to_okx};
 use crate::domain::{
     Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
@@ -119,7 +119,7 @@ impl OkxClient {
             .data
             .into_iter()
             .filter_map(|d| {
-                let symbol = parse_okx_symbol(&d.inst_id)?;
+                let symbol = from_okx(&d.inst_id)?;
                 let price_step: f64 = d.tick_sz.parse().ok().filter(|&v| v > 0.0)?;
                 let size_step: f64 = d.lot_sz.parse().ok().filter(|&v| v > 0.0)?;
                 let min_order_size: f64 = d.min_sz.parse().unwrap_or(0.0);
@@ -209,7 +209,7 @@ impl ExchangeClient for OkxClient {
 
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
         let path = "/api/v5/trade/order";
-        let inst_id = order.symbol.to_okx();
+        let inst_id = to_okx(&order.symbol);
         let side = side_to_okx(order.side);
         let (ord_type, price) = order_type_to_okx(&order.order_type);
         let sz = order.quantity.to_string();
@@ -305,7 +305,7 @@ impl ExchangeClient for OkxClient {
 
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
         let path = "/api/v5/account/set-leverage";
-        let inst_id = symbol.to_okx();
+        let inst_id = to_okx(symbol);
 
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]

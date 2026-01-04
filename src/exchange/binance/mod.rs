@@ -5,7 +5,7 @@ mod symbol;
 
 pub use actor::{BinanceActor, BinanceActorArgs};
 pub use client::BinanceClient;
-pub use symbol::{parse_binance_symbol, BinanceSymbol};
+pub use symbol::{from_binance, to_binance};
 
 /// Binance 永续合约 REST API 地址
 pub const REST_BASE_URL: &str = "https://fapi.binance.com";

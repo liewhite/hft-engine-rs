@@ -6,7 +6,7 @@
 //! - 将收到的消息转发给父 BinanceActor
 
 use super::binance_actor::BinanceActor;
-use crate::exchange::binance::BinanceSymbol;
+use crate::exchange::binance::to_binance;
 use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ws_loop;
 use futures_util::StreamExt;
@@ -214,10 +214,10 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePublicWs
 fn kind_to_stream(kind: &SubscriptionKind) -> String {
     match kind {
         SubscriptionKind::FundingRate { symbol } => {
-            format!("{}@markPrice@1s", symbol.to_binance().to_lowercase())
+            format!("{}@markPrice@1s", to_binance(symbol).to_lowercase())
         }
         SubscriptionKind::BBO { symbol } => {
-            format!("{}@bookTicker", symbol.to_binance().to_lowercase())
+            format!("{}@bookTicker", to_binance(symbol).to_lowercase())
         }
     }
 }
