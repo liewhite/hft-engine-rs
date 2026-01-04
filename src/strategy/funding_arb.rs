@@ -410,23 +410,6 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
-        match event.data {
-            ExchangeEventData::FundingRate { .. } => {
-                tracing::info!(
-                    symbol = %self.symbol,
-                    event  = ?event,
-                    "Processing event for FundingArbStrategy"
-                );
-            }
-            _ => {
-                tracing::debug!(
-                    symbol = %self.symbol,
-                    event  = ?event,
-                    "Ignoring non-funding-rate event for FundingArbStrategy"
-                );
-            }
-        }
-        return vec![];
         // 获取本策略关注的 symbol 状态
         let symbol_state = match state.symbol_state(&self.symbol) {
             Some(s) => s,

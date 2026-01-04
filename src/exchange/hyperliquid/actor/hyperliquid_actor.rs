@@ -141,13 +141,13 @@ impl Actor for HyperliquidActor {
 impl Message<Subscribe> for HyperliquidActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: Subscribe, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+    async fn handle(&mut self, msg: Subscribe, ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
         // 转发给 PublicWsActor
         if let Some(ref public_ws) = self.public_ws {
-            public_ws
-                .tell(msg)
-                .await
-                .expect("Failed to forward Subscribe to PublicWsActor");
+            if let Err(e) = public_ws.tell(msg).await {
+                tracing::error!(error = %e, "Failed to forward Subscribe, killing actor");
+                ctx.actor_ref().kill();
+            }
         }
     }
 }
@@ -158,14 +158,14 @@ impl Message<Unsubscribe> for HyperliquidActor {
     async fn handle(
         &mut self,
         msg: Unsubscribe,
-        _ctx: Context<'_, Self, Self::Reply>,
+        ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor
         if let Some(ref public_ws) = self.public_ws {
-            public_ws
-                .tell(msg)
-                .await
-                .expect("Failed to forward Unsubscribe to PublicWsActor");
+            if let Err(e) = public_ws.tell(msg).await {
+                tracing::error!(error = %e, "Failed to forward Unsubscribe, killing actor");
+                ctx.actor_ref().kill();
+            }
         }
     }
 }
@@ -208,39 +208,53 @@ fn parse_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> 
             "activeAssetCtx" => {
                 // 资产上下文（包含资金费率）
                 let data = &value["data"];
-                if let Ok(ctx) = serde_json::from_value::<WsActiveAssetCtx>(data.clone()) {
-                    let mut events = Vec::new();
+                match serde_json::from_value::<WsActiveAssetCtx>(data.clone()) {
+                    Ok(ctx) => {
+                        let mut events = Vec::new();
 
-                    // 资金费率事件
-                    let rate = ctx.to_funding_rate();
-                    events.push(IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::FundingRate(rate),
-                    });
-
-                    // 如果有 impact_pxs，也生成 BBO 事件
-                    if let Some(bbo) = ctx.to_bbo() {
+                        // 资金费率事件
+                        let rate = ctx.to_funding_rate();
                         events.push(IncomeEvent {
                             exchange_ts: local_ts,
                             local_ts,
-                            data: ExchangeEventData::BBO(bbo),
+                            data: ExchangeEventData::FundingRate(rate),
                         });
-                    }
 
-                    return Ok(events);
+                        // 如果有 impact_pxs，也生成 BBO 事件
+                        if let Some(bbo) = ctx.to_bbo() {
+                            events.push(IncomeEvent {
+                                exchange_ts: local_ts,
+                                local_ts,
+                                data: ExchangeEventData::BBO(bbo),
+                            });
+                        }
+
+                        return Ok(events);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, data = %data, "Failed to parse activeAssetCtx");
+                    }
                 }
             }
             "bbo" => {
                 // BBO 数据
                 let data = &value["data"];
-                if let Ok(bbo_data) = serde_json::from_value::<WsBbo>(data.clone()) {
-                    let bbo = bbo_data.to_bbo();
-                    return Ok(vec![IncomeEvent {
-                        exchange_ts: bbo.timestamp,
-                        local_ts,
-                        data: ExchangeEventData::BBO(bbo),
-                    }]);
+                match serde_json::from_value::<WsBbo>(data.clone()) {
+                    Ok(bbo_data) => {
+                        // to_bbo 返回 Option，因为 bid/ask 可能为 null
+                        if let Some(bbo) = bbo_data.to_bbo() {
+                            return Ok(vec![IncomeEvent {
+                                exchange_ts: bbo.timestamp,
+                                local_ts,
+                                data: ExchangeEventData::BBO(bbo),
+                            }]);
+                        }
+                        // bid/ask 为 null 时，返回空事件
+                        return Ok(Vec::new());
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, data = %data, "Failed to parse bbo");
+                    }
                 }
             }
             "allMids" => {

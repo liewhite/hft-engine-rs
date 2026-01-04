@@ -69,32 +69,44 @@ pub struct AllMids {
 }
 
 /// BBO 数据
+/// API 格式: { coin, time, bbo: [bid_level | null, ask_level | null] }
 #[derive(Debug, Deserialize)]
 pub struct WsBbo {
     pub coin: String,
     pub time: u64,
+    /// [bid, ask] - 每个可能为 null
+    pub bbo: [Option<WsLevel>; 2],
+}
+
+/// BBO Level (价格层)
+#[derive(Debug, Deserialize)]
+pub struct WsLevel {
+    /// 价格
     pub px: String,
-    /// 买一价
-    pub bid: String,
-    /// 卖一价
-    pub ask: String,
-    /// 买一量
-    #[serde(rename = "bidSz")]
-    pub bid_sz: String,
-    /// 卖一量
-    #[serde(rename = "askSz")]
-    pub ask_sz: String,
+    /// 数量
+    pub sz: String,
+    /// 订单数量
+    pub n: u32,
 }
 
 impl WsBbo {
-    pub fn to_bbo(&self) -> BBO {
+    pub fn to_bbo(&self) -> Option<BBO> {
         let symbol = Symbol::from_hyperliquid(&self.coin);
-        let bid_price = f64::from_str(&self.bid).unwrap_or(0.0);
-        let bid_qty = f64::from_str(&self.bid_sz).unwrap_or(0.0);
-        let ask_price = f64::from_str(&self.ask).unwrap_or(0.0);
-        let ask_qty = f64::from_str(&self.ask_sz).unwrap_or(0.0);
 
-        BBO {
+        // 需要同时有 bid 和 ask 才能构造有效的 BBO
+        let bid = self.bbo[0].as_ref()?;
+        let ask = self.bbo[1].as_ref()?;
+
+        let bid_price = f64::from_str(&bid.px)
+            .expect("bid price must be valid float from Hyperliquid API");
+        let bid_qty = f64::from_str(&bid.sz)
+            .expect("bid size must be valid float from Hyperliquid API");
+        let ask_price = f64::from_str(&ask.px)
+            .expect("ask price must be valid float from Hyperliquid API");
+        let ask_qty = f64::from_str(&ask.sz)
+            .expect("ask size must be valid float from Hyperliquid API");
+
+        Some(BBO {
             exchange: Exchange::Hyperliquid,
             symbol,
             bid_price,
@@ -102,7 +114,7 @@ impl WsBbo {
             ask_price,
             ask_qty,
             timestamp: self.time,
-        }
+        })
     }
 }
 
@@ -118,7 +130,8 @@ impl WsActiveAssetCtx {
     /// Hyperliquid 每小时结算一次资金费率
     pub fn to_funding_rate(&self) -> FundingRate {
         let symbol = Symbol::from_hyperliquid(&self.coin);
-        let rate = f64::from_str(&self.ctx.funding).unwrap_or(0.0);
+        let rate = f64::from_str(&self.ctx.funding)
+            .expect("funding rate must be valid float from Hyperliquid API");
 
         FundingRate {
             exchange: Exchange::Hyperliquid,
@@ -131,6 +144,7 @@ impl WsActiveAssetCtx {
     }
 
     /// 转换为 BBO (从 impact_pxs 提取)
+    /// 注意: impact_pxs 是冲击价格，不是真实 BBO，数量为 0
     pub fn to_bbo(&self) -> Option<BBO> {
         let impact_pxs = self.ctx.impact_pxs.as_ref()?;
         if impact_pxs.len() < 2 {
@@ -138,8 +152,10 @@ impl WsActiveAssetCtx {
         }
 
         let symbol = Symbol::from_hyperliquid(&self.coin);
-        let bid_price = f64::from_str(&impact_pxs[0]).ok()?;
-        let ask_price = f64::from_str(&impact_pxs[1]).ok()?;
+        let bid_price = f64::from_str(&impact_pxs[0])
+            .expect("impact bid price must be valid float from Hyperliquid API");
+        let ask_price = f64::from_str(&impact_pxs[1])
+            .expect("impact ask price must be valid float from Hyperliquid API");
 
         Some(BBO {
             exchange: Exchange::Hyperliquid,
