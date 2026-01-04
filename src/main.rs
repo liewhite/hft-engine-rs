@@ -49,11 +49,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Create ManagerActor (modules 和 ExchangeActors 由 ManagerActor 内部创建)
-    let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs {
+    let manager = ManagerActor::new(ManagerActorArgs {
         binance_credentials: Some(binance_credentials),
         okx_credentials: Some(okx_credentials),
         hyperliquid_credentials,
-    }));
+    })
+    .await;
 
     // Add strategies
     let enabled_exchanges = config.exchanges.enabled_exchanges();
