@@ -192,3 +192,163 @@ pub fn price_step() -> f64 {
 pub fn size_step(sz_decimals: i32) -> f64 {
     10f64.powi(-sz_decimals)
 }
+
+// ============================================================================
+// WebSocket 账户订阅消息结构
+// ============================================================================
+
+/// WebData3 响应 (账户状态)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsWebData3 {
+    pub clearinghouse_state: Option<ClearinghouseState>,
+}
+
+/// Clearinghouse 状态 (仓位和余额)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearinghouseState {
+    pub asset_positions: Vec<AssetPositionWrapper>,
+    pub cross_margin_summary: MarginSummary,
+    pub withdrawable: String,
+}
+
+/// MarginSummary (保证金摘要)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarginSummary {
+    pub account_value: String,
+    pub total_ntl_pos: String,
+    pub total_raw_usd: String,
+    pub total_margin_used: String,
+}
+
+/// AssetPosition 包装器
+#[derive(Debug, Deserialize)]
+pub struct AssetPositionWrapper {
+    pub position: AssetPosition,
+    #[serde(rename = "type")]
+    pub position_type: String,
+}
+
+/// AssetPosition (单个仓位)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetPosition {
+    pub coin: String,
+    /// 带符号的仓位大小 (负数为空头)
+    pub szi: String,
+    pub entry_px: Option<String>,
+    pub leverage: PositionLeverage,
+    pub liquidation_px: Option<String>,
+    pub unrealized_pnl: String,
+    pub margin_used: String,
+    pub position_value: String,
+    pub return_on_equity: String,
+    pub max_leverage: u32,
+}
+
+/// 杠杆信息
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionLeverage {
+    #[serde(rename = "type")]
+    pub leverage_type: String, // "cross" or "isolated"
+    pub value: u32,
+    pub raw_usd: Option<String>,
+}
+
+impl AssetPosition {
+    pub fn to_position(&self) -> crate::domain::Position {
+        let symbol = from_hyperliquid(&self.coin);
+        let size = f64::from_str(&self.szi).unwrap_or(0.0);
+        let entry_price = self.entry_px.as_ref()
+            .and_then(|p| f64::from_str(p).ok())
+            .unwrap_or(0.0);
+        let unrealized_pnl = f64::from_str(&self.unrealized_pnl).unwrap_or(0.0);
+        let mark_price = if size.abs() > 1e-10 {
+            // 根据 position_value 和 size 反推 mark_price
+            let pos_value = f64::from_str(&self.position_value).unwrap_or(0.0);
+            pos_value / size.abs()
+        } else {
+            0.0
+        };
+
+        crate::domain::Position {
+            exchange: Exchange::Hyperliquid,
+            symbol,
+            size,
+            entry_price,
+            leverage: self.leverage.value,
+            unrealized_pnl,
+            mark_price,
+        }
+    }
+}
+
+/// OrderUpdates 响应
+#[derive(Debug, Deserialize)]
+pub struct WsOrderUpdate {
+    pub order: WsBasicOrder,
+    pub status: String,
+    #[serde(rename = "statusTimestamp")]
+    pub status_timestamp: u64,
+}
+
+/// 基本订单信息
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsBasicOrder {
+    pub coin: String,
+    pub side: String, // "A" (ask/sell) or "B" (bid/buy)
+    pub limit_px: String,
+    pub sz: String,
+    pub oid: u64,
+    pub timestamp: u64,
+    pub orig_sz: String,
+    pub cloid: Option<String>,
+}
+
+impl WsOrderUpdate {
+    pub fn to_order_update(&self) -> crate::domain::OrderUpdate {
+        let symbol = from_hyperliquid(&self.order.coin);
+        let orig_sz = f64::from_str(&self.order.orig_sz).unwrap_or(0.0);
+        let current_sz = f64::from_str(&self.order.sz).unwrap_or(0.0);
+        let filled_quantity = orig_sz - current_sz;
+        let avg_price = f64::from_str(&self.order.limit_px).ok();
+
+        let status = map_hyperliquid_order_status(&self.status, filled_quantity);
+
+        crate::domain::OrderUpdate {
+            order_id: self.order.oid.to_string(),
+            client_order_id: self.order.cloid.clone(),
+            exchange: Exchange::Hyperliquid,
+            symbol,
+            status,
+            filled_quantity,
+            avg_price,
+            timestamp: self.status_timestamp,
+        }
+    }
+}
+
+/// Hyperliquid 订单状态映射
+fn map_hyperliquid_order_status(status: &str, filled: f64) -> crate::domain::OrderStatus {
+    match status {
+        "open" => {
+            if filled > 0.0 {
+                crate::domain::OrderStatus::PartiallyFilled { filled }
+            } else {
+                crate::domain::OrderStatus::Pending
+            }
+        }
+        "filled" => crate::domain::OrderStatus::Filled,
+        "canceled" | "cancelled" => crate::domain::OrderStatus::Cancelled,
+        "rejected" => crate::domain::OrderStatus::Rejected {
+            reason: "Order rejected".to_string(),
+        },
+        other => crate::domain::OrderStatus::Rejected {
+            reason: format!("Unknown status: {}", other),
+        },
+    }
+}

@@ -1,20 +1,24 @@
 //! HyperliquidActor - Hyperliquid 交易所的父 Actor
 //!
 //! 职责:
-//! - 管理 PublicWsActor 子 actor
+//! - 管理 PublicWsActor 和 PrivateWsActor 子 actor
 //! - 接收子 actor 的 WsData 并解析
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
 //! - 将解析后的事件发送到 EventSink
 //!
 //! 架构:
 //! HyperliquidActor
-//! └── HyperliquidPublicWsActor [spawn_link]
+//! ├── HyperliquidPublicWsActor [spawn_link]
+//! └── HyperliquidPrivateWsActor [spawn_link] (可选，需要wallet_address)
 
+use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs};
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
 use super::WsData;
-use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use crate::exchange::client::{EventSink, Subscribe, Unsubscribe, WsError};
-use crate::exchange::hyperliquid::codec::{WsActiveAssetCtx, WsBbo};
+use crate::exchange::hyperliquid::codec::{
+    ClearinghouseState, WsActiveAssetCtx, WsBbo, WsOrderUpdate,
+};
 use crate::exchange::hyperliquid::HyperliquidCredentials;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
@@ -23,12 +27,14 @@ use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 /// 子 Actor 类型
 #[derive(Debug, Clone, Copy)]
 enum ChildKind {
     PublicWs,
+    PrivateWs,
 }
 
 /// HyperliquidActor 初始化参数
@@ -43,8 +49,7 @@ pub struct HyperliquidActorArgs {
 
 /// HyperliquidActor - 父 Actor
 pub struct HyperliquidActor {
-    /// 凭证
-    #[allow(dead_code)]
+    /// 凭证（用于下单，包含钱包地址）
     credentials: Option<HyperliquidCredentials>,
     /// Symbol 元数据
     #[allow(dead_code)]
@@ -55,6 +60,8 @@ pub struct HyperliquidActor {
     // 子 Actors
     /// Public WebSocket Actor
     public_ws: Option<ActorRef<HyperliquidPublicWsActor>>,
+    /// Private WebSocket Actor (账户订阅)
+    private_ws: Option<ActorRef<HyperliquidPrivateWsActor>>,
 
     /// 子 Actor ID -> Kind 映射
     child_actors: HashMap<ActorID, ChildKind>,
@@ -67,6 +74,7 @@ impl HyperliquidActor {
             symbol_metas: args.symbol_metas,
             event_sink: args.event_sink,
             public_ws: None,
+            private_ws: None,
             child_actors: HashMap::new(),
         }
     }
@@ -86,14 +94,38 @@ impl Actor for HyperliquidActor {
         let public_ws = spawn_link(
             &actor_ref,
             HyperliquidPublicWsActor::new(HyperliquidPublicWsActorArgs {
-                parent: weak_ref,
+                parent: weak_ref.clone(),
             }),
         )
         .await;
         self.child_actors.insert(public_ws.id(), ChildKind::PublicWs);
         self.public_ws = Some(public_ws);
 
-        tracing::info!(exchange = "Hyperliquid", "HyperliquidActor started");
+        // spawn_link PrivateWsActor (如果有 credentials)
+        if let Some(ref creds) = self.credentials {
+            let private_ws = spawn_link(
+                &actor_ref,
+                HyperliquidPrivateWsActor::new(HyperliquidPrivateWsActorArgs {
+                    parent: weak_ref,
+                    wallet_address: creds.wallet_address.clone(),
+                }),
+            )
+            .await;
+            self.child_actors
+                .insert(private_ws.id(), ChildKind::PrivateWs);
+            self.private_ws = Some(private_ws);
+
+            tracing::info!(
+                exchange = "Hyperliquid",
+                wallet = %creds.wallet_address,
+                "HyperliquidActor started with private subscription"
+            );
+        } else {
+            tracing::info!(
+                exchange = "Hyperliquid",
+                "HyperliquidActor started (public only, no credentials)"
+            );
+        }
 
         Ok(())
     }
@@ -119,6 +151,10 @@ impl Actor for HyperliquidActor {
             Some(ChildKind::PublicWs) => {
                 tracing::error!(reason = ?reason, "HyperliquidPublicWsActor died, shutting down");
                 self.public_ws = None;
+            }
+            Some(ChildKind::PrivateWs) => {
+                tracing::error!(reason = ?reason, "HyperliquidPrivateWsActor died, shutting down");
+                self.private_ws = None;
             }
             None => {
                 tracing::warn!(actor_id = ?id, reason = ?reason, "Unknown linked actor died");
@@ -257,6 +293,16 @@ fn parse_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> 
                 // 所有中间价，当前不处理
                 return Ok(Vec::new());
             }
+            "webData3" => {
+                // 账户状态 (positions, balance)
+                let data = &value["data"];
+                return parse_web_data3(data, local_ts);
+            }
+            "orderUpdates" => {
+                // 订单更新
+                let data = &value["data"];
+                return parse_order_updates(data, local_ts);
+            }
             _ => {
                 tracing::debug!(channel, "Unknown Hyperliquid channel");
                 return Ok(Vec::new());
@@ -272,4 +318,86 @@ fn parse_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> 
     // 其他未知消息
     tracing::debug!(raw, "Unhandled Hyperliquid message");
     Ok(Vec::new())
+}
+
+/// 解析 webData3 消息 (账户状态)
+fn parse_web_data3(data: &serde_json::Value, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+    let mut events = Vec::new();
+
+    // 解析 clearinghouseState
+    if let Some(ch_state) = data.get("clearinghouseState") {
+        match serde_json::from_value::<ClearinghouseState>(ch_state.clone()) {
+            Ok(state) => {
+                // 解析仓位
+                for wrapper in &state.asset_positions {
+                    let position = wrapper.position.to_position();
+                    events.push(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::Position(position),
+                    });
+                }
+
+                // 解析账户净值 (equity = accountValue)
+                if let Ok(equity) = f64::from_str(&state.cross_margin_summary.account_value) {
+                    events.push(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::Equity {
+                            exchange: Exchange::Hyperliquid,
+                            equity,
+                        },
+                    });
+                }
+
+                // 解析可用余额
+                if let Ok(withdrawable) = f64::from_str(&state.withdrawable) {
+                    events.push(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::Balance(crate::domain::Balance {
+                            exchange: Exchange::Hyperliquid,
+                            asset: "USDC".to_string(),
+                            available: withdrawable,
+                            frozen: 0.0, // Hyperliquid 不直接提供 frozen，通过 marginUsed 计算
+                        }),
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, data = %ch_state, "Failed to parse clearinghouseState");
+            }
+        }
+    }
+
+    Ok(events)
+}
+
+/// 解析 orderUpdates 消息
+fn parse_order_updates(
+    data: &serde_json::Value,
+    local_ts: u64,
+) -> Result<Vec<IncomeEvent>, WsError> {
+    let mut events = Vec::new();
+
+    // orderUpdates 是一个数组
+    if let Some(updates) = data.as_array() {
+        for update in updates {
+            match serde_json::from_value::<WsOrderUpdate>(update.clone()) {
+                Ok(order_update) => {
+                    let update = order_update.to_order_update();
+                    events.push(IncomeEvent {
+                        exchange_ts: update.timestamp,
+                        local_ts,
+                        data: ExchangeEventData::OrderUpdate(update),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, data = %update, "Failed to parse order update");
+                }
+            }
+        }
+    }
+
+    Ok(events)
 }
