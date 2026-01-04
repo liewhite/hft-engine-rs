@@ -241,16 +241,12 @@ fn parse_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> 
                 let data = &value["data"];
                 match serde_json::from_value::<WsBbo>(data.clone()) {
                     Ok(bbo_data) => {
-                        // to_bbo 返回 Option，因为 bid/ask 可能为 null
-                        if let Some(bbo) = bbo_data.to_bbo() {
-                            return Ok(vec![IncomeEvent {
-                                exchange_ts: bbo.timestamp,
-                                local_ts,
-                                data: ExchangeEventData::BBO(bbo),
-                            }]);
-                        }
-                        // bid/ask 为 null 时，返回空事件
-                        return Ok(Vec::new());
+                        let bbo = bbo_data.to_bbo();
+                        return Ok(vec![IncomeEvent {
+                            exchange_ts: bbo.timestamp,
+                            local_ts,
+                            data: ExchangeEventData::BBO(bbo),
+                        }]);
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, data = %data, "Failed to parse bbo");

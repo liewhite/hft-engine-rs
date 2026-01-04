@@ -90,12 +90,13 @@ pub struct WsLevel {
 }
 
 impl WsBbo {
-    pub fn to_bbo(&self) -> Option<BBO> {
+    pub fn to_bbo(&self) -> BBO {
         let symbol = Symbol::from_hyperliquid(&self.coin);
 
-        // 需要同时有 bid 和 ask 才能构造有效的 BBO
-        let bid = self.bbo[0].as_ref()?;
-        let ask = self.bbo[1].as_ref()?;
+        let bid = self.bbo[0].as_ref()
+            .expect("BBO bid must exist for liquid symbols");
+        let ask = self.bbo[1].as_ref()
+            .expect("BBO ask must exist for liquid symbols");
 
         let bid_price = f64::from_str(&bid.px)
             .expect("bid price must be valid float from Hyperliquid API");
@@ -106,7 +107,7 @@ impl WsBbo {
         let ask_qty = f64::from_str(&ask.sz)
             .expect("ask size must be valid float from Hyperliquid API");
 
-        Some(BBO {
+        BBO {
             exchange: Exchange::Hyperliquid,
             symbol,
             bid_price,
@@ -114,7 +115,7 @@ impl WsBbo {
             ask_price,
             ask_qty,
             timestamp: self.time,
-        })
+        }
     }
 }
 
