@@ -3,12 +3,14 @@
 //! 职责:
 //! - 维护公开 WebSocket 连接
 //! - 处理 Subscribe/Unsubscribe 请求
-//! - 将收到的消息转发给父 OkxActor
+//! - 直接解析消息并发送到 EventSink
 
-use super::okx_actor::OkxActor;
-use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::okx::codec::{BboData, FundingRateData, WsPush};
 use crate::exchange::okx::to_okx;
 use crate::exchange::ws_loop;
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -16,7 +18,8 @@ use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -25,14 +28,19 @@ const WS_PUBLIC_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 
 /// OkxPublicWsActor 初始化参数
 pub struct OkxPublicWsActorArgs {
-    /// 父 Actor 弱引用
-    pub parent: WeakActorRef<OkxActor>,
+    /// 事件接收器
+    pub event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据
+    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// OkxPublicWsActor - 公开 WebSocket Actor
 pub struct OkxPublicWsActor {
-    /// 父 Actor 弱引用
-    parent: WeakActorRef<OkxActor>,
+    /// 事件接收器
+    event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据
+    #[allow(dead_code)]
+    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的 kinds (用于去重)
@@ -43,7 +51,8 @@ impl OkxPublicWsActor {
     /// 创建新的 OkxPublicWsActor
     pub fn new(args: OkxPublicWsActorArgs) -> Self {
         Self {
-            parent: args.parent,
+            event_sink: args.event_sink,
+            symbol_metas: args.symbol_metas,
             ws_tx: None,
             subscribed: HashSet::new(),
         }
@@ -77,6 +86,21 @@ impl OkxPublicWsActor {
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
+    }
+
+    /// 解析并处理消息
+    async fn handle_message(&self, raw: &str) {
+        let local_ts = now_ms();
+        match parse_public_message(raw, local_ts) {
+            Ok(events) => {
+                for event in events {
+                    self.event_sink.send_event(event).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, raw = %raw, "Failed to parse OKX public message");
+            }
+        }
     }
 }
 
@@ -179,15 +203,8 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPublicWsActo
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 转发给父 Actor
-                let parent = self
-                    .parent
-                    .upgrade()
-                    .expect("Parent actor must be alive while child is running");
-                parent
-                    .tell(super::WsData { data })
-                    .await
-                    .expect("Failed to forward WsData to parent");
+                // 直接解析并发送到 EventSink
+                self.handle_message(&data).await;
             }
             StreamMessage::Next(Err(e)) => {
                 tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
@@ -200,6 +217,90 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPublicWsActo
                 // ws_loop 正常退出（outgoing_tx 被 drop）
                 tracing::debug!("WsIncoming stream finished");
             }
+        }
+    }
+}
+
+// ============================================================================
+// 消息解析
+// ============================================================================
+
+fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+
+    // 检查是否是事件响应（控制消息，返回空 Vec）
+    if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
+        match event {
+            "subscribe" | "unsubscribe" => return Ok(Vec::new()),
+            "error" => {
+                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                return Err(WsError::ParseError(format!(
+                    "OKX error: code={}, msg={}",
+                    code, msg
+                )));
+            }
+            _ => return Ok(Vec::new()),
+        }
+    }
+
+    // 获取频道
+    let channel = value
+        .get("arg")
+        .and_then(|a| a.get("channel"))
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| WsError::ParseError(format!("Missing channel: {}", raw)))?;
+
+    match channel {
+        "funding-rate" => {
+            let push: WsPush<FundingRateData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("funding-rate parse: {}", e)))?;
+
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let rate = data.to_funding_rate();
+                    IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::FundingRate(rate),
+                    }
+                })
+                .collect();
+            Ok(events)
+        }
+        "bbo-tbt" => {
+            let push: WsPush<BboData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("bbo-tbt parse: {}", e)))?;
+            let inst_id = push
+                .arg
+                .inst_id
+                .as_ref()
+                .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
+
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let exchange_ts = data
+                        .ts
+                        .parse::<u64>()
+                        .unwrap_or_else(|_| panic!("Failed to parse BBO timestamp: {}", data.ts));
+                    let bbo = data.to_bbo(inst_id);
+                    IncomeEvent {
+                        exchange_ts,
+                        local_ts,
+                        data: ExchangeEventData::BBO(bbo),
+                    }
+                })
+                .collect();
+            Ok(events)
+        }
+        _ => {
+            tracing::warn!(channel, raw, "Unknown OKX public channel");
+            Ok(Vec::new())
         }
     }
 }

@@ -3,12 +3,14 @@
 //! 职责:
 //! - 维护公开 WebSocket 连接
 //! - 处理 Subscribe/Unsubscribe 请求
-//! - 将收到的消息转发给父 BinanceActor
+//! - 直接解析消息并发送到 EventSink
 
-use super::binance_actor::BinanceActor;
+use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::exchange::binance::codec::{BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
-use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ws_loop;
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -16,7 +18,8 @@ use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -25,14 +28,19 @@ const WS_PUBLIC_URL: &str = "wss://fstream.binance.com/ws";
 
 /// BinancePublicWsActor 初始化参数
 pub struct BinancePublicWsActorArgs {
-    /// 父 Actor 弱引用
-    pub parent: WeakActorRef<BinanceActor>,
+    /// 事件接收器
+    pub event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据（公开 WS 目前不需要，但保持一致性）
+    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// BinancePublicWsActor - 公开 WebSocket Actor
 pub struct BinancePublicWsActor {
-    /// 父 Actor 弱引用
-    parent: WeakActorRef<BinanceActor>,
+    /// 事件接收器
+    event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据
+    #[allow(dead_code)]
+    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的 kinds (用于去重)
@@ -43,7 +51,8 @@ impl BinancePublicWsActor {
     /// 创建新的 BinancePublicWsActor
     pub fn new(args: BinancePublicWsActorArgs) -> Self {
         Self {
-            parent: args.parent,
+            event_sink: args.event_sink,
+            symbol_metas: args.symbol_metas,
             ws_tx: None,
             subscribed: HashSet::new(),
         }
@@ -79,6 +88,21 @@ impl BinancePublicWsActor {
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
+    }
+
+    /// 解析并处理消息
+    async fn handle_message(&self, raw: &str) {
+        let local_ts = now_ms();
+        match parse_public_message(raw, local_ts) {
+            Ok(events) => {
+                for event in events {
+                    self.event_sink.send_event(event).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, raw = %raw, "Failed to parse Binance public message");
+            }
+        }
     }
 }
 
@@ -182,15 +206,8 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePublicWs
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 转发给父 Actor
-                let parent = self
-                    .parent
-                    .upgrade()
-                    .expect("Parent actor must be alive while child is running");
-                parent
-                    .tell(super::WsData { data })
-                    .await
-                    .expect("Failed to forward WsData to parent");
+                // 直接解析并发送到 EventSink
+                self.handle_message(&data).await;
             }
             StreamMessage::Next(Err(e)) => {
                 tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
@@ -203,6 +220,68 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePublicWs
                 // ws_loop 正常退出（outgoing_tx 被 drop）
                 tracing::debug!("WsIncoming stream finished");
             }
+        }
+    }
+}
+
+// ============================================================================
+// 消息解析
+// ============================================================================
+
+fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+
+    // 检查是否是订阅响应（控制消息，返回空 Vec）
+    if value.get("id").is_some() {
+        if let Ok(resp) = serde_json::from_str::<WsResponse>(raw) {
+            if let Some(err) = resp.error {
+                return Err(WsError::ParseError(format!(
+                    "Subscribe error: code={}, msg={}",
+                    err.code, err.msg
+                )));
+            }
+        }
+        return Ok(Vec::new());
+    }
+
+    // 提取交易所事件时间 (E 字段，毫秒)
+    let exchange_ts = value
+        .get("E")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(local_ts);
+
+    // 根据事件类型解析
+    let event_type = value
+        .get("e")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| WsError::ParseError(format!("Missing event type: {}", raw)))?;
+
+    match event_type {
+        "markPriceUpdate" => {
+            let update: MarkPriceUpdate = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
+            let rate = update.to_funding_rate(8.0);
+            Ok(vec![IncomeEvent {
+                exchange_ts,
+                local_ts,
+                data: ExchangeEventData::FundingRate(rate),
+            }])
+        }
+        "bookTicker" => {
+            let ticker: BookTicker = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
+            let bbo = ticker.to_bbo();
+            Ok(vec![IncomeEvent {
+                exchange_ts,
+                local_ts,
+                data: ExchangeEventData::BBO(bbo),
+            }])
+        }
+        _ => {
+            // 未知事件类型，记录警告但不报错
+            tracing::warn!(event_type, raw, "Unknown Binance public event type");
+            Ok(Vec::new())
         }
     }
 }

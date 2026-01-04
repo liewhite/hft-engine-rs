@@ -3,13 +3,14 @@
 //! 职责:
 //! - 建立私有 WebSocket 连接并完成登录
 //! - 自动订阅私有频道 (positions, account, orders)
-//! - 将收到的私有消息转发给父 OkxActor
+//! - 直接解析消息并发送到 EventSink
 
-use super::okx_actor::OkxActor;
-use crate::exchange::client::WsError;
-use crate::exchange::okx::codec::WsEvent;
+use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
+use crate::exchange::client::{EventSink, WsError};
+use crate::exchange::okx::codec::{AccountData, OrderPushData, PositionData, WsEvent, WsPush};
 use crate::exchange::okx::OkxCredentials;
 use crate::exchange::ws_loop;
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -17,6 +18,8 @@ use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -26,18 +29,22 @@ const WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
 
 /// OkxPrivateWsActor 初始化参数
 pub struct OkxPrivateWsActorArgs {
-    /// 父 Actor 弱引用
-    pub parent: WeakActorRef<OkxActor>,
     /// 凭证
     pub credentials: OkxCredentials,
+    /// 事件接收器
+    pub event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据（用于仓位转换）
+    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// OkxPrivateWsActor - 私有 WebSocket Actor
 pub struct OkxPrivateWsActor {
-    /// 父 Actor 弱引用
-    parent: WeakActorRef<OkxActor>,
     /// 凭证
     credentials: OkxCredentials,
+    /// 事件接收器
+    event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据
+    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
 }
@@ -46,9 +53,25 @@ impl OkxPrivateWsActor {
     /// 创建新的 OkxPrivateWsActor
     pub fn new(args: OkxPrivateWsActorArgs) -> Self {
         Self {
-            parent: args.parent,
             credentials: args.credentials,
+            event_sink: args.event_sink,
+            symbol_metas: args.symbol_metas,
             ws_tx: None,
+        }
+    }
+
+    /// 解析并处理消息
+    async fn handle_message(&self, raw: &str) {
+        let local_ts = now_ms();
+        match parse_private_message(raw, local_ts, &self.symbol_metas) {
+            Ok(events) => {
+                for event in events {
+                    self.event_sink.send_event(event).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, raw = %raw, "Failed to parse OKX private message");
+            }
         }
     }
 }
@@ -187,15 +210,8 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPrivateWsAct
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 转发给父 Actor
-                let parent = self
-                    .parent
-                    .upgrade()
-                    .expect("Parent actor must be alive while child is running");
-                parent
-                    .tell(super::WsData { data })
-                    .await
-                    .expect("Failed to forward WsData to parent");
+                // 直接解析并发送到 EventSink
+                self.handle_message(&data).await;
             }
             StreamMessage::Next(Err(e)) => {
                 tracing::error!(error = %e, "Private WebSocket loop exited, killing actor");
@@ -208,6 +224,113 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPrivateWsAct
                 // ws_loop 正常退出（outgoing_tx 被 drop）
                 tracing::debug!("WsIncoming stream finished");
             }
+        }
+    }
+}
+
+// ============================================================================
+// 消息解析
+// ============================================================================
+
+fn parse_private_message(
+    raw: &str,
+    local_ts: u64,
+    symbol_metas: &HashMap<Symbol, SymbolMeta>,
+) -> Result<Vec<IncomeEvent>, WsError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+
+    // 检查是否是事件响应（控制消息，返回空 Vec）
+    if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
+        match event {
+            "subscribe" | "unsubscribe" => return Ok(Vec::new()),
+            "error" => {
+                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                return Err(WsError::ParseError(format!(
+                    "OKX error: code={}, msg={}",
+                    code, msg
+                )));
+            }
+            _ => return Ok(Vec::new()),
+        }
+    }
+
+    // 获取频道
+    let channel = value
+        .get("arg")
+        .and_then(|a| a.get("channel"))
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| WsError::ParseError(format!("Missing channel: {}", raw)))?;
+
+    match channel {
+        "positions" => {
+            let push: WsPush<PositionData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("positions parse: {}", e)))?;
+
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let mut position = data.to_position();
+                    let meta = symbol_metas
+                        .get(&position.symbol)
+                        .expect("SymbolMeta not found for position symbol");
+                    position.size = meta.qty_to_coin(position.size);
+                    IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::Position(position),
+                    }
+                })
+                .collect();
+            Ok(events)
+        }
+        "account" => {
+            let push: WsPush<AccountData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;
+
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let exchange_ts = data.u_time.parse::<u64>().unwrap_or_else(|_| {
+                        panic!("Failed to parse account timestamp: {}", data.u_time)
+                    });
+                    let equity = data.to_equity();
+                    IncomeEvent {
+                        exchange_ts,
+                        local_ts,
+                        data: ExchangeEventData::Equity {
+                            exchange: Exchange::OKX,
+                            equity,
+                        },
+                    }
+                })
+                .collect();
+            Ok(events)
+        }
+        "orders" => {
+            let push: WsPush<OrderPushData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("orders parse: {}", e)))?;
+
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let update = data.to_order_update();
+                    IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::OrderUpdate(update),
+                    }
+                })
+                .collect();
+            Ok(events)
+        }
+        _ => {
+            tracing::warn!(channel, raw, "Unknown OKX private channel");
+            Ok(Vec::new())
         }
     }
 }

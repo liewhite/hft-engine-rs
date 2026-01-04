@@ -2,9 +2,8 @@
 //!
 //! 职责:
 //! - 管理 PublicWsActor 和 PrivateWsActor 子 actor
-//! - 接收子 actor 的 WsData 并解析
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
-//! - 将解析后的事件发送到 EventSink
+//! - WsActors 直接解析消息并发送到 EventSink
 //!
 //! 架构:
 //! BinanceActor (0 spawn)
@@ -14,13 +13,9 @@
 
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
-use crate::domain::{now_ms, Symbol, SymbolMeta};
-use crate::exchange::binance::codec::{
-    AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
-};
+use crate::domain::{Symbol, SymbolMeta};
 use crate::exchange::binance::BinanceCredentials;
-use crate::exchange::client::{EventSink, Subscribe, Unsubscribe, WsError};
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::exchange::client::{EventSink, Subscribe, Unsubscribe};
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -91,7 +86,8 @@ impl BinanceActor {
         let public_ws = spawn_link(
             actor_ref,
             BinancePublicWsActor::new(BinancePublicWsActorArgs {
-                parent: actor_ref.downgrade(),
+                event_sink: self.event_sink.clone(),
+                symbol_metas: self.symbol_metas.clone(),
             }),
         )
         .await;
@@ -112,9 +108,10 @@ impl BinanceActor {
         let private_ws = spawn_link(
             actor_ref,
             BinancePrivateWsActor::new(BinancePrivateWsActorArgs {
-                parent: actor_ref.downgrade(),
                 credentials: credentials.clone(),
                 rest_base_url: self.rest_base_url.clone(),
+                event_sink: self.event_sink.clone(),
+                symbol_metas: self.symbol_metas.clone(),
             }),
         )
         .await;
@@ -221,138 +218,6 @@ impl Message<Unsubscribe> for BinanceActor {
                 .tell(msg)
                 .await
                 .expect("Failed to forward Unsubscribe to PublicWsActor");
-        }
-    }
-}
-
-/// 内部 WebSocket 数据消息 (从子 actor 收到)
-pub struct WsData {
-    pub data: String,
-}
-
-impl Message<WsData> for BinanceActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
-        let timestamp = now_ms();
-        match parse_message(&msg.data, timestamp, &self.symbol_metas) {
-            Ok(events) => {
-                for event in events {
-                    self.event_sink.send_event(event).await;
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, raw = %msg.data, "Failed to parse Binance message");
-            }
-        }
-    }
-}
-
-// ============================================================================
-// 消息解析
-// ============================================================================
-
-fn parse_message(
-    raw: &str,
-    local_ts: u64,
-    symbol_metas: &HashMap<Symbol, SymbolMeta>,
-) -> Result<Vec<IncomeEvent>, WsError> {
-    let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
-
-    // 检查是否是订阅响应（控制消息，返回空 Vec）
-    if value.get("id").is_some() {
-        if let Ok(resp) = serde_json::from_str::<WsResponse>(raw) {
-            if let Some(err) = resp.error {
-                return Err(WsError::ParseError(format!(
-                    "Subscribe error: code={}, msg={}",
-                    err.code, err.msg
-                )));
-            }
-        }
-        return Ok(Vec::new());
-    }
-
-    // 提取交易所事件时间 (E 字段，毫秒)
-    let exchange_ts = value
-        .get("E")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(local_ts);
-
-    // 根据事件类型解析
-    let event_type = value
-        .get("e")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| WsError::ParseError(format!("Missing event type: {}", raw)))?;
-
-    match event_type {
-        "markPriceUpdate" => {
-            let update: MarkPriceUpdate = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
-            let rate = update.to_funding_rate(8.0);
-            Ok(vec![IncomeEvent {
-                exchange_ts,
-                local_ts,
-                data: ExchangeEventData::FundingRate(rate),
-            }])
-        }
-        "bookTicker" => {
-            let ticker: BookTicker = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
-            let bbo = ticker.to_bbo();
-            Ok(vec![IncomeEvent {
-                exchange_ts,
-                local_ts,
-                data: ExchangeEventData::BBO(bbo),
-            }])
-        }
-        "ACCOUNT_UPDATE" => {
-            let update: AccountUpdate = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("ACCOUNT_UPDATE parse: {}", e)))?;
-
-            let mut events = Vec::new();
-
-            // 处理所有 position 更新
-            for pos_data in &update.a.positions {
-                let mut position = pos_data.to_position();
-                // qty 归一化: 张 -> 币
-                let meta = symbol_metas
-                    .get(&position.symbol)
-                    .expect("SymbolMeta not found for position symbol");
-                position.size = meta.qty_to_coin(position.size);
-                events.push(IncomeEvent {
-                    exchange_ts,
-                    local_ts,
-                    data: ExchangeEventData::Position(position),
-                });
-            }
-
-            // 处理所有 balance 更新
-            for bal_data in &update.a.balances {
-                let balance = bal_data.to_balance();
-                events.push(IncomeEvent {
-                    exchange_ts,
-                    local_ts,
-                    data: ExchangeEventData::Balance(balance),
-                });
-            }
-
-            Ok(events)
-        }
-        "ORDER_TRADE_UPDATE" => {
-            let update: OrderTradeUpdate = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("ORDER_TRADE_UPDATE parse: {}", e)))?;
-            let order_update = update.to_order_update();
-            Ok(vec![IncomeEvent {
-                exchange_ts,
-                local_ts,
-                data: ExchangeEventData::OrderUpdate(order_update),
-            }])
-        }
-        _ => {
-            // 未知事件类型，记录警告但不报错
-            tracing::warn!(event_type, raw, "Unknown Binance event type");
-            Ok(Vec::new())
         }
     }
 }

@@ -2,9 +2,8 @@
 //!
 //! 职责:
 //! - 管理 PublicWsActor 和 PrivateWsActor 子 actor
-//! - 接收子 actor 的 WsData 并解析
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
-//! - 将解析后的事件发送到 EventSink
+//! - WsActors 直接解析消息并发送到 EventSink
 //!
 //! 架构:
 //! OkxActor (0 spawn)
@@ -13,13 +12,9 @@
 
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
-use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, Subscribe, Unsubscribe, WsError};
-use crate::exchange::okx::codec::{
-    AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsPush,
-};
+use crate::domain::{Symbol, SymbolMeta};
+use crate::exchange::client::{EventSink, Subscribe, Unsubscribe};
 use crate::exchange::okx::OkxCredentials;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -85,7 +80,8 @@ impl OkxActor {
         let public_ws = spawn_link(
             actor_ref,
             OkxPublicWsActor::new(OkxPublicWsActorArgs {
-                parent: actor_ref.downgrade(),
+                event_sink: self.event_sink.clone(),
+                symbol_metas: self.symbol_metas.clone(),
             }),
         )
         .await;
@@ -106,8 +102,9 @@ impl OkxActor {
         let private_ws = spawn_link(
             actor_ref,
             OkxPrivateWsActor::new(OkxPrivateWsActorArgs {
-                parent: actor_ref.downgrade(),
                 credentials: credentials.clone(),
+                event_sink: self.event_sink.clone(),
+                symbol_metas: self.symbol_metas.clone(),
             }),
         )
         .await;
@@ -214,181 +211,6 @@ impl Message<Unsubscribe> for OkxActor {
                 .tell(msg)
                 .await
                 .expect("Failed to forward Unsubscribe to PublicWsActor");
-        }
-    }
-}
-
-/// 内部 WebSocket 数据消息 (从子 actor 收到)
-pub struct WsData {
-    pub data: String,
-}
-
-impl Message<WsData> for OkxActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
-        let timestamp = now_ms();
-        match parse_message(&msg.data, timestamp, &self.symbol_metas) {
-            Ok(events) => {
-                for event in events {
-                    self.event_sink.send_event(event).await;
-                }
-            }
-            Err(e) => {
-                tracing::error!(error = %e, raw = %msg.data, "Failed to parse OKX message");
-            }
-        }
-    }
-}
-
-// ============================================================================
-// 消息解析
-// ============================================================================
-
-fn parse_message(
-    raw: &str,
-    local_ts: u64,
-    symbol_metas: &HashMap<Symbol, SymbolMeta>,
-) -> Result<Vec<IncomeEvent>, WsError> {
-    let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
-
-    // 检查是否是事件响应（控制消息，返回空 Vec）
-    if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
-        match event {
-            "subscribe" | "unsubscribe" => return Ok(Vec::new()),
-            "error" => {
-                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
-                return Err(WsError::ParseError(format!(
-                    "OKX error: code={}, msg={}",
-                    code, msg
-                )));
-            }
-            _ => return Ok(Vec::new()),
-        }
-    }
-
-    // 获取频道
-    let channel = value
-        .get("arg")
-        .and_then(|a| a.get("channel"))
-        .and_then(|c| c.as_str())
-        .ok_or_else(|| WsError::ParseError(format!("Missing channel: {}", raw)))?;
-
-    match channel {
-        "funding-rate" => {
-            let push: WsPush<FundingRateData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("funding-rate parse: {}", e)))?;
-
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let rate = data.to_funding_rate();
-                    IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::FundingRate(rate),
-                    }
-                })
-                .collect();
-            Ok(events)
-        }
-        "bbo-tbt" => {
-            let push: WsPush<BboData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("bbo-tbt parse: {}", e)))?;
-            let inst_id = push
-                .arg
-                .inst_id
-                .as_ref()
-                .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
-
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let exchange_ts = data
-                        .ts
-                        .parse::<u64>()
-                        .unwrap_or_else(|_| panic!("Failed to parse BBO timestamp: {}", data.ts));
-                    let bbo = data.to_bbo(inst_id);
-                    IncomeEvent {
-                        exchange_ts,
-                        local_ts,
-                        data: ExchangeEventData::BBO(bbo),
-                    }
-                })
-                .collect();
-            Ok(events)
-        }
-        "positions" => {
-            let push: WsPush<PositionData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("positions parse: {}", e)))?;
-
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let mut position = data.to_position();
-                    let meta = symbol_metas
-                        .get(&position.symbol)
-                        .expect("SymbolMeta not found for position symbol");
-                    position.size = meta.qty_to_coin(position.size);
-                    IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::Position(position),
-                    }
-                })
-                .collect();
-            Ok(events)
-        }
-        "account" => {
-            let push: WsPush<AccountData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;
-
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let exchange_ts = data.u_time.parse::<u64>().unwrap_or_else(|_| {
-                        panic!("Failed to parse account timestamp: {}", data.u_time)
-                    });
-                    let equity = data.to_equity();
-                    IncomeEvent {
-                        exchange_ts,
-                        local_ts,
-                        data: ExchangeEventData::Equity {
-                            exchange: Exchange::OKX,
-                            equity,
-                        },
-                    }
-                })
-                .collect();
-            Ok(events)
-        }
-        "orders" => {
-            let push: WsPush<OrderPushData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("orders parse: {}", e)))?;
-
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let update = data.to_order_update();
-                    IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::OrderUpdate(update),
-                    }
-                })
-                .collect();
-            Ok(events)
-        }
-        _ => {
-            tracing::warn!(channel, raw, "Unknown OKX channel");
-            Ok(Vec::new())
         }
     }
 }

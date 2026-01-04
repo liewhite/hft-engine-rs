@@ -3,13 +3,14 @@
 //! 职责:
 //! - 维护 WebSocket 连接
 //! - 处理 Subscribe/Unsubscribe 请求
-//! - 将收到的消息转发给父 HyperliquidActor
+//! - 直接解析消息并发送到 EventSink
 
-use super::hyperliquid_actor::HyperliquidActor;
-use super::WsData;
-use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::hyperliquid::codec::{WsActiveAssetCtx, WsBbo};
 use crate::exchange::hyperliquid::{to_hyperliquid, WS_URL};
 use crate::exchange::ws_loop;
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -17,20 +18,26 @@ use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// HyperliquidPublicWsActor 初始化参数
 pub struct HyperliquidPublicWsActorArgs {
-    /// 父 Actor 弱引用
-    pub parent: WeakActorRef<HyperliquidActor>,
+    /// 事件接收器
+    pub event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据
+    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// HyperliquidPublicWsActor - WebSocket Actor
 pub struct HyperliquidPublicWsActor {
-    /// 父 Actor 弱引用
-    parent: WeakActorRef<HyperliquidActor>,
+    /// 事件接收器
+    event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据
+    #[allow(dead_code)]
+    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的 kinds (用于去重)
@@ -41,7 +48,8 @@ impl HyperliquidPublicWsActor {
     /// 创建新的 HyperliquidPublicWsActor
     pub fn new(args: HyperliquidPublicWsActorArgs) -> Self {
         Self {
-            parent: args.parent,
+            event_sink: args.event_sink,
+            symbol_metas: args.symbol_metas,
             ws_tx: None,
             subscribed: HashSet::new(),
         }
@@ -75,6 +83,21 @@ impl HyperliquidPublicWsActor {
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
+    }
+
+    /// 解析并处理消息
+    async fn handle_message(&self, raw: &str) {
+        let local_ts = now_ms();
+        match parse_public_message(raw, local_ts) {
+            Ok(events) => {
+                for event in events {
+                    self.event_sink.send_event(event).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, raw = %raw, "Failed to parse Hyperliquid public message");
+            }
+        }
     }
 }
 
@@ -178,15 +201,8 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPubl
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 转发给父 Actor
-                let parent = self
-                    .parent
-                    .upgrade()
-                    .expect("Parent actor must be alive while child is running");
-                parent
-                    .tell(WsData { data })
-                    .await
-                    .expect("Failed to forward WsData to parent");
+                // 直接解析并发送到 EventSink
+                self.handle_message(&data).await;
             }
             StreamMessage::Next(Err(e)) => {
                 tracing::error!(error = %e, "WebSocket loop exited, killing actor");
@@ -201,6 +217,92 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPubl
             }
         }
     }
+}
+
+// ============================================================================
+// 消息解析
+// ============================================================================
+
+fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+
+    // 检查是否是订阅确认
+    if value.get("channel").is_some() {
+        let channel = value["channel"].as_str().unwrap_or("");
+
+        match channel {
+            "subscriptionResponse" => {
+                // 订阅响应，忽略
+                return Ok(Vec::new());
+            }
+            "activeAssetCtx" => {
+                // 资产上下文（包含资金费率）
+                let data = &value["data"];
+                match serde_json::from_value::<WsActiveAssetCtx>(data.clone()) {
+                    Ok(ctx) => {
+                        let mut events = Vec::new();
+
+                        // 资金费率事件
+                        let rate = ctx.to_funding_rate();
+                        events.push(IncomeEvent {
+                            exchange_ts: local_ts,
+                            local_ts,
+                            data: ExchangeEventData::FundingRate(rate),
+                        });
+
+                        // 如果有 impact_pxs，也生成 BBO 事件
+                        if let Some(bbo) = ctx.to_bbo() {
+                            events.push(IncomeEvent {
+                                exchange_ts: local_ts,
+                                local_ts,
+                                data: ExchangeEventData::BBO(bbo),
+                            });
+                        }
+
+                        return Ok(events);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, data = %data, "Failed to parse activeAssetCtx");
+                    }
+                }
+            }
+            "bbo" => {
+                // BBO 数据
+                let data = &value["data"];
+                match serde_json::from_value::<WsBbo>(data.clone()) {
+                    Ok(bbo_data) => {
+                        let bbo = bbo_data.to_bbo();
+                        return Ok(vec![IncomeEvent {
+                            exchange_ts: bbo.timestamp,
+                            local_ts,
+                            data: ExchangeEventData::BBO(bbo),
+                        }]);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, data = %data, "Failed to parse bbo");
+                    }
+                }
+            }
+            "allMids" => {
+                // 所有中间价，当前不处理
+                return Ok(Vec::new());
+            }
+            _ => {
+                tracing::debug!(channel, "Unknown Hyperliquid public channel");
+                return Ok(Vec::new());
+            }
+        }
+    }
+
+    // pong 消息
+    if value.get("method").map(|v| v.as_str()) == Some(Some("pong")) {
+        return Ok(Vec::new());
+    }
+
+    // 其他未知消息
+    tracing::debug!(raw, "Unhandled Hyperliquid public message");
+    Ok(Vec::new())
 }
 
 // ============================================================================

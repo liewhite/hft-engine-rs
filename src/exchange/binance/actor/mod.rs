@@ -11,4 +11,4 @@ mod listen_key;
 mod private_ws;
 mod public_ws;
 
-pub use binance_actor::{BinanceActor, BinanceActorArgs, WsData};
+pub use binance_actor::{BinanceActor, BinanceActorArgs};

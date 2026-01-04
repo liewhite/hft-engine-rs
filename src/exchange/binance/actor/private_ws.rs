@@ -3,19 +3,23 @@
 //! 职责:
 //! - 获取 ListenKey 并建立私有 WebSocket 连接
 //! - 管理 BinanceListenKeyActor 子 actor (定时刷新 ListenKey)
-//! - 将收到的私有消息转发给父 BinanceActor
+//! - 直接解析消息并发送到 EventSink
 
-use super::binance_actor::BinanceActor;
 use super::listen_key::{BinanceListenKeyActor, BinanceListenKeyActorArgs};
+use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsResponse};
 use crate::exchange::binance::BinanceCredentials;
-use crate::exchange::client::WsError;
+use crate::exchange::client::{EventSink, WsError};
 use crate::exchange::ws_loop;
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -24,22 +28,26 @@ const WS_PRIVATE_BASE: &str = "wss://fstream.binance.com/ws";
 
 /// BinancePrivateWsActor 初始化参数
 pub struct BinancePrivateWsActorArgs {
-    /// 父 Actor 弱引用
-    pub parent: WeakActorRef<BinanceActor>,
     /// 凭证
     pub credentials: BinanceCredentials,
     /// REST API 基础 URL
     pub rest_base_url: String,
+    /// 事件接收器
+    pub event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据（用于仓位转换）
+    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// BinancePrivateWsActor - 私有 WebSocket Actor
 pub struct BinancePrivateWsActor {
-    /// 父 Actor 弱引用
-    parent: WeakActorRef<BinanceActor>,
     /// 凭证
     credentials: BinanceCredentials,
     /// REST API 基础 URL
     rest_base_url: String,
+    /// 事件接收器
+    event_sink: Arc<dyn EventSink>,
+    /// Symbol 元数据
+    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// ListenKey 子 actor
@@ -52,12 +60,28 @@ impl BinancePrivateWsActor {
     /// 创建新的 BinancePrivateWsActor
     pub fn new(args: BinancePrivateWsActorArgs) -> Self {
         Self {
-            parent: args.parent,
             credentials: args.credentials,
             rest_base_url: args.rest_base_url,
+            event_sink: args.event_sink,
+            symbol_metas: args.symbol_metas,
             ws_tx: None,
             listen_key_actor: None,
             listen_key_actor_id: None,
+        }
+    }
+
+    /// 解析并处理消息
+    async fn handle_message(&self, raw: &str) {
+        let local_ts = now_ms();
+        match parse_private_message(raw, local_ts, &self.symbol_metas) {
+            Ok(events) => {
+                for event in events {
+                    self.event_sink.send_event(event).await;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, raw = %raw, "Failed to parse Binance private message");
+            }
         }
     }
 }
@@ -159,15 +183,8 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePrivateW
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 转发给父 Actor
-                let parent = self
-                    .parent
-                    .upgrade()
-                    .expect("Parent actor must be alive while child is running");
-                parent
-                    .tell(super::WsData { data })
-                    .await
-                    .expect("Failed to forward WsData to parent");
+                // 直接解析并发送到 EventSink
+                self.handle_message(&data).await;
             }
             StreamMessage::Next(Err(e)) => {
                 tracing::error!(error = %e, "Private WebSocket loop exited, killing actor");
@@ -180,6 +197,95 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePrivateW
                 // ws_loop 正常退出（outgoing_tx 被 drop）
                 tracing::debug!("WsIncoming stream finished");
             }
+        }
+    }
+}
+
+// ============================================================================
+// 消息解析
+// ============================================================================
+
+fn parse_private_message(
+    raw: &str,
+    local_ts: u64,
+    symbol_metas: &HashMap<Symbol, SymbolMeta>,
+) -> Result<Vec<IncomeEvent>, WsError> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+
+    // 检查是否是订阅响应（控制消息，返回空 Vec）
+    if value.get("id").is_some() {
+        if let Ok(resp) = serde_json::from_str::<WsResponse>(raw) {
+            if let Some(err) = resp.error {
+                return Err(WsError::ParseError(format!(
+                    "Subscribe error: code={}, msg={}",
+                    err.code, err.msg
+                )));
+            }
+        }
+        return Ok(Vec::new());
+    }
+
+    // 提取交易所事件时间 (E 字段，毫秒)
+    let exchange_ts = value
+        .get("E")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(local_ts);
+
+    // 根据事件类型解析
+    let event_type = value
+        .get("e")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| WsError::ParseError(format!("Missing event type: {}", raw)))?;
+
+    match event_type {
+        "ACCOUNT_UPDATE" => {
+            let update: AccountUpdate = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("ACCOUNT_UPDATE parse: {}", e)))?;
+
+            let mut events = Vec::new();
+
+            // 处理所有 position 更新
+            for pos_data in &update.a.positions {
+                let mut position = pos_data.to_position();
+                // qty 归一化: 张 -> 币
+                let meta = symbol_metas
+                    .get(&position.symbol)
+                    .expect("SymbolMeta not found for position symbol");
+                position.size = meta.qty_to_coin(position.size);
+                events.push(IncomeEvent {
+                    exchange_ts,
+                    local_ts,
+                    data: ExchangeEventData::Position(position),
+                });
+            }
+
+            // 处理所有 balance 更新
+            for bal_data in &update.a.balances {
+                let balance = bal_data.to_balance();
+                events.push(IncomeEvent {
+                    exchange_ts,
+                    local_ts,
+                    data: ExchangeEventData::Balance(balance),
+                });
+            }
+
+            Ok(events)
+        }
+        "ORDER_TRADE_UPDATE" => {
+            let update: OrderTradeUpdate = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("ORDER_TRADE_UPDATE parse: {}", e)))?;
+            let order_update = update.to_order_update();
+            Ok(vec![IncomeEvent {
+                exchange_ts,
+                local_ts,
+                data: ExchangeEventData::OrderUpdate(order_update),
+            }])
+        }
+        _ => {
+            // 未知事件类型，记录警告但不报错
+            tracing::warn!(event_type, raw, "Unknown Binance private event type");
+            Ok(Vec::new())
         }
     }
 }

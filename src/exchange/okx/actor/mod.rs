@@ -9,4 +9,4 @@ mod okx_actor;
 mod private_ws;
 mod public_ws;
 
-pub use okx_actor::{OkxActor, OkxActorArgs, WsData};
+pub use okx_actor::{OkxActor, OkxActorArgs};
