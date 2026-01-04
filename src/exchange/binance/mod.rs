@@ -1,10 +1,12 @@
 pub(crate) mod actor;
 pub(crate) mod codec;
 mod client;
+mod module;
 mod symbol;
 
 pub use actor::{BinanceActor, BinanceActorArgs};
 pub use client::BinanceClient;
+pub use module::BinanceModule;
 pub use symbol::{from_binance, to_binance};
 
 /// Binance 永续合约 REST API 地址

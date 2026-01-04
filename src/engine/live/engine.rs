@@ -6,13 +6,10 @@
 //! - 子 Actor 失败时级联退出
 
 use super::{
-    ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, ProcessorActor, RegisterClockExecutor,
-    RegisterExecutor, SignalProcessorActor,
+    ClockActor, ClockArgs, ExchangeModule, ExecutorActor, ExecutorArgs, ProcessorActor,
+    RegisterClockExecutor, RegisterExecutor, SignalProcessorActor,
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient};
-use crate::exchange::hyperliquid::{HyperliquidActor, HyperliquidActorArgs, HyperliquidClient};
-use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient};
 use crate::exchange::{EventSink, ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
@@ -45,20 +42,14 @@ enum ChildActorKind {
 
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
-    /// Binance 客户端（可选）
-    pub binance_client: Option<Arc<BinanceClient>>,
-    /// OKX 客户端（可选）
-    pub okx_client: Option<Arc<OkxClient>>,
-    /// Hyperliquid 客户端（可选）
-    pub hyperliquid_client: Option<Arc<HyperliquidClient>>,
+    /// 交易所模块列表
+    pub modules: Vec<Arc<dyn ExchangeModule>>,
 }
 
 /// ManagerActor - 顶层管理 Actor
 pub struct ManagerActor {
-    // === Exchange Clients (REST) ===
-    binance_client: Option<Arc<BinanceClient>>,
-    okx_client: Option<Arc<OkxClient>>,
-    hyperliquid_client: Option<Arc<HyperliquidClient>>,
+    // === Exchange Modules ===
+    modules: HashMap<Exchange, Arc<dyn ExchangeModule>>,
 
     // === Symbol Metas 缓存 ===
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
@@ -84,10 +75,14 @@ pub struct ManagerActor {
 
 impl ManagerActor {
     pub fn new(args: ManagerActorArgs) -> Self {
+        let modules = args
+            .modules
+            .into_iter()
+            .map(|m| (m.exchange(), m))
+            .collect();
+
         Self {
-            binance_client: args.binance_client,
-            okx_client: args.okx_client,
-            hyperliquid_client: args.hyperliquid_client,
+            modules,
             symbol_metas: HashMap::new(),
             signal_processor: None,
             processor: None,
@@ -101,14 +96,10 @@ impl ManagerActor {
 
     /// 获取所有已配置的 ExchangeClient (用于遍历)
     fn configured_clients(&self) -> HashMap<Exchange, Arc<dyn ExchangeClient>> {
-        [
-            self.binance_client.clone().map(|c| (Exchange::Binance, c as Arc<dyn ExchangeClient>)),
-            self.okx_client.clone().map(|c| (Exchange::OKX, c as Arc<dyn ExchangeClient>)),
-            self.hyperliquid_client.clone().map(|c| (Exchange::Hyperliquid, c as Arc<dyn ExchangeClient>)),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
+        self.modules
+            .iter()
+            .map(|(e, m)| (*e, m.client()))
+            .collect()
     }
 
     /// 预加载所有交易所的 symbol metas
@@ -168,46 +159,15 @@ impl ManagerActor {
 
         let symbol_metas = self.get_symbol_metas_for(exchange);
 
-        // 创建 Actor 并转换为 Box<dyn ExchangeActorOps>
-        let (actor_id, boxed_actor): (ActorID, Box<dyn ExchangeActorOps>) = match exchange {
-            Exchange::Binance => {
-                let client = self.binance_client.as_ref().ok_or_else(|| {
-                    ExchangeError::Other("Binance client not configured".to_string())
-                })?;
-                let actor = BinanceActor::new(BinanceActorArgs {
-                    credentials: client.credentials().cloned(),
-                    symbol_metas,
-                    event_sink,
-                    rest_base_url: client.rest_base_url().to_string(),
-                });
-                let actor_ref = spawn_link(actor_ref, actor).await;
-                (actor_ref.id(), Box::new(actor_ref))
-            }
-            Exchange::OKX => {
-                let client = self.okx_client.as_ref().ok_or_else(|| {
-                    ExchangeError::Other("OKX client not configured".to_string())
-                })?;
-                let actor = OkxActor::new(OkxActorArgs {
-                    credentials: client.credentials().cloned(),
-                    symbol_metas,
-                    event_sink,
-                });
-                let actor_ref = spawn_link(actor_ref, actor).await;
-                (actor_ref.id(), Box::new(actor_ref))
-            }
-            Exchange::Hyperliquid => {
-                let client = self.hyperliquid_client.as_ref().ok_or_else(|| {
-                    ExchangeError::Other("Hyperliquid client not configured".to_string())
-                })?;
-                let actor = HyperliquidActor::new(HyperliquidActorArgs {
-                    credentials: client.credentials().cloned(),
-                    symbol_metas,
-                    event_sink,
-                });
-                let actor_ref = spawn_link(actor_ref, actor).await;
-                (actor_ref.id(), Box::new(actor_ref))
-            }
-        };
+        // 获取对应的 module
+        let module = self.modules.get(&exchange).ok_or_else(|| {
+            ExchangeError::Other(format!("{} module not configured", exchange))
+        })?;
+
+        // 使用 module 创建 Actor
+        let (actor_id, boxed_actor) = module
+            .spawn_actor(actor_ref, symbol_metas, event_sink)
+            .await;
 
         self.actor_kinds
             .insert(actor_id, ChildActorKind::Exchange(exchange));
@@ -354,11 +314,16 @@ impl Actor for ManagerActor {
         let clock_event_sink = Arc::new(ProcessorEventSink {
             processor: processor.clone(),
         });
+        // 获取 Binance client 用于 ClockActor（如果有配置）
+        let binance_client = self
+            .modules
+            .get(&Exchange::Binance)
+            .map(|m| m.client());
         let clock_actor = spawn_link(
             &actor_ref,
             ClockActor::new(ClockArgs {
                 interval_ms: 1000, // 1 秒
-                binance_client: self.binance_client.clone().map(|c| c as Arc<dyn ExchangeClient>),
+                binance_client,
                 event_sink: clock_event_sink,
             }),
         )

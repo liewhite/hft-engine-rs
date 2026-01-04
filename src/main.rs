@@ -1,7 +1,7 @@
 use fee_arb::config::AppConfig;
-use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs};
-use fee_arb::exchange::binance::{BinanceClient, BinanceCredentials};
-use fee_arb::exchange::okx::{OkxClient, OkxCredentials};
+use fee_arb::engine::{AddStrategy, ExchangeModule, ManagerActor, ManagerActorArgs};
+use fee_arb::exchange::binance::{BinanceCredentials, BinanceModule};
+use fee_arb::exchange::okx::{OkxCredentials, OkxModule};
 use fee_arb::strategy::FundingArbStrategy;
 use kameo::request::MessageSend;
 use std::sync::Arc;
@@ -29,27 +29,26 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // Create Binance client
+    // Create exchange modules
+    let mut modules: Vec<Arc<dyn ExchangeModule>> = Vec::new();
+
+    // Binance module
     let binance_credentials = BinanceCredentials {
         api_key: config.exchanges.binance.api_key.clone(),
         secret: config.exchanges.binance.secret.clone(),
     };
-    let binance_client = Arc::new(BinanceClient::new(Some(binance_credentials))?);
+    modules.push(Arc::new(BinanceModule::new(Some(binance_credentials))?));
 
-    // Create OKX client
+    // OKX module
     let okx_credentials = OkxCredentials {
         api_key: config.exchanges.okx.api_key.clone(),
         secret: config.exchanges.okx.secret.clone(),
         passphrase: config.exchanges.okx.passphrase.clone(),
     };
-    let okx_client = Arc::new(OkxClient::new(Some(okx_credentials))?);
+    modules.push(Arc::new(OkxModule::new(Some(okx_credentials))?));
 
     // Create ManagerActor
-    let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs {
-        binance_client: Some(binance_client),
-        okx_client: Some(okx_client),
-        hyperliquid_client: None, // 暂未配置
-    }));
+    let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs { modules }));
 
     // Add strategies (this will automatically create ExchangeActors as needed)
     let enabled_exchanges = config.exchanges.enabled_exchanges();

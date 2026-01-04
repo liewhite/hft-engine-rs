@@ -1,10 +1,12 @@
 pub(crate) mod actor;
 pub(crate) mod codec;
 mod client;
+mod module;
 mod symbol;
 
 pub use actor::{OkxActor, OkxActorArgs};
 pub use client::OkxClient;
+pub use module::OkxModule;
 pub use symbol::{from_okx, to_okx};
 
 use base64::{engine::general_purpose, Engine as _};
