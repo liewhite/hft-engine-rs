@@ -1,9 +1,8 @@
 //! ClockActor - 定时广播时钟信号
 //!
-//! 每秒发送 Clock 事件给所有注册的 ExecutorActor
+//! 每秒通过 EventSink 发送 Clock 事件到 ProcessorActor，由其统一分发
 //! 同时负责查询不支持 WebSocket 推送 equity 的交易所 (如 Binance)
 
-use super::executor::ExecutorActor;
 use crate::domain::{now_ms, Exchange};
 use crate::exchange::{EventSink, ExchangeClient};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -33,10 +32,8 @@ pub struct ClockActor<S: EventSink> {
     interval: Duration,
     /// Binance client
     binance_client: Option<Arc<dyn ExchangeClient>>,
-    /// 事件接收器 (父 Actor)
+    /// 事件接收器 (发送到 ProcessorActor)
     event_sink: Arc<S>,
-    /// 已注册的 ExecutorActor 列表
-    executors: Vec<ActorRef<ExecutorActor>>,
 }
 
 impl<S: EventSink> ClockActor<S> {
@@ -46,7 +43,6 @@ impl<S: EventSink> ClockActor<S> {
             interval: Duration::from_millis(args.interval_ms),
             binance_client: args.binance_client,
             event_sink: args.event_sink,
-            executors: Vec::new(),
         }
     }
 
@@ -79,18 +75,14 @@ impl<S: EventSink> ClockActor<S> {
             }
         }
 
-        // 向所有 executor 发送 Clock 事件
-        let clock_event = IncomeEvent {
-            exchange_ts: local_ts,
-            local_ts,
-            data: ExchangeEventData::Clock,
-        };
-        for executor in &self.executors {
-            executor
-                .tell(clock_event.clone())
-                .await
-                .expect("Failed to tell ExecutorActor clock event");
-        }
+        // 通过 EventSink 发送 Clock 事件到 ProcessorActor，由其统一广播
+        self.event_sink
+            .send_event(IncomeEvent {
+                exchange_ts: local_ts,
+                local_ts,
+                data: ExchangeEventData::Clock,
+            })
+            .await;
     }
 }
 
@@ -121,19 +113,6 @@ impl<S: EventSink> Actor for ClockActor<S> {
 }
 
 // === Messages ===
-
-/// 注册 ExecutorActor
-pub struct RegisterExecutor {
-    pub executor: ActorRef<ExecutorActor>,
-}
-
-impl<S: EventSink> Message<RegisterExecutor> for ClockActor<S> {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: RegisterExecutor, _ctx: Context<'_, Self, Self::Reply>) {
-        self.executors.push(msg.executor);
-    }
-}
 
 /// Ticker stream 消息处理
 impl<S: EventSink> Message<StreamMessage<Instant, (), ()>> for ClockActor<S> {

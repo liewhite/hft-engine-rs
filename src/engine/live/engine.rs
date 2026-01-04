@@ -6,8 +6,8 @@
 //! - 子 Actor 失败时级联退出
 
 use super::{
-    ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, ProcessorActor, RegisterClockExecutor,
-    RegisterExecutor, SignalProcessorActor,
+    ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, ProcessorActor, RegisterExecutor,
+    SignalProcessorActor,
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{
@@ -354,6 +354,7 @@ impl ManagerActor {
             .insert(executor_ref.id(), ChildActorKind::Executor(executor_idx));
 
         // 6. 向 ProcessorActor 注册 Executor 的订阅
+        // Clock 事件由 ProcessorActor 统一广播，无需单独注册
         processor
             .tell(RegisterExecutor {
                 executor: executor_ref.clone(),
@@ -362,17 +363,9 @@ impl ManagerActor {
             .await
             .expect("Failed to register executor to ProcessorActor");
 
-        // 7. 向 ClockActor 注册 Executor（用于接收 Clock 事件）
-        self.clock_actor
-            .tell(RegisterClockExecutor {
-                executor: executor_ref.clone(),
-            })
-            .await
-            .expect("Failed to register executor to ClockActor");
-
         self.executors.push(executor_ref);
 
-        // 8. 向 ExchangeActors 发送订阅请求
+        // 7. 向 ExchangeActors 发送订阅请求
         for (exchange, kind) in subscriptions {
             if let Some(actor) = self.exchange_actors.get(&exchange) {
                 actor
