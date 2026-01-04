@@ -261,14 +261,20 @@ pub struct PositionLeverage {
 impl AssetPosition {
     pub fn to_position(&self) -> crate::domain::Position {
         let symbol = from_hyperliquid(&self.coin);
-        let size = f64::from_str(&self.szi).unwrap_or(0.0);
-        let entry_price = self.entry_px.as_ref()
+        let size = f64::from_str(&self.szi)
+            .expect("szi must be valid float from Hyperliquid API");
+        // entry_px 在空仓 (size=0) 时可能为 None，此时使用 0.0
+        let entry_price = self
+            .entry_px
+            .as_ref()
             .and_then(|p| f64::from_str(p).ok())
             .unwrap_or(0.0);
-        let unrealized_pnl = f64::from_str(&self.unrealized_pnl).unwrap_or(0.0);
+        let unrealized_pnl = f64::from_str(&self.unrealized_pnl)
+            .expect("unrealized_pnl must be valid float from Hyperliquid API");
+        // position_value = mark_price * |size| (USD 名义价值)
         let mark_price = if size.abs() > 1e-10 {
-            // 根据 position_value 和 size 反推 mark_price
-            let pos_value = f64::from_str(&self.position_value).unwrap_or(0.0);
+            let pos_value = f64::from_str(&self.position_value)
+                .expect("position_value must be valid float from Hyperliquid API");
             pos_value / size.abs()
         } else {
             0.0
@@ -312,10 +318,13 @@ pub struct WsBasicOrder {
 impl WsOrderUpdate {
     pub fn to_order_update(&self) -> crate::domain::OrderUpdate {
         let symbol = from_hyperliquid(&self.order.coin);
-        let orig_sz = f64::from_str(&self.order.orig_sz).unwrap_or(0.0);
-        let current_sz = f64::from_str(&self.order.sz).unwrap_or(0.0);
+        let orig_sz = f64::from_str(&self.order.orig_sz)
+            .expect("orig_sz must be valid float from Hyperliquid API");
+        let current_sz = f64::from_str(&self.order.sz)
+            .expect("sz must be valid float from Hyperliquid API");
         let filled_quantity = orig_sz - current_sz;
-        let avg_price = f64::from_str(&self.order.limit_px).ok();
+        let limit_px = f64::from_str(&self.order.limit_px)
+            .expect("limit_px must be valid float from Hyperliquid API");
 
         let status = map_hyperliquid_order_status(&self.status, filled_quantity);
 
@@ -326,7 +335,7 @@ impl WsOrderUpdate {
             symbol,
             status,
             filled_quantity,
-            avg_price,
+            avg_price: Some(limit_px),
             timestamp: self.status_timestamp,
         }
     }

@@ -339,30 +339,30 @@ fn parse_web_data3(data: &serde_json::Value, local_ts: u64) -> Result<Vec<Income
                 }
 
                 // 解析账户净值 (equity = accountValue)
-                if let Ok(equity) = f64::from_str(&state.cross_margin_summary.account_value) {
-                    events.push(IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::Equity {
-                            exchange: Exchange::Hyperliquid,
-                            equity,
-                        },
-                    });
-                }
+                let equity = f64::from_str(&state.cross_margin_summary.account_value)
+                    .expect("accountValue must be valid float from Hyperliquid API");
+                events.push(IncomeEvent {
+                    exchange_ts: local_ts,
+                    local_ts,
+                    data: ExchangeEventData::Equity {
+                        exchange: Exchange::Hyperliquid,
+                        equity,
+                    },
+                });
 
                 // 解析可用余额
-                if let Ok(withdrawable) = f64::from_str(&state.withdrawable) {
-                    events.push(IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::Balance(crate::domain::Balance {
-                            exchange: Exchange::Hyperliquid,
-                            asset: "USDC".to_string(),
-                            available: withdrawable,
-                            frozen: 0.0, // Hyperliquid 不直接提供 frozen，通过 marginUsed 计算
-                        }),
-                    });
-                }
+                let withdrawable = f64::from_str(&state.withdrawable)
+                    .expect("withdrawable must be valid float from Hyperliquid API");
+                events.push(IncomeEvent {
+                    exchange_ts: local_ts,
+                    local_ts,
+                    data: ExchangeEventData::Balance(crate::domain::Balance {
+                        exchange: Exchange::Hyperliquid,
+                        asset: "USDC".to_string(),
+                        available: withdrawable,
+                        frozen: 0.0, // Hyperliquid 不直接提供 frozen，通过 marginUsed 计算
+                    }),
+                });
             }
             Err(e) => {
                 tracing::warn!(error = %e, data = %ch_state, "Failed to parse clearinghouseState");
