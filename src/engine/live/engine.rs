@@ -13,7 +13,7 @@ use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient};
 use crate::exchange::hyperliquid::{HyperliquidActor, HyperliquidActorArgs, HyperliquidClient};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient};
-use crate::exchange::{EventSink, ExchangeClient, Subscribe, SubscriptionKind};
+use crate::exchange::{EventSink, ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
 use async_trait::async_trait;
@@ -70,12 +70,8 @@ pub struct ManagerActor {
     processor: Option<ActorRef<ProcessorActor>>,
     /// ClockActor (on_start 创建)
     clock_actor: Option<ActorRef<ClockActor<ProcessorEventSink>>>,
-    /// BinanceActor (按需创建)
-    binance_actor: Option<ActorRef<BinanceActor>>,
-    /// OkxActor (按需创建)
-    okx_actor: Option<ActorRef<OkxActor>>,
-    /// HyperliquidActor (按需创建)
-    hyperliquid_actor: Option<ActorRef<HyperliquidActor>>,
+    /// ExchangeActors (按需创建，类型擦除)
+    exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
     /// ExecutorActors (add_strategy 时创建)
     executors: Vec<ActorRef<ExecutorActor>>,
 
@@ -96,9 +92,7 @@ impl ManagerActor {
             signal_processor: None,
             processor: None,
             clock_actor: None,
-            binance_actor: None,
-            okx_actor: None,
-            hyperliquid_actor: None,
+            exchange_actors: HashMap::new(),
             executors: Vec::new(),
             actor_kinds: HashMap::new(),
             self_ref: None,
@@ -157,6 +151,17 @@ impl ManagerActor {
         Ok(())
     }
 
+    /// 提取指定交易所的 symbol metas
+    fn get_symbol_metas_for(&self, exchange: Exchange) -> Arc<HashMap<Symbol, SymbolMeta>> {
+        Arc::new(
+            self.symbol_metas
+                .iter()
+                .filter(|((e, _), _)| *e == exchange)
+                .map(|((_, s), m)| (s.clone(), m.clone()))
+                .collect(),
+        )
+    }
+
     /// 创建指定交易所的 Actor（无条件创建）
     async fn create_exchange_actor(
         &mut self,
@@ -167,93 +172,58 @@ impl ManagerActor {
             ExchangeError::Other("ProcessorActor not initialized".to_string())
         })?;
 
-        // 创建 ProcessorEventSink（实现 EventSink，发送到 ProcessorActor）
         let event_sink: Arc<dyn EventSink> = Arc::new(ProcessorEventSink {
             processor: processor.clone(),
         });
 
-        match exchange {
+        let symbol_metas = self.get_symbol_metas_for(exchange);
+
+        // 创建 Actor 并转换为 Box<dyn ExchangeActorOps>
+        let (actor_id, boxed_actor): (ActorID, Box<dyn ExchangeActorOps>) = match exchange {
             Exchange::Binance => {
                 let client = self.binance_client.as_ref().ok_or_else(|| {
                     ExchangeError::Other("Binance client not configured".to_string())
                 })?;
-
-                // 提取该交易所的 symbol metas
-                let symbol_metas: HashMap<Symbol, SymbolMeta> = self
-                    .symbol_metas
-                    .iter()
-                    .filter(|((e, _), _)| *e == Exchange::Binance)
-                    .map(|((_, s), m)| (s.clone(), m.clone()))
-                    .collect();
-
                 let actor = BinanceActor::new(BinanceActorArgs {
                     credentials: client.credentials().cloned(),
-                    symbol_metas: Arc::new(symbol_metas),
+                    symbol_metas,
                     event_sink,
                     rest_base_url: client.rest_base_url().to_string(),
                 });
-
-                let binance_ref = spawn_link(actor_ref, actor).await;
-                self.actor_kinds
-                    .insert(binance_ref.id(), ChildActorKind::Exchange(Exchange::Binance));
-                self.binance_actor = Some(binance_ref);
-
-                tracing::info!("BinanceActor created");
+                let actor_ref = spawn_link(actor_ref, actor).await;
+                (actor_ref.id(), Box::new(actor_ref))
             }
             Exchange::OKX => {
                 let client = self.okx_client.as_ref().ok_or_else(|| {
                     ExchangeError::Other("OKX client not configured".to_string())
                 })?;
-
-                // 提取该交易所的 symbol metas
-                let symbol_metas: HashMap<Symbol, SymbolMeta> = self
-                    .symbol_metas
-                    .iter()
-                    .filter(|((e, _), _)| *e == Exchange::OKX)
-                    .map(|((_, s), m)| (s.clone(), m.clone()))
-                    .collect();
-
                 let actor = OkxActor::new(OkxActorArgs {
                     credentials: client.credentials().cloned(),
-                    symbol_metas: Arc::new(symbol_metas),
+                    symbol_metas,
                     event_sink,
                 });
-
-                let okx_ref = spawn_link(actor_ref, actor).await;
-                self.actor_kinds
-                    .insert(okx_ref.id(), ChildActorKind::Exchange(Exchange::OKX));
-                self.okx_actor = Some(okx_ref);
-
-                tracing::info!("OkxActor created");
+                let actor_ref = spawn_link(actor_ref, actor).await;
+                (actor_ref.id(), Box::new(actor_ref))
             }
             Exchange::Hyperliquid => {
                 let client = self.hyperliquid_client.as_ref().ok_or_else(|| {
                     ExchangeError::Other("Hyperliquid client not configured".to_string())
                 })?;
-
-                // 提取该交易所的 symbol metas
-                let symbol_metas: HashMap<Symbol, SymbolMeta> = self
-                    .symbol_metas
-                    .iter()
-                    .filter(|((e, _), _)| *e == Exchange::Hyperliquid)
-                    .map(|((_, s), m)| (s.clone(), m.clone()))
-                    .collect();
-
                 let actor = HyperliquidActor::new(HyperliquidActorArgs {
                     credentials: client.credentials().cloned(),
-                    symbol_metas: Arc::new(symbol_metas),
+                    symbol_metas,
                     event_sink,
                 });
-
-                let hyperliquid_ref = spawn_link(actor_ref, actor).await;
-                self.actor_kinds
-                    .insert(hyperliquid_ref.id(), ChildActorKind::Exchange(Exchange::Hyperliquid));
-                self.hyperliquid_actor = Some(hyperliquid_ref);
-
-                tracing::info!("HyperliquidActor created");
+                let actor_ref = spawn_link(actor_ref, actor).await;
+                (actor_ref.id(), Box::new(actor_ref))
             }
-        }
+        };
 
+        self.actor_kinds
+            .insert(actor_id, ChildActorKind::Exchange(exchange));
+        self.exchange_actors.insert(exchange, boxed_actor);
+
+        tracing::info!(%exchange, "ExchangeActor created");
         Ok(())
     }
 
@@ -263,16 +233,9 @@ impl ManagerActor {
         exchange: Exchange,
         actor_ref: &ActorRef<Self>,
     ) -> Result<(), ExchangeError> {
-        let exists = match exchange {
-            Exchange::Binance => self.binance_actor.is_some(),
-            Exchange::OKX => self.okx_actor.is_some(),
-            Exchange::Hyperliquid => self.hyperliquid_actor.is_some(),
-        };
-
-        if !exists {
+        if !self.exchange_actors.contains_key(&exchange) {
             self.create_exchange_actor(exchange, actor_ref).await?;
         }
-
         Ok(())
     }
 
@@ -343,31 +306,11 @@ impl ManagerActor {
 
         // 8. 向 ExchangeActors 发送订阅请求
         for (exchange, kind) in subscriptions {
-            match exchange {
-                Exchange::Binance => {
-                    if let Some(actor) = &self.binance_actor {
-                        actor
-                            .tell(Subscribe { kind })
-                            .await
-                            .expect("Failed to subscribe to BinanceActor");
-                    }
-                }
-                Exchange::OKX => {
-                    if let Some(actor) = &self.okx_actor {
-                        actor
-                            .tell(Subscribe { kind })
-                            .await
-                            .expect("Failed to subscribe to OkxActor");
-                    }
-                }
-                Exchange::Hyperliquid => {
-                    if let Some(actor) = &self.hyperliquid_actor {
-                        actor
-                            .tell(Subscribe { kind })
-                            .await
-                            .expect("Failed to subscribe to HyperliquidActor");
-                    }
-                }
+            if let Some(actor) = self.exchange_actors.get(&exchange) {
+                actor
+                    .subscribe(kind)
+                    .await
+                    .expect("Failed to subscribe to ExchangeActor");
             }
         }
 
@@ -467,15 +410,11 @@ impl Actor for ManagerActor {
         match kind {
             Some(ChildActorKind::Exchange(exchange)) => {
                 tracing::error!(
-                    exchange = %exchange,
+                    %exchange,
                     reason = ?reason,
                     "ExchangeActor died, shutting down"
                 );
-                match exchange {
-                    Exchange::Binance => self.binance_actor = None,
-                    Exchange::OKX => self.okx_actor = None,
-                    Exchange::Hyperliquid => self.hyperliquid_actor = None,
-                }
+                self.exchange_actors.remove(&exchange);
                 Ok(Some(ActorStopReason::LinkDied {
                     id,
                     reason: Box::new(reason),

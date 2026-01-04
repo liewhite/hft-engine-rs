@@ -110,3 +110,43 @@ pub enum WsError {
     #[error("Parse error: {0}")]
     ParseError(String),
 }
+
+// ============================================================================
+// ExchangeActorOps trait (类型擦除的 Actor 操作接口)
+// ============================================================================
+
+/// 交易所 Actor 操作接口
+///
+/// 用于类型擦除，使 ManagerActor 可以用 `HashMap<Exchange, Box<dyn ExchangeActorOps>>`
+/// 统一管理不同类型的交易所 Actor
+#[async_trait]
+pub trait ExchangeActorOps: Send + Sync {
+    /// 订阅
+    async fn subscribe(&self, kind: SubscriptionKind) -> Result<(), String>;
+    /// 取消订阅
+    async fn unsubscribe(&self, kind: SubscriptionKind) -> Result<(), String>;
+}
+
+/// 为 ActorRef<A> 实现 ExchangeActorOps 的宏
+///
+/// 要求 A 实现 `Message<Subscribe, Reply = ()>` 和 `Message<Unsubscribe, Reply = ()>`
+#[macro_export]
+macro_rules! impl_exchange_actor_ops {
+    ($($actor:ty),*) => {
+        $(
+            #[async_trait::async_trait]
+            impl $crate::exchange::ExchangeActorOps for kameo::actor::ActorRef<$actor> {
+                async fn subscribe(&self, kind: $crate::exchange::SubscriptionKind) -> Result<(), String> {
+                    self.tell($crate::exchange::Subscribe { kind })
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                async fn unsubscribe(&self, kind: $crate::exchange::SubscriptionKind) -> Result<(), String> {
+                    self.tell($crate::exchange::Unsubscribe { kind })
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
+        )*
+    };
+}
