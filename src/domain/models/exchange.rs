@@ -6,6 +6,7 @@ use std::fmt;
 pub enum Exchange {
     Binance,
     OKX,
+    Hyperliquid,
 }
 
 impl fmt::Display for Exchange {
@@ -13,6 +14,7 @@ impl fmt::Display for Exchange {
         match self {
             Exchange::Binance => write!(f, "Binance"),
             Exchange::OKX => write!(f, "OKX"),
+            Exchange::Hyperliquid => write!(f, "Hyperliquid"),
         }
     }
 }

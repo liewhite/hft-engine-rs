@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs {
         binance_client: Some(binance_client),
         okx_client: Some(okx_client),
+        hyperliquid_client: None, // 暂未配置
     }));
 
     // Add strategies (this will automatically create ExchangeActors as needed)

@@ -72,6 +72,22 @@ impl Symbol {
             None
         }
     }
+
+    /// 转换为 Hyperliquid 格式 (e.g., "BTC")
+    /// Hyperliquid 永续合约使用币种名，默认 USDC 结算
+    pub fn to_hyperliquid(&self) -> String {
+        self.base.clone()
+    }
+
+    /// 从 Hyperliquid 格式解析
+    /// coin: 币种名 (e.g., "BTC", "ETH")
+    /// Hyperliquid 永续合约默认 USDC 结算
+    pub fn from_hyperliquid(coin: &str) -> Self {
+        Symbol {
+            base: coin.to_string(),
+            quote: "USDC".to_string(),
+        }
+    }
 }
 
 impl fmt::Display for Symbol {
