@@ -145,30 +145,6 @@ impl WsActiveAssetCtx {
         }
     }
 
-    /// 转换为 BBO (从 impact_pxs 提取)
-    /// 注意: impact_pxs 是冲击价格，不是真实 BBO，数量为 0
-    pub fn to_bbo(&self) -> Option<BBO> {
-        let impact_pxs = self.ctx.impact_pxs.as_ref()?;
-        if impact_pxs.len() < 2 {
-            return None;
-        }
-
-        let symbol = from_hyperliquid(&self.coin);
-        let bid_price = f64::from_str(&impact_pxs[0])
-            .expect("impact bid price must be valid float from Hyperliquid API");
-        let ask_price = f64::from_str(&impact_pxs[1])
-            .expect("impact ask price must be valid float from Hyperliquid API");
-
-        Some(BBO {
-            exchange: Exchange::Hyperliquid,
-            symbol,
-            bid_price,
-            bid_qty: 0.0, // impact price 不包含数量
-            ask_price,
-            ask_qty: 0.0,
-            timestamp: now_ms(),
-        })
-    }
 }
 
 // ============================================================================

@@ -250,16 +250,6 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
                             local_ts,
                             data: ExchangeEventData::FundingRate(rate),
                         });
-
-                        // 如果有 impact_pxs，也生成 BBO 事件
-                        if let Some(bbo) = ctx.to_bbo() {
-                            events.push(IncomeEvent {
-                                exchange_ts: local_ts,
-                                local_ts,
-                                data: ExchangeEventData::BBO(bbo),
-                            });
-                        }
-
                         return Ok(events);
                     }
                     Err(e) => {
