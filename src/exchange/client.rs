@@ -96,20 +96,6 @@ pub struct Unsubscribe {
     pub kind: SubscriptionKind,
 }
 
-/// 设置事件接收器消息
-///
-/// 用于延迟注入 EventSink，使 ExchangeActor 可以在 main 中提前创建
-pub struct SetEventSink {
-    pub event_sink: Arc<dyn EventSink>,
-}
-
-/// 设置 Symbol 元数据消息
-///
-/// 用于延迟注入 SymbolMetas（ManagerActor preload 后发送）
-pub struct SetSymbolMetas {
-    pub symbol_metas: Arc<std::collections::HashMap<crate::domain::Symbol, crate::domain::SymbolMeta>>,
-}
-
 /// WebSocket 错误
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum WsError {
@@ -153,13 +139,6 @@ pub trait ExchangeModule: Send + Sync {
 pub trait ExchangeActorOps: Send + Sync {
     /// 获取 Actor ID（用于建立 link）
     fn actor_id(&self) -> kameo::actor::ActorID;
-    /// 设置事件接收器（延迟注入）
-    async fn set_event_sink(&self, event_sink: Arc<dyn EventSink>) -> Result<(), String>;
-    /// 设置 Symbol 元数据（延迟注入）
-    async fn set_symbol_metas(
-        &self,
-        symbol_metas: Arc<std::collections::HashMap<crate::domain::Symbol, crate::domain::SymbolMeta>>,
-    ) -> Result<(), String>;
     /// 订阅
     async fn subscribe(&self, kind: SubscriptionKind) -> Result<(), String>;
     /// 取消订阅
@@ -168,7 +147,7 @@ pub trait ExchangeActorOps: Send + Sync {
 
 /// 为 ActorRef<A> 实现 ExchangeActorOps 的宏
 ///
-/// 要求 A 实现 `Message<SetEventSink>`, `Message<SetSymbolMetas>`, `Message<Subscribe>`, `Message<Unsubscribe>`
+/// 要求 A 实现 `Message<Subscribe>`, `Message<Unsubscribe>`
 #[macro_export]
 macro_rules! impl_exchange_actor_ops {
     ($($actor:ty),*) => {
@@ -177,22 +156,6 @@ macro_rules! impl_exchange_actor_ops {
             impl $crate::exchange::ExchangeActorOps for kameo::actor::ActorRef<$actor> {
                 fn actor_id(&self) -> kameo::actor::ActorID {
                     self.id()
-                }
-                async fn set_event_sink(
-                    &self,
-                    event_sink: std::sync::Arc<dyn $crate::exchange::EventSink>,
-                ) -> Result<(), String> {
-                    self.tell($crate::exchange::SetEventSink { event_sink })
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-                async fn set_symbol_metas(
-                    &self,
-                    symbol_metas: std::sync::Arc<std::collections::HashMap<$crate::domain::Symbol, $crate::domain::SymbolMeta>>,
-                ) -> Result<(), String> {
-                    self.tell($crate::exchange::SetSymbolMetas { symbol_metas })
-                        .await
-                        .map_err(|e| e.to_string())
                 }
                 async fn subscribe(&self, kind: $crate::exchange::SubscriptionKind) -> Result<(), String> {
                     self.tell($crate::exchange::Subscribe { kind })

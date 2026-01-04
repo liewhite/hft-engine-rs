@@ -19,7 +19,7 @@ use crate::exchange::binance::codec::{
     AccountUpdate, BookTicker, MarkPriceUpdate, OrderTradeUpdate, WsResponse,
 };
 use crate::exchange::binance::BinanceCredentials;
-use crate::exchange::client::{EventSink, SetEventSink, SetSymbolMetas, Subscribe, Unsubscribe, WsError};
+use crate::exchange::client::{EventSink, Subscribe, Unsubscribe, WsError};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -202,32 +202,6 @@ impl Actor for BinanceActor {
 // ============================================================================
 // 消息处理
 // ============================================================================
-
-impl Message<SetEventSink> for BinanceActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: SetEventSink,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.event_sink = msg.event_sink;
-        tracing::debug!(exchange = "Binance", "EventSink set");
-    }
-}
-
-impl Message<SetSymbolMetas> for BinanceActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: SetSymbolMetas,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.symbol_metas = msg.symbol_metas;
-        tracing::debug!(exchange = "Binance", "SymbolMetas set");
-    }
-}
 
 impl Message<Subscribe> for BinanceActor {
     type Reply = ();
