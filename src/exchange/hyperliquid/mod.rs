@@ -1,6 +1,7 @@
 pub(crate) mod actor;
 pub(crate) mod codec;
 mod client;
+pub(crate) mod signing;
 
 pub use actor::{HyperliquidActor, HyperliquidActorArgs};
 pub use client::HyperliquidClient;
