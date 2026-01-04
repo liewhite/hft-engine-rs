@@ -7,15 +7,15 @@
 //! - 将解析后的事件发送到 EventSink
 //!
 //! 架构:
-//! HyperliquidActor
-//! ├── HyperliquidPublicWsActor [spawn_link]
-//! └── HyperliquidPrivateWsActor [spawn_link] (可选，需要wallet_address)
+//! HyperliquidActor (0 spawn)
+//! ├── HyperliquidPublicWsActor [spawn_link] (懒创建)
+//! └── HyperliquidPrivateWsActor [spawn_link] (懒创建, optional)
 
 use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs};
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
 use super::WsData;
 use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, Subscribe, Unsubscribe, WsError};
+use crate::exchange::client::{EventSink, SetEventSink, Subscribe, Unsubscribe, WsError};
 use crate::exchange::hyperliquid::codec::{
     ClearinghouseState, WsActiveAssetCtx, WsBbo, WsOrderUpdate,
 };
@@ -43,8 +43,6 @@ pub struct HyperliquidActorArgs {
     pub credentials: Option<HyperliquidCredentials>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 事件接收器
-    pub event_sink: Arc<dyn EventSink>,
 }
 
 /// HyperliquidActor - 父 Actor
@@ -54,10 +52,13 @@ pub struct HyperliquidActor {
     /// Symbol 元数据
     #[allow(dead_code)]
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 事件接收器
-    event_sink: Arc<dyn EventSink>,
+    /// 事件接收器（延迟注入）
+    event_sink: Option<Arc<dyn EventSink>>,
 
-    // 子 Actors
+    /// 自身引用（用于懒创建子 Actor）
+    self_ref: Option<ActorRef<Self>>,
+
+    // 子 Actors (懒创建)
     /// Public WebSocket Actor
     public_ws: Option<ActorRef<HyperliquidPublicWsActor>>,
     /// Private WebSocket Actor (账户订阅)
@@ -72,11 +73,63 @@ impl HyperliquidActor {
         Self {
             credentials: args.credentials,
             symbol_metas: args.symbol_metas,
-            event_sink: args.event_sink,
+            event_sink: None,
+            self_ref: None,
             public_ws: None,
             private_ws: None,
             child_actors: HashMap::new(),
         }
+    }
+
+    /// 确保 PublicWsActor 存在（懒创建）
+    async fn ensure_public_ws(&mut self) {
+        if self.public_ws.is_some() {
+            return;
+        }
+
+        let actor_ref = self
+            .self_ref
+            .as_ref()
+            .expect("self_ref must be set in on_start");
+
+        let public_ws = spawn_link(
+            actor_ref,
+            HyperliquidPublicWsActor::new(HyperliquidPublicWsActorArgs {
+                parent: actor_ref.downgrade(),
+            }),
+        )
+        .await;
+        self.child_actors.insert(public_ws.id(), ChildKind::PublicWs);
+        self.public_ws = Some(public_ws);
+
+        tracing::info!(exchange = "Hyperliquid", "PublicWsActor created (lazy)");
+    }
+
+    /// 确保 PrivateWsActor 存在（懒创建，需要凭证）
+    async fn ensure_private_ws(&mut self) {
+        if self.private_ws.is_some() || self.credentials.is_none() {
+            return;
+        }
+
+        let actor_ref = self
+            .self_ref
+            .as_ref()
+            .expect("self_ref must be set in on_start");
+        let credentials = self.credentials.as_ref().unwrap();
+
+        let private_ws = spawn_link(
+            actor_ref,
+            HyperliquidPrivateWsActor::new(HyperliquidPrivateWsActorArgs {
+                parent: actor_ref.downgrade(),
+                wallet_address: credentials.wallet_address.clone(),
+            }),
+        )
+        .await;
+        self.child_actors
+            .insert(private_ws.id(), ChildKind::PrivateWs);
+        self.private_ws = Some(private_ws);
+
+        tracing::info!(exchange = "Hyperliquid", "PrivateWsActor created (lazy)");
     }
 }
 
@@ -88,44 +141,14 @@ impl Actor for HyperliquidActor {
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        let weak_ref = actor_ref.downgrade();
+        // 只保存引用，不创建 WebSocket（等待 Subscribe 时懒创建）
+        self.self_ref = Some(actor_ref);
 
-        // spawn_link PublicWsActor
-        let public_ws = spawn_link(
-            &actor_ref,
-            HyperliquidPublicWsActor::new(HyperliquidPublicWsActorArgs {
-                parent: weak_ref.clone(),
-            }),
-        )
-        .await;
-        self.child_actors.insert(public_ws.id(), ChildKind::PublicWs);
-        self.public_ws = Some(public_ws);
-
-        // spawn_link PrivateWsActor (如果有 credentials)
-        if let Some(ref creds) = self.credentials {
-            let private_ws = spawn_link(
-                &actor_ref,
-                HyperliquidPrivateWsActor::new(HyperliquidPrivateWsActorArgs {
-                    parent: weak_ref,
-                    wallet_address: creds.wallet_address.clone(),
-                }),
-            )
-            .await;
-            self.child_actors
-                .insert(private_ws.id(), ChildKind::PrivateWs);
-            self.private_ws = Some(private_ws);
-
-            tracing::info!(
-                exchange = "Hyperliquid",
-                wallet = %creds.wallet_address,
-                "HyperliquidActor started with private subscription"
-            );
-        } else {
-            tracing::info!(
-                exchange = "Hyperliquid",
-                "HyperliquidActor started (public only, no credentials)"
-            );
-        }
+        tracing::info!(
+            exchange = "Hyperliquid",
+            has_credentials = self.credentials.is_some(),
+            "HyperliquidActor started (WebSocket will be created on first subscribe)"
+        );
 
         Ok(())
     }
@@ -174,16 +197,33 @@ impl Actor for HyperliquidActor {
 // 消息处理
 // ============================================================================
 
+impl Message<SetEventSink> for HyperliquidActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SetEventSink,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.event_sink = Some(msg.event_sink);
+        tracing::debug!(exchange = "Hyperliquid", "EventSink set");
+    }
+}
+
 impl Message<Subscribe> for HyperliquidActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: Subscribe, ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+    async fn handle(&mut self, msg: Subscribe, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+        // 懒创建 WebSocket actors
+        self.ensure_public_ws().await;
+        self.ensure_private_ws().await;
+
         // 转发给 PublicWsActor
         if let Some(ref public_ws) = self.public_ws {
-            if let Err(e) = public_ws.tell(msg).await {
-                tracing::error!(error = %e, "Failed to forward Subscribe, killing actor");
-                ctx.actor_ref().kill();
-            }
+            public_ws
+                .tell(msg)
+                .await
+                .expect("Failed to forward Subscribe to PublicWsActor");
         }
     }
 }
@@ -194,14 +234,14 @@ impl Message<Unsubscribe> for HyperliquidActor {
     async fn handle(
         &mut self,
         msg: Unsubscribe,
-        ctx: Context<'_, Self, Self::Reply>,
+        _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor
         if let Some(ref public_ws) = self.public_ws {
-            if let Err(e) = public_ws.tell(msg).await {
-                tracing::error!(error = %e, "Failed to forward Unsubscribe, killing actor");
-                ctx.actor_ref().kill();
-            }
+            public_ws
+                .tell(msg)
+                .await
+                .expect("Failed to forward Unsubscribe to PublicWsActor");
         }
     }
 }
@@ -210,11 +250,19 @@ impl Message<WsData> for HyperliquidActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+        let event_sink = match &self.event_sink {
+            Some(sink) => sink,
+            None => {
+                tracing::warn!("Received WsData but EventSink not set, dropping");
+                return;
+            }
+        };
+
         let local_ts = now_ms();
         match parse_message(&msg.data, local_ts) {
             Ok(events) => {
                 for event in events {
-                    self.event_sink.send_event(event).await;
+                    event_sink.send_event(event).await;
                 }
             }
             Err(e) => {

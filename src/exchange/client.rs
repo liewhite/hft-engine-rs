@@ -96,6 +96,13 @@ pub struct Unsubscribe {
     pub kind: SubscriptionKind,
 }
 
+/// 设置事件接收器消息
+///
+/// 用于延迟注入 EventSink，使 ExchangeActor 可以在 main 中提前创建
+pub struct SetEventSink {
+    pub event_sink: Arc<dyn EventSink>,
+}
+
 /// WebSocket 错误
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum WsError {
@@ -137,6 +144,8 @@ pub trait ExchangeModule: Send + Sync {
 /// 统一管理不同类型的交易所 Actor
 #[async_trait]
 pub trait ExchangeActorOps: Send + Sync {
+    /// 设置事件接收器（延迟注入）
+    async fn set_event_sink(&self, event_sink: Arc<dyn EventSink>) -> Result<(), String>;
     /// 订阅
     async fn subscribe(&self, kind: SubscriptionKind) -> Result<(), String>;
     /// 取消订阅
@@ -145,13 +154,21 @@ pub trait ExchangeActorOps: Send + Sync {
 
 /// 为 ActorRef<A> 实现 ExchangeActorOps 的宏
 ///
-/// 要求 A 实现 `Message<Subscribe, Reply = ()>` 和 `Message<Unsubscribe, Reply = ()>`
+/// 要求 A 实现 `Message<SetEventSink>`, `Message<Subscribe>`, `Message<Unsubscribe>`
 #[macro_export]
 macro_rules! impl_exchange_actor_ops {
     ($($actor:ty),*) => {
         $(
             #[async_trait::async_trait]
             impl $crate::exchange::ExchangeActorOps for kameo::actor::ActorRef<$actor> {
+                async fn set_event_sink(
+                    &self,
+                    event_sink: std::sync::Arc<dyn $crate::exchange::EventSink>,
+                ) -> Result<(), String> {
+                    self.tell($crate::exchange::SetEventSink { event_sink })
+                        .await
+                        .map_err(|e| e.to_string())
+                }
                 async fn subscribe(&self, kind: $crate::exchange::SubscriptionKind) -> Result<(), String> {
                     self.tell($crate::exchange::Subscribe { kind })
                         .await

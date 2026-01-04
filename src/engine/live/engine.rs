@@ -10,7 +10,7 @@ use super::{
     RegisterExecutor, SignalProcessorActor,
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::{AnyModule, EventSink, ExchangeActorOps, ExchangeClient, SubscriptionKind};
+use crate::exchange::{EventSink, ExchangeActorOps, ExchangeClient, ExchangeModule, SubscriptionKind};
 use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
 use async_trait::async_trait;
@@ -29,7 +29,6 @@ use std::sync::Arc;
 /// 子 Actor 类型（用于 on_link_died 中识别）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildActorKind {
-    Exchange(Exchange),
     Executor(usize),
     SignalProcessor,
     Processor,
@@ -42,14 +41,16 @@ enum ChildActorKind {
 
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
-    /// 交易所模块列表
-    pub modules: Vec<AnyModule>,
+    /// 交易所模块列表（用于 REST 客户端访问）
+    pub modules: Vec<Arc<dyn ExchangeModule>>,
+    /// 预创建的 ExchangeActors（main.rs 中 spawn）
+    pub exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
 }
 
 /// ManagerActor - 顶层管理 Actor
 pub struct ManagerActor {
     // === Exchange Modules ===
-    modules: HashMap<Exchange, AnyModule>,
+    modules: HashMap<Exchange, Arc<dyn ExchangeModule>>,
 
     // === Symbol Metas 缓存 ===
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
@@ -61,7 +62,7 @@ pub struct ManagerActor {
     processor: Option<ActorRef<ProcessorActor>>,
     /// ClockActor (on_start 创建)
     clock_actor: Option<ActorRef<ClockActor<ProcessorEventSink>>>,
-    /// ExchangeActors (按需创建，类型擦除)
+    /// ExchangeActors (预创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
     /// ExecutorActors (add_strategy 时创建)
     executors: Vec<ActorRef<ExecutorActor>>,
@@ -87,7 +88,7 @@ impl ManagerActor {
             signal_processor: None,
             processor: None,
             clock_actor: None,
-            exchange_actors: HashMap::new(),
+            exchange_actors: args.exchange_actors,
             executors: Vec::new(),
             actor_kinds: HashMap::new(),
             self_ref: None,
@@ -132,61 +133,13 @@ impl ManagerActor {
         Ok(())
     }
 
-    /// 提取指定交易所的 symbol metas
-    fn get_symbol_metas_for(&self, exchange: Exchange) -> Arc<HashMap<Symbol, SymbolMeta>> {
-        Arc::new(
-            self.symbol_metas
-                .iter()
-                .filter(|((e, _), _)| *e == exchange)
-                .map(|((_, s), m)| (s.clone(), m.clone()))
-                .collect(),
-        )
-    }
-
-    /// 创建指定交易所的 Actor（无条件创建）
-    async fn create_exchange_actor(
-        &mut self,
-        exchange: Exchange,
-        actor_ref: &ActorRef<Self>,
-    ) -> Result<(), ExchangeError> {
-        let processor = self.processor.as_ref().ok_or_else(|| {
-            ExchangeError::Other("ProcessorActor not initialized".to_string())
-        })?;
-
-        let event_sink: Arc<dyn EventSink> = Arc::new(ProcessorEventSink {
-            processor: processor.clone(),
-        });
-
-        let symbol_metas = self.get_symbol_metas_for(exchange);
-
-        // 获取对应的 module
-        let module = self.modules.get(&exchange).ok_or_else(|| {
-            ExchangeError::Other(format!("{} module not configured", exchange))
-        })?;
-
-        // 使用 module 创建 Actor
-        let (actor_id, boxed_actor) = module
-            .spawn_actor(actor_ref, symbol_metas, event_sink)
-            .await;
-
-        self.actor_kinds
-            .insert(actor_id, ChildActorKind::Exchange(exchange));
-        self.exchange_actors.insert(exchange, boxed_actor);
-
-        tracing::info!(%exchange, "ExchangeActor created");
-        Ok(())
-    }
-
-    /// 确保 ExchangeActor 存在（如不存在则创建）
-    async fn ensure_exchange_actor(
-        &mut self,
-        exchange: Exchange,
-        actor_ref: &ActorRef<Self>,
-    ) -> Result<(), ExchangeError> {
-        if !self.exchange_actors.contains_key(&exchange) {
-            self.create_exchange_actor(exchange, actor_ref).await?;
+    /// 向所有 ExchangeActors 发送 EventSink
+    async fn set_event_sink_to_all(&self, event_sink: Arc<dyn EventSink>) {
+        for (exchange, actor) in &self.exchange_actors {
+            if let Err(e) = actor.set_event_sink(event_sink.clone()).await {
+                tracing::error!(%exchange, error = %e, "Failed to set EventSink to ExchangeActor");
+            }
         }
-        Ok(())
     }
 
     /// 添加策略的内部实现
@@ -209,9 +162,14 @@ impl ManagerActor {
         // 2. 获取策略需要的 public streams
         let public_streams = strategy.public_streams();
 
-        // 3. 启动缺失的 ExchangeActors
+        // 3. 检查所需的 ExchangeActors 是否已注册
         for exchange in public_streams.keys() {
-            self.ensure_exchange_actor(*exchange, &actor_ref).await?;
+            if !self.exchange_actors.contains_key(exchange) {
+                return Err(ExchangeError::Other(format!(
+                    "{} ExchangeActor not registered",
+                    exchange
+                )));
+            }
         }
 
         // 4. 收集策略需要的订阅
@@ -297,7 +255,10 @@ impl Actor for ManagerActor {
             processor: processor.clone(),
         });
 
-        // 3. 创建 SignalProcessorActor
+        // 3. 向所有预注册的 ExchangeActors 发送 EventSink
+        self.set_event_sink_to_all(event_sink.clone()).await;
+
+        // 4. 创建 SignalProcessorActor
         let signal_processor = spawn_link(
             &actor_ref,
             SignalProcessorActor::new(super::SignalProcessorArgs {
@@ -310,7 +271,7 @@ impl Actor for ManagerActor {
             .insert(signal_processor.id(), ChildActorKind::SignalProcessor);
         self.signal_processor = Some(signal_processor);
 
-        // 4. 创建 ClockActor（使用具体类型 ProcessorEventSink）
+        // 5. 创建 ClockActor（使用具体类型 ProcessorEventSink）
         let clock_event_sink = Arc::new(ProcessorEventSink {
             processor: processor.clone(),
         });
@@ -354,18 +315,6 @@ impl Actor for ManagerActor {
         let kind = self.actor_kinds.remove(&id);
 
         match kind {
-            Some(ChildActorKind::Exchange(exchange)) => {
-                tracing::error!(
-                    %exchange,
-                    reason = ?reason,
-                    "ExchangeActor died, shutting down"
-                );
-                self.exchange_actors.remove(&exchange);
-                Ok(Some(ActorStopReason::LinkDied {
-                    id,
-                    reason: Box::new(reason),
-                }))
-            }
             Some(ChildActorKind::Executor(idx)) => {
                 tracing::error!(
                     executor_idx = idx,

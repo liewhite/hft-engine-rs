@@ -8,13 +8,13 @@
 //!
 //! 架构:
 //! OkxActor (0 spawn)
-//! ├── OkxPublicWsActor [spawn_link]
-//! └── OkxPrivateWsActor [spawn_link] (optional)
+//! ├── OkxPublicWsActor [spawn_link] (懒创建)
+//! └── OkxPrivateWsActor [spawn_link] (懒创建, optional)
 
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
 use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, Subscribe, Unsubscribe, WsError};
+use crate::exchange::client::{EventSink, SetEventSink, Subscribe, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsPush,
 };
@@ -41,8 +41,6 @@ pub struct OkxActorArgs {
     pub credentials: Option<OkxCredentials>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 事件接收器
-    pub event_sink: Arc<dyn EventSink>,
 }
 
 /// OkxActor - 父 Actor
@@ -51,10 +49,13 @@ pub struct OkxActor {
     credentials: Option<OkxCredentials>,
     /// Symbol 元数据
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 事件接收器
-    event_sink: Arc<dyn EventSink>,
+    /// 事件接收器（延迟注入）
+    event_sink: Option<Arc<dyn EventSink>>,
 
-    // 子 Actors
+    /// 自身引用（用于懒创建子 Actor）
+    self_ref: Option<ActorRef<Self>>,
+
+    // 子 Actors (懒创建)
     /// Public WebSocket Actor
     public_ws: Option<ActorRef<OkxPublicWsActor>>,
     /// Private WebSocket Actor
@@ -69,11 +70,63 @@ impl OkxActor {
         Self {
             credentials: args.credentials,
             symbol_metas: args.symbol_metas,
-            event_sink: args.event_sink,
+            event_sink: None,
+            self_ref: None,
             public_ws: None,
             private_ws: None,
             child_actors: HashMap::new(),
         }
+    }
+
+    /// 确保 PublicWsActor 存在（懒创建）
+    async fn ensure_public_ws(&mut self) {
+        if self.public_ws.is_some() {
+            return;
+        }
+
+        let actor_ref = self
+            .self_ref
+            .as_ref()
+            .expect("self_ref must be set in on_start");
+
+        let public_ws = spawn_link(
+            actor_ref,
+            OkxPublicWsActor::new(OkxPublicWsActorArgs {
+                parent: actor_ref.downgrade(),
+            }),
+        )
+        .await;
+        self.child_actors.insert(public_ws.id(), ChildKind::PublicWs);
+        self.public_ws = Some(public_ws);
+
+        tracing::info!(exchange = "OKX", "PublicWsActor created (lazy)");
+    }
+
+    /// 确保 PrivateWsActor 存在（懒创建，需要凭证）
+    async fn ensure_private_ws(&mut self) {
+        if self.private_ws.is_some() || self.credentials.is_none() {
+            return;
+        }
+
+        let actor_ref = self
+            .self_ref
+            .as_ref()
+            .expect("self_ref must be set in on_start");
+        let credentials = self.credentials.as_ref().unwrap();
+
+        let private_ws = spawn_link(
+            actor_ref,
+            OkxPrivateWsActor::new(OkxPrivateWsActorArgs {
+                parent: actor_ref.downgrade(),
+                credentials: credentials.clone(),
+            }),
+        )
+        .await;
+        self.child_actors
+            .insert(private_ws.id(), ChildKind::PrivateWs);
+        self.private_ws = Some(private_ws);
+
+        tracing::info!(exchange = "OKX", "PrivateWsActor created (lazy)");
     }
 }
 
@@ -85,38 +138,13 @@ impl Actor for OkxActor {
     }
 
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        let weak_ref = actor_ref.downgrade();
-
-        // 1. spawn_link PublicWsActor
-        let public_ws = spawn_link(
-            &actor_ref,
-            OkxPublicWsActor::new(OkxPublicWsActorArgs {
-                parent: weak_ref.clone(),
-            }),
-        )
-        .await;
-        self.child_actors.insert(public_ws.id(), ChildKind::PublicWs);
-        self.public_ws = Some(public_ws);
-
-        // 2. 如果有凭证，spawn_link PrivateWsActor
-        if let Some(credentials) = &self.credentials {
-            let private_ws = spawn_link(
-                &actor_ref,
-                OkxPrivateWsActor::new(OkxPrivateWsActorArgs {
-                    parent: weak_ref,
-                    credentials: credentials.clone(),
-                }),
-            )
-            .await;
-            self.child_actors
-                .insert(private_ws.id(), ChildKind::PrivateWs);
-            self.private_ws = Some(private_ws);
-        }
+        // 只保存引用，不创建 WebSocket（等待 Subscribe 时懒创建）
+        self.self_ref = Some(actor_ref);
 
         tracing::info!(
             exchange = "OKX",
-            has_private = self.private_ws.is_some(),
-            "OkxActor started"
+            has_credentials = self.credentials.is_some(),
+            "OkxActor started (WebSocket will be created on first subscribe)"
         );
 
         Ok(())
@@ -166,10 +194,28 @@ impl Actor for OkxActor {
 // 消息处理
 // ============================================================================
 
+impl Message<SetEventSink> for OkxActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SetEventSink,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.event_sink = Some(msg.event_sink);
+        tracing::debug!(exchange = "OKX", "EventSink set");
+    }
+}
+
 impl Message<Subscribe> for OkxActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: Subscribe, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+        // 懒创建 WebSocket actors
+        self.ensure_public_ws().await;
+        self.ensure_private_ws().await;
+
+        // 转发给 PublicWsActor
         if let Some(ref public_ws) = self.public_ws {
             public_ws
                 .tell(msg)
@@ -187,6 +233,7 @@ impl Message<Unsubscribe> for OkxActor {
         msg: Unsubscribe,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
+        // 转发给 PublicWsActor
         if let Some(ref public_ws) = self.public_ws {
             public_ws
                 .tell(msg)
@@ -205,11 +252,19 @@ impl Message<WsData> for OkxActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+        let event_sink = match &self.event_sink {
+            Some(sink) => sink,
+            None => {
+                tracing::warn!("Received WsData but EventSink not set, dropping");
+                return;
+            }
+        };
+
         let timestamp = now_ms();
         match parse_message(&msg.data, timestamp, &self.symbol_metas) {
             Ok(events) => {
                 for event in events {
-                    self.event_sink.send_event(event).await;
+                    event_sink.send_event(event).await;
                 }
             }
             Err(e) => {
