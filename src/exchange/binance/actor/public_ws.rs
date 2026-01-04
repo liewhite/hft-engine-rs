@@ -7,7 +7,7 @@
 
 use super::binance_actor::BinanceActor;
 use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::ws_loop::{self, WsIncoming};
+use crate::exchange::ws_loop;
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
@@ -101,7 +101,7 @@ impl Actor for BinancePublicWsActor {
         self.ws_tx = Some(outgoing_tx);
 
         // 创建入站消息 channel (收到的数据/错误)
-        let (incoming_tx, incoming_rx) = mpsc::channel::<WsIncoming>(100);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
 
         // attach_stream 监控入站消息
         let incoming_stream = ReceiverStream::new(incoming_rx);
@@ -171,32 +171,30 @@ impl Message<Unsubscribe> for BinancePublicWsActor {
 }
 
 /// WebSocket 入站消息处理
-impl Message<StreamMessage<WsIncoming, (), ()>> for BinancePublicWsActor {
+impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePublicWsActor {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        msg: StreamMessage<WsIncoming, (), ()>,
+        msg: StreamMessage<Result<String, WsError>, (), ()>,
         ctx: Context<'_, Self, Self::Reply>,
     ) {
         match msg {
-            StreamMessage::Next(incoming) => match incoming {
-                WsIncoming::Data(data) => {
-                    // 转发给父 Actor
-                    let parent = self
-                        .parent
-                        .upgrade()
-                        .expect("Parent actor must be alive while child is running");
-                    parent
-                        .tell(super::WsData { data })
-                        .await
-                        .expect("Failed to forward WsData to parent");
-                }
-                WsIncoming::Error(e) => {
-                    tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
-                    ctx.actor_ref().kill();
-                }
-            },
+            StreamMessage::Next(Ok(data)) => {
+                // 转发给父 Actor
+                let parent = self
+                    .parent
+                    .upgrade()
+                    .expect("Parent actor must be alive while child is running");
+                parent
+                    .tell(super::WsData { data })
+                    .await
+                    .expect("Failed to forward WsData to parent");
+            }
+            StreamMessage::Next(Err(e)) => {
+                tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
+                ctx.actor_ref().kill();
+            }
             StreamMessage::Started(_) => {
                 tracing::debug!("WsIncoming stream started");
             }

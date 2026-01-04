@@ -2,7 +2,7 @@ use crate::domain::{
     Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO,
 };
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{IncomeEvent, StateManager, SymbolState};
+use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -33,13 +33,27 @@ pub struct FundingArbConfig {
     pub unhedge_value_threshold: f64,
 }
 
-fn default_min_spread() -> Rate { 0.0005 }
-fn default_max_spread() -> Rate { 0.002 }
-fn default_close_spread() -> Rate { 0.0002 }
-fn default_max_notional() -> f64 { 1000.0 }
-fn default_max_quantity() -> Quantity { 1.0 }
-fn default_order_timeout_ms() -> u64 { 10_000 }
-fn default_unhedge_value_threshold() -> f64 { 50.0 }
+fn default_min_spread() -> Rate {
+    0.0005
+}
+fn default_max_spread() -> Rate {
+    0.002
+}
+fn default_close_spread() -> Rate {
+    0.0002
+}
+fn default_max_notional() -> f64 {
+    1000.0
+}
+fn default_max_quantity() -> Quantity {
+    1.0
+}
+fn default_order_timeout_ms() -> u64 {
+    10_000
+}
+fn default_unhedge_value_threshold() -> f64 {
+    50.0
+}
 
 impl Default for FundingArbConfig {
     fn default() -> Self {
@@ -373,8 +387,12 @@ impl FundingArbStrategy {
 impl Strategy for FundingArbStrategy {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
         let kinds: HashSet<SubscriptionKind> = [
-            SubscriptionKind::FundingRate { symbol: self.symbol.clone() },
-            SubscriptionKind::BBO { symbol: self.symbol.clone() },
+            SubscriptionKind::FundingRate {
+                symbol: self.symbol.clone(),
+            },
+            SubscriptionKind::BBO {
+                symbol: self.symbol.clone(),
+            },
         ]
         .into_iter()
         .collect();
@@ -392,11 +410,23 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
-        tracing::info!(
-            symbol = %self.symbol,
-            event  = ?event,
-            "Processing event for FundingArbStrategy"
-        );
+        match event.data {
+            ExchangeEventData::FundingRate { .. } => {
+                tracing::info!(
+                    symbol = %self.symbol,
+                    event  = ?event,
+                    "Processing event for FundingArbStrategy"
+                );
+            }
+            _ => {
+                tracing::debug!(
+                    symbol = %self.symbol,
+                    event  = ?event,
+                    "Ignoring non-funding-rate event for FundingArbStrategy"
+                );
+            }
+        }
+        return vec![];
         // 获取本策略关注的 symbol 状态
         let symbol_state = match state.symbol_state(&self.symbol) {
             Some(s) => s,
@@ -412,11 +442,8 @@ impl Strategy for FundingArbStrategy {
         let (net_exposure, price) = symbol_state.net_exposure();
 
         // 优先级 1: 检测并修复显著的持仓不平衡
-        if Self::is_significantly_unhedged(
-            net_exposure,
-            price,
-            self.config.unhedge_value_threshold,
-        ) {
+        if Self::is_significantly_unhedged(net_exposure, price, self.config.unhedge_value_threshold)
+        {
             let orders = Self::make_hedge_repair_orders(net_exposure, symbol_state);
             return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
         }
