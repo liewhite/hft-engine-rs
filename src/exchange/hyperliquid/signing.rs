@@ -61,8 +61,13 @@ pub struct SignatureJson {
 /// 2. 附加 nonce 的大端字节
 /// 3. 如果有 vault_address，附加 1 + address bytes
 /// 4. Keccak256 哈希
-pub fn action_hash<T: Serialize>(action: &T, nonce: u64, vault_address: Option<&str>) -> B256 {
-    let mut data = rmp_serde::to_vec_named(action).expect("Failed to serialize action");
+pub fn action_hash<T: Serialize>(
+    action: &T,
+    nonce: u64,
+    vault_address: Option<&str>,
+) -> Result<B256, String> {
+    let mut data = rmp_serde::to_vec_named(action)
+        .map_err(|e| format!("Failed to serialize action: {}", e))?;
 
     // 附加 nonce (大端)
     data.extend_from_slice(&nonce.to_be_bytes());
@@ -71,13 +76,13 @@ pub fn action_hash<T: Serialize>(action: &T, nonce: u64, vault_address: Option<&
     if let Some(addr) = vault_address {
         data.push(1u8);
         let addr_bytes = hex::decode(addr.trim_start_matches("0x"))
-            .expect("Invalid vault address");
+            .map_err(|e| format!("Invalid vault address: {}", e))?;
         data.extend_from_slice(&addr_bytes);
     } else {
         data.push(0u8);
     }
 
-    keccak256(&data)
+    Ok(keccak256(&data))
 }
 
 /// 签名 L1 action
@@ -287,7 +292,7 @@ mod tests {
             action_type: "test".to_string(),
         };
 
-        let hash = action_hash(&action, 1234567890000, None);
+        let hash = action_hash(&action, 1234567890000, None).expect("hash should succeed");
         assert_eq!(hash.len(), 32);
     }
 }

@@ -210,7 +210,15 @@ impl HyperliquidClient {
                 let tif_str = match tif {
                     crate::domain::TimeInForce::GTC => "Gtc",
                     crate::domain::TimeInForce::IOC => "Ioc",
-                    crate::domain::TimeInForce::FOK => "Ioc", // Hyperliquid 没有 FOK，用 IOC 近似
+                    crate::domain::TimeInForce::FOK => {
+                        // FOK 要求全部成交或取消，IOC 允许部分成交，语义不同
+                        // Hyperliquid 不支持 FOK，记录警告
+                        tracing::warn!(
+                            symbol = %order.symbol,
+                            "FOK not supported on Hyperliquid, using IOC (may result in partial fill)"
+                        );
+                        "Ioc"
+                    }
                     crate::domain::TimeInForce::PostOnly => "Alo", // Add Liquidity Only
                 };
                 (
@@ -283,7 +291,8 @@ impl ExchangeClient for HyperliquidClient {
         let nonce = now_ms();
 
         // 计算 action hash (用于签名)
-        let connection_id = action_hash(&action, nonce, None);
+        let connection_id = action_hash(&action, nonce, None)
+            .map_err(|e| ExchangeError::Other(format!("Action hash failed: {}", e)))?;
 
         // EIP-712 签名
         let signature = sign_l1_action(signer, connection_id, self.is_mainnet)
