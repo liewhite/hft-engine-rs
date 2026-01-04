@@ -99,38 +99,28 @@ impl ManagerActor {
         }
     }
 
+    /// 获取所有已配置的 ExchangeClient (用于遍历)
+    fn configured_clients(&self) -> HashMap<Exchange, Arc<dyn ExchangeClient>> {
+        [
+            self.binance_client.clone().map(|c| (Exchange::Binance, c as Arc<dyn ExchangeClient>)),
+            self.okx_client.clone().map(|c| (Exchange::OKX, c as Arc<dyn ExchangeClient>)),
+            self.hyperliquid_client.clone().map(|c| (Exchange::Hyperliquid, c as Arc<dyn ExchangeClient>)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
     /// 预加载所有交易所的 symbol metas
     async fn preload_symbol_metas(&mut self) -> Result<(), ExchangeError> {
-        // Binance
-        if let Some(client) = &self.binance_client {
+        for (exchange, client) in self.configured_clients() {
             let metas = client.fetch_all_symbol_metas().await?;
             let count = metas.len();
             for meta in metas {
-                self.symbol_metas.insert((Exchange::Binance, meta.symbol.clone()), meta);
+                self.symbol_metas.insert((exchange, meta.symbol.clone()), meta);
             }
-            tracing::info!(exchange = %Exchange::Binance, count, "Preloaded symbol metas");
+            tracing::info!(%exchange, count, "Preloaded symbol metas");
         }
-
-        // OKX
-        if let Some(client) = &self.okx_client {
-            let metas = client.fetch_all_symbol_metas().await?;
-            let count = metas.len();
-            for meta in metas {
-                self.symbol_metas.insert((Exchange::OKX, meta.symbol.clone()), meta);
-            }
-            tracing::info!(exchange = %Exchange::OKX, count, "Preloaded symbol metas");
-        }
-
-        // Hyperliquid
-        if let Some(client) = &self.hyperliquid_client {
-            let metas = client.fetch_all_symbol_metas().await?;
-            let count = metas.len();
-            for meta in metas {
-                self.symbol_metas.insert((Exchange::Hyperliquid, meta.symbol.clone()), meta);
-            }
-            tracing::info!(exchange = %Exchange::Hyperliquid, count, "Preloaded symbol metas");
-        }
-
         Ok(())
     }
 
@@ -348,19 +338,10 @@ impl Actor for ManagerActor {
         });
 
         // 3. 创建 SignalProcessorActor
-        let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = [
-            self.binance_client.clone().map(|c| (Exchange::Binance, c as Arc<dyn ExchangeClient>)),
-            self.okx_client.clone().map(|c| (Exchange::OKX, c as Arc<dyn ExchangeClient>)),
-            self.hyperliquid_client.clone().map(|c| (Exchange::Hyperliquid, c as Arc<dyn ExchangeClient>)),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-
         let signal_processor = spawn_link(
             &actor_ref,
             SignalProcessorActor::new(super::SignalProcessorArgs {
-                clients,
+                clients: self.configured_clients(),
                 event_sink: event_sink.clone(),
             }),
         )
