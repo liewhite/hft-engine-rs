@@ -44,6 +44,8 @@ pub struct BinanceActorArgs {
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// REST 基础 URL（用于 ListenKey）
     pub rest_base_url: String,
+    /// 事件接收器
+    pub event_sink: Arc<dyn EventSink>,
 }
 
 /// BinanceActor - 父 Actor
@@ -52,8 +54,8 @@ pub struct BinanceActor {
     credentials: Option<BinanceCredentials>,
     /// Symbol 元数据
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 事件接收器（延迟注入）
-    event_sink: Option<Arc<dyn EventSink>>,
+    /// 事件接收器
+    event_sink: Arc<dyn EventSink>,
     /// REST 基础 URL
     rest_base_url: String,
 
@@ -75,7 +77,7 @@ impl BinanceActor {
         Self {
             credentials: args.credentials,
             symbol_metas: args.symbol_metas,
-            event_sink: None,
+            event_sink: args.event_sink,
             rest_base_url: args.rest_base_url,
             self_ref: None,
             public_ws: None,
@@ -209,7 +211,7 @@ impl Message<SetEventSink> for BinanceActor {
         msg: SetEventSink,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        self.event_sink = Some(msg.event_sink);
+        self.event_sink = msg.event_sink;
         tracing::debug!(exchange = "Binance", "EventSink set");
     }
 }
@@ -272,19 +274,11 @@ impl Message<WsData> for BinanceActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
-        let event_sink = match &self.event_sink {
-            Some(sink) => sink,
-            None => {
-                tracing::warn!("Received WsData but EventSink not set, dropping");
-                return;
-            }
-        };
-
         let timestamp = now_ms();
         match parse_message(&msg.data, timestamp, &self.symbol_metas) {
             Ok(events) => {
                 for event in events {
-                    event_sink.send_event(event).await;
+                    self.event_sink.send_event(event).await;
                 }
             }
             Err(e) => {

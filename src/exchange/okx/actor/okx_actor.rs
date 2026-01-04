@@ -41,6 +41,8 @@ pub struct OkxActorArgs {
     pub credentials: Option<OkxCredentials>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 事件接收器
+    pub event_sink: Arc<dyn EventSink>,
 }
 
 /// OkxActor - 父 Actor
@@ -49,8 +51,8 @@ pub struct OkxActor {
     credentials: Option<OkxCredentials>,
     /// Symbol 元数据
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 事件接收器（延迟注入）
-    event_sink: Option<Arc<dyn EventSink>>,
+    /// 事件接收器
+    event_sink: Arc<dyn EventSink>,
 
     /// 自身引用（用于懒创建子 Actor）
     self_ref: Option<ActorRef<Self>>,
@@ -70,7 +72,7 @@ impl OkxActor {
         Self {
             credentials: args.credentials,
             symbol_metas: args.symbol_metas,
-            event_sink: None,
+            event_sink: args.event_sink,
             self_ref: None,
             public_ws: None,
             private_ws: None,
@@ -202,7 +204,7 @@ impl Message<SetEventSink> for OkxActor {
         msg: SetEventSink,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        self.event_sink = Some(msg.event_sink);
+        self.event_sink = msg.event_sink;
         tracing::debug!(exchange = "OKX", "EventSink set");
     }
 }
@@ -265,19 +267,11 @@ impl Message<WsData> for OkxActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
-        let event_sink = match &self.event_sink {
-            Some(sink) => sink,
-            None => {
-                tracing::warn!("Received WsData but EventSink not set, dropping");
-                return;
-            }
-        };
-
         let timestamp = now_ms();
         match parse_message(&msg.data, timestamp, &self.symbol_metas) {
             Ok(events) => {
                 for event in events {
-                    event_sink.send_event(event).await;
+                    self.event_sink.send_event(event).await;
                 }
             }
             Err(e) => {

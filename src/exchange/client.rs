@@ -64,6 +64,9 @@ pub trait ExchangeClient: Send + Sync + 'static {
     /// 获取交易所标识
     fn exchange(&self) -> Exchange;
 
+    /// 用于 downcast 到具体类型（获取 credentials 等）
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// 获取所有交易对元数据
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError>;
 

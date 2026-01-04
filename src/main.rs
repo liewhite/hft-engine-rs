@@ -1,14 +1,10 @@
 use fee_arb::config::AppConfig;
-use fee_arb::domain::Exchange;
 use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs};
-use fee_arb::exchange::binance::{
-    BinanceActor, BinanceActorArgs, BinanceCredentials, BinanceModule, REST_BASE_URL,
-};
-use fee_arb::exchange::okx::{OkxActor, OkxActorArgs, OkxCredentials, OkxModule};
-use fee_arb::exchange::{ExchangeActorOps, ExchangeModule};
+use fee_arb::exchange::binance::{BinanceCredentials, BinanceModule};
+use fee_arb::exchange::okx::{OkxCredentials, OkxModule};
+use fee_arb::exchange::ExchangeModule;
 use fee_arb::strategy::FundingArbStrategy;
 use kameo::request::MessageSend;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -42,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
         api_key: config.exchanges.binance.api_key.clone(),
         secret: config.exchanges.binance.secret.clone(),
     };
-    let binance_module = BinanceModule::new(Some(binance_credentials.clone()))?;
+    let binance_module = BinanceModule::new(Some(binance_credentials))?;
     modules.push(Arc::new(binance_module));
 
     // OKX module
@@ -51,32 +47,11 @@ async fn main() -> anyhow::Result<()> {
         secret: config.exchanges.okx.secret.clone(),
         passphrase: config.exchanges.okx.passphrase.clone(),
     };
-    let okx_module = OkxModule::new(Some(okx_credentials.clone()))?;
+    let okx_module = OkxModule::new(Some(okx_credentials))?;
     modules.push(Arc::new(okx_module));
 
-    // Spawn ExchangeActors (WebSocket 将在第一次 Subscribe 时懒创建)
-    let mut exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>> = HashMap::new();
-
-    // Binance Actor
-    let binance_actor = kameo::spawn(BinanceActor::new(BinanceActorArgs {
-        credentials: Some(binance_credentials),
-        symbol_metas: Arc::new(HashMap::new()), // 会在 ManagerActor 中通过 symbol fetch 填充
-        rest_base_url: REST_BASE_URL.to_string(),
-    }));
-    exchange_actors.insert(Exchange::Binance, Box::new(binance_actor));
-
-    // OKX Actor
-    let okx_actor = kameo::spawn(OkxActor::new(OkxActorArgs {
-        credentials: Some(okx_credentials),
-        symbol_metas: Arc::new(HashMap::new()),
-    }));
-    exchange_actors.insert(Exchange::OKX, Box::new(okx_actor));
-
-    // Create ManagerActor
-    let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs {
-        modules,
-        exchange_actors,
-    }));
+    // Create ManagerActor (ExchangeActors will be lazy spawned with spawn_link)
+    let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs { modules }));
 
     // Add strategies
     let enabled_exchanges = config.exchanges.enabled_exchanges();

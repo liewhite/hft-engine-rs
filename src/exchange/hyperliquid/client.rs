@@ -253,6 +253,10 @@ impl ExchangeClient for HyperliquidClient {
         Exchange::Hyperliquid
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         let meta = self.get_meta().await?;
 

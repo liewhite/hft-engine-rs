@@ -246,6 +246,10 @@ impl ExchangeClient for BinanceClient {
         Exchange::Binance
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         self.get_all_exchange_info().await
     }

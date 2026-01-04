@@ -43,6 +43,8 @@ pub struct HyperliquidActorArgs {
     pub credentials: Option<HyperliquidCredentials>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 事件接收器
+    pub event_sink: Arc<dyn EventSink>,
 }
 
 /// HyperliquidActor - 父 Actor
@@ -52,8 +54,8 @@ pub struct HyperliquidActor {
     /// Symbol 元数据
     #[allow(dead_code)]
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 事件接收器（延迟注入）
-    event_sink: Option<Arc<dyn EventSink>>,
+    /// 事件接收器
+    event_sink: Arc<dyn EventSink>,
 
     /// 自身引用（用于懒创建子 Actor）
     self_ref: Option<ActorRef<Self>>,
@@ -73,7 +75,7 @@ impl HyperliquidActor {
         Self {
             credentials: args.credentials,
             symbol_metas: args.symbol_metas,
-            event_sink: None,
+            event_sink: args.event_sink,
             self_ref: None,
             public_ws: None,
             private_ws: None,
@@ -205,7 +207,7 @@ impl Message<SetEventSink> for HyperliquidActor {
         msg: SetEventSink,
         _ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        self.event_sink = Some(msg.event_sink);
+        self.event_sink = msg.event_sink;
         tracing::debug!(exchange = "Hyperliquid", "EventSink set");
     }
 }
@@ -263,19 +265,11 @@ impl Message<WsData> for HyperliquidActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: WsData, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
-        let event_sink = match &self.event_sink {
-            Some(sink) => sink,
-            None => {
-                tracing::warn!("Received WsData but EventSink not set, dropping");
-                return;
-            }
-        };
-
         let local_ts = now_ms();
         match parse_message(&msg.data, local_ts) {
             Ok(events) => {
                 for event in events {
-                    event_sink.send_event(event).await;
+                    self.event_sink.send_event(event).await;
                 }
             }
             Err(e) => {
