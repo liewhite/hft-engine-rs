@@ -1,6 +1,7 @@
 use fee_arb::config::AppConfig;
 use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs};
 use fee_arb::exchange::binance::BinanceCredentials;
+use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::FundingArbStrategy;
 use kameo::request::MessageSend;
@@ -40,11 +41,18 @@ async fn main() -> anyhow::Result<()> {
         passphrase: config.exchanges.okx.passphrase.clone(),
     };
 
+    let hyperliquid_credentials = config.exchanges.hyperliquid.as_ref().map(|h| {
+        HyperliquidCredentials {
+            wallet_address: h.wallet_address.clone(),
+            private_key: h.private_key.clone(),
+        }
+    });
+
     // Create ManagerActor (modules 和 ExchangeActors 由 ManagerActor 内部创建)
     let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs {
         binance_credentials: Some(binance_credentials),
         okx_credentials: Some(okx_credentials),
-        hyperliquid_credentials: None,
+        hyperliquid_credentials,
     }));
 
     // Add strategies

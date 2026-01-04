@@ -8,6 +8,10 @@
       "api_key": "YOUR_OKX_API_KEY",
       "secret": "YOUR_OKX_SECRET",
       "passphrase": "YOUR_OKX_PASSPHRASE"
+    },
+    "hyperliquid": {
+      "wallet_address": "0xYOUR_WALLET_ADDRESS",
+      "private_key": "YOUR_PRIVATE_KEY_WITHOUT_0x_PREFIX"
     }
   },
   "strategy": {

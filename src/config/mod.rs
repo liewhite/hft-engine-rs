@@ -26,6 +26,8 @@ pub struct ExchangeCredentials {
 pub struct ExchangesConfig {
     pub binance: ExchangeCredentials,
     pub okx: OkxCredentials,
+    #[serde(default)]
+    pub hyperliquid: Option<HyperliquidCredentials>,
 }
 
 /// OKX 特定凭证 (需要 passphrase)
@@ -36,11 +38,23 @@ pub struct OkxCredentials {
     pub passphrase: String,
 }
 
+/// Hyperliquid 凭证 (使用私钥签名)
+#[derive(Debug, Clone, Deserialize)]
+pub struct HyperliquidCredentials {
+    /// 钱包地址 (0x...)
+    pub wallet_address: String,
+    /// 私钥 (不含 0x 前缀)
+    pub private_key: String,
+}
+
 impl ExchangesConfig {
     /// 获取已配置的交易所列表
     pub fn enabled_exchanges(&self) -> Vec<Exchange> {
-        // 当前配置中 binance 和 okx 都是必填，所以都启用
-        vec![Exchange::Binance, Exchange::OKX]
+        let mut exchanges = vec![Exchange::Binance, Exchange::OKX];
+        if self.hyperliquid.is_some() {
+            exchanges.push(Exchange::Hyperliquid);
+        }
+        exchanges
     }
 }
 
@@ -108,8 +122,24 @@ impl AppConfig {
             std::env::var("SYMBOLS").unwrap_or_else(|_| "BTC_USDT,ETH_USDT".to_string());
         let symbols: Vec<String> = symbols_str.split(',').map(|s| s.trim().to_string()).collect();
 
+        // Hyperliquid 从环境变量读取 (可选)
+        let hyperliquid = match (
+            std::env::var("HYPERLIQUID_WALLET_ADDRESS"),
+            std::env::var("HYPERLIQUID_PRIVATE_KEY"),
+        ) {
+            (Ok(wallet_address), Ok(private_key)) => Some(HyperliquidCredentials {
+                wallet_address,
+                private_key,
+            }),
+            _ => None,
+        };
+
         Ok(Self {
-            exchanges: ExchangesConfig { binance, okx },
+            exchanges: ExchangesConfig {
+                binance,
+                okx,
+                hyperliquid,
+            },
             strategy: StrategyConfig {
                 symbols,
                 funding_arb: FundingArbConfig::default(),
