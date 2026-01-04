@@ -7,6 +7,7 @@
 
 use super::okx_actor::OkxActor;
 use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::okx::OkxSymbol;
 use crate::exchange::ws_loop;
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};

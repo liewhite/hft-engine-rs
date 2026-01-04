@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use super::{parse_hyperliquid_symbol, HyperliquidSymbol};
 use crate::domain::{now_ms, Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta};
 use crate::exchange::client::ExchangeClient;
 use crate::exchange::hyperliquid::codec::{price_step, size_step, AssetCtx, AssetInfo, MetaResponse};
@@ -380,7 +381,7 @@ impl ExchangeClient for HyperliquidClient {
 
 /// 将 AssetInfo 转换为 SymbolMeta
 fn asset_info_to_symbol_meta(info: &AssetInfo) -> SymbolMeta {
-    let symbol = Symbol::from_hyperliquid(&info.name);
+    let symbol = parse_hyperliquid_symbol(&info.name);
 
     SymbolMeta {
         exchange: Exchange::Hyperliquid,

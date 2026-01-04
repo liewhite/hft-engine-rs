@@ -1,5 +1,6 @@
 //! OKX ExchangeClient 实现 (仅 REST)
 
+use super::{parse_okx_symbol, OkxSymbol};
 use crate::domain::{
     Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
@@ -118,7 +119,7 @@ impl OkxClient {
             .data
             .into_iter()
             .filter_map(|d| {
-                let symbol = Symbol::from_okx(&d.inst_id)?;
+                let symbol = parse_okx_symbol(&d.inst_id)?;
                 let price_step: f64 = d.tick_sz.parse().ok().filter(|&v| v > 0.0)?;
                 let size_step: f64 = d.lot_sz.parse().ok().filter(|&v| v > 0.0)?;
                 let min_order_size: f64 = d.min_sz.parse().unwrap_or(0.0);

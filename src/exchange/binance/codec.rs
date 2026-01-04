@@ -1,5 +1,6 @@
+use super::parse_binance_symbol;
 use crate::domain::{
-    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position, Symbol, now_ms, BBO,
+    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -21,7 +22,7 @@ impl MarkPriceUpdate {
     /// 转换为 FundingRate
     /// settle_interval_hours: 结算间隔小时数 (从 fundingInfo API 获取，默认 8)
     pub fn to_funding_rate(&self, settle_interval_hours: f64) -> FundingRate {
-        let symbol = Symbol::from_binance(&self.s)
+        let symbol = parse_binance_symbol(&self.s)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
         let rate = f64::from_str(&self.r)
             .unwrap_or_else(|_| panic!("Failed to parse funding rate: {}", self.r));
@@ -36,8 +37,8 @@ impl MarkPriceUpdate {
     }
 
     /// 获取 symbol (用于查询结算间隔)
-    pub fn symbol(&self) -> Symbol {
-        Symbol::from_binance(&self.s)
+    pub fn symbol(&self) -> crate::domain::Symbol {
+        parse_binance_symbol(&self.s)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s))
     }
 }
@@ -60,7 +61,7 @@ pub struct BookTicker {
 
 impl BookTicker {
     pub fn to_bbo(&self) -> BBO {
-        let symbol = Symbol::from_binance(&self.s)
+        let symbol = parse_binance_symbol(&self.s)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
         let bid_price = f64::from_str(&self.b)
             .unwrap_or_else(|_| panic!("Failed to parse bid price: {}", self.b));
@@ -138,7 +139,7 @@ pub struct AccountPosition {
 
 impl AccountPosition {
     pub fn to_position(&self) -> Position {
-        let symbol = Symbol::from_binance(&self.s)
+        let symbol = parse_binance_symbol(&self.s)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
         let pos_amount = f64::from_str(&self.pa)
             .unwrap_or_else(|_| panic!("Failed to parse position amount: {}", self.pa));
@@ -183,7 +184,7 @@ pub struct OrderData {
 
 impl OrderTradeUpdate {
     pub fn to_order_update(&self) -> OrderUpdate {
-        let symbol = Symbol::from_binance(&self.o.s)
+        let symbol = parse_binance_symbol(&self.o.s)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.o.s));
         let filled_qty = f64::from_str(&self.o.z)
             .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.o.z));

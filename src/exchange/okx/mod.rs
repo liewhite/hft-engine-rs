@@ -1,9 +1,11 @@
 pub(crate) mod actor;
 pub(crate) mod codec;
 mod client;
+mod symbol;
 
 pub use actor::{OkxActor, OkxActorArgs};
 pub use client::OkxClient;
+pub use symbol::{parse_okx_symbol, OkxSymbol};
 
 use base64::{engine::general_purpose, Engine as _};
 use hmac::{Hmac, Mac};

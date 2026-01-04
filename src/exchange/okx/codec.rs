@@ -1,6 +1,5 @@
-use crate::domain::{
-    Exchange, FundingRate, OrderStatus, OrderUpdate, Position, Symbol, now_ms, BBO,
-};
+use super::parse_okx_symbol;
+use crate::domain::{Exchange, FundingRate, OrderStatus, OrderUpdate, Position, now_ms, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -38,7 +37,7 @@ pub struct FundingRateData {
 
 impl FundingRateData {
     pub fn to_funding_rate(&self) -> FundingRate {
-        let symbol = Symbol::from_okx(&self.inst_id)
+        let symbol = parse_okx_symbol(&self.inst_id)
             .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
         let rate = f64::from_str(&self.funding_rate)
             .unwrap_or_else(|_| panic!("Failed to parse funding rate: {}", self.funding_rate));
@@ -76,7 +75,7 @@ pub struct BboData {
 
 impl BboData {
     pub fn to_bbo(&self, inst_id: &str) -> BBO {
-        let symbol = Symbol::from_okx(inst_id)
+        let symbol = parse_okx_symbol(inst_id)
             .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", inst_id));
 
         let ask = self.asks.first()
@@ -130,7 +129,7 @@ pub struct PositionData {
 
 impl PositionData {
     pub fn to_position(&self) -> Position {
-        let symbol = Symbol::from_okx(&self.inst_id)
+        let symbol = parse_okx_symbol(&self.inst_id)
             .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
         let pos_amount = f64::from_str(&self.pos)
             .unwrap_or_else(|_| panic!("Failed to parse position amount: {}", self.pos));
@@ -207,7 +206,7 @@ pub struct OrderPushData {
 
 impl OrderPushData {
     pub fn to_order_update(&self) -> OrderUpdate {
-        let symbol = Symbol::from_okx(&self.inst_id)
+        let symbol = parse_okx_symbol(&self.inst_id)
             .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
         let filled_qty = f64::from_str(&self.fill_sz)
             .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.fill_sz));

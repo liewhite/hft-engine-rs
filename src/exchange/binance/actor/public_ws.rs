@@ -6,6 +6,7 @@
 //! - 将收到的消息转发给父 BinanceActor
 
 use super::binance_actor::BinanceActor;
+use crate::exchange::binance::BinanceSymbol;
 use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ws_loop;
 use futures_util::StreamExt;

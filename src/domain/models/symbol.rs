@@ -33,61 +33,6 @@ impl Symbol {
             None
         }
     }
-
-    /// 转换为 Binance 格式 (e.g., "BTCUSDT")
-    pub fn to_binance(&self) -> String {
-        format!("{}{}", self.base, self.quote)
-    }
-
-    /// 从 Binance 格式解析
-    pub fn from_binance(s: &str) -> Option<Self> {
-        const KNOWN_QUOTES: [&str; 4] = ["USDT", "BUSD", "USDC", "USD"];
-
-        for quote in KNOWN_QUOTES {
-            if s.ends_with(quote) {
-                let base = &s[..s.len() - quote.len()];
-                return Some(Symbol {
-                    base: base.to_string(),
-                    quote: quote.to_string(),
-                });
-            }
-        }
-        None
-    }
-
-    /// 转换为 OKX 格式 (e.g., "BTC-USDT-SWAP")
-    pub fn to_okx(&self) -> String {
-        format!("{}-{}-SWAP", self.base, self.quote)
-    }
-
-    /// 从 OKX 格式解析
-    pub fn from_okx(inst_id: &str) -> Option<Self> {
-        let parts: Vec<&str> = inst_id.split('-').collect();
-        if parts.len() == 3 && parts[2] == "SWAP" {
-            Some(Symbol {
-                base: parts[0].to_string(),
-                quote: parts[1].to_string(),
-            })
-        } else {
-            None
-        }
-    }
-
-    /// 转换为 Hyperliquid 格式 (e.g., "BTC")
-    /// Hyperliquid 永续合约使用币种名，默认 USDC 结算
-    pub fn to_hyperliquid(&self) -> String {
-        self.base.clone()
-    }
-
-    /// 从 Hyperliquid 格式解析
-    /// coin: 币种名 (e.g., "BTC", "ETH")
-    /// Hyperliquid 永续合约默认 USDC 结算
-    pub fn from_hyperliquid(coin: &str) -> Self {
-        Symbol {
-            base: coin.to_string(),
-            quote: "USDC".to_string(),
-        }
-    }
 }
 
 impl fmt::Display for Symbol {

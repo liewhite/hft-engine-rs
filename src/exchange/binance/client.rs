@@ -1,5 +1,6 @@
 //! Binance ExchangeClient 实现 (仅 REST)
 
+use super::{parse_binance_symbol, BinanceSymbol};
 use crate::domain::{
     Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
@@ -159,7 +160,7 @@ impl BinanceClient {
             .symbols
             .into_iter()
             .filter_map(|s| {
-                let symbol = Symbol::from_binance(&s.symbol)?;
+                let symbol = parse_binance_symbol(&s.symbol)?;
                 let mut price_step: Option<f64> = None;
                 let mut size_step: Option<f64> = None;
                 let mut min_order_size: Option<f64> = None;

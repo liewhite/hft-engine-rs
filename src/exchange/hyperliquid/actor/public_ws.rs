@@ -8,7 +8,7 @@
 use super::hyperliquid_actor::HyperliquidActor;
 use super::WsData;
 use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::hyperliquid::WS_URL;
+use crate::exchange::hyperliquid::{HyperliquidSymbol, WS_URL};
 use crate::exchange::ws_loop;
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
