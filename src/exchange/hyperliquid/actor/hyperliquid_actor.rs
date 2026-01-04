@@ -15,7 +15,7 @@ use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
 use super::WsData;
 use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, SetEventSink, Subscribe, Unsubscribe, WsError};
+use crate::exchange::client::{EventSink, SetEventSink, SetSymbolMetas, Subscribe, Unsubscribe, WsError};
 use crate::exchange::hyperliquid::codec::{
     ClearinghouseState, WsActiveAssetCtx, WsBbo, WsOrderUpdate,
 };
@@ -207,6 +207,19 @@ impl Message<SetEventSink> for HyperliquidActor {
     ) -> Self::Reply {
         self.event_sink = Some(msg.event_sink);
         tracing::debug!(exchange = "Hyperliquid", "EventSink set");
+    }
+}
+
+impl Message<SetSymbolMetas> for HyperliquidActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SetSymbolMetas,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.symbol_metas = msg.symbol_metas;
+        tracing::debug!(exchange = "Hyperliquid", "SymbolMetas set");
     }
 }
 

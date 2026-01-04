@@ -29,6 +29,7 @@ use std::sync::Arc;
 /// 子 Actor 类型（用于 on_link_died 中识别）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildActorKind {
+    Exchange(Exchange),
     Executor(usize),
     SignalProcessor,
     Processor,
@@ -133,12 +134,51 @@ impl ManagerActor {
         Ok(())
     }
 
-    /// 向所有 ExchangeActors 发送 EventSink
-    async fn set_event_sink_to_all(&self, event_sink: Arc<dyn EventSink>) {
+    /// 向所有 ExchangeActors 发送 EventSink（失败时返回错误）
+    async fn set_event_sink_to_all(&self, event_sink: Arc<dyn EventSink>) -> Result<(), ExchangeError> {
         for (exchange, actor) in &self.exchange_actors {
-            if let Err(e) = actor.set_event_sink(event_sink.clone()).await {
-                tracing::error!(%exchange, error = %e, "Failed to set EventSink to ExchangeActor");
-            }
+            actor.set_event_sink(event_sink.clone()).await.map_err(|e| {
+                ExchangeError::Other(format!("Failed to set EventSink to {}: {}", exchange, e))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// 提取指定交易所的 symbol metas
+    fn get_symbol_metas_for(&self, exchange: Exchange) -> Arc<HashMap<Symbol, SymbolMeta>> {
+        Arc::new(
+            self.symbol_metas
+                .iter()
+                .filter(|((e, _), _)| *e == exchange)
+                .map(|((_, s), m)| (s.clone(), m.clone()))
+                .collect(),
+        )
+    }
+
+    /// 向所有 ExchangeActors 发送 SymbolMetas
+    async fn set_symbol_metas_to_all(&self) -> Result<(), ExchangeError> {
+        for (exchange, actor) in &self.exchange_actors {
+            let symbol_metas = self.get_symbol_metas_for(*exchange);
+            actor.set_symbol_metas(symbol_metas).await.map_err(|e| {
+                ExchangeError::Other(format!("Failed to set SymbolMetas to {}: {}", exchange, e))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// 注册 ExchangeActors 到 actor_kinds（用于 on_link_died 追踪）
+    ///
+    /// 注意：由于 ExchangeActors 是在 main.rs 中用 kameo::spawn 创建的（而非 spawn_link），
+    /// 它们与 ManagerActor 之间没有真正的 link。如果 ExchangeActor 崩溃，ManagerActor
+    /// 不会收到 on_link_died 通知。这是当前架构的一个已知限制。
+    ///
+    /// 要恢复 spawn_link 保护，需要让 ManagerActor 自己创建 ExchangeActors，
+    /// 但这会增加架构复杂度。
+    fn register_exchange_actors(&mut self) {
+        for (exchange, actor) in &self.exchange_actors {
+            let actor_id = actor.actor_id();
+            self.actor_kinds.insert(actor_id, ChildActorKind::Exchange(*exchange));
+            tracing::debug!(%exchange, ?actor_id, "Registered ExchangeActor");
         }
     }
 
@@ -241,10 +281,16 @@ impl Actor for ManagerActor {
     async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         self.self_ref = Some(actor_ref.clone());
 
-        // 1. 预加载所有交易所的 symbol metas
+        // 1. 注册所有预创建的 ExchangeActors（用于追踪，但没有真正的 link）
+        self.register_exchange_actors();
+
+        // 2. 预加载所有交易所的 symbol metas
         self.preload_symbol_metas().await?;
 
-        // 2. 创建 ProcessorActor（先创建，因为其他 Actor 需要它的引用）
+        // 3. 向所有 ExchangeActors 发送 SymbolMetas
+        self.set_symbol_metas_to_all().await?;
+
+        // 4. 创建 ProcessorActor（先创建，因为其他 Actor 需要它的引用）
         let processor = spawn_link(&actor_ref, ProcessorActor::new()).await;
         self.actor_kinds
             .insert(processor.id(), ChildActorKind::Processor);
@@ -255,10 +301,10 @@ impl Actor for ManagerActor {
             processor: processor.clone(),
         });
 
-        // 3. 向所有预注册的 ExchangeActors 发送 EventSink
-        self.set_event_sink_to_all(event_sink.clone()).await;
+        // 5. 向所有 ExchangeActors 发送 EventSink（失败时启动失败）
+        self.set_event_sink_to_all(event_sink.clone()).await?;
 
-        // 4. 创建 SignalProcessorActor
+        // 6. 创建 SignalProcessorActor
         let signal_processor = spawn_link(
             &actor_ref,
             SignalProcessorActor::new(super::SignalProcessorArgs {
@@ -315,6 +361,18 @@ impl Actor for ManagerActor {
         let kind = self.actor_kinds.remove(&id);
 
         match kind {
+            Some(ChildActorKind::Exchange(exchange)) => {
+                tracing::error!(
+                    %exchange,
+                    reason = ?reason,
+                    "ExchangeActor died, shutting down"
+                );
+                self.exchange_actors.remove(&exchange);
+                Ok(Some(ActorStopReason::LinkDied {
+                    id,
+                    reason: Box::new(reason),
+                }))
+            }
             Some(ChildActorKind::Executor(idx)) => {
                 tracing::error!(
                     executor_idx = idx,

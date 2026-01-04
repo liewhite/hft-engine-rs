@@ -5,8 +5,8 @@ pub mod okx;
 pub mod ws_loop;
 
 pub use client::{
-    EventSink, ExchangeActorOps, ExchangeClient, ExchangeModule, SetEventSink, Subscribe,
-    SubscriptionKind, Unsubscribe,
+    EventSink, ExchangeActorOps, ExchangeClient, ExchangeModule, SetEventSink, SetSymbolMetas,
+    Subscribe, SubscriptionKind, Unsubscribe,
 };
 
 // 为各交易所 Actor 实现 ExchangeActorOps

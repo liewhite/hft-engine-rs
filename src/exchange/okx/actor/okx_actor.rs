@@ -14,7 +14,7 @@
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
 use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, SetEventSink, Subscribe, Unsubscribe, WsError};
+use crate::exchange::client::{EventSink, SetEventSink, SetSymbolMetas, Subscribe, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{
     AccountData, BboData, FundingRateData, OrderPushData, PositionData, WsPush,
 };
@@ -204,6 +204,19 @@ impl Message<SetEventSink> for OkxActor {
     ) -> Self::Reply {
         self.event_sink = Some(msg.event_sink);
         tracing::debug!(exchange = "OKX", "EventSink set");
+    }
+}
+
+impl Message<SetSymbolMetas> for OkxActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SetSymbolMetas,
+        _ctx: Context<'_, Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.symbol_metas = msg.symbol_metas;
+        tracing::debug!(exchange = "OKX", "SymbolMetas set");
     }
 }
 
