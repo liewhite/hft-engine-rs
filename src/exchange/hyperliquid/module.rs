@@ -2,10 +2,9 @@
 
 use super::{HyperliquidActor, HyperliquidActorArgs, HyperliquidClient, HyperliquidCredentials};
 use crate::domain::{Exchange, Symbol, SymbolMeta};
-use crate::engine::live::{ExchangeModule, ManagerActor};
-use crate::exchange::{EventSink, ExchangeActorOps, ExchangeClient};
-use async_trait::async_trait;
+use crate::exchange::{EventSink, ExchangeActorOps, ExchangeClient, ExchangeModule};
 use kameo::actor::{spawn_link, ActorID, ActorRef};
+use kameo::Actor;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -22,21 +21,11 @@ impl HyperliquidModule {
         let client = Arc::new(HyperliquidClient::new(credentials)?);
         Ok(Self { client })
     }
-}
 
-#[async_trait]
-impl ExchangeModule for HyperliquidModule {
-    fn exchange(&self) -> Exchange {
-        Exchange::Hyperliquid
-    }
-
-    fn client(&self) -> Arc<dyn ExchangeClient> {
-        self.client.clone()
-    }
-
-    async fn spawn_actor(
+    /// 创建并 spawn_link 交易所 Actor（泛型方法，可接受任意 parent Actor）
+    pub async fn spawn_actor<P: Actor>(
         &self,
-        parent: &ActorRef<ManagerActor>,
+        parent: &ActorRef<P>,
         symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
         event_sink: Arc<dyn EventSink>,
     ) -> (ActorID, Box<dyn ExchangeActorOps>) {
@@ -47,5 +36,15 @@ impl ExchangeModule for HyperliquidModule {
         });
         let actor_ref = spawn_link(parent, actor).await;
         (actor_ref.id(), Box::new(actor_ref))
+    }
+}
+
+impl ExchangeModule for HyperliquidModule {
+    fn exchange(&self) -> Exchange {
+        Exchange::Hyperliquid
+    }
+
+    fn client(&self) -> Arc<dyn ExchangeClient> {
+        self.client.clone()
     }
 }

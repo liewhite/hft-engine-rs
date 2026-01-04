@@ -1,10 +1,10 @@
 use fee_arb::config::AppConfig;
-use fee_arb::engine::{AddStrategy, ExchangeModule, ManagerActor, ManagerActorArgs};
+use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs};
 use fee_arb::exchange::binance::{BinanceCredentials, BinanceModule};
 use fee_arb::exchange::okx::{OkxCredentials, OkxModule};
+use fee_arb::exchange::AnyModule;
 use fee_arb::strategy::FundingArbStrategy;
 use kameo::request::MessageSend;
-use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
@@ -30,14 +30,16 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
     // Create exchange modules
-    let mut modules: Vec<Arc<dyn ExchangeModule>> = Vec::new();
+    let mut modules: Vec<AnyModule> = Vec::new();
 
     // Binance module
     let binance_credentials = BinanceCredentials {
         api_key: config.exchanges.binance.api_key.clone(),
         secret: config.exchanges.binance.secret.clone(),
     };
-    modules.push(Arc::new(BinanceModule::new(Some(binance_credentials))?));
+    modules.push(AnyModule::Binance(BinanceModule::new(Some(
+        binance_credentials,
+    ))?));
 
     // OKX module
     let okx_credentials = OkxCredentials {
@@ -45,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
         secret: config.exchanges.okx.secret.clone(),
         passphrase: config.exchanges.okx.passphrase.clone(),
     };
-    modules.push(Arc::new(OkxModule::new(Some(okx_credentials))?));
+    modules.push(AnyModule::Okx(OkxModule::new(Some(okx_credentials))?));
 
     // Create ManagerActor
     let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs { modules }));

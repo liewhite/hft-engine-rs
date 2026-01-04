@@ -4,14 +4,12 @@
 
 mod clock;
 mod engine;
-mod exchange_module;
 mod executor;
 mod processor;
 mod signal_processor;
 
 pub use clock::{ClockActor, ClockArgs, RegisterExecutor as RegisterClockExecutor};
 pub use engine::{AddStrategy, ManagerActor, ManagerActorArgs, Stop};
-pub use exchange_module::ExchangeModule;
 pub use executor::{ExecutorActor, ExecutorArgs};
 pub use processor::{ProcessorActor, RegisterExecutor};
 pub use signal_processor::{SignalProcessorActor, SignalProcessorArgs};

@@ -6,11 +6,11 @@
 //! - 子 Actor 失败时级联退出
 
 use super::{
-    ClockActor, ClockArgs, ExchangeModule, ExecutorActor, ExecutorArgs, ProcessorActor,
-    RegisterClockExecutor, RegisterExecutor, SignalProcessorActor,
+    ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, ProcessorActor, RegisterClockExecutor,
+    RegisterExecutor, SignalProcessorActor,
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::{EventSink, ExchangeActorOps, ExchangeClient, SubscriptionKind};
+use crate::exchange::{AnyModule, EventSink, ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
 use async_trait::async_trait;
@@ -43,13 +43,13 @@ enum ChildActorKind {
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
     /// 交易所模块列表
-    pub modules: Vec<Arc<dyn ExchangeModule>>,
+    pub modules: Vec<AnyModule>,
 }
 
 /// ManagerActor - 顶层管理 Actor
 pub struct ManagerActor {
     // === Exchange Modules ===
-    modules: HashMap<Exchange, Arc<dyn ExchangeModule>>,
+    modules: HashMap<Exchange, AnyModule>,
 
     // === Symbol Metas 缓存 ===
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
