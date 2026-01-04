@@ -5,6 +5,7 @@ use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
 use serde::Deserialize;
+use tracing::event;
 use std::collections::{HashMap, HashSet};
 
 /// 资金费率套利策略配置
@@ -410,6 +411,18 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+        match event.exchange() {
+            Some(ex) if ex == Exchange::Hyperliquid => {
+                tracing::info!(
+                    symbol = %self.symbol,
+                    exchange = %ex,
+                    event = ?event.data,
+                    "Ignoring Hyperliquid events in FundingArbStrategy"
+                );
+                return vec![];
+            }
+            _ => return vec![],
+        }
         // 获取本策略关注的 symbol 状态
         let symbol_state = match state.symbol_state(&self.symbol) {
             Some(s) => s,
