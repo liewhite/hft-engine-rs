@@ -59,9 +59,6 @@ pub struct BinanceActor {
     /// REST 基础 URL
     rest_base_url: String,
 
-    /// 自身引用（用于懒创建子 Actor）
-    self_ref: Option<ActorRef<Self>>,
-
     // 子 Actors (懒创建)
     /// Public WebSocket Actor
     public_ws: Option<ActorRef<BinancePublicWsActor>>,
@@ -79,7 +76,6 @@ impl BinanceActor {
             symbol_metas: args.symbol_metas,
             event_sink: args.event_sink,
             rest_base_url: args.rest_base_url,
-            self_ref: None,
             public_ws: None,
             private_ws: None,
             child_actors: HashMap::new(),
@@ -87,15 +83,10 @@ impl BinanceActor {
     }
 
     /// 确保 PublicWsActor 存在（懒创建）
-    async fn ensure_public_ws(&mut self) {
+    async fn ensure_public_ws(&mut self, actor_ref: &ActorRef<Self>) {
         if self.public_ws.is_some() {
             return;
         }
-
-        let actor_ref = self
-            .self_ref
-            .as_ref()
-            .expect("self_ref must be set in on_start");
 
         let public_ws = spawn_link(
             actor_ref,
@@ -111,15 +102,11 @@ impl BinanceActor {
     }
 
     /// 确保 PrivateWsActor 存在（懒创建，需要凭证）
-    async fn ensure_private_ws(&mut self) {
+    async fn ensure_private_ws(&mut self, actor_ref: &ActorRef<Self>) {
         if self.private_ws.is_some() || self.credentials.is_none() {
             return;
         }
 
-        let actor_ref = self
-            .self_ref
-            .as_ref()
-            .expect("self_ref must be set in on_start");
         let credentials = self.credentials.as_ref().unwrap();
 
         let private_ws = spawn_link(
@@ -146,10 +133,7 @@ impl Actor for BinanceActor {
         "BinanceActor"
     }
 
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        // 只保存引用，不创建 WebSocket（等待 Subscribe 时懒创建）
-        self.self_ref = Some(actor_ref);
-
+    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         tracing::info!(
             exchange = "Binance",
             has_credentials = self.credentials.is_some(),
@@ -206,10 +190,12 @@ impl Actor for BinanceActor {
 impl Message<Subscribe> for BinanceActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: Subscribe, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+    async fn handle(&mut self, msg: Subscribe, ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+        let actor_ref = ctx.actor_ref();
+
         // 懒创建 WebSocket actors
-        self.ensure_public_ws().await;
-        self.ensure_private_ws().await;
+        self.ensure_public_ws(&actor_ref).await;
+        self.ensure_private_ws(&actor_ref).await;
 
         // 转发给 PublicWsActor
         if let Some(ref public_ws) = self.public_ws {
