@@ -1,11 +1,9 @@
 use fee_arb::config::AppConfig;
 use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs};
-use fee_arb::exchange::binance::{BinanceCredentials, BinanceModule};
-use fee_arb::exchange::okx::{OkxCredentials, OkxModule};
-use fee_arb::exchange::ExchangeModule;
+use fee_arb::exchange::binance::BinanceCredentials;
+use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::FundingArbStrategy;
 use kameo::request::MessageSend;
-use std::sync::Arc;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
@@ -30,32 +28,23 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // Create exchange modules (for REST client access)
-    let mut modules: Vec<Arc<dyn ExchangeModule>> = Vec::new();
-
-    // Binance
+    // 从配置读取 credentials
     let binance_credentials = BinanceCredentials {
         api_key: config.exchanges.binance.api_key.clone(),
         secret: config.exchanges.binance.secret.clone(),
     };
-    let binance_module = BinanceModule::new(Some(binance_credentials.clone()))?;
-    modules.push(Arc::new(binance_module));
 
-    // OKX
     let okx_credentials = OkxCredentials {
         api_key: config.exchanges.okx.api_key.clone(),
         secret: config.exchanges.okx.secret.clone(),
         passphrase: config.exchanges.okx.passphrase.clone(),
     };
-    let okx_module = OkxModule::new(Some(okx_credentials.clone()))?;
-    modules.push(Arc::new(okx_module));
 
-    // Create ManagerActor (ExchangeActors will be lazy spawned with spawn_link)
+    // Create ManagerActor (modules 和 ExchangeActors 由 ManagerActor 内部创建)
     let manager = kameo::spawn(ManagerActor::new(ManagerActorArgs {
-        modules,
         binance_credentials: Some(binance_credentials),
         okx_credentials: Some(okx_credentials),
-        hyperliquid_credentials: None, // Hyperliquid 暂未配置
+        hyperliquid_credentials: None,
     }));
 
     // Add strategies

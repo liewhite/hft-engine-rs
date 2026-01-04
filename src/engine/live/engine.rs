@@ -10,9 +10,13 @@ use super::{
     RegisterExecutor, SignalProcessorActor,
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceCredentials, REST_BASE_URL};
-use crate::exchange::hyperliquid::{HyperliquidActor, HyperliquidActorArgs, HyperliquidCredentials};
-use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxCredentials};
+use crate::exchange::binance::{
+    BinanceActor, BinanceActorArgs, BinanceCredentials, BinanceModule, REST_BASE_URL,
+};
+use crate::exchange::hyperliquid::{
+    HyperliquidActor, HyperliquidActorArgs, HyperliquidCredentials, HyperliquidModule,
+};
+use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxCredentials, OkxModule};
 use crate::exchange::{EventSink, ExchangeActorOps, ExchangeClient, ExchangeModule, SubscriptionKind};
 use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
@@ -45,8 +49,6 @@ enum ChildActorKind {
 
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
-    /// 交易所模块列表（用于 REST 客户端访问和创建 Actor）
-    pub modules: Vec<Arc<dyn ExchangeModule>>,
     /// Binance 凭证（可选）
     pub binance_credentials: Option<BinanceCredentials>,
     /// OKX 凭证（可选）
@@ -89,11 +91,26 @@ pub struct ManagerActor {
 
 impl ManagerActor {
     pub fn new(args: ManagerActorArgs) -> Self {
-        let modules = args
-            .modules
-            .into_iter()
-            .map(|m| (m.exchange(), m))
-            .collect();
+        // 根据 credentials 创建对应的 modules
+        let mut modules: HashMap<Exchange, Arc<dyn ExchangeModule>> = HashMap::new();
+
+        if let Some(ref cred) = args.binance_credentials {
+            let module = BinanceModule::new(Some(cred.clone()))
+                .expect("Failed to create BinanceModule");
+            modules.insert(Exchange::Binance, Arc::new(module));
+        }
+
+        if let Some(ref cred) = args.okx_credentials {
+            let module = OkxModule::new(Some(cred.clone()))
+                .expect("Failed to create OkxModule");
+            modules.insert(Exchange::OKX, Arc::new(module));
+        }
+
+        if let Some(ref cred) = args.hyperliquid_credentials {
+            let module = HyperliquidModule::new(Some(cred.clone()))
+                .expect("Failed to create HyperliquidModule");
+            modules.insert(Exchange::Hyperliquid, Arc::new(module));
+        }
 
         Self {
             modules,
