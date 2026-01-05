@@ -68,19 +68,51 @@ impl SymbolState {
         before - self.pending_orders.len()
     }
 
-    /// 获取费率最高的交易所 (适合做空)
+    /// 获取日化费率最高的交易所 (适合做空)
+    ///
+    /// 日化费率 = rate * 24h / (next_settle_time - reference_time)
+    /// reference_time 取所有 FundingRate 中最小的 timestamp
     pub fn best_short_exchange(&self) -> Option<(Exchange, &FundingRate)> {
+        if self.funding_rates.is_empty() {
+            return None;
+        }
+
+        // 取所有 FundingRate 中最小的 timestamp 作为参考时间
+        let reference_time = self.funding_rates.values()
+            .map(|fr| fr.timestamp)
+            .min()
+            .expect("funding_rates is not empty");
+
         self.funding_rates
             .iter()
-            .max_by(|a, b| a.1.rate.total_cmp(&b.1.rate))
+            .max_by(|a, b| {
+                a.1.daily_rate_by_time_remaining(reference_time)
+                    .total_cmp(&b.1.daily_rate_by_time_remaining(reference_time))
+            })
             .map(|(e, r)| (*e, r))
     }
 
-    /// 获取费率最低的交易所 (适合做多)
+    /// 获取日化费率最低的交易所 (适合做多)
+    ///
+    /// 日化费率 = rate * 24h / (next_settle_time - reference_time)
+    /// reference_time 取所有 FundingRate 中最小的 timestamp
     pub fn best_long_exchange(&self) -> Option<(Exchange, &FundingRate)> {
+        if self.funding_rates.is_empty() {
+            return None;
+        }
+
+        // 取所有 FundingRate 中最小的 timestamp 作为参考时间
+        let reference_time = self.funding_rates.values()
+            .map(|fr| fr.timestamp)
+            .min()
+            .expect("funding_rates is not empty");
+
         self.funding_rates
             .iter()
-            .min_by(|a, b| a.1.rate.total_cmp(&b.1.rate))
+            .min_by(|a, b| {
+                a.1.daily_rate_by_time_remaining(reference_time)
+                    .total_cmp(&b.1.daily_rate_by_time_remaining(reference_time))
+            })
             .map(|(e, r)| (*e, r))
     }
 
