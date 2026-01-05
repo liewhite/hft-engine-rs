@@ -1,24 +1,76 @@
 use crate::domain::{
-    Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO,
+    Exchange, Order, OrderType, Price, Quantity, Side, Symbol, TimeInForce, BBO,
 };
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{IncomeEvent, StateManager, SymbolState};
+use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
+/// EMA (Exponential Moving Average) 计算器
+#[derive(Debug, Clone)]
+pub struct EmaCalculator {
+    period: usize,
+    alpha: f64,
+    value: Option<f64>,
+    count: usize,
+}
+
+impl EmaCalculator {
+    pub fn new(period: usize) -> Self {
+        let alpha = 2.0 / (period as f64 + 1.0);
+        Self {
+            period,
+            alpha,
+            value: None,
+            count: 0,
+        }
+    }
+
+    /// 更新 EMA，返回当前 EMA 值
+    pub fn update(&mut self, new_value: f64) -> f64 {
+        self.count += 1;
+        match self.value {
+            None => {
+                self.value = Some(new_value);
+                new_value
+            }
+            Some(prev) => {
+                let ema = self.alpha * new_value + (1.0 - self.alpha) * prev;
+                self.value = Some(ema);
+                ema
+            }
+        }
+    }
+
+    /// 获取当前 EMA 值
+    pub fn value(&self) -> Option<f64> {
+        self.value
+    }
+
+    /// 获取更新次数
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// 是否已经预热完成（满足 period 次更新）
+    pub fn is_ready(&self) -> bool {
+        self.count >= self.period
+    }
+}
+
 /// 资金费率套利策略配置
 #[derive(Debug, Clone, Deserialize)]
 pub struct FundingArbConfig {
-    /// 最小日化费率差 (开仓阈值)
-    #[serde(default = "default_min_spread")]
-    pub min_spread: Rate,
-    /// 最大日化费率差 (限制风险)
-    #[serde(default = "default_max_spread")]
-    pub max_spread: Rate,
-    /// 平仓日化费率差阈值
-    #[serde(default = "default_close_spread")]
-    pub close_spread: Rate,
+    /// EMA 周期（默认 100）
+    #[serde(default = "default_ema_period")]
+    pub ema_period: usize,
+    /// 开仓偏离阈值（metric 偏离 EMA 的百分比，如 0.003 表示 0.3%）
+    #[serde(default = "default_open_deviation")]
+    pub open_deviation: f64,
+    /// 平仓偏离阈值（metric 回归 EMA 的百分比，如 0.0005 表示 0.05%）
+    #[serde(default = "default_close_deviation")]
+    pub close_deviation: f64,
     /// 单笔最大下单金额 (USDT)
     #[serde(default = "default_max_notional")]
     pub max_notional: f64,
@@ -28,19 +80,22 @@ pub struct FundingArbConfig {
     /// 订单超时时间 (毫秒)
     #[serde(default = "default_order_timeout_ms")]
     pub order_timeout_ms: u64,
-    /// 不平衡修复阈值 - 敞口价值 (USD, 超过该价值视为不平衡)
-    #[serde(default = "default_unhedge_value_threshold")]
-    pub unhedge_value_threshold: f64,
+    /// 单交易所仓位/净值比例限制（如 0.2 表示 20%）
+    #[serde(default = "default_max_position_equity_ratio")]
+    pub max_position_equity_ratio: f64,
+    /// 敞口比例限制（敞口/较小仓位，如 0.01 表示 1%）
+    #[serde(default = "default_max_exposure_ratio")]
+    pub max_exposure_ratio: f64,
 }
 
-fn default_min_spread() -> Rate {
-    0.0005
+fn default_ema_period() -> usize {
+    100
 }
-fn default_max_spread() -> Rate {
-    0.002
+fn default_open_deviation() -> f64 {
+    0.003 // 0.3%
 }
-fn default_close_spread() -> Rate {
-    0.0002
+fn default_close_deviation() -> f64 {
+    0.0005 // 0.05%
 }
 fn default_max_notional() -> f64 {
     1000.0
@@ -51,120 +106,240 @@ fn default_max_quantity() -> Quantity {
 fn default_order_timeout_ms() -> u64 {
     10_000
 }
-fn default_unhedge_value_threshold() -> f64 {
-    50.0
+fn default_max_position_equity_ratio() -> f64 {
+    0.2 // 20%
+}
+fn default_max_exposure_ratio() -> f64 {
+    0.01 // 1%
 }
 
 impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
-            min_spread: default_min_spread(),
-            max_spread: default_max_spread(),
-            close_spread: default_close_spread(),
+            ema_period: default_ema_period(),
+            open_deviation: default_open_deviation(),
+            close_deviation: default_close_deviation(),
             max_notional: default_max_notional(),
             max_quantity: default_max_quantity(),
             order_timeout_ms: default_order_timeout_ms(),
-            unhedge_value_threshold: default_unhedge_value_threshold(),
+            max_position_equity_ratio: default_max_position_equity_ratio(),
+            max_exposure_ratio: default_max_exposure_ratio(),
         }
     }
 }
 
-/// 开仓条件检查结果
-struct OpenCondition {
-    short_ex: Exchange,
+/// Metric 计算结果
+#[derive(Debug, Clone)]
+struct MetricResult {
+    /// metric = short_bid / long_ask - 1
+    metric: f64,
+    /// 资费最高交易所（做空）
+    short_exchange: Exchange,
+    /// 资费最高交易所的 BBO
     short_bbo: BBO,
-    long_ex: Exchange,
+    /// 资费最低交易所（做多）
+    long_exchange: Exchange,
+    /// 资费最低交易所的 BBO
     long_bbo: BBO,
 }
 
 /// 资金费率套利策略 (单 symbol)
+///
+/// 策略逻辑：
+/// 1. 监控 metric = 最大资费bid1 / 最小资费ask1 - 1
+/// 2. 维护 metric 的 EMA，在 BBO 事件时更新
+/// 3. 满 ema_period 次更新后才允许开平仓
+/// 4. 当 metric 偏离 EMA > open_deviation 时开仓
+/// 5. 当 metric 回归 EMA < close_deviation 时平仓
 pub struct FundingArbStrategy {
     config: FundingArbConfig,
     exchanges: Vec<Exchange>,
     symbol: Symbol,
+    /// EMA 计算器
+    ema: EmaCalculator,
+    /// 当前 metric 值
+    current_metric: Option<f64>,
 }
 
 impl FundingArbStrategy {
     pub fn new(config: FundingArbConfig, exchanges: Vec<Exchange>, symbol: Symbol) -> Self {
+        let ema = EmaCalculator::new(config.ema_period);
         Self {
             config,
             exchanges,
             symbol,
+            ema,
+            current_metric: None,
         }
     }
 
-    /// 检查开仓条件
-    fn check_open_condition(
-        state: &SymbolState,
-        config: &FundingArbConfig,
-    ) -> Option<OpenCondition> {
-        let spread = state.funding_spread()?;
+    /// 计算 metric = short_bid / long_ask - 1
+    ///
+    /// short_exchange: 资费最高的交易所（适合做空）
+    /// long_exchange: 资费最低的交易所（适合做多）
+    fn calculate_metric(state: &SymbolState) -> Option<MetricResult> {
+        let (short_exchange, _) = state.best_short_exchange()?;
+        let (long_exchange, _) = state.best_long_exchange()?;
 
-        if spread.abs() < config.min_spread {
+        let short_bbo = state.bbo(short_exchange)?.clone();
+        let long_bbo = state.bbo(long_exchange)?.clone();
+
+        if long_bbo.ask_price <= 0.0 {
             return None;
         }
 
-        if spread.abs() > config.max_spread {
-            tracing::warn!(
-                symbol = %state.symbol,
-                spread = spread,
-                "Spread exceeds max threshold"
-            );
-            return None;
-        }
+        let metric = short_bbo.bid_price / long_bbo.ask_price - 1.0;
 
-        // 如果已有持仓，不开新仓
-        if state.has_positions() {
-            return None;
-        }
-
-        // 如果有未完成订单，等待
-        if state.has_pending_orders() {
-            return None;
-        }
-
-        let (short_ex, short_rate) = state.best_short_exchange()?;
-        let (long_ex, long_rate) = state.best_long_exchange()?;
-
-        // 检查两个交易所的 BBO 是否都存在
-        let short_bbo = state.bbo(short_ex)?.clone();
-        let long_bbo = state.bbo(long_ex)?.clone();
-
-        tracing::info!(
-            symbol = %state.symbol,
-            spread = spread,
-            short_exchange = %short_ex,
-            short_rate = short_rate.rate,
-            long_exchange = %long_ex,
-            long_rate = long_rate.rate,
-            "Opening condition met"
-        );
-
-        Some(OpenCondition {
-            short_ex,
+        Some(MetricResult {
+            metric,
+            short_exchange,
             short_bbo,
-            long_ex,
+            long_exchange,
             long_bbo,
         })
     }
 
+    /// 检查开仓条件
+    ///
+    /// 条件：
+    /// 1. EMA 已预热完成
+    /// 2. metric 偏离 EMA > open_deviation
+    /// 3. 无现有持仓
+    /// 4. 无未完成订单
+    /// 5. 风控检查通过
+    fn check_open_condition(
+        &self,
+        state: &SymbolState,
+        metric_result: &MetricResult,
+        state_manager: &StateManager,
+    ) -> bool {
+        // EMA 未预热完成
+        if !self.ema.is_ready() {
+            return false;
+        }
+
+        // 已有持仓
+        if state.has_positions() {
+            return false;
+        }
+
+        // 有未完成订单
+        if state.has_pending_orders() {
+            return false;
+        }
+
+        let ema_value = match self.ema.value() {
+            Some(v) => v,
+            None => return false,
+        };
+
+        // 计算偏离度 = metric - ema
+        let deviation = metric_result.metric - ema_value;
+
+        // 偏离度 > open_deviation 时开仓
+        // metric > ema 意味着 short_bid/long_ask 比均值高，适合做空 short_exchange、做多 long_exchange
+        if deviation.abs() < self.config.open_deviation {
+            return false;
+        }
+
+        // 风控检查：单交易所仓位限制
+        let short_equity = state_manager.equity(metric_result.short_exchange);
+        let long_equity = state_manager.equity(metric_result.long_exchange);
+
+        if short_equity <= 0.0 || long_equity <= 0.0 {
+            tracing::warn!(
+                symbol = %self.symbol,
+                short_equity = short_equity,
+                long_equity = long_equity,
+                "Insufficient equity"
+            );
+            return false;
+        }
+
+        tracing::info!(
+            symbol = %self.symbol,
+            metric = format!("{:.6}", metric_result.metric),
+            ema = format!("{:.6}", ema_value),
+            deviation = format!("{:.6}", deviation),
+            short_exchange = %metric_result.short_exchange,
+            long_exchange = %metric_result.long_exchange,
+            "Opening condition met"
+        );
+
+        true
+    }
+
     /// 检查平仓条件
-    fn check_close_condition(state: &SymbolState, config: &FundingArbConfig) -> bool {
+    ///
+    /// 条件：
+    /// 1. 有持仓
+    /// 2. metric 回归 EMA（偏离度 < close_deviation）
+    fn check_close_condition(&self, state: &SymbolState) -> bool {
         if !state.has_positions() {
             return false;
         }
 
-        let spread = match state.funding_spread() {
-            Some(s) => s,
+        let ema_value = match self.ema.value() {
+            Some(v) => v,
             None => return false,
         };
 
-        // 费率差收窄到阈值以下，平仓
-        spread.abs() < config.close_spread
+        let metric = match self.current_metric {
+            Some(m) => m,
+            None => return false,
+        };
+
+        let deviation = (metric - ema_value).abs();
+
+        if deviation < self.config.close_deviation {
+            tracing::info!(
+                symbol = %self.symbol,
+                metric = format!("{:.6}", metric),
+                ema = format!("{:.6}", ema_value),
+                deviation = format!("{:.6}", deviation),
+                "Closing condition met - metric reverted to EMA"
+            );
+            return true;
+        }
+
+        false
     }
 
-    /// 单币种最大持仓占比 (100%)
-    const MAX_POSITION_RATIO: f64 = 1.0;
+    /// 检查敞口是否在允许范围内
+    ///
+    /// 敞口限制：敞口 < min(|long|, |short|) * max_exposure_ratio
+    fn check_exposure(&self, state: &SymbolState) -> bool {
+        let (long_size, short_size) = state.position_sizes();
+
+        if long_size.abs() < 1e-10 && short_size.abs() < 1e-10 {
+            return true; // 无持仓，无敞口问题
+        }
+
+        let exposure = (long_size + short_size).abs();
+        let min_position = long_size.abs().min(short_size.abs());
+
+        if min_position < 1e-10 {
+            // 只有单边持仓，允许（可能是刚开仓）
+            return true;
+        }
+
+        let exposure_ratio = exposure / min_position;
+
+        if exposure_ratio > self.config.max_exposure_ratio {
+            tracing::warn!(
+                symbol = %self.symbol,
+                long_size = long_size,
+                short_size = short_size,
+                exposure = exposure,
+                exposure_ratio = format!("{:.4}", exposure_ratio),
+                max_ratio = self.config.max_exposure_ratio,
+                "Exposure exceeds limit"
+            );
+            return false;
+        }
+
+        true
+    }
 
     /// 计算下单数量
     fn calculate_quantity(
@@ -186,25 +361,21 @@ impl FundingArbStrategy {
     }
 
     /// 生成开仓订单
-    ///
-    /// 根据两边交易所的净值计算开仓大小，取较小的那个
     fn make_open_orders(
-        symbol: &Symbol,
-        short_ex: Exchange,
-        short_bbo: &BBO,
-        long_ex: Exchange,
-        long_bbo: &BBO,
-        config: &FundingArbConfig,
-        short_equity: f64,
-        long_equity: f64,
+        &self,
+        metric_result: &MetricResult,
+        state_manager: &StateManager,
     ) -> Vec<Order> {
-        // 取两边净值较小的那个来计算最大仓位
+        let short_equity = state_manager.equity(metric_result.short_exchange);
+        let long_equity = state_manager.equity(metric_result.long_exchange);
+
+        // 取两边净值较小的那个，再乘以仓位比例限制
         let min_equity = short_equity.min(long_equity);
-        let max_position_value = min_equity * Self::MAX_POSITION_RATIO;
+        let max_position_value = min_equity * self.config.max_position_equity_ratio;
 
         if max_position_value <= 0.0 {
             tracing::warn!(
-                symbol = %symbol,
+                symbol = %self.symbol,
                 short_equity = short_equity,
                 long_equity = long_equity,
                 "Insufficient equity for opening position"
@@ -212,19 +383,27 @@ impl FundingArbStrategy {
             return vec![];
         }
 
-        let short_price = short_bbo.bid_price;
-        let short_qty =
-            Self::calculate_quantity(config, short_price, short_bbo.bid_qty, max_position_value);
+        let short_price = metric_result.short_bbo.bid_price;
+        let short_qty = Self::calculate_quantity(
+            &self.config,
+            short_price,
+            metric_result.short_bbo.bid_qty,
+            max_position_value,
+        );
 
-        let long_price = long_bbo.ask_price;
-        let long_qty =
-            Self::calculate_quantity(config, long_price, long_bbo.ask_qty, max_position_value);
+        let long_price = metric_result.long_bbo.ask_price;
+        let long_qty = Self::calculate_quantity(
+            &self.config,
+            long_price,
+            metric_result.long_bbo.ask_qty,
+            max_position_value,
+        );
 
         let qty = short_qty.min(long_qty);
 
         if qty <= 0.0 {
             tracing::warn!(
-                symbol = %symbol,
+                symbol = %self.symbol,
                 short_qty = short_qty,
                 long_qty = long_qty,
                 "Calculated quantity is zero or negative"
@@ -233,10 +412,10 @@ impl FundingArbStrategy {
         }
 
         tracing::info!(
-            symbol = %symbol,
-            short_ex = %short_ex,
+            symbol = %self.symbol,
+            short_ex = %metric_result.short_exchange,
             short_price = short_price,
-            long_ex = %long_ex,
+            long_ex = %metric_result.long_exchange,
             long_price = long_price,
             qty = qty,
             "Opening positions"
@@ -245,8 +424,8 @@ impl FundingArbStrategy {
         vec![
             Order {
                 id: String::new(),
-                exchange: short_ex,
-                symbol: symbol.clone(),
+                exchange: metric_result.short_exchange,
+                symbol: self.symbol.clone(),
                 side: Side::Short,
                 order_type: OrderType::Limit {
                     price: short_price,
@@ -258,8 +437,8 @@ impl FundingArbStrategy {
             },
             Order {
                 id: String::new(),
-                exchange: long_ex,
-                symbol: symbol.clone(),
+                exchange: metric_result.long_exchange,
+                symbol: self.symbol.clone(),
                 side: Side::Long,
                 order_type: OrderType::Limit {
                     price: long_price,
@@ -273,11 +452,10 @@ impl FundingArbStrategy {
     }
 
     /// 生成平仓订单
-    fn make_close_orders(state: &SymbolState) -> Vec<Order> {
+    fn make_close_orders(&self, state: &SymbolState) -> Vec<Order> {
         let mut orders = Vec::new();
 
         for (exchange, pos) in &state.positions {
-            // pos.side() 返回 None 表示空仓，跳过
             if let Some(pos_side) = pos.side() {
                 let order_type = if let Some(bbo) = state.bbo(*exchange) {
                     let price = match pos_side {
@@ -295,7 +473,7 @@ impl FundingArbStrategy {
                 orders.push(Order {
                     id: String::new(),
                     exchange: *exchange,
-                    symbol: state.symbol.clone(),
+                    symbol: self.symbol.clone(),
                     side: pos_side.opposite(),
                     order_type,
                     quantity: pos.size.abs(),
@@ -308,119 +486,26 @@ impl FundingArbStrategy {
         orders
     }
 
-    /// 检查净敞口是否超过阈值
-    ///
-    /// 参数:
-    /// - net_exposure: 净持仓量 (正数净多头，负数净空头)
-    /// - price: 估算价格
-    /// - value_threshold: 敞口价值阈值 (USD)
-    ///
-    /// 返回: 敞口价值是否超过阈值
-    fn is_significantly_unhedged(net_exposure: f64, price: f64, value_threshold: f64) -> bool {
-        if price <= 0.0 {
-            return false;
-        }
-        let exposure_value = net_exposure.abs() * price;
-        exposure_value > value_threshold
-    }
-
-    /// 生成敞口修复订单
-    ///
-    /// 根据净敞口选择资费最优的交易所下单:
-    /// - 净多头 (net > 0): 在资费最高的交易所开空单对冲
-    /// - 净空头 (net < 0): 在资费最低的交易所开多单对冲
-    fn make_hedge_repair_orders(net_exposure: f64, state: &SymbolState) -> Vec<Order> {
-        let qty = net_exposure.abs();
-        if qty < 1e-10 {
-            return vec![];
-        }
-
-        // 净多头 → 开空单对冲 → 选资费最高的交易所
-        // 净空头 → 开多单对冲 → 选资费最低的交易所
-        let (exchange, side) = if net_exposure > 0.0 {
-            match state.best_short_exchange() {
-                Some((ex, _)) => (ex, Side::Short),
-                None => return vec![],
+    /// 打印市场指标
+    fn log_market_metrics(&self, metric_result: Option<&MetricResult>) {
+        let (metric, ema, deviation, ready) = match (metric_result, self.ema.value()) {
+            (Some(mr), Some(ema)) => {
+                let deviation = mr.metric - ema;
+                (mr.metric, ema, deviation, self.ema.is_ready())
             }
-        } else {
-            match state.best_long_exchange() {
-                Some((ex, _)) => (ex, Side::Long),
-                None => return vec![],
-            }
+            (Some(mr), None) => (mr.metric, 0.0, 0.0, false),
+            _ => return,
         };
 
-        let order_type = if let Some(bbo) = state.bbo(exchange) {
-            let price = match side {
-                Side::Long => bbo.ask_price,
-                Side::Short => bbo.bid_price,
-            };
-            OrderType::Limit {
-                price,
-                tif: TimeInForce::IOC,
-            }
-        } else {
-            OrderType::Market
-        };
-
-        tracing::warn!(
-            symbol = %state.symbol,
-            exchange = %exchange,
-            side = %side,
-            qty = qty,
-            net_exposure = net_exposure,
-            "Detected unhedged exposure, generating repair order"
+        tracing::info!(
+            symbol = %self.symbol,
+            metric = format!("{:.6}", metric),
+            ema = format!("{:.6}", ema),
+            deviation = format!("{:.6}", deviation),
+            ema_count = self.ema.count(),
+            ema_ready = ready,
+            "Market metrics"
         );
-
-        vec![Order {
-            id: String::new(),
-            exchange,
-            symbol: state.symbol.clone(),
-            side,
-            order_type,
-            quantity: qty,
-            reduce_only: false,
-            client_order_id: String::new(),
-        }]
-    }
-
-    /// 打印各交易所的市场指标（溢价指数和资金费率）
-    fn log_market_metrics(&self, state: &SymbolState) {
-        for exchange in &self.exchanges {
-            let funding_rate = state
-                .funding_rates
-                .get(exchange)
-                .map(|r| r.rate)
-                .unwrap_or(0.0);
-
-            let index_price = state
-                .index_prices
-                .get(exchange)
-                .map(|ip| ip.price)
-                .unwrap_or(0.0);
-
-            let bbo = state.bbo(*exchange);
-
-            // premium_long = ask1 / index_price - 1 (做多吃 ask)
-            // premium_short = bid1 / index_price - 1 (做空吃 bid)
-            let (premium_long, premium_short) = if index_price > 0.0 {
-                match bbo {
-                    Some(b) => (b.ask_price / index_price - 1.0, b.bid_price / index_price - 1.0),
-                    None => (0.0, 0.0),
-                }
-            } else {
-                (0.0, 0.0)
-            };
-
-            tracing::info!(
-                symbol = %self.symbol,
-                exchange = %exchange,
-                funding_rate = format!("{:.6}", funding_rate),
-                premium_long = format!("{:.6}", premium_long),
-                premium_short = format!("{:.6}", premium_short),
-                index_price = format!("{:.2}", index_price),
-                "Market metrics"
-            );
-        }
     }
 }
 
@@ -431,12 +516,6 @@ impl Strategy for FundingArbStrategy {
                 symbol: self.symbol.clone(),
             },
             SubscriptionKind::BBO {
-                symbol: self.symbol.clone(),
-            },
-            SubscriptionKind::MarkPrice {
-                symbol: self.symbol.clone(),
-            },
-            SubscriptionKind::IndexPrice {
                 symbol: self.symbol.clone(),
             },
         ]
@@ -462,44 +541,48 @@ impl Strategy for FundingArbStrategy {
             None => return vec![],
         };
 
-        // 打印各交易所的溢价指数和资金费率
-        self.log_market_metrics(symbol_state);
-        return vec![];
+        // 计算 metric
+        let metric_result = Self::calculate_metric(symbol_state);
+
+        // BBO 事件时更新 EMA
+        if matches!(&event.data, ExchangeEventData::BBO(_)) {
+            if let Some(ref mr) = metric_result {
+                self.ema.update(mr.metric);
+                self.current_metric = Some(mr.metric);
+            }
+        }
+
+        // 打印市场指标
+        self.log_market_metrics(metric_result.as_ref());
+
+        // EMA 未预热完成，不进行交易
+        if !self.ema.is_ready() {
+            return vec![];
+        }
 
         // 有未完成订单时等待
         if symbol_state.has_pending_orders() {
             return vec![];
         }
 
-        // 计算净敞口
-        let (net_exposure, price) = symbol_state.net_exposure();
+        // 检查敞口
+        if !self.check_exposure(symbol_state) {
+            // 敞口超限，不操作（可以考虑后续添加修复逻辑）
+            return vec![];
+        }
 
-        // 优先级 1: 检测并修复显著的持仓不平衡
-        if Self::is_significantly_unhedged(net_exposure, price, self.config.unhedge_value_threshold)
-        {
-            let orders = Self::make_hedge_repair_orders(net_exposure, symbol_state);
+        // 优先级 1: 检查平仓条件
+        if self.check_close_condition(symbol_state) {
+            let orders = self.make_close_orders(symbol_state);
             return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
         }
 
-        // 优先级 2: 检查平仓条件
-        if Self::check_close_condition(symbol_state, &self.config) {
-            let orders = Self::make_close_orders(symbol_state);
-            return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
-        }
-
-        // 优先级 3: 检查开仓条件
-        if let Some(cond) = Self::check_open_condition(symbol_state, &self.config) {
-            let orders = Self::make_open_orders(
-                &self.symbol,
-                cond.short_ex,
-                &cond.short_bbo,
-                cond.long_ex,
-                &cond.long_bbo,
-                &self.config,
-                state.equity(cond.short_ex),
-                state.equity(cond.long_ex),
-            );
-            return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
+        // 优先级 2: 检查开仓条件
+        if let Some(ref mr) = metric_result {
+            if self.check_open_condition(symbol_state, mr, state) {
+                let orders = self.make_open_orders(mr, state);
+                return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
+            }
         }
 
         vec![]

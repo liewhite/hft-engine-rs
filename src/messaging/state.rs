@@ -121,6 +121,26 @@ impl SymbolState {
         !self.pending_orders.is_empty()
     }
 
+    /// 获取多空仓位大小
+    ///
+    /// 返回 (多头总量, 空头总量):
+    /// - 多头总量: 所有正向持仓之和（正数）
+    /// - 空头总量: 所有负向持仓之和（负数）
+    pub fn position_sizes(&self) -> (f64, f64) {
+        let mut long_size = 0.0;
+        let mut short_size = 0.0;
+
+        for pos in self.positions.values() {
+            if pos.size > 0.0 {
+                long_size += pos.size;
+            } else if pos.size < 0.0 {
+                short_size += pos.size;
+            }
+        }
+
+        (long_size, short_size)
+    }
+
     /// 计算净敞口 (net exposure)
     ///
     /// 返回 (净持仓量, 估算价格):
