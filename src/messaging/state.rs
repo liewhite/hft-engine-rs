@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, Position, Rate, Symbol, Timestamp, BBO};
+use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, Position, Symbol, Timestamp, BBO};
 use crate::messaging::event::{ExchangeEventData, IncomeEvent};
 use std::collections::HashMap;
 
@@ -68,27 +68,20 @@ impl SymbolState {
         before - self.pending_orders.len()
     }
 
-    /// 获取日化费率最高的交易所 (适合做空)
+    /// 获取费率最高的交易所 (适合做空)
     pub fn best_short_exchange(&self) -> Option<(Exchange, &FundingRate)> {
         self.funding_rates
             .iter()
-            .max_by(|a, b| a.1.daily_rate().total_cmp(&b.1.daily_rate()))
+            .max_by(|a, b| a.1.rate.total_cmp(&b.1.rate))
             .map(|(e, r)| (*e, r))
     }
 
-    /// 获取日化费率最低的交易所 (适合做多)
+    /// 获取费率最低的交易所 (适合做多)
     pub fn best_long_exchange(&self) -> Option<(Exchange, &FundingRate)> {
         self.funding_rates
             .iter()
-            .min_by(|a, b| a.1.daily_rate().total_cmp(&b.1.daily_rate()))
+            .min_by(|a, b| a.1.rate.total_cmp(&b.1.rate))
             .map(|(e, r)| (*e, r))
-    }
-
-    /// 计算日化费率差
-    pub fn funding_spread(&self) -> Option<Rate> {
-        let (_, high) = self.best_short_exchange()?;
-        let (_, low) = self.best_long_exchange()?;
-        Some(high.daily_rate() - low.daily_rate())
     }
 
     /// 是否有持仓

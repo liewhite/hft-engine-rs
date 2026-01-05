@@ -297,7 +297,7 @@ fn parse_public_message(
                 events.push(IncomeEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::FundingRate(update.to_funding_rate(8.0, exchange_ts)),
+                    data: ExchangeEventData::FundingRate(update.to_funding_rate(exchange_ts)),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() }) {

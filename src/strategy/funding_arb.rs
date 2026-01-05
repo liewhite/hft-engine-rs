@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
 /// 最大允许的时间戳差异（毫秒）
-const MAX_TIMESTAMP_DIFF_MS: u64 = 60_000; // 1 分钟
+const MAX_TIMESTAMP_DIFF_MS: u64 = 120_000; // 1 分钟
 
 /// EMA (Exponential Moving Average) 计算器
 #[derive(Debug, Clone)]
@@ -566,16 +566,27 @@ impl FundingArbStrategy {
             (Some(mr), None) => (mr.metric, 0.0, 0.0, false),
             _ => return,
         };
+        if deviation > 0.002 || deviation < -0.001 {
+            tracing::info!(
+                symbol = %self.symbol,
+                metric = format!("{:.6}", metric),
+                ema = format!("{:.6}", ema),
+                deviation = format!("{:.6}", deviation),
+                ema_count = self.ema.count(),
+                ema_ready = ready,
+                "High deviation detected"
+            );
+        }
 
-        tracing::info!(
-            symbol = %self.symbol,
-            metric = format!("{:.6}", metric),
-            ema = format!("{:.6}", ema),
-            deviation = format!("{:.6}", deviation),
-            ema_count = self.ema.count(),
-            ema_ready = ready,
-            "Market metrics"
-        );
+        // tracing::info!(
+        //     symbol = %self.symbol,
+        //     metric = format!("{:.6}", metric),
+        //     ema = format!("{:.6}", ema),
+        //     deviation = format!("{:.6}", deviation),
+        //     ema_count = self.ema.count(),
+        //     ema_ready = ready,
+        //     "Market metrics"
+        // );
     }
 }
 
