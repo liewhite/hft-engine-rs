@@ -425,9 +425,12 @@ impl FundingArbStrategy {
     }
 
     /// 生成开仓订单
+    ///
+    /// 如果当前持仓不平衡，会在短缺的一边增加不平衡量，使成交后两边平衡
     fn make_open_orders(
         &self,
         metric_result: &MetricResult,
+        state: &SymbolState,
         state_manager: &StateManager,
     ) -> Vec<Order> {
         let short_equity = state_manager.equity(metric_result.short_exchange);
@@ -448,7 +451,7 @@ impl FundingArbStrategy {
         }
 
         let short_price = metric_result.short_bbo.bid_price;
-        let short_qty = Self::calculate_quantity(
+        let base_short_qty = Self::calculate_quantity(
             &self.config,
             short_price,
             metric_result.short_bbo.bid_qty,
@@ -456,32 +459,54 @@ impl FundingArbStrategy {
         );
 
         let long_price = metric_result.long_bbo.ask_price;
-        let long_qty = Self::calculate_quantity(
+        let base_long_qty = Self::calculate_quantity(
             &self.config,
             long_price,
             metric_result.long_bbo.ask_qty,
             max_position_value,
         );
 
-        let qty = short_qty.min(long_qty);
+        let base_qty = base_short_qty.min(base_long_qty);
 
-        if qty <= 0.0 {
+        if base_qty <= 0.0 {
             tracing::warn!(
                 symbol = %self.symbol,
-                short_qty = short_qty,
-                long_qty = long_qty,
-                "Calculated quantity is zero or negative"
+                base_short_qty = base_short_qty,
+                base_long_qty = base_long_qty,
+                "Calculated base quantity is zero or negative"
             );
             return vec![];
         }
+
+        // 计算当前持仓不平衡量
+        // long_size 是正数，short_size 是负数
+        // imbalance = long_size + short_size
+        // imbalance > 0: 多头多了，空头短缺
+        // imbalance < 0: 空头多了，多头短缺
+        let (long_size, short_size) = state.position_sizes();
+        let imbalance = long_size + short_size;
+
+        let (short_qty, long_qty) = if imbalance.abs() < 1e-10 {
+            // 平衡，两边相同数量
+            (base_qty, base_qty)
+        } else if imbalance > 0.0 {
+            // 多头多了，空头需要补上不平衡量
+            (base_qty + imbalance, base_qty)
+        } else {
+            // 空头多了，多头需要补上不平衡量
+            (base_qty, base_qty + (-imbalance))
+        };
 
         tracing::info!(
             symbol = %self.symbol,
             short_ex = %metric_result.short_exchange,
             short_price = short_price,
+            short_qty = short_qty,
             long_ex = %metric_result.long_exchange,
             long_price = long_price,
-            qty = qty,
+            long_qty = long_qty,
+            base_qty = base_qty,
+            imbalance = imbalance,
             "Opening positions"
         );
 
@@ -495,7 +520,7 @@ impl FundingArbStrategy {
                     price: short_price,
                     tif: TimeInForce::IOC,
                 },
-                quantity: qty,
+                quantity: short_qty,
                 reduce_only: false,
                 client_order_id: String::new(),
             },
@@ -508,7 +533,7 @@ impl FundingArbStrategy {
                     price: long_price,
                     tif: TimeInForce::IOC,
                 },
-                quantity: qty,
+                quantity: long_qty,
                 reduce_only: false,
                 client_order_id: String::new(),
             },
@@ -655,7 +680,7 @@ impl Strategy for FundingArbStrategy {
         // 优先级 2: 检查开仓条件
         if let Some(ref mr) = metric_result {
             if self.check_open_condition(symbol_state, mr, state) {
-                let orders = self.make_open_orders(mr, state);
+                let orders = self.make_open_orders(mr, symbol_state, state);
                 return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
             }
         }
