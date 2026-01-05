@@ -2,10 +2,9 @@ use crate::domain::{
     Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO,
 };
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
+use crate::messaging::{IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
 use serde::Deserialize;
-use tracing::event;
 use std::collections::{HashMap, HashSet};
 
 /// 资金费率套利策略配置
@@ -383,6 +382,46 @@ impl FundingArbStrategy {
             client_order_id: String::new(),
         }]
     }
+
+    /// 打印各交易所的市场指标（溢价指数和资金费率）
+    fn log_market_metrics(&self, state: &SymbolState) {
+        for exchange in &self.exchanges {
+            let funding_rate = state
+                .funding_rates
+                .get(exchange)
+                .map(|r| r.rate)
+                .unwrap_or(0.0);
+
+            let mark_price = state
+                .mark_prices
+                .get(exchange)
+                .map(|mp| mp.price)
+                .unwrap_or(0.0);
+
+            let index_price = state
+                .index_prices
+                .get(exchange)
+                .map(|ip| ip.price)
+                .unwrap_or(0.0);
+
+            // 溢价指数 = mark_price / index_price - 1
+            let premium = if index_price > 0.0 {
+                mark_price / index_price - 1.0
+            } else {
+                0.0
+            };
+
+            tracing::info!(
+                symbol = %self.symbol,
+                exchange = %exchange,
+                funding_rate = format!("{:.6}", funding_rate),
+                premium = format!("{:.6}", premium),
+                mark_price = format!("{:.2}", mark_price),
+                index_price = format!("{:.2}", index_price),
+                "Market metrics"
+            );
+        }
+    }
 }
 
 impl Strategy for FundingArbStrategy {
@@ -392,6 +431,12 @@ impl Strategy for FundingArbStrategy {
                 symbol: self.symbol.clone(),
             },
             SubscriptionKind::BBO {
+                symbol: self.symbol.clone(),
+            },
+            SubscriptionKind::MarkPrice {
+                symbol: self.symbol.clone(),
+            },
+            SubscriptionKind::IndexPrice {
                 symbol: self.symbol.clone(),
             },
         ]
@@ -411,23 +456,14 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
-        match event.exchange() {
-            Some(ex) if ex == Exchange::Hyperliquid => {
-                tracing::info!(
-                    symbol = %self.symbol,
-                    exchange = %ex,
-                    event = ?event.data,
-                    "Ignoring Hyperliquid events in FundingArbStrategy"
-                );
-                return vec![];
-            }
-            _ => return vec![],
-        }
         // 获取本策略关注的 symbol 状态
         let symbol_state = match state.symbol_state(&self.symbol) {
             Some(s) => s,
             None => return vec![],
         };
+
+        // 打印各交易所的溢价指数和资金费率
+        self.log_market_metrics(symbol_state);
 
         // 有未完成订单时等待
         if symbol_state.has_pending_orders() {
