@@ -14,11 +14,38 @@ pub struct FundingRate {
 
 impl FundingRate {
     /// 日化费率 = rate * (24 / settle_interval_hours)
+    ///
+    /// 基于固定结算周期计算
     pub fn daily_rate(&self) -> Rate {
         if self.settle_interval_hours <= 0.0 {
             return 0.0;
         }
         self.rate * (24.0 / self.settle_interval_hours)
+    }
+
+    /// 基于剩余时间的日化费率
+    ///
+    /// 公式：rate * 24 / hours_to_settle
+    ///
+    /// 例如：
+    /// - binance 距离下次资费 5 小时，费率 0.05%，日化 = 0.05% * 24 / 5 = 0.24%
+    /// - hyperliquid 距离下次资费 1 小时，费率 0.02%，日化 = 0.02% * 24 / 1 = 0.48%
+    pub fn daily_rate_by_time_remaining(&self, current_time: Timestamp) -> Rate {
+        if current_time >= self.next_settle_time {
+            // 已过结算时间，使用固定周期
+            return self.daily_rate();
+        }
+
+        let ms_to_settle = self.next_settle_time - current_time;
+        let hours_to_settle = ms_to_settle as f64 / (1000.0 * 60.0 * 60.0);
+
+        if hours_to_settle <= 0.0 {
+            return self.daily_rate();
+        }
+
+        // 为防止临近结算时日化费率过高，设置最小时间为 0.5 小时
+        let effective_hours = hours_to_settle.max(0.5);
+        self.rate * (24.0 / effective_hours)
     }
 
     /// 年化费率 = daily_rate * 365

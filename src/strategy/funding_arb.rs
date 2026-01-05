@@ -1,11 +1,12 @@
 use crate::domain::{
-    Exchange, Order, OrderType, Price, Quantity, Side, Symbol, TimeInForce, BBO,
+    Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, Timestamp, BBO,
 };
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// EMA (Exponential Moving Average) 计算器
 #[derive(Debug, Clone)]
@@ -71,6 +72,10 @@ pub struct FundingArbConfig {
     /// 平仓偏离阈值（metric 回归 EMA 的百分比，如 0.0005 表示 0.05%）
     #[serde(default = "default_close_deviation")]
     pub close_deviation: f64,
+    /// 最小资费差（日化，如 0.003 表示 0.3%）
+    /// 只有当最大资费日化 - 最小资费日化 > 此阈值时才允许开仓
+    #[serde(default = "default_min_funding_spread")]
+    pub min_funding_spread: Rate,
     /// 单笔最大下单金额 (USDT)
     #[serde(default = "default_max_notional")]
     pub max_notional: f64,
@@ -97,6 +102,9 @@ fn default_open_deviation() -> f64 {
 fn default_close_deviation() -> f64 {
     0.0005 // 0.05%
 }
+fn default_min_funding_spread() -> Rate {
+    0.003 // 0.3% 日化资费差
+}
 fn default_max_notional() -> f64 {
     1000.0
 }
@@ -119,6 +127,7 @@ impl Default for FundingArbConfig {
             ema_period: default_ema_period(),
             open_deviation: default_open_deviation(),
             close_deviation: default_close_deviation(),
+            min_funding_spread: default_min_funding_spread(),
             max_notional: default_max_notional(),
             max_quantity: default_max_quantity(),
             order_timeout_ms: default_order_timeout_ms(),
@@ -161,6 +170,14 @@ pub struct FundingArbStrategy {
     current_metric: Option<f64>,
 }
 
+/// 获取当前时间戳（毫秒）
+fn current_timestamp() -> Timestamp {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis() as Timestamp
+}
+
 impl FundingArbStrategy {
     pub fn new(config: FundingArbConfig, exchanges: Vec<Exchange>, symbol: Symbol) -> Self {
         let ema = EmaCalculator::new(config.ema_period);
@@ -171,6 +188,35 @@ impl FundingArbStrategy {
             ema,
             current_metric: None,
         }
+    }
+
+    /// 计算基于剩余时间的资费差（日化）
+    ///
+    /// 返回 (最大日化资费, 最小日化资费, 资费差)
+    fn calculate_funding_spread(&self, state: &SymbolState) -> Option<(Rate, Rate, Rate)> {
+        let now = current_timestamp();
+
+        let (short_ex, short_rate) = state.best_short_exchange()?;
+        let (long_ex, long_rate) = state.best_long_exchange()?;
+
+        let short_daily = short_rate.daily_rate_by_time_remaining(now);
+        let long_daily = long_rate.daily_rate_by_time_remaining(now);
+
+        let spread = short_daily - long_daily;
+
+        tracing::debug!(
+            symbol = %self.symbol,
+            short_exchange = %short_ex,
+            short_rate = format!("{:.6}", short_rate.rate),
+            short_daily = format!("{:.6}", short_daily),
+            long_exchange = %long_ex,
+            long_rate = format!("{:.6}", long_rate.rate),
+            long_daily = format!("{:.6}", long_daily),
+            funding_spread = format!("{:.6}", spread),
+            "Funding spread calculated"
+        );
+
+        Some((short_daily, long_daily, spread))
     }
 
     /// 计算 metric = short_bid / long_ask - 1
@@ -204,8 +250,9 @@ impl FundingArbStrategy {
     /// 条件：
     /// 1. 无现有持仓
     /// 2. 无未完成订单
-    /// 3. metric 偏离 EMA > open_deviation
-    /// 4. 风控检查通过
+    /// 3. 资费差（日化）> min_funding_spread
+    /// 4. metric 偏离 EMA > open_deviation
+    /// 5. 风控检查通过
     ///
     /// 前置条件：EMA 已预热完成（由 on_event 保证）
     fn check_open_condition(
@@ -221,6 +268,22 @@ impl FundingArbStrategy {
 
         // 有未完成订单
         if state.has_pending_orders() {
+            return false;
+        }
+
+        // 检查资费差（基于剩余时间的日化）
+        let funding_spread = match self.calculate_funding_spread(state) {
+            Some((_, _, spread)) => spread,
+            None => return false,
+        };
+
+        if funding_spread < self.config.min_funding_spread {
+            tracing::debug!(
+                symbol = %self.symbol,
+                funding_spread = format!("{:.6}", funding_spread),
+                min_funding_spread = format!("{:.6}", self.config.min_funding_spread),
+                "Funding spread too low for opening"
+            );
             return false;
         }
 
@@ -256,6 +319,7 @@ impl FundingArbStrategy {
             metric = format!("{:.6}", metric_result.metric),
             ema = format!("{:.6}", ema_value),
             deviation = format!("{:.6}", deviation),
+            funding_spread = format!("{:.6}", funding_spread),
             short_exchange = %metric_result.short_exchange,
             long_exchange = %metric_result.long_exchange,
             "Opening condition met"
