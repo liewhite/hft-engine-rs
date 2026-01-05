@@ -266,11 +266,10 @@ impl FundingArbStrategy {
     /// 检查开仓条件
     ///
     /// 条件：
-    /// 1. 无现有持仓
-    /// 2. 无未完成订单
-    /// 3. 资费差（日化）> min_funding_spread
-    /// 4. metric 偏离 EMA > open_deviation
-    /// 5. 风控检查通过
+    /// 1. 无未完成订单
+    /// 2. 资费差（日化）> min_funding_spread
+    /// 3. metric 偏离 EMA > open_deviation
+    /// 4. 风控检查通过
     ///
     /// 前置条件：EMA 已预热完成（由 on_event 保证）
     fn check_open_condition(
@@ -279,11 +278,6 @@ impl FundingArbStrategy {
         metric_result: &MetricResult,
         state_manager: &StateManager,
     ) -> bool {
-        // 已有持仓
-        if state.has_positions() {
-            return false;
-        }
-
         // 有未完成订单
         if state.has_pending_orders() {
             return false;
