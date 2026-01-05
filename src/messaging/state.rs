@@ -69,28 +69,18 @@ impl SymbolState {
     }
 
     /// 获取日化费率最高的交易所 (适合做空)
-    ///
-    /// 日化费率 = rate * 24h / (next_settle_time - timestamp)
     pub fn best_short_exchange(&self) -> Option<(Exchange, &FundingRate)> {
         self.funding_rates
             .iter()
-            .max_by(|a, b| {
-                a.1.daily_rate_by_time_remaining(a.1.timestamp)
-                    .total_cmp(&b.1.daily_rate_by_time_remaining(b.1.timestamp))
-            })
+            .max_by(|a, b| a.1.daily_rate().total_cmp(&b.1.daily_rate()))
             .map(|(e, r)| (*e, r))
     }
 
     /// 获取日化费率最低的交易所 (适合做多)
-    ///
-    /// 日化费率 = rate * 24h / (next_settle_time - timestamp)
     pub fn best_long_exchange(&self) -> Option<(Exchange, &FundingRate)> {
         self.funding_rates
             .iter()
-            .min_by(|a, b| {
-                a.1.daily_rate_by_time_remaining(a.1.timestamp)
-                    .total_cmp(&b.1.daily_rate_by_time_remaining(b.1.timestamp))
-            })
+            .min_by(|a, b| a.1.daily_rate().total_cmp(&b.1.daily_rate()))
             .map(|(e, r)| (*e, r))
     }
 

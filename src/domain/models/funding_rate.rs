@@ -17,18 +17,16 @@ impl FundingRate {
     ///
     /// 公式：rate * 24 / hours_to_settle
     ///
-    /// 参数 reference_time: 计算时使用的参考时间戳（通常使用多个交易所中最小的时间戳）
-    ///
     /// 例如：
     /// - binance 距离下次资费 5 小时，费率 0.05%，日化 = 0.05% * 24 / 5 = 0.24%
     /// - hyperliquid 距离下次资费 1 小时，费率 0.02%，日化 = 0.02% * 24 / 1 = 0.48%
-    pub fn daily_rate_by_time_remaining(&self, reference_time: Timestamp) -> Rate {
-        if reference_time >= self.next_settle_time {
+    pub fn daily_rate(&self) -> Rate {
+        if self.timestamp >= self.next_settle_time {
             // 已过结算时间，返回 0（数据过期）
             return 0.0;
         }
 
-        let ms_to_settle = self.next_settle_time - reference_time;
+        let ms_to_settle = self.next_settle_time - self.timestamp;
         let hours_to_settle = ms_to_settle as f64 / (1000.0 * 60.0 * 60.0);
 
         if hours_to_settle <= 0.0 {

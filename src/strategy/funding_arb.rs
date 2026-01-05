@@ -186,8 +186,7 @@ impl FundingArbStrategy {
 
     /// 计算基于剩余时间的资费差（日化）
     ///
-    /// 使用各交易所 FundingRate 中最小的时间戳作为参考时间
-    /// 如果最大时间戳 - 最小时间戳 > 1分钟，返回 None 并打印警告
+    /// 如果最大时间戳 - 最小时间戳 > 2分钟，返回 None 并打印警告
     ///
     /// 返回 (最大日化资费, 最小日化资费, 资费差)
     fn calculate_funding_spread(&self, state: &SymbolState) -> Option<(Rate, Rate, Rate)> {
@@ -213,12 +212,8 @@ impl FundingArbStrategy {
             return None;
         }
 
-        // 使用最小时间戳作为参考时间
-        let reference_time = min_ts;
-
-        let short_daily = short_rate.daily_rate_by_time_remaining(reference_time);
-        let long_daily = long_rate.daily_rate_by_time_remaining(reference_time);
-
+        let short_daily = short_rate.daily_rate();
+        let long_daily = long_rate.daily_rate();
         let spread = short_daily - long_daily;
 
         tracing::debug!(
@@ -230,7 +225,6 @@ impl FundingArbStrategy {
             long_rate = format!("{:.6}", long_rate.rate),
             long_daily = format!("{:.6}", long_daily),
             funding_spread = format!("{:.6}", spread),
-            reference_time = reference_time,
             "Funding spread calculated"
         );
 
