@@ -1,6 +1,4 @@
-use crate::domain::{
-    Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO,
-};
+use crate::domain::{Exchange, Order, OrderType, Rate, Side, Symbol, TimeInForce, BBO};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
@@ -78,18 +76,12 @@ pub struct FundingArbConfig {
     /// 只有当最大资费日化 - 最小资费日化 > 此阈值时才允许开仓
     #[serde(default = "default_min_funding_spread")]
     pub min_funding_spread: Rate,
-    /// 单笔最大下单金额 (USDT)
+    /// 单笔下单金额 (USDT)，开平仓均按此金额计算数量
     #[serde(default = "default_max_notional")]
     pub max_notional: f64,
-    /// 最大持仓数量
-    #[serde(default = "default_max_quantity")]
-    pub max_quantity: Quantity,
     /// 订单超时时间 (毫秒)
     #[serde(default = "default_order_timeout_ms")]
     pub order_timeout_ms: u64,
-    /// 单交易所仓位/净值比例限制（如 0.2 表示 20%）
-    #[serde(default = "default_max_position_equity_ratio")]
-    pub max_position_equity_ratio: f64,
     /// 敞口比例限制（敞口/较小仓位，如 0.01 表示 1%）
     #[serde(default = "default_max_exposure_ratio")]
     pub max_exposure_ratio: f64,
@@ -110,14 +102,8 @@ fn default_min_funding_spread() -> Rate {
 fn default_max_notional() -> f64 {
     1000.0
 }
-fn default_max_quantity() -> Quantity {
-    1.0
-}
 fn default_order_timeout_ms() -> u64 {
     10_000
-}
-fn default_max_position_equity_ratio() -> f64 {
-    0.2 // 20%
 }
 fn default_max_exposure_ratio() -> f64 {
     0.01 // 1%
@@ -131,9 +117,7 @@ impl Default for FundingArbConfig {
             close_deviation: default_close_deviation(),
             min_funding_spread: default_min_funding_spread(),
             max_notional: default_max_notional(),
-            max_quantity: default_max_quantity(),
             order_timeout_ms: default_order_timeout_ms(),
-            max_position_equity_ratio: default_max_position_equity_ratio(),
             max_exposure_ratio: default_max_exposure_ratio(),
         }
     }
@@ -405,76 +389,25 @@ impl FundingArbStrategy {
         true
     }
 
-    /// 计算下单数量
-    fn calculate_quantity(
-        config: &FundingArbConfig,
-        price: Price,
-        counter_qty: Quantity,
-        max_position_value: f64,
-    ) -> Quantity {
-        if price <= 0.0 {
-            return 0.0;
-        }
-        let qty_by_notional = config.max_notional / price;
-        let qty_by_book = counter_qty / 2.0;
-        let qty_by_balance = max_position_value / price;
-        qty_by_notional
-            .min(qty_by_book)
-            .min(config.max_quantity)
-            .min(qty_by_balance)
-    }
-
     /// 生成开仓订单
     ///
-    /// 如果当前持仓不平衡，会在短缺的一边增加不平衡量，使成交后两边平衡
+    /// 按固定USD金额计算开仓数量，如果当前持仓不平衡，在短缺一边增加不平衡量
     fn make_open_orders(
         &self,
         metric_result: &MetricResult,
         state: &SymbolState,
-        state_manager: &StateManager,
     ) -> Vec<Order> {
-        let short_equity = state_manager.equity(metric_result.short_exchange);
-        let long_equity = state_manager.equity(metric_result.long_exchange);
+        let short_price = metric_result.short_bbo.bid_price;
+        let long_price = metric_result.long_bbo.ask_price;
 
-        // 取两边净值较小的那个，再乘以仓位比例限制
-        let min_equity = short_equity.min(long_equity);
-        let max_position_value = min_equity * self.config.max_position_equity_ratio;
-
-        if max_position_value <= 0.0 {
-            tracing::warn!(
-                symbol = %self.symbol,
-                short_equity = short_equity,
-                long_equity = long_equity,
-                "Insufficient equity for opening position"
-            );
+        if short_price <= 0.0 || long_price <= 0.0 {
             return vec![];
         }
 
-        let short_price = metric_result.short_bbo.bid_price;
-        let base_short_qty = Self::calculate_quantity(
-            &self.config,
-            short_price,
-            metric_result.short_bbo.bid_qty,
-            max_position_value,
-        );
-
-        let long_price = metric_result.long_bbo.ask_price;
-        let base_long_qty = Self::calculate_quantity(
-            &self.config,
-            long_price,
-            metric_result.long_bbo.ask_qty,
-            max_position_value,
-        );
-
-        let base_qty = base_short_qty.min(base_long_qty);
+        // 按固定USD金额计算基础数量
+        let base_qty = self.config.max_notional / short_price.max(long_price);
 
         if base_qty <= 0.0 {
-            tracing::warn!(
-                symbol = %self.symbol,
-                base_short_qty = base_short_qty,
-                base_long_qty = base_long_qty,
-                "Calculated base quantity is zero or negative"
-            );
             return vec![];
         }
 
@@ -487,7 +420,6 @@ impl FundingArbStrategy {
         let imbalance = long_size + short_size;
 
         let (short_qty, long_qty) = if imbalance.abs() < 1e-10 {
-            // 平衡，两边相同数量
             (base_qty, base_qty)
         } else if imbalance > 0.0 {
             // 多头多了，空头需要补上不平衡量
@@ -541,34 +473,122 @@ impl FundingArbStrategy {
     }
 
     /// 生成平仓订单
+    ///
+    /// 按固定USD金额计算平仓数量，处理不平衡，并和当前持仓取最小值
     fn make_close_orders(&self, state: &SymbolState) -> Vec<Order> {
-        let mut orders = Vec::new();
+        // 获取当前持仓
+        let (long_size, short_size) = state.position_sizes();
+
+        // 没有持仓
+        if long_size.abs() < 1e-10 && short_size.abs() < 1e-10 {
+            return vec![];
+        }
+
+        // 找到多头和空头所在的交易所
+        let mut long_exchange = None;
+        let mut short_exchange = None;
+        let mut long_bbo = None;
+        let mut short_bbo = None;
 
         for (exchange, pos) in &state.positions {
-            if let Some(pos_side) = pos.side() {
-                let order_type = if let Some(bbo) = state.bbo(*exchange) {
-                    let price = match pos_side {
-                        Side::Long => bbo.bid_price,
-                        Side::Short => bbo.ask_price,
-                    };
-                    OrderType::Limit {
-                        price,
-                        tif: TimeInForce::IOC,
-                    }
-                } else {
-                    OrderType::Market
-                };
+            if pos.size > 1e-10 {
+                long_exchange = Some(*exchange);
+                long_bbo = state.bbo(*exchange).cloned();
+            } else if pos.size < -1e-10 {
+                short_exchange = Some(*exchange);
+                short_bbo = state.bbo(*exchange).cloned();
+            }
+        }
 
-                orders.push(Order {
-                    id: String::new(),
-                    exchange: *exchange,
-                    symbol: self.symbol.clone(),
-                    side: pos_side.opposite(),
-                    order_type,
-                    quantity: pos.size.abs(),
-                    reduce_only: true,
-                    client_order_id: String::new(),
-                });
+        let mut orders = Vec::new();
+
+        // 计算不平衡量
+        // imbalance = long_size + short_size (short_size是负数)
+        // imbalance > 0: long多了，long需要多平
+        // imbalance < 0: short多了，short需要多平
+        let imbalance = long_size + short_size;
+
+        // 处理多头平仓
+        if let (Some(exchange), Some(bbo)) = (long_exchange, long_bbo) {
+            let price = bbo.bid_price;
+            if price > 0.0 {
+                let base_qty = self.config.max_notional / price;
+                let close_qty = if imbalance > 0.0 {
+                    // long多了，long需要多平
+                    base_qty + imbalance
+                } else {
+                    base_qty
+                };
+                // 和当前持仓取最小值，避免反向
+                let close_qty = close_qty.min(long_size);
+
+                if close_qty > 1e-10 {
+                    tracing::info!(
+                        symbol = %self.symbol,
+                        exchange = %exchange,
+                        side = "close_long",
+                        price = price,
+                        close_qty = close_qty,
+                        current_pos = long_size,
+                        imbalance = imbalance,
+                        "Closing long position"
+                    );
+                    orders.push(Order {
+                        id: String::new(),
+                        exchange,
+                        symbol: self.symbol.clone(),
+                        side: Side::Short, // 平多用空
+                        order_type: OrderType::Limit {
+                            price,
+                            tif: TimeInForce::IOC,
+                        },
+                        quantity: close_qty,
+                        reduce_only: true,
+                        client_order_id: String::new(),
+                    });
+                }
+            }
+        }
+
+        // 处理空头平仓
+        if let (Some(exchange), Some(bbo)) = (short_exchange, short_bbo) {
+            let price = bbo.ask_price;
+            if price > 0.0 {
+                let base_qty = self.config.max_notional / price;
+                let close_qty = if imbalance < 0.0 {
+                    // short多了，short需要多平
+                    base_qty + (-imbalance)
+                } else {
+                    base_qty
+                };
+                // 和当前持仓取最小值，避免反向 (short_size是负数，取绝对值)
+                let close_qty = close_qty.min((-short_size));
+
+                if close_qty > 1e-10 {
+                    tracing::info!(
+                        symbol = %self.symbol,
+                        exchange = %exchange,
+                        side = "close_short",
+                        price = price,
+                        close_qty = close_qty,
+                        current_pos = short_size,
+                        imbalance = imbalance,
+                        "Closing short position"
+                    );
+                    orders.push(Order {
+                        id: String::new(),
+                        exchange,
+                        symbol: self.symbol.clone(),
+                        side: Side::Long, // 平空用多
+                        order_type: OrderType::Limit {
+                            price,
+                            tif: TimeInForce::IOC,
+                        },
+                        quantity: close_qty,
+                        reduce_only: true,
+                        client_order_id: String::new(),
+                    });
+                }
             }
         }
 
@@ -680,7 +700,7 @@ impl Strategy for FundingArbStrategy {
         // 优先级 2: 检查开仓条件
         if let Some(ref mr) = metric_result {
             if self.check_open_condition(symbol_state, mr, state) {
-                let orders = self.make_open_orders(mr, symbol_state, state);
+                let orders = self.make_open_orders(mr, symbol_state);
                 return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
             }
         }
