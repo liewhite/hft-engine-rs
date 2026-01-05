@@ -392,31 +392,31 @@ impl FundingArbStrategy {
                 .map(|r| r.rate)
                 .unwrap_or(0.0);
 
-            let mark_price = state
-                .mark_prices
-                .get(exchange)
-                .map(|mp| mp.price)
-                .unwrap_or(0.0);
-
             let index_price = state
                 .index_prices
                 .get(exchange)
                 .map(|ip| ip.price)
                 .unwrap_or(0.0);
 
-            // 溢价指数 = mark_price / index_price - 1
-            let premium = if index_price > 0.0 {
-                mark_price / index_price - 1.0
+            let bbo = state.bbo(*exchange);
+
+            // premium_long = ask1 / index_price - 1 (做多吃 ask)
+            // premium_short = bid1 / index_price - 1 (做空吃 bid)
+            let (premium_long, premium_short) = if index_price > 0.0 {
+                match bbo {
+                    Some(b) => (b.ask_price / index_price - 1.0, b.bid_price / index_price - 1.0),
+                    None => (0.0, 0.0),
+                }
             } else {
-                0.0
+                (0.0, 0.0)
             };
 
             tracing::info!(
                 symbol = %self.symbol,
                 exchange = %exchange,
                 funding_rate = format!("{:.6}", funding_rate),
-                premium = format!("{:.6}", premium),
-                mark_price = format!("{:.2}", mark_price),
+                premium_long = format!("{:.6}", premium_long),
+                premium_short = format!("{:.6}", premium_short),
                 index_price = format!("{:.2}", index_price),
                 "Market metrics"
             );
@@ -464,6 +464,7 @@ impl Strategy for FundingArbStrategy {
 
         // 打印各交易所的溢价指数和资金费率
         self.log_market_metrics(symbol_state);
+        return vec![];
 
         // 有未完成订单时等待
         if symbol_state.has_pending_orders() {

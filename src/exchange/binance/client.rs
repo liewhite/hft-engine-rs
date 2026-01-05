@@ -111,14 +111,16 @@ impl BinanceClient {
             symbols: Vec<SymbolInfo>,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize,Debug)]
         #[serde(rename_all = "camelCase")]
         struct SymbolInfo {
             symbol: String,
+            baseAsset: String,
+            underlyingType: String,
             filters: Vec<Filter>,
         }
 
-        #[derive(Deserialize)]
+        #[derive(Deserialize,Debug)]
         #[serde(tag = "filterType")]
         enum Filter {
             #[serde(rename = "PRICE_FILTER")]
@@ -160,6 +162,7 @@ impl BinanceClient {
             .symbols
             .into_iter()
             .filter_map(|s| {
+                println!("Parsing symbol info: {:?}", s);
                 let symbol = from_binance(&s.symbol)?;
                 let mut price_step: Option<f64> = None;
                 let mut size_step: Option<f64> = None;
