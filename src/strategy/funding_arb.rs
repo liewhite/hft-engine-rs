@@ -308,7 +308,8 @@ impl FundingArbStrategy {
 
         // 偏离度 > open_deviation 时开仓
         // metric > ema 意味着 short_bid/long_ask 比均值高，适合做空 short_exchange、做多 long_exchange
-        if deviation.abs() < self.config.open_deviation {
+        // 只在正向偏离时开仓，负向偏离说明价差已经收窄不适合开仓
+        if deviation < self.config.open_deviation {
             return false;
         }
 
