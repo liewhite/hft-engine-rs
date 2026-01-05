@@ -40,8 +40,10 @@ pub struct HyperliquidPublicWsActor {
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
-    /// 已订阅的 kinds (用于去重)
-    subscribed: HashSet<SubscriptionKind>,
+    /// 已订阅的底层 stream (用于 WebSocket 去重)
+    subscribed_streams: HashSet<String>,
+    /// 已订阅的 kinds (用于事件分发和取消订阅)
+    subscribed_kinds: HashSet<SubscriptionKind>,
 }
 
 impl HyperliquidPublicWsActor {
@@ -51,7 +53,8 @@ impl HyperliquidPublicWsActor {
             event_sink: args.event_sink,
             symbol_metas: args.symbol_metas,
             ws_tx: None,
-            subscribed: HashSet::new(),
+            subscribed_streams: HashSet::new(),
+            subscribed_kinds: HashSet::new(),
         }
     }
 
@@ -88,7 +91,7 @@ impl HyperliquidPublicWsActor {
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) {
         let local_ts = now_ms();
-        match parse_public_message(raw, local_ts) {
+        match parse_public_message(raw, local_ts, &self.subscribed_kinds) {
             Ok(events) => {
                 for event in events {
                     self.event_sink.send_event(event).await;
@@ -158,16 +161,24 @@ impl Message<Subscribe> for HyperliquidPublicWsActor {
         msg: Subscribe,
         ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        if self.subscribed.contains(&msg.kind) {
+        // 检查是否已订阅该 kind
+        if self.subscribed_kinds.contains(&msg.kind) {
             return;
         }
 
-        if let Err(e) = self.send_subscribe(&msg.kind).await {
-            tracing::error!(error = %e, "Failed to send subscribe, killing actor");
-            ctx.actor_ref().kill();
-            return;
+        // 检查底层 stream 是否已订阅
+        let stream = kind_to_stream(&msg.kind);
+        if !self.subscribed_streams.contains(&stream) {
+            // 发送 WebSocket 订阅请求
+            if let Err(e) = self.send_subscribe(&msg.kind).await {
+                tracing::error!(error = %e, "Failed to send subscribe, killing actor");
+                ctx.actor_ref().kill();
+                return;
+            }
+            self.subscribed_streams.insert(stream);
         }
-        self.subscribed.insert(msg.kind);
+
+        self.subscribed_kinds.insert(msg.kind);
     }
 }
 
@@ -179,13 +190,24 @@ impl Message<Unsubscribe> for HyperliquidPublicWsActor {
         msg: Unsubscribe,
         ctx: Context<'_, Self, Self::Reply>,
     ) -> Self::Reply {
-        if !self.subscribed.remove(&msg.kind) {
+        if !self.subscribed_kinds.remove(&msg.kind) {
             return;
         }
 
-        if let Err(e) = self.send_unsubscribe(&msg.kind).await {
-            tracing::error!(error = %e, "Failed to send unsubscribe, killing actor");
-            ctx.actor_ref().kill();
+        // 检查是否还有其他 kinds 使用同一个 stream
+        let stream = kind_to_stream(&msg.kind);
+        let stream_still_needed = self
+            .subscribed_kinds
+            .iter()
+            .any(|k| kind_to_stream(k) == stream);
+
+        if !stream_still_needed {
+            if let Err(e) = self.send_unsubscribe(&msg.kind).await {
+                tracing::error!(error = %e, "Failed to send unsubscribe, killing actor");
+                ctx.actor_ref().kill();
+                return;
+            }
+            self.subscribed_streams.remove(&stream);
         }
     }
 }
@@ -223,7 +245,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPubl
 // 消息解析
 // ============================================================================
 
-fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+fn parse_public_message(
+    raw: &str,
+    local_ts: u64,
+    subscribed_kinds: &HashSet<SubscriptionKind>,
+) -> Result<Vec<IncomeEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -237,19 +263,40 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
                 return Ok(Vec::new());
             }
             "activeAssetCtx" => {
-                // 资产上下文（包含资金费率）
+                // 资产上下文（包含资金费率、标记价格、指数价格）
                 let data = &value["data"];
                 match serde_json::from_value::<WsActiveAssetCtx>(data.clone()) {
                     Ok(ctx) => {
+                        let symbol = ctx.symbol();
                         let mut events = Vec::new();
 
-                        // 资金费率事件
-                        let rate = ctx.to_funding_rate();
-                        events.push(IncomeEvent {
-                            exchange_ts: local_ts,
-                            local_ts,
-                            data: ExchangeEventData::FundingRate(rate),
-                        });
+                        // 根据订阅的 kinds 生成对应的事件
+                        if subscribed_kinds
+                            .contains(&SubscriptionKind::FundingRate { symbol: symbol.clone() })
+                        {
+                            events.push(IncomeEvent {
+                                exchange_ts: local_ts,
+                                local_ts,
+                                data: ExchangeEventData::FundingRate(ctx.to_funding_rate()),
+                            });
+                        }
+                        if subscribed_kinds
+                            .contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() })
+                        {
+                            events.push(IncomeEvent {
+                                exchange_ts: local_ts,
+                                local_ts,
+                                data: ExchangeEventData::MarkPrice(ctx.to_mark_price(local_ts)),
+                            });
+                        }
+                        if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
+                            events.push(IncomeEvent {
+                                exchange_ts: local_ts,
+                                local_ts,
+                                data: ExchangeEventData::IndexPrice(ctx.to_index_price(local_ts)),
+                            });
+                        }
+
                         return Ok(events);
                     }
                     Err(e) => {
@@ -299,11 +346,28 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
 // 辅助函数
 // ============================================================================
 
+/// 将 SubscriptionKind 转换为底层 stream 标识符 (用于去重)
+fn kind_to_stream(kind: &SubscriptionKind) -> String {
+    match kind {
+        // FundingRate、MarkPrice、IndexPrice 都使用同一个 activeAssetCtx 订阅
+        SubscriptionKind::FundingRate { symbol }
+        | SubscriptionKind::MarkPrice { symbol }
+        | SubscriptionKind::IndexPrice { symbol } => {
+            format!("activeAssetCtx:{}", to_hyperliquid(symbol))
+        }
+        SubscriptionKind::BBO { symbol } => {
+            format!("bbo:{}", to_hyperliquid(symbol))
+        }
+    }
+}
+
 /// 将 SubscriptionKind 转换为 Hyperliquid 订阅格式
 fn kind_to_subscription(kind: &SubscriptionKind) -> serde_json::Value {
     match kind {
-        SubscriptionKind::FundingRate { symbol } => {
-            // 使用 activeAssetCtx 获取资金费率
+        // FundingRate、MarkPrice、IndexPrice 都使用 activeAssetCtx 订阅
+        SubscriptionKind::FundingRate { symbol }
+        | SubscriptionKind::MarkPrice { symbol }
+        | SubscriptionKind::IndexPrice { symbol } => {
             json!({
                 "type": "activeAssetCtx",
                 "coin": to_hyperliquid(symbol)

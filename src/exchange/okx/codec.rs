@@ -1,5 +1,5 @@
-use super::from_okx;
-use crate::domain::{Exchange, FundingRate, OrderStatus, OrderUpdate, Position, now_ms, BBO};
+use super::{from_okx, from_okx_index};
+use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, now_ms, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -104,6 +104,63 @@ impl BboData {
             bid_qty,
             ask_price,
             ask_qty,
+            timestamp,
+        }
+    }
+}
+
+/// Mark Price 数据 (mark-price channel)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkPriceData {
+    pub inst_id: String,
+    #[allow(dead_code)]
+    pub inst_type: String,
+    pub mark_px: String,
+    pub ts: String,
+}
+
+impl MarkPriceData {
+    pub fn to_mark_price(&self) -> MarkPrice {
+        let symbol = from_okx(&self.inst_id)
+            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+        let price = f64::from_str(&self.mark_px)
+            .unwrap_or_else(|_| panic!("Failed to parse mark price: {}", self.mark_px));
+        let timestamp = self.ts.parse::<u64>()
+            .unwrap_or_else(|_| panic!("Failed to parse timestamp: {}", self.ts));
+
+        MarkPrice {
+            exchange: Exchange::OKX,
+            symbol,
+            price,
+            timestamp,
+        }
+    }
+}
+
+/// Index Ticker 数据 (index-tickers channel)
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexTickerData {
+    pub inst_id: String,
+    pub idx_px: String,
+    pub ts: String,
+}
+
+impl IndexTickerData {
+    pub fn to_index_price(&self) -> IndexPrice {
+        // index-tickers 返回 BTC-USDT 格式，使用 from_okx_index 解析
+        let symbol = from_okx_index(&self.inst_id)
+            .unwrap_or_else(|| panic!("Unknown OKX index symbol: {}", self.inst_id));
+        let price = f64::from_str(&self.idx_px)
+            .unwrap_or_else(|_| panic!("Failed to parse index price: {}", self.idx_px));
+        let timestamp = self.ts.parse::<u64>()
+            .unwrap_or_else(|_| panic!("Failed to parse timestamp: {}", self.ts));
+
+        IndexPrice {
+            exchange: Exchange::OKX,
+            symbol,
+            price,
             timestamp,
         }
     }

@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use super::from_hyperliquid;
-use crate::domain::{now_ms, Exchange, FundingRate, BBO};
+use crate::domain::{now_ms, Exchange, FundingRate, IndexPrice, MarkPrice, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -145,6 +145,38 @@ impl WsActiveAssetCtx {
         }
     }
 
+    /// 转换为 MarkPrice
+    pub fn to_mark_price(&self, timestamp: u64) -> MarkPrice {
+        let symbol = from_hyperliquid(&self.coin);
+        let price = f64::from_str(&self.ctx.mark_px)
+            .expect("mark_px must be valid float from Hyperliquid API");
+
+        MarkPrice {
+            exchange: Exchange::Hyperliquid,
+            symbol,
+            price,
+            timestamp,
+        }
+    }
+
+    /// 转换为 IndexPrice (使用 oracle_px 作为指数价格)
+    pub fn to_index_price(&self, timestamp: u64) -> IndexPrice {
+        let symbol = from_hyperliquid(&self.coin);
+        let price = f64::from_str(&self.ctx.oracle_px)
+            .expect("oracle_px must be valid float from Hyperliquid API");
+
+        IndexPrice {
+            exchange: Exchange::Hyperliquid,
+            symbol,
+            price,
+            timestamp,
+        }
+    }
+
+    /// 获取 symbol
+    pub fn symbol(&self) -> crate::domain::Symbol {
+        from_hyperliquid(&self.coin)
+    }
 }
 
 // ============================================================================

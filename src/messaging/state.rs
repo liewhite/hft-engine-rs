@@ -208,6 +208,9 @@ impl SymbolState {
                     }
                 }
             }
+            ExchangeEventData::MarkPrice(_) | ExchangeEventData::IndexPrice(_) => {
+                // MarkPrice/IndexPrice 事件暂不存储在状态中，由策略层按需处理
+            }
             ExchangeEventData::Clock => {
                 // Clock 事件由策略层处理，这里不需要处理
             }

@@ -20,6 +20,10 @@ pub enum SubscriptionKind {
     FundingRate { symbol: Symbol },
     /// Best Bid/Offer
     BBO { symbol: Symbol },
+    /// 标记价格
+    MarkPrice { symbol: Symbol },
+    /// 指数价格
+    IndexPrice { symbol: Symbol },
 }
 
 impl SubscriptionKind {
@@ -28,6 +32,8 @@ impl SubscriptionKind {
         match self {
             SubscriptionKind::FundingRate { symbol } => symbol,
             SubscriptionKind::BBO { symbol } => symbol,
+            SubscriptionKind::MarkPrice { symbol } => symbol,
+            SubscriptionKind::IndexPrice { symbol } => symbol,
         }
     }
 }

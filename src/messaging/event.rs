@@ -1,4 +1,4 @@
-use crate::domain::{Balance, Exchange, FundingRate, OrderUpdate, Position, Symbol, Timestamp, BBO};
+use crate::domain::{Balance, Exchange, FundingRate, IndexPrice, MarkPrice, OrderUpdate, Position, Symbol, Timestamp, BBO};
 
 /// 统一的交易所事件
 ///
@@ -21,6 +21,8 @@ pub struct IncomeEvent {
 pub enum ExchangeEventData {
     FundingRate(FundingRate),
     BBO(BBO),
+    MarkPrice(MarkPrice),
+    IndexPrice(IndexPrice),
     Position(Position),
     OrderUpdate(OrderUpdate),
     Balance(Balance),
@@ -36,6 +38,8 @@ impl IncomeEvent {
         match &self.data {
             ExchangeEventData::FundingRate(rate) => Some(&rate.symbol),
             ExchangeEventData::BBO(bbo) => Some(&bbo.symbol),
+            ExchangeEventData::MarkPrice(mp) => Some(&mp.symbol),
+            ExchangeEventData::IndexPrice(ip) => Some(&ip.symbol),
             ExchangeEventData::Position(pos) => Some(&pos.symbol),
             ExchangeEventData::OrderUpdate(update) => Some(&update.symbol),
             ExchangeEventData::Balance(_)
@@ -49,6 +53,8 @@ impl IncomeEvent {
         match &self.data {
             ExchangeEventData::FundingRate(rate) => Some(rate.exchange),
             ExchangeEventData::BBO(bbo) => Some(bbo.exchange),
+            ExchangeEventData::MarkPrice(mp) => Some(mp.exchange),
+            ExchangeEventData::IndexPrice(ip) => Some(ip.exchange),
             ExchangeEventData::Position(pos) => Some(pos.exchange),
             ExchangeEventData::OrderUpdate(update) => Some(update.exchange),
             ExchangeEventData::Balance(bal) => Some(bal.exchange),

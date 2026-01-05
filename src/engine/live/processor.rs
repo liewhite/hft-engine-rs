@@ -55,6 +55,14 @@ impl ProcessorActor {
                 exchange: bbo.exchange,
                 symbol: bbo.symbol.clone(),
             },
+            ExchangeEventData::MarkPrice(mp) => EventRouting::BySymbol {
+                exchange: mp.exchange,
+                symbol: mp.symbol.clone(),
+            },
+            ExchangeEventData::IndexPrice(ip) => EventRouting::BySymbol {
+                exchange: ip.exchange,
+                symbol: ip.symbol.clone(),
+            },
             // Private 数据：Position 和 OrderUpdate 按 symbol 路由
             ExchangeEventData::Position(pos) => EventRouting::BySymbol {
                 exchange: pos.exchange,

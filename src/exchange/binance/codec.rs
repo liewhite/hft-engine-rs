@@ -1,6 +1,6 @@
 use super::from_binance;
 use crate::domain::{
-    Balance, Exchange, FundingRate, OrderStatus, OrderUpdate, Position, now_ms, BBO,
+    Balance, Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -33,6 +33,36 @@ impl MarkPriceUpdate {
             rate,
             next_settle_time: self.t as u64,
             settle_interval_hours,
+        }
+    }
+
+    /// 转换为 MarkPrice
+    pub fn to_mark_price(&self, timestamp: u64) -> MarkPrice {
+        let symbol = from_binance(&self.s)
+            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
+        let price = f64::from_str(&self.p)
+            .unwrap_or_else(|_| panic!("Failed to parse mark price: {}", self.p));
+
+        MarkPrice {
+            exchange: Exchange::Binance,
+            symbol,
+            price,
+            timestamp,
+        }
+    }
+
+    /// 转换为 IndexPrice
+    pub fn to_index_price(&self, timestamp: u64) -> IndexPrice {
+        let symbol = from_binance(&self.s)
+            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
+        let price = f64::from_str(&self.i)
+            .unwrap_or_else(|_| panic!("Failed to parse index price: {}", self.i));
+
+        IndexPrice {
+            exchange: Exchange::Binance,
+            symbol,
+            price,
+            timestamp,
         }
     }
 

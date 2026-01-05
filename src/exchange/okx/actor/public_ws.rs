@@ -7,8 +7,8 @@
 
 use crate::domain::{now_ms, Symbol, SymbolMeta};
 use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::okx::codec::{BboData, FundingRateData, WsPush};
-use crate::exchange::okx::to_okx;
+use crate::exchange::okx::codec::{BboData, FundingRateData, IndexTickerData, MarkPriceData, WsPush};
+use crate::exchange::okx::{to_okx, to_okx_index};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
@@ -298,6 +298,42 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
                 .collect();
             Ok(events)
         }
+        "mark-price" => {
+            let push: WsPush<MarkPriceData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("mark-price parse: {}", e)))?;
+
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let mp = data.to_mark_price();
+                    IncomeEvent {
+                        exchange_ts: mp.timestamp,
+                        local_ts,
+                        data: ExchangeEventData::MarkPrice(mp),
+                    }
+                })
+                .collect();
+            Ok(events)
+        }
+        "index-tickers" => {
+            let push: WsPush<IndexTickerData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("index-tickers parse: {}", e)))?;
+
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let ip = data.to_index_price();
+                    IncomeEvent {
+                        exchange_ts: ip.timestamp,
+                        local_ts,
+                        data: ExchangeEventData::IndexPrice(ip),
+                    }
+                })
+                .collect();
+            Ok(events)
+        }
         _ => {
             tracing::warn!(channel, raw, "Unknown OKX public channel");
             Ok(Vec::new())
@@ -321,6 +357,19 @@ fn kind_to_arg(kind: &SubscriptionKind) -> serde_json::Value {
             json!({
                 "channel": "bbo-tbt",
                 "instId": to_okx(symbol)
+            })
+        }
+        SubscriptionKind::MarkPrice { symbol } => {
+            json!({
+                "channel": "mark-price",
+                "instId": to_okx(symbol)
+            })
+        }
+        SubscriptionKind::IndexPrice { symbol } => {
+            // OKX index-tickers 使用指数 ID 格式 (如 BTC-USDT)
+            json!({
+                "channel": "index-tickers",
+                "instId": to_okx_index(symbol)
             })
         }
     }
