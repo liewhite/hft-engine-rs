@@ -36,7 +36,9 @@ pub struct FundingRateData {
 }
 
 impl FundingRateData {
-    pub fn to_funding_rate(&self) -> FundingRate {
+    /// 转换为 FundingRate
+    /// timestamp: 数据时间戳（毫秒）
+    pub fn to_funding_rate(&self, timestamp: u64) -> FundingRate {
         let symbol = from_okx(&self.inst_id)
             .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
         let rate = f64::from_str(&self.funding_rate)
@@ -58,6 +60,7 @@ impl FundingRateData {
             rate,
             next_settle_time: next_settle_ms,
             settle_interval_hours,
+            timestamp,
         }
     }
 }

@@ -130,7 +130,8 @@ pub struct WsActiveAssetCtx {
 impl WsActiveAssetCtx {
     /// 转换为 FundingRate
     /// Hyperliquid 每小时结算一次资金费率
-    pub fn to_funding_rate(&self) -> FundingRate {
+    /// timestamp: 数据时间戳（毫秒）
+    pub fn to_funding_rate(&self, timestamp: u64) -> FundingRate {
         let symbol = from_hyperliquid(&self.coin);
         let rate = f64::from_str(&self.ctx.funding)
             .expect("funding rate must be valid float from Hyperliquid API");
@@ -142,6 +143,7 @@ impl WsActiveAssetCtx {
             // Hyperliquid 每小时整点结算，计算下一个整点时间
             next_settle_time: next_hourly_settle_time(),
             settle_interval_hours: 1.0,
+            timestamp,
         }
     }
 

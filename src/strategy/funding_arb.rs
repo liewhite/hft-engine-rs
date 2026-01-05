@@ -1,12 +1,14 @@
 use crate::domain::{
-    Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, Timestamp, BBO,
+    Exchange, Order, OrderType, Price, Quantity, Rate, Side, Symbol, TimeInForce, BBO,
 };
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+/// 最大允许的时间戳差异（毫秒）
+const MAX_TIMESTAMP_DIFF_MS: u64 = 60_000; // 1 分钟
 
 /// EMA (Exponential Moving Average) 计算器
 #[derive(Debug, Clone)]
@@ -170,14 +172,6 @@ pub struct FundingArbStrategy {
     current_metric: Option<f64>,
 }
 
-/// 获取当前时间戳（毫秒）
-fn current_timestamp() -> Timestamp {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_millis() as Timestamp
-}
-
 impl FundingArbStrategy {
     pub fn new(config: FundingArbConfig, exchanges: Vec<Exchange>, symbol: Symbol) -> Self {
         let ema = EmaCalculator::new(config.ema_period);
@@ -192,15 +186,38 @@ impl FundingArbStrategy {
 
     /// 计算基于剩余时间的资费差（日化）
     ///
+    /// 使用各交易所 FundingRate 中最小的时间戳作为参考时间
+    /// 如果最大时间戳 - 最小时间戳 > 1分钟，返回 None 并打印警告
+    ///
     /// 返回 (最大日化资费, 最小日化资费, 资费差)
     fn calculate_funding_spread(&self, state: &SymbolState) -> Option<(Rate, Rate, Rate)> {
-        let now = current_timestamp();
-
         let (short_ex, short_rate) = state.best_short_exchange()?;
         let (long_ex, long_rate) = state.best_long_exchange()?;
 
-        let short_daily = short_rate.daily_rate_by_time_remaining(now);
-        let long_daily = long_rate.daily_rate_by_time_remaining(now);
+        // 检查时间戳差异
+        let min_ts = short_rate.timestamp.min(long_rate.timestamp);
+        let max_ts = short_rate.timestamp.max(long_rate.timestamp);
+        let ts_diff = max_ts - min_ts;
+
+        if ts_diff > MAX_TIMESTAMP_DIFF_MS {
+            tracing::warn!(
+                symbol = %self.symbol,
+                short_exchange = %short_ex,
+                short_ts = short_rate.timestamp,
+                long_exchange = %long_ex,
+                long_ts = long_rate.timestamp,
+                ts_diff_ms = ts_diff,
+                max_allowed_ms = MAX_TIMESTAMP_DIFF_MS,
+                "Funding rate timestamp difference too large, refusing to open"
+            );
+            return None;
+        }
+
+        // 使用最小时间戳作为参考时间
+        let reference_time = min_ts;
+
+        let short_daily = short_rate.daily_rate_by_time_remaining(reference_time);
+        let long_daily = long_rate.daily_rate_by_time_remaining(reference_time);
 
         let spread = short_daily - long_daily;
 
@@ -213,6 +230,7 @@ impl FundingArbStrategy {
             long_rate = format!("{:.6}", long_rate.rate),
             long_daily = format!("{:.6}", long_daily),
             funding_spread = format!("{:.6}", spread),
+            reference_time = reference_time,
             "Funding spread calculated"
         );
 

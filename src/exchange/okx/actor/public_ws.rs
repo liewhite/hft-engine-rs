@@ -261,7 +261,7 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
                 .data
                 .iter()
                 .map(|data| {
-                    let rate = data.to_funding_rate();
+                    let rate = data.to_funding_rate(local_ts);
                     IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,

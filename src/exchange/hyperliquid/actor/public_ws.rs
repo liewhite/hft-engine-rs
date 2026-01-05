@@ -277,7 +277,7 @@ fn parse_public_message(
                             events.push(IncomeEvent {
                                 exchange_ts: local_ts,
                                 local_ts,
-                                data: ExchangeEventData::FundingRate(ctx.to_funding_rate()),
+                                data: ExchangeEventData::FundingRate(ctx.to_funding_rate(local_ts)),
                             });
                         }
                         if subscribed_kinds
