@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, FundingRate, OrderStatus, Position, Rate, Symbol, Timestamp, BBO};
+use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, Position, Rate, Symbol, Timestamp, BBO};
 use crate::messaging::event::{ExchangeEventData, IncomeEvent};
 use std::collections::HashMap;
 
@@ -17,6 +17,8 @@ pub struct SymbolState {
     pub symbol: Symbol,
     pub funding_rates: HashMap<Exchange, FundingRate>,
     pub bbos: HashMap<Exchange, BBO>,
+    pub mark_prices: HashMap<Exchange, MarkPrice>,
+    pub index_prices: HashMap<Exchange, IndexPrice>,
     pub positions: HashMap<Exchange, Position>,
     /// 待处理订单 (以 client_order_id 为 key)
     pending_orders: HashMap<String, PendingOrder>,
@@ -28,6 +30,8 @@ impl SymbolState {
             symbol,
             funding_rates: HashMap::new(),
             bbos: HashMap::new(),
+            mark_prices: HashMap::new(),
+            index_prices: HashMap::new(),
             positions: HashMap::new(),
             pending_orders: HashMap::new(),
         }
@@ -100,6 +104,16 @@ impl SymbolState {
     /// 获取某个交易所的 BBO
     pub fn bbo(&self, exchange: Exchange) -> Option<&BBO> {
         self.bbos.get(&exchange)
+    }
+
+    /// 获取某个交易所的标记价格
+    pub fn mark_price(&self, exchange: Exchange) -> Option<&MarkPrice> {
+        self.mark_prices.get(&exchange)
+    }
+
+    /// 获取某个交易所的指数价格
+    pub fn index_price(&self, exchange: Exchange) -> Option<&IndexPrice> {
+        self.index_prices.get(&exchange)
     }
 
     /// 是否有未完成订单
@@ -208,8 +222,11 @@ impl SymbolState {
                     }
                 }
             }
-            ExchangeEventData::MarkPrice(_) | ExchangeEventData::IndexPrice(_) => {
-                // MarkPrice/IndexPrice 事件暂不存储在状态中，由策略层按需处理
+            ExchangeEventData::MarkPrice(mp) => {
+                self.mark_prices.insert(mp.exchange, mp.clone());
+            }
+            ExchangeEventData::IndexPrice(ip) => {
+                self.index_prices.insert(ip.exchange, ip.clone());
             }
             ExchangeEventData::Clock => {
                 // Clock 事件由策略层处理，这里不需要处理
