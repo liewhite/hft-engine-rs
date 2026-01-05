@@ -202,22 +202,18 @@ impl FundingArbStrategy {
     /// 检查开仓条件
     ///
     /// 条件：
-    /// 1. EMA 已预热完成
-    /// 2. metric 偏离 EMA > open_deviation
-    /// 3. 无现有持仓
-    /// 4. 无未完成订单
-    /// 5. 风控检查通过
+    /// 1. 无现有持仓
+    /// 2. 无未完成订单
+    /// 3. metric 偏离 EMA > open_deviation
+    /// 4. 风控检查通过
+    ///
+    /// 前置条件：EMA 已预热完成（由 on_event 保证）
     fn check_open_condition(
         &self,
         state: &SymbolState,
         metric_result: &MetricResult,
         state_manager: &StateManager,
     ) -> bool {
-        // EMA 未预热完成
-        if !self.ema.is_ready() {
-            return false;
-        }
-
         // 已有持仓
         if state.has_positions() {
             return false;
@@ -228,10 +224,9 @@ impl FundingArbStrategy {
             return false;
         }
 
-        let ema_value = match self.ema.value() {
-            Some(v) => v,
-            None => return false,
-        };
+        // is_ready() == true 保证 value() 为 Some
+        let ema_value = self.ema.value()
+            .expect("EMA value must exist when is_ready() is true");
 
         // 计算偏离度 = metric - ema
         let deviation = metric_result.metric - ema_value;
@@ -274,20 +269,18 @@ impl FundingArbStrategy {
     /// 条件：
     /// 1. 有持仓
     /// 2. metric 回归 EMA（偏离度 < close_deviation）
+    ///
+    /// 前置条件：EMA 已预热完成且 current_metric 已设置（开仓前提条件保证）
     fn check_close_condition(&self, state: &SymbolState) -> bool {
         if !state.has_positions() {
             return false;
         }
 
-        let ema_value = match self.ema.value() {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let metric = match self.current_metric {
-            Some(m) => m,
-            None => return false,
-        };
+        // 有持仓时，EMA 和 metric 必然存在（开仓前提条件）
+        let ema_value = self.ema.value()
+            .expect("EMA must exist when positions are open");
+        let metric = self.current_metric
+            .expect("current_metric must exist when positions are open");
 
         let deviation = (metric - ema_value).abs();
 
