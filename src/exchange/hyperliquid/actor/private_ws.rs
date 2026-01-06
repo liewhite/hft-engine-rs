@@ -238,8 +238,10 @@ fn parse_private_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, W
 fn parse_clearinghouse_state(data: &serde_json::Value, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
     let mut events = Vec::new();
 
-    // clearinghouseState 订阅直接返回 ClearinghouseState 结构
-    match serde_json::from_value::<ClearinghouseState>(data.clone()) {
+    // clearinghouseState 订阅返回结构: { clearinghouseState: {...}, user: "...", dex: "..." }
+    // 需要提取 clearinghouseState 字段
+    let state_value = data.get("clearinghouseState").unwrap_or(data);
+    match serde_json::from_value::<ClearinghouseState>(state_value.clone()) {
         Ok(state) => {
             // 解析仓位
             for wrapper in &state.asset_positions {
