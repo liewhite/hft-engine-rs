@@ -69,9 +69,14 @@ pub struct FundingArbConfig {
     pub order_timeout_ms: u64,
     /// 敞口比例限制（敞口/较小仓位）
     /// - 超过此比例时禁止开仓
-    /// - 超过此比例时强制 rebalance（平掉多余仓位）
+    /// - 配合 max_exposure_value 触发 rebalance
     #[serde(default = "default_max_exposure_ratio")]
     pub max_exposure_ratio: f64,
+    /// 敞口价值限制 (USDT)
+    /// - 需同时超过 max_exposure_ratio 和 max_exposure_value 才触发 rebalance
+    /// - 避免基础仓位小时频繁 rebalance
+    #[serde(default = "default_max_exposure_value")]
+    pub max_exposure_value: f64,
 }
 
 fn default_ema_period() -> usize {
@@ -86,6 +91,9 @@ fn default_order_timeout_ms() -> u64 {
 fn default_max_exposure_ratio() -> f64 {
     0.20 // 20%
 }
+fn default_max_exposure_value() -> f64 {
+    100.0 // 100 USDT
+}
 
 impl Default for FundingArbConfig {
     fn default() -> Self {
@@ -94,6 +102,7 @@ impl Default for FundingArbConfig {
             max_notional: default_max_notional(),
             order_timeout_ms: default_order_timeout_ms(),
             max_exposure_ratio: default_max_exposure_ratio(),
+            max_exposure_value: default_max_exposure_value(),
         }
     }
 }
@@ -466,7 +475,8 @@ impl FundingArbStrategy {
     /// 检查是否需要强制 rebalance
     ///
     /// 敞口比例 = |exposure| / min(|long|, |short|)
-    /// 超过 max_exposure_ratio 时需要 rebalance（平掉多余仓位）
+    /// 敞口价值 = |exposure| * price
+    /// 需同时超过 max_exposure_ratio 和 max_exposure_value 才触发 rebalance
     ///
     /// 返回 Some((需要平仓的交易所, 需要平的数量)) 或 None
     fn check_rebalance_needed(&self, state: &SymbolState) -> Option<(Exchange, f64)> {
@@ -481,7 +491,23 @@ impl FundingArbStrategy {
         let min_position = long_size.abs().min(short_size.abs());
         let exposure_ratio = exposure.abs() / min_position;
 
+        // 检查敞口比例
         if exposure_ratio <= self.config.max_exposure_ratio {
+            return None;
+        }
+
+        // 获取价格计算敞口价值
+        let price = state
+            .bbos
+            .values()
+            .next()
+            .map(|bbo| bbo.mid_price())
+            .unwrap_or(0.0);
+
+        let exposure_value = exposure.abs() * price;
+
+        // 需同时超过比例和价值阈值
+        if exposure_value <= self.config.max_exposure_value {
             return None;
         }
 
@@ -510,9 +536,10 @@ impl FundingArbStrategy {
                 short_size = short_size,
                 exposure = exposure,
                 exposure_ratio = format!("{:.4}", exposure_ratio),
+                exposure_value = format!("{:.2}", exposure_value),
                 target_exchange = %ex,
                 rebalance_qty = rebalance_qty,
-                "Rebalance needed due to exposure exceeding limit"
+                "Rebalance needed due to exposure exceeding limits"
             );
             (ex, rebalance_qty)
         })
@@ -806,11 +833,11 @@ impl Strategy for FundingArbStrategy {
         };
 
         // log equity
-        tracing::info!(
-            symbol = %self.symbol,
-            equities = ?self.exchanges.iter().map(|ex| (*ex, state.equity(*ex))).collect::<HashMap<_, _>>(),
-            "Current equities"
-        );
+        // tracing::info!(
+        //     symbol = %self.symbol,
+        //     equities = ?self.exchanges.iter().map(|ex| (*ex, state.equity(*ex))).collect::<HashMap<_, _>>(),
+        //     "Current equities"
+        // );
 
         // BBO 事件时更新对应交易所的 EMA
         if let ExchangeEventData::BBO(bbo) = &event.data {
