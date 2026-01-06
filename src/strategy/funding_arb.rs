@@ -334,7 +334,6 @@ impl FundingArbStrategy {
         let short_deviation = self.bid_up_deviation(short_exchange, short_bbo)?;
         let long_deviation = self.ask_down_deviation(long_exchange, long_bbo)?;
         let total_deviation = short_deviation + long_deviation;
-
         if total_deviation < open_threshold {
             return None;
         }
@@ -346,7 +345,9 @@ impl FundingArbStrategy {
         if short_equity <= 0.0 || long_equity <= 0.0 {
             tracing::warn!(
                 symbol = %self.symbol,
+                short_exchange = %short_exchange,
                 short_equity = short_equity,
+                long_exchange = %long_exchange,
                 long_equity = long_equity,
                 "Insufficient equity"
             );
@@ -725,7 +726,6 @@ impl Strategy for FundingArbStrategy {
             Some(s) => s,
             None => return vec![],
         };
-
         // BBO 事件时更新对应交易所的 EMA
         if let ExchangeEventData::BBO(bbo) = &event.data {
             self.update_ema(bbo.exchange, bbo);
