@@ -355,40 +355,6 @@ impl FundingArbStrategy {
         false
     }
 
-    /// 检查敞口是否允许开仓
-    ///
-    /// 敞口比例 = 敞口 / min(|long|, |short|)
-    /// 超过 max_exposure_ratio 时禁止开仓
-    fn can_open_position(&self, state: &SymbolState) -> bool {
-        let (long_size, short_size) = state.position_sizes();
-
-        if long_size.abs() < 1e-10 && short_size.abs() < 1e-10 {
-            return true; // 无持仓，可以开仓
-        }
-
-        let exposure = (long_size + short_size).abs();
-        let min_position = long_size.abs().min(short_size.abs());
-
-        if min_position < 1e-10 {
-            // 只有单边持仓，允许开仓（需要补另一边）
-            return true;
-        }
-
-        let exposure_ratio = exposure / min_position;
-
-        if exposure_ratio > self.config.max_exposure_ratio {
-            tracing::debug!(
-                symbol = %self.symbol,
-                exposure_ratio = format!("{:.4}", exposure_ratio),
-                max_ratio = self.config.max_exposure_ratio,
-                "Exposure exceeds limit, blocking new positions"
-            );
-            return false;
-        }
-
-        true
-    }
-
     /// 检查是否需要强制 rebalance
     ///
     /// 敞口比例 = |exposure| / min(|long|, |short|)
@@ -784,26 +750,28 @@ impl Strategy for FundingArbStrategy {
             return vec![];
         }
 
-        // 优先级 1: 强制 rebalance（敞口超限时平掉多余仓位）
+        // 步骤 2: 敞口超限 → rebalance（平掉多余仓位）
         if let Some((exchange, qty)) = self.check_rebalance_needed(symbol_state) {
-            if let Some(order) = self.make_rebalance_order(symbol_state, exchange, qty) {
-                return vec![OutcomeEvent::PlaceOrder(order)];
-            }
+            return self.make_rebalance_order(symbol_state, exchange, qty)
+                .map(|order| vec![OutcomeEvent::PlaceOrder(order)])
+                .unwrap_or_default();
         }
 
-        // 优先级 2: 检查平仓条件
+        // 步骤 3: 检查平仓条件
         if self.check_close_condition(symbol_state) {
-            let orders = self.make_close_orders(symbol_state);
-            return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
+            return self.make_close_orders(symbol_state)
+                .into_iter()
+                .map(OutcomeEvent::PlaceOrder)
+                .collect();
         }
 
-        // 优先级 3: 检查开仓条件（敞口超限时禁止开仓）
-        if self.can_open_position(symbol_state) {
-            if let Some(ref mr) = metric_result {
-                if self.check_open_condition(symbol_state, mr, state) {
-                    let orders = self.make_open_orders(mr, symbol_state);
-                    return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
-                }
+        // 步骤 4: 检查开仓条件（敞口超限已在步骤2拦截，此处无需再检查）
+        if let Some(ref mr) = metric_result {
+            if self.check_open_condition(symbol_state, mr, state) {
+                return self.make_open_orders(mr, symbol_state)
+                    .into_iter()
+                    .map(OutcomeEvent::PlaceOrder)
+                    .collect();
             }
         }
 
