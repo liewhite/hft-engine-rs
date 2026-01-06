@@ -144,17 +144,14 @@ impl ManagerActor {
         }));
 
         // 7. 创建 ClockActor
-        // Binance 和 Hyperliquid 需要通过 REST API 查询 equity
-        // (Binance 的 WS 不推送 equity，Hyperliquid 的 WS 在 DEX 模式下返回总余额而非 perp 余额)
+        // Binance 需要通过 REST API 查询 equity (Binance 的 WS 不推送 equity)
+        // OKX 和 Hyperliquid 通过 WebSocket 推送
         let clock_event_sink = Arc::new(ProcessorEventSink {
             processor: processor.clone(),
         });
         let mut equity_clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
         if let Some(client) = modules.get(&Exchange::Binance).map(|m| m.client()) {
             equity_clients.insert(Exchange::Binance, client);
-        }
-        if let Some(client) = modules.get(&Exchange::Hyperliquid).map(|m| m.client()) {
-            equity_clients.insert(Exchange::Hyperliquid, client);
         }
         let clock_actor = kameo::spawn(ClockActor::new(ClockArgs {
             interval_ms: 1000,

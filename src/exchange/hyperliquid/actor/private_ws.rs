@@ -107,20 +107,20 @@ impl Actor for HyperliquidPrivateWsActor {
         tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
 
         // 5. 订阅账户频道
-        // webData3: 账户状态 (positions, balance)
-        let subscribe_web_data = json!({
+        // clearinghouseState: perp 账户状态 (positions, equity, margin)
+        let subscribe_clearinghouse = json!({
             "method": "subscribe",
             "subscription": {
-                "type": "webData3",
+                "type": "clearinghouseState",
                 "user": self.wallet_address
             }
         })
         .to_string();
 
         outgoing_tx
-            .send(subscribe_web_data)
+            .send(subscribe_clearinghouse)
             .await
-            .map_err(|_| WsError::Network("Failed to send webData3 subscription".to_string()))?;
+            .map_err(|_| WsError::Network("Failed to send clearinghouseState subscription".to_string()))?;
 
         // orderUpdates: 订单更新
         let subscribe_orders = json!({
@@ -139,7 +139,7 @@ impl Actor for HyperliquidPrivateWsActor {
 
         tracing::info!(
             wallet = %self.wallet_address,
-            "HyperliquidPrivateWsActor started, subscribed to webData3 and orderUpdates"
+            "HyperliquidPrivateWsActor started, subscribed to clearinghouseState and orderUpdates"
         );
 
         Ok(())
@@ -207,10 +207,10 @@ fn parse_private_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, W
                 // 订阅响应，忽略
                 return Ok(Vec::new());
             }
-            "webData3" => {
-                // 账户状态 (positions, balance)
+            "clearinghouseState" => {
+                // perp 账户状态 (positions, equity, margin)
                 let data = &value["data"];
-                return parse_web_data3(data, local_ts);
+                return parse_clearinghouse_state(data, local_ts);
             }
             "orderUpdates" => {
                 // 订单更新
@@ -234,57 +234,53 @@ fn parse_private_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, W
     Ok(Vec::new())
 }
 
-/// 解析 webData3 消息 (账户状态)
-fn parse_web_data3(data: &serde_json::Value, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+/// 解析 clearinghouseState 消息 (perp 账户状态)
+fn parse_clearinghouse_state(data: &serde_json::Value, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
     let mut events = Vec::new();
 
-    // 尝试解析 clearinghouseState（传统模式）
-    if let Some(ch_state) = data.get("clearinghouseState") {
-        match serde_json::from_value::<ClearinghouseState>(ch_state.clone()) {
-            Ok(state) => {
-                // 解析仓位
-                for wrapper in &state.asset_positions {
-                    let position = wrapper.position.to_position();
-                    events.push(IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::Position(position),
-                    });
-                }
-
-                // 解析账户净值 (equity = accountValue)
-                let equity = f64::from_str(&state.cross_margin_summary.account_value)
-                    .expect("accountValue must be valid float from Hyperliquid API");
+    // clearinghouseState 订阅直接返回 ClearinghouseState 结构
+    match serde_json::from_value::<ClearinghouseState>(data.clone()) {
+        Ok(state) => {
+            // 解析仓位
+            for wrapper in &state.asset_positions {
+                let position = wrapper.position.to_position();
                 events.push(IncomeEvent {
                     exchange_ts: local_ts,
                     local_ts,
-                    data: ExchangeEventData::Equity {
-                        exchange: Exchange::Hyperliquid,
-                        equity,
-                    },
+                    data: ExchangeEventData::Position(position),
                 });
+            }
 
-                // 解析可用余额
-                let withdrawable = f64::from_str(&state.withdrawable)
-                    .expect("withdrawable must be valid float from Hyperliquid API");
-                events.push(IncomeEvent {
-                    exchange_ts: local_ts,
-                    local_ts,
-                    data: ExchangeEventData::Balance(Balance {
-                        exchange: Exchange::Hyperliquid,
-                        asset: "USDC".to_string(),
-                        available: withdrawable,
-                        frozen: 0.0,
-                    }),
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, data = %ch_state, "Failed to parse clearinghouseState");
-            }
+            // 解析账户净值 (equity = accountValue)
+            let equity = f64::from_str(&state.cross_margin_summary.account_value)
+                .expect("accountValue must be valid float from Hyperliquid API");
+            events.push(IncomeEvent {
+                exchange_ts: local_ts,
+                local_ts,
+                data: ExchangeEventData::Equity {
+                    exchange: Exchange::Hyperliquid,
+                    equity,
+                },
+            });
+
+            // 解析可用余额
+            let withdrawable = f64::from_str(&state.withdrawable)
+                .expect("withdrawable must be valid float from Hyperliquid API");
+            events.push(IncomeEvent {
+                exchange_ts: local_ts,
+                local_ts,
+                data: ExchangeEventData::Balance(Balance {
+                    exchange: Exchange::Hyperliquid,
+                    asset: "USDC".to_string(),
+                    available: withdrawable,
+                    frozen: 0.0,
+                }),
+            });
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, data = %data, "Failed to parse clearinghouseState");
         }
     }
-    // DEX 抽象模式下，cumLedger 是总余额（spot + perp），不是 perp 账户余额
-    // perp 账户余额通过 REST API (clearinghouseState) 在 ClockActor 中定时获取
 
     Ok(events)
 }
