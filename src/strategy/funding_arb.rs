@@ -82,12 +82,11 @@ pub struct FundingArbConfig {
     /// 订单超时时间 (毫秒)
     #[serde(default = "default_order_timeout_ms")]
     pub order_timeout_ms: u64,
-    /// 敞口比例限制（敞口/较小仓位，超过此比例停止开仓）
+    /// 敞口比例限制（敞口/较小仓位）
+    /// - 超过此比例时禁止开仓
+    /// - 超过此比例时强制 rebalance（平掉多余仓位）
     #[serde(default = "default_max_exposure_ratio")]
     pub max_exposure_ratio: f64,
-    /// 不平衡比例阈值（不平衡量/较小仓位，超过此比例强制 rebalance）
-    #[serde(default = "default_max_imbalance_ratio")]
-    pub max_imbalance_ratio: f64,
 }
 
 fn default_ema_period() -> usize {
@@ -111,9 +110,6 @@ fn default_order_timeout_ms() -> u64 {
 fn default_max_exposure_ratio() -> f64 {
     0.20 // 20%
 }
-fn default_max_imbalance_ratio() -> f64 {
-    0.10 // 10%
-}
 
 impl Default for FundingArbConfig {
     fn default() -> Self {
@@ -125,7 +121,6 @@ impl Default for FundingArbConfig {
             max_notional: default_max_notional(),
             order_timeout_ms: default_order_timeout_ms(),
             max_exposure_ratio: default_max_exposure_ratio(),
-            max_imbalance_ratio: default_max_imbalance_ratio(),
         }
     }
 }
@@ -396,8 +391,8 @@ impl FundingArbStrategy {
 
     /// 检查是否需要强制 rebalance
     ///
-    /// 不平衡比例 = |imbalance| / min(|long|, |short|)
-    /// 超过 max_imbalance_ratio 时需要 rebalance
+    /// 敞口比例 = |exposure| / min(|long|, |short|)
+    /// 超过 max_exposure_ratio 时需要 rebalance（平掉多余仓位）
     ///
     /// 返回 Some((需要平仓的交易所, 需要平的数量)) 或 None
     fn check_rebalance_needed(&self, state: &SymbolState) -> Option<(Exchange, f64)> {
@@ -408,21 +403,21 @@ impl FundingArbStrategy {
             return None;
         }
 
-        let imbalance = long_size + short_size; // short_size 是负数
+        let exposure = long_size + short_size; // short_size 是负数
         let min_position = long_size.abs().min(short_size.abs());
-        let imbalance_ratio = imbalance.abs() / min_position;
+        let exposure_ratio = exposure.abs() / min_position;
 
-        if imbalance_ratio <= self.config.max_imbalance_ratio {
+        if exposure_ratio <= self.config.max_exposure_ratio {
             return None;
         }
 
         // 需要 rebalance：平掉多的那边
-        // imbalance > 0: long 多了，平 long
-        // imbalance < 0: short 多了，平 short
-        let rebalance_qty = imbalance.abs();
+        // exposure > 0: long 多了，平 long
+        // exposure < 0: short 多了，平 short
+        let rebalance_qty = exposure.abs();
 
         // 找到需要平仓的交易所
-        let target_exchange = if imbalance > 0.0 {
+        let target_exchange = if exposure > 0.0 {
             // long 多了，找 long 的交易所
             state.positions.iter()
                 .find(|(_, pos)| pos.size > 1e-10)
@@ -439,11 +434,11 @@ impl FundingArbStrategy {
                 symbol = %self.symbol,
                 long_size = long_size,
                 short_size = short_size,
-                imbalance = imbalance,
-                imbalance_ratio = format!("{:.4}", imbalance_ratio),
+                exposure = exposure,
+                exposure_ratio = format!("{:.4}", exposure_ratio),
                 target_exchange = %ex,
                 rebalance_qty = rebalance_qty,
-                "Rebalance needed"
+                "Rebalance needed due to exposure exceeding limit"
             );
             (ex, rebalance_qty)
         })
@@ -789,7 +784,7 @@ impl Strategy for FundingArbStrategy {
             return vec![];
         }
 
-        // 优先级 1: 强制 rebalance（不平衡超限）
+        // 优先级 1: 强制 rebalance（敞口超限时平掉多余仓位）
         if let Some((exchange, qty)) = self.check_rebalance_needed(symbol_state) {
             if let Some(order) = self.make_rebalance_order(symbol_state, exchange, qty) {
                 return vec![OutcomeEvent::PlaceOrder(order)];
