@@ -291,26 +291,32 @@ impl ManagerActor {
                     .okx_credentials
                     .clone()
                     .expect("OKX credentials not configured");
-                let actor = OkxActor::new(OkxActorArgs {
-                    credentials: Some(credentials),
-                    symbol_metas: symbol_metas.clone(),
-                    event_sink: event_sink.clone(),
-                });
-                let actor_ref = spawn_link(actor_ref, actor).await;
-                (actor_ref.id(), Box::new(actor_ref))
+                let okx_ref = OkxActor::new(
+                    actor_ref,
+                    OkxActorArgs {
+                        credentials: Some(credentials),
+                        symbol_metas: symbol_metas.clone(),
+                        event_sink: event_sink.clone(),
+                    },
+                )
+                .await;
+                (okx_ref.id(), Box::new(okx_ref))
             }
             Exchange::Hyperliquid => {
                 let credentials = self
                     .hyperliquid_credentials
                     .clone()
                     .expect("Hyperliquid credentials not configured");
-                let actor = HyperliquidActor::new(HyperliquidActorArgs {
-                    credentials: Some(credentials),
-                    symbol_metas: symbol_metas.clone(),
-                    event_sink: event_sink.clone(),
-                });
-                let actor_ref = spawn_link(actor_ref, actor).await;
-                (actor_ref.id(), Box::new(actor_ref))
+                let hyper_ref = HyperliquidActor::new(
+                    actor_ref,
+                    HyperliquidActorArgs {
+                        credentials: Some(credentials),
+                        symbol_metas: symbol_metas.clone(),
+                        event_sink: event_sink.clone(),
+                    },
+                )
+                .await;
+                (hyper_ref.id(), Box::new(hyper_ref))
             }
         };
 
