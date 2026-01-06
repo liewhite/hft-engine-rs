@@ -238,7 +238,7 @@ fn parse_private_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, W
 fn parse_web_data3(data: &serde_json::Value, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
     let mut events = Vec::new();
 
-    // 解析 clearinghouseState
+    // 尝试解析 clearinghouseState（传统模式）
     if let Some(ch_state) = data.get("clearinghouseState") {
         match serde_json::from_value::<ClearinghouseState>(ch_state.clone()) {
             Ok(state) => {
@@ -274,7 +274,7 @@ fn parse_web_data3(data: &serde_json::Value, local_ts: u64) -> Result<Vec<Income
                         exchange: Exchange::Hyperliquid,
                         asset: "USDC".to_string(),
                         available: withdrawable,
-                        frozen: 0.0, // Hyperliquid 不直接提供 frozen，通过 marginUsed 计算
+                        frozen: 0.0,
                     }),
                 });
             }
@@ -283,6 +283,8 @@ fn parse_web_data3(data: &serde_json::Value, local_ts: u64) -> Result<Vec<Income
             }
         }
     }
+    // DEX 抽象模式下，cumLedger 是总余额（spot + perp），不是 perp 账户余额
+    // perp 账户余额通过 REST API (clearinghouseState) 在 ClockActor 中定时获取
 
     Ok(events)
 }
