@@ -273,15 +273,18 @@ impl ManagerActor {
                     .get(&Exchange::Binance)
                     .expect("Binance module not configured")
                     .client();
-                let actor = BinanceActor::new(BinanceActorArgs {
-                    credentials: Some(credentials),
-                    symbol_metas: symbol_metas.clone(),
-                    rest_base_url: REST_BASE_URL.to_string(),
-                    event_sink: event_sink.clone(),
-                    client,
-                });
-                let actor_ref = spawn_link(actor_ref, actor).await;
-                (actor_ref.id(), Box::new(actor_ref))
+                let binance_ref = BinanceActor::new(
+                    actor_ref,
+                    BinanceActorArgs {
+                        credentials: Some(credentials),
+                        symbol_metas: symbol_metas.clone(),
+                        rest_base_url: REST_BASE_URL.to_string(),
+                        event_sink: event_sink.clone(),
+                        client,
+                    },
+                )
+                .await;
+                (binance_ref.id(), Box::new(binance_ref))
             }
             Exchange::OKX => {
                 let credentials = self
