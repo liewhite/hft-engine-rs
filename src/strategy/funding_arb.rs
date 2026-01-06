@@ -726,6 +726,14 @@ impl Strategy for FundingArbStrategy {
             Some(s) => s,
             None => return vec![],
         };
+
+        // log equity
+        tracing::info!(
+            symbol = %self.symbol,
+            equities = ?self.exchanges.iter().map(|ex| (*ex, state.equity(*ex))).collect::<HashMap<_, _>>(),
+            "Current equities"
+        );
+
         // BBO 事件时更新对应交易所的 EMA
         if let ExchangeEventData::BBO(bbo) = &event.data {
             self.update_ema(bbo.exchange, bbo);
