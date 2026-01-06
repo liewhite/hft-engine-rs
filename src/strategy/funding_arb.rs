@@ -634,6 +634,84 @@ impl FundingArbStrategy {
         ]
     }
 
+    /// 根据挂单量限制订单数量（不超过该价位挂单量的一半）
+    ///
+    /// - 单笔订单（rebalance）：直接 min 处理
+    /// - 双笔订单（open/close）：保持多空数量一致，取两边限制后的最小值
+    fn apply_orderbook_limit(&self, orders: Vec<Order>, state: &SymbolState) -> Vec<Order> {
+        if orders.is_empty() {
+            return orders;
+        }
+
+        // 计算单个订单的挂单量限制
+        let get_limit = |order: &Order| -> Option<f64> {
+            let bbo = state.bbo(order.exchange)?;
+            // 卖出用 bid_qty，买入用 ask_qty
+            let orderbook_qty = match order.side {
+                Side::Short => bbo.bid_qty,
+                Side::Long => bbo.ask_qty,
+            };
+            Some(orderbook_qty / 2.0)
+        };
+
+        if orders.len() == 1 {
+            // rebalance 订单：直接 min 处理
+            let mut order = orders.into_iter().next().unwrap();
+            if let Some(limit) = get_limit(&order) {
+                let original_qty = order.quantity;
+                order.quantity = order.quantity.min(limit);
+                if order.quantity < original_qty {
+                    tracing::info!(
+                        symbol = %self.symbol,
+                        exchange = %order.exchange,
+                        original_qty = original_qty,
+                        limited_qty = order.quantity,
+                        orderbook_limit = limit,
+                        "Rebalance order quantity limited by orderbook"
+                    );
+                }
+            }
+            vec![order]
+        } else if orders.len() == 2 {
+            // open/close 订单：保持多空数量一致
+            let limits: Vec<Option<f64>> = orders.iter().map(get_limit).collect();
+
+            // 计算两边都能接受的最小数量
+            let min_limit = limits
+                .iter()
+                .filter_map(|l| *l)
+                .fold(f64::MAX, f64::min);
+
+            let original_qty = orders[0].quantity.min(orders[1].quantity);
+            let final_qty = if min_limit < f64::MAX {
+                original_qty.min(min_limit)
+            } else {
+                original_qty
+            };
+
+            if final_qty < original_qty {
+                tracing::info!(
+                    symbol = %self.symbol,
+                    original_qty = original_qty,
+                    limited_qty = final_qty,
+                    limits = ?limits,
+                    "Open/Close order quantity limited by orderbook"
+                );
+            }
+
+            orders
+                .into_iter()
+                .map(|mut order| {
+                    order.quantity = final_qty;
+                    order
+                })
+                .collect()
+        } else {
+            // 不应该出现其他数量，原样返回
+            orders
+        }
+    }
+
     /// 生成平仓订单
     ///
     /// 基于平仓信号，以较小持仓为准生成订单
@@ -751,25 +829,25 @@ impl Strategy for FundingArbStrategy {
 
         // 步骤 2: 敞口超限 → rebalance（平掉多余仓位）
         if let Some((exchange, qty)) = self.check_rebalance_needed(symbol_state) {
-            return self.make_rebalance_order(symbol_state, exchange, qty)
-                .map(|order| vec![OutcomeEvent::PlaceOrder(order)])
-                .unwrap_or_default();
+            if let Some(order) = self.make_rebalance_order(symbol_state, exchange, qty) {
+                let orders = self.apply_orderbook_limit(vec![order], symbol_state);
+                return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
+            }
+            return vec![];
         }
 
         // 步骤 3: 检查平仓条件
         if let Some(close_signal) = self.check_close_signal(symbol_state) {
-            return self.make_close_orders(&close_signal)
-                .into_iter()
-                .map(OutcomeEvent::PlaceOrder)
-                .collect();
+            let orders = self.make_close_orders(&close_signal);
+            let orders = self.apply_orderbook_limit(orders, symbol_state);
+            return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
         }
 
         // 步骤 4: 检查开仓条件
         if let Some(open_signal) = self.check_open_signal(symbol_state, state) {
-            return self.make_open_orders(&open_signal, symbol_state)
-                .into_iter()
-                .map(OutcomeEvent::PlaceOrder)
-                .collect();
+            let orders = self.make_open_orders(&open_signal, symbol_state);
+            let orders = self.apply_orderbook_limit(orders, symbol_state);
+            return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
         }
 
         vec![]
