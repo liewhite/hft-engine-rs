@@ -1,11 +1,34 @@
-use fee_arb::config::AppConfig;
+use fee_arb::config::{load_config, AppConfig};
+use fee_arb::domain::Symbol;
 use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs};
-use fee_arb::exchange::binance::BinanceCredentials;
-use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
-use fee_arb::exchange::okx::OkxCredentials;
-use fee_arb::strategy::FundingArbStrategy;
+use fee_arb::strategy::{FundingArbConfig, FundingArbStrategy};
 use kameo::request::MessageSend;
+use serde::Deserialize;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+/// 策略配置
+#[derive(Debug, Clone, Deserialize)]
+struct StrategyConfig {
+    symbols: Vec<String>,
+    funding_arb: FundingArbConfig,
+}
+
+impl StrategyConfig {
+    fn parse_symbols(&self) -> Vec<Symbol> {
+        self.symbols
+            .iter()
+            .filter_map(|s| Symbol::from_canonical(s))
+            .collect()
+    }
+}
+
+/// 完整配置（框架 + 策略）
+#[derive(Debug, Clone, Deserialize)]
+struct Config {
+    #[serde(flatten)]
+    app: AppConfig,
+    strategy: StrategyConfig,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,49 +41,32 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Fee arbitrage system starting...");
 
     // Load configuration from config.json (or specified path)
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.json".to_string());
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "config.json".to_string());
     tracing::info!(path = %config_path, "Loading config from file");
-    let config = AppConfig::from_file(&config_path)?;
+    let config: Config = load_config(&config_path)?;
 
-    let symbols = config.parse_symbols();
+    let symbols = config.strategy.parse_symbols();
     if symbols.is_empty() {
         anyhow::bail!("No valid symbols configured");
     }
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // 从配置读取 credentials
-    let binance_credentials = BinanceCredentials {
-        api_key: config.exchanges.binance.api_key.clone(),
-        secret: config.exchanges.binance.secret.clone(),
-    };
-
-    let okx_credentials = OkxCredentials {
-        api_key: config.exchanges.okx.api_key.clone(),
-        secret: config.exchanges.okx.secret.clone(),
-        passphrase: config.exchanges.okx.passphrase.clone(),
-    };
-
-    let hyperliquid_credentials = config.exchanges.hyperliquid.as_ref().map(|h| {
-        HyperliquidCredentials {
-            wallet_address: h.wallet_address.clone(),
-            private_key: h.private_key.clone(),
-        }
-    });
-
-    // Create ManagerActor (modules 和 ExchangeActors 由 ManagerActor 内部创建)
+    // Create ManagerActor
     let manager = ManagerActor::new(ManagerActorArgs {
-        binance_credentials: Some(binance_credentials),
-        okx_credentials: Some(okx_credentials),
-        hyperliquid_credentials,
+        binance_credentials: Some(config.app.exchanges.binance.clone()),
+        okx_credentials: Some(config.app.exchanges.okx.clone()),
+        hyperliquid_credentials: config.app.exchanges.hyperliquid.clone(),
     })
     .await;
 
     // Add strategies
-    let enabled_exchanges = config.exchanges.enabled_exchanges();
+    let enabled_exchanges = config.app.exchanges.enabled_exchanges();
     for symbol in symbols {
         let strategy = FundingArbStrategy::new(
-            config.strategy.funding_arb.clone().into(),
+            config.strategy.funding_arb.clone(),
             enabled_exchanges.clone(),
             symbol.clone(),
         );

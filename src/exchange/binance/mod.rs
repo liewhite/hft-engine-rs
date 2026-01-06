@@ -16,7 +16,7 @@ pub const REST_BASE_URL: &str = "https://fapi.binance.com";
 pub const WS_PUBLIC_URL: &str = "wss://fstream.binance.com/ws";
 
 /// Binance 凭证
-#[derive(Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct BinanceCredentials {
     pub api_key: String,
     pub secret: String,

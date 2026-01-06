@@ -1,50 +1,18 @@
-use crate::domain::{Exchange, Symbol};
-use crate::strategy::FundingArbConfig;
+use crate::domain::Exchange;
+use crate::exchange::binance::BinanceCredentials;
+use crate::exchange::hyperliquid::HyperliquidCredentials;
+use crate::exchange::okx::OkxCredentials;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
-/// 应用配置
-#[derive(Debug, Clone, Deserialize)]
-pub struct AppConfig {
-    pub exchanges: ExchangesConfig,
-    pub strategy: StrategyConfig,
-    pub engine: EngineConfig,
-}
-
-/// 交易所凭证配置
-#[derive(Debug, Clone, Deserialize)]
-pub struct ExchangeCredentials {
-    pub api_key: String,
-    pub secret: String,
-    #[serde(default)]
-    pub passphrase: Option<String>,
-}
-
 /// 交易所配置集合
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExchangesConfig {
-    pub binance: ExchangeCredentials,
+    pub binance: BinanceCredentials,
     pub okx: OkxCredentials,
     #[serde(default)]
     pub hyperliquid: Option<HyperliquidCredentials>,
-}
-
-/// OKX 特定凭证 (需要 passphrase)
-#[derive(Debug, Clone, Deserialize)]
-pub struct OkxCredentials {
-    pub api_key: String,
-    pub secret: String,
-    pub passphrase: String,
-}
-
-/// Hyperliquid 凭证 (使用私钥签名)
-#[derive(Debug, Clone, Deserialize)]
-pub struct HyperliquidCredentials {
-    /// 钱包地址 (0x...)
-    pub wallet_address: String,
-    /// 私钥 (不含 0x 前缀)
-    pub private_key: String,
 }
 
 impl ExchangesConfig {
@@ -56,13 +24,6 @@ impl ExchangesConfig {
         }
         exchanges
     }
-}
-
-/// 策略配置
-#[derive(Debug, Clone, Deserialize)]
-pub struct StrategyConfig {
-    pub symbols: Vec<String>,
-    pub funding_arb: FundingArbConfig,
 }
 
 /// 引擎配置
@@ -84,27 +45,26 @@ impl Default for EngineConfig {
     }
 }
 
-impl AppConfig {
-    /// 从配置文件加载 (支持 JSON 和 TOML)
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
-        let content = fs::read_to_string(path)?;
+/// 框架层应用配置（不包含策略配置）
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppConfig {
+    pub exchanges: ExchangesConfig,
+    #[serde(default)]
+    pub engine: EngineConfig,
+}
 
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("json") => Ok(serde_json::from_str(&content)?),
-            Some("toml") => Ok(toml::from_str(&content)?),
-            Some(ext) => Err(ConfigError::UnsupportedFormat(ext.to_string())),
-            None => Err(ConfigError::UnsupportedFormat("unknown".to_string())),
-        }
-    }
+/// 从配置文件加载配置
+pub fn load_config<T: for<'de> Deserialize<'de>, P: AsRef<Path>>(
+    path: P,
+) -> Result<T, ConfigError> {
+    let path = path.as_ref();
+    let content = fs::read_to_string(path)?;
 
-    /// 解析 symbols 字符串为 Symbol 列表
-    pub fn parse_symbols(&self) -> Vec<Symbol> {
-        self.strategy
-            .symbols
-            .iter()
-            .filter_map(|s| Symbol::from_canonical(s))
-            .collect()
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("json") => Ok(serde_json::from_str(&content)?),
+        Some("toml") => Ok(toml::from_str(&content)?),
+        Some(ext) => Err(ConfigError::UnsupportedFormat(ext.to_string())),
+        None => Err(ConfigError::UnsupportedFormat("unknown".to_string())),
     }
 }
 

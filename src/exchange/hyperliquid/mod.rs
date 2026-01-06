@@ -18,7 +18,7 @@ pub const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
 /// Hyperliquid 凭证
 /// 使用私钥进行 EIP-712 签名
-#[derive(Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct HyperliquidCredentials {
     /// 钱包地址 (0x...)
     pub wallet_address: String,

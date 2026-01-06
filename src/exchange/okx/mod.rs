@@ -21,7 +21,7 @@ pub const WS_PUBLIC_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 pub const WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
 
 /// OKX 凭证
-#[derive(Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct OkxCredentials {
     pub api_key: String,
     pub secret: String,
