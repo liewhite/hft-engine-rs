@@ -182,7 +182,9 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPriv
                 tracing::debug!("Private WsIncoming stream started");
             }
             StreamMessage::Finished(_) => {
-                tracing::debug!("Private WsIncoming stream finished");
+                // ws_loop 异常退出，kill actor 触发级联退出
+                tracing::error!("Private WebSocket stream unexpectedly finished, killing actor");
+                ctx.actor_ref().kill();
             }
         }
     }

@@ -234,8 +234,9 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPubl
                 tracing::debug!("WsIncoming stream started");
             }
             StreamMessage::Finished(_) => {
-                // ws_loop 正常退出
-                tracing::debug!("WsIncoming stream finished");
+                // ws_loop 异常退出，kill actor 触发级联退出
+                tracing::error!("WebSocket stream unexpectedly finished, killing actor");
+                ctx.actor_ref().kill();
             }
         }
     }
