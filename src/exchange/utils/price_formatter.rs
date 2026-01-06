@@ -48,7 +48,8 @@ impl StepFormatter {
 impl PriceFormatter for StepFormatter {
     fn format(&self, price: f64) -> String {
         let rounded = Self::round_to_step(price, self.step);
-        format!("{:.precision$}", rounded, precision = self.decimals)
+        let s = format!("{:.precision$}", rounded, precision = self.decimals);
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
 }
 
@@ -121,6 +122,7 @@ mod tests {
         let f = StepFormatter::new(0.01);
         assert_eq!(f.format(100.123), "100.12");
         assert_eq!(f.format(100.126), "100.13");
+        assert_eq!(f.format(100.0), "100");
     }
 
     #[test]
