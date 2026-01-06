@@ -62,7 +62,6 @@ impl ExchangesConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StrategyConfig {
     pub symbols: Vec<String>,
-    #[serde(default)]
     pub funding_arb: FundingArbConfig,
 }
 
@@ -99,55 +98,6 @@ impl AppConfig {
         }
     }
 
-    /// 从环境变量加载配置
-    pub fn from_env() -> Result<Self, ConfigError> {
-        let binance = ExchangeCredentials {
-            api_key: std::env::var("BINANCE_API_KEY")
-                .map_err(|_| ConfigError::MissingEnv("BINANCE_API_KEY"))?,
-            secret: std::env::var("BINANCE_SECRET")
-                .map_err(|_| ConfigError::MissingEnv("BINANCE_SECRET"))?,
-            passphrase: None,
-        };
-
-        let okx = OkxCredentials {
-            api_key: std::env::var("OKX_API_KEY")
-                .map_err(|_| ConfigError::MissingEnv("OKX_API_KEY"))?,
-            secret: std::env::var("OKX_SECRET")
-                .map_err(|_| ConfigError::MissingEnv("OKX_SECRET"))?,
-            passphrase: std::env::var("OKX_PASSPHRASE")
-                .map_err(|_| ConfigError::MissingEnv("OKX_PASSPHRASE"))?,
-        };
-
-        let symbols_str =
-            std::env::var("SYMBOLS").unwrap_or_else(|_| "BTC_USDT,ETH_USDT".to_string());
-        let symbols: Vec<String> = symbols_str.split(',').map(|s| s.trim().to_string()).collect();
-
-        // Hyperliquid 从环境变量读取 (可选)
-        let hyperliquid = match (
-            std::env::var("HYPERLIQUID_WALLET_ADDRESS"),
-            std::env::var("HYPERLIQUID_PRIVATE_KEY"),
-        ) {
-            (Ok(wallet_address), Ok(private_key)) => Some(HyperliquidCredentials {
-                wallet_address,
-                private_key,
-            }),
-            _ => None,
-        };
-
-        Ok(Self {
-            exchanges: ExchangesConfig {
-                binance,
-                okx,
-                hyperliquid,
-            },
-            strategy: StrategyConfig {
-                symbols,
-                funding_arb: FundingArbConfig::default(),
-            },
-            engine: EngineConfig::default(),
-        })
-    }
-
     /// 解析 symbols 字符串为 Symbol 列表
     pub fn parse_symbols(&self) -> Vec<Symbol> {
         self.strategy
@@ -169,9 +119,6 @@ pub enum ConfigError {
 
     #[error("JSON parse error: {0}")]
     ParseJson(#[from] serde_json::Error),
-
-    #[error("Missing environment variable: {0}")]
-    MissingEnv(&'static str),
 
     #[error("Unsupported config format: {0}")]
     UnsupportedFormat(String),

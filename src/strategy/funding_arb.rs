@@ -58,53 +58,20 @@ impl EmaCalculator {
 /// 资金费率套利策略配置
 #[derive(Debug, Clone, Deserialize)]
 pub struct FundingArbConfig {
-    /// EMA 周期（默认 100）
-    #[serde(default = "default_ema_period")]
+    /// EMA 周期
     pub ema_period: usize,
     /// 单笔下单金额 (USDT)，开平仓均按此金额计算数量
-    #[serde(default = "default_max_notional")]
     pub max_notional: f64,
     /// 订单超时时间 (毫秒)
-    #[serde(default = "default_order_timeout_ms")]
     pub order_timeout_ms: u64,
     /// 敞口比例限制（敞口/较小仓位）
     /// - 超过此比例时禁止开仓
     /// - 配合 max_exposure_value 触发 rebalance
-    #[serde(default = "default_max_exposure_ratio")]
     pub max_exposure_ratio: f64,
     /// 敞口价值限制 (USDT)
     /// - 需同时超过 max_exposure_ratio 和 max_exposure_value 才触发 rebalance
     /// - 避免基础仓位小时频繁 rebalance
-    #[serde(default = "default_max_exposure_value")]
     pub max_exposure_value: f64,
-}
-
-fn default_ema_period() -> usize {
-    100
-}
-fn default_max_notional() -> f64 {
-    1000.0
-}
-fn default_order_timeout_ms() -> u64 {
-    10_000
-}
-fn default_max_exposure_ratio() -> f64 {
-    0.20 // 20%
-}
-fn default_max_exposure_value() -> f64 {
-    100.0 // 100 USDT
-}
-
-impl Default for FundingArbConfig {
-    fn default() -> Self {
-        Self {
-            ema_period: default_ema_period(),
-            max_notional: default_max_notional(),
-            order_timeout_ms: default_order_timeout_ms(),
-            max_exposure_ratio: default_max_exposure_ratio(),
-            max_exposure_value: default_max_exposure_value(),
-        }
-    }
 }
 
 /// 根据资费差（日化）计算开平仓阈值
