@@ -66,16 +66,6 @@ pub struct FundingArbConfig {
     /// EMA 周期（默认 100）
     #[serde(default = "default_ema_period")]
     pub ema_period: usize,
-    /// 开仓偏离阈值（metric 偏离 EMA 的百分比，如 0.003 表示 0.3%）
-    #[serde(default = "default_open_deviation")]
-    pub open_deviation: f64,
-    /// 平仓偏离阈值（metric 回归 EMA 的百分比，如 0.0005 表示 0.05%）
-    #[serde(default = "default_close_deviation")]
-    pub close_deviation: f64,
-    /// 最小资费差（日化，如 0.003 表示 0.3%）
-    /// 只有当最大资费日化 - 最小资费日化 > 此阈值时才允许开仓
-    #[serde(default = "default_min_funding_spread")]
-    pub min_funding_spread: Rate,
     /// 单笔下单金额 (USDT)，开平仓均按此金额计算数量
     #[serde(default = "default_max_notional")]
     pub max_notional: f64,
@@ -92,15 +82,6 @@ pub struct FundingArbConfig {
 fn default_ema_period() -> usize {
     100
 }
-fn default_open_deviation() -> f64 {
-    0.003 // 0.3%
-}
-fn default_close_deviation() -> f64 {
-    0.0005 // 0.05%
-}
-fn default_min_funding_spread() -> Rate {
-    0.003 // 0.3% 日化资费差
-}
 fn default_max_notional() -> f64 {
     1000.0
 }
@@ -115,13 +96,40 @@ impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
             ema_period: default_ema_period(),
-            open_deviation: default_open_deviation(),
-            close_deviation: default_close_deviation(),
-            min_funding_spread: default_min_funding_spread(),
             max_notional: default_max_notional(),
             order_timeout_ms: default_order_timeout_ms(),
             max_exposure_ratio: default_max_exposure_ratio(),
         }
+    }
+}
+
+/// 根据资费差（日化）计算开平仓阈值
+///
+/// | 资费差日化 | 开仓阈值 | 平仓阈值 |
+/// |-----------|---------|---------|
+/// | < 0.2%    | 不开仓   | -       |
+/// | 0.2%~0.3% | 0.20%   | -0.10%  |
+/// | 0.3%~0.5% | 0.15%   | -0.15%  |
+/// | 0.5%~0.8% | 0.10%   | -0.20%  |
+/// | > 0.8%    | 0.05%   | -0.25%  |
+///
+/// 返回 (open_threshold, close_threshold)，None 表示不允许开仓
+fn calculate_thresholds(funding_spread: Rate) -> Option<(f64, f64)> {
+    if funding_spread < 0.002 {
+        // < 0.2%，不开仓
+        None
+    } else if funding_spread < 0.003 {
+        // 0.2% ~ 0.3%
+        Some((0.002, -0.001))
+    } else if funding_spread < 0.005 {
+        // 0.3% ~ 0.5%
+        Some((0.0015, -0.0015))
+    } else if funding_spread < 0.008 {
+        // 0.5% ~ 0.8%
+        Some((0.001, -0.002))
+    } else {
+        // > 0.8%
+        Some((0.0005, -0.0025))
     }
 }
 
@@ -299,8 +307,8 @@ impl FundingArbStrategy {
     /// 检查开仓条件，返回开仓信号
     ///
     /// 条件：
-    /// 1. 资费差（日化）> min_funding_spread
-    /// 2. 资费最高交易所 bid 向上偏离 + 资费最低交易所 ask 向下偏离 ≥ open_deviation
+    /// 1. 资费差满足最低要求（根据资费差动态计算阈值）
+    /// 2. 资费最高交易所 bid 向上偏离 + 资费最低交易所 ask 向下偏离 ≥ open_threshold
     /// 3. 风控检查通过
     fn check_open_signal(
         &self,
@@ -313,15 +321,18 @@ impl FundingArbStrategy {
             None => return None,
         };
 
-        if funding_spread < self.config.min_funding_spread {
-            tracing::debug!(
-                symbol = %self.symbol,
-                funding_spread = format!("{:.6}", funding_spread),
-                min_funding_spread = format!("{:.6}", self.config.min_funding_spread),
-                "Funding spread too low for opening"
-            );
-            return None;
-        }
+        // 根据资费差计算动态阈值
+        let (open_threshold, _) = match calculate_thresholds(funding_spread) {
+            Some(thresholds) => thresholds,
+            None => {
+                tracing::debug!(
+                    symbol = %self.symbol,
+                    funding_spread = format!("{:.6}", funding_spread),
+                    "Funding spread too low for opening (< 0.2%)"
+                );
+                return None;
+            }
+        };
 
         // 获取资费最高和最低的交易所
         let (short_exchange, _) = state.best_short_exchange()?;
@@ -337,7 +348,7 @@ impl FundingArbStrategy {
         let long_deviation = self.ask_down_deviation(long_exchange, long_bbo)?;
         let total_deviation = short_deviation + long_deviation;
 
-        if total_deviation < self.config.open_deviation {
+        if total_deviation < open_threshold {
             return None;
         }
 
@@ -363,6 +374,7 @@ impl FundingArbStrategy {
             long_deviation = format!("{:.6}", long_deviation),
             total_deviation = format!("{:.6}", total_deviation),
             funding_spread = format!("{:.6}", funding_spread),
+            open_threshold = format!("{:.6}", open_threshold),
             "Opening signal detected"
         );
 
@@ -382,11 +394,19 @@ impl FundingArbStrategy {
     /// 1. 将持仓分为多头组和空头组
     /// 2. 多头组中找 bid 向上偏离最大的交易所（平多卖出用 bid）
     /// 3. 空头组中找 ask 向下偏离最大的交易所（平空买入用 ask）
-    /// 4. 两者偏离之和 ≥ close_deviation 时触发平仓
+    /// 4. 两者偏离之和 < close_threshold（负数）时触发平仓
     fn check_close_signal(&self, state: &SymbolState) -> Option<CloseSignal> {
         if !state.has_positions() {
             return None;
         }
+
+        // 获取当前资费差，用于计算动态平仓阈值
+        let funding_spread = self.calculate_funding_spread(state)
+            .map(|(_, _, spread)| spread)
+            .unwrap_or(0.002); // 默认使用最低档
+
+        let (_, close_threshold) = calculate_thresholds(funding_spread)
+            .unwrap_or((0.002, -0.001)); // 默认使用最低档阈值
 
         // 收集多头和空头交易所
         let mut long_positions: Vec<(Exchange, f64)> = Vec::new(); // (exchange, size)
@@ -427,7 +447,9 @@ impl FundingArbStrategy {
 
         let total_deviation = best_long.3 + best_short.3;
 
-        if total_deviation < self.config.close_deviation {
+        // close_threshold 是负数，当 total_deviation < close_threshold 时平仓
+        // 即价差收窄到反向偏离时平仓
+        if total_deviation > close_threshold {
             return None;
         }
 
@@ -440,6 +462,8 @@ impl FundingArbStrategy {
             short_deviation = format!("{:.6}", best_short.3),
             short_size = best_short.2,
             total_deviation = format!("{:.6}", total_deviation),
+            funding_spread = format!("{:.6}", funding_spread),
+            close_threshold = format!("{:.6}", close_threshold),
             "Closing signal detected"
         );
 
