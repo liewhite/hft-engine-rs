@@ -1,10 +1,31 @@
-use fee_arb::config::{load_config, AppConfig};
-use fee_arb::domain::Symbol;
+use fee_arb::domain::{Exchange, Symbol};
 use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs};
+use fee_arb::exchange::binance::BinanceCredentials;
+use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
+use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::{FundingArbConfig, FundingArbStrategy};
 use kameo::request::MessageSend;
 use serde::Deserialize;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+/// 交易所配置
+#[derive(Debug, Clone, Deserialize)]
+struct ExchangesConfig {
+    binance: BinanceCredentials,
+    okx: OkxCredentials,
+    #[serde(default)]
+    hyperliquid: Option<HyperliquidCredentials>,
+}
+
+impl ExchangesConfig {
+    fn enabled_exchanges(&self) -> Vec<Exchange> {
+        let mut exchanges = vec![Exchange::Binance, Exchange::OKX];
+        if self.hyperliquid.is_some() {
+            exchanges.push(Exchange::Hyperliquid);
+        }
+        exchanges
+    }
+}
 
 /// 策略配置
 #[derive(Debug, Clone, Deserialize)]
@@ -22,17 +43,15 @@ impl StrategyConfig {
     }
 }
 
-/// 完整配置（框架 + 策略）
+/// 完整配置
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
-    #[serde(flatten)]
-    app: AppConfig,
+    exchanges: ExchangesConfig,
     strategy: StrategyConfig,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(EnvFilter::from_default_env().add_directive("fee_arb=info".parse()?))
@@ -40,12 +59,13 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Fee arbitrage system starting...");
 
-    // Load configuration from config.json (or specified path)
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.json".to_string());
-    tracing::info!(path = %config_path, "Loading config from file");
-    let config: Config = load_config(&config_path)?;
+    tracing::info!(path = %config_path, "Loading config");
+
+    let content = std::fs::read_to_string(&config_path)?;
+    let config: Config = serde_json::from_str(&content)?;
 
     let symbols = config.strategy.parse_symbols();
     if symbols.is_empty() {
@@ -54,16 +74,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    // Create ManagerActor
     let manager = ManagerActor::new(ManagerActorArgs {
-        binance_credentials: Some(config.app.exchanges.binance.clone()),
-        okx_credentials: Some(config.app.exchanges.okx.clone()),
-        hyperliquid_credentials: config.app.exchanges.hyperliquid.clone(),
+        binance_credentials: Some(config.exchanges.binance.clone()),
+        okx_credentials: Some(config.exchanges.okx.clone()),
+        hyperliquid_credentials: config.exchanges.hyperliquid.clone(),
     })
     .await;
 
-    // Add strategies
-    let enabled_exchanges = config.app.exchanges.enabled_exchanges();
+    let enabled_exchanges = config.exchanges.enabled_exchanges();
     for symbol in symbols {
         let strategy = FundingArbStrategy::new(
             config.strategy.funding_arb.clone(),
@@ -80,18 +98,14 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(symbol = %symbol, "Strategy added");
     }
 
-    tracing::info!("All strategies added. System running. Press Ctrl+C to stop.");
+    tracing::info!("System running. Press Ctrl+C to stop.");
 
-    // Wait for shutdown signal
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to listen for ctrl-c");
 
     tracing::info!("Received shutdown signal");
-
-    // Graceful shutdown
     manager.stop_gracefully().await.ok();
-
     tracing::info!("Manager stopped");
 
     Ok(())
