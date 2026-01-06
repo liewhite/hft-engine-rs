@@ -23,8 +23,5 @@
       "max_exposure_ratio": 0.20,
       "max_exposure_value": 100.0
     }
-  },
-  "engine": {
-    "queue_capacity": 256
   }
 }
