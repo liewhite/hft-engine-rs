@@ -7,6 +7,7 @@ use crate::domain::{
 use crate::exchange::client::ExchangeClient;
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
+use crate::exchange::utils::StepFormatter;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
@@ -15,6 +16,7 @@ use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// OKX 交易所客户端
@@ -128,7 +130,7 @@ impl OkxClient {
                 Some(SymbolMeta {
                     exchange: Exchange::OKX,
                     symbol,
-                    price_step,
+                    price_formatter: Arc::new(StepFormatter::new(price_step)),
                     size_step,
                     min_order_size,
                     contract_size,

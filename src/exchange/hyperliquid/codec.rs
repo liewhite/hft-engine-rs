@@ -192,11 +192,6 @@ fn next_hourly_settle_time() -> u64 {
     current_hour + hour_ms
 }
 
-/// 计算价格精度 (Hyperliquid 使用 6 位小数)
-pub fn price_step() -> f64 {
-    0.000001 // 6 位小数
-}
-
 /// 计算数量精度
 pub fn size_step(sz_decimals: i32) -> f64 {
     10f64.powi(-sz_decimals)

@@ -7,11 +7,13 @@ use crate::domain::{
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
 use crate::exchange::client::ExchangeClient;
+use crate::exchange::utils::StepFormatter;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::Sha256;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Binance 交易所客户端
@@ -188,7 +190,7 @@ impl BinanceClient {
                 Some(SymbolMeta {
                     exchange: Exchange::Binance,
                     symbol,
-                    price_step,
+                    price_formatter: Arc::new(StepFormatter::new(price_step)),
                     size_step,
                     min_order_size,
                     contract_size: 1.0,

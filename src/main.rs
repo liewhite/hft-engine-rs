@@ -13,16 +13,12 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 struct ExchangesConfig {
     binance: BinanceCredentials,
     okx: OkxCredentials,
-    #[serde(default)]
-    hyperliquid: Option<HyperliquidCredentials>,
+    hyperliquid: HyperliquidCredentials,
 }
 
 impl ExchangesConfig {
     fn enabled_exchanges(&self) -> Vec<Exchange> {
-        let mut exchanges = vec![Exchange::Binance, Exchange::OKX];
-        if self.hyperliquid.is_some() {
-            exchanges.push(Exchange::Hyperliquid);
-        }
+        let exchanges = vec![Exchange::Binance, Exchange::OKX, Exchange::Hyperliquid];
         exchanges
     }
 }
@@ -77,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
     let manager = ManagerActor::new(ManagerActorArgs {
         binance_credentials: Some(config.exchanges.binance.clone()),
         okx_credentials: Some(config.exchanges.okx.clone()),
-        hyperliquid_credentials: config.exchanges.hyperliquid.clone(),
+        hyperliquid_credentials: Some(config.exchanges.hyperliquid.clone()),
     })
     .await;
 

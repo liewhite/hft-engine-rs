@@ -5,7 +5,9 @@
 use super::symbol::{from_hyperliquid, to_hyperliquid};
 use crate::domain::{now_ms, Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta};
 use crate::exchange::client::ExchangeClient;
-use crate::exchange::hyperliquid::codec::{price_step, size_step, AssetCtx, AssetInfo, MetaResponse};
+use crate::exchange::hyperliquid::codec::{size_step, AssetCtx, AssetInfo, MetaResponse};
+use crate::exchange::utils::SignificantFiguresFormatter;
+use std::sync::Arc;
 use crate::exchange::hyperliquid::signing::{
     action_hash, create_signer, sign_l1_action, BulkOrderAction, ExchangeRequest, LimitOrder,
     OrderResponse, OrderStatus, OrderType as WireOrderType, OrderWire,
@@ -382,11 +384,12 @@ impl ExchangeClient for HyperliquidClient {
 /// 将 AssetInfo 转换为 SymbolMeta
 fn asset_info_to_symbol_meta(info: &AssetInfo) -> SymbolMeta {
     let symbol = from_hyperliquid(&info.name);
+    let sz_decimals = info.sz_decimals.max(0) as u32;
 
     SymbolMeta {
         exchange: Exchange::Hyperliquid,
         symbol,
-        price_step: price_step(),
+        price_formatter: Arc::new(SignificantFiguresFormatter::new(sz_decimals)),
         size_step: size_step(info.sz_decimals),
         min_order_size: size_step(info.sz_decimals), // 最小下单量为一个精度单位
         contract_size: 1.0, // Hyperliquid 是币本位，合约乘数为 1

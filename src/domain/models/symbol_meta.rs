@@ -1,14 +1,16 @@
 use crate::domain::models::{Exchange, Symbol};
+use crate::exchange::utils::PriceFormatter;
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
+use std::sync::Arc;
 
 /// 交易对元数据
 #[derive(Debug, Clone)]
 pub struct SymbolMeta {
     pub exchange: Exchange,
     pub symbol: Symbol,
-    /// 价格精度 (最小价格变动单位)
-    pub price_step: f64,
+    /// 价格格式化器
+    pub price_formatter: Arc<dyn PriceFormatter>,
     /// 数量精度 (最小数量变动单位)
     pub size_step: f64,
     /// 最小下单数量
@@ -22,9 +24,9 @@ pub struct SymbolMeta {
 }
 
 impl SymbolMeta {
-    /// 检查元数据是否有效 (所有精度值 > 0)
+    /// 检查元数据是否有效
     pub fn is_valid(&self) -> bool {
-        self.price_step > 0.0 && self.size_step > 0.0 && self.contract_size > 0.0
+        self.size_step > 0.0 && self.contract_size > 0.0
     }
 
     /// 将币本位数量转换为下单数量
@@ -41,14 +43,17 @@ impl SymbolMeta {
         qty * self.contract_size
     }
 
-    /// 将价格调整到合法精度 (向下取整)
-    pub fn round_price_down(&self, price: f64) -> f64 {
-        Self::round_to_step(price, self.price_step, RoundingStrategy::ToNegativeInfinity)
+    /// 格式化价格为字符串 (用于 API 请求)
+    pub fn format_price(&self, price: f64) -> String {
+        self.price_formatter.format(price)
     }
 
-    /// 将价格调整到合法精度 (向上取整)
-    pub fn round_price_up(&self, price: f64) -> f64 {
-        Self::round_to_step(price, self.price_step, RoundingStrategy::ToPositiveInfinity)
+    /// 将价格取整到合法精度 (通过 format 再 parse)
+    pub fn round_price(&self, price: f64) -> f64 {
+        self.price_formatter
+            .format(price)
+            .parse()
+            .unwrap_or(price)
     }
 
     /// 将数量调整到合法精度 (向下取整)
@@ -58,15 +63,12 @@ impl SymbolMeta {
 
     /// 使用 Decimal 精确计算，按 step 取整
     fn round_to_step(value: f64, step: f64, strategy: RoundingStrategy) -> f64 {
-        // 转换为 Decimal 进行精确计算
         let value_dec = Decimal::from_f64(value).unwrap_or_default();
         let step_dec = Decimal::from_f64(step).unwrap_or(Decimal::ONE);
 
-        // 计算 tick 数 (value / step)，然后取整
         let ticks = value_dec / step_dec;
         let rounded_ticks = ticks.round_dp_with_strategy(0, strategy);
 
-        // 乘回 step 得到结果
         let result = rounded_ticks * step_dec;
         result.to_f64().unwrap_or(value)
     }
