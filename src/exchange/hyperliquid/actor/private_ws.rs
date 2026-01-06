@@ -61,17 +61,19 @@ impl HyperliquidPrivateWsActor {
         }
     }
 
-    /// 解析并处理消息
-    async fn handle_message(&self, raw: &str) {
+    /// 解析并处理消息，返回是否成功
+    async fn handle_message(&self, raw: &str) -> bool {
         let local_ts = now_ms();
         match parse_private_message(raw, local_ts) {
             Ok(events) => {
                 for event in events {
                     self.event_sink.send_event(event).await;
                 }
+                true
             }
             Err(e) => {
                 tracing::error!(error = %e, raw = %raw, "Failed to parse Hyperliquid private message");
+                false
             }
         }
     }
@@ -171,8 +173,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPriv
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 直接解析并发送到 EventSink
-                self.handle_message(&data).await;
+                // 解析并发送到 EventSink，失败则 kill actor
+                if !self.handle_message(&data).await {
+                    tracing::error!("Critical parse error, killing actor");
+                    ctx.actor_ref().kill();
+                }
             }
             StreamMessage::Next(Err(e)) => {
                 tracing::error!(error = %e, "Private WebSocket loop exited, killing actor");
@@ -241,48 +246,44 @@ fn parse_clearinghouse_state(data: &serde_json::Value, local_ts: u64) -> Result<
     // clearinghouseState 订阅返回结构: { clearinghouseState: {...}, user: "...", dex: "..." }
     // 需要提取 clearinghouseState 字段
     let state_value = data.get("clearinghouseState").unwrap_or(data);
-    match serde_json::from_value::<ClearinghouseState>(state_value.clone()) {
-        Ok(state) => {
-            // 解析仓位
-            for wrapper in &state.asset_positions {
-                let position = wrapper.position.to_position();
-                events.push(IncomeEvent {
-                    exchange_ts: local_ts,
-                    local_ts,
-                    data: ExchangeEventData::Position(position),
-                });
-            }
+    let state: ClearinghouseState = serde_json::from_value(state_value.clone())
+        .map_err(|e| WsError::ParseError(format!("clearinghouseState parse: {}", e)))?;
 
-            // 解析账户净值 (equity = accountValue)
-            let equity = f64::from_str(&state.cross_margin_summary.account_value)
-                .expect("accountValue must be valid float from Hyperliquid API");
-            events.push(IncomeEvent {
-                exchange_ts: local_ts,
-                local_ts,
-                data: ExchangeEventData::Equity {
-                    exchange: Exchange::Hyperliquid,
-                    equity,
-                },
-            });
-
-            // 解析可用余额
-            let withdrawable = f64::from_str(&state.withdrawable)
-                .expect("withdrawable must be valid float from Hyperliquid API");
-            events.push(IncomeEvent {
-                exchange_ts: local_ts,
-                local_ts,
-                data: ExchangeEventData::Balance(Balance {
-                    exchange: Exchange::Hyperliquid,
-                    asset: "USDC".to_string(),
-                    available: withdrawable,
-                    frozen: 0.0,
-                }),
-            });
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, data = %data, "Failed to parse clearinghouseState");
-        }
+    // 解析仓位
+    for wrapper in &state.asset_positions {
+        let position = wrapper.position.to_position();
+        events.push(IncomeEvent {
+            exchange_ts: local_ts,
+            local_ts,
+            data: ExchangeEventData::Position(position),
+        });
     }
+
+    // 解析账户净值 (equity = accountValue)
+    let equity = f64::from_str(&state.cross_margin_summary.account_value)
+        .map_err(|_| WsError::ParseError(format!("invalid accountValue: {}", state.cross_margin_summary.account_value)))?;
+    events.push(IncomeEvent {
+        exchange_ts: local_ts,
+        local_ts,
+        data: ExchangeEventData::Equity {
+            exchange: Exchange::Hyperliquid,
+            equity,
+        },
+    });
+
+    // 解析可用余额
+    let withdrawable = f64::from_str(&state.withdrawable)
+        .map_err(|_| WsError::ParseError(format!("invalid withdrawable: {}", state.withdrawable)))?;
+    events.push(IncomeEvent {
+        exchange_ts: local_ts,
+        local_ts,
+        data: ExchangeEventData::Balance(Balance {
+            exchange: Exchange::Hyperliquid,
+            asset: "USDC".to_string(),
+            available: withdrawable,
+            frozen: 0.0,
+        }),
+    });
 
     Ok(events)
 }
@@ -294,23 +295,19 @@ fn parse_order_updates(
 ) -> Result<Vec<IncomeEvent>, WsError> {
     let mut events = Vec::new();
 
-    // orderUpdates 是一个数组
-    if let Some(updates) = data.as_array() {
-        for update in updates {
-            match serde_json::from_value::<WsOrderUpdate>(update.clone()) {
-                Ok(order_update) => {
-                    let update = order_update.to_order_update();
-                    events.push(IncomeEvent {
-                        exchange_ts: update.timestamp,
-                        local_ts,
-                        data: ExchangeEventData::OrderUpdate(update),
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, data = %update, "Failed to parse order update");
-                }
-            }
-        }
+    // orderUpdates 必须是一个数组
+    let updates = data.as_array()
+        .ok_or_else(|| WsError::ParseError(format!("orderUpdates is not an array: {}", data)))?;
+
+    for update in updates {
+        let order_update: WsOrderUpdate = serde_json::from_value(update.clone())
+            .map_err(|e| WsError::ParseError(format!("orderUpdate parse: {}", e)))?;
+        let update = order_update.to_order_update();
+        events.push(IncomeEvent {
+            exchange_ts: update.timestamp,
+            local_ts,
+            data: ExchangeEventData::OrderUpdate(update),
+        });
     }
 
     Ok(events)

@@ -88,17 +88,19 @@ impl HyperliquidPublicWsActor {
             .map_err(|_| WsError::Network("Channel closed".to_string()))
     }
 
-    /// 解析并处理消息
-    async fn handle_message(&self, raw: &str) {
+    /// 解析并处理消息，返回是否成功
+    async fn handle_message(&self, raw: &str) -> bool {
         let local_ts = now_ms();
         match parse_public_message(raw, local_ts, &self.subscribed_kinds) {
             Ok(events) => {
                 for event in events {
                     self.event_sink.send_event(event).await;
                 }
+                true
             }
             Err(e) => {
                 tracing::error!(error = %e, raw = %raw, "Failed to parse Hyperliquid public message");
+                false
             }
         }
     }
@@ -223,8 +225,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPubl
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 直接解析并发送到 EventSink
-                self.handle_message(&data).await;
+                // 解析并发送到 EventSink，失败则 kill actor
+                if !self.handle_message(&data).await {
+                    tracing::error!("Critical parse error, killing actor");
+                    ctx.actor_ref().kill();
+                }
             }
             StreamMessage::Next(Err(e)) => {
                 tracing::error!(error = %e, "WebSocket loop exited, killing actor");
@@ -266,61 +271,53 @@ fn parse_public_message(
             "activeAssetCtx" => {
                 // 资产上下文（包含资金费率、标记价格、指数价格）
                 let data = &value["data"];
-                match serde_json::from_value::<WsActiveAssetCtx>(data.clone()) {
-                    Ok(ctx) => {
-                        let symbol = ctx.symbol();
-                        let mut events = Vec::new();
+                let ctx: WsActiveAssetCtx = serde_json::from_value(data.clone())
+                    .map_err(|e| WsError::ParseError(format!("activeAssetCtx parse: {}", e)))?;
 
-                        // 根据订阅的 kinds 生成对应的事件
-                        if subscribed_kinds
-                            .contains(&SubscriptionKind::FundingRate { symbol: symbol.clone() })
-                        {
-                            events.push(IncomeEvent {
-                                exchange_ts: local_ts,
-                                local_ts,
-                                data: ExchangeEventData::FundingRate(ctx.to_funding_rate(local_ts)),
-                            });
-                        }
-                        if subscribed_kinds
-                            .contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() })
-                        {
-                            events.push(IncomeEvent {
-                                exchange_ts: local_ts,
-                                local_ts,
-                                data: ExchangeEventData::MarkPrice(ctx.to_mark_price(local_ts)),
-                            });
-                        }
-                        if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
-                            events.push(IncomeEvent {
-                                exchange_ts: local_ts,
-                                local_ts,
-                                data: ExchangeEventData::IndexPrice(ctx.to_index_price(local_ts)),
-                            });
-                        }
+                let symbol = ctx.symbol();
+                let mut events = Vec::new();
 
-                        return Ok(events);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, data = %data, "Failed to parse activeAssetCtx");
-                    }
+                // 根据订阅的 kinds 生成对应的事件
+                if subscribed_kinds
+                    .contains(&SubscriptionKind::FundingRate { symbol: symbol.clone() })
+                {
+                    events.push(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::FundingRate(ctx.to_funding_rate(local_ts)),
+                    });
                 }
+                if subscribed_kinds
+                    .contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() })
+                {
+                    events.push(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::MarkPrice(ctx.to_mark_price(local_ts)),
+                    });
+                }
+                if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
+                    events.push(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::IndexPrice(ctx.to_index_price(local_ts)),
+                    });
+                }
+
+                return Ok(events);
             }
             "bbo" => {
                 // BBO 数据
                 let data = &value["data"];
-                match serde_json::from_value::<WsBbo>(data.clone()) {
-                    Ok(bbo_data) => {
-                        let bbo = bbo_data.to_bbo();
-                        return Ok(vec![IncomeEvent {
-                            exchange_ts: bbo.timestamp,
-                            local_ts,
-                            data: ExchangeEventData::BBO(bbo),
-                        }]);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, data = %data, "Failed to parse bbo");
-                    }
-                }
+                let bbo_data: WsBbo = serde_json::from_value(data.clone())
+                    .map_err(|e| WsError::ParseError(format!("bbo parse: {}", e)))?;
+
+                let bbo = bbo_data.to_bbo();
+                return Ok(vec![IncomeEvent {
+                    exchange_ts: bbo.timestamp,
+                    local_ts,
+                    data: ExchangeEventData::BBO(bbo),
+                }]);
             }
             "allMids" => {
                 // 所有中间价，当前不处理

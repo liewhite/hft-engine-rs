@@ -93,17 +93,19 @@ impl BinancePublicWsActor {
             .map_err(|_| WsError::Network("Channel closed".to_string()))
     }
 
-    /// 解析并处理消息
-    async fn handle_message(&self, raw: &str) {
+    /// 解析并处理消息，返回是否成功
+    async fn handle_message(&self, raw: &str) -> bool {
         let local_ts = now_ms();
         match parse_public_message(raw, local_ts, &self.subscribed_kinds) {
             Ok(events) => {
                 for event in events {
                     self.event_sink.send_event(event).await;
                 }
+                true
             }
             Err(e) => {
                 tracing::error!(error = %e, raw = %raw, "Failed to parse Binance public message");
+                false
             }
         }
     }
@@ -228,8 +230,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePublicWs
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 直接解析并发送到 EventSink
-                self.handle_message(&data).await;
+                // 解析并发送到 EventSink，失败则 kill actor
+                if !self.handle_message(&data).await {
+                    tracing::error!("Critical parse error, killing actor");
+                    ctx.actor_ref().kill();
+                }
             }
             StreamMessage::Next(Err(e)) => {
                 tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
