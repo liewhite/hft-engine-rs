@@ -122,17 +122,29 @@ mod tests {
         let f = StepFormatter::new(0.01);
         assert_eq!(f.format(100.123), "100.12");
         assert_eq!(f.format(100.126), "100.13");
-        assert_eq!(f.format(100.0), "100");
+        assert_eq!(f.format(100_f64), "100");
+        assert_eq!(f.format(10000000000_f64), "10000000000");
     }
 
     #[test]
     fn test_significant_figures_formatter() {
-        let f = SignificantFiguresFormatter::new(2); // sz_decimals=2, max_decimals=4
+        // Hyperliquid 规则:
+        // - 最多 5 位有效数字
+        // - 小数位限制: 6 - sz_decimals (永续)
+        // - 整数价格总是允许
 
-        // BTC ~100000, 5 sig figs -> 0 decimals for integer part 6 digits
-        assert_eq!(f.format(100000.0), "100000");
+        // sz_decimals=0, max_decimals=6
+        let f0 = SignificantFiguresFormatter::new(0);
+        assert_eq!(f0.format(0.000251), "0.000251"); // 6 位小数, 3 位有效数字
+        assert_eq!(f0.format(0.00012345), "0.000123"); // 受 5 位有效数字限制
 
-        // 小价格
-        assert_eq!(f.format(0.12345), "0.1235"); // 5 sig figs, but max 4 decimals
+        // sz_decimals=2, max_decimals=4
+        let f2 = SignificantFiguresFormatter::new(2);
+        assert_eq!(f2.format(0.12345), "0.1235"); // 受 max_decimals=4 限制
+        assert_eq!(f2.format(1234.5), "1234.5"); // 5 位有效数字
+
+        // 整数价格总是允许
+        assert_eq!(f2.format(100000.0), "100000");
+        assert_eq!(f2.format(123456789.0), "123456789");
     }
 }
