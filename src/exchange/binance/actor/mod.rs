@@ -3,10 +3,12 @@
 //! 树状结构:
 //! BinanceActor (父)
 //! ├── BinancePublicWsActor [spawn_link]
-//! └── BinancePrivateWsActor [spawn_link]
-//!     └── BinanceListenKeyActor [spawn_link]
+//! ├── BinancePrivateWsActor [spawn_link]
+//! │   └── BinanceListenKeyActor [spawn_link]
+//! └── BinanceEquityPollingActor [spawn_link]
 
 mod binance_actor;
+mod equity_polling;
 mod listen_key;
 mod private_ws;
 mod public_ws;

@@ -1,21 +1,24 @@
 //! BinanceActor - Binance 交易所的父 Actor
 //!
 //! 职责:
-//! - 管理 PublicWsActor 和 PrivateWsActor 子 actor
+//! - 管理 PublicWsActor、PrivateWsActor 和 EquityPollingActor 子 actor
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
 //! - WsActors 直接解析消息并发送到 EventSink
 //!
 //! 架构:
-//! BinanceActor (0 spawn)
+//! BinanceActor (父)
 //! ├── BinancePublicWsActor [spawn_link] (懒创建)
-//! └── BinancePrivateWsActor [spawn_link] (懒创建, optional)
-//!     └── BinanceListenKeyActor [spawn_link]
+//! ├── BinancePrivateWsActor [spawn_link] (懒创建, optional)
+//! │   └── BinanceListenKeyActor [spawn_link]
+//! └── BinanceEquityPollingActor [spawn_link] (懒创建)
 
+use super::equity_polling::{BinanceEquityPollingActor, BinanceEquityPollingActorArgs};
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta};
 use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::client::{EventSink, Subscribe, Unsubscribe};
+use crate::exchange::ExchangeClient;
 use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, BoxError};
 use kameo::mailbox::unbounded::UnboundedMailbox;
@@ -29,6 +32,7 @@ use std::sync::Arc;
 enum ChildKind {
     PublicWs,
     PrivateWs,
+    EquityPolling,
 }
 
 /// BinanceActor 初始化参数
@@ -41,6 +45,8 @@ pub struct BinanceActorArgs {
     pub rest_base_url: String,
     /// 事件接收器
     pub event_sink: Arc<dyn EventSink>,
+    /// Exchange client（用于查询 equity）
+    pub client: Arc<dyn ExchangeClient>,
 }
 
 /// BinanceActor - 父 Actor
@@ -53,12 +59,16 @@ pub struct BinanceActor {
     event_sink: Arc<dyn EventSink>,
     /// REST 基础 URL
     rest_base_url: String,
+    /// Exchange client（用于查询 equity）
+    client: Arc<dyn ExchangeClient>,
 
     // 子 Actors (懒创建)
     /// Public WebSocket Actor
     public_ws: Option<ActorRef<BinancePublicWsActor>>,
     /// Private WebSocket Actor
     private_ws: Option<ActorRef<BinancePrivateWsActor>>,
+    /// Equity Polling Actor
+    equity_polling: Option<ActorRef<BinanceEquityPollingActor>>,
 
     /// 子 Actor ID -> Kind 映射
     child_actors: HashMap<ActorID, ChildKind>,
@@ -71,8 +81,10 @@ impl BinanceActor {
             symbol_metas: args.symbol_metas,
             event_sink: args.event_sink,
             rest_base_url: args.rest_base_url,
+            client: args.client,
             public_ws: None,
             private_ws: None,
+            equity_polling: None,
             child_actors: HashMap::new(),
         }
     }
@@ -121,6 +133,28 @@ impl BinanceActor {
 
         tracing::info!(exchange = "Binance", "PrivateWsActor created (lazy)");
     }
+
+    /// 确保 EquityPollingActor 存在（懒创建）
+    async fn ensure_equity_polling(&mut self, actor_ref: &ActorRef<Self>) {
+        if self.equity_polling.is_some() {
+            return;
+        }
+
+        let equity_polling = spawn_link(
+            actor_ref,
+            BinanceEquityPollingActor::new(BinanceEquityPollingActorArgs {
+                client: self.client.clone(),
+                event_sink: self.event_sink.clone(),
+                interval_ms: 1000, // 每秒查询一次
+            }),
+        )
+        .await;
+        self.child_actors
+            .insert(equity_polling.id(), ChildKind::EquityPolling);
+        self.equity_polling = Some(equity_polling);
+
+        tracing::info!(exchange = "Binance", "EquityPollingActor created (lazy)");
+    }
 }
 
 impl Actor for BinanceActor {
@@ -166,6 +200,10 @@ impl Actor for BinanceActor {
                 tracing::error!(reason = ?reason, "BinancePrivateWsActor died, shutting down");
                 self.private_ws = None;
             }
+            Some(ChildKind::EquityPolling) => {
+                tracing::error!(reason = ?reason, "BinanceEquityPollingActor died, shutting down");
+                self.equity_polling = None;
+            }
             None => {
                 tracing::warn!(actor_id = ?id, reason = ?reason, "Unknown linked actor died");
                 return Ok(None);
@@ -190,9 +228,10 @@ impl Message<Subscribe> for BinanceActor {
     async fn handle(&mut self, msg: Subscribe, ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
         let actor_ref = ctx.actor_ref();
 
-        // 懒创建 WebSocket actors
+        // 懒创建所有子 actors
         self.ensure_public_ws(&actor_ref).await;
         self.ensure_private_ws(&actor_ref).await;
+        self.ensure_equity_polling(&actor_ref).await;
 
         // 转发给 PublicWsActor
         if let Some(ref public_ws) = self.public_ws {

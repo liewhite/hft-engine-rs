@@ -75,8 +75,8 @@ pub struct ManagerActor {
     signal_processor: ActorRef<SignalProcessorActor>,
     /// ProcessorActor
     processor: ActorRef<ProcessorActor>,
-    /// ClockActor
-    clock_actor: ActorRef<ClockActor<ProcessorEventSink>>,
+    /// ClockActor（保持引用以维持 actor 生命周期）
+    _clock_actor: ActorRef<ClockActor<ProcessorEventSink>>,
     /// ExchangeActors (惰性创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
     /// ExecutorActors (add_strategy 时创建)
@@ -143,19 +143,12 @@ impl ManagerActor {
             event_sink: event_sink.clone(),
         }));
 
-        // 7. 创建 ClockActor
-        // Binance 需要通过 REST API 查询 equity (Binance 的 WS 不推送 equity)
-        // OKX 和 Hyperliquid 通过 WebSocket 推送
+        // 7. 创建 ClockActor（只负责发送 Clock 事件）
         let clock_event_sink = Arc::new(ProcessorEventSink {
             processor: processor.clone(),
         });
-        let mut equity_clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
-        if let Some(client) = modules.get(&Exchange::Binance).map(|m| m.client()) {
-            equity_clients.insert(Exchange::Binance, client);
-        }
         let clock_actor = kameo::spawn(ClockActor::new(ClockArgs {
             interval_ms: 1000,
-            equity_clients,
             event_sink: clock_event_sink,
         }));
 
@@ -174,7 +167,7 @@ impl ManagerActor {
             symbol_metas,
             signal_processor: signal_processor.clone(),
             processor: processor.clone(),
-            clock_actor: clock_actor.clone(),
+            _clock_actor: clock_actor.clone(),
             exchange_actors: HashMap::new(),
             executors: Vec::new(),
             actor_kinds,
@@ -275,11 +268,17 @@ impl ManagerActor {
                     .binance_credentials
                     .clone()
                     .expect("Binance credentials not configured");
+                let client = self
+                    .modules
+                    .get(&Exchange::Binance)
+                    .expect("Binance module not configured")
+                    .client();
                 let actor = BinanceActor::new(BinanceActorArgs {
                     credentials: Some(credentials),
                     symbol_metas: symbol_metas.clone(),
                     rest_base_url: REST_BASE_URL.to_string(),
                     event_sink: event_sink.clone(),
+                    client,
                 });
                 let actor_ref = spawn_link(actor_ref, actor).await;
                 (actor_ref.id(), Box::new(actor_ref))
