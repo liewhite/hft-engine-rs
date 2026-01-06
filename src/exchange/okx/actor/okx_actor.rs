@@ -55,13 +55,10 @@ impl OkxActor {
     /// 创建 OkxActor 并返回 ActorRef
     ///
     /// 使用 PreparedActor 模式，在构造时 spawn_link 所有子 actors
-    pub async fn new<P: Actor>(parent: &ActorRef<P>, args: OkxActorArgs) -> ActorRef<Self> {
+    pub async fn new(args: OkxActorArgs) -> ActorRef<Self> {
         // 1. 准备 actor，获取 actor_ref
         let prepared = PreparedActor::<Self>::new();
         let actor_ref = prepared.actor_ref().clone();
-
-        // 2. 与父 actor 建立 link
-        actor_ref.link(parent).await;
 
         let mut child_actors = HashMap::new();
 

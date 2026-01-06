@@ -273,17 +273,15 @@ impl ManagerActor {
                     .get(&Exchange::Binance)
                     .expect("Binance module not configured")
                     .client();
-                let binance_ref = BinanceActor::new(
-                    actor_ref,
-                    BinanceActorArgs {
-                        credentials: Some(credentials),
-                        symbol_metas: symbol_metas.clone(),
-                        rest_base_url: REST_BASE_URL.to_string(),
-                        event_sink: event_sink.clone(),
-                        client,
-                    },
-                )
+                let binance_ref = BinanceActor::new(BinanceActorArgs {
+                    credentials: Some(credentials),
+                    symbol_metas: symbol_metas.clone(),
+                    rest_base_url: REST_BASE_URL.to_string(),
+                    event_sink: event_sink.clone(),
+                    client,
+                })
                 .await;
+                actor_ref.link(&binance_ref).await;
                 (binance_ref.id(), Box::new(binance_ref))
             }
             Exchange::OKX => {
@@ -291,15 +289,13 @@ impl ManagerActor {
                     .okx_credentials
                     .clone()
                     .expect("OKX credentials not configured");
-                let okx_ref = OkxActor::new(
-                    actor_ref,
-                    OkxActorArgs {
-                        credentials: Some(credentials),
-                        symbol_metas: symbol_metas.clone(),
-                        event_sink: event_sink.clone(),
-                    },
-                )
+                let okx_ref = OkxActor::new(OkxActorArgs {
+                    credentials: Some(credentials),
+                    symbol_metas: symbol_metas.clone(),
+                    event_sink: event_sink.clone(),
+                })
                 .await;
+                actor_ref.link(&okx_ref).await;
                 (okx_ref.id(), Box::new(okx_ref))
             }
             Exchange::Hyperliquid => {
@@ -307,15 +303,13 @@ impl ManagerActor {
                     .hyperliquid_credentials
                     .clone()
                     .expect("Hyperliquid credentials not configured");
-                let hyper_ref = HyperliquidActor::new(
-                    actor_ref,
-                    HyperliquidActorArgs {
-                        credentials: Some(credentials),
-                        symbol_metas: symbol_metas.clone(),
-                        event_sink: event_sink.clone(),
-                    },
-                )
+                let hyper_ref = HyperliquidActor::new(HyperliquidActorArgs {
+                    credentials: Some(credentials),
+                    symbol_metas: symbol_metas.clone(),
+                    event_sink: event_sink.clone(),
+                })
                 .await;
+                actor_ref.link(&hyper_ref).await;
                 (hyper_ref.id(), Box::new(hyper_ref))
             }
         };
