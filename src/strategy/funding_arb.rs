@@ -49,11 +49,6 @@ impl EmaCalculator {
         self.value
     }
 
-    /// 获取更新次数
-    pub fn count(&self) -> usize {
-        self.count
-    }
-
     /// 是否已经预热完成（满足 period 次更新）
     pub fn is_ready(&self) -> bool {
         self.count >= self.period
@@ -140,14 +135,10 @@ struct OpenSignal {
     short_exchange: Exchange,
     /// 做空价格
     short_price: f64,
-    /// 做空交易所的 bid 向上偏离 EMA 的比例
-    short_deviation: f64,
     /// 资费最低交易所（做多）
     long_exchange: Exchange,
     /// 做多价格
     long_price: f64,
-    /// 做多交易所的 ask 向下偏离 EMA 的比例
-    long_deviation: f64,
 }
 
 /// 平仓信号
@@ -159,16 +150,12 @@ struct CloseSignal {
     long_price: f64,
     /// 平多交易所的持仓量
     long_size: f64,
-    /// 平多交易所的 bid 向上偏离
-    long_deviation: f64,
     /// 平空交易所
     short_exchange: Exchange,
     /// 平空价格（ask）
     short_price: f64,
     /// 平空交易所的持仓量（负数）
     short_size: f64,
-    /// 平空交易所的 ask 向下偏离
-    short_deviation: f64,
 }
 
 /// 交易所的 BBO EMA
@@ -381,10 +368,8 @@ impl FundingArbStrategy {
         Some(OpenSignal {
             short_exchange,
             short_price: short_bbo.bid_price,
-            short_deviation,
             long_exchange,
             long_price: long_bbo.ask_price,
-            long_deviation,
         })
     }
 
@@ -471,11 +456,9 @@ impl FundingArbStrategy {
             long_exchange: best_long.0,
             long_price: best_long.1,
             long_size: best_long.2,
-            long_deviation: best_long.3,
             short_exchange: best_short.0,
             short_price: best_short.1,
             short_size: best_short.2,
-            short_deviation: best_short.3,
         })
     }
 

@@ -124,17 +124,27 @@ impl ExecutorActor {
                 OutcomeEvent::PlaceOrder(order) => {
                     // 转换订单
                     let converted_order = self.convert_order(order);
-                    // 添加到 pending_orders
-                    self.state_manager.add_pending_order(
-                        &converted_order.symbol,
-                        converted_order.client_order_id.clone(),
-                        converted_order.exchange,
+                    tracing::info!(
+                        exchange = %converted_order.exchange,
+                        symbol = %converted_order.symbol,
+                        side = ?converted_order.side,
+                        order_type = ?converted_order.order_type,
+                        quantity = converted_order.quantity,
+                        client_order_id = %converted_order.client_order_id,
+                        "Placing order"
                     );
-                    // 发送到 SignalProcessor
-                    self.signal_processor
-                        .tell(OutcomeEvent::PlaceOrder(converted_order))
-                        .await
-                        .expect("Failed to send order to SignalProcessorActor");
+
+                    // // 添加到 pending_orders
+                    // self.state_manager.add_pending_order(
+                    //     &converted_order.symbol,
+                    //     converted_order.client_order_id.clone(),
+                    //     converted_order.exchange,
+                    // );
+                    // // 发送到 SignalProcessor
+                    // self.signal_processor
+                    //     .tell(OutcomeEvent::PlaceOrder(converted_order))
+                    //     .await
+                    //     .expect("Failed to send order to SignalProcessorActor");
                 }
             }
         }
