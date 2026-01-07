@@ -65,6 +65,8 @@ pub struct FundingArbConfig {
     pub ema_period: usize,
     /// 单笔下单金额 (USDT)，开平仓均按此金额计算数量
     pub max_notional: f64,
+    /// 最小下单金额 (USDT)，低于此金额的订单将被放弃
+    pub min_notional: f64,
     /// 订单超时时间 (毫秒)
     pub order_timeout_ms: u64,
     /// 敞口比例限制（敞口/较小仓位）
@@ -536,6 +538,20 @@ impl FundingArbStrategy {
         // 确保不超过当前持仓
         let qty = qty.min(pos.size.abs());
 
+        // 检查最小下单金额
+        let notional = qty * price;
+        if notional < self.config.min_notional {
+            tracing::debug!(
+                symbol = %self.symbol,
+                exchange = %exchange,
+                qty = qty,
+                notional = notional,
+                min_notional = self.config.min_notional,
+                "Rebalance order below min_notional, skipping"
+            );
+            return None;
+        }
+
         tracing::info!(
             symbol = %self.symbol,
             exchange = %exchange,
@@ -594,6 +610,20 @@ impl FundingArbStrategy {
         // long_price 是 ask，做多用 ask + slippage
         let short_limit_price = signal.short_price * (1.0 - MARKET_ORDER_SLIPPAGE);
         let long_limit_price = signal.long_price * (1.0 + MARKET_ORDER_SLIPPAGE);
+
+        // 检查最小下单金额（任一边低于 min_notional 则放弃本次套利）
+        let short_notional = short_qty * short_limit_price;
+        let long_notional = long_qty * long_limit_price;
+        if short_notional < self.config.min_notional || long_notional < self.config.min_notional {
+            tracing::debug!(
+                symbol = %self.symbol,
+                short_notional = short_notional,
+                long_notional = long_notional,
+                min_notional = self.config.min_notional,
+                "Open orders below min_notional, skipping"
+            );
+            return vec![];
+        }
 
         tracing::info!(
             symbol = %self.symbol,
@@ -738,6 +768,20 @@ impl FundingArbStrategy {
         let close_long_price = signal.long_price * (1.0 - MARKET_ORDER_SLIPPAGE);
         let close_short_price = signal.short_price * (1.0 + MARKET_ORDER_SLIPPAGE);
 
+        // 检查最小下单金额（任一边低于 min_notional 则放弃本次平仓）
+        let long_notional = close_qty * close_long_price;
+        let short_notional = close_qty * close_short_price;
+        if long_notional < self.config.min_notional || short_notional < self.config.min_notional {
+            tracing::debug!(
+                symbol = %self.symbol,
+                long_notional = long_notional,
+                short_notional = short_notional,
+                min_notional = self.config.min_notional,
+                "Close orders below min_notional, skipping"
+            );
+            return vec![];
+        }
+
         tracing::info!(
             symbol = %self.symbol,
             long_exchange = %signal.long_exchange,
@@ -814,13 +858,6 @@ impl Strategy for FundingArbStrategy {
             Some(s) => s,
             None => return vec![],
         };
-
-        // log equity
-        // tracing::info!(
-        //     symbol = %self.symbol,
-        //     equities = ?self.exchanges.iter().map(|ex| (*ex, state.equity(*ex))).collect::<HashMap<_, _>>(),
-        //     "Current equities"
-        // );
 
         // BBO 事件时更新对应交易所的 EMA
         if let ExchangeEventData::BBO(bbo) = &event.data {

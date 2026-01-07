@@ -19,6 +19,7 @@
     "funding_arb": {
       "ema_period": 100,
       "max_notional": 1000.0,
+      "min_notional": 10.0,
       "order_timeout_ms": 10000,
       "max_exposure_ratio": 0.20,
       "max_exposure_value": 100.0
