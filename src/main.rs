@@ -1,9 +1,12 @@
 use fee_arb::domain::{Exchange, Symbol};
-use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs};
+use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs, SubscribeIncome};
 use fee_arb::exchange::binance::BinanceCredentials;
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
-use fee_arb::strategy::{FundingArbConfig, FundingArbStrategy};
+use fee_arb::strategy::{
+    FundingArbConfig, FundingArbStrategy, MetricsSubscriberActor, MetricsSubscriberArgs,
+    SlackNotifierActor, SlackNotifierArgs,
+};
 use kameo::actor::Spawn;
 use kameo::mailbox;
 use serde::Deserialize;
@@ -31,6 +34,21 @@ struct StrategyConfig {
     funding_arb: FundingArbConfig,
 }
 
+/// 监控配置
+#[derive(Debug, Clone, Deserialize)]
+pub struct MonitoringConfig {
+    /// Prometheus Pushgateway URL
+    pub pushgateway_url: String,
+    /// Metric 前缀
+    pub metric_prefix: String,
+    /// 推送间隔（毫秒）
+    pub push_interval_ms: u64,
+    /// Slack channel
+    pub slack_channel: String,
+    /// Slack token
+    pub slack_token: String,
+}
+
 impl StrategyConfig {
     fn parse_symbols(&self) -> Vec<Symbol> {
         self.symbols
@@ -45,6 +63,7 @@ impl StrategyConfig {
 struct Config {
     exchanges: ExchangesConfig,
     strategy: StrategyConfig,
+    monitoring: Option<MonitoringConfig>,
 }
 
 #[tokio::main]
@@ -95,6 +114,44 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
 
         tracing::info!(symbol = %symbol, "Strategy added");
+    }
+
+    // 初始化监控 subscribers（如果配置了）
+    if let Some(ref monitoring) = config.monitoring {
+        // 创建 MetricsSubscriberActor
+        let metrics_subscriber = MetricsSubscriberActor::spawn_with_mailbox(
+            MetricsSubscriberArgs {
+                pushgateway_url: monitoring.pushgateway_url.clone(),
+                metric_prefix: monitoring.metric_prefix.clone(),
+                push_interval_ms: monitoring.push_interval_ms,
+            },
+            mailbox::unbounded(),
+        );
+
+        // 订阅 Income 事件
+        manager
+            .tell(SubscribeIncome(metrics_subscriber))
+            .send()
+            .await
+            .ok();
+        tracing::info!("MetricsSubscriberActor created and subscribed");
+
+        // 创建 SlackNotifierActor
+        let slack_notifier = SlackNotifierActor::spawn_with_mailbox(
+            SlackNotifierArgs {
+                channel: monitoring.slack_channel.clone(),
+                token: monitoring.slack_token.clone(),
+            },
+            mailbox::unbounded(),
+        );
+
+        // 订阅 Income 事件（用于监听订单成交）
+        manager
+            .tell(SubscribeIncome(slack_notifier))
+            .send()
+            .await
+            .ok();
+        tracing::info!("SlackNotifierActor created and subscribed");
     }
 
     tracing::info!("System running. Press Ctrl+C to stop.");
