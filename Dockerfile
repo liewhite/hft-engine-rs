@@ -38,7 +38,4 @@ RUN apt-get update && apt-get install -y \
 # Copy the binary from builder
 COPY --from=builder /app/target/release/fee-arb /app/fee-arb
 
-# Copy config example for reference
-COPY config.example.json /app/config.example.json
-
 ENTRYPOINT ["/app/fee-arb"]
