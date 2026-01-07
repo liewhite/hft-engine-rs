@@ -231,6 +231,7 @@ impl FundingArbStrategy {
 
     /// 计算基于剩余时间的资费差（日化）
     ///
+    /// 使用统一时间基准：所有交易所中最近的结算时间
     /// 如果最大时间戳 - 最小时间戳 > 2分钟，返回 None 并打印警告
     ///
     /// 返回 (最大日化资费, 最小日化资费, 资费差)
@@ -257,8 +258,14 @@ impl FundingArbStrategy {
             return None;
         }
 
-        let short_daily = short_rate.daily_rate();
-        let long_daily = long_rate.daily_rate();
+        // 使用统一时间基准计算日化费率
+        // base_settle_time: 所有交易所中最近的结算时间
+        // current_time: 最新的数据时间戳
+        let base_settle_time = short_rate.next_settle_time.min(long_rate.next_settle_time);
+        let current_time = short_rate.timestamp.max(long_rate.timestamp);
+
+        let short_daily = short_rate.daily_rate_with_base_time(base_settle_time, current_time);
+        let long_daily = long_rate.daily_rate_with_base_time(base_settle_time, current_time);
         let spread = short_daily - long_daily;
 
         tracing::debug!(
@@ -266,11 +273,14 @@ impl FundingArbStrategy {
             short_exchange = %short_ex,
             short_rate = format!("{:.6}", short_rate.rate),
             short_daily = format!("{:.6}", short_daily),
+            short_settle_time = short_rate.next_settle_time,
             long_exchange = %long_ex,
             long_rate = format!("{:.6}", long_rate.rate),
             long_daily = format!("{:.6}", long_daily),
+            long_settle_time = long_rate.next_settle_time,
+            base_settle_time = base_settle_time,
             funding_spread = format!("{:.6}", spread),
-            "Funding spread calculated"
+            "Funding spread calculated with unified time base"
         );
 
         Some((short_daily, long_daily, spread))

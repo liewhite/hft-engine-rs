@@ -37,4 +37,27 @@ impl FundingRate {
         let effective_hours = hours_to_settle.max(0.5);
         self.rate * (24.0 / effective_hours)
     }
+
+    /// 基于指定时间基准的日化费率
+    ///
+    /// 用于跨交易所比较时，统一使用最近的结算时间作为基准
+    ///
+    /// # 参数
+    /// - `base_settle_time`: 统一的结算时间基准（通常取所有交易所中最近的）
+    /// - `current_time`: 当前时间
+    pub fn daily_rate_with_base_time(&self, base_settle_time: Timestamp, current_time: Timestamp) -> Rate {
+        if current_time >= base_settle_time {
+            return 0.0;
+        }
+
+        let ms_to_settle = base_settle_time - current_time;
+        let hours_to_settle = ms_to_settle as f64 / (1000.0 * 60.0 * 60.0);
+
+        if hours_to_settle <= 0.0 {
+            return 0.0;
+        }
+
+        let effective_hours = hours_to_settle.max(0.5);
+        self.rate * (24.0 / effective_hours)
+    }
 }

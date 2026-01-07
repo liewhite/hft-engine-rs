@@ -68,19 +68,60 @@ impl SymbolState {
         before - self.pending_orders.len()
     }
 
+    /// 获取统一时间基准（所有交易所中最近的结算时间和当前时间）
+    ///
+    /// 返回 (base_settle_time, current_time)
+    fn unified_time_base(&self) -> Option<(Timestamp, Timestamp)> {
+        if self.funding_rates.is_empty() {
+            return None;
+        }
+
+        // 找出最近的 next_settle_time
+        let min_settle_time = self
+            .funding_rates
+            .values()
+            .map(|r| r.next_settle_time)
+            .min()?;
+
+        // 使用最新的 timestamp 作为当前时间
+        let current_time = self
+            .funding_rates
+            .values()
+            .map(|r| r.timestamp)
+            .max()?;
+
+        Some((min_settle_time, current_time))
+    }
+
     /// 获取日化费率最高的交易所 (适合做空)
+    ///
+    /// 使用统一时间基准计算日化费率，确保跨交易所比较公平
     pub fn best_short_exchange(&self) -> Option<(Exchange, &FundingRate)> {
+        let (base_settle_time, current_time) = self.unified_time_base()?;
+
         self.funding_rates
             .iter()
-            .max_by(|a, b| a.1.daily_rate().total_cmp(&b.1.daily_rate()))
+            .max_by(|a, b| {
+                let a_daily = a.1.daily_rate_with_base_time(base_settle_time, current_time);
+                let b_daily = b.1.daily_rate_with_base_time(base_settle_time, current_time);
+                a_daily.total_cmp(&b_daily)
+            })
             .map(|(e, r)| (*e, r))
     }
 
     /// 获取日化费率最低的交易所 (适合做多)
+    ///
+    /// 使用统一时间基准计算日化费率，确保跨交易所比较公平
     pub fn best_long_exchange(&self) -> Option<(Exchange, &FundingRate)> {
+        let (base_settle_time, current_time) = self.unified_time_base()?;
+
         self.funding_rates
             .iter()
-            .min_by(|a, b| a.1.daily_rate().total_cmp(&b.1.daily_rate()))
+            .min_by(|a, b| {
+                let a_daily = a.1.daily_rate_with_base_time(base_settle_time, current_time);
+                let b_daily = b.1.daily_rate_with_base_time(base_settle_time, current_time);
+                a_daily.total_cmp(&b_daily)
+            })
             .map(|(e, r)| (*e, r))
     }
 
