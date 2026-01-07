@@ -64,7 +64,8 @@ impl ExecutorActor {
     /// 转换订单：生成 client_order_id，coin_to_qty + round price/size
     fn convert_order(&self, mut order: Order) -> Order {
         // 生成 client_order_id (去掉 `-`，OKX 只允许字母数字)
-        order.client_order_id = Uuid::new_v4().simple().to_string();
+        let cli_id = format!("0x{}", Uuid::new_v4().simple().to_string());
+        order.client_order_id = cli_id;
 
         let key = (order.exchange, order.symbol.clone());
         let meta = match self.symbol_metas.get(&key) {

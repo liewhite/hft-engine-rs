@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, Order, OrderType, Rate, Side, Symbol, TimeInForce, BBO};
+use crate::domain::{Exchange, Order, OrderType, Rate, Side, Symbol, BBO};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
@@ -546,10 +546,7 @@ impl FundingArbStrategy {
             exchange,
             symbol: self.symbol.clone(),
             side,
-            order_type: OrderType::Limit {
-                price,
-                tif: TimeInForce::IOC,
-            },
+            order_type: OrderType::Market,
             quantity: qty,
             reduce_only: true,
             client_order_id: String::new(),
@@ -604,10 +601,7 @@ impl FundingArbStrategy {
                 exchange: signal.short_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Short,
-                order_type: OrderType::Limit {
-                    price: signal.short_price,
-                    tif: TimeInForce::IOC,
-                },
+                order_type: OrderType::Market,
                 quantity: short_qty,
                 reduce_only: false,
                 client_order_id: String::new(),
@@ -617,10 +611,7 @@ impl FundingArbStrategy {
                 exchange: signal.long_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Long,
-                order_type: OrderType::Limit {
-                    price: signal.long_price,
-                    tif: TimeInForce::IOC,
-                },
+                order_type: OrderType::Market,
                 quantity: long_qty,
                 reduce_only: false,
                 client_order_id: String::new(),
@@ -741,10 +732,7 @@ impl FundingArbStrategy {
                 exchange: signal.long_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Short,
-                order_type: OrderType::Limit {
-                    price: signal.long_price,
-                    tif: TimeInForce::IOC,
-                },
+                order_type: OrderType::Market,
                 quantity: close_qty,
                 reduce_only: true,
                 client_order_id: String::new(),
@@ -755,10 +743,7 @@ impl FundingArbStrategy {
                 exchange: signal.short_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Long,
-                order_type: OrderType::Limit {
-                    price: signal.short_price,
-                    tif: TimeInForce::IOC,
-                },
+                order_type: OrderType::Market,
                 quantity: close_qty,
                 reduce_only: true,
                 client_order_id: String::new(),

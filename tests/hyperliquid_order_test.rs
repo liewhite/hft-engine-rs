@@ -10,8 +10,8 @@ use fee_arb::exchange::ExchangeClient;
 use reqwest::Client;
 use serde::Deserialize;
 
-/// 测试交易对
-const TEST_SYMBOL: (&str, &str) = ("BTC", "USDC");
+/// 测试交易对 (系统内部统一用 USDT 作为 quote，实际结算用 USDC)
+const TEST_SYMBOL: (&str, &str) = ("BTC", "USDT");
 
 /// 测试数量 - 请根据实际情况填写
 const TEST_QUANTITY: f64 = 0.001; // TODO: 填写测试数量
@@ -95,6 +95,7 @@ async fn test_hyperliquid_limit_buy() {
     let price: f64 = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", ask, price);
 
+    let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple().to_string());
     // 构造限价买单
     let order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -107,7 +108,7 @@ async fn test_hyperliquid_limit_buy() {
         },
         quantity: TEST_QUANTITY,
         reduce_only: false,
-        client_order_id: format!("test_buy_{}", chrono::Utc::now().timestamp_millis()),
+        client_order_id: cli_id,
     };
 
     println!("提交买单: {:?}", order);
@@ -142,6 +143,7 @@ async fn test_hyperliquid_limit_sell() {
     let price: f64 = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", bid, price);
 
+    let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple().to_string());
     // 构造限价卖单
     let order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -154,7 +156,7 @@ async fn test_hyperliquid_limit_sell() {
         },
         quantity: TEST_QUANTITY,
         reduce_only: false,
-        client_order_id: format!("test_sell_{}", chrono::Utc::now().timestamp_millis()),
+        client_order_id: cli_id,
     };
 
     println!("提交卖单: {:?}", order);

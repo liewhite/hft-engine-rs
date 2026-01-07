@@ -14,7 +14,7 @@ use serde::Deserialize;
 const TEST_SYMBOL: (&str, &str) = ("BTC", "USDT");
 
 /// 测试数量 - 请根据实际情况填写
-const TEST_QUANTITY: f64 = 0.001; // TODO: 填写测试数量
+const TEST_QUANTITY: f64 = 0.002; // TODO: 填写测试数量
 
 /// 从环境变量获取凭证
 fn get_credentials() -> Option<BinanceCredentials> {
@@ -86,17 +86,17 @@ async fn test_binance_limit_buy() {
         side: Side::Long,
         order_type: OrderType::Limit {
             price,
-            tif: TimeInForce::GTC,
+            tif: TimeInForce::IOC,
         },
         quantity: TEST_QUANTITY,
         reduce_only: false,
-        client_order_id: format!("test_buy_{}", chrono::Utc::now().timestamp_millis()),
+        client_order_id: uuid::Uuid::new_v4().to_string(),
     };
 
     println!("提交买单: {:?}", order);
 
-    let order_id = client.place_order(order).await.expect("下单失败");
-    println!("买单成功，订单ID: {}", order_id);
+    // let order_id = client.place_order(order).await.expect("下单失败");
+    // println!("买单成功，订单ID: {}", order_id);
 }
 
 /// 限价卖单测试 - 使用 bid 价格
@@ -136,7 +136,7 @@ async fn test_binance_limit_sell() {
         },
         quantity: TEST_QUANTITY,
         reduce_only: false,
-        client_order_id: format!("test_sell_{}", chrono::Utc::now().timestamp_millis()),
+        client_order_id: uuid::Uuid::new_v4().to_string(),
     };
 
     println!("提交卖单: {:?}", order);

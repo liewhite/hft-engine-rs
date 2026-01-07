@@ -15,7 +15,7 @@ use serde::Deserialize;
 const TEST_SYMBOL: (&str, &str) = ("BTC", "USDT");
 
 /// 测试数量 - 请根据实际情况填写 (OKX 是张数，1张 = ctVal BTC)
-const TEST_QUANTITY: f64 = 1.0; // TODO: 填写测试数量（张数）
+const TEST_QUANTITY: f64 = 0.01; // TODO: 填写测试数量（张数）
 
 /// 从环境变量获取凭证
 fn get_credentials() -> Option<OkxCredentials> {
@@ -97,17 +97,17 @@ async fn test_okx_limit_buy() {
 
     // 构造限价买单
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: uuid::Uuid::new_v4().simple().to_string(),
         exchange: Exchange::OKX,
         symbol,
         side: Side::Long,
         order_type: OrderType::Limit {
             price,
-            tif: TimeInForce::GTC,
+            tif: TimeInForce::IOC,
         },
         quantity: TEST_QUANTITY,
         reduce_only: false,
-        client_order_id: format!("test_buy_{}", chrono::Utc::now().timestamp_millis()),
+        client_order_id: uuid::Uuid::new_v4().simple().to_string(),
     };
 
     println!("提交买单: {:?}", order);
@@ -143,17 +143,17 @@ async fn test_okx_limit_sell() {
 
     // 构造限价卖单
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: uuid::Uuid::new_v4().simple().to_string(),
         exchange: Exchange::OKX,
         symbol,
         side: Side::Short,
         order_type: OrderType::Limit {
             price,
-            tif: TimeInForce::GTC,
+            tif: TimeInForce::IOC,
         },
         quantity: TEST_QUANTITY,
         reduce_only: false,
-        client_order_id: format!("test_sell_{}", chrono::Utc::now().timestamp_millis()),
+        client_order_id: uuid::Uuid::new_v4().simple().to_string(),
     };
 
     println!("提交卖单: {:?}", order);
