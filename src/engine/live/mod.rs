@@ -3,7 +3,7 @@
 //! 包含引擎中各个 Actor 的实现
 
 mod clock;
-mod engine;
+mod manager;
 mod executor;
 mod processor;
 mod signal_processor;
@@ -19,7 +19,7 @@ pub type IncomePubSub = PubSub<IncomeEvent>;
 pub type OutcomePubSub = PubSub<OutcomeEvent>;
 
 pub use clock::{ClockActor, ClockActorArgs};
-pub use engine::{AddStrategy, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome};
+pub use manager::{AddStrategy, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome};
 pub use executor::{ExecutorActor, ExecutorArgs};
 pub use processor::{IncomeProcessorActor, RegisterExecutor};
 pub use signal_processor::{OutcomeProcessorActor, SignalProcessorArgs};

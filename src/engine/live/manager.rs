@@ -55,15 +55,9 @@ pub struct ManagerActor {
 
     // === 子 Actors ===
     /// ProcessorActor (订阅 income_pubsub)
-    processor: ActorRef<IncomeProcessorActor>,
-    /// SignalProcessorActor (订阅 outcome_pubsub) - 保持引用以维持生命周期
-    _signal_processor: ActorRef<OutcomeProcessorActor>,
-    /// ClockActor - 保持引用以维持生命周期
-    _clock_actor: ActorRef<ClockActor>,
+    income_processor: ActorRef<IncomeProcessorActor>,
     /// ExchangeActors (启动时创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
-    /// ExecutorActors (add_strategy 时创建)
-    _executors: Vec<ActorRef<ExecutorActor>>,
 }
 
 impl ManagerActor {
@@ -122,7 +116,7 @@ impl ManagerActor {
         strategy: Box<dyn Strategy>,
         actor_ref: ActorRef<Self>,
     ) -> Result<(), ExchangeError> {
-        let processor = self.processor.clone();
+        let processor = self.income_processor.clone();
         let outcome_pubsub = self.outcome_pubsub.clone();
 
         // 1. 检查策略所需的 symbols 是否都已缓存（启动时已预加载）
@@ -138,7 +132,6 @@ impl ManagerActor {
             .collect();
 
         // 4. 创建 ExecutorActor (使用 spawn_link_with_mailbox)
-        let executor_idx = self._executors.len();
         let executor_ref = ExecutorActor::spawn_link_with_mailbox(
             &actor_ref,
             ExecutorArgs {
@@ -159,8 +152,6 @@ impl ManagerActor {
             .send()
             .await;
 
-        self._executors.push(executor_ref);
-
         // 6. 向 ExchangeActors 发送订阅请求
         for (exchange, kind) in subscriptions {
             if let Some(actor) = self.exchange_actors.get(&exchange) {
@@ -171,10 +162,7 @@ impl ManagerActor {
             }
         }
 
-        tracing::info!(
-            executor_idx = executor_idx,
-            "Strategy added, ExecutorActor created"
-        );
+        tracing::info!("Strategy added, ExecutorActor created");
 
         Ok(())
     }
@@ -234,7 +222,7 @@ impl Actor for ManagerActor {
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 5. 创建 SignalProcessorActor 并订阅 outcome_pubsub
-        let signal_processor = OutcomeProcessorActor::spawn_link_with_mailbox(
+        let _signal_processor = OutcomeProcessorActor::spawn_link_with_mailbox(
             &actor_ref,
             SignalProcessorArgs {
                 clients: clients.clone(),
@@ -244,13 +232,13 @@ impl Actor for ManagerActor {
         )
         .await;
         outcome_pubsub
-            .tell(Subscribe(signal_processor.clone()))
+            .tell(Subscribe(_signal_processor.clone()))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 6. 创建 ClockActor（发布 Clock 事件到 income_pubsub）
-        let clock_actor = ClockActor::spawn_link_with_mailbox(
+        let _clock_actor = ClockActor::spawn_link_with_mailbox(
             &actor_ref,
             ClockActorArgs {
                 interval_ms: 1000,
@@ -325,11 +313,8 @@ impl Actor for ManagerActor {
             symbol_metas,
             income_pubsub,
             outcome_pubsub,
-            processor,
-            _signal_processor: signal_processor,
-            _clock_actor: clock_actor,
+            income_processor: processor,
             exchange_actors,
-            _executors: Vec::new(),
         })
     }
 
