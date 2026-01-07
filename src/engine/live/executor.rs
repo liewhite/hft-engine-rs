@@ -12,7 +12,6 @@ use kameo::Actor;
 use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use super::OutcomePubSub;
 
@@ -41,9 +40,8 @@ pub struct ExecutorActor {
 impl ExecutorActor {
     /// 转换订单：生成 client_order_id，coin_to_qty + round price/size
     fn convert_order(&self, mut order: Order) -> Order {
-        // 生成 client_order_id (去掉 `-`，OKX 只允许字母数字)
-        let cli_id = format!("0x{}", Uuid::new_v4().simple().to_string());
-        order.client_order_id = cli_id;
+        // 生成交易所特定的 client_order_id
+        order.client_order_id = order.exchange.new_cli_order_id();
 
         let key = (order.exchange, order.symbol.clone());
         let meta = match self.symbol_metas.get(&key) {
