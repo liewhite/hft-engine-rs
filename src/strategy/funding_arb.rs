@@ -441,18 +441,6 @@ impl FundingArbStrategy {
         // close_threshold 是负数，当 total_deviation < close_threshold 时平仓
         // 即价差收窄到反向偏离时平仓
         if total_deviation > close_threshold {
-            tracing::debug!(
-                symbol = %self.symbol,
-                long_exchange = %best_long.0,
-                long_deviation = format!("{:.6}", best_long.3),
-                long_size = best_long.2,
-                short_exchange = %best_short.0,
-                short_deviation = format!("{:.6}", best_short.3),
-                short_size = best_short.2,
-                total_deviation = format!("{:.6}", total_deviation),
-                close_threshold = format!("{:.6}", close_threshold),
-                "Close check not passed"
-            );
             return None;
         }
 
@@ -787,6 +775,12 @@ impl FundingArbStrategy {
     /// 基于平仓信号，以较小持仓为准生成订单
     fn make_close_orders(&self, signal: &CloseSignal) -> Vec<Order> {
         if signal.long_price <= 0.0 || signal.short_price <= 0.0 {
+            tracing::info!(
+                symbol = %self.symbol,
+                long_price = signal.long_price,
+                short_price = signal.short_price,
+                "make_close_orders: invalid price, skipping"
+            );
             return vec![];
         }
 
@@ -795,6 +789,13 @@ impl FundingArbStrategy {
         let close_qty = signal.long_size.min(signal.short_size.abs());
 
         if close_qty < 1e-10 {
+            tracing::info!(
+                symbol = %self.symbol,
+                long_size = signal.long_size,
+                short_size = signal.short_size,
+                close_qty = close_qty,
+                "make_close_orders: close_qty too small, skipping"
+            );
             return vec![];
         }
 
@@ -808,6 +809,14 @@ impl FundingArbStrategy {
         let long_notional = close_qty * close_long_price;
         let short_notional = close_qty * close_short_price;
         if long_notional < self.config.min_notional || short_notional < self.config.min_notional {
+            tracing::info!(
+                symbol = %self.symbol,
+                close_qty = close_qty,
+                long_notional = long_notional,
+                short_notional = short_notional,
+                min_notional = self.config.min_notional,
+                "make_close_orders: notional below min, skipping"
+            );
             return vec![];
         }
 
@@ -915,7 +924,17 @@ impl Strategy for FundingArbStrategy {
         // 步骤 3: 检查平仓条件
         if let Some(close_signal) = self.check_close_signal(symbol_state) {
             let orders = self.make_close_orders(&close_signal);
+            tracing::info!(
+                symbol = %self.symbol,
+                orders_count = orders.len(),
+                "Close orders generated from make_close_orders"
+            );
             let orders = self.apply_orderbook_limit(orders, symbol_state);
+            tracing::info!(
+                symbol = %self.symbol,
+                orders_count = orders.len(),
+                "Close orders after apply_orderbook_limit"
+            );
             return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
         }
 
