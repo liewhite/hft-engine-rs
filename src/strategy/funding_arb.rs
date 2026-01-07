@@ -77,6 +77,10 @@ pub struct FundingArbConfig {
     /// - 需同时超过 max_exposure_ratio 和 max_exposure_value 才触发 rebalance
     /// - 避免基础仓位小时频繁 rebalance
     pub max_exposure_value: f64,
+    /// 单边仓位占账户 equity 的最大比例
+    /// - 任一交易所的仓位价值 / equity 超过此比例时禁止开仓
+    /// - 不影响平仓和 rebalance
+    pub max_position_ratio: f64,
 }
 
 /// 根据资费差（日化）计算开平仓阈值
@@ -331,6 +335,28 @@ impl FundingArbStrategy {
                 long_exchange = %long_exchange,
                 long_equity = long_equity,
                 "Insufficient equity"
+            );
+            return None;
+        }
+
+        // 检查单边仓位比例是否超限
+        let mid_price = (short_bbo.bid_price + long_bbo.ask_price) / 2.0;
+        let short_pos = state.position(short_exchange).map(|p| p.size.abs()).unwrap_or(0.0);
+        let long_pos = state.position(long_exchange).map(|p| p.size.abs()).unwrap_or(0.0);
+        let short_pos_value = short_pos * mid_price;
+        let long_pos_value = long_pos * mid_price;
+        let short_pos_ratio = short_pos_value / short_equity;
+        let long_pos_ratio = long_pos_value / long_equity;
+
+        if short_pos_ratio >= self.config.max_position_ratio || long_pos_ratio >= self.config.max_position_ratio {
+            tracing::debug!(
+                symbol = %self.symbol,
+                short_exchange = %short_exchange,
+                short_pos_ratio = format!("{:.4}", short_pos_ratio),
+                long_exchange = %long_exchange,
+                long_pos_ratio = format!("{:.4}", long_pos_ratio),
+                max_position_ratio = self.config.max_position_ratio,
+                "Position ratio exceeded, refusing to open"
             );
             return None;
         }
