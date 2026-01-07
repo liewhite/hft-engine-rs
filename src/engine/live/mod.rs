@@ -19,7 +19,7 @@ pub type IncomePubSub = PubSub<IncomeEvent>;
 pub type OutcomePubSub = PubSub<OutcomeEvent>;
 
 pub use clock::{ClockActor, ClockActorArgs};
-pub use engine::{AddStrategy, ManagerActor, ManagerActorArgs, Stop};
+pub use engine::{AddStrategy, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome};
 pub use executor::{ExecutorActor, ExecutorArgs};
 pub use processor::{IncomeProcessorActor, RegisterExecutor};
 pub use signal_processor::{OutcomeProcessorActor, SignalProcessorArgs};

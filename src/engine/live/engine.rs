@@ -48,6 +48,8 @@ pub struct ManagerActor {
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
 
     // === PubSub Actors ===
+    /// Income PubSub (行情/账户事件)
+    income_pubsub: ActorRef<IncomePubSub>,
     /// Outcome PubSub (策略信号)
     outcome_pubsub: ActorRef<OutcomePubSub>,
 
@@ -321,6 +323,7 @@ impl Actor for ManagerActor {
 
         Ok(Self {
             symbol_metas,
+            income_pubsub,
             outcome_pubsub,
             processor,
             _signal_processor: signal_processor,
@@ -381,5 +384,41 @@ impl Message<Stop> for ManagerActor {
     async fn handle(&mut self, _msg: Stop, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         tracing::info!("Stopping ManagerActor...");
         ctx.actor_ref().stop_gracefully().await.ok();
+    }
+}
+
+/// 订阅 Income 事件
+pub struct SubscribeIncome<A: Actor>(pub ActorRef<A>);
+
+impl<A> Message<SubscribeIncome<A>> for ManagerActor
+where
+    A: Actor + Message<crate::messaging::IncomeEvent>,
+{
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribeIncome<A>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let _ = self.income_pubsub.tell(Subscribe(msg.0)).send().await;
+    }
+}
+
+/// 订阅 Outcome 事件
+pub struct SubscribeOutcome<A: Actor>(pub ActorRef<A>);
+
+impl<A> Message<SubscribeOutcome<A>> for ManagerActor
+where
+    A: Actor + Message<crate::strategy::OutcomeEvent>,
+{
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribeOutcome<A>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let _ = self.outcome_pubsub.tell(Subscribe(msg.0)).send().await;
     }
 }
