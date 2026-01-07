@@ -209,14 +209,6 @@ impl ManagerActor {
         Ok(symbol_metas)
     }
 
-    /// 获取所有已配置的 ExchangeClient (用于遍历)
-    fn configured_clients(&self) -> HashMap<Exchange, Arc<dyn ExchangeClient>> {
-        self.modules
-            .iter()
-            .map(|(e, m)| (*e, m.client()))
-            .collect()
-    }
-
     /// 检查策略所需的 symbols 是否都已缓存
     fn check_required_symbols(&self, strategy: &dyn Strategy) -> Result<(), ExchangeError> {
         let public_streams = strategy.public_streams();
