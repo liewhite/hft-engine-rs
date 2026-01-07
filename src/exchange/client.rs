@@ -89,8 +89,8 @@ pub enum WsError {
     Network(String),
     #[error("Authentication failed: {0}")]
     AuthFailed(String),
-    #[error("Server closed connection")]
-    ServerClosed,
+    #[error("Server closed connection: {0}")]
+    ServerClosed(String),
     #[error("Parse error: {0}")]
     ParseError(String),
 }

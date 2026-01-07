@@ -72,14 +72,17 @@ async fn run_ws_loop_inner(
                             WsError::Network("Failed to send pong".to_string())
                         })?;
                     }
-                    Some(Ok(WsMessage::Close(_))) => {
-                        return Err(WsError::ServerClosed);
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        let reason = frame
+                            .map(|f| format!("code={}, reason={}", f.code, f.reason))
+                            .unwrap_or_else(|| "no reason".to_string());
+                        return Err(WsError::ServerClosed(reason));
                     }
                     Some(Err(e)) => {
                         return Err(WsError::Network(e.to_string()));
                     }
                     None => {
-                        return Err(WsError::ServerClosed);
+                        return Err(WsError::ServerClosed("connection dropped".to_string()));
                     }
                     // Binary, Frame 等忽略
                     _ => {}
