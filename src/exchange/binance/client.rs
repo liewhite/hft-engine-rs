@@ -201,6 +201,76 @@ impl BinanceClient {
         Ok(metas)
     }
 
+    /// 查询所有持仓
+    pub async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+        let api_key = self
+            .api_key()
+            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PositionInfo {
+            symbol: String,
+            position_amt: String,
+            entry_price: String,
+            mark_price: String,
+            unr_realized_profit: String,
+            leverage: String,
+        }
+
+        let query = self
+            .build_signed_query(&[])
+            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+
+        let resp = self
+            .client
+            .get(format!("{}/fapi/v2/positionRisk?{}", self.base_url, query))
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
+        }
+
+        let positions: Vec<PositionInfo> = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        let result: Vec<crate::domain::Position> = positions
+            .into_iter()
+            .filter_map(|p| {
+                let symbol = from_binance(&p.symbol)?;
+                let size: f64 = p.position_amt.parse().ok()?;
+                // 跳过空仓位
+                if size.abs() < 1e-10 {
+                    return None;
+                }
+                let entry_price: f64 = p.entry_price.parse().unwrap_or(0.0);
+                let mark_price: f64 = p.mark_price.parse().unwrap_or(0.0);
+                let unrealized_pnl: f64 = p.unr_realized_profit.parse().unwrap_or(0.0);
+                let leverage: u32 = p.leverage.parse().unwrap_or(1);
+
+                Some(crate::domain::Position {
+                    exchange: Exchange::Binance,
+                    symbol,
+                    size,
+                    entry_price,
+                    mark_price,
+                    unrealized_pnl,
+                    leverage,
+                })
+            })
+            .collect();
+
+        Ok(result)
+    }
+
     /// 查询账户净值 (totalMarginBalance)
     async fn get_equity(&self) -> Result<f64, ExchangeError> {
         let api_key = self

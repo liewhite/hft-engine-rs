@@ -4,6 +4,7 @@
 //! - 管理 PublicWsActor、PrivateWsActor 和 EquityPollingActor 子 actor
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
 //! - WsActors 直接解析消息并发布到 IncomePubSub
+//! - 启动时查询持仓并推送到 IncomePubSub
 //!
 //! 架构:
 //! BinanceActor (父)
@@ -15,16 +16,18 @@
 use super::equity_polling::{BinanceEquityPollingActor, BinanceEquityPollingActorArgs};
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
-use crate::domain::{Symbol, SymbolMeta};
+use crate::domain::{Symbol, SymbolMeta, Timestamp};
 use crate::engine::IncomePubSub;
-use crate::exchange::binance::BinanceCredentials;
+use crate::exchange::binance::{BinanceClient, BinanceCredentials};
 use crate::exchange::client::{Subscribe, Unsubscribe};
 use crate::exchange::ExchangeClient;
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
+use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -54,6 +57,33 @@ impl Actor for BinanceActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        // 0. 查询初始持仓并推送到 IncomePubSub
+        if let Some(ref credentials) = args.credentials {
+            if let Ok(client) = BinanceClient::new(Some(credentials.clone())) {
+                if let Ok(positions) = client.fetch_positions().await {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as Timestamp;
+
+                    for position in positions {
+                        tracing::info!(
+                            exchange = "Binance",
+                            symbol = %position.symbol,
+                            size = position.size,
+                            "Initial position loaded"
+                        );
+                        let event = IncomeEvent {
+                            exchange_ts: now,
+                            local_ts: now,
+                            data: ExchangeEventData::Position(position),
+                        };
+                        let _ = args.income_pubsub.tell(Publish(event)).send().await;
+                    }
+                }
+            }
+        }
+
         // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
         let public_ws = BinancePublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
