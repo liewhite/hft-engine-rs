@@ -441,6 +441,18 @@ impl FundingArbStrategy {
         // close_threshold 是负数，当 total_deviation < close_threshold 时平仓
         // 即价差收窄到反向偏离时平仓
         if total_deviation > close_threshold {
+            tracing::debug!(
+                symbol = %self.symbol,
+                long_exchange = %best_long.0,
+                long_deviation = format!("{:.6}", best_long.3),
+                long_size = best_long.2,
+                short_exchange = %best_short.0,
+                short_deviation = format!("{:.6}", best_short.3),
+                short_size = best_short.2,
+                total_deviation = format!("{:.6}", total_deviation),
+                close_threshold = format!("{:.6}", close_threshold),
+                "Close check not passed"
+            );
             return None;
         }
 
