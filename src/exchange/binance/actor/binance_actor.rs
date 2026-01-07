@@ -7,10 +7,10 @@
 //!
 //! 架构:
 //! BinanceActor (父)
-//! ├── BinancePublicWsActor [spawn + link]
-//! ├── BinancePrivateWsActor [spawn + link] (optional, 需要凭证)
-//! │   └── BinanceListenKeyActor [spawn + link]
-//! └── BinanceEquityPollingActor [spawn + link]
+//! ├── BinancePublicWsActor [spawn_link]
+//! ├── BinancePrivateWsActor [spawn_link] (optional, 需要凭证)
+//! │   └── BinanceListenKeyActor [spawn_link]
+//! └── BinanceEquityPollingActor [spawn_link]
 
 use super::equity_polling::{BinanceEquityPollingActor, BinanceEquityPollingActorArgs};
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
@@ -20,7 +20,7 @@ use crate::engine::IncomePubSub;
 use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::client::{Subscribe, Unsubscribe};
 use crate::exchange::ExchangeClient;
-use kameo::actor::{ActorId, ActorRef, PreparedActor, Spawn, WeakActorRef};
+use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::mailbox;
 use kameo::message::{Context, Message};
@@ -56,7 +56,7 @@ pub struct BinanceActor {
     /// Public WebSocket Actor
     public_ws: ActorRef<BinancePublicWsActor>,
     /// Private WebSocket Actor (可选，需要凭证)
-    private_ws: Option<ActorRef<BinancePrivateWsActor>>,
+    _private_ws: Option<ActorRef<BinancePrivateWsActor>>,
     /// Equity Polling Actor
     _equity_polling: ActorRef<BinanceEquityPollingActor>,
 
@@ -64,32 +64,30 @@ pub struct BinanceActor {
     child_actors: HashMap<ActorId, ChildKind>,
 }
 
-impl BinanceActor {
-    /// 创建 BinanceActor 并返回 ActorRef
-    ///
-    /// 使用 PreparedActor 模式，在构造时 spawn + link 所有子 actors
-    pub async fn new(args: BinanceActorArgs) -> ActorRef<Self> {
-        // 1. 准备 actor，获取 actor_ref
-        let prepared = PreparedActor::<Self>::new(mailbox::unbounded());
-        let actor_ref = prepared.actor_ref().clone();
+impl Actor for BinanceActor {
+    type Args = BinanceActorArgs;
+    type Error = Infallible;
 
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let mut child_actors = HashMap::new();
 
-        // 2. 创建 PublicWsActor
-        let public_ws = BinancePublicWsActor::spawn_with_mailbox(
+        // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
+        let public_ws = BinancePublicWsActor::spawn_link_with_mailbox(
+            &actor_ref,
             BinancePublicWsActorArgs {
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
             },
             mailbox::unbounded(),
-        );
-        actor_ref.link(&public_ws).await;
+        )
+        .await;
         child_actors.insert(public_ws.id(), ChildKind::PublicWs);
         tracing::info!(exchange = "Binance", "PublicWsActor created");
 
-        // 3. 创建 PrivateWsActor (如果有凭证)
+        // 2. 创建 PrivateWsActor (如果有凭证)
         let private_ws = if let Some(credentials) = args.credentials {
-            let private_ws = BinancePrivateWsActor::spawn_with_mailbox(
+            let private_ws = BinancePrivateWsActor::spawn_link_with_mailbox(
+                &actor_ref,
                 BinancePrivateWsActorArgs {
                     credentials,
                     rest_base_url: args.rest_base_url,
@@ -97,8 +95,8 @@ impl BinanceActor {
                     symbol_metas: args.symbol_metas.clone(),
                 },
                 mailbox::unbounded(),
-            );
-            actor_ref.link(&private_ws).await;
+            )
+            .await;
             child_actors.insert(private_ws.id(), ChildKind::PrivateWs);
             tracing::info!(exchange = "Binance", "PrivateWsActor created");
             Some(private_ws)
@@ -106,44 +104,32 @@ impl BinanceActor {
             None
         };
 
-        // 4. 创建 EquityPollingActor
-        let equity_polling = BinanceEquityPollingActor::spawn_with_mailbox(
+        // 3. 创建 EquityPollingActor
+        let equity_polling = BinanceEquityPollingActor::spawn_link_with_mailbox(
+            &actor_ref,
             BinanceEquityPollingActorArgs {
                 client: args.client,
                 income_pubsub: args.income_pubsub,
                 interval_ms: 1000, // 每秒查询一次
             },
             mailbox::unbounded(),
-        );
-        actor_ref.link(&equity_polling).await;
+        )
+        .await;
         child_actors.insert(equity_polling.id(), ChildKind::EquityPolling);
         tracing::info!(exchange = "Binance", "EquityPollingActor created");
 
-        // 5. 构造 actor state 并 spawn
-        let state = Self {
-            public_ws,
-            private_ws,
-            _equity_polling: equity_polling,
-            child_actors,
-        };
-
-        prepared.spawn(state);
-
-        actor_ref
-    }
-}
-
-impl Actor for BinanceActor {
-    type Args = Self;
-    type Error = Infallible;
-
-    async fn on_start(state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::info!(
             exchange = "Binance",
-            has_private_ws = state.private_ws.is_some(),
+            has_private_ws = private_ws.is_some(),
             "BinanceActor started"
         );
-        Ok(state)
+
+        Ok(Self {
+            public_ws,
+            _private_ws: private_ws,
+            _equity_polling: equity_polling,
+            child_actors,
+        })
     }
 
     async fn on_stop(

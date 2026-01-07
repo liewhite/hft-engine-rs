@@ -4,6 +4,8 @@ use fee_arb::exchange::binance::BinanceCredentials;
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::{FundingArbConfig, FundingArbStrategy};
+use kameo::actor::Spawn;
+use kameo::mailbox;
 use serde::Deserialize;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -69,12 +71,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(symbols = ?symbols, "Configured symbols");
 
-    let manager = ManagerActor::new(ManagerActorArgs {
-        binance_credentials: Some(config.exchanges.binance.clone()),
-        okx_credentials: Some(config.exchanges.okx.clone()),
-        hyperliquid_credentials: Some(config.exchanges.hyperliquid.clone()),
-    })
-    .await;
+    let manager = ManagerActor::spawn_with_mailbox(
+        ManagerActorArgs {
+            binance_credentials: Some(config.exchanges.binance.clone()),
+            okx_credentials: Some(config.exchanges.okx.clone()),
+            hyperliquid_credentials: Some(config.exchanges.hyperliquid.clone()),
+        },
+        mailbox::unbounded(),
+    );
 
     let enabled_exchanges = config.exchanges.enabled_exchanges();
     for symbol in symbols {

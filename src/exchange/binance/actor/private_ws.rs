@@ -98,15 +98,16 @@ impl Actor for BinancePrivateWsActor {
         // 5. 启动 ws_loop
         tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
 
-        // 6. spawn + link ListenKeyActor
-        let listen_key_actor = BinanceListenKeyActor::spawn_with_mailbox(
+        // 6. spawn_link ListenKeyActor
+        let listen_key_actor = BinanceListenKeyActor::spawn_link_with_mailbox(
+            &actor_ref,
             BinanceListenKeyActorArgs {
                 rest_base_url: args.rest_base_url,
                 api_key: args.credentials.api_key,
             },
             mailbox::unbounded(),
-        );
-        actor_ref.link(&listen_key_actor).await;
+        )
+        .await;
         let listen_key_actor_id = listen_key_actor.id();
 
         tracing::info!("BinancePrivateWsActor started");

@@ -21,8 +21,7 @@ use crate::exchange::hyperliquid::{
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
 use crate::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::strategy::Strategy;
-use kameo::actor::{ActorId, ActorRef, PreparedActor, Spawn, WeakActorRef};
-use std::ops::ControlFlow;
+use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::mailbox;
 use kameo::message::{Context, Message};
@@ -30,6 +29,7 @@ use kameo::Actor;
 use kameo_actors::pubsub::Subscribe;
 use kameo_actors::DeliveryStrategy;
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 // ============================================================================
@@ -98,124 +98,6 @@ pub struct ManagerActor {
 }
 
 impl ManagerActor {
-    /// 创建并启动 ManagerActor，返回 ActorRef
-    ///
-    /// 在返回之前完成所有初始化工作：
-    /// - 创建 Exchange Clients
-    /// - 预加载所有交易所的 symbol metas
-    /// - 创建 PubSub Actors
-    /// - 创建并 link 所有子 Actors
-    pub async fn new(args: ManagerActorArgs) -> ActorRef<Self> {
-        // 1. 创建 Exchange Clients
-        let mut clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
-
-        if let Some(ref cred) = args.binance_credentials {
-            let client =
-                BinanceClient::new(Some(cred.clone())).expect("Failed to create BinanceClient");
-            clients.insert(Exchange::Binance, Arc::new(client));
-        }
-
-        if let Some(ref cred) = args.okx_credentials {
-            let client = OkxClient::new(Some(cred.clone())).expect("Failed to create OkxClient");
-            clients.insert(Exchange::OKX, Arc::new(client));
-        }
-
-        if let Some(ref cred) = args.hyperliquid_credentials {
-            let client = HyperliquidClient::new(Some(cred.clone()))
-                .expect("Failed to create HyperliquidClient");
-            clients.insert(Exchange::Hyperliquid, Arc::new(client));
-        }
-
-        // 2. 预加载所有交易所的 symbol metas
-        let symbol_metas = Self::preload_all_symbol_metas(&clients)
-            .await
-            .expect("Failed to preload symbol metas");
-
-        // 3. 创建 PubSub Actors (使用 unbounded mailbox)
-        let income_pubsub = IncomePubSub::spawn_with_mailbox(
-            IncomePubSub::new(DeliveryStrategy::BestEffort),
-            mailbox::unbounded(),
-        );
-        let outcome_pubsub = OutcomePubSub::spawn_with_mailbox(
-            OutcomePubSub::new(DeliveryStrategy::BestEffort),
-            mailbox::unbounded(),
-        );
-
-        // 4. 创建 ProcessorActor 并订阅 income_pubsub
-        let processor = IncomeProcessorActor::spawn_with_mailbox(
-            IncomeProcessorActor::default(),
-            mailbox::unbounded(),
-        );
-        let _ = income_pubsub
-            .tell(Subscribe(processor.clone()))
-            .send()
-            .await;
-
-        // 5. 创建 SignalProcessorActor 并订阅 outcome_pubsub
-        let signal_processor = OutcomeProcessorActor::spawn_with_mailbox(
-            SignalProcessorArgs {
-                clients: clients.clone(),
-                income_pubsub: income_pubsub.clone(),
-            },
-            mailbox::unbounded(),
-        );
-        let _ = outcome_pubsub
-            .tell(Subscribe(signal_processor.clone()))
-            .send()
-            .await;
-
-        // 7. 创建 ClockActor（发布 Clock 事件到 income_pubsub）
-        let clock_actor = ClockActor::spawn_with_mailbox(
-            ClockActorArgs {
-                interval_ms: 1000,
-                income_pubsub: income_pubsub.clone(),
-            },
-            mailbox::unbounded(),
-        );
-
-        // 8. 构建 actor_kinds 映射
-        let mut actor_kinds = HashMap::new();
-        actor_kinds.insert(income_pubsub.id(), ChildActorKind::IncomePubSub);
-        actor_kinds.insert(outcome_pubsub.id(), ChildActorKind::OutcomePubSub);
-        actor_kinds.insert(processor.id(), ChildActorKind::Processor);
-        actor_kinds.insert(signal_processor.id(), ChildActorKind::SignalProcessor);
-        actor_kinds.insert(clock_actor.id(), ChildActorKind::Clock);
-
-        // 8. 构建 ManagerActor state
-        let state = Self {
-            clients,
-            binance_credentials: args.binance_credentials,
-            okx_credentials: args.okx_credentials,
-            hyperliquid_credentials: args.hyperliquid_credentials,
-            symbol_metas,
-            income_pubsub: income_pubsub.clone(),
-            outcome_pubsub: outcome_pubsub.clone(),
-            processor: processor.clone(),
-            _signal_processor: signal_processor.clone(),
-            _clock_actor: clock_actor.clone(),
-            exchange_actors: HashMap::new(),
-            executors: Vec::new(),
-            actor_kinds,
-        };
-
-        // 10. 使用 PreparedActor 准备 ManagerActor 并获取 actor_ref
-        let prepared = PreparedActor::new(mailbox::unbounded());
-        let manager_ref = prepared.actor_ref().clone();
-
-        // 11. 建立双向 link (在 spawn 之前)
-        manager_ref.link(&income_pubsub).await;
-        manager_ref.link(&outcome_pubsub).await;
-        manager_ref.link(&processor).await;
-        manager_ref.link(&signal_processor).await;
-        manager_ref.link(&clock_actor).await;
-
-        // 12. spawn ManagerActor
-        prepared.spawn(state);
-
-        tracing::info!("ManagerActor created with all child actors linked");
-        manager_ref
-    }
-
     /// 预加载所有交易所的 symbol metas（静态方法）
     async fn preload_all_symbol_metas(
         clients: &HashMap<Exchange, Arc<dyn ExchangeClient>>,
@@ -262,7 +144,7 @@ impl ManagerActor {
         )
     }
 
-    /// 惰性创建 ExchangeActor（如不存在则 spawn + link）
+    /// 惰性创建 ExchangeActor（如不存在则 spawn_link）
     async fn ensure_exchange_actor(
         &mut self,
         exchange: Exchange,
@@ -275,7 +157,7 @@ impl ManagerActor {
         let income_pubsub = self.income_pubsub.clone();
         let symbol_metas = self.get_symbol_metas_for(exchange);
 
-        // 根据交易所类型创建对应的 Actor
+        // 根据交易所类型创建对应的 Actor (使用 spawn_link_with_mailbox)
         let (actor_id, boxed_actor): (ActorId, Box<dyn ExchangeActorOps>) = match exchange {
             Exchange::Binance => {
                 let credentials = self
@@ -287,15 +169,18 @@ impl ManagerActor {
                     .get(&Exchange::Binance)
                     .expect("Binance client not configured")
                     .clone();
-                let binance_ref = BinanceActor::new(BinanceActorArgs {
-                    credentials: Some(credentials),
-                    symbol_metas: symbol_metas.clone(),
-                    rest_base_url: REST_BASE_URL.to_string(),
-                    income_pubsub: income_pubsub.clone(),
-                    client,
-                })
+                let binance_ref = BinanceActor::spawn_link_with_mailbox(
+                    actor_ref,
+                    BinanceActorArgs {
+                        credentials: Some(credentials),
+                        symbol_metas: symbol_metas.clone(),
+                        rest_base_url: REST_BASE_URL.to_string(),
+                        income_pubsub: income_pubsub.clone(),
+                        client,
+                    },
+                    mailbox::unbounded(),
+                )
                 .await;
-                actor_ref.link(&binance_ref).await;
                 (binance_ref.id(), Box::new(binance_ref))
             }
             Exchange::OKX => {
@@ -303,13 +188,16 @@ impl ManagerActor {
                     .okx_credentials
                     .clone()
                     .expect("OKX credentials not configured");
-                let okx_ref = OkxActor::new(OkxActorArgs {
-                    credentials: Some(credentials),
-                    symbol_metas: symbol_metas.clone(),
-                    income_pubsub: income_pubsub.clone(),
-                })
+                let okx_ref = OkxActor::spawn_link_with_mailbox(
+                    actor_ref,
+                    OkxActorArgs {
+                        credentials: Some(credentials),
+                        symbol_metas: symbol_metas.clone(),
+                        income_pubsub: income_pubsub.clone(),
+                    },
+                    mailbox::unbounded(),
+                )
                 .await;
-                actor_ref.link(&okx_ref).await;
                 (okx_ref.id(), Box::new(okx_ref))
             }
             Exchange::Hyperliquid => {
@@ -317,13 +205,16 @@ impl ManagerActor {
                     .hyperliquid_credentials
                     .clone()
                     .expect("Hyperliquid credentials not configured");
-                let hyper_ref = HyperliquidActor::new(HyperliquidActorArgs {
-                    credentials: Some(credentials),
-                    symbol_metas: symbol_metas.clone(),
-                    income_pubsub: income_pubsub.clone(),
-                })
+                let hyper_ref = HyperliquidActor::spawn_link_with_mailbox(
+                    actor_ref,
+                    HyperliquidActorArgs {
+                        credentials: Some(credentials),
+                        symbol_metas: symbol_metas.clone(),
+                        income_pubsub: income_pubsub.clone(),
+                    },
+                    mailbox::unbounded(),
+                )
                 .await;
-                actor_ref.link(&hyper_ref).await;
                 (hyper_ref.id(), Box::new(hyper_ref))
             }
         };
@@ -362,18 +253,18 @@ impl ManagerActor {
             .flat_map(|(exchange, kinds)| kinds.iter().map(move |kind| (*exchange, kind.clone())))
             .collect();
 
-        // 5. 创建 ExecutorActor
+        // 5. 创建 ExecutorActor (使用 spawn_link_with_mailbox)
         let executor_idx = self.executors.len();
-
-        // Prepare executor with link
-        let prepared = PreparedActor::<ExecutorActor>::new(mailbox::unbounded());
-        let executor_ref = prepared.actor_ref().clone();
-        actor_ref.link(&executor_ref).await;
-        prepared.spawn(ExecutorArgs {
-            strategy,
-            symbol_metas: Arc::new(self.symbol_metas.clone()),
-            outcome_pubsub,
-        });
+        let executor_ref = ExecutorActor::spawn_link_with_mailbox(
+            &actor_ref,
+            ExecutorArgs {
+                strategy,
+                symbol_metas: Arc::new(self.symbol_metas.clone()),
+                outcome_pubsub,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
 
         self.actor_kinds
             .insert(executor_ref.id(), ChildActorKind::Executor(executor_idx));
@@ -409,13 +300,112 @@ impl ManagerActor {
 }
 
 impl Actor for ManagerActor {
-    type Args = Self;
+    type Args = ManagerActorArgs;
     type Error = Infallible;
 
-    async fn on_start(state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 所有初始化工作已在 new() 中完成
-        tracing::info!("ManagerActor started");
-        Ok(state)
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        // 1. 创建 Exchange Clients
+        let mut clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
+
+        if let Some(ref cred) = args.binance_credentials {
+            let client =
+                BinanceClient::new(Some(cred.clone())).expect("Failed to create BinanceClient");
+            clients.insert(Exchange::Binance, Arc::new(client));
+        }
+
+        if let Some(ref cred) = args.okx_credentials {
+            let client = OkxClient::new(Some(cred.clone())).expect("Failed to create OkxClient");
+            clients.insert(Exchange::OKX, Arc::new(client));
+        }
+
+        if let Some(ref cred) = args.hyperliquid_credentials {
+            let client = HyperliquidClient::new(Some(cred.clone()))
+                .expect("Failed to create HyperliquidClient");
+            clients.insert(Exchange::Hyperliquid, Arc::new(client));
+        }
+
+        // 2. 预加载所有交易所的 symbol metas
+        let symbol_metas = Self::preload_all_symbol_metas(&clients)
+            .await
+            .expect("Failed to preload symbol metas");
+
+        // 3. 创建 PubSub Actors (使用 spawn_link_with_mailbox)
+        let income_pubsub = IncomePubSub::spawn_link_with_mailbox(
+            &actor_ref,
+            IncomePubSub::new(DeliveryStrategy::BestEffort),
+            mailbox::unbounded(),
+        )
+        .await;
+        let outcome_pubsub = OutcomePubSub::spawn_link_with_mailbox(
+            &actor_ref,
+            OutcomePubSub::new(DeliveryStrategy::BestEffort),
+            mailbox::unbounded(),
+        )
+        .await;
+
+        // 4. 创建 ProcessorActor 并订阅 income_pubsub
+        let processor = IncomeProcessorActor::spawn_link_with_mailbox(
+            &actor_ref,
+            IncomeProcessorActor::default(),
+            mailbox::unbounded(),
+        )
+        .await;
+        let _ = income_pubsub
+            .tell(Subscribe(processor.clone()))
+            .send()
+            .await;
+
+        // 5. 创建 SignalProcessorActor 并订阅 outcome_pubsub
+        let signal_processor = OutcomeProcessorActor::spawn_link_with_mailbox(
+            &actor_ref,
+            SignalProcessorArgs {
+                clients: clients.clone(),
+                income_pubsub: income_pubsub.clone(),
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        let _ = outcome_pubsub
+            .tell(Subscribe(signal_processor.clone()))
+            .send()
+            .await;
+
+        // 6. 创建 ClockActor（发布 Clock 事件到 income_pubsub）
+        let clock_actor = ClockActor::spawn_link_with_mailbox(
+            &actor_ref,
+            ClockActorArgs {
+                interval_ms: 1000,
+                income_pubsub: income_pubsub.clone(),
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+
+        // 7. 构建 actor_kinds 映射
+        let mut actor_kinds = HashMap::new();
+        actor_kinds.insert(income_pubsub.id(), ChildActorKind::IncomePubSub);
+        actor_kinds.insert(outcome_pubsub.id(), ChildActorKind::OutcomePubSub);
+        actor_kinds.insert(processor.id(), ChildActorKind::Processor);
+        actor_kinds.insert(signal_processor.id(), ChildActorKind::SignalProcessor);
+        actor_kinds.insert(clock_actor.id(), ChildActorKind::Clock);
+
+        tracing::info!("ManagerActor started with all child actors linked");
+
+        Ok(Self {
+            clients,
+            binance_credentials: args.binance_credentials,
+            okx_credentials: args.okx_credentials,
+            hyperliquid_credentials: args.hyperliquid_credentials,
+            symbol_metas,
+            income_pubsub,
+            outcome_pubsub,
+            processor,
+            _signal_processor: signal_processor,
+            _clock_actor: clock_actor,
+            exchange_actors: HashMap::new(),
+            executors: Vec::new(),
+            actor_kinds,
+        })
     }
 
     async fn on_stop(

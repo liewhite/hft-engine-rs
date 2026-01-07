@@ -7,8 +7,8 @@
 //!
 //! 架构:
 //! OkxActor (父)
-//! ├── OkxPublicWsActor [spawn + link]
-//! └── OkxPrivateWsActor [spawn + link] (optional, 需要凭证)
+//! ├── OkxPublicWsActor [spawn_link]
+//! └── OkxPrivateWsActor [spawn_link] (optional, 需要凭证)
 
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
@@ -16,7 +16,7 @@ use crate::domain::{Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, Unsubscribe};
 use crate::exchange::okx::OkxCredentials;
-use kameo::actor::{ActorId, ActorRef, PreparedActor, Spawn, WeakActorRef};
+use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::mailbox;
 use kameo::message::{Context, Message};
@@ -53,40 +53,38 @@ pub struct OkxActor {
     child_actors: HashMap<ActorId, ChildKind>,
 }
 
-impl OkxActor {
-    /// 创建 OkxActor 并返回 ActorRef
-    ///
-    /// 使用 PreparedActor 模式，在构造时 spawn + link 所有子 actors
-    pub async fn new(args: OkxActorArgs) -> ActorRef<Self> {
-        // 1. 准备 actor，获取 actor_ref
-        let prepared = PreparedActor::<Self>::new(mailbox::unbounded());
-        let actor_ref = prepared.actor_ref().clone();
+impl Actor for OkxActor {
+    type Args = OkxActorArgs;
+    type Error = Infallible;
 
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let mut child_actors = HashMap::new();
 
-        // 2. 创建 PublicWsActor
-        let public_ws = OkxPublicWsActor::spawn_with_mailbox(
+        // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
+        let public_ws = OkxPublicWsActor::spawn_link_with_mailbox(
+            &actor_ref,
             OkxPublicWsActorArgs {
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
             },
             mailbox::unbounded(),
-        );
-        actor_ref.link(&public_ws).await;
+        )
+        .await;
         child_actors.insert(public_ws.id(), ChildKind::PublicWs);
         tracing::info!(exchange = "OKX", "PublicWsActor created");
 
-        // 3. 创建 PrivateWsActor (如果有凭证)
+        // 2. 创建 PrivateWsActor (如果有凭证)
         let private_ws = if let Some(credentials) = args.credentials {
-            let private_ws = OkxPrivateWsActor::spawn_with_mailbox(
+            let private_ws = OkxPrivateWsActor::spawn_link_with_mailbox(
+                &actor_ref,
                 OkxPrivateWsActorArgs {
                     credentials,
                     income_pubsub: args.income_pubsub,
                     symbol_metas: args.symbol_metas,
                 },
                 mailbox::unbounded(),
-            );
-            actor_ref.link(&private_ws).await;
+            )
+            .await;
             child_actors.insert(private_ws.id(), ChildKind::PrivateWs);
             tracing::info!(exchange = "OKX", "PrivateWsActor created");
             Some(private_ws)
@@ -94,31 +92,17 @@ impl OkxActor {
             None
         };
 
-        // 4. 构造 actor 并 spawn
-        let actor = Self {
-            public_ws,
-            _private_ws: private_ws,
-            child_actors,
-        };
-
-        prepared.spawn(actor);
-
-        actor_ref
-    }
-}
-
-impl Actor for OkxActor {
-    type Args = Self;
-    type Error = Infallible;
-
-    async fn on_start(state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::info!(
             exchange = "OKX",
-            has_private_ws = state._private_ws.is_some(),
+            has_private_ws = private_ws.is_some(),
             "OkxActor started"
         );
 
-        Ok(state)
+        Ok(Self {
+            public_ws,
+            _private_ws: private_ws,
+            child_actors,
+        })
     }
 
     async fn on_stop(
