@@ -47,13 +47,15 @@ pub struct HyperliquidPrivateWsActor {
     /// 发送消息到 ws_loop 的 channel
     #[allow(dead_code)]
     ws_tx: Option<mpsc::Sender<String>>,
+    /// 已知持仓的 symbols（用于检测仓位消失）
+    known_positions: std::collections::HashSet<Symbol>,
 }
 
 impl HyperliquidPrivateWsActor {
     /// 解析并处理消息
-    async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
+    async fn handle_message(&mut self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_private_message(raw, local_ts)?;
+        let events = parse_private_message(raw, local_ts, &mut self.known_positions)?;
         for event in events {
             let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
@@ -126,6 +128,7 @@ impl Actor for HyperliquidPrivateWsActor {
             income_pubsub: args.income_pubsub,
             symbol_metas: args.symbol_metas,
             ws_tx: Some(outgoing_tx),
+            known_positions: std::collections::HashSet::new(),
         })
     }
 
@@ -181,7 +184,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPriv
 // 消息解析
 // ============================================================================
 
-fn parse_private_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+fn parse_private_message(
+    raw: &str,
+    local_ts: u64,
+    known_positions: &mut std::collections::HashSet<Symbol>,
+) -> Result<Vec<IncomeEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -197,7 +204,7 @@ fn parse_private_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, W
             "clearinghouseState" => {
                 // perp 账户状态 (positions, equity, margin)
                 let data = &value["data"];
-                return parse_clearinghouse_state(data, local_ts);
+                return parse_clearinghouse_state(data, local_ts, known_positions);
             }
             "orderUpdates" => {
                 // 订单更新
@@ -222,7 +229,14 @@ fn parse_private_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, W
 }
 
 /// 解析 clearinghouseState 消息 (perp 账户状态)
-fn parse_clearinghouse_state(data: &serde_json::Value, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+fn parse_clearinghouse_state(
+    data: &serde_json::Value,
+    local_ts: u64,
+    known_positions: &mut std::collections::HashSet<Symbol>,
+) -> Result<Vec<IncomeEvent>, WsError> {
+    use crate::domain::Position;
+    use std::collections::HashSet;
+
     let mut events = Vec::new();
 
     // clearinghouseState 订阅返回结构: { clearinghouseState: {...}, user: "...", dex: "..." }
@@ -231,15 +245,56 @@ fn parse_clearinghouse_state(data: &serde_json::Value, local_ts: u64) -> Result<
     let state: ClearinghouseState = serde_json::from_value(state_value.clone())
         .map_err(|e| WsError::ParseError(format!("clearinghouseState parse: {}", e)))?;
 
+    // 收集本次响应中包含的 symbols
+    let mut current_symbols: HashSet<Symbol> = HashSet::new();
+
     // 解析仓位
+    tracing::debug!(
+        positions_count = state.asset_positions.len(),
+        coins = ?state.asset_positions.iter().map(|w| &w.position.coin).collect::<Vec<_>>(),
+        "Hyperliquid clearinghouseState received"
+    );
     for wrapper in &state.asset_positions {
         let position = wrapper.position.to_position();
+        // 只处理非零仓位
+        if position.size.abs() > 1e-10 {
+            tracing::debug!(
+                symbol = %position.symbol,
+                size = position.size,
+                "Hyperliquid position update"
+            );
+            current_symbols.insert(position.symbol.clone());
+            events.push(IncomeEvent {
+                exchange_ts: local_ts,
+                local_ts,
+                data: ExchangeEventData::Position(position),
+            });
+        }
+    }
+
+    // 对于之前有仓位但本次响应中消失的 symbols，发送 size=0 的仓位更新
+    for symbol in known_positions.difference(&current_symbols) {
+        tracing::info!(
+            symbol = %symbol,
+            "Hyperliquid position disappeared, setting to zero"
+        );
         events.push(IncomeEvent {
             exchange_ts: local_ts,
             local_ts,
-            data: ExchangeEventData::Position(position),
+            data: ExchangeEventData::Position(Position {
+                exchange: Exchange::Hyperliquid,
+                symbol: symbol.clone(),
+                size: 0.0,
+                entry_price: 0.0,
+                mark_price: 0.0,
+                unrealized_pnl: 0.0,
+                leverage: 1,
+            }),
         });
     }
+
+    // 更新已知仓位集合
+    *known_positions = current_symbols;
 
     // 解析账户净值 (equity = accountValue)
     let equity = f64::from_str(&state.cross_margin_summary.account_value)
