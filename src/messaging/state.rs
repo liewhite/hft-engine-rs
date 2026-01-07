@@ -194,12 +194,6 @@ impl SymbolState {
                 self.bbos.insert(bbo.exchange, bbo.clone());
             }
             ExchangeEventData::Position(position) => {
-                tracing::info!(
-                    exchange = %position.exchange,
-                    symbol = %self.symbol,
-                    size = position.size,
-                    "Updating position"
-                );
                 self.positions.insert(position.exchange, position.clone());
             }
             ExchangeEventData::OrderUpdate(update) => {
