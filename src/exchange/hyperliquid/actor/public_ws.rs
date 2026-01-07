@@ -3,20 +3,21 @@
 //! 职责:
 //! - 维护 WebSocket 连接
 //! - 处理 Subscribe/Unsubscribe 请求
-//! - 直接解析消息并发送到 EventSink
+//! - 直接解析消息并发布到 IncomePubSub
 
 use crate::domain::{now_ms, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::engine::IncomePubSub;
+use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::hyperliquid::codec::{WsActiveAssetCtx, WsBbo};
 use crate::exchange::hyperliquid::{to_hyperliquid, WS_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
+use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -25,16 +26,16 @@ use tokio_stream::wrappers::ReceiverStream;
 
 /// HyperliquidPublicWsActor 初始化参数
 pub struct HyperliquidPublicWsActorArgs {
-    /// 事件接收器
-    pub event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// HyperliquidPublicWsActor - WebSocket Actor
 pub struct HyperliquidPublicWsActor {
-    /// 事件接收器
-    event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     #[allow(dead_code)]
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
@@ -47,16 +48,6 @@ pub struct HyperliquidPublicWsActor {
 }
 
 impl HyperliquidPublicWsActor {
-    /// 创建新的 HyperliquidPublicWsActor
-    pub fn new(args: HyperliquidPublicWsActorArgs) -> Self {
-        Self {
-            event_sink: args.event_sink,
-            symbol_metas: args.symbol_metas,
-            ws_tx: None,
-            subscribed_streams: HashSet::new(),
-            subscribed_kinds: HashSet::new(),
-        }
-    }
 
     /// 发送订阅消息
     async fn send_subscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
@@ -93,30 +84,26 @@ impl HyperliquidPublicWsActor {
         let local_ts = now_ms();
         let events = parse_public_message(raw, local_ts, &self.subscribed_kinds)?;
         for event in events {
-            self.event_sink.send_event(event).await;
+            let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
         Ok(())
     }
 }
 
 impl Actor for HyperliquidPublicWsActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = HyperliquidPublicWsActorArgs;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "HyperliquidPublicWsActor"
-    }
-
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 连接 WebSocket
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_URL)
             .await
-            .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
+            .expect("Failed to connect to Hyperliquid WebSocket");
 
         let (write, read) = ws_stream.split();
 
         // 创建出站消息 channel (Subscribe/Unsubscribe)
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-        self.ws_tx = Some(outgoing_tx);
 
         // 创建入站消息 channel (收到的数据/错误)
         let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
@@ -129,14 +116,21 @@ impl Actor for HyperliquidPublicWsActor {
         tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
 
         tracing::info!("HyperliquidPublicWsActor started");
-        Ok(())
+
+        Ok(Self {
+            income_pubsub: args.income_pubsub,
+            symbol_metas: args.symbol_metas,
+            ws_tx: Some(outgoing_tx),
+            subscribed_streams: HashSet::new(),
+            subscribed_kinds: HashSet::new(),
+        })
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         // Drop ws_tx 会导致 ws_loop 退出
         self.ws_tx.take();
         tracing::info!("HyperliquidPublicWsActor stopped");
@@ -154,7 +148,7 @@ impl Message<Subscribe> for HyperliquidPublicWsActor {
     async fn handle(
         &mut self,
         msg: Subscribe,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 检查是否已订阅该 kind
         if self.subscribed_kinds.contains(&msg.kind) {
@@ -183,7 +177,7 @@ impl Message<Unsubscribe> for HyperliquidPublicWsActor {
     async fn handle(
         &mut self,
         msg: Unsubscribe,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if !self.subscribed_kinds.remove(&msg.kind) {
             return;
@@ -214,11 +208,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPubl
     async fn handle(
         &mut self,
         msg: StreamMessage<Result<String, WsError>, (), ()>,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 解析并发送到 EventSink，失败则 kill actor
+                // 解析并发布到 IncomePubSub，失败则 kill actor
                 if let Err(e) = self.handle_message(&data).await {
                     tracing::error!(error = %e, "Critical parse error, killing actor");
                     ctx.actor_ref().kill();

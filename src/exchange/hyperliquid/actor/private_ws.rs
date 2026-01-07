@@ -3,22 +3,23 @@
 //! 职责:
 //! - 维护 WebSocket 连接
 //! - 自动订阅账户频道 (webData3, orderUpdates)
-//! - 直接解析消息并发送到 EventSink
+//! - 直接解析消息并发布到 IncomePubSub
 //!
 //! 注意: Hyperliquid 的账户订阅不需要认证，只需要用户地址
 
 use crate::domain::{now_ms, Balance, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, WsError};
+use crate::engine::IncomePubSub;
+use crate::exchange::client::WsError;
 use crate::exchange::hyperliquid::codec::{ClearinghouseState, WsOrderUpdate};
 use crate::exchange::hyperliquid::WS_URL;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
+use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -30,18 +31,16 @@ use tokio_stream::wrappers::ReceiverStream;
 pub struct HyperliquidPrivateWsActorArgs {
     /// 用户钱包地址 (0x...)
     pub wallet_address: String,
-    /// 事件接收器
-    pub event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// HyperliquidPrivateWsActor - 账户 WebSocket Actor
 pub struct HyperliquidPrivateWsActor {
-    /// 用户钱包地址
-    wallet_address: String,
-    /// 事件接收器
-    event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     #[allow(dead_code)]
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
@@ -51,45 +50,31 @@ pub struct HyperliquidPrivateWsActor {
 }
 
 impl HyperliquidPrivateWsActor {
-    /// 创建新的 HyperliquidPrivateWsActor
-    pub fn new(args: HyperliquidPrivateWsActorArgs) -> Self {
-        Self {
-            wallet_address: args.wallet_address,
-            event_sink: args.event_sink,
-            symbol_metas: args.symbol_metas,
-            ws_tx: None,
-        }
-    }
-
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
         let events = parse_private_message(raw, local_ts)?;
         for event in events {
-            self.event_sink.send_event(event).await;
+            let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
         Ok(())
     }
 }
 
 impl Actor for HyperliquidPrivateWsActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = HyperliquidPrivateWsActorArgs;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "HyperliquidPrivateWsActor"
-    }
-
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 1. 连接 WebSocket
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_URL)
             .await
-            .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
+            .expect("Failed to connect to Hyperliquid WebSocket");
 
         let (write, read) = ws_stream.split();
 
         // 2. 创建出站消息 channel
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-        self.ws_tx = Some(outgoing_tx.clone());
 
         // 3. 创建入站消息 channel
         let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
@@ -107,7 +92,7 @@ impl Actor for HyperliquidPrivateWsActor {
             "method": "subscribe",
             "subscription": {
                 "type": "clearinghouseState",
-                "user": self.wallet_address
+                "user": args.wallet_address
             }
         })
         .to_string();
@@ -115,14 +100,14 @@ impl Actor for HyperliquidPrivateWsActor {
         outgoing_tx
             .send(subscribe_clearinghouse)
             .await
-            .map_err(|_| WsError::Network("Failed to send clearinghouseState subscription".to_string()))?;
+            .expect("Failed to send clearinghouseState subscription");
 
         // orderUpdates: 订单更新
         let subscribe_orders = json!({
             "method": "subscribe",
             "subscription": {
                 "type": "orderUpdates",
-                "user": self.wallet_address
+                "user": args.wallet_address
             }
         })
         .to_string();
@@ -130,21 +115,25 @@ impl Actor for HyperliquidPrivateWsActor {
         outgoing_tx
             .send(subscribe_orders)
             .await
-            .map_err(|_| WsError::Network("Failed to send orderUpdates subscription".to_string()))?;
+            .expect("Failed to send orderUpdates subscription");
 
         tracing::info!(
-            wallet = %self.wallet_address,
+            wallet = %args.wallet_address,
             "HyperliquidPrivateWsActor started, subscribed to clearinghouseState and orderUpdates"
         );
 
-        Ok(())
+        Ok(Self {
+            income_pubsub: args.income_pubsub,
+            symbol_metas: args.symbol_metas,
+            ws_tx: Some(outgoing_tx),
+        })
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         self.ws_tx.take();
         tracing::info!("HyperliquidPrivateWsActor stopped");
         Ok(())
@@ -162,11 +151,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPriv
     async fn handle(
         &mut self,
         msg: StreamMessage<Result<String, WsError>, (), ()>,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 解析并发送到 EventSink，失败则 kill actor
+                // 解析并发布到 IncomePubSub，失败则 kill actor
                 if let Err(e) = self.handle_message(&data).await {
                     tracing::error!(error = %e, "Critical parse error, killing actor");
                     ctx.actor_ref().kill();

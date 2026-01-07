@@ -1,16 +1,15 @@
 //! ProcessorActor - 事件分发 Actor
 //!
 //! 职责：
-//! - 接收来自 ExchangeActor 的 ExchangeEvent
+//! - 订阅 IncomePubSub 接收事件
 //! - 根据订阅关系分发到对应的 ExecutorActor
 
 use super::ExecutorActor;
 use crate::domain::{Exchange, Symbol};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
-use kameo::actor::{ActorID, ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::actor::{ActorId, ActorRef, WeakActorRef};
+use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::{HashMap, HashSet};
@@ -32,17 +31,11 @@ struct ExecutorSubscription {
 
 /// ProcessorActor - 事件分发
 pub struct IncomeProcessorActor {
-    /// ActorID -> Executor 订阅信息
-    executors: HashMap<ActorID, ExecutorSubscription>,
+    /// ActorId -> Executor 订阅信息
+    executors: HashMap<ActorId, ExecutorSubscription>,
 }
 
 impl IncomeProcessorActor {
-    pub fn new() -> Self {
-        Self {
-            executors: HashMap::new(),
-        }
-    }
-
     /// 确定事件的路由方式
     fn event_routing(event: &IncomeEvent) -> EventRouting {
         match &event.data {
@@ -82,27 +75,26 @@ impl IncomeProcessorActor {
 
 impl Default for IncomeProcessorActor {
     fn default() -> Self {
-        Self::new()
+        Self {
+            executors: HashMap::new(),
+        }
     }
 }
 
 impl Actor for IncomeProcessorActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = Self;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "ProcessorActor"
-    }
-
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::info!("ProcessorActor started");
-        Ok(())
+        Ok(args)
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         tracing::info!("ProcessorActor stopped");
         Ok(())
     }
@@ -121,7 +113,11 @@ pub struct RegisterExecutor {
 impl Message<RegisterExecutor> for IncomeProcessorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: RegisterExecutor, _ctx: Context<'_, Self, Self::Reply>) {
+    async fn handle(
+        &mut self,
+        msg: RegisterExecutor,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         let actor_id = msg.executor.id();
 
         // 从 subscriptions 提取 (exchange, symbol) 集合
@@ -147,30 +143,28 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
     }
 }
 
-/// ExchangeEvent 消息 - 从 ExchangeActor 接收
+/// IncomeEvent 消息 - 从 IncomePubSub 接收
 impl Message<IncomeEvent> for IncomeProcessorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: IncomeEvent, _ctx: Context<'_, Self, Self::Reply>) {
+    async fn handle(
+        &mut self,
+        msg: IncomeEvent,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         match Self::event_routing(&msg) {
             EventRouting::BySymbol { exchange, symbol } => {
                 // 按 symbol 路由：只发送给订阅了该 (exchange, symbol) 的 executor
                 for sub in self.executors.values() {
                     if sub.symbols.contains(&(exchange, symbol.clone())) {
-                        sub.executor
-                            .tell(msg.clone())
-                            .await
-                            .expect("Failed to tell ExecutorActor");
+                        let _ = sub.executor.tell(msg.clone()).send().await;
                     }
                 }
             }
             EventRouting::Broadcast => {
                 // 广播给所有 executor
                 for sub in self.executors.values() {
-                    sub.executor
-                        .tell(msg.clone())
-                        .await
-                        .expect("Failed to tell ExecutorActor");
+                    let _ = sub.executor.tell(msg.clone()).send().await;
                 }
             }
         }

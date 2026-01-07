@@ -8,7 +8,17 @@ mod executor;
 mod processor;
 mod signal_processor;
 
-pub use clock::{ClockActor, ClockArgs};
+use crate::messaging::IncomeEvent;
+use crate::strategy::OutcomeEvent;
+use kameo_actors::pubsub::PubSub;
+
+/// Income 事件的 PubSub Actor 类型
+pub type IncomePubSub = PubSub<IncomeEvent>;
+
+/// Outcome 事件的 PubSub Actor 类型
+pub type OutcomePubSub = PubSub<OutcomeEvent>;
+
+pub use clock::{ClockActor, ClockActorArgs};
 pub use engine::{AddStrategy, ManagerActor, ManagerActorArgs, Stop};
 pub use executor::{ExecutorActor, ExecutorArgs};
 pub use processor::{IncomeProcessorActor, RegisterExecutor};

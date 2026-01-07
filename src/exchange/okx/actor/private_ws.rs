@@ -3,20 +3,21 @@
 //! 职责:
 //! - 建立私有 WebSocket 连接并完成登录
 //! - 自动订阅私有频道 (positions, account, orders)
-//! - 直接解析消息并发送到 EventSink
+//! - 直接解析消息并发布到 IncomePubSub
 
 use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, WsError};
+use crate::engine::IncomePubSub;
+use crate::exchange::client::WsError;
 use crate::exchange::okx::codec::{AccountData, OrderPushData, PositionData, WsEvent, WsPush};
 use crate::exchange::okx::OkxCredentials;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
+use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,18 +32,16 @@ const WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
 pub struct OkxPrivateWsActorArgs {
     /// 凭证
     pub credentials: OkxCredentials,
-    /// 事件接收器
-    pub event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据（用于仓位转换）
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// OkxPrivateWsActor - 私有 WebSocket Actor
 pub struct OkxPrivateWsActor {
-    /// 凭证
-    credentials: OkxCredentials,
-    /// 事件接收器
-    event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
@@ -50,39 +49,26 @@ pub struct OkxPrivateWsActor {
 }
 
 impl OkxPrivateWsActor {
-    /// 创建新的 OkxPrivateWsActor
-    pub fn new(args: OkxPrivateWsActorArgs) -> Self {
-        Self {
-            credentials: args.credentials,
-            event_sink: args.event_sink,
-            symbol_metas: args.symbol_metas,
-            ws_tx: None,
-        }
-    }
-
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
         let events = parse_private_message(raw, local_ts, &self.symbol_metas)?;
         for event in events {
-            self.event_sink.send_event(event).await;
+            let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
         Ok(())
     }
 }
 
 impl Actor for OkxPrivateWsActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = OkxPrivateWsActorArgs;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "OkxPrivateWsActor"
-    }
-
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 1. 连接私有 WebSocket
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PRIVATE_URL)
             .await
-            .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
+            .expect("Failed to connect to OKX private WebSocket");
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -92,13 +78,13 @@ impl Actor for OkxPrivateWsActor {
             .unwrap()
             .as_secs()
             .to_string();
-        let sign = self.credentials.sign_ws_login(&timestamp);
+        let sign = args.credentials.sign_ws_login(&timestamp);
 
         let login_msg = json!({
             "op": "login",
             "args": [{
-                "apiKey": self.credentials.api_key,
-                "passphrase": self.credentials.passphrase,
+                "apiKey": args.credentials.api_key,
+                "passphrase": args.credentials.passphrase,
                 "timestamp": timestamp,
                 "sign": sign
             }]
@@ -108,7 +94,7 @@ impl Actor for OkxPrivateWsActor {
         write
             .send(WsMessage::Text(login_msg))
             .await
-            .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+            .expect("Failed to send login message");
 
         // 3. 等待 login 响应
         loop {
@@ -120,11 +106,7 @@ impl Actor for OkxPrivateWsActor {
                                 tracing::info!("OKX private login success");
                                 break;
                             } else {
-                                return Err(WsError::AuthFailed(format!(
-                                    "Login failed: {:?}",
-                                    event.msg
-                                ))
-                                .into());
+                                panic!("OKX login failed: {:?}", event.msg);
                             }
                         }
                     }
@@ -133,13 +115,13 @@ impl Actor for OkxPrivateWsActor {
                     write
                         .send(WsMessage::Pong(data))
                         .await
-                        .map_err(|e| WsError::Network(format!("Failed to send pong: {}", e)))?;
+                        .expect("Failed to send pong");
                 }
                 Some(Err(e)) => {
-                    return Err(WsError::Network(e.to_string()).into());
+                    panic!("OKX WebSocket error: {}", e);
                 }
                 None => {
-                    return Err(WsError::ServerClosed.into());
+                    panic!("OKX WebSocket closed unexpectedly");
                 }
                 _ => {}
             }
@@ -159,11 +141,10 @@ impl Actor for OkxPrivateWsActor {
         write
             .send(WsMessage::Text(subscribe_msg))
             .await
-            .map_err(|e| WsError::Network(e.to_string()))?;
+            .expect("Failed to send subscribe message");
 
         // 5. 创建出站消息 channel
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-        self.ws_tx = Some(outgoing_tx);
 
         // 6. 创建入站消息 channel (收到的数据/错误)
         let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
@@ -176,14 +157,19 @@ impl Actor for OkxPrivateWsActor {
         tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
 
         tracing::info!("OkxPrivateWsActor started");
-        Ok(())
+
+        Ok(Self {
+            income_pubsub: args.income_pubsub,
+            symbol_metas: args.symbol_metas,
+            ws_tx: Some(outgoing_tx),
+        })
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         self.ws_tx.take();
         tracing::info!("OkxPrivateWsActor stopped");
         Ok(())
@@ -201,11 +187,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPrivateWsAct
     async fn handle(
         &mut self,
         msg: StreamMessage<Result<String, WsError>, (), ()>,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 解析并发送到 EventSink，失败则 kill actor
+                // 解析并发布到 IncomePubSub，失败则 kill actor
                 if let Err(e) = self.handle_message(&data).await {
                     tracing::error!(error = %e, "Critical parse error, killing actor");
                     ctx.actor_ref().kill();

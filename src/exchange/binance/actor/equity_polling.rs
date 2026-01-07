@@ -3,14 +3,14 @@
 //! Binance 的 WebSocket 不推送 equity，需要通过 REST API 定时查询
 
 use crate::domain::{now_ms, Exchange};
-use crate::exchange::client::EventSink;
+use crate::engine::IncomePubSub;
 use crate::exchange::ExchangeClient;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
+use kameo_actors::pubsub::Publish;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -20,8 +20,8 @@ use tokio_stream::wrappers::IntervalStream;
 pub struct BinanceEquityPollingActorArgs {
     /// Binance client (用于查询 equity)
     pub client: Arc<dyn ExchangeClient>,
-    /// 事件接收器
-    pub event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    pub income_pubsub: ActorRef<IncomePubSub>,
     /// 查询间隔 (毫秒)
     pub interval_ms: u64,
 }
@@ -30,36 +30,30 @@ pub struct BinanceEquityPollingActorArgs {
 pub struct BinanceEquityPollingActor {
     /// Binance client
     client: Arc<dyn ExchangeClient>,
-    /// 事件接收器
-    event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    income_pubsub: ActorRef<IncomePubSub>,
     /// 查询间隔
     interval: Duration,
 }
 
 impl BinanceEquityPollingActor {
-    pub fn new(args: BinanceEquityPollingActorArgs) -> Self {
-        Self {
-            client: args.client,
-            event_sink: args.event_sink,
-            interval: Duration::from_millis(args.interval_ms),
-        }
-    }
-
     /// 执行一次 equity 查询
     async fn poll_equity(&self) {
         let local_ts = now_ms();
 
         match self.client.fetch_equity().await {
             Ok(equity) => {
-                self.event_sink
-                    .send_event(IncomeEvent {
+                let _ = self
+                    .income_pubsub
+                    .tell(Publish(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
                         data: ExchangeEventData::Equity {
                             exchange: Exchange::Binance,
                             equity,
                         },
-                    })
+                    }))
+                    .send()
                     .await;
             }
             Err(e) => {
@@ -74,30 +68,34 @@ impl BinanceEquityPollingActor {
 }
 
 impl Actor for BinanceEquityPollingActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = BinanceEquityPollingActorArgs;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "BinanceEquityPollingActor"
-    }
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let interval = Duration::from_millis(args.interval_ms);
 
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
         // 使用 attach_stream 管理定时器生命周期
-        let interval_stream = IntervalStream::new(tokio::time::interval(self.interval));
+        let interval_stream = IntervalStream::new(tokio::time::interval(interval));
         actor_ref.attach_stream(interval_stream, (), ());
 
         tracing::info!(
             exchange = "Binance",
-            interval_ms = self.interval.as_millis() as u64,
+            interval_ms = interval.as_millis() as u64,
             "BinanceEquityPollingActor started"
         );
-        Ok(())
+
+        Ok(Self {
+            client: args.client,
+            income_pubsub: args.income_pubsub,
+            interval,
+        })
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         tracing::info!("BinanceEquityPollingActor stopped");
         Ok(())
     }
@@ -110,7 +108,7 @@ impl Message<StreamMessage<Instant, (), ()>> for BinanceEquityPollingActor {
     async fn handle(
         &mut self,
         msg: StreamMessage<Instant, (), ()>,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) {
         match msg {
             StreamMessage::Next(_) => {

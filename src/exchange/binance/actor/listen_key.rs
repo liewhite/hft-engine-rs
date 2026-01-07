@@ -5,8 +5,7 @@
 
 use crate::exchange::client::WsError;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use std::time::Duration;
@@ -35,15 +34,6 @@ pub struct BinanceListenKeyActor {
 }
 
 impl BinanceListenKeyActor {
-    /// 创建新的 BinanceListenKeyActor
-    pub fn new(args: BinanceListenKeyActorArgs) -> Self {
-        Self {
-            rest_base_url: args.rest_base_url,
-            api_key: args.api_key,
-            client: reqwest::Client::new(),
-        }
-    }
-
     /// 刷新 ListenKey
     async fn refresh_listen_key(&self) -> Result<(), WsError> {
         let resp = self
@@ -68,27 +58,29 @@ impl BinanceListenKeyActor {
 }
 
 impl Actor for BinanceListenKeyActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = BinanceListenKeyActorArgs;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "BinanceListenKeyActor"
-    }
-
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 创建 IntervalStream，定时触发刷新
         let interval = Duration::from_secs(LISTEN_KEY_REFRESH_INTERVAL_SECS);
         let interval_stream = IntervalStream::new(tokio::time::interval(interval));
         actor_ref.attach_stream(interval_stream, (), ());
 
         tracing::info!("BinanceListenKeyActor started");
-        Ok(())
+
+        Ok(Self {
+            rest_base_url: args.rest_base_url,
+            api_key: args.api_key,
+            client: reqwest::Client::new(),
+        })
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         tracing::info!("BinanceListenKeyActor stopped");
         Ok(())
     }
@@ -105,7 +97,7 @@ impl Message<StreamMessage<Instant, (), ()>> for BinanceListenKeyActor {
     async fn handle(
         &mut self,
         msg: StreamMessage<Instant, (), ()>,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) {
         match msg {
             StreamMessage::Next(_) => {

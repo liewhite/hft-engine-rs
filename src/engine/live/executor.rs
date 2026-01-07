@@ -1,19 +1,20 @@
 //! ExecutorActor - 包装 Strategy 的 Actor
 //!
-//! 接收 ExchangeEvent，调用 Strategy.on_event()
+//! 接收 IncomeEvent，调用 Strategy.on_event()，发布 OutcomeEvent 到 OutcomePubSub
 
 use crate::domain::{Exchange, Order, OrderType, Symbol, SymbolMeta};
-use crate::engine::OutcomeProcessorActor;
 use crate::messaging::{IncomeEvent, StateManager};
 use crate::strategy::{OutcomeEvent, Strategy};
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
 use kameo::Actor;
+use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
+
+use super::OutcomePubSub;
 
 /// ExecutorActor 初始化参数
 pub struct ExecutorArgs {
@@ -21,8 +22,8 @@ pub struct ExecutorArgs {
     pub strategy: Box<dyn Strategy>,
     /// Symbol 元数据 (用于 qty 转换)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// SignalProcessorActor 引用 (用于下单)
-    pub signal_processor: ActorRef<OutcomeProcessorActor>,
+    /// Outcome PubSub 引用 (用于发布信号)
+    pub outcome_pubsub: ActorRef<OutcomePubSub>,
 }
 
 /// ExecutorActor - 执行策略的 Actor
@@ -33,34 +34,11 @@ pub struct ExecutorActor {
     state_manager: StateManager,
     /// Symbol 元数据 (用于订单转换)
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// SignalProcessorActor 引用 (用于下单)
-    signal_processor: ActorRef<OutcomeProcessorActor>,
+    /// Outcome PubSub 引用 (用于发布信号)
+    outcome_pubsub: ActorRef<OutcomePubSub>,
 }
 
 impl ExecutorActor {
-    /// 创建 ExecutorActor
-    pub fn new(args: ExecutorArgs) -> Self {
-        // 从策略获取订阅的 symbols (去重)
-        let public_streams = args.strategy.public_streams();
-        let symbols: Vec<Symbol> = public_streams
-            .values()
-            .flat_map(|kinds| kinds.iter().map(|k| k.symbol().clone()))
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        // 创建状态管理器
-        let order_timeout_ms = args.strategy.order_timeout_ms();
-        let state_manager = StateManager::new(&symbols, order_timeout_ms);
-
-        Self {
-            strategy: args.strategy,
-            state_manager,
-            symbol_metas: args.symbol_metas,
-            signal_processor: args.signal_processor,
-        }
-    }
-
     /// 转换订单：生成 client_order_id，coin_to_qty + round price/size
     fn convert_order(&self, mut order: Order) -> Order {
         // 生成 client_order_id (去掉 `-`，OKX 只允许字母数字)
@@ -108,7 +86,7 @@ impl ExecutorActor {
         }
     }
 
-    /// 处理 ExchangeEvent，调用策略并处理返回的信号
+    /// 处理 IncomeEvent，调用策略并处理返回的信号
     async fn handle_event(&mut self, event: IncomeEvent) {
         // 先更新状态
         self.state_manager.apply(&event);
@@ -128,11 +106,12 @@ impl ExecutorActor {
                         converted_order.client_order_id.clone(),
                         converted_order.exchange,
                     );
-                    // 发送到 SignalProcessor
-                    self.signal_processor
-                        .tell(OutcomeEvent::PlaceOrder(converted_order))
-                        .await
-                        .expect("Failed to send order to SignalProcessorActor");
+                    // 发布到 OutcomePubSub
+                    let _ = self
+                        .outcome_pubsub
+                        .tell(Publish(OutcomeEvent::PlaceOrder(converted_order)))
+                        .send()
+                        .await;
                 }
             }
         }
@@ -140,22 +119,37 @@ impl ExecutorActor {
 }
 
 impl Actor for ExecutorActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = ExecutorArgs;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "ExecutorActor"
-    }
+    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        // 从策略获取订阅的 symbols (去重)
+        let public_streams = args.strategy.public_streams();
+        let symbols: Vec<Symbol> = public_streams
+            .values()
+            .flat_map(|kinds| kinds.iter().map(|k| k.symbol().clone()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
 
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+        // 创建状态管理器
+        let order_timeout_ms = args.strategy.order_timeout_ms();
+        let state_manager = StateManager::new(&symbols, order_timeout_ms);
+
         tracing::info!("ExecutorActor started");
-        Ok(())
+        Ok(Self {
+            strategy: args.strategy,
+            state_manager,
+            symbol_metas: args.symbol_metas,
+            outcome_pubsub: args.outcome_pubsub,
+        })
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         tracing::info!("ExecutorActor stopped");
         Ok(())
     }
@@ -163,11 +157,15 @@ impl Actor for ExecutorActor {
 
 // === Messages ===
 
-/// ExchangeEvent 消息 - 从 ProcessorActor 接收 (包含所有事件类型，含 Clock)
+/// IncomeEvent 消息 - 从 ProcessorActor 接收 (包含所有事件类型，含 Clock)
 impl Message<IncomeEvent> for ExecutorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: IncomeEvent, _ctx: Context<'_, Self, Self::Reply>) {
+    async fn handle(
+        &mut self,
+        msg: IncomeEvent,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         self.handle_event(msg).await;
     }
 }

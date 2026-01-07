@@ -1,7 +1,6 @@
 //! 交易所客户端统一抽象
 //!
 //! ExchangeClient trait 封装交易所 REST 交互
-//! Sink traits 用于解耦 Actor 之间的数据流
 
 use crate::domain::{Exchange, ExchangeError, Order, OrderId, Symbol, SymbolMeta};
 use async_trait::async_trait;
@@ -35,26 +34,6 @@ impl SubscriptionKind {
             SubscriptionKind::MarkPrice { symbol } => symbol,
             SubscriptionKind::IndexPrice { symbol } => symbol,
         }
-    }
-}
-
-// ============================================================================
-// 事件接收器
-// ============================================================================
-
-use crate::messaging::IncomeEvent;
-
-/// 交易所事件接收器
-#[async_trait]
-pub trait EventSink: Send + Sync + 'static {
-    async fn send_event(&self, event: IncomeEvent);
-}
-
-/// 为 Arc<T> 实现 EventSink (blanket impl)
-#[async_trait]
-impl<T: EventSink + ?Sized> EventSink for Arc<T> {
-    async fn send_event(&self, event: IncomeEvent) {
-        self.as_ref().send_event(event).await;
     }
 }
 
@@ -144,7 +123,7 @@ pub trait ExchangeModule: Send + Sync {
 #[async_trait]
 pub trait ExchangeActorOps: Send + Sync {
     /// 获取 Actor ID（用于建立 link）
-    fn actor_id(&self) -> kameo::actor::ActorID;
+    fn actor_id(&self) -> kameo::actor::ActorId;
     /// 订阅
     async fn subscribe(&self, kind: SubscriptionKind) -> Result<(), String>;
     /// 取消订阅
@@ -160,16 +139,18 @@ macro_rules! impl_exchange_actor_ops {
         $(
             #[async_trait::async_trait]
             impl $crate::exchange::ExchangeActorOps for kameo::actor::ActorRef<$actor> {
-                fn actor_id(&self) -> kameo::actor::ActorID {
+                fn actor_id(&self) -> kameo::actor::ActorId {
                     self.id()
                 }
                 async fn subscribe(&self, kind: $crate::exchange::SubscriptionKind) -> Result<(), String> {
                     self.tell($crate::exchange::Subscribe { kind })
+                        .send()
                         .await
                         .map_err(|e| e.to_string())
                 }
                 async fn unsubscribe(&self, kind: $crate::exchange::SubscriptionKind) -> Result<(), String> {
                     self.tell($crate::exchange::Unsubscribe { kind })
+                        .send()
                         .await
                         .map_err(|e| e.to_string())
                 }

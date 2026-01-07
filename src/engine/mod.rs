@@ -1,7 +1,7 @@
 pub mod live;
 
 pub use live::{
-    AddStrategy, ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, ManagerActor,
-    ManagerActorArgs, IncomeProcessorActor, RegisterExecutor, OutcomeProcessorActor, SignalProcessorArgs,
-    Stop,
+    AddStrategy, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
+    IncomeProcessorActor, ManagerActor, ManagerActorArgs, OutcomePubSub, OutcomeProcessorActor,
+    RegisterExecutor, SignalProcessorArgs, Stop,
 };

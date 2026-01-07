@@ -3,22 +3,25 @@
 //! 职责:
 //! - 获取 ListenKey 并建立私有 WebSocket 连接
 //! - 管理 BinanceListenKeyActor 子 actor (定时刷新 ListenKey)
-//! - 直接解析消息并发送到 EventSink
+//! - 直接解析消息并发布到 IncomePubSub
 
 use super::listen_key::{BinanceListenKeyActor, BinanceListenKeyActorArgs};
 use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::engine::IncomePubSub;
 use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsResponse};
 use crate::exchange::binance::BinanceCredentials;
-use crate::exchange::client::{EventSink, WsError};
+use crate::exchange::client::WsError;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
-use kameo::actor::{spawn_link, ActorID, ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
+use kameo::error::{ActorStopReason, Infallible};
+use kameo::mailbox;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
+use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -32,20 +35,16 @@ pub struct BinancePrivateWsActorArgs {
     pub credentials: BinanceCredentials,
     /// REST API 基础 URL
     pub rest_base_url: String,
-    /// 事件接收器
-    pub event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据（用于仓位转换）
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// BinancePrivateWsActor - 私有 WebSocket Actor
 pub struct BinancePrivateWsActor {
-    /// 凭证
-    credentials: BinanceCredentials,
-    /// REST API 基础 URL
-    rest_base_url: String,
-    /// 事件接收器
-    event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
@@ -53,56 +52,41 @@ pub struct BinancePrivateWsActor {
     /// ListenKey 子 actor
     listen_key_actor: Option<ActorRef<BinanceListenKeyActor>>,
     /// 子 actor ID 映射
-    listen_key_actor_id: Option<ActorID>,
+    listen_key_actor_id: Option<ActorId>,
 }
 
 impl BinancePrivateWsActor {
-    /// 创建新的 BinancePrivateWsActor
-    pub fn new(args: BinancePrivateWsActorArgs) -> Self {
-        Self {
-            credentials: args.credentials,
-            rest_base_url: args.rest_base_url,
-            event_sink: args.event_sink,
-            symbol_metas: args.symbol_metas,
-            ws_tx: None,
-            listen_key_actor: None,
-            listen_key_actor_id: None,
-        }
-    }
-
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
         let events = parse_private_message(raw, local_ts, &self.symbol_metas)?;
         for event in events {
-            self.event_sink.send_event(event).await;
+            let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
         Ok(())
     }
 }
 
 impl Actor for BinancePrivateWsActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = BinancePrivateWsActorArgs;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "BinancePrivateWsActor"
-    }
-
-    async fn on_start(&mut self, actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 1. 获取 ListenKey
-        let listen_key = create_listen_key(&self.rest_base_url, &self.credentials.api_key).await?;
+        let listen_key = create_listen_key(&args.rest_base_url, &args.credentials.api_key)
+            .await
+            .expect("Failed to create listen key");
 
         // 2. 连接私有 WebSocket
         let url = format!("{}/{}", WS_PRIVATE_BASE, listen_key);
         let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
             .await
-            .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
+            .expect("Failed to connect to Binance private WebSocket");
 
         let (write, read) = ws_stream.split();
 
         // 3. 创建出站消息 channel (Subscribe/Unsubscribe)
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-        self.ws_tx = Some(outgoing_tx);
 
         // 4. 创建入站消息 channel (收到的数据/错误)
         let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
@@ -114,27 +98,33 @@ impl Actor for BinancePrivateWsActor {
         // 5. 启动 ws_loop
         tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
 
-        // 6. spawn_link ListenKeyActor
-        let listen_key_actor = spawn_link(
-            &actor_ref,
-            BinanceListenKeyActor::new(BinanceListenKeyActorArgs {
-                rest_base_url: self.rest_base_url.clone(),
-                api_key: self.credentials.api_key.clone(),
-            }),
-        )
-        .await;
-        self.listen_key_actor_id = Some(listen_key_actor.id());
-        self.listen_key_actor = Some(listen_key_actor);
+        // 6. spawn + link ListenKeyActor
+        let listen_key_actor = BinanceListenKeyActor::spawn_with_mailbox(
+            BinanceListenKeyActorArgs {
+                rest_base_url: args.rest_base_url,
+                api_key: args.credentials.api_key,
+            },
+            mailbox::unbounded(),
+        );
+        actor_ref.link(&listen_key_actor).await;
+        let listen_key_actor_id = listen_key_actor.id();
 
         tracing::info!("BinancePrivateWsActor started");
-        Ok(())
+
+        Ok(Self {
+            income_pubsub: args.income_pubsub,
+            symbol_metas: args.symbol_metas,
+            ws_tx: Some(outgoing_tx),
+            listen_key_actor: Some(listen_key_actor),
+            listen_key_actor_id: Some(listen_key_actor_id),
+        })
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         // Drop ws_tx 会导致 ws_loop 退出
         self.ws_tx.take();
         tracing::info!("BinancePrivateWsActor stopped");
@@ -144,22 +134,22 @@ impl Actor for BinancePrivateWsActor {
     async fn on_link_died(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
-        id: ActorID,
+        id: ActorId,
         reason: ActorStopReason,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         // ListenKeyActor 死亡 -> 级联退出
         if Some(id) == self.listen_key_actor_id {
             tracing::error!(reason = ?reason, "BinanceListenKeyActor died, shutting down");
             self.listen_key_actor = None;
             self.listen_key_actor_id = None;
-            return Ok(Some(ActorStopReason::LinkDied {
+            return Ok(ControlFlow::Break(ActorStopReason::LinkDied {
                 id,
                 reason: Box::new(reason),
             }));
         }
 
         tracing::warn!(actor_id = ?id, reason = ?reason, "Unknown linked actor died");
-        Ok(None)
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -174,11 +164,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePrivateW
     async fn handle(
         &mut self,
         msg: StreamMessage<Result<String, WsError>, (), ()>,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 解析并发送到 EventSink，失败则 kill actor
+                // 解析并发布到 IncomePubSub，失败则 kill actor
                 if let Err(e) = self.handle_message(&data).await {
                     tracing::error!(error = %e, "Critical parse error, killing actor");
                     ctx.actor_ref().kill();

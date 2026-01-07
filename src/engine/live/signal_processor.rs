@@ -1,62 +1,54 @@
 //! SignalProcessorActor - 处理策略信号并执行下单
 //!
-//! 接收 Signal 消息，调用交易所 REST API 执行订单
+//! 订阅 OutcomePubSub 接收策略信号，调用交易所 REST API 执行订单
 
 use crate::domain::{now_ms, Exchange, OrderStatus, OrderUpdate};
-use crate::exchange::{EventSink, ExchangeClient};
-use crate::messaging::{IncomeEvent, ExchangeEventData};
+use crate::exchange::ExchangeClient;
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
 use kameo::Actor;
+use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use super::IncomePubSub;
 
 /// SignalProcessorActor 初始化参数
 pub struct SignalProcessorArgs {
     /// 交易所客户端映射
     pub clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
-    /// 事件接收器（用于发送下单失败事件）
-    pub event_sink: Arc<dyn EventSink>,
+    /// Income PubSub（用于发布下单失败事件）
+    pub income_pubsub: ActorRef<IncomePubSub>,
 }
 
 /// SignalProcessorActor - 处理交易信号
 pub struct OutcomeProcessorActor {
     /// 交易所客户端
     clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
-    /// 事件接收器
-    event_sink: Arc<dyn EventSink>,
-}
-
-impl OutcomeProcessorActor {
-    /// 创建 SignalProcessorActor
-    pub fn new(args: SignalProcessorArgs) -> Self {
-        Self {
-            clients: args.clients,
-            event_sink: args.event_sink,
-        }
-    }
+    /// Income PubSub
+    income_pubsub: ActorRef<IncomePubSub>,
 }
 
 impl Actor for OutcomeProcessorActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = SignalProcessorArgs;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "SignalProcessorActor"
-    }
-
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::info!("SignalProcessorActor started");
-        Ok(())
+        Ok(Self {
+            clients: args.clients,
+            income_pubsub: args.income_pubsub,
+        })
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         tracing::info!("SignalProcessorActor stopped");
         Ok(())
     }
@@ -67,7 +59,11 @@ impl Actor for OutcomeProcessorActor {
 impl Message<OutcomeEvent> for OutcomeProcessorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: OutcomeEvent, _ctx: Context<'_, Self, Self::Reply>) {
+    async fn handle(
+        &mut self,
+        msg: OutcomeEvent,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         match msg {
             OutcomeEvent::PlaceOrder(order) => {
                 let client = match self.clients.get(&order.exchange) {
@@ -138,12 +134,14 @@ impl OutcomeProcessorActor {
             timestamp: local_ts,
         };
 
-        self.event_sink
-            .send_event(IncomeEvent {
+        let _ = self
+            .income_pubsub
+            .tell(Publish(IncomeEvent {
                 exchange_ts: local_ts, // 本地错误，没有交易所时间戳
                 local_ts,
                 data: ExchangeEventData::OrderUpdate(update),
-            })
+            }))
+            .send()
             .await;
     }
 }

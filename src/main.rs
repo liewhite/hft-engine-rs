@@ -4,7 +4,6 @@ use fee_arb::exchange::binance::BinanceCredentials;
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::{FundingArbConfig, FundingArbStrategy};
-use kameo::request::MessageSend;
 use serde::Deserialize;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 

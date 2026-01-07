@@ -3,24 +3,26 @@
 //! 职责:
 //! - 管理 PublicWsActor 和 PrivateWsActor 子 actor
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
-//! - WsActors 直接解析消息并发送到 EventSink
+//! - WsActors 直接解析消息并发布到 IncomePubSub
 //!
 //! 架构:
 //! HyperliquidActor (父)
-//! ├── HyperliquidPublicWsActor [spawn_link]
-//! └── HyperliquidPrivateWsActor [spawn_link] (optional, 需要凭证)
+//! ├── HyperliquidPublicWsActor [spawn + link]
+//! └── HyperliquidPrivateWsActor [spawn + link] (optional, 需要凭证)
 
 use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs};
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta};
-use crate::exchange::client::{EventSink, Subscribe, Unsubscribe};
+use crate::engine::IncomePubSub;
+use crate::exchange::client::{Subscribe, Unsubscribe};
 use crate::exchange::hyperliquid::HyperliquidCredentials;
-use kameo::actor::{spawn_link, ActorID, ActorRef, PreparedActor, WeakActorRef};
-use kameo::error::{ActorStopReason, BoxError};
-use kameo::mailbox::unbounded::UnboundedMailbox;
+use kameo::actor::{ActorId, ActorRef, PreparedActor, Spawn, WeakActorRef};
+use kameo::error::{ActorStopReason, Infallible};
+use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// 子 Actor 类型
@@ -36,8 +38,8 @@ pub struct HyperliquidActorArgs {
     pub credentials: Option<HyperliquidCredentials>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 事件接收器
-    pub event_sink: Arc<dyn EventSink>,
+    /// Income PubSub (发布事件)
+    pub income_pubsub: ActorRef<IncomePubSub>,
 }
 
 /// HyperliquidActor - 父 Actor
@@ -48,43 +50,43 @@ pub struct HyperliquidActor {
     _private_ws: Option<ActorRef<HyperliquidPrivateWsActor>>,
 
     /// 子 Actor ID -> Kind 映射
-    child_actors: HashMap<ActorID, ChildKind>,
+    child_actors: HashMap<ActorId, ChildKind>,
 }
 
 impl HyperliquidActor {
     /// 创建 HyperliquidActor 并返回 ActorRef
     ///
-    /// 使用 PreparedActor 模式，在构造时 spawn_link 所有子 actors
+    /// 使用 PreparedActor 模式，在构造时 spawn + link 所有子 actors
     pub async fn new(args: HyperliquidActorArgs) -> ActorRef<Self> {
         // 1. 准备 actor，获取 actor_ref
-        let prepared = PreparedActor::<Self>::new();
+        let prepared = PreparedActor::<Self>::new(mailbox::unbounded());
         let actor_ref = prepared.actor_ref().clone();
 
         let mut child_actors = HashMap::new();
 
-        // 3. 创建 PublicWsActor
-        let public_ws = spawn_link(
-            &actor_ref,
-            HyperliquidPublicWsActor::new(HyperliquidPublicWsActorArgs {
-                event_sink: args.event_sink.clone(),
+        // 2. 创建 PublicWsActor
+        let public_ws = HyperliquidPublicWsActor::spawn_with_mailbox(
+            HyperliquidPublicWsActorArgs {
+                income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
-            }),
-        )
-        .await;
+            },
+            mailbox::unbounded(),
+        );
+        actor_ref.link(&public_ws).await;
         child_actors.insert(public_ws.id(), ChildKind::PublicWs);
         tracing::info!(exchange = "Hyperliquid", "PublicWsActor created");
 
-        // 4. 创建 PrivateWsActor (如果有凭证)
+        // 3. 创建 PrivateWsActor (如果有凭证)
         let private_ws = if let Some(credentials) = args.credentials {
-            let private_ws = spawn_link(
-                &actor_ref,
-                HyperliquidPrivateWsActor::new(HyperliquidPrivateWsActorArgs {
+            let private_ws = HyperliquidPrivateWsActor::spawn_with_mailbox(
+                HyperliquidPrivateWsActorArgs {
                     wallet_address: credentials.wallet_address,
-                    event_sink: args.event_sink,
+                    income_pubsub: args.income_pubsub,
                     symbol_metas: args.symbol_metas,
-                }),
-            )
-            .await;
+                },
+                mailbox::unbounded(),
+            );
+            actor_ref.link(&private_ws).await;
             child_actors.insert(private_ws.id(), ChildKind::PrivateWs);
             tracing::info!(exchange = "Hyperliquid", "PrivateWsActor created");
             Some(private_ws)
@@ -92,7 +94,7 @@ impl HyperliquidActor {
             None
         };
 
-        // 5. 构造 actor 并 spawn
+        // 4. 构造 actor 并 spawn
         let actor = Self {
             public_ws,
             _private_ws: private_ws,
@@ -106,27 +108,24 @@ impl HyperliquidActor {
 }
 
 impl Actor for HyperliquidActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = Self;
+    type Error = Infallible;
 
-    fn name() -> &'static str {
-        "HyperliquidActor"
-    }
-
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(state: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::info!(
             exchange = "Hyperliquid",
-            has_private_ws = self._private_ws.is_some(),
+            has_private_ws = state._private_ws.is_some(),
             "HyperliquidActor started"
         );
 
-        Ok(())
+        Ok(state)
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         tracing::info!("HyperliquidActor stopped");
         Ok(())
     }
@@ -134,9 +133,9 @@ impl Actor for HyperliquidActor {
     async fn on_link_died(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
-        id: ActorID,
+        id: ActorId,
         reason: ActorStopReason,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         let kind = self.child_actors.remove(&id);
 
         match kind {
@@ -148,12 +147,12 @@ impl Actor for HyperliquidActor {
             }
             None => {
                 tracing::warn!(actor_id = ?id, reason = ?reason, "Unknown linked actor died");
-                return Ok(None);
+                return Ok(ControlFlow::Continue(()));
             }
         }
 
         // 子 actor 死亡级联退出
-        Ok(Some(ActorStopReason::LinkDied {
+        Ok(ControlFlow::Break(ActorStopReason::LinkDied {
             id,
             reason: Box::new(reason),
         }))
@@ -167,12 +166,13 @@ impl Actor for HyperliquidActor {
 impl Message<Subscribe> for HyperliquidActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: Subscribe, _ctx: Context<'_, Self, Self::Reply>) -> Self::Reply {
+    async fn handle(
+        &mut self,
+        msg: Subscribe,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
         // 转发给 PublicWsActor
-        self.public_ws
-            .tell(msg)
-            .await
-            .expect("Failed to forward Subscribe to PublicWsActor");
+        let _ = self.public_ws.tell(msg).send().await;
     }
 }
 
@@ -182,12 +182,9 @@ impl Message<Unsubscribe> for HyperliquidActor {
     async fn handle(
         &mut self,
         msg: Unsubscribe,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor
-        self.public_ws
-            .tell(msg)
-            .await
-            .expect("Failed to forward Unsubscribe to PublicWsActor");
+        let _ = self.public_ws.tell(msg).send().await;
     }
 }

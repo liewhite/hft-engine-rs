@@ -1377,6 +1377,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "downcast-rs"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1530,6 +1536,7 @@ dependencies = [
  "hex",
  "hmac",
  "kameo",
+ "kameo_actors",
  "reqwest",
  "rmp-serde",
  "rust_decimal",
@@ -2227,31 +2234,42 @@ dependencies = [
 
 [[package]]
 name = "kameo"
-version = "0.14.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1542e1113415cdfd5dac5f663cb69f6be472cff28e90adf6e284e520e399312"
+checksum = "9c4af7638c67029fd6821d02813c3913c803784648725d4df4082c9b91d7cbb1"
 dependencies = [
+ "downcast-rs",
  "dyn-clone",
  "futures",
  "kameo_macros",
- "once_cell",
  "serde",
  "tokio",
- "tokio-stream",
  "tracing",
 ]
 
 [[package]]
-name = "kameo_macros"
-version = "0.14.0"
+name = "kameo_actors"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d7adf8a6a19b8582095d1819f4e992817f7dce2b85cd205b6386f9079a2cc81"
+checksum = "57101cc01d16e87fad2cb0d6332a84bbdd3468c28d52d6929ec43d340e2e6713"
+dependencies = [
+ "futures",
+ "glob",
+ "kameo",
+ "thiserror 2.0.17",
+ "tokio",
+]
+
+[[package]]
+name = "kameo_macros"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a13c324e2d8c8e126e63e66087448b4267e263e6cb8770c56d10a9d0d279d9e2"
 dependencies = [
  "heck",
  "proc-macro2",
  "quote",
  "syn 2.0.113",
- "uuid",
 ]
 
 [[package]]
