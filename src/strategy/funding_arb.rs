@@ -339,24 +339,30 @@ impl FundingArbStrategy {
             return None;
         }
 
-        // 检查单边仓位比例是否超限
+        // 检查单边仓位比例是否超限（包括本次开仓后的预期仓位）
         let mid_price = (short_bbo.bid_price + long_bbo.ask_price) / 2.0;
         let short_pos = state.position(short_exchange).map(|p| p.size.abs()).unwrap_or(0.0);
         let long_pos = state.position(long_exchange).map(|p| p.size.abs()).unwrap_or(0.0);
-        let short_pos_value = short_pos * mid_price;
-        let long_pos_value = long_pos * mid_price;
-        let short_pos_ratio = short_pos_value / short_equity;
-        let long_pos_ratio = long_pos_value / long_equity;
 
-        if short_pos_ratio >= self.config.max_position_ratio || long_pos_ratio >= self.config.max_position_ratio {
+        // 预估本次开仓数量（按 max_notional 计算）
+        let expected_open_qty = self.config.max_notional / mid_price;
+
+        // 计算开仓后的预期仓位价值
+        let short_pos_value_after = (short_pos + expected_open_qty) * mid_price;
+        let long_pos_value_after = (long_pos + expected_open_qty) * mid_price;
+        let short_pos_ratio_after = short_pos_value_after / short_equity;
+        let long_pos_ratio_after = long_pos_value_after / long_equity;
+
+        if short_pos_ratio_after >= self.config.max_position_ratio || long_pos_ratio_after >= self.config.max_position_ratio {
             tracing::debug!(
                 symbol = %self.symbol,
                 short_exchange = %short_exchange,
-                short_pos_ratio = format!("{:.4}", short_pos_ratio),
+                short_pos_ratio_after = format!("{:.4}", short_pos_ratio_after),
                 long_exchange = %long_exchange,
-                long_pos_ratio = format!("{:.4}", long_pos_ratio),
+                long_pos_ratio_after = format!("{:.4}", long_pos_ratio_after),
                 max_position_ratio = self.config.max_position_ratio,
-                "Position ratio exceeded, refusing to open"
+                expected_open_qty = expected_open_qty,
+                "Position ratio would exceed limit after opening, refusing to open"
             );
             return None;
         }
