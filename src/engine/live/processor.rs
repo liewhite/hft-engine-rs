@@ -31,12 +31,12 @@ struct ExecutorSubscription {
 }
 
 /// ProcessorActor - 事件分发
-pub struct ProcessorActor {
+pub struct IncomeProcessorActor {
     /// ActorID -> Executor 订阅信息
     executors: HashMap<ActorID, ExecutorSubscription>,
 }
 
-impl ProcessorActor {
+impl IncomeProcessorActor {
     pub fn new() -> Self {
         Self {
             executors: HashMap::new(),
@@ -80,13 +80,13 @@ impl ProcessorActor {
     }
 }
 
-impl Default for ProcessorActor {
+impl Default for IncomeProcessorActor {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Actor for ProcessorActor {
+impl Actor for IncomeProcessorActor {
     type Mailbox = UnboundedMailbox<Self>;
 
     fn name() -> &'static str {
@@ -118,7 +118,7 @@ pub struct RegisterExecutor {
     pub subscriptions: HashSet<(Exchange, SubscriptionKind)>,
 }
 
-impl Message<RegisterExecutor> for ProcessorActor {
+impl Message<RegisterExecutor> for IncomeProcessorActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: RegisterExecutor, _ctx: Context<'_, Self, Self::Reply>) {
@@ -148,7 +148,7 @@ impl Message<RegisterExecutor> for ProcessorActor {
 }
 
 /// ExchangeEvent 消息 - 从 ExchangeActor 接收
-impl Message<IncomeEvent> for ProcessorActor {
+impl Message<IncomeEvent> for IncomeProcessorActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: IncomeEvent, _ctx: Context<'_, Self, Self::Reply>) {

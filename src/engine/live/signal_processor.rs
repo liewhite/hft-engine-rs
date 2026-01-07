@@ -23,14 +23,14 @@ pub struct SignalProcessorArgs {
 }
 
 /// SignalProcessorActor - 处理交易信号
-pub struct SignalProcessorActor {
+pub struct OutcomeProcessorActor {
     /// 交易所客户端
     clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
     /// 事件接收器
     event_sink: Arc<dyn EventSink>,
 }
 
-impl SignalProcessorActor {
+impl OutcomeProcessorActor {
     /// 创建 SignalProcessorActor
     pub fn new(args: SignalProcessorArgs) -> Self {
         Self {
@@ -40,7 +40,7 @@ impl SignalProcessorActor {
     }
 }
 
-impl Actor for SignalProcessorActor {
+impl Actor for OutcomeProcessorActor {
     type Mailbox = UnboundedMailbox<Self>;
 
     fn name() -> &'static str {
@@ -64,7 +64,7 @@ impl Actor for SignalProcessorActor {
 
 // === Message Handlers ===
 
-impl Message<OutcomeEvent> for SignalProcessorActor {
+impl Message<OutcomeEvent> for OutcomeProcessorActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: OutcomeEvent, _ctx: Context<'_, Self, Self::Reply>) {
@@ -123,7 +123,7 @@ impl Message<OutcomeEvent> for SignalProcessorActor {
     }
 }
 
-impl SignalProcessorActor {
+impl OutcomeProcessorActor {
     /// 发送订单错误事件
     async fn send_order_error(&self, order: &crate::domain::Order, reason: String) {
         let local_ts = now_ms();

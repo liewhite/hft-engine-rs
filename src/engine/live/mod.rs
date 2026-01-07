@@ -11,5 +11,5 @@ mod signal_processor;
 pub use clock::{ClockActor, ClockArgs};
 pub use engine::{AddStrategy, ManagerActor, ManagerActorArgs, Stop};
 pub use executor::{ExecutorActor, ExecutorArgs};
-pub use processor::{ProcessorActor, RegisterExecutor};
-pub use signal_processor::{SignalProcessorActor, SignalProcessorArgs};
+pub use processor::{IncomeProcessorActor, RegisterExecutor};
+pub use signal_processor::{OutcomeProcessorActor, SignalProcessorArgs};

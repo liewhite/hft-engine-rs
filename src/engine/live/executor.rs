@@ -3,7 +3,7 @@
 //! 接收 ExchangeEvent，调用 Strategy.on_event()
 
 use crate::domain::{Exchange, Order, OrderType, Symbol, SymbolMeta};
-use crate::engine::SignalProcessorActor;
+use crate::engine::OutcomeProcessorActor;
 use crate::messaging::{IncomeEvent, StateManager};
 use crate::strategy::{OutcomeEvent, Strategy};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -22,7 +22,7 @@ pub struct ExecutorArgs {
     /// Symbol 元数据 (用于 qty 转换)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// SignalProcessorActor 引用 (用于下单)
-    pub signal_processor: ActorRef<SignalProcessorActor>,
+    pub signal_processor: ActorRef<OutcomeProcessorActor>,
 }
 
 /// ExecutorActor - 执行策略的 Actor
@@ -34,7 +34,7 @@ pub struct ExecutorActor {
     /// Symbol 元数据 (用于订单转换)
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// SignalProcessorActor 引用 (用于下单)
-    signal_processor: ActorRef<SignalProcessorActor>,
+    signal_processor: ActorRef<OutcomeProcessorActor>,
 }
 
 impl ExecutorActor {

@@ -6,8 +6,8 @@
 //! - 子 Actor 失败时级联退出
 
 use super::{
-    ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, ProcessorActor, RegisterExecutor,
-    SignalProcessorActor,
+    ClockActor, ClockArgs, ExecutorActor, ExecutorArgs, IncomeProcessorActor, RegisterExecutor,
+    OutcomeProcessorActor,
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{
@@ -72,9 +72,9 @@ pub struct ManagerActor {
 
     // === 子 Actors (在 new() 中创建) ===
     /// SignalProcessorActor
-    signal_processor: ActorRef<SignalProcessorActor>,
+    signal_processor: ActorRef<OutcomeProcessorActor>,
     /// ProcessorActor
-    processor: ActorRef<ProcessorActor>,
+    processor: ActorRef<IncomeProcessorActor>,
     /// ClockActor（保持引用以维持 actor 生命周期）
     _clock_actor: ActorRef<ClockActor<ProcessorEventSink>>,
     /// ExchangeActors (惰性创建，类型擦除)
@@ -124,11 +124,11 @@ impl ManagerActor {
             .expect("Failed to preload symbol metas");
 
         // 3. 创建 ProcessorActor
-        let processor = kameo::spawn(ProcessorActor::new());
+        let income_processor = kameo::spawn(IncomeProcessorActor::new());
 
         // 4. 创建 ProcessorEventSink
         let event_sink: Arc<dyn EventSink> = Arc::new(ProcessorEventSink {
-            processor: processor.clone(),
+            processor: income_processor.clone(),
         });
 
         // 5. 获取 configured_clients (用于 SignalProcessorActor)
@@ -138,14 +138,14 @@ impl ManagerActor {
             .collect();
 
         // 6. 创建 SignalProcessorActor
-        let signal_processor = kameo::spawn(SignalProcessorActor::new(super::SignalProcessorArgs {
+        let outcome_processor = kameo::spawn(OutcomeProcessorActor::new(super::SignalProcessorArgs {
             clients: configured_clients,
             event_sink: event_sink.clone(),
         }));
 
         // 7. 创建 ClockActor（只负责发送 Clock 事件）
         let clock_event_sink = Arc::new(ProcessorEventSink {
-            processor: processor.clone(),
+            processor: income_processor.clone(),
         });
         let clock_actor = kameo::spawn(ClockActor::new(ClockArgs {
             interval_ms: 1000,
@@ -154,8 +154,8 @@ impl ManagerActor {
 
         // 8. 构建 actor_kinds 映射
         let mut actor_kinds = HashMap::new();
-        actor_kinds.insert(processor.id(), ChildActorKind::Processor);
-        actor_kinds.insert(signal_processor.id(), ChildActorKind::SignalProcessor);
+        actor_kinds.insert(income_processor.id(), ChildActorKind::Processor);
+        actor_kinds.insert(outcome_processor.id(), ChildActorKind::SignalProcessor);
         actor_kinds.insert(clock_actor.id(), ChildActorKind::Clock);
 
         // 9. 构建 ManagerActor
@@ -165,8 +165,8 @@ impl ManagerActor {
             okx_credentials: args.okx_credentials,
             hyperliquid_credentials: args.hyperliquid_credentials,
             symbol_metas,
-            signal_processor: signal_processor.clone(),
-            processor: processor.clone(),
+            signal_processor: outcome_processor.clone(),
+            processor: income_processor.clone(),
             _clock_actor: clock_actor.clone(),
             exchange_actors: HashMap::new(),
             executors: Vec::new(),
@@ -179,8 +179,8 @@ impl ManagerActor {
         let manager_ref = prepared.actor_ref().clone();
 
         // 11. 建立双向 link (在 spawn 之前)
-        manager_ref.link(&processor).await;
-        manager_ref.link(&signal_processor).await;
+        manager_ref.link(&income_processor).await;
+        manager_ref.link(&outcome_processor).await;
         manager_ref.link(&clock_actor).await;
 
         // 12. spawn ManagerActor
@@ -489,7 +489,7 @@ impl Message<Stop> for ManagerActor {
 
 /// ProcessorActor 的事件接收器
 pub struct ProcessorEventSink {
-    processor: ActorRef<ProcessorActor>,
+    processor: ActorRef<IncomeProcessorActor>,
 }
 
 #[async_trait]
