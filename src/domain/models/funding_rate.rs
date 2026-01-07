@@ -33,8 +33,8 @@ impl FundingRate {
             return 0.0;
         }
 
-        // 为防止临近结算时日化费率过高，设置最小时间为 0.5 小时
-        let effective_hours = hours_to_settle.max(0.5);
+        // 为防止临近结算时日化费率过高，设置最小时间为 1 小时
+        let effective_hours = hours_to_settle.max(1.0);
         self.rate * (24.0 / effective_hours)
     }
 
@@ -57,7 +57,8 @@ impl FundingRate {
             return 0.0;
         }
 
-        let effective_hours = hours_to_settle.max(0.5);
+        // 为防止临近结算时日化费率过高，设置最小时间为 1 小时
+        let effective_hours = hours_to_settle.max(1.0);
         self.rate * (24.0 / effective_hours)
     }
 }
