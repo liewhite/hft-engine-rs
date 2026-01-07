@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, Order, OrderType, Rate, Side, Symbol, BBO};
+use crate::domain::{Exchange, Order, OrderType, Rate, Side, Symbol, TimeInForce, BBO};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
@@ -7,6 +7,9 @@ use std::collections::{HashMap, HashSet};
 
 /// 最大允许的时间戳差异（毫秒）
 const MAX_TIMESTAMP_DIFF_MS: u64 = 120_000; // 2 分钟
+
+/// 市价单滑点（用限价单 IOC 模拟市价单）
+const MARKET_ORDER_SLIPPAGE: f64 = 0.001; // 0.1%
 
 /// EMA (Exponential Moving Average) 计算器
 #[derive(Debug, Clone)]
@@ -517,12 +520,13 @@ impl FundingArbStrategy {
         let pos = state.position(exchange)?;
         let bbo = state.bbo(exchange)?;
 
+        // 计算带滑点的价格（模拟市价单）
         let (side, price) = if pos.size > 0.0 {
-            // 平多：卖出
-            (Side::Short, bbo.bid_price)
+            // 平多：卖出，bid - slippage
+            (Side::Short, bbo.bid_price * (1.0 - MARKET_ORDER_SLIPPAGE))
         } else {
-            // 平空：买入
-            (Side::Long, bbo.ask_price)
+            // 平空：买入，ask + slippage
+            (Side::Long, bbo.ask_price * (1.0 + MARKET_ORDER_SLIPPAGE))
         };
 
         if price <= 0.0 {
@@ -546,7 +550,10 @@ impl FundingArbStrategy {
             exchange,
             symbol: self.symbol.clone(),
             side,
-            order_type: OrderType::Market,
+            order_type: OrderType::Limit {
+                price,
+                tif: TimeInForce::IOC,
+            },
             quantity: qty,
             reduce_only: true,
             client_order_id: String::new(),
@@ -582,13 +589,19 @@ impl FundingArbStrategy {
             (base_qty, base_qty + (-imbalance))
         };
 
+        // 计算带滑点的价格（模拟市价单）
+        // short_price 是 bid，做空用 bid - slippage
+        // long_price 是 ask，做多用 ask + slippage
+        let short_limit_price = signal.short_price * (1.0 - MARKET_ORDER_SLIPPAGE);
+        let long_limit_price = signal.long_price * (1.0 + MARKET_ORDER_SLIPPAGE);
+
         tracing::info!(
             symbol = %self.symbol,
             short_ex = %signal.short_exchange,
-            short_price = signal.short_price,
+            short_price = short_limit_price,
             short_qty = short_qty,
             long_ex = %signal.long_exchange,
-            long_price = signal.long_price,
+            long_price = long_limit_price,
             long_qty = long_qty,
             base_qty = base_qty,
             imbalance = imbalance,
@@ -601,7 +614,10 @@ impl FundingArbStrategy {
                 exchange: signal.short_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Short,
-                order_type: OrderType::Market,
+                order_type: OrderType::Limit {
+                    price: short_limit_price,
+                    tif: TimeInForce::IOC,
+                },
                 quantity: short_qty,
                 reduce_only: false,
                 client_order_id: String::new(),
@@ -611,7 +627,10 @@ impl FundingArbStrategy {
                 exchange: signal.long_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Long,
-                order_type: OrderType::Market,
+                order_type: OrderType::Limit {
+                    price: long_limit_price,
+                    tif: TimeInForce::IOC,
+                },
                 quantity: long_qty,
                 reduce_only: false,
                 client_order_id: String::new(),
@@ -713,13 +732,19 @@ impl FundingArbStrategy {
             return vec![];
         }
 
+        // 计算带滑点的价格（模拟市价单）
+        // long_price 是 bid，平多卖出用 bid - slippage
+        // short_price 是 ask，平空买入用 ask + slippage
+        let close_long_price = signal.long_price * (1.0 - MARKET_ORDER_SLIPPAGE);
+        let close_short_price = signal.short_price * (1.0 + MARKET_ORDER_SLIPPAGE);
+
         tracing::info!(
             symbol = %self.symbol,
             long_exchange = %signal.long_exchange,
-            long_price = signal.long_price,
+            long_price = close_long_price,
             long_size = signal.long_size,
             short_exchange = %signal.short_exchange,
-            short_price = signal.short_price,
+            short_price = close_short_price,
             short_size = signal.short_size,
             close_qty = close_qty,
             "Closing positions"
@@ -732,7 +757,10 @@ impl FundingArbStrategy {
                 exchange: signal.long_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Short,
-                order_type: OrderType::Market,
+                order_type: OrderType::Limit {
+                    price: close_long_price,
+                    tif: TimeInForce::IOC,
+                },
                 quantity: close_qty,
                 reduce_only: true,
                 client_order_id: String::new(),
@@ -743,7 +771,10 @@ impl FundingArbStrategy {
                 exchange: signal.short_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Long,
-                order_type: OrderType::Market,
+                order_type: OrderType::Limit {
+                    price: close_short_price,
+                    tif: TimeInForce::IOC,
+                },
                 quantity: close_qty,
                 reduce_only: true,
                 client_order_id: String::new(),
