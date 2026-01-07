@@ -61,6 +61,7 @@ async fn run_ws_loop_inner(
             ws_msg = read.next() => {
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
+                        tracing::trace!(text = %text, "ws_loop received message");
                         // 发送失败说明 actor 已停止，正常退出
                         if incoming_tx.send(Ok(text)).await.is_err() {
                             return Ok(());

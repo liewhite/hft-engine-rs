@@ -32,8 +32,6 @@ pub struct BinanceEquityPollingActor {
     client: Arc<dyn ExchangeClient>,
     /// Income PubSub (发布事件)
     income_pubsub: ActorRef<IncomePubSub>,
-    /// 查询间隔
-    interval: Duration,
 }
 
 impl BinanceEquityPollingActor {
@@ -87,7 +85,6 @@ impl Actor for BinanceEquityPollingActor {
         Ok(Self {
             client: args.client,
             income_pubsub: args.income_pubsub,
-            interval,
         })
     }
 

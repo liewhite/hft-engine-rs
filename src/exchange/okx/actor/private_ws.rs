@@ -51,8 +51,10 @@ pub struct OkxPrivateWsActor {
 impl OkxPrivateWsActor {
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
+        tracing::debug!(raw, "OKX private message received");
         let local_ts = now_ms();
         let events = parse_private_message(raw, local_ts, &self.symbol_metas)?;
+        tracing::debug!(count = events.len(), "OKX private events parsed");
         for event in events {
             let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
@@ -228,7 +230,14 @@ fn parse_private_message(
     // 检查是否是事件响应（控制消息，返回空 Vec）
     if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
         match event {
-            "subscribe" | "unsubscribe" => return Ok(Vec::new()),
+            "subscribe" | "unsubscribe" => {
+                tracing::info!(event, raw, "OKX private subscription response");
+                return Ok(Vec::new());
+            }
+            "channel-conn-count" => {
+                // OKX 连接计数事件，忽略
+                return Ok(Vec::new());
+            }
             "error" => {
                 let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
                 let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -237,7 +246,10 @@ fn parse_private_message(
                     code, msg
                 )));
             }
-            _ => return Ok(Vec::new()),
+            _ => {
+                tracing::warn!(event, raw, "OKX unknown event");
+                return Ok(Vec::new());
+            }
         }
     }
 
