@@ -1,6 +1,6 @@
 services:
   fee-arb:
-    build: .
+    image: ghcr.io/liewhite/hft-engine-rs:latest
     container_name: fee-arb
     restart: unless-stopped
     volumes:
