@@ -2,7 +2,7 @@
 //!
 //! 职责：
 //! - 创建 PubSub Actors (IncomePubSub, OutcomePubSub)
-//! - 使用 spawn + link 创建所有子 Actor
+//! - 使用 spawn_link 创建所有子 Actor
 //! - 通过 add_strategy 动态添加策略和相关 Actor
 //! - 子 Actor 失败时级联退出
 
@@ -31,26 +31,6 @@ use kameo_actors::DeliveryStrategy;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
-
-// ============================================================================
-// 子 Actor 类型标识
-// ============================================================================
-
-/// 子 Actor 类型（用于 on_link_died 中识别）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChildActorKind {
-    Exchange(Exchange),
-    Executor(usize),
-    SignalProcessor,
-    Processor,
-    Clock,
-    IncomePubSub,
-    OutcomePubSub,
-}
-
-// ============================================================================
-// ManagerActor
-// ============================================================================
 
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
@@ -81,10 +61,7 @@ pub struct ManagerActor {
     /// ExchangeActors (启动时创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
     /// ExecutorActors (add_strategy 时创建)
-    executors: Vec<ActorRef<ExecutorActor>>,
-
-    /// ActorId -> ChildActorKind 映射（用于 on_link_died）
-    actor_kinds: HashMap<ActorId, ChildActorKind>,
+    _executors: Vec<ActorRef<ExecutorActor>>,
 }
 
 impl ManagerActor {
@@ -159,7 +136,7 @@ impl ManagerActor {
             .collect();
 
         // 4. 创建 ExecutorActor (使用 spawn_link_with_mailbox)
-        let executor_idx = self.executors.len();
+        let executor_idx = self._executors.len();
         let executor_ref = ExecutorActor::spawn_link_with_mailbox(
             &actor_ref,
             ExecutorArgs {
@@ -171,9 +148,6 @@ impl ManagerActor {
         )
         .await;
 
-        self.actor_kinds
-            .insert(executor_ref.id(), ChildActorKind::Executor(executor_idx));
-
         // 5. 向 ProcessorActor 注册 Executor 的订阅
         let _ = processor
             .tell(RegisterExecutor {
@@ -183,7 +157,7 @@ impl ManagerActor {
             .send()
             .await;
 
-        self.executors.push(executor_ref);
+        self._executors.push(executor_ref);
 
         // 6. 向 ExchangeActors 发送订阅请求
         for (exchange, kind) in subscriptions {
@@ -286,15 +260,7 @@ impl Actor for ManagerActor {
         )
         .await;
 
-        // 7. 构建 actor_kinds 映射
-        let mut actor_kinds = HashMap::new();
-        actor_kinds.insert(income_pubsub.id(), ChildActorKind::IncomePubSub);
-        actor_kinds.insert(outcome_pubsub.id(), ChildActorKind::OutcomePubSub);
-        actor_kinds.insert(processor.id(), ChildActorKind::Processor);
-        actor_kinds.insert(signal_processor.id(), ChildActorKind::SignalProcessor);
-        actor_kinds.insert(clock_actor.id(), ChildActorKind::Clock);
-
-        // 8. 创建所有配置了凭证的 ExchangeActors
+        // 7. 创建所有配置了凭证的 ExchangeActors
         let mut exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>> = HashMap::new();
 
         if let Some(ref credentials) = args.binance_credentials {
@@ -316,7 +282,6 @@ impl Actor for ManagerActor {
                 mailbox::unbounded(),
             )
             .await;
-            actor_kinds.insert(binance_ref.id(), ChildActorKind::Exchange(Exchange::Binance));
             exchange_actors.insert(Exchange::Binance, Box::new(binance_ref));
             tracing::info!(exchange = "Binance", "ExchangeActor created");
         }
@@ -333,7 +298,6 @@ impl Actor for ManagerActor {
                 mailbox::unbounded(),
             )
             .await;
-            actor_kinds.insert(okx_ref.id(), ChildActorKind::Exchange(Exchange::OKX));
             exchange_actors.insert(Exchange::OKX, Box::new(okx_ref));
             tracing::info!(exchange = "OKX", "ExchangeActor created");
         }
@@ -351,10 +315,6 @@ impl Actor for ManagerActor {
                 mailbox::unbounded(),
             )
             .await;
-            actor_kinds.insert(
-                hyper_ref.id(),
-                ChildActorKind::Exchange(Exchange::Hyperliquid),
-            );
             exchange_actors.insert(Exchange::Hyperliquid, Box::new(hyper_ref));
             tracing::info!(exchange = "Hyperliquid", "ExchangeActor created");
         }
@@ -368,8 +328,7 @@ impl Actor for ManagerActor {
             _signal_processor: signal_processor,
             _clock_actor: clock_actor,
             exchange_actors,
-            executors: Vec::new(),
-            actor_kinds,
+            _executors: Vec::new(),
         })
     }
 
@@ -388,46 +347,7 @@ impl Actor for ManagerActor {
         id: ActorId,
         reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        let kind = self.actor_kinds.remove(&id);
-
-        match kind {
-            Some(ChildActorKind::Exchange(exchange)) => {
-                tracing::error!(
-                    %exchange,
-                    reason = ?reason,
-                    "ExchangeActor died, shutting down"
-                );
-                self.exchange_actors.remove(&exchange);
-            }
-            Some(ChildActorKind::Executor(idx)) => {
-                tracing::error!(
-                    executor_idx = idx,
-                    reason = ?reason,
-                    "ExecutorActor died, shutting down"
-                );
-            }
-            Some(ChildActorKind::SignalProcessor) => {
-                tracing::error!(reason = ?reason, "SignalProcessorActor died, shutting down");
-            }
-            Some(ChildActorKind::Processor) => {
-                tracing::error!(reason = ?reason, "ProcessorActor died, shutting down");
-            }
-            Some(ChildActorKind::Clock) => {
-                tracing::error!(reason = ?reason, "ClockActor died, shutting down");
-            }
-            Some(ChildActorKind::IncomePubSub) => {
-                tracing::error!(reason = ?reason, "IncomePubSub died, shutting down");
-            }
-            Some(ChildActorKind::OutcomePubSub) => {
-                tracing::error!(reason = ?reason, "OutcomePubSub died, shutting down");
-            }
-            None => {
-                tracing::warn!(actor_id = ?id, reason = ?reason, "Unknown linked actor died");
-                return Ok(ControlFlow::Continue(()));
-            }
-        }
-
-        // 任何已知子 actor 死亡都级联退出
+        tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
         Ok(ControlFlow::Break(ActorStopReason::LinkDied {
             id,
             reason: Box::new(reason),
