@@ -10,7 +10,14 @@ use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message};
 use kameo::Actor;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// Slack API 响应
+#[derive(Deserialize)]
+struct SlackResponse {
+    ok: bool,
+    error: Option<String>,
+}
 
 /// SlackNotifierActor 初始化参数
 pub struct SlackNotifierArgs {
@@ -55,12 +62,27 @@ impl SlackNotifierActor {
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                tracing::debug!(channel = %self.channel, "Slack message sent successfully");
+                // 检查 Slack API 响应中的 ok 字段
+                match resp.json::<SlackResponse>().await {
+                    Ok(slack_resp) if slack_resp.ok => {
+                        tracing::debug!(channel = %self.channel, "Slack message sent successfully");
+                    }
+                    Ok(slack_resp) => {
+                        tracing::warn!(
+                            error = ?slack_resp.error,
+                            channel = %self.channel,
+                            "Slack API returned error"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to parse Slack response");
+                    }
+                }
             }
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
-                tracing::warn!(status = %status, body = %body, "Slack API returned non-success status");
+                tracing::warn!(status = %status, body = %body, "Slack API returned non-success HTTP status");
             }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to send Slack message");

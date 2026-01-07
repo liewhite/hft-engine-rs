@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
             .tell(SubscribeIncome(metrics_subscriber))
             .send()
             .await
-            .ok();
+            .expect("Failed to subscribe MetricsSubscriberActor to income events");
         tracing::info!("MetricsSubscriberActor created and subscribed");
 
         // 创建 SlackNotifierActor
@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
             .tell(SubscribeIncome(slack_notifier))
             .send()
             .await
-            .ok();
+            .expect("Failed to subscribe SlackNotifierActor to income events");
         tracing::info!("SlackNotifierActor created and subscribed");
     }
 

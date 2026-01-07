@@ -163,7 +163,7 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
             ExchangeEventData::Equity { exchange, equity } => {
                 let exchange_label = exchange_to_label(*exchange);
                 self.equity_gauge
-                    .with_label_values(&[&exchange_label])
+                    .with_label_values(&[exchange_label])
                     .set(*equity);
                 tracing::debug!(exchange = %exchange_label, equity = %equity, "Updated equity gauge");
             }
@@ -171,7 +171,7 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
                 let exchange_label = exchange_to_label(position.exchange);
                 let symbol_label = position.symbol.canonical();
                 self.position_gauge
-                    .with_label_values(&[&exchange_label, &symbol_label])
+                    .with_label_values(&[exchange_label, symbol_label.as_str()])
                     .set(position.size);
                 tracing::debug!(
                     exchange = %exchange_label,
@@ -199,10 +199,10 @@ impl Message<PushMetrics> for MetricsSubscriberActor {
 }
 
 /// 将 Exchange 枚举转换为标签字符串
-fn exchange_to_label(exchange: Exchange) -> String {
+fn exchange_to_label(exchange: Exchange) -> &'static str {
     match exchange {
-        Exchange::Binance => "binance".to_string(),
-        Exchange::OKX => "okx".to_string(),
-        Exchange::Hyperliquid => "hyperliquid".to_string(),
+        Exchange::Binance => "binance",
+        Exchange::OKX => "okx",
+        Exchange::Hyperliquid => "hyperliquid",
     }
 }
