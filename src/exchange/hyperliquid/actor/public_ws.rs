@@ -246,13 +246,29 @@ fn parse_public_message(
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
+    // 检查是否有错误
+    if let Some(error) = value.get("error") {
+        return Err(WsError::ParseError(format!(
+            "Hyperliquid error: {}",
+            error
+        )));
+    }
+
     // 检查是否是订阅确认
     if value.get("channel").is_some() {
         let channel = value["channel"].as_str().unwrap_or("");
 
         match channel {
             "subscriptionResponse" => {
-                // 订阅响应，忽略
+                // 订阅响应，检查是否有错误
+                if let Some(data) = value.get("data") {
+                    if let Some(err) = data.get("error") {
+                        return Err(WsError::ParseError(format!(
+                            "Hyperliquid subscription error: {}",
+                            err
+                        )));
+                    }
+                }
                 return Ok(Vec::new());
             }
             "activeAssetCtx" => {
