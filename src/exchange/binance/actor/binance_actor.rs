@@ -29,14 +29,6 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-/// 子 Actor 类型
-#[derive(Debug, Clone, Copy)]
-enum ChildKind {
-    PublicWs,
-    PrivateWs,
-    EquityPolling,
-}
-
 /// BinanceActor 初始化参数
 pub struct BinanceActorArgs {
     /// 凭证（可选）
@@ -55,13 +47,6 @@ pub struct BinanceActorArgs {
 pub struct BinanceActor {
     /// Public WebSocket Actor
     public_ws: ActorRef<BinancePublicWsActor>,
-    /// Private WebSocket Actor (可选，需要凭证)
-    _private_ws: Option<ActorRef<BinancePrivateWsActor>>,
-    /// Equity Polling Actor
-    _equity_polling: ActorRef<BinanceEquityPollingActor>,
-
-    /// 子 Actor ID -> Kind 映射
-    child_actors: HashMap<ActorId, ChildKind>,
 }
 
 impl Actor for BinanceActor {
@@ -69,8 +54,6 @@ impl Actor for BinanceActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let mut child_actors = HashMap::new();
-
         // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
         let public_ws = BinancePublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
@@ -81,12 +64,11 @@ impl Actor for BinanceActor {
             mailbox::unbounded(),
         )
         .await;
-        child_actors.insert(public_ws.id(), ChildKind::PublicWs);
         tracing::info!(exchange = "Binance", "PublicWsActor created");
 
         // 2. 创建 PrivateWsActor (如果有凭证)
-        let private_ws = if let Some(credentials) = args.credentials {
-            let private_ws = BinancePrivateWsActor::spawn_link_with_mailbox(
+        let has_private_ws = if let Some(credentials) = args.credentials {
+            BinancePrivateWsActor::spawn_link_with_mailbox(
                 &actor_ref,
                 BinancePrivateWsActorArgs {
                     credentials,
@@ -97,15 +79,14 @@ impl Actor for BinanceActor {
                 mailbox::unbounded(),
             )
             .await;
-            child_actors.insert(private_ws.id(), ChildKind::PrivateWs);
             tracing::info!(exchange = "Binance", "PrivateWsActor created");
-            Some(private_ws)
+            true
         } else {
-            None
+            false
         };
 
         // 3. 创建 EquityPollingActor
-        let equity_polling = BinanceEquityPollingActor::spawn_link_with_mailbox(
+        BinanceEquityPollingActor::spawn_link_with_mailbox(
             &actor_ref,
             BinanceEquityPollingActorArgs {
                 client: args.client,
@@ -115,21 +96,15 @@ impl Actor for BinanceActor {
             mailbox::unbounded(),
         )
         .await;
-        child_actors.insert(equity_polling.id(), ChildKind::EquityPolling);
         tracing::info!(exchange = "Binance", "EquityPollingActor created");
 
         tracing::info!(
             exchange = "Binance",
-            has_private_ws = private_ws.is_some(),
+            has_private_ws,
             "BinanceActor started"
         );
 
-        Ok(Self {
-            public_ws,
-            _private_ws: private_ws,
-            _equity_polling: equity_polling,
-            child_actors,
-        })
+        Ok(Self { public_ws })
     }
 
     async fn on_stop(
@@ -147,25 +122,7 @@ impl Actor for BinanceActor {
         id: ActorId,
         reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        let kind = self.child_actors.remove(&id);
-
-        match kind {
-            Some(ChildKind::PublicWs) => {
-                tracing::error!(reason = ?reason, "BinancePublicWsActor died, shutting down");
-            }
-            Some(ChildKind::PrivateWs) => {
-                tracing::error!(reason = ?reason, "BinancePrivateWsActor died, shutting down");
-            }
-            Some(ChildKind::EquityPolling) => {
-                tracing::error!(reason = ?reason, "BinanceEquityPollingActor died, shutting down");
-            }
-            None => {
-                tracing::warn!(actor_id = ?id, reason = ?reason, "Unknown linked actor died");
-                return Ok(ControlFlow::Continue(()));
-            }
-        }
-
-        // 任何子 actor 死亡都级联退出
+        tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
         Ok(ControlFlow::Break(ActorStopReason::LinkDied {
             id,
             reason: Box::new(reason),

@@ -25,13 +25,6 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-/// 子 Actor 类型
-#[derive(Debug, Clone, Copy)]
-enum ChildKind {
-    PublicWs,
-    PrivateWs,
-}
-
 /// OkxActor 初始化参数
 pub struct OkxActorArgs {
     /// 凭证（可选）
@@ -46,11 +39,6 @@ pub struct OkxActorArgs {
 pub struct OkxActor {
     /// Public WebSocket Actor
     public_ws: ActorRef<OkxPublicWsActor>,
-    /// Private WebSocket Actor (可选，需要凭证)
-    _private_ws: Option<ActorRef<OkxPrivateWsActor>>,
-
-    /// 子 Actor ID -> Kind 映射
-    child_actors: HashMap<ActorId, ChildKind>,
 }
 
 impl Actor for OkxActor {
@@ -58,8 +46,6 @@ impl Actor for OkxActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let mut child_actors = HashMap::new();
-
         // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
         let public_ws = OkxPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
@@ -70,12 +56,11 @@ impl Actor for OkxActor {
             mailbox::unbounded(),
         )
         .await;
-        child_actors.insert(public_ws.id(), ChildKind::PublicWs);
         tracing::info!(exchange = "OKX", "PublicWsActor created");
 
         // 2. 创建 PrivateWsActor (如果有凭证)
-        let private_ws = if let Some(credentials) = args.credentials {
-            let private_ws = OkxPrivateWsActor::spawn_link_with_mailbox(
+        let has_private_ws = if let Some(credentials) = args.credentials {
+            OkxPrivateWsActor::spawn_link_with_mailbox(
                 &actor_ref,
                 OkxPrivateWsActorArgs {
                     credentials,
@@ -85,24 +70,19 @@ impl Actor for OkxActor {
                 mailbox::unbounded(),
             )
             .await;
-            child_actors.insert(private_ws.id(), ChildKind::PrivateWs);
             tracing::info!(exchange = "OKX", "PrivateWsActor created");
-            Some(private_ws)
+            true
         } else {
-            None
+            false
         };
 
         tracing::info!(
             exchange = "OKX",
-            has_private_ws = private_ws.is_some(),
+            has_private_ws,
             "OkxActor started"
         );
 
-        Ok(Self {
-            public_ws,
-            _private_ws: private_ws,
-            child_actors,
-        })
+        Ok(Self { public_ws })
     }
 
     async fn on_stop(
@@ -120,22 +100,7 @@ impl Actor for OkxActor {
         id: ActorId,
         reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        let kind = self.child_actors.remove(&id);
-
-        match kind {
-            Some(ChildKind::PublicWs) => {
-                tracing::error!(reason = ?reason, "OkxPublicWsActor died, shutting down");
-            }
-            Some(ChildKind::PrivateWs) => {
-                tracing::error!(reason = ?reason, "OkxPrivateWsActor died, shutting down");
-            }
-            None => {
-                tracing::warn!(actor_id = ?id, reason = ?reason, "Unknown linked actor died");
-                return Ok(ControlFlow::Continue(()));
-            }
-        }
-
-        // 任何子 actor 死亡都级联退出
+        tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
         Ok(ControlFlow::Break(ActorStopReason::LinkDied {
             id,
             reason: Box::new(reason),
