@@ -214,7 +214,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPubl
             StreamMessage::Next(Ok(data)) => {
                 // 解析并发布到 IncomePubSub，失败则 kill actor
                 if let Err(e) = self.handle_message(&data).await {
-                    tracing::error!(error = %e, "Critical parse error, killing actor");
+                    tracing::error!(exchange = "Hyperliquid", error = %e, raw = %data, "Public WS parse error, killing actor");
                     ctx.actor_ref().kill();
                 }
             }
