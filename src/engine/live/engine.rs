@@ -22,7 +22,7 @@ use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
 use crate::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
@@ -165,7 +165,7 @@ impl ManagerActor {
                 actor
                     .subscribe(kind)
                     .await
-                    .expect("Failed to subscribe to ExchangeActor");
+                    .map_err(ExchangeError::Other)?;
             }
         }
 
@@ -180,33 +180,29 @@ impl ManagerActor {
 
 impl Actor for ManagerActor {
     type Args = ManagerActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 1. 创建 Exchange Clients
         let mut clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
 
         if let Some(ref cred) = args.binance_credentials {
-            let client =
-                BinanceClient::new(Some(cred.clone())).expect("Failed to create BinanceClient");
+            let client = BinanceClient::new(Some(cred.clone()))?;
             clients.insert(Exchange::Binance, Arc::new(client));
         }
 
         if let Some(ref cred) = args.okx_credentials {
-            let client = OkxClient::new(Some(cred.clone())).expect("Failed to create OkxClient");
+            let client = OkxClient::new(Some(cred.clone()))?;
             clients.insert(Exchange::OKX, Arc::new(client));
         }
 
         if let Some(ref cred) = args.hyperliquid_credentials {
-            let client = HyperliquidClient::new(Some(cred.clone()))
-                .expect("Failed to create HyperliquidClient");
+            let client = HyperliquidClient::new(Some(cred.clone()))?;
             clients.insert(Exchange::Hyperliquid, Arc::new(client));
         }
 
         // 2. 预加载所有交易所的 symbol metas
-        let symbol_metas = Self::preload_all_symbol_metas(&clients)
-            .await
-            .expect("Failed to preload symbol metas");
+        let symbol_metas = Self::preload_all_symbol_metas(&clients).await?;
 
         // 3. 创建 PubSub Actors (使用 spawn_link_with_mailbox)
         let income_pubsub = IncomePubSub::spawn_link_with_mailbox(
@@ -229,10 +225,11 @@ impl Actor for ManagerActor {
             mailbox::unbounded(),
         )
         .await;
-        let _ = income_pubsub
+        income_pubsub
             .tell(Subscribe(processor.clone()))
             .send()
-            .await;
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 5. 创建 SignalProcessorActor 并订阅 outcome_pubsub
         let signal_processor = OutcomeProcessorActor::spawn_link_with_mailbox(
@@ -244,10 +241,11 @@ impl Actor for ManagerActor {
             mailbox::unbounded(),
         )
         .await;
-        let _ = outcome_pubsub
+        outcome_pubsub
             .tell(Subscribe(signal_processor.clone()))
             .send()
-            .await;
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 6. 创建 ClockActor（发布 Clock 事件到 income_pubsub）
         let clock_actor = ClockActor::spawn_link_with_mailbox(
@@ -268,7 +266,7 @@ impl Actor for ManagerActor {
                 Self::get_symbol_metas_for(&symbol_metas, Exchange::Binance);
             let client = clients
                 .get(&Exchange::Binance)
-                .expect("Binance client not found")
+                .ok_or_else(|| ExchangeError::Other("Binance client not found".to_string()))?
                 .clone();
             let binance_ref = BinanceActor::spawn_link_with_mailbox(
                 &actor_ref,
