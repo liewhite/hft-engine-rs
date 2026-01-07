@@ -5,7 +5,7 @@
 //! - 处理 Subscribe/Unsubscribe 请求
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Symbol, SymbolMeta, Timestamp};
 use crate::engine::IncomePubSub;
 use crate::exchange::binance::codec::{BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
@@ -21,8 +21,12 @@ use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+
+/// Binance WebSocket 订阅速率限制：每秒最多 10 条消息
+const SUBSCRIBE_INTERVAL_MS: u64 = 110; // 略大于 100ms 以确保安全
 
 /// Public WebSocket URL
 const WS_PUBLIC_URL: &str = "wss://fstream.binance.com/ws";
@@ -48,11 +52,22 @@ pub struct BinancePublicWsActor {
     subscribed_streams: HashSet<String>,
     /// 已订阅的 kinds (用于事件分发和取消订阅)
     subscribed_kinds: HashSet<SubscriptionKind>,
+    /// 上次发送订阅消息的时间戳 (用于速率限制)
+    last_subscribe_time: Timestamp,
 }
 
 impl BinancePublicWsActor {
-    /// 发送订阅消息
-    async fn send_subscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
+    /// 发送订阅消息 (带速率限制)
+    async fn send_subscribe(&mut self, kind: &SubscriptionKind) -> Result<(), WsError> {
+        // 速率限制：确保距离上次订阅至少 SUBSCRIBE_INTERVAL_MS 毫秒
+        let now = now_ms();
+        let elapsed = now.saturating_sub(self.last_subscribe_time);
+        if elapsed < SUBSCRIBE_INTERVAL_MS {
+            let delay = SUBSCRIBE_INTERVAL_MS - elapsed;
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        self.last_subscribe_time = now_ms();
+
         let stream = kind_to_stream(kind);
         let msg = json!({
             "method": "SUBSCRIBE",
@@ -127,6 +142,7 @@ impl Actor for BinancePublicWsActor {
             ws_tx: Some(outgoing_tx),
             subscribed_streams: HashSet::new(),
             subscribed_kinds: HashSet::new(),
+            last_subscribe_time: 0,
         })
     }
 
