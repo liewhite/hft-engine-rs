@@ -281,6 +281,10 @@ fn parse_private_message(
                 data: ExchangeEventData::OrderUpdate(order_update),
             }])
         }
+        "TRADE_LITE" => {
+            // 忽略 TRADE_LITE 消息（轻量成交通知，已在 ORDER_TRADE_UPDATE 中处理）
+            Ok(Vec::new())
+        }
         _ => {
             // 未知事件类型，记录警告但不报错
             tracing::warn!(event_type, raw, "Unknown Binance private event type");
