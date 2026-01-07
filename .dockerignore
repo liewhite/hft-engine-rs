@@ -1,0 +1,11 @@
+target/
+.git/
+.gitignore
+.claude/
+docs/
+tests/
+*.md
+*.py
+config.json
+config.toml
+*.example.toml
