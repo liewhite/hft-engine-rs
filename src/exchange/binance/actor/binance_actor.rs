@@ -59,8 +59,17 @@ impl Actor for BinanceActor {
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 0. 查询初始持仓并推送到 IncomePubSub
         if let Some(ref credentials) = args.credentials {
-            if let Ok(client) = BinanceClient::new(Some(credentials.clone())) {
-                if let Ok(positions) = client.fetch_positions().await {
+            let client = BinanceClient::new(Some(credentials.clone()))
+                .expect("Failed to create BinanceClient");
+
+            match client.fetch_positions().await {
+                Ok(positions) => {
+                    tracing::info!(
+                        exchange = "Binance",
+                        count = positions.len(),
+                        "Fetched initial positions"
+                    );
+
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -80,6 +89,9 @@ impl Actor for BinanceActor {
                         };
                         let _ = args.income_pubsub.tell(Publish(event)).send().await;
                     }
+                }
+                Err(e) => {
+                    tracing::error!(exchange = "Binance", error = %e, "Failed to fetch initial positions");
                 }
             }
         }

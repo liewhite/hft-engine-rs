@@ -353,25 +353,8 @@ impl FundingArbStrategy {
         let short_pos_ratio_after = short_pos_value_after / short_equity;
         let long_pos_ratio_after = long_pos_value_after / long_equity;
 
-        // 详细日志：显示仓位检查的所有数值
-        tracing::info!(
-            symbol = %self.symbol,
-            short_exchange = %short_exchange,
-            short_pos = short_pos,
-            short_equity = short_equity,
-            short_pos_ratio_after = format!("{:.4}", short_pos_ratio_after),
-            long_exchange = %long_exchange,
-            long_pos = long_pos,
-            long_equity = long_equity,
-            long_pos_ratio_after = format!("{:.4}", long_pos_ratio_after),
-            mid_price = mid_price,
-            expected_open_qty = expected_open_qty,
-            max_position_ratio = self.config.max_position_ratio,
-            "Position ratio check"
-        );
-
         if short_pos_ratio_after >= self.config.max_position_ratio || long_pos_ratio_after >= self.config.max_position_ratio {
-            tracing::warn!(
+            tracing::debug!(
                 symbol = %self.symbol,
                 short_exchange = %short_exchange,
                 short_pos_ratio_after = format!("{:.4}", short_pos_ratio_after),
@@ -799,12 +782,6 @@ impl FundingArbStrategy {
     /// 基于平仓信号，以较小持仓为准生成订单
     fn make_close_orders(&self, signal: &CloseSignal) -> Vec<Order> {
         if signal.long_price <= 0.0 || signal.short_price <= 0.0 {
-            tracing::warn!(
-                symbol = %self.symbol,
-                long_price = signal.long_price,
-                short_price = signal.short_price,
-                "Close orders skipped: invalid price"
-            );
             return vec![];
         }
 
@@ -813,13 +790,6 @@ impl FundingArbStrategy {
         let close_qty = signal.long_size.min(signal.short_size.abs());
 
         if close_qty < 1e-10 {
-            tracing::warn!(
-                symbol = %self.symbol,
-                long_size = signal.long_size,
-                short_size = signal.short_size,
-                close_qty = close_qty,
-                "Close orders skipped: close_qty too small"
-            );
             return vec![];
         }
 
@@ -833,14 +803,6 @@ impl FundingArbStrategy {
         let long_notional = close_qty * close_long_price;
         let short_notional = close_qty * close_short_price;
         if long_notional < self.config.min_notional || short_notional < self.config.min_notional {
-            tracing::warn!(
-                symbol = %self.symbol,
-                close_qty = close_qty,
-                long_notional = long_notional,
-                short_notional = short_notional,
-                min_notional = self.config.min_notional,
-                "Close orders below min_notional, skipping"
-            );
             return vec![];
         }
 
