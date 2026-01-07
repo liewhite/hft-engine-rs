@@ -64,20 +64,10 @@ pub struct ManagerActorArgs {
 
 /// ManagerActor - 顶层管理 Actor
 pub struct ManagerActor {
-    // === Exchange Clients ===
-    clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
-
-    // === Credentials ===
-    binance_credentials: Option<BinanceCredentials>,
-    okx_credentials: Option<OkxCredentials>,
-    hyperliquid_credentials: Option<HyperliquidCredentials>,
-
     // === Symbol Metas 缓存 ===
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
 
     // === PubSub Actors ===
-    /// Income PubSub (行情/账户事件)
-    income_pubsub: ActorRef<IncomePubSub>,
     /// Outcome PubSub (策略信号)
     outcome_pubsub: ActorRef<OutcomePubSub>,
 
@@ -88,7 +78,7 @@ pub struct ManagerActor {
     _signal_processor: ActorRef<OutcomeProcessorActor>,
     /// ClockActor - 保持引用以维持生命周期
     _clock_actor: ActorRef<ClockActor>,
-    /// ExchangeActors (惰性创建，类型擦除)
+    /// ExchangeActors (启动时创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
     /// ExecutorActors (add_strategy 时创建)
     executors: Vec<ActorRef<ExecutorActor>>,
@@ -133,98 +123,18 @@ impl ManagerActor {
         Ok(())
     }
 
-    /// 提取指定交易所的 symbol metas
-    fn get_symbol_metas_for(&self, exchange: Exchange) -> Arc<HashMap<Symbol, SymbolMeta>> {
+    /// 提取指定交易所的 symbol metas（静态方法）
+    fn get_symbol_metas_for(
+        symbol_metas: &HashMap<(Exchange, Symbol), SymbolMeta>,
+        exchange: Exchange,
+    ) -> Arc<HashMap<Symbol, SymbolMeta>> {
         Arc::new(
-            self.symbol_metas
+            symbol_metas
                 .iter()
                 .filter(|((e, _), _)| *e == exchange)
                 .map(|((_, s), m)| (s.clone(), m.clone()))
                 .collect(),
         )
-    }
-
-    /// 惰性创建 ExchangeActor（如不存在则 spawn_link）
-    async fn ensure_exchange_actor(
-        &mut self,
-        exchange: Exchange,
-        actor_ref: &ActorRef<Self>,
-    ) -> Result<(), ExchangeError> {
-        if self.exchange_actors.contains_key(&exchange) {
-            return Ok(());
-        }
-
-        let income_pubsub = self.income_pubsub.clone();
-        let symbol_metas = self.get_symbol_metas_for(exchange);
-
-        // 根据交易所类型创建对应的 Actor (使用 spawn_link_with_mailbox)
-        let (actor_id, boxed_actor): (ActorId, Box<dyn ExchangeActorOps>) = match exchange {
-            Exchange::Binance => {
-                let credentials = self
-                    .binance_credentials
-                    .clone()
-                    .expect("Binance credentials not configured");
-                let client = self
-                    .clients
-                    .get(&Exchange::Binance)
-                    .expect("Binance client not configured")
-                    .clone();
-                let binance_ref = BinanceActor::spawn_link_with_mailbox(
-                    actor_ref,
-                    BinanceActorArgs {
-                        credentials: Some(credentials),
-                        symbol_metas: symbol_metas.clone(),
-                        rest_base_url: REST_BASE_URL.to_string(),
-                        income_pubsub: income_pubsub.clone(),
-                        client,
-                    },
-                    mailbox::unbounded(),
-                )
-                .await;
-                (binance_ref.id(), Box::new(binance_ref))
-            }
-            Exchange::OKX => {
-                let credentials = self
-                    .okx_credentials
-                    .clone()
-                    .expect("OKX credentials not configured");
-                let okx_ref = OkxActor::spawn_link_with_mailbox(
-                    actor_ref,
-                    OkxActorArgs {
-                        credentials: Some(credentials),
-                        symbol_metas: symbol_metas.clone(),
-                        income_pubsub: income_pubsub.clone(),
-                    },
-                    mailbox::unbounded(),
-                )
-                .await;
-                (okx_ref.id(), Box::new(okx_ref))
-            }
-            Exchange::Hyperliquid => {
-                let credentials = self
-                    .hyperliquid_credentials
-                    .clone()
-                    .expect("Hyperliquid credentials not configured");
-                let hyper_ref = HyperliquidActor::spawn_link_with_mailbox(
-                    actor_ref,
-                    HyperliquidActorArgs {
-                        credentials: Some(credentials),
-                        symbol_metas: symbol_metas.clone(),
-                        income_pubsub: income_pubsub.clone(),
-                    },
-                    mailbox::unbounded(),
-                )
-                .await;
-                (hyper_ref.id(), Box::new(hyper_ref))
-            }
-        };
-
-        self.actor_kinds
-            .insert(actor_id, ChildActorKind::Exchange(exchange));
-        self.exchange_actors.insert(exchange, boxed_actor);
-
-        tracing::info!(%exchange, "ExchangeActor created (lazy)");
-        Ok(())
     }
 
     /// 添加策略的内部实现
@@ -242,18 +152,13 @@ impl ManagerActor {
         // 2. 获取策略需要的 public streams
         let public_streams = strategy.public_streams();
 
-        // 3. 惰性创建所需的 ExchangeActors
-        for exchange in public_streams.keys() {
-            self.ensure_exchange_actor(*exchange, &actor_ref).await?;
-        }
-
-        // 4. 收集策略需要的订阅
+        // 3. 收集策略需要的订阅
         let subscriptions: HashSet<(Exchange, SubscriptionKind)> = public_streams
             .iter()
             .flat_map(|(exchange, kinds)| kinds.iter().map(move |kind| (*exchange, kind.clone())))
             .collect();
 
-        // 5. 创建 ExecutorActor (使用 spawn_link_with_mailbox)
+        // 4. 创建 ExecutorActor (使用 spawn_link_with_mailbox)
         let executor_idx = self.executors.len();
         let executor_ref = ExecutorActor::spawn_link_with_mailbox(
             &actor_ref,
@@ -269,7 +174,7 @@ impl ManagerActor {
         self.actor_kinds
             .insert(executor_ref.id(), ChildActorKind::Executor(executor_idx));
 
-        // 6. 向 ProcessorActor 注册 Executor 的订阅
+        // 5. 向 ProcessorActor 注册 Executor 的订阅
         let _ = processor
             .tell(RegisterExecutor {
                 executor: executor_ref.clone(),
@@ -280,7 +185,7 @@ impl ManagerActor {
 
         self.executors.push(executor_ref);
 
-        // 7. 向 ExchangeActors 发送订阅请求
+        // 6. 向 ExchangeActors 发送订阅请求
         for (exchange, kind) in subscriptions {
             if let Some(actor) = self.exchange_actors.get(&exchange) {
                 actor
@@ -389,20 +294,80 @@ impl Actor for ManagerActor {
         actor_kinds.insert(signal_processor.id(), ChildActorKind::SignalProcessor);
         actor_kinds.insert(clock_actor.id(), ChildActorKind::Clock);
 
+        // 8. 创建所有配置了凭证的 ExchangeActors
+        let mut exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>> = HashMap::new();
+
+        if let Some(ref credentials) = args.binance_credentials {
+            let symbol_metas_for_exchange =
+                Self::get_symbol_metas_for(&symbol_metas, Exchange::Binance);
+            let client = clients
+                .get(&Exchange::Binance)
+                .expect("Binance client not found")
+                .clone();
+            let binance_ref = BinanceActor::spawn_link_with_mailbox(
+                &actor_ref,
+                BinanceActorArgs {
+                    credentials: Some(credentials.clone()),
+                    symbol_metas: symbol_metas_for_exchange,
+                    rest_base_url: REST_BASE_URL.to_string(),
+                    income_pubsub: income_pubsub.clone(),
+                    client,
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+            actor_kinds.insert(binance_ref.id(), ChildActorKind::Exchange(Exchange::Binance));
+            exchange_actors.insert(Exchange::Binance, Box::new(binance_ref));
+            tracing::info!(exchange = "Binance", "ExchangeActor created");
+        }
+
+        if let Some(ref credentials) = args.okx_credentials {
+            let symbol_metas_for_exchange = Self::get_symbol_metas_for(&symbol_metas, Exchange::OKX);
+            let okx_ref = OkxActor::spawn_link_with_mailbox(
+                &actor_ref,
+                OkxActorArgs {
+                    credentials: Some(credentials.clone()),
+                    symbol_metas: symbol_metas_for_exchange,
+                    income_pubsub: income_pubsub.clone(),
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+            actor_kinds.insert(okx_ref.id(), ChildActorKind::Exchange(Exchange::OKX));
+            exchange_actors.insert(Exchange::OKX, Box::new(okx_ref));
+            tracing::info!(exchange = "OKX", "ExchangeActor created");
+        }
+
+        if let Some(ref credentials) = args.hyperliquid_credentials {
+            let symbol_metas_for_exchange =
+                Self::get_symbol_metas_for(&symbol_metas, Exchange::Hyperliquid);
+            let hyper_ref = HyperliquidActor::spawn_link_with_mailbox(
+                &actor_ref,
+                HyperliquidActorArgs {
+                    credentials: Some(credentials.clone()),
+                    symbol_metas: symbol_metas_for_exchange,
+                    income_pubsub: income_pubsub.clone(),
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+            actor_kinds.insert(
+                hyper_ref.id(),
+                ChildActorKind::Exchange(Exchange::Hyperliquid),
+            );
+            exchange_actors.insert(Exchange::Hyperliquid, Box::new(hyper_ref));
+            tracing::info!(exchange = "Hyperliquid", "ExchangeActor created");
+        }
+
         tracing::info!("ManagerActor started with all child actors linked");
 
         Ok(Self {
-            clients,
-            binance_credentials: args.binance_credentials,
-            okx_credentials: args.okx_credentials,
-            hyperliquid_credentials: args.hyperliquid_credentials,
             symbol_metas,
-            income_pubsub,
             outcome_pubsub,
             processor,
             _signal_processor: signal_processor,
             _clock_actor: clock_actor,
-            exchange_actors: HashMap::new(),
+            exchange_actors,
             executors: Vec::new(),
             actor_kinds,
         })
