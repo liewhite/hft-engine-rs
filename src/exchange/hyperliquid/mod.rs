@@ -1,13 +1,11 @@
 pub(crate) mod actor;
 pub(crate) mod codec;
 mod client;
-mod module;
 pub(crate) mod signing;
 mod symbol;
 
 pub use actor::{HyperliquidActor, HyperliquidActorArgs};
 pub use client::HyperliquidClient;
-pub use module::HyperliquidModule;
 pub use symbol::{from_hyperliquid, to_hyperliquid};
 
 /// Hyperliquid REST API 地址

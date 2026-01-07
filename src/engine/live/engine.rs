@@ -13,13 +13,13 @@ use super::{
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{
-    BinanceActor, BinanceActorArgs, BinanceCredentials, BinanceModule, REST_BASE_URL,
+    BinanceActor, BinanceActorArgs, BinanceClient, BinanceCredentials, REST_BASE_URL,
 };
 use crate::exchange::hyperliquid::{
-    HyperliquidActor, HyperliquidActorArgs, HyperliquidCredentials, HyperliquidModule,
+    HyperliquidActor, HyperliquidActorArgs, HyperliquidClient, HyperliquidCredentials,
 };
-use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxCredentials, OkxModule};
-use crate::exchange::{ExchangeActorOps, ExchangeClient, ExchangeModule, SubscriptionKind};
+use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
+use crate::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorId, ActorRef, PreparedActor, Spawn, WeakActorRef};
 use std::ops::ControlFlow;
@@ -64,8 +64,8 @@ pub struct ManagerActorArgs {
 
 /// ManagerActor - 顶层管理 Actor
 pub struct ManagerActor {
-    // === Exchange Modules ===
-    modules: HashMap<Exchange, Arc<dyn ExchangeModule>>,
+    // === Exchange Clients ===
+    clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
 
     // === Credentials ===
     binance_credentials: Option<BinanceCredentials>,
@@ -101,33 +101,33 @@ impl ManagerActor {
     /// 创建并启动 ManagerActor，返回 ActorRef
     ///
     /// 在返回之前完成所有初始化工作：
-    /// - 创建 Exchange Modules
+    /// - 创建 Exchange Clients
     /// - 预加载所有交易所的 symbol metas
     /// - 创建 PubSub Actors
     /// - 创建并 link 所有子 Actors
     pub async fn new(args: ManagerActorArgs) -> ActorRef<Self> {
-        // 1. 创建 Exchange Modules
-        let mut modules: HashMap<Exchange, Arc<dyn ExchangeModule>> = HashMap::new();
+        // 1. 创建 Exchange Clients
+        let mut clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
 
         if let Some(ref cred) = args.binance_credentials {
-            let module =
-                BinanceModule::new(Some(cred.clone())).expect("Failed to create BinanceModule");
-            modules.insert(Exchange::Binance, Arc::new(module));
+            let client =
+                BinanceClient::new(Some(cred.clone())).expect("Failed to create BinanceClient");
+            clients.insert(Exchange::Binance, Arc::new(client));
         }
 
         if let Some(ref cred) = args.okx_credentials {
-            let module = OkxModule::new(Some(cred.clone())).expect("Failed to create OkxModule");
-            modules.insert(Exchange::OKX, Arc::new(module));
+            let client = OkxClient::new(Some(cred.clone())).expect("Failed to create OkxClient");
+            clients.insert(Exchange::OKX, Arc::new(client));
         }
 
         if let Some(ref cred) = args.hyperliquid_credentials {
-            let module = HyperliquidModule::new(Some(cred.clone()))
-                .expect("Failed to create HyperliquidModule");
-            modules.insert(Exchange::Hyperliquid, Arc::new(module));
+            let client = HyperliquidClient::new(Some(cred.clone()))
+                .expect("Failed to create HyperliquidClient");
+            clients.insert(Exchange::Hyperliquid, Arc::new(client));
         }
 
         // 2. 预加载所有交易所的 symbol metas
-        let symbol_metas = Self::preload_all_symbol_metas(&modules)
+        let symbol_metas = Self::preload_all_symbol_metas(&clients)
             .await
             .expect("Failed to preload symbol metas");
 
@@ -151,16 +151,10 @@ impl ManagerActor {
             .send()
             .await;
 
-        // 5. 获取 configured_clients (用于 SignalProcessorActor)
-        let configured_clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = modules
-            .iter()
-            .map(|(e, m)| (*e, m.client()))
-            .collect();
-
-        // 6. 创建 SignalProcessorActor 并订阅 outcome_pubsub
+        // 5. 创建 SignalProcessorActor 并订阅 outcome_pubsub
         let signal_processor = OutcomeProcessorActor::spawn_with_mailbox(
             SignalProcessorArgs {
-                clients: configured_clients,
+                clients: clients.clone(),
                 income_pubsub: income_pubsub.clone(),
             },
             mailbox::unbounded(),
@@ -187,9 +181,9 @@ impl ManagerActor {
         actor_kinds.insert(signal_processor.id(), ChildActorKind::SignalProcessor);
         actor_kinds.insert(clock_actor.id(), ChildActorKind::Clock);
 
-        // 9. 构建 ManagerActor state
+        // 8. 构建 ManagerActor state
         let state = Self {
-            modules,
+            clients,
             binance_credentials: args.binance_credentials,
             okx_credentials: args.okx_credentials,
             hyperliquid_credentials: args.hyperliquid_credentials,
@@ -224,12 +218,11 @@ impl ManagerActor {
 
     /// 预加载所有交易所的 symbol metas（静态方法）
     async fn preload_all_symbol_metas(
-        modules: &HashMap<Exchange, Arc<dyn ExchangeModule>>,
+        clients: &HashMap<Exchange, Arc<dyn ExchangeClient>>,
     ) -> Result<HashMap<(Exchange, Symbol), SymbolMeta>, ExchangeError> {
         let mut symbol_metas = HashMap::new();
 
-        for (exchange, module) in modules {
-            let client = module.client();
+        for (exchange, client) in clients {
             let metas = client.fetch_all_symbol_metas().await?;
             let count = metas.len();
             for meta in metas {
@@ -290,10 +283,10 @@ impl ManagerActor {
                     .clone()
                     .expect("Binance credentials not configured");
                 let client = self
-                    .modules
+                    .clients
                     .get(&Exchange::Binance)
-                    .expect("Binance module not configured")
-                    .client();
+                    .expect("Binance client not configured")
+                    .clone();
                 let binance_ref = BinanceActor::new(BinanceActorArgs {
                     credentials: Some(credentials),
                     symbol_metas: symbol_metas.clone(),
