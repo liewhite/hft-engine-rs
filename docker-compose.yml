@@ -1,0 +1,7 @@
+services:
+  fee-arb:
+    build: .
+    container_name: fee-arb
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
