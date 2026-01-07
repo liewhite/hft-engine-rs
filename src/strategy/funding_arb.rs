@@ -354,15 +354,6 @@ impl FundingArbStrategy {
         let long_pos_ratio_after = long_pos_value_after / long_equity;
 
         if short_pos_ratio_after >= self.config.max_position_ratio || long_pos_ratio_after >= self.config.max_position_ratio {
-            tracing::debug!(
-                symbol = %self.symbol,
-                short_exchange = %short_exchange,
-                short_pos_ratio_after = format!("{:.4}", short_pos_ratio_after),
-                long_exchange = %long_exchange,
-                long_pos_ratio_after = format!("{:.4}", long_pos_ratio_after),
-                max_position_ratio = self.config.max_position_ratio,
-                "Position ratio would exceed limit after opening, refusing to open"
-            );
             return None;
         }
 
@@ -370,8 +361,10 @@ impl FundingArbStrategy {
             symbol = %self.symbol,
             short_exchange = %short_exchange,
             short_deviation = format!("{:.6}", short_deviation),
+            short_pos_ratio = format!("{:.4}", short_pos_ratio_after),
             long_exchange = %long_exchange,
             long_deviation = format!("{:.6}", long_deviation),
+            long_pos_ratio = format!("{:.4}", long_pos_ratio_after),
             total_deviation = format!("{:.6}", total_deviation),
             funding_spread = format!("{:.6}", funding_spread),
             open_threshold = format!("{:.6}", open_threshold),
