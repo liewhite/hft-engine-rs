@@ -103,13 +103,23 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                     }
                     Err(e) => {
                         let reason = e.to_string();
-                        tracing::error!(
-                            exchange = %order.exchange,
-                            symbol = %order.symbol,
-                            client_order_id = ?order.client_order_id,
-                            error = %reason,
-                            "Failed to place order"
-                        );
+                        // reduce_only 订单因仓位已平而被拒绝是正常的竞态情况
+                        if reason.contains("Reduce only") || reason.contains("reduce only") {
+                            tracing::info!(
+                                exchange = %order.exchange,
+                                symbol = %order.symbol,
+                                client_order_id = ?order.client_order_id,
+                                "Reduce-only order rejected: position already closed"
+                            );
+                        } else {
+                            tracing::error!(
+                                exchange = %order.exchange,
+                                symbol = %order.symbol,
+                                client_order_id = ?order.client_order_id,
+                                error = %reason,
+                                "Failed to place order"
+                            );
+                        }
                         // 发送错误事件
                         self.send_order_error(&order, reason).await;
                     }
