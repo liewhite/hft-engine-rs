@@ -40,7 +40,7 @@ struct BboTicker {
 /// 获取 BBO (REST API)
 async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Error>> {
     let client = Client::new();
-    let binance_symbol = format!("{}{}", symbol.base, TEST_QUOTE);
+    let binance_symbol = format!("{}{}", symbol, TEST_QUOTE);
 
     let resp: BboTicker = client
         .get(format!(
@@ -65,7 +65,7 @@ async fn test_binance_limit_buy() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
     let client = BinanceClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_BASE);
+    let symbol: Symbol = TEST_BASE.to_string();
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");
@@ -111,7 +111,7 @@ async fn test_binance_limit_sell() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
     let client = BinanceClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_BASE);
+    let symbol: Symbol = TEST_BASE.to_string();
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");

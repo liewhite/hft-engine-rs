@@ -169,7 +169,7 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
             }
             ExchangeEventData::Position(position) => {
                 let exchange_label = exchange_to_label(position.exchange);
-                let symbol_label = &position.symbol.base;
+                let symbol_label = &position.symbol;
                 self.position_gauge
                     .with_label_values(&[exchange_label, symbol_label])
                     .set(position.size);

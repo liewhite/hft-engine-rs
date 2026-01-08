@@ -10,7 +10,6 @@ mod order_type;
 mod order_update;
 mod position;
 mod side;
-mod symbol;
 mod symbol_meta;
 mod time_in_force;
 
@@ -26,6 +25,8 @@ pub use order_type::OrderType;
 pub use order_update::OrderUpdate;
 pub use position::Position;
 pub use side::Side;
-pub use symbol::Symbol;
 pub use symbol_meta::SymbolMeta;
 pub use time_in_force::TimeInForce;
+
+/// 统一交易对符号（只包含 base，quote 由交易所配置决定）
+pub type Symbol = String;

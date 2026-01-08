@@ -44,7 +44,7 @@ struct Level {
 /// 获取 BBO (REST API)
 async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Error>> {
     let client = Client::new();
-    let coin = &symbol.base; // Hyperliquid 使用 base 作为 coin 名
+    let coin = symbol; // Hyperliquid 使用 base 作为 coin 名
 
     let resp: L2Book = client
         .post("https://api.hyperliquid.xyz/info")
@@ -79,7 +79,7 @@ async fn test_hyperliquid_limit_buy() {
         get_credentials().expect("需要设置 HYPERLIQUID_WALLET_ADDRESS 和 HYPERLIQUID_PRIVATE_KEY");
     let client = HyperliquidClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_BASE);
+    let symbol: Symbol = TEST_BASE.to_string();
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");
@@ -127,7 +127,7 @@ async fn test_hyperliquid_limit_sell() {
         get_credentials().expect("需要设置 HYPERLIQUID_WALLET_ADDRESS 和 HYPERLIQUID_PRIVATE_KEY");
     let client = HyperliquidClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_BASE);
+    let symbol: Symbol = TEST_BASE.to_string();
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");

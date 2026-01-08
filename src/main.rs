@@ -51,10 +51,7 @@ pub struct MonitoringConfig {
 
 impl StrategyConfig {
     fn parse_symbols(&self) -> Vec<Symbol> {
-        self.symbols
-            .iter()
-            .map(|s| Symbol::new(s))
-            .collect()
+        self.symbols.clone()
     }
 }
 

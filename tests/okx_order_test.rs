@@ -49,7 +49,7 @@ struct TickerData {
 /// 获取 BBO (REST API)
 async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Error>> {
     let client = Client::new();
-    let inst_id = format!("{}-{}-SWAP", symbol.base, TEST_QUOTE);
+    let inst_id = format!("{}-{}-SWAP", symbol, TEST_QUOTE);
 
     let resp: OkxResponse<TickerData> = client
         .get(format!(
@@ -79,7 +79,7 @@ async fn test_okx_limit_buy() {
     let credentials = get_credentials().expect("需要设置 OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE");
     let client = OkxClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_BASE);
+    let symbol: Symbol = TEST_BASE.to_string();
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");
@@ -125,7 +125,7 @@ async fn test_okx_limit_sell() {
     let credentials = get_credentials().expect("需要设置 OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE");
     let client = OkxClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_BASE);
+    let symbol: Symbol = TEST_BASE.to_string();
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");

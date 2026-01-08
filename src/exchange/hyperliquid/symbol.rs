@@ -10,11 +10,11 @@ use crate::domain::Symbol;
 pub fn to_hyperliquid(symbol: &Symbol, _quote: &str) -> String {
     // Hyperliquid 当前只使用 base 名称
     // 不同 quote 的合约可能通过不同的 API 端点或参数区分
-    symbol.base.clone()
+    symbol.clone()
 }
 
 /// 从 Hyperliquid 格式解析 Symbol
 /// coin: 币种名 (e.g., "BTC", "ETH")
 pub fn from_hyperliquid(coin: &str) -> Symbol {
-    Symbol::new(coin)
+    coin.to_string()
 }
