@@ -1,15 +1,19 @@
-use crate::domain::{Exchange, Order, OrderType, Rate, Side, Symbol, TimeInForce, BBO};
+use crate::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce, BBO};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-/// 最大允许的时间戳差异（毫秒）
-const MAX_TIMESTAMP_DIFF_MS: u64 = 120_000; // 2 分钟
-
 /// 市价单滑点（用限价单 IOC 模拟市价单）
 const MARKET_ORDER_SLIPPAGE: f64 = 0.001; // 0.1%
+
+/// 开仓阈值：价差 >= 0.25% 时开仓
+/// 开仓成本 0.05% * 2 = 0.1%，阈值设为 0.25% 保证即使平仓没有利润也不亏
+const OPEN_THRESHOLD: f64 = 0.0025;
+
+/// 平仓阈值：价差 <= 0% 时平仓
+const CLOSE_THRESHOLD: f64 = 0.0;
 
 /// EMA (Exponential Moving Average) 计算器
 #[derive(Debug, Clone)]
@@ -58,7 +62,7 @@ impl EmaCalculator {
     }
 }
 
-/// 资金费率套利策略配置
+/// 跨所价差套利策略配置
 #[derive(Debug, Clone, Deserialize)]
 pub struct FundingArbConfig {
     /// EMA 周期
@@ -83,46 +87,16 @@ pub struct FundingArbConfig {
     pub max_position_ratio: f64,
 }
 
-/// 根据资费差（日化）计算开平仓阈值
-///
-/// | 资费差日化 | 开仓阈值 | 平仓阈值 |
-/// |-----------|---------|---------|
-/// | < 0.2%    | 不开仓   | -       |
-/// | 0.2%~0.3% | 0.20%   | -0.10%  |
-/// | 0.3%~0.5% | 0.15%   | -0.15%  |
-/// | 0.5%~0.8% | 0.10%   | -0.20%  |
-/// | > 0.8%    | 0.05%   | -0.25%  |
-///
-/// 返回 (open_threshold, close_threshold)，None 表示不允许开仓
-fn calculate_thresholds(funding_spread: Rate) -> Option<(f64, f64)> {
-    if funding_spread < 0.002 {
-        // < 0.2%，不开仓
-        None
-    } else if funding_spread < 0.003 {
-        // 0.2% ~ 0.3%
-        Some((0.002, -0.001))
-    } else if funding_spread < 0.005 {
-        // 0.3% ~ 0.5%
-        Some((0.0015, -0.0015))
-    } else if funding_spread < 0.008 {
-        // 0.5% ~ 0.8%
-        Some((0.001, -0.002))
-    } else {
-        // > 0.8%
-        Some((0.0005, -0.0025))
-    }
-}
-
 /// 开仓信号
 #[derive(Debug, Clone)]
 struct OpenSignal {
-    /// 资费最高交易所（做空）
+    /// 价格最高交易所（做空）
     short_exchange: Exchange,
-    /// 做空价格
+    /// 做空价格（bid）
     short_price: f64,
-    /// 资费最低交易所（做多）
+    /// 价格最低交易所（做多）
     long_exchange: Exchange,
-    /// 做多价格
+    /// 做多价格（ask）
     long_price: f64,
 }
 
@@ -152,12 +126,16 @@ struct ExchangeEma {
     ask_ema: EmaCalculator,
 }
 
-/// 资金费率套利策略 (单 symbol)
+/// 跨所价差套利策略 (单 symbol)
 ///
 /// 策略逻辑：
 /// 1. 为每个交易所维护独立的 bid_ema 和 ask_ema
-/// 2. 开仓：资费最高交易所 bid 向上偏离 bid_ema + 资费最低交易所 ask 向下偏离 ask_ema ≥ 阈值
-/// 3. 平仓：多头组中 bid 向上偏离最大 + 空头组中 ask 向下偏离最大 ≥ 阈值
+/// 2. 开仓：价格最高交易所 bid 向上偏离 + 价格最低交易所 ask 向下偏离 ≥ 0.25%
+/// 3. 平仓：多头组中 bid 向上偏离最大 + 空头组中 ask 向下偏离最大 ≤ 0%
+///
+/// 阈值设计：
+/// - 开仓成本：0.05% * 2 = 0.1%（双边手续费）
+/// - 开仓阈值：0.25%，保证即使平仓没有利润也不亏钱
 pub struct FundingArbStrategy {
     config: FundingArbConfig,
     exchanges: Vec<Exchange>,
@@ -229,99 +207,42 @@ impl FundingArbStrategy {
         Some((ema - bbo.ask_price) / ema)
     }
 
-    /// 计算基于剩余时间的资费差（日化）
-    ///
-    /// 使用统一时间基准：所有交易所中最近的结算时间
-    /// 如果最大时间戳 - 最小时间戳 > 2分钟，返回 None 并打印警告
-    ///
-    /// 返回 (最大日化资费, 最小日化资费, 资费差)
-    fn calculate_funding_spread(&self, state: &SymbolState) -> Option<(Rate, Rate, Rate)> {
-        let (short_ex, short_rate) = state.best_short_exchange()?;
-        let (long_ex, long_rate) = state.best_long_exchange()?;
+    /// 找出价格最高的交易所（用于做空）
+    /// 返回 (交易所, BBO)
+    fn best_short_exchange<'a>(&self, state: &'a SymbolState) -> Option<(Exchange, &'a BBO)> {
+        self.exchanges
+            .iter()
+            .filter_map(|ex| state.bbo(*ex).map(|bbo| (*ex, bbo)))
+            .max_by(|a, b| a.1.bid_price.partial_cmp(&b.1.bid_price).unwrap_or(std::cmp::Ordering::Equal))
+    }
 
-        // 检查时间戳差异
-        let min_ts = short_rate.timestamp.min(long_rate.timestamp);
-        let max_ts = short_rate.timestamp.max(long_rate.timestamp);
-        let ts_diff = max_ts - min_ts;
-
-        if ts_diff > MAX_TIMESTAMP_DIFF_MS {
-            tracing::warn!(
-                symbol = %self.symbol,
-                short_exchange = %short_ex,
-                short_ts = short_rate.timestamp,
-                long_exchange = %long_ex,
-                long_ts = long_rate.timestamp,
-                ts_diff_ms = ts_diff,
-                max_allowed_ms = MAX_TIMESTAMP_DIFF_MS,
-                "Funding rate timestamp difference too large, refusing to open"
-            );
-            return None;
-        }
-
-        // 使用统一时间基准计算日化费率
-        // base_settle_time: 所有交易所中最近的结算时间
-        // current_time: 最新的数据时间戳
-        let base_settle_time = short_rate.next_settle_time.min(long_rate.next_settle_time);
-        let current_time = short_rate.timestamp.max(long_rate.timestamp);
-
-        let short_daily = short_rate.daily_rate_with_base_time(base_settle_time, current_time);
-        let long_daily = long_rate.daily_rate_with_base_time(base_settle_time, current_time);
-        let spread = short_daily - long_daily;
-
-        tracing::debug!(
-            symbol = %self.symbol,
-            short_exchange = %short_ex,
-            short_rate = format!("{:.6}", short_rate.rate),
-            short_daily = format!("{:.6}", short_daily),
-            short_settle_time = short_rate.next_settle_time,
-            long_exchange = %long_ex,
-            long_rate = format!("{:.6}", long_rate.rate),
-            long_daily = format!("{:.6}", long_daily),
-            long_settle_time = long_rate.next_settle_time,
-            base_settle_time = base_settle_time,
-            funding_spread = format!("{:.6}", spread),
-            "Funding spread calculated with unified time base"
-        );
-
-        Some((short_daily, long_daily, spread))
+    /// 找出价格最低的交易所（用于做多）
+    /// 返回 (交易所, BBO)
+    fn best_long_exchange<'a>(&self, state: &'a SymbolState) -> Option<(Exchange, &'a BBO)> {
+        self.exchanges
+            .iter()
+            .filter_map(|ex| state.bbo(*ex).map(|bbo| (*ex, bbo)))
+            .min_by(|a, b| a.1.ask_price.partial_cmp(&b.1.ask_price).unwrap_or(std::cmp::Ordering::Equal))
     }
 
     /// 检查开仓条件，返回开仓信号
     ///
     /// 条件：
-    /// 1. 资费差满足最低要求（根据资费差动态计算阈值）
-    /// 2. 资费最高交易所 bid 向上偏离 + 资费最低交易所 ask 向下偏离 ≥ open_threshold
-    /// 3. 风控检查通过
+    /// 1. 价格最高交易所 bid 向上偏离 + 价格最低交易所 ask 向下偏离 ≥ OPEN_THRESHOLD (0.25%)
+    /// 2. 风控检查通过
     fn check_open_signal(
         &self,
         state: &SymbolState,
         state_manager: &StateManager,
     ) -> Option<OpenSignal> {
-        // 检查资费差（基于剩余时间的日化）
-        let funding_spread = match self.calculate_funding_spread(state) {
-            Some((_, _, spread)) => spread,
-            None => return None,
-        };
+        // 找价格最高/最低的交易所
+        let (short_exchange, short_bbo) = self.best_short_exchange(state)?;
+        let (long_exchange, long_bbo) = self.best_long_exchange(state)?;
 
-        // 根据资费差计算动态阈值
-        let (open_threshold, _) = match calculate_thresholds(funding_spread) {
-            Some(thresholds) => thresholds,
-            None => {
-                tracing::debug!(
-                    symbol = %self.symbol,
-                    funding_spread = format!("{:.6}", funding_spread),
-                    "Funding spread too low for opening (< 0.2%)"
-                );
-                return None;
-            }
-        };
-
-        // 获取资费最高和最低的交易所
-        let (short_exchange, _) = state.best_short_exchange()?;
-        let (long_exchange, _) = state.best_long_exchange()?;
-
-        let short_bbo = state.bbo(short_exchange)?;
-        let long_bbo = state.bbo(long_exchange)?;
+        // 必须是不同交易所
+        if short_exchange == long_exchange {
+            return None;
+        }
 
         // 计算偏离
         // short_exchange: bid 向上偏离（卖出开空）
@@ -329,7 +250,8 @@ impl FundingArbStrategy {
         let short_deviation = self.bid_up_deviation(short_exchange, short_bbo)?;
         let long_deviation = self.ask_down_deviation(long_exchange, long_bbo)?;
         let total_deviation = short_deviation + long_deviation;
-        if total_deviation < open_threshold {
+
+        if total_deviation < OPEN_THRESHOLD {
             return None;
         }
 
@@ -370,14 +292,15 @@ impl FundingArbStrategy {
         tracing::info!(
             symbol = %self.symbol,
             short_exchange = %short_exchange,
+            short_bid = short_bbo.bid_price,
             short_deviation = format!("{:.6}", short_deviation),
             short_pos_ratio = format!("{:.4}", short_pos_ratio_after),
             long_exchange = %long_exchange,
+            long_ask = long_bbo.ask_price,
             long_deviation = format!("{:.6}", long_deviation),
             long_pos_ratio = format!("{:.4}", long_pos_ratio_after),
             total_deviation = format!("{:.6}", total_deviation),
-            funding_spread = format!("{:.6}", funding_spread),
-            open_threshold = format!("{:.6}", open_threshold),
+            open_threshold = format!("{:.6}", OPEN_THRESHOLD),
             "Opening signal detected"
         );
 
@@ -395,19 +318,11 @@ impl FundingArbStrategy {
     /// 1. 将持仓分为多头组和空头组
     /// 2. 多头组中找 bid 向上偏离最大的交易所（平多卖出用 bid）
     /// 3. 空头组中找 ask 向下偏离最大的交易所（平空买入用 ask）
-    /// 4. 两者偏离之和 < close_threshold（负数）时触发平仓
+    /// 4. 两者偏离之和 <= CLOSE_THRESHOLD (0%) 时触发平仓
     fn check_close_signal(&self, state: &SymbolState) -> Option<CloseSignal> {
         if !state.has_positions() {
             return None;
         }
-
-        // 获取当前资费差，用于计算动态平仓阈值
-        let funding_spread = self.calculate_funding_spread(state)
-            .map(|(_, _, spread)| spread)
-            .unwrap_or(0.002); // 默认使用最低档
-
-        let (_, close_threshold) = calculate_thresholds(funding_spread)
-            .unwrap_or((0.002, -0.001)); // 默认使用最低档阈值
 
         // 收集多头和空头交易所
         let mut long_positions: Vec<(Exchange, f64)> = Vec::new(); // (exchange, size)
@@ -448,23 +363,24 @@ impl FundingArbStrategy {
 
         let total_deviation = best_long.3 + best_short.3;
 
-        // close_threshold 是负数，当 total_deviation < close_threshold 时平仓
-        // 即价差收窄到反向偏离时平仓
-        if total_deviation > close_threshold {
+        // 当 total_deviation <= CLOSE_THRESHOLD (0%) 时平仓
+        // 即价差收窄到零时平仓
+        if total_deviation > CLOSE_THRESHOLD {
             return None;
         }
 
         tracing::info!(
             symbol = %self.symbol,
             long_exchange = %best_long.0,
+            long_bid = best_long.1,
             long_deviation = format!("{:.6}", best_long.3),
             long_size = best_long.2,
             short_exchange = %best_short.0,
+            short_ask = best_short.1,
             short_deviation = format!("{:.6}", best_short.3),
             short_size = best_short.2,
             total_deviation = format!("{:.6}", total_deviation),
-            funding_spread = format!("{:.6}", funding_spread),
-            close_threshold = format!("{:.6}", close_threshold),
+            close_threshold = format!("{:.6}", CLOSE_THRESHOLD),
             "Closing signal detected"
         );
 
@@ -877,14 +793,10 @@ impl FundingArbStrategy {
 
 impl Strategy for FundingArbStrategy {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
-        let kinds: HashSet<SubscriptionKind> = [
-            SubscriptionKind::FundingRate {
-                symbol: self.symbol.clone(),
-            },
-            SubscriptionKind::BBO {
-                symbol: self.symbol.clone(),
-            },
-        ]
+        // 纯价差套利只需要 BBO 数据，不需要资费数据
+        let kinds: HashSet<SubscriptionKind> = [SubscriptionKind::BBO {
+            symbol: self.symbol.clone(),
+        }]
         .into_iter()
         .collect();
 
