@@ -437,3 +437,22 @@ where
         let _ = self.outcome_pubsub.tell(Subscribe(msg.0)).send().await;
     }
 }
+
+/// 获取所有交易所的 SymbolMeta
+pub struct GetAllSymbolMetas;
+
+impl Message<GetAllSymbolMetas> for ManagerActor {
+    type Reply = HashMap<Exchange, Vec<SymbolMeta>>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetAllSymbolMetas,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let mut result: HashMap<Exchange, Vec<SymbolMeta>> = HashMap::new();
+        for ((exchange, _), meta) in &self.symbol_metas {
+            result.entry(*exchange).or_default().push(meta.clone());
+        }
+        result
+    }
+}

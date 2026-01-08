@@ -123,10 +123,6 @@ async fn main() -> anyhow::Result<()> {
     let content = std::fs::read_to_string(&config_path)?;
     let config: Config = serde_json::from_str(&content)?;
 
-    // 打印交易所 symbols 并退出
-    print_exchange_symbols(&config.exchanges).await?;
-    return Ok(());
-
     let symbols = config.strategy.parse_symbols();
     if symbols.is_empty() {
         anyhow::bail!("No valid symbols configured");
