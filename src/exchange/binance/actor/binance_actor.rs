@@ -44,6 +44,8 @@ pub struct BinanceActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// Exchange client（用于查询 equity）
     pub client: Arc<dyn ExchangeClient>,
+    /// 计价币种 (e.g., "USDT")
+    pub quote: String,
 }
 
 /// BinanceActor - 父 Actor
@@ -102,6 +104,7 @@ impl Actor for BinanceActor {
             BinancePublicWsActorArgs {
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
+                quote: args.quote.clone(),
             },
             mailbox::unbounded(),
         )
@@ -117,6 +120,7 @@ impl Actor for BinanceActor {
                     rest_base_url: args.rest_base_url,
                     income_pubsub: args.income_pubsub.clone(),
                     symbol_metas: args.symbol_metas.clone(),
+                    quote: args.quote.clone(),
                 },
                 mailbox::unbounded(),
             )

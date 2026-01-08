@@ -33,6 +33,8 @@ pub struct OkxActorArgs {
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// Income PubSub (发布事件)
     pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 计价币种 (e.g., "USDT")
+    pub quote: String,
 }
 
 /// OkxActor - 父 Actor
@@ -52,6 +54,7 @@ impl Actor for OkxActor {
             OkxPublicWsActorArgs {
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
+                quote: args.quote.clone(),
             },
             mailbox::unbounded(),
         )

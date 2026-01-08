@@ -39,6 +39,8 @@ pub struct BinancePrivateWsActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据（用于仓位转换）
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币种 (e.g., "USDT")
+    pub quote: String,
 }
 
 /// BinancePrivateWsActor - 私有 WebSocket Actor
@@ -47,6 +49,8 @@ pub struct BinancePrivateWsActor {
     income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币种 (e.g., "USDT")
+    quote: String,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// ListenKey 子 actor
@@ -59,7 +63,7 @@ impl BinancePrivateWsActor {
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_private_message(raw, local_ts, &self.symbol_metas)?;
+        let events = parse_private_message(raw, &self.quote, local_ts, &self.symbol_metas)?;
         for event in events {
             let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
@@ -115,6 +119,7 @@ impl Actor for BinancePrivateWsActor {
         Ok(Self {
             income_pubsub: args.income_pubsub,
             symbol_metas: args.symbol_metas,
+            quote: args.quote,
             ws_tx: Some(outgoing_tx),
             listen_key_actor: Some(listen_key_actor),
             listen_key_actor_id: Some(listen_key_actor_id),
@@ -197,6 +202,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePrivateW
 
 fn parse_private_message(
     raw: &str,
+    quote: &str,
     local_ts: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
 ) -> Result<Vec<IncomeEvent>, WsError> {
@@ -237,7 +243,7 @@ fn parse_private_message(
 
             // 处理所有 position 更新
             for pos_data in &update.a.positions {
-                let mut position = pos_data.to_position();
+                let mut position = pos_data.to_position(quote);
                 // qty 归一化: 张 -> 币
                 let meta = symbol_metas
                     .get(&position.symbol)
@@ -265,7 +271,7 @@ fn parse_private_message(
         "ORDER_TRADE_UPDATE" => {
             let update: OrderTradeUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("ORDER_TRADE_UPDATE parse: {}", e)))?;
-            let order_update = update.to_order_update();
+            let order_update = update.to_order_update(quote);
             Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,

@@ -266,6 +266,7 @@ impl Actor for ManagerActor {
                     rest_base_url: REST_BASE_URL.to_string(),
                     income_pubsub: income_pubsub.clone(),
                     client,
+                    quote: credentials.quote.clone(),
                 },
                 mailbox::unbounded(),
             )
@@ -282,6 +283,7 @@ impl Actor for ManagerActor {
                     credentials: Some(credentials.clone()),
                     symbol_metas: symbol_metas_for_exchange,
                     income_pubsub: income_pubsub.clone(),
+                    quote: credentials.quote.clone(),
                 },
                 mailbox::unbounded(),
             )
@@ -299,6 +301,7 @@ impl Actor for ManagerActor {
                     credentials: Some(credentials.clone()),
                     symbol_metas: symbol_metas_for_exchange,
                     income_pubsub: income_pubsub.clone(),
+                    quote: credentials.quote.clone(),
                 },
                 mailbox::unbounded(),
             )

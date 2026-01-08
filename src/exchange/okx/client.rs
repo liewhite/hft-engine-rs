@@ -27,6 +27,8 @@ pub struct OkxClient {
     credentials: Option<OkxCredentials>,
     /// REST API 基础 URL
     base_url: String,
+    /// 计价币种 (e.g., "USDT")
+    quote: String,
 }
 
 impl OkxClient {
@@ -37,11 +39,22 @@ impl OkxClient {
             .build()
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
 
+        let quote = credentials
+            .as_ref()
+            .map(|c| c.quote.clone())
+            .unwrap_or_else(|| "USDT".to_string());
+
         Ok(Self {
             client,
             credentials,
             base_url: REST_BASE_URL.to_string(),
+            quote,
         })
+    }
+
+    /// 获取计价币种
+    pub fn quote(&self) -> &str {
+        &self.quote
     }
 
     /// 获取凭证（供 ManagerActor 创建 OkxActor 使用）
@@ -121,6 +134,10 @@ impl OkxClient {
             .data
             .into_iter()
             .filter_map(|d| {
+                // 只处理配置的 quote 对应的品种 (e.g., BTC-USDT-SWAP)
+                if !d.inst_id.contains(&format!("-{}-", self.quote)) {
+                    return None;
+                }
                 let symbol = from_okx(&d.inst_id)?;
                 let price_step: f64 = d.tick_sz.parse().ok().filter(|&v| v > 0.0)?;
                 let size_step: f64 = d.lot_sz.parse().ok().filter(|&v| v > 0.0)?;
@@ -211,7 +228,7 @@ impl ExchangeClient for OkxClient {
 
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
         let path = "/api/v5/trade/order";
-        let inst_id = to_okx(&order.symbol);
+        let inst_id = to_okx(&order.symbol, &self.quote);
         let side = side_to_okx(order.side);
         let (ord_type, price) = order_type_to_okx(&order.order_type);
         let sz = order.quantity.to_string();
@@ -307,7 +324,7 @@ impl ExchangeClient for OkxClient {
 
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
         let path = "/api/v5/account/set-leverage";
-        let inst_id = to_okx(symbol);
+        let inst_id = to_okx(symbol, &self.quote);
 
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]

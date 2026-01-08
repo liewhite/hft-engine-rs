@@ -24,6 +24,8 @@ pub struct BinanceClient {
     credentials: Option<BinanceCredentials>,
     /// REST API 基础 URL
     base_url: String,
+    /// 计价币种 (e.g., "USDT")
+    quote: String,
 }
 
 impl BinanceClient {
@@ -34,11 +36,22 @@ impl BinanceClient {
             .build()
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
 
+        let quote = credentials
+            .as_ref()
+            .map(|c| c.quote.clone())
+            .unwrap_or_else(|| "USDT".to_string());
+
         Ok(Self {
             client,
             credentials,
             base_url: REST_BASE_URL.to_string(),
+            quote,
         })
+    }
+
+    /// 获取计价币种
+    pub fn quote(&self) -> &str {
+        &self.quote
     }
 
     /// 获取凭证（供 ManagerActor 创建 BinanceActor 使用）
@@ -165,7 +178,7 @@ impl BinanceClient {
             .into_iter()
             .filter_map(|s| {
                 println!("Parsing symbol info: {:?}", s);
-                let symbol = from_binance(&s.symbol)?;
+                let symbol = from_binance(&s.symbol, &self.quote)?;
                 let mut price_step: Option<f64> = None;
                 let mut size_step: Option<f64> = None;
                 let mut min_order_size: Option<f64> = None;
@@ -245,7 +258,7 @@ impl BinanceClient {
         let result: Vec<crate::domain::Position> = positions
             .into_iter()
             .filter_map(|p| {
-                let symbol = from_binance(&p.symbol)?;
+                let symbol = from_binance(&p.symbol, &self.quote)?;
                 let size: f64 = p.position_amt.parse().ok()?;
                 // 跳过空仓位
                 if size.abs() < 1e-10 {
@@ -336,7 +349,7 @@ impl ExchangeClient for BinanceClient {
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
 
-        let symbol = to_binance(&order.symbol);
+        let symbol = to_binance(&order.symbol, &self.quote);
         let side = side_to_binance(order.side);
         let (order_type, price, tif) = order_type_to_binance(&order.order_type);
         let qty = order.quantity.to_string();
@@ -398,7 +411,7 @@ impl ExchangeClient for BinanceClient {
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
 
-        let symbol_str = to_binance(symbol);
+        let symbol_str = to_binance(symbol, &self.quote);
         let leverage_str = leverage.to_string();
         let params = [("symbol", symbol_str.as_str()), ("leverage", &leverage_str)];
         let query = self

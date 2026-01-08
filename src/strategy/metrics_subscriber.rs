@@ -169,9 +169,9 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
             }
             ExchangeEventData::Position(position) => {
                 let exchange_label = exchange_to_label(position.exchange);
-                let symbol_label = position.symbol.canonical();
+                let symbol_label = &position.symbol.base;
                 self.position_gauge
-                    .with_label_values(&[exchange_label, symbol_label.as_str()])
+                    .with_label_values(&[exchange_label, symbol_label])
                     .set(position.size);
                 tracing::debug!(
                     exchange = %exchange_label,

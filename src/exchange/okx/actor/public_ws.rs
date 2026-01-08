@@ -33,6 +33,8 @@ pub struct OkxPublicWsActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币种 (e.g., "USDT")
+    pub quote: String,
 }
 
 /// OkxPublicWsActor - 公开 WebSocket Actor
@@ -42,6 +44,8 @@ pub struct OkxPublicWsActor {
     /// Symbol 元数据
     #[allow(dead_code)]
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币种 (e.g., "USDT")
+    quote: String,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的 kinds (用于去重)
@@ -52,7 +56,7 @@ impl OkxPublicWsActor {
 
     /// 发送订阅消息
     async fn send_subscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let arg = kind_to_arg(kind);
+        let arg = kind_to_arg(kind, &self.quote);
         let msg = json!({
             "op": "subscribe",
             "args": [arg]
@@ -67,7 +71,7 @@ impl OkxPublicWsActor {
 
     /// 发送取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let arg = kind_to_arg(kind);
+        let arg = kind_to_arg(kind, &self.quote);
         let msg = json!({
             "op": "unsubscribe",
             "args": [arg]
@@ -121,6 +125,7 @@ impl Actor for OkxPublicWsActor {
         Ok(Self {
             income_pubsub: args.income_pubsub,
             symbol_metas: args.symbol_metas,
+            quote: args.quote,
             ws_tx: Some(outgoing_tx),
             subscribed: HashSet::new(),
         })
@@ -338,31 +343,31 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
 // 辅助函数
 // ============================================================================
 
-fn kind_to_arg(kind: &SubscriptionKind) -> serde_json::Value {
+fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> serde_json::Value {
     match kind {
         SubscriptionKind::FundingRate { symbol } => {
             json!({
                 "channel": "funding-rate",
-                "instId": to_okx(symbol)
+                "instId": to_okx(symbol, quote)
             })
         }
         SubscriptionKind::BBO { symbol } => {
             json!({
                 "channel": "bbo-tbt",
-                "instId": to_okx(symbol)
+                "instId": to_okx(symbol, quote)
             })
         }
         SubscriptionKind::MarkPrice { symbol } => {
             json!({
                 "channel": "mark-price",
-                "instId": to_okx(symbol)
+                "instId": to_okx(symbol, quote)
             })
         }
         SubscriptionKind::IndexPrice { symbol } => {
             // OKX index-tickers 使用指数 ID 格式 (如 BTC-USDT)
             json!({
                 "channel": "index-tickers",
-                "instId": to_okx_index(symbol)
+                "instId": to_okx_index(symbol, quote)
             })
         }
     }

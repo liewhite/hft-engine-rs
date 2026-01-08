@@ -20,9 +20,10 @@ pub struct MarkPriceUpdate {
 
 impl MarkPriceUpdate {
     /// 转换为 FundingRate
+    /// quote: 计价币种（用于解析 symbol）
     /// timestamp: 数据时间戳（毫秒）
-    pub fn to_funding_rate(&self, timestamp: u64) -> FundingRate {
-        let symbol = from_binance(&self.s)
+    pub fn to_funding_rate(&self, quote: &str, timestamp: u64) -> FundingRate {
+        let symbol = from_binance(&self.s, quote)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
         let rate = f64::from_str(&self.r)
             .unwrap_or_else(|_| panic!("Failed to parse funding rate: {}", self.r));
@@ -37,8 +38,8 @@ impl MarkPriceUpdate {
     }
 
     /// 转换为 MarkPrice
-    pub fn to_mark_price(&self, timestamp: u64) -> MarkPrice {
-        let symbol = from_binance(&self.s)
+    pub fn to_mark_price(&self, quote: &str, timestamp: u64) -> MarkPrice {
+        let symbol = from_binance(&self.s, quote)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
         let price = f64::from_str(&self.p)
             .unwrap_or_else(|_| panic!("Failed to parse mark price: {}", self.p));
@@ -52,8 +53,8 @@ impl MarkPriceUpdate {
     }
 
     /// 转换为 IndexPrice
-    pub fn to_index_price(&self, timestamp: u64) -> IndexPrice {
-        let symbol = from_binance(&self.s)
+    pub fn to_index_price(&self, quote: &str, timestamp: u64) -> IndexPrice {
+        let symbol = from_binance(&self.s, quote)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
         let price = f64::from_str(&self.i)
             .unwrap_or_else(|_| panic!("Failed to parse index price: {}", self.i));
@@ -67,8 +68,8 @@ impl MarkPriceUpdate {
     }
 
     /// 获取 symbol (用于查询结算间隔)
-    pub fn symbol(&self) -> crate::domain::Symbol {
-        from_binance(&self.s)
+    pub fn symbol(&self, quote: &str) -> crate::domain::Symbol {
+        from_binance(&self.s, quote)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s))
     }
 }
@@ -90,8 +91,8 @@ pub struct BookTicker {
 }
 
 impl BookTicker {
-    pub fn to_bbo(&self) -> BBO {
-        let symbol = from_binance(&self.s)
+    pub fn to_bbo(&self, quote: &str) -> BBO {
+        let symbol = from_binance(&self.s, quote)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
         let bid_price = f64::from_str(&self.b)
             .unwrap_or_else(|_| panic!("Failed to parse bid price: {}", self.b));
@@ -168,8 +169,8 @@ pub struct AccountPosition {
 }
 
 impl AccountPosition {
-    pub fn to_position(&self) -> Position {
-        let symbol = from_binance(&self.s)
+    pub fn to_position(&self, quote: &str) -> Position {
+        let symbol = from_binance(&self.s, quote)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
         let pos_amount = f64::from_str(&self.pa)
             .unwrap_or_else(|_| panic!("Failed to parse position amount: {}", self.pa));
@@ -213,8 +214,8 @@ pub struct OrderData {
 }
 
 impl OrderTradeUpdate {
-    pub fn to_order_update(&self) -> OrderUpdate {
-        let symbol = from_binance(&self.o.s)
+    pub fn to_order_update(&self, quote: &str) -> OrderUpdate {
+        let symbol = from_binance(&self.o.s, quote)
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.o.s));
         let filled_qty = f64::from_str(&self.o.z)
             .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.o.z));

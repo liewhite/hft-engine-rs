@@ -163,7 +163,7 @@ impl Message<IncomeEvent> for SlackNotifierActor {
                 OrderStatus::Filled | OrderStatus::PartiallyFilled { .. } => {
                     let message = Self::format_fill_message(
                         update.exchange,
-                        &update.symbol.canonical(),
+                        &update.symbol.base,
                         &update.status,
                         update.filled_quantity,
                         update.avg_price,

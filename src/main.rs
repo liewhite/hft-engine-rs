@@ -53,7 +53,7 @@ impl StrategyConfig {
     fn parse_symbols(&self) -> Vec<Symbol> {
         self.symbols
             .iter()
-            .filter_map(|s| Symbol::from_canonical(s))
+            .map(|s| Symbol::new(s))
             .collect()
     }
 }

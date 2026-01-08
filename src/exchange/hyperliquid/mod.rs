@@ -22,4 +22,6 @@ pub struct HyperliquidCredentials {
     pub wallet_address: String,
     /// 私钥 (不含 0x 前缀)
     pub private_key: String,
+    /// 计价币种 (e.g., "USDC", "USDE")
+    pub quote: String,
 }

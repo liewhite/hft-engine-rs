@@ -30,6 +30,8 @@ pub struct HyperliquidPublicWsActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币种 (e.g., "USDC", "USDE")
+    pub quote: String,
 }
 
 /// HyperliquidPublicWsActor - WebSocket Actor
@@ -39,6 +41,8 @@ pub struct HyperliquidPublicWsActor {
     /// Symbol 元数据
     #[allow(dead_code)]
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币种 (e.g., "USDC", "USDE")
+    quote: String,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的底层 stream (用于 WebSocket 去重)
@@ -51,7 +55,7 @@ impl HyperliquidPublicWsActor {
 
     /// 发送订阅消息
     async fn send_subscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let subscription = kind_to_subscription(kind);
+        let subscription = kind_to_subscription(kind, &self.quote);
         let msg = json!({
             "method": "subscribe",
             "subscription": subscription
@@ -66,7 +70,7 @@ impl HyperliquidPublicWsActor {
 
     /// 发送取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let subscription = kind_to_subscription(kind);
+        let subscription = kind_to_subscription(kind, &self.quote);
         let msg = json!({
             "method": "unsubscribe",
             "subscription": subscription
@@ -120,6 +124,7 @@ impl Actor for HyperliquidPublicWsActor {
         Ok(Self {
             income_pubsub: args.income_pubsub,
             symbol_metas: args.symbol_metas,
+            quote: args.quote,
             ws_tx: Some(outgoing_tx),
             subscribed_streams: HashSet::new(),
             subscribed_kinds: HashSet::new(),
@@ -156,7 +161,7 @@ impl Message<Subscribe> for HyperliquidPublicWsActor {
         }
 
         // 检查底层 stream 是否已订阅
-        let stream = kind_to_stream(&msg.kind);
+        let stream = kind_to_stream(&msg.kind, &self.quote);
         if !self.subscribed_streams.contains(&stream) {
             // 发送 WebSocket 订阅请求
             if let Err(e) = self.send_subscribe(&msg.kind).await {
@@ -184,11 +189,12 @@ impl Message<Unsubscribe> for HyperliquidPublicWsActor {
         }
 
         // 检查是否还有其他 kinds 使用同一个 stream
-        let stream = kind_to_stream(&msg.kind);
+        let stream = kind_to_stream(&msg.kind, &self.quote);
+        let quote = &self.quote;
         let stream_still_needed = self
             .subscribed_kinds
             .iter()
-            .any(|k| kind_to_stream(k) == stream);
+            .any(|k| kind_to_stream(k, quote) == stream);
 
         if !stream_still_needed {
             if let Err(e) = self.send_unsubscribe(&msg.kind).await {
@@ -348,22 +354,22 @@ fn parse_public_message(
 // ============================================================================
 
 /// 将 SubscriptionKind 转换为底层 stream 标识符 (用于去重)
-fn kind_to_stream(kind: &SubscriptionKind) -> String {
+fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> String {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用同一个 activeAssetCtx 订阅
         SubscriptionKind::FundingRate { symbol }
         | SubscriptionKind::MarkPrice { symbol }
         | SubscriptionKind::IndexPrice { symbol } => {
-            format!("activeAssetCtx:{}", to_hyperliquid(symbol))
+            format!("activeAssetCtx:{}", to_hyperliquid(symbol, quote))
         }
         SubscriptionKind::BBO { symbol } => {
-            format!("bbo:{}", to_hyperliquid(symbol))
+            format!("bbo:{}", to_hyperliquid(symbol, quote))
         }
     }
 }
 
 /// 将 SubscriptionKind 转换为 Hyperliquid 订阅格式
-fn kind_to_subscription(kind: &SubscriptionKind) -> serde_json::Value {
+fn kind_to_subscription(kind: &SubscriptionKind, quote: &str) -> serde_json::Value {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用 activeAssetCtx 订阅
         SubscriptionKind::FundingRate { symbol }
@@ -371,14 +377,14 @@ fn kind_to_subscription(kind: &SubscriptionKind) -> serde_json::Value {
         | SubscriptionKind::IndexPrice { symbol } => {
             json!({
                 "type": "activeAssetCtx",
-                "coin": to_hyperliquid(symbol)
+                "coin": to_hyperliquid(symbol, quote)
             })
         }
         SubscriptionKind::BBO { symbol } => {
             // 使用 bbo 获取最优买卖价
             json!({
                 "type": "bbo",
-                "coin": to_hyperliquid(symbol)
+                "coin": to_hyperliquid(symbol, quote)
             })
         }
     }

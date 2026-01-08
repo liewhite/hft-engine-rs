@@ -31,6 +31,8 @@ pub struct HyperliquidClient {
     signer: Option<PrivateKeySigner>,
     /// REST API 基础 URL
     base_url: String,
+    /// 计价币种 (e.g., "USDC", "USDE")
+    quote: String,
     /// 是否是主网
     is_mainnet: bool,
     /// Coin -> Asset Index 映射 (懒加载)
@@ -52,14 +54,25 @@ impl HyperliquidClient {
             .transpose()
             .map_err(|e| ExchangeError::Other(format!("Failed to create signer: {}", e)))?;
 
+        let quote = credentials
+            .as_ref()
+            .map(|c| c.quote.clone())
+            .unwrap_or_else(|| "USDC".to_string());
+
         Ok(Self {
             client,
             credentials,
             signer,
             base_url: REST_BASE_URL.to_string(),
+            quote,
             is_mainnet: true, // 默认主网
             coin_to_asset: RwLock::new(None),
         })
+    }
+
+    /// 获取计价币种
+    pub fn quote(&self) -> &str {
+        &self.quote
     }
 
     /// 获取凭证
@@ -192,7 +205,7 @@ impl HyperliquidClient {
 
     /// 将 domain Order 转换为 OrderWire
     async fn order_to_wire(&self, order: &Order) -> Result<OrderWire, ExchangeError> {
-        let coin = to_hyperliquid(&order.symbol);
+        let coin = to_hyperliquid(&order.symbol, &self.quote);
         let asset = self.get_asset_index(&coin).await?;
 
         let is_buy = matches!(order.side, Side::Long);

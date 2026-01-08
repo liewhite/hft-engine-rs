@@ -33,6 +33,8 @@ pub struct HyperliquidActorArgs {
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// Income PubSub (发布事件)
     pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 计价币种 (e.g., "USDC", "USDE")
+    pub quote: String,
 }
 
 /// HyperliquidActor - 父 Actor
@@ -52,6 +54,7 @@ impl Actor for HyperliquidActor {
             HyperliquidPublicWsActorArgs {
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
+                quote: args.quote.clone(),
             },
             mailbox::unbounded(),
         )

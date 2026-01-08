@@ -24,6 +24,8 @@ pub struct OkxCredentials {
     pub api_key: String,
     pub secret: String,
     pub passphrase: String,
+    /// 计价币种 (e.g., "USDT", "USDC")
+    pub quote: String,
 }
 
 impl OkxCredentials {

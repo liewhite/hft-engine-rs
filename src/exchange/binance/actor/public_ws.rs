@@ -37,6 +37,8 @@ pub struct BinancePublicWsActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据（公开 WS 目前不需要，但保持一致性）
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币种 (e.g., "USDT")
+    pub quote: String,
 }
 
 /// BinancePublicWsActor - 公开 WebSocket Actor
@@ -46,6 +48,8 @@ pub struct BinancePublicWsActor {
     /// Symbol 元数据
     #[allow(dead_code)]
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币种 (e.g., "USDT")
+    quote: String,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的底层 stream (用于 WebSocket 去重)
@@ -68,7 +72,7 @@ impl BinancePublicWsActor {
         }
         self.last_subscribe_time = now_ms();
 
-        let stream = kind_to_stream(kind);
+        let stream = kind_to_stream(kind, &self.quote);
         let msg = json!({
             "method": "SUBSCRIBE",
             "params": [stream],
@@ -84,7 +88,7 @@ impl BinancePublicWsActor {
 
     /// 发送取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let stream = kind_to_stream(kind);
+        let stream = kind_to_stream(kind, &self.quote);
         let msg = json!({
             "method": "UNSUBSCRIBE",
             "params": [stream],
@@ -101,7 +105,7 @@ impl BinancePublicWsActor {
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_public_message(raw, local_ts, &self.subscribed_kinds)?;
+        let events = parse_public_message(raw, &self.quote, local_ts, &self.subscribed_kinds)?;
         for event in events {
             let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
@@ -139,6 +143,7 @@ impl Actor for BinancePublicWsActor {
         Ok(Self {
             income_pubsub: args.income_pubsub,
             symbol_metas: args.symbol_metas,
+            quote: args.quote,
             ws_tx: Some(outgoing_tx),
             subscribed_streams: HashSet::new(),
             subscribed_kinds: HashSet::new(),
@@ -176,7 +181,7 @@ impl Message<Subscribe> for BinancePublicWsActor {
         }
 
         // 检查底层 stream 是否已订阅
-        let stream = kind_to_stream(&msg.kind);
+        let stream = kind_to_stream(&msg.kind, &self.quote);
         if !self.subscribed_streams.contains(&stream) {
             // 发送 WebSocket 订阅请求
             if let Err(e) = self.send_subscribe(&msg.kind).await {
@@ -204,11 +209,11 @@ impl Message<Unsubscribe> for BinancePublicWsActor {
         }
 
         // 检查是否还有其他 kinds 使用同一个 stream
-        let stream = kind_to_stream(&msg.kind);
+        let stream = kind_to_stream(&msg.kind, &self.quote);
         let stream_still_needed = self
             .subscribed_kinds
             .iter()
-            .any(|k| kind_to_stream(k) == stream);
+            .any(|k| kind_to_stream(k, &self.quote) == stream);
 
         if !stream_still_needed {
             if let Err(e) = self.send_unsubscribe(&msg.kind).await {
@@ -260,6 +265,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePublicWs
 
 fn parse_public_message(
     raw: &str,
+    quote: &str,
     local_ts: u64,
     subscribed_kinds: &HashSet<SubscriptionKind>,
 ) -> Result<Vec<IncomeEvent>, WsError> {
@@ -295,7 +301,7 @@ fn parse_public_message(
         "markPriceUpdate" => {
             let update: MarkPriceUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
-            let symbol = update.symbol();
+            let symbol = update.symbol(quote);
 
             let mut events = Vec::new();
 
@@ -305,21 +311,21 @@ fn parse_public_message(
                 events.push(IncomeEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::FundingRate(update.to_funding_rate(exchange_ts)),
+                    data: ExchangeEventData::FundingRate(update.to_funding_rate(quote, exchange_ts)),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() }) {
                 events.push(IncomeEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::MarkPrice(update.to_mark_price(exchange_ts)),
+                    data: ExchangeEventData::MarkPrice(update.to_mark_price(quote, exchange_ts)),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
                 events.push(IncomeEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::IndexPrice(update.to_index_price(exchange_ts)),
+                    data: ExchangeEventData::IndexPrice(update.to_index_price(quote, exchange_ts)),
                 });
             }
 
@@ -328,7 +334,7 @@ fn parse_public_message(
         "bookTicker" => {
             let ticker: BookTicker = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
-            let bbo = ticker.to_bbo();
+            let bbo = ticker.to_bbo(quote);
             Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,
@@ -347,16 +353,16 @@ fn parse_public_message(
 // 辅助函数
 // ============================================================================
 
-fn kind_to_stream(kind: &SubscriptionKind) -> String {
+fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> String {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用同一个 markPrice@1s 流
         SubscriptionKind::FundingRate { symbol }
         | SubscriptionKind::MarkPrice { symbol }
         | SubscriptionKind::IndexPrice { symbol } => {
-            format!("{}@markPrice@1s", to_binance(symbol).to_lowercase())
+            format!("{}@markPrice@1s", to_binance(symbol, quote).to_lowercase())
         }
         SubscriptionKind::BBO { symbol } => {
-            format!("{}@bookTicker", to_binance(symbol).to_lowercase())
+            format!("{}@bookTicker", to_binance(symbol, quote).to_lowercase())
         }
     }
 }
