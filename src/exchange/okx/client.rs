@@ -135,7 +135,7 @@ impl OkxClient {
             .into_iter()
             .filter_map(|d| {
                 // 只处理配置的 quote 对应的品种 (e.g., BTC-USDT-SWAP)
-                if !d.inst_id.contains(&format!("-{}-", self.quote)) {
+                if !d.inst_id.contains(&format!("-{}-SWAP", self.quote)) {
                     return None;
                 }
                 let symbol = from_okx(&d.inst_id)?;

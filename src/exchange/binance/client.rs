@@ -177,7 +177,6 @@ impl BinanceClient {
             .symbols
             .into_iter()
             .filter_map(|s| {
-                println!("Parsing symbol info: {:?}", s);
                 let symbol = from_binance(&s.symbol, &self.quote)?;
                 let mut price_step: Option<f64> = None;
                 let mut size_step: Option<f64> = None;

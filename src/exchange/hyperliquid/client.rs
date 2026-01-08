@@ -274,7 +274,11 @@ impl ExchangeClient for HyperliquidClient {
         let metas: Vec<SymbolMeta> = meta
             .universe
             .into_iter()
-            .filter(|a| !a.is_delisted)
+            .filter(|a| {
+                // 过滤已下架和带冒号的 symbol
+                // 带冒号的是其他类型资产 (e.g., "xyz:NVDA")，我们只关心主流永续合约
+                !a.is_delisted && !a.name.contains(':')
+            })
             .map(|a| asset_info_to_symbol_meta(&a))
             .collect();
 

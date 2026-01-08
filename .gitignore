@@ -14,3 +14,4 @@ config.json
 
 # OS
 .DS_Store
+*.pem
