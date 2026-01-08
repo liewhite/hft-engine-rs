@@ -1,17 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
 use fee_arb::engine::{AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, SubscribeIncome};
-use fee_arb::exchange::binance::{BinanceClient, BinanceCredentials};
-use fee_arb::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
-use fee_arb::exchange::okx::{OkxClient, OkxCredentials};
-use fee_arb::exchange::ExchangeClient;
+use fee_arb::exchange::binance::BinanceCredentials;
+use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
+use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::{
     FundingArbConfig, FundingArbStrategy, MetricsSubscriberActor, MetricsSubscriberArgs,
     SlackNotifierActor, SlackNotifierArgs,
 };
 use kameo::actor::Spawn;
 use kameo::mailbox;
+use md5::{Md5, Digest};
 use serde::Deserialize;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -52,60 +52,12 @@ pub struct MonitoringConfig {
     pub slack_token: String,
 }
 
-impl StrategyConfig {
-    fn parse_symbols(&self) -> Vec<Symbol> {
-        self.symbols.clone()
-    }
-}
-
 /// 完整配置
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
     exchanges: ExchangesConfig,
     strategy: StrategyConfig,
     monitoring: Option<MonitoringConfig>,
-}
-
-/// 打印所有交易所的 symbols
-async fn print_exchange_symbols(config: &ExchangesConfig) -> anyhow::Result<()> {
-    use std::collections::HashSet;
-
-    println!("\n=== Exchange Symbols ===\n");
-
-    // Binance
-    let binance = BinanceClient::new(Some(config.binance.clone()))?;
-    let binance_metas = binance.fetch_all_symbol_metas().await?;
-    let binance_symbols: HashSet<_> = binance_metas.iter().map(|m| m.symbol.clone()).collect();
-    println!("Binance ({} symbols)", binance_symbols.len());
-
-    // OKX
-    let okx = OkxClient::new(Some(config.okx.clone()))?;
-    let okx_metas = okx.fetch_all_symbol_metas().await?;
-    let okx_symbols: HashSet<_> = okx_metas.iter().map(|m| m.symbol.clone()).collect();
-    println!("OKX ({} symbols)", okx_symbols.len());
-
-    // Hyperliquid
-    let hl = HyperliquidClient::new(Some(config.hyperliquid.clone()))?;
-    let hl_metas = hl.fetch_all_symbol_metas().await?;
-    let hl_symbols: HashSet<_> = hl_metas.iter().map(|m| m.symbol.clone()).collect();
-    println!("Hyperliquid ({} symbols)", hl_symbols.len());
-
-    // 计算交集
-    let intersection: HashSet<_> = binance_symbols
-        .intersection(&okx_symbols)
-        .cloned()
-        .collect::<HashSet<_>>()
-        .intersection(&hl_symbols)
-        .cloned()
-        .collect();
-
-    let mut common: Vec<_> = intersection.into_iter().collect();
-    common.sort();
-
-    println!("\n=== Common Symbols ({}) ===\n", common.len());
-    println!("{:?}", common);
-
-    Ok(())
 }
 
 #[tokio::main]
@@ -125,13 +77,6 @@ async fn main() -> anyhow::Result<()> {
     let content = std::fs::read_to_string(&config_path)?;
     let config: Config = serde_json::from_str(&content)?;
 
-    let symbols = config.strategy.parse_symbols();
-    if symbols.is_empty() {
-        anyhow::bail!("No valid symbols configured");
-    }
-
-    tracing::info!(symbols = ?symbols, "Configured symbols");
-
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
             binance_credentials: Some(config.exchanges.binance.clone()),
@@ -140,16 +85,39 @@ async fn main() -> anyhow::Result<()> {
         },
         mailbox::unbounded(),
     );
+
+    // 获取所有交易所的 symbol metas
     let metas: HashMap<Exchange, Vec<SymbolMeta>> = manager
-      .ask(GetAllSymbolMetas)
-      .send()
-      .await?;
-    metas.iter().for_each(|(exchange, metas)| {
-        metas.iter().for_each(|meta| {
-            tracing::info!(exchange = %exchange, symbol = %meta.symbol, "SymbolMeta");
-        });
-    });
-    return Ok(());
+        .ask(GetAllSymbolMetas)
+        .send()
+        .await?;
+
+    // 计算所有交易所 symbol 的并集
+    let all_symbols: HashSet<Symbol> = metas
+        .values()
+        .flat_map(|metas| metas.iter().map(|m| m.symbol.clone()))
+        .collect();
+
+    tracing::info!(total_symbols = all_symbols.len(), "Total unique symbols from all exchanges");
+
+    // 对 symbol 做 MD5 取模 4，选取余数为 0 的（1/4 的 symbol）
+    let symbols: Vec<Symbol> = all_symbols
+        .into_iter()
+        .filter(|symbol| {
+            let mut hasher = Md5::new();
+            hasher.update(symbol.as_bytes());
+            let hash = hasher.finalize();
+            // 取 MD5 哈希的最后一个字节取模 4
+            let remainder = hash[15] % 4;
+            remainder == 0
+        })
+        .collect();
+
+    if symbols.is_empty() {
+        anyhow::bail!("No symbols selected after MD5 filtering");
+    }
+
+    tracing::info!(selected_symbols = symbols.len(), "Symbols selected (MD5 mod 4 == 0)");
 
 
     let enabled_exchanges = config.exchanges.enabled_exchanges();

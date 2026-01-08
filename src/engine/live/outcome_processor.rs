@@ -64,6 +64,7 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
         msg: OutcomeEvent,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        return;
         match msg {
             OutcomeEvent::PlaceOrder(order) => {
                 let client = match self.clients.get(&order.exchange) {

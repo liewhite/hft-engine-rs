@@ -5,8 +5,8 @@
 mod clock;
 mod manager;
 mod executor;
-mod processor;
-mod signal_processor;
+mod income_processor;
+mod outcome_processor;
 
 use crate::messaging::IncomeEvent;
 use crate::strategy::OutcomeEvent;
@@ -21,5 +21,5 @@ pub type OutcomePubSub = PubSub<OutcomeEvent>;
 pub use clock::{ClockActor, ClockActorArgs};
 pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome};
 pub use executor::{ExecutorActor, ExecutorArgs};
-pub use processor::{IncomeProcessorActor, RegisterExecutor};
-pub use signal_processor::{OutcomeProcessorActor, SignalProcessorArgs};
+pub use income_processor::{IncomeProcessorActor, RegisterExecutor};
+pub use outcome_processor::{OutcomeProcessorActor, SignalProcessorArgs};
