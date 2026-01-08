@@ -192,9 +192,16 @@ impl FundingArbStrategy {
     /// 计算单个交易所的 bid deviation
     /// bid_deviation = bid / bid_ema - 1
     /// 正值表示当前 bid 高于均值，适合卖出
+    /// 注意：EMA 必须预热完成（满 ema_period 条）才返回有效值
     fn bid_deviation(&self, exchange: Exchange, state: &SymbolState) -> Option<f64> {
         let bbo = state.bbo(exchange)?;
         let ema = self.exchange_emas.get(&exchange)?;
+
+        // EMA 必须预热完成才参与比较
+        if !ema.bid_ema.is_ready() {
+            return None;
+        }
+
         let bid_ema = ema.bid_ema.value()?;
 
         if bid_ema <= 0.0 {
@@ -207,9 +214,16 @@ impl FundingArbStrategy {
     /// 计算单个交易所的 ask deviation
     /// ask_deviation = ask_ema / ask - 1
     /// 正值表示当前 ask 低于均值，适合买入
+    /// 注意：EMA 必须预热完成（满 ema_period 条）才返回有效值
     fn ask_deviation(&self, exchange: Exchange, state: &SymbolState) -> Option<f64> {
         let bbo = state.bbo(exchange)?;
         let ema = self.exchange_emas.get(&exchange)?;
+
+        // EMA 必须预热完成才参与比较
+        if !ema.ask_ema.is_ready() {
+            return None;
+        }
+
         let ask_ema = ema.ask_ema.value()?;
 
         if bbo.ask_price <= 0.0 {
