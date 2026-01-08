@@ -161,9 +161,10 @@ impl BinanceClient {
             .await
             .map_err(Self::map_reqwest_error)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+
+        if !status.is_success() {
             return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
                 Exchange::Binance,
                 status.as_u16() as i32,
@@ -171,7 +172,13 @@ impl BinanceClient {
             )));
         }
 
-        let info: ExchangeInfo = resp.json().await.map_err(Self::map_reqwest_error)?;
+        let info: ExchangeInfo = serde_json::from_str(&text).map_err(|e| {
+            ExchangeError::Other(format!(
+                "Failed to parse exchangeInfo: {}, response preview: {}",
+                e,
+                &text[..text.len().min(500)]
+            ))
+        })?;
 
         let metas: Vec<SymbolMeta> = info
             .symbols

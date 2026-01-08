@@ -1,5 +1,7 @@
-use fee_arb::domain::{Exchange, Symbol};
-use fee_arb::engine::{AddStrategies, ManagerActor, ManagerActorArgs, SubscribeIncome};
+use std::collections::HashMap;
+
+use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
+use fee_arb::engine::{AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, SubscribeIncome};
 use fee_arb::exchange::binance::{BinanceClient, BinanceCredentials};
 use fee_arb::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
 use fee_arb::exchange::okx::{OkxClient, OkxCredentials};
@@ -138,6 +140,17 @@ async fn main() -> anyhow::Result<()> {
         },
         mailbox::unbounded(),
     );
+    let metas: HashMap<Exchange, Vec<SymbolMeta>> = manager
+      .ask(GetAllSymbolMetas)
+      .send()
+      .await?;
+    metas.iter().for_each(|(exchange, metas)| {
+        metas.iter().for_each(|meta| {
+            tracing::info!(exchange = %exchange, symbol = %meta.symbol, "SymbolMeta");
+        });
+    });
+    return Ok(());
+
 
     let enabled_exchanges = config.exchanges.enabled_exchanges();
 
