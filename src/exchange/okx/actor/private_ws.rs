@@ -231,7 +231,6 @@ fn parse_private_message(
     if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
         match event {
             "subscribe" | "unsubscribe" => {
-                tracing::info!(event, raw, "OKX private subscription response");
                 return Ok(Vec::new());
             }
             "channel-conn-count" => {

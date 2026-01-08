@@ -33,7 +33,6 @@ impl ExchangesConfig {
 /// 策略配置
 #[derive(Debug, Clone, Deserialize)]
 struct StrategyConfig {
-    symbols: Vec<String>,
     funding_arb: FundingArbConfig,
 }
 
@@ -185,13 +184,17 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("System running. Press Ctrl+C to stop.");
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for ctrl-c");
+    // 同时等待 Ctrl+C 或 Manager 死亡
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Received shutdown signal");
+            manager.stop_gracefully().await.ok();
+        }
+        _ = manager.wait_for_shutdown() => {
+            tracing::error!("Manager actor died unexpectedly, exiting");
+        }
+    }
 
-    tracing::info!("Received shutdown signal");
-    manager.stop_gracefully().await.ok();
-    tracing::info!("Manager stopped");
-
+    tracing::info!("System stopped");
     Ok(())
 }
