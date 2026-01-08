@@ -10,8 +10,9 @@ use fee_arb::exchange::ExchangeClient;
 use reqwest::Client;
 use serde::Deserialize;
 
-/// 测试交易对 (系统内部统一用 USDT 作为 quote，实际结算用 USDC)
-const TEST_SYMBOL: (&str, &str) = ("BTC", "USDT");
+/// 测试交易对
+const TEST_BASE: &str = "BTC";
+const TEST_QUOTE: &str = "USDC"; // Hyperliquid 使用 USDC
 
 /// 测试数量 - 请根据实际情况填写
 const TEST_QUANTITY: f64 = 0.001; // TODO: 填写测试数量
@@ -23,6 +24,7 @@ fn get_credentials() -> Option<HyperliquidCredentials> {
     Some(HyperliquidCredentials {
         wallet_address,
         private_key,
+        quote: TEST_QUOTE.to_string(),
     })
 }
 
@@ -77,7 +79,7 @@ async fn test_hyperliquid_limit_buy() {
         get_credentials().expect("需要设置 HYPERLIQUID_WALLET_ADDRESS 和 HYPERLIQUID_PRIVATE_KEY");
     let client = HyperliquidClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_SYMBOL.0, TEST_SYMBOL.1);
+    let symbol = Symbol::new(TEST_BASE);
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");
@@ -125,7 +127,7 @@ async fn test_hyperliquid_limit_sell() {
         get_credentials().expect("需要设置 HYPERLIQUID_WALLET_ADDRESS 和 HYPERLIQUID_PRIVATE_KEY");
     let client = HyperliquidClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_SYMBOL.0, TEST_SYMBOL.1);
+    let symbol = Symbol::new(TEST_BASE);
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");

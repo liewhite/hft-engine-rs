@@ -11,7 +11,8 @@ use reqwest::Client;
 use serde::Deserialize;
 
 /// 测试交易对
-const TEST_SYMBOL: (&str, &str) = ("BTC", "USDT");
+const TEST_BASE: &str = "BTC";
+const TEST_QUOTE: &str = "USDT";
 
 /// 测试数量 - 请根据实际情况填写
 const TEST_QUANTITY: f64 = 0.002; // TODO: 填写测试数量
@@ -20,7 +21,11 @@ const TEST_QUANTITY: f64 = 0.002; // TODO: 填写测试数量
 fn get_credentials() -> Option<BinanceCredentials> {
     let api_key = std::env::var("BINANCE_API_KEY").ok()?;
     let secret = std::env::var("BINANCE_SECRET").ok()?;
-    Some(BinanceCredentials { api_key, secret })
+    Some(BinanceCredentials {
+        api_key,
+        secret,
+        quote: TEST_QUOTE.to_string(),
+    })
 }
 
 /// BBO 数据
@@ -35,7 +40,7 @@ struct BboTicker {
 /// 获取 BBO (REST API)
 async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Error>> {
     let client = Client::new();
-    let binance_symbol = format!("{}{}", symbol.base, symbol.quote);
+    let binance_symbol = format!("{}{}", symbol.base, TEST_QUOTE);
 
     let resp: BboTicker = client
         .get(format!(
@@ -60,7 +65,7 @@ async fn test_binance_limit_buy() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
     let client = BinanceClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_SYMBOL.0, TEST_SYMBOL.1);
+    let symbol = Symbol::new(TEST_BASE);
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");
@@ -106,7 +111,7 @@ async fn test_binance_limit_sell() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
     let client = BinanceClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_SYMBOL.0, TEST_SYMBOL.1);
+    let symbol = Symbol::new(TEST_BASE);
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");

@@ -12,7 +12,8 @@ use reqwest::Client;
 use serde::Deserialize;
 
 /// 测试交易对
-const TEST_SYMBOL: (&str, &str) = ("BTC", "USDT");
+const TEST_BASE: &str = "BTC";
+const TEST_QUOTE: &str = "USDT";
 
 /// 测试数量 - 请根据实际情况填写 (OKX 是张数，1张 = ctVal BTC)
 const TEST_QUANTITY: f64 = 0.01; // TODO: 填写测试数量（张数）
@@ -26,6 +27,7 @@ fn get_credentials() -> Option<OkxCredentials> {
         api_key,
         secret,
         passphrase,
+        quote: TEST_QUOTE.to_string(),
     })
 }
 
@@ -47,7 +49,7 @@ struct TickerData {
 /// 获取 BBO (REST API)
 async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Error>> {
     let client = Client::new();
-    let inst_id = format!("{}-{}-SWAP", symbol.base, symbol.quote);
+    let inst_id = format!("{}-{}-SWAP", symbol.base, TEST_QUOTE);
 
     let resp: OkxResponse<TickerData> = client
         .get(format!(
@@ -77,7 +79,7 @@ async fn test_okx_limit_buy() {
     let credentials = get_credentials().expect("需要设置 OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE");
     let client = OkxClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_SYMBOL.0, TEST_SYMBOL.1);
+    let symbol = Symbol::new(TEST_BASE);
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");
@@ -123,7 +125,7 @@ async fn test_okx_limit_sell() {
     let credentials = get_credentials().expect("需要设置 OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE");
     let client = OkxClient::new(Some(credentials)).expect("创建客户端失败");
 
-    let symbol = Symbol::new(TEST_SYMBOL.0, TEST_SYMBOL.1);
+    let symbol = Symbol::new(TEST_BASE);
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(&symbol).await.expect("获取 BBO 失败");
