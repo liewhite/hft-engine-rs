@@ -51,22 +51,6 @@ pub struct HyperliquidPublicWsActor {
 }
 
 impl HyperliquidPublicWsActor {
-
-    /// 发送订阅消息
-    async fn send_subscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let subscription = kind_to_subscription(kind, &self.quote);
-        let msg = json!({
-            "method": "subscribe",
-            "subscription": subscription
-        })
-        .to_string();
-
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
-        tx.send(msg)
-            .await
-            .map_err(|_| WsError::Network("Channel closed".to_string()))
-    }
-
     /// 批量发送订阅消息（发送多条消息，无速率限制）
     async fn send_subscribe_batch(&self, kinds: &[SubscriptionKind]) -> Result<(), WsError> {
         let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
@@ -174,35 +158,9 @@ impl Message<Subscribe> for HyperliquidPublicWsActor {
         msg: Subscribe,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 检查 symbol 是否存在于 symbol_metas 中
-        let symbol = msg.kind.symbol();
-        if !self.symbol_metas.contains_key(symbol) {
-            tracing::warn!(
-                exchange = "Hyperliquid",
-                symbol = %symbol,
-                "Symbol not found in symbol_metas, ignoring subscription"
-            );
-            return;
-        }
-
-        // 检查是否已订阅该 kind
-        if self.subscribed_kinds.contains(&msg.kind) {
-            return;
-        }
-
-        // 检查底层 stream 是否已订阅
-        let stream = kind_to_stream(&msg.kind, &self.quote);
-        if !self.subscribed_streams.contains(&stream) {
-            // 发送 WebSocket 订阅请求
-            if let Err(e) = self.send_subscribe(&msg.kind).await {
-                tracing::error!(error = %e, "Failed to send subscribe, killing actor");
-                ctx.actor_ref().kill();
-                return;
-            }
-            self.subscribed_streams.insert(stream);
-        }
-
-        self.subscribed_kinds.insert(msg.kind);
+        // 委托给批量订阅
+        self.handle(SubscribeBatch { kinds: vec![msg.kind] }, ctx)
+            .await
     }
 }
 

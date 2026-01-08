@@ -93,61 +93,6 @@ impl ManagerActor {
         )
     }
 
-    /// 添加策略的内部实现
-    async fn do_add_strategy(
-        &mut self,
-        strategy: Box<dyn Strategy>,
-        actor_ref: ActorRef<Self>,
-    ) -> Result<(), ExchangeError> {
-        let processor = self.income_processor.clone();
-        let outcome_pubsub = self.outcome_pubsub.clone();
-
-        // 1. 获取策略需要的 public streams
-        // 注意：不再做硬性检查，exchange actor 会忽略不存在的 symbol
-        let public_streams = strategy.public_streams();
-
-        // 2. 收集策略需要的订阅
-        let subscriptions: HashSet<(Exchange, SubscriptionKind)> = public_streams
-            .iter()
-            .flat_map(|(exchange, kinds)| kinds.iter().map(move |kind| (*exchange, kind.clone())))
-            .collect();
-
-        // 3. 创建 ExecutorActor (使用 spawn_link_with_mailbox)
-        let executor_ref = ExecutorActor::spawn_link_with_mailbox(
-            &actor_ref,
-            ExecutorArgs {
-                strategy,
-                symbol_metas: Arc::new(self.symbol_metas.clone()),
-                outcome_pubsub,
-            },
-            mailbox::unbounded(),
-        )
-        .await;
-
-        // 4. 向 ProcessorActor 注册 Executor 的订阅
-        let _ = processor
-            .tell(RegisterExecutor {
-                executor: executor_ref.clone(),
-                subscriptions: subscriptions.clone(),
-            })
-            .send()
-            .await;
-
-        // 5. 向 ExchangeActors 发送订阅请求
-        for (exchange, kind) in subscriptions {
-            if let Some(actor) = self.exchange_actors.get(&exchange) {
-                actor
-                    .subscribe(kind)
-                    .await
-                    .map_err(ExchangeError::Other)?;
-            }
-        }
-
-        tracing::info!("Strategy added, ExecutorActor created");
-
-        Ok(())
-    }
-
     /// 批量添加策略的内部实现
     async fn do_add_strategies(
         &mut self,
@@ -424,7 +369,9 @@ impl Message<AddStrategy> for ManagerActor {
         msg: AddStrategy,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.do_add_strategy(msg.0, ctx.actor_ref().clone()).await
+        // 委托给批量添加
+        self.do_add_strategies(vec![msg.0], ctx.actor_ref().clone())
+            .await
     }
 }
 

@@ -52,22 +52,6 @@ pub struct OkxPublicWsActor {
 }
 
 impl OkxPublicWsActor {
-
-    /// 发送订阅消息
-    async fn send_subscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let arg = kind_to_arg(kind, &self.quote);
-        let msg = json!({
-            "op": "subscribe",
-            "args": [arg]
-        })
-        .to_string();
-
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
-        tx.send(msg)
-            .await
-            .map_err(|_| WsError::Network("Channel closed".to_string()))
-    }
-
     /// 批量发送订阅消息（一条 WebSocket 消息包含多个 args）
     async fn send_subscribe_batch(&self, args: Vec<serde_json::Value>) -> Result<(), WsError> {
         if args.is_empty() {
@@ -171,27 +155,9 @@ impl Message<Subscribe> for OkxPublicWsActor {
         msg: Subscribe,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 检查 symbol 是否存在于 symbol_metas 中
-        let symbol = msg.kind.symbol();
-        if !self.symbol_metas.contains_key(symbol) {
-            tracing::warn!(
-                exchange = "OKX",
-                symbol = %symbol,
-                "Symbol not found in symbol_metas, ignoring subscription"
-            );
-            return;
-        }
-
-        if self.subscribed.contains(&msg.kind) {
-            return;
-        }
-
-        if let Err(e) = self.send_subscribe(&msg.kind).await {
-            tracing::error!(error = %e, "Failed to send subscribe, killing actor");
-            ctx.actor_ref().kill();
-            return;
-        }
-        self.subscribed.insert(msg.kind);
+        // 委托给批量订阅
+        self.handle(SubscribeBatch { kinds: vec![msg.kind] }, ctx)
+            .await
     }
 }
 

@@ -5,7 +5,7 @@
 //! - 处理 Subscribe/Unsubscribe 请求
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Symbol, SymbolMeta, Timestamp};
+use crate::domain::{now_ms, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::binance::codec::{BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
@@ -21,12 +21,8 @@ use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-
-/// Binance WebSocket 订阅速率限制：每秒最多 10 条消息
-const SUBSCRIBE_INTERVAL_MS: u64 = 110; // 略大于 100ms 以确保安全
 
 /// Public WebSocket URL
 const WS_PUBLIC_URL: &str = "wss://fstream.binance.com/ws";
@@ -55,36 +51,9 @@ pub struct BinancePublicWsActor {
     subscribed_streams: HashSet<String>,
     /// 已订阅的 kinds (用于事件分发和取消订阅)
     subscribed_kinds: HashSet<SubscriptionKind>,
-    /// 上次发送订阅消息的时间戳 (用于速率限制)
-    last_subscribe_time: Timestamp,
 }
 
 impl BinancePublicWsActor {
-    /// 发送订阅消息 (带速率限制)
-    async fn send_subscribe(&mut self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        // 速率限制：确保距离上次订阅至少 SUBSCRIBE_INTERVAL_MS 毫秒
-        let now = now_ms();
-        let elapsed = now.saturating_sub(self.last_subscribe_time);
-        if elapsed < SUBSCRIBE_INTERVAL_MS {
-            let delay = SUBSCRIBE_INTERVAL_MS - elapsed;
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-        self.last_subscribe_time = now_ms();
-
-        let stream = kind_to_stream(kind, &self.quote);
-        let msg = json!({
-            "method": "SUBSCRIBE",
-            "params": [stream],
-            "id": 1
-        })
-        .to_string();
-
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
-        tx.send(msg)
-            .await
-            .map_err(|_| WsError::Network("Channel closed".to_string()))
-    }
-
     /// 批量发送订阅消息（一条 WebSocket 消息包含多个 streams）
     async fn send_subscribe_batch(&self, streams: Vec<String>) -> Result<(), WsError> {
         if streams.is_empty() {
@@ -165,7 +134,6 @@ impl Actor for BinancePublicWsActor {
             ws_tx: Some(outgoing_tx),
             subscribed_streams: HashSet::new(),
             subscribed_kinds: HashSet::new(),
-            last_subscribe_time: 0,
         })
     }
 
@@ -193,35 +161,9 @@ impl Message<Subscribe> for BinancePublicWsActor {
         msg: Subscribe,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 检查 symbol 是否存在于 symbol_metas 中
-        let symbol = msg.kind.symbol();
-        if !self.symbol_metas.contains_key(symbol) {
-            tracing::warn!(
-                exchange = "Binance",
-                symbol = %symbol,
-                "Symbol not found in symbol_metas, ignoring subscription"
-            );
-            return;
-        }
-
-        // 检查是否已订阅该 kind
-        if self.subscribed_kinds.contains(&msg.kind) {
-            return;
-        }
-
-        // 检查底层 stream 是否已订阅
-        let stream = kind_to_stream(&msg.kind, &self.quote);
-        if !self.subscribed_streams.contains(&stream) {
-            // 发送 WebSocket 订阅请求
-            if let Err(e) = self.send_subscribe(&msg.kind).await {
-                tracing::error!(error = %e, "Failed to send subscribe, killing actor");
-                ctx.actor_ref().kill();
-                return;
-            }
-            self.subscribed_streams.insert(stream);
-        }
-
-        self.subscribed_kinds.insert(msg.kind);
+        // 委托给批量订阅
+        self.handle(SubscribeBatch { kinds: vec![msg.kind] }, ctx)
+            .await
     }
 }
 
