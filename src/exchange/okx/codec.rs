@@ -32,7 +32,7 @@ pub struct FundingRateData {
     pub next_funding_rate: Option<String>,
     #[allow(dead_code)]
     pub funding_time: String,
-    pub next_funding_time: String,
+    // pub next_funding_time: String,
 }
 
 impl FundingRateData {

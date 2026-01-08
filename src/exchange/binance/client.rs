@@ -130,8 +130,6 @@ impl BinanceClient {
         #[serde(rename_all = "camelCase")]
         struct SymbolInfo {
             symbol: String,
-            base_asset: String,
-            underlying_type: String,
             filters: Vec<Filter>,
         }
 

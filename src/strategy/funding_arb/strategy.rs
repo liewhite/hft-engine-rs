@@ -67,6 +67,41 @@ impl FundingArbStrategy {
         self.exchange_emas.values().all(|ema| ema.is_ready())
     }
 
+    /// 打印当前最大的 deviation（用于 Clock 事件）
+    fn log_max_deviation(&self, state: &SymbolState) {
+        // 找到 bid_deviation 最大的交易所
+        let max_bid_dev = self.exchanges.iter()
+            .filter_map(|&ex| self.bid_deviation(ex, state).map(|dev| (ex, dev)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+        // 找到 ask_deviation 最大的交易所
+        let max_ask_dev = self.exchanges.iter()
+            .filter_map(|&ex| self.ask_deviation(ex, state).map(|dev| (ex, dev)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+        match (max_bid_dev, max_ask_dev) {
+            (Some((bid_ex, bid_dev)), Some((ask_ex, ask_dev))) => {
+                let total_dev = bid_dev + ask_dev;
+                tracing::info!(
+                    symbol = %self.symbol,
+                    max_bid_exchange = %bid_ex,
+                    max_bid_deviation = format!("{:.6}", bid_dev),
+                    max_ask_exchange = %ask_ex,
+                    max_ask_deviation = format!("{:.6}", ask_dev),
+                    total_deviation = format!("{:.6}", total_dev),
+                    threshold = format!("{:.6}", self.config.deviation_threshold),
+                    "Current max deviation"
+                );
+            }
+            _ => {
+                tracing::debug!(
+                    symbol = %self.symbol,
+                    "EMA not ready, cannot compute deviation"
+                );
+            }
+        }
+    }
+
     /// 计算单个交易所的 bid deviation
     /// bid_deviation = bid / bid_ema - 1
     /// 正值表示当前 bid 高于均值，适合卖出
@@ -722,6 +757,12 @@ impl Strategy for FundingArbStrategy {
         // BBO 事件时更新该交易所的 bid/ask EMA
         if let ExchangeEventData::BBO(bbo) = &event.data {
             self.update_exchange_ema(bbo.exchange, symbol_state);
+        }
+
+        // Clock 事件时打印当前最大 deviation
+        if let ExchangeEventData::Clock = &event.data {
+            self.log_max_deviation(symbol_state);
+            return vec![];
         }
 
         // EMA 未预热完成，不进行交易

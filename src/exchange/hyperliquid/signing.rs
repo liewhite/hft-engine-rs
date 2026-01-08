@@ -168,7 +168,7 @@ pub struct OrderWire {
 #[serde(rename_all = "camelCase")]
 pub enum OrderType {
     Limit(LimitOrder),
-    Trigger(TriggerOrder),
+    // Trigger(TriggerOrder),
 }
 
 /// 限价单参数
