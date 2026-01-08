@@ -79,23 +79,6 @@ impl ManagerActor {
         Ok(symbol_metas)
     }
 
-    /// 检查策略所需的 symbols 是否都已缓存
-    fn check_required_symbols(&self, strategy: &dyn Strategy) -> Result<(), ExchangeError> {
-        let public_streams = strategy.public_streams();
-        for (exchange, kinds) in &public_streams {
-            for kind in kinds {
-                let symbol = kind.symbol();
-                if !self.symbol_metas.contains_key(&(*exchange, symbol.clone())) {
-                    return Err(ExchangeError::Other(format!(
-                        "Symbol {:?} not found on {:?}. May be newly listed, please restart.",
-                        symbol, exchange
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// 提取指定交易所的 symbol metas（静态方法）
     fn get_symbol_metas_for(
         symbol_metas: &HashMap<(Exchange, Symbol), SymbolMeta>,
@@ -119,19 +102,17 @@ impl ManagerActor {
         let processor = self.income_processor.clone();
         let outcome_pubsub = self.outcome_pubsub.clone();
 
-        // 1. 检查策略所需的 symbols 是否都已缓存（启动时已预加载）
-        self.check_required_symbols(strategy.as_ref())?;
-
-        // 2. 获取策略需要的 public streams
+        // 1. 获取策略需要的 public streams
+        // 注意：不再做硬性检查，exchange actor 会忽略不存在的 symbol
         let public_streams = strategy.public_streams();
 
-        // 3. 收集策略需要的订阅
+        // 2. 收集策略需要的订阅
         let subscriptions: HashSet<(Exchange, SubscriptionKind)> = public_streams
             .iter()
             .flat_map(|(exchange, kinds)| kinds.iter().map(move |kind| (*exchange, kind.clone())))
             .collect();
 
-        // 4. 创建 ExecutorActor (使用 spawn_link_with_mailbox)
+        // 3. 创建 ExecutorActor (使用 spawn_link_with_mailbox)
         let executor_ref = ExecutorActor::spawn_link_with_mailbox(
             &actor_ref,
             ExecutorArgs {
@@ -143,7 +124,7 @@ impl ManagerActor {
         )
         .await;
 
-        // 5. 向 ProcessorActor 注册 Executor 的订阅
+        // 4. 向 ProcessorActor 注册 Executor 的订阅
         let _ = processor
             .tell(RegisterExecutor {
                 executor: executor_ref.clone(),
@@ -152,7 +133,7 @@ impl ManagerActor {
             .send()
             .await;
 
-        // 6. 向 ExchangeActors 发送订阅请求
+        // 5. 向 ExchangeActors 发送订阅请求
         for (exchange, kind) in subscriptions {
             if let Some(actor) = self.exchange_actors.get(&exchange) {
                 actor

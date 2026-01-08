@@ -41,8 +41,7 @@ pub struct OkxPublicWsActorArgs {
 pub struct OkxPublicWsActor {
     /// Income PubSub (发布事件)
     income_pubsub: ActorRef<IncomePubSub>,
-    /// Symbol 元数据
-    #[allow(dead_code)]
+    /// Symbol 元数据（用于过滤不存在的 symbol）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
     quote: String,
@@ -154,6 +153,17 @@ impl Message<Subscribe> for OkxPublicWsActor {
         msg: Subscribe,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // 检查 symbol 是否存在于 symbol_metas 中
+        let symbol = msg.kind.symbol();
+        if !self.symbol_metas.contains_key(symbol) {
+            tracing::warn!(
+                exchange = "OKX",
+                symbol = %symbol,
+                "Symbol not found in symbol_metas, ignoring subscription"
+            );
+            return;
+        }
+
         if self.subscribed.contains(&msg.kind) {
             return;
         }

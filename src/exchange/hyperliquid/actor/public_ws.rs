@@ -38,8 +38,7 @@ pub struct HyperliquidPublicWsActorArgs {
 pub struct HyperliquidPublicWsActor {
     /// Income PubSub (发布事件)
     income_pubsub: ActorRef<IncomePubSub>,
-    /// Symbol 元数据
-    #[allow(dead_code)]
+    /// Symbol 元数据（用于过滤不存在的 symbol）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDC", "USDE")
     quote: String,
@@ -155,6 +154,17 @@ impl Message<Subscribe> for HyperliquidPublicWsActor {
         msg: Subscribe,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // 检查 symbol 是否存在于 symbol_metas 中
+        let symbol = msg.kind.symbol();
+        if !self.symbol_metas.contains_key(symbol) {
+            tracing::warn!(
+                exchange = "Hyperliquid",
+                symbol = %symbol,
+                "Symbol not found in symbol_metas, ignoring subscription"
+            );
+            return;
+        }
+
         // 检查是否已订阅该 kind
         if self.subscribed_kinds.contains(&msg.kind) {
             return;
