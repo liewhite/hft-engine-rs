@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce, BBO};
+use crate::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
@@ -8,11 +8,7 @@ use std::collections::{HashMap, HashSet};
 /// 市价单滑点（用限价单 IOC 模拟市价单）
 const MARKET_ORDER_SLIPPAGE: f64 = 0.001; // 0.1%
 
-/// 开仓阈值：价差 >= 0.25% 时开仓
-/// 开仓成本 0.05% * 2 = 0.1%，阈值设为 0.25% 保证即使平仓没有利润也不亏
-const OPEN_THRESHOLD: f64 = 0.0025;
-
-/// 平仓阈值：价差 <= 0% 时平仓
+/// 平仓阈值：deviation <= 0% 时平仓
 const CLOSE_THRESHOLD: f64 = 0.0;
 
 /// EMA (Exponential Moving Average) 计算器
@@ -65,8 +61,11 @@ impl EmaCalculator {
 /// 跨所价差套利策略配置
 #[derive(Debug, Clone, Deserialize)]
 pub struct FundingArbConfig {
-    /// EMA 周期
+    /// EMA 周期（表示最近多少笔 BBO 更新的均价）
     pub ema_period: usize,
+    /// 开仓 deviation 阈值
+    /// - max_bid_deviation + max_ask_deviation > deviation_threshold 时开仓
+    pub deviation_threshold: f64,
     /// 单笔下单金额 (USDT)，开平仓均按此金额计算数量
     pub max_notional: f64,
     /// 最小下单金额 (USDT)，低于此金额的订单将被放弃
@@ -87,17 +86,41 @@ pub struct FundingArbConfig {
     pub max_position_ratio: f64,
 }
 
+/// 交易所的 bid/ask EMA
+#[derive(Debug, Clone)]
+struct ExchangeEma {
+    bid_ema: EmaCalculator,
+    ask_ema: EmaCalculator,
+}
+
+impl ExchangeEma {
+    fn new(period: usize) -> Self {
+        Self {
+            bid_ema: EmaCalculator::new(period),
+            ask_ema: EmaCalculator::new(period),
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.bid_ema.is_ready() && self.ask_ema.is_ready()
+    }
+}
+
 /// 开仓信号
 #[derive(Debug, Clone)]
 struct OpenSignal {
-    /// 价格最高交易所（做空）
+    /// bid deviation 最大的交易所（做空/卖出）
     short_exchange: Exchange,
     /// 做空价格（bid）
     short_price: f64,
-    /// 价格最低交易所（做多）
+    /// bid deviation = bid / bid_ema - 1
+    bid_deviation: f64,
+    /// ask deviation 最大的交易所（做多/买入）
     long_exchange: Exchange,
     /// 做多价格（ask）
     long_price: f64,
+    /// ask deviation = ask_ema / ask - 1
+    ask_deviation: f64,
 }
 
 /// 平仓信号
@@ -120,136 +143,127 @@ struct CloseSignal {
 /// 跨所价差套利策略 (单 symbol)
 ///
 /// 策略逻辑：
-/// 1. 为每对交易所 (long_ex, short_ex) 维护价差 EMA
-///    - 价差 = short_ex.bid - long_ex.ask（在 long_ex 买入，在 short_ex 卖出的价差）
-/// 2. 开仓：当价差偏离 EMA 超过 0.25% 时开仓
-/// 3. 平仓：当价差回归 EMA（偏离 <= 0%）时平仓
-///
-/// 阈值设计：
-/// - 开仓成本：0.05% * 2 = 0.1%（双边手续费）
-/// - 开仓阈值：0.25%，保证即使平仓没有利润也不亏钱
+/// 1. 为每个交易所的 bid 和 ask 分别维护 EMA（表示最近 N 笔 BBO 更新的均价）
+/// 2. 当 BBO 更新时，更新对应交易所的 bid_ema 和 ask_ema
+/// 3. 计算每个交易所的偏离度：
+///    - bid_deviation = bid / bid_ema - 1（正值表示当前 bid 高于均值，适合卖出）
+///    - ask_deviation = ask_ema / ask - 1（正值表示当前 ask 低于均值，适合买入）
+/// 4. 找到 max_bid_deviation 最大的交易所（卖出）和 max_ask_deviation 最大的交易所（买入）
+/// 5. 如果 max_bid_deviation + max_ask_deviation > threshold，则开仓
 pub struct FundingArbStrategy {
     config: FundingArbConfig,
     exchanges: Vec<Exchange>,
     symbol: Symbol,
-    /// 交易所对的价差 EMA
-    /// key: (做多交易所, 做空交易所)
-    /// value: 价差 EMA，其中 spread = short_ex.bid - long_ex.ask
-    spread_emas: HashMap<(Exchange, Exchange), EmaCalculator>,
+    /// 每个交易所的 bid/ask EMA
+    exchange_emas: HashMap<Exchange, ExchangeEma>,
 }
 
 impl FundingArbStrategy {
     pub fn new(config: FundingArbConfig, exchanges: Vec<Exchange>, symbol: Symbol) -> Self {
-        // 为每对交易所创建价差 EMA
-        // 对于 N 个交易所，有 N*(N-1) 个方向（A买B卖 和 B买A卖 是不同的）
-        let mut spread_emas = HashMap::new();
-        for &long_ex in &exchanges {
-            for &short_ex in &exchanges {
-                if long_ex != short_ex {
-                    spread_emas.insert(
-                        (long_ex, short_ex),
-                        EmaCalculator::new(config.ema_period),
-                    );
-                }
-            }
+        // 为每个交易所创建 bid/ask EMA
+        let mut exchange_emas = HashMap::new();
+        for &ex in &exchanges {
+            exchange_emas.insert(ex, ExchangeEma::new(config.ema_period));
         }
 
         Self {
             config,
             exchanges,
             symbol,
-            spread_emas,
+            exchange_emas,
         }
     }
 
-    /// 更新所有涉及该交易所的价差 EMA
-    fn update_spread_emas(&mut self, state: &SymbolState) {
-        // 获取所有交易所的 BBO
-        let bbos: HashMap<Exchange, &BBO> = self
-            .exchanges
-            .iter()
-            .filter_map(|ex| state.bbo(*ex).map(|bbo| (*ex, bbo)))
-            .collect();
-
-        // 更新所有交易所对的价差 EMA
-        for (&long_ex, &long_bbo) in &bbos {
-            for (&short_ex, &short_bbo) in &bbos {
-                if long_ex != short_ex {
-                    // 价差 = short_ex.bid - long_ex.ask
-                    let spread = short_bbo.bid_price - long_bbo.ask_price;
-                    if let Some(ema) = self.spread_emas.get_mut(&(long_ex, short_ex)) {
-                        ema.update(spread);
-                    }
-                }
+    /// 更新指定交易所的 bid/ask EMA
+    fn update_exchange_ema(&mut self, exchange: Exchange, state: &SymbolState) {
+        if let Some(bbo) = state.bbo(exchange) {
+            if let Some(ema) = self.exchange_emas.get_mut(&exchange) {
+                ema.bid_ema.update(bbo.bid_price);
+                ema.ask_ema.update(bbo.ask_price);
             }
         }
     }
 
-    /// 检查所有价差 EMA 是否都预热完成
+    /// 检查所有交易所的 EMA 是否都预热完成
     fn all_emas_ready(&self) -> bool {
-        self.spread_emas.values().all(|ema| ema.is_ready())
+        self.exchange_emas.values().all(|ema| ema.is_ready())
     }
 
-    /// 计算交易所对的价差偏离
-    /// 返回 (当前价差, EMA, 偏离比例)
-    /// 偏离比例 = (spread - ema) / mid_price
-    fn spread_deviation(
-        &self,
-        long_ex: Exchange,
-        short_ex: Exchange,
-        state: &SymbolState,
-    ) -> Option<(f64, f64, f64)> {
-        let long_bbo = state.bbo(long_ex)?;
-        let short_bbo = state.bbo(short_ex)?;
-        let ema = self.spread_emas.get(&(long_ex, short_ex))?.value()?;
+    /// 计算单个交易所的 bid deviation
+    /// bid_deviation = bid / bid_ema - 1
+    /// 正值表示当前 bid 高于均值，适合卖出
+    fn bid_deviation(&self, exchange: Exchange, state: &SymbolState) -> Option<f64> {
+        let bbo = state.bbo(exchange)?;
+        let ema = self.exchange_emas.get(&exchange)?;
+        let bid_ema = ema.bid_ema.value()?;
 
-        // 当前价差 = short_ex.bid - long_ex.ask
-        let spread = short_bbo.bid_price - long_bbo.ask_price;
-        // 中间价用于计算偏离比例
-        let mid_price = (long_bbo.ask_price + short_bbo.bid_price) / 2.0;
-
-        if mid_price <= 0.0 {
+        if bid_ema <= 0.0 {
             return None;
         }
 
-        // 偏离比例 = (spread - ema) / mid_price
-        let deviation = (spread - ema) / mid_price;
+        Some(bbo.bid_price / bid_ema - 1.0)
+    }
 
-        Some((spread, ema, deviation))
+    /// 计算单个交易所的 ask deviation
+    /// ask_deviation = ask_ema / ask - 1
+    /// 正值表示当前 ask 低于均值，适合买入
+    fn ask_deviation(&self, exchange: Exchange, state: &SymbolState) -> Option<f64> {
+        let bbo = state.bbo(exchange)?;
+        let ema = self.exchange_emas.get(&exchange)?;
+        let ask_ema = ema.ask_ema.value()?;
+
+        if bbo.ask_price <= 0.0 {
+            return None;
+        }
+
+        Some(ask_ema / bbo.ask_price - 1.0)
     }
 
     /// 检查开仓条件，返回开仓信号
     ///
-    /// 条件：
-    /// 1. 遍历所有交易所对，找到价差偏离 EMA 最大的
-    /// 2. 偏离 >= OPEN_THRESHOLD (0.25%) 时开仓
-    /// 3. 风控检查通过
+    /// 逻辑：
+    /// 1. 找到 bid_deviation 最大的交易所（卖出）
+    /// 2. 找到 ask_deviation 最大的交易所（买入）
+    /// 3. 如果 max_bid_deviation + max_ask_deviation > threshold，且两个交易所不同，则开仓
+    /// 4. 开仓前检查杠杆率：开仓后仓位 notional 不能超过 equity * max_position_ratio
     fn check_open_signal(
         &self,
         state: &SymbolState,
         state_manager: &StateManager,
     ) -> Option<OpenSignal> {
-        // 遍历所有交易所对，找到偏离最大的
-        let mut best_pair: Option<(Exchange, Exchange, f64, f64, f64)> = None; // (long_ex, short_ex, spread, ema, deviation)
-
-        for &long_ex in &self.exchanges {
-            for &short_ex in &self.exchanges {
-                if long_ex == short_ex {
-                    continue;
-                }
-
-                if let Some((spread, ema, deviation)) = self.spread_deviation(long_ex, short_ex, state) {
-                    if deviation >= OPEN_THRESHOLD {
-                        // 找偏离最大的
-                        if best_pair.is_none() || deviation > best_pair.as_ref().unwrap().4 {
-                            best_pair = Some((long_ex, short_ex, spread, ema, deviation));
-                        }
-                    }
+        // 找到 bid_deviation 最大的交易所（卖出）
+        let mut max_bid_dev: Option<(Exchange, f64)> = None;
+        for &ex in &self.exchanges {
+            if let Some(dev) = self.bid_deviation(ex, state) {
+                if max_bid_dev.is_none() || dev > max_bid_dev.as_ref().unwrap().1 {
+                    max_bid_dev = Some((ex, dev));
                 }
             }
         }
 
-        let (long_exchange, short_exchange, spread, ema, deviation) = best_pair?;
+        // 找到 ask_deviation 最大的交易所（买入）
+        let mut max_ask_dev: Option<(Exchange, f64)> = None;
+        for &ex in &self.exchanges {
+            if let Some(dev) = self.ask_deviation(ex, state) {
+                if max_ask_dev.is_none() || dev > max_ask_dev.as_ref().unwrap().1 {
+                    max_ask_dev = Some((ex, dev));
+                }
+            }
+        }
+
+        let (short_exchange, bid_deviation) = max_bid_dev?;
+        let (long_exchange, ask_deviation) = max_ask_dev?;
+
+        // 两个交易所必须不同
+        if short_exchange == long_exchange {
+            return None;
+        }
+
+        // 检查 deviation 之和是否超过阈值
+        let total_deviation = bid_deviation + ask_deviation;
+        if total_deviation < self.config.deviation_threshold {
+            return None;
+        }
 
         let long_bbo = state.bbo(long_exchange)?;
         let short_bbo = state.bbo(short_exchange)?;
@@ -270,7 +284,7 @@ impl FundingArbStrategy {
             return None;
         }
 
-        // 检查单边仓位比例是否超限（包括本次开仓后的预期仓位）
+        // 检查杠杆率：开仓后仓位 notional 不能超过 equity * max_position_ratio
         let mid_price = (short_bbo.bid_price + long_bbo.ask_price) / 2.0;
         let short_pos = state.position(short_exchange).map(|p| p.size.abs()).unwrap_or(0.0);
         let long_pos = state.position(long_exchange).map(|p| p.size.abs()).unwrap_or(0.0);
@@ -293,21 +307,23 @@ impl FundingArbStrategy {
             long_exchange = %long_exchange,
             long_ask = long_bbo.ask_price,
             long_pos_ratio = format!("{:.4}", long_pos_ratio_after),
+            ask_deviation = format!("{:.6}", ask_deviation),
             short_exchange = %short_exchange,
             short_bid = short_bbo.bid_price,
             short_pos_ratio = format!("{:.4}", short_pos_ratio_after),
-            spread = format!("{:.6}", spread),
-            spread_ema = format!("{:.6}", ema),
-            deviation = format!("{:.6}", deviation),
-            open_threshold = format!("{:.6}", OPEN_THRESHOLD),
-            "Opening signal detected: spread deviation exceeds threshold"
+            bid_deviation = format!("{:.6}", bid_deviation),
+            total_deviation = format!("{:.6}", total_deviation),
+            deviation_threshold = format!("{:.6}", self.config.deviation_threshold),
+            "Opening signal detected: total deviation exceeds threshold"
         );
 
         Some(OpenSignal {
             short_exchange,
             short_price: short_bbo.bid_price,
+            bid_deviation,
             long_exchange,
             long_price: long_bbo.ask_price,
+            ask_deviation,
         })
     }
 
@@ -315,8 +331,8 @@ impl FundingArbStrategy {
     ///
     /// 逻辑：
     /// 1. 找到当前持仓的多头和空头交易所
-    /// 2. 检查该交易所对的价差是否回归 EMA（偏离 <= CLOSE_THRESHOLD）
-    /// 3. 如果回归，则平仓
+    /// 2. 计算持仓对的 total_deviation = bid_deviation(空头交易所) + ask_deviation(多头交易所)
+    /// 3. 当 total_deviation <= CLOSE_THRESHOLD (0%) 时平仓（价差回归均值）
     fn check_close_signal(&self, state: &SymbolState) -> Option<CloseSignal> {
         if !state.has_positions() {
             return None;
@@ -339,26 +355,31 @@ impl FundingArbStrategy {
             return None;
         }
 
-        // 检查所有持仓对的价差是否回归 EMA
-        // 找到偏离最小（最适合平仓）的持仓对
+        // 检查所有持仓对的 deviation 是否回归
+        // 找到 total_deviation 最小（最适合平仓）的持仓对
         let mut best_close: Option<(Exchange, f64, Exchange, f64, f64, f64, f64)> = None;
-        // (long_ex, long_size, short_ex, short_size, spread, ema, deviation)
+        // (long_ex, long_size, short_ex, short_size, bid_dev, ask_dev, total_dev)
 
         for &(long_ex, long_size) in &long_positions {
             for &(short_ex, short_size) in &short_positions {
-                if let Some((spread, ema, deviation)) = self.spread_deviation(long_ex, short_ex, state) {
-                    // 当价差回归 EMA（偏离 <= 0%）时平仓
-                    if deviation <= CLOSE_THRESHOLD {
-                        // 找偏离最小的（最有利平仓）
-                        if best_close.is_none() || deviation < best_close.as_ref().unwrap().6 {
-                            best_close = Some((long_ex, long_size, short_ex, short_size, spread, ema, deviation));
+                // 计算空头交易所的 bid_deviation 和多头交易所的 ask_deviation
+                let bid_dev = self.bid_deviation(short_ex, state);
+                let ask_dev = self.ask_deviation(long_ex, state);
+
+                if let (Some(bid_dev), Some(ask_dev)) = (bid_dev, ask_dev) {
+                    let total_dev = bid_dev + ask_dev;
+                    // 当 total_deviation <= 0 时平仓（价差回归均值）
+                    if total_dev <= CLOSE_THRESHOLD {
+                        // 找 total_deviation 最小的（最有利平仓）
+                        if best_close.is_none() || total_dev < best_close.as_ref().unwrap().6 {
+                            best_close = Some((long_ex, long_size, short_ex, short_size, bid_dev, ask_dev, total_dev));
                         }
                     }
                 }
             }
         }
 
-        let (long_exchange, long_size, short_exchange, short_size, spread, ema, deviation) = best_close?;
+        let (long_exchange, long_size, short_exchange, short_size, bid_dev, ask_dev, total_dev) = best_close?;
 
         let long_bbo = state.bbo(long_exchange)?;
         let short_bbo = state.bbo(short_exchange)?;
@@ -368,14 +389,14 @@ impl FundingArbStrategy {
             long_exchange = %long_exchange,
             long_bid = long_bbo.bid_price,
             long_size = long_size,
+            ask_deviation = format!("{:.6}", ask_dev),
             short_exchange = %short_exchange,
             short_ask = short_bbo.ask_price,
             short_size = short_size,
-            spread = format!("{:.6}", spread),
-            spread_ema = format!("{:.6}", ema),
-            deviation = format!("{:.6}", deviation),
+            bid_deviation = format!("{:.6}", bid_dev),
+            total_deviation = format!("{:.6}", total_dev),
             close_threshold = format!("{:.6}", CLOSE_THRESHOLD),
-            "Closing signal detected: spread reverted to EMA"
+            "Closing signal detected: deviation reverted to threshold"
         );
 
         Some(CloseSignal {
@@ -807,15 +828,20 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+        tracing::info!(
+            symbol = %self.symbol,
+            event = ?event,
+            "FundingArbStrategy received event"
+        );
         // 获取本策略关注的 symbol 状态
         let symbol_state = match state.symbol_state(&self.symbol) {
             Some(s) => s,
             None => return vec![],
         };
 
-        // BBO 事件时更新所有交易所对的价差 EMA
-        if let ExchangeEventData::BBO(_) = &event.data {
-            self.update_spread_emas(symbol_state);
+        // BBO 事件时更新该交易所的 bid/ask EMA
+        if let ExchangeEventData::BBO(bbo) = &event.data {
+            self.update_exchange_ema(bbo.exchange, symbol_state);
         }
 
         // EMA 未预热完成，不进行交易
