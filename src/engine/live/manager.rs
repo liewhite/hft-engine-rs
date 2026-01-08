@@ -147,6 +147,90 @@ impl ManagerActor {
 
         Ok(())
     }
+
+    /// 批量添加策略的内部实现
+    async fn do_add_strategies(
+        &mut self,
+        strategies: Vec<Box<dyn Strategy>>,
+        actor_ref: ActorRef<Self>,
+    ) -> Result<(), ExchangeError> {
+        if strategies.is_empty() {
+            return Ok(());
+        }
+
+        let processor = self.income_processor.clone();
+        let outcome_pubsub = self.outcome_pubsub.clone();
+
+        // 1. 收集所有策略的订阅，并按交易所分组
+        let mut all_subscriptions: HashSet<(Exchange, SubscriptionKind)> = HashSet::new();
+        let mut strategy_subscriptions: Vec<HashSet<(Exchange, SubscriptionKind)>> = Vec::new();
+
+        for strategy in &strategies {
+            let public_streams = strategy.public_streams();
+            let subscriptions: HashSet<(Exchange, SubscriptionKind)> = public_streams
+                .iter()
+                .flat_map(|(exchange, kinds)| {
+                    kinds.iter().map(move |kind| (*exchange, kind.clone()))
+                })
+                .collect();
+            all_subscriptions.extend(subscriptions.clone());
+            strategy_subscriptions.push(subscriptions);
+        }
+
+        // 2. 按交易所分组订阅
+        let mut exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>> = HashMap::new();
+        for (exchange, kind) in &all_subscriptions {
+            exchange_subscriptions
+                .entry(*exchange)
+                .or_default()
+                .push(kind.clone());
+        }
+
+        // 3. 批量创建 ExecutorActors
+        let mut executor_refs = Vec::new();
+        for strategy in strategies {
+            let executor_ref = ExecutorActor::spawn_link_with_mailbox(
+                &actor_ref,
+                ExecutorArgs {
+                    strategy,
+                    symbol_metas: Arc::new(self.symbol_metas.clone()),
+                    outcome_pubsub: outcome_pubsub.clone(),
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+            executor_refs.push(executor_ref);
+        }
+
+        // 4. 向 ProcessorActor 注册所有 Executor 的订阅
+        for (executor_ref, subscriptions) in executor_refs.iter().zip(strategy_subscriptions.iter())
+        {
+            let _ = processor
+                .tell(RegisterExecutor {
+                    executor: executor_ref.clone(),
+                    subscriptions: subscriptions.clone(),
+                })
+                .send()
+                .await;
+        }
+
+        // 5. 批量向各 ExchangeActors 发送订阅请求
+        for (exchange, kinds) in exchange_subscriptions {
+            if let Some(actor) = self.exchange_actors.get(&exchange) {
+                actor
+                    .subscribe_batch(kinds)
+                    .await
+                    .map_err(ExchangeError::Other)?;
+            }
+        }
+
+        tracing::info!(
+            count = executor_refs.len(),
+            "Strategies batch added, ExecutorActors created"
+        );
+
+        Ok(())
+    }
 }
 
 impl Actor for ManagerActor {
@@ -341,6 +425,21 @@ impl Message<AddStrategy> for ManagerActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.do_add_strategy(msg.0, ctx.actor_ref().clone()).await
+    }
+}
+
+/// 批量添加策略
+pub struct AddStrategies(pub Vec<Box<dyn Strategy>>);
+
+impl Message<AddStrategies> for ManagerActor {
+    type Reply = Result<(), ExchangeError>;
+
+    async fn handle(
+        &mut self,
+        msg: AddStrategies,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.do_add_strategies(msg.0, ctx.actor_ref().clone()).await
     }
 }
 

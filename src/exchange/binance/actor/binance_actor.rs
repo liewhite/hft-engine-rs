@@ -19,7 +19,7 @@ use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta, Timestamp};
 use crate::engine::IncomePubSub;
 use crate::exchange::binance::{BinanceClient, BinanceCredentials};
-use crate::exchange::client::{Subscribe, Unsubscribe};
+use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::ExchangeClient;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
@@ -186,6 +186,19 @@ impl Message<Subscribe> for BinanceActor {
     async fn handle(
         &mut self,
         msg: Subscribe,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // 转发给 PublicWsActor
+        let _ = self.public_ws.tell(msg).send().await;
+    }
+}
+
+impl Message<SubscribeBatch> for BinanceActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribeBatch,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor

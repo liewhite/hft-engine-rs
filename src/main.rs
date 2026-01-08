@@ -1,5 +1,5 @@
 use fee_arb::domain::{Exchange, Symbol};
-use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs, SubscribeIncome};
+use fee_arb::engine::{AddStrategies, ManagerActor, ManagerActorArgs, SubscribeIncome};
 use fee_arb::exchange::binance::{BinanceClient, BinanceCredentials};
 use fee_arb::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
 use fee_arb::exchange::okx::{OkxClient, OkxCredentials};
@@ -66,28 +66,42 @@ struct Config {
 
 /// 打印所有交易所的 symbols
 async fn print_exchange_symbols(config: &ExchangesConfig) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+
     println!("\n=== Exchange Symbols ===\n");
 
     // Binance
     let binance = BinanceClient::new(Some(config.binance.clone()))?;
     let binance_metas = binance.fetch_all_symbol_metas().await?;
-    let binance_symbols: Vec<_> = binance_metas.iter().map(|m| &m.symbol).collect();
-    println!("Binance ({} symbols):", binance_symbols.len());
-    println!("{:?}\n", binance_symbols);
+    let binance_symbols: HashSet<_> = binance_metas.iter().map(|m| m.symbol.clone()).collect();
+    println!("Binance ({} symbols)", binance_symbols.len());
 
     // OKX
     let okx = OkxClient::new(Some(config.okx.clone()))?;
     let okx_metas = okx.fetch_all_symbol_metas().await?;
-    let okx_symbols: Vec<_> = okx_metas.iter().map(|m| &m.symbol).collect();
-    println!("OKX ({} symbols):", okx_symbols.len());
-    println!("{:?}\n", okx_symbols);
+    let okx_symbols: HashSet<_> = okx_metas.iter().map(|m| m.symbol.clone()).collect();
+    println!("OKX ({} symbols)", okx_symbols.len());
 
     // Hyperliquid
     let hl = HyperliquidClient::new(Some(config.hyperliquid.clone()))?;
     let hl_metas = hl.fetch_all_symbol_metas().await?;
-    let hl_symbols: Vec<_> = hl_metas.iter().map(|m| &m.symbol).collect();
-    println!("Hyperliquid ({} symbols):", hl_symbols.len());
-    println!("{:?}\n", hl_symbols);
+    let hl_symbols: HashSet<_> = hl_metas.iter().map(|m| m.symbol.clone()).collect();
+    println!("Hyperliquid ({} symbols)", hl_symbols.len());
+
+    // 计算交集
+    let intersection: HashSet<_> = binance_symbols
+        .intersection(&okx_symbols)
+        .cloned()
+        .collect::<HashSet<_>>()
+        .intersection(&hl_symbols)
+        .cloned()
+        .collect();
+
+    let mut common: Vec<_> = intersection.into_iter().collect();
+    common.sort();
+
+    println!("\n=== Common Symbols ({}) ===\n", common.len());
+    println!("{:?}", common);
 
     Ok(())
 }
@@ -130,21 +144,29 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let enabled_exchanges = config.exchanges.enabled_exchanges();
-    for symbol in symbols {
-        let strategy = FundingArbStrategy::new(
-            config.strategy.funding_arb.clone(),
-            enabled_exchanges.clone(),
-            symbol.clone(),
-        );
 
-        manager
-            .ask(AddStrategy(Box::new(strategy)))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
+    // 批量创建所有策略
+    let strategies: Vec<Box<dyn fee_arb::strategy::Strategy>> = symbols
+        .iter()
+        .map(|symbol| {
+            Box::new(FundingArbStrategy::new(
+                config.strategy.funding_arb.clone(),
+                enabled_exchanges.clone(),
+                symbol.clone(),
+            )) as Box<dyn fee_arb::strategy::Strategy>
+        })
+        .collect();
 
-        tracing::info!(symbol = %symbol, "Strategy added");
-    }
+    let strategy_count = strategies.len();
+
+    // 批量添加策略
+    manager
+        .ask(AddStrategies(strategies))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
+
+    tracing::info!(count = strategy_count, "Strategies batch added");
 
     // 初始化监控 subscribers（如果配置了）
     if let Some(ref monitoring) = config.monitoring {

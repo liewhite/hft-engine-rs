@@ -9,7 +9,7 @@ use crate::domain::{now_ms, Symbol, SymbolMeta, Timestamp};
 use crate::engine::IncomePubSub;
 use crate::exchange::binance::codec::{BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
-use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
@@ -75,6 +75,25 @@ impl BinancePublicWsActor {
         let msg = json!({
             "method": "SUBSCRIBE",
             "params": [stream],
+            "id": 1
+        })
+        .to_string();
+
+        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        tx.send(msg)
+            .await
+            .map_err(|_| WsError::Network("Channel closed".to_string()))
+    }
+
+    /// 批量发送订阅消息（一条 WebSocket 消息包含多个 streams）
+    async fn send_subscribe_batch(&self, streams: Vec<String>) -> Result<(), WsError> {
+        if streams.is_empty() {
+            return Ok(());
+        }
+
+        let msg = json!({
+            "method": "SUBSCRIBE",
+            "params": streams,
             "id": 1
         })
         .to_string();
@@ -203,6 +222,73 @@ impl Message<Subscribe> for BinancePublicWsActor {
         }
 
         self.subscribed_kinds.insert(msg.kind);
+    }
+}
+
+impl Message<SubscribeBatch> for BinancePublicWsActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribeBatch,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // 1. 过滤有效的 kinds（symbol 存在且未订阅）
+        let mut new_streams = Vec::new();
+        let mut new_kinds = Vec::new();
+
+        for kind in msg.kinds {
+            let symbol = kind.symbol();
+            if !self.symbol_metas.contains_key(symbol) {
+                tracing::warn!(
+                    exchange = "Binance",
+                    symbol = %symbol,
+                    "Symbol not found in symbol_metas, ignoring subscription"
+                );
+                continue;
+            }
+
+            if self.subscribed_kinds.contains(&kind) {
+                continue;
+            }
+
+            let stream = kind_to_stream(&kind, &self.quote);
+            if !self.subscribed_streams.contains(&stream) {
+                new_streams.push(stream);
+            }
+            new_kinds.push(kind);
+        }
+
+        // 2. 批量发送订阅请求
+        if !new_streams.is_empty() {
+            // 去重
+            let unique_streams: Vec<_> = new_streams
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            tracing::info!(
+                exchange = "Binance",
+                count = unique_streams.len(),
+                "Batch subscribing to streams"
+            );
+
+            if let Err(e) = self.send_subscribe_batch(unique_streams.clone()).await {
+                tracing::error!(error = %e, "Failed to send batch subscribe, killing actor");
+                ctx.actor_ref().kill();
+                return;
+            }
+
+            for stream in unique_streams {
+                self.subscribed_streams.insert(stream);
+            }
+        }
+
+        // 3. 记录已订阅的 kinds
+        for kind in new_kinds {
+            self.subscribed_kinds.insert(kind);
+        }
     }
 }
 

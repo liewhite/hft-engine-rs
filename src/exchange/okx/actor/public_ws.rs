@@ -7,7 +7,7 @@
 
 use crate::domain::{now_ms, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
-use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{BboData, FundingRateData, IndexTickerData, MarkPriceData, WsPush};
 use crate::exchange::okx::{to_okx, to_okx_index};
 use crate::exchange::ws_loop;
@@ -59,6 +59,24 @@ impl OkxPublicWsActor {
         let msg = json!({
             "op": "subscribe",
             "args": [arg]
+        })
+        .to_string();
+
+        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        tx.send(msg)
+            .await
+            .map_err(|_| WsError::Network("Channel closed".to_string()))
+    }
+
+    /// 批量发送订阅消息（一条 WebSocket 消息包含多个 args）
+    async fn send_subscribe_batch(&self, args: Vec<serde_json::Value>) -> Result<(), WsError> {
+        if args.is_empty() {
+            return Ok(());
+        }
+
+        let msg = json!({
+            "op": "subscribe",
+            "args": args
         })
         .to_string();
 
@@ -174,6 +192,59 @@ impl Message<Subscribe> for OkxPublicWsActor {
             return;
         }
         self.subscribed.insert(msg.kind);
+    }
+}
+
+impl Message<SubscribeBatch> for OkxPublicWsActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribeBatch,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // 1. 过滤有效的 kinds（symbol 存在且未订阅）
+        let mut new_args = Vec::new();
+        let mut new_kinds = Vec::new();
+
+        for kind in msg.kinds {
+            let symbol = kind.symbol();
+            if !self.symbol_metas.contains_key(symbol) {
+                tracing::warn!(
+                    exchange = "OKX",
+                    symbol = %symbol,
+                    "Symbol not found in symbol_metas, ignoring subscription"
+                );
+                continue;
+            }
+
+            if self.subscribed.contains(&kind) {
+                continue;
+            }
+
+            new_args.push(kind_to_arg(&kind, &self.quote));
+            new_kinds.push(kind);
+        }
+
+        // 2. 批量发送订阅请求
+        if !new_args.is_empty() {
+            tracing::info!(
+                exchange = "OKX",
+                count = new_args.len(),
+                "Batch subscribing to channels"
+            );
+
+            if let Err(e) = self.send_subscribe_batch(new_args).await {
+                tracing::error!(error = %e, "Failed to send batch subscribe, killing actor");
+                ctx.actor_ref().kill();
+                return;
+            }
+        }
+
+        // 3. 记录已订阅的 kinds
+        for kind in new_kinds {
+            self.subscribed.insert(kind);
+        }
     }
 }
 

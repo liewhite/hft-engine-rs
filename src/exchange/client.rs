@@ -74,6 +74,12 @@ pub struct Subscribe {
     pub kind: SubscriptionKind,
 }
 
+/// 批量订阅消息
+#[derive(Debug, Clone)]
+pub struct SubscribeBatch {
+    pub kinds: Vec<SubscriptionKind>,
+}
+
 /// 取消订阅消息
 #[derive(Debug, Clone)]
 pub struct Unsubscribe {
@@ -109,13 +115,15 @@ pub trait ExchangeActorOps: Send + Sync {
     fn actor_id(&self) -> kameo::actor::ActorId;
     /// 订阅
     async fn subscribe(&self, kind: SubscriptionKind) -> Result<(), String>;
+    /// 批量订阅
+    async fn subscribe_batch(&self, kinds: Vec<SubscriptionKind>) -> Result<(), String>;
     /// 取消订阅
     async fn unsubscribe(&self, kind: SubscriptionKind) -> Result<(), String>;
 }
 
 /// 为 ActorRef<A> 实现 ExchangeActorOps 的宏
 ///
-/// 要求 A 实现 `Message<Subscribe>`, `Message<Unsubscribe>`
+/// 要求 A 实现 `Message<Subscribe>`, `Message<SubscribeBatch>`, `Message<Unsubscribe>`
 #[macro_export]
 macro_rules! impl_exchange_actor_ops {
     ($($actor:ty),*) => {
@@ -127,6 +135,12 @@ macro_rules! impl_exchange_actor_ops {
                 }
                 async fn subscribe(&self, kind: $crate::exchange::SubscriptionKind) -> Result<(), String> {
                     self.tell($crate::exchange::Subscribe { kind })
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                async fn subscribe_batch(&self, kinds: Vec<$crate::exchange::SubscriptionKind>) -> Result<(), String> {
+                    self.tell($crate::exchange::SubscribeBatch { kinds })
                         .send()
                         .await
                         .map_err(|e| e.to_string())

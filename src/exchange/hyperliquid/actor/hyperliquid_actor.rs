@@ -14,7 +14,7 @@ use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
-use crate::exchange::client::{Subscribe, Unsubscribe};
+use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::hyperliquid::HyperliquidCredentials;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -121,6 +121,19 @@ impl Message<Subscribe> for HyperliquidActor {
     async fn handle(
         &mut self,
         msg: Subscribe,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // 转发给 PublicWsActor
+        let _ = self.public_ws.tell(msg).send().await;
+    }
+}
+
+impl Message<SubscribeBatch> for HyperliquidActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribeBatch,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor

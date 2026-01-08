@@ -7,7 +7,7 @@
 
 use crate::domain::{now_ms, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
-use crate::exchange::client::{Subscribe, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::hyperliquid::codec::{WsActiveAssetCtx, WsBbo};
 use crate::exchange::hyperliquid::{to_hyperliquid, WS_URL};
 use crate::exchange::ws_loop;
@@ -65,6 +65,26 @@ impl HyperliquidPublicWsActor {
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
+    }
+
+    /// 批量发送订阅消息（发送多条消息，无速率限制）
+    async fn send_subscribe_batch(&self, kinds: &[SubscriptionKind]) -> Result<(), WsError> {
+        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+
+        for kind in kinds {
+            let subscription = kind_to_subscription(kind, &self.quote);
+            let msg = json!({
+                "method": "subscribe",
+                "subscription": subscription
+            })
+            .to_string();
+
+            tx.send(msg)
+                .await
+                .map_err(|_| WsError::Network("Channel closed".to_string()))?;
+        }
+
+        Ok(())
     }
 
     /// 发送取消订阅消息
@@ -183,6 +203,63 @@ impl Message<Subscribe> for HyperliquidPublicWsActor {
         }
 
         self.subscribed_kinds.insert(msg.kind);
+    }
+}
+
+impl Message<SubscribeBatch> for HyperliquidPublicWsActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribeBatch,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        // 1. 过滤有效的 kinds（symbol 存在且未订阅）
+        let mut new_stream_kinds = Vec::new();
+        let mut new_kinds = Vec::new();
+
+        for kind in msg.kinds {
+            let symbol = kind.symbol();
+            if !self.symbol_metas.contains_key(symbol) {
+                tracing::warn!(
+                    exchange = "Hyperliquid",
+                    symbol = %symbol,
+                    "Symbol not found in symbol_metas, ignoring subscription"
+                );
+                continue;
+            }
+
+            if self.subscribed_kinds.contains(&kind) {
+                continue;
+            }
+
+            let stream = kind_to_stream(&kind, &self.quote);
+            if !self.subscribed_streams.contains(&stream) {
+                new_stream_kinds.push(kind.clone());
+                self.subscribed_streams.insert(stream);
+            }
+            new_kinds.push(kind);
+        }
+
+        // 2. 批量发送订阅请求
+        if !new_stream_kinds.is_empty() {
+            tracing::info!(
+                exchange = "Hyperliquid",
+                count = new_stream_kinds.len(),
+                "Batch subscribing to streams"
+            );
+
+            if let Err(e) = self.send_subscribe_batch(&new_stream_kinds).await {
+                tracing::error!(error = %e, "Failed to send batch subscribe, killing actor");
+                ctx.actor_ref().kill();
+                return;
+            }
+        }
+
+        // 3. 记录已订阅的 kinds
+        for kind in new_kinds {
+            self.subscribed_kinds.insert(kind);
+        }
     }
 }
 
