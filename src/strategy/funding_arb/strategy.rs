@@ -2,9 +2,12 @@ use crate::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
-use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+
+use super::config::FundingArbConfig;
+use super::ema::ExchangeEma;
+use super::signals::{CloseSignal, OpenSignal};
 
 /// 市价单滑点（用限价单 IOC 模拟市价单）
 const MARKET_ORDER_SLIPPAGE: f64 = 0.001; // 0.1%
@@ -14,131 +17,6 @@ const CLOSE_THRESHOLD: f64 = 0.0;
 
 /// 仓位比较的 epsilon（用于判断仓位是否为零）
 const POSITION_EPSILON: f64 = 1e-10;
-
-/// EMA (Exponential Moving Average) 计算器
-#[derive(Debug, Clone)]
-pub struct EmaCalculator {
-    period: usize,
-    alpha: f64,
-    value: Option<f64>,
-    count: usize,
-}
-
-impl EmaCalculator {
-    pub fn new(period: usize) -> Self {
-        let alpha = 2.0 / (period as f64 + 1.0);
-        Self {
-            period,
-            alpha,
-            value: None,
-            count: 0,
-        }
-    }
-
-    /// 更新 EMA，返回当前 EMA 值
-    pub fn update(&mut self, new_value: f64) -> f64 {
-        self.count += 1;
-        match self.value {
-            None => {
-                self.value = Some(new_value);
-                new_value
-            }
-            Some(prev) => {
-                let ema = self.alpha * new_value + (1.0 - self.alpha) * prev;
-                self.value = Some(ema);
-                ema
-            }
-        }
-    }
-
-    /// 获取当前 EMA 值
-    pub fn value(&self) -> Option<f64> {
-        self.value
-    }
-
-    /// 是否已经预热完成（满足 period 次更新）
-    pub fn is_ready(&self) -> bool {
-        self.count >= self.period
-    }
-}
-
-/// 跨所价差套利策略配置
-#[derive(Debug, Clone, Deserialize)]
-pub struct FundingArbConfig {
-    /// EMA 周期（表示最近多少笔 BBO 更新的均价）
-    pub ema_period: usize,
-    /// 开仓 deviation 阈值
-    /// - max_bid_deviation + max_ask_deviation > deviation_threshold 时开仓
-    pub deviation_threshold: f64,
-    /// 单笔下单金额 (USDT)，开平仓均按此金额计算数量
-    pub max_notional: f64,
-    /// 最小下单金额 (USDT)，低于此金额的订单将被放弃
-    pub min_notional: f64,
-    /// 订单超时时间 (毫秒)
-    pub order_timeout_ms: u64,
-    /// 敞口比例限制（敞口/较小仓位）
-    /// - 超过此比例时禁止开仓
-    /// - 配合 max_exposure_value 触发 rebalance
-    pub max_exposure_ratio: f64,
-    /// 敞口价值限制 (USDT)
-    /// - 需同时超过 max_exposure_ratio 和 max_exposure_value 才触发 rebalance
-    /// - 避免基础仓位小时频繁 rebalance
-    pub max_exposure_value: f64,
-    /// 单边仓位占账户 equity 的最大比例
-    /// - 任一交易所的仓位价值 / equity 超过此比例时禁止开仓
-    /// - 不影响平仓和 rebalance
-    pub max_position_ratio: f64,
-}
-
-/// 交易所的 bid/ask EMA
-#[derive(Debug, Clone)]
-struct ExchangeEma {
-    bid_ema: EmaCalculator,
-    ask_ema: EmaCalculator,
-}
-
-impl ExchangeEma {
-    fn new(period: usize) -> Self {
-        Self {
-            bid_ema: EmaCalculator::new(period),
-            ask_ema: EmaCalculator::new(period),
-        }
-    }
-
-    fn is_ready(&self) -> bool {
-        self.bid_ema.is_ready() && self.ask_ema.is_ready()
-    }
-}
-
-/// 开仓信号
-#[derive(Debug, Clone)]
-struct OpenSignal {
-    /// bid deviation 最大的交易所（做空/卖出）
-    short_exchange: Exchange,
-    /// 做空价格（bid）
-    short_price: f64,
-    /// ask deviation 最大的交易所（做多/买入）
-    long_exchange: Exchange,
-    /// 做多价格（ask）
-    long_price: f64,
-}
-
-/// 平仓信号
-#[derive(Debug, Clone)]
-struct CloseSignal {
-    /// 平多交易所
-    long_exchange: Exchange,
-    /// 平多价格（bid）
-    long_price: f64,
-    /// 平多交易所的持仓量
-    long_size: f64,
-    /// 平空交易所
-    short_exchange: Exchange,
-    /// 平空价格（ask）
-    short_price: f64,
-    /// 平空交易所的持仓量（负数）
-    short_size: f64,
-}
 
 /// 跨所价差套利策略 (单 symbol)
 ///
