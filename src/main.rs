@@ -1,8 +1,9 @@
 use fee_arb::domain::{Exchange, Symbol};
 use fee_arb::engine::{AddStrategy, ManagerActor, ManagerActorArgs, SubscribeIncome};
-use fee_arb::exchange::binance::BinanceCredentials;
-use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
-use fee_arb::exchange::okx::OkxCredentials;
+use fee_arb::exchange::binance::{BinanceClient, BinanceCredentials};
+use fee_arb::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
+use fee_arb::exchange::okx::{OkxClient, OkxCredentials};
+use fee_arb::exchange::ExchangeClient;
 use fee_arb::strategy::{
     FundingArbConfig, FundingArbStrategy, MetricsSubscriberActor, MetricsSubscriberArgs,
     SlackNotifierActor, SlackNotifierArgs,
@@ -63,6 +64,34 @@ struct Config {
     monitoring: Option<MonitoringConfig>,
 }
 
+/// 打印所有交易所的 symbols
+async fn print_exchange_symbols(config: &ExchangesConfig) -> anyhow::Result<()> {
+    println!("\n=== Exchange Symbols ===\n");
+
+    // Binance
+    let binance = BinanceClient::new(Some(config.binance.clone()))?;
+    let binance_metas = binance.fetch_all_symbol_metas().await?;
+    let binance_symbols: Vec<_> = binance_metas.iter().map(|m| &m.symbol).collect();
+    println!("Binance ({} symbols):", binance_symbols.len());
+    println!("{:?}\n", binance_symbols);
+
+    // OKX
+    let okx = OkxClient::new(Some(config.okx.clone()))?;
+    let okx_metas = okx.fetch_all_symbol_metas().await?;
+    let okx_symbols: Vec<_> = okx_metas.iter().map(|m| &m.symbol).collect();
+    println!("OKX ({} symbols):", okx_symbols.len());
+    println!("{:?}\n", okx_symbols);
+
+    // Hyperliquid
+    let hl = HyperliquidClient::new(Some(config.hyperliquid.clone()))?;
+    let hl_metas = hl.fetch_all_symbol_metas().await?;
+    let hl_symbols: Vec<_> = hl_metas.iter().map(|m| &m.symbol).collect();
+    println!("Hyperliquid ({} symbols):", hl_symbols.len());
+    println!("{:?}\n", hl_symbols);
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
@@ -79,6 +108,10 @@ async fn main() -> anyhow::Result<()> {
 
     let content = std::fs::read_to_string(&config_path)?;
     let config: Config = serde_json::from_str(&content)?;
+
+    // 打印交易所 symbols 并退出
+    print_exchange_symbols(&config.exchanges).await?;
+    return Ok(());
 
     let symbols = config.strategy.parse_symbols();
     if symbols.is_empty() {
