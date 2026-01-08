@@ -3,6 +3,7 @@ use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
 use serde::Deserialize;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 /// 市价单滑点（用限价单 IOC 模拟市价单）
@@ -10,6 +11,9 @@ const MARKET_ORDER_SLIPPAGE: f64 = 0.001; // 0.1%
 
 /// 平仓阈值：deviation <= 0% 时平仓
 const CLOSE_THRESHOLD: f64 = 0.0;
+
+/// 仓位比较的 epsilon（用于判断仓位是否为零）
+const POSITION_EPSILON: f64 = 1e-10;
 
 /// EMA (Exponential Moving Average) 计算器
 #[derive(Debug, Clone)]
@@ -113,14 +117,10 @@ struct OpenSignal {
     short_exchange: Exchange,
     /// 做空价格（bid）
     short_price: f64,
-    /// bid deviation = bid / bid_ema - 1
-    bid_deviation: f64,
     /// ask deviation 最大的交易所（做多/买入）
     long_exchange: Exchange,
     /// 做多价格（ask）
     long_price: f64,
-    /// ask deviation = ask_ema / ask - 1
-    ask_deviation: f64,
 }
 
 /// 平仓信号
@@ -177,10 +177,10 @@ impl FundingArbStrategy {
     /// 更新指定交易所的 bid/ask EMA
     fn update_exchange_ema(&mut self, exchange: Exchange, state: &SymbolState) {
         if let Some(bbo) = state.bbo(exchange) {
-            if let Some(ema) = self.exchange_emas.get_mut(&exchange) {
-                ema.bid_ema.update(bbo.bid_price);
-                ema.ask_ema.update(bbo.ask_price);
-            }
+            let ema = self.exchange_emas.get_mut(&exchange)
+                .expect("exchange must exist in exchange_emas");
+            ema.bid_ema.update(bbo.bid_price);
+            ema.ask_ema.update(bbo.ask_price);
         }
     }
 
@@ -232,24 +232,14 @@ impl FundingArbStrategy {
         state_manager: &StateManager,
     ) -> Option<OpenSignal> {
         // 找到 bid_deviation 最大的交易所（卖出）
-        let mut max_bid_dev: Option<(Exchange, f64)> = None;
-        for &ex in &self.exchanges {
-            if let Some(dev) = self.bid_deviation(ex, state) {
-                if max_bid_dev.is_none() || dev > max_bid_dev.as_ref().unwrap().1 {
-                    max_bid_dev = Some((ex, dev));
-                }
-            }
-        }
+        let max_bid_dev = self.exchanges.iter()
+            .filter_map(|&ex| self.bid_deviation(ex, state).map(|dev| (ex, dev)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         // 找到 ask_deviation 最大的交易所（买入）
-        let mut max_ask_dev: Option<(Exchange, f64)> = None;
-        for &ex in &self.exchanges {
-            if let Some(dev) = self.ask_deviation(ex, state) {
-                if max_ask_dev.is_none() || dev > max_ask_dev.as_ref().unwrap().1 {
-                    max_ask_dev = Some((ex, dev));
-                }
-            }
-        }
+        let max_ask_dev = self.exchanges.iter()
+            .filter_map(|&ex| self.ask_deviation(ex, state).map(|dev| (ex, dev)))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
         let (short_exchange, bid_deviation) = max_bid_dev?;
         let (long_exchange, ask_deviation) = max_ask_dev?;
@@ -320,10 +310,8 @@ impl FundingArbStrategy {
         Some(OpenSignal {
             short_exchange,
             short_price: short_bbo.bid_price,
-            bid_deviation,
             long_exchange,
             long_price: long_bbo.ask_price,
-            ask_deviation,
         })
     }
 
@@ -343,9 +331,9 @@ impl FundingArbStrategy {
         let mut short_positions: Vec<(Exchange, f64)> = Vec::new();
 
         for (exchange, pos) in &state.positions {
-            if pos.size > 1e-10 {
+            if pos.size > POSITION_EPSILON {
                 long_positions.push((*exchange, pos.size));
-            } else if pos.size < -1e-10 {
+            } else if pos.size < -POSITION_EPSILON {
                 short_positions.push((*exchange, pos.size));
             }
         }
@@ -420,7 +408,7 @@ impl FundingArbStrategy {
         let (long_size, short_size) = state.position_sizes();
 
         // 无持仓或只有单边持仓，不需要 rebalance
-        if long_size.abs() < 1e-10 || short_size.abs() < 1e-10 {
+        if long_size.abs() < POSITION_EPSILON || short_size.abs() < POSITION_EPSILON {
             return None;
         }
 
@@ -457,12 +445,12 @@ impl FundingArbStrategy {
         let target_exchange = if exposure > 0.0 {
             // long 多了，找 long 的交易所
             state.positions.iter()
-                .find(|(_, pos)| pos.size > 1e-10)
+                .find(|(_, pos)| pos.size > POSITION_EPSILON)
                 .map(|(ex, _)| *ex)
         } else {
             // short 多了，找 short 的交易所
             state.positions.iter()
-                .find(|(_, pos)| pos.size < -1e-10)
+                .find(|(_, pos)| pos.size < -POSITION_EPSILON)
                 .map(|(ex, _)| *ex)
         };
 
@@ -560,7 +548,7 @@ impl FundingArbStrategy {
         let (long_size, short_size) = state.position_sizes();
         let imbalance = long_size + short_size;
 
-        let (short_qty, long_qty) = if imbalance.abs() < 1e-10 {
+        let (short_qty, long_qty) = if imbalance.abs() < POSITION_EPSILON {
             (base_qty, base_qty)
         } else if imbalance > 0.0 {
             // 多头多了，空头需要补上不平衡量
@@ -729,7 +717,7 @@ impl FundingArbStrategy {
         // long_size 是正数，short_size 是负数
         let close_qty = signal.long_size.min(signal.short_size.abs());
 
-        if close_qty < 1e-10 {
+        if close_qty < POSITION_EPSILON {
             tracing::info!(
                 symbol = %self.symbol,
                 long_size = signal.long_size,
@@ -828,7 +816,7 @@ impl Strategy for FundingArbStrategy {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
-        tracing::info!(
+        tracing::debug!(
             symbol = %self.symbol,
             event = ?event,
             "FundingArbStrategy received event"
