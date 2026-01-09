@@ -1,10 +1,10 @@
-//! SlackNotifierActor - 订阅 Income 事件，当订单成交时发送 Slack 通知
+//! SlackNotifierActor - 订阅 Income 事件，当订单完全成交时发送 Slack 通知
 //!
 //! 职责：
 //! - 订阅 OrderUpdate 事件
-//! - 当订单状态为 Filled 或 PartiallyFilled 时发送 Slack 通知
+//! - 当订单状态为 Filled 时发送 Slack 通知（包含多空方向）
 
-use crate::domain::{Exchange, OrderStatus};
+use crate::domain::{Exchange, OrderStatus, Side};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -94,7 +94,7 @@ impl SlackNotifierActor {
     fn format_fill_message(
         exchange: Exchange,
         symbol: &str,
-        status: &OrderStatus,
+        side: Side,
         filled_qty: f64,
         avg_price: Option<f64>,
     ) -> String {
@@ -104,10 +104,9 @@ impl SlackNotifierActor {
             Exchange::Hyperliquid => "Hyperliquid",
         };
 
-        let status_emoji = match status {
-            OrderStatus::Filled => ":white_check_mark:",
-            OrderStatus::PartiallyFilled { .. } => ":hourglass:",
-            _ => ":question:",
+        let (side_emoji, side_name) = match side {
+            Side::Long => (":chart_with_upwards_trend:", "Long"),
+            Side::Short => (":chart_with_downwards_trend:", "Short"),
         };
 
         let price_info = avg_price
@@ -115,8 +114,8 @@ impl SlackNotifierActor {
             .unwrap_or_default();
 
         format!(
-            "{} *Order Filled*\n• Exchange: {}\n• Symbol: {}\n• Filled: {:.4}{}\n• Status: {:?}",
-            status_emoji, exchange_name, symbol, filled_qty, price_info, status
+            ":white_check_mark: *Order Filled*\n• Exchange: {}\n• Symbol: {}\n• Side: {} {}\n• Filled: {:.4}{}",
+            exchange_name, symbol, side_emoji, side_name, filled_qty, price_info
         )
     }
 }
@@ -158,21 +157,16 @@ impl Message<IncomeEvent> for SlackNotifierActor {
 
     async fn handle(&mut self, msg: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
         if let ExchangeEventData::OrderUpdate(update) = &msg.data {
-            // 只处理成交事件
-            match &update.status {
-                OrderStatus::Filled | OrderStatus::PartiallyFilled { .. } => {
-                    let message = Self::format_fill_message(
-                        update.exchange,
-                        &update.symbol,
-                        &update.status,
-                        update.filled_quantity,
-                        update.avg_price,
-                    );
-                    self.send_slack_message(&message).await;
-                }
-                _ => {
-                    // 忽略其他状态
-                }
+            // 只发送完全成交的通知，忽略部分成交
+            if matches!(update.status, OrderStatus::Filled) {
+                let message = Self::format_fill_message(
+                    update.exchange,
+                    &update.symbol,
+                    update.side,
+                    update.filled_quantity,
+                    update.avg_price,
+                );
+                self.send_slack_message(&message).await;
             }
         }
     }

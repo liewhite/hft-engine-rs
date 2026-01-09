@@ -138,6 +138,7 @@ impl OutcomeProcessorActor {
             client_order_id: Some(order.client_order_id.clone()),
             exchange: order.exchange,
             symbol: order.symbol.clone(),
+            side: order.side,
             status: OrderStatus::Error { reason },
             filled_quantity: 0.0,
             avg_price: None,

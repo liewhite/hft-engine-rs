@@ -1,6 +1,6 @@
 use super::from_binance;
 use crate::domain::{
-    Balance, Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, now_ms, BBO,
+    Balance, Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -204,6 +204,8 @@ pub struct OrderTradeUpdate {
 pub struct OrderData {
     pub s: String,
     pub c: String,  // client_order_id
+    #[serde(rename = "S")]
+    pub side: String, // "BUY" or "SELL"
     pub i: i64,
     #[serde(rename = "X")]
     pub status: String,
@@ -221,6 +223,12 @@ impl OrderTradeUpdate {
             .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.o.z));
         // avg_price 可能为空字符串（未成交时）
         let avg_price = f64::from_str(&self.o.ap).ok();
+
+        let side = match self.o.side.as_str() {
+            "BUY" => Side::Long,
+            "SELL" => Side::Short,
+            other => panic!("Unknown Binance side: {}", other),
+        };
 
         let status = match self.o.status.as_str() {
             "NEW" => OrderStatus::Pending,
@@ -240,6 +248,7 @@ impl OrderTradeUpdate {
             client_order_id: if self.o.c.is_empty() { None } else { Some(self.o.c.clone()) },
             exchange: Exchange::Binance,
             symbol,
+            side,
             status,
             filled_quantity: filled_qty,
             avg_price,

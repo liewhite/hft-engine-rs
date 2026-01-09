@@ -1,5 +1,5 @@
 use super::{from_okx, from_okx_index};
-use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, now_ms, BBO};
+use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -245,6 +245,7 @@ pub struct OrderPushData {
     pub ord_id: String,
     #[allow(dead_code)]
     pub cl_ord_id: Option<String>,
+    pub side: String, // "buy" or "sell"
     pub state: String,
     #[allow(dead_code)]
     pub sz: String,
@@ -265,6 +266,12 @@ impl OrderPushData {
         // avg_price 可能为空字符串（未成交时）
         let avg_price = f64::from_str(&self.avg_px).ok();
 
+        let side = match self.side.as_str() {
+            "buy" => Side::Long,
+            "sell" => Side::Short,
+            other => panic!("Unknown OKX side: {}", other),
+        };
+
         let status = map_okx_order_state(&self.state, filled_qty);
 
         OrderUpdate {
@@ -272,6 +279,7 @@ impl OrderPushData {
             client_order_id: self.cl_ord_id.clone(),
             exchange: Exchange::OKX,
             symbol,
+            side,
             status,
             filled_quantity: filled_qty,
             avg_price,

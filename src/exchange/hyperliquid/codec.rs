@@ -337,6 +337,8 @@ pub struct WsBasicOrder {
 
 impl WsOrderUpdate {
     pub fn to_order_update(&self) -> crate::domain::OrderUpdate {
+        use crate::domain::Side;
+
         let symbol = from_hyperliquid(&self.order.coin);
         let orig_sz = f64::from_str(&self.order.orig_sz)
             .expect("orig_sz must be valid float from Hyperliquid API");
@@ -346,6 +348,13 @@ impl WsOrderUpdate {
         let limit_px = f64::from_str(&self.order.limit_px)
             .expect("limit_px must be valid float from Hyperliquid API");
 
+        // Hyperliquid: "A" = ask/sell, "B" = bid/buy
+        let side = match self.order.side.as_str() {
+            "B" => Side::Long,
+            "A" => Side::Short,
+            other => panic!("Unknown Hyperliquid side: {}", other),
+        };
+
         let status = map_hyperliquid_order_status(&self.status, filled_quantity);
 
         crate::domain::OrderUpdate {
@@ -353,6 +362,7 @@ impl WsOrderUpdate {
             client_order_id: self.order.cloid.clone(),
             exchange: Exchange::Hyperliquid,
             symbol,
+            side,
             status,
             filled_quantity,
             avg_price: Some(limit_px),
