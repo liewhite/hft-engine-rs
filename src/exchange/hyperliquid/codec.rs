@@ -213,6 +213,9 @@ pub struct WsWebData3 {
 #[serde(rename_all = "camelCase")]
 pub struct ClearinghouseState {
     pub asset_positions: Vec<AssetPositionWrapper>,
+    /// 总账户保证金摘要（全仓 + 逐仓）
+    pub margin_summary: MarginSummary,
+    /// 全仓部分的保证金摘要
     pub cross_margin_summary: MarginSummary,
     pub withdrawable: String,
 }

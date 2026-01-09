@@ -296,9 +296,9 @@ fn parse_clearinghouse_state(
     // 更新已知仓位集合
     *known_positions = current_symbols;
 
-    // 解析账户净值 (equity = accountValue)
-    let equity = f64::from_str(&state.cross_margin_summary.account_value)
-        .map_err(|_| WsError::ParseError(format!("invalid accountValue: {}", state.cross_margin_summary.account_value)))?;
+    // 解析账户净值 (equity = marginSummary.accountValue，包含全仓+逐仓)
+    let equity = f64::from_str(&state.margin_summary.account_value)
+        .map_err(|_| WsError::ParseError(format!("invalid accountValue: {}", state.margin_summary.account_value)))?;
     events.push(IncomeEvent {
         exchange_ts: local_ts,
         local_ts,
