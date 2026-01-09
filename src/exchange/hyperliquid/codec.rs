@@ -32,6 +32,19 @@ pub struct AssetInfo {
     /// 是否已下架
     #[serde(default)]
     pub is_delisted: bool,
+    /// 保证金模式 (None = 默认允许全仓, "strictIsolated" = 仅逐仓, "noCross" = 不支持全仓)
+    pub margin_mode: Option<String>,
+}
+
+impl AssetInfo {
+    /// 是否支持全仓保证金模式
+    pub fn supports_cross_margin(&self) -> bool {
+        match self.margin_mode.as_deref() {
+            None => true, // 默认允许全仓
+            Some("strictIsolated") | Some("noCross") => false,
+            Some(_) => true, // 其他模式默认允许
+        }
+    }
 }
 
 /// 资产上下文 (包含资金费率等实时数据)

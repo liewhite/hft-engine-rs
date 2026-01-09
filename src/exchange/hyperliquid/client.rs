@@ -275,9 +275,11 @@ impl ExchangeClient for HyperliquidClient {
             .universe
             .into_iter()
             .filter(|a| {
-                // 过滤已下架和带冒号的 symbol
-                // 带冒号的是其他类型资产 (e.g., "xyz:NVDA")，我们只关心主流永续合约
-                !a.is_delisted && !a.name.contains(':')
+                // 过滤条件:
+                // 1. 未下架
+                // 2. 不带冒号 (带冒号是其他类型资产如 "xyz:NVDA")
+                // 3. 支持全仓保证金 (排除 strictIsolated 和 noCross)
+                !a.is_delisted && !a.name.contains(':') && a.supports_cross_margin()
             })
             .map(|a| asset_info_to_symbol_meta(&a))
             .collect();
