@@ -65,41 +65,6 @@ impl FundingArbStrategy {
         self.exchange_emas.values().all(|ema| ema.is_ready())
     }
 
-    /// 打印当前最大的 deviation（用于 Clock 事件）
-    fn log_max_deviation(&self, state: &SymbolState) {
-        // 找到 bid_deviation 最大的交易所
-        let max_bid_dev = self.exchanges.iter()
-            .filter_map(|&ex| self.bid_deviation(ex, state).map(|dev| (ex, dev)))
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-
-        // 找到 ask_deviation 最大的交易所
-        let max_ask_dev = self.exchanges.iter()
-            .filter_map(|&ex| self.ask_deviation(ex, state).map(|dev| (ex, dev)))
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-
-        match (max_bid_dev, max_ask_dev) {
-            (Some((bid_ex, bid_dev)), Some((ask_ex, ask_dev))) => {
-                let total_dev = bid_dev + ask_dev;
-                tracing::info!(
-                    symbol = %self.symbol,
-                    max_bid_exchange = %bid_ex,
-                    max_bid_deviation = format!("{:.6}", bid_dev),
-                    max_ask_exchange = %ask_ex,
-                    max_ask_deviation = format!("{:.6}", ask_dev),
-                    total_deviation = format!("{:.6}", total_dev),
-                    threshold = format!("{:.6}", self.config.deviation_threshold),
-                    "Current max deviation"
-                );
-            }
-            _ => {
-                tracing::debug!(
-                    symbol = %self.symbol,
-                    "EMA not ready, cannot compute deviation"
-                );
-            }
-        }
-    }
-
     /// 计算单个交易所的 bid deviation
     /// bid_deviation = bid / bid_ema - 1
     /// 正值表示当前 bid 高于均值，适合卖出
@@ -181,19 +146,6 @@ impl FundingArbStrategy {
         let long_bbo = state.bbo(long_exchange)?;
         let short_bbo = state.bbo(short_exchange)?;
 
-        tracing::info!(
-            symbol = %self.symbol,
-            long_exchange = %long_exchange,
-            long_ask = long_bbo.ask_price,
-            ask_deviation = format!("{:.6}", ask_deviation),
-            short_exchange = %short_exchange,
-            short_bid = short_bbo.bid_price,
-            bid_deviation = format!("{:.6}", bid_deviation),
-            total_deviation = format!("{:.6}", total_deviation),
-            deviation_threshold = format!("{:.6}", self.config.deviation_threshold),
-            "Signal detected: total deviation exceeds threshold"
-        );
-
         Some(TradingSignal {
             long_exchange,
             long_price: long_bbo.ask_price,
@@ -211,21 +163,21 @@ impl FundingArbStrategy {
     /// 检查各字段是否有效（价格和数量都大于0）
     fn validate_signal(&self, signal: TradingSignal) -> Option<TradingSignal> {
         if signal.long_price <= 0.0 || signal.short_price <= 0.0 {
-            tracing::debug!(
+            tracing::info!(
                 symbol = %self.symbol,
                 long_price = signal.long_price,
                 short_price = signal.short_price,
-                "Signal validation failed: invalid price"
+                "Signal filtered: invalid price"
             );
             return None;
         }
 
         if signal.long_size <= 0.0 || signal.short_size <= 0.0 {
-            tracing::debug!(
+            tracing::info!(
                 symbol = %self.symbol,
                 long_size = signal.long_size,
                 short_size = signal.short_size,
-                "Signal validation failed: invalid size"
+                "Signal filtered: invalid size"
             );
             return None;
         }
@@ -279,14 +231,14 @@ impl FundingArbStrategy {
             && new_long_leverage >= self.config.max_position_ratio;
 
         if short_blocked || long_blocked {
-            tracing::debug!(
+            tracing::info!(
                 symbol = %self.symbol,
                 old_short_leverage = format!("{:.4}", old_short_leverage),
                 new_short_leverage = format!("{:.4}", new_short_leverage),
                 old_long_leverage = format!("{:.4}", old_long_leverage),
                 new_long_leverage = format!("{:.4}", new_long_leverage),
                 max_position_ratio = format!("{:.4}", self.config.max_position_ratio),
-                "Signal blocked by leverage check"
+                "Signal filtered: leverage exceeds threshold"
             );
             return None;
         }
@@ -327,14 +279,6 @@ impl FundingArbStrategy {
             signal.short_size = (base_qty - abs_exposure).max(0.0);
         }
 
-        tracing::debug!(
-            symbol = %self.symbol,
-            net_exposure = net_exposure,
-            base_qty = base_qty,
-            adjusted_long_size = signal.long_size,
-            adjusted_short_size = signal.short_size,
-            "Signal adjusted for exposure"
-        );
 
         Some(signal)
     }
@@ -355,14 +299,14 @@ impl FundingArbStrategy {
 
         // 检查是否低于最小 notional
         if signal.long_size < min_qty_long || signal.short_size < min_qty_short {
-            tracing::debug!(
+            tracing::info!(
                 symbol = %self.symbol,
                 long_size = signal.long_size,
                 long_notional = signal.long_size * signal.long_price,
                 short_size = signal.short_size,
                 short_notional = signal.short_size * signal.short_price,
                 min_notional = self.config.min_notional,
-                "Signal below min_notional, discarding"
+                "Signal filtered: below min_notional"
             );
             return None;
         }
@@ -619,12 +563,6 @@ impl Strategy for FundingArbStrategy {
         // BBO 事件时更新该交易所的 bid/ask EMA
         if let ExchangeEventData::BBO(bbo) = &event.data {
             self.update_exchange_ema(bbo.exchange, symbol_state);
-        }
-
-        // Clock 事件时打印当前最大 deviation
-        if let ExchangeEventData::Clock = &event.data {
-            self.log_max_deviation(symbol_state);
-            return vec![];
         }
 
         // EMA 未预热完成，不进行交易
