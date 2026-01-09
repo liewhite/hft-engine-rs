@@ -233,8 +233,9 @@ impl FundingArbStrategy {
         Some(signal)
     }
 
-    /// Pipeline 第2步：杠杆率检查
+    /// Pipeline 第3步：杠杆率检查
     ///
+    /// 基于调整后的 signal.long_size/short_size 计算新杠杆率
     /// 如果 new_leverage > old_leverage 且 new_leverage 超过阈值，则丢弃信号
     fn check_leverage(
         &self,
@@ -267,13 +268,9 @@ impl FundingArbStrategy {
         let old_short_leverage = (short_pos * mid_price) / short_equity;
         let old_long_leverage = (long_pos * mid_price) / long_equity;
 
-        // 预估本次开仓数量（按 max_notional 计算，取两边盘口 size 的较小值）
-        let max_notional_qty = self.config.max_notional / mid_price;
-        let expected_qty = max_notional_qty.min(signal.long_size).min(signal.short_size);
-
-        // 新杠杆率
-        let new_short_leverage = ((short_pos + expected_qty) * mid_price) / short_equity;
-        let new_long_leverage = ((long_pos + expected_qty) * mid_price) / long_equity;
+        // 新杠杆率（基于 signal 中已调整后的 size）
+        let new_short_leverage = ((short_pos + signal.short_size) * mid_price) / short_equity;
+        let new_long_leverage = ((long_pos + signal.long_size) * mid_price) / long_equity;
 
         // 检查：如果新杠杆率 > 旧杠杆率 且 新杠杆率超过阈值，则丢弃
         let short_blocked = new_short_leverage > old_short_leverage
@@ -297,7 +294,7 @@ impl FundingArbStrategy {
         Some(signal)
     }
 
-    /// Pipeline 第3步：净敞口修正
+    /// Pipeline 第2步：净敞口修正
     ///
     /// 根据当前净敞口调整下单数量
     /// 例如：净敞口为 +10（多头多），则多头下单量减去 10（取 max(0)）
@@ -320,13 +317,13 @@ impl FundingArbStrategy {
             signal.long_size = base_qty;
             signal.short_size = base_qty;
         } else if net_exposure > 0.0 {
-            // 多头多了，多头下单量减少，空头补上
+            // 多头多了，减少多头下单量，空头正常开
             signal.long_size = (base_qty - net_exposure).max(0.0);
-            signal.short_size = base_qty + net_exposure;
+            signal.short_size = base_qty;
         } else {
-            // 空头多了，空头下单量减少，多头补上
+            // 空头多了，减少空头下单量，多头正常开
             let abs_exposure = net_exposure.abs();
-            signal.long_size = base_qty + abs_exposure;
+            signal.long_size = base_qty;
             signal.short_size = (base_qty - abs_exposure).max(0.0);
         }
 
@@ -374,6 +371,9 @@ impl FundingArbStrategy {
     }
 
     /// 运行完整的信号处理 pipeline
+    ///
+    /// 顺序：validate → adjust_for_exposure → check_leverage → check_notional_limits
+    /// 先调整 exposure 再检查 leverage，确保 leverage 基于实际下单量计算
     fn process_signal(
         &self,
         signal: TradingSignal,
@@ -381,8 +381,8 @@ impl FundingArbStrategy {
         state_manager: &StateManager,
     ) -> Option<TradingSignal> {
         self.validate_signal(signal)
-            .and_then(|s| self.check_leverage(s, state, state_manager))
             .and_then(|s| self.adjust_for_exposure(s, state))
+            .and_then(|s| self.check_leverage(s, state, state_manager))
             .and_then(|s| self.check_notional_limits(s))
     }
 
