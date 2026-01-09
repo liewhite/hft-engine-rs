@@ -326,8 +326,8 @@ impl FundingArbStrategy {
     ) -> Option<TradingSignal> {
         self.validate_signal(signal)
             .and_then(|s| self.adjust_for_exposure(s, state))
-            .and_then(|s| self.check_leverage(s, state, state_manager))
             .and_then(|s| self.check_notional_limits(s))
+            .and_then(|s| self.check_leverage(s, state, state_manager))
     }
 
     // ========== 辅助功能 ==========
