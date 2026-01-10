@@ -286,35 +286,25 @@ fn parse_private_message(
             let push: WsPush<AccountData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;
 
-            let mut events = Vec::new();
-            for data in &push.data {
-                let exchange_ts = data
-                    .u_time
-                    .parse::<u64>()
-                    .expect("Failed to parse OKX account timestamp");
-                let equity = data.to_equity();
-                let notional = data.to_notional();
-
-                // 发布 Equity 事件
-                events.push(IncomeEvent {
-                    exchange_ts,
-                    local_ts,
-                    data: ExchangeEventData::Equity {
-                        exchange: Exchange::OKX,
-                        equity,
-                    },
-                });
-
-                // 发布 AccountNotional 事件
-                events.push(IncomeEvent {
-                    exchange_ts,
-                    local_ts,
-                    data: ExchangeEventData::AccountNotional {
-                        exchange: Exchange::OKX,
-                        notional,
-                    },
-                });
-            }
+            let events = push
+                .data
+                .iter()
+                .map(|data| {
+                    let exchange_ts = data
+                        .u_time
+                        .parse::<u64>()
+                        .expect("Failed to parse OKX account timestamp");
+                    IncomeEvent {
+                        exchange_ts,
+                        local_ts,
+                        data: ExchangeEventData::AccountInfo {
+                            exchange: Exchange::OKX,
+                            equity: data.to_equity(),
+                            notional: data.to_notional(),
+                        },
+                    }
+                })
+                .collect();
             Ok(events)
         }
         "orders" => {

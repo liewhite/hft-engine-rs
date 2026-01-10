@@ -279,9 +279,7 @@ impl SymbolState {
             ExchangeEventData::Clock => {
                 // Clock 事件由策略层处理，这里不需要处理
             }
-            ExchangeEventData::Balance(_)
-            | ExchangeEventData::Equity { .. }
-            | ExchangeEventData::AccountNotional { .. } => {
+            ExchangeEventData::Balance(_) | ExchangeEventData::AccountInfo { .. } => {
                 // 已在上面提前返回，这里不会执行
                 unreachable!()
             }

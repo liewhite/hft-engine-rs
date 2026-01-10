@@ -160,7 +160,7 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
 
     async fn handle(&mut self, msg: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
         match &msg.data {
-            ExchangeEventData::Equity { exchange, equity } => {
+            ExchangeEventData::AccountInfo { exchange, equity, .. } => {
                 let exchange_label = exchange_to_label(*exchange);
                 self.equity_gauge
                     .with_label_values(&[exchange_label])

@@ -296,26 +296,17 @@ fn parse_clearinghouse_state(
     // 更新已知仓位集合
     *known_positions = current_symbols;
 
-    // 解析账户净值 (equity = marginSummary.accountValue，包含全仓+逐仓)
+    // 解析账户信息 (equity + notional)
     let equity = f64::from_str(&state.margin_summary.account_value)
         .expect("Failed to parse Hyperliquid accountValue");
-    events.push(IncomeEvent {
-        exchange_ts: local_ts,
-        local_ts,
-        data: ExchangeEventData::Equity {
-            exchange: Exchange::Hyperliquid,
-            equity,
-        },
-    });
-
-    // 解析账户总持仓名义价值
     let notional = f64::from_str(&state.margin_summary.total_ntl_pos)
         .expect("Failed to parse Hyperliquid total_ntl_pos");
     events.push(IncomeEvent {
         exchange_ts: local_ts,
         local_ts,
-        data: ExchangeEventData::AccountNotional {
+        data: ExchangeEventData::AccountInfo {
             exchange: Exchange::Hyperliquid,
+            equity,
             notional,
         },
     });

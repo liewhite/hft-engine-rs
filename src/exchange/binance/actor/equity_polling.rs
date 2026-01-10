@@ -41,28 +41,15 @@ impl BinanceEquityPollingActor {
 
         match self.client.fetch_account_info().await {
             Ok(info) => {
-                // 发布 Equity 事件
+                // 发布 AccountInfo 事件
                 let _ = self
                     .income_pubsub
                     .tell(Publish(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::Equity {
+                        data: ExchangeEventData::AccountInfo {
                             exchange: Exchange::Binance,
                             equity: info.equity,
-                        },
-                    }))
-                    .send()
-                    .await;
-
-                // 发布 AccountNotional 事件
-                let _ = self
-                    .income_pubsub
-                    .tell(Publish(IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::AccountNotional {
-                            exchange: Exchange::Binance,
                             notional: info.notional,
                         },
                     }))

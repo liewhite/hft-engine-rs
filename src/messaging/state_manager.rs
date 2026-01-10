@@ -112,22 +112,19 @@ impl StateManager {
                     self.balances.insert(balance.exchange, balance.available);
                 }
             }
-            // 全局事件: Equity
-            ExchangeEventData::Equity { exchange, equity } => {
+            // 全局事件: AccountInfo (equity + notional)
+            ExchangeEventData::AccountInfo {
+                exchange,
+                equity,
+                notional,
+            } => {
                 tracing::debug!(
                     exchange = %exchange,
                     equity = equity,
-                    "Equity updated"
+                    notional = notional,
+                    "AccountInfo updated"
                 );
                 self.equities.insert(*exchange, *equity);
-            }
-            // 全局事件: AccountNotional
-            ExchangeEventData::AccountNotional { exchange, notional } => {
-                tracing::debug!(
-                    exchange = %exchange,
-                    notional = notional,
-                    "AccountNotional updated"
-                );
                 self.account_notionals.insert(*exchange, *notional);
             }
             // 全局事件: Clock (检查订单超时)
