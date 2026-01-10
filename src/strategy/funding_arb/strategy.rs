@@ -135,9 +135,14 @@ impl FundingArbStrategy {
             return None;
         }
 
-        // 计算动态阈值：基于 symbol 杠杆率调整
+        // 计算动态阈值：基于参与交易的两个交易所的 symbol 杠杆率调整
         // 杠杆率越高，阈值越低（更容易开仓以降低仓位）
-        let effective_threshold = self.calculate_effective_threshold(state, state_manager);
+        let effective_threshold = self.calculate_effective_threshold(
+            short_exchange,
+            long_exchange,
+            state,
+            state_manager,
+        );
 
         // 检查 deviation 之和是否超过动态阈值
         let total_deviation = bid_deviation + ask_deviation;
@@ -160,26 +165,33 @@ impl FundingArbStrategy {
 
     /// 计算有效开仓阈值
     ///
-    /// 根据两边交易所的 symbol 杠杆率，动态降低开仓阈值
+    /// 根据参与交易的两个交易所的 symbol 杠杆率，动态降低开仓阈值
     /// 公式: effective_threshold = deviation_threshold * max(0, 1 - max_leverage * decay)
-    fn calculate_effective_threshold(&self, state: &SymbolState, state_manager: &StateManager) -> f64 {
+    fn calculate_effective_threshold(
+        &self,
+        short_exchange: Exchange,
+        long_exchange: Exchange,
+        state: &SymbolState,
+        state_manager: &StateManager,
+    ) -> f64 {
         let base_threshold = self.config.deviation_threshold;
         let decay = self.config.leverage_threshold_decay;
 
-        // 计算两边交易所的 symbol 杠杆率
-        let mut max_leverage = 0.0_f64;
-
-        for &exchange in &self.exchanges {
+        // 计算单个交易所的 symbol 杠杆率
+        let calc_leverage = |exchange: Exchange| -> f64 {
             let equity = state_manager.equity(exchange);
             if equity <= 0.0 {
-                continue;
+                return 0.0;
             }
-
             let pos_size = state.position(exchange).map(|p| p.size.abs()).unwrap_or(0.0);
             let price = state.bbo(exchange).map(|b| b.mid_price()).unwrap_or(0.0);
-            let leverage = (pos_size * price) / equity;
-            max_leverage = max_leverage.max(leverage);
-        }
+            (pos_size * price) / equity
+        };
+
+        // 取两个交易所中较大的杠杆率
+        let short_leverage = calc_leverage(short_exchange);
+        let long_leverage = calc_leverage(long_exchange);
+        let max_leverage = short_leverage.max(long_leverage);
 
         // 计算衰减因子: 1 - max_leverage * decay，最小为 0
         let decay_factor = (1.0 - max_leverage * decay).max(0.0);
@@ -188,6 +200,10 @@ impl FundingArbStrategy {
         tracing::debug!(
             symbol = %self.symbol,
             base_threshold = format!("{:.4}", base_threshold),
+            short_exchange = %short_exchange,
+            short_leverage = format!("{:.4}", short_leverage),
+            long_exchange = %long_exchange,
+            long_leverage = format!("{:.4}", long_leverage),
             max_leverage = format!("{:.4}", max_leverage),
             decay = format!("{:.2}", decay),
             decay_factor = format!("{:.4}", decay_factor),
