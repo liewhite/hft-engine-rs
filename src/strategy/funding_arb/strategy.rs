@@ -223,9 +223,9 @@ impl FundingArbStrategy {
 
         // 检查：如果新杠杆率 > 旧杠杆率 且 新杠杆率超过阈值，则丢弃
         let short_blocked = new_short_leverage > old_short_leverage
-            && new_short_leverage >= self.config.max_position_ratio;
+            && new_short_leverage >= self.config.max_symbol_leverage;
         let long_blocked = new_long_leverage > old_long_leverage
-            && new_long_leverage >= self.config.max_position_ratio;
+            && new_long_leverage >= self.config.max_symbol_leverage;
 
         if short_blocked || long_blocked {
             tracing::info!(
@@ -234,7 +234,7 @@ impl FundingArbStrategy {
                 new_short_leverage = format!("{:.4}", new_short_leverage),
                 old_long_leverage = format!("{:.4}", old_long_leverage),
                 new_long_leverage = format!("{:.4}", new_long_leverage),
-                max_position_ratio = format!("{:.4}", self.config.max_position_ratio),
+                max_symbol_leverage = format!("{:.4}", self.config.max_symbol_leverage),
                 "Signal filtered: leverage exceeds threshold"
             );
             return None;

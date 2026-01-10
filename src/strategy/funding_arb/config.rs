@@ -25,7 +25,7 @@ pub struct FundingArbConfig {
     /// 单边仓位占账户 equity 的最大比例
     /// - 任一交易所的仓位价值 / equity 超过此比例时禁止开仓
     /// - 不影响平仓和 rebalance
-    pub max_position_ratio: f64,
+    pub max_symbol_leverage: f64,
     /// 账户级别最大杠杆率 (account_notional / equity)
     /// - 任一交易所超过此阈值，且订单方向与现有仓位方向相同时，禁止开仓
     /// - 用于控制账户整体风险

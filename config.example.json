@@ -26,7 +26,7 @@
       "order_timeout_ms": 10000,
       "max_exposure_ratio": 0.20,
       "max_exposure_value": 100.0,
-      "max_position_ratio": 0.50,
+      "max_symbol_leverage": 0.50,
       "max_account_leverage": 3.0,
       "deviation_threshold": 0.0005,
       "ioc_slippage": 0.001
