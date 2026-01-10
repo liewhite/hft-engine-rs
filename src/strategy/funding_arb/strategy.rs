@@ -186,7 +186,7 @@ impl FundingArbStrategy {
     ///
     /// 基于调整后的 signal.long_size/short_size 计算新杠杆率
     /// 如果 new_leverage > old_leverage 且 new_leverage 超过阈值，则丢弃信号
-    fn check_leverage(
+    fn check_symbol_leverage(
         &self,
         signal: TradingSignal,
         state: &SymbolState,
@@ -387,10 +387,10 @@ impl FundingArbStrategy {
         state_manager: &StateManager,
     ) -> Option<TradingSignal> {
         self.validate_signal(signal)
+            .and_then(|s| self.check_account_leverage(s, state, state_manager))
             .and_then(|s| self.adjust_for_exposure(s, state))
             .and_then(|s| self.check_notional_limits(s))
-            .and_then(|s| self.check_leverage(s, state, state_manager))
-            .and_then(|s| self.check_account_leverage(s, state, state_manager))
+            .and_then(|s| self.check_symbol_leverage(s, state, state_manager))
     }
 
     // ========== 辅助功能 ==========
