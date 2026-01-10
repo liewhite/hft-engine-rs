@@ -34,4 +34,9 @@ pub struct FundingArbConfig {
     /// - 例如 0.001 表示 0.1%
     /// - 做多时 ask + slippage，做空时 bid - slippage
     pub ioc_slippage: f64,
+    /// 杠杆率-阈值衰减系数
+    /// - 控制 symbol 杠杆率对开仓阈值的影响
+    /// - 例如 2.0 表示杠杆率每上升 10%，阈值降低 20%
+    /// - 计算公式: effective_threshold = deviation_threshold * max(0, 1 - max_leverage * decay)
+    pub leverage_threshold_decay: f64,
 }

@@ -29,7 +29,8 @@
       "max_symbol_leverage": 0.50,
       "max_account_leverage": 3.0,
       "deviation_threshold": 0.0005,
-      "ioc_slippage": 0.001
+      "ioc_slippage": 0.001,
+      "leverage_threshold_decay": 2.0
     }
   }
 }

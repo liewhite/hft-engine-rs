@@ -113,9 +113,10 @@ impl FundingArbStrategy {
     /// 逻辑：
     /// 1. 找到 bid_deviation 最大的交易所（卖出）
     /// 2. 找到 ask_deviation 最大的交易所（买入）
-    /// 3. 如果 max_bid_deviation + max_ask_deviation > threshold，且两个交易所不同，则生成信号
-    /// 4. 信号包含盘口的 size（bid_qty / ask_qty）
-    fn check_signal(&self, state: &SymbolState) -> Option<TradingSignal> {
+    /// 3. 根据 symbol 杠杆率计算动态阈值（杠杆率越高，阈值越低）
+    /// 4. 如果 max_bid_deviation + max_ask_deviation > effective_threshold，且两个交易所不同，则生成信号
+    /// 5. 信号包含盘口的 size（bid_qty / ask_qty）
+    fn check_signal(&self, state: &SymbolState, state_manager: &StateManager) -> Option<TradingSignal> {
         // 找到 bid_deviation 最大的交易所（卖出）
         let max_bid_dev = self.exchanges.iter()
             .filter_map(|&ex| self.bid_deviation(ex, state).map(|dev| (ex, dev)))
@@ -134,9 +135,13 @@ impl FundingArbStrategy {
             return None;
         }
 
-        // 检查 deviation 之和是否超过阈值
+        // 计算动态阈值：基于 symbol 杠杆率调整
+        // 杠杆率越高，阈值越低（更容易开仓以降低仓位）
+        let effective_threshold = self.calculate_effective_threshold(state, state_manager);
+
+        // 检查 deviation 之和是否超过动态阈值
         let total_deviation = bid_deviation + ask_deviation;
-        if total_deviation < self.config.deviation_threshold {
+        if total_deviation < effective_threshold {
             return None;
         }
 
@@ -151,6 +156,46 @@ impl FundingArbStrategy {
             short_price: short_bbo.bid_price,
             short_size: short_bbo.bid_qty,
         })
+    }
+
+    /// 计算有效开仓阈值
+    ///
+    /// 根据两边交易所的 symbol 杠杆率，动态降低开仓阈值
+    /// 公式: effective_threshold = deviation_threshold * max(0, 1 - max_leverage * decay)
+    fn calculate_effective_threshold(&self, state: &SymbolState, state_manager: &StateManager) -> f64 {
+        let base_threshold = self.config.deviation_threshold;
+        let decay = self.config.leverage_threshold_decay;
+
+        // 计算两边交易所的 symbol 杠杆率
+        let mut max_leverage = 0.0_f64;
+
+        for &exchange in &self.exchanges {
+            let equity = state_manager.equity(exchange);
+            if equity <= 0.0 {
+                continue;
+            }
+
+            let pos_size = state.position(exchange).map(|p| p.size.abs()).unwrap_or(0.0);
+            let price = state.bbo(exchange).map(|b| b.mid_price()).unwrap_or(0.0);
+            let leverage = (pos_size * price) / equity;
+            max_leverage = max_leverage.max(leverage);
+        }
+
+        // 计算衰减因子: 1 - max_leverage * decay，最小为 0
+        let decay_factor = (1.0 - max_leverage * decay).max(0.0);
+        let effective_threshold = base_threshold * decay_factor;
+
+        tracing::debug!(
+            symbol = %self.symbol,
+            base_threshold = format!("{:.4}", base_threshold),
+            max_leverage = format!("{:.4}", max_leverage),
+            decay = format!("{:.2}", decay),
+            decay_factor = format!("{:.4}", decay_factor),
+            effective_threshold = format!("{:.4}", effective_threshold),
+            "Calculated effective threshold"
+        );
+
+        effective_threshold
     }
 
     // ========== Pipeline 处理 ==========
@@ -647,7 +692,7 @@ impl Strategy for FundingArbStrategy {
         }
 
         // 步骤 2: 检查信号并通过 pipeline 处理
-        if let Some(signal) = self.check_signal(symbol_state) {
+        if let Some(signal) = self.check_signal(symbol_state, state) {
             if let Some(processed_signal) = self.process_signal(signal, symbol_state, state) {
                 let orders = self.make_orders(&processed_signal);
                 return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
