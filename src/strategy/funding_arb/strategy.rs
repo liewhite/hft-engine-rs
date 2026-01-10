@@ -166,7 +166,9 @@ impl FundingArbStrategy {
     /// 计算有效开仓阈值
     ///
     /// 根据参与交易的两个交易所的 symbol 杠杆率，动态降低开仓阈值
-    /// 公式: effective_threshold = deviation_threshold * max(0, 1 - max_leverage * decay)
+    /// - 杠杆率 = 0 → 阈值 = deviation_threshold
+    /// - 杠杆率 = max_symbol_leverage → 阈值 = 0
+    /// 公式: effective_threshold = deviation_threshold * (1 - max_leverage / max_symbol_leverage)
     fn calculate_effective_threshold(
         &self,
         short_exchange: Exchange,
@@ -175,7 +177,7 @@ impl FundingArbStrategy {
         state_manager: &StateManager,
     ) -> f64 {
         let base_threshold = self.config.deviation_threshold;
-        let decay = self.config.leverage_threshold_decay;
+        let max_symbol_leverage = self.config.max_symbol_leverage;
 
         // 计算单个交易所的 symbol 杠杆率
         let calc_leverage = |exchange: Exchange| -> f64 {
@@ -193,8 +195,9 @@ impl FundingArbStrategy {
         let long_leverage = calc_leverage(long_exchange);
         let max_leverage = short_leverage.max(long_leverage);
 
-        // 计算衰减因子: 1 - max_leverage * decay，最小为 0
-        let decay_factor = (1.0 - max_leverage * decay).max(0.0);
+        // 计算衰减因子: 1 - max_leverage / max_symbol_leverage，clamp 到 [0, 1]
+        let leverage_ratio = max_leverage / max_symbol_leverage;
+        let decay_factor = (1.0 - leverage_ratio).clamp(0.0, 1.0);
         let effective_threshold = base_threshold * decay_factor;
 
         tracing::debug!(
@@ -205,7 +208,7 @@ impl FundingArbStrategy {
             long_exchange = %long_exchange,
             long_leverage = format!("{:.4}", long_leverage),
             max_leverage = format!("{:.4}", max_leverage),
-            decay = format!("{:.2}", decay),
+            max_symbol_leverage = format!("{:.4}", max_symbol_leverage),
             decay_factor = format!("{:.4}", decay_factor),
             effective_threshold = format!("{:.4}", effective_threshold),
             "Calculated effective threshold"
