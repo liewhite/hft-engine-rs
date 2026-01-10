@@ -31,6 +31,10 @@ pub struct MetricsSubscriberActor {
     registry: Registry,
     /// Equity Gauge (labels: exchange)
     equity_gauge: GaugeVec,
+    /// Notional Gauge (labels: exchange)
+    notional_gauge: GaugeVec,
+    /// Leverage Gauge (labels: exchange)
+    leverage_gauge: GaugeVec,
     /// Position Gauge (labels: exchange, symbol)
     position_gauge: GaugeVec,
     /// Pushgateway URL
@@ -95,6 +99,22 @@ impl Actor for MetricsSubscriberActor {
         let equity_gauge = GaugeVec::new(equity_opts, &["exchange"])?;
         registry.register(Box::new(equity_gauge.clone()))?;
 
+        // 创建 notional gauge (labels: exchange)
+        let notional_opts = Opts::new(
+            format!("{}_notional", args.metric_prefix),
+            "Account total position notional by exchange",
+        );
+        let notional_gauge = GaugeVec::new(notional_opts, &["exchange"])?;
+        registry.register(Box::new(notional_gauge.clone()))?;
+
+        // 创建 leverage gauge (labels: exchange)
+        let leverage_opts = Opts::new(
+            format!("{}_leverage", args.metric_prefix),
+            "Account leverage (notional/equity) by exchange",
+        );
+        let leverage_gauge = GaugeVec::new(leverage_opts, &["exchange"])?;
+        registry.register(Box::new(leverage_gauge.clone()))?;
+
         // 创建 position gauge (labels: exchange, symbol)
         let position_opts = Opts::new(
             format!("{}_position", args.metric_prefix),
@@ -109,6 +129,8 @@ impl Actor for MetricsSubscriberActor {
         let actor = Self {
             registry,
             equity_gauge,
+            notional_gauge,
+            leverage_gauge,
             position_gauge,
             pushgateway_url,
             http_client: reqwest::Client::new(),
@@ -160,12 +182,38 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
 
     async fn handle(&mut self, msg: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
         match &msg.data {
-            ExchangeEventData::AccountInfo { exchange, equity, .. } => {
+            ExchangeEventData::AccountInfo {
+                exchange,
+                equity,
+                notional,
+            } => {
                 let exchange_label = exchange_to_label(*exchange);
+
                 self.equity_gauge
                     .with_label_values(&[exchange_label])
                     .set(*equity);
-                tracing::debug!(exchange = %exchange_label, equity = %equity, "Updated equity gauge");
+
+                self.notional_gauge
+                    .with_label_values(&[exchange_label])
+                    .set(*notional);
+
+                // 计算杠杆率 (notional / equity)
+                let leverage = if *equity > 0.0 {
+                    notional / equity
+                } else {
+                    0.0
+                };
+                self.leverage_gauge
+                    .with_label_values(&[exchange_label])
+                    .set(leverage);
+
+                tracing::debug!(
+                    exchange = %exchange_label,
+                    equity = %equity,
+                    notional = %notional,
+                    leverage = %format!("{:.2}", leverage),
+                    "Updated account metrics"
+                );
             }
             ExchangeEventData::Position(position) => {
                 let exchange_label = exchange_to_label(position.exchange);
