@@ -165,10 +165,13 @@ impl FundingArbStrategy {
 
     /// 计算有效开仓阈值
     ///
-    /// 根据参与交易的两个交易所的 symbol 杠杆率，动态降低开仓阈值
-    /// - 杠杆率 = 0 → 阈值 = deviation_threshold
-    /// - 杠杆率 = max_symbol_leverage → 阈值 = 0
-    /// 公式: effective_threshold = deviation_threshold * (1 - max_leverage / max_symbol_leverage)
+    /// 根据杠杆率高的一边的仓位方向动态调整阈值：
+    /// - 开仓/加仓方向 → 阈值提高（更难触发，控制风险）
+    /// - 平仓方向 → 阈值降低（更易触发，降低风险）
+    ///
+    /// 公式: effective_threshold = base * (1 + direction_factor * leverage_ratio)
+    /// - direction_factor = sign(position * order_direction)
+    /// - 同向/新开仓 = +1，反向 = -1
     fn calculate_effective_threshold(
         &self,
         short_exchange: Exchange,
@@ -190,26 +193,42 @@ impl FundingArbStrategy {
             (pos_size * price) / equity
         };
 
-        // 取两个交易所中较大的杠杆率
         let short_leverage = calc_leverage(short_exchange);
         let long_leverage = calc_leverage(long_exchange);
-        let max_leverage = short_leverage.max(long_leverage);
 
-        // 计算衰减因子: 1 - max_leverage / max_symbol_leverage，clamp 到 [0, 1]
-        let leverage_ratio = max_leverage / max_symbol_leverage;
-        let decay_factor = (1.0 - leverage_ratio).clamp(0.0, 1.0);
-        let effective_threshold = base_threshold * decay_factor;
+        // 获取仓位
+        let short_pos = state.position(short_exchange).map(|p| p.size).unwrap_or(0.0);
+        let long_pos = state.position(long_exchange).map(|p| p.size).unwrap_or(0.0);
+
+        // 计算方向因子：position * order_direction 的符号
+        // long 做多 (+1)，short 做空 (-1)
+        // 同向/新开仓 → +1，反向 → -1
+        let long_factor = (long_pos + f64::EPSILON).signum();
+        let short_factor = (short_pos * -1.0 + f64::EPSILON).signum();
+
+        // 以杠杆率高的一边为参考
+        let (leverage_ratio, direction_factor) = if short_leverage >= long_leverage {
+            (short_leverage / max_symbol_leverage, short_factor)
+        } else {
+            (long_leverage / max_symbol_leverage, long_factor)
+        };
+
+        // 统一公式：开仓时阈值提高，平仓时阈值降低
+        let effective_threshold = base_threshold * (1.0 + direction_factor * leverage_ratio);
 
         tracing::debug!(
             symbol = %self.symbol,
             base_threshold = format!("{:.4}", base_threshold),
             short_exchange = %short_exchange,
             short_leverage = format!("{:.4}", short_leverage),
+            short_pos = format!("{:.4}", short_pos),
+            short_factor = format!("{:.1}", short_factor),
             long_exchange = %long_exchange,
             long_leverage = format!("{:.4}", long_leverage),
-            max_leverage = format!("{:.4}", max_leverage),
-            max_symbol_leverage = format!("{:.4}", max_symbol_leverage),
-            decay_factor = format!("{:.4}", decay_factor),
+            long_pos = format!("{:.4}", long_pos),
+            long_factor = format!("{:.1}", long_factor),
+            direction_factor = format!("{:.1}", direction_factor),
+            leverage_ratio = format!("{:.4}", leverage_ratio),
             effective_threshold = format!("{:.4}", effective_threshold),
             "Calculated effective threshold"
         );
