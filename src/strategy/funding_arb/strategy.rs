@@ -9,9 +9,6 @@ use super::config::FundingArbConfig;
 use super::ema::ExchangeEma;
 use super::signals::TradingSignal;
 
-/// 市价单滑点（用限价单 IOC 模拟市价单）
-const MARKET_ORDER_SLIPPAGE: f64 = 0.001; // 0.1%
-
 /// 仓位比较的 epsilon（用于判断仓位是否为零）
 const POSITION_EPSILON: f64 = 1e-10;
 
@@ -413,10 +410,10 @@ impl FundingArbStrategy {
         // 计算带滑点的价格（模拟市价单）
         let (side, price) = if pos.size > 0.0 {
             // 平多：卖出，bid - slippage
-            (Side::Short, bbo.bid_price * (1.0 - MARKET_ORDER_SLIPPAGE))
+            (Side::Short, bbo.bid_price * (1.0 - self.config.ioc_slippage))
         } else {
             // 平空：买入，ask + slippage
-            (Side::Long, bbo.ask_price * (1.0 + MARKET_ORDER_SLIPPAGE))
+            (Side::Long, bbo.ask_price * (1.0 + self.config.ioc_slippage))
         };
 
         if price <= 0.0 {
@@ -477,8 +474,8 @@ impl FundingArbStrategy {
         // 计算带滑点的价格（模拟市价单）
         // short_price 是 bid，做空用 bid - slippage
         // long_price 是 ask，做多用 ask + slippage
-        let short_limit_price = signal.short_price * (1.0 - MARKET_ORDER_SLIPPAGE);
-        let long_limit_price = signal.long_price * (1.0 + MARKET_ORDER_SLIPPAGE);
+        let short_limit_price = signal.short_price * (1.0 - self.config.ioc_slippage);
+        let long_limit_price = signal.long_price * (1.0 + self.config.ioc_slippage);
 
         let mut orders = Vec::new();
 

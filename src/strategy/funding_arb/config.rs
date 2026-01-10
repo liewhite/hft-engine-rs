@@ -26,4 +26,8 @@ pub struct FundingArbConfig {
     /// - 任一交易所的仓位价值 / equity 超过此比例时禁止开仓
     /// - 不影响平仓和 rebalance
     pub max_position_ratio: f64,
+    /// IOC 订单滑点（用限价单 IOC 模拟市价单）
+    /// - 例如 0.001 表示 0.1%
+    /// - 做多时 ask + slippage，做空时 bid - slippage
+    pub ioc_slippage: f64,
 }
