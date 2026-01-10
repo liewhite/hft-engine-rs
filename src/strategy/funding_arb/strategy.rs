@@ -243,6 +243,71 @@ impl FundingArbStrategy {
         Some(signal)
     }
 
+    /// Pipeline 第4步：账户杠杆率检查
+    ///
+    /// 检查账户级别杠杆率 (account_notional / equity)
+    /// 如果某交易所杠杆率超过阈值，且订单方向与现有仓位方向相同，则拒绝开仓
+    fn check_account_leverage(
+        &self,
+        signal: TradingSignal,
+        state: &SymbolState,
+        state_manager: &StateManager,
+    ) -> Option<TradingSignal> {
+        // 计算两边交易所的账户杠杆率
+        let short_equity = state_manager.equity(signal.short_exchange);
+        let short_notional = state_manager.account_notional(signal.short_exchange);
+        let short_leverage = if short_equity > 0.0 {
+            short_notional / short_equity
+        } else {
+            0.0
+        };
+
+        let long_equity = state_manager.equity(signal.long_exchange);
+        let long_notional = state_manager.account_notional(signal.long_exchange);
+        let long_leverage = if long_equity > 0.0 {
+            long_notional / long_equity
+        } else {
+            0.0
+        };
+
+        // 获取当前 symbol 在各交易所的仓位
+        let short_pos = state
+            .position(signal.short_exchange)
+            .map(|p| p.size)
+            .unwrap_or(0.0);
+        let long_pos = state
+            .position(signal.long_exchange)
+            .map(|p| p.size)
+            .unwrap_or(0.0);
+
+        // 检查做空方：杠杆率超标 && 已有空头仓位（方向相同，会增加杠杆）
+        let short_blocked =
+            short_leverage >= self.config.max_account_leverage && short_pos < -POSITION_EPSILON;
+
+        // 检查做多方：杠杆率超标 && 已有多头仓位（方向相同，会增加杠杆）
+        let long_blocked =
+            long_leverage >= self.config.max_account_leverage && long_pos > POSITION_EPSILON;
+
+        if short_blocked || long_blocked {
+            tracing::info!(
+                symbol = %self.symbol,
+                short_exchange = %signal.short_exchange,
+                short_leverage = format!("{:.2}", short_leverage),
+                short_pos = format!("{:.4}", short_pos),
+                short_blocked = short_blocked,
+                long_exchange = %signal.long_exchange,
+                long_leverage = format!("{:.2}", long_leverage),
+                long_pos = format!("{:.4}", long_pos),
+                long_blocked = long_blocked,
+                max_account_leverage = format!("{:.2}", self.config.max_account_leverage),
+                "Signal filtered: account leverage exceeds threshold"
+            );
+            return None;
+        }
+
+        Some(signal)
+    }
+
     /// Pipeline 第2步：净敞口修正
     ///
     /// 根据当前净敞口调整下单数量
@@ -313,7 +378,7 @@ impl FundingArbStrategy {
 
     /// 运行完整的信号处理 pipeline
     ///
-    /// 顺序：validate → adjust_for_exposure → check_leverage → check_notional_limits
+    /// 顺序：validate → adjust_for_exposure → check_notional_limits → check_leverage → check_account_leverage
     /// 先调整 exposure 再检查 leverage，确保 leverage 基于实际下单量计算
     fn process_signal(
         &self,
@@ -325,6 +390,7 @@ impl FundingArbStrategy {
             .and_then(|s| self.adjust_for_exposure(s, state))
             .and_then(|s| self.check_notional_limits(s))
             .and_then(|s| self.check_leverage(s, state, state_manager))
+            .and_then(|s| self.check_account_leverage(s, state, state_manager))
     }
 
     // ========== 辅助功能 ==========
