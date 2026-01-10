@@ -211,10 +211,11 @@ impl PositionData {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountData {
-    #[allow(dead_code)]
     pub u_time: String,
     /// 账户总权益 (USDT)
     pub total_eq: String,
+    /// 账户总持仓名义价值 (USD)
+    pub notional_usd: String,
     #[allow(dead_code)]
     pub details: Vec<AccountDetail>,
 }
@@ -222,7 +223,12 @@ pub struct AccountData {
 impl AccountData {
     pub fn to_equity(&self) -> f64 {
         f64::from_str(&self.total_eq)
-            .unwrap_or_else(|_| panic!("Failed to parse total equity: {}", self.total_eq))
+            .expect("Failed to parse OKX total equity")
+    }
+
+    pub fn to_notional(&self) -> f64 {
+        f64::from_str(&self.notional_usd)
+            .expect("Failed to parse OKX notionalUsd")
     }
 }
 

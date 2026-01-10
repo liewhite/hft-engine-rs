@@ -3,3 +3,4 @@
 exchange实现new cli id方法
 ExchangeModule 是个多余的trait，直接使用ExchangeClient
 多个public websocket链接，避免429和超过订阅数限制
+ioc订单容忍一些滑点， 只要整体不亏钱， 比如阈值0.4%， 滑点到0.3%

@@ -363,40 +363,13 @@ impl ExchangeClient for HyperliquidClient {
         Ok(())
     }
 
-    async fn fetch_equity(&self) -> Result<f64, ExchangeError> {
-        // 获取账户净值需要地址，如果没有凭证则报错
-        let wallet_address = self
-            .credentials
-            .as_ref()
-            .map(|c| c.wallet_address.clone())
-            .ok_or_else(|| ExchangeError::Other("No wallet address configured".to_string()))?;
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ClearinghouseState {
-            margin_summary: MarginSummary,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct MarginSummary {
-            account_value: String,
-        }
-
-        let state: ClearinghouseState = self
-            .post_info(serde_json::json!({
-                "type": "clearinghouseState",
-                "user": wallet_address
-            }))
-            .await?;
-
-        let equity: f64 = state
-            .margin_summary
-            .account_value
-            .parse()
-            .map_err(|_| ExchangeError::Other("Failed to parse account value".to_string()))?;
-
-        Ok(equity)
+    async fn fetch_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+        // Hyperliquid 通过 WebSocket 推送 equity 和 notional，这里仅实现 trait
+        // 实际使用中不会调用此方法
+        Ok(crate::exchange::AccountInfo {
+            equity: 0.0,
+            notional: 0.0,
+        })
     }
 }
 

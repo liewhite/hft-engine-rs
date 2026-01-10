@@ -28,6 +28,8 @@ pub enum ExchangeEventData {
     Balance(Balance),
     /// 账户净值 (balance + unrealized_pnl)
     Equity { exchange: Exchange, equity: f64 },
+    /// 账户总持仓名义价值 (用于计算杠杆率)
+    AccountNotional { exchange: Exchange, notional: f64 },
     /// 时钟事件 (用于超时检测等定时任务)
     Clock,
 }
@@ -44,6 +46,7 @@ impl IncomeEvent {
             ExchangeEventData::OrderUpdate(update) => Some(&update.symbol),
             ExchangeEventData::Balance(_)
             | ExchangeEventData::Equity { .. }
+            | ExchangeEventData::AccountNotional { .. }
             | ExchangeEventData::Clock => None,
         }
     }
@@ -59,6 +62,7 @@ impl IncomeEvent {
             ExchangeEventData::OrderUpdate(update) => Some(update.exchange),
             ExchangeEventData::Balance(bal) => Some(bal.exchange),
             ExchangeEventData::Equity { exchange, .. } => Some(*exchange),
+            ExchangeEventData::AccountNotional { exchange, .. } => Some(*exchange),
             ExchangeEventData::Clock => None,
         }
     }

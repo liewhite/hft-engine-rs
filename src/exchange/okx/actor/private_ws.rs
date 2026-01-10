@@ -286,24 +286,35 @@ fn parse_private_message(
             let push: WsPush<AccountData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;
 
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let exchange_ts = data.u_time.parse::<u64>().unwrap_or_else(|_| {
-                        panic!("Failed to parse account timestamp: {}", data.u_time)
-                    });
-                    let equity = data.to_equity();
-                    IncomeEvent {
-                        exchange_ts,
-                        local_ts,
-                        data: ExchangeEventData::Equity {
-                            exchange: Exchange::OKX,
-                            equity,
-                        },
-                    }
-                })
-                .collect();
+            let mut events = Vec::new();
+            for data in &push.data {
+                let exchange_ts = data
+                    .u_time
+                    .parse::<u64>()
+                    .expect("Failed to parse OKX account timestamp");
+                let equity = data.to_equity();
+                let notional = data.to_notional();
+
+                // 发布 Equity 事件
+                events.push(IncomeEvent {
+                    exchange_ts,
+                    local_ts,
+                    data: ExchangeEventData::Equity {
+                        exchange: Exchange::OKX,
+                        equity,
+                    },
+                });
+
+                // 发布 AccountNotional 事件
+                events.push(IncomeEvent {
+                    exchange_ts,
+                    local_ts,
+                    data: ExchangeEventData::AccountNotional {
+                        exchange: Exchange::OKX,
+                        notional,
+                    },
+                });
+            }
             Ok(events)
         }
         "orders" => {

@@ -5,6 +5,15 @@
 use crate::domain::{Exchange, ExchangeError, Order, OrderId, Symbol, SymbolMeta};
 use async_trait::async_trait;
 
+/// 账户信息 (净值 + 总持仓名义价值)
+#[derive(Debug, Clone, Copy)]
+pub struct AccountInfo {
+    /// 账户净值 (balance + unrealized_pnl)
+    pub equity: f64,
+    /// 账户总持仓名义价值 (用于计算杠杆率)
+    pub notional: f64,
+}
+
 // ============================================================================
 // 订阅类型
 // ============================================================================
@@ -60,8 +69,8 @@ pub trait ExchangeClient: Send + Sync + 'static {
     /// 设置杠杆
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError>;
 
-    /// 获取账户净值 (balance + unrealized_pnl)
-    async fn fetch_equity(&self) -> Result<f64, ExchangeError>;
+    /// 获取账户信息 (净值 + 总持仓名义价值)
+    async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError>;
 }
 
 // ============================================================================

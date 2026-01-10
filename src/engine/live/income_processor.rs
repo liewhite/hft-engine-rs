@@ -68,6 +68,7 @@ impl IncomeProcessorActor {
             // 账户级别数据和 Clock：广播
             ExchangeEventData::Balance(_)
             | ExchangeEventData::Equity { .. }
+            | ExchangeEventData::AccountNotional { .. }
             | ExchangeEventData::Clock => EventRouting::Broadcast,
         }
     }

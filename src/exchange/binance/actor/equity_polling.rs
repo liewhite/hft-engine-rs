@@ -35,12 +35,13 @@ pub struct BinanceEquityPollingActor {
 }
 
 impl BinanceEquityPollingActor {
-    /// 执行一次 equity 查询
-    async fn poll_equity(&self) {
+    /// 执行一次账户信息查询 (equity + notional)
+    async fn poll_account_info(&self) {
         let local_ts = now_ms();
 
-        match self.client.fetch_equity().await {
-            Ok(equity) => {
+        match self.client.fetch_account_info().await {
+            Ok(info) => {
+                // 发布 Equity 事件
                 let _ = self
                     .income_pubsub
                     .tell(Publish(IncomeEvent {
@@ -48,7 +49,21 @@ impl BinanceEquityPollingActor {
                         local_ts,
                         data: ExchangeEventData::Equity {
                             exchange: Exchange::Binance,
-                            equity,
+                            equity: info.equity,
+                        },
+                    }))
+                    .send()
+                    .await;
+
+                // 发布 AccountNotional 事件
+                let _ = self
+                    .income_pubsub
+                    .tell(Publish(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::AccountNotional {
+                            exchange: Exchange::Binance,
+                            notional: info.notional,
                         },
                     }))
                     .send()
@@ -58,7 +73,7 @@ impl BinanceEquityPollingActor {
                 tracing::warn!(
                     exchange = %Exchange::Binance,
                     error = %e,
-                    "Failed to fetch equity"
+                    "Failed to fetch account info"
                 );
             }
         }
@@ -109,7 +124,7 @@ impl Message<StreamMessage<Instant, (), ()>> for BinanceEquityPollingActor {
     ) {
         match msg {
             StreamMessage::Next(_) => {
-                self.poll_equity().await;
+                self.poll_account_info().await;
             }
             StreamMessage::Started(_) => {
                 tracing::debug!("Equity polling stream started");

@@ -10,6 +10,8 @@ pub struct StateManager {
     balances: HashMap<Exchange, f64>,
     /// 账户净值 (per exchange)
     equities: HashMap<Exchange, f64>,
+    /// 账户总持仓名义价值 (per exchange)
+    account_notionals: HashMap<Exchange, f64>,
     /// 订单超时时间 (毫秒)
     order_timeout_ms: u64,
 }
@@ -26,6 +28,7 @@ impl StateManager {
             states,
             balances: HashMap::new(),
             equities: HashMap::new(),
+            account_notionals: HashMap::new(),
             order_timeout_ms,
         }
     }
@@ -75,6 +78,16 @@ impl StateManager {
         self.equities.values().sum()
     }
 
+    /// 获取指定交易所的账户总持仓名义价值
+    pub fn account_notional(&self, exchange: Exchange) -> f64 {
+        self.account_notionals.get(&exchange).copied().unwrap_or(0.0)
+    }
+
+    /// 获取所有交易所的总持仓名义价值
+    pub fn total_account_notional(&self) -> f64 {
+        self.account_notionals.values().sum()
+    }
+
     /// 检查指定 symbol 是否有未完成订单
     pub fn has_pending_orders(&self, symbol: &Symbol) -> bool {
         self.states
@@ -107,6 +120,15 @@ impl StateManager {
                     "Equity updated"
                 );
                 self.equities.insert(*exchange, *equity);
+            }
+            // 全局事件: AccountNotional
+            ExchangeEventData::AccountNotional { exchange, notional } => {
+                tracing::debug!(
+                    exchange = %exchange,
+                    notional = notional,
+                    "AccountNotional updated"
+                );
+                self.account_notionals.insert(*exchange, *notional);
             }
             // 全局事件: Clock (检查订单超时)
             ExchangeEventData::Clock => {

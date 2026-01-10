@@ -373,8 +373,14 @@ impl ExchangeClient for OkxClient {
         Ok(())
     }
 
-    async fn fetch_equity(&self) -> Result<f64, ExchangeError> {
-        self.get_equity().await
+    async fn fetch_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+        // OKX 通过 WebSocket 推送 equity 和 notional，这里仅实现 trait
+        // 实际使用中不会调用此方法
+        let equity = self.get_equity().await?;
+        Ok(crate::exchange::AccountInfo {
+            equity,
+            notional: 0.0, // OKX 通过 WebSocket 推送 notional
+        })
     }
 }
 

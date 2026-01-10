@@ -288,16 +288,23 @@ impl BinanceClient {
         Ok(result)
     }
 
-    /// 查询账户净值 (totalMarginBalance)
-    async fn get_equity(&self) -> Result<f64, ExchangeError> {
+    /// 查询账户信息 (净值 + 总持仓名义价值)
+    async fn get_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
 
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
-        struct AccountInfo {
+        struct AccountResponse {
             total_margin_balance: String,
+            positions: Vec<PositionInfo>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PositionInfo {
+            notional: String,
         }
 
         let query = self
@@ -306,7 +313,7 @@ impl BinanceClient {
 
         let resp = self
             .client
-            .get(format!("{}/fapi/v2/account?{}", self.base_url, query))
+            .get(format!("{}/fapi/v3/account?{}", self.base_url, query))
             .header("X-MBX-APIKEY", api_key)
             .send()
             .await
@@ -322,13 +329,26 @@ impl BinanceClient {
             )));
         }
 
-        let account: AccountInfo = resp.json().await.map_err(Self::map_reqwest_error)?;
+        let account: AccountResponse = resp.json().await.map_err(Self::map_reqwest_error)?;
+
         let equity: f64 = account
             .total_margin_balance
             .parse()
-            .map_err(|_| ExchangeError::Other("Failed to parse totalMarginBalance".to_string()))?;
+            .expect("Failed to parse Binance totalMarginBalance");
 
-        Ok(equity)
+        // 汇总所有持仓的 notional (取绝对值)
+        let notional: f64 = account
+            .positions
+            .iter()
+            .map(|p| {
+                p.notional
+                    .parse::<f64>()
+                    .expect("Failed to parse Binance position notional")
+                    .abs()
+            })
+            .sum();
+
+        Ok(crate::exchange::AccountInfo { equity, notional })
     }
 }
 
@@ -442,8 +462,8 @@ impl ExchangeClient for BinanceClient {
         Ok(())
     }
 
-    async fn fetch_equity(&self) -> Result<f64, ExchangeError> {
-        self.get_equity().await
+    async fn fetch_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+        self.get_account_info().await
     }
 }
 
