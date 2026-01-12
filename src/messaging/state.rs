@@ -293,21 +293,28 @@ impl SymbolState {
             }
             ExchangeEventData::Fill(fill) => {
                 // Fill 事件用于即时更新仓位（无论是策略订单还是手动订单）
-                if let Some(pos) = self.positions.get_mut(&fill.exchange) {
-                    let delta = match fill.side {
-                        Side::Long => fill.size,
-                        Side::Short => -fill.size,
-                    };
-                    pos.size += delta;
-                    tracing::info!(
-                        exchange = %fill.exchange,
-                        side = ?fill.side,
-                        fill_size = fill.size,
-                        fill_price = fill.price,
-                        new_position_size = pos.size,
-                        "Updated position on fill"
-                    );
-                }
+                let delta = match fill.side {
+                    Side::Long => fill.size,
+                    Side::Short => -fill.size,
+                };
+                let pos = self.positions.entry(fill.exchange).or_insert_with(|| {
+                    Position {
+                        exchange: fill.exchange,
+                        symbol: self.symbol.clone(),
+                        size: 0.0,
+                        entry_price: fill.price,
+                        unrealized_pnl: 0.0,
+                    }
+                });
+                pos.size += delta;
+                tracing::info!(
+                    exchange = %fill.exchange,
+                    side = ?fill.side,
+                    fill_size = fill.size,
+                    fill_price = fill.price,
+                    new_position_size = pos.size,
+                    "Updated position on fill"
+                );
             }
             ExchangeEventData::MarkPrice(mp) => {
                 self.mark_prices.insert(mp.exchange, mp.clone());
