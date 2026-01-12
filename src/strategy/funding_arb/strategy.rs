@@ -254,10 +254,20 @@ impl FundingArbStrategy {
             return;
         }
 
-        if signal.long_size <= 0.0 {
+        if signal.long_size < 0.0 {
+            tracing::warn!(
+                symbol = %self.symbol,
+                long_size = signal.long_size,
+                "Signal filtered: negative long_size"
+            );
             signal.long_size = 0.0;
         }
-        if signal.short_size <= 0.0 {
+        if signal.short_size < 0.0 {
+            tracing::warn!(
+                symbol = %self.symbol,
+                short_size = signal.short_size,
+                "Signal filtered: negative short_size"
+            );
             signal.short_size = 0.0;
         }
     }
