@@ -5,13 +5,14 @@
 //! - 维护 Gauge metrics（equity 按 exchange 标签，position 按 exchange + symbol 标签）
 //! - 定时推送 metrics 到 Pushgateway
 
-use crate::domain::Exchange;
+use crate::domain::{Exchange, Symbol};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use prometheus::{Encoder, GaugeVec, Opts, Registry, TextEncoder};
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::interval;
 
@@ -43,6 +44,8 @@ pub struct MetricsSubscriberActor {
     http_client: reqwest::Client,
     /// Job 名称（用于 Pushgateway）
     job_name: String,
+    /// 价格缓存 (用于计算 position notional)
+    price_cache: HashMap<(Exchange, Symbol), f64>,
 }
 
 impl MetricsSubscriberActor {
@@ -118,7 +121,7 @@ impl Actor for MetricsSubscriberActor {
         // 创建 position gauge (labels: exchange, symbol)
         let position_opts = Opts::new(
             format!("{}_position", args.metric_prefix),
-            "Position size by exchange and symbol",
+            "Position notional (size * price) by exchange and symbol",
         );
         let position_gauge = GaugeVec::new(position_opts, &["exchange", "symbol"])?;
         registry.register(Box::new(position_gauge.clone()))?;
@@ -135,6 +138,7 @@ impl Actor for MetricsSubscriberActor {
             pushgateway_url,
             http_client: reqwest::Client::new(),
             job_name: args.metric_prefix.clone(),
+            price_cache: HashMap::new(),
         };
 
         // 启动定时推送任务
@@ -215,16 +219,28 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
                     "Updated account metrics"
                 );
             }
+            ExchangeEventData::BBO(bbo) => {
+                // 更新价格缓存（中间价）
+                let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
+                self.price_cache
+                    .insert((bbo.exchange, bbo.symbol.clone()), mid_price);
+            }
             ExchangeEventData::Position(position) => {
                 let exchange_label = exchange_to_label(position.exchange);
                 let symbol_label = &position.symbol;
+                // 使用缓存的中间价计算 notional
+                let notional = self
+                    .price_cache
+                    .get(&(position.exchange, position.symbol.clone()))
+                    .map(|price| position.size * price)
+                    .unwrap_or(0.0);
                 self.position_gauge
                     .with_label_values(&[exchange_label, symbol_label])
-                    .set(position.size);
+                    .set(notional);
                 tracing::debug!(
                     exchange = %exchange_label,
                     symbol = %symbol_label,
-                    size = %position.size,
+                    notional = %notional,
                     "Updated position gauge"
                 );
             }
