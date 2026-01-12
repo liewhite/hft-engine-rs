@@ -240,8 +240,8 @@ impl FundingArbStrategy {
 
     /// Pipeline 第1步：合法性检查
     ///
-    /// 检查各字段是否有效（价格和数量都大于0）
-    fn validate_signal(&self, signal: TradingSignal) -> Option<TradingSignal> {
+    /// 检查各字段是否有效，无效的设置 size 为 0
+    fn validate_signal(&self, mut signal: TradingSignal) -> TradingSignal {
         if signal.long_price <= 0.0 || signal.short_price <= 0.0 {
             tracing::info!(
                 symbol = %self.symbol,
@@ -249,32 +249,31 @@ impl FundingArbStrategy {
                 short_price = signal.short_price,
                 "Signal filtered: invalid price"
             );
-            return None;
+            signal.long_size = 0.0;
+            signal.short_size = 0.0;
+            return signal;
         }
 
-        if signal.long_size <= 0.0 || signal.short_size <= 0.0 {
-            tracing::info!(
-                symbol = %self.symbol,
-                long_size = signal.long_size,
-                short_size = signal.short_size,
-                "Signal filtered: invalid size"
-            );
-            return None;
+        if signal.long_size <= 0.0 {
+            signal.long_size = 0.0;
+        }
+        if signal.short_size <= 0.0 {
+            signal.short_size = 0.0;
         }
 
-        Some(signal)
+        signal
     }
 
     /// Pipeline 第3步：杠杆率检查
     ///
     /// 基于调整后的 signal.long_size/short_size 计算新杠杆率
-    /// 如果 new_leverage > old_leverage 且 new_leverage 超过阈值，则丢弃信号
+    /// 如果 new_leverage > old_leverage 且 new_leverage 超过阈值，则将对应侧 size 设为 0
     fn check_symbol_leverage(
         &self,
-        signal: TradingSignal,
+        mut signal: TradingSignal,
         state: &SymbolState,
         state_manager: &StateManager,
-    ) -> Option<TradingSignal> {
+    ) -> TradingSignal {
         let short_equity = state_manager.equity(signal.short_exchange);
         let long_equity = state_manager.equity(signal.long_exchange);
 
@@ -287,7 +286,9 @@ impl FundingArbStrategy {
                 long_equity = long_equity,
                 "Insufficient equity"
             );
-            return None;
+            signal.long_size = 0.0;
+            signal.short_size = 0.0;
+            return signal;
         }
 
         let mid_price = (signal.short_price + signal.long_price) / 2.0;
@@ -304,11 +305,18 @@ impl FundingArbStrategy {
         let new_short_leverage = ((short_pos + signal.short_size) * mid_price) / short_equity;
         let new_long_leverage = ((long_pos + signal.long_size) * mid_price) / long_equity;
 
-        // 检查：如果新杠杆率 > 旧杠杆率 且 新杠杆率超过阈值，则丢弃
+        // 检查：如果新杠杆率 > 旧杠杆率 且 新杠杆率超过阈值，则将对应侧 size 设为 0
         let short_blocked = new_short_leverage > old_short_leverage
             && new_short_leverage >= self.config.max_symbol_leverage;
         let long_blocked = new_long_leverage > old_long_leverage
             && new_long_leverage >= self.config.max_symbol_leverage;
+
+        if short_blocked {
+            signal.short_size = 0.0;
+        }
+        if long_blocked {
+            signal.long_size = 0.0;
+        }
 
         if short_blocked || long_blocked {
             tracing::info!(
@@ -318,24 +326,25 @@ impl FundingArbStrategy {
                 old_long_leverage = format!("{:.4}", old_long_leverage),
                 new_long_leverage = format!("{:.4}", new_long_leverage),
                 max_symbol_leverage = format!("{:.4}", self.config.max_symbol_leverage),
-                "Signal filtered: leverage exceeds threshold"
+                short_blocked = short_blocked,
+                long_blocked = long_blocked,
+                "Signal adjusted: leverage exceeds threshold"
             );
-            return None;
         }
 
-        Some(signal)
+        signal
     }
 
     /// Pipeline 第4步：账户杠杆率检查
     ///
     /// 检查账户级别杠杆率 (account_notional / equity)
-    /// 如果某交易所杠杆率超过阈值，且订单方向与现有仓位方向相同，则拒绝开仓
+    /// 如果某交易所杠杆率超过阈值，且订单方向与现有仓位方向相同，则将对应侧 size 设为 0
     fn check_account_leverage(
         &self,
-        signal: TradingSignal,
+        mut signal: TradingSignal,
         state: &SymbolState,
         state_manager: &StateManager,
-    ) -> Option<TradingSignal> {
+    ) -> TradingSignal {
         // 计算两边交易所的账户杠杆率
         let short_equity = state_manager.equity(signal.short_exchange);
         let short_notional = state_manager.account_notional(signal.short_exchange);
@@ -371,6 +380,13 @@ impl FundingArbStrategy {
         let long_blocked =
             long_leverage >= self.config.max_account_leverage && long_pos > POSITION_EPSILON;
 
+        if short_blocked {
+            signal.short_size = 0.0;
+        }
+        if long_blocked {
+            signal.long_size = 0.0;
+        }
+
         if short_blocked || long_blocked {
             tracing::info!(
                 symbol = %self.symbol,
@@ -383,19 +399,18 @@ impl FundingArbStrategy {
                 long_pos = format!("{:.4}", long_pos),
                 long_blocked = long_blocked,
                 max_account_leverage = format!("{:.2}", self.config.max_account_leverage),
-                "Signal filtered: account leverage exceeds threshold"
+                "Signal adjusted: account leverage exceeds threshold"
             );
-            return None;
         }
 
-        Some(signal)
+        signal
     }
 
     /// Pipeline 第2步：净敞口修正
     ///
     /// 根据当前净敞口调整下单数量
     /// 例如：净敞口为 +10（多头多），则多头下单量减去 10（取 max(0)）
-    fn adjust_for_exposure(&self, mut signal: TradingSignal, state: &SymbolState) -> Option<TradingSignal> {
+    fn adjust_for_exposure(&self, mut signal: TradingSignal, state: &SymbolState) -> TradingSignal {
         let (long_size, short_size) = state.position_sizes();
         // net_exposure = long_size + short_size（short_size 是负数）
         // > 0 表示多头多了，< 0 表示空头多了
@@ -424,15 +439,14 @@ impl FundingArbStrategy {
             signal.short_size = (base_qty - abs_exposure).max(0.0);
         }
 
-
-        Some(signal)
+        signal
     }
 
     /// Pipeline 第4步：notional 限制
     ///
     /// - 小于 min_notional 的 size 设为 0（该侧不下单）
     /// - 大于 max_notional 的 size 限制到 max_notional
-    fn check_notional_limits(&self, mut signal: TradingSignal) -> TradingSignal {
+    fn set_notional_limits(&self, mut signal: TradingSignal) -> TradingSignal {
         let min_qty_long = self.config.min_notional / signal.long_price;
         let max_qty_long = self.config.max_notional / signal.long_price;
         let min_qty_short = self.config.min_notional / signal.short_price;
@@ -456,19 +470,19 @@ impl FundingArbStrategy {
 
     /// 运行完整的信号处理 pipeline
     ///
-    /// 顺序：validate → adjust_for_exposure → check_notional_limits → check_leverage → check_account_leverage
-    /// 先调整 exposure 再检查 leverage，确保 leverage 基于实际下单量计算
+    /// 顺序：validate → check_account_leverage → adjust_for_exposure → set_notional_limits → check_symbol_leverage
+    /// 各步骤通过将 size 设为 0 表示不开仓，而非返回 None
     fn process_signal(
         &self,
         signal: TradingSignal,
         state: &SymbolState,
         state_manager: &StateManager,
-    ) -> Option<TradingSignal> {
-        self.validate_signal(signal)
-            .and_then(|s| self.check_account_leverage(s, state, state_manager))
-            .and_then(|s| self.adjust_for_exposure(s, state))
-            .map(|s| self.check_notional_limits(s))
-            .and_then(|s| self.check_symbol_leverage(s, state, state_manager))
+    ) -> TradingSignal {
+        let signal = self.validate_signal(signal);
+        let signal = self.check_account_leverage(signal, state, state_manager);
+        let signal = self.adjust_for_exposure(signal, state);
+        let signal = self.set_notional_limits(signal);
+        self.check_symbol_leverage(signal, state, state_manager)
     }
 
     // ========== 辅助功能 ==========
@@ -726,8 +740,9 @@ impl Strategy for FundingArbStrategy {
 
         // 步骤 2: 检查信号并通过 pipeline 处理
         if let Some(signal) = self.check_signal(symbol_state, state) {
-            if let Some(processed_signal) = self.process_signal(signal, symbol_state, state) {
-                let orders = self.make_orders(&processed_signal);
+            let processed_signal = self.process_signal(signal, symbol_state, state);
+            let orders = self.make_orders(&processed_signal);
+            if !orders.is_empty() {
                 return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
             }
         }
