@@ -56,7 +56,7 @@ impl IncomeProcessorActor {
                 exchange: ip.exchange,
                 symbol: ip.symbol.clone(),
             },
-            // Private 数据：Position 和 OrderUpdate 按 symbol 路由
+            // Private 数据：Position、OrderUpdate、Fill 按 symbol 路由
             ExchangeEventData::Position(pos) => EventRouting::BySymbol {
                 exchange: pos.exchange,
                 symbol: pos.symbol.clone(),
@@ -64,6 +64,10 @@ impl IncomeProcessorActor {
             ExchangeEventData::OrderUpdate(update) => EventRouting::BySymbol {
                 exchange: update.exchange,
                 symbol: update.symbol.clone(),
+            },
+            ExchangeEventData::Fill(fill) => EventRouting::BySymbol {
+                exchange: fill.exchange,
+                symbol: fill.symbol.clone(),
             },
             // 账户级别数据和 Clock：广播
             ExchangeEventData::Balance(_)

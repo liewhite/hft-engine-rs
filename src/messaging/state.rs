@@ -6,7 +6,6 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct PendingOrder {
     pub exchange: Exchange,
-    pub side: Side,
     pub status: OrderStatus,
     pub created_at: Timestamp,
 }
@@ -43,12 +42,10 @@ impl SymbolState {
         &mut self,
         client_order_id: String,
         exchange: Exchange,
-        side: Side,
         created_at: Timestamp,
     ) {
         self.pending_orders.insert(client_order_id, PendingOrder {
             exchange,
-            side,
             status: OrderStatus::Created,
             created_at,
         });
@@ -256,65 +253,48 @@ impl SymbolState {
                     "Updating order status"
                 );
                 // 使用 client_order_id 跟踪订单状态
-                // 如果没有返回client_order_id说明不是我们发起的订单，忽略
+                // 如果没有返回 client_order_id 说明不是我们发起的订单，忽略
                 if let Some(ref client_id) = update.client_order_id {
                     match update.status {
-                        OrderStatus::Filled => {
-                            // 订单成交，乐观更新仓位并移除
-                            if let Some(order) = self.pending_orders.remove(client_id) {
-                                if let Some(pos) = self.positions.get_mut(&order.exchange) {
-                                    // 使用 fill_sz（本次成交量）更新仓位
-                                    let delta = match order.side {
-                                        Side::Long => update.fill_sz,
-                                        Side::Short => -update.fill_sz,
-                                    };
-                                    pos.size += delta;
-                                    tracing::info!(
-                                        exchange = %order.exchange,
-                                        side = ?order.side,
-                                        fill_sz = update.fill_sz,
-                                        new_size = pos.size,
-                                        "Optimistically updated position on order filled"
-                                    );
-                                }
-                            }
-                        }
-                        OrderStatus::Cancelled
+                        OrderStatus::Filled
+                        | OrderStatus::Cancelled
                         | OrderStatus::Rejected { .. }
                         | OrderStatus::Error { .. } => {
-                            // 订单取消或失败，仅移除
+                            // 订单终态，移除 pending order
                             self.pending_orders.remove(client_id);
                         }
-                        OrderStatus::Pending => {
+                        OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
                             // 交易所已确认订单，更新状态
                             if let Some(order) = self.pending_orders.get_mut(client_id) {
                                 order.status = update.status.clone();
                             }
                         }
-                        OrderStatus::PartiallyFilled { .. } => {
-                            // 部分成交，乐观更新仓位但保留订单
-                            if let Some(order) = self.pending_orders.get_mut(client_id) {
-                                order.status = update.status.clone();
-                                if let Some(pos) = self.positions.get_mut(&order.exchange) {
-                                    let delta = match order.side {
-                                        Side::Long => update.fill_sz,
-                                        Side::Short => -update.fill_sz,
-                                    };
-                                    pos.size += delta;
-                                    tracing::info!(
-                                        exchange = %order.exchange,
-                                        side = ?order.side,
-                                        fill_sz = update.fill_sz,
-                                        new_size = pos.size,
-                                        "Optimistically updated position on partial fill"
-                                    );
-                                }
-                            }
-                        }
                         OrderStatus::Created => {
                             // 交易所不会推送 Created 状态，这是本地状态
-                            // 如果收到说明有 bug
                             unreachable!("Exchange should never push Created status")
+                        }
+                    }
+                }
+            }
+            ExchangeEventData::Fill(fill) => {
+                // Fill 事件用于乐观更新仓位
+                // 只有关联到我们的订单才处理
+                if let Some(ref client_id) = fill.client_order_id {
+                    if self.pending_orders.contains_key(client_id) {
+                        if let Some(pos) = self.positions.get_mut(&fill.exchange) {
+                            let delta = match fill.side {
+                                Side::Long => fill.size,
+                                Side::Short => -fill.size,
+                            };
+                            pos.size += delta;
+                            tracing::info!(
+                                exchange = %fill.exchange,
+                                side = ?fill.side,
+                                fill_size = fill.size,
+                                fill_price = fill.price,
+                                new_position_size = pos.size,
+                                "Optimistically updated position on fill"
+                            );
                         }
                     }
                 }

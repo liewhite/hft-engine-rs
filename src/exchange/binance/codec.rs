@@ -1,6 +1,6 @@
 use super::from_binance;
 use crate::domain::{
-    Balance, Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO,
+    Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -212,6 +212,9 @@ pub struct OrderData {
     pub z: String,
     /// 本次成交量 (Last filled quantity)
     pub l: String,
+    /// 本次成交价格 (Last filled price)
+    #[serde(rename = "L")]
+    pub last_price: String,
     pub ap: String,
     pub rp: String,
 }
@@ -255,6 +258,39 @@ impl OrderTradeUpdate {
             fill_sz,
             timestamp: now_ms(),
         }
+    }
+
+    /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）
+    pub fn to_fill(&self, quote: &str) -> Option<Fill> {
+        let fill_sz = f64::from_str(&self.o.l)
+            .unwrap_or_else(|_| panic!("Failed to parse last filled qty: {}", self.o.l));
+
+        // 没有成交则不生成 Fill
+        if fill_sz == 0.0 {
+            return None;
+        }
+
+        let symbol = from_binance(&self.o.s, quote)
+            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.o.s));
+        let last_price = f64::from_str(&self.o.last_price)
+            .unwrap_or_else(|_| panic!("Failed to parse last price: {}", self.o.last_price));
+
+        let side = match self.o.side.as_str() {
+            "BUY" => Side::Long,
+            "SELL" => Side::Short,
+            other => panic!("Unknown Binance side: {}", other),
+        };
+
+        Some(Fill {
+            exchange: Exchange::Binance,
+            symbol,
+            side,
+            price: last_price,
+            size: fill_sz,
+            client_order_id: if self.o.c.is_empty() { None } else { Some(self.o.c.clone()) },
+            order_id: self.o.i.to_string(),
+            timestamp: now_ms(),
+        })
     }
 }
 

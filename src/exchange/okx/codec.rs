@@ -1,5 +1,5 @@
 use super::{from_okx, from_okx_index};
-use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
+use crate::domain::{Exchange, Fill, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -249,6 +249,8 @@ pub struct OrderPushData {
     pub sz: String,
     /// 本次成交数量
     pub fill_sz: String,
+    /// 本次成交价格
+    pub fill_px: String,
     /// 累计成交数量
     pub acc_fill_sz: String,
     #[allow(dead_code)]
@@ -287,6 +289,39 @@ impl OrderPushData {
             fill_sz,
             timestamp: now_ms(),
         }
+    }
+
+    /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）
+    pub fn to_fill(&self) -> Option<Fill> {
+        let fill_sz = f64::from_str(&self.fill_sz)
+            .unwrap_or_else(|_| panic!("Failed to parse fill_sz: {}", self.fill_sz));
+
+        // 没有成交则不生成 Fill
+        if fill_sz == 0.0 {
+            return None;
+        }
+
+        let symbol = from_okx(&self.inst_id)
+            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+        let fill_px = f64::from_str(&self.fill_px)
+            .unwrap_or_else(|_| panic!("Failed to parse fill_px: {}", self.fill_px));
+
+        let side = match self.side.as_str() {
+            "buy" => Side::Long,
+            "sell" => Side::Short,
+            other => panic!("Unknown OKX side: {}", other),
+        };
+
+        Some(Fill {
+            exchange: Exchange::OKX,
+            symbol,
+            side,
+            price: fill_px,
+            size: fill_sz,
+            client_order_id: self.cl_ord_id.clone(),
+            order_id: self.ord_id.clone(),
+            timestamp: now_ms(),
+        })
     }
 }
 

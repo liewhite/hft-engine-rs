@@ -1,6 +1,7 @@
 mod balance;
 mod bbo;
 mod exchange;
+mod fill;
 mod funding_rate;
 mod index_price;
 mod mark_price;
@@ -16,6 +17,7 @@ mod time_in_force;
 pub use balance::Balance;
 pub use bbo::BBO;
 pub use exchange::Exchange;
+pub use fill::Fill;
 pub use funding_rate::FundingRate;
 pub use index_price::IndexPrice;
 pub use mark_price::MarkPrice;

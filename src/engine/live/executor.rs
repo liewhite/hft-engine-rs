@@ -98,12 +98,11 @@ impl ExecutorActor {
                 OutcomeEvent::PlaceOrder(order) => {
                     // 转换订单
                     let converted_order = self.convert_order(order);
-                    // 添加到 pending_orders（用于追踪订单状态和乐观更新仓位）
+                    // 添加到 pending_orders（用于追踪订单状态）
                     self.state_manager.add_pending_order(
                         &converted_order.symbol,
                         converted_order.client_order_id.clone(),
                         converted_order.exchange,
-                        converted_order.side,
                     );
                     // 发布到 OutcomePubSub
                     let _ = self

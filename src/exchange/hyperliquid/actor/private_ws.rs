@@ -10,7 +10,7 @@
 use crate::domain::{now_ms, Balance, Exchange, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
-use crate::exchange::hyperliquid::codec::{ClearinghouseState, WsOrderUpdate};
+use crate::exchange::hyperliquid::codec::{ClearinghouseState, WsOrderUpdate, WsUserFills};
 use crate::exchange::hyperliquid::WS_URL;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -119,9 +119,24 @@ impl Actor for HyperliquidPrivateWsActor {
             .await
             .expect("Failed to send orderUpdates subscription");
 
+        // userFills: 成交推送
+        let subscribe_fills = json!({
+            "method": "subscribe",
+            "subscription": {
+                "type": "userFills",
+                "user": args.wallet_address
+            }
+        })
+        .to_string();
+
+        outgoing_tx
+            .send(subscribe_fills)
+            .await
+            .expect("Failed to send userFills subscription");
+
         tracing::info!(
             wallet = %args.wallet_address,
-            "HyperliquidPrivateWsActor started, subscribed to clearinghouseState and orderUpdates"
+            "HyperliquidPrivateWsActor started, subscribed to clearinghouseState, orderUpdates and userFills"
         );
 
         Ok(Self {
@@ -210,6 +225,11 @@ fn parse_private_message(
                 // 订单更新
                 let data = &value["data"];
                 return parse_order_updates(data, local_ts);
+            }
+            "userFills" => {
+                // 成交推送
+                let data = &value["data"];
+                return parse_user_fills(data, local_ts);
             }
             _ => {
                 tracing::debug!(channel, "Unknown Hyperliquid private channel");
@@ -347,6 +367,40 @@ fn parse_order_updates(
             data: ExchangeEventData::OrderUpdate(update),
         });
     }
+
+    Ok(events)
+}
+
+/// 解析 userFills 消息
+fn parse_user_fills(
+    data: &serde_json::Value,
+    local_ts: u64,
+) -> Result<Vec<IncomeEvent>, WsError> {
+    let user_fills: WsUserFills = serde_json::from_value(data.clone())
+        .map_err(|e| WsError::ParseError(format!("userFills parse: {}", e)))?;
+
+    // 忽略 snapshot（初始快照），只处理增量更新
+    if user_fills.is_snapshot {
+        tracing::debug!(
+            user = %user_fills.user,
+            fills_count = user_fills.fills.len(),
+            "Received userFills snapshot, ignoring"
+        );
+        return Ok(Vec::new());
+    }
+
+    let events = user_fills
+        .fills
+        .iter()
+        .map(|ws_fill| {
+            let fill = ws_fill.to_fill();
+            IncomeEvent {
+                exchange_ts: fill.timestamp,
+                local_ts,
+                data: ExchangeEventData::Fill(fill),
+            }
+        })
+        .collect();
 
     Ok(events)
 }

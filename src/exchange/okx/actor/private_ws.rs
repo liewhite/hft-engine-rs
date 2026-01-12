@@ -311,18 +311,24 @@ fn parse_private_message(
             let push: WsPush<OrderPushData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("orders parse: {}", e)))?;
 
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let update = data.to_order_update();
-                    IncomeEvent {
+            let mut events = Vec::new();
+            for data in &push.data {
+                // OrderUpdate 事件
+                events.push(IncomeEvent {
+                    exchange_ts: local_ts,
+                    local_ts,
+                    data: ExchangeEventData::OrderUpdate(data.to_order_update()),
+                });
+
+                // 如果有成交，额外发出 Fill 事件
+                if let Some(fill) = data.to_fill() {
+                    events.push(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::OrderUpdate(update),
-                    }
-                })
-                .collect();
+                        data: ExchangeEventData::Fill(fill),
+                    });
+                }
+            }
             Ok(events)
         }
         _ => {

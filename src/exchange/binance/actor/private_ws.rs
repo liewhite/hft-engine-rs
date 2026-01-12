@@ -271,12 +271,23 @@ fn parse_private_message(
         "ORDER_TRADE_UPDATE" => {
             let update: OrderTradeUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("ORDER_TRADE_UPDATE parse: {}", e)))?;
-            let order_update = update.to_order_update(quote);
-            Ok(vec![IncomeEvent {
+
+            let mut events = vec![IncomeEvent {
                 exchange_ts,
                 local_ts,
-                data: ExchangeEventData::OrderUpdate(order_update),
-            }])
+                data: ExchangeEventData::OrderUpdate(update.to_order_update(quote)),
+            }];
+
+            // 如果有成交，额外发出 Fill 事件
+            if let Some(fill) = update.to_fill(quote) {
+                events.push(IncomeEvent {
+                    exchange_ts,
+                    local_ts,
+                    data: ExchangeEventData::Fill(fill),
+                });
+            }
+
+            Ok(events)
         }
         "TRADE_LITE" => {
             // 忽略 TRADE_LITE 消息（轻量成交通知，已在 ORDER_TRADE_UPDATE 中处理）

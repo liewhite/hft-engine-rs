@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use super::from_hyperliquid;
-use crate::domain::{now_ms, Exchange, FundingRate, IndexPrice, MarkPrice, BBO};
+use crate::domain::{now_ms, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, Side, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -379,5 +379,63 @@ fn map_hyperliquid_order_status(status: &str, filled: f64) -> crate::domain::Ord
         other => crate::domain::OrderStatus::Rejected {
             reason: format!("Unknown status: {}", other),
         },
+    }
+}
+
+// ============================================================================
+// userFills 消息结构
+// ============================================================================
+
+/// userFills 响应包装器
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsUserFills {
+    pub user: String,
+    pub fills: Vec<WsFill>,
+    #[serde(default)]
+    pub is_snapshot: bool,
+}
+
+/// 单个成交记录
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsFill {
+    pub coin: String,
+    pub px: String,
+    pub sz: String,
+    pub side: String, // "B" (buy) or "A" (sell/ask)
+    pub time: u64,
+    pub oid: u64,
+    #[serde(default)]
+    pub cloid: Option<String>,
+    pub fee: String,
+    pub closed_pnl: String,
+}
+
+impl WsFill {
+    pub fn to_fill(&self) -> Fill {
+        let symbol = from_hyperliquid(&self.coin);
+        let price = f64::from_str(&self.px)
+            .expect("px must be valid float from Hyperliquid API");
+        let size = f64::from_str(&self.sz)
+            .expect("sz must be valid float from Hyperliquid API");
+
+        // Hyperliquid: "B" = bid/buy, "A" = ask/sell
+        let side = match self.side.as_str() {
+            "B" => Side::Long,
+            "A" => Side::Short,
+            other => panic!("Unknown Hyperliquid fill side: {}", other),
+        };
+
+        Fill {
+            exchange: Exchange::Hyperliquid,
+            symbol,
+            side,
+            price,
+            size,
+            client_order_id: self.cloid.clone(),
+            order_id: self.oid.to_string(),
+            timestamp: self.time,
+        }
     }
 }

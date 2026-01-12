@@ -1,4 +1,4 @@
-use crate::domain::{Balance, Exchange, FundingRate, IndexPrice, MarkPrice, OrderUpdate, Position, Symbol, Timestamp, BBO};
+use crate::domain::{Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, OrderUpdate, Position, Symbol, Timestamp, BBO};
 
 /// 统一的交易所事件
 ///
@@ -25,6 +25,8 @@ pub enum ExchangeEventData {
     IndexPrice(IndexPrice),
     Position(Position),
     OrderUpdate(OrderUpdate),
+    /// 成交事件 (用于乐观更新仓位)
+    Fill(Fill),
     Balance(Balance),
     /// 账户信息 (净值 + 总持仓名义价值)
     AccountInfo {
@@ -48,6 +50,7 @@ impl IncomeEvent {
             ExchangeEventData::IndexPrice(ip) => Some(&ip.symbol),
             ExchangeEventData::Position(pos) => Some(&pos.symbol),
             ExchangeEventData::OrderUpdate(update) => Some(&update.symbol),
+            ExchangeEventData::Fill(fill) => Some(&fill.symbol),
             ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::Clock => None,
@@ -63,6 +66,7 @@ impl IncomeEvent {
             ExchangeEventData::IndexPrice(ip) => Some(ip.exchange),
             ExchangeEventData::Position(pos) => Some(pos.exchange),
             ExchangeEventData::OrderUpdate(update) => Some(update.exchange),
+            ExchangeEventData::Fill(fill) => Some(fill.exchange),
             ExchangeEventData::Balance(bal) => Some(bal.exchange),
             ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
             ExchangeEventData::Clock => None,
