@@ -56,10 +56,12 @@ impl SymbolState {
     /// 只移除 Created 状态的订单（交易所未确认）
     pub fn remove_timed_out_orders(&mut self, now: Timestamp, timeout_ms: u64) -> usize {
         let before = self.pending_orders.len();
+        let symbol = self.symbol.clone();
         self.pending_orders.retain(|client_id, order| {
             let elapsed = now.saturating_sub(order.created_at);
             if elapsed > timeout_ms && order.status == OrderStatus::Created {
                 tracing::warn!(
+                    symbol = %symbol,
                     client_order_id = %client_id,
                     exchange = %order.exchange,
                     elapsed_ms = elapsed,
@@ -248,6 +250,7 @@ impl SymbolState {
                         let size_diff = (local_pos.size - position.size).abs();
                         if size_diff > 1e-10 {
                             tracing::warn!(
+                                symbol = %self.symbol,
                                 exchange = %position.exchange,
                                 local_size = local_pos.size,
                                 pushed_size = position.size,
@@ -261,6 +264,7 @@ impl SymbolState {
             }
             ExchangeEventData::OrderUpdate(update) => {
                 tracing::info!(
+                    symbol = %self.symbol,
                     exchange = %update.exchange,
                     order_id = %update.order_id,
                     client_order_id = ?update.client_order_id,
@@ -308,6 +312,7 @@ impl SymbolState {
                 });
                 pos.size += delta;
                 tracing::info!(
+                    symbol = %self.symbol,
                     exchange = %fill.exchange,
                     side = ?fill.side,
                     fill_size = fill.size,
