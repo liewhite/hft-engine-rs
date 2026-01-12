@@ -313,15 +313,27 @@ fn parse_private_message(
 
             let mut events = Vec::new();
             for data in &push.data {
+                let mut order_update = data.to_order_update();
+
+                // 获取 meta 转换数量单位（张 -> 币）
+                if let Some(meta) = symbol_metas.get(&order_update.symbol) {
+                    order_update.filled_quantity = meta.qty_to_coin(order_update.filled_quantity);
+                    order_update.fill_sz = meta.qty_to_coin(order_update.fill_sz);
+                }
+
                 // OrderUpdate 事件
                 events.push(IncomeEvent {
                     exchange_ts: local_ts,
                     local_ts,
-                    data: ExchangeEventData::OrderUpdate(data.to_order_update()),
+                    data: ExchangeEventData::OrderUpdate(order_update),
                 });
 
                 // 如果有成交，额外发出 Fill 事件
-                if let Some(fill) = data.to_fill() {
+                if let Some(mut fill) = data.to_fill() {
+                    // 获取 meta 转换数量单位（张 -> 币）
+                    if let Some(meta) = symbol_metas.get(&fill.symbol) {
+                        fill.size = meta.qty_to_coin(fill.size);
+                    }
                     events.push(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
