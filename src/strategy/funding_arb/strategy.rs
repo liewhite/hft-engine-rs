@@ -153,13 +153,16 @@ impl FundingArbStrategy {
         let long_bbo = state.bbo(long_exchange)?;
         let short_bbo = state.bbo(short_exchange)?;
 
+        // 使用盘口较小一侧的一半作为基础开仓数量
+        let base_size = (long_bbo.ask_qty / 2.0).min(short_bbo.bid_qty / 2.0);
+
         Some(TradingSignal {
             long_exchange,
             long_price: long_bbo.ask_price,
-            long_size: long_bbo.ask_qty,
+            long_size: base_size,
             short_exchange,
             short_price: short_bbo.bid_price,
-            short_size: short_bbo.bid_qty,
+            short_size: base_size,
         })
     }
 
@@ -420,13 +423,10 @@ impl FundingArbStrategy {
         // > 0 表示多头多了，< 0 表示空头多了
         let net_exposure = long_size + short_size;
 
-        // 按 max_notional 计算基础数量
+        // 使用 signal 中的 size（已由 check_signal 设置为盘口限制）和 max_notional 的较小值
         let mid_price = (signal.short_price + signal.long_price) / 2.0;
-        let base_qty = self.config.max_notional / mid_price;
-
-        // 取盘口 size 的一半作为上限
-        let orderbook_limit = (signal.long_size / 2.0).min(signal.short_size / 2.0);
-        let base_qty = base_qty.min(orderbook_limit);
+        let max_qty = self.config.max_notional / mid_price;
+        let base_qty = signal.long_size.min(signal.short_size).min(max_qty);
 
         if net_exposure.abs() < POSITION_EPSILON {
             // 无敞口，两边数量相等
