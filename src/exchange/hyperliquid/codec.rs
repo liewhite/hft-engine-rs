@@ -297,7 +297,6 @@ impl AssetPosition {
             symbol,
             size,
             entry_price,
-            leverage: self.leverage.value,
             unrealized_pnl,
         }
     }
@@ -336,8 +335,6 @@ impl WsOrderUpdate {
         let current_sz = f64::from_str(&self.order.sz)
             .expect("sz must be valid float from Hyperliquid API");
         let filled_quantity = orig_sz - current_sz;
-        let limit_px = f64::from_str(&self.order.limit_px)
-            .expect("limit_px must be valid float from Hyperliquid API");
 
         // Hyperliquid: "A" = ask/sell, "B" = bid/buy
         let side = match self.order.side.as_str() {
@@ -356,7 +353,6 @@ impl WsOrderUpdate {
             side,
             status,
             filled_quantity,
-            avg_price: Some(limit_px),
             timestamp: self.status_timestamp,
         }
     }

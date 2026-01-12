@@ -184,7 +184,6 @@ impl AccountPosition {
             symbol,
             size: pos_amount, // 正数多头，负数空头
             entry_price,
-            leverage: 1, // 需要从其他接口获取
             unrealized_pnl,
         }
     }
@@ -220,8 +219,6 @@ impl OrderTradeUpdate {
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.o.s));
         let filled_qty = f64::from_str(&self.o.z)
             .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.o.z));
-        // avg_price 可能为空字符串（未成交时）
-        let avg_price = f64::from_str(&self.o.ap).ok();
 
         let side = match self.o.side.as_str() {
             "BUY" => Side::Long,
@@ -250,7 +247,6 @@ impl OrderTradeUpdate {
             side,
             status,
             filled_quantity: filled_qty,
-            avg_price,
             timestamp: now_ms(),
         }
     }

@@ -287,7 +287,6 @@ fn parse_clearinghouse_state(
                 size: 0.0,
                 entry_price: 0.0,
                 unrealized_pnl: 0.0,
-                leverage: 1,
             }),
         });
     }

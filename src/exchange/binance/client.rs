@@ -271,7 +271,6 @@ impl BinanceClient {
                 }
                 let entry_price: f64 = p.entry_price.parse().unwrap_or(0.0);
                 let unrealized_pnl: f64 = p.un_realized_profit.parse().unwrap_or(0.0);
-                let leverage: u32 = p.leverage.parse().unwrap_or(1);
 
                 Some(crate::domain::Position {
                     exchange: Exchange::Binance,
@@ -279,7 +278,6 @@ impl BinanceClient {
                     size,
                     entry_price,
                     unrealized_pnl,
-                    leverage,
                 })
             })
             .collect();

@@ -11,7 +11,6 @@ pub struct Position {
     /// 仓位数量：正数为多头，负数为空头
     pub size: Quantity,
     pub entry_price: f64,
-    pub leverage: u32,
     pub unrealized_pnl: f64,
 }
 
@@ -44,7 +43,6 @@ impl Position {
             symbol,
             size: 0.0,
             entry_price: 0.0,
-            leverage: 1,
             unrealized_pnl: 0.0,
         }
     }

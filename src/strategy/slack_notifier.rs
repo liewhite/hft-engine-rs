@@ -96,7 +96,6 @@ impl SlackNotifierActor {
         symbol: &str,
         side: Side,
         filled_qty: f64,
-        avg_price: Option<f64>,
     ) -> String {
         let exchange_name = match exchange {
             Exchange::Binance => "Binance",
@@ -109,13 +108,9 @@ impl SlackNotifierActor {
             Side::Short => (":chart_with_downwards_trend:", "Short"),
         };
 
-        let price_info = avg_price
-            .map(|p| format!(" @ {:.4}", p))
-            .unwrap_or_default();
-
         format!(
-            ":white_check_mark: *Order Filled*\n• Exchange: {}\n• Symbol: {}\n• Side: {} {}\n• Filled: {:.4}{}",
-            exchange_name, symbol, side_emoji, side_name, filled_qty, price_info
+            ":white_check_mark: *Order Filled*\n• Exchange: {}\n• Symbol: {}\n• Side: {} {}\n• Filled: {:.4}",
+            exchange_name, symbol, side_emoji, side_name, filled_qty
         )
     }
 }
@@ -164,7 +159,6 @@ impl Message<IncomeEvent> for SlackNotifierActor {
                     &update.symbol,
                     update.side,
                     update.filled_quantity,
-                    update.avg_price,
                 );
                 self.send_slack_message(&message).await;
             }

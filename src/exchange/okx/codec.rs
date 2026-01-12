@@ -173,6 +173,7 @@ pub struct PositionData {
     pub pos_side: String,
     pub avg_px: String,
     pub upl: String,
+    #[allow(dead_code)]
     pub lever: String,
     #[allow(dead_code)]
     pub mgn_mode: String,
@@ -187,14 +188,12 @@ impl PositionData {
         // 以下字段可能为空字符串，使用默认值
         let avg_price = f64::from_str(&self.avg_px).unwrap_or(0.0);
         let unrealized_pnl = f64::from_str(&self.upl).unwrap_or(0.0);
-        let leverage: u32 = self.lever.parse().unwrap_or(1);
 
         Position {
             exchange: Exchange::OKX,
             symbol,
             size: pos_amount, // 正数多头，负数空头
             entry_price: avg_price,
-            leverage,
             unrealized_pnl,
         }
     }
@@ -249,6 +248,7 @@ pub struct OrderPushData {
     #[allow(dead_code)]
     pub sz: String,
     pub fill_sz: String,
+    #[allow(dead_code)]
     pub avg_px: String,
     #[allow(dead_code)]
     pub fee: String,
@@ -262,8 +262,6 @@ impl OrderPushData {
             .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
         let filled_qty = f64::from_str(&self.fill_sz)
             .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.fill_sz));
-        // avg_price 可能为空字符串（未成交时）
-        let avg_price = f64::from_str(&self.avg_px).ok();
 
         let side = match self.side.as_str() {
             "buy" => Side::Long,
@@ -281,7 +279,6 @@ impl OrderPushData {
             side,
             status,
             filled_quantity: filled_qty,
-            avg_price,
             timestamp: now_ms(),
         }
     }
