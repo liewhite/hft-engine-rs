@@ -239,7 +239,7 @@ impl SymbolState {
                 self.bbos.insert(bbo.exchange, bbo.clone());
             }
             ExchangeEventData::Position(position) => {
-                // 只在没有 pending orders 时更新，避免覆盖乐观更新
+                // 只在没有 pending orders 时更新，避免延迟的推送覆盖 Fill 更新的值
                 if self.pending_orders.is_empty() {
                     self.positions.insert(position.exchange, position.clone());
                 }
@@ -277,26 +277,21 @@ impl SymbolState {
                 }
             }
             ExchangeEventData::Fill(fill) => {
-                // Fill 事件用于乐观更新仓位
-                // 只有关联到我们的订单才处理
-                if let Some(ref client_id) = fill.client_order_id {
-                    if self.pending_orders.contains_key(client_id) {
-                        if let Some(pos) = self.positions.get_mut(&fill.exchange) {
-                            let delta = match fill.side {
-                                Side::Long => fill.size,
-                                Side::Short => -fill.size,
-                            };
-                            pos.size += delta;
-                            tracing::info!(
-                                exchange = %fill.exchange,
-                                side = ?fill.side,
-                                fill_size = fill.size,
-                                fill_price = fill.price,
-                                new_position_size = pos.size,
-                                "Optimistically updated position on fill"
-                            );
-                        }
-                    }
+                // Fill 事件用于即时更新仓位（无论是策略订单还是手动订单）
+                if let Some(pos) = self.positions.get_mut(&fill.exchange) {
+                    let delta = match fill.side {
+                        Side::Long => fill.size,
+                        Side::Short => -fill.size,
+                    };
+                    pos.size += delta;
+                    tracing::info!(
+                        exchange = %fill.exchange,
+                        side = ?fill.side,
+                        fill_size = fill.size,
+                        fill_price = fill.price,
+                        new_position_size = pos.size,
+                        "Updated position on fill"
+                    );
                 }
             }
             ExchangeEventData::MarkPrice(mp) => {
