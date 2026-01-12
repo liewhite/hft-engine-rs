@@ -285,10 +285,30 @@ impl SymbolState {
                             // 订单取消或失败，仅移除
                             self.pending_orders.remove(client_id);
                         }
-                        OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
+                        OrderStatus::Pending => {
                             // 交易所已确认订单，更新状态
                             if let Some(order) = self.pending_orders.get_mut(client_id) {
                                 order.status = update.status.clone();
+                            }
+                        }
+                        OrderStatus::PartiallyFilled { .. } => {
+                            // 部分成交，乐观更新仓位但保留订单
+                            if let Some(order) = self.pending_orders.get_mut(client_id) {
+                                order.status = update.status.clone();
+                                if let Some(pos) = self.positions.get_mut(&order.exchange) {
+                                    let delta = match order.side {
+                                        Side::Long => update.fill_sz,
+                                        Side::Short => -update.fill_sz,
+                                    };
+                                    pos.size += delta;
+                                    tracing::info!(
+                                        exchange = %order.exchange,
+                                        side = ?order.side,
+                                        fill_sz = update.fill_sz,
+                                        new_size = pos.size,
+                                        "Optimistically updated position on partial fill"
+                                    );
+                                }
                             }
                         }
                         OrderStatus::Created => {
