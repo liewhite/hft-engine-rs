@@ -245,7 +245,10 @@ impl SymbolState {
                 self.bbos.insert(bbo.exchange, bbo.clone());
             }
             ExchangeEventData::Position(position) => {
-                self.positions.insert(position.exchange, position.clone());
+                // 只在没有 pending orders 时更新，避免覆盖乐观更新
+                if self.pending_orders.is_empty() {
+                    self.positions.insert(position.exchange, position.clone());
+                }
             }
             ExchangeEventData::OrderUpdate(update) => {
                 tracing::info!(
