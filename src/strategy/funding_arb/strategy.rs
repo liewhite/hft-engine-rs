@@ -428,39 +428,30 @@ impl FundingArbStrategy {
         Some(signal)
     }
 
-    /// Pipeline 第4步：最大和最小 notional 检查
+    /// Pipeline 第4步：notional 限制
     ///
-    /// 将 size 限制到 [min_notional/price, max_notional/price] 范围
-    /// 如果 notional 太小，返回 None
-    fn check_notional_limits(&self, mut signal: TradingSignal) -> Option<TradingSignal> {
+    /// - 小于 min_notional 的 size 设为 0（该侧不下单）
+    /// - 大于 max_notional 的 size 限制到 max_notional
+    fn check_notional_limits(&self, mut signal: TradingSignal) -> TradingSignal {
         let min_qty_long = self.config.min_notional / signal.long_price;
         let max_qty_long = self.config.max_notional / signal.long_price;
         let min_qty_short = self.config.min_notional / signal.short_price;
         let max_qty_short = self.config.max_notional / signal.short_price;
 
-        // 限制在最大 notional 范围内
-        signal.long_size = signal.long_size.min(max_qty_long);
-        signal.short_size = signal.short_size.min(max_qty_short);
-
-        // 检查是否低于最小 notional
-        // size 为 0 表示该侧不下单，是合法的；只有 size > 0 但低于最小 notional 才过滤
-        let long_below_min = signal.long_size > 0.0 && signal.long_size < min_qty_long;
-        let short_below_min = signal.short_size > 0.0 && signal.short_size < min_qty_short;
-
-        if long_below_min || short_below_min {
-            tracing::info!(
-                symbol = %self.symbol,
-                long_size = signal.long_size,
-                long_notional = signal.long_size * signal.long_price,
-                short_size = signal.short_size,
-                short_notional = signal.short_size * signal.short_price,
-                min_notional = self.config.min_notional,
-                "Signal filtered: below min_notional"
-            );
-            return None;
+        // 小于 min_notional 设为 0，大于 max_notional 限制到 max_notional
+        if signal.long_size < min_qty_long {
+            signal.long_size = 0.0;
+        } else if signal.long_size > max_qty_long {
+            signal.long_size = max_qty_long;
         }
 
-        Some(signal)
+        if signal.short_size < min_qty_short {
+            signal.short_size = 0.0;
+        } else if signal.short_size > max_qty_short {
+            signal.short_size = max_qty_short;
+        }
+
+        signal
     }
 
     /// 运行完整的信号处理 pipeline
@@ -476,7 +467,7 @@ impl FundingArbStrategy {
         self.validate_signal(signal)
             .and_then(|s| self.check_account_leverage(s, state, state_manager))
             .and_then(|s| self.adjust_for_exposure(s, state))
-            .and_then(|s| self.check_notional_limits(s))
+            .map(|s| self.check_notional_limits(s))
             .and_then(|s| self.check_symbol_leverage(s, state, state_manager))
     }
 
