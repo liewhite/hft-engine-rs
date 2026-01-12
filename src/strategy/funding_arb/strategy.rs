@@ -160,9 +160,13 @@ impl FundingArbStrategy {
             long_exchange,
             long_price: long_bbo.ask_price,
             long_size: base_size,
+            long_book_qty: long_bbo.ask_qty,
             short_exchange,
             short_price: short_bbo.bid_price,
             short_size: base_size,
+            short_book_qty: short_bbo.bid_qty,
+            long_deviation: ask_deviation,
+            short_deviation: bid_deviation,
         })
     }
 
@@ -561,18 +565,33 @@ impl FundingArbStrategy {
         })
     }
 
-    /// 生成 rebalance 订单
-    fn make_rebalance_order(&self, state: &SymbolState, exchange: Exchange, qty: f64) -> Option<Order> {
+    /// 生成 rebalance 订单，返回订单和描述
+    fn make_rebalance_order(
+        &self,
+        state: &SymbolState,
+        exchange: Exchange,
+        qty: f64,
+    ) -> Option<(Order, String)> {
         let pos = state.position(exchange)?;
         let bbo = state.bbo(exchange)?;
 
         // 计算带滑点的价格（模拟市价单）
-        let (side, price) = if pos.size > 0.0 {
+        let (side, price, orderbook_price, orderbook_qty) = if pos.size > 0.0 {
             // 平多：卖出，bid - slippage
-            (Side::Short, bbo.bid_price * (1.0 - self.config.ioc_slippage))
+            (
+                Side::Short,
+                bbo.bid_price * (1.0 - self.config.ioc_slippage),
+                bbo.bid_price,
+                bbo.bid_qty,
+            )
         } else {
             // 平空：买入，ask + slippage
-            (Side::Long, bbo.ask_price * (1.0 + self.config.ioc_slippage))
+            (
+                Side::Long,
+                bbo.ask_price * (1.0 + self.config.ioc_slippage),
+                bbo.ask_price,
+                bbo.ask_qty,
+            )
         };
 
         if price <= 0.0 {
@@ -597,12 +616,12 @@ impl FundingArbStrategy {
         }
 
         // 限制在盘口的一半
-        let orderbook_limit = if pos.size > 0.0 {
-            bbo.bid_qty / 2.0
-        } else {
-            bbo.ask_qty / 2.0
-        };
+        let orderbook_limit = orderbook_qty / 2.0;
         let qty = qty.min(orderbook_limit);
+
+        // 获取敞口信息
+        let (long_size, short_size) = state.position_sizes();
+        let exposure = long_size + short_size;
 
         tracing::info!(
             symbol = %self.symbol,
@@ -613,7 +632,7 @@ impl FundingArbStrategy {
             "Generating rebalance order"
         );
 
-        Some(Order {
+        let order = Order {
             id: String::new(),
             exchange,
             symbol: self.symbol.clone(),
@@ -625,22 +644,45 @@ impl FundingArbStrategy {
             quantity: qty,
             reduce_only: true,
             client_order_id: String::new(),
-        })
+        };
+
+        // 生成描述
+        let comment = format!(
+            "Rebalance: exposure={:.4}, long={:.4}, short={:.4} | {}: {} @ {:.4} (book: {:.4} x {:.4})",
+            exposure,
+            long_size,
+            short_size,
+            exchange,
+            side,
+            price,
+            orderbook_price,
+            orderbook_qty,
+        );
+
+        Some((order, comment))
     }
 
-    /// 根据处理后的信号生成订单
-    fn make_orders(&self, signal: &TradingSignal) -> Vec<Order> {
+    /// 根据处理后的信号生成订单，返回订单和描述的列表
+    fn make_orders(&self, signal: &TradingSignal) -> Vec<(Order, String)> {
         // 计算带滑点的价格（模拟市价单）
         // short_price 是 bid，做空用 bid - slippage
         // long_price 是 ask，做多用 ask + slippage
         let short_limit_price = signal.short_price * (1.0 - self.config.ioc_slippage);
         let long_limit_price = signal.long_price * (1.0 + self.config.ioc_slippage);
 
+        // 生成信号描述前缀
+        let signal_desc = format!(
+            "Signal: short_dev={:.4}%, long_dev={:.4}%, total={:.4}%",
+            signal.short_deviation * 100.0,
+            signal.long_deviation * 100.0,
+            (signal.short_deviation + signal.long_deviation) * 100.0,
+        );
+
         let mut orders = Vec::new();
 
         // 只有 size > 0 时才生成订单
         if signal.short_size > POSITION_EPSILON {
-            orders.push(Order {
+            let order = Order {
                 id: String::new(),
                 exchange: signal.short_exchange,
                 symbol: self.symbol.clone(),
@@ -652,11 +694,21 @@ impl FundingArbStrategy {
                 quantity: signal.short_size,
                 reduce_only: false,
                 client_order_id: String::new(),
-            });
+            };
+            let comment = format!(
+                "{} | {}: Short @ {:.4} (book: {:.4} x {:.4}), qty={:.4}",
+                signal_desc,
+                signal.short_exchange,
+                short_limit_price,
+                signal.short_price,
+                signal.short_book_qty,
+                signal.short_size,
+            );
+            orders.push((order, comment));
         }
 
         if signal.long_size > POSITION_EPSILON {
-            orders.push(Order {
+            let order = Order {
                 id: String::new(),
                 exchange: signal.long_exchange,
                 symbol: self.symbol.clone(),
@@ -668,7 +720,17 @@ impl FundingArbStrategy {
                 quantity: signal.long_size,
                 reduce_only: false,
                 client_order_id: String::new(),
-            });
+            };
+            let comment = format!(
+                "{} | {}: Long @ {:.4} (book: {:.4} x {:.4}), qty={:.4}",
+                signal_desc,
+                signal.long_exchange,
+                long_limit_price,
+                signal.long_price,
+                signal.long_book_qty,
+                signal.long_size,
+            );
+            orders.push((order, comment));
         }
 
         if !orders.is_empty() {
@@ -735,8 +797,8 @@ impl Strategy for FundingArbStrategy {
 
         // 步骤 1: 敞口超限 → rebalance（平掉多余仓位）
         if let Some((exchange, qty)) = self.check_rebalance_needed(symbol_state) {
-            if let Some(order) = self.make_rebalance_order(symbol_state, exchange, qty) {
-                return vec![OutcomeEvent::PlaceOrder(order)];
+            if let Some((order, comment)) = self.make_rebalance_order(symbol_state, exchange, qty) {
+                return vec![OutcomeEvent::PlaceOrder { order, comment }];
             }
             return vec![];
         }
@@ -746,7 +808,10 @@ impl Strategy for FundingArbStrategy {
             let processed_signal = self.process_signal(signal, symbol_state, state);
             let orders = self.make_orders(&processed_signal);
             if !orders.is_empty() {
-                return orders.into_iter().map(OutcomeEvent::PlaceOrder).collect();
+                return orders
+                    .into_iter()
+                    .map(|(order, comment)| OutcomeEvent::PlaceOrder { order, comment })
+                    .collect();
             }
         }
 

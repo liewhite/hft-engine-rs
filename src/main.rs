@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
-use fee_arb::engine::{AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, SubscribeIncome};
+use fee_arb::engine::{AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, SubscribeIncome, SubscribeOutcome};
 use fee_arb::exchange::binance::BinanceCredentials;
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
@@ -175,10 +175,17 @@ async fn main() -> anyhow::Result<()> {
 
         // 订阅 Income 事件（用于监听订单成交）
         manager
-            .tell(SubscribeIncome(slack_notifier))
+            .tell(SubscribeIncome(slack_notifier.clone()))
             .send()
             .await
             .expect("Failed to subscribe SlackNotifierActor to income events");
+
+        // 订阅 Outcome 事件（用于监听下单信号）
+        manager
+            .tell(SubscribeOutcome(slack_notifier))
+            .send()
+            .await
+            .expect("Failed to subscribe SlackNotifierActor to outcome events");
         tracing::info!("SlackNotifierActor created and subscribed");
     }
 

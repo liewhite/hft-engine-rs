@@ -4,8 +4,9 @@
 //! - 订阅 OrderUpdate 事件
 //! - 当订单状态为 Filled 时发送 Slack 通知（包含多空方向）
 
-use crate::domain::{Exchange, OrderStatus, Side};
+use crate::domain::{Exchange, Order, OrderStatus, Side};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message};
@@ -113,6 +114,30 @@ impl SlackNotifierActor {
             exchange_name, symbol, side_emoji, side_name, filled_qty
         )
     }
+
+    /// 格式化下单通知
+    fn format_place_order_message(order: &Order, comment: &str) -> String {
+        let exchange_name = match order.exchange {
+            Exchange::Binance => "Binance",
+            Exchange::OKX => "OKX",
+            Exchange::Hyperliquid => "Hyperliquid",
+        };
+
+        let (side_emoji, side_name) = match order.side {
+            Side::Long => (":chart_with_upwards_trend:", "Long"),
+            Side::Short => (":chart_with_downwards_trend:", "Short"),
+        };
+
+        let price = match &order.order_type {
+            crate::domain::OrderType::Market => "Market".to_string(),
+            crate::domain::OrderType::Limit { price, .. } => format!("{:.4}", price),
+        };
+
+        format!(
+            ":outbox_tray: *Order Placed*\n• Exchange: {}\n• Symbol: {}\n• Side: {} {}\n• Price: {}\n• Quantity: {:.4}\n• Reason: {}",
+            exchange_name, order.symbol, side_emoji, side_name, price, order.quantity, comment
+        )
+    }
 }
 
 impl Actor for SlackNotifierActor {
@@ -160,6 +185,20 @@ impl Message<IncomeEvent> for SlackNotifierActor {
                     update.side,
                     update.filled_quantity,
                 );
+                self.send_slack_message(&message).await;
+            }
+        }
+    }
+}
+
+/// 处理 Outcome 事件（下单信号）
+impl Message<OutcomeEvent> for SlackNotifierActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: OutcomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
+        match msg {
+            OutcomeEvent::PlaceOrder { order, comment } => {
+                let message = Self::format_place_order_message(&order, &comment);
                 self.send_slack_message(&message).await;
             }
         }

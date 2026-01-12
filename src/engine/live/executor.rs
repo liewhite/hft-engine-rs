@@ -95,7 +95,7 @@ impl ExecutorActor {
         // 处理每个信号
         for signal in signals {
             match signal {
-                OutcomeEvent::PlaceOrder(order) => {
+                OutcomeEvent::PlaceOrder { order, comment } => {
                     // 转换订单
                     let converted_order = self.convert_order(order);
                     // 添加到 pending_orders（用于追踪订单状态）
@@ -107,7 +107,10 @@ impl ExecutorActor {
                     // 发布到 OutcomePubSub
                     let _ = self
                         .outcome_pubsub
-                        .tell(Publish(OutcomeEvent::PlaceOrder(converted_order)))
+                        .tell(Publish(OutcomeEvent::PlaceOrder {
+                            order: converted_order,
+                            comment,
+                        }))
                         .send()
                         .await;
                 }

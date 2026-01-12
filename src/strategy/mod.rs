@@ -15,7 +15,12 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone)]
 pub enum OutcomeEvent {
     /// 下单信号
-    PlaceOrder(Order),
+    PlaceOrder {
+        /// 订单
+        order: Order,
+        /// 订单描述（信号原因、上下文等）
+        comment: String,
+    },
 }
 
 /// 策略 trait

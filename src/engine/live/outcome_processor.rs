@@ -65,7 +65,7 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         match msg {
-            OutcomeEvent::PlaceOrder(order) => {
+            OutcomeEvent::PlaceOrder { order, comment } => {
                 let client = match self.clients.get(&order.exchange) {
                     Some(e) => e.clone(),
                     None => {
@@ -87,6 +87,7 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                     order_type = ?order.order_type,
                     quantity = order.quantity,
                     client_order_id = ?order.client_order_id,
+                    comment = %comment,
                     "Placing order"
                 );
 

@@ -10,12 +10,20 @@ pub struct TradingSignal {
     pub long_exchange: Exchange,
     /// 做多价格（ask）
     pub long_price: f64,
-    /// 做多数量（盘口 ask_qty）
+    /// 做多计划交易量
     pub long_size: f64,
+    /// 做多交易所的盘口 ask 数量
+    pub long_book_qty: f64,
     /// 做空交易所
     pub short_exchange: Exchange,
     /// 做空价格（bid）
     pub short_price: f64,
-    /// 做空数量（盘口 bid_qty）
+    /// 做空计划交易量
     pub short_size: f64,
+    /// 做空交易所的盘口 bid 数量
+    pub short_book_qty: f64,
+    /// 做多方 ask deviation
+    pub long_deviation: f64,
+    /// 做空方 bid deviation
+    pub short_deviation: f64,
 }
