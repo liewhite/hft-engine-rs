@@ -7,7 +7,6 @@ use std::collections::HashMap;
 pub struct PendingOrder {
     pub exchange: Exchange,
     pub side: Side,
-    pub quantity: f64,
     pub status: OrderStatus,
     pub created_at: Timestamp,
 }
@@ -45,13 +44,11 @@ impl SymbolState {
         client_order_id: String,
         exchange: Exchange,
         side: Side,
-        quantity: f64,
         created_at: Timestamp,
     ) {
         self.pending_orders.insert(client_order_id, PendingOrder {
             exchange,
             side,
-            quantity,
             status: OrderStatus::Created,
             created_at,
         });
@@ -266,15 +263,16 @@ impl SymbolState {
                             // 订单成交，乐观更新仓位并移除
                             if let Some(order) = self.pending_orders.remove(client_id) {
                                 if let Some(pos) = self.positions.get_mut(&order.exchange) {
+                                    // 使用 fill_sz（本次成交量）更新仓位
                                     let delta = match order.side {
-                                        Side::Long => order.quantity,
-                                        Side::Short => -order.quantity,
+                                        Side::Long => update.fill_sz,
+                                        Side::Short => -update.fill_sz,
                                     };
                                     pos.size += delta;
                                     tracing::info!(
                                         exchange = %order.exchange,
                                         side = ?order.side,
-                                        quantity = order.quantity,
+                                        fill_sz = update.fill_sz,
                                         new_size = pos.size,
                                         "Optimistically updated position on order filled"
                                     );

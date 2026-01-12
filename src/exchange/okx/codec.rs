@@ -247,7 +247,10 @@ pub struct OrderPushData {
     pub state: String,
     #[allow(dead_code)]
     pub sz: String,
+    /// 本次成交数量
     pub fill_sz: String,
+    /// 累计成交数量
+    pub acc_fill_sz: String,
     #[allow(dead_code)]
     pub avg_px: String,
     #[allow(dead_code)]
@@ -260,8 +263,10 @@ impl OrderPushData {
     pub fn to_order_update(&self) -> OrderUpdate {
         let symbol = from_okx(&self.inst_id)
             .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
-        let filled_qty = f64::from_str(&self.fill_sz)
-            .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.fill_sz));
+        let fill_sz = f64::from_str(&self.fill_sz)
+            .unwrap_or_else(|_| panic!("Failed to parse fill_sz: {}", self.fill_sz));
+        let acc_fill_sz = f64::from_str(&self.acc_fill_sz)
+            .unwrap_or_else(|_| panic!("Failed to parse acc_fill_sz: {}", self.acc_fill_sz));
 
         let side = match self.side.as_str() {
             "buy" => Side::Long,
@@ -269,7 +274,7 @@ impl OrderPushData {
             other => panic!("Unknown OKX side: {}", other),
         };
 
-        let status = map_okx_order_state(&self.state, filled_qty);
+        let status = map_okx_order_state(&self.state, acc_fill_sz);
 
         OrderUpdate {
             order_id: self.ord_id.clone(),
@@ -278,7 +283,8 @@ impl OrderPushData {
             symbol,
             side,
             status,
-            filled_quantity: filled_qty,
+            filled_quantity: acc_fill_sz,
+            fill_sz,
             timestamp: now_ms(),
         }
     }

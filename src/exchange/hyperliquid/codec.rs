@@ -345,6 +345,8 @@ impl WsOrderUpdate {
 
         let status = map_hyperliquid_order_status(&self.status, filled_quantity);
 
+        // Hyperliquid 不直接提供本次成交量，使用 filled_quantity
+        // 对于 IOC 订单（一次性成交），这等于实际成交量
         crate::domain::OrderUpdate {
             order_id: self.order.oid.to_string(),
             client_order_id: self.order.cloid.clone(),
@@ -353,6 +355,7 @@ impl WsOrderUpdate {
             side,
             status,
             filled_quantity,
+            fill_sz: filled_quantity,
             timestamp: self.status_timestamp,
         }
     }

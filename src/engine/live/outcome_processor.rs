@@ -141,6 +141,7 @@ impl OutcomeProcessorActor {
             side: order.side,
             status: OrderStatus::Error { reason },
             filled_quantity: 0.0,
+            fill_sz: 0.0,
             timestamp: local_ts,
         };
 

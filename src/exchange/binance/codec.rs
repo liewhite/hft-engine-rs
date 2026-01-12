@@ -208,7 +208,10 @@ pub struct OrderData {
     #[serde(rename = "X")]
     pub status: String,
     pub q: String,
+    /// 累计成交量 (Cumulative filled quantity)
     pub z: String,
+    /// 本次成交量 (Last filled quantity)
+    pub l: String,
     pub ap: String,
     pub rp: String,
 }
@@ -219,6 +222,8 @@ impl OrderTradeUpdate {
             .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.o.s));
         let filled_qty = f64::from_str(&self.o.z)
             .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.o.z));
+        let fill_sz = f64::from_str(&self.o.l)
+            .unwrap_or_else(|_| panic!("Failed to parse last filled qty: {}", self.o.l));
 
         let side = match self.o.side.as_str() {
             "BUY" => Side::Long,
@@ -247,6 +252,7 @@ impl OrderTradeUpdate {
             side,
             status,
             filled_quantity: filled_qty,
+            fill_sz,
             timestamp: now_ms(),
         }
     }
