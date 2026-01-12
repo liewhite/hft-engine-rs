@@ -237,14 +237,6 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
                 self.position_gauge
                     .with_label_values(&[exchange_label, symbol_label])
                     .set(notional);
-                tracing::info!(
-                    exchange = %exchange_label,
-                    symbol = %symbol_label,
-                    size = %position.size,
-                    entry_price = %position.entry_price,
-                    notional = %notional,
-                    "Position"
-                );
             }
             // ExchangeEventData::OrderUpdate(update) => {
             //     tracing::info!(
