@@ -291,14 +291,6 @@ impl AssetPosition {
             .unwrap_or(0.0);
         let unrealized_pnl = f64::from_str(&self.unrealized_pnl)
             .expect("unrealized_pnl must be valid float from Hyperliquid API");
-        // position_value = mark_price * |size| (USD 名义价值)
-        let mark_price = if size.abs() > 1e-10 {
-            let pos_value = f64::from_str(&self.position_value)
-                .expect("position_value must be valid float from Hyperliquid API");
-            pos_value / size.abs()
-        } else {
-            0.0
-        };
 
         crate::domain::Position {
             exchange: Exchange::Hyperliquid,
@@ -307,7 +299,6 @@ impl AssetPosition {
             entry_price,
             leverage: self.leverage.value,
             unrealized_pnl,
-            mark_price,
         }
     }
 }

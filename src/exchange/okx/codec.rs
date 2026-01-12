@@ -176,7 +176,6 @@ pub struct PositionData {
     pub lever: String,
     #[allow(dead_code)]
     pub mgn_mode: String,
-    pub mark_px: Option<String>,
 }
 
 impl PositionData {
@@ -189,11 +188,6 @@ impl PositionData {
         let avg_price = f64::from_str(&self.avg_px).unwrap_or(0.0);
         let unrealized_pnl = f64::from_str(&self.upl).unwrap_or(0.0);
         let leverage: u32 = self.lever.parse().unwrap_or(1);
-        let mark_price = self
-            .mark_px
-            .as_ref()
-            .and_then(|p| f64::from_str(p).ok())
-            .unwrap_or(0.0);
 
         Position {
             exchange: Exchange::OKX,
@@ -202,7 +196,6 @@ impl PositionData {
             entry_price: avg_price,
             leverage,
             unrealized_pnl,
-            mark_price,
         }
     }
 }

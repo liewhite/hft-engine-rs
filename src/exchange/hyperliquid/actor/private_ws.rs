@@ -286,7 +286,6 @@ fn parse_clearinghouse_state(
                 symbol: symbol.clone(),
                 size: 0.0,
                 entry_price: 0.0,
-                mark_price: 0.0,
                 unrealized_pnl: 0.0,
                 leverage: 1,
             }),

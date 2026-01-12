@@ -226,11 +226,12 @@ impl BinanceClient {
 
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
+        #[allow(dead_code)]
         struct PositionInfo {
             symbol: String,
             position_amt: String,
             entry_price: String,
-            mark_price: String,
+            mark_price: String, // API 返回但不使用
             un_realized_profit: String,
             leverage: String,
         }
@@ -269,7 +270,6 @@ impl BinanceClient {
                     return None;
                 }
                 let entry_price: f64 = p.entry_price.parse().unwrap_or(0.0);
-                let mark_price: f64 = p.mark_price.parse().unwrap_or(0.0);
                 let unrealized_pnl: f64 = p.un_realized_profit.parse().unwrap_or(0.0);
                 let leverage: u32 = p.leverage.parse().unwrap_or(1);
 
@@ -278,7 +278,6 @@ impl BinanceClient {
                     symbol,
                     size,
                     entry_price,
-                    mark_price,
                     unrealized_pnl,
                     leverage,
                 })

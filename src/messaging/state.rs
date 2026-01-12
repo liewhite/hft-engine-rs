@@ -192,12 +192,11 @@ impl SymbolState {
         // 计算净持仓 (size 本身带符号：正数多头，负数空头)
         let net_position: f64 = positions.iter().map(|p| p.size).sum();
 
-        // 估算价格：优先用 mark_price，否则用 entry_price
-        let price = positions.iter()
+        // 估算价格：使用 entry_price
+        let price = positions
+            .iter()
             .find_map(|p| {
-                if p.mark_price > 0.0 {
-                    Some(p.mark_price)
-                } else if p.entry_price > 0.0 {
+                if p.entry_price > 0.0 {
                     Some(p.entry_price)
                 } else {
                     None

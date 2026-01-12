@@ -186,7 +186,6 @@ impl AccountPosition {
             entry_price,
             leverage: 1, // 需要从其他接口获取
             unrealized_pnl,
-            mark_price: 0.0, // 需要从 mark price 更新
         }
     }
 }
