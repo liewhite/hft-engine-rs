@@ -243,7 +243,7 @@ impl FundingArbStrategy {
     /// 检查各字段是否有效，无效的设置 size 为 0
     fn validate_signal(&self, signal: &mut TradingSignal) {
         if signal.long_price <= 0.0 || signal.short_price <= 0.0 {
-            tracing::info!(
+            tracing::warn!(
                 symbol = %self.symbol,
                 long_price = signal.long_price,
                 short_price = signal.short_price,
