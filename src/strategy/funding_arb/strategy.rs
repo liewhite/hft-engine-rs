@@ -675,10 +675,12 @@ impl FundingArbStrategy {
             tracing::info!(
                 symbol = %self.symbol,
                 short_ex = %signal.short_exchange,
-                short_price = short_limit_price,
+                short_bid = signal.short_price,
+                short_limit = short_limit_price,
                 short_qty = signal.short_size,
                 long_ex = %signal.long_exchange,
-                long_price = long_limit_price,
+                long_ask = signal.long_price,
+                long_limit = long_limit_price,
                 long_qty = signal.long_size,
                 "Placing orders"
             );
