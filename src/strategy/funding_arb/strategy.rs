@@ -241,7 +241,7 @@ impl FundingArbStrategy {
     /// Pipeline 第1步：合法性检查
     ///
     /// 检查各字段是否有效，无效的设置 size 为 0
-    fn validate_signal(&self, mut signal: TradingSignal) -> TradingSignal {
+    fn validate_signal(&self, signal: &mut TradingSignal) {
         if signal.long_price <= 0.0 || signal.short_price <= 0.0 {
             tracing::info!(
                 symbol = %self.symbol,
@@ -251,7 +251,7 @@ impl FundingArbStrategy {
             );
             signal.long_size = 0.0;
             signal.short_size = 0.0;
-            return signal;
+            return;
         }
 
         if signal.long_size <= 0.0 {
@@ -260,8 +260,6 @@ impl FundingArbStrategy {
         if signal.short_size <= 0.0 {
             signal.short_size = 0.0;
         }
-
-        signal
     }
 
     /// Pipeline 第3步：杠杆率检查
@@ -270,10 +268,10 @@ impl FundingArbStrategy {
     /// 如果 new_leverage > old_leverage 且 new_leverage 超过阈值，则将对应侧 size 设为 0
     fn check_symbol_leverage(
         &self,
-        mut signal: TradingSignal,
+        signal: &mut TradingSignal,
         state: &SymbolState,
         state_manager: &StateManager,
-    ) -> TradingSignal {
+    ) {
         let short_equity = state_manager.equity(signal.short_exchange);
         let long_equity = state_manager.equity(signal.long_exchange);
 
@@ -288,7 +286,7 @@ impl FundingArbStrategy {
             );
             signal.long_size = 0.0;
             signal.short_size = 0.0;
-            return signal;
+            return;
         }
 
         let mid_price = (signal.short_price + signal.long_price) / 2.0;
@@ -331,8 +329,6 @@ impl FundingArbStrategy {
                 "Signal adjusted: leverage exceeds threshold"
             );
         }
-
-        signal
     }
 
     /// Pipeline 第4步：账户杠杆率检查
@@ -341,10 +337,10 @@ impl FundingArbStrategy {
     /// 如果某交易所杠杆率超过阈值，且订单方向与现有仓位方向相同，则将对应侧 size 设为 0
     fn check_account_leverage(
         &self,
-        mut signal: TradingSignal,
+        signal: &mut TradingSignal,
         state: &SymbolState,
         state_manager: &StateManager,
-    ) -> TradingSignal {
+    ) {
         // 计算两边交易所的账户杠杆率
         let short_equity = state_manager.equity(signal.short_exchange);
         let short_notional = state_manager.account_notional(signal.short_exchange);
@@ -402,15 +398,13 @@ impl FundingArbStrategy {
                 "Signal adjusted: account leverage exceeds threshold"
             );
         }
-
-        signal
     }
 
     /// Pipeline 第2步：净敞口修正
     ///
     /// 根据当前净敞口调整下单数量
     /// 例如：净敞口为 +10（多头多），则多头下单量减去 10（取 max(0)）
-    fn adjust_for_exposure(&self, mut signal: TradingSignal, state: &SymbolState) -> TradingSignal {
+    fn adjust_for_exposure(&self, signal: &mut TradingSignal, state: &SymbolState) {
         let (long_size, short_size) = state.position_sizes();
         // net_exposure = long_size + short_size（short_size 是负数）
         // > 0 表示多头多了，< 0 表示空头多了
@@ -438,15 +432,13 @@ impl FundingArbStrategy {
             signal.long_size = base_qty;
             signal.short_size = (base_qty - abs_exposure).max(0.0);
         }
-
-        signal
     }
 
     /// Pipeline 第4步：notional 限制
     ///
     /// - 小于 min_notional 的 size 设为 0（该侧不下单）
     /// - 大于 max_notional 的 size 限制到 max_notional
-    fn set_notional_limits(&self, mut signal: TradingSignal) -> TradingSignal {
+    fn set_notional_limits(&self, signal: &mut TradingSignal) {
         let min_qty_long = self.config.min_notional / signal.long_price;
         let max_qty_long = self.config.max_notional / signal.long_price;
         let min_qty_short = self.config.min_notional / signal.short_price;
@@ -464,25 +456,24 @@ impl FundingArbStrategy {
         } else if signal.short_size > max_qty_short {
             signal.short_size = max_qty_short;
         }
-
-        signal
     }
 
     /// 运行完整的信号处理 pipeline
     ///
     /// 顺序：validate → check_account_leverage → adjust_for_exposure → set_notional_limits → check_symbol_leverage
-    /// 各步骤通过将 size 设为 0 表示不开仓，而非返回 None
+    /// 各步骤通过将 size 设为 0 表示不开仓
     fn process_signal(
         &self,
-        signal: TradingSignal,
+        mut signal: TradingSignal,
         state: &SymbolState,
         state_manager: &StateManager,
     ) -> TradingSignal {
-        let signal = self.validate_signal(signal);
-        let signal = self.check_account_leverage(signal, state, state_manager);
-        let signal = self.adjust_for_exposure(signal, state);
-        let signal = self.set_notional_limits(signal);
-        self.check_symbol_leverage(signal, state, state_manager)
+        self.validate_signal(&mut signal);
+        self.check_account_leverage(&mut signal, state, state_manager);
+        self.adjust_for_exposure(&mut signal, state);
+        self.set_notional_limits(&mut signal);
+        self.check_symbol_leverage(&mut signal, state, state_manager);
+        signal
     }
 
     // ========== 辅助功能 ==========
