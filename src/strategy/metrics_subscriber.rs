@@ -225,51 +225,51 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
                 self.price_cache
                     .insert((bbo.exchange, bbo.symbol.clone()), mid_price);
             }
-            ExchangeEventData::Position(position) => {
-                let exchange_label = exchange_to_label(position.exchange);
-                let symbol_label = &position.symbol;
-                // 使用缓存的中间价计算 notional
-                let notional = self
-                    .price_cache
-                    .get(&(position.exchange, position.symbol.clone()))
-                    .map(|price| position.size * price)
-                    .unwrap_or(0.0);
-                self.position_gauge
-                    .with_label_values(&[exchange_label, symbol_label])
-                    .set(notional);
-                tracing::info!(
-                    exchange = %exchange_label,
-                    symbol = %symbol_label,
-                    size = %position.size,
-                    entry_price = %position.entry_price,
-                    notional = %notional,
-                    "Position"
-                );
-            }
-            ExchangeEventData::OrderUpdate(update) => {
-                tracing::info!(
-                    exchange = %exchange_to_label(update.exchange),
-                    symbol = %update.symbol,
-                    order_id = %update.order_id,
-                    client_order_id = ?update.client_order_id,
-                    side = ?update.side,
-                    status = ?update.status,
-                    filled_quantity = %update.filled_quantity,
-                    "Order update"
-                );
-            }
-            ExchangeEventData::Fill(fill) => {
-                tracing::info!(
-                    exchange = %exchange_to_label(fill.exchange),
-                    symbol = %fill.symbol,
-                    order_id = %fill.order_id,
-                    client_order_id = ?fill.client_order_id,
-                    side = ?fill.side,
-                    price = %fill.price,
-                    size = %fill.size,
-                    "Fill"
-                );
-            }
+            // ExchangeEventData::Position(position) => {
+            //     let exchange_label = exchange_to_label(position.exchange);
+            //     let symbol_label = &position.symbol;
+            //     // 使用缓存的中间价计算 notional
+            //     let notional = self
+            //         .price_cache
+            //         .get(&(position.exchange, position.symbol.clone()))
+            //         .map(|price| position.size * price)
+            //         .unwrap_or(0.0);
+            //     self.position_gauge
+            //         .with_label_values(&[exchange_label, symbol_label])
+            //         .set(notional);
+            //     tracing::info!(
+            //         exchange = %exchange_label,
+            //         symbol = %symbol_label,
+            //         size = %position.size,
+            //         entry_price = %position.entry_price,
+            //         notional = %notional,
+            //         "Position"
+            //     );
+            // }
+            // ExchangeEventData::OrderUpdate(update) => {
+            //     tracing::info!(
+            //         exchange = %exchange_to_label(update.exchange),
+            //         symbol = %update.symbol,
+            //         order_id = %update.order_id,
+            //         client_order_id = ?update.client_order_id,
+            //         side = ?update.side,
+            //         status = ?update.status,
+            //         filled_quantity = %update.filled_quantity,
+            //         "Order update"
+            //     );
+            // }
+            // ExchangeEventData::Fill(fill) => {
+            //     tracing::info!(
+            //         exchange = %exchange_to_label(fill.exchange),
+            //         symbol = %fill.symbol,
+            //         order_id = %fill.order_id,
+            //         client_order_id = ?fill.client_order_id,
+            //         side = ?fill.side,
+            //         price = %fill.price,
+            //         size = %fill.size,
+            //         "Fill"
+            //     );
+            // }
             _ => {
                 // 忽略其他事件
             }
