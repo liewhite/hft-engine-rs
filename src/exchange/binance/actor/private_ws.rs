@@ -272,13 +272,9 @@ fn parse_private_message(
             let update: OrderTradeUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("ORDER_TRADE_UPDATE parse: {}", e)))?;
 
-            let mut events = vec![IncomeEvent {
-                exchange_ts,
-                local_ts,
-                data: ExchangeEventData::OrderUpdate(update.to_order_update(quote)),
-            }];
+            let mut events = Vec::new();
 
-            // 如果有成交，额外发出 Fill 事件
+            // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
             if let Some(fill) = update.to_fill(quote) {
                 events.push(IncomeEvent {
                     exchange_ts,
@@ -286,6 +282,12 @@ fn parse_private_message(
                     data: ExchangeEventData::Fill(fill),
                 });
             }
+
+            events.push(IncomeEvent {
+                exchange_ts,
+                local_ts,
+                data: ExchangeEventData::OrderUpdate(update.to_order_update(quote)),
+            });
 
             Ok(events)
         }

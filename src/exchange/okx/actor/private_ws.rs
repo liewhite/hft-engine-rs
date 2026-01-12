@@ -321,14 +321,7 @@ fn parse_private_message(
                     order_update.fill_sz = meta.qty_to_coin(order_update.fill_sz);
                 }
 
-                // OrderUpdate 事件
-                events.push(IncomeEvent {
-                    exchange_ts: local_ts,
-                    local_ts,
-                    data: ExchangeEventData::OrderUpdate(order_update),
-                });
-
-                // 如果有成交，额外发出 Fill 事件
+                // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
                 if let Some(mut fill) = data.to_fill() {
                     // 获取 meta 转换数量单位（张 -> 币）
                     if let Some(meta) = symbol_metas.get(&fill.symbol) {
@@ -340,6 +333,13 @@ fn parse_private_message(
                         data: ExchangeEventData::Fill(fill),
                     });
                 }
+
+                // OrderUpdate 事件
+                events.push(IncomeEvent {
+                    exchange_ts: local_ts,
+                    local_ts,
+                    data: ExchangeEventData::OrderUpdate(order_update),
+                });
             }
             Ok(events)
         }
