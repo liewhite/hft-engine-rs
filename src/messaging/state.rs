@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, Position, Symbol, Timestamp, BBO};
+use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, Position, Side, Symbol, Timestamp, BBO};
 use crate::messaging::event::{ExchangeEventData, IncomeEvent};
 use std::collections::HashMap;
 
@@ -6,6 +6,8 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct PendingOrder {
     pub exchange: Exchange,
+    pub side: Side,
+    pub quantity: f64,
     pub status: OrderStatus,
     pub created_at: Timestamp,
 }
@@ -38,9 +40,18 @@ impl SymbolState {
     }
 
     /// 添加待处理订单 (发送订单信号时调用)
-    pub fn add_pending_order(&mut self, client_order_id: String, exchange: Exchange, created_at: Timestamp) {
+    pub fn add_pending_order(
+        &mut self,
+        client_order_id: String,
+        exchange: Exchange,
+        side: Side,
+        quantity: f64,
+        created_at: Timestamp,
+    ) {
         self.pending_orders.insert(client_order_id, PendingOrder {
             exchange,
+            side,
+            quantity,
             status: OrderStatus::Created,
             created_at,
         });
@@ -248,11 +259,29 @@ impl SymbolState {
                 // 如果没有返回client_order_id说明不是我们发起的订单，忽略
                 if let Some(ref client_id) = update.client_order_id {
                     match update.status {
-                        OrderStatus::Filled
-                        | OrderStatus::Cancelled
+                        OrderStatus::Filled => {
+                            // 订单成交，乐观更新仓位并移除
+                            if let Some(order) = self.pending_orders.remove(client_id) {
+                                if let Some(pos) = self.positions.get_mut(&order.exchange) {
+                                    let delta = match order.side {
+                                        Side::Long => order.quantity,
+                                        Side::Short => -order.quantity,
+                                    };
+                                    pos.size += delta;
+                                    tracing::info!(
+                                        exchange = %order.exchange,
+                                        side = ?order.side,
+                                        quantity = order.quantity,
+                                        new_size = pos.size,
+                                        "Optimistically updated position on order filled"
+                                    );
+                                }
+                            }
+                        }
+                        OrderStatus::Cancelled
                         | OrderStatus::Rejected { .. }
                         | OrderStatus::Error { .. } => {
-                            // 订单结束或失败，移除
+                            // 订单取消或失败，仅移除
                             self.pending_orders.remove(client_id);
                         }
                         OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {

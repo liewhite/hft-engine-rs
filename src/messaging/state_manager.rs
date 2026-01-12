@@ -1,4 +1,4 @@
-use crate::domain::{now_ms, Exchange, Symbol, USDT};
+use crate::domain::{now_ms, Exchange, Side, Symbol, USDT};
 use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
 use std::collections::HashMap;
 
@@ -44,11 +44,13 @@ impl StateManager {
         symbol: &Symbol,
         client_order_id: String,
         exchange: Exchange,
+        side: Side,
+        quantity: f64,
     ) {
         self.states
             .get_mut(symbol)
             .expect("Symbol not found in StateManager")
-            .add_pending_order(client_order_id, exchange, now_ms());
+            .add_pending_order(client_order_id, exchange, side, quantity, now_ms());
     }
 
     // ==================== 状态查询 ====================
