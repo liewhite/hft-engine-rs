@@ -443,7 +443,11 @@ impl FundingArbStrategy {
         signal.short_size = signal.short_size.min(max_qty_short);
 
         // 检查是否低于最小 notional
-        if signal.long_size < min_qty_long || signal.short_size < min_qty_short {
+        // size 为 0 表示该侧不下单，是合法的；只有 size > 0 但低于最小 notional 才过滤
+        let long_below_min = signal.long_size > 0.0 && signal.long_size < min_qty_long;
+        let short_below_min = signal.short_size > 0.0 && signal.short_size < min_qty_short;
+
+        if long_below_min || short_below_min {
             tracing::info!(
                 symbol = %self.symbol,
                 long_size = signal.long_size,
