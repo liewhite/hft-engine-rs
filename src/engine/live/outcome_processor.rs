@@ -91,40 +91,43 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                     "Placing order"
                 );
 
-                // 直接 await 下单请求
-                match client.place_order(order.clone()).await {
-                    Ok(order_id) => {
-                        tracing::info!(
-                            exchange = %order.exchange,
-                            symbol = %order.symbol,
-                            order_id = %order_id,
-                            client_order_id = ?order.client_order_id,
-                            "Order placed successfully"
-                        );
-                    }
-                    Err(e) => {
-                        let reason = e.to_string();
-                        // reduce_only 订单因仓位已平而被拒绝是正常的竞态情况
-                        if reason.contains("Reduce only") || reason.contains("reduce only") {
+                // 使用 tokio::spawn 异步发送订单，不阻塞后续订单处理
+                let income_pubsub = self.income_pubsub.clone();
+                tokio::spawn(async move {
+                    match client.place_order(order.clone()).await {
+                        Ok(order_id) => {
                             tracing::info!(
                                 exchange = %order.exchange,
                                 symbol = %order.symbol,
+                                order_id = %order_id,
                                 client_order_id = ?order.client_order_id,
-                                "Reduce-only order rejected: position already closed"
-                            );
-                        } else {
-                            tracing::error!(
-                                exchange = %order.exchange,
-                                symbol = %order.symbol,
-                                client_order_id = ?order.client_order_id,
-                                error = %reason,
-                                "Failed to place order"
+                                "Order placed successfully"
                             );
                         }
-                        // 发送错误事件
-                        self.send_order_error(&order, reason).await;
+                        Err(e) => {
+                            let reason = e.to_string();
+                            // reduce_only 订单因仓位已平而被拒绝是正常的竞态情况
+                            if reason.contains("Reduce only") || reason.contains("reduce only") {
+                                tracing::info!(
+                                    exchange = %order.exchange,
+                                    symbol = %order.symbol,
+                                    client_order_id = ?order.client_order_id,
+                                    "Reduce-only order rejected: position already closed"
+                                );
+                            } else {
+                                tracing::error!(
+                                    exchange = %order.exchange,
+                                    symbol = %order.symbol,
+                                    client_order_id = ?order.client_order_id,
+                                    error = %reason,
+                                    "Failed to place order"
+                                );
+                            }
+                            // 发送错误事件
+                            Self::send_order_error_static(&income_pubsub, &order, reason).await;
+                        }
                     }
-                }
+                });
             }
         }
     }
@@ -133,6 +136,15 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
 impl OutcomeProcessorActor {
     /// 发送订单错误事件
     async fn send_order_error(&self, order: &crate::domain::Order, reason: String) {
+        Self::send_order_error_static(&self.income_pubsub, order, reason).await;
+    }
+
+    /// 发送订单错误事件（静态版本，用于 tokio::spawn）
+    async fn send_order_error_static(
+        income_pubsub: &ActorRef<IncomePubSub>,
+        order: &crate::domain::Order,
+        reason: String,
+    ) {
         let local_ts = now_ms();
         let update = OrderUpdate {
             order_id: String::new(),
@@ -146,8 +158,7 @@ impl OutcomeProcessorActor {
             timestamp: local_ts,
         };
 
-        let _ = self
-            .income_pubsub
+        let _ = income_pubsub
             .tell(Publish(IncomeEvent {
                 exchange_ts: local_ts, // 本地错误，没有交易所时间戳
                 local_ts,
