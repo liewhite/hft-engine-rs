@@ -646,15 +646,11 @@ impl FundingArbStrategy {
             client_order_id: String::new(),
         };
 
-        // 生成描述
+        // comment: rebalance 标记 | 敞口 | 下单数量 | 对手价x挂单量
         let comment = format!(
-            "Rebalance: exposure={:.4}, long={:.4}, short={:.4} | {}: {} @ {:.4} (book: {:.4} x {:.4})",
+            "rebal | exp={:.4} | qty={:.4} | book={:.4}x{:.4}",
             exposure,
-            long_size,
-            short_size,
-            exchange,
-            side,
-            price,
+            qty,
             orderbook_price,
             orderbook_qty,
         );
@@ -663,20 +659,16 @@ impl FundingArbStrategy {
     }
 
     /// 根据处理后的信号生成订单，返回订单和描述的列表
-    fn make_orders(&self, signal: &TradingSignal) -> Vec<(Order, String)> {
+    fn make_orders(&self, signal: &TradingSignal, state: &SymbolState) -> Vec<(Order, String)> {
         // 计算带滑点的价格（模拟市价单）
         // short_price 是 bid，做空用 bid - slippage
         // long_price 是 ask，做多用 ask + slippage
         let short_limit_price = signal.short_price * (1.0 - self.config.ioc_slippage);
         let long_limit_price = signal.long_price * (1.0 + self.config.ioc_slippage);
 
-        // 生成信号描述前缀
-        let signal_desc = format!(
-            "Signal: short_dev={:.4}%, long_dev={:.4}%, total={:.4}%",
-            signal.short_deviation * 100.0,
-            signal.long_deviation * 100.0,
-            (signal.short_deviation + signal.long_deviation) * 100.0,
-        );
+        // 获取当前敞口
+        let (long_size, short_size) = state.position_sizes();
+        let net_exposure = long_size + short_size;
 
         let mut orders = Vec::new();
 
@@ -695,14 +687,14 @@ impl FundingArbStrategy {
                 reduce_only: false,
                 client_order_id: String::new(),
             };
+            // comment: 敞口 | 下单数量 | 对手价x挂单量 | deviation
             let comment = format!(
-                "{} | {}: Short @ {:.4} (book: {:.4} x {:.4}), qty={:.4}",
-                signal_desc,
-                signal.short_exchange,
-                short_limit_price,
+                "exp={:.4} | qty={:.4} | book={:.4}x{:.4} | dev={:.4}%",
+                net_exposure,
+                signal.short_size,
                 signal.short_price,
                 signal.short_book_qty,
-                signal.short_size,
+                signal.short_deviation * 100.0,
             );
             orders.push((order, comment));
         }
@@ -721,14 +713,14 @@ impl FundingArbStrategy {
                 reduce_only: false,
                 client_order_id: String::new(),
             };
+            // comment: 敞口 | 下单数量 | 对手价x挂单量 | deviation
             let comment = format!(
-                "{} | {}: Long @ {:.4} (book: {:.4} x {:.4}), qty={:.4}",
-                signal_desc,
-                signal.long_exchange,
-                long_limit_price,
+                "exp={:.4} | qty={:.4} | book={:.4}x{:.4} | dev={:.4}%",
+                net_exposure,
+                signal.long_size,
                 signal.long_price,
                 signal.long_book_qty,
-                signal.long_size,
+                signal.long_deviation * 100.0,
             );
             orders.push((order, comment));
         }
@@ -806,7 +798,7 @@ impl Strategy for FundingArbStrategy {
         // 步骤 2: 检查信号并通过 pipeline 处理
         if let Some(signal) = self.check_signal(symbol_state, state) {
             let processed_signal = self.process_signal(signal, symbol_state, state);
-            let orders = self.make_orders(&processed_signal);
+            let orders = self.make_orders(&processed_signal, symbol_state);
             if !orders.is_empty() {
                 return orders
                     .into_iter()
