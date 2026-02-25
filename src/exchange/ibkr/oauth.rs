@@ -32,7 +32,6 @@ pub struct IbkrOAuth {
     consumer_key: String,
     access_token: String,
     realm: String,
-    _encryption_key: RsaPrivateKey,
     signature_key: RsaPrivateKey,
     dh_prime: BigUint,
     dh_generator: u32,
@@ -74,14 +73,13 @@ impl IbkrOAuth {
             consumer_key: cred.consumer_key.clone(),
             access_token: cred.access_token.clone(),
             realm: "limited_poa".to_string(),
-            _encryption_key: encryption_key,
             signature_key,
             dh_prime,
             dh_generator: 2,
             prepend_bytes,
             prepend_hex,
             live_session_token: None,
-            base_url: "https://api.ibkr.com/v1/api/".to_string(),
+            base_url: super::REST_BASE_URL.to_string(),
         })
     }
 
@@ -340,26 +338,10 @@ fn generate_authorization_header(params: &[(&str, String)], realm: &str) -> Stri
 
 /// 将 BigUint 转换为字节数组 (含前导零逻辑，与 Python ibind 一致)
 fn to_byte_array(x: &BigUint) -> Vec<u8> {
-    let hex_string = format!("{:x}", x);
-    // 确保偶数长度
-    let hex_string = if hex_string.len() % 2 != 0 {
-        format!("0{}", hex_string)
-    } else {
-        hex_string
-    };
-
-    let mut bytes = Vec::new();
-
-    // 如果最高位 bit 为 1 (即 bit_length 恰好是 8 的倍数)，前置一个 0 字节
-    let bit_len = x.bits();
-    if bit_len % 8 == 0 {
-        bytes.push(0);
+    let mut bytes = x.to_bytes_be();
+    // 与 Python ibind 一致: 如果最高位 bit 为 1，需要前置 0 字节
+    if !bytes.is_empty() && bytes[0] & 0x80 != 0 {
+        bytes.insert(0, 0);
     }
-
-    for i in (0..hex_string.len()).step_by(2) {
-        let byte = u8::from_str_radix(&hex_string[i..i + 2], 16).unwrap();
-        bytes.push(byte);
-    }
-
     bytes
 }

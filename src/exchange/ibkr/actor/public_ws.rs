@@ -94,12 +94,15 @@ impl IbkrPublicWsActor {
         // 忽略非数据消息 (心跳、状态等)
         let conid = match value.get("conid").and_then(|v| v.as_i64()) {
             Some(id) => id,
-            None => return Ok(()),
+            None => return Ok(()), // 心跳/状态消息无 conid
         };
 
         let symbol = match self.conid_to_symbol.get(&conid) {
             Some(s) => s.clone(),
-            None => return Ok(()),
+            None => {
+                tracing::warn!(conid, "Received data for unknown conid");
+                return Ok(());
+            }
         };
 
         let cache = self.bbo_cache.entry(conid).or_default();
@@ -336,7 +339,16 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for IbkrPublicWsAct
 fn parse_ib_number(v: &serde_json::Value) -> Option<f64> {
     match v {
         serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.replace(',', "").parse::<f64>().ok(),
+        serde_json::Value::String(s) => {
+            let cleaned = s.replace(',', "");
+            match cleaned.parse::<f64>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::trace!(raw = %s, "Failed to parse IB number");
+                    None
+                }
+            }
+        }
         _ => None,
     }
 }

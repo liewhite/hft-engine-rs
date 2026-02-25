@@ -102,13 +102,21 @@ impl IbkrClient {
             .sign_request("POST", &switch_url, None)
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
 
-        let _ = http
+        let resp = http
             .post(&switch_url)
             .header("Authorization", &auth)
             .header("User-Agent", "ibind-rs")
             .json(&serde_json::json!({"acctId": account_id}))
             .send()
-            .await;
+            .await
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(ExchangeError::ConnectionFailed(
+                Exchange::IBKR,
+                format!("switch account failed: {}", resp.status()),
+            ));
+        }
 
         // 5. 禁用下单确认 (POST /iserver/questions/suppress)
         let suppress_url = format!("{}iserver/questions/suppress", base_url);
@@ -116,15 +124,24 @@ impl IbkrClient {
             .sign_request("POST", &suppress_url, None)
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
 
-        let _ = http
+        match http
             .post(&suppress_url)
             .header("Authorization", &auth)
             .header("User-Agent", "ibind-rs")
             .json(&serde_json::json!({"messageIds": SUPPRESS_MESSAGE_IDS}))
             .send()
-            .await;
-
-        tracing::info!("IBKR order confirmations suppressed");
+            .await
+        {
+            Ok(r) if !r.status().is_success() => {
+                tracing::warn!(status = %r.status(), "IBKR suppress questions failed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "IBKR suppress questions request failed");
+            }
+            _ => {
+                tracing::info!("IBKR order confirmations suppressed");
+            }
+        }
 
         // 6. 解析 conids
         let conids = resolve_conids(&http, &oauth, &credentials.symbols)
@@ -263,18 +280,21 @@ impl ExchangeClient for IbkrClient {
         let oauth = self.oauth.read().await;
         let base_url = oauth.base_url().to_string();
 
-        // 先 receive brokerage accounts
+        // 先 receive brokerage accounts (预热缓存)
         let recv_url = format!("{}portfolio/accounts", base_url);
         let auth = oauth
             .sign_request("GET", &recv_url, None)
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
-        let _ = self
+        if let Err(e) = self
             .http
             .get(&recv_url)
             .header("Authorization", &auth)
             .header("User-Agent", "ibind-rs")
             .send()
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "IBKR portfolio/accounts prefetch failed");
+        }
 
         // 获取 account summary
         let summary_url = format!(
@@ -298,27 +318,17 @@ impl ExchangeClient for IbkrClient {
         let summary: serde_json::Value =
             resp.json().await.map_err(Self::map_reqwest_error)?;
 
-        let equity = summary
-            .get("netliquidation")
-            .or_else(|| summary.get("netLiquidationValue"))
-            .and_then(|v| {
-                v.get("amount")
-                    .and_then(|a| a.as_f64())
-                    .or_else(|| v.as_f64())
-                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
-            })
-            .unwrap_or(0.0);
+        let equity = extract_summary_value(&summary, &["netliquidation", "netLiquidationValue"])
+            .unwrap_or_else(|| {
+                tracing::warn!(summary = %summary, "Failed to parse equity from IBKR summary");
+                0.0
+            });
 
-        let notional = summary
-            .get("grosspositionvalue")
-            .or_else(|| summary.get("securitiesGVP"))
-            .and_then(|v| {
-                v.get("amount")
-                    .and_then(|a| a.as_f64())
-                    .or_else(|| v.as_f64())
-                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+        let notional = extract_summary_value(&summary, &["grosspositionvalue", "securitiesGVP"])
+            .unwrap_or_else(|| {
+                tracing::warn!(summary = %summary, "Failed to parse notional from IBKR summary");
+                0.0
             })
-            .unwrap_or(0.0)
             .abs();
 
         Ok(crate::exchange::AccountInfo { equity, notional })
@@ -381,4 +391,26 @@ impl IbkrClient {
             "Too many reply confirmations".to_string(),
         ))
     }
+}
+
+/// 从 IBKR account summary 中提取数值字段
+///
+/// 尝试多个候选字段名，支持 `{"amount": f64}` 嵌套格式、直接 f64、字符串 f64
+fn extract_summary_value(summary: &serde_json::Value, field_names: &[&str]) -> Option<f64> {
+    for name in field_names {
+        if let Some(v) = summary.get(name) {
+            if let Some(amount) = v.get("amount").and_then(|a| a.as_f64()) {
+                return Some(amount);
+            }
+            if let Some(n) = v.as_f64() {
+                return Some(n);
+            }
+            if let Some(s) = v.as_str() {
+                if let Ok(n) = s.parse::<f64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
 }

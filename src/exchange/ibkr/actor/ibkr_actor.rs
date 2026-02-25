@@ -59,11 +59,17 @@ impl Actor for IbkrActor {
         tracing::info!(exchange = "IBKR", "PublicWsActor created");
 
         // 2. 启动 tickle 保活任务 (每 60s POST /tickle)
+        // 使用 weak_ref 检测 actor 存活，actor 停止后自动退出
         let oauth = args.oauth;
+        let weak_ref = actor_ref.downgrade();
         tokio::spawn(async move {
             let http = Client::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                if weak_ref.upgrade().is_none() {
+                    tracing::info!("IBKR tickle task: actor stopped, exiting");
+                    break;
+                }
                 let oauth_guard = oauth.read().await;
                 let base_url = oauth_guard.base_url().to_string();
                 let tickle_url = format!("{}tickle", base_url);
