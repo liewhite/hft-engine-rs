@@ -18,6 +18,7 @@ use crate::exchange::binance::{
 use crate::exchange::hyperliquid::{
     HyperliquidActor, HyperliquidActorArgs, HyperliquidClient, HyperliquidCredentials,
 };
+use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
 use crate::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::strategy::Strategy;
@@ -40,6 +41,8 @@ pub struct ManagerActorArgs {
     pub okx_credentials: Option<OkxCredentials>,
     /// Hyperliquid 凭证（可选）
     pub hyperliquid_credentials: Option<HyperliquidCredentials>,
+    /// IBKR 凭证（可选）
+    pub ibkr_credentials: Option<IbkrCredentials>,
 }
 
 /// ManagerActor - 顶层管理 Actor
@@ -201,6 +204,14 @@ impl Actor for ManagerActor {
             clients.insert(Exchange::Hyperliquid, Arc::new(client));
         }
 
+        // IBKR 需要额外保存 oauth 和 conids 供 Actor 使用
+        let mut ibkr_actor_data = None;
+        if let Some(ref cred) = args.ibkr_credentials {
+            let client = IbkrClient::new(cred).await?;
+            ibkr_actor_data = Some((client.oauth(), client.conids().clone()));
+            clients.insert(Exchange::IBKR, Arc::new(client));
+        }
+
         // 2. 预加载所有交易所的 symbol metas
         let symbol_metas = Self::preload_all_symbol_metas(&clients).await?;
 
@@ -318,6 +329,21 @@ impl Actor for ManagerActor {
             .await;
             exchange_actors.insert(Exchange::Hyperliquid, Box::new(hyper_ref));
             tracing::info!(exchange = "Hyperliquid", "ExchangeActor created");
+        }
+
+        if let Some((ibkr_oauth, ibkr_conids)) = ibkr_actor_data {
+            let ibkr_ref = IbkrActor::spawn_link_with_mailbox(
+                &actor_ref,
+                IbkrActorArgs {
+                    oauth: ibkr_oauth,
+                    income_pubsub: income_pubsub.clone(),
+                    conids: ibkr_conids,
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+            exchange_actors.insert(Exchange::IBKR, Box::new(ibkr_ref));
+            tracing::info!(exchange = "IBKR", "ExchangeActor created");
         }
 
         tracing::info!("ManagerActor started with all child actors linked");

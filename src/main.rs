@@ -4,6 +4,7 @@ use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
 use fee_arb::engine::{AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, SubscribeIncome, SubscribeOutcome};
 use fee_arb::exchange::binance::BinanceCredentials;
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
+use fee_arb::exchange::ibkr::IbkrCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::{
     FundingArbConfig, FundingArbStrategy, MetricsSubscriberActor, MetricsSubscriberArgs,
@@ -21,11 +22,15 @@ struct ExchangesConfig {
     binance: BinanceCredentials,
     okx: OkxCredentials,
     hyperliquid: HyperliquidCredentials,
+    ibkr: Option<IbkrCredentials>,
 }
 
 impl ExchangesConfig {
     fn enabled_exchanges(&self) -> Vec<Exchange> {
-        let exchanges = vec![Exchange::Binance, Exchange::OKX, Exchange::Hyperliquid];
+        let mut exchanges = vec![Exchange::Binance, Exchange::OKX, Exchange::Hyperliquid];
+        if self.ibkr.is_some() {
+            exchanges.push(Exchange::IBKR);
+        }
         exchanges
     }
 }
@@ -81,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
             binance_credentials: Some(config.exchanges.binance.clone()),
             okx_credentials: Some(config.exchanges.okx.clone()),
             hyperliquid_credentials: Some(config.exchanges.hyperliquid.clone()),
+            ibkr_credentials: config.exchanges.ibkr.clone(),
         },
         mailbox::unbounded(),
     );

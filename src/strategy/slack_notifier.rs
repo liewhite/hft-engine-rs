@@ -102,6 +102,7 @@ impl SlackNotifierActor {
             Exchange::Binance => "Binance",
             Exchange::OKX => "OKX",
             Exchange::Hyperliquid => "Hyperliquid",
+            Exchange::IBKR => "IBKR",
         };
 
         let (side_emoji, side_name) = match side {
@@ -121,6 +122,7 @@ impl SlackNotifierActor {
             Exchange::Binance => "Binance",
             Exchange::OKX => "OKX",
             Exchange::Hyperliquid => "Hyperliquid",
+            Exchange::IBKR => "IBKR",
         };
 
         let (side_emoji, side_name) = match order.side {

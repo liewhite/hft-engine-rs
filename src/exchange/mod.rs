@@ -1,6 +1,7 @@
 pub mod binance;
 pub mod client;
 pub mod hyperliquid;
+pub mod ibkr;
 pub mod okx;
 pub mod utils;
 pub mod ws_loop;
@@ -14,5 +15,6 @@ pub use client::{
 crate::impl_exchange_actor_ops!(
     binance::BinanceActor,
     okx::OkxActor,
-    hyperliquid::HyperliquidActor
+    hyperliquid::HyperliquidActor,
+    ibkr::IbkrActor
 );

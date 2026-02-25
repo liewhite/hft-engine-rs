@@ -286,5 +286,6 @@ fn exchange_to_label(exchange: Exchange) -> &'static str {
         Exchange::Binance => "binance",
         Exchange::OKX => "okx",
         Exchange::Hyperliquid => "hyperliquid",
+        Exchange::IBKR => "ibkr",
     }
 }

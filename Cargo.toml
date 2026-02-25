@@ -63,3 +63,11 @@ rust_decimal = "1"
 
 # Metrics
 prometheus = "0.14"
+
+# IBKR OAuth 1.0a
+rsa = { version = "0.9", features = ["sha2"] }
+num-bigint = "0.4"
+sha1 = "0.10"
+rand = "0.8"
+pkcs8 = { version = "0.10", features = ["pem"] }
+percent-encoding = "2"
