@@ -1,13 +1,13 @@
 {
-  "_comment": "复制为 ibkr_config.json 并填入真实凭证。mode = 'gateway' 或 'oauth'",
+  "_comment": "复制为 ibkr_config.json，只保留一个模式的配置作为顶层对象，删除 _comment 和另一个模式的 key",
 
-  "_gateway_example": {
+  "_gateway_example — 使用时删除其余 key，只保留 mode/base_url/symbols": {
     "mode": "gateway",
     "base_url": "https://localhost:5000/v1/api/",
     "symbols": ["AAPL", "NVDA"]
   },
 
-  "_oauth_example": {
+  "_oauth_example — 使用时删除其余 key，只保留 mode 及以下字段": {
     "mode": "oauth",
     "consumer_key": "YOUR_CONSUMER_KEY",
     "encryption_key_fp": "/path/to/encryption.pem",

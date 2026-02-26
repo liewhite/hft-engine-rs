@@ -298,7 +298,71 @@ impl ExchangeClient for IbkrClient {
     }
 }
 
+/// IBKR snapshot field tag: Bid Price
+const SNAPSHOT_FIELD_BID: &str = "84";
+/// IBKR snapshot field tag: Ask Price
+const SNAPSHOT_FIELD_ASK: &str = "86";
+
 impl IbkrClient {
+    /// 获取指定 symbol 的 snapshot 中间价
+    ///
+    /// IBKR 股票无公开 BBO REST API，通过 `/iserver/marketdata/snapshot` 获取。
+    /// 首次请求可能触发订阅，需要多次请求才能拿到数据。
+    pub async fn fetch_snapshot_mid_price(&self, symbol: &str) -> Result<f64, ExchangeError> {
+        let conid = self.conids.get(symbol).ok_or_else(|| {
+            ExchangeError::SymbolNotFound(Exchange::IBKR, symbol.to_string())
+        })?;
+
+        let url = format!(
+            "{}iserver/marketdata/snapshot?conids={}&fields={},{}",
+            self.auth.base_url(),
+            conid,
+            SNAPSHOT_FIELD_BID,
+            SNAPSHOT_FIELD_ASK
+        );
+
+        for attempt in 0..3u8 {
+            let resp = self
+                .authed_request("GET", &url)?
+                .send()
+                .await
+                .map_err(Self::map_reqwest_error)?;
+
+            let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+            let arr = body.as_array().ok_or_else(|| {
+                ExchangeError::ConnectionFailed(
+                    Exchange::IBKR,
+                    format!("snapshot 响应不是数组: {}", body),
+                )
+            })?;
+
+            let first = arr.first().ok_or_else(|| {
+                ExchangeError::ConnectionFailed(
+                    Exchange::IBKR,
+                    "snapshot 响应数组为空".to_string(),
+                )
+            })?;
+
+            let bid = parse_snapshot_field(first, SNAPSHOT_FIELD_BID);
+            let ask = parse_snapshot_field(first, SNAPSHOT_FIELD_ASK);
+
+            if let (Some(b), Some(a)) = (bid, ask) {
+                tracing::debug!(attempt, bid = b, ask = a, "IBKR snapshot");
+                return Ok((b + a) / 2.0);
+            }
+
+            // 字段缺失 = 数据未就绪，等待重试
+            tracing::debug!(attempt, "IBKR snapshot 数据未就绪");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+
+        Err(ExchangeError::ConnectionFailed(
+            Exchange::IBKR,
+            format!("3 次尝试后仍无法获取 {} 的 snapshot 价格", symbol),
+        ))
+    }
+
     /// 处理下单响应，包括 reply 确认循环 (最多 5 轮)
     async fn handle_order_response(
         &self,
@@ -348,6 +412,19 @@ impl IbkrClient {
             "Too many reply confirmations".to_string(),
         ))
     }
+}
+
+/// 解析 snapshot 响应中的价格字段
+///
+/// 字段不存在时返回 None（数据未就绪），字段存在但格式异常时 panic（API 不兼容）。
+fn parse_snapshot_field(data: &serde_json::Value, field: &str) -> Option<f64> {
+    let v = data.get(field)?;
+    Some(v.as_f64().unwrap_or_else(|| {
+        v.as_str()
+            .unwrap_or_else(|| panic!("snapshot field {} 既不是 f64 也不是字符串: {}", field, v))
+            .parse()
+            .unwrap_or_else(|_| panic!("snapshot field {} 字符串无法解析为 f64: {}", field, v))
+    }))
 }
 
 /// 从 IBKR account summary 中提取数值字段
