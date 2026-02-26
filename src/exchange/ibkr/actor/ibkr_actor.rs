@@ -57,34 +57,69 @@ impl Actor for IbkrActor {
         tracing::info!(exchange = "IBKR", "PublicWsActor created");
 
         // 2. 启动 tickle 保活任务 (每 60s POST /tickle)
+        // 连续失败 3 次则 kill actor，触发级联退出
         let auth = args.auth;
         let weak_ref = actor_ref.downgrade();
         tokio::spawn(async move {
+            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
             let http = match auth.build_http_client() {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!(error = %e, "IBKR tickle: failed to build HTTP client");
+                    tracing::error!(error = %e, "IBKR tickle: failed to build HTTP client, killing actor");
+                    if let Some(actor) = weak_ref.upgrade() {
+                        actor.kill();
+                    }
                     return;
                 }
             };
+
+            let mut consecutive_failures: u32 = 0;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                if weak_ref.upgrade().is_none() {
-                    tracing::info!("IBKR tickle task: actor stopped, exiting");
-                    break;
-                }
-                let tickle_url = format!("{}tickle", auth.base_url());
-                let req = match auth.authed_request(&http, "POST", &tickle_url) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "IBKR tickle sign failed");
-                        continue;
+                let actor = match weak_ref.upgrade() {
+                    Some(a) => a,
+                    None => {
+                        tracing::info!("IBKR tickle task: actor stopped, exiting");
+                        break;
                     }
                 };
-                if let Err(e) = req.send().await {
-                    tracing::warn!(error = %e, "IBKR tickle request failed");
+
+                let tickle_url = format!("{}tickle", auth.base_url());
+                let succeeded = match auth.authed_request(&http, "POST", &tickle_url) {
+                    Ok(req) => match req.send().await {
+                        Ok(resp) if resp.status().is_success() => true,
+                        Ok(resp) => {
+                            tracing::warn!(status = %resp.status(), "IBKR tickle: non-success status");
+                            false
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "IBKR tickle request failed");
+                            false
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(error = %e, "IBKR tickle sign failed");
+                        false
+                    }
+                };
+
+                if succeeded {
+                    consecutive_failures = 0;
+                    tracing::trace!("IBKR tickle sent");
+                } else {
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        consecutive_failures,
+                        max = MAX_CONSECUTIVE_FAILURES,
+                        "IBKR tickle failed"
+                    );
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        tracing::error!("IBKR tickle: {} consecutive failures, killing actor", MAX_CONSECUTIVE_FAILURES);
+                        actor.kill();
+                        break;
+                    }
                 }
-                tracing::trace!("IBKR tickle sent");
             }
         });
 

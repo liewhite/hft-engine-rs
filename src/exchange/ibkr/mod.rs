@@ -72,10 +72,10 @@ impl IbkrCredentials {
                     dh_prime,
                 )
                 .await?;
-                Ok(Arc::new(oauth))
+                Ok(Arc::new(oauth) as Arc<dyn IbkrAuth>)
             }
             Self::Gateway { base_url, .. } => {
-                Ok(Arc::new(IbkrGateway::new(base_url.clone())))
+                Ok(Arc::new(IbkrGateway::new(base_url.clone())) as Arc<dyn IbkrAuth>)
             }
         }
     }
