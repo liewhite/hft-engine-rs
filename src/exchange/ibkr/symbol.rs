@@ -2,7 +2,7 @@
 //!
 //! 通过 REST API 将 symbol 列表解析为 conid 映射
 
-use super::oauth::IbkrOAuth;
+use super::auth::IbkrAuth;
 use reqwest::Client;
 use std::collections::HashMap;
 
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// 过滤 isUS=true 的合约，取第一个 conid
 pub async fn resolve_conids(
     http: &Client,
-    oauth: &IbkrOAuth,
+    auth: &dyn IbkrAuth,
     symbols: &[String],
 ) -> anyhow::Result<HashMap<String, i64>> {
     if symbols.is_empty() {
@@ -20,19 +20,24 @@ pub async fn resolve_conids(
     }
 
     let symbols_param = symbols.join(",");
-    let url = format!("{}trsrv/stocks", oauth.base_url());
+    let url = format!("{}trsrv/stocks", auth.base_url());
     let full_url = format!("{}?symbols={}", url, symbols_param);
 
-    let auth_header = oauth.sign_request(
+    let auth_header = auth.sign_request(
         "GET",
         &url,
         Some(&[("symbols", &symbols_param)]),
     )?;
 
-    let resp = http
+    let mut req = http
         .get(&full_url)
-        .header("Authorization", &auth_header)
-        .header("User-Agent", "ibind-rs")
+        .header("User-Agent", "ibind-rs");
+
+    if let Some(header) = auth_header {
+        req = req.header("Authorization", header);
+    }
+
+    let resp = req
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("resolve_conids request failed: {}", e))?;

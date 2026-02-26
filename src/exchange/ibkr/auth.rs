@@ -1,0 +1,23 @@
+//! IbkrAuth trait — 抽象 IBKR 认证行为
+//!
+//! OAuth 和 Gateway 两种模式共享同一套业务逻辑（REST + WS），
+//! 仅在认证方式、URL、TLS 配置上有差异。
+
+/// IBKR 认证抽象
+///
+/// - `sign_request` 返回 `Option<String>`: OAuth 返回签名 header, Gateway 返回 None
+/// - `ws_url()`: OAuth 返回含 token 的 URL, Gateway 返回裸 URL
+/// - `build_http_client()`: Gateway 跳过证书验证
+/// - `ws_connector()`: Gateway 返回跳过证书验证的 TLS connector
+pub trait IbkrAuth: Send + Sync + 'static {
+    fn base_url(&self) -> &str;
+    fn ws_url(&self) -> String;
+    fn sign_request(
+        &self,
+        method: &str,
+        url: &str,
+        params: Option<&[(&str, &str)]>,
+    ) -> anyhow::Result<Option<String>>;
+    fn build_http_client(&self) -> anyhow::Result<reqwest::Client>;
+    fn ws_connector(&self) -> Option<tokio_tungstenite::Connector>;
+}

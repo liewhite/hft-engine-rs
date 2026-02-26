@@ -204,11 +204,11 @@ impl Actor for ManagerActor {
             clients.insert(Exchange::Hyperliquid, Arc::new(client));
         }
 
-        // IBKR 需要额外保存 oauth 和 conids 供 Actor 使用
+        // IBKR 需要额外保存 auth 和 conids 供 Actor 使用
         let mut ibkr_actor_data = None;
         if let Some(ref cred) = args.ibkr_credentials {
             let client = IbkrClient::new(cred).await?;
-            ibkr_actor_data = Some((client.oauth(), client.conids().clone()));
+            ibkr_actor_data = Some((client.auth(), client.conids().clone()));
             clients.insert(Exchange::IBKR, Arc::new(client));
         }
 
@@ -331,11 +331,11 @@ impl Actor for ManagerActor {
             tracing::info!(exchange = "Hyperliquid", "ExchangeActor created");
         }
 
-        if let Some((ibkr_oauth, ibkr_conids)) = ibkr_actor_data {
+        if let Some((ibkr_auth, ibkr_conids)) = ibkr_actor_data {
             let ibkr_ref = IbkrActor::spawn_link_with_mailbox(
                 &actor_ref,
                 IbkrActorArgs {
-                    oauth: ibkr_oauth,
+                    auth: ibkr_auth,
                     income_pubsub: income_pubsub.clone(),
                     conids: ibkr_conids,
                 },

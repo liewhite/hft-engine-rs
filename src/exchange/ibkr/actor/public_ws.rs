@@ -1,14 +1,14 @@
 //! IbkrPublicWsActor - 管理 IBKR 公开 WebSocket 连接
 //!
 //! 职责:
-//! - 维护 WebSocket 连接 (wss://api.ibkr.com/v1/api/ws?oauth_token=...)
+//! - 维护 WebSocket 连接
 //! - 处理 BBO 订阅 (其他类型静默忽略)
 //! - 增量更新 bid/ask 缓存并发布 BBO 到 IncomePubSub
 
 use crate::domain::{now_ms, Exchange, BBO};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::ibkr::oauth::IbkrOAuth;
+use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
@@ -19,13 +19,13 @@ use kameo::Actor;
 use kameo_actors::pubsub::Publish;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// IbkrPublicWsActor 初始化参数
 pub struct IbkrPublicWsActorArgs {
-    /// OAuth 认证器 (共享)
-    pub oauth: Arc<RwLock<IbkrOAuth>>,
+    /// 认证器 (共享，不可变)
+    pub auth: Arc<dyn IbkrAuth>,
     /// Income PubSub (发布事件)
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// conid 映射 (symbol → conid)
@@ -168,16 +168,26 @@ impl Actor for IbkrPublicWsActor {
             .collect();
 
         // 连接 WebSocket
-        let oauth = args.oauth.read().await;
-        let ws_url = format!(
-            "wss://api.ibkr.com/v1/api/ws?oauth_token={}",
-            oauth.access_token()
-        );
-        drop(oauth);
+        let ws_url = args.auth.ws_url();
+        let connector = args.auth.ws_connector();
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
-            .await
-            .expect("Failed to connect to IBKR WebSocket");
+        let (ws_stream, _) = match connector {
+            Some(conn) => {
+                tokio_tungstenite::connect_async_tls_with_config(
+                    &ws_url,
+                    None,
+                    false,
+                    Some(conn),
+                )
+                .await
+                .expect("Failed to connect to IBKR WebSocket")
+            }
+            None => {
+                tokio_tungstenite::connect_async(&ws_url)
+                    .await
+                    .expect("Failed to connect to IBKR WebSocket")
+            }
+        };
 
         let (write, read) = ws_stream.split();
 

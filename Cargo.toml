@@ -64,6 +64,9 @@ rust_decimal = "1"
 # Metrics
 prometheus = "0.14"
 
+# TLS (for IBKR Gateway self-signed certs)
+native-tls = "0.2"
+
 # IBKR OAuth 1.0a
 rsa = { version = "0.9", features = ["sha2"] }
 num-bigint = "0.4"
