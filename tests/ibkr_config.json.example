@@ -1,0 +1,20 @@
+{
+  "_comment": "复制为 ibkr_config.json 并填入真实凭证。mode = 'gateway' 或 'oauth'",
+
+  "_gateway_example": {
+    "mode": "gateway",
+    "base_url": "https://localhost:5000/v1/api/",
+    "symbols": ["AAPL", "NVDA"]
+  },
+
+  "_oauth_example": {
+    "mode": "oauth",
+    "consumer_key": "YOUR_CONSUMER_KEY",
+    "encryption_key_fp": "/path/to/encryption.pem",
+    "signature_key_fp": "/path/to/signature.pem",
+    "access_token": "YOUR_ACCESS_TOKEN",
+    "access_token_secret": "BASE64_ENCRYPTED_SECRET",
+    "dh_prime": "HEX_DH_PRIME",
+    "symbols": ["AAPL", "NVDA"]
+  }
+}

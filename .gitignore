@@ -12,6 +12,9 @@
 config.toml
 config.json
 
+# Test credentials
+tests/ibkr_config.json
+
 # OS
 .DS_Store
 *.pem
