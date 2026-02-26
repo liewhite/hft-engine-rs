@@ -74,20 +74,16 @@ impl Actor for IbkrActor {
                     break;
                 }
                 let tickle_url = format!("{}tickle", auth.base_url());
-                let auth_header = match auth.sign_request("POST", &tickle_url, None) {
-                    Ok(h) => h,
+                let req = match auth.authed_request(&http, "POST", &tickle_url) {
+                    Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(error = %e, "IBKR tickle sign failed");
                         continue;
                     }
                 };
-                let mut req = http
-                    .post(&tickle_url)
-                    .header("User-Agent", "ibind-rs");
-                if let Some(header) = auth_header {
-                    req = req.header("Authorization", header);
+                if let Err(e) = req.send().await {
+                    tracing::warn!(error = %e, "IBKR tickle request failed");
                 }
-                let _ = req.send().await;
                 tracing::trace!("IBKR tickle sent");
             }
         });

@@ -20,4 +20,30 @@ pub trait IbkrAuth: Send + Sync + 'static {
     ) -> anyhow::Result<Option<String>>;
     fn build_http_client(&self) -> anyhow::Result<reqwest::Client>;
     fn ws_connector(&self) -> Option<tokio_tungstenite::Connector>;
+
+    /// 构建带认证 header 的 HTTP 请求
+    ///
+    /// 自动调用 `sign_request` 并在有签名时添加 Authorization header。
+    fn authed_request(
+        &self,
+        http: &reqwest::Client,
+        method: &str,
+        url: &str,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        let auth_header = self.sign_request(method, url, None)?;
+
+        let builder = match method {
+            "GET" => http.get(url),
+            "POST" => http.post(url),
+            "DELETE" => http.delete(url),
+            _ => unreachable!("unsupported HTTP method: {}", method),
+        };
+
+        let mut req = builder.header("User-Agent", "ibind-rs");
+        if let Some(header) = auth_header {
+            req = req.header("Authorization", header);
+        }
+
+        Ok(req)
+    }
 }

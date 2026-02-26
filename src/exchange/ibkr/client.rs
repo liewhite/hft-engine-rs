@@ -45,7 +45,8 @@ impl IbkrClient {
 
         // 2. 初始化交易会话 (POST /iserver/auth/ssodh/init)
         let init_url = format!("{}iserver/auth/ssodh/init", base_url);
-        let resp = Self::authed_request_static(&http, &*auth, "POST", &init_url)?
+        let resp = auth.authed_request(&http, "POST", &init_url)
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
             .json(&serde_json::json!({"publish": true, "compete": true}))
             .send()
             .await
@@ -55,7 +56,8 @@ impl IbkrClient {
 
         // 3. 获取 account_id (GET /portfolio/accounts)
         let accounts_url = format!("{}portfolio/accounts", base_url);
-        let resp = Self::authed_request_static(&http, &*auth, "GET", &accounts_url)?
+        let resp = auth.authed_request(&http, "GET", &accounts_url)
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
             .send()
             .await
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
@@ -78,7 +80,8 @@ impl IbkrClient {
 
         // 4. Switch account (POST /iserver/account)
         let switch_url = format!("{}iserver/account", base_url);
-        let resp = Self::authed_request_static(&http, &*auth, "POST", &switch_url)?
+        let resp = auth.authed_request(&http, "POST", &switch_url)
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
             .json(&serde_json::json!({"acctId": account_id}))
             .send()
             .await
@@ -93,7 +96,8 @@ impl IbkrClient {
 
         // 5. 禁用下单确认 (POST /iserver/questions/suppress)
         let suppress_url = format!("{}iserver/questions/suppress", base_url);
-        match Self::authed_request_static(&http, &*auth, "POST", &suppress_url)?
+        match auth.authed_request(&http, "POST", &suppress_url)
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
             .json(&serde_json::json!({"messageIds": SUPPRESS_MESSAGE_IDS}))
             .send()
             .await
@@ -134,39 +138,15 @@ impl IbkrClient {
         &self.conids
     }
 
-    /// 构建带认证 header 的请求 (静态方法，用于初始化阶段)
-    fn authed_request_static(
-        http: &Client,
-        auth: &dyn IbkrAuth,
-        method: &str,
-        url: &str,
-    ) -> Result<reqwest::RequestBuilder, ExchangeError> {
-        let auth_header = auth
-            .sign_request(method, url, None)
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
-
-        let builder = match method {
-            "GET" => http.get(url),
-            "POST" => http.post(url),
-            "DELETE" => http.delete(url),
-            _ => http.get(url),
-        };
-
-        let mut req = builder.header("User-Agent", "ibind-rs");
-        if let Some(header) = auth_header {
-            req = req.header("Authorization", header);
-        }
-
-        Ok(req)
-    }
-
-    /// 构建带认证 header 的请求 (实例方法)
+    /// 构建带认证 header 的请求
     fn authed_request(
         &self,
         method: &str,
         url: &str,
     ) -> Result<reqwest::RequestBuilder, ExchangeError> {
-        Self::authed_request_static(&self.http, &*self.auth, method, url)
+        self.auth
+            .authed_request(&self.http, method, url)
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))
     }
 
     fn map_reqwest_error(e: reqwest::Error) -> ExchangeError {
