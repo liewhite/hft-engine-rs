@@ -3,6 +3,23 @@
 //! OAuth 和 Gateway 两种模式共享同一套业务逻辑（REST + WS），
 //! 仅在认证方式、URL、TLS 配置上有差异。
 
+/// 调用 POST /tickle，返回 session_id
+pub async fn tickle(auth: &dyn IbkrAuth, http: &reqwest::Client) -> anyhow::Result<String> {
+    let tickle_url = format!("{}tickle", auth.base_url());
+    let resp = auth
+        .authed_request(http, "POST", &tickle_url)?
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!("Tickle failed: {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await?;
+    let session_id = body["session"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'session' in tickle response"))?;
+    Ok(session_id.to_string())
+}
+
 /// IBKR 认证抽象
 ///
 /// - `sign_request` 返回 `Option<String>`: OAuth 返回签名 header, Gateway 返回 None

@@ -30,6 +30,8 @@ pub struct IbkrPublicWsActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// conid 映射 (symbol → conid)
     pub conids: HashMap<String, i64>,
+    /// tickle 返回的 session_id (用于 WS Cookie)
+    pub session_id: String,
 }
 
 /// 每个 conid 的 BBO 缓存 (IB 推送增量数据)
@@ -170,30 +172,7 @@ impl Actor for IbkrPublicWsActor {
         // 连接 WebSocket (需要 Cookie + User-Agent header)
         let ws_url = args.auth.ws_url();
         let connector = args.auth.ws_connector();
-
-        // 1. 调用 tickle 获取 session_id
-        let http = args
-            .auth
-            .build_http_client()
-            .expect("Failed to build HTTP client for WS tickle");
-        let tickle_url = format!("{}tickle", args.auth.base_url());
-        let tickle_resp = args
-            .auth
-            .authed_request(&http, "POST", &tickle_url)
-            .expect("Failed to sign tickle request")
-            .send()
-            .await
-            .expect("Tickle request failed");
-        let tickle_body: serde_json::Value = tickle_resp
-            .json()
-            .await
-            .expect("Failed to parse tickle response");
-        let session_id = tickle_body["session"]
-            .as_str()
-            .expect("Missing 'session' in tickle response");
-
-        // 2. 构建带 Cookie + User-Agent 的 WS 请求
-        let cookie = args.auth.format_ws_cookie(session_id);
+        let cookie = args.auth.format_ws_cookie(&args.session_id);
         let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
             .uri(&ws_url)
             .header("Cookie", &cookie)

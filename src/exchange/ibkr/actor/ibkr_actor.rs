@@ -11,7 +11,7 @@
 
 use super::public_ws::{IbkrPublicWsActor, IbkrPublicWsActorArgs};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
-use crate::exchange::ibkr::auth::IbkrAuth;
+use crate::exchange::ibkr::auth::{self, IbkrAuth};
 use crate::engine::IncomePubSub;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -43,36 +43,35 @@ impl Actor for IbkrActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 1. 创建 PublicWsActor
+        // 1. Tickle 获取 session_id (供 WS Cookie 使用)
+        let http = args
+            .auth
+            .build_http_client()
+            .expect("Failed to build HTTP client");
+        let session_id = auth::tickle(&*args.auth, &http)
+            .await
+            .expect("Initial tickle failed");
+
+        // 2. 创建 PublicWsActor (传入 session_id)
         let public_ws = IbkrPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             IbkrPublicWsActorArgs {
                 auth: args.auth.clone(),
                 income_pubsub: args.income_pubsub,
                 conids: args.conids,
+                session_id,
             },
             mailbox::unbounded(),
         )
         .await;
         tracing::info!(exchange = "IBKR", "PublicWsActor created");
 
-        // 2. 启动 tickle 保活任务 (每 60s POST /tickle)
+        // 3. 启动 tickle 保活任务 (每 60s POST /tickle)
         // 连续失败 3 次则 kill actor，触发级联退出
         let auth = args.auth;
         let weak_ref = actor_ref.downgrade();
         tokio::spawn(async move {
             const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-
-            let http = match auth.build_http_client() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(error = %e, "IBKR tickle: failed to build HTTP client, killing actor");
-                    if let Some(actor) = weak_ref.upgrade() {
-                        actor.kill();
-                    }
-                    return;
-                }
-            };
 
             let mut consecutive_failures: u32 = 0;
             loop {
@@ -85,24 +84,7 @@ impl Actor for IbkrActor {
                     }
                 };
 
-                let tickle_url = format!("{}tickle", auth.base_url());
-                let succeeded = match auth.authed_request(&http, "POST", &tickle_url) {
-                    Ok(req) => match req.send().await {
-                        Ok(resp) if resp.status().is_success() => true,
-                        Ok(resp) => {
-                            tracing::warn!(status = %resp.status(), "IBKR tickle: non-success status");
-                            false
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "IBKR tickle request failed");
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(error = %e, "IBKR tickle sign failed");
-                        false
-                    }
-                };
+                let succeeded = auth::tickle(&*auth, &http).await.is_ok();
 
                 if succeeded {
                     consecutive_failures = 0;
