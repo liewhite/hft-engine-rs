@@ -155,6 +155,10 @@ impl IbkrAuth for IbkrOAuth {
     fn ws_connector(&self) -> Option<tokio_tungstenite::Connector> {
         None
     }
+
+    fn format_ws_cookie(&self, session_id: &str) -> String {
+        format!("api={}", session_id)
+    }
 }
 
 // ============================================================================

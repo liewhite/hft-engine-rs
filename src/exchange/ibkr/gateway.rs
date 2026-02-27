@@ -49,4 +49,8 @@ impl IbkrAuth for IbkrGateway {
             .expect("Failed to build TLS connector");
         Some(tokio_tungstenite::Connector::NativeTls(tls))
     }
+
+    fn format_ws_cookie(&self, session_id: &str) -> String {
+        format!("api={}", serde_json::json!({"session": session_id}))
+    }
 }

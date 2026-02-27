@@ -20,6 +20,8 @@ pub trait IbkrAuth: Send + Sync + 'static {
     ) -> anyhow::Result<Option<String>>;
     fn build_http_client(&self) -> anyhow::Result<reqwest::Client>;
     fn ws_connector(&self) -> Option<tokio_tungstenite::Connector>;
+    /// 格式化 WebSocket 连接所需的 session cookie
+    fn format_ws_cookie(&self, session_id: &str) -> String;
 
     /// 构建带认证 header 的 HTTP 请求
     ///
