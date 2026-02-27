@@ -207,29 +207,32 @@ async fn dh_exchange(
 
     let auth_header = generate_authorization_header(&headers, "limited_poa");
 
-    // 4. POST 请求
+    // 4. POST 请求 (必须带 Content-Length: 0，否则 411)
     let resp = http
         .post(&url)
         .header("Authorization", &auth_header)
         .header("User-Agent", "ibind-rs")
-        .header("Host", "api.ibkr.com")
+        .header("Content-Length", "0")
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("LST request failed: {}", e))?;
 
     let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
+    let resp_text = resp
+        .text()
         .await
-        .map_err(|e| anyhow::anyhow!("LST response parse failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("LST response read failed: {}", e))?;
 
     if !status.is_success() {
         return Err(anyhow::anyhow!(
             "LST request returned {}: {}",
             status,
-            body
+            resp_text
         ));
     }
+
+    let body: serde_json::Value = serde_json::from_str(&resp_text)
+        .map_err(|e| anyhow::anyhow!("LST response parse failed: {}", e))?;
 
     // 5. 提取 DH response 并计算 shared secret
     let dh_response_hex = body["diffie_hellman_response"]
