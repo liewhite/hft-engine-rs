@@ -24,4 +24,7 @@ pub struct HyperliquidCredentials {
     pub private_key: String,
     /// 计价币种 (e.g., "USDC", "USDE")
     pub quote: String,
+    /// Perp DEX 名称 (e.g., "xyz" 表示股票永续合约, "" 表示默认 perp DEX)
+    #[serde(default)]
+    pub dex: String,
 }

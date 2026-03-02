@@ -323,6 +323,7 @@ impl Actor for ManagerActor {
                     symbol_metas: symbol_metas_for_exchange,
                     income_pubsub: income_pubsub.clone(),
                     quote: credentials.quote.clone(),
+                    dex: credentials.dex.clone(),
                 },
                 mailbox::unbounded(),
             )

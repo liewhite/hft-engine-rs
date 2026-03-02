@@ -25,6 +25,7 @@ fn get_credentials() -> Option<HyperliquidCredentials> {
         wallet_address,
         private_key,
         quote: TEST_QUOTE.to_string(),
+        dex: String::new(),
     })
 }
 

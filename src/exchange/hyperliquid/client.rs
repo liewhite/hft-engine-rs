@@ -33,6 +33,8 @@ pub struct HyperliquidClient {
     base_url: String,
     /// 计价币种 (e.g., "USDC", "USDE")
     quote: String,
+    /// Perp DEX 名称 ("" = 默认 perp DEX, "xyz" = 股票永续合约等)
+    dex: String,
     /// 是否是主网
     is_mainnet: bool,
     /// Coin -> Asset Index 映射 (懒加载)
@@ -59,12 +61,18 @@ impl HyperliquidClient {
             .map(|c| c.quote.clone())
             .unwrap_or_else(|| "USDC".to_string());
 
+        let dex = credentials
+            .as_ref()
+            .map(|c| c.dex.clone())
+            .unwrap_or_default();
+
         Ok(Self {
             client,
             credentials,
             signer,
             base_url: REST_BASE_URL.to_string(),
             quote,
+            dex,
             is_mainnet: true, // 默认主网
             coin_to_asset: RwLock::new(None),
         })
@@ -73,6 +81,11 @@ impl HyperliquidClient {
     /// 获取计价币种
     pub fn quote(&self) -> &str {
         &self.quote
+    }
+
+    /// 获取 Perp DEX 名称
+    pub fn dex(&self) -> &str {
+        &self.dex
     }
 
     /// 获取凭证
@@ -119,14 +132,15 @@ impl HyperliquidClient {
 
     /// 获取所有交易对元数据
     async fn get_meta(&self) -> Result<MetaResponse, ExchangeError> {
-        self.post_info(serde_json::json!({"type": "meta"})).await
+        self.post_info(serde_json::json!({"type": "meta", "dex": self.dex}))
+            .await
     }
 
     /// 获取元数据和资产上下文
     async fn get_meta_and_asset_ctxs(&self) -> Result<(MetaResponse, Vec<AssetCtx>), ExchangeError> {
         // metaAndAssetCtxs 返回一个二元组: [meta, [assetCtx...]]
         let resp: serde_json::Value = self
-            .post_info(serde_json::json!({"type": "metaAndAssetCtxs"}))
+            .post_info(serde_json::json!({"type": "metaAndAssetCtxs", "dex": self.dex}))
             .await?;
 
         // 解析 meta

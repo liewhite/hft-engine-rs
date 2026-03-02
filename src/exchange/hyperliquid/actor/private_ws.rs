@@ -35,6 +35,8 @@ pub struct HyperliquidPrivateWsActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// Perp DEX 名称 ("" = 默认 perp DEX)
+    pub dex: String,
 }
 
 /// HyperliquidPrivateWsActor - 账户 WebSocket Actor
@@ -94,7 +96,8 @@ impl Actor for HyperliquidPrivateWsActor {
             "method": "subscribe",
             "subscription": {
                 "type": "clearinghouseState",
-                "user": args.wallet_address
+                "user": args.wallet_address,
+                "dex": args.dex
             }
         })
         .to_string();
