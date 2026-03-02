@@ -171,33 +171,55 @@ impl IbkrClient {
             .map(|(symbol, &conid)| (conid, symbol.as_str()))
             .collect();
 
-        let empty = Vec::new();
-        let arr = body.as_array().unwrap_or(&empty);
+        let arr = match body.as_array() {
+            Some(arr) => arr,
+            None => {
+                tracing::warn!(body = %body, "IBKR positions response is not an array");
+                return Ok(Vec::new());
+            }
+        };
 
-        let positions: Vec<crate::domain::Position> = arr
-            .iter()
-            .filter_map(|item| {
-                let conid = item.get("conid")?.as_i64()?;
-                let symbol = conid_to_symbol.get(&conid)?;
-                let size = item.get("position")?.as_f64()?;
-                let avg_cost = item
-                    .get("avgCost")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let unrealized_pnl = item
-                    .get("unrealizedPnl")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
+        let mut positions = Vec::new();
+        for item in arr {
+            let conid = match item.get("conid").and_then(|v| v.as_i64()) {
+                Some(c) => c,
+                None => {
+                    tracing::warn!(item = %item, "IBKR position missing/invalid conid");
+                    continue;
+                }
+            };
 
-                Some(crate::domain::Position {
-                    exchange: Exchange::IBKR,
-                    symbol: symbol.to_string(),
-                    size,
-                    entry_price: avg_cost,
-                    unrealized_pnl,
-                })
-            })
-            .collect();
+            // 跳过未配置的 symbol（不记录 warn，IBKR 账户可能持有其他股票）
+            let symbol = match conid_to_symbol.get(&conid) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let size = match item.get("position").and_then(|v| v.as_f64()) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(item = %item, "IBKR position missing/invalid size");
+                    continue;
+                }
+            };
+
+            let avg_cost = item
+                .get("avgCost")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let unrealized_pnl = item
+                .get("unrealizedPnl")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+
+            positions.push(crate::domain::Position {
+                exchange: Exchange::IBKR,
+                symbol: symbol.to_string(),
+                size,
+                entry_price: avg_cost,
+                unrealized_pnl,
+            });
+        }
 
         tracing::debug!(count = positions.len(), "IBKR positions fetched");
         Ok(positions)

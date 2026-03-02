@@ -24,6 +24,9 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+/// IBKR 持仓轮询间隔 (毫秒)
+const POSITION_POLLING_INTERVAL_MS: u64 = 3000;
+
 /// IbkrActor 初始化参数
 pub struct IbkrActorArgs {
     /// 认证器 (共享，不可变)
@@ -118,7 +121,7 @@ impl Actor for IbkrActor {
             IbkrPositionPollingActorArgs {
                 client: args.client,
                 income_pubsub: income_pubsub.clone(),
-                interval_ms: 3000,
+                interval_ms: POSITION_POLLING_INTERVAL_MS,
             },
             mailbox::unbounded(),
         )
