@@ -242,9 +242,11 @@ async fn test_ibkr_ws_bbo() {
     let symbols = credentials.symbols().to_vec();
 
     // 1. 创建 IbkrClient 获取 auth + conids
-    let client = IbkrClient::new(&credentials)
-        .await
-        .expect("IBKR 连接失败");
+    let client = Arc::new(
+        IbkrClient::new(&credentials)
+            .await
+            .expect("IBKR 连接失败"),
+    );
 
     let auth = client.auth();
     let conids = client.conids().clone();
@@ -275,6 +277,7 @@ async fn test_ibkr_ws_bbo() {
             auth,
             income_pubsub,
             conids,
+            client,
         },
         mailbox::unbounded(),
     );

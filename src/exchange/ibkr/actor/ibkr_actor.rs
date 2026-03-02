@@ -9,9 +9,11 @@
 //! IbkrActor (父)
 //! └── IbkrPublicWsActor [spawn_link]
 
+use super::position_polling::{IbkrPositionPollingActor, IbkrPositionPollingActorArgs};
 use super::public_ws::{IbkrPublicWsActor, IbkrPublicWsActorArgs};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::ibkr::auth::{self, IbkrAuth};
+use crate::exchange::ibkr::IbkrClient;
 use crate::engine::IncomePubSub;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -30,12 +32,16 @@ pub struct IbkrActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// conid 映射 (symbol → conid)
     pub conids: HashMap<String, i64>,
+    /// IBKR 客户端 (用于持仓轮询)
+    pub client: Arc<IbkrClient>,
 }
 
 /// IbkrActor - 父 Actor
 pub struct IbkrActor {
     /// Public WebSocket Actor
     public_ws: ActorRef<IbkrPublicWsActor>,
+    /// 持仓轮询 Actor
+    _position_polling: ActorRef<IbkrPositionPollingActor>,
 }
 
 impl Actor for IbkrActor {
@@ -53,11 +59,12 @@ impl Actor for IbkrActor {
             .expect("Initial tickle failed");
 
         // 2. 创建 PublicWsActor (传入 session_id)
+        let income_pubsub = args.income_pubsub;
         let public_ws = IbkrPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             IbkrPublicWsActorArgs {
                 auth: args.auth.clone(),
-                income_pubsub: args.income_pubsub,
+                income_pubsub: income_pubsub.clone(),
                 conids: args.conids,
                 session_id,
             },
@@ -105,9 +112,25 @@ impl Actor for IbkrActor {
             }
         });
 
+        // 4. 创建持仓轮询 Actor (每 3 秒)
+        let position_polling = IbkrPositionPollingActor::spawn_link_with_mailbox(
+            &actor_ref,
+            IbkrPositionPollingActorArgs {
+                client: args.client,
+                income_pubsub: income_pubsub.clone(),
+                interval_ms: 3000,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        tracing::info!(exchange = "IBKR", "PositionPollingActor created");
+
         tracing::info!(exchange = "IBKR", "IbkrActor started");
 
-        Ok(Self { public_ws })
+        Ok(Self {
+            public_ws,
+            _position_polling: position_polling,
+        })
     }
 
     async fn on_stop(

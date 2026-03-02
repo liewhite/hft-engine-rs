@@ -204,12 +204,16 @@ impl Actor for ManagerActor {
             clients.insert(Exchange::Hyperliquid, Arc::new(client));
         }
 
-        // IBKR 需要额外保存 auth 和 conids 供 Actor 使用
+        // IBKR 需要额外保存 auth / conids / client 供 Actor 使用
         let mut ibkr_actor_data = None;
         if let Some(ref cred) = args.ibkr_credentials {
-            let client = IbkrClient::new(cred).await?;
-            ibkr_actor_data = Some((client.auth(), client.conids().clone()));
-            clients.insert(Exchange::IBKR, Arc::new(client));
+            let ibkr_client = Arc::new(IbkrClient::new(cred).await?);
+            ibkr_actor_data = Some((
+                ibkr_client.auth(),
+                ibkr_client.conids().clone(),
+                ibkr_client.clone(),
+            ));
+            clients.insert(Exchange::IBKR, ibkr_client as Arc<dyn ExchangeClient>);
         }
 
         // 2. 预加载所有交易所的 symbol metas
@@ -331,13 +335,14 @@ impl Actor for ManagerActor {
             tracing::info!(exchange = "Hyperliquid", "ExchangeActor created");
         }
 
-        if let Some((ibkr_auth, ibkr_conids)) = ibkr_actor_data {
+        if let Some((ibkr_auth, ibkr_conids, ibkr_client)) = ibkr_actor_data {
             let ibkr_ref = IbkrActor::spawn_link_with_mailbox(
                 &actor_ref,
                 IbkrActorArgs {
                     auth: ibkr_auth,
                     income_pubsub: income_pubsub.clone(),
                     conids: ibkr_conids,
+                    client: ibkr_client,
                 },
                 mailbox::unbounded(),
             )

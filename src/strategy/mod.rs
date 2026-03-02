@@ -1,10 +1,12 @@
 mod funding_arb;
 mod metrics_subscriber;
 mod slack_notifier;
+mod spread_arb;
 
 pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
 pub use metrics_subscriber::{MetricsSubscriberActor, MetricsSubscriberArgs};
 pub use slack_notifier::{SlackNotifierActor, SlackNotifierArgs};
+pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy};
 
 use crate::domain::{Exchange, Order};
 use crate::exchange::SubscriptionKind;

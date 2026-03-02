@@ -30,6 +30,15 @@
       "max_account_leverage": 3.0,
       "deviation_threshold": 0.0005,
       "ioc_slippage": 0.001
+    },
+    "spread_arb": {
+      "symbols": ["AAPL", "NVDA"],
+      "open_threshold": 0.003,
+      "close_threshold": 0.001,
+      "order_usd_value": 500.0,
+      "max_leverage": 2.0,
+      "ioc_slippage": 0.001,
+      "order_timeout_ms": 5000
     }
   }
 }

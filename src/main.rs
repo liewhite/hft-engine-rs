@@ -8,7 +8,7 @@ use fee_arb::exchange::ibkr::IbkrCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::{
     FundingArbConfig, FundingArbStrategy, MetricsSubscriberActor, MetricsSubscriberArgs,
-    SlackNotifierActor, SlackNotifierArgs,
+    SlackNotifierActor, SlackNotifierArgs, SpreadArbConfig, SpreadArbStrategy,
 };
 use kameo::actor::Spawn;
 use kameo::mailbox;
@@ -39,6 +39,7 @@ impl ExchangesConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct StrategyConfig {
     funding_arb: FundingArbConfig,
+    spread_arb: Option<SpreadArbConfig>,
 }
 
 /// 监控配置
@@ -128,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
     let enabled_exchanges = config.exchanges.enabled_exchanges();
 
     // 批量创建所有策略
-    let strategies: Vec<Box<dyn fee_arb::strategy::Strategy>> = symbols
+    let mut strategies: Vec<Box<dyn fee_arb::strategy::Strategy>> = symbols
         .iter()
         .map(|symbol| {
             Box::new(FundingArbStrategy::new(
@@ -138,6 +139,24 @@ async fn main() -> anyhow::Result<()> {
             )) as Box<dyn fee_arb::strategy::Strategy>
         })
         .collect();
+
+    // SpreadArb 策略 (IBKR 股票 vs Hyperliquid 永续)
+    if let Some(ref spread_arb_config) = config.strategy.spread_arb {
+        if config.exchanges.ibkr.is_some() {
+            for symbol in &spread_arb_config.symbols {
+                strategies.push(Box::new(SpreadArbStrategy::new(
+                    spread_arb_config.clone(),
+                    symbol.clone(),
+                )));
+            }
+            tracing::info!(
+                count = spread_arb_config.symbols.len(),
+                "SpreadArb strategies created"
+            );
+        } else {
+            tracing::warn!("spread_arb configured but IBKR is not enabled, skipping");
+        }
+    }
 
     let strategy_count = strategies.len();
 

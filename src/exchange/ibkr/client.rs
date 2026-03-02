@@ -138,6 +138,71 @@ impl IbkrClient {
         &self.conids
     }
 
+    /// 获取持仓列表
+    ///
+    /// 调用 GET /portfolio/{accountId}/positions/0
+    /// 返回 Vec<Position>，仅包含已配置的 symbol
+    pub async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+        let base_url = self.auth.base_url();
+
+        // 先预热 portfolio accounts 缓存
+        let recv_url = format!("{}portfolio/accounts", base_url);
+        if let Err(e) = self.authed_request("GET", &recv_url)?.send().await {
+            tracing::warn!(error = %e, "IBKR portfolio/accounts prefetch failed");
+        }
+
+        let url = format!(
+            "{}portfolio/{}/positions/0",
+            base_url, self.account_id
+        );
+
+        let resp = self
+            .authed_request("GET", &url)?
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        // 构建 conid → symbol 反向映射
+        let conid_to_symbol: HashMap<i64, &str> = self
+            .conids
+            .iter()
+            .map(|(symbol, &conid)| (conid, symbol.as_str()))
+            .collect();
+
+        let empty = Vec::new();
+        let arr = body.as_array().unwrap_or(&empty);
+
+        let positions: Vec<crate::domain::Position> = arr
+            .iter()
+            .filter_map(|item| {
+                let conid = item.get("conid")?.as_i64()?;
+                let symbol = conid_to_symbol.get(&conid)?;
+                let size = item.get("position")?.as_f64()?;
+                let avg_cost = item
+                    .get("avgCost")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let unrealized_pnl = item
+                    .get("unrealizedPnl")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+
+                Some(crate::domain::Position {
+                    exchange: Exchange::IBKR,
+                    symbol: symbol.to_string(),
+                    size,
+                    entry_price: avg_cost,
+                    unrealized_pnl,
+                })
+            })
+            .collect();
+
+        tracing::debug!(count = positions.len(), "IBKR positions fetched");
+        Ok(positions)
+    }
+
     /// 构建带认证 header 的请求
     fn authed_request(
         &self,
