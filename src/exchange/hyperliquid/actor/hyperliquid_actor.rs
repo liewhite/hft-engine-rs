@@ -35,8 +35,6 @@ pub struct HyperliquidActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// 计价币种 (e.g., "USDC", "USDE")
     pub quote: String,
-    /// Perp DEX 名称 ("" = 默认 perp DEX)
-    pub dex: String,
 }
 
 /// HyperliquidActor - 父 Actor
@@ -69,9 +67,9 @@ impl Actor for HyperliquidActor {
                 &actor_ref,
                 HyperliquidPrivateWsActorArgs {
                     wallet_address: credentials.wallet_address,
+                    dex: credentials.dex,
                     income_pubsub: args.income_pubsub,
                     symbol_metas: args.symbol_metas,
-                    dex: args.dex,
                 },
                 mailbox::unbounded(),
             )
