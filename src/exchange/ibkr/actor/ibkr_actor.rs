@@ -28,6 +28,9 @@ use std::sync::Arc;
 /// IBKR 持仓轮询间隔 (毫秒)
 const POSITION_POLLING_INTERVAL_MS: u64 = 3000;
 
+/// 市场状态轮询间隔 (毫秒)
+const STATUS_POLLING_INTERVAL_MS: u64 = 60_000;
+
 /// IbkrActor 初始化参数
 pub struct IbkrActorArgs {
     /// 认证器 (共享，不可变)
@@ -46,6 +49,8 @@ pub struct IbkrActor {
     public_ws: ActorRef<IbkrPublicWsActor>,
     /// 持仓轮询 Actor
     _position_polling: ActorRef<IbkrPositionPollingActor>,
+    /// 市场状态轮询 Actor
+    _status_polling: ActorRef<IbkrStatusPollingActor>,
 }
 
 impl Actor for IbkrActor {
@@ -129,13 +134,13 @@ impl Actor for IbkrActor {
         .await;
         tracing::info!(exchange = "IBKR", "PositionPollingActor created");
 
-        // 5. 创建市场状态轮询 Actor (每 60 秒)
-        let _status_polling = IbkrStatusPollingActor::spawn_link_with_mailbox(
+        // 5. 创建市场状态轮询 Actor
+        let status_polling = IbkrStatusPollingActor::spawn_link_with_mailbox(
             &actor_ref,
             IbkrStatusPollingActorArgs {
                 client: args.client,
                 income_pubsub: income_pubsub.clone(),
-                interval_ms: 60_000,
+                interval_ms: STATUS_POLLING_INTERVAL_MS,
             },
             mailbox::unbounded(),
         )
@@ -147,6 +152,7 @@ impl Actor for IbkrActor {
         Ok(Self {
             public_ws,
             _position_polling: position_polling,
+            _status_polling: status_polling,
         })
     }
 

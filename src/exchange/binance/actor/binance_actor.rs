@@ -32,6 +32,9 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+/// 市场状态广播间隔 (毫秒)
+const STATUS_BROADCAST_INTERVAL_MS: u64 = 60_000;
+
 /// BinanceActor 初始化参数
 pub struct BinanceActorArgs {
     /// 凭证（可选）
@@ -150,7 +153,7 @@ impl Actor for BinanceActor {
             CryptoStatusActorArgs {
                 exchange: crate::domain::Exchange::Binance,
                 income_pubsub: args.income_pubsub,
-                interval_ms: 60_000,
+                interval_ms: STATUS_BROADCAST_INTERVAL_MS,
             },
             mailbox::unbounded(),
         )

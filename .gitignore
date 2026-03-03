@@ -18,3 +18,4 @@ tests/ibkr_config.json
 # OS
 .DS_Store
 *.pem
+ibkr_config.json

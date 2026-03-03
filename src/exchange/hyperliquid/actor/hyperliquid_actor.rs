@@ -25,6 +25,9 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
+/// 市场状态广播间隔 (毫秒)
+const STATUS_BROADCAST_INTERVAL_MS: u64 = 60_000;
+
 /// HyperliquidActor 初始化参数
 pub struct HyperliquidActorArgs {
     /// 凭证（可选）
@@ -88,7 +91,7 @@ impl Actor for HyperliquidActor {
             CryptoStatusActorArgs {
                 exchange: crate::domain::Exchange::Hyperliquid,
                 income_pubsub,
-                interval_ms: 60_000,
+                interval_ms: STATUS_BROADCAST_INTERVAL_MS,
             },
             mailbox::unbounded(),
         )

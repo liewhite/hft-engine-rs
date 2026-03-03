@@ -261,10 +261,8 @@ impl IbkrClient {
             let id = item.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
             let trade_venue_id = item.get("tradeVenueId").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-            let entry_schedules = item
-                .get("schedules")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
+            let entry_schedules = match item.get("schedules").and_then(|v| v.as_array()) {
+                Some(arr) => {
                     arr.iter()
                         .map(|entry| {
                             let sessions = entry
@@ -287,8 +285,12 @@ impl IbkrClient {
                             }
                         })
                         .collect()
-                })
-                .unwrap_or_default();
+                }
+                None => {
+                    tracing::warn!(item = %item, "IBKR schedule item missing 'schedules' array");
+                    Vec::new()
+                }
+            };
 
             schedules.push(TradingSchedule {
                 id,

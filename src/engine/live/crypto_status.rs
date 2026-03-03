@@ -1,7 +1,11 @@
 //! CryptoStatusActor - 加密货币交易所市场状态广播
 //!
-//! 加密货币交易所 7x24 运行，始终为 Liquid 状态。
+//! 加密货币交易所 7x24 运行，当前始终为 Liquid 状态。
 //! 定时发布 ExchangeStatus 事件，供策略层统一感知市场状态。
+//!
+//! 保留独立 Actor 的理由：
+//! - StateManager 默认 Closed（安全侧），需要主动"喂"状态以避免策略误判
+//! - 未来加密交易所可能有维护停机等非 Liquid 状态，届时可在此扩展判定逻辑
 
 use crate::domain::{now_ms, Exchange, MarketStatus};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
