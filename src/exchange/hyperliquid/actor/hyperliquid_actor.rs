@@ -13,7 +13,7 @@
 use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs};
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta};
-use crate::engine::IncomePubSub;
+use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::hyperliquid::HyperliquidCredentials;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
@@ -48,11 +48,13 @@ impl Actor for HyperliquidActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let income_pubsub = args.income_pubsub;
+
         // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
         let public_ws = HyperliquidPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             HyperliquidPublicWsActorArgs {
-                income_pubsub: args.income_pubsub.clone(),
+                income_pubsub: income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
@@ -68,7 +70,7 @@ impl Actor for HyperliquidActor {
                 HyperliquidPrivateWsActorArgs {
                     wallet_address: credentials.wallet_address,
                     dex: credentials.dex,
-                    income_pubsub: args.income_pubsub,
+                    income_pubsub: income_pubsub.clone(),
                     symbol_metas: args.symbol_metas,
                 },
                 mailbox::unbounded(),
@@ -79,6 +81,19 @@ impl Actor for HyperliquidActor {
         } else {
             false
         };
+
+        // 3. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
+        CryptoStatusActor::spawn_link_with_mailbox(
+            &actor_ref,
+            CryptoStatusActorArgs {
+                exchange: crate::domain::Exchange::Hyperliquid,
+                income_pubsub,
+                interval_ms: 60_000,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        tracing::info!(exchange = "Hyperliquid", "CryptoStatusActor created");
 
         tracing::info!(
             exchange = "Hyperliquid",

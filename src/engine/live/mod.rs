@@ -3,6 +3,7 @@
 //! 包含引擎中各个 Actor 的实现
 
 mod clock;
+mod crypto_status;
 mod manager;
 mod executor;
 mod income_processor;
@@ -19,6 +20,7 @@ pub type IncomePubSub = PubSub<IncomeEvent>;
 pub type OutcomePubSub = PubSub<OutcomeEvent>;
 
 pub use clock::{ClockActor, ClockActorArgs};
+pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
 pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome};
 pub use executor::{ExecutorActor, ExecutorArgs};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor};

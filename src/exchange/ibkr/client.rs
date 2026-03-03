@@ -228,6 +228,78 @@ impl IbkrClient {
         Ok(positions)
     }
 
+    /// 查询 AAPL 交易时间表
+    ///
+    /// 调用 GET /trsrv/secdef/schedule?assetClass=STK&symbol=AAPL
+    /// 返回交易时段列表，用于判断当前市场状态
+    pub async fn fetch_trading_schedule(&self) -> Result<Vec<TradingSchedule>, ExchangeError> {
+        let url = format!(
+            "{}trsrv/secdef/schedule?assetClass=STK&symbol=AAPL",
+            self.auth.base_url()
+        );
+
+        let resp = self
+            .authed_request("GET", &url)?
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        // 防御性解析：响应可能是数组或单个对象
+        let items = if let Some(arr) = body.as_array() {
+            arr.clone()
+        } else if body.is_object() {
+            vec![body]
+        } else {
+            tracing::warn!(body = %body, "IBKR schedule response unexpected format");
+            return Ok(Vec::new());
+        };
+
+        let mut schedules = Vec::new();
+        for item in &items {
+            let id = item.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let trade_venue_id = item.get("tradeVenueId").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            let entry_schedules = item
+                .get("schedules")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|entry| {
+                            let sessions = entry
+                                .get("sessions")
+                                .and_then(|v| v.as_array())
+                                .map(|sarr| {
+                                    sarr.iter()
+                                        .map(|s| TradingSession {
+                                            opening_time: s.get("openingTime").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                            closing_time: s.get("closingTime").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                            prop: s.get("prop").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
+                            ScheduleEntry {
+                                trading_schedule_date: entry.get("tradingScheduleDate").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                sessions,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            schedules.push(TradingSchedule {
+                id,
+                trade_venue_id,
+                schedules: entry_schedules,
+            });
+        }
+
+        Ok(schedules)
+    }
+
     /// 构建带认证 header 的请求
     fn authed_request(
         &self,
@@ -515,6 +587,35 @@ fn parse_snapshot_field(data: &serde_json::Value, field: &str) -> Option<f64> {
             .parse()
             .unwrap_or_else(|_| panic!("snapshot field {} 字符串无法解析为 f64: {}", field, v))
     }))
+}
+
+// ============================================================================
+// IBKR Trading Schedule 数据结构
+// ============================================================================
+
+/// IBKR 交易时间表
+pub struct TradingSchedule {
+    pub id: Option<String>,
+    pub trade_venue_id: Option<String>,
+    pub schedules: Vec<ScheduleEntry>,
+}
+
+/// 交易日程条目
+pub struct ScheduleEntry {
+    /// 交易日期 (格式: "YYYYMMDD")
+    pub trading_schedule_date: Option<String>,
+    /// 交易时段列表
+    pub sessions: Vec<TradingSession>,
+}
+
+/// 单个交易时段
+pub struct TradingSession {
+    /// 开盘时间 (格式: "YYYYMMDD-HH:mm:ss")
+    pub opening_time: Option<String>,
+    /// 收盘时间 (格式: "YYYYMMDD-HH:mm:ss")
+    pub closing_time: Option<String>,
+    /// 时段属性 (可能标识 session 类型)
+    pub prop: Option<String>,
 }
 
 /// 从 IBKR account summary 中提取数值字段

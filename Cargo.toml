@@ -33,6 +33,7 @@ rmp-serde = "1"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 
 # Error handling
 thiserror = "2"

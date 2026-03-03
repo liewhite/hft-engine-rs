@@ -1,4 +1,4 @@
-use crate::domain::{now_ms, Exchange, Symbol, USDT};
+use crate::domain::{now_ms, Exchange, MarketStatus, Symbol, USDT};
 use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
 use std::collections::HashMap;
 
@@ -12,6 +12,8 @@ pub struct StateManager {
     equities: HashMap<Exchange, f64>,
     /// 账户总持仓名义价值 (per exchange)
     account_notionals: HashMap<Exchange, f64>,
+    /// 交易所市场状态 (per exchange)
+    market_statuses: HashMap<Exchange, MarketStatus>,
     /// 订单超时时间 (毫秒)
     order_timeout_ms: u64,
 }
@@ -29,6 +31,7 @@ impl StateManager {
             balances: HashMap::new(),
             equities: HashMap::new(),
             account_notionals: HashMap::new(),
+            market_statuses: HashMap::new(),
             order_timeout_ms,
         }
     }
@@ -88,6 +91,14 @@ impl StateManager {
         self.account_notionals.values().sum()
     }
 
+    /// 获取指定交易所的市场状态（默认 Closed，安全侧）
+    pub fn market_status(&self, exchange: Exchange) -> MarketStatus {
+        self.market_statuses
+            .get(&exchange)
+            .copied()
+            .unwrap_or(MarketStatus::Closed)
+    }
+
     /// 检查指定 symbol 是否有未完成订单
     pub fn has_pending_orders(&self, symbol: &Symbol) -> bool {
         self.states
@@ -126,6 +137,10 @@ impl StateManager {
                 );
                 self.equities.insert(*exchange, *equity);
                 self.account_notionals.insert(*exchange, *notional);
+            }
+            // 全局事件: ExchangeStatus
+            ExchangeEventData::ExchangeStatus { exchange, status } => {
+                self.market_statuses.insert(*exchange, *status);
             }
             // 全局事件: Clock (检查订单超时)
             ExchangeEventData::Clock => {

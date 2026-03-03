@@ -1,6 +1,6 @@
 pub(crate) mod actor;
 pub mod auth;
-mod client;
+pub(crate) mod client;
 mod gateway;
 pub mod oauth;
 mod symbol;

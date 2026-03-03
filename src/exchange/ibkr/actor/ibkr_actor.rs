@@ -11,6 +11,7 @@
 
 use super::position_polling::{IbkrPositionPollingActor, IbkrPositionPollingActorArgs};
 use super::public_ws::{IbkrPublicWsActor, IbkrPublicWsActorArgs};
+use super::status_polling::{IbkrStatusPollingActor, IbkrStatusPollingActorArgs};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::ibkr::auth::{self, IbkrAuth};
 use crate::exchange::ibkr::IbkrClient;
@@ -119,7 +120,7 @@ impl Actor for IbkrActor {
         let position_polling = IbkrPositionPollingActor::spawn_link_with_mailbox(
             &actor_ref,
             IbkrPositionPollingActorArgs {
-                client: args.client,
+                client: args.client.clone(),
                 income_pubsub: income_pubsub.clone(),
                 interval_ms: POSITION_POLLING_INTERVAL_MS,
             },
@@ -127,6 +128,19 @@ impl Actor for IbkrActor {
         )
         .await;
         tracing::info!(exchange = "IBKR", "PositionPollingActor created");
+
+        // 5. 创建市场状态轮询 Actor (每 60 秒)
+        let _status_polling = IbkrStatusPollingActor::spawn_link_with_mailbox(
+            &actor_ref,
+            IbkrStatusPollingActorArgs {
+                client: args.client,
+                income_pubsub: income_pubsub.clone(),
+                interval_ms: 60_000,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        tracing::info!(exchange = "IBKR", "StatusPollingActor created");
 
         tracing::info!(exchange = "IBKR", "IbkrActor started");
 

@@ -17,7 +17,7 @@ use super::equity_polling::{BinanceEquityPollingActor, BinanceEquityPollingActor
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta, Timestamp};
-use crate::engine::IncomePubSub;
+use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::binance::{BinanceClient, BinanceCredentials};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::ExchangeClient;
@@ -136,13 +136,26 @@ impl Actor for BinanceActor {
             &actor_ref,
             BinanceEquityPollingActorArgs {
                 client: args.client,
-                income_pubsub: args.income_pubsub,
+                income_pubsub: args.income_pubsub.clone(),
                 interval_ms: 1000, // 每秒查询一次
             },
             mailbox::unbounded(),
         )
         .await;
         tracing::info!(exchange = "Binance", "EquityPollingActor created");
+
+        // 4. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
+        CryptoStatusActor::spawn_link_with_mailbox(
+            &actor_ref,
+            CryptoStatusActorArgs {
+                exchange: crate::domain::Exchange::Binance,
+                income_pubsub: args.income_pubsub,
+                interval_ms: 60_000,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        tracing::info!(exchange = "Binance", "CryptoStatusActor created");
 
         tracing::info!(
             exchange = "Binance",

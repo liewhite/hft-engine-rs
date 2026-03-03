@@ -13,7 +13,7 @@
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta};
-use crate::engine::IncomePubSub;
+use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::okx::OkxCredentials;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
@@ -48,11 +48,13 @@ impl Actor for OkxActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let income_pubsub = args.income_pubsub;
+
         // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
         let public_ws = OkxPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             OkxPublicWsActorArgs {
-                income_pubsub: args.income_pubsub.clone(),
+                income_pubsub: income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
@@ -67,7 +69,7 @@ impl Actor for OkxActor {
                 &actor_ref,
                 OkxPrivateWsActorArgs {
                     credentials,
-                    income_pubsub: args.income_pubsub,
+                    income_pubsub: income_pubsub.clone(),
                     symbol_metas: args.symbol_metas,
                 },
                 mailbox::unbounded(),
@@ -78,6 +80,19 @@ impl Actor for OkxActor {
         } else {
             false
         };
+
+        // 3. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
+        CryptoStatusActor::spawn_link_with_mailbox(
+            &actor_ref,
+            CryptoStatusActorArgs {
+                exchange: crate::domain::Exchange::OKX,
+                income_pubsub,
+                interval_ms: 60_000,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        tracing::info!(exchange = "OKX", "CryptoStatusActor created");
 
         tracing::info!(
             exchange = "OKX",
