@@ -192,7 +192,12 @@ impl PositionData {
             }
             0.0
         });
-        let unrealized_pnl = f64::from_str(&self.upl).unwrap_or(0.0);
+        let unrealized_pnl = f64::from_str(&self.upl).unwrap_or_else(|_| {
+            if !self.upl.is_empty() {
+                tracing::warn!(inst_id = %self.inst_id, upl = %self.upl, "Failed to parse OKX upl, defaulting to 0.0");
+            }
+            0.0
+        });
 
         Position {
             exchange: Exchange::OKX,
