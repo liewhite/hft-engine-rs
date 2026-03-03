@@ -19,3 +19,4 @@ tests/ibkr_config.json
 .DS_Store
 *.pem
 ibkr_config.json
+hype_config.json

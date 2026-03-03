@@ -218,10 +218,14 @@ pub struct ExchangeRequest {
 }
 
 /// 下单响应
+///
+/// 成功时: `{"status":"ok","response":{"type":"order","data":{...}}}`
+/// 失败时: `{"status":"err","response":"error message"}`
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrderResponse {
     pub status: String,
-    pub response: Option<OrderResponseData>,
+    /// 成功时为 OrderResponseData 对象，失败时为错误消息字符串
+    pub response: Option<serde_json::Value>,
 }
 
 /// 下单响应数据

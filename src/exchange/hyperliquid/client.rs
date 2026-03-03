@@ -10,7 +10,7 @@ use crate::exchange::utils::SignificantFiguresFormatter;
 use std::sync::Arc;
 use crate::exchange::hyperliquid::signing::{
     action_hash, create_signer, sign_l1_action, BulkOrderAction, ExchangeRequest, LimitOrder,
-    OrderResponse, OrderStatus, OrderType as WireOrderType, OrderWire,
+    OrderResponse, OrderResponseData, OrderStatus, OrderType as WireOrderType, OrderWire,
 };
 use crate::exchange::hyperliquid::{HyperliquidCredentials, REST_BASE_URL};
 use alloy::signers::local::PrivateKeySigner;
@@ -154,6 +154,40 @@ impl HyperliquidClient {
         Ok((meta, asset_ctxs))
     }
 
+    /// 获取非默认 DEX 的 asset index 偏移量
+    ///
+    /// 默认 perp DEX: offset = 0
+    /// Builder-deployed DEXes (如 xyz): offset = 110000 + i * 10000
+    ///   其中 i 为该 DEX 在 perpDexs 列表中的顺序（从 0 开始，跳过 null）
+    async fn get_dex_offset(&self) -> Result<u32, ExchangeError> {
+        if self.dex.is_empty() {
+            return Ok(0);
+        }
+
+        // 查询 perpDexs 列表
+        let dexes: Vec<Option<serde_json::Value>> = self
+            .post_info(serde_json::json!({"type": "perpDexs"}))
+            .await?;
+
+        // 找到我们的 DEX 在非 null 条目中的位置
+        let mut non_null_idx = 0u32;
+        for entry in &dexes {
+            if let Some(obj) = entry {
+                if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
+                    if name == self.dex {
+                        return Ok(110_000 + non_null_idx * 10_000);
+                    }
+                }
+                non_null_idx += 1;
+            }
+        }
+
+        Err(ExchangeError::Other(format!(
+            "DEX '{}' not found in perpDexs",
+            self.dex
+        )))
+    }
+
     /// 获取 coin 对应的 asset index
     async fn get_asset_index(&self, coin: &str) -> Result<u32, ExchangeError> {
         // 先检查缓存
@@ -166,13 +200,13 @@ impl HyperliquidClient {
             }
         }
 
-        // 需要加载 meta 数据
-        let meta = self.get_meta().await?;
+        // 需要加载 meta 数据和 DEX offset
+        let (meta, offset) = tokio::try_join!(self.get_meta(), self.get_dex_offset())?;
 
-        // 构建映射
+        // 构建映射（全局 asset index = offset + 数组位置）
         let mut map = HashMap::new();
         for (idx, asset) in meta.universe.iter().enumerate() {
-            map.insert(asset.name.clone(), idx as u32);
+            map.insert(asset.name.clone(), offset + idx as u32);
         }
 
         // 获取结果
@@ -204,9 +238,10 @@ impl HyperliquidClient {
             .await
             .map_err(Self::map_reqwest_error)?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+
+        if !status.is_success() {
             return Err(ExchangeError::ApiError(
                 Exchange::Hyperliquid,
                 status.as_u16() as i32,
@@ -214,7 +249,12 @@ impl HyperliquidClient {
             ));
         }
 
-        resp.json::<T>().await.map_err(Self::map_reqwest_error)
+        serde_json::from_str::<T>(&text).map_err(|e| {
+            ExchangeError::Other(format!(
+                "Failed to parse exchange response: {} (body: {})",
+                e, text
+            ))
+        })
     }
 
     /// 将 domain Order 转换为 OrderWire
@@ -284,6 +324,7 @@ impl ExchangeClient for HyperliquidClient {
 
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         let meta = self.get_meta().await?;
+        let has_dex = !self.dex.is_empty();
 
         let metas: Vec<SymbolMeta> = meta
             .universe
@@ -291,9 +332,12 @@ impl ExchangeClient for HyperliquidClient {
             .filter(|a| {
                 // 过滤条件:
                 // 1. 未下架
-                // 2. 不带冒号 (带冒号是其他类型资产如 "xyz:NVDA")
+                // 2. 默认 DEX 时排除带冒号的 asset (属于其他 DEX 如 "xyz:NVDA")
+                //    非默认 DEX 时不过滤冒号 (API 已按 DEX 筛选)
                 // 3. 支持全仓保证金 (排除 strictIsolated 和 noCross)
-                !a.is_delisted && !a.name.contains(':') && a.supports_cross_margin()
+                !a.is_delisted
+                    && (has_dex || !a.name.contains(':'))
+                    && a.supports_cross_margin()
             })
             .map(|a| asset_info_to_symbol_meta(&a))
             .collect();
@@ -347,19 +391,27 @@ impl ExchangeClient for HyperliquidClient {
         // 发送请求
         let response: OrderResponse = self.post_exchange(&request).await?;
 
-        // 解析响应
+        // 解析响应 — 错误时 response 是字符串，成功时是 OrderResponseData 对象
         if response.status != "ok" {
+            let error_msg = response
+                .response
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| format!("status={}", response.status));
             return Err(ExchangeError::Other(format!(
-                "Order rejected: status={}",
-                response.status
+                "Order rejected: {}",
+                error_msg
             )));
         }
 
         // 提取订单 ID
-        let data = response
+        let resp_value = response
             .response
-            .and_then(|r| r.data)
             .ok_or_else(|| ExchangeError::Other("Empty order response".to_string()))?;
+        let resp_data: OrderResponseData = serde_json::from_value(resp_value)
+            .map_err(|e| ExchangeError::Other(format!("Failed to parse order response: {}", e)))?;
+        let data = resp_data
+            .data
+            .ok_or_else(|| ExchangeError::Other("Empty order response data".to_string()))?;
 
         if data.statuses.is_empty() {
             return Err(ExchangeError::Other("No order status returned".to_string()));
