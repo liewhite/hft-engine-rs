@@ -186,7 +186,12 @@ impl PositionData {
         let pos_amount = f64::from_str(&self.pos)
             .unwrap_or_else(|_| panic!("Failed to parse position amount: {}", self.pos));
         // 以下字段可能为空字符串，使用默认值
-        let avg_price = f64::from_str(&self.avg_px).unwrap_or(0.0);
+        let avg_price = f64::from_str(&self.avg_px).unwrap_or_else(|_| {
+            if !self.avg_px.is_empty() {
+                tracing::warn!(inst_id = %self.inst_id, avg_px = %self.avg_px, "Failed to parse OKX avg_px, defaulting to 0.0");
+            }
+            0.0
+        });
         let unrealized_pnl = f64::from_str(&self.upl).unwrap_or(0.0);
 
         Position {

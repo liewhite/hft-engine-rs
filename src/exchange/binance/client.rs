@@ -269,8 +269,14 @@ impl BinanceClient {
                 if size.abs() < 1e-10 {
                     return None;
                 }
-                let entry_price: f64 = p.entry_price.parse().unwrap_or(0.0);
-                let unrealized_pnl: f64 = p.un_realized_profit.parse().unwrap_or(0.0);
+                let entry_price: f64 = p.entry_price.parse().unwrap_or_else(|_| {
+                    tracing::warn!(symbol = %p.symbol, entry_price = %p.entry_price, "Failed to parse Binance entry_price, defaulting to 0.0");
+                    0.0
+                });
+                let unrealized_pnl: f64 = p.un_realized_profit.parse().unwrap_or_else(|_| {
+                    tracing::warn!(symbol = %p.symbol, un_realized_profit = %p.un_realized_profit, "Failed to parse Binance un_realized_profit, defaulting to 0.0");
+                    0.0
+                });
 
                 Some(crate::domain::Position {
                     exchange: Exchange::Binance,

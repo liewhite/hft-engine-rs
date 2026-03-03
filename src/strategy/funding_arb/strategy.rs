@@ -358,22 +358,29 @@ impl FundingArbStrategy {
         state: &SymbolState,
         state_manager: &StateManager,
     ) {
-        // 计算两边交易所的账户杠杆率
         let short_equity = state_manager.equity(signal.short_exchange);
-        let short_notional = state_manager.account_notional(signal.short_exchange);
-        let short_leverage = if short_equity > 0.0 {
-            short_notional / short_equity
-        } else {
-            0.0
-        };
-
         let long_equity = state_manager.equity(signal.long_exchange);
+
+        if short_equity <= 0.0 || long_equity <= 0.0 {
+            tracing::warn!(
+                symbol = %self.symbol,
+                short_exchange = %signal.short_exchange,
+                short_equity = short_equity,
+                long_exchange = %signal.long_exchange,
+                long_equity = long_equity,
+                "Account leverage check: insufficient equity"
+            );
+            signal.long_size = 0.0;
+            signal.short_size = 0.0;
+            return;
+        }
+
+        // 计算两边交易所的账户杠杆率
+        let short_notional = state_manager.account_notional(signal.short_exchange);
+        let short_leverage = short_notional / short_equity;
+
         let long_notional = state_manager.account_notional(signal.long_exchange);
-        let long_leverage = if long_equity > 0.0 {
-            long_notional / long_equity
-        } else {
-            0.0
-        };
+        let long_leverage = long_notional / long_equity;
 
         // 获取当前 symbol 在各交易所的仓位
         let short_pos = state
@@ -517,12 +524,13 @@ impl FundingArbStrategy {
         }
 
         // 获取价格计算敞口价值
-        let price = state
-            .bbos
-            .values()
-            .next()
-            .map(|bbo| bbo.mid_price())
-            .unwrap_or(0.0);
+        let price = match state.bbos.values().next() {
+            Some(bbo) => bbo.mid_price(),
+            None => {
+                tracing::error!(symbol = %self.symbol, "BBO unavailable during rebalance check, cannot assess exposure value");
+                return None;
+            }
+        };
 
         let exposure_value = exposure.abs() * price;
 

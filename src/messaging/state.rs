@@ -182,38 +182,6 @@ impl SymbolState {
         (long_size, short_size)
     }
 
-    /// 计算净敞口 (net exposure)
-    ///
-    /// 返回 (净持仓量, 估算价格):
-    /// - 净持仓量: 正数表示净多头，负数表示净空头，0 表示完全对冲或无持仓
-    /// - 估算价格: 用于计算敞口价值
-    pub fn net_exposure(&self) -> (f64, f64) {
-        let positions: Vec<_> = self.positions.values()
-            .filter(|p| !p.is_empty())
-            .collect();
-
-        if positions.is_empty() {
-            return (0.0, 0.0);
-        }
-
-        // 计算净持仓 (size 本身带符号：正数多头，负数空头)
-        let net_position: f64 = positions.iter().map(|p| p.size).sum();
-
-        // 估算价格：使用 entry_price
-        let price = positions
-            .iter()
-            .find_map(|p| {
-                if p.entry_price > 0.0 {
-                    Some(p.entry_price)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0.0);
-
-        (net_position, price)
-    }
-
     /// 更新状态
     ///
     /// 如果事件的 symbol 与 state 的 symbol 不一致，则忽略该事件
