@@ -206,7 +206,10 @@ impl IbkrClient {
             let avg_cost = item
                 .get("avgCost")
                 .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+                .unwrap_or_else(|| {
+                    tracing::warn!(symbol = %symbol, item = %item, "IBKR position missing/invalid avgCost");
+                    0.0
+                });
             let unrealized_pnl = item
                 .get("unrealizedPnl")
                 .and_then(|v| v.as_f64())

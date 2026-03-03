@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http};
 
 /// IbkrPublicWsActor 初始化参数
 pub struct IbkrPublicWsActorArgs {
@@ -173,10 +174,10 @@ impl Actor for IbkrPublicWsActor {
         let ws_url = args.auth.ws_url();
         let connector = args.auth.ws_connector();
         let cookie = args.auth.format_ws_cookie(&args.session_id);
-        let uri: tokio_tungstenite::tungstenite::http::Uri = ws_url.parse().expect("Invalid WS URL");
+        let uri: http::Uri = ws_url.parse().expect("Invalid WS URL");
         let host = uri.host().expect("WS URL missing host");
-        let ws_key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
-        let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
+        let ws_key = generate_key();
+        let ws_request = http::Request::builder()
             .uri(&ws_url)
             .header("Host", host)
             .header("Connection", "Upgrade")
@@ -373,7 +374,7 @@ fn parse_ib_number(v: &serde_json::Value) -> Option<f64> {
             match cleaned.parse::<f64>() {
                 Ok(n) => Some(n),
                 Err(_) => {
-                    tracing::trace!(raw = %s, "Failed to parse IB number");
+                    tracing::warn!(raw = %s, "Failed to parse IB number");
                     None
                 }
             }
