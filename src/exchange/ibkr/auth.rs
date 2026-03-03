@@ -8,6 +8,7 @@ pub async fn tickle(auth: &dyn IbkrAuth, http: &reqwest::Client) -> anyhow::Resu
     let tickle_url = format!("{}tickle", auth.base_url());
     let resp = auth
         .authed_request(http, "POST", &tickle_url)?
+        .header("Content-Length", "0")
         .send()
         .await?;
     if !resp.status().is_success() {

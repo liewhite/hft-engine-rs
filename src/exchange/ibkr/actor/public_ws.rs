@@ -169,12 +169,20 @@ impl Actor for IbkrPublicWsActor {
             .map(|(s, c)| (*c, s.clone()))
             .collect();
 
-        // 连接 WebSocket (需要 Cookie + User-Agent header)
+        // 连接 WebSocket (需要 Cookie + User-Agent + 标准 WebSocket 握手 header)
         let ws_url = args.auth.ws_url();
         let connector = args.auth.ws_connector();
         let cookie = args.auth.format_ws_cookie(&args.session_id);
+        let uri: tokio_tungstenite::tungstenite::http::Uri = ws_url.parse().expect("Invalid WS URL");
+        let host = uri.host().expect("WS URL missing host");
+        let ws_key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
         let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
             .uri(&ws_url)
+            .header("Host", host)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", &ws_key)
             .header("Cookie", &cookie)
             .header("User-Agent", "ClientPortalGW/1")
             .body(())
