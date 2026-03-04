@@ -1,8 +1,9 @@
-//! IbkrPublicWsActor - 管理 IBKR 公开 WebSocket 连接
+//! IbkrPublicWsActor - 管理 IBKR WebSocket 连接
 //!
 //! 职责:
 //! - 维护 WebSocket 连接
-//! - 处理 BBO 订阅 (其他类型静默忽略)
+//! - 处理 BBO 订阅 (smd topic)
+//! - 处理订单状态推送 (sor topic)
 //! - 增量更新 bid/ask 缓存并发布 BBO 到 IncomePubSub
 
 use crate::domain::{now_ms, Exchange, OrderStatus, OrderUpdate, Side, BBO};
@@ -206,7 +207,15 @@ impl IbkrPublicWsActor {
                 None => continue,
             };
 
+            let filled_qty = item
+                .get("filledQuantity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+
             let status = match ib_status {
+                "Submitted" if filled_qty > 0.0 => {
+                    OrderStatus::PartiallyFilled { filled: filled_qty }
+                }
                 "PendingSubmit" | "PreSubmitted" | "Submitted" => OrderStatus::Pending,
                 "Filled" => OrderStatus::Filled,
                 "Cancelled" => OrderStatus::Cancelled,
@@ -240,15 +249,14 @@ impl IbkrPublicWsActor {
                 }
             };
 
-            let filled_qty = item
-                .get("filledQuantity")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-
             let side_str = item.get("side").and_then(|v| v.as_str()).unwrap_or("");
             let side = match side_str {
                 "BUY" | "B" => Side::Long,
-                _ => Side::Short,
+                "SELL" | "S" => Side::Short,
+                other => {
+                    tracing::warn!(side = other, order_ref, "IBKR unknown order side, skipping");
+                    continue;
+                }
             };
 
             tracing::info!(

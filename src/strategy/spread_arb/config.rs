@@ -57,5 +57,9 @@ impl SpreadArbConfig {
             self.order_timeout_ms > 0,
             "SpreadArbConfig: order_timeout_ms must be > 0",
         );
+        assert!(
+            self.bbo_staleness_ms > 0,
+            "SpreadArbConfig: bbo_staleness_ms must be > 0",
+        );
     }
 }
