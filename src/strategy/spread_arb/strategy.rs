@@ -9,6 +9,9 @@ use super::config::SpreadArbConfig;
 /// 仓位比较的 epsilon（用于判断仓位是否为零）
 const POSITION_EPSILON: f64 = 1e-10;
 
+/// 最小下单数量（IBKR 股票最小单位 1 股）
+const MIN_ORDER_QTY: f64 = 1.0;
+
 /// IBKR 股票 vs Hyperliquid 永续合约的价差套利策略 (单 symbol)
 ///
 /// 策略逻辑：
@@ -79,7 +82,7 @@ impl SpreadArbStrategy {
         if ibkr_wrong {
             // IBKR 意外空头 → 买入平仓
             let qty = ibkr_pos.abs().floor();
-            if qty >= 1.0 {
+            if qty >= MIN_ORDER_QTY {
                 let price = ibkr_ask * (1.0 + self.config.ioc_slippage);
                 orders.push(OutcomeEvent::PlaceOrder {
                     order: Order {
@@ -96,8 +99,8 @@ impl SpreadArbStrategy {
                         client_order_id: String::new(),
                     },
                     comment: format!(
-                        "emergency_flatten | ibkr_pos={:.4} | qty={:.4}",
-                        ibkr_pos, qty,
+                        "emergency_flatten | ibkr_pos={:.4} | qty={:.4} | price={:.4}",
+                        ibkr_pos, qty, price,
                     ),
                 });
             }
@@ -106,7 +109,7 @@ impl SpreadArbStrategy {
         if hl_wrong {
             // HL 意外多头 → 卖出平仓
             let qty = hl_pos.floor();
-            if qty >= 1.0 {
+            if qty >= MIN_ORDER_QTY {
                 let price = hl_bid * (1.0 - self.config.ioc_slippage);
                 orders.push(OutcomeEvent::PlaceOrder {
                     order: Order {
@@ -123,11 +126,20 @@ impl SpreadArbStrategy {
                         client_order_id: String::new(),
                     },
                     comment: format!(
-                        "emergency_flatten | hl_pos={:.4} | qty={:.4}",
-                        hl_pos, qty,
+                        "emergency_flatten | hl_pos={:.4} | qty={:.4} | price={:.4}",
+                        hl_pos, qty, price,
                     ),
                 });
             }
+        }
+
+        if orders.is_empty() {
+            tracing::warn!(
+                symbol = %self.symbol,
+                ibkr_pos,
+                hl_pos,
+                "SpreadArb: abnormal position detected but qty < 1, strategy halted"
+            );
         }
 
         Some(orders)
@@ -148,7 +160,7 @@ impl SpreadArbStrategy {
         // 理想状态: ibkr_pos == hl_pos.abs()
         let exposure = ibkr_pos - hl_pos.abs();
 
-        if exposure.abs() < 1.0 {
+        if exposure.abs() < MIN_ORDER_QTY {
             // 股票最小单位 1 股，差异不足 1 股无需 rebalance
             return vec![];
         }
@@ -156,7 +168,7 @@ impl SpreadArbStrategy {
         if exposure > 0.0 {
             // IBKR 多头多了，需要卖出 IBKR 多余的部分
             let rebal_qty = exposure.floor();
-            if rebal_qty < 1.0 {
+            if rebal_qty < MIN_ORDER_QTY {
                 return vec![];
             }
 
@@ -193,7 +205,7 @@ impl SpreadArbStrategy {
         } else {
             // HL 空头多了，需要买入 HL 平掉多余的部分
             let rebal_qty = exposure.abs().floor();
-            if rebal_qty < 1.0 {
+            if rebal_qty < MIN_ORDER_QTY {
                 return vec![];
             }
 
@@ -316,8 +328,8 @@ impl Strategy for SpreadArbStrategy {
 
         // === 步骤 2: 平仓 ===
         if has_position && spread < self.config.close_threshold {
-            let close_qty = ibkr_pos.min(hl_pos.abs());
-            if close_qty < POSITION_EPSILON {
+            let close_qty = ibkr_pos.min(hl_pos.abs()).floor();
+            if close_qty < MIN_ORDER_QTY {
                 return vec![];
             }
 
@@ -398,7 +410,7 @@ impl Strategy for SpreadArbStrategy {
             // IBKR 股票最小单位 1 股，向下取整
             // HL 永续合约两边使用相同数量（股数），具体精度由交易所下单时校验
             let qty = (self.config.order_usd_value / ibkr_bbo.ask_price).floor();
-            if qty < 1.0 {
+            if qty < MIN_ORDER_QTY {
                 return vec![];
             }
 
