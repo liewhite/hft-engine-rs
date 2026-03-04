@@ -23,6 +23,7 @@ pub struct SpreadArbStrategy {
 
 impl SpreadArbStrategy {
     pub fn new(config: SpreadArbConfig, symbol: Symbol) -> Self {
+        config.validate();
         Self { config, symbol }
     }
 
@@ -45,6 +46,91 @@ impl SpreadArbStrategy {
             return f64::MAX;
         }
         position_value / hl_equity
+    }
+
+    /// 检测仓位方向异常，紧急平仓
+    ///
+    /// 正常状态下 IBKR 应为多头(>=0)，HL 应为空头(<=0)。
+    /// 如果出现反方向仓位（IBKR 空头或 HL 多头），说明系统异常，
+    /// 立即生成 reduce_only 平仓单，阻止后续正常逻辑执行。
+    fn emergency_flatten(
+        &self,
+        ibkr_pos: f64,
+        hl_pos: f64,
+        ibkr_ask: f64,
+        hl_bid: f64,
+    ) -> Option<Vec<OutcomeEvent>> {
+        let ibkr_wrong = ibkr_pos < -POSITION_EPSILON;
+        let hl_wrong = hl_pos > POSITION_EPSILON;
+
+        if !ibkr_wrong && !hl_wrong {
+            return None;
+        }
+
+        tracing::error!(
+            symbol = %self.symbol,
+            ibkr_pos,
+            hl_pos,
+            "SpreadArb: EMERGENCY — unexpected position direction, flattening"
+        );
+
+        let mut orders = Vec::new();
+
+        if ibkr_wrong {
+            // IBKR 意外空头 → 买入平仓
+            let qty = ibkr_pos.abs().floor();
+            if qty >= 1.0 {
+                let price = ibkr_ask * (1.0 + self.config.ioc_slippage);
+                orders.push(OutcomeEvent::PlaceOrder {
+                    order: Order {
+                        id: String::new(),
+                        exchange: Exchange::IBKR,
+                        symbol: self.symbol.clone(),
+                        side: Side::Long,
+                        order_type: OrderType::Limit {
+                            price,
+                            tif: TimeInForce::IOC,
+                        },
+                        quantity: qty,
+                        reduce_only: true,
+                        client_order_id: String::new(),
+                    },
+                    comment: format!(
+                        "emergency_flatten | ibkr_pos={:.4} | qty={:.4}",
+                        ibkr_pos, qty,
+                    ),
+                });
+            }
+        }
+
+        if hl_wrong {
+            // HL 意外多头 → 卖出平仓
+            let qty = hl_pos.floor();
+            if qty >= 1.0 {
+                let price = hl_bid * (1.0 - self.config.ioc_slippage);
+                orders.push(OutcomeEvent::PlaceOrder {
+                    order: Order {
+                        id: String::new(),
+                        exchange: Exchange::Hyperliquid,
+                        symbol: self.symbol.clone(),
+                        side: Side::Short,
+                        order_type: OrderType::Limit {
+                            price,
+                            tif: TimeInForce::IOC,
+                        },
+                        quantity: qty,
+                        reduce_only: true,
+                        client_order_id: String::new(),
+                    },
+                    comment: format!(
+                        "emergency_flatten | hl_pos={:.4} | qty={:.4}",
+                        hl_pos, qty,
+                    ),
+                });
+            }
+        }
+
+        Some(orders)
     }
 
     /// 检查两腿敞口是否需要 rebalance
@@ -107,7 +193,7 @@ impl SpreadArbStrategy {
         } else {
             // HL 空头多了，需要买入 HL 平掉多余的部分
             let rebal_qty = exposure.abs().floor();
-            if rebal_qty < POSITION_EPSILON {
+            if rebal_qty < 1.0 {
                 return vec![];
             }
 
@@ -197,7 +283,17 @@ impl Strategy for SpreadArbStrategy {
             .map(|p| p.size)
             .unwrap_or(0.0);
 
-        let has_position = ibkr_pos > POSITION_EPSILON || hl_pos < -POSITION_EPSILON;
+        // === 步骤 0: 仓位方向守卫 ===
+        if let Some(emergency_orders) = self.emergency_flatten(
+            ibkr_pos,
+            hl_pos,
+            ibkr_bbo.ask_price,
+            hl_bbo.bid_price,
+        ) {
+            return emergency_orders;
+        }
+
+        let has_position = ibkr_pos.abs() > POSITION_EPSILON || hl_pos.abs() > POSITION_EPSILON;
 
         // === 步骤 1: 敞口 rebalance 优先 ===
         if has_position {

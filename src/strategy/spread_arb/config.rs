@@ -20,3 +20,34 @@ pub struct SpreadArbConfig {
     /// 订单超时 (ms)
     pub order_timeout_ms: u64,
 }
+
+impl SpreadArbConfig {
+    /// 启动时校验配置参数合法性，不合法则 panic (fail-fast)
+    pub fn validate(&self) {
+        assert!(
+            self.open_threshold > self.close_threshold,
+            "SpreadArbConfig: open_threshold ({}) must be > close_threshold ({})",
+            self.open_threshold,
+            self.close_threshold,
+        );
+        assert!(
+            self.ioc_slippage >= 0.0,
+            "SpreadArbConfig: ioc_slippage ({}) must be >= 0.0",
+            self.ioc_slippage,
+        );
+        assert!(
+            self.max_leverage > 0.0,
+            "SpreadArbConfig: max_leverage ({}) must be > 0.0",
+            self.max_leverage,
+        );
+        assert!(
+            self.order_usd_value > 0.0,
+            "SpreadArbConfig: order_usd_value ({}) must be > 0.0",
+            self.order_usd_value,
+        );
+        assert!(
+            self.order_timeout_ms > 0,
+            "SpreadArbConfig: order_timeout_ms must be > 0",
+        );
+    }
+}
