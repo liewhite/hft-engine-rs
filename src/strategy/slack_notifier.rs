@@ -98,13 +98,6 @@ impl SlackNotifierActor {
         side: Side,
         filled_qty: f64,
     ) -> String {
-        let exchange_name = match exchange {
-            Exchange::Binance => "Binance",
-            Exchange::OKX => "OKX",
-            Exchange::Hyperliquid => "Hyperliquid",
-            Exchange::IBKR => "IBKR",
-        };
-
         let (side_emoji, side_name) = match side {
             Side::Long => (":chart_with_upwards_trend:", "Long"),
             Side::Short => (":chart_with_downwards_trend:", "Short"),
@@ -112,7 +105,7 @@ impl SlackNotifierActor {
 
         format!(
             ":white_check_mark: *Order Filled*\n• Exchange: {}\n• Symbol: {}\n• Side: {} {}\n• Filled: {:.4}",
-            exchange_name, symbol, side_emoji, side_name, filled_qty
+            exchange, symbol, side_emoji, side_name, filled_qty
         )
     }
 
@@ -121,13 +114,6 @@ impl SlackNotifierActor {
         let mut lines = vec![format!(":outbox_tray: *Signal: {}*", comment)];
 
         for order in orders {
-            let exchange_name = match order.exchange {
-                Exchange::Binance => "Binance",
-                Exchange::OKX => "OKX",
-                Exchange::Hyperliquid => "Hyperliquid",
-                Exchange::IBKR => "IBKR",
-            };
-
             let (side_emoji, side_name) = match order.side {
                 Side::Long => (":chart_with_upwards_trend:", "Long"),
                 Side::Short => (":chart_with_downwards_trend:", "Short"),
@@ -140,7 +126,7 @@ impl SlackNotifierActor {
 
             lines.push(format!(
                 "  • {} {} {} {} {:.4} @ {}",
-                exchange_name, order.symbol, side_emoji, side_name, order.quantity, price,
+                order.exchange, order.symbol, side_emoji, side_name, order.quantity, price,
             ));
         }
 

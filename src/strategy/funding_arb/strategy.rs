@@ -766,7 +766,7 @@ impl Strategy for FundingArbStrategy {
             let (order, comment) = self.make_rebalance_order(symbol_state, exchange, qty)?;
             return Some(OutcomeEvent::PlaceOrders {
                 orders: vec![order],
-                comment: format!("rebal | {}", comment),
+                comment,
             });
         }
 

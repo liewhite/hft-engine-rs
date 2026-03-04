@@ -14,6 +14,9 @@ pub struct SpreadArbStatsArgs {
 }
 
 /// 统计中心 — 订阅 IncomeEvent + OutcomeEvent，维护双边账户状态
+///
+/// equities/positions/prices 状态当前仅维护，待 DB writer 就绪后用于
+/// 定时快照和信号/成交记录的上下文关联。
 pub struct SpreadArbStatsActor {
     /// 策略跟踪的 symbols
     symbols: HashSet<Symbol>,

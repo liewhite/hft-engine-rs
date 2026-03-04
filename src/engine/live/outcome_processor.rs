@@ -1,4 +1,4 @@
-//! SignalProcessorActor - 处理策略信号并执行下单
+//! OutcomeProcessorActor - 处理策略信号并执行下单
 //!
 //! 订阅 OutcomePubSub 接收策略信号，调用交易所 REST API 执行订单
 
@@ -16,15 +16,15 @@ use std::sync::Arc;
 
 use super::IncomePubSub;
 
-/// SignalProcessorActor 初始化参数
-pub struct SignalProcessorArgs {
+/// OutcomeProcessorActor 初始化参数
+pub struct OutcomeProcessorArgs {
     /// 交易所客户端映射
     pub clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
     /// Income PubSub（用于发布下单失败事件）
     pub income_pubsub: ActorRef<IncomePubSub>,
 }
 
-/// SignalProcessorActor - 处理交易信号
+/// OutcomeProcessorActor - 处理策略信号并执行下单
 pub struct OutcomeProcessorActor {
     /// 交易所客户端
     clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
@@ -33,11 +33,11 @@ pub struct OutcomeProcessorActor {
 }
 
 impl Actor for OutcomeProcessorActor {
-    type Args = SignalProcessorArgs;
+    type Args = OutcomeProcessorArgs;
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        tracing::info!("SignalProcessorActor started");
+        tracing::info!("OutcomeProcessorActor started");
         Ok(Self {
             clients: args.clients,
             income_pubsub: args.income_pubsub,
@@ -49,7 +49,7 @@ impl Actor for OutcomeProcessorActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
-        tracing::info!("SignalProcessorActor stopped");
+        tracing::info!("OutcomeProcessorActor stopped");
         Ok(())
     }
 }
@@ -66,6 +66,8 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
     ) -> Self::Reply {
         match msg {
             OutcomeEvent::PlaceOrders { orders, comment } => {
+                // 关联订单独立并行下单：IOC 订单本身接受部分成交，
+                // 敞口由策略层 rebalance 机制兜底修正。
                 for order in orders {
                     let client = match self.clients.get(&order.exchange) {
                         Some(e) => e.clone(),

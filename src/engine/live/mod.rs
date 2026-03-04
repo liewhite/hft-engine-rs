@@ -24,4 +24,4 @@ pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
 pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome};
 pub use executor::{ExecutorActor, ExecutorArgs};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor};
-pub use outcome_processor::{OutcomeProcessorActor, SignalProcessorArgs};
+pub use outcome_processor::{OutcomeProcessorActor, OutcomeProcessorArgs};

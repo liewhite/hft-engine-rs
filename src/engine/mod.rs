@@ -5,6 +5,6 @@ pub use live::{
     CryptoStatusActor, CryptoStatusActorArgs,
     ExecutorActor, ExecutorArgs,
     GetAllSymbolMetas, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
-    OutcomePubSub, OutcomeProcessorActor, RegisterExecutor, SignalProcessorArgs, Stop,
+    OutcomePubSub, OutcomeProcessorActor, RegisterExecutor, OutcomeProcessorArgs, Stop,
     SubscribeIncome, SubscribeOutcome,
 };

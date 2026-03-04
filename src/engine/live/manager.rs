@@ -9,7 +9,7 @@
 use super::{
     ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
     IncomeProcessorActor, OutcomePubSub, OutcomeProcessorActor, RegisterExecutor,
-    SignalProcessorArgs,
+    OutcomeProcessorArgs,
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{
@@ -246,10 +246,10 @@ impl Actor for ManagerActor {
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
-        // 5. 创建 SignalProcessorActor 并订阅 outcome_pubsub
+        // 5. 创建 OutcomeProcessorActor 并订阅 outcome_pubsub
         let _signal_processor = OutcomeProcessorActor::spawn_link_with_mailbox(
             &actor_ref,
-            SignalProcessorArgs {
+            OutcomeProcessorArgs {
                 clients: clients.clone(),
                 income_pubsub: income_pubsub.clone(),
             },
