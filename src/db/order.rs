@@ -15,16 +15,12 @@ pub struct Model {
     pub client_order_id: String,
     #[sea_orm(column_type = "String(StringLen::N(100))", nullable)]
     pub external_order_id: Option<String>,
-    #[sea_orm(column_type = "String(StringLen::N(10))")]
-    pub side: String,
+    pub side: super::enums::DbSide,
     pub quantity: f64,
     pub price: f64,
-    #[sea_orm(column_type = "String(StringLen::N(20))")]
-    pub order_type: String,
-    #[sea_orm(column_type = "String(StringLen::N(10))")]
-    pub time_in_force: String,
-    #[sea_orm(column_type = "String(StringLen::N(20))")]
-    pub status: String,
+    pub order_type: super::enums::DbOrderType,
+    pub time_in_force: super::enums::DbTimeInForce,
+    pub status: super::enums::DbOrderStatus,
     pub filled_qty: f64,
     pub avg_price: f64,
     #[sea_orm(column_type = "Text", nullable)]

@@ -10,10 +10,8 @@ pub struct Model {
     pub perp_symbol: String,
     #[sea_orm(column_type = "String(StringLen::N(50))")]
     pub spot_symbol: String,
-    #[sea_orm(column_type = "String(StringLen::N(20))")]
-    pub signal_type: String,
-    #[sea_orm(column_type = "String(StringLen::N(50))")]
-    pub direction: String,
+    pub signal_type: super::enums::SignalType,
+    pub direction: super::enums::Direction,
     pub perp_bid: f64,
     pub perp_ask: f64,
     pub spot_bid: f64,

@@ -1,5 +1,8 @@
+use crate::db::enums::{
+    DbOrderStatus, DbOrderType, DbSide, DbTimeInForce, Direction, SignalType,
+};
 use crate::db::{fill as db_fill, order as db_order, signal as db_signal};
-use crate::domain::{Exchange, OrderStatus, OrderType, Side, Symbol};
+use crate::domain::{Exchange, OrderStatus, OrderType, Symbol};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -18,6 +21,8 @@ pub struct SpreadArbStatsArgs {
 }
 
 /// 统计中心 — 订阅 IncomeEvent + OutcomeEvent，持久化信号/订单/成交
+///
+/// 单 actor 顺序处理所有事件，DB 读写不存在并发竞态。
 pub struct SpreadArbStatsActor {
     /// 策略跟踪的 symbols
     symbols: HashSet<Symbol>,
@@ -36,65 +41,11 @@ impl SpreadArbStatsActor {
         matches!(exchange, Exchange::IBKR | Exchange::Hyperliquid)
     }
 
-    /// 从 comment 前缀提取 signal_type
-    fn parse_signal_type(comment: &str) -> &'static str {
-        if comment.starts_with("spread_open") {
-            "open"
-        } else if comment.starts_with("spread_close") {
-            "close"
-        } else if comment.starts_with("spread_rebal") {
-            "rebalance"
-        } else {
-            "unknown"
-        }
-    }
-
-    /// 从 HL 侧订单推导 direction
-    fn derive_direction(orders: &[&crate::domain::Order]) -> &'static str {
-        orders
-            .iter()
-            .find(|o| o.exchange == Exchange::Hyperliquid)
-            .map(|o| match o.side {
-                Side::Long => "long_perp_short_spot",
-                Side::Short => "short_perp_long_spot",
-            })
-            .unwrap_or("unknown")
-    }
-
     /// 从 OrderType 提取 limit price
     fn order_price(order: &crate::domain::Order) -> f64 {
         match &order.order_type {
             OrderType::Limit { price, .. } => *price,
             OrderType::Market => 0.0,
-        }
-    }
-
-    /// 格式化 OrderType 为 (type_str, tif_str)
-    fn format_order_type(order_type: &OrderType) -> (&'static str, &'static str) {
-        match order_type {
-            OrderType::Limit { tif, .. } => (
-                "limit",
-                match tif {
-                    crate::domain::TimeInForce::GTC => "GTC",
-                    crate::domain::TimeInForce::IOC => "IOC",
-                    crate::domain::TimeInForce::FOK => "FOK",
-                    crate::domain::TimeInForce::PostOnly => "PostOnly",
-                },
-            ),
-            OrderType::Market => ("market", "IOC"),
-        }
-    }
-
-    /// 格式化 OrderStatus 为 DB status string
-    fn format_status(status: &OrderStatus) -> &'static str {
-        match status {
-            OrderStatus::Created => "created",
-            OrderStatus::Pending => "pending",
-            OrderStatus::PartiallyFilled { .. } => "partially_filled",
-            OrderStatus::Filled => "filled",
-            OrderStatus::Cancelled => "cancelled",
-            OrderStatus::Rejected { .. } => "rejected",
-            OrderStatus::Error { .. } => "error",
         }
     }
 
@@ -117,19 +68,33 @@ impl SpreadArbStatsActor {
 
         let symbol = &tracked[0].symbol;
 
-        let (hl_bid, hl_ask) = self
-            .prices
-            .get(&(Exchange::Hyperliquid, symbol.clone()))
-            .copied()
-            .unwrap_or((0.0, 0.0));
-        let (ibkr_bid, ibkr_ask) = self
-            .prices
-            .get(&(Exchange::IBKR, symbol.clone()))
-            .copied()
-            .unwrap_or((0.0, 0.0));
+        // BBO 缓存：信号下单时应已有报价，缺失则记录 warn
+        let (hl_bid, hl_ask) = match self.prices.get(&(Exchange::Hyperliquid, symbol.clone())) {
+            Some(&bbo) => bbo,
+            None => {
+                tracing::warn!(symbol = %symbol, "SpreadArbStats: Hyperliquid BBO missing at signal time");
+                (0.0, 0.0)
+            }
+        };
+        let (ibkr_bid, ibkr_ask) = match self.prices.get(&(Exchange::IBKR, symbol.clone())) {
+            Some(&bbo) => bbo,
+            None => {
+                tracing::warn!(symbol = %symbol, "SpreadArbStats: IBKR BBO missing at signal time");
+                (0.0, 0.0)
+            }
+        };
 
-        let signal_type = Self::parse_signal_type(comment);
-        let direction = Self::derive_direction(&tracked);
+        let signal_type = SignalType::from_comment(comment);
+
+        // 从 HL 侧订单推导 direction
+        let direction = tracked
+            .iter()
+            .find(|o| o.exchange == Exchange::Hyperliquid)
+            .map(|o| Direction::from(o.side))
+            .unwrap_or_else(|| {
+                tracing::warn!("SpreadArbStats: no Hyperliquid order in signal, direction unknown");
+                Direction::Unknown
+            });
 
         let open_spread_pct = if ibkr_ask > 0.0 {
             (hl_bid - ibkr_ask) / ibkr_ask * 100.0
@@ -156,8 +121,8 @@ impl SpreadArbStatsActor {
             created_at: Set(chrono::Utc::now()),
             perp_symbol: Set(symbol.clone()),
             spot_symbol: Set(symbol.clone()),
-            signal_type: Set(signal_type.to_string()),
-            direction: Set(direction.to_string()),
+            signal_type: Set(signal_type),
+            direction: Set(direction),
             perp_bid: Set(hl_bid),
             perp_ask: Set(hl_ask),
             spot_bid: Set(ibkr_bid),
@@ -179,7 +144,6 @@ impl SpreadArbStatsActor {
 
         for order in &tracked {
             let price = Self::order_price(order);
-            let (order_type_str, tif_str) = Self::format_order_type(&order.order_type);
 
             let db_order = db_order::ActiveModel {
                 created_at: Set(chrono::Utc::now()),
@@ -188,12 +152,12 @@ impl SpreadArbStatsActor {
                 symbol: Set(order.symbol.clone()),
                 client_order_id: Set(order.client_order_id.clone()),
                 external_order_id: Set(None),
-                side: Set(order.side.to_string()),
+                side: Set(DbSide::from(order.side)),
                 quantity: Set(order.quantity),
                 price: Set(price),
-                order_type: Set(order_type_str.to_string()),
-                time_in_force: Set(tif_str.to_string()),
-                status: Set("pending".to_string()),
+                order_type: Set(DbOrderType::from(&order.order_type)),
+                time_in_force: Set(DbTimeInForce::from_order_type(&order.order_type)),
+                status: Set(DbOrderStatus::Pending),
                 filled_qty: Set(0.0),
                 avg_price: Set(0.0),
                 error_message: Set(None),
@@ -206,6 +170,9 @@ impl SpreadArbStatsActor {
     }
 
     /// Fill → 查询 order + 插入 fill + 更新 filled_qty
+    ///
+    /// filled_qty 采用 read-then-write 累加（单 actor 无并发竞态）。
+    /// 终态 OrderUpdate 会以交易所报告的 filled_quantity 覆写，自动修正中间态。
     async fn on_fill(&self, fill: &crate::domain::Fill) {
         if !self.symbols.contains(&fill.symbol) {
             return;
@@ -222,7 +189,14 @@ impl SpreadArbStatsActor {
 
         let client_oid = match &fill.client_order_id {
             Some(id) => id,
-            None => return,
+            None => {
+                tracing::warn!(
+                    exchange = %fill.exchange,
+                    symbol = %fill.symbol,
+                    "Fill without client_order_id, skipping DB persistence"
+                );
+                return;
+            }
         };
 
         let order = match db_order::Entity::find()
@@ -244,13 +218,13 @@ impl SpreadArbStatsActor {
         let db_fill = db_fill::ActiveModel {
             created_at: Set(chrono::Utc::now()),
             order_id: Set(order.id),
-            external_fill_id: Set(Some(fill.order_id.clone())),
+            external_order_id: Set(Some(fill.order_id.clone())),
             exchange: Set(fill.exchange.to_string()),
             symbol: Set(fill.symbol.clone()),
-            side: Set(fill.side.to_string()),
+            side: Set(DbSide::from(fill.side)),
             price: Set(fill.price),
             quantity: Set(fill.size),
-            fee: Set(0.0),
+            fee: Set(None),
             fill_timestamp: Set(Some(fill.timestamp as i64)),
             ..Default::default()
         };
@@ -258,7 +232,7 @@ impl SpreadArbStatsActor {
             tracing::error!(error = %e, "Failed to insert fill");
         }
 
-        // 更新 order filled_qty
+        // 更新 order filled_qty（单 actor 串行，无并发问题）
         let new_filled_qty = order.filled_qty + fill.size;
         let mut order_am: db_order::ActiveModel = order.into();
         order_am.filled_qty = Set(new_filled_qty);
@@ -268,6 +242,8 @@ impl SpreadArbStatsActor {
     }
 
     /// OrderUpdate (terminal) → 更新 order status
+    ///
+    /// 终态以交易所报告的 filled_quantity 为准，覆写 fill 累加的中间值。
     async fn on_order_update(&self, update: &crate::domain::OrderUpdate) {
         if !update.status.is_terminal() || !self.symbols.contains(&update.symbol) {
             return;
@@ -284,7 +260,14 @@ impl SpreadArbStatsActor {
 
         let client_oid = match &update.client_order_id {
             Some(id) => id,
-            None => return,
+            None => {
+                tracing::warn!(
+                    exchange = %update.exchange,
+                    symbol = %update.symbol,
+                    "OrderUpdate without client_order_id, skipping DB update"
+                );
+                return;
+            }
         };
 
         let order = match db_order::Entity::find()
@@ -303,7 +286,6 @@ impl SpreadArbStatsActor {
             }
         };
 
-        let status_str = Self::format_status(&update.status);
         let error_msg = match &update.status {
             OrderStatus::Rejected { reason } | OrderStatus::Error { reason } => {
                 Some(reason.clone())
@@ -312,7 +294,7 @@ impl SpreadArbStatsActor {
         };
 
         let mut order_am: db_order::ActiveModel = order.into();
-        order_am.status = Set(status_str.to_string());
+        order_am.status = Set(DbOrderStatus::from(&update.status));
         order_am.filled_qty = Set(update.filled_quantity);
         order_am.external_order_id = Set(Some(update.order_id.clone()));
         order_am.error_message = Set(error_msg);

@@ -223,6 +223,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // SpreadArb 统计 + 持久化（需要 database 配置）
+    if config.strategy.spread_arb.is_some() && config.database.is_none() {
+        tracing::warn!("spread_arb configured but database is not set, signals/orders/fills will not be persisted");
+    }
     if let (Some(ref spread_arb_config), Some(ref db_config)) =
         (&config.strategy.spread_arb, &config.database)
     {
