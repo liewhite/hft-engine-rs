@@ -1,5 +1,5 @@
 use super::{from_okx, from_okx_index};
-use crate::domain::{Exchange, Fill, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
+use crate::domain::{Candle, CandleInterval, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -355,4 +355,92 @@ pub struct WsEvent {
     pub event: String,
     pub code: Option<String>,
     pub msg: Option<String>,
+}
+
+// ============================================================================
+// Candle (K线)
+// ============================================================================
+
+/// OKX K线数据（字符串数组格式）
+/// [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+pub type CandleRawData = Vec<String>;
+
+/// 将 OKX K线原始数据转换为 Candle
+pub fn parse_candle_data(
+    raw: &CandleRawData,
+    inst_id: &str,
+    interval: CandleInterval,
+) -> Candle {
+    assert!(raw.len() >= 9, "OKX candle data incomplete: {:?}", raw);
+
+    let symbol = from_okx(inst_id)
+        .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", inst_id));
+    let open_time: u64 = raw[0].parse()
+        .unwrap_or_else(|_| panic!("Failed to parse candle ts: {}", raw[0]));
+    let open = f64::from_str(&raw[1])
+        .unwrap_or_else(|_| panic!("Failed to parse candle open: {}", raw[1]));
+    let high = f64::from_str(&raw[2])
+        .unwrap_or_else(|_| panic!("Failed to parse candle high: {}", raw[2]));
+    let low = f64::from_str(&raw[3])
+        .unwrap_or_else(|_| panic!("Failed to parse candle low: {}", raw[3]));
+    let close = f64::from_str(&raw[4])
+        .unwrap_or_else(|_| panic!("Failed to parse candle close: {}", raw[4]));
+    let volume = f64::from_str(&raw[5])
+        .unwrap_or_else(|_| panic!("Failed to parse candle vol: {}", raw[5]));
+    let confirm = &raw[8] == "1";
+
+    Candle {
+        exchange: Exchange::OKX,
+        symbol,
+        interval,
+        open_time,
+        open,
+        high,
+        low,
+        close,
+        volume,
+        confirm,
+        timestamp: open_time,
+    }
+}
+
+/// CandleInterval → OKX bar 参数 (REST 和 WS channel 后缀)
+pub fn candle_interval_to_okx_bar(interval: CandleInterval) -> &'static str {
+    match interval {
+        CandleInterval::Min1 => "1m",
+        CandleInterval::Min3 => "3m",
+        CandleInterval::Min5 => "5m",
+        CandleInterval::Min15 => "15m",
+        CandleInterval::Min30 => "30m",
+        CandleInterval::Hour1 => "1H",
+        CandleInterval::Hour2 => "2H",
+        CandleInterval::Hour4 => "4H",
+        CandleInterval::Hour6 => "6H",
+        CandleInterval::Hour12 => "12H",
+        CandleInterval::Day1 => "1D",
+        CandleInterval::Week1 => "1W",
+        CandleInterval::Month1 => "1M",
+        CandleInterval::Month3 => "3M",
+    }
+}
+
+/// OKX WS channel → CandleInterval
+pub fn okx_channel_to_candle_interval(channel: &str) -> Option<CandleInterval> {
+    match channel {
+        "candle1m" => Some(CandleInterval::Min1),
+        "candle3m" => Some(CandleInterval::Min3),
+        "candle5m" => Some(CandleInterval::Min5),
+        "candle15m" => Some(CandleInterval::Min15),
+        "candle30m" => Some(CandleInterval::Min30),
+        "candle1H" => Some(CandleInterval::Hour1),
+        "candle2H" => Some(CandleInterval::Hour2),
+        "candle4H" => Some(CandleInterval::Hour4),
+        "candle6H" => Some(CandleInterval::Hour6),
+        "candle12H" => Some(CandleInterval::Hour12),
+        "candle1D" => Some(CandleInterval::Day1),
+        "candle1W" => Some(CandleInterval::Week1),
+        "candle1M" => Some(CandleInterval::Month1),
+        "candle3M" => Some(CandleInterval::Month3),
+        _ => None,
+    }
 }

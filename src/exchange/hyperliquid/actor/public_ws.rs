@@ -410,6 +410,9 @@ fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> String {
         SubscriptionKind::BBO { symbol } => {
             format!("bbo:{}", to_hyperliquid(symbol, quote))
         }
+        SubscriptionKind::Candle { .. } => {
+            panic!("Hyperliquid Candle subscription not implemented")
+        }
     }
 }
 
@@ -431,6 +434,9 @@ fn kind_to_subscription(kind: &SubscriptionKind, quote: &str) -> serde_json::Val
                 "type": "bbo",
                 "coin": to_hyperliquid(symbol, quote)
             })
+        }
+        SubscriptionKind::Candle { .. } => {
+            panic!("Hyperliquid Candle subscription not implemented")
         }
     }
 }

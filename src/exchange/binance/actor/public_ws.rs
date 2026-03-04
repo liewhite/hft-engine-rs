@@ -402,5 +402,8 @@ fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> String {
         SubscriptionKind::BBO { symbol } => {
             format!("{}@bookTicker", to_binance(symbol, quote).to_lowercase())
         }
+        SubscriptionKind::Candle { .. } => {
+            panic!("Binance Candle subscription not implemented")
+        }
     }
 }

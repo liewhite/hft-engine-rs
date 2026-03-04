@@ -1,5 +1,6 @@
 mod balance;
 mod bbo;
+mod candle;
 mod exchange;
 mod fill;
 mod funding_rate;
@@ -17,6 +18,7 @@ mod time_in_force;
 
 pub use balance::Balance;
 pub use bbo::BBO;
+pub use candle::{Candle, CandleInterval};
 pub use exchange::Exchange;
 pub use fill::Fill;
 pub use funding_rate::FundingRate;

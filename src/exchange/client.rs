@@ -2,7 +2,7 @@
 //!
 //! ExchangeClient trait 封装交易所 REST 交互
 
-use crate::domain::{Exchange, ExchangeError, Order, OrderId, Symbol, SymbolMeta};
+use crate::domain::{CandleInterval, Exchange, ExchangeError, Order, OrderId, Symbol, SymbolMeta};
 use async_trait::async_trait;
 
 /// 账户信息 (净值 + 总持仓名义价值)
@@ -31,16 +31,19 @@ pub enum SubscriptionKind {
     MarkPrice { symbol: Symbol },
     /// 指数价格
     IndexPrice { symbol: Symbol },
+    /// K线
+    Candle { symbol: Symbol, interval: CandleInterval },
 }
 
 impl SubscriptionKind {
     /// 获取订阅的 symbol
     pub fn symbol(&self) -> &Symbol {
         match self {
-            SubscriptionKind::FundingRate { symbol } => symbol,
-            SubscriptionKind::BBO { symbol } => symbol,
-            SubscriptionKind::MarkPrice { symbol } => symbol,
-            SubscriptionKind::IndexPrice { symbol } => symbol,
+            SubscriptionKind::FundingRate { symbol }
+            | SubscriptionKind::BBO { symbol }
+            | SubscriptionKind::MarkPrice { symbol }
+            | SubscriptionKind::IndexPrice { symbol }
+            | SubscriptionKind::Candle { symbol, .. } => symbol,
         }
     }
 }

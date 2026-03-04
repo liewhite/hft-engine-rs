@@ -1,15 +1,19 @@
-//! OkxPublicWsActor - 管理 OKX 公开 WebSocket 连接
+//! OkxBusinessWsActor - 管理 OKX Business WebSocket 连接 (K线数据)
 //!
 //! 职责:
-//! - 维护公开 WebSocket 连接
-//! - 处理 Subscribe/Unsubscribe 请求
+//! - 维护 Business WebSocket 连接 (wss://ws.okx.com:8443/ws/v5/business)
+//! - 处理 Candle 类型的 Subscribe/Unsubscribe 请求
+//! - 收到订阅时先通过 REST 获取 100 根历史 K线并发布，再 WS 订阅实时推送
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::domain::{CandleInterval, now_ms, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::okx::codec::{BboData, FundingRateData, IndexTickerData, MarkPriceData, WsPush};
-use crate::exchange::okx::{to_okx, to_okx_index};
+use crate::exchange::okx::codec::{
+    CandleRawData, WsPush, candle_interval_to_okx_bar, okx_channel_to_candle_interval,
+    parse_candle_data,
+};
+use crate::exchange::okx::{to_okx, REST_BASE_URL, WS_BUSINESS_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
@@ -18,17 +22,16 @@ use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
+use reqwest::Client;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-/// Public WebSocket URL
-const WS_PUBLIC_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
-
-/// OkxPublicWsActor 初始化参数
-pub struct OkxPublicWsActorArgs {
+/// OkxBusinessWsActor 初始化参数
+pub struct OkxBusinessWsActorArgs {
     /// Income PubSub (发布事件)
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据
@@ -37,8 +40,8 @@ pub struct OkxPublicWsActorArgs {
     pub quote: String,
 }
 
-/// OkxPublicWsActor - 公开 WebSocket Actor
-pub struct OkxPublicWsActor {
+/// OkxBusinessWsActor - Business WebSocket Actor (K线)
+pub struct OkxBusinessWsActor {
     /// Income PubSub (发布事件)
     income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据（用于过滤不存在的 symbol）
@@ -49,10 +52,12 @@ pub struct OkxPublicWsActor {
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的 kinds (用于去重)
     subscribed: HashSet<SubscriptionKind>,
+    /// HTTP 客户端 (用于获取历史 K线, 公开 API 无需签名)
+    http_client: Client,
 }
 
-impl OkxPublicWsActor {
-    /// 批量发送订阅消息（一条 WebSocket 消息包含多个 args）
+impl OkxBusinessWsActor {
+    /// 发送 WS 订阅消息
     async fn send_subscribe_batch(&self, args: Vec<serde_json::Value>) -> Result<(), WsError> {
         if args.is_empty() {
             return Ok(());
@@ -70,9 +75,9 @@ impl OkxPublicWsActor {
             .map_err(|_| WsError::Network("Channel closed".to_string()))
     }
 
-    /// 发送取消订阅消息
+    /// 发送 WS 取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let arg = kind_to_arg(kind, &self.quote);
+        let arg = kind_to_business_arg(kind, &self.quote);
         let msg = json!({
             "op": "unsubscribe",
             "args": [arg]
@@ -85,10 +90,78 @@ impl OkxPublicWsActor {
             .map_err(|_| WsError::Network("Channel closed".to_string()))
     }
 
-    /// 解析并处理消息
+    /// 获取历史 K线并发布
+    async fn fetch_and_publish_history(
+        &self,
+        symbol: &Symbol,
+        interval: CandleInterval,
+    ) {
+        let inst_id = to_okx(symbol, &self.quote);
+        let bar = candle_interval_to_okx_bar(interval);
+        let url = format!(
+            "{}/api/v5/market/candles?instId={}&bar={}&limit=100",
+            REST_BASE_URL, inst_id, bar
+        );
+
+        let resp = match self.http_client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(symbol = %symbol, interval = %interval, error = %e, "Failed to fetch history candles");
+                return;
+            }
+        };
+
+        #[derive(Deserialize)]
+        struct Response {
+            code: String,
+            #[allow(dead_code)]
+            msg: String,
+            data: Vec<CandleRawData>,
+        }
+
+        let data: Response = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!(symbol = %symbol, interval = %interval, error = %e, "Failed to parse history candles");
+                return;
+            }
+        };
+
+        if data.code != "0" {
+            tracing::error!(
+                symbol = %symbol,
+                interval = %interval,
+                code = %data.code,
+                "OKX history candles API error"
+            );
+            return;
+        }
+
+        let local_ts = now_ms();
+
+        // OKX 返回的数据按时间倒序，需要反转
+        for raw in data.data.iter().rev() {
+            let candle = parse_candle_data(raw, &inst_id, interval);
+            let event = IncomeEvent {
+                exchange_ts: candle.open_time,
+                local_ts,
+                data: ExchangeEventData::Candle(candle),
+            };
+            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+        }
+
+        tracing::info!(
+            symbol = %symbol,
+            interval = %interval,
+            count = data.data.len(),
+            "Published history candles"
+        );
+    }
+
+    /// 解析并处理 Business WS 消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_public_message(raw, local_ts)?;
+        let events = parse_business_message(raw, local_ts)?;
         for event in events {
             let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
@@ -96,22 +169,22 @@ impl OkxPublicWsActor {
     }
 }
 
-impl Actor for OkxPublicWsActor {
-    type Args = OkxPublicWsActorArgs;
+impl Actor for OkxBusinessWsActor {
+    type Args = OkxBusinessWsActorArgs;
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 连接 WebSocket
-        let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PUBLIC_URL)
+        // 连接 Business WebSocket
+        let (ws_stream, _) = tokio_tungstenite::connect_async(WS_BUSINESS_URL)
             .await
-            .expect("Failed to connect to OKX public WebSocket");
+            .expect("Failed to connect to OKX business WebSocket");
 
         let (write, read) = ws_stream.split();
 
-        // 创建出站消息 channel (Subscribe/Unsubscribe)
+        // 创建出站消息 channel
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
 
-        // 创建入站消息 channel (收到的数据/错误)
+        // 创建入站消息 channel
         let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
 
         // attach_stream 监控入站消息
@@ -121,7 +194,12 @@ impl Actor for OkxPublicWsActor {
         // 启动 ws_loop
         tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
 
-        tracing::info!("OkxPublicWsActor started");
+        let http_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to create HTTP client");
+
+        tracing::info!("OkxBusinessWsActor started");
 
         Ok(Self {
             income_pubsub: args.income_pubsub,
@@ -129,6 +207,7 @@ impl Actor for OkxPublicWsActor {
             quote: args.quote,
             ws_tx: Some(outgoing_tx),
             subscribed: HashSet::new(),
+            http_client,
         })
     }
 
@@ -138,7 +217,7 @@ impl Actor for OkxPublicWsActor {
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
         self.ws_tx.take();
-        tracing::info!("OkxPublicWsActor stopped");
+        tracing::info!("OkxBusinessWsActor stopped");
         Ok(())
     }
 }
@@ -147,7 +226,7 @@ impl Actor for OkxPublicWsActor {
 // 消息处理
 // ============================================================================
 
-impl Message<Subscribe> for OkxPublicWsActor {
+impl Message<Subscribe> for OkxBusinessWsActor {
     type Reply = ();
 
     async fn handle(
@@ -155,13 +234,12 @@ impl Message<Subscribe> for OkxPublicWsActor {
         msg: Subscribe,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 委托给批量订阅
         self.handle(SubscribeBatch { kinds: vec![msg.kind] }, ctx)
             .await
     }
 }
 
-impl Message<SubscribeBatch> for OkxPublicWsActor {
+impl Message<SubscribeBatch> for OkxBusinessWsActor {
     type Reply = ();
 
     async fn handle(
@@ -169,7 +247,6 @@ impl Message<SubscribeBatch> for OkxPublicWsActor {
         msg: SubscribeBatch,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 1. 过滤有效的 kinds（symbol 存在且未订阅）
         let mut new_args = Vec::new();
         let mut new_kinds = Vec::new();
 
@@ -179,7 +256,7 @@ impl Message<SubscribeBatch> for OkxPublicWsActor {
                 tracing::warn!(
                     exchange = "OKX",
                     symbol = %symbol,
-                    "Symbol not found in symbol_metas, ignoring subscription"
+                    "Symbol not found in symbol_metas, ignoring candle subscription"
                 );
                 continue;
             }
@@ -188,16 +265,23 @@ impl Message<SubscribeBatch> for OkxPublicWsActor {
                 continue;
             }
 
-            new_args.push(kind_to_arg(&kind, &self.quote));
+            new_args.push(kind_to_business_arg(&kind, &self.quote));
             new_kinds.push(kind);
         }
 
-        // 2. 批量发送订阅请求
+        // 1. 对每个新订阅先获取历史 K线
+        for kind in &new_kinds {
+            if let SubscriptionKind::Candle { symbol, interval } = kind {
+                self.fetch_and_publish_history(symbol, *interval).await;
+            }
+        }
+
+        // 2. WS 订阅实时推送
         if !new_args.is_empty() {
             tracing::info!(
                 exchange = "OKX",
                 count = new_args.len(),
-                "Batch subscribing to channels"
+                "Batch subscribing to business channels"
             );
 
             if let Err(e) = self.send_subscribe_batch(new_args).await {
@@ -207,14 +291,14 @@ impl Message<SubscribeBatch> for OkxPublicWsActor {
             }
         }
 
-        // 3. 记录已订阅的 kinds
+        // 3. 记录已订阅
         for kind in new_kinds {
             self.subscribed.insert(kind);
         }
     }
 }
 
-impl Message<Unsubscribe> for OkxPublicWsActor {
+impl Message<Unsubscribe> for OkxBusinessWsActor {
     type Reply = ();
 
     async fn handle(
@@ -234,7 +318,7 @@ impl Message<Unsubscribe> for OkxPublicWsActor {
 }
 
 /// WebSocket 入站消息处理
-impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPublicWsActor {
+impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxBusinessWsActor {
     type Reply = ();
 
     async fn handle(
@@ -244,22 +328,20 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPublicWsActo
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                // 解析并发布到 IncomePubSub，失败则 kill actor
                 if let Err(e) = self.handle_message(&data).await {
-                    tracing::error!(exchange = "OKX", error = %e, raw = %data, "Public WS parse error, killing actor");
+                    tracing::error!(exchange = "OKX", error = %e, raw = %data, "Business WS parse error, killing actor");
                     ctx.actor_ref().kill();
                 }
             }
             StreamMessage::Next(Err(e)) => {
-                tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
+                tracing::error!(error = %e, "Business WebSocket loop exited, killing actor");
                 ctx.actor_ref().kill();
             }
             StreamMessage::Started(_) => {
-                tracing::debug!("WsIncoming stream started");
+                tracing::debug!("Business WsIncoming stream started");
             }
             StreamMessage::Finished(_) => {
-                // ws_loop 异常退出，kill actor 触发级联退出
-                tracing::error!("WebSocket stream unexpectedly finished, killing actor");
+                tracing::error!("Business WebSocket stream unexpectedly finished, killing actor");
                 ctx.actor_ref().kill();
             }
         }
@@ -270,11 +352,11 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPublicWsActo
 // 消息解析
 // ============================================================================
 
-fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
-    // 检查是否是事件响应（控制消息，返回空 Vec）
+    // 检查事件响应（控制消息）
     if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
         match event {
             "subscribe" | "unsubscribe" => return Ok(Vec::new()),
@@ -282,7 +364,7 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
                 let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
                 let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
                 return Err(WsError::ParseError(format!(
-                    "OKX error: code={}, msg={}",
+                    "OKX business error: code={}, msg={}",
                     code, msg
                 )));
             }
@@ -297,128 +379,48 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
         .and_then(|c| c.as_str())
         .ok_or_else(|| WsError::ParseError(format!("Missing channel: {}", raw)))?;
 
-    match channel {
-        "funding-rate" => {
-            let push: WsPush<FundingRateData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("funding-rate parse: {}", e)))?;
+    // 匹配 candle 频道 (candle1m, candle5m, candle1H, ...)
+    if let Some(interval) = okx_channel_to_candle_interval(channel) {
+        let push: WsPush<CandleRawData> = serde_json::from_str(raw)
+            .map_err(|e| WsError::ParseError(format!("{} parse: {}", channel, e)))?;
+        let inst_id = push
+            .arg
+            .inst_id
+            .as_ref()
+            .ok_or_else(|| WsError::ParseError(format!("Missing instId in {}", channel)))?;
 
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let rate = data.to_funding_rate(local_ts);
-                    IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::FundingRate(rate),
-                    }
-                })
-                .collect();
-            Ok(events)
-        }
-        "bbo-tbt" => {
-            let push: WsPush<BboData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("bbo-tbt parse: {}", e)))?;
-            let inst_id = push
-                .arg
-                .inst_id
-                .as_ref()
-                .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
-
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let exchange_ts = data
-                        .ts
-                        .parse::<u64>()
-                        .unwrap_or_else(|_| panic!("Failed to parse BBO timestamp: {}", data.ts));
-                    let bbo = data.to_bbo(inst_id);
-                    IncomeEvent {
-                        exchange_ts,
-                        local_ts,
-                        data: ExchangeEventData::BBO(bbo),
-                    }
-                })
-                .collect();
-            Ok(events)
-        }
-        "mark-price" => {
-            let push: WsPush<MarkPriceData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("mark-price parse: {}", e)))?;
-
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let mp = data.to_mark_price();
-                    IncomeEvent {
-                        exchange_ts: mp.timestamp,
-                        local_ts,
-                        data: ExchangeEventData::MarkPrice(mp),
-                    }
-                })
-                .collect();
-            Ok(events)
-        }
-        "index-tickers" => {
-            let push: WsPush<IndexTickerData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("index-tickers parse: {}", e)))?;
-
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let ip = data.to_index_price();
-                    IncomeEvent {
-                        exchange_ts: ip.timestamp,
-                        local_ts,
-                        data: ExchangeEventData::IndexPrice(ip),
-                    }
-                })
-                .collect();
-            Ok(events)
-        }
-        _ => {
-            tracing::warn!(channel, raw, "Unknown OKX public channel");
-            Ok(Vec::new())
-        }
+        let events = push
+            .data
+            .iter()
+            .map(|raw_data| {
+                let candle = parse_candle_data(raw_data, inst_id, interval);
+                IncomeEvent {
+                    exchange_ts: candle.open_time,
+                    local_ts,
+                    data: ExchangeEventData::Candle(candle),
+                }
+            })
+            .collect();
+        return Ok(events);
     }
+
+    tracing::warn!(channel, raw, "Unknown OKX business channel");
+    Ok(Vec::new())
 }
 
 // ============================================================================
 // 辅助函数
 // ============================================================================
 
-fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> serde_json::Value {
+fn kind_to_business_arg(kind: &SubscriptionKind, quote: &str) -> serde_json::Value {
     match kind {
-        SubscriptionKind::FundingRate { symbol } => {
+        SubscriptionKind::Candle { symbol, interval } => {
+            let bar = candle_interval_to_okx_bar(*interval);
             json!({
-                "channel": "funding-rate",
+                "channel": format!("candle{}", bar),
                 "instId": to_okx(symbol, quote)
             })
         }
-        SubscriptionKind::BBO { symbol } => {
-            json!({
-                "channel": "bbo-tbt",
-                "instId": to_okx(symbol, quote)
-            })
-        }
-        SubscriptionKind::MarkPrice { symbol } => {
-            json!({
-                "channel": "mark-price",
-                "instId": to_okx(symbol, quote)
-            })
-        }
-        SubscriptionKind::IndexPrice { symbol } => {
-            // OKX index-tickers 使用指数 ID 格式 (如 BTC-USDT)
-            json!({
-                "channel": "index-tickers",
-                "instId": to_okx_index(symbol, quote)
-            })
-        }
-        SubscriptionKind::Candle { .. } => {
-            panic!("Candle subscriptions should be routed to BusinessWsActor")
-        }
+        _ => panic!("BusinessWsActor only handles Candle subscriptions"),
     }
 }

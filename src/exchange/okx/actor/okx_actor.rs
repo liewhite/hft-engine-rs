@@ -10,11 +10,12 @@
 //! ├── OkxPublicWsActor [spawn_link]
 //! └── OkxPrivateWsActor [spawn_link] (optional, 需要凭证)
 
+use super::business_ws::{OkxBusinessWsActor, OkxBusinessWsActorArgs};
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
-use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
+use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
 use crate::exchange::okx::OkxCredentials;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -44,6 +45,8 @@ pub struct OkxActorArgs {
 pub struct OkxActor {
     /// Public WebSocket Actor
     public_ws: ActorRef<OkxPublicWsActor>,
+    /// Business WebSocket Actor (K线)
+    business_ws: ActorRef<OkxBusinessWsActor>,
 }
 
 impl Actor for OkxActor {
@@ -66,7 +69,20 @@ impl Actor for OkxActor {
         .await;
         tracing::info!(exchange = "OKX", "PublicWsActor created");
 
-        // 2. 创建 PrivateWsActor (如果有凭证)
+        // 2. 创建 BusinessWsActor (K线数据)
+        let business_ws = OkxBusinessWsActor::spawn_link_with_mailbox(
+            &actor_ref,
+            OkxBusinessWsActorArgs {
+                income_pubsub: income_pubsub.clone(),
+                symbol_metas: args.symbol_metas.clone(),
+                quote: args.quote.clone(),
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        tracing::info!(exchange = "OKX", "BusinessWsActor created");
+
+        // 3. 创建 PrivateWsActor (如果有凭证)
         let has_private_ws = if let Some(credentials) = args.credentials {
             OkxPrivateWsActor::spawn_link_with_mailbox(
                 &actor_ref,
@@ -103,7 +119,7 @@ impl Actor for OkxActor {
             "OkxActor started"
         );
 
-        Ok(Self { public_ws })
+        Ok(Self { public_ws, business_ws })
     }
 
     async fn on_stop(
@@ -141,8 +157,14 @@ impl Message<Subscribe> for OkxActor {
         msg: Subscribe,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 转发给 PublicWsActor
-        let _ = self.public_ws.tell(msg).send().await;
+        match &msg.kind {
+            SubscriptionKind::Candle { .. } => {
+                let _ = self.business_ws.tell(msg).send().await;
+            }
+            _ => {
+                let _ = self.public_ws.tell(msg).send().await;
+            }
+        }
     }
 }
 
@@ -154,8 +176,23 @@ impl Message<SubscribeBatch> for OkxActor {
         msg: SubscribeBatch,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 转发给 PublicWsActor
-        let _ = self.public_ws.tell(msg).send().await;
+        // 按目标 actor 拆分
+        let mut public_kinds = Vec::new();
+        let mut business_kinds = Vec::new();
+
+        for kind in msg.kinds {
+            match &kind {
+                SubscriptionKind::Candle { .. } => business_kinds.push(kind),
+                _ => public_kinds.push(kind),
+            }
+        }
+
+        if !public_kinds.is_empty() {
+            let _ = self.public_ws.tell(SubscribeBatch { kinds: public_kinds }).send().await;
+        }
+        if !business_kinds.is_empty() {
+            let _ = self.business_ws.tell(SubscribeBatch { kinds: business_kinds }).send().await;
+        }
     }
 }
 
@@ -167,7 +204,13 @@ impl Message<Unsubscribe> for OkxActor {
         msg: Unsubscribe,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 转发给 PublicWsActor
-        let _ = self.public_ws.tell(msg).send().await;
+        match &msg.kind {
+            SubscriptionKind::Candle { .. } => {
+                let _ = self.business_ws.tell(msg).send().await;
+            }
+            _ => {
+                let _ = self.public_ws.tell(msg).send().await;
+            }
+        }
     }
 }
