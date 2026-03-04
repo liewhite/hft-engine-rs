@@ -8,7 +8,8 @@ use fee_arb::exchange::ibkr::IbkrCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::{
     FundingArbConfig, FundingArbStrategy, MetricsSubscriberActor, MetricsSubscriberArgs,
-    SlackNotifierActor, SlackNotifierArgs, SpreadArbConfig, SpreadArbStrategy,
+    SlackNotifierActor, SlackNotifierArgs, SpreadArbConfig, SpreadArbStatsActor,
+    SpreadArbStatsArgs, SpreadArbStrategy,
 };
 use kameo::actor::Spawn;
 use kameo::mailbox;
@@ -57,12 +58,19 @@ pub struct MonitoringConfig {
     pub slack_token: String,
 }
 
+/// 数据库配置
+#[derive(Debug, Clone, Deserialize)]
+struct DatabaseConfig {
+    url: String,
+}
+
 /// 完整配置
 #[derive(Debug, Clone, Deserialize)]
 struct Config {
     exchanges: ExchangesConfig,
     strategy: StrategyConfig,
     monitoring: Option<MonitoringConfig>,
+    database: Option<DatabaseConfig>,
 }
 
 #[tokio::main]
@@ -212,6 +220,35 @@ async fn main() -> anyhow::Result<()> {
             .await
             .expect("Failed to subscribe SlackNotifierActor to outcome events");
         tracing::info!("SlackNotifierActor created and subscribed");
+    }
+
+    // SpreadArb 统计 + 持久化（需要 database 配置）
+    if let (Some(ref spread_arb_config), Some(ref db_config)) =
+        (&config.strategy.spread_arb, &config.database)
+    {
+        if config.exchanges.ibkr.is_some() {
+            let db = fee_arb::db::init_db(&db_config.url).await?;
+
+            let stats_actor = SpreadArbStatsActor::spawn_with_mailbox(
+                SpreadArbStatsArgs {
+                    symbols: spread_arb_config.symbols.iter().cloned().collect(),
+                    db,
+                },
+                mailbox::unbounded(),
+            );
+
+            manager
+                .tell(SubscribeIncome(stats_actor.clone()))
+                .send()
+                .await
+                .expect("Failed to subscribe SpreadArbStatsActor to income events");
+            manager
+                .tell(SubscribeOutcome(stats_actor))
+                .send()
+                .await
+                .expect("Failed to subscribe SpreadArbStatsActor to outcome events");
+            tracing::info!("SpreadArbStatsActor created and subscribed");
+        }
     }
 
     tracing::info!("System running. Press Ctrl+C to stop.");

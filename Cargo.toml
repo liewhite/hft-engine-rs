@@ -75,3 +75,6 @@ sha1 = "0.10"
 rand = "0.8"
 pkcs8 = { version = "0.10", features = ["pem"] }
 percent-encoding = "2"
+
+# Database ORM
+sea-orm = { version = "=2.0.0-rc.35", features = ["sqlx-mysql", "runtime-tokio-native-tls"] }
