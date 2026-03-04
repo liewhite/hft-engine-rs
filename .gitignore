@@ -20,3 +20,4 @@ tests/ibkr_config.json
 *.pem
 ibkr_config.json
 hype_config.json
+spread_arb_config.json

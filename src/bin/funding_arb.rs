@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
-use fee_arb::engine::{AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, SubscribeIncome, SubscribeOutcome};
+use fee_arb::engine::{
+    AddStrategies, DatabaseConfig, GetAllSymbolMetas, ManagerActor, ManagerActorArgs,
+    MonitoringConfig, SubscribeIncome, SubscribeOutcome,
+};
 use fee_arb::exchange::binance::BinanceCredentials;
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::ibkr::IbkrCredentials;
@@ -13,7 +16,7 @@ use fee_arb::strategy::{
 };
 use kameo::actor::Spawn;
 use kameo::mailbox;
-use md5::{Md5, Digest};
+use md5::{Digest, Md5};
 use serde::Deserialize;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -41,27 +44,6 @@ impl ExchangesConfig {
 struct StrategyConfig {
     funding_arb: FundingArbConfig,
     spread_arb: Option<SpreadArbConfig>,
-}
-
-/// 监控配置
-#[derive(Debug, Clone, Deserialize)]
-pub struct MonitoringConfig {
-    /// Prometheus Pushgateway URL
-    pub pushgateway_url: String,
-    /// Metric 前缀
-    pub metric_prefix: String,
-    /// 推送间隔（毫秒）
-    pub push_interval_ms: u64,
-    /// Slack channel
-    pub slack_channel: String,
-    /// Slack token
-    pub slack_token: String,
-}
-
-/// 数据库配置
-#[derive(Debug, Clone, Deserialize)]
-struct DatabaseConfig {
-    url: String,
 }
 
 /// 完整配置
@@ -101,10 +83,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 获取所有交易所的 symbol metas
-    let metas: HashMap<Exchange, Vec<SymbolMeta>> = manager
-        .ask(GetAllSymbolMetas)
-        .send()
-        .await?;
+    let metas: HashMap<Exchange, Vec<SymbolMeta>> =
+        manager.ask(GetAllSymbolMetas).send().await?;
 
     // 计算所有交易所 symbol 的并集
     let all_symbols: HashSet<Symbol> = metas
@@ -112,7 +92,10 @@ async fn main() -> anyhow::Result<()> {
         .flat_map(|metas| metas.iter().map(|m| m.symbol.clone()))
         .collect();
 
-    tracing::info!(total_symbols = all_symbols.len(), "Total unique symbols from all exchanges");
+    tracing::info!(
+        total_symbols = all_symbols.len(),
+        "Total unique symbols from all exchanges"
+    );
 
     // 对 symbol 做 MD5 取模 4，选取余数为 0 的（1/4 的 symbol）
     let symbols: Vec<Symbol> = all_symbols
@@ -131,8 +114,10 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("No symbols selected after MD5 filtering");
     }
 
-    tracing::info!(selected_symbols = symbols.len(), "Symbols selected (MD5 mod 4 == 0)");
-
+    tracing::info!(
+        selected_symbols = symbols.len(),
+        "Symbols selected (MD5 mod 4 == 0)"
+    );
 
     let enabled_exchanges = config.exchanges.enabled_exchanges();
 
@@ -224,7 +209,9 @@ async fn main() -> anyhow::Result<()> {
 
     // SpreadArb 统计 + 持久化（需要 database 配置）
     if config.strategy.spread_arb.is_some() && config.database.is_none() {
-        tracing::warn!("spread_arb configured but database is not set, signals/orders/fills will not be persisted");
+        tracing::warn!(
+            "spread_arb configured but database is not set, signals/orders/fills will not be persisted"
+        );
     }
     if let (Some(ref spread_arb_config), Some(ref db_config)) =
         (&config.strategy.spread_arb, &config.database)

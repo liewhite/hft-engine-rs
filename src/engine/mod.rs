@@ -1,5 +1,7 @@
+pub mod config;
 pub mod live;
 
+pub use config::{DatabaseConfig, MonitoringConfig};
 pub use live::{
     AddStrategy, AddStrategies, ClockActor, ClockActorArgs,
     CryptoStatusActor, CryptoStatusActorArgs,

@@ -78,3 +78,11 @@ percent-encoding = "2"
 
 # Database ORM
 sea-orm = { version = "=2.0.0-rc.35", features = ["sqlx-mysql", "runtime-tokio-native-tls"] }
+
+[[bin]]
+name = "funding_arb"
+path = "src/bin/funding_arb.rs"
+
+[[bin]]
+name = "spread_arb"
+path = "src/bin/spread_arb.rs"
