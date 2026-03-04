@@ -400,28 +400,14 @@ pub fn parse_candle_data(
         close,
         volume,
         confirm,
-        timestamp: open_time,
     }
 }
 
 /// CandleInterval → OKX bar 参数 (REST 和 WS channel 后缀)
-pub fn candle_interval_to_okx_bar(interval: CandleInterval) -> &'static str {
-    match interval {
-        CandleInterval::Min1 => "1m",
-        CandleInterval::Min3 => "3m",
-        CandleInterval::Min5 => "5m",
-        CandleInterval::Min15 => "15m",
-        CandleInterval::Min30 => "30m",
-        CandleInterval::Hour1 => "1H",
-        CandleInterval::Hour2 => "2H",
-        CandleInterval::Hour4 => "4H",
-        CandleInterval::Hour6 => "6H",
-        CandleInterval::Hour12 => "12H",
-        CandleInterval::Day1 => "1D",
-        CandleInterval::Week1 => "1W",
-        CandleInterval::Month1 => "1M",
-        CandleInterval::Month3 => "3M",
-    }
+///
+/// OKX 格式恰好与 CandleInterval::Display 一致
+pub fn candle_interval_to_okx_bar(interval: CandleInterval) -> String {
+    interval.to_string()
 }
 
 /// OKX WS channel → CandleInterval

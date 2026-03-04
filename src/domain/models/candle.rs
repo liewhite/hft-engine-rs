@@ -58,5 +58,4 @@ pub struct Candle {
     pub volume: f64,
     /// true=已完结, false=实时更新中
     pub confirm: bool,
-    pub timestamp: Timestamp,
 }

@@ -90,74 +90,6 @@ impl OkxBusinessWsActor {
             .map_err(|_| WsError::Network("Channel closed".to_string()))
     }
 
-    /// 获取历史 K线并发布
-    async fn fetch_and_publish_history(
-        &self,
-        symbol: &Symbol,
-        interval: CandleInterval,
-    ) {
-        let inst_id = to_okx(symbol, &self.quote);
-        let bar = candle_interval_to_okx_bar(interval);
-        let url = format!(
-            "{}/api/v5/market/candles?instId={}&bar={}&limit=100",
-            REST_BASE_URL, inst_id, bar
-        );
-
-        let resp = match self.http_client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(symbol = %symbol, interval = %interval, error = %e, "Failed to fetch history candles");
-                return;
-            }
-        };
-
-        #[derive(Deserialize)]
-        struct Response {
-            code: String,
-            #[allow(dead_code)]
-            msg: String,
-            data: Vec<CandleRawData>,
-        }
-
-        let data: Response = match resp.json().await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!(symbol = %symbol, interval = %interval, error = %e, "Failed to parse history candles");
-                return;
-            }
-        };
-
-        if data.code != "0" {
-            tracing::error!(
-                symbol = %symbol,
-                interval = %interval,
-                code = %data.code,
-                "OKX history candles API error"
-            );
-            return;
-        }
-
-        let local_ts = now_ms();
-
-        // OKX 返回的数据按时间倒序，需要反转
-        for raw in data.data.iter().rev() {
-            let candle = parse_candle_data(raw, &inst_id, interval);
-            let event = IncomeEvent {
-                exchange_ts: candle.open_time,
-                local_ts,
-                data: ExchangeEventData::Candle(candle),
-            };
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
-        }
-
-        tracing::info!(
-            symbol = %symbol,
-            interval = %interval,
-            count = data.data.len(),
-            "Published history candles"
-        );
-    }
-
     /// 解析并处理 Business WS 消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
@@ -269,10 +201,19 @@ impl Message<SubscribeBatch> for OkxBusinessWsActor {
             new_kinds.push(kind);
         }
 
-        // 1. 对每个新订阅先获取历史 K线
+        // 1. 对每个新订阅 spawn 后台任务获取历史 K线（不阻塞 actor 消息处理）
         for kind in &new_kinds {
             if let SubscriptionKind::Candle { symbol, interval } = kind {
-                self.fetch_and_publish_history(symbol, *interval).await;
+                let pubsub = self.income_pubsub.clone();
+                let http = self.http_client.clone();
+                let inst_id = to_okx(symbol, &self.quote);
+                let bar = candle_interval_to_okx_bar(*interval);
+                let symbol = symbol.clone();
+                let interval = *interval;
+                tokio::spawn(async move {
+                    fetch_and_publish_history(pubsub, http, &inst_id, &symbol, interval, &bar)
+                        .await;
+                });
             }
         }
 
@@ -411,6 +352,75 @@ fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, 
 // ============================================================================
 // 辅助函数
 // ============================================================================
+
+/// 获取历史 K线并发布到 IncomePubSub (独立 task，不阻塞 actor)
+async fn fetch_and_publish_history(
+    income_pubsub: ActorRef<IncomePubSub>,
+    http_client: Client,
+    inst_id: &str,
+    symbol: &str,
+    interval: CandleInterval,
+    bar: &str,
+) {
+    let url = format!(
+        "{}/api/v5/market/candles?instId={}&bar={}&limit=100",
+        REST_BASE_URL, inst_id, bar
+    );
+
+    let resp = match http_client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(symbol = %symbol, interval = %interval, error = %e, "Failed to fetch history candles");
+            return;
+        }
+    };
+
+    #[derive(Deserialize)]
+    struct Response {
+        code: String,
+        #[allow(dead_code)]
+        msg: String,
+        data: Vec<CandleRawData>,
+    }
+
+    let data: Response = match resp.json().await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(symbol = %symbol, interval = %interval, error = %e, "Failed to parse history candles");
+            return;
+        }
+    };
+
+    if data.code != "0" {
+        tracing::error!(
+            symbol = %symbol,
+            interval = %interval,
+            code = %data.code,
+            "OKX history candles API error"
+        );
+        return;
+    }
+
+    let local_ts = now_ms();
+
+    // OKX 返回的数据按时间倒序，需要反转
+    for raw in data.data.iter().rev() {
+        let candle = parse_candle_data(raw, inst_id, interval);
+        let event = IncomeEvent {
+            exchange_ts: candle.open_time,
+            local_ts,
+            data: ExchangeEventData::Candle(candle),
+        };
+        let _ = income_pubsub.tell(Publish(event)).send().await;
+    }
+
+    tracing::info!(
+        symbol = %symbol,
+        interval = %interval,
+        count = data.data.len(),
+        "Published history candles"
+    );
+}
 
 fn kind_to_business_arg(kind: &SubscriptionKind, quote: &str) -> serde_json::Value {
     match kind {
