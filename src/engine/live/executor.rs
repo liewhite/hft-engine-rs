@@ -90,25 +90,25 @@ impl ExecutorActor {
         self.state_manager.apply(&event);
 
         // 调用策略，获取信号
-        let signals = self.strategy.on_event(&event, &self.state_manager);
-
-        // 处理每个信号
-        for signal in signals {
+        if let Some(signal) = self.strategy.on_event(&event, &self.state_manager) {
             match signal {
-                OutcomeEvent::PlaceOrder { order, comment } => {
-                    // 转换订单
-                    let converted_order = self.convert_order(order);
-                    // 添加到 pending_orders（用于追踪订单状态）
-                    self.state_manager.add_pending_order(
-                        &converted_order.symbol,
-                        converted_order.client_order_id.clone(),
-                        converted_order.exchange,
-                    );
-                    // 发布到 OutcomePubSub
+                OutcomeEvent::PlaceOrders { orders, comment } => {
+                    let converted: Vec<Order> = orders
+                        .into_iter()
+                        .map(|o| {
+                            let c = self.convert_order(o);
+                            self.state_manager.add_pending_order(
+                                &c.symbol,
+                                c.client_order_id.clone(),
+                                c.exchange,
+                            );
+                            c
+                        })
+                        .collect();
                     let _ = self
                         .outcome_pubsub
-                        .tell(Publish(OutcomeEvent::PlaceOrder {
-                            order: converted_order,
+                        .tell(Publish(OutcomeEvent::PlaceOrders {
+                            orders: converted,
                             comment,
                         }))
                         .send()

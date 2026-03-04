@@ -116,29 +116,35 @@ impl SlackNotifierActor {
         )
     }
 
-    /// 格式化下单通知
-    fn format_place_order_message(order: &Order, comment: &str) -> String {
-        let exchange_name = match order.exchange {
-            Exchange::Binance => "Binance",
-            Exchange::OKX => "OKX",
-            Exchange::Hyperliquid => "Hyperliquid",
-            Exchange::IBKR => "IBKR",
-        };
+    /// 格式化批量下单通知
+    fn format_place_orders_message(orders: &[Order], comment: &str) -> String {
+        let mut lines = vec![format!(":outbox_tray: *Signal: {}*", comment)];
 
-        let (side_emoji, side_name) = match order.side {
-            Side::Long => (":chart_with_upwards_trend:", "Long"),
-            Side::Short => (":chart_with_downwards_trend:", "Short"),
-        };
+        for order in orders {
+            let exchange_name = match order.exchange {
+                Exchange::Binance => "Binance",
+                Exchange::OKX => "OKX",
+                Exchange::Hyperliquid => "Hyperliquid",
+                Exchange::IBKR => "IBKR",
+            };
 
-        let price = match &order.order_type {
-            crate::domain::OrderType::Market => "Market".to_string(),
-            crate::domain::OrderType::Limit { price, .. } => format!("{:.4}", price),
-        };
+            let (side_emoji, side_name) = match order.side {
+                Side::Long => (":chart_with_upwards_trend:", "Long"),
+                Side::Short => (":chart_with_downwards_trend:", "Short"),
+            };
 
-        format!(
-            ":outbox_tray: *Order Placed*\n• Exchange: {}\n• Symbol: {}\n• Side: {} {}\n• Price: {}\n• Quantity: {:.4}\n• Reason: {}",
-            exchange_name, order.symbol, side_emoji, side_name, price, order.quantity, comment
-        )
+            let price = match &order.order_type {
+                crate::domain::OrderType::Market => "Market".to_string(),
+                crate::domain::OrderType::Limit { price, .. } => format!("{:.4}", price),
+            };
+
+            lines.push(format!(
+                "  • {} {} {} {} {:.4} @ {}",
+                exchange_name, order.symbol, side_emoji, side_name, order.quantity, price,
+            ));
+        }
+
+        lines.join("\n")
     }
 }
 
@@ -199,8 +205,8 @@ impl Message<OutcomeEvent> for SlackNotifierActor {
 
     async fn handle(&mut self, msg: OutcomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
         match msg {
-            OutcomeEvent::PlaceOrder { order, comment } => {
-                let message = Self::format_place_order_message(&order, &comment);
+            OutcomeEvent::PlaceOrders { orders, comment } => {
+                let message = Self::format_place_orders_message(&orders, &comment);
                 self.send_slack_message(&message).await;
             }
         }

@@ -62,7 +62,7 @@ impl SpreadArbStrategy {
         hl_pos: f64,
         ibkr_ask: f64,
         hl_bid: f64,
-    ) -> Option<Vec<OutcomeEvent>> {
+    ) -> Option<OutcomeEvent> {
         let ibkr_wrong = ibkr_pos < -POSITION_EPSILON;
         let hl_wrong = hl_pos > POSITION_EPSILON;
 
@@ -84,24 +84,18 @@ impl SpreadArbStrategy {
             let qty = ibkr_pos.abs().floor();
             if qty >= MIN_ORDER_QTY {
                 let price = ibkr_ask * (1.0 + self.config.ioc_slippage);
-                orders.push(OutcomeEvent::PlaceOrder {
-                    order: Order {
-                        id: String::new(),
-                        exchange: Exchange::IBKR,
-                        symbol: self.symbol.clone(),
-                        side: Side::Long,
-                        order_type: OrderType::Limit {
-                            price,
-                            tif: TimeInForce::IOC,
-                        },
-                        quantity: qty,
-                        reduce_only: true,
-                        client_order_id: String::new(),
+                orders.push(Order {
+                    id: String::new(),
+                    exchange: Exchange::IBKR,
+                    symbol: self.symbol.clone(),
+                    side: Side::Long,
+                    order_type: OrderType::Limit {
+                        price,
+                        tif: TimeInForce::IOC,
                     },
-                    comment: format!(
-                        "emergency_flatten | ibkr_pos={:.4} | qty={:.4} | price={:.4}",
-                        ibkr_pos, qty, price,
-                    ),
+                    quantity: qty,
+                    reduce_only: true,
+                    client_order_id: String::new(),
                 });
             }
         }
@@ -111,24 +105,18 @@ impl SpreadArbStrategy {
             let qty = hl_pos.floor();
             if qty >= MIN_ORDER_QTY {
                 let price = hl_bid * (1.0 - self.config.ioc_slippage);
-                orders.push(OutcomeEvent::PlaceOrder {
-                    order: Order {
-                        id: String::new(),
-                        exchange: Exchange::Hyperliquid,
-                        symbol: self.symbol.clone(),
-                        side: Side::Short,
-                        order_type: OrderType::Limit {
-                            price,
-                            tif: TimeInForce::IOC,
-                        },
-                        quantity: qty,
-                        reduce_only: true,
-                        client_order_id: String::new(),
+                orders.push(Order {
+                    id: String::new(),
+                    exchange: Exchange::Hyperliquid,
+                    symbol: self.symbol.clone(),
+                    side: Side::Short,
+                    order_type: OrderType::Limit {
+                        price,
+                        tif: TimeInForce::IOC,
                     },
-                    comment: format!(
-                        "emergency_flatten | hl_pos={:.4} | qty={:.4} | price={:.4}",
-                        hl_pos, qty, price,
-                    ),
+                    quantity: qty,
+                    reduce_only: true,
+                    client_order_id: String::new(),
                 });
             }
         }
@@ -140,9 +128,16 @@ impl SpreadArbStrategy {
                 hl_pos,
                 "SpreadArb: abnormal position detected but qty < 1, strategy halted"
             );
+            return None;
         }
 
-        Some(orders)
+        Some(OutcomeEvent::PlaceOrders {
+            comment: format!(
+                "emergency_flatten | ibkr_pos={:.4} | hl_pos={:.4}",
+                ibkr_pos, hl_pos,
+            ),
+            orders,
+        })
     }
 
     /// 检查两腿敞口是否需要 rebalance
@@ -155,21 +150,20 @@ impl SpreadArbStrategy {
         hl_pos: f64,
         ibkr_bid: f64,
         hl_ask: f64,
-    ) -> Vec<OutcomeEvent> {
+    ) -> Option<OutcomeEvent> {
         // ibkr_pos >= 0 (多头), hl_pos <= 0 (空头)
         // 理想状态: ibkr_pos == hl_pos.abs()
         let exposure = ibkr_pos - hl_pos.abs();
 
         if exposure.abs() < MIN_ORDER_QTY {
-            // 股票最小单位 1 股，差异不足 1 股无需 rebalance
-            return vec![];
+            return None;
         }
 
-        if exposure > 0.0 {
+        let (order, rebal_qty) = if exposure > 0.0 {
             // IBKR 多头多了，需要卖出 IBKR 多余的部分
             let rebal_qty = exposure.floor();
             if rebal_qty < MIN_ORDER_QTY {
-                return vec![];
+                return None;
             }
 
             let price = ibkr_bid * (1.0 - self.config.ioc_slippage);
@@ -183,30 +177,25 @@ impl SpreadArbStrategy {
                 "SpreadArb: rebalance — IBKR long excess, selling"
             );
 
-            vec![OutcomeEvent::PlaceOrder {
-                order: Order {
-                    id: String::new(),
-                    exchange: Exchange::IBKR,
-                    symbol: self.symbol.clone(),
-                    side: Side::Short,
-                    order_type: OrderType::Limit {
-                        price,
-                        tif: TimeInForce::IOC,
-                    },
-                    quantity: rebal_qty,
-                    reduce_only: true,
-                    client_order_id: String::new(),
+            let order = Order {
+                id: String::new(),
+                exchange: Exchange::IBKR,
+                symbol: self.symbol.clone(),
+                side: Side::Short,
+                order_type: OrderType::Limit {
+                    price,
+                    tif: TimeInForce::IOC,
                 },
-                comment: format!(
-                    "spread_rebal | exp={:.4} | qty={:.4} | ibkr_bid={:.4}",
-                    exposure, rebal_qty, ibkr_bid,
-                ),
-            }]
+                quantity: rebal_qty,
+                reduce_only: true,
+                client_order_id: String::new(),
+            };
+            (order, rebal_qty)
         } else {
             // HL 空头多了，需要买入 HL 平掉多余的部分
             let rebal_qty = exposure.abs().floor();
             if rebal_qty < MIN_ORDER_QTY {
-                return vec![];
+                return None;
             }
 
             let price = hl_ask * (1.0 + self.config.ioc_slippage);
@@ -220,26 +209,29 @@ impl SpreadArbStrategy {
                 "SpreadArb: rebalance — HL short excess, buying"
             );
 
-            vec![OutcomeEvent::PlaceOrder {
-                order: Order {
-                    id: String::new(),
-                    exchange: Exchange::Hyperliquid,
-                    symbol: self.symbol.clone(),
-                    side: Side::Long,
-                    order_type: OrderType::Limit {
-                        price,
-                        tif: TimeInForce::IOC,
-                    },
-                    quantity: rebal_qty,
-                    reduce_only: true,
-                    client_order_id: String::new(),
+            let order = Order {
+                id: String::new(),
+                exchange: Exchange::Hyperliquid,
+                symbol: self.symbol.clone(),
+                side: Side::Long,
+                order_type: OrderType::Limit {
+                    price,
+                    tif: TimeInForce::IOC,
                 },
-                comment: format!(
-                    "spread_rebal | exp={:.4} | qty={:.4} | hl_ask={:.4}",
-                    exposure, rebal_qty, hl_ask,
-                ),
-            }]
-        }
+                quantity: rebal_qty,
+                reduce_only: true,
+                client_order_id: String::new(),
+            };
+            (order, rebal_qty)
+        };
+
+        Some(OutcomeEvent::PlaceOrders {
+            comment: format!(
+                "spread_rebal | exp={:.4} | qty={:.4}",
+                exposure, rebal_qty,
+            ),
+            orders: vec![order],
+        })
     }
 }
 
@@ -259,30 +251,27 @@ impl Strategy for SpreadArbStrategy {
         self.config.order_timeout_ms
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Option<OutcomeEvent> {
         // 只响应 BBO 事件
         if !matches!(&event.data, ExchangeEventData::BBO(_)) {
-            return vec![];
+            return None;
         }
 
-        let symbol_state = match state.symbol_state(&self.symbol) {
-            Some(s) => s,
-            None => return vec![],
-        };
+        let symbol_state = state.symbol_state(&self.symbol)?;
 
         // 需要两边 BBO 都就绪
         let ibkr_bbo = match symbol_state.bbo(Exchange::IBKR) {
             Some(b) if b.ask_price > 0.0 && b.bid_price > 0.0 => b,
-            _ => return vec![],
+            _ => return None,
         };
         let hl_bbo = match symbol_state.bbo(Exchange::Hyperliquid) {
             Some(b) if b.ask_price > 0.0 && b.bid_price > 0.0 => b,
-            _ => return vec![],
+            _ => return None,
         };
 
         // 跳过有 pending orders 的情况
         if symbol_state.has_pending_orders() {
-            return vec![];
+            return None;
         }
 
         // 获取当前持仓
@@ -296,41 +285,37 @@ impl Strategy for SpreadArbStrategy {
             .unwrap_or(0.0);
 
         // === 步骤 0: 仓位方向守卫 ===
-        if let Some(emergency_orders) = self.emergency_flatten(
+        if let Some(signal) = self.emergency_flatten(
             ibkr_pos,
             hl_pos,
             ibkr_bbo.ask_price,
             hl_bbo.bid_price,
         ) {
-            return emergency_orders;
+            return Some(signal);
         }
 
         let has_position = ibkr_pos.abs() > POSITION_EPSILON || hl_pos.abs() > POSITION_EPSILON;
 
         // === 步骤 1: 敞口 rebalance 优先 ===
         if has_position {
-            let rebalance_orders = self.check_rebalance(
+            if let Some(signal) = self.check_rebalance(
                 ibkr_pos,
                 hl_pos,
                 ibkr_bbo.bid_price,
                 hl_bbo.ask_price,
-            );
-            if !rebalance_orders.is_empty() {
-                return rebalance_orders;
+            ) {
+                return Some(signal);
             }
         }
 
         // 计算 spread
-        let spread = match self.calc_spread(hl_bbo.bid_price, ibkr_bbo.ask_price) {
-            Some(s) => s,
-            None => return vec![],
-        };
+        let spread = self.calc_spread(hl_bbo.bid_price, ibkr_bbo.ask_price)?;
 
         // === 步骤 2: 平仓 ===
         if has_position && spread < self.config.close_threshold {
             let close_qty = ibkr_pos.min(hl_pos.abs()).floor();
             if close_qty < MIN_ORDER_QTY {
-                return vec![];
+                return None;
             }
 
             let ibkr_price = ibkr_bbo.bid_price * (1.0 - self.config.ioc_slippage);
@@ -346,10 +331,14 @@ impl Strategy for SpreadArbStrategy {
                 "SpreadArb: closing position"
             );
 
-            return vec![
-                // IBKR: 卖出平仓
-                OutcomeEvent::PlaceOrder {
-                    order: Order {
+            return Some(OutcomeEvent::PlaceOrders {
+                comment: format!(
+                    "spread_close | spread={:.4}% | qty={:.4} | ibkr_bid={:.4} | hl_ask={:.4}",
+                    spread * 100.0, close_qty, ibkr_bbo.bid_price, hl_bbo.ask_price,
+                ),
+                orders: vec![
+                    // IBKR: 卖出平仓
+                    Order {
                         id: String::new(),
                         exchange: Exchange::IBKR,
                         symbol: self.symbol.clone(),
@@ -362,14 +351,8 @@ impl Strategy for SpreadArbStrategy {
                         reduce_only: true,
                         client_order_id: String::new(),
                     },
-                    comment: format!(
-                        "spread_close | spread={:.4}% | qty={:.4} | ibkr_bid={:.4}",
-                        spread * 100.0, close_qty, ibkr_bbo.bid_price,
-                    ),
-                },
-                // HL: 买入平空
-                OutcomeEvent::PlaceOrder {
-                    order: Order {
+                    // HL: 买入平空
+                    Order {
                         id: String::new(),
                         exchange: Exchange::Hyperliquid,
                         symbol: self.symbol.clone(),
@@ -382,12 +365,8 @@ impl Strategy for SpreadArbStrategy {
                         reduce_only: true,
                         client_order_id: String::new(),
                     },
-                    comment: format!(
-                        "spread_close | spread={:.4}% | qty={:.4} | hl_ask={:.4}",
-                        spread * 100.0, close_qty, hl_bbo.ask_price,
-                    ),
-                },
-            ];
+                ],
+            });
         }
 
         // === 步骤 3: 开仓 ===
@@ -404,14 +383,14 @@ impl Strategy for SpreadArbStrategy {
                     max_leverage = format!("{:.2}", self.config.max_leverage),
                     "SpreadArb: leverage limit reached, skip opening"
                 );
-                return vec![];
+                return None;
             }
 
             // IBKR 股票最小单位 1 股，向下取整
             // HL 永续合约两边使用相同数量（股数），具体精度由交易所下单时校验
             let qty = (self.config.order_usd_value / ibkr_bbo.ask_price).floor();
             if qty < MIN_ORDER_QTY {
-                return vec![];
+                return None;
             }
 
             let ibkr_price = ibkr_bbo.ask_price * (1.0 + self.config.ioc_slippage);
@@ -428,10 +407,14 @@ impl Strategy for SpreadArbStrategy {
                 "SpreadArb: opening position"
             );
 
-            return vec![
-                // IBKR: 买入
-                OutcomeEvent::PlaceOrder {
-                    order: Order {
+            return Some(OutcomeEvent::PlaceOrders {
+                comment: format!(
+                    "spread_open | spread={:.4}% | qty={:.4} | ibkr_ask={:.4} | hl_bid={:.4} | lev={:.2}",
+                    spread * 100.0, qty, ibkr_bbo.ask_price, hl_bbo.bid_price, leverage,
+                ),
+                orders: vec![
+                    // IBKR: 买入
+                    Order {
                         id: String::new(),
                         exchange: Exchange::IBKR,
                         symbol: self.symbol.clone(),
@@ -444,14 +427,8 @@ impl Strategy for SpreadArbStrategy {
                         reduce_only: false,
                         client_order_id: String::new(),
                     },
-                    comment: format!(
-                        "spread_open | spread={:.4}% | qty={:.4} | ibkr_ask={:.4}",
-                        spread * 100.0, qty, ibkr_bbo.ask_price,
-                    ),
-                },
-                // HL: 做空
-                OutcomeEvent::PlaceOrder {
-                    order: Order {
+                    // HL: 做空
+                    Order {
                         id: String::new(),
                         exchange: Exchange::Hyperliquid,
                         symbol: self.symbol.clone(),
@@ -464,14 +441,10 @@ impl Strategy for SpreadArbStrategy {
                         reduce_only: false,
                         client_order_id: String::new(),
                     },
-                    comment: format!(
-                        "spread_open | spread={:.4}% | qty={:.4} | hl_bid={:.4}",
-                        spread * 100.0, qty, hl_bbo.bid_price,
-                    ),
-                },
-            ];
+                ],
+            });
         }
 
-        vec![]
+        None
     }
 }

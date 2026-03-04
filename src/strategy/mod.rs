@@ -6,7 +6,7 @@ mod spread_arb;
 pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
 pub use metrics_subscriber::{MetricsSubscriberActor, MetricsSubscriberArgs};
 pub use slack_notifier::{SlackNotifierActor, SlackNotifierArgs};
-pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy};
+pub use spread_arb::{SpreadArbConfig, SpreadArbStatsActor, SpreadArbStatsArgs, SpreadArbStrategy};
 
 use crate::domain::{Exchange, Order};
 use crate::exchange::SubscriptionKind;
@@ -16,11 +16,11 @@ use std::collections::{HashMap, HashSet};
 /// 策略输出的信号
 #[derive(Debug, Clone)]
 pub enum OutcomeEvent {
-    /// 下单信号
-    PlaceOrder {
-        /// 订单
-        order: Order,
-        /// 订单描述（信号原因、上下文等）
+    /// 下单信号（一次决策可包含多个关联订单）
+    PlaceOrders {
+        /// 关联订单列表
+        orders: Vec<Order>,
+        /// 信号意图描述，如 "spread_open | spread=0.30% | qty=10"
         comment: String,
     },
 }
@@ -36,9 +36,6 @@ pub trait Strategy: Send + Sync {
     /// 订单超时时间 (毫秒)
     fn order_timeout_ms(&self) -> u64;
 
-    /// 处理事件，返回要执行的动作
-    ///
-    /// state: 状态管理器，只读
-    /// 返回: 策略产生的信号列表 (如下单)
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent>;
+    /// 处理事件，一次事件最多产出一个信号
+    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Option<OutcomeEvent>;
 }

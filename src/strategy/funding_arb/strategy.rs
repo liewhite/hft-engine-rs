@@ -160,11 +160,9 @@ impl FundingArbStrategy {
             long_exchange,
             long_price: long_bbo.ask_price,
             long_size: base_size,
-            long_book_qty: long_bbo.ask_qty,
             short_exchange,
             short_price: short_bbo.bid_price,
             short_size: base_size,
-            short_book_qty: short_bbo.bid_qty,
             long_deviation: ask_deviation,
             short_deviation: bid_deviation,
         })
@@ -573,7 +571,7 @@ impl FundingArbStrategy {
         })
     }
 
-    /// 生成 rebalance 订单，返回订单和描述
+    /// 生成 rebalance 订单
     fn make_rebalance_order(
         &self,
         state: &SymbolState,
@@ -654,35 +652,26 @@ impl FundingArbStrategy {
             client_order_id: String::new(),
         };
 
-        // comment: rebalance 标记 | 敞口 | 下单数量 | 对手价x挂单量
         let comment = format!(
             "rebal | exp={:.4} | qty={:.4} | book={:.4}x{:.4}",
-            exposure,
-            qty,
-            orderbook_price,
-            orderbook_qty,
+            exposure, qty, orderbook_price, orderbook_qty,
         );
 
         Some((order, comment))
     }
 
-    /// 根据处理后的信号生成订单，返回订单和描述的列表
-    fn make_orders(&self, signal: &TradingSignal, state: &SymbolState) -> Vec<(Order, String)> {
+    /// 根据处理后的信号生成订单列表
+    fn make_orders(&self, signal: &TradingSignal) -> Vec<Order> {
         // 计算带滑点的价格（模拟市价单）
         // short_price 是 bid，做空用 bid - slippage
         // long_price 是 ask，做多用 ask + slippage
         let short_limit_price = signal.short_price * (1.0 - self.config.ioc_slippage);
         let long_limit_price = signal.long_price * (1.0 + self.config.ioc_slippage);
 
-        // 获取当前敞口
-        let (long_size, short_size) = state.position_sizes();
-        let net_exposure = long_size + short_size;
-
         let mut orders = Vec::new();
 
-        // 只有 size > 0 时才生成订单
         if signal.short_size > POSITION_EPSILON {
-            let order = Order {
+            orders.push(Order {
                 id: String::new(),
                 exchange: signal.short_exchange,
                 symbol: self.symbol.clone(),
@@ -694,21 +683,11 @@ impl FundingArbStrategy {
                 quantity: signal.short_size,
                 reduce_only: false,
                 client_order_id: String::new(),
-            };
-            // comment: 敞口 | 下单数量 | 对手价x挂单量 | deviation
-            let comment = format!(
-                "exp={:.4} | qty={:.4} | book={:.4}x{:.4} | dev={:.4}%",
-                net_exposure,
-                signal.short_size,
-                signal.short_price,
-                signal.short_book_qty,
-                signal.short_deviation * 100.0,
-            );
-            orders.push((order, comment));
+            });
         }
 
         if signal.long_size > POSITION_EPSILON {
-            let order = Order {
+            orders.push(Order {
                 id: String::new(),
                 exchange: signal.long_exchange,
                 symbol: self.symbol.clone(),
@@ -720,17 +699,7 @@ impl FundingArbStrategy {
                 quantity: signal.long_size,
                 reduce_only: false,
                 client_order_id: String::new(),
-            };
-            // comment: 敞口 | 下单数量 | 对手价x挂单量 | deviation
-            let comment = format!(
-                "exp={:.4} | qty={:.4} | book={:.4}x{:.4} | dev={:.4}%",
-                net_exposure,
-                signal.long_size,
-                signal.long_price,
-                signal.long_book_qty,
-                signal.long_deviation * 100.0,
-            );
-            orders.push((order, comment));
+            });
         }
 
         if !orders.is_empty() {
@@ -773,12 +742,9 @@ impl Strategy for FundingArbStrategy {
         self.config.order_timeout_ms
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Option<OutcomeEvent> {
         // 获取本策略关注的 symbol 状态
-        let symbol_state = match state.symbol_state(&self.symbol) {
-            Some(s) => s,
-            None => return vec![],
-        };
+        let symbol_state = state.symbol_state(&self.symbol)?;
 
         // BBO 事件时更新该交易所的 bid/ask EMA
         if let ExchangeEventData::BBO(bbo) = &event.data {
@@ -787,34 +753,42 @@ impl Strategy for FundingArbStrategy {
 
         // EMA 未预热完成，不进行交易
         if !self.all_emas_ready() {
-            return vec![];
+            return None;
         }
 
         // 有未完成订单时等待
         if symbol_state.has_pending_orders() {
-            return vec![];
+            return None;
         }
 
         // 步骤 1: 敞口超限 → rebalance（平掉多余仓位）
         if let Some((exchange, qty)) = self.check_rebalance_needed(symbol_state) {
-            if let Some((order, comment)) = self.make_rebalance_order(symbol_state, exchange, qty) {
-                return vec![OutcomeEvent::PlaceOrder { order, comment }];
-            }
-            return vec![];
+            let (order, comment) = self.make_rebalance_order(symbol_state, exchange, qty)?;
+            return Some(OutcomeEvent::PlaceOrders {
+                orders: vec![order],
+                comment: format!("rebal | {}", comment),
+            });
         }
 
         // 步骤 2: 检查信号并通过 pipeline 处理
         if let Some(signal) = self.check_signal(symbol_state, state) {
-            let processed_signal = self.process_signal(signal, symbol_state, state);
-            let orders = self.make_orders(&processed_signal, symbol_state);
+            let processed = self.process_signal(signal, symbol_state, state);
+            let orders = self.make_orders(&processed);
             if !orders.is_empty() {
-                return orders
-                    .into_iter()
-                    .map(|(order, comment)| OutcomeEvent::PlaceOrder { order, comment })
-                    .collect();
+                let (long_size, short_size) = symbol_state.position_sizes();
+                let net_exposure = long_size + short_size;
+                let comment = format!(
+                    "deviation | short={} long={} | s_dev={:.4}% l_dev={:.4}% | exp={:.4}",
+                    processed.short_exchange,
+                    processed.long_exchange,
+                    processed.short_deviation * 100.0,
+                    processed.long_deviation * 100.0,
+                    net_exposure,
+                );
+                return Some(OutcomeEvent::PlaceOrders { orders, comment });
             }
         }
 
-        vec![]
+        None
     }
 }

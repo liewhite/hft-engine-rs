@@ -65,69 +65,71 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         match msg {
-            OutcomeEvent::PlaceOrder { order, comment } => {
-                let client = match self.clients.get(&order.exchange) {
-                    Some(e) => e.clone(),
-                    None => {
-                        let reason = format!("No client found for exchange {}", order.exchange);
-                        tracing::error!(
-                            exchange = %order.exchange,
-                            "{}", reason
-                        );
-                        // 发送错误事件
-                        self.send_order_error(&order, reason).await;
-                        return;
-                    }
-                };
-
-                tracing::info!(
-                    exchange = %order.exchange,
-                    symbol = %order.symbol,
-                    side = %order.side,
-                    order_type = ?order.order_type,
-                    quantity = order.quantity,
-                    client_order_id = ?order.client_order_id,
-                    comment = %comment,
-                    "Placing order"
-                );
-
-                // 使用 tokio::spawn 异步发送订单，不阻塞后续订单处理
-                let income_pubsub = self.income_pubsub.clone();
-                tokio::spawn(async move {
-                    match client.place_order(order.clone()).await {
-                        Ok(order_id) => {
-                            tracing::info!(
+            OutcomeEvent::PlaceOrders { orders, comment } => {
+                for order in orders {
+                    let client = match self.clients.get(&order.exchange) {
+                        Some(e) => e.clone(),
+                        None => {
+                            let reason =
+                                format!("No client found for exchange {}", order.exchange);
+                            tracing::error!(
                                 exchange = %order.exchange,
-                                symbol = %order.symbol,
-                                order_id = %order_id,
-                                client_order_id = ?order.client_order_id,
-                                "Order placed successfully"
+                                "{}", reason
                             );
+                            self.send_order_error(&order, reason).await;
+                            continue;
                         }
-                        Err(e) => {
-                            let reason = e.to_string();
-                            // reduce_only 订单因仓位已平而被拒绝是正常的竞态情况
-                            if reason.contains("Reduce only") || reason.contains("reduce only") {
+                    };
+
+                    tracing::info!(
+                        exchange = %order.exchange,
+                        symbol = %order.symbol,
+                        side = %order.side,
+                        order_type = ?order.order_type,
+                        quantity = order.quantity,
+                        client_order_id = ?order.client_order_id,
+                        signal = %comment,
+                        "Placing order"
+                    );
+
+                    let income_pubsub = self.income_pubsub.clone();
+                    tokio::spawn(async move {
+                        match client.place_order(order.clone()).await {
+                            Ok(order_id) => {
                                 tracing::info!(
                                     exchange = %order.exchange,
                                     symbol = %order.symbol,
+                                    order_id = %order_id,
                                     client_order_id = ?order.client_order_id,
-                                    "Reduce-only order rejected: position already closed"
-                                );
-                            } else {
-                                tracing::error!(
-                                    exchange = %order.exchange,
-                                    symbol = %order.symbol,
-                                    client_order_id = ?order.client_order_id,
-                                    error = %reason,
-                                    "Failed to place order"
+                                    "Order placed successfully"
                                 );
                             }
-                            // 发送错误事件
-                            Self::send_order_error_static(&income_pubsub, &order, reason).await;
+                            Err(e) => {
+                                let reason = e.to_string();
+                                if reason.contains("Reduce only")
+                                    || reason.contains("reduce only")
+                                {
+                                    tracing::info!(
+                                        exchange = %order.exchange,
+                                        symbol = %order.symbol,
+                                        client_order_id = ?order.client_order_id,
+                                        "Reduce-only order rejected: position already closed"
+                                    );
+                                } else {
+                                    tracing::error!(
+                                        exchange = %order.exchange,
+                                        symbol = %order.symbol,
+                                        client_order_id = ?order.client_order_id,
+                                        error = %reason,
+                                        "Failed to place order"
+                                    );
+                                }
+                                Self::send_order_error_static(&income_pubsub, &order, reason)
+                                    .await;
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
     }
