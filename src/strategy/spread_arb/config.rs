@@ -1,5 +1,10 @@
 use serde::Deserialize;
 
+/// BBO 新鲜度默认阈值 (ms)
+fn default_bbo_staleness_ms() -> u64 {
+    1000
+}
+
 /// Spread 套利策略配置 (IBKR 股票 vs Hyperliquid 永续)
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpreadArbConfig {
@@ -19,6 +24,9 @@ pub struct SpreadArbConfig {
     pub ioc_slippage: f64,
     /// 订单超时 (ms)
     pub order_timeout_ms: u64,
+    /// BBO 新鲜度阈值 (ms)，超过此值视为过期
+    #[serde(default = "default_bbo_staleness_ms")]
+    pub bbo_staleness_ms: u64,
 }
 
 impl SpreadArbConfig {

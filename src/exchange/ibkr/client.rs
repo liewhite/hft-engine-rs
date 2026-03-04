@@ -381,6 +381,7 @@ impl ExchangeClient for IbkrClient {
         let mut order_body = serde_json::json!({
             "conidex": format!("{}@SMART", conid),
             "secType": format!("{}:STK", conid),
+            "cOID": order.client_order_id,
             "side": side,
             "quantity": order.quantity,
             "orderType": order_type,

@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, MarketStatus, Order, OrderType, Side, Symbol, TimeInForce};
+use crate::domain::{now_ms, Exchange, MarketStatus, Order, OrderType, Side, Symbol, TimeInForce};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager};
 use crate::strategy::{OutcomeEvent, Strategy};
@@ -194,8 +194,13 @@ impl SpreadArbStrategy {
             (order, rebal_qty)
         } else {
             // HL 空头多了，需要买入 HL 平掉多余的部分
-            let rebal_qty = exposure.abs().floor();
-            if rebal_qty < MIN_ORDER_QTY {
+            // 当 IBKR 侧实质为零时，直接用 raw qty（executor 会按 HL size_step 取整）
+            let rebal_qty = if ibkr_pos.abs() < MIN_ORDER_QTY {
+                exposure.abs()
+            } else {
+                exposure.abs().floor()
+            };
+            if rebal_qty < POSITION_EPSILON {
                 return None;
             }
 
@@ -277,6 +282,26 @@ impl Strategy for SpreadArbStrategy {
             _ => return None,
         };
 
+        // BBO 新鲜度检查
+        let now = now_ms();
+        let staleness = self.config.bbo_staleness_ms;
+        if now.saturating_sub(ibkr_bbo.timestamp) > staleness {
+            tracing::debug!(
+                symbol = %self.symbol,
+                age_ms = now.saturating_sub(ibkr_bbo.timestamp),
+                "SpreadArb: IBKR BBO stale, skipping"
+            );
+            return None;
+        }
+        if now.saturating_sub(hl_bbo.timestamp) > staleness {
+            tracing::debug!(
+                symbol = %self.symbol,
+                age_ms = now.saturating_sub(hl_bbo.timestamp),
+                "SpreadArb: HL BBO stale, skipping"
+            );
+            return None;
+        }
+
         // 跳过有 pending orders 的情况
         if symbol_state.has_pending_orders() {
             return None;
@@ -321,46 +346,80 @@ impl Strategy for SpreadArbStrategy {
 
         // === 步骤 2: 平仓 ===
         if has_position && spread < self.config.close_threshold {
-            let close_qty = ibkr_pos.min(hl_pos.abs()).floor();
-            if close_qty < MIN_ORDER_QTY {
-                return None;
+            let paired_qty = ibkr_pos.min(hl_pos.abs());
+            let close_qty = paired_qty.floor();
+
+            if close_qty >= MIN_ORDER_QTY {
+                // 双腿配对平仓
+                let ibkr_price = ibkr_bbo.bid_price * (1.0 - self.config.ioc_slippage);
+                let hl_price = hl_bbo.ask_price * (1.0 + self.config.ioc_slippage);
+
+                tracing::info!(
+                    symbol = %self.symbol,
+                    spread = format!("{:.4}%", spread * 100.0),
+                    close_threshold = format!("{:.4}%", self.config.close_threshold * 100.0),
+                    close_qty,
+                    ibkr_bid = ibkr_bbo.bid_price,
+                    hl_ask = hl_bbo.ask_price,
+                    "SpreadArb: closing position"
+                );
+
+                return Some(OutcomeEvent::PlaceOrders {
+                    comment: format!(
+                        "spread_close | spread={:.4}% | qty={:.4} | ibkr_bid={:.4} | hl_ask={:.4}",
+                        spread * 100.0, close_qty, ibkr_bbo.bid_price, hl_bbo.ask_price,
+                    ),
+                    orders: vec![
+                        // IBKR: 卖出平仓
+                        Order {
+                            id: String::new(),
+                            exchange: Exchange::IBKR,
+                            symbol: self.symbol.clone(),
+                            side: Side::Short,
+                            order_type: OrderType::Limit {
+                                price: ibkr_price,
+                                tif: TimeInForce::IOC,
+                            },
+                            quantity: close_qty,
+                            reduce_only: true,
+                            client_order_id: String::new(),
+                        },
+                        // HL: 买入平空
+                        Order {
+                            id: String::new(),
+                            exchange: Exchange::Hyperliquid,
+                            symbol: self.symbol.clone(),
+                            side: Side::Long,
+                            order_type: OrderType::Limit {
+                                price: hl_price,
+                                tif: TimeInForce::IOC,
+                            },
+                            quantity: close_qty,
+                            reduce_only: true,
+                            client_order_id: String::new(),
+                        },
+                    ],
+                });
             }
 
-            let ibkr_price = ibkr_bbo.bid_price * (1.0 - self.config.ioc_slippage);
-            let hl_price = hl_bbo.ask_price * (1.0 + self.config.ioc_slippage);
+            // 残余清理: IBKR 侧已清零但 HL 侧有残余空头，单独平 HL
+            if ibkr_pos.abs() < MIN_ORDER_QTY && hl_pos.abs() > POSITION_EPSILON {
+                let hl_close_qty = hl_pos.abs();
+                let hl_price = hl_bbo.ask_price * (1.0 + self.config.ioc_slippage);
 
-            tracing::info!(
-                symbol = %self.symbol,
-                spread = format!("{:.4}%", spread * 100.0),
-                close_threshold = format!("{:.4}%", self.config.close_threshold * 100.0),
-                close_qty,
-                ibkr_bid = ibkr_bbo.bid_price,
-                hl_ask = hl_bbo.ask_price,
-                "SpreadArb: closing position"
-            );
+                tracing::info!(
+                    symbol = %self.symbol,
+                    hl_pos,
+                    hl_close_qty,
+                    "SpreadArb: closing residual HL position (IBKR already flat)"
+                );
 
-            return Some(OutcomeEvent::PlaceOrders {
-                comment: format!(
-                    "spread_close | spread={:.4}% | qty={:.4} | ibkr_bid={:.4} | hl_ask={:.4}",
-                    spread * 100.0, close_qty, ibkr_bbo.bid_price, hl_bbo.ask_price,
-                ),
-                orders: vec![
-                    // IBKR: 卖出平仓
-                    Order {
-                        id: String::new(),
-                        exchange: Exchange::IBKR,
-                        symbol: self.symbol.clone(),
-                        side: Side::Short,
-                        order_type: OrderType::Limit {
-                            price: ibkr_price,
-                            tif: TimeInForce::IOC,
-                        },
-                        quantity: close_qty,
-                        reduce_only: true,
-                        client_order_id: String::new(),
-                    },
-                    // HL: 买入平空
-                    Order {
+                return Some(OutcomeEvent::PlaceOrders {
+                    comment: format!(
+                        "spread_close_residual_hl | hl_pos={:.4} | qty={:.4}",
+                        hl_pos, hl_close_qty,
+                    ),
+                    orders: vec![Order {
                         id: String::new(),
                         exchange: Exchange::Hyperliquid,
                         symbol: self.symbol.clone(),
@@ -369,12 +428,14 @@ impl Strategy for SpreadArbStrategy {
                             price: hl_price,
                             tif: TimeInForce::IOC,
                         },
-                        quantity: close_qty,
+                        quantity: hl_close_qty,
                         reduce_only: true,
                         client_order_id: String::new(),
-                    },
-                ],
-            });
+                    }],
+                });
+            }
+
+            return None;
         }
 
         // === 步骤 3: 开仓 ===

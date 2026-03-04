@@ -53,10 +53,13 @@ impl SymbolState {
 
     /// 检查并移除超时订单，返回被移除的订单数量
     ///
-    /// 只移除 Created 状态的订单（交易所未确认）
+    /// 两道超时检查:
+    /// 1. Created 状态超过 timeout_ms → 交易所未确认，移除
+    /// 2. 非 Created 状态超过 3 * timeout_ms → 终态丢失，安全移除
     pub fn remove_timed_out_orders(&mut self, now: Timestamp, timeout_ms: u64) -> usize {
         let before = self.pending_orders.len();
         let symbol = self.symbol.clone();
+        let safe_timeout_ms = timeout_ms * 3;
         self.pending_orders.retain(|client_id, order| {
             let elapsed = now.saturating_sub(order.created_at);
             if elapsed > timeout_ms && order.status == OrderStatus::Created {
@@ -67,10 +70,20 @@ impl SymbolState {
                     elapsed_ms = elapsed,
                     "Order timed out (no exchange confirmation), removing from pending"
                 );
-                false
-            } else {
-                true
+                return false;
             }
+            if elapsed > safe_timeout_ms && order.status != OrderStatus::Created {
+                tracing::warn!(
+                    symbol = %symbol,
+                    client_order_id = %client_id,
+                    exchange = %order.exchange,
+                    status = ?order.status,
+                    elapsed_ms = elapsed,
+                    "Confirmed order timed out (terminal status lost), force removing from pending"
+                );
+                return false;
+            }
+            true
         });
         before - self.pending_orders.len()
     }

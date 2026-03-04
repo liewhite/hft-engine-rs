@@ -5,7 +5,7 @@
 //! - 处理 BBO 订阅 (其他类型静默忽略)
 //! - 增量更新 bid/ask 缓存并发布 BBO 到 IncomePubSub
 
-use crate::domain::{now_ms, Exchange, BBO};
+use crate::domain::{now_ms, Exchange, OrderStatus, OrderUpdate, Side, BBO};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ibkr::auth::IbkrAuth;
@@ -94,12 +94,29 @@ impl IbkrPublicWsActor {
         let value: serde_json::Value =
             serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
-        // 忽略非数据消息 (心跳、状态等)
+        // 路由: topic 以 "sor" 开头 → 订单状态更新
+        if let Some(topic) = value.get("topic").and_then(|v| v.as_str()) {
+            if topic.starts_with("sor") {
+                return self.handle_order_update(&value, local_ts).await;
+            }
+        }
+
+        // 路由: 含 conid → BBO 行情
         let conid = match value.get("conid").and_then(|v| v.as_i64()) {
             Some(id) => id,
-            None => return Ok(()), // 心跳/状态消息无 conid
+            None => return Ok(()), // 心跳/状态消息
         };
 
+        self.handle_bbo(&value, conid, local_ts).await
+    }
+
+    /// 处理 BBO 行情消息
+    async fn handle_bbo(
+        &mut self,
+        value: &serde_json::Value,
+        conid: i64,
+        local_ts: u64,
+    ) -> Result<(), WsError> {
         let symbol = match self.conid_to_symbol.get(&conid) {
             Some(s) => s.clone(),
             None => {
@@ -149,6 +166,117 @@ impl IbkrPublicWsActor {
                 exchange_ts: local_ts,
                 local_ts,
                 data: ExchangeEventData::BBO(bbo),
+            };
+
+            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+        }
+
+        Ok(())
+    }
+
+    /// 处理 sor 订单状态更新
+    ///
+    /// IBKR WS `sor` topic 推送订单更新，包含 order_ref (= 我们的 cOID)。
+    /// 跳过无 order_ref 的非策略订单。
+    async fn handle_order_update(
+        &mut self,
+        value: &serde_json::Value,
+        local_ts: u64,
+    ) -> Result<(), WsError> {
+        let args = match value.get("args").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => return Ok(()),
+        };
+
+        for item in args {
+            // order_ref 是我们下单时设置的 cOID
+            let order_ref = match item.get("order_ref").and_then(|v| v.as_str()) {
+                Some(r) if !r.is_empty() => r,
+                _ => continue, // 跳过非策略订单
+            };
+
+            let order_id = item
+                .get("orderId")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+
+            let ib_status = match item.get("status").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let status = match ib_status {
+                "PendingSubmit" | "PreSubmitted" | "Submitted" => OrderStatus::Pending,
+                "Filled" => OrderStatus::Filled,
+                "Cancelled" => OrderStatus::Cancelled,
+                "Inactive" => OrderStatus::Rejected {
+                    reason: "Inactive".to_string(),
+                },
+                other => {
+                    tracing::debug!(
+                        ib_status = other,
+                        order_ref,
+                        "IBKR unknown order status, ignoring"
+                    );
+                    continue;
+                }
+            };
+
+            // 解析 symbol: 通过 conid 反查
+            let conid = item.get("conid").and_then(|v| v.as_i64());
+            let symbol = conid.and_then(|c| self.conid_to_symbol.get(&c).cloned());
+
+            let symbol = match symbol {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(
+                        order_ref,
+                        order_id,
+                        ?conid,
+                        "IBKR order update: cannot resolve symbol"
+                    );
+                    continue;
+                }
+            };
+
+            let filled_qty = item
+                .get("filledQuantity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+
+            let side_str = item.get("side").and_then(|v| v.as_str()).unwrap_or("");
+            let side = match side_str {
+                "BUY" | "B" => Side::Long,
+                _ => Side::Short,
+            };
+
+            tracing::info!(
+                symbol = %symbol,
+                order_ref,
+                order_id,
+                ib_status,
+                ?status,
+                filled_qty,
+                "IBKR order status update"
+            );
+
+            let update = OrderUpdate {
+                order_id,
+                client_order_id: Some(order_ref.to_string()),
+                exchange: Exchange::IBKR,
+                symbol,
+                side,
+                status,
+                filled_quantity: filled_qty,
+                fill_sz: 0.0, // sor 推送无增量 fill 信息
+                timestamp: local_ts,
+            };
+
+            let event = IncomeEvent {
+                exchange_ts: local_ts,
+                local_ts,
+                data: ExchangeEventData::OrderUpdate(update),
             };
 
             let _ = self.income_pubsub.tell(Publish(event)).send().await;
@@ -218,6 +346,13 @@ impl Actor for IbkrPublicWsActor {
         actor_ref.attach_stream(incoming_stream, (), ());
 
         tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
+
+        // 订阅订单状态推送 (sor topic)
+        if let Err(e) = outgoing_tx.send("sor+{}".to_string()).await {
+            tracing::error!(error = %e, "Failed to send IBKR sor subscription");
+        } else {
+            tracing::info!("IBKR sor (order status) subscription sent");
+        }
 
         tracing::info!("IbkrPublicWsActor started");
 

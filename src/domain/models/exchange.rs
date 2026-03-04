@@ -20,7 +20,7 @@ impl Exchange {
         let uuid_hex = Uuid::new_v4().simple().to_string();
         match self {
             Exchange::OKX => format!("x{}", &uuid_hex[..31]),
-            Exchange::IBKR => String::new(),
+            Exchange::IBKR => format!("ib{}", &uuid_hex[..30]),
             _ => format!("0x{}", uuid_hex),
         }
     }
