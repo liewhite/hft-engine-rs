@@ -123,9 +123,14 @@ impl OkxBusinessWsActor {
         }
 
         // OKX 返回的数据按时间倒序，反转为正序
-        let candles: Vec<_> = data.data.iter().rev()
+        let mut candles: Vec<_> = data.data.iter().rev()
             .map(|raw| parse_candle_data(raw, &inst_id, interval))
             .collect();
+
+        // 最新一条若未 confirm 则删除（WS 实时推送会补上）
+        if candles.last().is_some_and(|c| !c.confirm) {
+            candles.pop();
+        }
 
         let count = candles.len();
         let local_ts = now_ms();
