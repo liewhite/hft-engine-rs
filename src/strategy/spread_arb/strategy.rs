@@ -151,9 +151,10 @@ impl SpreadArbStrategy {
         ibkr_bid: f64,
         hl_ask: f64,
     ) -> Option<OutcomeEvent> {
+        // 净敞口 = 两腿仓位之和
         // ibkr_pos >= 0 (多头), hl_pos <= 0 (空头)
-        // 理想状态: ibkr_pos == hl_pos.abs()
-        let exposure = ibkr_pos - hl_pos.abs();
+        // 理想对冲: ibkr_pos + hl_pos == 0
+        let exposure = ibkr_pos + hl_pos;
 
         if exposure.abs() < MIN_ORDER_QTY {
             return None;
