@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
+use crate::domain::{Exchange, MarketStatus, Order, OrderType, Side, Symbol, TimeInForce};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager};
 use crate::strategy::{OutcomeEvent, Strategy};
@@ -258,6 +258,13 @@ impl Strategy for SpreadArbStrategy {
         }
 
         let symbol_state = state.symbol_state(&self.symbol)?;
+
+        // 两边市场都必须是 Liquid 才允许下单
+        if state.market_status(Exchange::IBKR) != MarketStatus::Liquid
+            || state.market_status(Exchange::Hyperliquid) != MarketStatus::Liquid
+        {
+            return None;
+        }
 
         // 需要两边 BBO 都就绪
         let ibkr_bbo = match symbol_state.bbo(Exchange::IBKR) {
