@@ -1,6 +1,8 @@
+pub mod bootstrap;
 pub mod config;
 pub mod live;
 
+pub use bootstrap::{init_monitoring, init_spread_arb_stats, init_tracing, load_config, wait_for_shutdown};
 pub use config::{DatabaseConfig, MonitoringConfig};
 pub use live::{
     AddStrategy, AddStrategies, ClockActor, ClockActorArgs,

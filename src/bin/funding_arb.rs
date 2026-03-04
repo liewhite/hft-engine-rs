@@ -2,23 +2,21 @@ use std::collections::{HashMap, HashSet};
 
 use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
 use fee_arb::engine::{
+    init_monitoring, init_spread_arb_stats, init_tracing, load_config, wait_for_shutdown,
     AddStrategies, DatabaseConfig, GetAllSymbolMetas, ManagerActor, ManagerActorArgs,
-    MonitoringConfig, SubscribeIncome, SubscribeOutcome,
+    MonitoringConfig,
 };
 use fee_arb::exchange::binance::BinanceCredentials;
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::ibkr::IbkrCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::{
-    FundingArbConfig, FundingArbStrategy, MetricsSubscriberActor, MetricsSubscriberArgs,
-    SlackNotifierActor, SlackNotifierArgs, SpreadArbConfig, SpreadArbStatsActor,
-    SpreadArbStatsArgs, SpreadArbStrategy,
+    FundingArbConfig, FundingArbStrategy, SpreadArbConfig, SpreadArbStrategy,
 };
 use kameo::actor::Spawn;
 use kameo::mailbox;
 use md5::{Digest, Md5};
 use serde::Deserialize;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// 交易所配置
 #[derive(Debug, Clone, Deserialize)]
@@ -57,20 +55,10 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::from_default_env().add_directive("fee_arb=info".parse()?))
-        .init();
-
+    init_tracing()?;
     tracing::info!("Fee arbitrage system starting...");
 
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "config.json".to_string());
-    tracing::info!(path = %config_path, "Loading config");
-
-    let content = std::fs::read_to_string(&config_path)?;
-    let config: Config = serde_json::from_str(&content)?;
+    let config: Config = load_config("config.json")?;
 
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
@@ -104,7 +92,6 @@ async fn main() -> anyhow::Result<()> {
             let mut hasher = Md5::new();
             hasher.update(symbol.as_bytes());
             let hash = hasher.finalize();
-            // 取 MD5 哈希的最后一个字节取模 4
             let remainder = hash[15] % 4;
             remainder == 0
         })
@@ -153,7 +140,6 @@ async fn main() -> anyhow::Result<()> {
 
     let strategy_count = strategies.len();
 
-    // 批量添加策略
     manager
         .ask(AddStrategies(strategies))
         .send()
@@ -162,98 +148,23 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(count = strategy_count, "Strategies batch added");
 
-    // 初始化监控 subscribers（如果配置了）
+    // 监控
     if let Some(ref monitoring) = config.monitoring {
-        // 创建 MetricsSubscriberActor
-        let metrics_subscriber = MetricsSubscriberActor::spawn_with_mailbox(
-            MetricsSubscriberArgs {
-                pushgateway_url: monitoring.pushgateway_url.clone(),
-                metric_prefix: monitoring.metric_prefix.clone(),
-                push_interval_ms: monitoring.push_interval_ms,
-            },
-            mailbox::unbounded(),
-        );
-
-        // 订阅 Income 事件
-        manager
-            .tell(SubscribeIncome(metrics_subscriber))
-            .send()
-            .await
-            .expect("Failed to subscribe MetricsSubscriberActor to income events");
-        tracing::info!("MetricsSubscriberActor created and subscribed");
-
-        // 创建 SlackNotifierActor
-        let slack_notifier = SlackNotifierActor::spawn_with_mailbox(
-            SlackNotifierArgs {
-                channel: monitoring.slack_channel.clone(),
-                token: monitoring.slack_token.clone(),
-            },
-            mailbox::unbounded(),
-        );
-
-        // 订阅 Income 事件（用于监听订单成交）
-        manager
-            .tell(SubscribeIncome(slack_notifier.clone()))
-            .send()
-            .await
-            .expect("Failed to subscribe SlackNotifierActor to income events");
-
-        // 订阅 Outcome 事件（用于监听下单信号）
-        manager
-            .tell(SubscribeOutcome(slack_notifier))
-            .send()
-            .await
-            .expect("Failed to subscribe SlackNotifierActor to outcome events");
-        tracing::info!("SlackNotifierActor created and subscribed");
+        init_monitoring(&manager, monitoring).await?;
     }
 
-    // SpreadArb 统计 + 持久化（需要 database 配置）
-    if config.strategy.spread_arb.is_some() && config.database.is_none() {
-        tracing::warn!(
-            "spread_arb configured but database is not set, signals/orders/fills will not be persisted"
-        );
-    }
-    if let (Some(ref spread_arb_config), Some(ref db_config)) =
-        (&config.strategy.spread_arb, &config.database)
-    {
-        if config.exchanges.ibkr.is_some() {
-            let db = fee_arb::db::init_db(&db_config.url).await?;
-
-            let stats_actor = SpreadArbStatsActor::spawn_with_mailbox(
-                SpreadArbStatsArgs {
-                    symbols: spread_arb_config.symbols.iter().cloned().collect(),
-                    db,
-                },
-                mailbox::unbounded(),
-            );
-
-            manager
-                .tell(SubscribeIncome(stats_actor.clone()))
-                .send()
-                .await
-                .expect("Failed to subscribe SpreadArbStatsActor to income events");
-            manager
-                .tell(SubscribeOutcome(stats_actor))
-                .send()
-                .await
-                .expect("Failed to subscribe SpreadArbStatsActor to outcome events");
-            tracing::info!("SpreadArbStatsActor created and subscribed");
+    // SpreadArb 统计 + 持久化
+    if let Some(ref spread_arb_config) = config.strategy.spread_arb {
+        if config.exchanges.ibkr.is_none() {
+            // spread_arb 策略创建时已 warn，此处无需重复
+        } else if let Some(ref db_config) = config.database {
+            init_spread_arb_stats(&manager, spread_arb_config.symbols.iter().cloned(), db_config)
+                .await?;
+        } else {
+            tracing::warn!("spread_arb configured but database is not set, signals/orders/fills will not be persisted");
         }
     }
 
-    tracing::info!("System running. Press Ctrl+C to stop.");
-
-    // 同时等待 Ctrl+C 或 Manager 死亡
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received shutdown signal");
-            manager.stop_gracefully().await.ok();
-        }
-        _ = manager.wait_for_shutdown() => {
-            tracing::error!("Manager actor died unexpectedly, exiting");
-        }
-    }
-
-    tracing::info!("System stopped");
+    wait_for_shutdown(manager).await;
     Ok(())
 }
