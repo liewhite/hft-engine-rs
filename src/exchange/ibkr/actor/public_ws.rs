@@ -95,10 +95,14 @@ impl IbkrPublicWsActor {
         let value: serde_json::Value =
             serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
-        // 路由: topic 以 "sor" 开头 → 订单状态更新
+        // 路由: topic 以 "sor" 开头 → 订单状态更新; "str" 开头 → 成交推送
         if let Some(topic) = value.get("topic").and_then(|v| v.as_str()) {
             if topic.starts_with("sor") {
                 return self.handle_order_update(&value, local_ts).await;
+            }
+            if topic.starts_with("str") {
+                tracing::info!(raw = %raw, "IBKR str (trades) raw message");
+                return Ok(());
             }
         }
 
@@ -360,6 +364,16 @@ impl Actor for IbkrPublicWsActor {
             tracing::error!(error = %e, "Failed to send IBKR sor subscription");
         } else {
             tracing::info!("IBKR sor (order status) subscription sent");
+        }
+
+        // 订阅成交推送 (str topic) — 先打日志观察字段结构
+        if let Err(e) = outgoing_tx
+            .send(r#"str+{"realtimeUpdatesOnly":true}"#.to_string())
+            .await
+        {
+            tracing::error!(error = %e, "Failed to send IBKR str subscription");
+        } else {
+            tracing::info!("IBKR str (trades) subscription sent");
         }
 
         tracing::info!("IbkrPublicWsActor started");
