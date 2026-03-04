@@ -295,7 +295,7 @@ impl SymbolState {
             ExchangeEventData::IndexPrice(ip) => {
                 self.index_prices.insert(ip.exchange, ip.clone());
             }
-            ExchangeEventData::Candle(_) => {
+            ExchangeEventData::Candle(_) | ExchangeEventData::HistoryCandles(_) => {
                 // K线数据由策略层处理，SymbolState 不存储
             }
             ExchangeEventData::Clock => {

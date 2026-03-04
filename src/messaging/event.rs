@@ -41,8 +41,10 @@ pub enum ExchangeEventData {
         exchange: Exchange,
         status: MarketStatus,
     },
-    /// K线数据
+    /// K线实时推送
     Candle(Candle),
+    /// 历史K线批量数据（订阅时一次性推送）
+    HistoryCandles(Vec<Candle>),
     /// 时钟事件 (用于超时检测等定时任务)
     Clock,
 }
@@ -59,6 +61,7 @@ impl IncomeEvent {
             ExchangeEventData::OrderUpdate(update) => Some(&update.symbol),
             ExchangeEventData::Fill(fill) => Some(&fill.symbol),
             ExchangeEventData::Candle(candle) => Some(&candle.symbol),
+            ExchangeEventData::HistoryCandles(candles) => candles.first().map(|c| &c.symbol),
             ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. }
@@ -77,6 +80,7 @@ impl IncomeEvent {
             ExchangeEventData::OrderUpdate(update) => Some(update.exchange),
             ExchangeEventData::Fill(fill) => Some(fill.exchange),
             ExchangeEventData::Candle(candle) => Some(candle.exchange),
+            ExchangeEventData::HistoryCandles(candles) => candles.first().map(|c| c.exchange),
             ExchangeEventData::Balance(bal) => Some(bal.exchange),
             ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
             ExchangeEventData::ExchangeStatus { exchange, .. } => Some(*exchange),

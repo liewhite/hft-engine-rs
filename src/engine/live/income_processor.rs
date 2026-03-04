@@ -73,6 +73,13 @@ impl IncomeProcessorActor {
                 exchange: candle.exchange,
                 symbol: candle.symbol.clone(),
             },
+            ExchangeEventData::HistoryCandles(candles) => {
+                let first = candles.first().expect("HistoryCandles must not be empty");
+                EventRouting::BySymbol {
+                    exchange: first.exchange,
+                    symbol: first.symbol.clone(),
+                }
+            }
             // 账户级别数据、ExchangeStatus 和 Clock：广播
             ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
