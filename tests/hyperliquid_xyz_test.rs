@@ -216,10 +216,8 @@ async fn test_xyz_fetch_meta_and_asset_ctxs() {
 // 交易接口测试
 // ============================================================================
 
-/// 限价买单 (做多) — 使用 ask 价格，立即成交
-#[tokio::test]
-#[ignore = "需要真实凭证和网络"]
-async fn test_xyz_limit_buy() {
+/// 下单测试辅助函数
+async fn place_test_order(side: Side) {
     let credentials = load_credentials();
     let client = HyperliquidClient::new(Some(credentials)).expect("创建客户端失败");
 
@@ -240,12 +238,16 @@ async fn test_xyz_limit_buy() {
         meta.size_step, meta.min_order_size
     );
 
-    // 使用 ask 价格下买单（立即成交）
-    let formatted_price = meta.format_price(ask);
+    // 做多用 ask 价格，做空用 bid 价格（立即成交）
+    let raw_price = match side {
+        Side::Long => ask,
+        Side::Short => bid,
+    };
+    let formatted_price = meta.format_price(raw_price);
     let price: f64 = formatted_price.parse().expect("价格解析失败");
-    println!("下单价格: {} (格式化后: {})", ask, price);
+    println!("下单价格: {} (格式化后: {})", raw_price, price);
 
-    // XYZ DEX 股票永续可能有最小 notional 要求，尝试 1 股
+    // XYZ DEX 股票永续有最小 notional 要求，使用 1 股
     let quantity = 1.0_f64.max(meta.min_order_size);
     println!("下单数量: {}", quantity);
 
@@ -254,7 +256,7 @@ async fn test_xyz_limit_buy() {
         id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::Hyperliquid,
         symbol,
-        side: Side::Long,
+        side,
         order_type: OrderType::Limit {
             price,
             tif: TimeInForce::GTC,
@@ -264,58 +266,25 @@ async fn test_xyz_limit_buy() {
         client_order_id: cli_id.clone(),
     };
 
-    println!("提交买单 (做多): {:?}", order);
+    println!("提交订单: {:?}", order);
 
-    let order_id = client.place_order(order).await.expect("做多下单失败");
-    println!("做多买单成功，订单ID: {}, 客户端ID: {}", order_id, cli_id);
+    let order_id = client.place_order(order).await.expect("下单失败");
+    println!(
+        "下单成功，方向={:?}，订单ID: {}, 客户端ID: {}",
+        side, order_id, cli_id
+    );
+}
+
+/// 限价买单 (做多) — 使用 ask 价格，立即成交
+#[tokio::test]
+#[ignore = "需要真实凭证和网络"]
+async fn test_xyz_limit_buy() {
+    place_test_order(Side::Long).await;
 }
 
 /// 限价卖单 (做空) — 使用 bid 价格，立即成交
 #[tokio::test]
 #[ignore = "需要真实凭证和网络"]
 async fn test_xyz_limit_sell() {
-    let credentials = load_credentials();
-    let client = HyperliquidClient::new(Some(credentials)).expect("创建客户端失败");
-
-    let symbol: Symbol = TEST_COIN.to_string();
-
-    // 获取 BBO
-    let (bid, ask) = fetch_bbo(TEST_COIN).await.expect("获取 BBO 失败");
-    println!("{} BBO: bid={}, ask={}", TEST_COIN, bid, ask);
-
-    // 获取 SymbolMeta 用于格式化价格
-    let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
-        .await
-        .expect("获取 SymbolMeta 失败");
-    let meta = metas.first().expect("未找到交易对元数据");
-
-    // 使用 bid 价格下卖单（立即成交）
-    let formatted_price = meta.format_price(bid);
-    let price: f64 = formatted_price.parse().expect("价格解析失败");
-    println!("下单价格: {} (格式化后: {})", bid, price);
-
-    // XYZ DEX 股票永续可能有最小 notional 要求，尝试 1 股
-    let quantity = 1.0_f64.max(meta.min_order_size);
-    println!("下单数量: {}", quantity);
-
-    let cli_id = Exchange::Hyperliquid.new_cli_order_id();
-    let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
-        exchange: Exchange::Hyperliquid,
-        symbol,
-        side: Side::Short,
-        order_type: OrderType::Limit {
-            price,
-            tif: TimeInForce::GTC,
-        },
-        quantity,
-        reduce_only: false,
-        client_order_id: cli_id.clone(),
-    };
-
-    println!("提交卖单 (做空): {:?}", order);
-
-    let order_id = client.place_order(order).await.expect("做空下单失败");
-    println!("做空卖单成功，订单ID: {}, 客户端ID: {}", order_id, cli_id);
+    place_test_order(Side::Short).await;
 }

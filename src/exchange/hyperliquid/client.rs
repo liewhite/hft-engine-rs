@@ -21,6 +21,11 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
 
+/// Builder-deployed DEX 的基础 asset index 偏移量 (Hyperliquid 协议规定)
+const DEX_ASSET_INDEX_BASE: u32 = 110_000;
+/// 每个 DEX 之间的 asset index 间距
+const DEX_ASSET_INDEX_STEP: u32 = 10_000;
+
 /// Hyperliquid 交易所客户端
 pub struct HyperliquidClient {
     /// HTTP 客户端
@@ -157,7 +162,7 @@ impl HyperliquidClient {
     /// 获取非默认 DEX 的 asset index 偏移量
     ///
     /// 默认 perp DEX: offset = 0
-    /// Builder-deployed DEXes (如 xyz): offset = 110000 + i * 10000
+    /// Builder-deployed DEXes (如 xyz): offset = DEX_ASSET_INDEX_BASE + i * DEX_ASSET_INDEX_STEP
     ///   其中 i 为该 DEX 在 perpDexs 列表中的顺序（从 0 开始，跳过 null）
     async fn get_dex_offset(&self) -> Result<u32, ExchangeError> {
         if self.dex.is_empty() {
@@ -173,10 +178,17 @@ impl HyperliquidClient {
         let mut non_null_idx = 0u32;
         for entry in &dexes {
             if let Some(obj) = entry {
-                if let Some(name) = obj.get("name").and_then(|n| n.as_str()) {
-                    if name == self.dex {
-                        return Ok(110_000 + non_null_idx * 10_000);
-                    }
+                let name = obj
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| {
+                        ExchangeError::Other(format!(
+                            "perpDexs entry missing 'name' field: {}",
+                            obj
+                        ))
+                    })?;
+                if name == self.dex {
+                    return Ok(DEX_ASSET_INDEX_BASE + non_null_idx * DEX_ASSET_INDEX_STEP);
                 }
                 non_null_idx += 1;
             }
@@ -393,10 +405,10 @@ impl ExchangeClient for HyperliquidClient {
 
         // 解析响应 — 错误时 response 是字符串，成功时是 OrderResponseData 对象
         if response.status != "ok" {
-            let error_msg = response
-                .response
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| format!("status={}", response.status));
+            let error_msg = match response.response {
+                Some(v) => v.to_string(),
+                None => format!("status={}", response.status),
+            };
             return Err(ExchangeError::Other(format!(
                 "Order rejected: {}",
                 error_msg
