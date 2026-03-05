@@ -69,7 +69,7 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                 // 关联订单独立并行下单：IOC 订单本身接受部分成交，
                 // 敞口由策略层 rebalance 机制兜底修正。
                 for order in orders {
-                    let client = match self.clients.get(&order.exchange) {
+                    let _client = match self.clients.get(&order.exchange) {
                         Some(e) => e.clone(),
                         None => {
                             let reason =
@@ -83,7 +83,8 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                         }
                     };
 
-                    tracing::info!(
+                    // TODO: 下单功能暂时禁用，仅打印信号日志
+                    tracing::warn!(
                         exchange = %order.exchange,
                         symbol = %order.symbol,
                         side = %order.side,
@@ -91,46 +92,8 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                         quantity = order.quantity,
                         client_order_id = ?order.client_order_id,
                         signal = %comment,
-                        "Placing order"
+                        "[DRY-RUN] Order NOT placed"
                     );
-
-                    let income_pubsub = self.income_pubsub.clone();
-                    tokio::spawn(async move {
-                        match client.place_order(order.clone()).await {
-                            Ok(order_id) => {
-                                tracing::info!(
-                                    exchange = %order.exchange,
-                                    symbol = %order.symbol,
-                                    order_id = %order_id,
-                                    client_order_id = ?order.client_order_id,
-                                    "Order placed successfully"
-                                );
-                            }
-                            Err(e) => {
-                                let reason = e.to_string();
-                                if reason.contains("Reduce only")
-                                    || reason.contains("reduce only")
-                                {
-                                    tracing::info!(
-                                        exchange = %order.exchange,
-                                        symbol = %order.symbol,
-                                        client_order_id = ?order.client_order_id,
-                                        "Reduce-only order rejected: position already closed"
-                                    );
-                                } else {
-                                    tracing::error!(
-                                        exchange = %order.exchange,
-                                        symbol = %order.symbol,
-                                        client_order_id = ?order.client_order_id,
-                                        error = %reason,
-                                        "Failed to place order"
-                                    );
-                                }
-                                Self::send_order_error_static(&income_pubsub, &order, reason)
-                                    .await;
-                            }
-                        }
-                    });
                 }
             }
         }

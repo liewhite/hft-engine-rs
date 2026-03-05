@@ -101,7 +101,6 @@ impl IbkrPublicWsActor {
                 return self.handle_order_update(&value, local_ts).await;
             }
             if topic.starts_with("str") {
-                tracing::info!(raw = %raw, "IBKR str (trades) raw message");
                 return Ok(());
             }
         }
