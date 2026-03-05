@@ -21,13 +21,25 @@ const MIN_ORDER_QTY: f64 = 1.0;
 /// - 敞口 rebalance 优先 > 平仓 > 开仓
 pub struct SpreadArbStrategy {
     config: SpreadArbConfig,
-    symbol: Symbol,
+    /// IBKR 侧 symbol (e.g., "AAPL")
+    ibkr_symbol: Symbol,
+    /// Hyperliquid 侧 symbol (e.g., "xyz:AAPL")
+    hl_symbol: Symbol,
 }
 
 impl SpreadArbStrategy {
-    pub fn new(config: SpreadArbConfig, symbol: Symbol) -> Self {
+    pub fn new(config: SpreadArbConfig, symbol: Symbol, hl_dex: &str) -> Self {
         config.validate();
-        Self { config, symbol }
+        let hl_symbol = if hl_dex.is_empty() {
+            symbol.clone()
+        } else {
+            format!("{}:{}", hl_dex, symbol)
+        };
+        Self {
+            config,
+            ibkr_symbol: symbol,
+            hl_symbol,
+        }
     }
 
     /// 计算开仓 spread = (HL_bid - IBKR_ask) / IBKR_ask
@@ -81,7 +93,7 @@ impl SpreadArbStrategy {
         }
 
         tracing::error!(
-            symbol = %self.symbol,
+            symbol = %self.ibkr_symbol,
             ibkr_pos,
             hl_pos,
             "SpreadArb: EMERGENCY — unexpected position direction, flattening"
@@ -97,7 +109,7 @@ impl SpreadArbStrategy {
                 orders.push(Order {
                     id: String::new(),
                     exchange: Exchange::IBKR,
-                    symbol: self.symbol.clone(),
+                    symbol: self.ibkr_symbol.clone(),
                     side: Side::Long,
                     order_type: OrderType::Limit {
                         price,
@@ -118,7 +130,7 @@ impl SpreadArbStrategy {
                 orders.push(Order {
                     id: String::new(),
                     exchange: Exchange::Hyperliquid,
-                    symbol: self.symbol.clone(),
+                    symbol: self.hl_symbol.clone(),
                     side: Side::Short,
                     order_type: OrderType::Limit {
                         price,
@@ -133,7 +145,7 @@ impl SpreadArbStrategy {
 
         if orders.is_empty() {
             tracing::warn!(
-                symbol = %self.symbol,
+                symbol = %self.ibkr_symbol,
                 ibkr_pos,
                 hl_pos,
                 "SpreadArb: abnormal position detected but qty < 1, strategy halted"
@@ -180,7 +192,7 @@ impl SpreadArbStrategy {
             let price = ibkr_bid * (1.0 - self.config.ioc_slippage);
 
             tracing::info!(
-                symbol = %self.symbol,
+                symbol = %self.ibkr_symbol,
                 ibkr_pos,
                 hl_pos,
                 exposure,
@@ -191,7 +203,7 @@ impl SpreadArbStrategy {
             let order = Order {
                 id: String::new(),
                 exchange: Exchange::IBKR,
-                symbol: self.symbol.clone(),
+                symbol: self.ibkr_symbol.clone(),
                 side: Side::Short,
                 order_type: OrderType::Limit {
                     price,
@@ -217,7 +229,7 @@ impl SpreadArbStrategy {
             let price = hl_ask * (1.0 + self.config.ioc_slippage);
 
             tracing::info!(
-                symbol = %self.symbol,
+                symbol = %self.ibkr_symbol,
                 ibkr_pos,
                 hl_pos,
                 exposure,
@@ -228,7 +240,7 @@ impl SpreadArbStrategy {
             let order = Order {
                 id: String::new(),
                 exchange: Exchange::Hyperliquid,
-                symbol: self.symbol.clone(),
+                symbol: self.hl_symbol.clone(),
                 side: Side::Long,
                 order_type: OrderType::Limit {
                     price,
@@ -253,13 +265,16 @@ impl SpreadArbStrategy {
 
 impl Strategy for SpreadArbStrategy {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
-        let bbo = SubscriptionKind::BBO {
-            symbol: self.symbol.clone(),
+        let ibkr_bbo = SubscriptionKind::BBO {
+            symbol: self.ibkr_symbol.clone(),
+        };
+        let hl_bbo = SubscriptionKind::BBO {
+            symbol: self.hl_symbol.clone(),
         };
 
         let mut streams = HashMap::new();
-        streams.insert(Exchange::IBKR, [bbo.clone()].into_iter().collect());
-        streams.insert(Exchange::Hyperliquid, [bbo].into_iter().collect());
+        streams.insert(Exchange::IBKR, [ibkr_bbo].into_iter().collect());
+        streams.insert(Exchange::Hyperliquid, [hl_bbo].into_iter().collect());
         streams
     }
 
@@ -273,7 +288,9 @@ impl Strategy for SpreadArbStrategy {
             return None;
         }
 
-        let symbol_state = state.symbol_state(&self.symbol)?;
+        // 跨交易所 symbol 不同 (IBKR: "AAPL", HL: "xyz:AAPL")，分别查询
+        let ibkr_state = state.symbol_state(&self.ibkr_symbol)?;
+        let hl_state = state.symbol_state(&self.hl_symbol)?;
 
         // 两边市场都必须是 Liquid 才允许下单
         if state.market_status(Exchange::IBKR) != MarketStatus::Liquid
@@ -283,11 +300,11 @@ impl Strategy for SpreadArbStrategy {
         }
 
         // 需要两边 BBO 都就绪
-        let ibkr_bbo = match symbol_state.bbo(Exchange::IBKR) {
+        let ibkr_bbo = match ibkr_state.bbo(Exchange::IBKR) {
             Some(b) if b.ask_price > 0.0 && b.bid_price > 0.0 => b,
             _ => return None,
         };
-        let hl_bbo = match symbol_state.bbo(Exchange::Hyperliquid) {
+        let hl_bbo = match hl_state.bbo(Exchange::Hyperliquid) {
             Some(b) if b.ask_price > 0.0 && b.bid_price > 0.0 => b,
             _ => return None,
         };
@@ -297,7 +314,7 @@ impl Strategy for SpreadArbStrategy {
         let staleness = self.config.bbo_staleness_ms;
         if now.saturating_sub(ibkr_bbo.timestamp) > staleness {
             tracing::debug!(
-                symbol = %self.symbol,
+                symbol = %self.ibkr_symbol,
                 age_ms = now.saturating_sub(ibkr_bbo.timestamp),
                 "SpreadArb: IBKR BBO stale, skipping"
             );
@@ -305,24 +322,24 @@ impl Strategy for SpreadArbStrategy {
         }
         if now.saturating_sub(hl_bbo.timestamp) > staleness {
             tracing::debug!(
-                symbol = %self.symbol,
+                symbol = %self.hl_symbol,
                 age_ms = now.saturating_sub(hl_bbo.timestamp),
                 "SpreadArb: HL BBO stale, skipping"
             );
             return None;
         }
 
-        // 跳过有 pending orders 的情况
-        if symbol_state.has_pending_orders() {
+        // 跳过有 pending orders 的情况 (两侧都要检查)
+        if ibkr_state.has_pending_orders() || hl_state.has_pending_orders() {
             return None;
         }
 
         // 获取当前持仓
-        let ibkr_pos = symbol_state
+        let ibkr_pos = ibkr_state
             .position(Exchange::IBKR)
             .map(|p| p.size)
             .unwrap_or(0.0);
-        let hl_pos = symbol_state
+        let hl_pos = hl_state
             .position(Exchange::Hyperliquid)
             .map(|p| p.size)
             .unwrap_or(0.0);
@@ -364,7 +381,7 @@ impl Strategy for SpreadArbStrategy {
                 let hl_price = hl_bbo.ask_price * (1.0 + self.config.ioc_slippage);
 
                 tracing::info!(
-                    symbol = %self.symbol,
+                    symbol = %self.ibkr_symbol,
                     spread = format!("{:.4}%", spread * 100.0),
                     close_threshold = format!("{:.4}%", self.config.close_threshold * 100.0),
                     close_qty,
@@ -383,7 +400,7 @@ impl Strategy for SpreadArbStrategy {
                         Order {
                             id: String::new(),
                             exchange: Exchange::IBKR,
-                            symbol: self.symbol.clone(),
+                            symbol: self.ibkr_symbol.clone(),
                             side: Side::Short,
                             order_type: OrderType::Limit {
                                 price: ibkr_price,
@@ -397,7 +414,7 @@ impl Strategy for SpreadArbStrategy {
                         Order {
                             id: String::new(),
                             exchange: Exchange::Hyperliquid,
-                            symbol: self.symbol.clone(),
+                            symbol: self.hl_symbol.clone(),
                             side: Side::Long,
                             order_type: OrderType::Limit {
                                 price: hl_price,
@@ -417,7 +434,7 @@ impl Strategy for SpreadArbStrategy {
                 let hl_price = hl_bbo.ask_price * (1.0 + self.config.ioc_slippage);
 
                 tracing::info!(
-                    symbol = %self.symbol,
+                    symbol = %self.ibkr_symbol,
                     hl_pos,
                     hl_close_qty,
                     "SpreadArb: closing residual HL position (IBKR already flat)"
@@ -431,7 +448,7 @@ impl Strategy for SpreadArbStrategy {
                     orders: vec![Order {
                         id: String::new(),
                         exchange: Exchange::Hyperliquid,
-                        symbol: self.symbol.clone(),
+                        symbol: self.hl_symbol.clone(),
                         side: Side::Long,
                         order_type: OrderType::Limit {
                             price: hl_price,
@@ -458,7 +475,7 @@ impl Strategy for SpreadArbStrategy {
 
             if leverage > self.config.max_leverage {
                 tracing::debug!(
-                    symbol = %self.symbol,
+                    symbol = %self.ibkr_symbol,
                     leverage = format!("{:.2}", leverage),
                     max_leverage = format!("{:.2}", self.config.max_leverage),
                     "SpreadArb: leverage limit reached, skip opening"
@@ -477,7 +494,7 @@ impl Strategy for SpreadArbStrategy {
             let hl_price = hl_bbo.bid_price * (1.0 - self.config.ioc_slippage);
 
             tracing::info!(
-                symbol = %self.symbol,
+                symbol = %self.ibkr_symbol,
                 spread = format!("{:.4}%", spread * 100.0),
                 open_threshold = format!("{:.4}%", self.config.open_threshold * 100.0),
                 qty,
@@ -497,7 +514,7 @@ impl Strategy for SpreadArbStrategy {
                     Order {
                         id: String::new(),
                         exchange: Exchange::IBKR,
-                        symbol: self.symbol.clone(),
+                        symbol: self.ibkr_symbol.clone(),
                         side: Side::Long,
                         order_type: OrderType::Limit {
                             price: ibkr_price,
@@ -511,7 +528,7 @@ impl Strategy for SpreadArbStrategy {
                     Order {
                         id: String::new(),
                         exchange: Exchange::Hyperliquid,
-                        symbol: self.symbol.clone(),
+                        symbol: self.hl_symbol.clone(),
                         side: Side::Short,
                         order_type: OrderType::Limit {
                             price: hl_price,

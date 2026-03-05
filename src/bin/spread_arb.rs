@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 为每个 symbol 创建 SpreadArbStrategy
+    let hl_dex = &config.hyperliquid.dex;
     let strategies: Vec<Box<dyn fee_arb::strategy::Strategy>> = config
         .strategy
         .symbols
@@ -45,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
             Box::new(SpreadArbStrategy::new(
                 config.strategy.clone(),
                 symbol.clone(),
+                hl_dex,
             )) as Box<dyn fee_arb::strategy::Strategy>
         })
         .collect();

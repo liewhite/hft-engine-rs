@@ -123,10 +123,12 @@ async fn main() -> anyhow::Result<()> {
     // SpreadArb 策略 (IBKR 股票 vs Hyperliquid 永续)
     if let Some(ref spread_arb_config) = config.strategy.spread_arb {
         if config.exchanges.ibkr.is_some() {
+            let hl_dex = &config.exchanges.hyperliquid.dex;
             for symbol in &spread_arb_config.symbols {
                 strategies.push(Box::new(SpreadArbStrategy::new(
                     spread_arb_config.clone(),
                     symbol.clone(),
+                    hl_dex,
                 )));
             }
             tracing::info!(
