@@ -44,6 +44,8 @@ impl IbkrPositionPollingActor {
     async fn poll_positions(&mut self) {
         let local_ts = now_ms();
 
+        self.client.invalidate_positions_cache().await;
+
         match self.client.fetch_positions().await {
             Ok(positions) => {
                 let mut current_symbols = HashSet::new();
