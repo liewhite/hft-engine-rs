@@ -265,8 +265,9 @@ impl IbkrClient {
                 Some(arr) => {
                     arr.iter()
                         .map(|entry| {
+                            // IBKR API: 交易时段在 "tradingtimes" 字段 (非 "sessions")
                             let sessions = entry
-                                .get("sessions")
+                                .get("tradingtimes")
                                 .and_then(|v| v.as_array())
                                 .map(|sarr| {
                                     sarr.iter()

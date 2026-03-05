@@ -9,7 +9,7 @@ use crate::engine::IncomePubSub;
 use crate::exchange::ibkr::client::TradingSchedule;
 use crate::exchange::ibkr::IbkrClient;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
-use chrono::{NaiveDateTime, Timelike};
+use chrono::{Datelike, Timelike};
 use chrono_tz::US::Eastern;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -145,99 +145,98 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrStatusPollingActor {
 
 /// 从 IBKR 交易时间表判定当前市场状态
 ///
-/// API 成功返回时，严格根据返回的 schedule 数据判断。
-/// 未匹配任何 session 直接返回 Closed（API 成功意味着数据可信）。
+/// IBKR schedule API 的日期格式:
+/// - 周几模式: "2000-01-01"=周六, "2000-01-03"=周一, ..., "2000-01-07"=周五
+/// - 精确日期: 节假日用实际日期 (如 "20260403" = Good Friday)
+///
+/// 时间格式: "HHmm" (如 "0930"=09:30, "1600"=16:00)
 fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus {
     let now_et = chrono::Utc::now().with_timezone(&Eastern);
     let today_str = now_et.format("%Y%m%d").to_string();
+    let now_mins = now_et.hour() * 60 + now_et.minute();
 
-    for schedule in schedules {
-        for entry in &schedule.schedules {
-            let date_str = match &entry.trading_schedule_date {
-                Some(d) => d,
-                None => {
-                    tracing::debug!("IBKR schedule entry missing tradingScheduleDate, skipping");
-                    continue;
-                }
-            };
-            if date_str != &today_str {
-                continue;
-            }
+    // 2000-01-01 是周六，所以周几映射:
+    // Sat="20000101" Sun="20000102" Mon="20000103" ... Fri="20000107"
+    let dow_str = match now_et.weekday() {
+        chrono::Weekday::Mon => "20000103",
+        chrono::Weekday::Tue => "20000104",
+        chrono::Weekday::Wed => "20000105",
+        chrono::Weekday::Thu => "20000106",
+        chrono::Weekday::Fri => "20000107",
+        chrono::Weekday::Sat => "20000101",
+        chrono::Weekday::Sun => "20000102",
+    };
 
-            // 找到今天的 schedule，遍历 sessions
-            for session in &entry.sessions {
-                let (open, close) = match (&session.opening_time, &session.closing_time) {
-                    (Some(o), Some(c)) => (o, c),
-                    _ => {
-                        tracing::debug!(prop = ?session.prop, "IBKR session missing open/close time, skipping");
-                        continue;
-                    }
-                };
+    // 取第一个 venue 即可（所有 venue 的交易时间相同）
+    let schedule = match schedules.first() {
+        Some(s) => s,
+        None => return MarketStatus::Closed,
+    };
 
-                let open_dt = match parse_ibkr_datetime(open) {
-                    Some(dt) => dt,
-                    None => continue,
-                };
-                let close_dt = match parse_ibkr_datetime(close) {
-                    Some(dt) => dt,
-                    None => continue,
-                };
+    // 优先精确日期匹配 (节假日/特殊日期)，再匹配周几模式
+    let entry = schedule
+        .schedules
+        .iter()
+        .find(|e| e.trading_schedule_date.as_deref() == Some(&today_str))
+        .or_else(|| {
+            schedule
+                .schedules
+                .iter()
+                .find(|e| e.trading_schedule_date.as_deref() == Some(dow_str))
+        });
 
-                if now_et.naive_local() >= open_dt && now_et.naive_local() < close_dt {
-                    return classify_session(session);
-                }
+    let entry = match entry {
+        Some(e) => e,
+        None => return MarketStatus::Closed,
+    };
+
+    for session in &entry.sessions {
+        let (open_str, close_str) = match (&session.opening_time, &session.closing_time) {
+            (Some(o), Some(c)) => (o.as_str(), c.as_str()),
+            _ => continue,
+        };
+
+        let open_mins = parse_hhmm(open_str);
+        let close_mins = parse_hhmm(close_str);
+
+        if let (Some(open), Some(close)) = (open_mins, close_mins) {
+            if now_mins >= open && now_mins < close {
+                return classify_prop(session.prop.as_deref());
             }
         }
     }
 
-    // API 成功但未匹配任何 session → 确实不在交易时段内
     MarketStatus::Closed
 }
 
-/// 根据 session 的 prop 字段判断市场状态
-///
-/// IBKR API 的 prop 字段标识 session 类型。
-/// 如果 prop 不可用，fallback 到时间范围判断。
-fn classify_session(session: &crate::exchange::ibkr::client::TradingSession) -> MarketStatus {
-    // 优先使用 prop 字段
-    if let Some(ref prop) = session.prop {
-        let prop_upper = prop.to_uppercase();
-        if prop_upper.contains("REGULAR") {
-            return MarketStatus::Liquid;
+/// 根据 prop 字段判断市场状态
+fn classify_prop(prop: Option<&str>) -> MarketStatus {
+    match prop {
+        Some(p) => {
+            let upper = p.to_uppercase();
+            if upper.contains("LIQUID") || upper.contains("REGULAR") {
+                MarketStatus::Liquid
+            } else if upper.contains("PRE") || upper.contains("POST") || upper.contains("AFTER") {
+                MarketStatus::Extending
+            } else {
+                tracing::debug!(prop = %p, "Unknown IBKR session prop, treating as Extending");
+                MarketStatus::Extending
+            }
         }
-        if prop_upper.contains("PRE") || prop_upper.contains("POST") || prop_upper.contains("AFTER") {
-            return MarketStatus::Extending;
-        }
-        // prop 存在但未识别，记录日志后 fallback 到时间判断
-        tracing::debug!(prop = %prop, "Unknown IBKR session prop, falling back to time-based classification");
+        None => MarketStatus::Extending,
     }
-
-    // Fallback: 通过时间范围判断
-    let open_dt = session.opening_time.as_ref().and_then(|s| parse_ibkr_datetime(s));
-    let close_dt = session.closing_time.as_ref().and_then(|s| parse_ibkr_datetime(s));
-
-    if let (Some(open), Some(close)) = (open_dt, close_dt) {
-        let open_mins = open.hour() as u32 * 60 + open.minute() as u32;
-        let close_mins = close.hour() as u32 * 60 + close.minute() as u32;
-        // Regular session: 大致 9:00-10:00 开盘，15:00-17:00 收盘
-        if (540..=600).contains(&open_mins) && (900..=1020).contains(&close_mins) {
-            return MarketStatus::Liquid;
-        }
-    }
-
-    // 默认视为 Extending（在某个 session 内但无法确定类型）
-    MarketStatus::Extending
 }
 
-/// 解析 IBKR 日期时间格式 "YYYYMMDD-HH:mm:ss"
-fn parse_ibkr_datetime(s: &str) -> Option<NaiveDateTime> {
-    match NaiveDateTime::parse_from_str(s, "%Y%m%d-%H:%M:%S") {
-        Ok(dt) => Some(dt),
-        Err(e) => {
-            tracing::warn!(input = %s, error = %e, "Failed to parse IBKR datetime");
-            None
-        }
+/// 解析 "HHmm" 格式时间字符串为分钟数
+/// "0930" → 570, "1600" → 960, "0000" → 0
+fn parse_hhmm(s: &str) -> Option<u32> {
+    if s.len() != 4 {
+        tracing::warn!(input = %s, "Invalid HHmm format");
+        return None;
     }
+    let hh: u32 = s[..2].parse().ok()?;
+    let mm: u32 = s[2..].parse().ok()?;
+    Some(hh * 60 + mm)
 }
 
 /// 硬编码的 US 市场时间 fallback
