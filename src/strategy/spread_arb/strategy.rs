@@ -73,6 +73,63 @@ impl SpreadArbStrategy {
         position_value / hl_equity
     }
 
+    /// Clock 事件时打印当前状态摘要
+    fn log_status(&self, state: &StateManager) {
+        let ibkr_state = match state.symbol_state(&self.ibkr_symbol) {
+            Some(s) => s,
+            None => return,
+        };
+        let hl_state = match state.symbol_state(&self.hl_symbol) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let ibkr_bbo = ibkr_state.bbo(Exchange::IBKR);
+        let hl_bbo = hl_state.bbo(Exchange::Hyperliquid);
+
+        let ibkr_pos = ibkr_state
+            .position(Exchange::IBKR)
+            .map(|p| p.size)
+            .unwrap_or(0.0);
+        let hl_pos = hl_state
+            .position(Exchange::Hyperliquid)
+            .map(|p| p.size)
+            .unwrap_or(0.0);
+
+        let (ibkr_bid, ibkr_ask) = ibkr_bbo
+            .map(|b| (b.bid_price, b.ask_price))
+            .unwrap_or((0.0, 0.0));
+        let (hl_bid, hl_ask) = hl_bbo
+            .map(|b| (b.bid_price, b.ask_price))
+            .unwrap_or((0.0, 0.0));
+
+        let open_spread = self.calc_open_spread(hl_bid, ibkr_ask);
+        let close_spread = self.calc_close_spread(hl_ask, ibkr_bid);
+
+        let ibkr_status = state.market_status(Exchange::IBKR);
+        let hl_status = state.market_status(Exchange::Hyperliquid);
+
+        let ibkr_pending = ibkr_state.has_pending_orders();
+        let hl_pending = hl_state.has_pending_orders();
+
+        tracing::info!(
+            symbol = %self.ibkr_symbol,
+            ibkr_bid,
+            ibkr_ask,
+            hl_bid,
+            hl_ask,
+            open_spread = open_spread.map(|s| format!("{:.4}%", s * 100.0)).unwrap_or_default(),
+            close_spread = close_spread.map(|s| format!("{:.4}%", s * 100.0)).unwrap_or_default(),
+            ibkr_pos,
+            hl_pos,
+            ibkr_status = %ibkr_status,
+            hl_status = %hl_status,
+            ibkr_pending,
+            hl_pending,
+            "SpreadArb status"
+        );
+    }
+
     /// 检测仓位方向异常，紧急平仓
     ///
     /// 正常状态下 IBKR 应为多头(>=0)，HL 应为空头(<=0)。
@@ -283,6 +340,12 @@ impl Strategy for SpreadArbStrategy {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Option<OutcomeEvent> {
+        // Clock 事件: 打印当前状态摘要
+        if matches!(&event.data, ExchangeEventData::Clock) {
+            self.log_status(state);
+            return None;
+        }
+
         // 只响应 BBO 事件
         if !matches!(&event.data, ExchangeEventData::BBO(_)) {
             return None;
