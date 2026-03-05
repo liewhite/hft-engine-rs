@@ -2,7 +2,7 @@
 //!
 //! IBKR 股票交易所有明确的交易时段。
 //! 通过查询 AAPL 交易时间表判断当前市场状态 (Liquid/Extending/Closed)。
-//! API 失败时直接 panic（错误数据比崩溃更危险）。
+//! API 失败时 warn 并跳过本轮，等待下次轮询重试。
 
 use crate::domain::{now_ms, Exchange, MarketStatus};
 use crate::engine::IncomePubSub;
@@ -40,8 +40,18 @@ pub struct IbkrStatusPollingActor {
 
 impl IbkrStatusPollingActor {
     /// 执行一次状态轮询并发布事件
-    async fn poll_status(&mut self) -> anyhow::Result<()> {
-        let schedules = self.client.fetch_trading_schedule().await?;
+    async fn poll_status(&mut self) {
+        let schedules = match self.client.fetch_trading_schedule().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    exchange = %Exchange::IBKR,
+                    error = %e,
+                    "Failed to fetch IBKR trading schedule"
+                );
+                return;
+            }
+        };
         let status = determine_status_from_schedule(&schedules);
 
         // 仅在状态变化时打日志
@@ -68,7 +78,6 @@ impl IbkrStatusPollingActor {
             }))
             .send()
             .await;
-        Ok(())
     }
 }
 
@@ -116,10 +125,7 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrStatusPollingActor {
     ) {
         match msg {
             StreamMessage::Next(_) => {
-                if let Err(e) = self.poll_status().await {
-                    tracing::error!(error = %e, "IBKR status polling failed, killing actor");
-                    ctx.actor_ref().kill();
-                }
+                self.poll_status().await;
             }
             StreamMessage::Started(_) => {
                 tracing::debug!("IBKR status polling stream started");
