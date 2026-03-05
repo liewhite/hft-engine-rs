@@ -2,7 +2,7 @@
 //!
 //! IBKR 股票交易所有明确的交易时段。
 //! 通过查询 AAPL 交易时间表判断当前市场状态 (Liquid/Extending/Closed)。
-//! API 失败时 fallback 到硬编码的 US 市场时间。
+//! API 失败时直接 panic（错误数据比崩溃更危险）。
 
 use crate::domain::{now_ms, Exchange, MarketStatus};
 use crate::engine::IncomePubSub;
@@ -41,17 +41,12 @@ pub struct IbkrStatusPollingActor {
 impl IbkrStatusPollingActor {
     /// 执行一次状态轮询并发布事件
     async fn poll_status(&mut self) {
-        let status = match self.client.fetch_trading_schedule().await {
-            Ok(schedules) => determine_status_from_schedule(&schedules),
-            Err(e) => {
-                tracing::warn!(
-                    exchange = %Exchange::IBKR,
-                    error = %e,
-                    "Failed to fetch IBKR trading schedule, using fallback"
-                );
-                fallback_us_market_status()
-            }
-        };
+        let schedules = self
+            .client
+            .fetch_trading_schedule()
+            .await
+            .expect("Failed to fetch IBKR trading schedule");
+        let status = determine_status_from_schedule(&schedules);
 
         // 仅在状态变化时打日志
         if self.last_status != Some(status) {
@@ -257,33 +252,3 @@ fn parse_hhmm(s: &str) -> Option<u32> {
     Some(hh * 60 + mm)
 }
 
-/// 硬编码的 US 市场时间 fallback
-///
-/// - 周末 → Closed
-/// - 9:30-16:00 ET → Liquid
-/// - 4:00-9:30 / 16:00-20:00 ET → Extending
-/// - 其他 → Closed
-fn fallback_us_market_status() -> MarketStatus {
-    let now_et = chrono::Utc::now().with_timezone(&Eastern);
-
-    // 周末直接 Closed
-    if matches!(
-        now_et.weekday(),
-        chrono::Weekday::Sat | chrono::Weekday::Sun
-    ) {
-        return MarketStatus::Closed;
-    }
-
-    let time_mins = now_et.hour() * 60 + now_et.minute();
-
-    match time_mins {
-        // 9:30 (570) - 16:00 (960)
-        570..960 => MarketStatus::Liquid,
-        // 4:00 (240) - 9:30 (570)
-        240..570 => MarketStatus::Extending,
-        // 16:00 (960) - 20:00 (1200)
-        960..1200 => MarketStatus::Extending,
-        // 其他时间 → Closed
-        _ => MarketStatus::Closed,
-    }
-}
