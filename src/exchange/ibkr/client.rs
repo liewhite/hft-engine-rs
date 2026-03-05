@@ -583,6 +583,36 @@ impl IbkrClient {
             "Too many reply confirmations".to_string(),
         ))
     }
+
+    /// 查询当天 live orders (原始 JSON)
+    pub async fn fetch_live_orders(&self) -> Result<serde_json::Value, ExchangeError> {
+        let url = format!("{}iserver/account/orders", self.auth.base_url());
+        let resp = self
+            .authed_request("GET", &url)?
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        resp.json().await.map_err(Self::map_reqwest_error)
+    }
+
+    /// 使 IBKR 持仓缓存失效
+    pub async fn invalidate_positions_cache(&self) {
+        let url = format!(
+            "{}portfolio/{}/positions/invalidate",
+            self.auth.base_url(),
+            self.account_id
+        );
+        match self.authed_request("POST", &url) {
+            Ok(req) => {
+                if let Err(e) = req.send().await {
+                    tracing::warn!(error = %e, "IBKR invalidate positions cache failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "IBKR invalidate positions cache request build failed");
+            }
+        }
+    }
 }
 
 /// 解析 snapshot 响应中的价格字段

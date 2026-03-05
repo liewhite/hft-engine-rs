@@ -438,13 +438,14 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .expect("获取 BBO 失败");
     println!("[行情] {} bid={} ask={}", symbol, bid, ask);
 
-    // 3. 按 ask 价买入 (IOC，应立即成交)
+    // 3. 按 ask + 滑点 买入 (IOC，确保成交)
+    let slippage = 0.05; // $0.05 滑点
     let metas = client
         .fetch_symbol_meta(&[symbol.clone()])
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到 SymbolMeta");
-    let buy_price: f64 = meta.format_price(ask).parse().unwrap();
+    let buy_price: f64 = meta.format_price(ask + slippage).parse().unwrap();
 
     let buy_order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -462,12 +463,20 @@ async fn test_ibkr_place_order_and_verify_fill() {
 
     println!("[下单] 买入 {} 股 {} @ {}", TEST_QUANTITY, symbol, buy_price);
     let buy_order_id = client.place_order(buy_order).await.expect("买单失败");
-    println!("[成交] 买单 order_id={}", buy_order_id);
+    println!("[下单返回] order_id={}", buy_order_id);
 
-    // 4. 等待仓位更新
+    // 4. 查询订单状态确认成交 (首次调用激活订阅，第二次取数据)
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let _ = client.fetch_live_orders().await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let orders = client.fetch_live_orders().await.expect("查询订单失败");
+    println!("[订单状态] {}", orders);
+
+    // 5. 等待仓位更新，先 invalidate 缓存
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    client.invalidate_positions_cache().await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    // 5. 验证仓位增加
     let positions_after_buy = client.fetch_positions().await.expect("获取仓位失败");
     let pos_after_buy = positions_after_buy
         .iter()
@@ -488,7 +497,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .fetch_snapshot_bbo(&symbol)
         .await
         .expect("获取 BBO 失败");
-    let sell_price: f64 = meta.format_price(bid2).parse().unwrap();
+    let sell_price: f64 = meta.format_price(bid2 - slippage).parse().unwrap();
 
     let sell_order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -508,10 +517,15 @@ async fn test_ibkr_place_order_and_verify_fill() {
     let sell_order_id = client.place_order(sell_order).await.expect("卖单失败");
     println!("[成交] 卖单 order_id={}", sell_order_id);
 
-    // 7. 等待仓位更新
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // 7. 查询订单状态 + 等待仓位更新
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let orders2 = client.fetch_live_orders().await.expect("查询订单失败");
+    println!("[订单状态] {}", orders2);
 
-    // 8. 验证仓位恢复
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    client.invalidate_positions_cache().await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
     let positions_final = client.fetch_positions().await.expect("获取仓位失败");
     let pos_final = positions_final
         .iter()
