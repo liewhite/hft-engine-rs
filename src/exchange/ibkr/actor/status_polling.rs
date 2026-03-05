@@ -40,12 +40,8 @@ pub struct IbkrStatusPollingActor {
 
 impl IbkrStatusPollingActor {
     /// 执行一次状态轮询并发布事件
-    async fn poll_status(&mut self) {
-        let schedules = self
-            .client
-            .fetch_trading_schedule()
-            .await
-            .expect("Failed to fetch IBKR trading schedule");
+    async fn poll_status(&mut self) -> anyhow::Result<()> {
+        let schedules = self.client.fetch_trading_schedule().await?;
         let status = determine_status_from_schedule(&schedules);
 
         // 仅在状态变化时打日志
@@ -72,6 +68,7 @@ impl IbkrStatusPollingActor {
             }))
             .send()
             .await;
+        Ok(())
     }
 }
 
@@ -119,7 +116,10 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrStatusPollingActor {
     ) {
         match msg {
             StreamMessage::Next(_) => {
-                self.poll_status().await;
+                if let Err(e) = self.poll_status().await {
+                    tracing::error!(error = %e, "IBKR status polling failed, killing actor");
+                    ctx.actor_ref().kill();
+                }
             }
             StreamMessage::Started(_) => {
                 tracing::debug!("IBKR status polling stream started");
