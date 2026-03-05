@@ -66,23 +66,31 @@ impl SpreadArbStatsActor {
             "SpreadArbStats: signal placed"
         );
 
-        let symbol = &tracked[0].symbol;
+        // 从各交易所订单提取 symbol (IBKR: "AAPL", HL: "xyz:AAPL")
+        let ibkr_symbol = tracked
+            .iter()
+            .find(|o| o.exchange == Exchange::IBKR)
+            .map(|o| &o.symbol);
+        let hl_symbol = tracked
+            .iter()
+            .find(|o| o.exchange == Exchange::Hyperliquid)
+            .map(|o| &o.symbol);
 
-        // BBO 缓存：信号下单时应已有报价，缺失则记录 warn
-        let (hl_bid, hl_ask) = match self.prices.get(&(Exchange::Hyperliquid, symbol.clone())) {
-            Some(&bbo) => bbo,
-            None => {
-                tracing::warn!(symbol = %symbol, "SpreadArbStats: Hyperliquid BBO missing at signal time");
+        // BBO 缓存：用各自交易所的 symbol 查询
+        let (hl_bid, hl_ask) = hl_symbol
+            .and_then(|s| self.prices.get(&(Exchange::Hyperliquid, s.clone())))
+            .copied()
+            .unwrap_or_else(|| {
+                tracing::warn!("SpreadArbStats: Hyperliquid BBO missing at signal time");
                 (0.0, 0.0)
-            }
-        };
-        let (ibkr_bid, ibkr_ask) = match self.prices.get(&(Exchange::IBKR, symbol.clone())) {
-            Some(&bbo) => bbo,
-            None => {
-                tracing::warn!(symbol = %symbol, "SpreadArbStats: IBKR BBO missing at signal time");
+            });
+        let (ibkr_bid, ibkr_ask) = ibkr_symbol
+            .and_then(|s| self.prices.get(&(Exchange::IBKR, s.clone())))
+            .copied()
+            .unwrap_or_else(|| {
+                tracing::warn!("SpreadArbStats: IBKR BBO missing at signal time");
                 (0.0, 0.0)
-            }
-        };
+            });
 
         let signal_type = SignalType::from_comment(comment);
 
@@ -117,10 +125,18 @@ impl SpreadArbStatsActor {
             })
             .unwrap_or((0.0, 0.0));
 
+        // perp_symbol = HL 侧, spot_symbol = IBKR 侧
+        let perp_sym = hl_symbol
+            .cloned()
+            .unwrap_or_else(|| tracked[0].symbol.clone());
+        let spot_sym = ibkr_symbol
+            .cloned()
+            .unwrap_or_else(|| tracked[0].symbol.clone());
+
         let signal_model = db_signal::ActiveModel {
             created_at: Set(chrono::Utc::now()),
-            perp_symbol: Set(symbol.clone()),
-            spot_symbol: Set(symbol.clone()),
+            perp_symbol: Set(perp_sym),
+            spot_symbol: Set(spot_sym),
             signal_type: Set(signal_type),
             direction: Set(direction),
             perp_bid: Set(hl_bid),

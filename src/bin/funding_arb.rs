@@ -160,7 +160,17 @@ async fn main() -> anyhow::Result<()> {
         if config.exchanges.ibkr.is_none() {
             // spread_arb 策略创建时已 warn，此处无需重复
         } else if let Some(ref db_config) = config.database {
-            init_spread_arb_stats(&manager, spread_arb_config.symbols.iter().cloned(), db_config)
+            // symbols 需包含 IBKR 侧和 HL 侧 (e.g., "AAPL" + "xyz:AAPL")
+            let hl_dex_stats = &config.exchanges.hyperliquid.dex;
+            let all_symbols = spread_arb_config.symbols.iter().flat_map(|s| {
+                let hl_s = if hl_dex_stats.is_empty() {
+                    s.clone()
+                } else {
+                    format!("{}:{}", hl_dex_stats, s)
+                };
+                vec![s.clone(), hl_s]
+            });
+            init_spread_arb_stats(&manager, all_symbols, db_config)
                 .await?;
         } else {
             tracing::warn!("spread_arb configured but database is not set, signals/orders/fills will not be persisted");

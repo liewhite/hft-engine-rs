@@ -289,8 +289,12 @@ impl Strategy for SpreadArbStrategy {
         }
 
         // 跨交易所 symbol 不同 (IBKR: "AAPL", HL: "xyz:AAPL")，分别查询
-        let ibkr_state = state.symbol_state(&self.ibkr_symbol)?;
-        let hl_state = state.symbol_state(&self.hl_symbol)?;
+        let ibkr_state = state
+            .symbol_state(&self.ibkr_symbol)
+            .expect("ibkr_symbol must exist in StateManager");
+        let hl_state = state
+            .symbol_state(&self.hl_symbol)
+            .expect("hl_symbol must exist in StateManager");
 
         // 两边市场都必须是 Liquid 才允许下单
         if state.market_status(Exchange::IBKR) != MarketStatus::Liquid
