@@ -62,9 +62,21 @@ async fn run_ws_loop_inner(
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         tracing::trace!(text = %text, "ws_loop received message");
-                        // 发送失败说明 actor 已停止，正常退出
                         if incoming_tx.send(Ok(text)).await.is_err() {
                             return Ok(());
+                        }
+                    }
+                    Some(Ok(WsMessage::Binary(data))) => {
+                        match String::from_utf8(data.into()) {
+                            Ok(text) => {
+                                tracing::trace!(text = %text, "ws_loop received binary message");
+                                if incoming_tx.send(Ok(text)).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ws_loop: binary message is not valid UTF-8");
+                            }
                         }
                     }
                     Some(Ok(WsMessage::Ping(data))) => {

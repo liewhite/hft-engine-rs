@@ -107,9 +107,18 @@ impl IbkrPublicWsActor {
         }
 
         // 路由: 含 conid → BBO 行情
-        let conid = match value.get("conid").and_then(|v| v.as_i64()) {
-            Some(id) => id,
-            None => return Ok(()), // 心跳/状态消息
+        let conid = match value.get("conid") {
+            Some(v) => match v.as_i64() {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(raw = %value, "IBKR WS: conid field is not i64");
+                    return Ok(());
+                }
+            },
+            None => {
+                tracing::debug!(raw = %value, "IBKR WS: no conid, skipping");
+                return Ok(());
+            }
         };
 
         self.handle_bbo(&value, conid, local_ts).await
