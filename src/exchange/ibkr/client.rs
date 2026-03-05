@@ -469,11 +469,11 @@ const SNAPSHOT_FIELD_BID: &str = "84";
 const SNAPSHOT_FIELD_ASK: &str = "86";
 
 impl IbkrClient {
-    /// 获取指定 symbol 的 snapshot 中间价
+    /// 获取指定 symbol 的 snapshot BBO (bid, ask)
     ///
     /// IBKR 股票无公开 BBO REST API，通过 `/iserver/marketdata/snapshot` 获取。
     /// 首次请求可能触发订阅，需要多次请求才能拿到数据。
-    pub async fn fetch_snapshot_mid_price(&self, symbol: &str) -> Result<f64, ExchangeError> {
+    pub async fn fetch_snapshot_bbo(&self, symbol: &str) -> Result<(f64, f64), ExchangeError> {
         let conid = self.conids.get(symbol).ok_or_else(|| {
             ExchangeError::SymbolNotFound(Exchange::IBKR, symbol.to_string())
         })?;
@@ -514,7 +514,7 @@ impl IbkrClient {
 
             if let (Some(b), Some(a)) = (bid, ask) {
                 tracing::debug!(attempt, bid = b, ask = a, "IBKR snapshot");
-                return Ok((b + a) / 2.0);
+                return Ok((b, a));
             }
 
             // 字段缺失 = 数据未就绪，等待重试
@@ -526,6 +526,12 @@ impl IbkrClient {
             Exchange::IBKR,
             format!("3 次尝试后仍无法获取 {} 的 snapshot 价格", symbol),
         ))
+    }
+
+    /// 获取指定 symbol 的 snapshot 中间价
+    pub async fn fetch_snapshot_mid_price(&self, symbol: &str) -> Result<f64, ExchangeError> {
+        let (bid, ask) = self.fetch_snapshot_bbo(symbol).await?;
+        Ok((bid + ask) / 2.0)
     }
 
     /// 处理下单响应，包括 reply 确认循环 (最多 5 轮)

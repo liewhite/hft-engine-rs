@@ -404,3 +404,127 @@ async fn test_ibkr_ws_bbo() {
     // 清理
     ibkr_actor.kill();
 }
+
+/// 测试下单 → 验证成交流程
+///
+/// 1. 读取初始仓位
+/// 2. 获取 bid/ask，按对手价 IOC 买入 1 股
+/// 3. 等待成交，验证仓位增加
+/// 4. 按对手价 IOC 卖出平仓
+/// 5. 验证仓位恢复
+#[tokio::test]
+#[ignore = "需要真实凭证和网络，会产生真实交易"]
+async fn test_ibkr_place_order_and_verify_fill() {
+    let credentials = load_credentials();
+    let symbol = first_symbol(&credentials);
+
+    let client = IbkrClient::new(&credentials)
+        .await
+        .expect("IBKR 连接失败");
+
+    // 1. 读取初始仓位
+    let positions_before = client.fetch_positions().await.expect("获取仓位失败");
+    let pos_before = positions_before
+        .iter()
+        .find(|p| p.symbol == symbol)
+        .map(|p| p.size)
+        .unwrap_or(0.0);
+    println!("[初始] {} 仓位: {}", symbol, pos_before);
+
+    // 2. 获取 bid/ask
+    let (bid, ask) = client
+        .fetch_snapshot_bbo(&symbol)
+        .await
+        .expect("获取 BBO 失败");
+    println!("[行情] {} bid={} ask={}", symbol, bid, ask);
+
+    // 3. 按 ask 价买入 (IOC，应立即成交)
+    let metas = client
+        .fetch_symbol_meta(&[symbol.clone()])
+        .await
+        .expect("获取 SymbolMeta 失败");
+    let meta = metas.first().expect("未找到 SymbolMeta");
+    let buy_price: f64 = meta.format_price(ask).parse().unwrap();
+
+    let buy_order = Order {
+        id: uuid::Uuid::new_v4().to_string(),
+        exchange: Exchange::IBKR,
+        symbol: symbol.clone(),
+        side: Side::Long,
+        order_type: OrderType::Limit {
+            price: buy_price,
+            tif: TimeInForce::IOC,
+        },
+        quantity: TEST_QUANTITY,
+        reduce_only: false,
+        client_order_id: Exchange::IBKR.new_cli_order_id(),
+    };
+
+    println!("[下单] 买入 {} 股 {} @ {}", TEST_QUANTITY, symbol, buy_price);
+    let buy_order_id = client.place_order(buy_order).await.expect("买单失败");
+    println!("[成交] 买单 order_id={}", buy_order_id);
+
+    // 4. 等待仓位更新
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // 5. 验证仓位增加
+    let positions_after_buy = client.fetch_positions().await.expect("获取仓位失败");
+    let pos_after_buy = positions_after_buy
+        .iter()
+        .find(|p| p.symbol == symbol)
+        .map(|p| p.size)
+        .unwrap_or(0.0);
+    println!("[买入后] {} 仓位: {} (预期: {})", symbol, pos_after_buy, pos_before + TEST_QUANTITY);
+    assert!(
+        (pos_after_buy - (pos_before + TEST_QUANTITY)).abs() < 0.01,
+        "买入后仓位应增加 {} 股: before={} after={}",
+        TEST_QUANTITY,
+        pos_before,
+        pos_after_buy,
+    );
+
+    // 6. 按 bid 价卖出平仓 (IOC)
+    let (bid2, _ask2) = client
+        .fetch_snapshot_bbo(&symbol)
+        .await
+        .expect("获取 BBO 失败");
+    let sell_price: f64 = meta.format_price(bid2).parse().unwrap();
+
+    let sell_order = Order {
+        id: uuid::Uuid::new_v4().to_string(),
+        exchange: Exchange::IBKR,
+        symbol: symbol.clone(),
+        side: Side::Short,
+        order_type: OrderType::Limit {
+            price: sell_price,
+            tif: TimeInForce::IOC,
+        },
+        quantity: TEST_QUANTITY,
+        reduce_only: false,
+        client_order_id: Exchange::IBKR.new_cli_order_id(),
+    };
+
+    println!("[下单] 卖出 {} 股 {} @ {}", TEST_QUANTITY, symbol, sell_price);
+    let sell_order_id = client.place_order(sell_order).await.expect("卖单失败");
+    println!("[成交] 卖单 order_id={}", sell_order_id);
+
+    // 7. 等待仓位更新
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // 8. 验证仓位恢复
+    let positions_final = client.fetch_positions().await.expect("获取仓位失败");
+    let pos_final = positions_final
+        .iter()
+        .find(|p| p.symbol == symbol)
+        .map(|p| p.size)
+        .unwrap_or(0.0);
+    println!("[最终] {} 仓位: {} (预期: {})", symbol, pos_final, pos_before);
+    assert!(
+        (pos_final - pos_before).abs() < 0.01,
+        "仓位应恢复到初始值: before={} final={}",
+        pos_before,
+        pos_final,
+    );
+
+    println!("[完成] 买入卖出测试通过，仓位已恢复");
+}
