@@ -252,6 +252,7 @@ impl Actor for ManagerActor {
             OutcomeProcessorArgs {
                 clients: clients.clone(),
                 income_pubsub: income_pubsub.clone(),
+                dry_run: true, // TODO: 调试完成后改为 false
             },
             mailbox::unbounded(),
         )
