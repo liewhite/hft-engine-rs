@@ -30,12 +30,22 @@ impl SpreadArbStrategy {
         Self { config, symbol }
     }
 
-    /// 计算 spread = (HL_bid - IBKR_ask) / IBKR_ask
-    fn calc_spread(&self, hl_bid: f64, ibkr_ask: f64) -> Option<f64> {
+    /// 计算开仓 spread = (HL_bid - IBKR_ask) / IBKR_ask
+    /// 开仓时: IBKR 按 ask 买入, HL 按 bid 卖出
+    fn calc_open_spread(&self, hl_bid: f64, ibkr_ask: f64) -> Option<f64> {
         if ibkr_ask <= 0.0 {
             return None;
         }
         Some((hl_bid - ibkr_ask) / ibkr_ask)
+    }
+
+    /// 计算平仓 spread = (HL_ask - IBKR_bid) / IBKR_bid
+    /// 平仓时: IBKR 按 bid 卖出, HL 按 ask 买入
+    fn calc_close_spread(&self, hl_ask: f64, ibkr_bid: f64) -> Option<f64> {
+        if ibkr_bid <= 0.0 {
+            return None;
+        }
+        Some((hl_ask - ibkr_bid) / ibkr_bid)
     }
 
     /// 计算当前杠杆率 = 仓位价值 / HL equity
@@ -341,11 +351,10 @@ impl Strategy for SpreadArbStrategy {
             }
         }
 
-        // 计算 spread
-        let spread = self.calc_spread(hl_bbo.bid_price, ibkr_bbo.ask_price)?;
-
-        // === 步骤 2: 平仓 ===
-        if has_position && spread < self.config.close_threshold {
+        // === 步骤 2: 平仓 (用实际执行侧价格: IBKR bid / HL ask) ===
+        let close_spread = self.calc_close_spread(hl_bbo.ask_price, ibkr_bbo.bid_price)?;
+        if has_position && close_spread < self.config.close_threshold {
+            let spread = close_spread;
             let paired_qty = ibkr_pos.min(hl_pos.abs());
             let close_qty = paired_qty.floor();
 
@@ -438,8 +447,10 @@ impl Strategy for SpreadArbStrategy {
             return None;
         }
 
-        // === 步骤 3: 开仓 ===
-        if spread > self.config.open_threshold {
+        // === 步骤 3: 开仓 (用实际执行侧价格: IBKR ask / HL bid) ===
+        let open_spread = self.calc_open_spread(hl_bbo.bid_price, ibkr_bbo.ask_price)?;
+        if open_spread > self.config.open_threshold {
+            let spread = open_spread;
             let current_pos_value = hl_pos.abs() * hl_bbo.bid_price;
             let new_order_value = self.config.order_usd_value;
             let new_total_value = current_pos_value + new_order_value;
