@@ -281,7 +281,8 @@ impl IbkrClient {
                                 .unwrap_or_default();
 
                             ScheduleEntry {
-                                trading_schedule_date: entry.get("tradingScheduleDate").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                // 统一去掉连字符，兼容 "2000-01-03" 和 "20000103" 两种格式
+                                trading_schedule_date: entry.get("tradingScheduleDate").and_then(|v| v.as_str()).map(|s| s.replace('-', "")),
                                 sessions,
                             }
                         })
@@ -642,7 +643,9 @@ pub struct TradingSchedule {
 
 /// 交易日程条目
 pub struct ScheduleEntry {
-    /// 交易日期 (格式: "YYYYMMDD")
+    /// 交易日期 (格式: "YYYYMMDD"，已去连字符标准化)
+    /// - 周几模式: "20000101"=Sat, "20000103"=Mon, ..., "20000107"=Fri
+    /// - 精确日期: 节假日用实际日期 (如 "20260403" = Good Friday)
     pub trading_schedule_date: Option<String>,
     /// 交易时段列表
     pub sessions: Vec<TradingSession>,
@@ -650,11 +653,11 @@ pub struct ScheduleEntry {
 
 /// 单个交易时段
 pub struct TradingSession {
-    /// 开盘时间 (格式: "YYYYMMDD-HH:mm:ss")
+    /// 开盘时间 (格式: "HHmm"，如 "0930")
     pub opening_time: Option<String>,
-    /// 收盘时间 (格式: "YYYYMMDD-HH:mm:ss")
+    /// 收盘时间 (格式: "HHmm"，如 "1600")
     pub closing_time: Option<String>,
-    /// 时段属性 (可能标识 session 类型)
+    /// 时段属性 (如 "LIQUID", "PRE-OPEN" 等)
     pub prop: Option<String>,
 }
 

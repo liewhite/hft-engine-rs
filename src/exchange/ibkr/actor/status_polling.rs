@@ -145,8 +145,8 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrStatusPollingActor {
 
 /// 从 IBKR 交易时间表判定当前市场状态
 ///
-/// IBKR schedule API 的日期格式:
-/// - 周几模式: "2000-01-01"=周六, "2000-01-03"=周一, ..., "2000-01-07"=周五
+/// IBKR schedule API 的日期格式 (已在解析时去除连字符标准化为 YYYYMMDD):
+/// - 周几模式: "20000101"=Sat, "20000103"=Mon, ..., "20000107"=Fri
 /// - 精确日期: 节假日用实际日期 (如 "20260403" = Good Friday)
 ///
 /// 时间格式: "HHmm" (如 "0930"=09:30, "1600"=16:00)
@@ -193,14 +193,23 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
     for session in &entry.sessions {
         let (open_str, close_str) = match (&session.opening_time, &session.closing_time) {
             (Some(o), Some(c)) => (o.as_str(), c.as_str()),
-            _ => continue,
+            _ => {
+                tracing::warn!(prop = ?session.prop, "IBKR session missing open/close time, skipping");
+                continue;
+            }
         };
 
         let open_mins = parse_hhmm(open_str);
         let close_mins = parse_hhmm(close_str);
 
         if let (Some(open), Some(close)) = (open_mins, close_mins) {
-            if now_mins >= open && now_mins < close {
+            // 支持跨午夜时段 (close <= open 表示跨日)
+            let in_session = if close > open {
+                now_mins >= open && now_mins < close
+            } else {
+                now_mins >= open || now_mins < close
+            };
+            if in_session {
                 return classify_prop(session.prop.as_deref());
             }
         }
@@ -219,36 +228,53 @@ fn classify_prop(prop: Option<&str>) -> MarketStatus {
             } else if upper.contains("PRE") || upper.contains("POST") || upper.contains("AFTER") {
                 MarketStatus::Extending
             } else {
-                tracing::debug!(prop = %p, "Unknown IBKR session prop, treating as Extending");
+                tracing::warn!(prop = %p, "Unknown IBKR session prop, treating as Extending");
                 MarketStatus::Extending
             }
         }
-        None => MarketStatus::Extending,
+        None => {
+            tracing::warn!("IBKR session missing prop field, defaulting to Extending");
+            MarketStatus::Extending
+        }
     }
 }
 
 /// 解析 "HHmm" 格式时间字符串为分钟数
 /// "0930" → 570, "1600" → 960, "0000" → 0
 fn parse_hhmm(s: &str) -> Option<u32> {
-    if s.len() != 4 {
+    if s.len() != 4 || !s.is_ascii() {
         tracing::warn!(input = %s, "Invalid HHmm format");
         return None;
     }
-    let hh: u32 = s[..2].parse().ok()?;
-    let mm: u32 = s[2..].parse().ok()?;
+    let hh: u32 = s[..2].parse().ok().or_else(|| {
+        tracing::warn!(input = %s, "Invalid HHmm format: bad hour");
+        None
+    })?;
+    let mm: u32 = s[2..].parse().ok().or_else(|| {
+        tracing::warn!(input = %s, "Invalid HHmm format: bad minute");
+        None
+    })?;
     Some(hh * 60 + mm)
 }
 
 /// 硬编码的 US 市场时间 fallback
 ///
+/// - 周末 → Closed
 /// - 9:30-16:00 ET → Liquid
 /// - 4:00-9:30 / 16:00-20:00 ET → Extending
 /// - 其他 → Closed
 fn fallback_us_market_status() -> MarketStatus {
     let now_et = chrono::Utc::now().with_timezone(&Eastern);
-    let hour = now_et.hour();
-    let minute = now_et.minute();
-    let time_mins = hour * 60 + minute;
+
+    // 周末直接 Closed
+    if matches!(
+        now_et.weekday(),
+        chrono::Weekday::Sat | chrono::Weekday::Sun
+    ) {
+        return MarketStatus::Closed;
+    }
+
+    let time_mins = now_et.hour() * 60 + now_et.minute();
 
     match time_mins {
         // 9:30 (570) - 16:00 (960)
