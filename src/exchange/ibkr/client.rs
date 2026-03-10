@@ -151,11 +151,10 @@ impl IbkrClient {
             tracing::warn!(error = %e, "IBKR portfolio/accounts prefetch failed");
         }
 
-        // invalidate 缓存，强制 IBKR 从后端拉取最新持仓
-        self.invalidate_positions_cache().await;
-
+        // 使用 portfolio2 接口: 近实时数据，无缓存
+        // (portfolio v1 的 /positions/{page} 有缓存延迟，invalidate 也不可靠)
         let url = format!(
-            "{}portfolio/{}/positions/0",
+            "{}portfolio2/{}/positions",
             base_url, self.account_id
         );
 
@@ -184,7 +183,14 @@ impl IbkrClient {
 
         let mut positions = Vec::new();
         for item in arr {
-            let conid = match item.get("conid").and_then(|v| v.as_i64()) {
+            // portfolio2 返回 conid 为字符串，portfolio v1 为数字，兼容两种格式
+            let conid = match item.get("conid") {
+                Some(v) => {
+                    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                }
+                None => None,
+            };
+            let conid = match conid {
                 Some(c) => c,
                 None => {
                     tracing::warn!(item = %item, "IBKR position missing/invalid conid");
