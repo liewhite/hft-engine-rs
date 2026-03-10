@@ -246,8 +246,6 @@ impl IbkrClient {
 
         let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
 
-        tracing::debug!(body = %body, "IBKR trading schedule raw response");
-
         // 防御性解析：响应可能是数组或单个对象
         let items = if let Some(arr) = body.as_array() {
             arr.clone()

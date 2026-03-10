@@ -52,7 +52,6 @@ impl IbkrStatusPollingActor {
                 return;
             }
         };
-        tracing::debug!(schedules = ?schedules, "IBKR raw trading schedules");
         let status = determine_status_from_schedule(&schedules);
 
         // 仅在状态变化时打日志
@@ -147,6 +146,9 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrStatusPollingActor {
 
 /// 从 IBKR 交易时间表判定当前市场状态
 ///
+/// 遍历所有 venue，取最宽松的状态 (Liquid > Extending > Closed)。
+/// 不同 venue 的交易时段不同（如 NASDAQ 有盘前/盘后，RBC CMA 只有正常时段）。
+///
 /// IBKR schedule API 的日期格式 (已在解析时去除连字符标准化为 YYYYMMDD):
 /// - 周几模式: "20000101"=Sat, "20000103"=Mon, ..., "20000107"=Fri
 /// - 精确日期: 节假日用实际日期 (如 "20260403" = Good Friday)
@@ -169,76 +171,68 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
         chrono::Weekday::Sun => "20000102",
     };
 
-    // 取第一个 venue 即可（所有 venue 的交易时间相同）
-    let schedule = match schedules.first() {
-        Some(s) => s,
-        None => return MarketStatus::Closed,
-    };
+    let mut best_status = MarketStatus::Closed;
 
-    tracing::debug!(
-        today = %today_str,
-        dow = dow_str,
-        now_mins,
-        schedule_dates = ?schedule.schedules.iter().map(|e| e.trading_schedule_date.as_deref().unwrap_or("?")).collect::<Vec<_>>(),
-        "IBKR status: matching schedule entry"
-    );
+    for schedule in schedules {
+        // 优先精确日期匹配 (节假日/特殊日期)，再匹配周几模式
+        let entry = schedule
+            .schedules
+            .iter()
+            .find(|e| e.trading_schedule_date.as_deref() == Some(&today_str))
+            .or_else(|| {
+                schedule
+                    .schedules
+                    .iter()
+                    .find(|e| e.trading_schedule_date.as_deref() == Some(dow_str))
+            });
 
-    // 优先精确日期匹配 (节假日/特殊日期)，再匹配周几模式
-    let entry = schedule
-        .schedules
-        .iter()
-        .find(|e| e.trading_schedule_date.as_deref() == Some(&today_str))
-        .or_else(|| {
-            schedule
-                .schedules
-                .iter()
-                .find(|e| e.trading_schedule_date.as_deref() == Some(dow_str))
-        });
-
-    let entry = match entry {
-        Some(e) => e,
-        None => {
-            tracing::debug!("IBKR status: no matching schedule entry found → Closed");
-            return MarketStatus::Closed;
-        }
-    };
-
-    tracing::debug!(
-        sessions = ?entry.sessions.iter().map(|s| format!(
-            "{}-{} ({})",
-            s.opening_time.as_deref().unwrap_or("?"),
-            s.closing_time.as_deref().unwrap_or("?"),
-            s.prop.as_deref().unwrap_or("?"),
-        )).collect::<Vec<_>>(),
-        "IBKR status: matched entry sessions"
-    );
-
-    for session in &entry.sessions {
-        let (open_str, close_str) = match (&session.opening_time, &session.closing_time) {
-            (Some(o), Some(c)) => (o.as_str(), c.as_str()),
-            _ => {
-                tracing::warn!(prop = ?session.prop, "IBKR session missing open/close time, skipping");
-                continue;
-            }
+        let entry = match entry {
+            Some(e) => e,
+            None => continue,
         };
 
-        let open_mins = parse_hhmm(open_str);
-        let close_mins = parse_hhmm(close_str);
-
-        if let (Some(open), Some(close)) = (open_mins, close_mins) {
-            // 支持跨午夜时段 (close <= open 表示跨日)
-            let in_session = if close > open {
-                now_mins >= open && now_mins < close
-            } else {
-                now_mins >= open || now_mins < close
+        for session in &entry.sessions {
+            let (open_str, close_str) = match (&session.opening_time, &session.closing_time) {
+                (Some(o), Some(c)) => (o.as_str(), c.as_str()),
+                _ => continue,
             };
-            if in_session {
-                return classify_prop(session.prop.as_deref());
+
+            let open_mins = parse_hhmm(open_str);
+            let close_mins = parse_hhmm(close_str);
+
+            if let (Some(open), Some(close)) = (open_mins, close_mins) {
+                // 跳过 0000-0000 的空时段
+                if open == 0 && close == 0 {
+                    continue;
+                }
+                // 支持跨午夜时段 (close <= open 表示跨日)
+                let in_session = if close > open {
+                    now_mins >= open && now_mins < close
+                } else {
+                    now_mins >= open || now_mins < close
+                };
+                if in_session {
+                    let status = classify_prop(session.prop.as_deref());
+                    best_status = more_permissive(best_status, status);
+                    // Liquid 是最宽松的，无需继续
+                    if best_status == MarketStatus::Liquid {
+                        return best_status;
+                    }
+                }
             }
         }
     }
 
-    MarketStatus::Closed
+    best_status
+}
+
+/// 取两个状态中更宽松的一个 (Liquid > Extending > Closed)
+fn more_permissive(a: MarketStatus, b: MarketStatus) -> MarketStatus {
+    match (a, b) {
+        (MarketStatus::Liquid, _) | (_, MarketStatus::Liquid) => MarketStatus::Liquid,
+        (MarketStatus::Extending, _) | (_, MarketStatus::Extending) => MarketStatus::Extending,
+        _ => MarketStatus::Closed,
+    }
 }
 
 /// 根据 prop 字段判断市场状态
