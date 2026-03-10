@@ -171,29 +171,27 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
         chrono::Weekday::Sun => "20000102",
     };
 
-    // 只使用 NASDAQ venue 的时间表
-    // 优先匹配 description 包含 "NASDAQ"，其次 tradeVenueId 包含 "NASDAQ"，最后 id
-    tracing::debug!(
-        venues = ?schedules.iter().map(|s| format!(
-            "id={:?} tradeVenueId={:?} desc={:?}",
-            s.id, s.trade_venue_id, s.description
-        )).collect::<Vec<_>>(),
-        "IBKR schedule venues"
-    );
+    // 只使用 ISLAND venue 的时间表
+    // ISLAND ECN = NASDAQ 交易所的电子交易系统，有完整的 PRE/LIQUID/POST 时段
+    // "NASDAQ Market Making" 只有 LIQUID 时段，不含盘前/盘后
     let schedule = match schedules
         .iter()
-        .find(|s| {
-            let check = |field: &Option<String>| {
-                field.as_deref().map_or(false, |v| v.to_uppercase().contains("NASDAQ"))
-            };
-            check(&s.description) || check(&s.trade_venue_id) || check(&s.id)
-        })
+        .find(|s| s.description.as_deref().map_or(false, |d| d == "ISLAND"))
         .or_else(|| {
-            tracing::warn!("No NASDAQ venue found in IBKR schedule, falling back to first venue");
+            tracing::warn!(
+                "No ISLAND venue found in IBKR schedule, falling back to first venue"
+            );
             schedules.first()
         })
     {
-        Some(s) => s,
+        Some(s) => {
+            tracing::debug!(
+                id = ?s.id,
+                desc = ?s.description,
+                "IBKR matched venue"
+            );
+            s
+        }
         None => return MarketStatus::Closed,
     };
 
@@ -211,8 +209,18 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
 
     let entry = match entry {
         Some(e) => e,
-        None => return MarketStatus::Closed,
+        None => {
+            tracing::debug!(today = %today_str, dow = dow_str, "No matching schedule entry found");
+            return MarketStatus::Closed;
+        }
     };
+
+    tracing::debug!(
+        date = ?entry.trading_schedule_date,
+        sessions = ?entry.sessions,
+        now_mins = now_mins,
+        "IBKR matched schedule entry"
+    );
 
     for session in &entry.sessions {
         let (open_str, close_str) = match (&session.opening_time, &session.closing_time) {
