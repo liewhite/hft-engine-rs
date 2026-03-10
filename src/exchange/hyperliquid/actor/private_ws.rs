@@ -43,21 +43,57 @@ pub struct HyperliquidPrivateWsActorArgs {
 pub struct HyperliquidPrivateWsActor {
     /// Income PubSub (发布事件)
     income_pubsub: ActorRef<IncomePubSub>,
-    /// Symbol 元数据
-    #[allow(dead_code)]
+    /// Symbol 元数据（用于首次仓位初始化时获取所有配置 symbol）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
     #[allow(dead_code)]
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已知持仓的 symbols（用于检测仓位消失）
     known_positions: std::collections::HashSet<Symbol>,
+    /// 是否已完成首次仓位推送
+    initialized: bool,
 }
 
 impl HyperliquidPrivateWsActor {
     /// 解析并处理消息
     async fn handle_message(&mut self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_private_message(raw, local_ts, &mut self.known_positions)?;
+        let mut events = parse_private_message(raw, local_ts, &mut self.known_positions)?;
+
+        // 首次收到 clearinghouseState 时，为所有配置的 symbol 补充 position=0
+        if !self.initialized && events.iter().any(|e| matches!(&e.data, ExchangeEventData::Position(_))) {
+            use crate::domain::Position;
+
+            let existing: std::collections::HashSet<Symbol> = events
+                .iter()
+                .filter_map(|e| match &e.data {
+                    ExchangeEventData::Position(p) => Some(p.symbol.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            for symbol in self.symbol_metas.keys() {
+                if !existing.contains(symbol) {
+                    tracing::info!(
+                        symbol = %symbol,
+                        "Hyperliquid position initial load (empty)"
+                    );
+                    events.push(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::Position(Position {
+                            exchange: Exchange::Hyperliquid,
+                            symbol: symbol.clone(),
+                            size: 0.0,
+                            entry_price: 0.0,
+                            unrealized_pnl: 0.0,
+                        }),
+                    });
+                }
+            }
+            self.initialized = true;
+        }
+
         for event in events {
             let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
@@ -147,6 +183,7 @@ impl Actor for HyperliquidPrivateWsActor {
             symbol_metas: args.symbol_metas,
             ws_tx: Some(outgoing_tx),
             known_positions: std::collections::HashSet::new(),
+            initialized: false,
         })
     }
 

@@ -82,14 +82,14 @@ impl SpreadArbStrategy {
         let ibkr_bbo = ibkr_state.bbo(Exchange::IBKR);
         let hl_bbo = hl_state.bbo(Exchange::Hyperliquid);
 
-        let ibkr_pos = ibkr_state
-            .position(Exchange::IBKR)
-            .map(|p| p.size)
-            .unwrap_or(0.0);
-        let hl_pos = hl_state
-            .position(Exchange::Hyperliquid)
-            .map(|p| p.size)
-            .unwrap_or(0.0);
+        let ibkr_pos = match ibkr_state.position(Exchange::IBKR) {
+            Some(p) => p.size,
+            None => return, // 仓位尚未初始化
+        };
+        let hl_pos = match hl_state.position(Exchange::Hyperliquid) {
+            Some(p) => p.size,
+            None => return, // 仓位尚未初始化
+        };
 
         let (ibkr_bid, ibkr_ask) = ibkr_bbo
             .map(|b| (b.bid_price, b.ask_price))
@@ -397,16 +397,15 @@ impl Strategy for SpreadArbStrategy {
         }
 
         // 获取当前持仓
-        // IBKR 仓位必须已到达（polling actor 会对所有 symbol 推送，包括空仓）
-        // HL 仓位未到达时视为 0（空仓不会触发 clearinghouseState 推送）
+        // 两个交易所仓位都必须已初始化（polling/WS 会对所有配置 symbol 推送，包括空仓）
         let ibkr_pos = match ibkr_state.position(Exchange::IBKR) {
             Some(p) => p.size,
-            None => return None, // IBKR 仓位尚未 poll 到，跳过
+            None => return None,
         };
-        let hl_pos = hl_state
-            .position(Exchange::Hyperliquid)
-            .map(|p| p.size)
-            .unwrap_or(0.0);
+        let hl_pos = match hl_state.position(Exchange::Hyperliquid) {
+            Some(p) => p.size,
+            None => return None,
+        };
 
         // === 步骤 0: 仓位方向守卫 ===
         if let Some(signal) = self.emergency_flatten(
