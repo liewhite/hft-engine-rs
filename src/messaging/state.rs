@@ -222,25 +222,15 @@ impl SymbolState {
                 self.bbos.insert(bbo.exchange, bbo.clone());
             }
             ExchangeEventData::Position(position) => {
-                // 只在没有 pending orders 时更新，避免延迟的推送覆盖 Fill 更新的值
-                if self.pending_orders.is_empty() {
+                // 仅用于初始加载：本地无仓位时写入，之后完全由 Fill 事件维护
+                if !self.positions.contains_key(&position.exchange) {
+                    tracing::info!(
+                        symbol = %self.symbol,
+                        exchange = %position.exchange,
+                        size = position.size,
+                        "Position initialized from poll"
+                    );
                     self.positions.insert(position.exchange, position.clone());
-                } else {
-                    // 有 pending orders 时，检查推送值与本地值是否一致
-                    if let Some(local_pos) = self.positions.get(&position.exchange) {
-                        let size_diff = (local_pos.size - position.size).abs();
-                        if size_diff > 1e-10 {
-                            tracing::warn!(
-                                symbol = %self.symbol,
-                                exchange = %position.exchange,
-                                local_size = local_pos.size,
-                                pushed_size = position.size,
-                                size_diff = size_diff,
-                                pending_orders = self.pending_orders.len(),
-                                "Position mismatch: local vs pushed"
-                            );
-                        }
-                    }
                 }
             }
             ExchangeEventData::OrderUpdate(update) => {
