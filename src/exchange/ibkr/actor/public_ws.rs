@@ -231,9 +231,16 @@ impl IbkrPublicWsActor {
                 "PendingSubmit" | "PreSubmitted" | "Submitted" => OrderStatus::Pending,
                 "Filled" => OrderStatus::Filled,
                 "Cancelled" => OrderStatus::Cancelled,
-                "Inactive" => OrderStatus::Rejected {
-                    reason: "Inactive".to_string(),
-                },
+                // Inactive 是 IBKR 的中间状态（订单仍在处理中），不是终态拒绝。
+                // 映射为 Pending 防止策略误判为已拒绝而重复下单。
+                // 真正的拒绝会通过 REST API 返回 order_submit_issue 错误。
+                "Inactive" => {
+                    tracing::warn!(
+                        order_ref,
+                        "IBKR order status: Inactive (treating as Pending)"
+                    );
+                    OrderStatus::Pending
+                }
                 other => {
                     tracing::debug!(
                         ib_status = other,
