@@ -52,6 +52,7 @@ impl IbkrStatusPollingActor {
                 return;
             }
         };
+        tracing::debug!(schedules = ?schedules, "IBKR raw trading schedules");
         let status = determine_status_from_schedule(&schedules);
 
         // 仅在状态变化时打日志
@@ -174,6 +175,14 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
         None => return MarketStatus::Closed,
     };
 
+    tracing::debug!(
+        today = %today_str,
+        dow = dow_str,
+        now_mins,
+        schedule_dates = ?schedule.schedules.iter().map(|e| e.trading_schedule_date.as_deref().unwrap_or("?")).collect::<Vec<_>>(),
+        "IBKR status: matching schedule entry"
+    );
+
     // 优先精确日期匹配 (节假日/特殊日期)，再匹配周几模式
     let entry = schedule
         .schedules
@@ -188,8 +197,21 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
 
     let entry = match entry {
         Some(e) => e,
-        None => return MarketStatus::Closed,
+        None => {
+            tracing::debug!("IBKR status: no matching schedule entry found → Closed");
+            return MarketStatus::Closed;
+        }
     };
+
+    tracing::debug!(
+        sessions = ?entry.sessions.iter().map(|s| format!(
+            "{}-{} ({})",
+            s.opening_time.as_deref().unwrap_or("?"),
+            s.closing_time.as_deref().unwrap_or("?"),
+            s.prop.as_deref().unwrap_or("?"),
+        )).collect::<Vec<_>>(),
+        "IBKR status: matched entry sessions"
+    );
 
     for session in &entry.sessions {
         let (open_str, close_str) = match (&session.opening_time, &session.closing_time) {

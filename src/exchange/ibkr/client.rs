@@ -246,6 +246,8 @@ impl IbkrClient {
 
         let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
 
+        tracing::debug!(body = %body, "IBKR trading schedule raw response");
+
         // 防御性解析：响应可能是数组或单个对象
         let items = if let Some(arr) = body.as_array() {
             arr.clone()
@@ -635,6 +637,7 @@ fn parse_snapshot_field(data: &serde_json::Value, field: &str) -> Option<f64> {
 // ============================================================================
 
 /// IBKR 交易时间表
+#[derive(Debug)]
 pub struct TradingSchedule {
     pub id: Option<String>,
     pub trade_venue_id: Option<String>,
@@ -642,6 +645,7 @@ pub struct TradingSchedule {
 }
 
 /// 交易日程条目
+#[derive(Debug)]
 pub struct ScheduleEntry {
     /// 交易日期 (格式: "YYYYMMDD"，已去连字符标准化)
     /// - 周几模式: "20000101"=Sat, "20000103"=Mon, ..., "20000107"=Fri
@@ -652,6 +656,7 @@ pub struct ScheduleEntry {
 }
 
 /// 单个交易时段
+#[derive(Debug)]
 pub struct TradingSession {
     /// 开盘时间 (格式: "HHmm"，如 "0930")
     pub opening_time: Option<String>,
