@@ -151,6 +151,9 @@ impl IbkrClient {
             tracing::warn!(error = %e, "IBKR portfolio/accounts prefetch failed");
         }
 
+        // invalidate 缓存，强制 IBKR 从后端拉取最新持仓
+        self.invalidate_positions_cache().await;
+
         let url = format!(
             "{}portfolio/{}/positions/0",
             base_url, self.account_id
