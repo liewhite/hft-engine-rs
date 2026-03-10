@@ -239,12 +239,30 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
                 now_mins >= open || now_mins < close
             };
             if in_session {
-                return classify_prop(session.prop.as_deref());
+                return match session.prop.as_deref() {
+                    Some(p) => classify_prop(Some(p)),
+                    // ISLAND venue 没有 prop 标注，用标准 NASDAQ 时段判定:
+                    // 09:30-16:00 = Liquid, 其余 = Extending (盘前/盘后)
+                    None => classify_by_time(now_mins),
+                };
             }
         }
     }
 
     MarketStatus::Closed
+}
+
+/// 根据标准 NASDAQ 交易时段判定状态 (东部时间分钟数)
+/// - 09:30 (570) ~ 16:00 (960) → Liquid
+/// - 其余在交易窗口内 → Extending (盘前/盘后)
+fn classify_by_time(now_mins: u32) -> MarketStatus {
+    const REGULAR_OPEN: u32 = 9 * 60 + 30; // 09:30 = 570
+    const REGULAR_CLOSE: u32 = 16 * 60; // 16:00 = 960
+    if now_mins >= REGULAR_OPEN && now_mins < REGULAR_CLOSE {
+        MarketStatus::Liquid
+    } else {
+        MarketStatus::Extending
+    }
 }
 
 /// 根据 prop 字段判断市场状态
