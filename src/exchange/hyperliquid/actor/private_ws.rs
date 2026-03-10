@@ -7,7 +7,7 @@
 //!
 //! 注意: Hyperliquid 的账户订阅不需要认证，只需要用户地址
 
-use crate::domain::{now_ms, Balance, Exchange, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Balance, Exchange, Position, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
 use crate::exchange::hyperliquid::codec::{ClearinghouseState, WsOrderUpdate, WsUserFills};
@@ -58,42 +58,11 @@ impl HyperliquidPrivateWsActor {
     /// 解析并处理消息
     async fn handle_message(&mut self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let mut events = parse_private_message(raw, local_ts, &mut self.known_positions)?;
-
-        // 首次收到 clearinghouseState 时，为所有配置的 symbol 补充 position=0
+        let all_symbols = if self.initialized { None } else { Some(&self.symbol_metas) };
+        let events = parse_private_message(raw, local_ts, &mut self.known_positions, all_symbols)?;
         if !self.initialized && events.iter().any(|e| matches!(&e.data, ExchangeEventData::Position(_))) {
-            use crate::domain::Position;
-
-            let existing: std::collections::HashSet<Symbol> = events
-                .iter()
-                .filter_map(|e| match &e.data {
-                    ExchangeEventData::Position(p) => Some(p.symbol.clone()),
-                    _ => None,
-                })
-                .collect();
-
-            for symbol in self.symbol_metas.keys() {
-                if !existing.contains(symbol) {
-                    tracing::info!(
-                        symbol = %symbol,
-                        "Hyperliquid position initial load (empty)"
-                    );
-                    events.push(IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::Position(Position {
-                            exchange: Exchange::Hyperliquid,
-                            symbol: symbol.clone(),
-                            size: 0.0,
-                            entry_price: 0.0,
-                            unrealized_pnl: 0.0,
-                        }),
-                    });
-                }
-            }
             self.initialized = true;
         }
-
         for event in events {
             let _ = self.income_pubsub.tell(Publish(event)).send().await;
         }
@@ -243,6 +212,8 @@ fn parse_private_message(
     raw: &str,
     local_ts: u64,
     known_positions: &mut std::collections::HashSet<Symbol>,
+    // 首次调用时传入所有配置 symbol，用于补齐空仓 position=0
+    all_symbols: Option<&Arc<HashMap<Symbol, SymbolMeta>>>,
 ) -> Result<Vec<IncomeEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
@@ -259,7 +230,7 @@ fn parse_private_message(
             "clearinghouseState" => {
                 // perp 账户状态 (positions, equity, margin)
                 let data = &value["data"];
-                return parse_clearinghouse_state(data, local_ts, known_positions);
+                return parse_clearinghouse_state(data, local_ts, known_positions, all_symbols);
             }
             "orderUpdates" => {
                 // 订单更新
@@ -289,12 +260,14 @@ fn parse_private_message(
 }
 
 /// 解析 clearinghouseState 消息 (perp 账户状态)
+///
+/// `all_symbols`: 首次调用时传入所有配置 symbol，用于对空仓 symbol 补充 position=0 事件
 fn parse_clearinghouse_state(
     data: &serde_json::Value,
     local_ts: u64,
     known_positions: &mut std::collections::HashSet<Symbol>,
+    all_symbols: Option<&Arc<HashMap<Symbol, SymbolMeta>>>,
 ) -> Result<Vec<IncomeEvent>, WsError> {
-    use crate::domain::Position;
     use std::collections::HashSet;
 
     let mut events = Vec::new();
@@ -332,12 +305,26 @@ fn parse_clearinghouse_state(
         }
     }
 
-    // 对于之前有仓位但本次响应中消失的 symbols，发送 size=0 的仓位更新
-    for symbol in known_positions.difference(&current_symbols) {
-        tracing::info!(
-            symbol = %symbol,
-            "Hyperliquid position disappeared, setting to zero"
-        );
+    // 对不在本次响应中的 symbol 发送 size=0 的仓位更新:
+    // - 首次: 对所有配置 symbol 中缺失的补零（初始化）
+    // - 后续: 对之前有仓位但消失的 symbol 补零（仓位消失检测）
+    let missing_symbols: Vec<Symbol> = if let Some(all) = all_symbols {
+        // 首次：所有配置 symbol 中不在 current_symbols 的
+        all.keys()
+            .filter(|s| !current_symbols.contains(*s))
+            .cloned()
+            .collect()
+    } else {
+        // 后续：之前有仓位但现在消失的
+        known_positions
+            .difference(&current_symbols)
+            .cloned()
+            .collect()
+    };
+
+    for symbol in &missing_symbols {
+        let label = if all_symbols.is_some() { "initial load (empty)" } else { "disappeared, setting to zero" };
+        tracing::info!(symbol = %symbol, "Hyperliquid position {}", label);
         events.push(IncomeEvent {
             exchange_ts: local_ts,
             local_ts,
