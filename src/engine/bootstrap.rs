@@ -17,9 +17,14 @@ use crate::strategy::{
 
 /// 初始化 tracing（fmt + EnvFilter，默认 fee_arb=info）
 pub fn init_tracing() -> anyhow::Result<()> {
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else {
+        EnvFilter::new("fee_arb=info")
+    };
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(EnvFilter::from_default_env().add_directive("fee_arb=info".parse()?))
+        .with(filter)
         .init();
     Ok(())
 }
