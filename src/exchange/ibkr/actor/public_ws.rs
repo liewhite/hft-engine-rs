@@ -58,6 +58,8 @@ pub struct IbkrPublicWsActor {
     subscribed: HashSet<SubscriptionKind>,
     /// 每个 conid 的 BBO 缓存
     bbo_cache: HashMap<i64, BboCache>,
+    /// 已处理的 execution_id 集合（IBKR 对同一成交会推多条消息，需去重）
+    seen_executions: HashSet<String>,
 }
 
 impl IbkrPublicWsActor {
@@ -330,8 +332,15 @@ impl IbkrPublicWsActor {
         };
 
         for item in args {
-            // 打印完整消息用于调试
-            tracing::info!(raw = %item, "IBKR trade execution received");
+            // 用 execution_id 去重（IBKR 对同一成交会推多条消息：无 commission → 带 commission）
+            let execution_id = item
+                .get("execution_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !execution_id.is_empty() && !self.seen_executions.insert(execution_id.to_string()) {
+                tracing::debug!(execution_id, "IBKR trade: duplicate execution_id, skipping");
+                continue;
+            }
 
             // 解析字段
             let conid = item.get("conid").and_then(|v| v.as_i64());
@@ -526,6 +535,7 @@ impl Actor for IbkrPublicWsActor {
             ws_tx: Some(outgoing_tx),
             subscribed: HashSet::new(),
             bbo_cache: HashMap::new(),
+            seen_executions: HashSet::new(),
         })
     }
 
