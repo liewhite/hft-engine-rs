@@ -346,30 +346,6 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
                     .with_label_values(&[exchange_label, symbol_label])
                     .set(notional);
             }
-            // ExchangeEventData::OrderUpdate(update) => {
-            //     tracing::info!(
-            //         exchange = %exchange_to_label(update.exchange),
-            //         symbol = %update.symbol,
-            //         order_id = %update.order_id,
-            //         client_order_id = ?update.client_order_id,
-            //         side = ?update.side,
-            //         status = ?update.status,
-            //         filled_quantity = %update.filled_quantity,
-            //         "Order update"
-            //     );
-            // }
-            // ExchangeEventData::Fill(fill) => {
-            //     tracing::info!(
-            //         exchange = %exchange_to_label(fill.exchange),
-            //         symbol = %fill.symbol,
-            //         order_id = %fill.order_id,
-            //         client_order_id = ?fill.client_order_id,
-            //         side = ?fill.side,
-            //         price = %fill.price,
-            //         size = %fill.size,
-            //         "Fill"
-            //     );
-            // }
             _ => {
                 // 忽略其他事件
             }

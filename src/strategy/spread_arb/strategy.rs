@@ -28,13 +28,8 @@ pub struct SpreadArbStrategy {
 }
 
 impl SpreadArbStrategy {
-    pub fn new(config: SpreadArbConfig, symbol: Symbol, hl_dex: &str) -> Self {
+    pub fn new(config: SpreadArbConfig, symbol: Symbol, hl_symbol: Symbol) -> Self {
         config.validate();
-        let hl_symbol = if hl_dex.is_empty() {
-            symbol.clone()
-        } else {
-            format!("{}:{}", hl_dex, symbol)
-        };
         Self {
             config,
             ibkr_symbol: symbol,

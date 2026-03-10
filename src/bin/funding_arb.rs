@@ -123,12 +123,12 @@ async fn main() -> anyhow::Result<()> {
     // SpreadArb 策略 (IBKR 股票 vs Hyperliquid 永续)
     if let Some(ref spread_arb_config) = config.strategy.spread_arb {
         if config.exchanges.ibkr.is_some() {
-            let hl_dex = &config.exchanges.hyperliquid.dex;
+            let hl = &config.exchanges.hyperliquid;
             for symbol in &spread_arb_config.symbols {
                 strategies.push(Box::new(SpreadArbStrategy::new(
                     spread_arb_config.clone(),
                     symbol.clone(),
-                    hl_dex,
+                    hl.hl_symbol(symbol),
                 )));
             }
             tracing::info!(
@@ -161,15 +161,11 @@ async fn main() -> anyhow::Result<()> {
             // spread_arb 策略创建时已 warn，此处无需重复
         } else if let Some(ref db_config) = config.database {
             // symbols 需包含 IBKR 侧和 HL 侧 (e.g., "AAPL" + "xyz:AAPL")
-            let hl_dex_stats = &config.exchanges.hyperliquid.dex;
-            let all_symbols = spread_arb_config.symbols.iter().flat_map(|s| {
-                let hl_s = if hl_dex_stats.is_empty() {
-                    s.clone()
-                } else {
-                    format!("{}:{}", hl_dex_stats, s)
-                };
-                vec![s.clone(), hl_s]
-            });
+            let hl = &config.exchanges.hyperliquid;
+            let all_symbols = spread_arb_config
+                .symbols
+                .iter()
+                .flat_map(|s| vec![s.clone(), hl.hl_symbol(s)]);
             init_spread_arb_stats(&manager, all_symbols, db_config)
                 .await?;
         } else {
