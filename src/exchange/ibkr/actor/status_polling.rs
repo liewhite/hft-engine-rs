@@ -146,8 +146,9 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrStatusPollingActor {
 
 /// 从 IBKR 交易时间表判定当前市场状态
 ///
-/// 遍历所有 venue，取最宽松的状态 (Liquid > Extending > Closed)。
-/// 不同 venue 的交易时段不同（如 NASDAQ 有盘前/盘后，RBC CMA 只有正常时段）。
+/// 遍历所有 venue，取最保守的非 Closed 状态。
+/// 不同 venue 对同一时段标注不同（如 NASDAQ 盘前标 PRE，ECN 可能标 LIQUID），
+/// 取最保守的能正确区分盘前/盘后（Extending）和正常交易（Liquid）。
 ///
 /// IBKR schedule API 的日期格式 (已在解析时去除连字符标准化为 YYYYMMDD):
 /// - 周几模式: "20000101"=Sat, "20000103"=Mon, ..., "20000107"=Fri
@@ -213,11 +214,7 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
                 };
                 if in_session {
                     let status = classify_prop(session.prop.as_deref());
-                    best_status = more_permissive(best_status, status);
-                    // Liquid 是最宽松的，无需继续
-                    if best_status == MarketStatus::Liquid {
-                        return best_status;
-                    }
+                    best_status = merge_status(best_status, status);
                 }
             }
         }
@@ -226,12 +223,16 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
     best_status
 }
 
-/// 取两个状态中更宽松的一个 (Liquid > Extending > Closed)
-fn more_permissive(a: MarketStatus, b: MarketStatus) -> MarketStatus {
+/// 合并两个状态：有非 Closed 时取最保守的
+///
+/// - Closed + X → X (Closed 表示该 venue 无匹配，不参与判定)
+/// - Extending + Liquid → Extending (盘前/盘后优先)
+/// - Liquid + Liquid → Liquid
+fn merge_status(a: MarketStatus, b: MarketStatus) -> MarketStatus {
     match (a, b) {
-        (MarketStatus::Liquid, _) | (_, MarketStatus::Liquid) => MarketStatus::Liquid,
+        (MarketStatus::Closed, other) | (other, MarketStatus::Closed) => other,
         (MarketStatus::Extending, _) | (_, MarketStatus::Extending) => MarketStatus::Extending,
-        _ => MarketStatus::Closed,
+        _ => MarketStatus::Liquid,
     }
 }
 
