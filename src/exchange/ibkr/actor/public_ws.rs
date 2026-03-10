@@ -6,7 +6,7 @@
 //! - 处理订单状态推送 (sor topic)
 //! - 增量更新 bid/ask 缓存并发布 BBO 到 IncomePubSub
 
-use crate::domain::{now_ms, Exchange, OrderStatus, OrderUpdate, Side, BBO};
+use crate::domain::{now_ms, Exchange, Fill, OrderStatus, OrderUpdate, Side, BBO};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ibkr::auth::IbkrAuth;
@@ -101,7 +101,7 @@ impl IbkrPublicWsActor {
                 return self.handle_order_update(&value, local_ts).await;
             }
             if topic.starts_with("str") {
-                return Ok(());
+                return self.handle_trade_execution(&value, local_ts).await;
             }
         }
 
@@ -307,6 +307,132 @@ impl IbkrPublicWsActor {
             };
 
             let _ = self.income_pubsub.tell(Publish(event)).send().await;
+        }
+
+        Ok(())
+    }
+
+    /// 处理 str 成交推送
+    ///
+    /// IBKR WS `str` topic 推送成交信息。解析后生成 Fill 事件更新仓位，
+    /// 同时生成 Filled OrderUpdate 关闭 pending order。
+    async fn handle_trade_execution(
+        &mut self,
+        value: &serde_json::Value,
+        local_ts: u64,
+    ) -> Result<(), WsError> {
+        let args = match value.get("args").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => {
+                tracing::debug!(raw = %value, "IBKR str message without args");
+                return Ok(());
+            }
+        };
+
+        for item in args {
+            // 打印完整消息用于调试
+            tracing::info!(raw = %item, "IBKR trade execution received");
+
+            // 解析字段
+            let conid = item.get("conid").and_then(|v| v.as_i64());
+            let symbol = match conid.and_then(|c| self.conid_to_symbol.get(&c).cloned()) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(?conid, raw = %item, "IBKR trade: cannot resolve symbol");
+                    continue;
+                }
+            };
+
+            let order_ref = item
+                .get("order_ref")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let side_str = item.get("side").and_then(|v| v.as_str()).unwrap_or("");
+            let side = match side_str {
+                "BUY" | "B" => Side::Long,
+                "SELL" | "S" => Side::Short,
+                other => {
+                    tracing::warn!(side = other, raw = %item, "IBKR trade: unknown side");
+                    continue;
+                }
+            };
+
+            let price = item.get("price").and_then(parse_ib_number).unwrap_or(0.0);
+            let size = item.get("size").and_then(parse_ib_number).unwrap_or(0.0);
+
+            if price <= 0.0 || size <= 0.0 {
+                tracing::warn!(price, size, raw = %item, "IBKR trade: invalid price/size");
+                continue;
+            }
+
+            tracing::info!(
+                symbol = %symbol,
+                side = ?side,
+                price,
+                size,
+                order_ref,
+                "IBKR fill"
+            );
+
+            // 发布 Fill 事件
+            let fill = Fill {
+                exchange: Exchange::IBKR,
+                symbol: symbol.clone(),
+                order_id: item
+                    .get("execution_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                client_order_id: if order_ref.is_empty() {
+                    None
+                } else {
+                    Some(order_ref.to_string())
+                },
+                side,
+                price,
+                size,
+                timestamp: local_ts,
+            };
+
+            let _ = self
+                .income_pubsub
+                .tell(Publish(IncomeEvent {
+                    exchange_ts: local_ts,
+                    local_ts,
+                    data: ExchangeEventData::Fill(fill),
+                }))
+                .send()
+                .await;
+
+            // 如果有 order_ref，同时发布 Filled OrderUpdate 关闭 pending order
+            if !order_ref.is_empty() {
+                let order_id = item
+                    .get("orderId")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+
+                let _ = self
+                    .income_pubsub
+                    .tell(Publish(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::OrderUpdate(OrderUpdate {
+                            order_id,
+                            client_order_id: Some(order_ref.to_string()),
+                            exchange: Exchange::IBKR,
+                            symbol,
+                            side,
+                            status: OrderStatus::Filled,
+                            filled_quantity: size,
+                            fill_sz: size,
+                            timestamp: local_ts,
+                        }),
+                    }))
+                    .send()
+                    .await;
+            }
         }
 
         Ok(())
