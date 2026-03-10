@@ -171,56 +171,56 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
         chrono::Weekday::Sun => "20000102",
     };
 
-    // 只使用 ISLAND venue 的时间表
-    // ISLAND ECN = NASDAQ 交易所的电子交易系统，有完整的 PRE/LIQUID/POST 时段
-    // "NASDAQ Market Making" 只有 LIQUID 时段，不含盘前/盘后
-    let schedule = match schedules
+    // 查找策略：
+    // 1. 优先用 "NASDAQ Market Making" — 有精确的 prop 标注 (LIQUID 09:30-16:00)
+    // 2. 不在 NASDAQ 时段内，用 "ISLAND" — 覆盖完整交易窗口 (04:00-20:00)，命中即为盘前/盘后
+    // 两个 venue 都找不到则 fallback 到第一个 venue
+    let nasdaq = find_venue(schedules, "NASDAQ Market Making");
+    let island = find_venue(schedules, "ISLAND");
+
+    // 先尝试 NASDAQ
+    if let Some(status) = try_match_venue(nasdaq, &today_str, dow_str, now_mins) {
+        return status;
+    }
+    // NASDAQ 未命中，尝试 ISLAND（在交易窗口内 = 盘前/盘后）
+    if let Some(status) = try_match_venue(island, &today_str, dow_str, now_mins) {
+        return status;
+    }
+
+    // 两个 venue 都未匹配（周末/节假日无时段）
+    MarketStatus::Closed
+}
+
+/// 按 description 查找 venue
+fn find_venue<'a>(
+    schedules: &'a [TradingSchedule],
+    desc: &str,
+) -> Option<&'a TradingSchedule> {
+    schedules
         .iter()
-        .find(|s| s.description.as_deref().map_or(false, |d| d == "ISLAND"))
-        .or_else(|| {
-            tracing::warn!(
-                "No ISLAND venue found in IBKR schedule, falling back to first venue"
-            );
-            schedules.first()
-        })
-    {
-        Some(s) => {
-            tracing::debug!(
-                id = ?s.id,
-                desc = ?s.description,
-                "IBKR matched venue"
-            );
-            s
-        }
-        None => return MarketStatus::Closed,
-    };
+        .find(|s| s.description.as_deref() == Some(desc))
+}
+
+/// 尝试在指定 venue 中匹配当前时间，返回 Some(status) 或 None（未在该 venue 时段内）
+fn try_match_venue(
+    schedule: Option<&TradingSchedule>,
+    today_str: &str,
+    dow_str: &str,
+    now_mins: u32,
+) -> Option<MarketStatus> {
+    let schedule = schedule?;
 
     // 优先精确日期匹配 (节假日/特殊日期)，再匹配周几模式
     let entry = schedule
         .schedules
         .iter()
-        .find(|e| e.trading_schedule_date.as_deref() == Some(&today_str))
+        .find(|e| e.trading_schedule_date.as_deref() == Some(today_str))
         .or_else(|| {
             schedule
                 .schedules
                 .iter()
                 .find(|e| e.trading_schedule_date.as_deref() == Some(dow_str))
-        });
-
-    let entry = match entry {
-        Some(e) => e,
-        None => {
-            tracing::debug!(today = %today_str, dow = dow_str, "No matching schedule entry found");
-            return MarketStatus::Closed;
-        }
-    };
-
-    tracing::debug!(
-        date = ?entry.trading_schedule_date,
-        sessions = ?entry.sessions,
-        now_mins = now_mins,
-        "IBKR matched schedule entry"
-    );
+        })?;
 
     for session in &entry.sessions {
         let (open_str, close_str) = match (&session.opening_time, &session.closing_time) {
@@ -229,7 +229,6 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
         };
 
         if let (Some(open), Some(close)) = (parse_hhmm(open_str), parse_hhmm(close_str)) {
-            // 跳过 0000-0000 的空时段
             if open == 0 && close == 0 {
                 continue;
             }
@@ -239,30 +238,12 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
                 now_mins >= open || now_mins < close
             };
             if in_session {
-                return match session.prop.as_deref() {
-                    Some(p) => classify_prop(Some(p)),
-                    // ISLAND venue 没有 prop 标注，用标准 NASDAQ 时段判定:
-                    // 09:30-16:00 = Liquid, 其余 = Extending (盘前/盘后)
-                    None => classify_by_time(now_mins),
-                };
+                return Some(classify_prop(session.prop.as_deref()));
             }
         }
     }
 
-    MarketStatus::Closed
-}
-
-/// 根据标准 NASDAQ 交易时段判定状态 (东部时间分钟数)
-/// - 09:30 (570) ~ 16:00 (960) → Liquid
-/// - 其余在交易窗口内 → Extending (盘前/盘后)
-fn classify_by_time(now_mins: u32) -> MarketStatus {
-    const REGULAR_OPEN: u32 = 9 * 60 + 30; // 09:30 = 570
-    const REGULAR_CLOSE: u32 = 16 * 60; // 16:00 = 960
-    if now_mins >= REGULAR_OPEN && now_mins < REGULAR_CLOSE {
-        MarketStatus::Liquid
-    } else {
-        MarketStatus::Extending
-    }
+    None
 }
 
 /// 根据 prop 字段判断市场状态
@@ -280,7 +261,7 @@ fn classify_prop(prop: Option<&str>) -> MarketStatus {
             }
         }
         None => {
-            tracing::warn!("IBKR session missing prop field, defaulting to Extending");
+            // ISLAND venue 不提供 prop，命中即为盘前/盘后
             MarketStatus::Extending
         }
     }
