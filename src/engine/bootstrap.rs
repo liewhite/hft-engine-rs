@@ -10,7 +10,7 @@ use crate::engine::live::{
 };
 use crate::strategy::{
     MetricsSubscriberActor, MetricsSubscriberArgs, SlackNotifierActor, SlackNotifierArgs,
-    SpreadArbStatsActor, SpreadArbStatsArgs,
+    SpreadArbStatsActor, SpreadArbStatsArgs, SpreadPairConfig,
 };
 
 /// 初始化 tracing（fmt + EnvFilter，默认 fee_arb=info）
@@ -36,12 +36,14 @@ pub fn load_config<T: DeserializeOwned>(default_path: &str) -> anyhow::Result<T>
 pub async fn init_monitoring(
     manager: &ActorRef<ManagerActor>,
     monitoring: &MonitoringConfig,
+    spread_pairs: Vec<SpreadPairConfig>,
 ) -> anyhow::Result<()> {
     let metrics_subscriber = MetricsSubscriberActor::spawn_with_mailbox(
         MetricsSubscriberArgs {
             pushgateway_url: monitoring.pushgateway_url.clone(),
             metric_prefix: monitoring.metric_prefix.clone(),
             push_interval_ms: monitoring.push_interval_ms,
+            spread_pairs,
         },
         mailbox::unbounded(),
     );

@@ -4,7 +4,7 @@ use fee_arb::engine::{
 };
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::ibkr::IbkrCredentials;
-use fee_arb::strategy::{SpreadArbConfig, SpreadArbStrategy};
+use fee_arb::strategy::{SpreadArbConfig, SpreadArbStrategy, SpreadPairConfig};
 use kameo::actor::Spawn;
 use kameo::mailbox;
 use serde::Deserialize;
@@ -61,9 +61,27 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(count = strategy_count, "SpreadArb strategies added");
 
-    // 监控
+    // 监控（含 spread 指标）
     if let Some(ref monitoring) = config.monitoring {
-        init_monitoring(&manager, monitoring).await?;
+        let spread_pairs: Vec<SpreadPairConfig> = config
+            .strategy
+            .symbols
+            .iter()
+            .map(|symbol| {
+                let hl_symbol = if hl_dex.is_empty() {
+                    symbol.clone()
+                } else {
+                    format!("{}:{}", hl_dex, symbol)
+                };
+                SpreadPairConfig {
+                    spot_exchange: fee_arb::domain::Exchange::IBKR,
+                    spot_symbol: symbol.clone(),
+                    perp_exchange: fee_arb::domain::Exchange::Hyperliquid,
+                    perp_symbol: hl_symbol,
+                }
+            })
+            .collect();
+        init_monitoring(&manager, monitoring, spread_pairs).await?;
     }
 
     // SpreadArb 统计 + DB 持久化

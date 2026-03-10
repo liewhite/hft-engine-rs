@@ -152,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 监控
     if let Some(ref monitoring) = config.monitoring {
-        init_monitoring(&manager, monitoring).await?;
+        init_monitoring(&manager, monitoring, vec![]).await?;
     }
 
     // SpreadArb 统计 + 持久化

@@ -16,6 +16,19 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::interval;
 
+/// 跨交易所价差对配置
+///
+/// 用于计算 spread: open = (perp_bid - spot_ask) / spot_ask,
+///                   close = (perp_ask - spot_bid) / spot_bid
+pub struct SpreadPairConfig {
+    /// 现货侧交易所 (e.g., IBKR)
+    pub spot_exchange: Exchange,
+    pub spot_symbol: Symbol,
+    /// 永续侧交易所 (e.g., Hyperliquid)
+    pub perp_exchange: Exchange,
+    pub perp_symbol: Symbol,
+}
+
 /// MetricsSubscriberActor 初始化参数
 pub struct MetricsSubscriberArgs {
     /// Pushgateway URL
@@ -24,6 +37,8 @@ pub struct MetricsSubscriberArgs {
     pub metric_prefix: String,
     /// 推送间隔（毫秒）
     pub push_interval_ms: u64,
+    /// 可选：价差对配置（用于 spread_pct 和 quote 指标）
+    pub spread_pairs: Vec<SpreadPairConfig>,
 }
 
 /// MetricsSubscriberActor - 订阅 Income 事件，推送 metrics 到 Pushgateway
@@ -38,6 +53,10 @@ pub struct MetricsSubscriberActor {
     leverage_gauge: GaugeVec,
     /// Position Gauge (labels: exchange, symbol)
     position_gauge: GaugeVec,
+    /// Quote Gauge (labels: exchange, symbol, side)
+    quote_gauge: Option<GaugeVec>,
+    /// Spread Gauge (labels: symbol, type)
+    spread_pct_gauge: Option<GaugeVec>,
     /// Pushgateway URL
     pushgateway_url: String,
     /// HTTP Client
@@ -46,6 +65,10 @@ pub struct MetricsSubscriberActor {
     job_name: String,
     /// 价格缓存 (用于计算 position notional)
     price_cache: HashMap<(Exchange, Symbol), f64>,
+    /// BBO 缓存 (exchange, symbol) → (bid, ask)，用于 quote 和 spread 计算
+    bbo_cache: HashMap<(Exchange, Symbol), (f64, f64)>,
+    /// 价差对配置
+    spread_pairs: Vec<SpreadPairConfig>,
 }
 
 impl MetricsSubscriberActor {
@@ -126,6 +149,32 @@ impl Actor for MetricsSubscriberActor {
         let position_gauge = GaugeVec::new(position_opts, &["exchange", "symbol"])?;
         registry.register(Box::new(position_gauge.clone()))?;
 
+        // 有 spread pairs 时创建 quote 和 spread_pct gauges
+        let has_spread_pairs = !args.spread_pairs.is_empty();
+        let quote_gauge = if has_spread_pairs {
+            let opts = Opts::new(
+                format!("{}_quote", args.metric_prefix),
+                "BBO quote price by exchange, symbol, and side",
+            );
+            let gauge = GaugeVec::new(opts, &["exchange", "symbol", "side"])?;
+            registry.register(Box::new(gauge.clone()))?;
+            Some(gauge)
+        } else {
+            None
+        };
+
+        let spread_pct_gauge = if has_spread_pairs {
+            let opts = Opts::new(
+                format!("{}_spread_pct", args.metric_prefix),
+                "Cross-exchange spread percentage by symbol and type",
+            );
+            let gauge = GaugeVec::new(opts, &["symbol", "type"])?;
+            registry.register(Box::new(gauge.clone()))?;
+            Some(gauge)
+        } else {
+            None
+        };
+
         let pushgateway_url = args.pushgateway_url.clone();
         let push_interval_ms = args.push_interval_ms;
 
@@ -135,10 +184,14 @@ impl Actor for MetricsSubscriberActor {
             notional_gauge,
             leverage_gauge,
             position_gauge,
+            quote_gauge,
+            spread_pct_gauge,
             pushgateway_url,
             http_client: reqwest::Client::new(),
             job_name: args.metric_prefix.clone(),
             price_cache: HashMap::new(),
+            bbo_cache: HashMap::new(),
+            spread_pairs: args.spread_pairs,
         };
 
         // 启动定时推送任务
@@ -224,6 +277,61 @@ impl Message<IncomeEvent> for MetricsSubscriberActor {
                 let mid_price = (bbo.bid_price + bbo.ask_price) / 2.0;
                 self.price_cache
                     .insert((bbo.exchange, bbo.symbol.clone()), mid_price);
+
+                // 更新 BBO 缓存并刷新 quote + spread 指标
+                self.bbo_cache.insert(
+                    (bbo.exchange, bbo.symbol.clone()),
+                    (bbo.bid_price, bbo.ask_price),
+                );
+
+                if let Some(ref quote_gauge) = self.quote_gauge {
+                    let ex = exchange_to_label(bbo.exchange);
+                    quote_gauge
+                        .with_label_values(&[ex, &bbo.symbol, "bid"])
+                        .set(bbo.bid_price);
+                    quote_gauge
+                        .with_label_values(&[ex, &bbo.symbol, "ask"])
+                        .set(bbo.ask_price);
+                }
+
+                if let Some(ref spread_gauge) = self.spread_pct_gauge {
+                    for pair in &self.spread_pairs {
+                        // 只在当前 BBO 属于该 pair 时重新计算
+                        let is_spot =
+                            bbo.exchange == pair.spot_exchange && bbo.symbol == pair.spot_symbol;
+                        let is_perp =
+                            bbo.exchange == pair.perp_exchange && bbo.symbol == pair.perp_symbol;
+                        if !is_spot && !is_perp {
+                            continue;
+                        }
+
+                        let spot_bbo = self
+                            .bbo_cache
+                            .get(&(pair.spot_exchange, pair.spot_symbol.clone()));
+                        let perp_bbo = self
+                            .bbo_cache
+                            .get(&(pair.perp_exchange, pair.perp_symbol.clone()));
+
+                        if let (Some(&(spot_bid, spot_ask)), Some(&(perp_bid, perp_ask))) =
+                            (spot_bbo, perp_bbo)
+                        {
+                            // open_spread = (perp_bid - spot_ask) / spot_ask
+                            if spot_ask > 0.0 {
+                                let open = (perp_bid - spot_ask) / spot_ask * 100.0;
+                                spread_gauge
+                                    .with_label_values(&[pair.spot_symbol.as_str(), "open"])
+                                    .set(open);
+                            }
+                            // close_spread = (perp_ask - spot_bid) / spot_bid
+                            if spot_bid > 0.0 {
+                                let close = (perp_ask - spot_bid) / spot_bid * 100.0;
+                                spread_gauge
+                                    .with_label_values(&[pair.spot_symbol.as_str(), "close"])
+                                    .set(close);
+                            }
+                        }
+                    }
+                }
             }
             ExchangeEventData::Position(position) => {
                 let exchange_label = exchange_to_label(position.exchange);
