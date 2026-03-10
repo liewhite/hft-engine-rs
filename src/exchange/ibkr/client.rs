@@ -260,6 +260,7 @@ impl IbkrClient {
         for item in &items {
             let id = item.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
             let trade_venue_id = item.get("tradeVenueId").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let description = item.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
 
             let entry_schedules = match item.get("schedules").and_then(|v| v.as_array()) {
                 Some(arr) => {
@@ -297,6 +298,7 @@ impl IbkrClient {
             schedules.push(TradingSchedule {
                 id,
                 trade_venue_id,
+                description,
                 schedules: entry_schedules,
             });
         }
@@ -639,6 +641,7 @@ fn parse_snapshot_field(data: &serde_json::Value, field: &str) -> Option<f64> {
 pub struct TradingSchedule {
     pub id: Option<String>,
     pub trade_venue_id: Option<String>,
+    pub description: Option<String>,
     pub schedules: Vec<ScheduleEntry>,
 }
 
