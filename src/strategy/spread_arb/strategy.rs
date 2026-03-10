@@ -396,15 +396,17 @@ impl Strategy for SpreadArbStrategy {
             return None;
         }
 
-        // 获取当前持仓（两侧 position 必须已到达，未到达前不下单）
+        // 获取当前持仓
+        // IBKR 仓位必须已到达（polling actor 会对所有 symbol 推送，包括空仓）
+        // HL 仓位未到达时视为 0（空仓不会触发 clearinghouseState 推送）
         let ibkr_pos = match ibkr_state.position(Exchange::IBKR) {
             Some(p) => p.size,
             None => return None, // IBKR 仓位尚未 poll 到，跳过
         };
-        let hl_pos = match hl_state.position(Exchange::Hyperliquid) {
-            Some(p) => p.size,
-            None => return None, // HL 仓位尚未到达，跳过
-        };
+        let hl_pos = hl_state
+            .position(Exchange::Hyperliquid)
+            .map(|p| p.size)
+            .unwrap_or(0.0);
 
         // === 步骤 0: 仓位方向守卫 ===
         if let Some(signal) = self.emergency_flatten(
