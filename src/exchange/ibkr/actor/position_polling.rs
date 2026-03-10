@@ -13,7 +13,7 @@ use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -27,37 +27,53 @@ pub struct IbkrPositionPollingActorArgs {
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// 查询间隔 (毫秒)
     pub interval_ms: u64,
+    /// 所有配置的 symbols
+    pub symbols: Vec<Symbol>,
 }
-
-/// 连续缺失多少次才推零仓位（防止 IBKR 缓存未刷新导致的假空响应）
-const MISSING_THRESHOLD: u32 = 3;
 
 /// IbkrPositionPollingActor - 定时轮询 IBKR 持仓和账户信息
 pub struct IbkrPositionPollingActor {
     client: Arc<IbkrClient>,
     income_pubsub: ActorRef<IncomePubSub>,
-    /// 已知持仓 symbol → 连续缺失次数
-    known_positions: HashMap<Symbol, u32>,
+    /// 所有配置的 symbols（用于对空仓 symbol 推送 size=0）
+    all_symbols: Vec<Symbol>,
+    /// 是否已完成首次仓位推送
+    initialized: bool,
 }
 
 impl IbkrPositionPollingActor {
     /// 执行一次持仓查询并发布事件
     ///
-    /// 跟踪 known_positions，当 symbol 从持仓列表消失时推送零仓位
+    /// 首次 poll：对所有配置 symbol 推送 position（有仓位推实际值，空仓推 0），
+    /// 用于 SymbolState 初始化。之后的 poll 仍推送但 state 层会忽略（已初始化）。
     async fn poll_positions(&mut self) {
         let local_ts = now_ms();
 
         match self.client.fetch_positions().await {
             Ok(positions) => {
-                let mut current_symbols = HashSet::new();
+                let position_map: HashMap<Symbol, Position> = positions
+                    .into_iter()
+                    .map(|p| (p.symbol.clone(), p))
+                    .collect();
 
-                for pos in &positions {
-                    current_symbols.insert(pos.symbol.clone());
-                }
+                // 对所有配置 symbol 推送 position
+                for symbol in &self.all_symbols {
+                    let pos = position_map.get(symbol).cloned().unwrap_or(Position {
+                        exchange: Exchange::IBKR,
+                        symbol: symbol.clone(),
+                        size: 0.0,
+                        entry_price: 0.0,
+                        unrealized_pnl: 0.0,
+                    });
 
-                // 本次出现的 symbol: 重置缺失计数，发布仓位
-                for pos in positions {
-                    self.known_positions.insert(pos.symbol.clone(), 0);
+                    if !self.initialized {
+                        tracing::info!(
+                            symbol = %symbol,
+                            size = pos.size,
+                            "IBKR position initial load"
+                        );
+                    }
+
                     let _ = self
                         .income_pubsub
                         .tell(Publish(IncomeEvent {
@@ -69,47 +85,7 @@ impl IbkrPositionPollingActor {
                         .await;
                 }
 
-                // 本次未出现的已知 symbol: 累加缺失计数
-                let mut to_remove = Vec::new();
-                for (symbol, miss_count) in self.known_positions.iter_mut() {
-                    if current_symbols.contains(symbol) {
-                        continue;
-                    }
-                    *miss_count += 1;
-                    if *miss_count >= MISSING_THRESHOLD {
-                        tracing::info!(
-                            symbol = %symbol,
-                            miss_count,
-                            "IBKR position missing {} consecutive polls, setting to zero",
-                            MISSING_THRESHOLD,
-                        );
-                        let _ = self
-                            .income_pubsub
-                            .tell(Publish(IncomeEvent {
-                                exchange_ts: local_ts,
-                                local_ts,
-                                data: ExchangeEventData::Position(Position {
-                                    exchange: Exchange::IBKR,
-                                    symbol: symbol.clone(),
-                                    size: 0.0,
-                                    entry_price: 0.0,
-                                    unrealized_pnl: 0.0,
-                                }),
-                            }))
-                            .send()
-                            .await;
-                        to_remove.push(symbol.clone());
-                    } else {
-                        tracing::debug!(
-                            symbol = %symbol,
-                            miss_count,
-                            "IBKR position missing, waiting for threshold"
-                        );
-                    }
-                }
-                for symbol in to_remove {
-                    self.known_positions.remove(&symbol);
-                }
+                self.initialized = true;
             }
             Err(e) => {
                 tracing::warn!(
@@ -171,7 +147,8 @@ impl Actor for IbkrPositionPollingActor {
         Ok(Self {
             client: args.client,
             income_pubsub: args.income_pubsub,
-            known_positions: HashMap::new(),
+            all_symbols: args.symbols,
+            initialized: false,
         })
     }
 

@@ -128,6 +128,7 @@ impl Actor for IbkrActor {
                 client: args.client.clone(),
                 income_pubsub: income_pubsub.clone(),
                 interval_ms: POSITION_POLLING_INTERVAL_MS,
+                symbols: args.client.conids().keys().cloned().collect(),
             },
             mailbox::unbounded(),
         )
