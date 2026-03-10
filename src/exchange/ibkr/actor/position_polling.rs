@@ -47,7 +47,8 @@ impl IbkrPositionPollingActor {
     async fn poll_positions(&mut self) {
         let local_ts = now_ms();
 
-        // 先 fetch（拿上一轮 invalidate 后的数据），再 invalidate（为下一轮准备）
+        // 先 invalidate 使缓存失效，再 fetch 拿到最新数据
+        self.client.invalidate_positions_cache().await;
         match self.client.fetch_positions().await {
             Ok(positions) => {
                 let mut current_symbols = HashSet::new();
@@ -120,9 +121,6 @@ impl IbkrPositionPollingActor {
                 );
             }
         }
-
-        // 为下一轮 fetch 准备新鲜数据
-        self.client.invalidate_positions_cache().await;
     }
 
     /// 执行一次账户信息查询并发布事件
