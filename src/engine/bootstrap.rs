@@ -9,8 +9,10 @@ use crate::engine::live::{
     ManagerActor, SubscribeIncome, SubscribeOutcome,
 };
 use crate::strategy::{
-    MetricsSubscriberActor, MetricsSubscriberArgs, SlackNotifierActor, SlackNotifierArgs,
-    SpreadArbStatsActor, SpreadArbStatsArgs, SpreadPairConfig,
+    FundingArbMetricsActor, FundingArbMetricsArgs,
+    SlackNotifierActor, SlackNotifierArgs,
+    SpreadArbMetricsActor, SpreadArbMetricsArgs, SpreadArbStatsActor, SpreadArbStatsArgs,
+    SpreadPairConfig,
 };
 
 /// 初始化 tracing（fmt + EnvFilter，默认 fee_arb=info）
@@ -32,29 +34,11 @@ pub fn load_config<T: DeserializeOwned>(default_path: &str) -> anyhow::Result<T>
     Ok(serde_json::from_str(&content)?)
 }
 
-/// 初始化监控 subscribers（Metrics + Slack）并订阅到 Manager
-pub async fn init_monitoring(
+/// 初始化 Slack 通知 subscriber
+pub async fn init_slack(
     manager: &ActorRef<ManagerActor>,
     monitoring: &MonitoringConfig,
-    spread_pairs: Vec<SpreadPairConfig>,
 ) -> anyhow::Result<()> {
-    let metrics_subscriber = MetricsSubscriberActor::spawn_with_mailbox(
-        MetricsSubscriberArgs {
-            pushgateway_url: monitoring.pushgateway_url.clone(),
-            metric_prefix: monitoring.metric_prefix.clone(),
-            push_interval_ms: monitoring.push_interval_ms,
-            spread_pairs,
-        },
-        mailbox::unbounded(),
-    );
-
-    manager
-        .tell(SubscribeIncome(metrics_subscriber))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe MetricsSubscriber to income: {}", e))?;
-    tracing::info!("MetricsSubscriberActor created and subscribed");
-
     let slack_notifier = SlackNotifierActor::spawn_with_mailbox(
         SlackNotifierArgs {
             channel: monitoring.slack_channel.clone(),
@@ -75,6 +59,56 @@ pub async fn init_monitoring(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe SlackNotifier to outcome: {}", e))?;
     tracing::info!("SlackNotifierActor created and subscribed");
+
+    Ok(())
+}
+
+/// 初始化 FundingArb metrics 并订阅到 Manager
+pub async fn init_funding_arb_metrics(
+    manager: &ActorRef<ManagerActor>,
+    monitoring: &MonitoringConfig,
+) -> anyhow::Result<()> {
+    let metrics_actor = FundingArbMetricsActor::spawn_with_mailbox(
+        FundingArbMetricsArgs {
+            pushgateway_url: monitoring.pushgateway_url.clone(),
+            metric_prefix: monitoring.metric_prefix.clone(),
+            push_interval_ms: monitoring.push_interval_ms,
+        },
+        mailbox::unbounded(),
+    );
+
+    manager
+        .tell(SubscribeIncome(metrics_actor))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to subscribe FundingArbMetrics to income: {}", e))?;
+    tracing::info!("FundingArbMetricsActor created and subscribed");
+
+    Ok(())
+}
+
+/// 初始化 SpreadArb metrics 并订阅到 Manager
+pub async fn init_spread_arb_metrics(
+    manager: &ActorRef<ManagerActor>,
+    monitoring: &MonitoringConfig,
+    spread_pairs: Vec<SpreadPairConfig>,
+) -> anyhow::Result<()> {
+    let metrics_actor = SpreadArbMetricsActor::spawn_with_mailbox(
+        SpreadArbMetricsArgs {
+            pushgateway_url: monitoring.pushgateway_url.clone(),
+            metric_prefix: monitoring.metric_prefix.clone(),
+            push_interval_ms: monitoring.push_interval_ms,
+            spread_pairs,
+        },
+        mailbox::unbounded(),
+    );
+
+    manager
+        .tell(SubscribeIncome(metrics_actor))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to subscribe SpreadArbMetrics to income: {}", e))?;
+    tracing::info!("SpreadArbMetricsActor created and subscribed");
 
     Ok(())
 }

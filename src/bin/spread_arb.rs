@@ -1,6 +1,7 @@
 use fee_arb::engine::{
-    init_monitoring, init_spread_arb_stats, init_tracing, load_config, wait_for_shutdown,
-    AddStrategies, DatabaseConfig, ManagerActor, ManagerActorArgs, MonitoringConfig,
+    init_slack, init_spread_arb_metrics, init_spread_arb_stats, init_tracing, load_config,
+    wait_for_shutdown, AddStrategies, DatabaseConfig, ManagerActor, ManagerActorArgs,
+    MonitoringConfig,
 };
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::ibkr::IbkrCredentials;
@@ -61,8 +62,9 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(count = strategy_count, "SpreadArb strategies added");
 
-    // 监控（含 spread 指标）
+    // 监控
     if let Some(ref monitoring) = config.monitoring {
+        // SpreadArb 专属 metrics (quote + spread_pct + equity + leverage + position)
         let spread_pairs: Vec<SpreadPairConfig> = config
             .strategy
             .symbols
@@ -74,12 +76,14 @@ async fn main() -> anyhow::Result<()> {
                 perp_symbol: hl.hl_symbol(symbol),
             })
             .collect();
-        init_monitoring(&manager, monitoring, spread_pairs).await?;
+        init_spread_arb_metrics(&manager, monitoring, spread_pairs).await?;
+
+        // Slack 通知
+        init_slack(&manager, monitoring).await?;
     }
 
     // SpreadArb 统计 + DB 持久化
     if let Some(ref db_config) = config.database {
-        // symbols 需包含 IBKR 侧和 HL 侧 (e.g., "AAPL" + "xyz:AAPL")
         let all_symbols = config
             .strategy
             .symbols

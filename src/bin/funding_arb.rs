@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
 use fee_arb::engine::{
-    init_monitoring, init_spread_arb_stats, init_tracing, load_config, wait_for_shutdown,
-    AddStrategies, DatabaseConfig, GetAllSymbolMetas, ManagerActor, ManagerActorArgs,
-    MonitoringConfig,
+    init_funding_arb_metrics, init_slack, init_spread_arb_stats, init_tracing, load_config,
+    wait_for_shutdown, AddStrategies, DatabaseConfig, GetAllSymbolMetas, ManagerActor,
+    ManagerActorArgs, MonitoringConfig,
 };
 use fee_arb::exchange::binance::BinanceCredentials;
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
@@ -152,7 +152,8 @@ async fn main() -> anyhow::Result<()> {
 
     // 监控
     if let Some(ref monitoring) = config.monitoring {
-        init_monitoring(&manager, monitoring, vec![]).await?;
+        init_funding_arb_metrics(&manager, monitoring).await?;
+        init_slack(&manager, monitoring).await?;
     }
 
     // SpreadArb 统计 + 持久化
