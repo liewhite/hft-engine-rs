@@ -436,7 +436,8 @@ impl Strategy for SpreadArbStrategy {
         if has_position && close_spread < self.config.close_threshold {
             let spread = close_spread;
             let paired_qty = ibkr_pos.min(hl_pos.abs());
-            let close_qty = paired_qty.floor();
+            let max_close_qty = (self.config.order_usd_value / ibkr_bbo.bid_price).floor();
+            let close_qty = paired_qty.floor().min(max_close_qty);
 
             if close_qty >= MIN_ORDER_QTY {
                 // 双腿配对平仓
