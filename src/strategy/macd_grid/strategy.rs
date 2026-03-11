@@ -213,7 +213,25 @@ impl MacdGridStrategy {
             self.last_order_price = Some(mid_price);
             return None;
         }
-        let last = self.last_order_price.unwrap();
+        let mut last = self.last_order_price.unwrap();
+
+        // 追单: 持仓与趋势不一致或超限时，last_order_price 跟随价格移动，
+        // 确保平仓触发点始终贴近当前价，避免反转后无法平掉反向仓位
+        let need_reduce_long = pos_size > POSITION_EPSILON
+            && (params.max_long_usd == 0.0 || long_usd > params.max_long_usd);
+        let need_reduce_short = pos_size < -POSITION_EPSILON
+            && (params.max_short_usd == 0.0 || short_usd > params.max_short_usd);
+
+        if need_reduce_long && mid_price < last {
+            // 持多头需卖出平仓，价格下跌远离卖出触发点 → 跟随下移
+            self.last_order_price = Some(mid_price);
+            last = mid_price;
+        }
+        if need_reduce_short && mid_price > last {
+            // 持空头需买入平仓，价格上涨远离买入触发点 → 跟随上移
+            self.last_order_price = Some(mid_price);
+            last = mid_price;
+        }
 
         // === 买入方向 ===
         // 优先: 有空头仓位 → 买入减仓
