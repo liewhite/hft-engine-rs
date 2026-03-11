@@ -144,9 +144,13 @@ impl MacdGridStrategy {
         }
     }
 
-    /// 计算仓位层数：当前同方向持仓 USD / 单笔订单 USD
-    fn pos_levels(&self, same_dir_usd: f64) -> f64 {
-        (same_dir_usd / self.config.order_usd_value).floor()
+    /// 仓位深度系数: 1 + (pos_usd / max_pos_usd) * pos_weight
+    /// 归一化到 [1, 1+pos_weight]，与 ob_factor 尺度对等
+    fn pos_factor(&self, pos_usd: f64, max_pos_usd: f64) -> f64 {
+        if max_pos_usd <= 0.0 {
+            return 1.0;
+        }
+        1.0 + (pos_usd / max_pos_usd) * self.config.pos_weight
     }
 
     /// 网格核心逻辑：检查价格是否穿越网格线，触发则下一笔 IOC 订单。
@@ -192,9 +196,9 @@ impl MacdGridStrategy {
         let ob_buy_factor = (1.0 + deviation * w).clamp(0.5, 3.0);
         let ob_sell_factor = (1.0 - deviation * w).clamp(0.5, 3.0);
 
-        // 仓位深度系数: 仅影响开仓方向
-        let long_pos_factor = 1.0 + self.pos_levels(long_usd);
-        let short_pos_factor = 1.0 + self.pos_levels(short_usd);
+        // 仓位深度系数: 仅影响开仓方向，归一化到 [1, 1+pos_weight]
+        let long_pos_factor = self.pos_factor(long_usd, params.max_long_usd);
+        let short_pos_factor = self.pos_factor(short_usd, params.max_short_usd);
 
         let min = self.config.min_spacing;
 

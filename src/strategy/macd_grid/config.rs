@@ -29,6 +29,11 @@ pub struct MacdGridConfig {
     /// deviation = (price - slow_ema) / ATR, ob_factor = clamp(1 ± deviation * ob_weight, 0.5, 3.0)
     #[serde(default = "default_ob_weight")]
     pub ob_weight: f64,
+    /// 仓位深度对开仓间距的影响权重
+    /// pos_factor = 1 + (pos_usd / max_pos_usd) * pos_weight
+    /// 取值范围 [1, 1+pos_weight]，与 ob_factor 尺度对等
+    #[serde(default = "default_pos_weight")]
+    pub pos_weight: f64,
 }
 
 fn default_aggressive() -> f64 {
@@ -39,4 +44,7 @@ fn default_conservative() -> f64 {
 }
 fn default_ob_weight() -> f64 {
     0.5
+}
+fn default_pos_weight() -> f64 {
+    2.0
 }
