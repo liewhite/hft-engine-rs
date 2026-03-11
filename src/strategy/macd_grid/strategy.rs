@@ -107,19 +107,29 @@ impl MacdGridStrategy {
     }
 
     fn feed_candle(&mut self, close: f64, high: f64, low: f64, interval: CandleInterval, confirm: bool) {
-        if !confirm {
-            return;
-        }
         match interval {
             CandleInterval::Min15 => {
-                self.macd_15m.update(close);
-                self.atr.update(high, low, close);
+                if confirm {
+                    self.macd_15m.update(close);
+                    self.atr.update(high, low, close);
+                } else {
+                    self.macd_15m.update_live(close);
+                    self.atr.update_live(high, low, close);
+                }
             }
             CandleInterval::Hour1 => {
-                self.macd_1h.update(close);
+                if confirm {
+                    self.macd_1h.update(close);
+                } else {
+                    self.macd_1h.update_live(close);
+                }
             }
             CandleInterval::Hour4 => {
-                self.macd_4h.update(close);
+                if confirm {
+                    self.macd_4h.update(close);
+                } else {
+                    self.macd_4h.update_live(close);
+                }
             }
             _ => {}
         }
