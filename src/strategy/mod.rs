@@ -1,9 +1,11 @@
 mod funding_arb;
+mod macd_grid;
 pub(crate) mod metrics_pusher;
 mod slack_notifier;
 mod spread_arb;
 
 pub use funding_arb::{FundingArbConfig, FundingArbMetricsActor, FundingArbMetricsArgs, FundingArbStrategy};
+pub use macd_grid::{MacdGridConfig, MacdGridStrategy};
 pub use slack_notifier::{SlackNotifierActor, SlackNotifierArgs};
 pub use spread_arb::{
     SpreadArbConfig, SpreadArbMetricsActor, SpreadArbMetricsArgs, SpreadArbStatsActor,
