@@ -131,6 +131,11 @@ impl MacdGridStrategy {
         }
     }
 
+    /// 计算仓位层数：当前同方向持仓 USD / 单笔订单 USD
+    fn pos_levels(&self, same_dir_usd: f64) -> f64 {
+        (same_dir_usd / self.config.order_usd_value).floor()
+    }
+
     fn check_grid(&mut self, state: &StateManager) -> Option<OutcomeEvent> {
         let symbol_state = state.symbol_state(&self.symbol)?;
         let trend = self.current_trend()?;
@@ -157,74 +162,82 @@ impl MacdGridStrategy {
         }
         let last = self.last_order_price.unwrap();
 
-        // === 买入触发 (价格下穿 last - buy_spacing) ===
-        if mid_price <= last - params.buy_spacing {
-            // 优先: 有空头仓位 → 买入减仓 (reduce_only)
-            if pos_size < -POSITION_EPSILON {
-                let qty = (self.config.order_usd_value / bbo.ask_price).min(pos_size.abs());
-                self.last_order_price = Some(last - params.buy_spacing);
-                return self.make_order(
-                    Side::Long,
-                    bbo.ask_price,
-                    qty,
-                    true,
-                    &format!(
-                        "grid_reduce_short | trend={:?} | pos={:.4} | atr={:.4}",
-                        trend, pos_size, atr
-                    ),
-                );
-            }
-            // 其次: 允许开多且未超限 → 买入开多
-            if params.max_long_usd > 0.0 && long_usd < params.max_long_usd {
-                let qty = self.config.order_usd_value / bbo.ask_price;
-                self.last_order_price = Some(last - params.buy_spacing);
-                return self.make_order(
-                    Side::Long,
-                    bbo.ask_price,
-                    qty,
-                    false,
-                    &format!(
-                        "grid_open_long | trend={:?} | pos={:.4} | atr={:.4}",
-                        trend, pos_size, atr
-                    ),
-                );
-            }
-            // 无法执行: 不移动 last_order_price，等待下次条件满足
+        // === 买入方向 ===
+        // 平仓间距 = 基准间距 (不受仓位影响)
+        let reduce_buy_spacing = params.buy_spacing;
+        // 加仓间距 = 基准间距 * (1 + 多头仓位层数)，仓位越大间距越远
+        let open_buy_spacing = params.buy_spacing * (1.0 + self.pos_levels(long_usd));
+
+        // 优先: 有空头仓位 → 买入减仓 (基准间距)
+        if mid_price <= last - reduce_buy_spacing && pos_size < -POSITION_EPSILON {
+            let qty = (self.config.order_usd_value / bbo.ask_price).min(pos_size.abs());
+            self.last_order_price = Some(last - reduce_buy_spacing);
+            return self.make_order(
+                Side::Long,
+                bbo.ask_price,
+                qty,
+                true,
+                &format!(
+                    "grid_reduce_short | trend={:?} | pos={:.4} | spacing={:.4}",
+                    trend, pos_size, reduce_buy_spacing
+                ),
+            );
+        }
+        // 其次: 允许开多且未超限 → 买入开多 (仓位放大间距)
+        if mid_price <= last - open_buy_spacing
+            && params.max_long_usd > 0.0
+            && long_usd < params.max_long_usd
+        {
+            let qty = self.config.order_usd_value / bbo.ask_price;
+            self.last_order_price = Some(last - open_buy_spacing);
+            return self.make_order(
+                Side::Long,
+                bbo.ask_price,
+                qty,
+                false,
+                &format!(
+                    "grid_open_long | trend={:?} | pos={:.4} | spacing={:.4} | levels={:.0}",
+                    trend, pos_size, open_buy_spacing, self.pos_levels(long_usd)
+                ),
+            );
         }
 
-        // === 卖出触发 (价格上穿 last + sell_spacing) ===
-        if mid_price >= last + params.sell_spacing {
-            // 优先: 有多头仓位 → 卖出减仓 (reduce_only)
-            if pos_size > POSITION_EPSILON {
-                let qty = (self.config.order_usd_value / bbo.bid_price).min(pos_size);
-                self.last_order_price = Some(last + params.sell_spacing);
-                return self.make_order(
-                    Side::Short,
-                    bbo.bid_price,
-                    qty,
-                    true,
-                    &format!(
-                        "grid_reduce_long | trend={:?} | pos={:.4} | atr={:.4}",
-                        trend, pos_size, atr
-                    ),
-                );
-            }
-            // 其次: 允许开空且未超限 → 卖出开空
-            if params.max_short_usd > 0.0 && short_usd < params.max_short_usd {
-                let qty = self.config.order_usd_value / bbo.bid_price;
-                self.last_order_price = Some(last + params.sell_spacing);
-                return self.make_order(
-                    Side::Short,
-                    bbo.bid_price,
-                    qty,
-                    false,
-                    &format!(
-                        "grid_open_short | trend={:?} | pos={:.4} | atr={:.4}",
-                        trend, pos_size, atr
-                    ),
-                );
-            }
-            // 无法执行: 不移动 last_order_price
+        // === 卖出方向 ===
+        let reduce_sell_spacing = params.sell_spacing;
+        let open_sell_spacing = params.sell_spacing * (1.0 + self.pos_levels(short_usd));
+
+        // 优先: 有多头仓位 → 卖出减仓 (基准间距)
+        if mid_price >= last + reduce_sell_spacing && pos_size > POSITION_EPSILON {
+            let qty = (self.config.order_usd_value / bbo.bid_price).min(pos_size);
+            self.last_order_price = Some(last + reduce_sell_spacing);
+            return self.make_order(
+                Side::Short,
+                bbo.bid_price,
+                qty,
+                true,
+                &format!(
+                    "grid_reduce_long | trend={:?} | pos={:.4} | spacing={:.4}",
+                    trend, pos_size, reduce_sell_spacing
+                ),
+            );
+        }
+        // 其次: 允许开空且未超限 → 卖出开空 (仓位放大间距)
+        if mid_price >= last + open_sell_spacing
+            && params.max_short_usd > 0.0
+            && short_usd < params.max_short_usd
+        {
+            let qty = self.config.order_usd_value / bbo.bid_price;
+            self.last_order_price = Some(last + open_sell_spacing);
+            return self.make_order(
+                Side::Short,
+                bbo.bid_price,
+                qty,
+                false,
+                &format!(
+                    "grid_open_short | trend={:?} | pos={:.4} | spacing={:.4} | levels={:.0}",
+                    trend, pos_size, open_sell_spacing, self.pos_levels(short_usd)
+                ),
+            );
         }
 
         None
