@@ -25,6 +25,10 @@ pub struct MacdGridConfig {
     /// 强多头的卖出间距 / 强空头的买入间距 / 弱趋势两侧
     #[serde(default = "default_conservative")]
     pub conservative_spacing_factor: f64,
+    /// 超买超卖敏感度权重
+    /// deviation = (price - slow_ema) / ATR, ob_factor = clamp(1 ± deviation * ob_weight, 0.5, 3.0)
+    #[serde(default = "default_ob_weight")]
+    pub ob_weight: f64,
 }
 
 fn default_aggressive() -> f64 {
@@ -32,4 +36,7 @@ fn default_aggressive() -> f64 {
 }
 fn default_conservative() -> f64 {
     1.0
+}
+fn default_ob_weight() -> f64 {
+    0.5
 }

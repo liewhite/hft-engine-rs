@@ -74,6 +74,11 @@ impl MacdCalculator {
         self.signal_ema.value()
     }
 
+    /// Slow EMA (26-period) value, used as price reference for overbought/oversold
+    pub fn slow_ema_value(&self) -> Option<f64> {
+        self.slow_ema.value()
+    }
+
     pub fn is_ready(&self) -> bool {
         self.signal_ema.is_ready()
     }

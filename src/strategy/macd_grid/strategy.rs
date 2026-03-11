@@ -18,8 +18,10 @@ enum Trend {
 }
 
 struct GridParams {
-    buy_spacing: f64,
-    sell_spacing: f64,
+    /// 买入方向 ATR 基础因子 (趋势决定)
+    buy_base: f64,
+    /// 卖出方向 ATR 基础因子 (趋势决定)
+    sell_base: f64,
     /// 允许的最大多头仓位 (USDT), 0 = 不允许开多
     max_long_usd: f64,
     /// 允许的最大空头仓位 (USDT), 0 = 不允许开空
@@ -70,39 +72,43 @@ impl MacdGridStrategy {
         })
     }
 
-    fn grid_params(&self, trend: Trend, atr: f64) -> GridParams {
+    fn grid_params(&self, trend: Trend) -> GridParams {
         let agg = self.config.aggressive_spacing_factor;
         let con = self.config.conservative_spacing_factor;
-        let min = self.config.min_spacing;
-
-        let spacing = |factor: f64| (atr * factor).max(min);
 
         match trend {
             Trend::StrongBull => GridParams {
-                buy_spacing: spacing(agg),
-                sell_spacing: spacing(con),
+                buy_base: agg,
+                sell_base: con,
                 max_long_usd: self.config.max_position_usd,
                 max_short_usd: 0.0,
             },
             Trend::WeakBull => GridParams {
-                buy_spacing: spacing(con),
-                sell_spacing: spacing(con),
+                buy_base: con,
+                sell_base: con,
                 max_long_usd: self.config.weak_position_usd,
                 max_short_usd: 0.0,
             },
             Trend::WeakBear => GridParams {
-                buy_spacing: spacing(con),
-                sell_spacing: spacing(con),
+                buy_base: con,
+                sell_base: con,
                 max_long_usd: 0.0,
                 max_short_usd: self.config.weak_position_usd,
             },
             Trend::StrongBear => GridParams {
-                buy_spacing: spacing(con),
-                sell_spacing: spacing(agg),
+                buy_base: con,
+                sell_base: agg,
                 max_long_usd: 0.0,
                 max_short_usd: self.config.max_position_usd,
             },
         }
+    }
+
+    /// 超买超卖偏离度: (mid_price - slow_ema_15m) / ATR
+    /// 正值 = 超买, 负值 = 超卖
+    fn deviation(&self, mid_price: f64, atr: f64) -> Option<f64> {
+        let ema = self.macd_15m.slow_ema_value()?;
+        Some((mid_price - ema) / atr)
     }
 
     fn indicators_ready(&self) -> bool {
@@ -143,17 +149,35 @@ impl MacdGridStrategy {
         let bbo = symbol_state.bbo(Exchange::OKX)?;
         let mid_price = bbo.mid_price();
 
-        if mid_price <= 0.0 {
+        if mid_price <= 0.0 || atr <= 0.0 {
             return None;
         }
 
-        let params = self.grid_params(trend, atr);
+        let params = self.grid_params(trend);
         let pos_size = symbol_state
             .position(Exchange::OKX)
             .map(|p| p.size)
             .unwrap_or(0.0);
         let long_usd = pos_size.max(0.0) * mid_price;
         let short_usd = (-pos_size).max(0.0) * mid_price;
+
+        // 超买超卖系数: deviation > 0 → 超买 → 买入更远、卖出更近
+        let deviation = self.deviation(mid_price, atr).unwrap_or(0.0);
+        let w = self.config.ob_weight;
+        let ob_buy_factor = (1.0 + deviation * w).clamp(0.5, 3.0);
+        let ob_sell_factor = (1.0 - deviation * w).clamp(0.5, 3.0);
+
+        // 仓位深度系数: 仅影响开仓方向
+        let long_pos_factor = 1.0 + self.pos_levels(long_usd);
+        let short_pos_factor = 1.0 + self.pos_levels(short_usd);
+
+        let min = self.config.min_spacing;
+
+        // 统一间距公式: spacing = max(ATR * base * ob_factor [* pos_factor], min_spacing)
+        let reduce_buy_spacing = (atr * params.buy_base * ob_buy_factor).max(min);
+        let open_buy_spacing = (atr * params.buy_base * ob_buy_factor * long_pos_factor).max(min);
+        let reduce_sell_spacing = (atr * params.sell_base * ob_sell_factor).max(min);
+        let open_sell_spacing = (atr * params.sell_base * ob_sell_factor * short_pos_factor).max(min);
 
         // 初始化网格参考价
         if self.last_order_price.is_none() {
@@ -163,12 +187,7 @@ impl MacdGridStrategy {
         let last = self.last_order_price.unwrap();
 
         // === 买入方向 ===
-        // 平仓间距 = 基准间距 (不受仓位影响)
-        let reduce_buy_spacing = params.buy_spacing;
-        // 加仓间距 = 基准间距 * (1 + 多头仓位层数)，仓位越大间距越远
-        let open_buy_spacing = params.buy_spacing * (1.0 + self.pos_levels(long_usd));
-
-        // 优先: 有空头仓位 → 买入减仓 (基准间距)
+        // 优先: 有空头仓位 → 买入减仓
         if mid_price <= last - reduce_buy_spacing && pos_size < -POSITION_EPSILON {
             let qty = (self.config.order_usd_value / bbo.ask_price).min(pos_size.abs());
             self.last_order_price = Some(last - reduce_buy_spacing);
@@ -178,12 +197,12 @@ impl MacdGridStrategy {
                 qty,
                 true,
                 &format!(
-                    "grid_reduce_short | trend={:?} | pos={:.4} | spacing={:.4}",
-                    trend, pos_size, reduce_buy_spacing
+                    "grid_reduce_short | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
+                    trend, deviation, ob_buy_factor, reduce_buy_spacing
                 ),
             );
         }
-        // 其次: 允许开多且未超限 → 买入开多 (仓位放大间距)
+        // 其次: 允许开多且未超限 → 买入开多
         if mid_price <= last - open_buy_spacing
             && params.max_long_usd > 0.0
             && long_usd < params.max_long_usd
@@ -196,17 +215,14 @@ impl MacdGridStrategy {
                 qty,
                 false,
                 &format!(
-                    "grid_open_long | trend={:?} | pos={:.4} | spacing={:.4} | levels={:.0}",
-                    trend, pos_size, open_buy_spacing, self.pos_levels(long_usd)
+                    "grid_open_long | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
+                    trend, deviation, ob_buy_factor, long_pos_factor, open_buy_spacing
                 ),
             );
         }
 
         // === 卖出方向 ===
-        let reduce_sell_spacing = params.sell_spacing;
-        let open_sell_spacing = params.sell_spacing * (1.0 + self.pos_levels(short_usd));
-
-        // 优先: 有多头仓位 → 卖出减仓 (基准间距)
+        // 优先: 有多头仓位 → 卖出减仓
         if mid_price >= last + reduce_sell_spacing && pos_size > POSITION_EPSILON {
             let qty = (self.config.order_usd_value / bbo.bid_price).min(pos_size);
             self.last_order_price = Some(last + reduce_sell_spacing);
@@ -216,12 +232,12 @@ impl MacdGridStrategy {
                 qty,
                 true,
                 &format!(
-                    "grid_reduce_long | trend={:?} | pos={:.4} | spacing={:.4}",
-                    trend, pos_size, reduce_sell_spacing
+                    "grid_reduce_long | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
+                    trend, deviation, ob_sell_factor, reduce_sell_spacing
                 ),
             );
         }
-        // 其次: 允许开空且未超限 → 卖出开空 (仓位放大间距)
+        // 其次: 允许开空且未超限 → 卖出开空
         if mid_price >= last + open_sell_spacing
             && params.max_short_usd > 0.0
             && short_usd < params.max_short_usd
@@ -234,8 +250,8 @@ impl MacdGridStrategy {
                 qty,
                 false,
                 &format!(
-                    "grid_open_short | trend={:?} | pos={:.4} | spacing={:.4} | levels={:.0}",
-                    trend, pos_size, open_sell_spacing, self.pos_levels(short_usd)
+                    "grid_open_short | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
+                    trend, deviation, ob_sell_factor, short_pos_factor, open_sell_spacing
                 ),
             );
         }
