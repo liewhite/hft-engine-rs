@@ -34,10 +34,10 @@ pub struct MacdGridStrategy {
     macd_1h: MacdCalculator,
     macd_4h: MacdCalculator,
     atr: AtrCalculator,
+    /// 当前趋势状态，随 K 线更新 MACD 后刷新
+    trend: Option<Trend>,
     /// 上一次成交的参考价格，网格从此价格向两侧延伸
     last_fill_price: Option<f64>,
-    /// 上一次的趋势状态，用于检测趋势切换并重置网格参考价
-    last_trend: Option<Trend>,
 }
 
 impl MacdGridStrategy {
@@ -48,32 +48,13 @@ impl MacdGridStrategy {
             macd_1h: MacdCalculator::new(),
             macd_4h: MacdCalculator::new(),
             atr: AtrCalculator::new(14),
+            trend: None,
             last_fill_price: None,
-            last_trend: None,
         }
     }
 
     fn symbol(&self) -> &Symbol {
         &self.config.symbol
-    }
-
-    fn current_trend(&self) -> Option<Trend> {
-        let dea_15m = self.macd_15m.dea()?;
-        let dea_1h = self.macd_1h.dea()?;
-        let dea_4h = self.macd_4h.dea()?;
-
-        let above_count = [dea_15m, dea_1h, dea_4h]
-            .iter()
-            .filter(|d| **d > 0.0)
-            .count();
-
-        Some(match above_count {
-            3 => Trend::StrongBull,
-            2 => Trend::WeakBull,
-            1 => Trend::WeakBear,
-            0 => Trend::StrongBear,
-            _ => unreachable!(),
-        })
     }
 
     fn grid_params(&self, trend: Trend) -> GridParams {
@@ -142,6 +123,43 @@ impl MacdGridStrategy {
             }
             _ => {}
         }
+        self.update_trend();
+    }
+
+    /// 从 3 周期 MACD DEA 重新计算趋势，检测变化时重置网格参考价
+    fn update_trend(&mut self) {
+        let (Some(dea_15m), Some(dea_1h), Some(dea_4h)) =
+            (self.macd_15m.dea(), self.macd_1h.dea(), self.macd_4h.dea())
+        else {
+            return;
+        };
+
+        let above_count = [dea_15m, dea_1h, dea_4h]
+            .iter()
+            .filter(|d| **d > 0.0)
+            .count();
+
+        let new_trend = match above_count {
+            3 => Trend::StrongBull,
+            2 => Trend::WeakBull,
+            1 => Trend::WeakBear,
+            0 => Trend::StrongBear,
+            _ => unreachable!(),
+        };
+
+        if self.trend != Some(new_trend) {
+            if self.trend.is_some() {
+                tracing::info!(
+                    symbol = %self.symbol(),
+                    old_trend = ?self.trend,
+                    new_trend = ?new_trend,
+                    "Trend changed, will reset grid reference price on next BBO"
+                );
+                // 趋势切换时清除参考价，下次 check_grid 会用 mid_price 重新初始化
+                self.last_fill_price = None;
+            }
+            self.trend = Some(new_trend);
+        }
     }
 
     /// 仓位深度系数: 1 + (pos_usd / max_pos_usd) * pos_weight
@@ -158,28 +176,13 @@ impl MacdGridStrategy {
     /// has_pending_orders 保护下同一时间只有一笔挂单。
     fn check_grid(&mut self, state: &StateManager) -> Option<OutcomeEvent> {
         let symbol_state = state.symbol_state(self.symbol())?;
-        let trend = self.current_trend()?;
+        let trend = self.trend?;
         let atr = self.atr.value()?;
         let bbo = symbol_state.bbo(Exchange::OKX)?;
         let mid_price = bbo.mid_price();
 
         if mid_price <= 0.0 || atr <= 0.0 {
             return None;
-        }
-
-        // 趋势切换时重置网格参考价，防止 last_fill_price 远离当前价
-        if self.last_trend != Some(trend) {
-            if self.last_trend.is_some() {
-                tracing::info!(
-                    symbol = %self.symbol(),
-                    old_trend = ?self.last_trend,
-                    new_trend = ?trend,
-                    mid_price = format!("{:.4}", mid_price),
-                    "Trend changed, resetting grid reference price"
-                );
-                self.last_fill_price = Some(mid_price);
-            }
-            self.last_trend = Some(trend);
         }
 
         let params = self.grid_params(trend);
@@ -223,12 +226,10 @@ impl MacdGridStrategy {
             && (params.max_short_usd == 0.0 || short_usd > params.max_short_usd);
 
         if need_reduce_long && mid_price < last {
-            // 持多头需卖出平仓，价格下跌 → 跟随下移使卖单更贴近当前价
             self.last_fill_price = Some(mid_price);
             last = mid_price;
         }
         if need_reduce_short && mid_price > last {
-            // 持空头需买入平仓，价格上涨 → 跟随上移使买单更贴近当前价
             self.last_fill_price = Some(mid_price);
             last = mid_price;
         }
@@ -355,7 +356,7 @@ impl MacdGridStrategy {
 
         tracing::info!(
             symbol = %self.symbol(),
-            trend = ?self.current_trend(),
+            trend = ?self.trend,
             dea_15m = self.macd_15m.dea().map(|d| format!("{:.6}", d)),
             dea_1h = self.macd_1h.dea().map(|d| format!("{:.6}", d)),
             dea_4h = self.macd_4h.dea().map(|d| format!("{:.6}", d)),
@@ -440,7 +441,6 @@ impl Strategy for MacdGridStrategy {
                 None
             }
             ExchangeEventData::Fill(fill) => {
-                // 成交后更新网格参考价为成交价
                 if fill.symbol == *self.symbol() {
                     tracing::info!(
                         symbol = %self.symbol(),
@@ -454,7 +454,7 @@ impl Strategy for MacdGridStrategy {
                 None
             }
             ExchangeEventData::BBO(_) => {
-                if !self.indicators_ready() {
+                if self.trend.is_none() || !self.indicators_ready() {
                     return None;
                 }
                 let symbol_state = state.symbol_state(self.symbol())?;
