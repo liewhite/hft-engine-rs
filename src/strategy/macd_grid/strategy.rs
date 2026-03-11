@@ -30,27 +30,31 @@ struct GridParams {
 
 pub struct MacdGridStrategy {
     config: MacdGridConfig,
-    symbol: Symbol,
     macd_15m: MacdCalculator,
     macd_1h: MacdCalculator,
     macd_4h: MacdCalculator,
     atr: AtrCalculator,
     /// 上一次下单的参考价格，网格从此价格向两侧延伸
     last_order_price: Option<f64>,
+    /// 上一次的趋势状态，用于检测趋势切换并重置网格参考价
+    last_trend: Option<Trend>,
 }
 
 impl MacdGridStrategy {
     pub fn new(config: MacdGridConfig) -> Self {
-        let symbol = config.symbol.clone();
         Self {
             config,
-            symbol,
             macd_15m: MacdCalculator::new(),
             macd_1h: MacdCalculator::new(),
             macd_4h: MacdCalculator::new(),
             atr: AtrCalculator::new(14),
             last_order_price: None,
+            last_trend: None,
         }
+    }
+
+    fn symbol(&self) -> &Symbol {
+        &self.config.symbol
     }
 
     fn current_trend(&self) -> Option<Trend> {
@@ -106,9 +110,12 @@ impl MacdGridStrategy {
 
     /// 超买超卖偏离度: (mid_price - slow_ema_15m) / ATR
     /// 正值 = 超买, 负值 = 超卖
-    fn deviation(&self, mid_price: f64, atr: f64) -> Option<f64> {
-        let ema = self.macd_15m.slow_ema_value()?;
-        Some((mid_price - ema) / atr)
+    fn deviation(&self, mid_price: f64, atr: f64) -> f64 {
+        let ema = self
+            .macd_15m
+            .slow_ema_value()
+            .expect("slow_ema must be ready when indicators_ready");
+        (mid_price - ema) / atr
     }
 
     fn indicators_ready(&self) -> bool {
@@ -142,8 +149,11 @@ impl MacdGridStrategy {
         (same_dir_usd / self.config.order_usd_value).floor()
     }
 
+    /// 网格核心逻辑：检查价格是否穿越网格线，触发则下一笔 IOC 订单。
+    /// 单个 BBO tick 最多触发一笔订单，last_order_price 每次只移动一个网格步长，
+    /// 配合 has_pending_orders 保护，确保不会在短时间内连续下单。
     fn check_grid(&mut self, state: &StateManager) -> Option<OutcomeEvent> {
-        let symbol_state = state.symbol_state(&self.symbol)?;
+        let symbol_state = state.symbol_state(self.symbol())?;
         let trend = self.current_trend()?;
         let atr = self.atr.value()?;
         let bbo = symbol_state.bbo(Exchange::OKX)?;
@@ -151,6 +161,21 @@ impl MacdGridStrategy {
 
         if mid_price <= 0.0 || atr <= 0.0 {
             return None;
+        }
+
+        // 趋势切换时重置网格参考价，防止 last_order_price 远离当前价导致连续触发
+        if self.last_trend != Some(trend) {
+            if self.last_trend.is_some() {
+                tracing::info!(
+                    symbol = %self.symbol(),
+                    old_trend = ?self.last_trend,
+                    new_trend = ?trend,
+                    mid_price = format!("{:.4}", mid_price),
+                    "Trend changed, resetting grid reference price"
+                );
+                self.last_order_price = Some(mid_price);
+            }
+            self.last_trend = Some(trend);
         }
 
         let params = self.grid_params(trend);
@@ -162,7 +187,7 @@ impl MacdGridStrategy {
         let short_usd = (-pos_size).max(0.0) * mid_price;
 
         // 超买超卖系数: deviation > 0 → 超买 → 买入更远、卖出更近
-        let deviation = self.deviation(mid_price, atr).unwrap_or(0.0);
+        let deviation = self.deviation(mid_price, atr);
         let w = self.config.ob_weight;
         let ob_buy_factor = (1.0 + deviation * w).clamp(0.5, 3.0);
         let ob_sell_factor = (1.0 - deviation * w).clamp(0.5, 3.0);
@@ -277,7 +302,7 @@ impl MacdGridStrategy {
         };
 
         tracing::info!(
-            symbol = %self.symbol,
+            symbol = %self.symbol(),
             side = ?side,
             price = format!("{:.4}", price),
             limit_price = format!("{:.4}", limit_price),
@@ -291,7 +316,7 @@ impl MacdGridStrategy {
             orders: vec![Order {
                 id: String::new(),
                 exchange: Exchange::OKX,
-                symbol: self.symbol.clone(),
+                symbol: self.symbol().clone(),
                 side,
                 order_type: OrderType::Limit {
                     price: limit_price,
@@ -306,30 +331,28 @@ impl MacdGridStrategy {
     }
 
     fn log_status(&self, state: &StateManager) {
-        let symbol_state = match state.symbol_state(&self.symbol) {
+        let symbol_state = match state.symbol_state(self.symbol()) {
             Some(s) => s,
             None => return,
         };
 
         let mid = symbol_state
             .bbo(Exchange::OKX)
-            .map(|b| b.mid_price())
-            .unwrap_or(0.0);
-        let pos_size = symbol_state
+            .map(|b| format!("{:.4}", b.mid_price()));
+        let pos = symbol_state
             .position(Exchange::OKX)
-            .map(|p| p.size)
-            .unwrap_or(0.0);
+            .map(|p| format!("{:.4}", p.size));
 
         tracing::info!(
-            symbol = %self.symbol,
+            symbol = %self.symbol(),
             trend = ?self.current_trend(),
-            dea_15m = self.macd_15m.dea().map(|d| format!("{:.6}", d)).unwrap_or_default(),
-            dea_1h = self.macd_1h.dea().map(|d| format!("{:.6}", d)).unwrap_or_default(),
-            dea_4h = self.macd_4h.dea().map(|d| format!("{:.6}", d)).unwrap_or_default(),
-            atr = self.atr.value().map(|a| format!("{:.4}", a)).unwrap_or_default(),
-            mid_price = format!("{:.4}", mid),
-            pos = format!("{:.4}", pos_size),
-            last_order_price = self.last_order_price.map(|p| format!("{:.4}", p)).unwrap_or_default(),
+            dea_15m = self.macd_15m.dea().map(|d| format!("{:.6}", d)),
+            dea_1h = self.macd_1h.dea().map(|d| format!("{:.6}", d)),
+            dea_4h = self.macd_4h.dea().map(|d| format!("{:.6}", d)),
+            atr = self.atr.value().map(|a| format!("{:.4}", a)),
+            mid_price = mid,
+            pos = pos,
+            last_order_price = self.last_order_price.map(|p| format!("{:.4}", p)),
             ready = self.indicators_ready(),
             "MacdGrid status"
         );
@@ -340,18 +363,18 @@ impl Strategy for MacdGridStrategy {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
         let kinds: HashSet<SubscriptionKind> = [
             SubscriptionKind::BBO {
-                symbol: self.symbol.clone(),
+                symbol: self.symbol().clone(),
             },
             SubscriptionKind::Candle {
-                symbol: self.symbol.clone(),
+                symbol: self.symbol().clone(),
                 interval: CandleInterval::Min15,
             },
             SubscriptionKind::Candle {
-                symbol: self.symbol.clone(),
+                symbol: self.symbol().clone(),
                 interval: CandleInterval::Hour1,
             },
             SubscriptionKind::Candle {
-                symbol: self.symbol.clone(),
+                symbol: self.symbol().clone(),
                 interval: CandleInterval::Hour4,
             },
         ]
@@ -371,7 +394,7 @@ impl Strategy for MacdGridStrategy {
         match &event.data {
             ExchangeEventData::HistoryCandles(candles) => {
                 for candle in candles {
-                    if candle.symbol == self.symbol {
+                    if candle.symbol == *self.symbol() {
                         self.feed_candle(
                             candle.close,
                             candle.high,
@@ -382,16 +405,16 @@ impl Strategy for MacdGridStrategy {
                     }
                 }
                 tracing::info!(
-                    symbol = %self.symbol,
+                    symbol = %self.symbol(),
                     count = candles.len(),
                     interval = candles.first().map(|c| c.interval.to_string()).unwrap_or_default(),
                     ready = self.indicators_ready(),
                     "Fed history candles"
                 );
-                return None;
+                None
             }
             ExchangeEventData::Candle(candle) => {
-                if candle.symbol == self.symbol {
+                if candle.symbol == *self.symbol() {
                     self.feed_candle(
                         candle.close,
                         candle.high,
@@ -400,25 +423,23 @@ impl Strategy for MacdGridStrategy {
                         candle.confirm,
                     );
                 }
-                return None;
+                None
             }
             ExchangeEventData::Clock => {
                 self.log_status(state);
-                return None;
+                None
             }
-            ExchangeEventData::BBO(_) => {}
-            _ => return None,
+            ExchangeEventData::BBO(_) => {
+                if !self.indicators_ready() {
+                    return None;
+                }
+                let symbol_state = state.symbol_state(self.symbol())?;
+                if symbol_state.has_pending_orders() {
+                    return None;
+                }
+                self.check_grid(state)
+            }
+            _ => None,
         }
-
-        if !self.indicators_ready() {
-            return None;
-        }
-
-        let symbol_state = state.symbol_state(&self.symbol)?;
-        if symbol_state.has_pending_orders() {
-            return None;
-        }
-
-        self.check_grid(state)
     }
 }
