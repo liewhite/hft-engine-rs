@@ -34,8 +34,8 @@ pub struct MacdGridStrategy {
     macd_1h: MacdCalculator,
     macd_4h: MacdCalculator,
     atr: AtrCalculator,
-    /// 上一次下单的参考价格，网格从此价格向两侧延伸
-    last_order_price: Option<f64>,
+    /// 上一次成交的参考价格，网格从此价格向两侧延伸
+    last_fill_price: Option<f64>,
     /// 上一次的趋势状态，用于检测趋势切换并重置网格参考价
     last_trend: Option<Trend>,
 }
@@ -48,7 +48,7 @@ impl MacdGridStrategy {
             macd_1h: MacdCalculator::new(),
             macd_4h: MacdCalculator::new(),
             atr: AtrCalculator::new(14),
-            last_order_price: None,
+            last_fill_price: None,
             last_trend: None,
         }
     }
@@ -153,9 +153,9 @@ impl MacdGridStrategy {
         1.0 + (pos_usd / max_pos_usd) * self.config.pos_weight
     }
 
-    /// 网格核心逻辑：检查价格是否穿越网格线，触发则下一笔 IOC 订单。
-    /// 单个 BBO tick 最多触发一笔订单，last_order_price 每次只移动一个网格步长，
-    /// 配合 has_pending_orders 保护，确保不会在短时间内连续下单。
+    /// 网格核心逻辑：在网格价位挂 GTC 限价单，等待成交。
+    /// 无挂单时根据优先级选择方向，在 last_fill_price ± spacing 处挂单。
+    /// has_pending_orders 保护下同一时间只有一笔挂单。
     fn check_grid(&mut self, state: &StateManager) -> Option<OutcomeEvent> {
         let symbol_state = state.symbol_state(self.symbol())?;
         let trend = self.current_trend()?;
@@ -167,7 +167,7 @@ impl MacdGridStrategy {
             return None;
         }
 
-        // 趋势切换时重置网格参考价，防止 last_order_price 远离当前价导致连续触发
+        // 趋势切换时重置网格参考价，防止 last_fill_price 远离当前价
         if self.last_trend != Some(trend) {
             if self.last_trend.is_some() {
                 tracing::info!(
@@ -177,7 +177,7 @@ impl MacdGridStrategy {
                     mid_price = format!("{:.4}", mid_price),
                     "Trend changed, resetting grid reference price"
                 );
-                self.last_order_price = Some(mid_price);
+                self.last_fill_price = Some(mid_price);
             }
             self.last_trend = Some(trend);
         }
@@ -209,38 +209,38 @@ impl MacdGridStrategy {
         let open_sell_spacing = (atr * params.sell_base * ob_sell_factor * short_pos_factor).max(min);
 
         // 初始化网格参考价
-        if self.last_order_price.is_none() {
-            self.last_order_price = Some(mid_price);
+        if self.last_fill_price.is_none() {
+            self.last_fill_price = Some(mid_price);
             return None;
         }
-        let mut last = self.last_order_price.unwrap();
+        let mut last = self.last_fill_price.unwrap();
 
-        // 追单: 持仓与趋势不一致或超限时，last_order_price 跟随价格移动，
-        // 确保平仓触发点始终贴近当前价，避免反转后无法平掉反向仓位
+        // 追单: 持仓与趋势不一致或超限时，last_fill_price 跟随价格移动，
+        // 确保平仓挂单价始终贴近当前价，避免反转后无法平掉反向仓位
         let need_reduce_long = pos_size > POSITION_EPSILON
             && (params.max_long_usd == 0.0 || long_usd > params.max_long_usd);
         let need_reduce_short = pos_size < -POSITION_EPSILON
             && (params.max_short_usd == 0.0 || short_usd > params.max_short_usd);
 
         if need_reduce_long && mid_price < last {
-            // 持多头需卖出平仓，价格下跌远离卖出触发点 → 跟随下移
-            self.last_order_price = Some(mid_price);
+            // 持多头需卖出平仓，价格下跌 → 跟随下移使卖单更贴近当前价
+            self.last_fill_price = Some(mid_price);
             last = mid_price;
         }
         if need_reduce_short && mid_price > last {
-            // 持空头需买入平仓，价格上涨远离买入触发点 → 跟随上移
-            self.last_order_price = Some(mid_price);
+            // 持空头需买入平仓，价格上涨 → 跟随上移使买单更贴近当前价
+            self.last_fill_price = Some(mid_price);
             last = mid_price;
         }
 
         // === 买入方向 ===
         // 优先: 有空头仓位 → 买入减仓
-        if mid_price <= last - reduce_buy_spacing && pos_size < -POSITION_EPSILON {
-            let qty = (self.config.order_usd_value / bbo.ask_price).min(pos_size.abs());
-            self.last_order_price = Some(last - reduce_buy_spacing);
+        if pos_size < -POSITION_EPSILON {
+            let grid_price = last - reduce_buy_spacing;
+            let qty = (self.config.order_usd_value / grid_price).min(pos_size.abs());
             return self.make_order(
                 Side::Long,
-                bbo.ask_price,
+                grid_price,
                 qty,
                 true,
                 &format!(
@@ -250,15 +250,12 @@ impl MacdGridStrategy {
             );
         }
         // 其次: 允许开多且未超限 → 买入开多
-        if mid_price <= last - open_buy_spacing
-            && params.max_long_usd > 0.0
-            && long_usd < params.max_long_usd
-        {
-            let qty = self.config.order_usd_value / bbo.ask_price;
-            self.last_order_price = Some(last - open_buy_spacing);
+        if params.max_long_usd > 0.0 && long_usd < params.max_long_usd {
+            let grid_price = last - open_buy_spacing;
+            let qty = self.config.order_usd_value / grid_price;
             return self.make_order(
                 Side::Long,
-                bbo.ask_price,
+                grid_price,
                 qty,
                 false,
                 &format!(
@@ -270,12 +267,12 @@ impl MacdGridStrategy {
 
         // === 卖出方向 ===
         // 优先: 有多头仓位 → 卖出减仓
-        if mid_price >= last + reduce_sell_spacing && pos_size > POSITION_EPSILON {
-            let qty = (self.config.order_usd_value / bbo.bid_price).min(pos_size);
-            self.last_order_price = Some(last + reduce_sell_spacing);
+        if pos_size > POSITION_EPSILON {
+            let grid_price = last + reduce_sell_spacing;
+            let qty = (self.config.order_usd_value / grid_price).min(pos_size);
             return self.make_order(
                 Side::Short,
-                bbo.bid_price,
+                grid_price,
                 qty,
                 true,
                 &format!(
@@ -285,15 +282,12 @@ impl MacdGridStrategy {
             );
         }
         // 其次: 允许开空且未超限 → 卖出开空
-        if mid_price >= last + open_sell_spacing
-            && params.max_short_usd > 0.0
-            && short_usd < params.max_short_usd
-        {
-            let qty = self.config.order_usd_value / bbo.bid_price;
-            self.last_order_price = Some(last + open_sell_spacing);
+        if params.max_short_usd > 0.0 && short_usd < params.max_short_usd {
+            let grid_price = last + open_sell_spacing;
+            let qty = self.config.order_usd_value / grid_price;
             return self.make_order(
                 Side::Short,
-                bbo.bid_price,
+                grid_price,
                 qty,
                 false,
                 &format!(
@@ -318,16 +312,10 @@ impl MacdGridStrategy {
             return None;
         }
 
-        let limit_price = match side {
-            Side::Long => price * (1.0 + self.config.ioc_slippage),
-            Side::Short => price * (1.0 - self.config.ioc_slippage),
-        };
-
         tracing::info!(
             symbol = %self.symbol(),
             side = ?side,
             price = format!("{:.4}", price),
-            limit_price = format!("{:.4}", limit_price),
             qty = format!("{:.6}", qty),
             reduce_only,
             comment,
@@ -341,8 +329,8 @@ impl MacdGridStrategy {
                 symbol: self.symbol().clone(),
                 side,
                 order_type: OrderType::Limit {
-                    price: limit_price,
-                    tif: TimeInForce::IOC,
+                    price,
+                    tif: TimeInForce::GTC,
                 },
                 quantity: qty,
                 reduce_only,
@@ -374,7 +362,7 @@ impl MacdGridStrategy {
             atr = self.atr.value().map(|a| format!("{:.4}", a)),
             mid_price = mid,
             pos = pos,
-            last_order_price = self.last_order_price.map(|p| format!("{:.4}", p)),
+            last_fill_price = self.last_fill_price.map(|p| format!("{:.4}", p)),
             ready = self.indicators_ready(),
             "MacdGrid status"
         );
@@ -449,6 +437,20 @@ impl Strategy for MacdGridStrategy {
             }
             ExchangeEventData::Clock => {
                 self.log_status(state);
+                None
+            }
+            ExchangeEventData::Fill(fill) => {
+                // 成交后更新网格参考价为成交价
+                if fill.symbol == *self.symbol() {
+                    tracing::info!(
+                        symbol = %self.symbol(),
+                        side = ?fill.side,
+                        fill_price = format!("{:.4}", fill.price),
+                        fill_size = format!("{:.6}", fill.size),
+                        "Grid order filled, updating reference price"
+                    );
+                    self.last_fill_price = Some(fill.price);
+                }
                 None
             }
             ExchangeEventData::BBO(_) => {

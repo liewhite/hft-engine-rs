@@ -11,8 +11,6 @@ pub struct MacdGridConfig {
     pub max_position_usd: f64,
     /// 弱趋势最大持仓 (USDT)
     pub weak_position_usd: f64,
-    /// IOC 订单滑点 (e.g., 0.001 = 0.1%)
-    pub ioc_slippage: f64,
     /// 订单超时 (ms)
     pub order_timeout_ms: u64,
     /// 网格最小间距 (绝对价格)，防止 ATR 过低时网格过密
