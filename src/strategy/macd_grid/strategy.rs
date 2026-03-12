@@ -242,8 +242,8 @@ impl MacdGridStrategy {
             last = mid_price;
         }
 
-        // === 买入方向 ===
-        // 优先: 有空头仓位 → 买入减仓
+        // === 减仓优先 ===
+        // 有空头仓位 → 买入减仓
         if pos_size < -POSITION_EPSILON {
             let grid_price = last - reduce_buy_spacing;
             let qty = (self.config.order_usd_value / grid_price).min(pos_size.abs());
@@ -258,24 +258,7 @@ impl MacdGridStrategy {
                 ),
             );
         }
-        // 其次: 允许开多且未超限 → 买入开多
-        if params.max_long_usd > 0.0 && long_usd < params.max_long_usd {
-            let grid_price = last - open_buy_spacing;
-            let qty = self.config.order_usd_value / grid_price;
-            return self.make_order(
-                Side::Long,
-                grid_price,
-                qty,
-                false,
-                &format!(
-                    "grid_open_long | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
-                    trend, deviation, ob_buy_factor, long_pos_factor, open_buy_spacing
-                ),
-            );
-        }
-
-        // === 卖出方向 ===
-        // 优先: 有多头仓位 → 卖出减仓
+        // 有多头仓位 → 卖出减仓
         if pos_size > POSITION_EPSILON {
             let grid_price = last + reduce_sell_spacing;
             let qty = (self.config.order_usd_value / grid_price).min(pos_size);
@@ -290,7 +273,24 @@ impl MacdGridStrategy {
                 ),
             );
         }
-        // 其次: 允许开空且未超限 → 卖出开空
+
+        // === 无仓位时开仓 ===
+        // 允许开多且未超限 → 买入开多
+        if params.max_long_usd > 0.0 && long_usd < params.max_long_usd {
+            let grid_price = last - open_buy_spacing;
+            let qty = self.config.order_usd_value / grid_price;
+            return self.make_order(
+                Side::Long,
+                grid_price,
+                qty,
+                false,
+                &format!(
+                    "grid_open_long | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
+                    trend, deviation, ob_buy_factor, long_pos_factor, open_buy_spacing
+                ),
+            );
+        }
+        // 允许开空且未超限 → 卖出开空
         if params.max_short_usd > 0.0 && short_usd < params.max_short_usd {
             let grid_price = last + open_sell_spacing;
             let qty = self.config.order_usd_value / grid_price;
