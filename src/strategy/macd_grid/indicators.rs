@@ -105,6 +105,14 @@ impl MacdCalculator {
         }
     }
 
+    /// MACD line (DIF) = fast EMA - slow EMA
+    pub fn macd_line(&self) -> Option<f64> {
+        match (self.fast_ema.value(), self.slow_ema.value()) {
+            (Some(fast), Some(slow)) => Some(fast - slow),
+            _ => None,
+        }
+    }
+
     /// DEA (signal line) value
     pub fn dea(&self) -> Option<f64> {
         self.signal_ema.value()
