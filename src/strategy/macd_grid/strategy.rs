@@ -107,29 +107,20 @@ impl MacdGridStrategy {
     }
 
     fn feed_candle(&mut self, close: f64, high: f64, low: f64, interval: CandleInterval, confirm: bool) {
+        // 仅使用 confirmed K 线更新指标，未确认的当前 bar 不参与计算
+        if !confirm {
+            return;
+        }
         match interval {
             CandleInterval::Min15 => {
-                if confirm {
-                    self.macd_15m.update(close);
-                    self.atr.update(high, low, close);
-                } else {
-                    self.macd_15m.update_live(close);
-                    self.atr.update_live(high, low, close);
-                }
+                self.macd_15m.update(close);
+                self.atr.update(high, low, close);
             }
             CandleInterval::Hour1 => {
-                if confirm {
-                    self.macd_1h.update(close);
-                } else {
-                    self.macd_1h.update_live(close);
-                }
+                self.macd_1h.update(close);
             }
             CandleInterval::Hour4 => {
-                if confirm {
-                    self.macd_4h.update(close);
-                } else {
-                    self.macd_4h.update_live(close);
-                }
+                self.macd_4h.update(close);
             }
             _ => {}
         }
