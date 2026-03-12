@@ -2,7 +2,7 @@
 //!
 //! 订阅 OutcomePubSub 接收策略信号，调用交易所 REST API 执行订单
 
-use crate::domain::{now_ms, Exchange, OrderStatus, OrderUpdate};
+use crate::domain::{now_ms, Exchange, OrderStatus, OrderUpdate, Side};
 use crate::exchange::ExchangeClient;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::strategy::OutcomeEvent;
@@ -89,10 +89,35 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                 }
 
                 tracing::info!(%exchange, %symbol, %order_id, "Cancelling order");
+                let income_pubsub = self.income_pubsub.clone();
                 tokio::spawn(async move {
                     match client.cancel_order(&symbol, &order_id).await {
                         Ok(()) => {
                             tracing::info!(%exchange, %symbol, %order_id, "Order cancelled successfully");
+                            // 撤单成功，反馈 Cancelled 状态让 SymbolState 移除 pending_order
+                            let local_ts = now_ms();
+                            let update = OrderUpdate {
+                                order_id: order_id.clone(),
+                                client_order_id: Some(order_id),
+                                exchange,
+                                symbol,
+                                side: Side::Long, // 撤单事件中 side 无实际意义
+                                status: OrderStatus::Cancelled,
+                                filled_quantity: 0.0,
+                                fill_sz: 0.0,
+                                timestamp: local_ts,
+                            };
+                            if let Err(e) = income_pubsub
+                                .tell(Publish(IncomeEvent {
+                                    exchange_ts: local_ts,
+                                    local_ts,
+                                    data: ExchangeEventData::OrderUpdate(update),
+                                }))
+                                .send()
+                                .await
+                            {
+                                tracing::error!(error = %e, "Failed to publish cancel confirmation");
+                            }
                         }
                         Err(e) => {
                             tracing::error!(%exchange, %symbol, %order_id, error = %e, "Failed to cancel order");

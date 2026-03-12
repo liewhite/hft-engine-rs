@@ -347,18 +347,33 @@ impl ExchangeClient for OkxClient {
         for d in &data.data {
             let sym = match from_okx(&d.inst_id) {
                 Some(s) => s,
-                None => continue,
+                None => {
+                    tracing::warn!(inst_id = %d.inst_id, "Unknown inst_id in pending orders, skipping");
+                    continue;
+                }
             };
             let side = match d.side.as_str() {
                 "buy" => Side::Long,
                 "sell" => Side::Short,
-                _ => continue,
+                other => {
+                    tracing::warn!(side = %other, ord_id = %d.ord_id, "Unknown side in pending order, skipping");
+                    continue;
+                }
             };
-            let acc_fill_sz: f64 = d.acc_fill_sz.parse().unwrap_or(0.0);
+            let acc_fill_sz: f64 = match d.acc_fill_sz.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(ord_id = %d.ord_id, acc_fill_sz = %d.acc_fill_sz, "Failed to parse acc_fill_sz, skipping");
+                    continue;
+                }
+            };
             let status = match d.state.as_str() {
                 "live" => OrderStatus::Pending,
                 "partially_filled" => OrderStatus::PartiallyFilled { filled: acc_fill_sz },
-                _ => continue,
+                other => {
+                    tracing::warn!(state = %other, ord_id = %d.ord_id, "Unexpected state in pending orders, skipping");
+                    continue;
+                }
             };
 
             // 用 cl_ord_id 或 fallback 到 ord_id，确保 pending_orders 能跟踪
