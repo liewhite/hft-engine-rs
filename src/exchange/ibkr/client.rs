@@ -222,7 +222,10 @@ impl IbkrClient {
             let unrealized_pnl = item
                 .get("unrealizedPnl")
                 .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+                .unwrap_or_else(|| {
+                    tracing::warn!(symbol = %symbol, item = %item, "IBKR position missing/invalid unrealizedPnl");
+                    0.0
+                });
 
             positions.push(crate::domain::Position {
                 exchange: Exchange::IBKR,

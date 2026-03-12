@@ -202,7 +202,7 @@ impl BinanceClient {
 
                 let price_step = price_step.filter(|&v| v > 0.0)?;
                 let size_step = size_step.filter(|&v| v > 0.0)?;
-                let min_order_size = min_order_size.unwrap_or(0.0);
+                let min_order_size = min_order_size.filter(|&v| v > 0.0)?;
 
                 Some(SymbolMeta {
                     exchange: Exchange::Binance,

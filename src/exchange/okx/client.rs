@@ -141,7 +141,7 @@ impl OkxClient {
                 let symbol = from_okx(&d.inst_id)?;
                 let price_step: f64 = d.tick_sz.parse().ok().filter(|&v| v > 0.0)?;
                 let size_step: f64 = d.lot_sz.parse().ok().filter(|&v| v > 0.0)?;
-                let min_order_size: f64 = d.min_sz.parse().unwrap_or(0.0);
+                let min_order_size: f64 = d.min_sz.parse().ok().filter(|&v| v > 0.0)?;
                 let contract_size: f64 = d.ct_val.parse().ok().filter(|&v| v > 0.0)?;
 
                 Some(SymbolMeta {

@@ -228,7 +228,10 @@ fn parse_private_message(
     let exchange_ts = value
         .get("E")
         .and_then(|v| v.as_u64())
-        .unwrap_or(local_ts);
+        .unwrap_or_else(|| {
+            tracing::warn!(raw, "Missing exchange timestamp (E), using local_ts");
+            local_ts
+        });
 
     // 根据事件类型解析
     let event_type = value
