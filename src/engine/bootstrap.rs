@@ -3,16 +3,13 @@ use kameo::mailbox;
 use serde::de::DeserializeOwned;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::domain::Symbol;
-use crate::engine::config::{DatabaseConfig, MonitoringConfig};
+use crate::engine::config::MonitoringConfig;
 use crate::engine::live::{
     ManagerActor, SubscribeIncome, SubscribeOutcome,
 };
 use crate::strategy::{
     FundingArbMetricsActor, FundingArbMetricsArgs,
     SlackNotifierActor, SlackNotifierArgs,
-    SpreadArbMetricsActor, SpreadArbMetricsArgs, SpreadArbStatsActor, SpreadArbStatsArgs,
-    SpreadPairConfig,
 };
 
 /// 初始化 tracing（fmt + EnvFilter，默认 fee_arb=info）
@@ -88,63 +85,6 @@ pub async fn init_funding_arb_metrics(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe FundingArbMetrics to income: {}", e))?;
     tracing::info!("FundingArbMetricsActor created and subscribed");
-
-    Ok(())
-}
-
-/// 初始化 SpreadArb metrics 并订阅到 Manager
-pub async fn init_spread_arb_metrics(
-    manager: &ActorRef<ManagerActor>,
-    monitoring: &MonitoringConfig,
-    spread_pairs: Vec<SpreadPairConfig>,
-) -> anyhow::Result<()> {
-    let metrics_actor = SpreadArbMetricsActor::spawn_with_mailbox(
-        SpreadArbMetricsArgs {
-            pushgateway_url: monitoring.pushgateway_url.clone(),
-            metric_prefix: monitoring.metric_prefix.clone(),
-            push_interval_ms: monitoring.push_interval_ms,
-            spread_pairs,
-        },
-        mailbox::unbounded(),
-    );
-
-    manager
-        .tell(SubscribeIncome(metrics_actor))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe SpreadArbMetrics to income: {}", e))?;
-    tracing::info!("SpreadArbMetricsActor created and subscribed");
-
-    Ok(())
-}
-
-/// 初始化 SpreadArb 统计 actor 并订阅到 Manager
-pub async fn init_spread_arb_stats(
-    manager: &ActorRef<ManagerActor>,
-    symbols: impl IntoIterator<Item = Symbol>,
-    db_config: &DatabaseConfig,
-) -> anyhow::Result<()> {
-    let db = crate::db::init_db(&db_config.url).await?;
-
-    let stats_actor = SpreadArbStatsActor::spawn_with_mailbox(
-        SpreadArbStatsArgs {
-            symbols: symbols.into_iter().collect(),
-            db,
-        },
-        mailbox::unbounded(),
-    );
-
-    manager
-        .tell(SubscribeIncome(stats_actor.clone()))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe SpreadArbStats to income: {}", e))?;
-    manager
-        .tell(SubscribeOutcome(stats_actor))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe SpreadArbStats to outcome: {}", e))?;
-    tracing::info!("SpreadArbStatsActor created and subscribed");
 
     Ok(())
 }

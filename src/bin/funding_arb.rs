@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
 use fee_arb::engine::{
-    init_funding_arb_metrics, init_slack, init_spread_arb_stats, init_tracing, load_config,
-    wait_for_shutdown, AddStrategies, DatabaseConfig, GetAllSymbolMetas, ManagerActor,
+    init_funding_arb_metrics, init_slack, init_tracing, load_config,
+    wait_for_shutdown, AddStrategies, GetAllSymbolMetas, ManagerActor,
     ManagerActorArgs, MonitoringConfig,
 };
 use fee_arb::exchange::binance::BinanceCredentials;
@@ -11,7 +11,7 @@ use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
 use fee_arb::exchange::ibkr::IbkrCredentials;
 use fee_arb::exchange::okx::OkxCredentials;
 use fee_arb::strategy::{
-    FundingArbConfig, FundingArbStrategy, SpreadArbConfig, SpreadArbStrategy,
+    FundingArbConfig, FundingArbStrategy,
 };
 use kameo::actor::Spawn;
 use kameo::mailbox;
@@ -41,7 +41,6 @@ impl ExchangesConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct StrategyConfig {
     funding_arb: FundingArbConfig,
-    spread_arb: Option<SpreadArbConfig>,
 }
 
 /// 完整配置
@@ -50,7 +49,6 @@ struct Config {
     exchanges: ExchangesConfig,
     strategy: StrategyConfig,
     monitoring: Option<MonitoringConfig>,
-    database: Option<DatabaseConfig>,
 }
 
 #[tokio::main]
@@ -109,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
     let enabled_exchanges = config.exchanges.enabled_exchanges();
 
     // 批量创建所有策略
-    let mut strategies: Vec<Box<dyn fee_arb::strategy::Strategy>> = symbols
+    let strategies: Vec<Box<dyn fee_arb::strategy::Strategy>> = symbols
         .iter()
         .map(|symbol| {
             Box::new(FundingArbStrategy::new(
@@ -119,26 +117,6 @@ async fn main() -> anyhow::Result<()> {
             )) as Box<dyn fee_arb::strategy::Strategy>
         })
         .collect();
-
-    // SpreadArb 策略 (IBKR 股票 vs Hyperliquid 永续)
-    if let Some(ref spread_arb_config) = config.strategy.spread_arb {
-        if config.exchanges.ibkr.is_some() {
-            let hl = &config.exchanges.hyperliquid;
-            for symbol in &spread_arb_config.symbols {
-                strategies.push(Box::new(SpreadArbStrategy::new(
-                    spread_arb_config.clone(),
-                    symbol.clone(),
-                    hl.hl_symbol(symbol),
-                )));
-            }
-            tracing::info!(
-                count = spread_arb_config.symbols.len(),
-                "SpreadArb strategies created"
-            );
-        } else {
-            tracing::warn!("spread_arb configured but IBKR is not enabled, skipping");
-        }
-    }
 
     let strategy_count = strategies.len();
 
@@ -154,24 +132,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref monitoring) = config.monitoring {
         init_funding_arb_metrics(&manager, monitoring).await?;
         init_slack(&manager, monitoring).await?;
-    }
-
-    // SpreadArb 统计 + 持久化
-    if let Some(ref spread_arb_config) = config.strategy.spread_arb {
-        if config.exchanges.ibkr.is_none() {
-            // spread_arb 策略创建时已 warn，此处无需重复
-        } else if let Some(ref db_config) = config.database {
-            // symbols 需包含 IBKR 侧和 HL 侧 (e.g., "AAPL" + "xyz:AAPL")
-            let hl = &config.exchanges.hyperliquid;
-            let all_symbols = spread_arb_config
-                .symbols
-                .iter()
-                .flat_map(|s| vec![s.clone(), hl.hl_symbol(s)]);
-            init_spread_arb_stats(&manager, all_symbols, db_config)
-                .await?;
-        } else {
-            tracing::warn!("spread_arb configured but database is not set, signals/orders/fills will not be persisted");
-        }
     }
 
     wait_for_shutdown(manager).await;

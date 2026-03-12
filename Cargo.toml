@@ -84,9 +84,5 @@ name = "funding_arb"
 path = "src/bin/funding_arb.rs"
 
 [[bin]]
-name = "spread_arb"
-path = "src/bin/spread_arb.rs"
-
-[[bin]]
 name = "macd_grid"
 path = "src/bin/macd_grid.rs"
