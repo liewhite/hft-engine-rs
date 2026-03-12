@@ -189,7 +189,9 @@ impl FundingArbStrategy {
 
         // 计算单个交易所的 symbol 杠杆率
         let calc_leverage = |exchange: Exchange| -> f64 {
-            let equity = state_manager.equity(exchange).unwrap_or(0.0);
+            let Some(equity) = state_manager.equity(exchange) else {
+                return 0.0;
+            };
             if equity <= 0.0 {
                 return 0.0;
             }
@@ -287,8 +289,20 @@ impl FundingArbStrategy {
         state: &SymbolState,
         state_manager: &StateManager,
     ) {
-        let short_equity = state_manager.equity(signal.short_exchange).unwrap_or(0.0);
-        let long_equity = state_manager.equity(signal.long_exchange).unwrap_or(0.0);
+        let (Some(short_equity), Some(long_equity)) = (
+            state_manager.equity(signal.short_exchange),
+            state_manager.equity(signal.long_exchange),
+        ) else {
+            tracing::warn!(
+                symbol = %self.symbol,
+                short_exchange = %signal.short_exchange,
+                long_exchange = %signal.long_exchange,
+                "Equity not yet available, skipping leverage check"
+            );
+            signal.long_size = 0.0;
+            signal.short_size = 0.0;
+            return;
+        };
 
         if short_equity <= 0.0 || long_equity <= 0.0 {
             tracing::warn!(
@@ -356,8 +370,20 @@ impl FundingArbStrategy {
         state: &SymbolState,
         state_manager: &StateManager,
     ) {
-        let short_equity = state_manager.equity(signal.short_exchange).unwrap_or(0.0);
-        let long_equity = state_manager.equity(signal.long_exchange).unwrap_or(0.0);
+        let (Some(short_equity), Some(long_equity)) = (
+            state_manager.equity(signal.short_exchange),
+            state_manager.equity(signal.long_exchange),
+        ) else {
+            tracing::warn!(
+                symbol = %self.symbol,
+                short_exchange = %signal.short_exchange,
+                long_exchange = %signal.long_exchange,
+                "Account leverage check: equity not yet available"
+            );
+            signal.long_size = 0.0;
+            signal.short_size = 0.0;
+            return;
+        };
 
         if short_equity <= 0.0 || long_equity <= 0.0 {
             tracing::warn!(

@@ -269,7 +269,7 @@ fn parse_private_message(
             let mut events = Vec::new();
             for data in &push.data {
                 let mut position = data.to_position()
-                    .map_err(|e| WsError::ParseError(e))?;
+                    ?;
                 // OKX 私有 WS 只推送已配置 symbol 的仓位（通过 SWAP instType 过滤），
                 // 因此 symbol_metas 查找不会失败
                 let meta = symbol_metas
@@ -300,9 +300,9 @@ fn parse_private_message(
                     data: ExchangeEventData::AccountInfo {
                         exchange: Exchange::OKX,
                         equity: data.to_equity()
-                            .map_err(|e| WsError::ParseError(e))?,
+                            ?,
                         notional: data.to_notional()
-                            .map_err(|e| WsError::ParseError(e))?,
+                            ?,
                     },
                 });
             }
@@ -315,7 +315,7 @@ fn parse_private_message(
             let mut events = Vec::new();
             for data in &push.data {
                 let mut order_update = data.to_order_update()
-                    .map_err(|e| WsError::ParseError(e))?;
+                    ?;
 
                 // 获取 meta 转换数量单位（张 -> 币）
                 if let Some(meta) = symbol_metas.get(&order_update.symbol) {
@@ -325,7 +325,7 @@ fn parse_private_message(
 
                 // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
                 if let Some(mut fill) = data.to_fill()
-                    .map_err(|e| WsError::ParseError(e))? {
+                    ? {
                     // 获取 meta 转换数量单位（张 -> 币）
                     if let Some(meta) = symbol_metas.get(&fill.symbol) {
                         fill.size = meta.qty_to_coin(fill.size);

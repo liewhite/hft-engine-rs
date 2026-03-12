@@ -307,7 +307,7 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
             let mut events = Vec::new();
             for data in &push.data {
                 let rate = data.to_funding_rate(local_ts)
-                    .map_err(|e| WsError::ParseError(e))?;
+                    ?;
                 events.push(IncomeEvent {
                     exchange_ts: local_ts,
                     local_ts,
@@ -328,7 +328,7 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
             let mut events = Vec::new();
             for data in &push.data {
                 let bbo = data.to_bbo(inst_id)
-                    .map_err(|e| WsError::ParseError(e))?;
+                    ?;
                 events.push(IncomeEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,
@@ -344,7 +344,7 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
             let mut events = Vec::new();
             for data in &push.data {
                 let mp = data.to_mark_price()
-                    .map_err(|e| WsError::ParseError(e))?;
+                    ?;
                 events.push(IncomeEvent {
                     exchange_ts: mp.timestamp,
                     local_ts,
@@ -360,7 +360,7 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
             let mut events = Vec::new();
             for data in &push.data {
                 let ip = data.to_index_price()
-                    .map_err(|e| WsError::ParseError(e))?;
+                    ?;
                 events.push(IncomeEvent {
                     exchange_ts: ip.timestamp,
                     local_ts,

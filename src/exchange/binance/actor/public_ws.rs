@@ -342,7 +342,7 @@ fn parse_public_message(
             let update: MarkPriceUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
             let symbol = update.symbol(quote)
-                .map_err(|e| WsError::ParseError(e))?;
+                ?;
 
             let mut events = Vec::new();
 
@@ -354,7 +354,7 @@ fn parse_public_message(
                     local_ts,
                     data: ExchangeEventData::FundingRate(
                         update.to_funding_rate(quote, exchange_ts)
-                            .map_err(|e| WsError::ParseError(e))?,
+                            ?,
                     ),
                 });
             }
@@ -364,7 +364,7 @@ fn parse_public_message(
                     local_ts,
                     data: ExchangeEventData::MarkPrice(
                         update.to_mark_price(quote, exchange_ts)
-                            .map_err(|e| WsError::ParseError(e))?,
+                            ?,
                     ),
                 });
             }
@@ -374,7 +374,7 @@ fn parse_public_message(
                     local_ts,
                     data: ExchangeEventData::IndexPrice(
                         update.to_index_price(quote, exchange_ts)
-                            .map_err(|e| WsError::ParseError(e))?,
+                            ?,
                     ),
                 });
             }
@@ -385,7 +385,7 @@ fn parse_public_message(
             let ticker: BookTicker = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
             let bbo = ticker.to_bbo(quote)
-                .map_err(|e| WsError::ParseError(e))?;
+                ?;
             Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,

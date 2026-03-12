@@ -113,6 +113,12 @@ pub enum WsError {
     ParseError(String),
 }
 
+impl From<String> for WsError {
+    fn from(s: String) -> Self {
+        WsError::ParseError(s)
+    }
+}
+
 // ============================================================================
 // ExchangeActorOps trait (类型擦除的 Actor 操作接口)
 // ============================================================================

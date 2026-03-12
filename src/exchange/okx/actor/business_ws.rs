@@ -126,7 +126,7 @@ impl OkxBusinessWsActor {
         let mut candles: Vec<_> = data.data.iter().rev()
             .map(|raw| parse_candle_data(raw, &inst_id, interval))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| WsError::ParseError(e))?;
+            ?;
 
         // 最新一条若未 confirm 则删除（WS 实时推送会补上）
         if candles.last().is_some_and(|c| !c.confirm) {
@@ -393,7 +393,7 @@ fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, 
         let mut events = Vec::new();
         for raw_data in &push.data {
             let candle = parse_candle_data(raw_data, inst_id, interval)
-                .map_err(|e| WsError::ParseError(e))?;
+                ?;
             events.push(IncomeEvent {
                 exchange_ts: candle.open_time,
                 local_ts,

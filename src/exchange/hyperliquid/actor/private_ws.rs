@@ -277,7 +277,7 @@ fn parse_clearinghouse_state(
     );
     for wrapper in &state.asset_positions {
         let position = wrapper.position.to_position()
-            .map_err(|e| WsError::ParseError(e))?;
+            ?;
         // 只处理非零仓位
         if position.size.abs() > 1e-10 {
             tracing::debug!(
@@ -365,7 +365,7 @@ fn parse_order_updates(
         let order_update: WsOrderUpdate = serde_json::from_value(update.clone())
             .map_err(|e| WsError::ParseError(format!("orderUpdate parse: {}", e)))?;
         let update = order_update.to_order_update()
-            .map_err(|e| WsError::ParseError(e))?;
+            ?;
         events.push(IncomeEvent {
             exchange_ts: update.timestamp,
             local_ts,
@@ -397,7 +397,7 @@ fn parse_user_fills(
     let mut events = Vec::new();
     for ws_fill in &user_fills.fills {
         let fill = ws_fill.to_fill()
-            .map_err(|e| WsError::ParseError(e))?;
+            ?;
         events.push(IncomeEvent {
             exchange_ts: fill.timestamp,
             local_ts,

@@ -342,7 +342,7 @@ fn parse_public_message(
                         local_ts,
                         data: ExchangeEventData::FundingRate(
                             ctx.to_funding_rate(local_ts)
-                                .map_err(|e| WsError::ParseError(e))?,
+                                ?,
                         ),
                     });
                 }
@@ -354,7 +354,7 @@ fn parse_public_message(
                         local_ts,
                         data: ExchangeEventData::MarkPrice(
                             ctx.to_mark_price(local_ts)
-                                .map_err(|e| WsError::ParseError(e))?,
+                                ?,
                         ),
                     });
                 }
@@ -364,7 +364,7 @@ fn parse_public_message(
                         local_ts,
                         data: ExchangeEventData::IndexPrice(
                             ctx.to_index_price(local_ts)
-                                .map_err(|e| WsError::ParseError(e))?,
+                                ?,
                         ),
                     });
                 }
@@ -378,7 +378,7 @@ fn parse_public_message(
                     .map_err(|e| WsError::ParseError(format!("bbo parse: {}", e)))?;
 
                 let bbo = bbo_data.to_bbo()
-                    .map_err(|e| WsError::ParseError(e))?;
+                    ?;
                 return Ok(vec![IncomeEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,

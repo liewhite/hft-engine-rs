@@ -284,11 +284,13 @@ impl AssetPosition {
         let size = f64::from_str(&self.szi)
             .map_err(|_| format!("Failed to parse szi: {}", self.szi))?;
         // entry_px 在空仓 (size=0) 时可能为 None，此时使用 0.0
-        let entry_price = self
-            .entry_px
-            .as_ref()
-            .and_then(|p| f64::from_str(p).ok())
-            .unwrap_or(0.0);
+        let entry_price = match self.entry_px.as_deref() {
+            Some(p) => f64::from_str(p).unwrap_or_else(|_| {
+                tracing::warn!(coin = %self.coin, entry_px = %p, "Failed to parse entry_px, defaulting to 0.0");
+                0.0
+            }),
+            None => 0.0,
+        };
         let unrealized_pnl = f64::from_str(&self.unrealized_pnl)
             .map_err(|_| format!("Failed to parse unrealized_pnl: {}", self.unrealized_pnl))?;
 
