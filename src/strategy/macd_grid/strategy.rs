@@ -245,6 +245,8 @@ impl MacdGridStrategy {
             last = mid_price;
         }
 
+        // 同时收集减仓和开仓订单：减仓是保护性挂单（止盈/止损），
+        // 开仓是网格推进，两者可以并存（如持多时同时挂卖出减仓 + 买入加仓）
         let mut orders = Vec::new();
         let mut comments = Vec::new();
 
@@ -323,6 +325,12 @@ impl MacdGridStrategy {
         comment: &str,
     ) -> Option<Order> {
         if qty <= 0.0 || price <= 0.0 {
+            tracing::warn!(
+                symbol = %self.symbol(),
+                side = ?side,
+                price, qty,
+                "Grid make_order skipped: invalid price or qty"
+            );
             return None;
         }
 
