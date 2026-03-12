@@ -114,6 +114,9 @@ impl ExecutorActor {
                         .send()
                         .await;
                 }
+                cancel @ OutcomeEvent::CancelOrder { .. } => {
+                    let _ = self.outcome_pubsub.tell(Publish(cancel)).send().await;
+                }
             }
         }
     }

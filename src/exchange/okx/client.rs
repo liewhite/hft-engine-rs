@@ -2,7 +2,8 @@
 
 use super::symbol::{from_okx, to_okx};
 use crate::domain::{
-    Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
+    Exchange, ExchangeError, Order, OrderId, OrderStatus, OrderType, OrderUpdate, Side, Symbol,
+    SymbolMeta, TimeInForce, now_ms,
 };
 use crate::exchange::client::ExchangeClient;
 pub use crate::exchange::okx::OkxCredentials;
@@ -224,6 +225,163 @@ impl ExchangeClient for OkxClient {
         let all = self.get_all_instruments().await?;
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
         Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
+    }
+
+    async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
+        let path = "/api/v5/trade/cancel-order";
+        let inst_id = to_okx(symbol, &self.quote);
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CancelRequest {
+            inst_id: String,
+            ord_id: String,
+        }
+
+        let request = CancelRequest {
+            inst_id,
+            ord_id: order_id.clone(),
+        };
+
+        let body = serde_json::to_string(&request)?;
+        let timestamp = Self::iso_timestamp();
+        let sign = self
+            .sign(&timestamp, "POST", path, &body)
+            .ok_or_else(|| ExchangeError::Other("No credentials".to_string()))?;
+        let headers = self
+            .build_headers(&sign, &timestamp)
+            .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CancelData {
+            s_code: String,
+            s_msg: String,
+        }
+
+        #[derive(Deserialize)]
+        struct Response {
+            code: String,
+            msg: String,
+            data: Vec<CancelData>,
+        }
+
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        if let Some(cancel_data) = data.data.first() {
+            if cancel_data.s_code != "0" {
+                return Err(ExchangeError::ApiError(
+                    Exchange::OKX,
+                    cancel_data.s_code.parse().unwrap_or(-1),
+                    cancel_data.s_msg.clone(),
+                ));
+            }
+            return Ok(());
+        }
+
+        if data.code != "0" {
+            return Err(map_okx_error(&data.code, &data.msg));
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
+        let inst_id = to_okx(symbol, &self.quote);
+        let path = format!(
+            "/api/v5/trade/orders-pending?instId={}&instType=SWAP",
+            inst_id
+        );
+        let timestamp = Self::iso_timestamp();
+        let sign = self
+            .sign(&timestamp, "GET", &path, "")
+            .ok_or_else(|| ExchangeError::Other("No credentials".to_string()))?;
+        let headers = self
+            .build_headers(&sign, &timestamp)
+            .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PendingOrderData {
+            inst_id: String,
+            ord_id: String,
+            cl_ord_id: Option<String>,
+            side: String,
+            state: String,
+            #[allow(unused)]
+            sz: String,
+            acc_fill_sz: String,
+        }
+
+        #[derive(Deserialize)]
+        struct Response {
+            code: String,
+            msg: String,
+            data: Vec<PendingOrderData>,
+        }
+
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        if data.code != "0" {
+            return Err(map_okx_error(&data.code, &data.msg));
+        }
+
+        let mut updates = Vec::new();
+        for d in &data.data {
+            let sym = match from_okx(&d.inst_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            let side = match d.side.as_str() {
+                "buy" => Side::Long,
+                "sell" => Side::Short,
+                _ => continue,
+            };
+            let acc_fill_sz: f64 = d.acc_fill_sz.parse().unwrap_or(0.0);
+            let status = match d.state.as_str() {
+                "live" => OrderStatus::Pending,
+                "partially_filled" => OrderStatus::PartiallyFilled { filled: acc_fill_sz },
+                _ => continue,
+            };
+
+            // 用 cl_ord_id 或 fallback 到 ord_id，确保 pending_orders 能跟踪
+            let client_order_id = d
+                .cl_ord_id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| d.ord_id.clone());
+
+            updates.push(OrderUpdate {
+                order_id: d.ord_id.clone(),
+                client_order_id: Some(client_order_id),
+                exchange: Exchange::OKX,
+                symbol: sym,
+                side,
+                status,
+                filled_quantity: acc_fill_sz,
+                fill_sz: 0.0,
+                timestamp: now_ms(),
+            });
+        }
+
+        Ok(updates)
     }
 
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {

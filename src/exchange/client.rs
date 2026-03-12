@@ -2,7 +2,7 @@
 //!
 //! ExchangeClient trait 封装交易所 REST 交互
 
-use crate::domain::{CandleInterval, Exchange, ExchangeError, Order, OrderId, Symbol, SymbolMeta};
+use crate::domain::{CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderUpdate, Symbol, SymbolMeta};
 use async_trait::async_trait;
 
 /// 账户信息 (净值 + 总持仓名义价值)
@@ -68,6 +68,12 @@ pub trait ExchangeClient: Send + Sync + 'static {
 
     /// 下单
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError>;
+
+    /// 撤单
+    async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError>;
+
+    /// 查询当前挂单（live + partially_filled）
+    async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError>;
 
     /// 设置杠杆
     async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError>;

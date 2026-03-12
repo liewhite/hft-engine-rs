@@ -195,6 +195,10 @@ impl Message<OutcomeEvent> for SlackNotifierActor {
                 let message = Self::format_place_orders_message(&orders, &comment);
                 self.send_slack_message(&message).await;
             }
+            OutcomeEvent::CancelOrder { exchange, symbol, order_id } => {
+                let message = format!("Cancel order: {} {} {}", exchange, symbol, order_id);
+                self.send_slack_message(&message).await;
+            }
         }
     }
 }

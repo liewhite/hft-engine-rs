@@ -402,6 +402,7 @@ impl Message<OutcomeEvent> for SpreadArbStatsActor {
             OutcomeEvent::PlaceOrders { orders, comment } => {
                 self.on_place_orders(&orders, &comment).await;
             }
+            OutcomeEvent::CancelOrder { .. } => {}
         }
     }
 }

@@ -11,7 +11,8 @@ use super::{
     IncomeProcessorActor, OutcomePubSub, OutcomeProcessorActor, RegisterExecutor,
     OutcomeProcessorArgs,
 };
-use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
+use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta, now_ms};
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::exchange::binance::{
     BinanceActor, BinanceActorArgs, BinanceClient, BinanceCredentials, REST_BASE_URL,
 };
@@ -49,6 +50,9 @@ pub struct ManagerActorArgs {
 pub struct ManagerActor {
     // === Symbol Metas 缓存 ===
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
+
+    // === Exchange Clients (REST) ===
+    clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
 
     // === PubSub Actors ===
     /// Income PubSub (行情/账户事件)
@@ -165,7 +169,60 @@ impl ManagerActor {
             }
         }
 
-        // 5. 批量向各 ExchangeActors 发送订阅请求
+        // 5. 查询各交易所现有挂单，作为 OrderUpdate 推送给 executor（在行情订阅之前）
+        {
+            // 收集所有策略涉及的 (exchange, symbol) 对
+            let exchange_symbols: HashSet<(Exchange, Symbol)> = all_subscriptions
+                .iter()
+                .map(|(exchange, kind)| (*exchange, kind.symbol().clone()))
+                .collect();
+
+            for (exchange, symbol) in &exchange_symbols {
+                let client = match self.clients.get(exchange) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                match client.fetch_pending_orders(symbol).await {
+                    Ok(updates) => {
+                        if !updates.is_empty() {
+                            tracing::info!(
+                                %exchange,
+                                %symbol,
+                                count = updates.len(),
+                                "Fetched existing pending orders on startup"
+                            );
+                        }
+                        let local_ts = now_ms();
+                        for update in updates {
+                            let event = IncomeEvent {
+                                exchange_ts: local_ts,
+                                local_ts,
+                                data: ExchangeEventData::OrderUpdate(update),
+                            };
+                            // 通过 income_pubsub 广播，IncomeProcessor 会路由到对应 executor
+                            if let Err(e) = self
+                                .income_pubsub
+                                .tell(kameo_actors::pubsub::Publish(event))
+                                .send()
+                                .await
+                            {
+                                tracing::error!(error = %e, "Failed to publish existing order update");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %exchange,
+                            %symbol,
+                            error = %e,
+                            "Failed to fetch pending orders on startup, proceeding without"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 6. 批量向各 ExchangeActors 发送订阅请求
         for (exchange, kinds) in exchange_subscriptions {
             if let Some(actor) = self.exchange_actors.get(&exchange) {
                 actor
@@ -359,6 +416,7 @@ impl Actor for ManagerActor {
 
         Ok(Self {
             symbol_metas,
+            clients,
             income_pubsub,
             outcome_pubsub,
             income_processor: processor,

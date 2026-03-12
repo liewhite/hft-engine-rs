@@ -74,6 +74,32 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         match msg {
+            OutcomeEvent::CancelOrder { exchange, symbol, order_id } => {
+                let client = match self.clients.get(&exchange) {
+                    Some(e) => e.clone(),
+                    None => {
+                        tracing::error!(%exchange, "No client found for cancel_order");
+                        return;
+                    }
+                };
+
+                if self.dry_run {
+                    tracing::warn!(%exchange, %symbol, %order_id, "[DRY-RUN] CancelOrder NOT sent");
+                    return;
+                }
+
+                tracing::info!(%exchange, %symbol, %order_id, "Cancelling order");
+                tokio::spawn(async move {
+                    match client.cancel_order(&symbol, &order_id).await {
+                        Ok(()) => {
+                            tracing::info!(%exchange, %symbol, %order_id, "Order cancelled successfully");
+                        }
+                        Err(e) => {
+                            tracing::error!(%exchange, %symbol, %order_id, error = %e, "Failed to cancel order");
+                        }
+                    }
+                });
+            }
             OutcomeEvent::PlaceOrders { orders, comment } => {
                 // 关联订单独立并行下单：IOC 订单本身接受部分成交，
                 // 敞口由策略层 rebalance 机制兜底修正。

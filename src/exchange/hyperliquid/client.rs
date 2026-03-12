@@ -366,6 +366,14 @@ impl ExchangeClient for HyperliquidClient {
             .collect())
     }
 
+    async fn cancel_order(&self, _symbol: &Symbol, _order_id: &OrderId) -> Result<(), ExchangeError> {
+        Err(ExchangeError::Other("Hyperliquid cancel_order not implemented".to_string()))
+    }
+
+    async fn fetch_pending_orders(&self, _symbol: &Symbol) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
+        Ok(vec![])
+    }
+
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
         // 确保有签名器
         let signer = self

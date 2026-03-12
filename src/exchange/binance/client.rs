@@ -371,6 +371,14 @@ impl ExchangeClient for BinanceClient {
         Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
     }
 
+    async fn cancel_order(&self, _symbol: &Symbol, _order_id: &OrderId) -> Result<(), ExchangeError> {
+        Err(ExchangeError::Other("Binance cancel_order not implemented".to_string()))
+    }
+
+    async fn fetch_pending_orders(&self, _symbol: &Symbol) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
+        Ok(vec![])
+    }
+
     async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
         let api_key = self
             .api_key()

@@ -12,7 +12,7 @@ pub use spread_arb::{
     SpreadArbStatsArgs, SpreadArbStrategy, SpreadPairConfig,
 };
 
-use crate::domain::{Exchange, Order};
+use crate::domain::{Exchange, Order, OrderId, Symbol};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{IncomeEvent, StateManager};
 use std::collections::{HashMap, HashSet};
@@ -26,6 +26,12 @@ pub enum OutcomeEvent {
         orders: Vec<Order>,
         /// 信号意图描述，如 "spread_open | spread=0.30% | qty=10"
         comment: String,
+    },
+    /// 撤单信号
+    CancelOrder {
+        exchange: Exchange,
+        symbol: Symbol,
+        order_id: OrderId,
     },
 }
 
