@@ -400,10 +400,11 @@ impl FundingArbStrategy {
         }
 
         // 计算两边交易所的账户杠杆率
-        let short_notional = state_manager.account_notional(signal.short_exchange).unwrap_or(0.0);
+        // equity 有值说明账户数据已到达，notional 必然也有值
+        let short_notional = state_manager.account_notional(signal.short_exchange).unwrap();
         let short_leverage = short_notional / short_equity;
 
-        let long_notional = state_manager.account_notional(signal.long_exchange).unwrap_or(0.0);
+        let long_notional = state_manager.account_notional(signal.long_exchange).unwrap();
         let long_leverage = long_notional / long_equity;
 
         // 获取当前 symbol 在各交易所的仓位
