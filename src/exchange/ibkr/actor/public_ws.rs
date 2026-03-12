@@ -18,7 +18,7 @@ use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -45,6 +45,8 @@ struct BboCache {
     ask_size: f64,
 }
 
+const MAX_SEEN_EXECUTIONS: usize = 10_000;
+
 /// IbkrPublicWsActor
 pub struct IbkrPublicWsActor {
     income_pubsub: ActorRef<IncomePubSub>,
@@ -60,6 +62,8 @@ pub struct IbkrPublicWsActor {
     bbo_cache: HashMap<i64, BboCache>,
     /// 已处理的 execution_id 集合（IBKR 对同一成交会推多条消息，需去重）
     seen_executions: HashSet<String>,
+    /// 按插入顺序记录 execution_id，用于淘汰最旧条目（容量上限 MAX_SEEN_EXECUTIONS）
+    seen_executions_order: VecDeque<String>,
 }
 
 impl IbkrPublicWsActor {
@@ -337,9 +341,18 @@ impl IbkrPublicWsActor {
                 .get("execution_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if !execution_id.is_empty() && !self.seen_executions.insert(execution_id.to_string()) {
-                tracing::debug!(execution_id, "IBKR trade: duplicate execution_id, skipping");
-                continue;
+            if !execution_id.is_empty() {
+                if !self.seen_executions.insert(execution_id.to_string()) {
+                    tracing::debug!(execution_id, "IBKR trade: duplicate execution_id, skipping");
+                    continue;
+                }
+                self.seen_executions_order
+                    .push_back(execution_id.to_string());
+                if self.seen_executions_order.len() > MAX_SEEN_EXECUTIONS {
+                    if let Some(oldest) = self.seen_executions_order.pop_front() {
+                        self.seen_executions.remove(&oldest);
+                    }
+                }
             }
 
             // 解析字段
@@ -536,6 +549,7 @@ impl Actor for IbkrPublicWsActor {
             subscribed: HashSet::new(),
             bbo_cache: HashMap::new(),
             seen_executions: HashSet::new(),
+            seen_executions_order: VecDeque::new(),
         })
     }
 
