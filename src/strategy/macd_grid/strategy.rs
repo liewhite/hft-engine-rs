@@ -247,12 +247,16 @@ impl MacdGridStrategy {
 
         // 同时收集减仓和开仓订单：减仓是保护性挂单（止盈/止损），
         // 开仓是网格推进，两者可以并存（如持多时同时挂卖出减仓 + 买入加仓）
+        // 每个方向至多一笔挂单，已有同方向挂单时跳过
+        let has_pending_long = symbol_state.has_pending_side(Side::Long);
+        let has_pending_short = symbol_state.has_pending_side(Side::Short);
+
         let mut orders = Vec::new();
         let mut comments = Vec::new();
 
         // === 减仓 ===
         // 有多头仓位 → 卖出减仓
-        if pos_size > POSITION_EPSILON {
+        if pos_size > POSITION_EPSILON && !has_pending_short {
             let grid_price = last + reduce_sell_spacing;
             let qty = (self.config.order_usd_value / grid_price).min(pos_size);
             if let Some(order) = self.make_order(
@@ -265,7 +269,7 @@ impl MacdGridStrategy {
             }
         }
         // 有空头仓位 → 买入减仓
-        if pos_size < -POSITION_EPSILON {
+        if pos_size < -POSITION_EPSILON && !has_pending_long {
             let grid_price = last - reduce_buy_spacing;
             let qty = (self.config.order_usd_value / grid_price).min(pos_size.abs());
             if let Some(order) = self.make_order(
@@ -280,7 +284,7 @@ impl MacdGridStrategy {
 
         // === 开仓 ===
         // 允许开多且未超限 → 买入开多
-        if params.max_long_usd > 0.0 && long_usd < params.max_long_usd {
+        if params.max_long_usd > 0.0 && long_usd < params.max_long_usd && !has_pending_long {
             let grid_price = last - open_buy_spacing;
             let qty = self.config.order_usd_value / grid_price;
             if let Some(order) = self.make_order(
@@ -293,7 +297,7 @@ impl MacdGridStrategy {
             }
         }
         // 允许开空且未超限 → 卖出开空
-        if params.max_short_usd > 0.0 && short_usd < params.max_short_usd {
+        if params.max_short_usd > 0.0 && short_usd < params.max_short_usd && !has_pending_short {
             let grid_price = last + open_sell_spacing;
             let qty = self.config.order_usd_value / grid_price;
             if let Some(order) = self.make_order(
@@ -487,12 +491,6 @@ impl Strategy for MacdGridStrategy {
             }
             ExchangeEventData::BBO(_) => {
                 if self.trend.is_none() || !self.indicators_ready() {
-                    return vec![];
-                }
-                let Some(symbol_state) = state.symbol_state(self.symbol()) else {
-                    return vec![];
-                };
-                if symbol_state.has_pending_orders() {
                     return vec![];
                 }
                 self.check_grid(state)

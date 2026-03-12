@@ -97,11 +97,7 @@ impl ExecutorActor {
                         .into_iter()
                         .map(|o| {
                             let c = self.convert_order(o);
-                            self.state_manager.add_pending_order(
-                                &c.symbol,
-                                c.client_order_id.clone(),
-                                c.exchange,
-                            );
+                            self.state_manager.add_pending_order(c.clone());
                             c
                         })
                         .collect();

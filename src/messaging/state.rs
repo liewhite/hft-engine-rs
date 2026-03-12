@@ -1,11 +1,11 @@
-use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, OrderStatus, Position, Side, Symbol, Timestamp, BBO};
+use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, OrderType, Position, Side, Symbol, Timestamp, TimeInForce, BBO};
 use crate::messaging::event::{ExchangeEventData, IncomeEvent};
 use std::collections::HashMap;
 
-/// 待处理订单信息
+/// 待处理订单信息（保存完整订单 + 运行时状态）
 #[derive(Debug, Clone)]
 pub struct PendingOrder {
-    pub exchange: Exchange,
+    pub order: Order,
     pub status: OrderStatus,
     pub created_at: Timestamp,
 }
@@ -38,14 +38,10 @@ impl SymbolState {
     }
 
     /// 添加待处理订单 (发送订单信号时调用)
-    pub fn add_pending_order(
-        &mut self,
-        client_order_id: String,
-        exchange: Exchange,
-        created_at: Timestamp,
-    ) {
+    pub fn add_pending_order(&mut self, order: Order, created_at: Timestamp) {
+        let client_order_id = order.client_order_id.clone();
         self.pending_orders.insert(client_order_id, PendingOrder {
-            exchange,
+            order,
             status: OrderStatus::Created,
             created_at,
         });
@@ -63,24 +59,24 @@ impl SymbolState {
         let before = self.pending_orders.len();
         let symbol = self.symbol.clone();
         let safe_timeout_ms = timeout_ms * 3;
-        self.pending_orders.retain(|client_id, order| {
-            let elapsed = now.saturating_sub(order.created_at);
-            if elapsed > timeout_ms && order.status == OrderStatus::Created {
+        self.pending_orders.retain(|client_id, pending| {
+            let elapsed = now.saturating_sub(pending.created_at);
+            if elapsed > timeout_ms && pending.status == OrderStatus::Created {
                 tracing::warn!(
                     symbol = %symbol,
                     client_order_id = %client_id,
-                    exchange = %order.exchange,
+                    exchange = %pending.order.exchange,
                     elapsed_ms = elapsed,
                     "Order timed out (no exchange confirmation), removing from pending"
                 );
                 return false;
             }
-            if elapsed > safe_timeout_ms && order.status != OrderStatus::Created {
+            if elapsed > safe_timeout_ms && pending.status != OrderStatus::Created {
                 tracing::warn!(
                     symbol = %symbol,
                     client_order_id = %client_id,
-                    exchange = %order.exchange,
-                    status = ?order.status,
+                    exchange = %pending.order.exchange,
+                    status = ?pending.status,
                     elapsed_ms = elapsed,
                     "Confirmed order timed out (terminal status lost), force removing from pending"
                 );
@@ -186,6 +182,16 @@ impl SymbolState {
         !self.pending_orders.is_empty()
     }
 
+    /// 是否有指定方向的未完成订单
+    pub fn has_pending_side(&self, side: Side) -> bool {
+        self.pending_orders.values().any(|p| p.order.side == side)
+    }
+
+    /// 获取所有待处理订单
+    pub fn pending_orders(&self) -> impl Iterator<Item = &PendingOrder> {
+        self.pending_orders.values()
+    }
+
     /// 获取多空仓位大小
     ///
     /// 返回 (多头总量, 空头总量):
@@ -266,14 +272,27 @@ impl SymbolState {
                         }
                         OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
                             // 交易所已确认订单，更新或注册状态
-                            if let Some(order) = self.pending_orders.get_mut(client_id) {
-                                order.status = update.status.clone();
+                            if let Some(pending) = self.pending_orders.get_mut(client_id) {
+                                pending.status = update.status.clone();
                             } else {
                                 // 启动时同步的现有挂单，注册到 pending_orders
+                                // 从 OrderUpdate 重建 Order（缺少 order_type 等信息，用占位值）
                                 self.pending_orders.insert(
                                     client_id.clone(),
                                     PendingOrder {
-                                        exchange: update.exchange,
+                                        order: Order {
+                                            id: update.order_id.clone(),
+                                            exchange: update.exchange,
+                                            symbol: update.symbol.clone(),
+                                            side: update.side,
+                                            order_type: OrderType::Limit {
+                                                price: 0.0,
+                                                tif: TimeInForce::GTC,
+                                            },
+                                            quantity: 0.0,
+                                            reduce_only: false,
+                                            client_order_id: client_id.clone(),
+                                        },
                                         status: update.status.clone(),
                                         created_at: update.timestamp,
                                     },

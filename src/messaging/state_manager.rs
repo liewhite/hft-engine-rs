@@ -1,4 +1,4 @@
-use crate::domain::{now_ms, Exchange, MarketStatus, Symbol, USDT};
+use crate::domain::{now_ms, Exchange, MarketStatus, Order, Symbol, USDT};
 use crate::exchange::AccountInfo;
 use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
 use std::collections::HashMap;
@@ -40,16 +40,12 @@ impl StateManager {
     ///
     /// # Panics
     /// symbol 不存在时 panic（表示配置错误）
-    pub fn add_pending_order(
-        &mut self,
-        symbol: &Symbol,
-        client_order_id: String,
-        exchange: Exchange,
-    ) {
+    pub fn add_pending_order(&mut self, order: Order) {
+        let symbol = order.symbol.clone();
         self.states
-            .get_mut(symbol)
+            .get_mut(&symbol)
             .expect("Symbol not found in StateManager")
-            .add_pending_order(client_order_id, exchange, now_ms());
+            .add_pending_order(order, now_ms());
     }
 
     // ==================== 状态查询 ====================
