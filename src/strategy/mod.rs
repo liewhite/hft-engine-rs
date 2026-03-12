@@ -46,6 +46,6 @@ pub trait Strategy: Send + Sync {
     /// 订单超时时间 (毫秒)
     fn order_timeout_ms(&self) -> u64;
 
-    /// 处理事件，一次事件最多产出一个信号
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Option<OutcomeEvent>;
+    /// 处理事件，可产出零到多个信号
+    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent>;
 }

@@ -773,9 +773,11 @@ impl Strategy for FundingArbStrategy {
         self.config.order_timeout_ms
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Option<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
         // 获取本策略关注的 symbol 状态
-        let symbol_state = state.symbol_state(&self.symbol)?;
+        let Some(symbol_state) = state.symbol_state(&self.symbol) else {
+            return vec![];
+        };
 
         // BBO 事件时更新该交易所的 bid/ask EMA
         if let ExchangeEventData::BBO(bbo) = &event.data {
@@ -784,21 +786,22 @@ impl Strategy for FundingArbStrategy {
 
         // EMA 未预热完成，不进行交易
         if !self.all_emas_ready() {
-            return None;
+            return vec![];
         }
 
         // 有未完成订单时等待
         if symbol_state.has_pending_orders() {
-            return None;
+            return vec![];
         }
 
         // 步骤 1: 敞口超限 → rebalance（平掉多余仓位）
         if let Some((exchange, qty)) = self.check_rebalance_needed(symbol_state) {
-            let (order, comment) = self.make_rebalance_order(symbol_state, exchange, qty)?;
-            return Some(OutcomeEvent::PlaceOrders {
-                orders: vec![order],
-                comment,
-            });
+            if let Some((order, comment)) = self.make_rebalance_order(symbol_state, exchange, qty) {
+                return vec![OutcomeEvent::PlaceOrders {
+                    orders: vec![order],
+                    comment,
+                }];
+            }
         }
 
         // 步骤 2: 检查信号并通过 pipeline 处理
@@ -816,10 +819,10 @@ impl Strategy for FundingArbStrategy {
                     processed.long_deviation * 100.0,
                     net_exposure,
                 );
-                return Some(OutcomeEvent::PlaceOrders { orders, comment });
+                return vec![OutcomeEvent::PlaceOrders { orders, comment }];
             }
         }
 
-        None
+        vec![]
     }
 }

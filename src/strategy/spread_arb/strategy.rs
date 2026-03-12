@@ -330,16 +330,16 @@ impl Strategy for SpreadArbStrategy {
         self.config.order_timeout_ms
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Option<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
         // Clock 事件: 打印当前状态摘要
         if matches!(&event.data, ExchangeEventData::Clock) {
             self.log_status(state);
-            return None;
+            return vec![];
         }
 
         // 只响应 BBO 事件
         if !matches!(&event.data, ExchangeEventData::BBO(_)) {
-            return None;
+            return vec![];
         }
 
         // 跨交易所 symbol 不同 (IBKR: "AAPL", HL: "xyz:AAPL")，分别查询
@@ -354,17 +354,17 @@ impl Strategy for SpreadArbStrategy {
         if state.market_status(Exchange::IBKR) != MarketStatus::Liquid
             || state.market_status(Exchange::Hyperliquid) != MarketStatus::Liquid
         {
-            return None;
+            return vec![];
         }
 
         // 需要两边 BBO 都就绪
         let ibkr_bbo = match ibkr_state.bbo(Exchange::IBKR) {
             Some(b) if b.ask_price > 0.0 && b.bid_price > 0.0 => b,
-            _ => return None,
+            _ => return vec![],
         };
         let hl_bbo = match hl_state.bbo(Exchange::Hyperliquid) {
             Some(b) if b.ask_price > 0.0 && b.bid_price > 0.0 => b,
-            _ => return None,
+            _ => return vec![],
         };
 
         // BBO 新鲜度检查
@@ -376,7 +376,7 @@ impl Strategy for SpreadArbStrategy {
                 age_ms = now.saturating_sub(ibkr_bbo.timestamp),
                 "SpreadArb: IBKR BBO stale, skipping"
             );
-            return None;
+            return vec![];
         }
         if now.saturating_sub(hl_bbo.timestamp) > staleness {
             tracing::debug!(
@@ -384,23 +384,23 @@ impl Strategy for SpreadArbStrategy {
                 age_ms = now.saturating_sub(hl_bbo.timestamp),
                 "SpreadArb: HL BBO stale, skipping"
             );
-            return None;
+            return vec![];
         }
 
         // 跳过有 pending orders 的情况 (两侧都要检查)
         if ibkr_state.has_pending_orders() || hl_state.has_pending_orders() {
-            return None;
+            return vec![];
         }
 
         // 获取当前持仓
         // 两个交易所仓位都必须已初始化（polling/WS 会对所有配置 symbol 推送，包括空仓）
         let ibkr_pos = match ibkr_state.position(Exchange::IBKR) {
             Some(p) => p.size,
-            None => return None,
+            None => return vec![],
         };
         let hl_pos = match hl_state.position(Exchange::Hyperliquid) {
             Some(p) => p.size,
-            None => return None,
+            None => return vec![],
         };
 
         // === 步骤 0: 仓位方向守卫 ===
@@ -410,7 +410,7 @@ impl Strategy for SpreadArbStrategy {
             ibkr_bbo.ask_price,
             hl_bbo.bid_price,
         ) {
-            return Some(signal);
+            return vec![signal];
         }
 
         let has_position = ibkr_pos.abs() > POSITION_EPSILON || hl_pos.abs() > POSITION_EPSILON;
@@ -423,12 +423,14 @@ impl Strategy for SpreadArbStrategy {
                 ibkr_bbo.bid_price,
                 hl_bbo.ask_price,
             ) {
-                return Some(signal);
+                return vec![signal];
             }
         }
 
         // === 步骤 2: 平仓 (用实际执行侧价格: IBKR bid / HL ask) ===
-        let close_spread = self.calc_close_spread(hl_bbo.ask_price, ibkr_bbo.bid_price)?;
+        let Some(close_spread) = self.calc_close_spread(hl_bbo.ask_price, ibkr_bbo.bid_price) else {
+            return vec![];
+        };
         if has_position && close_spread < self.config.close_threshold {
             let spread = close_spread;
             let paired_qty = ibkr_pos.min(hl_pos.abs());
@@ -450,7 +452,7 @@ impl Strategy for SpreadArbStrategy {
                     "SpreadArb: closing position"
                 );
 
-                return Some(OutcomeEvent::PlaceOrders {
+                return vec![OutcomeEvent::PlaceOrders {
                     comment: format!(
                         "spread_close | spread={:.4}% | qty={:.4} | ibkr_bid={:.4} | hl_ask={:.4}",
                         spread * 100.0, close_qty, ibkr_bbo.bid_price, hl_bbo.ask_price,
@@ -485,7 +487,7 @@ impl Strategy for SpreadArbStrategy {
                             client_order_id: String::new(),
                         },
                     ],
-                });
+                }];
             }
 
             // 残余清理: IBKR 侧已清零但 HL 侧有残余空头，单独平 HL
@@ -500,7 +502,7 @@ impl Strategy for SpreadArbStrategy {
                     "SpreadArb: closing residual HL position (IBKR already flat)"
                 );
 
-                return Some(OutcomeEvent::PlaceOrders {
+                return vec![OutcomeEvent::PlaceOrders {
                     comment: format!(
                         "spread_close_residual_hl | hl_pos={:.4} | qty={:.4}",
                         hl_pos, hl_close_qty,
@@ -518,14 +520,16 @@ impl Strategy for SpreadArbStrategy {
                         reduce_only: true,
                         client_order_id: String::new(),
                     }],
-                });
+                }];
             }
 
-            return None;
+            return vec![];
         }
 
         // === 步骤 3: 开仓 (用实际执行侧价格: IBKR ask / HL bid) ===
-        let open_spread = self.calc_open_spread(hl_bbo.bid_price, ibkr_bbo.ask_price)?;
+        let Some(open_spread) = self.calc_open_spread(hl_bbo.bid_price, ibkr_bbo.ask_price) else {
+            return vec![];
+        };
         if open_spread > self.config.open_threshold {
             let spread = open_spread;
             let current_pos_value = hl_pos.abs() * hl_bbo.bid_price;
@@ -540,14 +544,14 @@ impl Strategy for SpreadArbStrategy {
                     max_leverage = format!("{:.2}", self.config.max_leverage),
                     "SpreadArb: leverage limit reached, skip opening"
                 );
-                return None;
+                return vec![];
             }
 
             // IBKR 股票最小单位 1 股，向下取整
             // HL 永续合约两边使用相同数量（股数），具体精度由交易所下单时校验
             let qty = (self.config.order_usd_value / ibkr_bbo.ask_price).floor();
             if qty < MIN_ORDER_QTY {
-                return None;
+                return vec![];
             }
 
             let ibkr_price = ibkr_bbo.ask_price * (1.0 + self.config.ioc_slippage);
@@ -564,7 +568,7 @@ impl Strategy for SpreadArbStrategy {
                 "SpreadArb: opening position"
             );
 
-            return Some(OutcomeEvent::PlaceOrders {
+            return vec![OutcomeEvent::PlaceOrders {
                 comment: format!(
                     "spread_open | spread={:.4}% | qty={:.4} | ibkr_ask={:.4} | hl_bid={:.4} | lev={:.2}",
                     spread * 100.0, qty, ibkr_bbo.ask_price, hl_bbo.bid_price, leverage,
@@ -599,9 +603,9 @@ impl Strategy for SpreadArbStrategy {
                         client_order_id: String::new(),
                     },
                 ],
-            });
+            }];
         }
 
-        None
+        vec![]
     }
 }

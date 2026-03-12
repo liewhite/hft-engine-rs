@@ -90,7 +90,7 @@ impl ExecutorActor {
         self.state_manager.apply(&event);
 
         // 调用策略，获取信号
-        if let Some(signal) = self.strategy.on_event(&event, &self.state_manager) {
+        for signal in self.strategy.on_event(&event, &self.state_manager) {
             match signal {
                 OutcomeEvent::PlaceOrders { orders, comment } => {
                     let converted: Vec<Order> = orders

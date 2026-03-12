@@ -180,17 +180,20 @@ impl MacdGridStrategy {
     }
 
     /// 网格核心逻辑：在网格价位挂 GTC 限价单，等待成交。
-    /// 无挂单时根据优先级选择方向，在 last_fill_price ± spacing 处挂单。
-    /// has_pending_orders 保护下同一时间只有一笔挂单。
-    fn check_grid(&mut self, state: &StateManager) -> Option<OutcomeEvent> {
-        let symbol_state = state.symbol_state(self.symbol())?;
-        let trend = self.trend?;
-        let atr = self.atr.value()?;
-        let bbo = symbol_state.bbo(Exchange::OKX)?;
+    /// 同时挂出减仓单和开仓单（如果条件允许），一次返回所有订单。
+    fn check_grid(&mut self, state: &StateManager) -> Vec<OutcomeEvent> {
+        let (Some(symbol_state), Some(trend), Some(atr)) =
+            (state.symbol_state(self.symbol()), self.trend, self.atr.value())
+        else {
+            return vec![];
+        };
+        let Some(bbo) = symbol_state.bbo(Exchange::OKX) else {
+            return vec![];
+        };
         let mid_price = bbo.mid_price();
 
         if mid_price <= 0.0 || atr <= 0.0 {
-            return None;
+            return vec![];
         }
 
         let params = self.grid_params(trend);
@@ -222,7 +225,7 @@ impl MacdGridStrategy {
         // 初始化网格参考价
         if self.last_fill_price.is_none() {
             self.last_fill_price = Some(mid_price);
-            return None;
+            return vec![];
         }
         let mut last = self.last_fill_price.unwrap();
 
@@ -242,71 +245,73 @@ impl MacdGridStrategy {
             last = mid_price;
         }
 
-        // === 减仓优先 ===
-        // 有空头仓位 → 买入减仓
-        if pos_size < -POSITION_EPSILON {
-            let grid_price = last - reduce_buy_spacing;
-            let qty = (self.config.order_usd_value / grid_price).min(pos_size.abs());
-            return self.make_order(
-                Side::Long,
-                grid_price,
-                qty,
-                true,
-                &format!(
-                    "grid_reduce_short | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
-                    trend, deviation, ob_buy_factor, reduce_buy_spacing
-                ),
-            );
-        }
+        let mut orders = Vec::new();
+        let mut comments = Vec::new();
+
+        // === 减仓 ===
         // 有多头仓位 → 卖出减仓
         if pos_size > POSITION_EPSILON {
             let grid_price = last + reduce_sell_spacing;
             let qty = (self.config.order_usd_value / grid_price).min(pos_size);
-            return self.make_order(
-                Side::Short,
-                grid_price,
-                qty,
-                true,
-                &format!(
-                    "grid_reduce_long | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
-                    trend, deviation, ob_sell_factor, reduce_sell_spacing
-                ),
-            );
+            if let Some(order) = self.make_order(
+                Side::Short, grid_price, qty, true,
+                &format!("grid_reduce_long | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
+                    trend, deviation, ob_sell_factor, reduce_sell_spacing),
+            ) {
+                orders.push(order);
+                comments.push(format!("reduce_long@{:.4}", grid_price));
+            }
+        }
+        // 有空头仓位 → 买入减仓
+        if pos_size < -POSITION_EPSILON {
+            let grid_price = last - reduce_buy_spacing;
+            let qty = (self.config.order_usd_value / grid_price).min(pos_size.abs());
+            if let Some(order) = self.make_order(
+                Side::Long, grid_price, qty, true,
+                &format!("grid_reduce_short | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
+                    trend, deviation, ob_buy_factor, reduce_buy_spacing),
+            ) {
+                orders.push(order);
+                comments.push(format!("reduce_short@{:.4}", grid_price));
+            }
         }
 
-        // === 无仓位时开仓 ===
+        // === 开仓 ===
         // 允许开多且未超限 → 买入开多
         if params.max_long_usd > 0.0 && long_usd < params.max_long_usd {
             let grid_price = last - open_buy_spacing;
             let qty = self.config.order_usd_value / grid_price;
-            return self.make_order(
-                Side::Long,
-                grid_price,
-                qty,
-                false,
-                &format!(
-                    "grid_open_long | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
-                    trend, deviation, ob_buy_factor, long_pos_factor, open_buy_spacing
-                ),
-            );
+            if let Some(order) = self.make_order(
+                Side::Long, grid_price, qty, false,
+                &format!("grid_open_long | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
+                    trend, deviation, ob_buy_factor, long_pos_factor, open_buy_spacing),
+            ) {
+                orders.push(order);
+                comments.push(format!("open_long@{:.4}", grid_price));
+            }
         }
         // 允许开空且未超限 → 卖出开空
         if params.max_short_usd > 0.0 && short_usd < params.max_short_usd {
             let grid_price = last + open_sell_spacing;
             let qty = self.config.order_usd_value / grid_price;
-            return self.make_order(
-                Side::Short,
-                grid_price,
-                qty,
-                false,
-                &format!(
-                    "grid_open_short | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
-                    trend, deviation, ob_sell_factor, short_pos_factor, open_sell_spacing
-                ),
-            );
+            if let Some(order) = self.make_order(
+                Side::Short, grid_price, qty, false,
+                &format!("grid_open_short | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
+                    trend, deviation, ob_sell_factor, short_pos_factor, open_sell_spacing),
+            ) {
+                orders.push(order);
+                comments.push(format!("open_short@{:.4}", grid_price));
+            }
         }
 
-        None
+        if orders.is_empty() {
+            return vec![];
+        }
+
+        vec![OutcomeEvent::PlaceOrders {
+            comment: format!("grid | trend={:?} | {}", trend, comments.join(" + ")),
+            orders,
+        }]
     }
 
     fn make_order(
@@ -316,7 +321,7 @@ impl MacdGridStrategy {
         qty: f64,
         reduce_only: bool,
         comment: &str,
-    ) -> Option<OutcomeEvent> {
+    ) -> Option<Order> {
         if qty <= 0.0 || price <= 0.0 {
             return None;
         }
@@ -331,21 +336,18 @@ impl MacdGridStrategy {
             "Placing grid order"
         );
 
-        Some(OutcomeEvent::PlaceOrders {
-            orders: vec![Order {
-                id: String::new(),
-                exchange: Exchange::OKX,
-                symbol: self.symbol().clone(),
-                side,
-                order_type: OrderType::Limit {
-                    price,
-                    tif: TimeInForce::GTC,
-                },
-                quantity: qty,
-                reduce_only,
-                client_order_id: String::new(),
-            }],
-            comment: comment.to_string(),
+        Some(Order {
+            id: String::new(),
+            exchange: Exchange::OKX,
+            symbol: self.symbol().clone(),
+            side,
+            order_type: OrderType::Limit {
+                price,
+                tif: TimeInForce::GTC,
+            },
+            quantity: qty,
+            reduce_only,
+            client_order_id: String::new(),
         })
     }
 
@@ -423,7 +425,7 @@ impl Strategy for MacdGridStrategy {
         self.config.order_timeout_ms
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Option<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
         match &event.data {
             ExchangeEventData::HistoryCandles(candles) => {
                 for candle in candles {
@@ -444,7 +446,7 @@ impl Strategy for MacdGridStrategy {
                     ready = self.indicators_ready(),
                     "Fed history candles"
                 );
-                None
+                vec![]
             }
             ExchangeEventData::Candle(candle) => {
                 if candle.symbol == *self.symbol() {
@@ -456,11 +458,11 @@ impl Strategy for MacdGridStrategy {
                         candle.confirm,
                     );
                 }
-                None
+                vec![]
             }
             ExchangeEventData::Clock => {
                 self.log_status(state);
-                None
+                vec![]
             }
             ExchangeEventData::Fill(fill) => {
                 if fill.symbol == *self.symbol() {
@@ -473,19 +475,21 @@ impl Strategy for MacdGridStrategy {
                     );
                     self.last_fill_price = Some(fill.price);
                 }
-                None
+                vec![]
             }
             ExchangeEventData::BBO(_) => {
                 if self.trend.is_none() || !self.indicators_ready() {
-                    return None;
+                    return vec![];
                 }
-                let symbol_state = state.symbol_state(self.symbol())?;
+                let Some(symbol_state) = state.symbol_state(self.symbol()) else {
+                    return vec![];
+                };
                 if symbol_state.has_pending_orders() {
-                    return None;
+                    return vec![];
                 }
                 self.check_grid(state)
             }
-            _ => None,
+            _ => vec![],
         }
     }
 }
