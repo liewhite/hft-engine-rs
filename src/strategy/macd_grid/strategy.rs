@@ -147,9 +147,13 @@ impl MacdGridStrategy {
         let above_count = [dea_15m, dea_1h, dea_4h]
             .iter()
             .filter(|d| **d > 0.0)
-            .count();
+            .count() as i8;
 
-        let new_trend = match above_count {
+        // 15m bar 趋势微调: 连续递增 +1 (增强看涨), 连续递减 -1 (增强看跌)
+        let bar_trend = self.macd_15m.bar_trend();
+        let score = (above_count + bar_trend).clamp(0, 3);
+
+        let new_trend = match score {
             3 => Trend::StrongBull,
             2 => Trend::WeakBull,
             1 => Trend::WeakBear,
@@ -395,6 +399,8 @@ impl MacdGridStrategy {
             slow_ema_15m = self.macd_15m.slow_ema_value().map(|v| format!("{:.4}", v)),
             dif_15m = self.macd_15m.macd_line().map(|d| format!("{:.6}", d)),
             dea_15m = self.macd_15m.dea().map(|d| format!("{:.6}", d)),
+            bar_15m = self.macd_15m.bar().map(|b| format!("{:.6}", b)),
+            bar_trend_15m = self.macd_15m.bar_trend(),
             dif_1h = self.macd_1h.macd_line().map(|d| format!("{:.6}", d)),
             dea_1h = self.macd_1h.dea().map(|d| format!("{:.6}", d)),
             dif_4h = self.macd_4h.macd_line().map(|d| format!("{:.6}", d)),

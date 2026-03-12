@@ -76,6 +76,10 @@ pub struct MacdCalculator {
     fast_ema: Ema,
     slow_ema: Ema,
     signal_ema: Ema,
+    /// 最近3个 committed bar 值 (DIF - DEA)，用于判断柱状图趋势
+    /// [0] = 前前bar, [1] = 前bar, [2] = 当前bar
+    recent_bars: [f64; 3],
+    bar_count: usize,
 }
 
 impl MacdCalculator {
@@ -84,6 +88,8 @@ impl MacdCalculator {
             fast_ema: Ema::new(12),
             slow_ema: Ema::new(26),
             signal_ema: Ema::new(9),
+            recent_bars: [0.0; 3],
+            bar_count: 0,
         }
     }
 
@@ -93,6 +99,13 @@ impl MacdCalculator {
         self.slow_ema.update(close);
         if let (Some(fast), Some(slow)) = (self.fast_ema.value(), self.slow_ema.value()) {
             self.signal_ema.update(fast - slow);
+            if let Some(dea) = self.signal_ema.value() {
+                let bar = (fast - slow) - dea;
+                self.recent_bars[0] = self.recent_bars[1];
+                self.recent_bars[1] = self.recent_bars[2];
+                self.recent_bars[2] = bar;
+                self.bar_count += 1;
+            }
         }
     }
 
@@ -116,6 +129,29 @@ impl MacdCalculator {
     /// DEA (signal line) value
     pub fn dea(&self) -> Option<f64> {
         self.signal_ema.value()
+    }
+
+    /// MACD bar (柱状图) = DIF - DEA
+    pub fn bar(&self) -> Option<f64> {
+        match (self.macd_line(), self.dea()) {
+            (Some(dif), Some(dea)) => Some(dif - dea),
+            _ => None,
+        }
+    }
+
+    /// 柱状图趋势：连续3根 bar 递增返回 1，递减返回 -1，否则 0
+    pub fn bar_trend(&self) -> i8 {
+        if self.bar_count < 3 {
+            return 0;
+        }
+        let [a, b, c] = self.recent_bars;
+        if c > b && b > a {
+            1
+        } else if c < b && b < a {
+            -1
+        } else {
+            0
+        }
     }
 
     /// Slow EMA (26-period) value, used as price reference for overbought/oversold
