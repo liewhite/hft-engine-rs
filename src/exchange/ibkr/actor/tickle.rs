@@ -72,22 +72,26 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrTickleActor {
     ) {
         match msg {
             StreamMessage::Next(_) => {
-                if auth::tickle(&*self.auth, &self.http).await.is_ok() {
-                    self.consecutive_failures = 0;
-                    tracing::trace!("IBKR tickle sent");
-                } else {
-                    self.consecutive_failures += 1;
-                    tracing::warn!(
-                        consecutive_failures = self.consecutive_failures,
-                        max = MAX_CONSECUTIVE_FAILURES,
-                        "IBKR tickle failed"
-                    );
-                    if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        tracing::error!(
-                            "IBKR tickle: {} consecutive failures, killing actor",
-                            MAX_CONSECUTIVE_FAILURES
+                match auth::tickle(&*self.auth, &self.http).await {
+                    Ok(_) => {
+                        self.consecutive_failures = 0;
+                        tracing::trace!("IBKR tickle sent");
+                    }
+                    Err(e) => {
+                        self.consecutive_failures += 1;
+                        tracing::warn!(
+                            error = %e,
+                            consecutive_failures = self.consecutive_failures,
+                            max = MAX_CONSECUTIVE_FAILURES,
+                            "IBKR tickle failed"
                         );
-                        ctx.actor_ref().kill();
+                        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                            tracing::error!(
+                                "IBKR tickle: {} consecutive failures, killing actor",
+                                MAX_CONSECUTIVE_FAILURES
+                            );
+                            ctx.actor_ref().kill();
+                        }
                     }
                 }
             }

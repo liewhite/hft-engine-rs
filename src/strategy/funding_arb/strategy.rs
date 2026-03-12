@@ -188,6 +188,8 @@ impl FundingArbStrategy {
         let max_symbol_leverage = self.config.max_symbol_leverage;
 
         // 计算单个交易所的 symbol 杠杆率
+        // 数据不足时返回 0.0（无仓位或无 equity 时杠杆率为零，安全侧）
+        // BBO 不存在时无法计算仓位价值，返回 0.0（保守：不会误触阈值放行）
         let calc_leverage = |exchange: Exchange| -> f64 {
             let Some(equity) = state_manager.equity(exchange) else {
                 return 0.0;
@@ -196,8 +198,10 @@ impl FundingArbStrategy {
                 return 0.0;
             }
             let pos_size = state.position_size(exchange).abs();
-            let price = state.bbo(exchange).map(|b| b.mid_price()).unwrap_or(0.0);
-            (pos_size * price) / equity
+            let Some(bbo) = state.bbo(exchange) else {
+                return 0.0;
+            };
+            (pos_size * bbo.mid_price()) / equity
         };
 
         let short_leverage = calc_leverage(short_exchange);
