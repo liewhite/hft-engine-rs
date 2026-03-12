@@ -19,7 +19,6 @@ enum Trend {
     StrongBear,
 }
 
-#[allow(dead_code)]
 struct GridParams {
     /// 买入方向 ATR 基础因子 (趋势决定)
     buy_base: f64,
@@ -60,7 +59,6 @@ impl MacdGridStrategy {
         &self.config.symbol
     }
 
-    #[allow(unused)]
     fn grid_params(&self, trend: Trend) -> GridParams {
         let agg = self.config.aggressive_spacing_factor;
         let con = self.config.conservative_spacing_factor;
@@ -93,7 +91,6 @@ impl MacdGridStrategy {
         }
     }
 
-    #[allow(unused)]
     fn deviation(&self, mid_price: f64, atr: f64) -> f64 {
         let ema = self
             .macd_15m
@@ -175,7 +172,6 @@ impl MacdGridStrategy {
         }
     }
 
-    #[allow(unused)]
     fn pos_factor(&self, pos_usd: f64, max_pos_usd: f64) -> f64 {
         if max_pos_usd <= 0.0 {
             return 1.0;
@@ -186,137 +182,133 @@ impl MacdGridStrategy {
     /// 网格核心逻辑：在网格价位挂 GTC 限价单，等待成交。
     /// 无挂单时根据优先级选择方向，在 last_fill_price ± spacing 处挂单。
     /// has_pending_orders 保护下同一时间只有一笔挂单。
-    // [dry-run] 下单逻辑暂时禁用，仅观察指标
-    #[allow(unused)]
-    fn check_grid(&mut self, _state: &StateManager) -> Option<OutcomeEvent> {
-        // let symbol_state = state.symbol_state(self.symbol())?;
-        // let trend = self.trend?;
-        // let atr = self.atr.value()?;
-        // let bbo = symbol_state.bbo(Exchange::OKX)?;
-        // let mid_price = bbo.mid_price();
-        //
-        // if mid_price <= 0.0 || atr <= 0.0 {
-        //     return None;
-        // }
-        //
-        // let params = self.grid_params(trend);
-        // let pos_size = symbol_state
-        //     .position(Exchange::OKX)
-        //     .map(|p| p.size)
-        //     .unwrap_or(0.0);
-        // let long_usd = pos_size.max(0.0) * mid_price;
-        // let short_usd = (-pos_size).max(0.0) * mid_price;
-        //
-        // // 超买超卖系数: deviation > 0 → 超买 → 买入更远、卖出更近
-        // let deviation = self.deviation(mid_price, atr);
-        // let w = self.config.ob_weight;
-        // let ob_buy_factor = (1.0 + deviation * w).clamp(0.5, 3.0);
-        // let ob_sell_factor = (1.0 - deviation * w).clamp(0.5, 3.0);
-        //
-        // // 仓位深度系数: 仅影响开仓方向，归一化到 [1, 1+pos_weight]
-        // let long_pos_factor = self.pos_factor(long_usd, params.max_long_usd);
-        // let short_pos_factor = self.pos_factor(short_usd, params.max_short_usd);
-        //
-        // let min = self.config.min_spacing;
-        //
-        // // 统一间距公式: spacing = max(ATR * base * ob_factor [* pos_factor], min_spacing)
-        // let reduce_buy_spacing = (atr * params.buy_base * ob_buy_factor).max(min);
-        // let open_buy_spacing = (atr * params.buy_base * ob_buy_factor * long_pos_factor).max(min);
-        // let reduce_sell_spacing = (atr * params.sell_base * ob_sell_factor).max(min);
-        // let open_sell_spacing = (atr * params.sell_base * ob_sell_factor * short_pos_factor).max(min);
-        //
-        // // 初始化网格参考价
-        // if self.last_fill_price.is_none() {
-        //     self.last_fill_price = Some(mid_price);
-        //     return None;
-        // }
-        // let mut last = self.last_fill_price.unwrap();
-        //
-        // // 追单: 持仓与趋势不一致或超限时，last_fill_price 跟随价格移动，
-        // // 确保平仓挂单价始终贴近当前价，避免反转后无法平掉反向仓位
-        // let need_reduce_long = pos_size > POSITION_EPSILON
-        //     && (params.max_long_usd == 0.0 || long_usd > params.max_long_usd);
-        // let need_reduce_short = pos_size < -POSITION_EPSILON
-        //     && (params.max_short_usd == 0.0 || short_usd > params.max_short_usd);
-        //
-        // if need_reduce_long && mid_price < last {
-        //     self.last_fill_price = Some(mid_price);
-        //     last = mid_price;
-        // }
-        // if need_reduce_short && mid_price > last {
-        //     self.last_fill_price = Some(mid_price);
-        //     last = mid_price;
-        // }
-        //
-        // // === 买入方向 ===
-        // // 优先: 有空头仓位 → 买入减仓
-        // if pos_size < -POSITION_EPSILON {
-        //     let grid_price = last - reduce_buy_spacing;
-        //     let qty = (self.config.order_usd_value / grid_price).min(pos_size.abs());
-        //     return self.make_order(
-        //         Side::Long,
-        //         grid_price,
-        //         qty,
-        //         true,
-        //         &format!(
-        //             "grid_reduce_short | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
-        //             trend, deviation, ob_buy_factor, reduce_buy_spacing
-        //         ),
-        //     );
-        // }
-        // // 其次: 允许开多且未超限 → 买入开多
-        // if params.max_long_usd > 0.0 && long_usd < params.max_long_usd {
-        //     let grid_price = last - open_buy_spacing;
-        //     let qty = self.config.order_usd_value / grid_price;
-        //     return self.make_order(
-        //         Side::Long,
-        //         grid_price,
-        //         qty,
-        //         false,
-        //         &format!(
-        //             "grid_open_long | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
-        //             trend, deviation, ob_buy_factor, long_pos_factor, open_buy_spacing
-        //         ),
-        //     );
-        // }
-        //
-        // // === 卖出方向 ===
-        // // 优先: 有多头仓位 → 卖出减仓
-        // if pos_size > POSITION_EPSILON {
-        //     let grid_price = last + reduce_sell_spacing;
-        //     let qty = (self.config.order_usd_value / grid_price).min(pos_size);
-        //     return self.make_order(
-        //         Side::Short,
-        //         grid_price,
-        //         qty,
-        //         true,
-        //         &format!(
-        //             "grid_reduce_long | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
-        //             trend, deviation, ob_sell_factor, reduce_sell_spacing
-        //         ),
-        //     );
-        // }
-        // // 其次: 允许开空且未超限 → 卖出开空
-        // if params.max_short_usd > 0.0 && short_usd < params.max_short_usd {
-        //     let grid_price = last + open_sell_spacing;
-        //     let qty = self.config.order_usd_value / grid_price;
-        //     return self.make_order(
-        //         Side::Short,
-        //         grid_price,
-        //         qty,
-        //         false,
-        //         &format!(
-        //             "grid_open_short | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
-        //             trend, deviation, ob_sell_factor, short_pos_factor, open_sell_spacing
-        //         ),
-        //     );
-        // }
+    fn check_grid(&mut self, state: &StateManager) -> Option<OutcomeEvent> {
+        let symbol_state = state.symbol_state(self.symbol())?;
+        let trend = self.trend?;
+        let atr = self.atr.value()?;
+        let bbo = symbol_state.bbo(Exchange::OKX)?;
+        let mid_price = bbo.mid_price();
+
+        if mid_price <= 0.0 || atr <= 0.0 {
+            return None;
+        }
+
+        let params = self.grid_params(trend);
+        let pos_size = symbol_state
+            .position(Exchange::OKX)
+            .map(|p| p.size)
+            .unwrap_or(0.0);
+        let long_usd = pos_size.max(0.0) * mid_price;
+        let short_usd = (-pos_size).max(0.0) * mid_price;
+
+        // 超买超卖系数: deviation > 0 → 超买 → 买入更远、卖出更近
+        let deviation = self.deviation(mid_price, atr);
+        let w = self.config.ob_weight;
+        let ob_buy_factor = (1.0 + deviation * w).clamp(0.5, 3.0);
+        let ob_sell_factor = (1.0 - deviation * w).clamp(0.5, 3.0);
+
+        // 仓位深度系数: 仅影响开仓方向，归一化到 [1, 1+pos_weight]
+        let long_pos_factor = self.pos_factor(long_usd, params.max_long_usd);
+        let short_pos_factor = self.pos_factor(short_usd, params.max_short_usd);
+
+        let min = self.config.min_spacing;
+
+        // 统一间距公式: spacing = max(ATR * base * ob_factor [* pos_factor], min_spacing)
+        let reduce_buy_spacing = (atr * params.buy_base * ob_buy_factor).max(min);
+        let open_buy_spacing = (atr * params.buy_base * ob_buy_factor * long_pos_factor).max(min);
+        let reduce_sell_spacing = (atr * params.sell_base * ob_sell_factor).max(min);
+        let open_sell_spacing = (atr * params.sell_base * ob_sell_factor * short_pos_factor).max(min);
+
+        // 初始化网格参考价
+        if self.last_fill_price.is_none() {
+            self.last_fill_price = Some(mid_price);
+            return None;
+        }
+        let mut last = self.last_fill_price.unwrap();
+
+        // 追单: 持仓与趋势不一致或超限时，last_fill_price 跟随价格移动，
+        // 确保平仓挂单价始终贴近当前价，避免反转后无法平掉反向仓位
+        let need_reduce_long = pos_size > POSITION_EPSILON
+            && (params.max_long_usd == 0.0 || long_usd > params.max_long_usd);
+        let need_reduce_short = pos_size < -POSITION_EPSILON
+            && (params.max_short_usd == 0.0 || short_usd > params.max_short_usd);
+
+        if need_reduce_long && mid_price < last {
+            self.last_fill_price = Some(mid_price);
+            last = mid_price;
+        }
+        if need_reduce_short && mid_price > last {
+            self.last_fill_price = Some(mid_price);
+            last = mid_price;
+        }
+
+        // === 买入方向 ===
+        // 优先: 有空头仓位 → 买入减仓
+        if pos_size < -POSITION_EPSILON {
+            let grid_price = last - reduce_buy_spacing;
+            let qty = (self.config.order_usd_value / grid_price).min(pos_size.abs());
+            return self.make_order(
+                Side::Long,
+                grid_price,
+                qty,
+                true,
+                &format!(
+                    "grid_reduce_short | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
+                    trend, deviation, ob_buy_factor, reduce_buy_spacing
+                ),
+            );
+        }
+        // 其次: 允许开多且未超限 → 买入开多
+        if params.max_long_usd > 0.0 && long_usd < params.max_long_usd {
+            let grid_price = last - open_buy_spacing;
+            let qty = self.config.order_usd_value / grid_price;
+            return self.make_order(
+                Side::Long,
+                grid_price,
+                qty,
+                false,
+                &format!(
+                    "grid_open_long | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
+                    trend, deviation, ob_buy_factor, long_pos_factor, open_buy_spacing
+                ),
+            );
+        }
+
+        // === 卖出方向 ===
+        // 优先: 有多头仓位 → 卖出减仓
+        if pos_size > POSITION_EPSILON {
+            let grid_price = last + reduce_sell_spacing;
+            let qty = (self.config.order_usd_value / grid_price).min(pos_size);
+            return self.make_order(
+                Side::Short,
+                grid_price,
+                qty,
+                true,
+                &format!(
+                    "grid_reduce_long | trend={:?} | dev={:.2} | ob={:.2} | spacing={:.4}",
+                    trend, deviation, ob_sell_factor, reduce_sell_spacing
+                ),
+            );
+        }
+        // 其次: 允许开空且未超限 → 卖出开空
+        if params.max_short_usd > 0.0 && short_usd < params.max_short_usd {
+            let grid_price = last + open_sell_spacing;
+            let qty = self.config.order_usd_value / grid_price;
+            return self.make_order(
+                Side::Short,
+                grid_price,
+                qty,
+                false,
+                &format!(
+                    "grid_open_short | trend={:?} | dev={:.2} | ob={:.2} | pos_f={:.1} | spacing={:.4}",
+                    trend, deviation, ob_sell_factor, short_pos_factor, open_sell_spacing
+                ),
+            );
+        }
 
         None
     }
 
-    // [dry-run] make_order 暂时禁用
-    #[allow(unused)]
     fn make_order(
         &self,
         side: Side,
@@ -325,37 +317,36 @@ impl MacdGridStrategy {
         reduce_only: bool,
         comment: &str,
     ) -> Option<OutcomeEvent> {
-        // if qty <= 0.0 || price <= 0.0 {
-        //     return None;
-        // }
-        //
-        // tracing::info!(
-        //     symbol = %self.symbol(),
-        //     side = ?side,
-        //     price = format!("{:.4}", price),
-        //     qty = format!("{:.6}", qty),
-        //     reduce_only,
-        //     comment,
-        //     "Placing grid order"
-        // );
-        //
-        // Some(OutcomeEvent::PlaceOrders {
-        //     orders: vec![Order {
-        //         id: String::new(),
-        //         exchange: Exchange::OKX,
-        //         symbol: self.symbol().clone(),
-        //         side,
-        //         order_type: OrderType::Limit {
-        //             price,
-        //             tif: TimeInForce::GTC,
-        //         },
-        //         quantity: qty,
-        //         reduce_only,
-        //         client_order_id: String::new(),
-        //     }],
-        //     comment: comment.to_string(),
-        // })
-        None
+        if qty <= 0.0 || price <= 0.0 {
+            return None;
+        }
+
+        tracing::info!(
+            symbol = %self.symbol(),
+            side = ?side,
+            price = format!("{:.4}", price),
+            qty = format!("{:.6}", qty),
+            reduce_only,
+            comment,
+            "Placing grid order"
+        );
+
+        Some(OutcomeEvent::PlaceOrders {
+            orders: vec![Order {
+                id: String::new(),
+                exchange: Exchange::OKX,
+                symbol: self.symbol().clone(),
+                side,
+                order_type: OrderType::Limit {
+                    price,
+                    tif: TimeInForce::GTC,
+                },
+                quantity: qty,
+                reduce_only,
+                client_order_id: String::new(),
+            }],
+            comment: comment.to_string(),
+        })
     }
 
     fn log_status(&self, state: &StateManager) {
