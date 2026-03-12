@@ -90,7 +90,9 @@ impl OkxPublicWsActor {
         let local_ts = now_ms();
         let events = parse_public_message(raw, local_ts)?;
         for event in events {
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
         }
         Ok(())
     }
@@ -302,18 +304,16 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
             let push: WsPush<FundingRateData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("funding-rate parse: {}", e)))?;
 
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let rate = data.to_funding_rate(local_ts);
-                    IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::FundingRate(rate),
-                    }
-                })
-                .collect();
+            let mut events = Vec::new();
+            for data in &push.data {
+                let rate = data.to_funding_rate(local_ts)
+                    .map_err(|e| WsError::ParseError(e))?;
+                events.push(IncomeEvent {
+                    exchange_ts: local_ts,
+                    local_ts,
+                    data: ExchangeEventData::FundingRate(rate),
+                });
+            }
             Ok(events)
         }
         "bbo-tbt" => {
@@ -325,58 +325,48 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
                 .as_ref()
                 .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
 
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let exchange_ts = data
-                        .ts
-                        .parse::<u64>()
-                        .unwrap_or_else(|_| panic!("Failed to parse BBO timestamp: {}", data.ts));
-                    let bbo = data.to_bbo(inst_id);
-                    IncomeEvent {
-                        exchange_ts,
-                        local_ts,
-                        data: ExchangeEventData::BBO(bbo),
-                    }
-                })
-                .collect();
+            let mut events = Vec::new();
+            for data in &push.data {
+                let bbo = data.to_bbo(inst_id)
+                    .map_err(|e| WsError::ParseError(e))?;
+                events.push(IncomeEvent {
+                    exchange_ts: bbo.timestamp,
+                    local_ts,
+                    data: ExchangeEventData::BBO(bbo),
+                });
+            }
             Ok(events)
         }
         "mark-price" => {
             let push: WsPush<MarkPriceData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("mark-price parse: {}", e)))?;
 
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let mp = data.to_mark_price();
-                    IncomeEvent {
-                        exchange_ts: mp.timestamp,
-                        local_ts,
-                        data: ExchangeEventData::MarkPrice(mp),
-                    }
-                })
-                .collect();
+            let mut events = Vec::new();
+            for data in &push.data {
+                let mp = data.to_mark_price()
+                    .map_err(|e| WsError::ParseError(e))?;
+                events.push(IncomeEvent {
+                    exchange_ts: mp.timestamp,
+                    local_ts,
+                    data: ExchangeEventData::MarkPrice(mp),
+                });
+            }
             Ok(events)
         }
         "index-tickers" => {
             let push: WsPush<IndexTickerData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("index-tickers parse: {}", e)))?;
 
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let ip = data.to_index_price();
-                    IncomeEvent {
-                        exchange_ts: ip.timestamp,
-                        local_ts,
-                        data: ExchangeEventData::IndexPrice(ip),
-                    }
-                })
-                .collect();
+            let mut events = Vec::new();
+            for data in &push.data {
+                let ip = data.to_index_price()
+                    .map_err(|e| WsError::ParseError(e))?;
+                events.push(IncomeEvent {
+                    exchange_ts: ip.timestamp,
+                    local_ts,
+                    data: ExchangeEventData::IndexPrice(ip),
+                });
+            }
             Ok(events)
         }
         _ => {

@@ -57,7 +57,9 @@ impl HyperliquidPrivateWsActor {
         let local_ts = now_ms();
         let events = parse_private_message(raw, local_ts, &mut self.known_positions)?;
         for event in events {
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
         }
         Ok(())
     }
@@ -274,7 +276,8 @@ fn parse_clearinghouse_state(
         "Hyperliquid clearinghouseState received"
     );
     for wrapper in &state.asset_positions {
-        let position = wrapper.position.to_position();
+        let position = wrapper.position.to_position()
+            .map_err(|e| WsError::ParseError(e))?;
         // 只处理非零仓位
         if position.size.abs() > 1e-10 {
             tracing::debug!(
@@ -317,9 +320,9 @@ fn parse_clearinghouse_state(
 
     // 解析账户信息 (equity + notional)
     let equity = f64::from_str(&state.margin_summary.account_value)
-        .expect("Failed to parse Hyperliquid accountValue");
+        .map_err(|_| WsError::ParseError(format!("Failed to parse Hyperliquid accountValue: {}", state.margin_summary.account_value)))?;
     let notional = f64::from_str(&state.margin_summary.total_ntl_pos)
-        .expect("Failed to parse Hyperliquid total_ntl_pos");
+        .map_err(|_| WsError::ParseError(format!("Failed to parse Hyperliquid total_ntl_pos: {}", state.margin_summary.total_ntl_pos)))?;
     events.push(IncomeEvent {
         exchange_ts: local_ts,
         local_ts,
@@ -361,7 +364,8 @@ fn parse_order_updates(
     for update in updates {
         let order_update: WsOrderUpdate = serde_json::from_value(update.clone())
             .map_err(|e| WsError::ParseError(format!("orderUpdate parse: {}", e)))?;
-        let update = order_update.to_order_update();
+        let update = order_update.to_order_update()
+            .map_err(|e| WsError::ParseError(e))?;
         events.push(IncomeEvent {
             exchange_ts: update.timestamp,
             local_ts,
@@ -390,18 +394,16 @@ fn parse_user_fills(
         return Ok(Vec::new());
     }
 
-    let events = user_fills
-        .fills
-        .iter()
-        .map(|ws_fill| {
-            let fill = ws_fill.to_fill();
-            IncomeEvent {
-                exchange_ts: fill.timestamp,
-                local_ts,
-                data: ExchangeEventData::Fill(fill),
-            }
-        })
-        .collect();
+    let mut events = Vec::new();
+    for ws_fill in &user_fills.fills {
+        let fill = ws_fill.to_fill()
+            .map_err(|e| WsError::ParseError(e))?;
+        events.push(IncomeEvent {
+            exchange_ts: fill.timestamp,
+            local_ts,
+            data: ExchangeEventData::Fill(fill),
+        });
+    }
 
     Ok(events)
 }

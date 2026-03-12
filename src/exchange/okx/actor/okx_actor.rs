@@ -159,10 +159,14 @@ impl Message<Subscribe> for OkxActor {
     ) -> Self::Reply {
         match &msg.kind {
             SubscriptionKind::Candle { .. } => {
-                let _ = self.business_ws.tell(msg).send().await;
+                if let Err(e) = self.business_ws.tell(msg).send().await {
+                    tracing::error!(error = %e, "Failed to forward message to OkxBusinessWsActor");
+                }
             }
             _ => {
-                let _ = self.public_ws.tell(msg).send().await;
+                if let Err(e) = self.public_ws.tell(msg).send().await {
+                    tracing::error!(error = %e, "Failed to forward message to OkxPublicWsActor");
+                }
             }
         }
     }
@@ -188,10 +192,14 @@ impl Message<SubscribeBatch> for OkxActor {
         }
 
         if !public_kinds.is_empty() {
-            let _ = self.public_ws.tell(SubscribeBatch { kinds: public_kinds }).send().await;
+            if let Err(e) = self.public_ws.tell(SubscribeBatch { kinds: public_kinds }).send().await {
+                tracing::error!(error = %e, "Failed to forward message to OkxPublicWsActor");
+            }
         }
         if !business_kinds.is_empty() {
-            let _ = self.business_ws.tell(SubscribeBatch { kinds: business_kinds }).send().await;
+            if let Err(e) = self.business_ws.tell(SubscribeBatch { kinds: business_kinds }).send().await {
+                tracing::error!(error = %e, "Failed to forward message to OkxBusinessWsActor");
+            }
         }
     }
 }
@@ -206,10 +214,14 @@ impl Message<Unsubscribe> for OkxActor {
     ) -> Self::Reply {
         match &msg.kind {
             SubscriptionKind::Candle { .. } => {
-                let _ = self.business_ws.tell(msg).send().await;
+                if let Err(e) = self.business_ws.tell(msg).send().await {
+                    tracing::error!(error = %e, "Failed to forward message to OkxBusinessWsActor");
+                }
             }
             _ => {
-                let _ = self.public_ws.tell(msg).send().await;
+                if let Err(e) = self.public_ws.tell(msg).send().await {
+                    tracing::error!(error = %e, "Failed to forward message to OkxPublicWsActor");
+                }
             }
         }
     }

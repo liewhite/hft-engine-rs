@@ -185,13 +185,16 @@ impl OutcomeProcessorActor {
             timestamp: local_ts,
         };
 
-        let _ = income_pubsub
+        if let Err(e) = income_pubsub
             .tell(Publish(IncomeEvent {
                 exchange_ts: local_ts, // 本地错误，没有交易所时间戳
                 local_ts,
                 data: ExchangeEventData::OrderUpdate(update),
             }))
             .send()
-            .await;
+            .await
+        {
+            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+        }
     }
 }

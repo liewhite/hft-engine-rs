@@ -94,7 +94,9 @@ impl BinancePublicWsActor {
         let local_ts = now_ms();
         let events = parse_public_message(raw, &self.quote, local_ts, &self.subscribed_kinds)?;
         for event in events {
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
         }
         Ok(())
     }
@@ -339,7 +341,8 @@ fn parse_public_message(
         "markPriceUpdate" => {
             let update: MarkPriceUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
-            let symbol = update.symbol(quote);
+            let symbol = update.symbol(quote)
+                .map_err(|e| WsError::ParseError(e))?;
 
             let mut events = Vec::new();
 
@@ -349,21 +352,30 @@ fn parse_public_message(
                 events.push(IncomeEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::FundingRate(update.to_funding_rate(quote, exchange_ts)),
+                    data: ExchangeEventData::FundingRate(
+                        update.to_funding_rate(quote, exchange_ts)
+                            .map_err(|e| WsError::ParseError(e))?,
+                    ),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() }) {
                 events.push(IncomeEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::MarkPrice(update.to_mark_price(quote, exchange_ts)),
+                    data: ExchangeEventData::MarkPrice(
+                        update.to_mark_price(quote, exchange_ts)
+                            .map_err(|e| WsError::ParseError(e))?,
+                    ),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
                 events.push(IncomeEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::IndexPrice(update.to_index_price(quote, exchange_ts)),
+                    data: ExchangeEventData::IndexPrice(
+                        update.to_index_price(quote, exchange_ts)
+                            .map_err(|e| WsError::ParseError(e))?,
+                    ),
                 });
             }
 
@@ -372,7 +384,8 @@ fn parse_public_message(
         "bookTicker" => {
             let ticker: BookTicker = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
-            let bbo = ticker.to_bbo(quote);
+            let bbo = ticker.to_bbo(quote)
+                .map_err(|e| WsError::ParseError(e))?;
             Ok(vec![IncomeEvent {
                 exchange_ts,
                 local_ts,

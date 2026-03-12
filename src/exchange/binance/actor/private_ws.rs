@@ -65,7 +65,9 @@ impl BinancePrivateWsActor {
         let local_ts = now_ms();
         let events = parse_private_message(raw, &self.quote, local_ts, &self.symbol_metas)?;
         for event in events {
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
         }
         Ok(())
     }
@@ -243,11 +245,14 @@ fn parse_private_message(
 
             // 处理所有 position 更新
             for pos_data in &update.a.positions {
-                let mut position = pos_data.to_position(quote);
+                let mut position = pos_data.to_position(quote)
+                    .map_err(|e| WsError::ParseError(e))?;
                 // qty 归一化: 张 -> 币
+                // Binance 私有 WS 只会推送已配置 symbol 的仓位（因为只订阅了这些 symbol），
+                // 因此 symbol_metas 查找不会失败
                 let meta = symbol_metas
                     .get(&position.symbol)
-                    .expect("SymbolMeta not found for position symbol");
+                    .expect("SymbolMeta not found: Binance private WS should only push configured symbols");
                 position.size = meta.qty_to_coin(position.size);
                 events.push(IncomeEvent {
                     exchange_ts,
@@ -258,7 +263,8 @@ fn parse_private_message(
 
             // 处理所有 balance 更新
             for bal_data in &update.a.balances {
-                let balance = bal_data.to_balance();
+                let balance = bal_data.to_balance()
+                    .map_err(|e| WsError::ParseError(e))?;
                 events.push(IncomeEvent {
                     exchange_ts,
                     local_ts,
@@ -275,7 +281,8 @@ fn parse_private_message(
             let mut events = Vec::new();
 
             // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
-            if let Some(fill) = update.to_fill(quote) {
+            if let Some(fill) = update.to_fill(quote)
+                .map_err(|e| WsError::ParseError(e))? {
                 events.push(IncomeEvent {
                     exchange_ts,
                     local_ts,
@@ -286,7 +293,10 @@ fn parse_private_message(
             events.push(IncomeEvent {
                 exchange_ts,
                 local_ts,
-                data: ExchangeEventData::OrderUpdate(update.to_order_update(quote)),
+                data: ExchangeEventData::OrderUpdate(
+                    update.to_order_update(quote)
+                        .map_err(|e| WsError::ParseError(e))?,
+                ),
             });
 
             Ok(events)

@@ -37,7 +37,7 @@ impl ClockActor {
         let local_ts = now_ms();
 
         // 发布 Clock 事件到 IncomePubSub
-        let _ = self
+        if let Err(e) = self
             .income_pubsub
             .tell(Publish(IncomeEvent {
                 exchange_ts: local_ts,
@@ -45,7 +45,10 @@ impl ClockActor {
                 data: ExchangeEventData::Clock,
             }))
             .send()
-            .await;
+            .await
+        {
+            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+        }
     }
 }
 

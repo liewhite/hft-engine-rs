@@ -92,7 +92,9 @@ impl Actor for BinanceActor {
                             local_ts: now,
                             data: ExchangeEventData::Position(position),
                         };
-                        let _ = args.income_pubsub.tell(Publish(event)).send().await;
+                        if let Err(e) = args.income_pubsub.tell(Publish(event)).send().await {
+                            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                        }
                     }
                 }
                 Err(e) => {
@@ -205,7 +207,9 @@ impl Message<Subscribe> for BinanceActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor
-        let _ = self.public_ws.tell(msg).send().await;
+        if let Err(e) = self.public_ws.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward message to BinancePublicWsActor");
+        }
     }
 }
 
@@ -218,7 +222,9 @@ impl Message<SubscribeBatch> for BinanceActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor
-        let _ = self.public_ws.tell(msg).send().await;
+        if let Err(e) = self.public_ws.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward message to BinancePublicWsActor");
+        }
     }
 }
 
@@ -231,6 +237,8 @@ impl Message<Unsubscribe> for BinanceActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor
-        let _ = self.public_ws.tell(msg).send().await;
+        if let Err(e) = self.public_ws.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward message to BinancePublicWsActor");
+        }
     }
 }

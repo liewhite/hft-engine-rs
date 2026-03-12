@@ -187,7 +187,9 @@ impl IbkrPublicWsActor {
                 data: ExchangeEventData::BBO(bbo),
             };
 
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
         }
 
         Ok(())
@@ -312,7 +314,9 @@ impl IbkrPublicWsActor {
                 data: ExchangeEventData::OrderUpdate(update),
             };
 
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
         }
 
         Ok(())
@@ -417,7 +421,7 @@ impl IbkrPublicWsActor {
                 timestamp: local_ts,
             };
 
-            let _ = self
+            if let Err(e) = self
                 .income_pubsub
                 .tell(Publish(IncomeEvent {
                     exchange_ts: local_ts,
@@ -425,7 +429,10 @@ impl IbkrPublicWsActor {
                     data: ExchangeEventData::Fill(fill),
                 }))
                 .send()
-                .await;
+                .await
+            {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
 
             // 如果有 order_ref，同时发布 Filled OrderUpdate 关闭 pending order
             if !order_ref.is_empty() {
@@ -435,7 +442,7 @@ impl IbkrPublicWsActor {
                     .map(|v| v.to_string())
                     .unwrap_or_default();
 
-                let _ = self
+                if let Err(e) = self
                     .income_pubsub
                     .tell(Publish(IncomeEvent {
                         exchange_ts: local_ts,
@@ -453,7 +460,10 @@ impl IbkrPublicWsActor {
                         }),
                     }))
                     .send()
-                    .await;
+                    .await
+                {
+                    tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                }
             }
         }
 

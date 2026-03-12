@@ -22,55 +22,55 @@ impl MarkPriceUpdate {
     /// 转换为 FundingRate
     /// quote: 计价币种（用于解析 symbol）
     /// timestamp: 数据时间戳（毫秒）
-    pub fn to_funding_rate(&self, quote: &str, timestamp: u64) -> FundingRate {
+    pub fn to_funding_rate(&self, quote: &str, timestamp: u64) -> Result<FundingRate, String> {
         let symbol = from_binance(&self.s, quote)
-            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
+            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
         let rate = f64::from_str(&self.r)
-            .unwrap_or_else(|_| panic!("Failed to parse funding rate: {}", self.r));
+            .map_err(|_| format!("Failed to parse funding rate: {}", self.r))?;
 
-        FundingRate {
+        Ok(FundingRate {
             exchange: Exchange::Binance,
             symbol,
             rate,
             next_settle_time: self.t as u64,
             timestamp,
-        }
+        })
     }
 
     /// 转换为 MarkPrice
-    pub fn to_mark_price(&self, quote: &str, timestamp: u64) -> MarkPrice {
+    pub fn to_mark_price(&self, quote: &str, timestamp: u64) -> Result<MarkPrice, String> {
         let symbol = from_binance(&self.s, quote)
-            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
+            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
         let price = f64::from_str(&self.p)
-            .unwrap_or_else(|_| panic!("Failed to parse mark price: {}", self.p));
+            .map_err(|_| format!("Failed to parse mark price: {}", self.p))?;
 
-        MarkPrice {
+        Ok(MarkPrice {
             exchange: Exchange::Binance,
             symbol,
             price,
             timestamp,
-        }
+        })
     }
 
     /// 转换为 IndexPrice
-    pub fn to_index_price(&self, quote: &str, timestamp: u64) -> IndexPrice {
+    pub fn to_index_price(&self, quote: &str, timestamp: u64) -> Result<IndexPrice, String> {
         let symbol = from_binance(&self.s, quote)
-            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
+            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
         let price = f64::from_str(&self.i)
-            .unwrap_or_else(|_| panic!("Failed to parse index price: {}", self.i));
+            .map_err(|_| format!("Failed to parse index price: {}", self.i))?;
 
-        IndexPrice {
+        Ok(IndexPrice {
             exchange: Exchange::Binance,
             symbol,
             price,
             timestamp,
-        }
+        })
     }
 
     /// 获取 symbol (用于查询结算间隔)
-    pub fn symbol(&self, quote: &str) -> crate::domain::Symbol {
+    pub fn symbol(&self, quote: &str) -> Result<crate::domain::Symbol, String> {
         from_binance(&self.s, quote)
-            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s))
+            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))
     }
 }
 
@@ -91,19 +91,19 @@ pub struct BookTicker {
 }
 
 impl BookTicker {
-    pub fn to_bbo(&self, quote: &str) -> BBO {
+    pub fn to_bbo(&self, quote: &str) -> Result<BBO, String> {
         let symbol = from_binance(&self.s, quote)
-            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
+            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
         let bid_price = f64::from_str(&self.b)
-            .unwrap_or_else(|_| panic!("Failed to parse bid price: {}", self.b));
+            .map_err(|_| format!("Failed to parse bid price: {}", self.b))?;
         let bid_qty = f64::from_str(&self.bid_qty)
-            .unwrap_or_else(|_| panic!("Failed to parse bid qty: {}", self.bid_qty));
+            .map_err(|_| format!("Failed to parse bid qty: {}", self.bid_qty))?;
         let ask_price = f64::from_str(&self.a)
-            .unwrap_or_else(|_| panic!("Failed to parse ask price: {}", self.a));
+            .map_err(|_| format!("Failed to parse ask price: {}", self.a))?;
         let ask_qty = f64::from_str(&self.ask_qty)
-            .unwrap_or_else(|_| panic!("Failed to parse ask qty: {}", self.ask_qty));
+            .map_err(|_| format!("Failed to parse ask qty: {}", self.ask_qty))?;
 
-        BBO {
+        Ok(BBO {
             exchange: Exchange::Binance,
             symbol,
             bid_price,
@@ -111,7 +111,7 @@ impl BookTicker {
             ask_price,
             ask_qty,
             timestamp: self.t as u64,
-        }
+        })
     }
 }
 
@@ -141,19 +141,19 @@ pub struct AccountBalance {
 }
 
 impl AccountBalance {
-    pub fn to_balance(&self) -> Balance {
+    pub fn to_balance(&self) -> Result<Balance, String> {
         let available = f64::from_str(&self.cw)
-            .unwrap_or_else(|_| panic!("Failed to parse available balance: {}", self.cw));
+            .map_err(|_| format!("Failed to parse available balance: {}", self.cw))?;
         let wallet_balance = f64::from_str(&self.wb)
-            .unwrap_or_else(|_| panic!("Failed to parse wallet balance: {}", self.wb));
+            .map_err(|_| format!("Failed to parse wallet balance: {}", self.wb))?;
         let frozen = (wallet_balance - available).max(0.0);
 
-        Balance {
+        Ok(Balance {
             exchange: Exchange::Binance,
             asset: self.a.clone(),
             available,
             frozen,
-        }
+        })
     }
 }
 
@@ -169,23 +169,23 @@ pub struct AccountPosition {
 }
 
 impl AccountPosition {
-    pub fn to_position(&self, quote: &str) -> Position {
+    pub fn to_position(&self, quote: &str) -> Result<Position, String> {
         let symbol = from_binance(&self.s, quote)
-            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.s));
+            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
         let pos_amount = f64::from_str(&self.pa)
-            .unwrap_or_else(|_| panic!("Failed to parse position amount: {}", self.pa));
+            .map_err(|_| format!("Failed to parse position amount: {}", self.pa))?;
         let entry_price = f64::from_str(&self.ep)
-            .unwrap_or_else(|_| panic!("Failed to parse entry price: {}", self.ep));
+            .map_err(|_| format!("Failed to parse entry price: {}", self.ep))?;
         let unrealized_pnl = f64::from_str(&self.up)
-            .unwrap_or_else(|_| panic!("Failed to parse unrealized pnl: {}", self.up));
+            .map_err(|_| format!("Failed to parse unrealized pnl: {}", self.up))?;
 
-        Position {
+        Ok(Position {
             exchange: Exchange::Binance,
             symbol,
             size: pos_amount, // 正数多头，负数空头
             entry_price,
             unrealized_pnl,
-        }
+        })
     }
 }
 
@@ -220,18 +220,18 @@ pub struct OrderData {
 }
 
 impl OrderTradeUpdate {
-    pub fn to_order_update(&self, quote: &str) -> OrderUpdate {
+    pub fn to_order_update(&self, quote: &str) -> Result<OrderUpdate, String> {
         let symbol = from_binance(&self.o.s, quote)
-            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.o.s));
+            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.o.s))?;
         let filled_qty = f64::from_str(&self.o.z)
-            .unwrap_or_else(|_| panic!("Failed to parse filled qty: {}", self.o.z));
+            .map_err(|_| format!("Failed to parse filled qty: {}", self.o.z))?;
         let fill_sz = f64::from_str(&self.o.l)
-            .unwrap_or_else(|_| panic!("Failed to parse last filled qty: {}", self.o.l));
+            .map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))?;
 
         let side = match self.o.side.as_str() {
             "BUY" => Side::Long,
             "SELL" => Side::Short,
-            other => panic!("Unknown Binance side: {}", other),
+            other => return Err(format!("Unknown Binance side: {}", other)),
         };
 
         let status = match self.o.status.as_str() {
@@ -247,7 +247,7 @@ impl OrderTradeUpdate {
             },
         };
 
-        OrderUpdate {
+        Ok(OrderUpdate {
             order_id: self.o.i.to_string(),
             client_order_id: if self.o.c.is_empty() { None } else { Some(self.o.c.clone()) },
             exchange: Exchange::Binance,
@@ -257,31 +257,31 @@ impl OrderTradeUpdate {
             filled_quantity: filled_qty,
             fill_sz,
             timestamp: now_ms(),
-        }
+        })
     }
 
     /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）
-    pub fn to_fill(&self, quote: &str) -> Option<Fill> {
+    pub fn to_fill(&self, quote: &str) -> Result<Option<Fill>, String> {
         let fill_sz = f64::from_str(&self.o.l)
-            .unwrap_or_else(|_| panic!("Failed to parse last filled qty: {}", self.o.l));
+            .map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))?;
 
         // 没有成交则不生成 Fill
         if fill_sz == 0.0 {
-            return None;
+            return Ok(None);
         }
 
         let symbol = from_binance(&self.o.s, quote)
-            .unwrap_or_else(|| panic!("Unknown Binance symbol: {}", self.o.s));
+            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.o.s))?;
         let last_price = f64::from_str(&self.o.last_price)
-            .unwrap_or_else(|_| panic!("Failed to parse last price: {}", self.o.last_price));
+            .map_err(|_| format!("Failed to parse last price: {}", self.o.last_price))?;
 
         let side = match self.o.side.as_str() {
             "BUY" => Side::Long,
             "SELL" => Side::Short,
-            other => panic!("Unknown Binance side: {}", other),
+            other => return Err(format!("Unknown Binance side: {}", other)),
         };
 
-        Some(Fill {
+        Ok(Some(Fill {
             exchange: Exchange::Binance,
             symbol,
             side,
@@ -290,7 +290,7 @@ impl OrderTradeUpdate {
             client_order_id: if self.o.c.is_empty() { None } else { Some(self.o.c.clone()) },
             order_id: self.o.i.to_string(),
             timestamp: now_ms(),
-        })
+        }))
     }
 }
 

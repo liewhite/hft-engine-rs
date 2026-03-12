@@ -192,7 +192,9 @@ impl Message<Subscribe> for IbkrActor {
         msg: Subscribe,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let _ = self.public_ws.tell(msg).send().await;
+        if let Err(e) = self.public_ws.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward message to IbkrPublicWsActor");
+        }
     }
 }
 
@@ -204,7 +206,9 @@ impl Message<SubscribeBatch> for IbkrActor {
         msg: SubscribeBatch,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let _ = self.public_ws.tell(msg).send().await;
+        if let Err(e) = self.public_ws.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward message to IbkrPublicWsActor");
+        }
     }
 }
 
@@ -216,6 +220,8 @@ impl Message<Unsubscribe> for IbkrActor {
         msg: Unsubscribe,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let _ = self.public_ws.tell(msg).send().await;
+        if let Err(e) = self.public_ws.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward message to IbkrPublicWsActor");
+        }
     }
 }

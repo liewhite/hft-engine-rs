@@ -38,22 +38,22 @@ pub struct FundingRateData {
 impl FundingRateData {
     /// 转换为 FundingRate
     /// timestamp: 数据时间戳（毫秒）
-    pub fn to_funding_rate(&self, timestamp: u64) -> FundingRate {
+    pub fn to_funding_rate(&self, timestamp: u64) -> Result<FundingRate, String> {
         let symbol = from_okx(&self.inst_id)
-            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+            .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let rate = f64::from_str(&self.funding_rate)
-            .unwrap_or_else(|_| panic!("Failed to parse funding rate: {}", self.funding_rate));
+            .map_err(|_| format!("Failed to parse funding rate: {}", self.funding_rate))?;
         // funding_time: 下次收取时间
         let next_settle_ms: u64 = self.funding_time.parse()
-            .unwrap_or_else(|_| panic!("Failed to parse funding time: {}", self.funding_time));
+            .map_err(|_| format!("Failed to parse funding time: {}", self.funding_time))?;
 
-        FundingRate {
+        Ok(FundingRate {
             exchange: Exchange::OKX,
             symbol,
             rate,
             next_settle_time: next_settle_ms,
             timestamp,
-        }
+        })
     }
 }
 
@@ -69,30 +69,34 @@ pub struct BboData {
 }
 
 impl BboData {
-    pub fn to_bbo(&self, inst_id: &str) -> BBO {
+    pub fn to_bbo(&self, inst_id: &str) -> Result<BBO, String> {
         let symbol = from_okx(inst_id)
-            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", inst_id));
+            .ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
 
         let ask = self.asks.first()
-            .expect("BBO asks is empty");
-        assert!(ask.len() >= 2, "BBO ask data incomplete");
+            .ok_or("BBO asks is empty")?;
+        if ask.len() < 2 {
+            return Err(format!("BBO ask data incomplete: {:?}", ask));
+        }
         let ask_price = f64::from_str(&ask[0])
-            .unwrap_or_else(|_| panic!("Failed to parse ask price: {}", ask[0]));
+            .map_err(|_| format!("Failed to parse ask price: {}", ask[0]))?;
         let ask_qty = f64::from_str(&ask[1])
-            .unwrap_or_else(|_| panic!("Failed to parse ask qty: {}", ask[1]));
+            .map_err(|_| format!("Failed to parse ask qty: {}", ask[1]))?;
 
         let bid = self.bids.first()
-            .expect("BBO bids is empty");
-        assert!(bid.len() >= 2, "BBO bid data incomplete");
+            .ok_or("BBO bids is empty")?;
+        if bid.len() < 2 {
+            return Err(format!("BBO bid data incomplete: {:?}", bid));
+        }
         let bid_price = f64::from_str(&bid[0])
-            .unwrap_or_else(|_| panic!("Failed to parse bid price: {}", bid[0]));
+            .map_err(|_| format!("Failed to parse bid price: {}", bid[0]))?;
         let bid_qty = f64::from_str(&bid[1])
-            .unwrap_or_else(|_| panic!("Failed to parse bid qty: {}", bid[1]));
+            .map_err(|_| format!("Failed to parse bid qty: {}", bid[1]))?;
 
         let timestamp = self.ts.parse::<u64>()
-            .unwrap_or_else(|_| panic!("Failed to parse timestamp: {}", self.ts));
+            .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
-        BBO {
+        Ok(BBO {
             exchange: Exchange::OKX,
             symbol,
             bid_price,
@@ -100,7 +104,7 @@ impl BboData {
             ask_price,
             ask_qty,
             timestamp,
-        }
+        })
     }
 }
 
@@ -116,20 +120,20 @@ pub struct MarkPriceData {
 }
 
 impl MarkPriceData {
-    pub fn to_mark_price(&self) -> MarkPrice {
+    pub fn to_mark_price(&self) -> Result<MarkPrice, String> {
         let symbol = from_okx(&self.inst_id)
-            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+            .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let price = f64::from_str(&self.mark_px)
-            .unwrap_or_else(|_| panic!("Failed to parse mark price: {}", self.mark_px));
+            .map_err(|_| format!("Failed to parse mark price: {}", self.mark_px))?;
         let timestamp = self.ts.parse::<u64>()
-            .unwrap_or_else(|_| panic!("Failed to parse timestamp: {}", self.ts));
+            .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
-        MarkPrice {
+        Ok(MarkPrice {
             exchange: Exchange::OKX,
             symbol,
             price,
             timestamp,
-        }
+        })
     }
 }
 
@@ -143,21 +147,21 @@ pub struct IndexTickerData {
 }
 
 impl IndexTickerData {
-    pub fn to_index_price(&self) -> IndexPrice {
+    pub fn to_index_price(&self) -> Result<IndexPrice, String> {
         // index-tickers 返回 BTC-USDT 格式，使用 from_okx_index 解析
         let symbol = from_okx_index(&self.inst_id)
-            .unwrap_or_else(|| panic!("Unknown OKX index symbol: {}", self.inst_id));
+            .ok_or_else(|| format!("Unknown OKX index symbol: {}", self.inst_id))?;
         let price = f64::from_str(&self.idx_px)
-            .unwrap_or_else(|_| panic!("Failed to parse index price: {}", self.idx_px));
+            .map_err(|_| format!("Failed to parse index price: {}", self.idx_px))?;
         let timestamp = self.ts.parse::<u64>()
-            .unwrap_or_else(|_| panic!("Failed to parse timestamp: {}", self.ts));
+            .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
-        IndexPrice {
+        Ok(IndexPrice {
             exchange: Exchange::OKX,
             symbol,
             price,
             timestamp,
-        }
+        })
     }
 }
 
@@ -180,11 +184,11 @@ pub struct PositionData {
 }
 
 impl PositionData {
-    pub fn to_position(&self) -> Position {
+    pub fn to_position(&self) -> Result<Position, String> {
         let symbol = from_okx(&self.inst_id)
-            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+            .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let pos_amount = f64::from_str(&self.pos)
-            .unwrap_or_else(|_| panic!("Failed to parse position amount: {}", self.pos));
+            .map_err(|_| format!("Failed to parse position amount: {}", self.pos))?;
         // 以下字段可能为空字符串，使用默认值
         let avg_price = f64::from_str(&self.avg_px).unwrap_or_else(|_| {
             if !self.avg_px.is_empty() {
@@ -199,13 +203,13 @@ impl PositionData {
             0.0
         });
 
-        Position {
+        Ok(Position {
             exchange: Exchange::OKX,
             symbol,
             size: pos_amount, // 正数多头，负数空头
             entry_price: avg_price,
             unrealized_pnl,
-        }
+        })
     }
 }
 
@@ -223,14 +227,14 @@ pub struct AccountData {
 }
 
 impl AccountData {
-    pub fn to_equity(&self) -> f64 {
+    pub fn to_equity(&self) -> Result<f64, String> {
         f64::from_str(&self.total_eq)
-            .expect("Failed to parse OKX total equity")
+            .map_err(|_| format!("Failed to parse OKX total equity: {}", self.total_eq))
     }
 
-    pub fn to_notional(&self) -> f64 {
+    pub fn to_notional(&self) -> Result<f64, String> {
         f64::from_str(&self.notional_usd)
-            .expect("Failed to parse OKX notionalUsd")
+            .map_err(|_| format!("Failed to parse OKX notionalUsd: {}", self.notional_usd))
     }
 }
 
@@ -272,23 +276,23 @@ pub struct OrderPushData {
 }
 
 impl OrderPushData {
-    pub fn to_order_update(&self) -> OrderUpdate {
+    pub fn to_order_update(&self) -> Result<OrderUpdate, String> {
         let symbol = from_okx(&self.inst_id)
-            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+            .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let fill_sz = f64::from_str(&self.fill_sz)
-            .unwrap_or_else(|_| panic!("Failed to parse fill_sz: {}", self.fill_sz));
+            .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?;
         let acc_fill_sz = f64::from_str(&self.acc_fill_sz)
-            .unwrap_or_else(|_| panic!("Failed to parse acc_fill_sz: {}", self.acc_fill_sz));
+            .map_err(|_| format!("Failed to parse acc_fill_sz: {}", self.acc_fill_sz))?;
 
         let side = match self.side.as_str() {
             "buy" => Side::Long,
             "sell" => Side::Short,
-            other => panic!("Unknown OKX side: {}", other),
+            other => return Err(format!("Unknown OKX side: {}", other)),
         };
 
         let status = map_okx_order_state(&self.state, acc_fill_sz);
 
-        OrderUpdate {
+        Ok(OrderUpdate {
             order_id: self.ord_id.clone(),
             client_order_id: self.cl_ord_id.clone(),
             exchange: Exchange::OKX,
@@ -298,31 +302,31 @@ impl OrderPushData {
             filled_quantity: acc_fill_sz,
             fill_sz,
             timestamp: now_ms(),
-        }
+        })
     }
 
     /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）
-    pub fn to_fill(&self) -> Option<Fill> {
+    pub fn to_fill(&self) -> Result<Option<Fill>, String> {
         let fill_sz = f64::from_str(&self.fill_sz)
-            .unwrap_or_else(|_| panic!("Failed to parse fill_sz: {}", self.fill_sz));
+            .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?;
 
         // 没有成交则不生成 Fill
         if fill_sz == 0.0 {
-            return None;
+            return Ok(None);
         }
 
         let symbol = from_okx(&self.inst_id)
-            .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", self.inst_id));
+            .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let fill_px = f64::from_str(&self.fill_px)
-            .unwrap_or_else(|_| panic!("Failed to parse fill_px: {}", self.fill_px));
+            .map_err(|_| format!("Failed to parse fill_px: {}", self.fill_px))?;
 
         let side = match self.side.as_str() {
             "buy" => Side::Long,
             "sell" => Side::Short,
-            other => panic!("Unknown OKX side: {}", other),
+            other => return Err(format!("Unknown OKX side: {}", other)),
         };
 
-        Some(Fill {
+        Ok(Some(Fill {
             exchange: Exchange::OKX,
             symbol,
             side,
@@ -331,7 +335,7 @@ impl OrderPushData {
             client_order_id: self.cl_ord_id.clone(),
             order_id: self.ord_id.clone(),
             timestamp: now_ms(),
-        })
+        }))
     }
 }
 
@@ -370,26 +374,28 @@ pub fn parse_candle_data(
     raw: &CandleRawData,
     inst_id: &str,
     interval: CandleInterval,
-) -> Candle {
-    assert!(raw.len() >= 9, "OKX candle data incomplete: {:?}", raw);
+) -> Result<Candle, String> {
+    if raw.len() < 9 {
+        return Err(format!("OKX candle data incomplete: {:?}", raw));
+    }
 
     let symbol = from_okx(inst_id)
-        .unwrap_or_else(|| panic!("Unknown OKX symbol: {}", inst_id));
+        .ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
     let open_time: u64 = raw[0].parse()
-        .unwrap_or_else(|_| panic!("Failed to parse candle ts: {}", raw[0]));
+        .map_err(|_| format!("Failed to parse candle ts: {}", raw[0]))?;
     let open = f64::from_str(&raw[1])
-        .unwrap_or_else(|_| panic!("Failed to parse candle open: {}", raw[1]));
+        .map_err(|_| format!("Failed to parse candle open: {}", raw[1]))?;
     let high = f64::from_str(&raw[2])
-        .unwrap_or_else(|_| panic!("Failed to parse candle high: {}", raw[2]));
+        .map_err(|_| format!("Failed to parse candle high: {}", raw[2]))?;
     let low = f64::from_str(&raw[3])
-        .unwrap_or_else(|_| panic!("Failed to parse candle low: {}", raw[3]));
+        .map_err(|_| format!("Failed to parse candle low: {}", raw[3]))?;
     let close = f64::from_str(&raw[4])
-        .unwrap_or_else(|_| panic!("Failed to parse candle close: {}", raw[4]));
+        .map_err(|_| format!("Failed to parse candle close: {}", raw[4]))?;
     let volume = f64::from_str(&raw[5])
-        .unwrap_or_else(|_| panic!("Failed to parse candle vol: {}", raw[5]));
+        .map_err(|_| format!("Failed to parse candle vol: {}", raw[5]))?;
     let confirm = &raw[8] == "1";
 
-    Candle {
+    Ok(Candle {
         exchange: Exchange::OKX,
         symbol,
         interval,
@@ -400,7 +406,7 @@ pub fn parse_candle_data(
         close,
         volume,
         confirm,
-    }
+    })
 }
 
 /// CandleInterval → OKX bar 参数 (REST 和 WS channel 后缀)

@@ -62,31 +62,37 @@ impl StateManager {
     }
 
     /// 获取指定交易所的 USDT 余额
-    pub fn usdt_balance(&self, exchange: Exchange) -> f64 {
-        self.balances.get(&exchange).copied().unwrap_or(0.0)
+    ///
+    /// 返回 None 表示该交易所的余额数据尚未到达
+    pub fn usdt_balance(&self, exchange: Exchange) -> Option<f64> {
+        self.balances.get(&exchange).copied()
     }
 
-    /// 获取所有交易所的 USDT 总余额
+    /// 获取所有交易所的 USDT 总余额（仅包含已收到数据的交易所）
     pub fn total_usdt_balance(&self) -> f64 {
         self.balances.values().sum()
     }
 
     /// 获取指定交易所的账户净值
-    pub fn equity(&self, exchange: Exchange) -> f64 {
-        self.equities.get(&exchange).copied().unwrap_or(0.0)
+    ///
+    /// 返回 None 表示该交易所的净值数据尚未到达
+    pub fn equity(&self, exchange: Exchange) -> Option<f64> {
+        self.equities.get(&exchange).copied()
     }
 
-    /// 获取所有交易所的总净值
+    /// 获取所有交易所的总净值（仅包含已收到数据的交易所）
     pub fn total_equity(&self) -> f64 {
         self.equities.values().sum()
     }
 
     /// 获取指定交易所的账户总持仓名义价值
-    pub fn account_notional(&self, exchange: Exchange) -> f64 {
-        self.account_notionals.get(&exchange).copied().unwrap_or(0.0)
+    ///
+    /// 返回 None 表示该交易所的名义价值数据尚未到达
+    pub fn account_notional(&self, exchange: Exchange) -> Option<f64> {
+        self.account_notionals.get(&exchange).copied()
     }
 
-    /// 获取所有交易所的总持仓名义价值
+    /// 获取所有交易所的总持仓名义价值（仅包含已收到数据的交易所）
     pub fn total_account_notional(&self) -> f64 {
         self.account_notionals.values().sum()
     }
@@ -150,13 +156,15 @@ impl StateManager {
                 }
             }
             // Symbol 事件: 委托对应 SymbolState 处理
+            // 事件由 IncomeProcessorActor 按 (exchange, symbol) 路由，只有已注册的 symbol 才会到达，
+            // 因此 symbol 查找不会失败（如果失败说明路由逻辑有 bug，应立即暴露）
             _ => {
                 let symbol = event
                     .symbol()
                     .expect("Symbol event must have symbol");
                 self.states
                     .get_mut(symbol)
-                    .expect("Symbol not found in StateManager")
+                    .expect("Symbol not found in StateManager: routing bug")
                     .apply(event);
             }
         }

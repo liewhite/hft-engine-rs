@@ -153,13 +153,16 @@ impl ManagerActor {
         // 4. 向 ProcessorActor 注册所有 Executor 的订阅
         for (executor_ref, subscriptions) in executor_refs.iter().zip(strategy_subscriptions.iter())
         {
-            let _ = processor
+            if let Err(e) = processor
                 .tell(RegisterExecutor {
                     executor: executor_ref.clone(),
                     subscriptions: subscriptions.clone(),
                 })
                 .send()
-                .await;
+                .await
+            {
+                tracing::error!(error = %e, "Failed to forward event to executor");
+            }
         }
 
         // 5. 批量向各 ExchangeActors 发送订阅请求
@@ -448,7 +451,9 @@ where
         msg: SubscribeIncome<A>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let _ = self.income_pubsub.tell(Subscribe(msg.0)).send().await;
+        if let Err(e) = self.income_pubsub.tell(Subscribe(msg.0)).send().await {
+            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+        }
     }
 }
 
@@ -466,7 +471,9 @@ where
         msg: SubscribeOutcome<A>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let _ = self.outcome_pubsub.tell(Subscribe(msg.0)).send().await;
+        if let Err(e) = self.outcome_pubsub.tell(Subscribe(msg.0)).send().await {
+            tracing::error!(error = %e, "Failed to publish to OutcomePubSub");
+        }
     }
 }
 

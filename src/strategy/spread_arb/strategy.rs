@@ -61,7 +61,7 @@ impl SpreadArbStrategy {
     /// 其"杠杆"受限于账户现金余额，由 IBKR 本身的保证金系统控制。
     /// HL 侧是永续合约，杠杆率是策略需要主动管理的风险指标。
     fn current_leverage(&self, position_value: f64, state: &StateManager) -> f64 {
-        let hl_equity = state.equity(Exchange::Hyperliquid);
+        let hl_equity = state.equity(Exchange::Hyperliquid).unwrap_or(0.0);
         if hl_equity <= 0.0 {
             return f64::MAX;
         }

@@ -66,7 +66,7 @@ impl IbkrStatusPollingActor {
         }
 
         let local_ts = now_ms();
-        let _ = self
+        if let Err(e) = self
             .income_pubsub
             .tell(Publish(IncomeEvent {
                 exchange_ts: local_ts,
@@ -77,7 +77,10 @@ impl IbkrStatusPollingActor {
                 },
             }))
             .send()
-            .await;
+            .await
+        {
+            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+        }
     }
 }
 

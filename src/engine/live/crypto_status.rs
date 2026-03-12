@@ -78,7 +78,7 @@ impl Message<StreamMessage<Instant, (), ()>> for CryptoStatusActor {
         match msg {
             StreamMessage::Next(_) => {
                 let local_ts = now_ms();
-                let _ = self
+                if let Err(e) = self
                     .income_pubsub
                     .tell(Publish(IncomeEvent {
                         exchange_ts: local_ts,
@@ -89,7 +89,10 @@ impl Message<StreamMessage<Instant, (), ()>> for CryptoStatusActor {
                         },
                     }))
                     .send()
-                    .await;
+                    .await
+                {
+                    tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                }
             }
             StreamMessage::Started(_) => {
                 tracing::debug!(exchange = %self.exchange, "Crypto status stream started");

@@ -104,24 +104,24 @@ pub struct WsLevel {
 }
 
 impl WsBbo {
-    pub fn to_bbo(&self) -> BBO {
+    pub fn to_bbo(&self) -> Result<BBO, String> {
         let symbol = from_hyperliquid(&self.coin);
 
         let bid = self.bbo[0].as_ref()
-            .expect("BBO bid must exist for liquid symbols");
+            .ok_or("BBO bid is null")?;
         let ask = self.bbo[1].as_ref()
-            .expect("BBO ask must exist for liquid symbols");
+            .ok_or("BBO ask is null")?;
 
         let bid_price = f64::from_str(&bid.px)
-            .expect("bid price must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse bid price: {}", bid.px))?;
         let bid_qty = f64::from_str(&bid.sz)
-            .expect("bid size must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse bid size: {}", bid.sz))?;
         let ask_price = f64::from_str(&ask.px)
-            .expect("ask price must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse ask price: {}", ask.px))?;
         let ask_qty = f64::from_str(&ask.sz)
-            .expect("ask size must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse ask size: {}", ask.sz))?;
 
-        BBO {
+        Ok(BBO {
             exchange: Exchange::Hyperliquid,
             symbol,
             bid_price,
@@ -129,7 +129,7 @@ impl WsBbo {
             ask_price,
             ask_qty,
             timestamp: self.time,
-        }
+        })
     }
 }
 
@@ -144,47 +144,47 @@ impl WsActiveAssetCtx {
     /// 转换为 FundingRate
     /// Hyperliquid 每小时整点结算
     /// timestamp: 数据时间戳（毫秒）
-    pub fn to_funding_rate(&self, timestamp: u64) -> FundingRate {
+    pub fn to_funding_rate(&self, timestamp: u64) -> Result<FundingRate, String> {
         let symbol = from_hyperliquid(&self.coin);
         let rate = f64::from_str(&self.ctx.funding)
-            .expect("funding rate must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse funding rate: {}", self.ctx.funding))?;
 
-        FundingRate {
+        Ok(FundingRate {
             exchange: Exchange::Hyperliquid,
             symbol,
             rate,
             // Hyperliquid 每小时整点结算，计算下一个整点时间
             next_settle_time: next_hourly_settle_time(),
             timestamp,
-        }
+        })
     }
 
     /// 转换为 MarkPrice
-    pub fn to_mark_price(&self, timestamp: u64) -> MarkPrice {
+    pub fn to_mark_price(&self, timestamp: u64) -> Result<MarkPrice, String> {
         let symbol = from_hyperliquid(&self.coin);
         let price = f64::from_str(&self.ctx.mark_px)
-            .expect("mark_px must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse mark_px: {}", self.ctx.mark_px))?;
 
-        MarkPrice {
+        Ok(MarkPrice {
             exchange: Exchange::Hyperliquid,
             symbol,
             price,
             timestamp,
-        }
+        })
     }
 
     /// 转换为 IndexPrice (使用 oracle_px 作为指数价格)
-    pub fn to_index_price(&self, timestamp: u64) -> IndexPrice {
+    pub fn to_index_price(&self, timestamp: u64) -> Result<IndexPrice, String> {
         let symbol = from_hyperliquid(&self.coin);
         let price = f64::from_str(&self.ctx.oracle_px)
-            .expect("oracle_px must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse oracle_px: {}", self.ctx.oracle_px))?;
 
-        IndexPrice {
+        Ok(IndexPrice {
             exchange: Exchange::Hyperliquid,
             symbol,
             price,
             timestamp,
-        }
+        })
     }
 
     /// 获取 symbol
@@ -279,10 +279,10 @@ pub struct PositionLeverage {
 }
 
 impl AssetPosition {
-    pub fn to_position(&self) -> crate::domain::Position {
+    pub fn to_position(&self) -> Result<crate::domain::Position, String> {
         let symbol = from_hyperliquid(&self.coin);
         let size = f64::from_str(&self.szi)
-            .expect("szi must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse szi: {}", self.szi))?;
         // entry_px 在空仓 (size=0) 时可能为 None，此时使用 0.0
         let entry_price = self
             .entry_px
@@ -290,15 +290,15 @@ impl AssetPosition {
             .and_then(|p| f64::from_str(p).ok())
             .unwrap_or(0.0);
         let unrealized_pnl = f64::from_str(&self.unrealized_pnl)
-            .expect("unrealized_pnl must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse unrealized_pnl: {}", self.unrealized_pnl))?;
 
-        crate::domain::Position {
+        Ok(crate::domain::Position {
             exchange: Exchange::Hyperliquid,
             symbol,
             size,
             entry_price,
             unrealized_pnl,
-        }
+        })
     }
 }
 
@@ -326,28 +326,28 @@ pub struct WsBasicOrder {
 }
 
 impl WsOrderUpdate {
-    pub fn to_order_update(&self) -> crate::domain::OrderUpdate {
+    pub fn to_order_update(&self) -> Result<crate::domain::OrderUpdate, String> {
         use crate::domain::Side;
 
         let symbol = from_hyperliquid(&self.order.coin);
         let orig_sz = f64::from_str(&self.order.orig_sz)
-            .expect("orig_sz must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse orig_sz: {}", self.order.orig_sz))?;
         let current_sz = f64::from_str(&self.order.sz)
-            .expect("sz must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse sz: {}", self.order.sz))?;
         let filled_quantity = orig_sz - current_sz;
 
         // Hyperliquid: "A" = ask/sell, "B" = bid/buy
         let side = match self.order.side.as_str() {
             "B" => Side::Long,
             "A" => Side::Short,
-            other => panic!("Unknown Hyperliquid side: {}", other),
+            other => return Err(format!("Unknown Hyperliquid side: {}", other)),
         };
 
         let status = map_hyperliquid_order_status(&self.status, filled_quantity);
 
         // Hyperliquid 不直接提供本次成交量，使用 filled_quantity
         // 对于 IOC 订单（一次性成交），这等于实际成交量
-        crate::domain::OrderUpdate {
+        Ok(crate::domain::OrderUpdate {
             order_id: self.order.oid.to_string(),
             client_order_id: self.order.cloid.clone(),
             exchange: Exchange::Hyperliquid,
@@ -357,7 +357,7 @@ impl WsOrderUpdate {
             filled_quantity,
             fill_sz: filled_quantity,
             timestamp: self.status_timestamp,
-        }
+        })
     }
 }
 
@@ -413,21 +413,21 @@ pub struct WsFill {
 }
 
 impl WsFill {
-    pub fn to_fill(&self) -> Fill {
+    pub fn to_fill(&self) -> Result<Fill, String> {
         let symbol = from_hyperliquid(&self.coin);
         let price = f64::from_str(&self.px)
-            .expect("px must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse fill px: {}", self.px))?;
         let size = f64::from_str(&self.sz)
-            .expect("sz must be valid float from Hyperliquid API");
+            .map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?;
 
         // Hyperliquid: "B" = bid/buy, "A" = ask/sell
         let side = match self.side.as_str() {
             "B" => Side::Long,
             "A" => Side::Short,
-            other => panic!("Unknown Hyperliquid fill side: {}", other),
+            other => return Err(format!("Unknown Hyperliquid fill side: {}", other)),
         };
 
-        Fill {
+        Ok(Fill {
             exchange: Exchange::Hyperliquid,
             symbol,
             side,
@@ -436,6 +436,6 @@ impl WsFill {
             client_order_id: self.cloid.clone(),
             order_id: self.oid.to_string(),
             timestamp: self.time,
-        }
+        })
     }
 }

@@ -143,7 +143,9 @@ impl Message<Subscribe> for HyperliquidActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor
-        let _ = self.public_ws.tell(msg).send().await;
+        if let Err(e) = self.public_ws.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward message to HyperliquidPublicWsActor");
+        }
     }
 }
 
@@ -156,7 +158,9 @@ impl Message<SubscribeBatch> for HyperliquidActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor
-        let _ = self.public_ws.tell(msg).send().await;
+        if let Err(e) = self.public_ws.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward message to HyperliquidPublicWsActor");
+        }
     }
 }
 
@@ -169,6 +173,8 @@ impl Message<Unsubscribe> for HyperliquidActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 转发给 PublicWsActor
-        let _ = self.public_ws.tell(msg).send().await;
+        if let Err(e) = self.public_ws.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward message to HyperliquidPublicWsActor");
+        }
     }
 }

@@ -74,6 +74,8 @@ impl IncomeProcessorActor {
                 symbol: candle.symbol.clone(),
             },
             ExchangeEventData::HistoryCandles(candles) => {
+                // HistoryCandles 由 BusinessWsActor 在 REST 成功获取非空数据后才发布，
+                // 空数组在发布前已被过滤，因此这里不会为空
                 let first = candles.first().expect("HistoryCandles must not be empty");
                 EventRouting::BySymbol {
                     exchange: first.exchange,
@@ -173,14 +175,18 @@ impl Message<IncomeEvent> for IncomeProcessorActor {
                 // 按 symbol 路由：只发送给订阅了该 (exchange, symbol) 的 executor
                 for sub in self.executors.values() {
                     if sub.symbols.contains(&(exchange, symbol.clone())) {
-                        let _ = sub.executor.tell(msg.clone()).send().await;
+                        if let Err(e) = sub.executor.tell(msg.clone()).send().await {
+                            tracing::error!(error = %e, "Failed to forward event to executor");
+                        }
                     }
                 }
             }
             EventRouting::Broadcast => {
                 // 广播给所有 executor
                 for sub in self.executors.values() {
-                    let _ = sub.executor.tell(msg.clone()).send().await;
+                    if let Err(e) = sub.executor.tell(msg.clone()).send().await {
+                        tracing::error!(error = %e, "Failed to forward event to executor");
+                    }
                 }
             }
         }

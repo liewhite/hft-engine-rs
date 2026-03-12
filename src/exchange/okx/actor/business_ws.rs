@@ -125,7 +125,8 @@ impl OkxBusinessWsActor {
         // OKX 返回的数据按时间倒序，反转为正序
         let mut candles: Vec<_> = data.data.iter().rev()
             .map(|raw| parse_candle_data(raw, &inst_id, interval))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| WsError::ParseError(e))?;
 
         // 最新一条若未 confirm 则删除（WS 实时推送会补上）
         if candles.last().is_some_and(|c| !c.confirm) {
@@ -139,7 +140,9 @@ impl OkxBusinessWsActor {
             local_ts,
             data: ExchangeEventData::HistoryCandles(candles),
         };
-        let _ = self.income_pubsub.tell(Publish(event)).send().await;
+        if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+        }
 
         tracing::info!(
             symbol = %symbol,
@@ -155,7 +158,9 @@ impl OkxBusinessWsActor {
         let local_ts = now_ms();
         let events = parse_business_message(raw, local_ts)?;
         for event in events {
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
         }
         Ok(())
     }
@@ -385,18 +390,16 @@ fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, 
             .as_ref()
             .ok_or_else(|| WsError::ParseError(format!("Missing instId in {}", channel)))?;
 
-        let events = push
-            .data
-            .iter()
-            .map(|raw_data| {
-                let candle = parse_candle_data(raw_data, inst_id, interval);
-                IncomeEvent {
-                    exchange_ts: candle.open_time,
-                    local_ts,
-                    data: ExchangeEventData::Candle(candle),
-                }
-            })
-            .collect();
+        let mut events = Vec::new();
+        for raw_data in &push.data {
+            let candle = parse_candle_data(raw_data, inst_id, interval)
+                .map_err(|e| WsError::ParseError(e))?;
+            events.push(IncomeEvent {
+                exchange_ts: candle.open_time,
+                local_ts,
+                data: ExchangeEventData::Candle(candle),
+            });
+        }
         return Ok(events);
     }
 

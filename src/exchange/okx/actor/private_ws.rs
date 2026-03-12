@@ -56,7 +56,9 @@ impl OkxPrivateWsActor {
         let events = parse_private_message(raw, local_ts, &self.symbol_metas)?;
         tracing::debug!(count = events.len(), "OKX private events parsed");
         for event in events {
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
         }
         Ok(())
     }
@@ -264,47 +266,46 @@ fn parse_private_message(
             let push: WsPush<PositionData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("positions parse: {}", e)))?;
 
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let mut position = data.to_position();
-                    let meta = symbol_metas
-                        .get(&position.symbol)
-                        .expect("SymbolMeta not found for position symbol");
-                    position.size = meta.qty_to_coin(position.size);
-                    IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::Position(position),
-                    }
-                })
-                .collect();
+            let mut events = Vec::new();
+            for data in &push.data {
+                let mut position = data.to_position()
+                    .map_err(|e| WsError::ParseError(e))?;
+                // OKX 私有 WS 只推送已配置 symbol 的仓位（通过 SWAP instType 过滤），
+                // 因此 symbol_metas 查找不会失败
+                let meta = symbol_metas
+                    .get(&position.symbol)
+                    .expect("SymbolMeta not found: OKX private WS should only push configured symbols");
+                position.size = meta.qty_to_coin(position.size);
+                events.push(IncomeEvent {
+                    exchange_ts: local_ts,
+                    local_ts,
+                    data: ExchangeEventData::Position(position),
+                });
+            }
             Ok(events)
         }
         "account" => {
             let push: WsPush<AccountData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;
 
-            let events = push
-                .data
-                .iter()
-                .map(|data| {
-                    let exchange_ts = data
-                        .u_time
-                        .parse::<u64>()
-                        .expect("Failed to parse OKX account timestamp");
-                    IncomeEvent {
-                        exchange_ts,
-                        local_ts,
-                        data: ExchangeEventData::AccountInfo {
-                            exchange: Exchange::OKX,
-                            equity: data.to_equity(),
-                            notional: data.to_notional(),
-                        },
-                    }
-                })
-                .collect();
+            let mut events = Vec::new();
+            for data in &push.data {
+                let exchange_ts = data
+                    .u_time
+                    .parse::<u64>()
+                    .map_err(|_| WsError::ParseError(format!("Failed to parse OKX account timestamp: {}", data.u_time)))?;
+                events.push(IncomeEvent {
+                    exchange_ts,
+                    local_ts,
+                    data: ExchangeEventData::AccountInfo {
+                        exchange: Exchange::OKX,
+                        equity: data.to_equity()
+                            .map_err(|e| WsError::ParseError(e))?,
+                        notional: data.to_notional()
+                            .map_err(|e| WsError::ParseError(e))?,
+                    },
+                });
+            }
             Ok(events)
         }
         "orders" => {
@@ -313,7 +314,8 @@ fn parse_private_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let mut order_update = data.to_order_update();
+                let mut order_update = data.to_order_update()
+                    .map_err(|e| WsError::ParseError(e))?;
 
                 // 获取 meta 转换数量单位（张 -> 币）
                 if let Some(meta) = symbol_metas.get(&order_update.symbol) {
@@ -322,7 +324,8 @@ fn parse_private_message(
                 }
 
                 // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
-                if let Some(mut fill) = data.to_fill() {
+                if let Some(mut fill) = data.to_fill()
+                    .map_err(|e| WsError::ParseError(e))? {
                     // 获取 meta 转换数量单位（张 -> 币）
                     if let Some(meta) = symbol_metas.get(&fill.symbol) {
                         fill.size = meta.qty_to_coin(fill.size);

@@ -74,7 +74,7 @@ impl IbkrPositionPollingActor {
                         );
                     }
 
-                    let _ = self
+                    if let Err(e) = self
                         .income_pubsub
                         .tell(Publish(IncomeEvent {
                             exchange_ts: local_ts,
@@ -82,7 +82,10 @@ impl IbkrPositionPollingActor {
                             data: ExchangeEventData::Position(pos),
                         }))
                         .send()
-                        .await;
+                        .await
+                    {
+                        tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                    }
                 }
 
                 self.initialized = true;
@@ -103,7 +106,7 @@ impl IbkrPositionPollingActor {
 
         match self.client.fetch_account_info().await {
             Ok(info) => {
-                let _ = self
+                if let Err(e) = self
                     .income_pubsub
                     .tell(Publish(IncomeEvent {
                         exchange_ts: local_ts,
@@ -115,7 +118,10 @@ impl IbkrPositionPollingActor {
                         },
                     }))
                     .send()
-                    .await;
+                    .await
+                {
+                    tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                }
             }
             Err(e) => {
                 tracing::warn!(

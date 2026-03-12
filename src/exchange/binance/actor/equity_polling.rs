@@ -42,7 +42,7 @@ impl BinanceEquityPollingActor {
         match self.client.fetch_account_info().await {
             Ok(info) => {
                 // 发布 AccountInfo 事件
-                let _ = self
+                if let Err(e) = self
                     .income_pubsub
                     .tell(Publish(IncomeEvent {
                         exchange_ts: local_ts,
@@ -54,7 +54,10 @@ impl BinanceEquityPollingActor {
                         },
                     }))
                     .send()
-                    .await;
+                    .await
+                {
+                    tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                }
             }
             Err(e) => {
                 tracing::warn!(

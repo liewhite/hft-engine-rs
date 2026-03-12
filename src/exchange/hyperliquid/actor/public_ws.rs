@@ -91,7 +91,9 @@ impl HyperliquidPublicWsActor {
         let local_ts = now_ms();
         let events = parse_public_message(raw, local_ts, &self.subscribed_kinds)?;
         for event in events {
-            let _ = self.income_pubsub.tell(Publish(event)).send().await;
+            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            }
         }
         Ok(())
     }
@@ -338,7 +340,10 @@ fn parse_public_message(
                     events.push(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::FundingRate(ctx.to_funding_rate(local_ts)),
+                        data: ExchangeEventData::FundingRate(
+                            ctx.to_funding_rate(local_ts)
+                                .map_err(|e| WsError::ParseError(e))?,
+                        ),
                     });
                 }
                 if subscribed_kinds
@@ -347,14 +352,20 @@ fn parse_public_message(
                     events.push(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::MarkPrice(ctx.to_mark_price(local_ts)),
+                        data: ExchangeEventData::MarkPrice(
+                            ctx.to_mark_price(local_ts)
+                                .map_err(|e| WsError::ParseError(e))?,
+                        ),
                     });
                 }
                 if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
                     events.push(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::IndexPrice(ctx.to_index_price(local_ts)),
+                        data: ExchangeEventData::IndexPrice(
+                            ctx.to_index_price(local_ts)
+                                .map_err(|e| WsError::ParseError(e))?,
+                        ),
                     });
                 }
 
@@ -366,7 +377,8 @@ fn parse_public_message(
                 let bbo_data: WsBbo = serde_json::from_value(data.clone())
                     .map_err(|e| WsError::ParseError(format!("bbo parse: {}", e)))?;
 
-                let bbo = bbo_data.to_bbo();
+                let bbo = bbo_data.to_bbo()
+                    .map_err(|e| WsError::ParseError(e))?;
                 return Ok(vec![IncomeEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,

@@ -189,7 +189,7 @@ impl FundingArbStrategy {
 
         // 计算单个交易所的 symbol 杠杆率
         let calc_leverage = |exchange: Exchange| -> f64 {
-            let equity = state_manager.equity(exchange);
+            let equity = state_manager.equity(exchange).unwrap_or(0.0);
             if equity <= 0.0 {
                 return 0.0;
             }
@@ -287,8 +287,8 @@ impl FundingArbStrategy {
         state: &SymbolState,
         state_manager: &StateManager,
     ) {
-        let short_equity = state_manager.equity(signal.short_exchange);
-        let long_equity = state_manager.equity(signal.long_exchange);
+        let short_equity = state_manager.equity(signal.short_exchange).unwrap_or(0.0);
+        let long_equity = state_manager.equity(signal.long_exchange).unwrap_or(0.0);
 
         if short_equity <= 0.0 || long_equity <= 0.0 {
             tracing::warn!(
@@ -356,8 +356,8 @@ impl FundingArbStrategy {
         state: &SymbolState,
         state_manager: &StateManager,
     ) {
-        let short_equity = state_manager.equity(signal.short_exchange);
-        let long_equity = state_manager.equity(signal.long_exchange);
+        let short_equity = state_manager.equity(signal.short_exchange).unwrap_or(0.0);
+        let long_equity = state_manager.equity(signal.long_exchange).unwrap_or(0.0);
 
         if short_equity <= 0.0 || long_equity <= 0.0 {
             tracing::warn!(
@@ -374,10 +374,10 @@ impl FundingArbStrategy {
         }
 
         // 计算两边交易所的账户杠杆率
-        let short_notional = state_manager.account_notional(signal.short_exchange);
+        let short_notional = state_manager.account_notional(signal.short_exchange).unwrap_or(0.0);
         let short_leverage = short_notional / short_equity;
 
-        let long_notional = state_manager.account_notional(signal.long_exchange);
+        let long_notional = state_manager.account_notional(signal.long_exchange).unwrap_or(0.0);
         let long_leverage = long_notional / long_equity;
 
         // 获取当前 symbol 在各交易所的仓位
