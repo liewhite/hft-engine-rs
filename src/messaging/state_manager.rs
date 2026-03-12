@@ -1,4 +1,5 @@
 use crate::domain::{now_ms, Exchange, MarketStatus, Symbol, USDT};
+use crate::exchange::AccountInfo;
 use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
 use std::collections::HashMap;
 
@@ -8,10 +9,8 @@ pub struct StateManager {
     states: HashMap<Symbol, SymbolState>,
     /// 全局 USDT 余额 (per exchange)
     balances: HashMap<Exchange, f64>,
-    /// 账户净值 (per exchange)
-    equities: HashMap<Exchange, f64>,
-    /// 账户总持仓名义价值 (per exchange)
-    account_notionals: HashMap<Exchange, f64>,
+    /// 账户信息: 净值 + 总持仓名义价值 (per exchange)
+    account_infos: HashMap<Exchange, AccountInfo>,
     /// 交易所市场状态 (per exchange)
     market_statuses: HashMap<Exchange, MarketStatus>,
     /// 订单超时时间 (毫秒)
@@ -29,8 +28,7 @@ impl StateManager {
         Self {
             states,
             balances: HashMap::new(),
-            equities: HashMap::new(),
-            account_notionals: HashMap::new(),
+            account_infos: HashMap::new(),
             market_statuses: HashMap::new(),
             order_timeout_ms,
         }
@@ -73,28 +71,35 @@ impl StateManager {
         self.balances.values().sum()
     }
 
+    /// 获取指定交易所的账户信息 (equity + notional 原子性保证)
+    ///
+    /// 返回 None 表示该交易所的账户数据尚未到达
+    pub fn account_info(&self, exchange: Exchange) -> Option<&AccountInfo> {
+        self.account_infos.get(&exchange)
+    }
+
     /// 获取指定交易所的账户净值
     ///
     /// 返回 None 表示该交易所的净值数据尚未到达
     pub fn equity(&self, exchange: Exchange) -> Option<f64> {
-        self.equities.get(&exchange).copied()
+        self.account_infos.get(&exchange).map(|i| i.equity)
     }
 
     /// 获取所有交易所的总净值（仅包含已收到数据的交易所）
     pub fn total_equity(&self) -> f64 {
-        self.equities.values().sum()
+        self.account_infos.values().map(|i| i.equity).sum()
     }
 
     /// 获取指定交易所的账户总持仓名义价值
     ///
     /// 返回 None 表示该交易所的名义价值数据尚未到达
     pub fn account_notional(&self, exchange: Exchange) -> Option<f64> {
-        self.account_notionals.get(&exchange).copied()
+        self.account_infos.get(&exchange).map(|i| i.notional)
     }
 
     /// 获取所有交易所的总持仓名义价值（仅包含已收到数据的交易所）
     pub fn total_account_notional(&self) -> f64 {
-        self.account_notionals.values().sum()
+        self.account_infos.values().map(|i| i.notional).sum()
     }
 
     /// 获取指定交易所的市场状态（默认 Closed，安全侧）
@@ -129,7 +134,7 @@ impl StateManager {
                     self.balances.insert(balance.exchange, balance.available);
                 }
             }
-            // 全局事件: AccountInfo (equity + notional)
+            // 全局事件: AccountInfo (equity + notional 原子写入)
             ExchangeEventData::AccountInfo {
                 exchange,
                 equity,
@@ -141,8 +146,10 @@ impl StateManager {
                     notional = notional,
                     "AccountInfo updated"
                 );
-                self.equities.insert(*exchange, *equity);
-                self.account_notionals.insert(*exchange, *notional);
+                self.account_infos.insert(*exchange, AccountInfo {
+                    equity: *equity,
+                    notional: *notional,
+                });
             }
             // 全局事件: ExchangeStatus
             ExchangeEventData::ExchangeStatus { exchange, status } => {

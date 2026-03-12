@@ -81,8 +81,14 @@ impl SpreadArbStrategy {
             None => return,
         };
 
-        let ibkr_bbo = ibkr_state.bbo(Exchange::IBKR);
-        let hl_bbo = hl_state.bbo(Exchange::Hyperliquid);
+        let ibkr_bbo = match ibkr_state.bbo(Exchange::IBKR) {
+            Some(b) => b,
+            None => return, // BBO 尚未到达
+        };
+        let hl_bbo = match hl_state.bbo(Exchange::Hyperliquid) {
+            Some(b) => b,
+            None => return, // BBO 尚未到达
+        };
 
         let ibkr_pos = match ibkr_state.position(Exchange::IBKR) {
             Some(p) => p.size,
@@ -93,12 +99,8 @@ impl SpreadArbStrategy {
             None => return, // 仓位尚未初始化
         };
 
-        let (ibkr_bid, ibkr_ask) = ibkr_bbo
-            .map(|b| (b.bid_price, b.ask_price))
-            .unwrap_or((0.0, 0.0));
-        let (hl_bid, hl_ask) = hl_bbo
-            .map(|b| (b.bid_price, b.ask_price))
-            .unwrap_or((0.0, 0.0));
+        let (ibkr_bid, ibkr_ask) = (ibkr_bbo.bid_price, ibkr_bbo.ask_price);
+        let (hl_bid, hl_ask) = (hl_bbo.bid_price, hl_bbo.ask_price);
 
         let open_spread = self.calc_open_spread(hl_bid, ibkr_ask);
         let close_spread = self.calc_close_spread(hl_ask, ibkr_bid);

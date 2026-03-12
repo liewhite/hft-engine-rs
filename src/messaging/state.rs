@@ -170,6 +170,14 @@ impl SymbolState {
         self.index_prices.get(&exchange)
     }
 
+    /// 获取某个交易所的仓位大小
+    ///
+    /// 无仓位记录等价于空仓（size = 0.0），这是正确的业务语义：
+    /// 策略启动初期确实没有仓位。
+    pub fn position_size(&self, exchange: Exchange) -> f64 {
+        self.positions.get(&exchange).map(|p| p.size).unwrap_or(0.0)
+    }
+
     /// 是否有未完成订单
     pub fn has_pending_orders(&self) -> bool {
         !self.pending_orders.is_empty()

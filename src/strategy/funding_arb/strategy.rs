@@ -195,7 +195,7 @@ impl FundingArbStrategy {
             if equity <= 0.0 {
                 return 0.0;
             }
-            let pos_size = state.position(exchange).map(|p| p.size.abs()).unwrap_or(0.0);
+            let pos_size = state.position_size(exchange).abs();
             let price = state.bbo(exchange).map(|b| b.mid_price()).unwrap_or(0.0);
             (pos_size * price) / equity
         };
@@ -204,8 +204,8 @@ impl FundingArbStrategy {
         let long_leverage = calc_leverage(long_exchange);
 
         // 获取仓位
-        let short_pos = state.position(short_exchange).map(|p| p.size).unwrap_or(0.0);
-        let long_pos = state.position(long_exchange).map(|p| p.size).unwrap_or(0.0);
+        let short_pos = state.position_size(short_exchange);
+        let long_pos = state.position_size(long_exchange);
 
         // 计算方向因子：position * order_direction 的符号
         // long 做多 (+1)，short 做空 (-1)
@@ -321,8 +321,8 @@ impl FundingArbStrategy {
         let mid_price = (signal.short_price + signal.long_price) / 2.0;
 
         // 当前持仓
-        let short_pos = state.position(signal.short_exchange).map(|p| p.size.abs()).unwrap_or(0.0);
-        let long_pos = state.position(signal.long_exchange).map(|p| p.size.abs()).unwrap_or(0.0);
+        let short_pos = state.position_size(signal.short_exchange).abs();
+        let long_pos = state.position_size(signal.long_exchange).abs();
 
         // 当前杠杆率
         let old_short_leverage = (short_pos * mid_price) / short_equity;
@@ -400,22 +400,22 @@ impl FundingArbStrategy {
         }
 
         // 计算两边交易所的账户杠杆率
-        // equity 有值说明账户数据已到达，notional 必然也有值
-        let short_notional = state_manager.account_notional(signal.short_exchange).unwrap();
+        // account_info 原子包含 equity + notional，上面已通过 equity 检查确认数据已到达
+        let short_notional = state_manager
+            .account_info(signal.short_exchange)
+            .expect("account_info must exist when equity exists")
+            .notional;
         let short_leverage = short_notional / short_equity;
 
-        let long_notional = state_manager.account_notional(signal.long_exchange).unwrap();
+        let long_notional = state_manager
+            .account_info(signal.long_exchange)
+            .expect("account_info must exist when equity exists")
+            .notional;
         let long_leverage = long_notional / long_equity;
 
         // 获取当前 symbol 在各交易所的仓位
-        let short_pos = state
-            .position(signal.short_exchange)
-            .map(|p| p.size)
-            .unwrap_or(0.0);
-        let long_pos = state
-            .position(signal.long_exchange)
-            .map(|p| p.size)
-            .unwrap_or(0.0);
+        let short_pos = state.position_size(signal.short_exchange);
+        let long_pos = state.position_size(signal.long_exchange);
 
         // 检查做空方：杠杆率超标 && 已有空头仓位（方向相同，会增加杠杆）
         let short_blocked =

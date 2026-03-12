@@ -1,17 +1,20 @@
 //! IbkrActor - IBKR 交易所的父 Actor
 //!
 //! 职责:
-//! - 管理 PublicWsActor 子 actor
+//! - 管理子 actor 生命周期 (全部 spawn_link)
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
-//! - 维护 tickle 保活任务
 //!
 //! 架构:
 //! IbkrActor (父)
-//! └── IbkrPublicWsActor [spawn_link]
+//! ├── IbkrPublicWsActor [spawn_link]
+//! ├── IbkrTickleActor [spawn_link]
+//! ├── IbkrPositionPollingActor [spawn_link]
+//! └── IbkrStatusPollingActor [spawn_link]
 
 use super::position_polling::{IbkrPositionPollingActor, IbkrPositionPollingActorArgs};
 use super::public_ws::{IbkrPublicWsActor, IbkrPublicWsActorArgs};
 use super::status_polling::{IbkrStatusPollingActor, IbkrStatusPollingActorArgs};
+use super::tickle::{IbkrTickleActor, IbkrTickleActorArgs};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::ibkr::auth::{self, IbkrAuth};
 use crate::exchange::ibkr::IbkrClient;
@@ -47,6 +50,8 @@ pub struct IbkrActorArgs {
 pub struct IbkrActor {
     /// Public WebSocket Actor
     public_ws: ActorRef<IbkrPublicWsActor>,
+    /// Tickle 保活 Actor
+    _tickle: ActorRef<IbkrTickleActor>,
     /// 持仓轮询 Actor
     _position_polling: ActorRef<IbkrPositionPollingActor>,
     /// 市场状态轮询 Actor
@@ -82,44 +87,17 @@ impl Actor for IbkrActor {
         .await;
         tracing::info!(exchange = "IBKR", "PublicWsActor created");
 
-        // 3. 启动 tickle 保活任务 (每 60s POST /tickle)
-        // 连续失败 3 次则 kill actor，触发级联退出
-        let auth = args.auth;
-        let weak_ref = actor_ref.downgrade();
-        tokio::spawn(async move {
-            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-
-            let mut consecutive_failures: u32 = 0;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                let actor = match weak_ref.upgrade() {
-                    Some(a) => a,
-                    None => {
-                        tracing::info!("IBKR tickle task: actor stopped, exiting");
-                        break;
-                    }
-                };
-
-                let succeeded = auth::tickle(&*auth, &http).await.is_ok();
-
-                if succeeded {
-                    consecutive_failures = 0;
-                    tracing::trace!("IBKR tickle sent");
-                } else {
-                    consecutive_failures += 1;
-                    tracing::warn!(
-                        consecutive_failures,
-                        max = MAX_CONSECUTIVE_FAILURES,
-                        "IBKR tickle failed"
-                    );
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        tracing::error!("IBKR tickle: {} consecutive failures, killing actor", MAX_CONSECUTIVE_FAILURES);
-                        actor.kill();
-                        break;
-                    }
-                }
-            }
-        });
+        // 3. 启动 tickle 保活 Actor (spawn_link, 纳入级联退出)
+        let tickle = IbkrTickleActor::spawn_link_with_mailbox(
+            &actor_ref,
+            IbkrTickleActorArgs {
+                auth: args.auth.clone(),
+                http,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        tracing::info!(exchange = "IBKR", "TickleActor created");
 
         // 4. 创建持仓轮询 Actor (每 3 秒)
         let position_polling = IbkrPositionPollingActor::spawn_link_with_mailbox(
@@ -152,6 +130,7 @@ impl Actor for IbkrActor {
 
         Ok(Self {
             public_ws,
+            _tickle: tickle,
             _position_polling: position_polling,
             _status_polling: status_polling,
         })
