@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
 use fee_arb::engine::{
-    init_funding_arb_metrics, init_slack, init_tracing, load_config,
+    init_tracing, load_config,
     wait_for_shutdown, AddStrategies, GetAllSymbolMetas, ManagerActor,
-    ManagerActorArgs, MonitoringConfig,
+    ManagerActorArgs,
 };
 use fee_arb::exchange::binance::BinanceCredentials;
 use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
@@ -48,7 +48,6 @@ struct StrategyConfig {
 struct Config {
     exchanges: ExchangesConfig,
     strategy: StrategyConfig,
-    monitoring: Option<MonitoringConfig>,
 }
 
 #[tokio::main]
@@ -127,12 +126,6 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
 
     tracing::info!(count = strategy_count, "Strategies batch added");
-
-    // 监控
-    if let Some(ref monitoring) = config.monitoring {
-        init_funding_arb_metrics(&manager, monitoring).await?;
-        init_slack(&manager, monitoring).await?;
-    }
 
     wait_for_shutdown(manager).await;
     Ok(())

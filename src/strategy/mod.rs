@@ -1,11 +1,8 @@
 mod funding_arb;
 mod macd_grid;
-pub mod metrics_pusher;
-mod slack_notifier;
 
-pub use funding_arb::{FundingArbConfig, FundingArbMetricsActor, FundingArbMetricsArgs, FundingArbStrategy};
+pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
 pub use macd_grid::{MacdGridConfig, MacdGridStrategy};
-pub use slack_notifier::{SlackNotifierActor, SlackNotifierArgs};
 
 use crate::domain::{Exchange, Order, OrderId, Symbol};
 use crate::exchange::SubscriptionKind;

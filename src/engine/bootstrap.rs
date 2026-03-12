@@ -1,16 +1,8 @@
-use kameo::actor::{ActorRef, Spawn};
-use kameo::mailbox;
+use kameo::actor::ActorRef;
 use serde::de::DeserializeOwned;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::engine::config::MonitoringConfig;
-use crate::engine::live::{
-    ManagerActor, SubscribeIncome, SubscribeOutcome,
-};
-use crate::strategy::{
-    FundingArbMetricsActor, FundingArbMetricsArgs,
-    SlackNotifierActor, SlackNotifierArgs,
-};
+use crate::engine::live::ManagerActor;
 
 /// 初始化 tracing（fmt + EnvFilter，默认 fee_arb=info）
 pub fn init_tracing() -> anyhow::Result<()> {
@@ -34,59 +26,6 @@ pub fn load_config<T: DeserializeOwned>(default_path: &str) -> anyhow::Result<T>
     tracing::info!(path = %config_path, "Loading config");
     let content = std::fs::read_to_string(&config_path)?;
     Ok(serde_json::from_str(&content)?)
-}
-
-/// 初始化 Slack 通知 subscriber
-pub async fn init_slack(
-    manager: &ActorRef<ManagerActor>,
-    monitoring: &MonitoringConfig,
-) -> anyhow::Result<()> {
-    let slack_notifier = SlackNotifierActor::spawn_with_mailbox(
-        SlackNotifierArgs {
-            channel: monitoring.slack_channel.clone(),
-            token: monitoring.slack_token.clone(),
-        },
-        mailbox::unbounded(),
-    );
-
-    manager
-        .tell(SubscribeIncome(slack_notifier.clone()))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe SlackNotifier to income: {}", e))?;
-
-    manager
-        .tell(SubscribeOutcome(slack_notifier))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe SlackNotifier to outcome: {}", e))?;
-    tracing::info!("SlackNotifierActor created and subscribed");
-
-    Ok(())
-}
-
-/// 初始化 FundingArb metrics 并订阅到 Manager
-pub async fn init_funding_arb_metrics(
-    manager: &ActorRef<ManagerActor>,
-    monitoring: &MonitoringConfig,
-) -> anyhow::Result<()> {
-    let metrics_actor = FundingArbMetricsActor::spawn_with_mailbox(
-        FundingArbMetricsArgs {
-            pushgateway_url: monitoring.pushgateway_url.clone(),
-            metric_prefix: monitoring.metric_prefix.clone(),
-            push_interval_ms: monitoring.push_interval_ms,
-        },
-        mailbox::unbounded(),
-    );
-
-    manager
-        .tell(SubscribeIncome(metrics_actor))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe FundingArbMetrics to income: {}", e))?;
-    tracing::info!("FundingArbMetricsActor created and subscribed");
-
-    Ok(())
 }
 
 /// 等待 Ctrl+C 或 Manager 意外退出

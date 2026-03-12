@@ -62,9 +62,6 @@ uuid = { version = "1", features = ["v4"] }
 # Decimal for precise financial calculations
 rust_decimal = "1"
 
-# Metrics
-prometheus = "0.14"
-
 # TLS (for IBKR Gateway self-signed certs)
 native-tls = "0.2"
 
@@ -75,9 +72,6 @@ sha1 = "0.10"
 rand = "0.8"
 pkcs8 = { version = "0.10", features = ["pem"] }
 percent-encoding = "2"
-
-# Database ORM
-sea-orm = { version = "=2.0.0-rc.37", features = ["sqlx-mysql", "runtime-tokio-native-tls", "schema-sync", "entity-registry"] }
 
 [[bin]]
 name = "funding_arb"
