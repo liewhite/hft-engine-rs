@@ -57,6 +57,9 @@ impl SymbolState {
     /// 1. Created 状态超过 timeout_ms → 交易所未确认，移除
     /// 2. 非 Created 状态超过 3 * timeout_ms → 终态丢失，安全移除
     pub fn remove_timed_out_orders(&mut self, now: Timestamp, timeout_ms: u64) -> usize {
+        if timeout_ms == 0 {
+            return 0;
+        }
         let before = self.pending_orders.len();
         let symbol = self.symbol.clone();
         let safe_timeout_ms = timeout_ms * 3;
