@@ -1,8 +1,6 @@
 mod funding_arb;
-mod macd_grid;
 
 pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
-pub use macd_grid::{MacdGridConfig, MacdGridStrategy};
 
 use crate::domain::{Exchange, Order, OrderId, Symbol};
 use crate::exchange::SubscriptionKind;
