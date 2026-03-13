@@ -62,35 +62,43 @@ impl Actor for BinanceActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 0. 查询初始持仓并推送到 IncomePubSub
+        // 0. 查询初始持仓并推送到 IncomePubSub（对所有配置 symbol 推送，空仓推 0）
         if let Some(ref credentials) = args.credentials {
             let client = BinanceClient::new(Some(credentials.clone()))
                 .expect("Failed to create BinanceClient");
 
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as Timestamp;
+
             match client.fetch_positions().await {
                 Ok(positions) => {
-                    tracing::info!(
-                        exchange = "Binance",
-                        count = positions.len(),
-                        "Fetched initial positions"
-                    );
+                    let position_map: std::collections::HashMap<Symbol, crate::domain::Position> = positions
+                        .into_iter()
+                        .map(|p| (p.symbol.clone(), p))
+                        .collect();
 
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as Timestamp;
+                    for symbol in args.symbol_metas.keys() {
+                        let pos = position_map.get(symbol).cloned().unwrap_or(crate::domain::Position {
+                            exchange: crate::domain::Exchange::Binance,
+                            symbol: symbol.clone(),
+                            size: 0.0,
+                            entry_price: 0.0,
+                            unrealized_pnl: 0.0,
+                        });
 
-                    for position in positions {
                         tracing::info!(
                             exchange = "Binance",
-                            symbol = %position.symbol,
-                            size = position.size,
+                            symbol = %symbol,
+                            size = pos.size,
                             "Initial position loaded"
                         );
+
                         let event = IncomeEvent {
                             exchange_ts: now,
                             local_ts: now,
-                            data: ExchangeEventData::Position(position),
+                            data: ExchangeEventData::Position(pos),
                         };
                         if let Err(e) = args.income_pubsub.tell(Publish(event)).send().await {
                             tracing::error!(error = %e, "Failed to publish to IncomePubSub");

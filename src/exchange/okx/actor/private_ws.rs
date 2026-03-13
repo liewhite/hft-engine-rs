@@ -5,7 +5,7 @@
 //! - 自动订阅私有频道 (positions, account, orders)
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Exchange, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, Position, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
 use crate::exchange::okx::codec::{AccountData, OrderPushData, PositionData, WsEvent, WsPush};
@@ -267,21 +267,39 @@ fn parse_private_message(
                 .map_err(|e| WsError::ParseError(format!("positions parse: {}", e)))?;
 
             let mut events = Vec::new();
+            let mut seen_symbols = std::collections::HashSet::new();
+
             for data in &push.data {
-                let mut position = data.to_position()
-                    ?;
-                // OKX 私有 WS 只推送已配置 symbol 的仓位（通过 SWAP instType 过滤），
-                // 因此 symbol_metas 查找不会失败
-                let meta = symbol_metas
-                    .get(&position.symbol)
-                    .expect("SymbolMeta not found: OKX private WS should only push configured symbols");
-                position.size = meta.qty_to_coin(position.size);
-                events.push(IncomeEvent {
-                    exchange_ts: local_ts,
-                    local_ts,
-                    data: ExchangeEventData::Position(position),
-                });
+                let mut position = data.to_position()?;
+                if let Some(meta) = symbol_metas.get(&position.symbol) {
+                    position.size = meta.qty_to_coin(position.size);
+                    seen_symbols.insert(position.symbol.clone());
+                    events.push(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::Position(position),
+                    });
+                }
             }
+
+            // 为推送中缺失的配置 symbol 补推 0-position，
+            // 确保策略端能区分 "确认空仓" 和 "未初始化"
+            for symbol in symbol_metas.keys() {
+                if !seen_symbols.contains(symbol) {
+                    events.push(IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::Position(Position {
+                            exchange: Exchange::OKX,
+                            symbol: symbol.clone(),
+                            size: 0.0,
+                            entry_price: 0.0,
+                            unrealized_pnl: 0.0,
+                        }),
+                    });
+                }
+            }
+
             Ok(events)
         }
         "account" => {
