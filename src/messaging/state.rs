@@ -271,9 +271,12 @@ impl SymbolState {
                             self.pending_orders.remove(client_id);
                         }
                         OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
-                            // 交易所已确认订单，更新或注册状态
+                            // 交易所已确认订单，更新状态并回填 order_id
                             if let Some(pending) = self.pending_orders.get_mut(client_id) {
                                 pending.status = update.status.clone();
+                                if pending.order.id.is_empty() {
+                                    pending.order.id = update.order_id.clone();
+                                }
                             } else {
                                 // 启动时同步的现有挂单，注册到 pending_orders
                                 // 从 OrderUpdate 重建 Order（缺少 order_type 等信息，用占位值）
