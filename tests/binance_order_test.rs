@@ -4,9 +4,9 @@
 //! - BINANCE_API_KEY
 //! - BINANCE_SECRET
 
-use fee_arb::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
-use fee_arb::exchange::binance::{BinanceClient, BinanceCredentials};
-use fee_arb::exchange::ExchangeClient;
+use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
+use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
+use hft_engine_rs::exchange::ExchangeClient;
 use reqwest::Client;
 use serde::Deserialize;
 

@@ -4,12 +4,12 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::engine::live::ManagerActor;
 
-/// 初始化 tracing（fmt + EnvFilter，默认 fee_arb=info）
+/// 初始化 tracing（fmt + EnvFilter，默认 hft_engine_rs=info）
 pub fn init_tracing() -> anyhow::Result<()> {
     let filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else {
-        EnvFilter::new("fee_arb=info")
+        EnvFilter::new("hft_engine_rs=info")
     };
     tracing_subscriber::registry()
         .with(fmt::layer())

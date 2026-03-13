@@ -1,16 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
-use fee_arb::domain::{Exchange, Symbol, SymbolMeta};
-use fee_arb::engine::{
+use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
+use hft_engine_rs::engine::{
     init_tracing, load_config,
     wait_for_shutdown, AddStrategies, GetAllSymbolMetas, ManagerActor,
     ManagerActorArgs,
 };
-use fee_arb::exchange::binance::BinanceCredentials;
-use fee_arb::exchange::hyperliquid::HyperliquidCredentials;
-use fee_arb::exchange::ibkr::IbkrCredentials;
-use fee_arb::exchange::okx::OkxCredentials;
-use fee_arb::strategy::{
+use hft_engine_rs::exchange::binance::BinanceCredentials;
+use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
+use hft_engine_rs::exchange::ibkr::IbkrCredentials;
+use hft_engine_rs::exchange::okx::OkxCredentials;
+use hft_engine_rs::strategy::{
     FundingArbConfig, FundingArbStrategy,
 };
 use kameo::actor::Spawn;
@@ -106,14 +106,14 @@ async fn main() -> anyhow::Result<()> {
     let enabled_exchanges = config.exchanges.enabled_exchanges();
 
     // 批量创建所有策略
-    let strategies: Vec<Box<dyn fee_arb::strategy::Strategy>> = symbols
+    let strategies: Vec<Box<dyn hft_engine_rs::strategy::Strategy>> = symbols
         .iter()
         .map(|symbol| {
             Box::new(FundingArbStrategy::new(
                 config.strategy.funding_arb.clone(),
                 enabled_exchanges.clone(),
                 symbol.clone(),
-            )) as Box<dyn fee_arb::strategy::Strategy>
+            )) as Box<dyn hft_engine_rs::strategy::Strategy>
         })
         .collect();
 

@@ -12,9 +12,9 @@
 //! cargo test --test hyperliquid_xyz_test -- --ignored --nocapture
 //! ```
 
-use fee_arb::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
-use fee_arb::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
-use fee_arb::exchange::ExchangeClient;
+use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
+use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
+use hft_engine_rs::exchange::ExchangeClient;
 use reqwest::Client;
 use serde::Deserialize;
 

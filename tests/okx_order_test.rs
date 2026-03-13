@@ -5,9 +5,9 @@
 //! - OKX_SECRET
 //! - OKX_PASSPHRASE
 
-use fee_arb::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
-use fee_arb::exchange::okx::{OkxClient, OkxCredentials};
-use fee_arb::exchange::ExchangeClient;
+use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
+use hft_engine_rs::exchange::okx::{OkxClient, OkxCredentials};
+use hft_engine_rs::exchange::ExchangeClient;
 use reqwest::Client;
 use serde::Deserialize;
 

@@ -922,7 +922,7 @@ fn calculate_equity(&self) -> f64 {
 ### 8.1 启动回测
 
 ```rust
-use fee_arb::engine::backtest::{
+use hft_engine_rs::engine::backtest::{
     BacktestManager, BacktestConfig, LatencyConfig,
     CsvDataSource, MemoryDataSource,
 };
