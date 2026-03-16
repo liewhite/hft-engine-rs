@@ -106,9 +106,10 @@ impl StateManager {
 
     /// 获取指定交易所和币种的希腊值 (delta 已包含现货余额修正)
     pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
-        self.greeks.get(&(exchange, ccy.to_string())).map(|g| {
+        let key = (exchange, ccy.to_string());
+        self.greeks.get(&key).map(|g| {
             let mut corrected = g.clone();
-            if let Some(&cash_bal) = self.cash_balances.get(&(exchange, ccy.to_string())) {
+            if let Some(&cash_bal) = self.cash_balances.get(&key) {
                 corrected.delta += cash_bal;
             }
             corrected

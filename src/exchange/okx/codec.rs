@@ -222,7 +222,6 @@ pub struct AccountData {
     pub total_eq: String,
     /// 账户总持仓名义价值 (USD)
     pub notional_usd: String,
-    #[allow(dead_code)]
     pub details: Vec<AccountDetail>,
 }
 
