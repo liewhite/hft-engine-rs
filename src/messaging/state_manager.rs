@@ -13,6 +13,8 @@ pub struct StateManager {
     account_infos: HashMap<Exchange, AccountInfo>,
     /// 账户希腊值 (per exchange, per ccy)
     greeks: HashMap<(Exchange, String), Greeks>,
+    /// 币种现金余额 (per exchange, per ccy) — 用于修正 greeks delta
+    cash_balances: HashMap<(Exchange, String), f64>,
     /// 交易所市场状态 (per exchange)
     market_statuses: HashMap<Exchange, MarketStatus>,
     /// 订单超时时间 (毫秒)
@@ -32,6 +34,7 @@ impl StateManager {
             balances: HashMap::new(),
             account_infos: HashMap::new(),
             greeks: HashMap::new(),
+            cash_balances: HashMap::new(),
             market_statuses: HashMap::new(),
             order_timeout_ms,
         }
@@ -101,9 +104,15 @@ impl StateManager {
         self.account_infos.values().map(|i| i.notional).sum()
     }
 
-    /// 获取指定交易所和币种的希腊值
-    pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<&Greeks> {
-        self.greeks.get(&(exchange, ccy.to_string()))
+    /// 获取指定交易所和币种的希腊值 (delta 已包含现货余额修正)
+    pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
+        self.greeks.get(&(exchange, ccy.to_string())).map(|g| {
+            let mut corrected = g.clone();
+            if let Some(&cash_bal) = self.cash_balances.get(&(exchange, ccy.to_string())) {
+                corrected.delta += cash_bal;
+            }
+            corrected
+        })
     }
 
     /// 获取指定交易所的市场状态（默认 Closed，安全侧）
@@ -137,6 +146,11 @@ impl StateManager {
                     );
                     self.balances.insert(balance.exchange, balance.available);
                 }
+                // 存储币种现金余额 (用于修正 greeks delta)
+                self.cash_balances.insert(
+                    (balance.exchange, balance.asset.clone()),
+                    balance.available,
+                );
             }
             // 全局事件: AccountInfo (equity + notional 原子写入)
             ExchangeEventData::AccountInfo {

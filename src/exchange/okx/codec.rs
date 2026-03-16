@@ -240,13 +240,18 @@ impl AccountData {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct AccountDetail {
     pub ccy: String,
+    #[allow(dead_code)]
     pub eq: String,
+    #[allow(dead_code)]
     pub avail_eq: String,
+    #[allow(dead_code)]
     pub avail_bal: String,
+    #[allow(dead_code)]
     pub frozen_bal: String,
+    /// 币种现金余额 (现货持有量)
+    pub cash_bal: String,
 }
 
 /// Order 推送数据

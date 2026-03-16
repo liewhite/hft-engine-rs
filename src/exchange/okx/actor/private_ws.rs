@@ -5,7 +5,7 @@
 //! - 自动订阅私有频道 (positions, account, orders)
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Exchange, Position, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Balance, Exchange, Position, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
 use crate::exchange::okx::codec::{AccountData, GreeksData, OrderPushData, PositionData, WsEvent, WsPush};
@@ -318,12 +318,25 @@ fn parse_private_message(
                     local_ts,
                     data: ExchangeEventData::AccountInfo {
                         exchange: Exchange::OKX,
-                        equity: data.to_equity()
-                            ?,
-                        notional: data.to_notional()
-                            ?,
+                        equity: data.to_equity()?,
+                        notional: data.to_notional()?,
                     },
                 });
+
+                // 推送每个币种的现金余额 (用于修正 greeks delta)
+                for detail in &data.details {
+                    let cash_bal: f64 = detail.cash_bal.parse().unwrap_or(0.0);
+                    events.push(IncomeEvent {
+                        exchange_ts,
+                        local_ts,
+                        data: ExchangeEventData::Balance(Balance {
+                            exchange: Exchange::OKX,
+                            asset: detail.ccy.clone(),
+                            available: cash_bal,
+                            frozen: 0.0,
+                        }),
+                    });
+                }
             }
             Ok(events)
         }
