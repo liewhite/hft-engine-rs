@@ -51,13 +51,21 @@ impl Strategy for GreeksPrintStrategy {
         30_000
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, _state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
         match &event.data {
-            ExchangeEventData::Greeks(g) => {
-                println!(
-                    "[GREEKS] ccy={} delta={:.6} gamma={:.6} theta={:.6} vega={:.6} ts={}",
-                    g.ccy, g.delta, g.gamma, g.theta, g.vega, g.timestamp
-                );
+            ExchangeEventData::Greeks(raw) => {
+                // state.greeks() 返回修正后的 delta (含现货 cashBal)
+                if let Some(g) = state.greeks(Exchange::OKX, &raw.ccy) {
+                    println!(
+                        "[GREEKS] ccy={} delta={:.6} (raw={:.6}) gamma={:.6} theta={:.6} vega={:.6} ts={}",
+                        g.ccy, g.delta, raw.delta, g.gamma, g.theta, g.vega, g.timestamp
+                    );
+                } else {
+                    println!(
+                        "[GREEKS] ccy={} waiting for cashBal... (raw delta={:.6})",
+                        raw.ccy, raw.delta
+                    );
+                }
             }
             _ => {}
         }
