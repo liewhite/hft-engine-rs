@@ -325,14 +325,12 @@ fn parse_private_message(
 
                 // 推送每个币种的现金余额 (用于修正 greeks delta)
                 for detail in &data.details {
-                    let cash_bal: f64 = detail.cash_bal.parse().unwrap_or_else(|_| {
-                        if !detail.cash_bal.is_empty() {
-                            tracing::warn!(ccy = %detail.ccy, cash_bal = %detail.cash_bal,
-                                "Failed to parse cash_bal, defaulting to 0.0");
-                        }
-                        0.0
-                    });
-                    let frozen: f64 = detail.frozen_bal.parse().unwrap_or(0.0);
+                    let cash_bal: f64 = detail.cash_bal.parse()
+                        .map_err(|_| WsError::ParseError(format!(
+                            "Failed to parse cash_bal '{}' for ccy {}", detail.cash_bal, detail.ccy)))?;
+                    let frozen: f64 = detail.frozen_bal.parse()
+                        .map_err(|_| WsError::ParseError(format!(
+                            "Failed to parse frozen_bal '{}' for ccy {}", detail.frozen_bal, detail.ccy)))?;
                     events.push(IncomeEvent {
                         exchange_ts,
                         local_ts,

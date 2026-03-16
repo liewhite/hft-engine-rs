@@ -260,33 +260,34 @@ impl BinanceClient {
 
         let positions: Vec<PositionInfo> = resp.json().await.map_err(Self::map_reqwest_error)?;
 
-        let result: Vec<crate::domain::Position> = positions
-            .into_iter()
-            .filter_map(|p| {
-                let symbol = from_binance(&p.symbol, &self.quote)?;
-                let size: f64 = p.position_amt.parse().ok()?;
-                // 跳过空仓位
-                if size.abs() < 1e-10 {
-                    return None;
-                }
-                let entry_price: f64 = p.entry_price.parse().unwrap_or_else(|_| {
-                    tracing::warn!(symbol = %p.symbol, entry_price = %p.entry_price, "Failed to parse Binance entry_price, defaulting to 0.0");
-                    0.0
-                });
-                let unrealized_pnl: f64 = p.un_realized_profit.parse().unwrap_or_else(|_| {
-                    tracing::warn!(symbol = %p.symbol, un_realized_profit = %p.un_realized_profit, "Failed to parse Binance un_realized_profit, defaulting to 0.0");
-                    0.0
-                });
+        let mut result = Vec::new();
+        for p in positions {
+            let symbol = match from_binance(&p.symbol, &self.quote) {
+                Some(s) => s,
+                None => continue, // 非当前 quote 的交易对，跳过
+            };
+            let size: f64 = p.position_amt.parse()
+                .map_err(|_| ExchangeError::Other(format!(
+                    "Failed to parse position_amt '{}' for {}", p.position_amt, p.symbol)))?;
+            // 跳过空仓位
+            if size.abs() < 1e-10 {
+                continue;
+            }
+            let entry_price: f64 = p.entry_price.parse()
+                .map_err(|_| ExchangeError::Other(format!(
+                    "Failed to parse entry_price '{}' for {}", p.entry_price, p.symbol)))?;
+            let unrealized_pnl: f64 = p.un_realized_profit.parse()
+                .map_err(|_| ExchangeError::Other(format!(
+                    "Failed to parse un_realized_profit '{}' for {}", p.un_realized_profit, p.symbol)))?;
 
-                Some(crate::domain::Position {
-                    exchange: Exchange::Binance,
-                    symbol,
-                    size,
-                    entry_price,
-                    unrealized_pnl,
-                })
-            })
-            .collect();
+            result.push(crate::domain::Position {
+                exchange: Exchange::Binance,
+                symbol,
+                size,
+                entry_price,
+                unrealized_pnl,
+            });
+        }
 
         Ok(result)
     }

@@ -189,19 +189,19 @@ impl PositionData {
             .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let pos_amount = f64::from_str(&self.pos)
             .map_err(|_| format!("Failed to parse position amount: {}", self.pos))?;
-        // 以下字段可能为空字符串，使用默认值
-        let avg_price = f64::from_str(&self.avg_px).unwrap_or_else(|_| {
-            if !self.avg_px.is_empty() {
-                tracing::warn!(inst_id = %self.inst_id, avg_px = %self.avg_px, "Failed to parse OKX avg_px, defaulting to 0.0");
-            }
+        // OKX 空仓时 avg_px/upl 为空字符串，此时为 0.0；非空必须解析成功
+        let avg_price = if self.avg_px.is_empty() {
             0.0
-        });
-        let unrealized_pnl = f64::from_str(&self.upl).unwrap_or_else(|_| {
-            if !self.upl.is_empty() {
-                tracing::warn!(inst_id = %self.inst_id, upl = %self.upl, "Failed to parse OKX upl, defaulting to 0.0");
-            }
+        } else {
+            f64::from_str(&self.avg_px)
+                .map_err(|_| format!("Failed to parse avg_px: {}", self.avg_px))?
+        };
+        let unrealized_pnl = if self.upl.is_empty() {
             0.0
-        });
+        } else {
+            f64::from_str(&self.upl)
+                .map_err(|_| format!("Failed to parse upl: {}", self.upl))?
+        };
 
         Ok(Position {
             exchange: Exchange::OKX,
