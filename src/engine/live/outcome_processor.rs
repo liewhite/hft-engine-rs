@@ -103,6 +103,8 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                                 symbol,
                                 side: Side::Long, // 撤单事件中 side 无实际意义
                                 status: OrderStatus::Cancelled,
+                                price: 0.0,
+                                quantity: 0.0,
                                 filled_quantity: 0.0,
                                 fill_sz: 0.0,
                                 timestamp: local_ts,
@@ -231,6 +233,8 @@ impl OutcomeProcessorActor {
             symbol: order.symbol.clone(),
             side: order.side,
             status: OrderStatus::Error { reason },
+            price: 0.0,
+            quantity: 0.0,
             filled_quantity: 0.0,
             fill_sz: 0.0,
             timestamp: local_ts,

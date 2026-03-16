@@ -317,7 +317,9 @@ impl ExchangeClient for OkxClient {
             cl_ord_id: Option<String>,
             side: String,
             state: String,
-            #[allow(unused)]
+            /// 订单价格
+            px: String,
+            /// 订单数量 (张)
             sz: String,
             acc_fill_sz: String,
         }
@@ -383,6 +385,15 @@ impl ExchangeClient for OkxClient {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| d.ord_id.clone());
 
+            let price: f64 = d.px.parse().unwrap_or(0.0);
+            let sz: f64 = match d.sz.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(ord_id = %d.ord_id, sz = %d.sz, "Failed to parse sz, skipping");
+                    continue;
+                }
+            };
+
             updates.push(OrderUpdate {
                 order_id: d.ord_id.clone(),
                 client_order_id: Some(client_order_id),
@@ -390,7 +401,9 @@ impl ExchangeClient for OkxClient {
                 symbol: sym,
                 side,
                 status,
-                filled_quantity: acc_fill_sz,
+                price,
+                quantity: sz,          // 张数，由 manager 转换为币
+                filled_quantity: acc_fill_sz, // 张数，由 manager 转换为币
                 fill_sz: 0.0,
                 timestamp: now_ms(),
             });

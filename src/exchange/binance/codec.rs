@@ -247,6 +247,9 @@ impl OrderTradeUpdate {
             },
         };
 
+        let price = f64::from_str(&self.o.ap).unwrap_or(0.0);
+        let quantity = f64::from_str(&self.o.q).unwrap_or(0.0);
+
         Ok(OrderUpdate {
             order_id: self.o.i.to_string(),
             client_order_id: if self.o.c.is_empty() { None } else { Some(self.o.c.clone()) },
@@ -254,6 +257,8 @@ impl OrderTradeUpdate {
             symbol,
             side,
             status,
+            price,
+            quantity,
             filled_quantity: filled_qty,
             fill_sz,
             timestamp: now_ms(),

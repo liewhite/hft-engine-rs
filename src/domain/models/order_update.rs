@@ -10,6 +10,10 @@ pub struct OrderUpdate {
     pub symbol: Symbol,
     pub side: Side,
     pub status: OrderStatus,
+    /// 订单价格 (限价单)
+    pub price: f64,
+    /// 订单总数量 (币单位)
+    pub quantity: Quantity,
     /// 累计成交量
     pub filled_quantity: Quantity,
     /// 本次成交量（用于乐观更新 position）

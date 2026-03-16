@@ -358,6 +358,7 @@ fn parse_private_message(
 
                 // 获取 meta 转换数量单位（张 -> 币）
                 if let Some(meta) = symbol_metas.get(&order_update.symbol) {
+                    order_update.quantity = meta.qty_to_coin(order_update.quantity);
                     order_update.filled_quantity = meta.qty_to_coin(order_update.filled_quantity);
                     order_update.fill_sz = meta.qty_to_coin(order_update.fill_sz);
                 }

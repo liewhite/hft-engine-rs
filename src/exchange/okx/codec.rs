@@ -259,11 +259,12 @@ pub struct AccountDetail {
 pub struct OrderPushData {
     pub inst_id: String,
     pub ord_id: String,
-    #[allow(dead_code)]
     pub cl_ord_id: Option<String>,
     pub side: String, // "buy" or "sell"
     pub state: String,
-    #[allow(dead_code)]
+    /// 订单价格 (限价单)
+    pub px: String,
+    /// 订单总数量 (张)
     pub sz: String,
     /// 本次成交数量
     pub fill_sz: String,
@@ -283,6 +284,9 @@ impl OrderPushData {
     pub fn to_order_update(&self) -> Result<OrderUpdate, String> {
         let symbol = from_okx(&self.inst_id)
             .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
+        let price = f64::from_str(&self.px).unwrap_or(0.0); // market order px 为空
+        let sz = f64::from_str(&self.sz)
+            .map_err(|_| format!("Failed to parse sz: {}", self.sz))?;
         let fill_sz = f64::from_str(&self.fill_sz)
             .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?;
         let acc_fill_sz = f64::from_str(&self.acc_fill_sz)
@@ -303,8 +307,10 @@ impl OrderPushData {
             symbol,
             side,
             status,
-            filled_quantity: acc_fill_sz,
-            fill_sz,
+            price,
+            quantity: sz,          // 张数，由 private_ws 转换为币
+            filled_quantity: acc_fill_sz, // 张数，由 private_ws 转换为币
+            fill_sz,               // 张数，由 private_ws 转换为币
             timestamp: now_ms(),
         })
     }

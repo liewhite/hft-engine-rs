@@ -266,7 +266,6 @@ impl SymbolState {
                                 }
                             } else {
                                 // 启动时同步的现有挂单，注册到 pending_orders
-                                // 从 OrderUpdate 重建 Order（缺少 order_type 等信息，用占位值）
                                 self.pending_orders.insert(
                                     client_id.clone(),
                                     PendingOrder {
@@ -276,10 +275,10 @@ impl SymbolState {
                                             symbol: update.symbol.clone(),
                                             side: update.side,
                                             order_type: OrderType::Limit {
-                                                price: 0.0,
+                                                price: update.price,
                                                 tif: TimeInForce::GTC,
                                             },
-                                            quantity: 0.0,
+                                            quantity: update.quantity,
                                             reduce_only: false,
                                             client_order_id: client_id.clone(),
                                         },
