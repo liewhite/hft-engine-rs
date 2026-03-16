@@ -284,7 +284,13 @@ impl OrderPushData {
     pub fn to_order_update(&self) -> Result<OrderUpdate, String> {
         let symbol = from_okx(&self.inst_id)
             .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
-        let price = f64::from_str(&self.px).unwrap_or(0.0); // market order px 为空
+        // market order px 为空字符串，此时 price 为 0.0
+        let price = if self.px.is_empty() {
+            0.0
+        } else {
+            f64::from_str(&self.px)
+                .map_err(|_| format!("Failed to parse px: {}", self.px))?
+        };
         let sz = f64::from_str(&self.sz)
             .map_err(|_| format!("Failed to parse sz: {}", self.sz))?;
         let fill_sz = f64::from_str(&self.fill_sz)

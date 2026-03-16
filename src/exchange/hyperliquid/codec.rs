@@ -349,7 +349,8 @@ impl WsOrderUpdate {
 
         // Hyperliquid 不直接提供本次成交量，使用 filled_quantity
         // 对于 IOC 订单（一次性成交），这等于实际成交量
-        let price = f64::from_str(&self.order.limit_px).unwrap_or(0.0);
+        let price = f64::from_str(&self.order.limit_px)
+            .map_err(|_| format!("Failed to parse limit_px: {}", self.order.limit_px))?;
 
         Ok(crate::domain::OrderUpdate {
             order_id: self.order.oid.to_string(),

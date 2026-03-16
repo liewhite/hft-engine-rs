@@ -385,14 +385,10 @@ impl ExchangeClient for OkxClient {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| d.ord_id.clone());
 
-            let price: f64 = d.px.parse().unwrap_or(0.0);
-            let sz: f64 = match d.sz.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!(ord_id = %d.ord_id, sz = %d.sz, "Failed to parse sz, skipping");
-                    continue;
-                }
-            };
+            let price: f64 = d.px.parse()
+                .map_err(|_| ExchangeError::Other(format!("Failed to parse px '{}' for order {}", d.px, d.ord_id)))?;
+            let sz: f64 = d.sz.parse()
+                .map_err(|_| ExchangeError::Other(format!("Failed to parse sz '{}' for order {}", d.sz, d.ord_id)))?;
 
             updates.push(OrderUpdate {
                 order_id: d.ord_id.clone(),

@@ -247,8 +247,10 @@ impl OrderTradeUpdate {
             },
         };
 
-        let price = f64::from_str(&self.o.ap).unwrap_or(0.0);
-        let quantity = f64::from_str(&self.o.q).unwrap_or(0.0);
+        let price = f64::from_str(&self.o.ap)
+            .map_err(|_| format!("Failed to parse avg price: {}", self.o.ap))?;
+        let quantity = f64::from_str(&self.o.q)
+            .map_err(|_| format!("Failed to parse quantity: {}", self.o.q))?;
 
         Ok(OrderUpdate {
             order_id: self.o.i.to_string(),
