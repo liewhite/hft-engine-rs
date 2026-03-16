@@ -84,6 +84,7 @@ impl IncomeProcessorActor {
             }
             // 账户级别数据、ExchangeStatus 和 Clock：广播
             ExchangeEventData::Balance(_)
+            | ExchangeEventData::Greeks(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. }
             | ExchangeEventData::Clock => EventRouting::Broadcast,

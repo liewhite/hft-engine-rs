@@ -1,5 +1,5 @@
 use super::{from_okx, from_okx_index};
-use crate::domain::{Candle, CandleInterval, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
+use crate::domain::{Candle, CandleInterval, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -349,6 +349,46 @@ fn map_okx_order_state(state: &str, filled: f64) -> OrderStatus {
         other => OrderStatus::Rejected {
             reason: format!("Unknown state: {}", other),
         },
+    }
+}
+
+/// Account Greeks 数据 (account-greeks channel)
+#[derive(Debug, Deserialize)]
+pub struct GreeksData {
+    pub ccy: String,
+    #[serde(rename = "deltaBS")]
+    pub delta_bs: String,
+    #[serde(rename = "gammaBS")]
+    pub gamma_bs: String,
+    #[serde(rename = "thetaBS")]
+    pub theta_bs: String,
+    #[serde(rename = "vegaBS")]
+    pub vega_bs: String,
+    pub ts: String,
+}
+
+impl GreeksData {
+    pub fn to_greeks(&self) -> Result<Greeks, String> {
+        let delta = f64::from_str(&self.delta_bs)
+            .map_err(|_| format!("Failed to parse deltaBS: {}", self.delta_bs))?;
+        let gamma = f64::from_str(&self.gamma_bs)
+            .map_err(|_| format!("Failed to parse gammaBS: {}", self.gamma_bs))?;
+        let theta = f64::from_str(&self.theta_bs)
+            .map_err(|_| format!("Failed to parse thetaBS: {}", self.theta_bs))?;
+        let vega = f64::from_str(&self.vega_bs)
+            .map_err(|_| format!("Failed to parse vegaBS: {}", self.vega_bs))?;
+        let timestamp = self.ts.parse::<u64>()
+            .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
+
+        Ok(Greeks {
+            exchange: Exchange::OKX,
+            ccy: self.ccy.clone(),
+            delta,
+            gamma,
+            theta,
+            vega,
+            timestamp,
+        })
     }
 }
 

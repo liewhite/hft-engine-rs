@@ -347,7 +347,8 @@ impl SymbolState {
             ExchangeEventData::Clock => {
                 // Clock 事件由策略层处理，这里不需要处理
             }
-            ExchangeEventData::Balance(_)
+            ExchangeEventData::Greeks(_)
+            | ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. } => {
                 // 已在上面提前返回，这里不会执行

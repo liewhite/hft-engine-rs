@@ -1,4 +1,4 @@
-use crate::domain::{now_ms, Exchange, MarketStatus, Order, Symbol, USDT};
+use crate::domain::{now_ms, Exchange, Greeks, MarketStatus, Order, Symbol, USDT};
 use crate::exchange::AccountInfo;
 use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
 use std::collections::HashMap;
@@ -11,6 +11,8 @@ pub struct StateManager {
     balances: HashMap<Exchange, f64>,
     /// 账户信息: 净值 + 总持仓名义价值 (per exchange)
     account_infos: HashMap<Exchange, AccountInfo>,
+    /// 账户希腊值 (per exchange, per ccy)
+    greeks: HashMap<(Exchange, String), Greeks>,
     /// 交易所市场状态 (per exchange)
     market_statuses: HashMap<Exchange, MarketStatus>,
     /// 订单超时时间 (毫秒)
@@ -29,6 +31,7 @@ impl StateManager {
             states,
             balances: HashMap::new(),
             account_infos: HashMap::new(),
+            greeks: HashMap::new(),
             market_statuses: HashMap::new(),
             order_timeout_ms,
         }
@@ -98,6 +101,11 @@ impl StateManager {
         self.account_infos.values().map(|i| i.notional).sum()
     }
 
+    /// 获取指定交易所和币种的希腊值
+    pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<&Greeks> {
+        self.greeks.get(&(exchange, ccy.to_string()))
+    }
+
     /// 获取指定交易所的市场状态（默认 Closed，安全侧）
     pub fn market_status(&self, exchange: Exchange) -> MarketStatus {
         self.market_statuses
@@ -146,6 +154,10 @@ impl StateManager {
                     equity: *equity,
                     notional: *notional,
                 });
+            }
+            // 全局事件: Greeks
+            ExchangeEventData::Greeks(g) => {
+                self.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
             }
             // 全局事件: ExchangeStatus
             ExchangeEventData::ExchangeStatus { exchange, status } => {
