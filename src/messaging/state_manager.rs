@@ -105,15 +105,15 @@ impl StateManager {
     }
 
     /// 获取指定交易所和币种的希腊值 (delta 已包含现货余额修正)
+    ///
+    /// 仅当 greeks 推送和 cashBal 均已到达时才返回，避免未修正的 delta 引发策略误判
     pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
         let key = (exchange, ccy.to_string());
-        self.greeks.get(&key).map(|g| {
-            let mut corrected = g.clone();
-            if let Some(&cash_bal) = self.cash_balances.get(&key) {
-                corrected.delta += cash_bal;
-            }
-            corrected
-        })
+        let g = self.greeks.get(&key)?;
+        let &cash_bal = self.cash_balances.get(&key)?;
+        let mut corrected = g.clone();
+        corrected.delta += cash_bal;
+        Some(corrected)
     }
 
     /// 获取指定交易所的市场状态（默认 Closed，安全侧）
