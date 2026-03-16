@@ -38,11 +38,10 @@ pub struct ExecutorActor {
 }
 
 impl ExecutorActor {
-    /// 转换订单：生成 client_order_id，coin_to_qty + round price/size
-    fn convert_order(&self, mut order: Order) -> Order {
-        // 生成交易所特定的 client_order_id
-        order.client_order_id = order.exchange.new_cli_order_id();
-
+    /// 转换订单：coin_to_qty + round price/size (用于发送给交易所)
+    ///
+    /// 注意: client_order_id 需在调用前已设置
+    fn convert_order(&self, order: Order) -> Order {
         let key = (order.exchange, order.symbol.clone());
         let meta = match self.symbol_metas.get(&key) {
             Some(m) => m,
@@ -95,10 +94,12 @@ impl ExecutorActor {
                 OutcomeEvent::PlaceOrders { orders, comment } => {
                     let converted: Vec<Order> = orders
                         .into_iter()
-                        .map(|o| {
-                            let c = self.convert_order(o);
-                            self.state_manager.add_pending_order(c.clone());
-                            c
+                        .map(|mut o| {
+                            o.client_order_id = o.exchange.new_cli_order_id();
+                            // 存原始订单 (币单位) 到 pending，策略端统一看到币的数量
+                            self.state_manager.add_pending_order(o.clone());
+                            // 转换为交易所格式 (合约张数 + 价格取整)
+                            self.convert_order(o)
                         })
                         .collect();
                     let _ = self
