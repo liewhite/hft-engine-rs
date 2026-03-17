@@ -342,6 +342,10 @@ impl OrderPushData {
             other => return Err(format!("Unknown OKX side: {}", other)),
         };
 
+        // OKX: fee 为负数表示收费，取反统一为正数=收费
+        let fee = f64::from_str(&self.fee)
+            .map_err(|_| format!("Failed to parse fee: {}", self.fee))?;
+
         Ok(Some(Fill {
             exchange: Exchange::OKX,
             symbol,
@@ -351,6 +355,7 @@ impl OrderPushData {
             client_order_id: self.cl_ord_id.clone(),
             order_id: self.ord_id.clone(),
             timestamp: now_ms(),
+            fee: -fee,
         }))
     }
 }

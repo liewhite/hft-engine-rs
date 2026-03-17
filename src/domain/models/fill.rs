@@ -16,4 +16,6 @@ pub struct Fill {
     /// 交易所订单ID
     pub order_id: String,
     pub timestamp: Timestamp,
+    /// 手续费 (正数 = 收费, 负数 = 返佣)
+    pub fee: f64,
 }

@@ -434,6 +434,9 @@ impl WsFill {
             other => return Err(format!("Unknown Hyperliquid fill side: {}", other)),
         };
 
+        let fee = f64::from_str(&self.fee)
+            .map_err(|_| format!("Failed to parse fill fee: {}", self.fee))?;
+
         Ok(Fill {
             exchange: Exchange::Hyperliquid,
             symbol,
@@ -443,6 +446,7 @@ impl WsFill {
             client_order_id: self.cloid.clone(),
             order_id: self.oid.to_string(),
             timestamp: self.time,
+            fee,
         })
     }
 }

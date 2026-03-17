@@ -217,6 +217,8 @@ pub struct OrderData {
     pub last_price: String,
     pub ap: String,
     pub rp: String,
+    /// 本次成交手续费 (Commission amount)
+    pub n: String,
 }
 
 impl OrderTradeUpdate {
@@ -288,6 +290,10 @@ impl OrderTradeUpdate {
             other => return Err(format!("Unknown Binance side: {}", other)),
         };
 
+        // Binance: n 为正数表示收费
+        let fee = f64::from_str(&self.o.n)
+            .map_err(|_| format!("Failed to parse commission: {}", self.o.n))?;
+
         Ok(Some(Fill {
             exchange: Exchange::Binance,
             symbol,
@@ -297,6 +303,7 @@ impl OrderTradeUpdate {
             client_order_id: if self.o.c.is_empty() { None } else { Some(self.o.c.clone()) },
             order_id: self.o.i.to_string(),
             timestamp: now_ms(),
+            fee,
         }))
     }
 }

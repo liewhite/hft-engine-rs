@@ -403,6 +403,9 @@ impl IbkrPublicWsActor {
                 "IBKR fill"
             );
 
+            // IBKR commission 字段名为 "comission" (IBKR API 拼写)
+            let fee = item.get("comission").and_then(parse_ib_number).unwrap_or(0.0);
+
             // 发布 Fill 事件
             let fill = Fill {
                 exchange: Exchange::IBKR,
@@ -421,6 +424,7 @@ impl IbkrPublicWsActor {
                 price,
                 size,
                 timestamp: local_ts,
+                fee,
             };
 
             if let Err(e) = self
