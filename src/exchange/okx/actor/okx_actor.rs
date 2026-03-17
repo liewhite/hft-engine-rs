@@ -11,12 +11,13 @@
 //! └── OkxPrivateWsActor [spawn_link] (optional, 需要凭证)
 
 use super::business_ws::{OkxBusinessWsActor, OkxBusinessWsActorArgs};
+use super::greeks_polling::{OkxGreeksPollingActor, OkxGreeksPollingActorArgs};
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
-use crate::exchange::okx::OkxCredentials;
+use crate::exchange::okx::{OkxClient, OkxCredentials};
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::mailbox;
@@ -29,10 +30,15 @@ use std::sync::Arc;
 /// 市场状态广播间隔 (毫秒)
 const STATUS_BROADCAST_INTERVAL_MS: u64 = 60_000;
 
+/// Greeks REST 轮询间隔 (毫秒) — 每秒 3 次，官方限速 10/2s
+const GREEKS_POLLING_INTERVAL_MS: u64 = 333;
+
 /// OkxActor 初始化参数
 pub struct OkxActorArgs {
     /// 凭证（可选）
     pub credentials: Option<OkxCredentials>,
+    /// REST client (用于 Greeks 轮询)
+    pub client: Option<Arc<OkxClient>>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// Income PubSub (发布事件)
@@ -100,7 +106,22 @@ impl Actor for OkxActor {
             false
         };
 
-        // 3. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
+        // 4. 创建 GreeksPollingActor (如果有 client)
+        if let Some(client) = args.client {
+            OkxGreeksPollingActor::spawn_link_with_mailbox(
+                &actor_ref,
+                OkxGreeksPollingActorArgs {
+                    client,
+                    income_pubsub: income_pubsub.clone(),
+                    interval_ms: GREEKS_POLLING_INTERVAL_MS,
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+            tracing::info!(exchange = "OKX", interval_ms = GREEKS_POLLING_INTERVAL_MS, "GreeksPollingActor created");
+        }
+
+        // 5. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
         CryptoStatusActor::spawn_link_with_mailbox(
             &actor_ref,
             CryptoStatusActorArgs {

@@ -1,6 +1,6 @@
-//! OKX Account Greeks 推送测试
+//! OKX Account Greeks 轮询测试
 //!
-//! 通过 ManagerActor + mock 策略，测试 OKX account-greeks 频道的完整框架链路。
+//! 通过 ManagerActor + mock 策略，测试 OKX Greeks REST 轮询的完整框架链路。
 //!
 //! 运行:
 //! OKX_API_KEY=xxx OKX_SECRET=xxx OKX_PASSPHRASE=xxx \
@@ -37,7 +37,7 @@ struct GreeksPrintStrategy {
 
 impl Strategy for GreeksPrintStrategy {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
-        // 订阅一个 BBO 以触发 OkxActor 创建（private WS 会自动订阅 account-greeks）
+        // 订阅一个 BBO 以触发 OkxActor 创建（Greeks 由 REST 轮询获取）
         let mut kinds = HashSet::new();
         kinds.insert(SubscriptionKind::BBO {
             symbol: self.symbol.clone(),
@@ -102,7 +102,7 @@ async fn test_okx_greeks_push() {
         .await;
     result.expect("添加策略失败");
 
-    println!("策略已启动，等待 Greeks 推送 (Ctrl+C 退出)...\n");
+    println!("策略已启动，等待 Greeks 轮询 (每333ms, Ctrl+C 退出)...\n");
 
     // 持续运行，等待推送
     tokio::signal::ctrl_c().await.unwrap();

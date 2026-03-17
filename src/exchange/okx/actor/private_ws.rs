@@ -8,7 +8,7 @@
 use crate::domain::{now_ms, Balance, Exchange, Position, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
-use crate::exchange::okx::codec::{AccountData, GreeksData, OrderPushData, PositionData, WsEvent, WsPush};
+use crate::exchange::okx::codec::{AccountData, OrderPushData, PositionData, WsEvent, WsPush};
 use crate::exchange::okx::OkxCredentials;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -137,8 +137,7 @@ impl Actor for OkxPrivateWsActor {
             "args": [
                 {"channel": "positions", "instType": "SWAP"},
                 {"channel": "account"},
-                {"channel": "orders", "instType": "SWAP"},
-                {"channel": "account-greeks"}
+                {"channel": "orders", "instType": "SWAP"}
             ]
         })
         .to_string();
@@ -384,21 +383,8 @@ fn parse_private_message(
             }
             Ok(events)
         }
-        "account-greeks" => {
-            let push: WsPush<GreeksData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("account-greeks parse: {}", e)))?;
-
-            let mut events = Vec::new();
-            for data in &push.data {
-                let greeks = data.to_greeks()?;
-                events.push(IncomeEvent {
-                    exchange_ts: greeks.timestamp,
-                    local_ts,
-                    data: ExchangeEventData::Greeks(greeks),
-                });
-            }
-            Ok(events)
-        }
+        // account-greeks 已迁移到 REST 轮询 (OkxGreeksPollingActor)
+        "account-greeks" => Ok(Vec::new()),
         _ => {
             tracing::warn!(channel, raw, "Unknown OKX private channel");
             Ok(Vec::new())

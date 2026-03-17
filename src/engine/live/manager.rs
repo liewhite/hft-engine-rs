@@ -259,10 +259,13 @@ impl Actor for ManagerActor {
             clients.insert(Exchange::Binance, Arc::new(client));
         }
 
-        if let Some(ref cred) = args.okx_credentials {
-            let client = OkxClient::new(Some(cred.clone()))?;
-            clients.insert(Exchange::OKX, Arc::new(client));
-        }
+        let okx_client: Option<Arc<OkxClient>> = if let Some(ref cred) = args.okx_credentials {
+            let client = Arc::new(OkxClient::new(Some(cred.clone()))?);
+            clients.insert(Exchange::OKX, client.clone());
+            Some(client)
+        } else {
+            None
+        };
 
         if let Some(ref cred) = args.hyperliquid_credentials {
             let client = HyperliquidClient::new(Some(cred.clone()))?;
@@ -372,6 +375,7 @@ impl Actor for ManagerActor {
                 &actor_ref,
                 OkxActorArgs {
                     credentials: Some(credentials.clone()),
+                    client: okx_client.clone(),
                     symbol_metas: symbol_metas_for_exchange,
                     income_pubsub: income_pubsub.clone(),
                     quote: credentials.quote.clone(),

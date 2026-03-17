@@ -2,9 +2,10 @@
 
 use super::symbol::{from_okx, to_okx};
 use crate::domain::{
-    Exchange, ExchangeError, Order, OrderId, OrderStatus, OrderType, OrderUpdate, Side, Symbol,
-    SymbolMeta, TimeInForce, now_ms,
+    Exchange, ExchangeError, Greeks, Order, OrderId, OrderStatus, OrderType, OrderUpdate, Side,
+    Symbol, SymbolMeta, TimeInForce, now_ms,
 };
+use crate::exchange::okx::codec::GreeksData;
 use crate::exchange::client::ExchangeClient;
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
@@ -208,6 +209,48 @@ impl OkxClient {
             .map_err(|_| ExchangeError::Other("Failed to parse totalEq".to_string()))?;
 
         Ok(equity)
+    }
+
+    /// 查询账户希腊值 (GET /api/v5/account/greeks)
+    pub async fn fetch_greeks(&self) -> Result<Vec<Greeks>, ExchangeError> {
+        let path = "/api/v5/account/greeks";
+        let timestamp = Self::iso_timestamp();
+        let sign = self
+            .sign(&timestamp, "GET", path, "")
+            .ok_or_else(|| ExchangeError::Other("No credentials".to_string()))?;
+        let headers = self
+            .build_headers(&sign, &timestamp)
+            .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
+
+        #[derive(Deserialize)]
+        struct Response {
+            code: String,
+            msg: String,
+            data: Vec<GreeksData>,
+        }
+
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        if data.code != "0" {
+            return Err(map_okx_error(&data.code, &data.msg));
+        }
+
+        let mut result = Vec::new();
+        for item in &data.data {
+            let greeks = item.to_greeks()
+                .map_err(|e| ExchangeError::Other(e))?;
+            result.push(greeks);
+        }
+
+        Ok(result)
     }
 }
 
