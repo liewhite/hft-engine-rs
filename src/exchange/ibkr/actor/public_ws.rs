@@ -342,15 +342,7 @@ impl IbkrPublicWsActor {
         };
 
         for item in args {
-            // IBKR 对同一成交推两条消息：先无 commission，后有 commission。
-            // 只处理带 commission 的那条，确保 fee 数据完整。
-            let has_commission = item.get("comission").is_some();
-            if !has_commission {
-                tracing::debug!(raw = %item, "IBKR trade: no commission field, waiting for next message");
-                continue;
-            }
-
-            // 用 execution_id 去重
+            // 用 execution_id 去重（IBKR 可能对同一成交推多条消息）
             let execution_id = item
                 .get("execution_id")
                 .and_then(|v| v.as_str())
