@@ -342,7 +342,7 @@ impl IbkrPublicWsActor {
         };
 
         for item in args {
-            // 用 execution_id 去重（IBKR 可能对同一成交推多条消息）
+            // 用 execution_id 去重
             let execution_id = item
                 .get("execution_id")
                 .and_then(|v| v.as_str())
@@ -403,8 +403,11 @@ impl IbkrPublicWsActor {
                 "IBKR fill"
             );
 
-            // IBKR commission 字段名为 "comission" (IBKR API 拼写)
-            let fee = item.get("comission").and_then(parse_ib_number).unwrap_or(0.0);
+            // IBKR WS str topic 用 "commission" (正确拼写)，REST API 用 "comission" (typo)
+            let fee = item.get("commission")
+                .or_else(|| item.get("comission"))
+                .and_then(parse_ib_number)
+                .unwrap_or(0.0);
 
             // 发布 Fill 事件
             let fill = Fill {
