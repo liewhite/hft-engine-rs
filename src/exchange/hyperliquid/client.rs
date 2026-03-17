@@ -271,7 +271,7 @@ impl HyperliquidClient {
 
     /// 将 domain Order 转换为 OrderWire
     async fn order_to_wire(&self, order: &Order) -> Result<OrderWire, ExchangeError> {
-        let coin = to_hyperliquid(&order.symbol, &self.quote);
+        let coin = to_hyperliquid(&order.symbol, &self.quote, &self.dex);
         let asset = self.get_asset_index(&coin).await?;
 
         let is_buy = matches!(order.side, Side::Long);

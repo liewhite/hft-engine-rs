@@ -1535,47 +1535,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fee-arb"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "chrono-tz",
- "futures-util",
- "hex",
- "hmac",
- "kameo",
- "kameo_actors",
- "md-5",
- "native-tls",
- "num-bigint",
- "percent-encoding",
- "pkcs8",
- "rand 0.8.5",
- "reqwest",
- "rmp-serde",
- "rsa",
- "rust_decimal",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "thiserror 2.0.17",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1882,6 +1841,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fda06d18ac606267c40c04e41b9947729bf8b9efe74bd4e82b61a5f26a510b9f"
 dependencies = [
  "arrayvec",
+]
+
+[[package]]
+name = "hft-engine-rs"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "chrono-tz",
+ "futures-util",
+ "hex",
+ "hmac",
+ "kameo",
+ "kameo_actors",
+ "md-5",
+ "native-tls",
+ "num-bigint",
+ "percent-encoding",
+ "pkcs8",
+ "rand 0.8.5",
+ "reqwest",
+ "rmp-serde",
+ "rsa",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-stream",
+ "tokio-tungstenite",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]
