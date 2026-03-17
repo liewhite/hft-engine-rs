@@ -60,9 +60,9 @@ pub struct IbkrPublicWsActor {
     subscribed: HashSet<SubscriptionKind>,
     /// 每个 conid 的 BBO 缓存
     bbo_cache: HashMap<i64, BboCache>,
-    /// 已处理的 execution_id 集合（IBKR 对同一成交会推多条消息，需去重）
+    /// 已处理的 execution_id 集合（去重）
     seen_executions: HashSet<String>,
-    /// 按插入顺序记录 execution_id，用于淘汰最旧条目（容量上限 MAX_SEEN_EXECUTIONS）
+    /// 按插入顺序记录 execution_id，用于淘汰最旧条目
     seen_executions_order: VecDeque<String>,
 }
 
@@ -342,7 +342,15 @@ impl IbkrPublicWsActor {
         };
 
         for item in args {
-            // 用 execution_id 去重（IBKR 对同一成交会推多条消息：无 commission → 带 commission）
+            // IBKR 对同一成交推两条消息：先无 commission，后有 commission。
+            // 只处理带 commission 的那条，确保 fee 数据完整。
+            let has_commission = item.get("comission").is_some();
+            if !has_commission {
+                tracing::debug!(raw = %item, "IBKR trade: no commission field, waiting for next message");
+                continue;
+            }
+
+            // 用 execution_id 去重
             let execution_id = item
                 .get("execution_id")
                 .and_then(|v| v.as_str())
