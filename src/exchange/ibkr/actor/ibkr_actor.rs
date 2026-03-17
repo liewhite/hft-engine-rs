@@ -32,7 +32,7 @@ use std::sync::Arc;
 const POSITION_POLLING_INTERVAL_MS: u64 = 3000;
 
 /// 市场状态轮询间隔 (毫秒)
-const STATUS_POLLING_INTERVAL_MS: u64 = 60_000;
+const STATUS_POLLING_INTERVAL_MS: u64 = 5_000;
 
 /// IbkrActor 初始化参数
 pub struct IbkrActorArgs {

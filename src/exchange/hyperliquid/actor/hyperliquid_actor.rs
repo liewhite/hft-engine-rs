@@ -26,7 +26,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
-const STATUS_BROADCAST_INTERVAL_MS: u64 = 60_000;
+const STATUS_BROADCAST_INTERVAL_MS: u64 = 5_000;
 
 /// HyperliquidActor 初始化参数
 pub struct HyperliquidActorArgs {
