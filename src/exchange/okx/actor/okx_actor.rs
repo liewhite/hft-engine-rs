@@ -30,8 +30,8 @@ use std::sync::Arc;
 /// 市场状态广播间隔 (毫秒)
 const STATUS_BROADCAST_INTERVAL_MS: u64 = 60_000;
 
-/// Greeks REST 轮询间隔 (毫秒) — 每秒 3 次，官方限速 10/2s
-const GREEKS_POLLING_INTERVAL_MS: u64 = 333;
+/// Greeks REST 轮询间隔 (毫秒) — 每秒 1 次，官方限速 10/2s
+const GREEKS_POLLING_INTERVAL_MS: u64 = 1000;
 
 /// OkxActor 初始化参数
 pub struct OkxActorArgs {
