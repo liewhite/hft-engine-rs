@@ -237,7 +237,11 @@ impl OkxClient {
             .await
             .map_err(Self::map_reqwest_error)?;
 
-        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        let data: Response = serde_json::from_str(&text)
+            .map_err(|e| ExchangeError::Other(format!(
+                "Failed to parse greeks response: {}, body: {}", e, text
+            )))?;
 
         if data.code != "0" {
             return Err(map_okx_error(&data.code, &data.msg));
