@@ -12,6 +12,7 @@ use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -31,15 +32,24 @@ pub struct OkxGreeksPollingActorArgs {
 pub struct OkxGreeksPollingActor {
     client: Arc<OkxClient>,
     income_pubsub: ActorRef<IncomePubSub>,
+    /// 缓存每个 ccy 的上次 timestamp，用于去重
+    last_ts: HashMap<String, u64>,
 }
 
 impl OkxGreeksPollingActor {
-    async fn poll_greeks(&self) {
+    async fn poll_greeks(&mut self) {
         let local_ts = now_ms();
 
         match self.client.fetch_greeks().await {
             Ok(greeks_list) => {
                 for greeks in greeks_list {
+                    // 跳过未变化的数据 (OKX 数据变化时 ts 会更新)
+                    let prev_ts = self.last_ts.get(&greeks.ccy).copied().unwrap_or(0);
+                    if greeks.timestamp == prev_ts {
+                        continue;
+                    }
+                    self.last_ts.insert(greeks.ccy.clone(), greeks.timestamp);
+
                     let exchange_ts = greeks.timestamp;
                     if let Err(e) = self
                         .income_pubsub
@@ -84,6 +94,7 @@ impl Actor for OkxGreeksPollingActor {
         Ok(Self {
             client: args.client,
             income_pubsub: args.income_pubsub,
+            last_ts: HashMap::new(),
         })
     }
 
