@@ -398,6 +398,19 @@ impl IbkrPublicWsActor {
                     fee = pending.fill.fee,
                     "IBKR fill: commission received, publishing"
                 );
+                // 校验第二条消息的 price/size 是否一致（防御性检查）
+                let price2 = item.get("price").and_then(parse_ib_number).unwrap_or(0.0);
+                let size2 = item.get("size").and_then(parse_ib_number).unwrap_or(0.0);
+                if (price2 - pending.fill.price).abs() > 1e-9
+                    || (size2 - pending.fill.size).abs() > 1e-9
+                {
+                    tracing::warn!(
+                        execution_id,
+                        price1 = pending.fill.price, price2,
+                        size1 = pending.fill.size, size2,
+                        "IBKR fill: second message has different price/size"
+                    );
+                }
                 self.publish_fill(pending).await;
                 self.mark_seen(execution_id);
                 continue;
@@ -562,8 +575,8 @@ impl IbkrPublicWsActor {
 
     /// 标记 execution_id 为已推送，并维护 FIFO 淘汰
     fn mark_seen(&mut self, execution_id: String) {
-        self.seen_executions.insert(execution_id.clone());
-        self.seen_executions_order.push_back(execution_id);
+        self.seen_executions_order.push_back(execution_id.clone());
+        self.seen_executions.insert(execution_id);
         if self.seen_executions_order.len() > MAX_SEEN_EXECUTIONS {
             if let Some(oldest) = self.seen_executions_order.pop_front() {
                 self.seen_executions.remove(&oldest);
