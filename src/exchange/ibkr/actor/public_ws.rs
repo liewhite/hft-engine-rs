@@ -46,6 +46,19 @@ struct BboCache {
 }
 
 const MAX_SEEN_EXECUTIONS: usize = 10_000;
+/// Fill commission 等待超时 (秒)
+const FILL_COMMISSION_TIMEOUT_SECS: u64 = 3;
+
+/// 暂存的 Fill (等待 commission 到来)
+struct PendingFill {
+    fill: Fill,
+    order_update: Option<OrderUpdate>,
+}
+
+/// Commission 超时消息 — 通知 actor 某个 execution_id 等待超时
+struct FillCommissionTimeout {
+    execution_id: String,
+}
 
 /// IbkrPublicWsActor
 pub struct IbkrPublicWsActor {
@@ -60,10 +73,12 @@ pub struct IbkrPublicWsActor {
     subscribed: HashSet<SubscriptionKind>,
     /// 每个 conid 的 BBO 缓存
     bbo_cache: HashMap<i64, BboCache>,
-    /// 已处理的 execution_id 集合（去重）
+    /// 已完成推送的 execution_id 集合（去重）
     seen_executions: HashSet<String>,
     /// 按插入顺序记录 execution_id，用于淘汰最旧条目
     seen_executions_order: VecDeque<String>,
+    /// 等待 commission 的 pending fills (execution_id → PendingFill)
+    pending_fills: HashMap<String, PendingFill>,
 }
 
 impl IbkrPublicWsActor {
@@ -95,7 +110,11 @@ impl IbkrPublicWsActor {
     }
 
     /// 解析并处理 WebSocket 消息
-    async fn handle_message(&mut self, raw: &str) -> Result<(), WsError> {
+    async fn handle_message(
+        &mut self,
+        raw: &str,
+        actor_ref: &ActorRef<Self>,
+    ) -> Result<(), WsError> {
         let local_ts = now_ms();
 
         let value: serde_json::Value =
@@ -107,7 +126,7 @@ impl IbkrPublicWsActor {
                 return self.handle_order_update(&value, local_ts).await;
             }
             if topic.starts_with("str") {
-                return self.handle_trade_execution(&value, local_ts).await;
+                return self.handle_trade_execution(&value, local_ts, actor_ref).await;
             }
         }
 
@@ -328,10 +347,17 @@ impl IbkrPublicWsActor {
     ///
     /// IBKR WS `str` topic 推送成交信息。解析后生成 Fill 事件更新仓位，
     /// 同时生成 Filled OrderUpdate 关闭 pending order。
+    ///
+    /// IBKR 对同一笔成交推送 2 条消息（同一 execution_id）：
+    /// - 第一条：无 commission 字段
+    /// - 第二条：带 commission 字段
+    ///
+    /// 策略：第一条暂存，等第二条带 commission 后推送；超时 3 秒则以 fee=0 推送。
     async fn handle_trade_execution(
         &mut self,
         value: &serde_json::Value,
         local_ts: u64,
+        actor_ref: &ActorRef<Self>,
     ) -> Result<(), WsError> {
         let args = match value.get("args").and_then(|v| v.as_array()) {
             Some(arr) => arr,
@@ -342,26 +368,42 @@ impl IbkrPublicWsActor {
         };
 
         for item in args {
-            // 用 execution_id 去重
             let execution_id = item
                 .get("execution_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !execution_id.is_empty() {
-                if !self.seen_executions.insert(execution_id.to_string()) {
-                    tracing::debug!(execution_id, "IBKR trade: duplicate execution_id, skipping");
-                    continue;
-                }
-                self.seen_executions_order
-                    .push_back(execution_id.to_string());
-                if self.seen_executions_order.len() > MAX_SEEN_EXECUTIONS {
-                    if let Some(oldest) = self.seen_executions_order.pop_front() {
-                        self.seen_executions.remove(&oldest);
-                    }
-                }
+                .unwrap_or("")
+                .to_string();
+
+            if execution_id.is_empty() {
+                continue;
             }
 
-            // 解析字段
+            // 已推送过的 execution_id，直接跳过
+            if self.seen_executions.contains(&execution_id) {
+                tracing::debug!(execution_id, "IBKR trade: already published, skipping");
+                continue;
+            }
+
+            // IBKR WS str topic 用 "commission" (正确拼写)，REST API 用 "comission" (typo)
+            let commission = item
+                .get("commission")
+                .or_else(|| item.get("comission"))
+                .and_then(parse_ib_number);
+
+            // 如果已有 pending fill，说明这是第二条消息（带 commission）
+            if let Some(mut pending) = self.pending_fills.remove(&execution_id) {
+                pending.fill.fee = commission.unwrap_or(0.0);
+                tracing::info!(
+                    execution_id,
+                    fee = pending.fill.fee,
+                    "IBKR fill: commission received, publishing"
+                );
+                self.publish_fill(pending).await;
+                self.mark_seen(execution_id);
+                continue;
+            }
+
+            // 第一条消息：解析并暂存
             let conid = item.get("conid").and_then(|v| v.as_i64());
             let symbol = match conid.and_then(|c| self.conid_to_symbol.get(&c).cloned()) {
                 Some(s) => s,
@@ -394,91 +436,139 @@ impl IbkrPublicWsActor {
                 continue;
             }
 
+            // 如果第一条就带了 commission（罕见），直接推送
+            if let Some(fee) = commission {
+                tracing::info!(
+                    symbol = %symbol, side = ?side, price, size, order_ref, fee,
+                    "IBKR fill: commission in first message, publishing immediately"
+                );
+                let fill = Fill {
+                    exchange: Exchange::IBKR,
+                    symbol: symbol.clone(),
+                    order_id: execution_id.clone(),
+                    client_order_id: if order_ref.is_empty() { None } else { Some(order_ref.to_string()) },
+                    side,
+                    price,
+                    size,
+                    timestamp: local_ts,
+                    fee,
+                };
+                let order_update = self.build_order_update(item, order_ref, &symbol, side, size, local_ts);
+                self.publish_fill(PendingFill { fill, order_update }).await;
+                self.mark_seen(execution_id);
+                continue;
+            }
+
+            // 暂存，等待 commission
             tracing::info!(
-                symbol = %symbol,
-                side = ?side,
-                price,
-                size,
-                order_ref,
-                "IBKR fill"
+                symbol = %symbol, side = ?side, price, size, order_ref,
+                "IBKR fill: pending commission, waiting up to {}s",
+                FILL_COMMISSION_TIMEOUT_SECS
             );
 
-            // IBKR WS str topic 用 "commission" (正确拼写)，REST API 用 "comission" (typo)
-            let fee = item.get("commission")
-                .or_else(|| item.get("comission"))
-                .and_then(parse_ib_number)
-                .unwrap_or(0.0);
-
-            // 发布 Fill 事件
             let fill = Fill {
                 exchange: Exchange::IBKR,
                 symbol: symbol.clone(),
-                order_id: item
-                    .get("execution_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                client_order_id: if order_ref.is_empty() {
-                    None
-                } else {
-                    Some(order_ref.to_string())
-                },
+                order_id: execution_id.clone(),
+                client_order_id: if order_ref.is_empty() { None } else { Some(order_ref.to_string()) },
                 side,
                 price,
                 size,
                 timestamp: local_ts,
-                fee,
+                fee: 0.0,
             };
+            let order_update = self.build_order_update(item, order_ref, &symbol, side, size, local_ts);
+            self.pending_fills.insert(execution_id.clone(), PendingFill { fill, order_update });
 
+            // 启动超时定时器
+            let actor_ref = actor_ref.clone();
+            let eid = execution_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(FILL_COMMISSION_TIMEOUT_SECS)).await;
+                let _ = actor_ref
+                    .tell(FillCommissionTimeout { execution_id: eid })
+                    .send()
+                    .await;
+            });
+        }
+
+        Ok(())
+    }
+
+    /// 构建 Filled OrderUpdate（如有 order_ref）
+    fn build_order_update(
+        &self,
+        item: &serde_json::Value,
+        order_ref: &str,
+        symbol: &str,
+        side: Side,
+        size: f64,
+        local_ts: u64,
+    ) -> Option<OrderUpdate> {
+        if order_ref.is_empty() {
+            return None;
+        }
+        let order_id = item
+            .get("orderId")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        Some(OrderUpdate {
+            order_id,
+            client_order_id: Some(order_ref.to_string()),
+            exchange: Exchange::IBKR,
+            symbol: symbol.to_string(),
+            side,
+            status: OrderStatus::Filled,
+            price: 0.0,
+            quantity: size,
+            filled_quantity: size,
+            fill_sz: size,
+            timestamp: local_ts,
+        })
+    }
+
+    /// 推送 Fill + OrderUpdate 到 IncomePubSub
+    async fn publish_fill(&self, pending: PendingFill) {
+        let local_ts = pending.fill.timestamp;
+        if let Err(e) = self
+            .income_pubsub
+            .tell(Publish(IncomeEvent {
+                exchange_ts: local_ts,
+                local_ts,
+                data: ExchangeEventData::Fill(pending.fill),
+            }))
+            .send()
+            .await
+        {
+            tracing::error!(error = %e, "Failed to publish Fill to IncomePubSub");
+        }
+
+        if let Some(order_update) = pending.order_update {
             if let Err(e) = self
                 .income_pubsub
                 .tell(Publish(IncomeEvent {
                     exchange_ts: local_ts,
                     local_ts,
-                    data: ExchangeEventData::Fill(fill),
+                    data: ExchangeEventData::OrderUpdate(order_update),
                 }))
                 .send()
                 .await
             {
-                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
-            }
-
-            // 如果有 order_ref，同时发布 Filled OrderUpdate 关闭 pending order
-            if !order_ref.is_empty() {
-                let order_id = item
-                    .get("orderId")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
-
-                if let Err(e) = self
-                    .income_pubsub
-                    .tell(Publish(IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::OrderUpdate(OrderUpdate {
-                            order_id,
-                            client_order_id: Some(order_ref.to_string()),
-                            exchange: Exchange::IBKR,
-                            symbol,
-                            side,
-                            status: OrderStatus::Filled,
-                            price: 0.0,
-                            quantity: size,
-                            filled_quantity: size,
-                            fill_sz: size,
-                            timestamp: local_ts,
-                        }),
-                    }))
-                    .send()
-                    .await
-                {
-                    tracing::error!(error = %e, "Failed to publish to IncomePubSub");
-                }
+                tracing::error!(error = %e, "Failed to publish OrderUpdate to IncomePubSub");
             }
         }
+    }
 
-        Ok(())
+    /// 标记 execution_id 为已推送，并维护 FIFO 淘汰
+    fn mark_seen(&mut self, execution_id: String) {
+        self.seen_executions.insert(execution_id.clone());
+        self.seen_executions_order.push_back(execution_id);
+        if self.seen_executions_order.len() > MAX_SEEN_EXECUTIONS {
+            if let Some(oldest) = self.seen_executions_order.pop_front() {
+                self.seen_executions.remove(&oldest);
+            }
+        }
     }
 }
 
@@ -571,6 +661,7 @@ impl Actor for IbkrPublicWsActor {
             bbo_cache: HashMap::new(),
             seen_executions: HashSet::new(),
             seen_executions_order: VecDeque::new(),
+            pending_fills: HashMap::new(),
         })
     }
 
@@ -673,6 +764,27 @@ impl Message<Unsubscribe> for IbkrPublicWsActor {
     }
 }
 
+/// Commission 超时处理 — 超时后以 fee=0 推送 pending fill
+impl Message<FillCommissionTimeout> for IbkrPublicWsActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: FillCommissionTimeout,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        if let Some(pending) = self.pending_fills.remove(&msg.execution_id) {
+            tracing::warn!(
+                execution_id = msg.execution_id,
+                "IBKR fill: commission timeout ({}s), publishing with fee=0",
+                FILL_COMMISSION_TIMEOUT_SECS
+            );
+            self.publish_fill(pending).await;
+            self.mark_seen(msg.execution_id);
+        }
+    }
+}
+
 /// WebSocket 入站消息处理
 impl Message<StreamMessage<Result<String, WsError>, (), ()>> for IbkrPublicWsActor {
     type Reply = ();
@@ -684,7 +796,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for IbkrPublicWsAct
     ) {
         match msg {
             StreamMessage::Next(Ok(data)) => {
-                if let Err(e) = self.handle_message(&data).await {
+                if let Err(e) = self.handle_message(&data, ctx.actor_ref()).await {
                     tracing::error!(exchange = "IBKR", error = %e, raw = %data, "Public WS parse error, killing actor");
                     ctx.actor_ref().kill();
                 }
