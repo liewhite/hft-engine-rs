@@ -1,4 +1,4 @@
-use crate::domain::{Balance, Candle, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice, MarketStatus, OrderUpdate, Position, Symbol, Timestamp, BBO};
+use crate::domain::{Balance, Candle, Exchange, Fill, FundingFee, FundingRate, Greeks, IndexPrice, MarkPrice, MarketStatus, OrderUpdate, Position, Symbol, Timestamp, BBO};
 
 /// 统一的交易所事件
 ///
@@ -28,6 +28,8 @@ pub enum ExchangeEventData {
     /// 成交事件 (用于乐观更新仓位)
     Fill(Fill),
     Balance(Balance),
+    /// 资费结算事件 (账户每次收/付资费时推送)
+    FundingFee(FundingFee),
     /// 账户希腊值 (按币种)
     Greeks(Greeks),
     /// 账户信息 (净值 + 总持仓名义价值)
@@ -65,6 +67,7 @@ impl IncomeEvent {
             ExchangeEventData::Candle(candle) => Some(&candle.symbol),
             ExchangeEventData::HistoryCandles(candles) => candles.first().map(|c| &c.symbol),
             ExchangeEventData::Balance(_)
+            | ExchangeEventData::FundingFee(_)
             | ExchangeEventData::Greeks(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. }
@@ -85,6 +88,7 @@ impl IncomeEvent {
             ExchangeEventData::Candle(candle) => Some(candle.exchange),
             ExchangeEventData::HistoryCandles(candles) => candles.first().map(|c| c.exchange),
             ExchangeEventData::Balance(bal) => Some(bal.exchange),
+            ExchangeEventData::FundingFee(fee) => Some(fee.exchange),
             ExchangeEventData::Greeks(g) => Some(g.exchange),
             ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
             ExchangeEventData::ExchangeStatus { exchange, .. } => Some(*exchange),

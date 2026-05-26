@@ -174,6 +174,15 @@ impl StateManager {
             ExchangeEventData::Greeks(g) => {
                 self.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
             }
+            // 全局事件: FundingFee (账户级别，仅记录日志，不维护内部状态)
+            ExchangeEventData::FundingFee(fee) => {
+                tracing::info!(
+                    exchange = %fee.exchange,
+                    asset = %fee.asset,
+                    amount = fee.amount,
+                    "Funding fee settled"
+                );
+            }
             // 全局事件: ExchangeStatus
             ExchangeEventData::ExchangeStatus { exchange, status } => {
                 self.market_statuses.insert(*exchange, *status);

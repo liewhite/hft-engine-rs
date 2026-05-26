@@ -275,6 +275,22 @@ fn parse_private_message(
                 });
             }
 
+            // 资费结算：原因为 FUNDING_FEE 时，按 balance 变更逐条推送 FundingFee
+            if update.a.reason.as_deref() == Some("FUNDING_FEE") {
+                for bal_data in &update.a.balances {
+                    let fee = bal_data.to_funding_fee(exchange_ts)?;
+                    // bc=0 视为无变化，跳过
+                    if fee.amount == 0.0 {
+                        continue;
+                    }
+                    events.push(IncomeEvent {
+                        exchange_ts,
+                        local_ts,
+                        data: ExchangeEventData::FundingFee(fee),
+                    });
+                }
+            }
+
             Ok(events)
         }
         "ORDER_TRADE_UPDATE" => {

@@ -335,6 +335,7 @@ impl SymbolState {
             }
             ExchangeEventData::Greeks(_)
             | ExchangeEventData::Balance(_)
+            | ExchangeEventData::FundingFee(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. } => {
                 // 已在上面提前返回，这里不会执行
