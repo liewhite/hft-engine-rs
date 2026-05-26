@@ -149,7 +149,7 @@ impl Actor for BinanceActor {
             }
         }
 
-        // 1a. 创建高频公共 WsActor (/public/ws)
+        // 1a. 创建高频公共 WsActor (/public/ws)，等握手完成再继续
         let public_ws = BinancePublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             BinancePublicWsActorArgs {
@@ -161,9 +161,10 @@ impl Actor for BinanceActor {
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "Binance", url = WS_PUBLIC_HIGH_FREQ_URL, "PublicWsActor created");
+        public_ws.wait_for_startup().await;
+        tracing::info!(exchange = "Binance", url = WS_PUBLIC_HIGH_FREQ_URL, "PublicWsActor ready");
 
-        // 1b. 创建常规市场 WsActor (/market/ws)
+        // 1b. 创建常规市场 WsActor (/market/ws)，等握手完成再继续
         let market_ws = BinancePublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             BinancePublicWsActorArgs {
@@ -175,11 +176,13 @@ impl Actor for BinanceActor {
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "Binance", url = WS_MARKET_URL, "MarketWsActor created");
+        market_ws.wait_for_startup().await;
+        tracing::info!(exchange = "Binance", url = WS_MARKET_URL, "MarketWsActor ready");
 
-        // 2. 创建 PrivateWsActor (如果有凭证)
+        // 2. 创建 PrivateWsActor (如果有凭证)；必须等 listenKey + WS 握手完成，
+        //    否则下游交易信号触发的订单更新会丢
         let has_private_ws = if let Some(credentials) = args.credentials {
-            BinancePrivateWsActor::spawn_link_with_mailbox(
+            let private_ws = BinancePrivateWsActor::spawn_link_with_mailbox(
                 &actor_ref,
                 BinancePrivateWsActorArgs {
                     credentials,
@@ -191,7 +194,8 @@ impl Actor for BinanceActor {
                 mailbox::unbounded(),
             )
             .await;
-            tracing::info!(exchange = "Binance", "PrivateWsActor created");
+            private_ws.wait_for_startup().await;
+            tracing::info!(exchange = "Binance", "PrivateWsActor ready");
             true
         } else {
             false

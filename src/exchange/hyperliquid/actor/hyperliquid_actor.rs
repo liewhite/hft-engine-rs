@@ -55,7 +55,7 @@ impl Actor for HyperliquidActor {
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let income_pubsub = args.income_pubsub;
 
-        // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
+        // 1. 创建 PublicWsActor 并等握手完成
         let public_ws = HyperliquidPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             HyperliquidPublicWsActorArgs {
@@ -67,11 +67,12 @@ impl Actor for HyperliquidActor {
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "Hyperliquid", "PublicWsActor created");
+        public_ws.wait_for_startup().await;
+        tracing::info!(exchange = "Hyperliquid", "PublicWsActor ready");
 
-        // 2. 创建 PrivateWsActor (如果有凭证)
+        // 2. 创建 PrivateWsActor (如果有凭证)，等 WS 握手完成避免错过订单/成交
         let has_private_ws = if let Some(credentials) = args.credentials {
-            HyperliquidPrivateWsActor::spawn_link_with_mailbox(
+            let private_ws = HyperliquidPrivateWsActor::spawn_link_with_mailbox(
                 &actor_ref,
                 HyperliquidPrivateWsActorArgs {
                     wallet_address: credentials.wallet_address,
@@ -82,7 +83,8 @@ impl Actor for HyperliquidActor {
                 mailbox::unbounded(),
             )
             .await;
-            tracing::info!(exchange = "Hyperliquid", "PrivateWsActor created");
+            private_ws.wait_for_startup().await;
+            tracing::info!(exchange = "Hyperliquid", "PrivateWsActor ready");
             true
         } else {
             false

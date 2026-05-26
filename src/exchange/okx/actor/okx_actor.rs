@@ -62,7 +62,7 @@ impl Actor for OkxActor {
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let income_pubsub = args.income_pubsub;
 
-        // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
+        // 1. 创建 PublicWsActor 并等握手完成
         let public_ws = OkxPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             OkxPublicWsActorArgs {
@@ -73,7 +73,8 @@ impl Actor for OkxActor {
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "OKX", "PublicWsActor created");
+        public_ws.wait_for_startup().await;
+        tracing::info!(exchange = "OKX", "PublicWsActor ready");
 
         // 2. 创建 BusinessWsActor (K线数据)
         let business_ws = OkxBusinessWsActor::spawn_link_with_mailbox(
@@ -86,11 +87,12 @@ impl Actor for OkxActor {
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "OKX", "BusinessWsActor created");
+        business_ws.wait_for_startup().await;
+        tracing::info!(exchange = "OKX", "BusinessWsActor ready");
 
-        // 3. 创建 PrivateWsActor (如果有凭证)
+        // 3. 创建 PrivateWsActor (如果有凭证)，等 login 完成避免错过订单更新
         let has_private_ws = if let Some(credentials) = args.credentials {
-            OkxPrivateWsActor::spawn_link_with_mailbox(
+            let private_ws = OkxPrivateWsActor::spawn_link_with_mailbox(
                 &actor_ref,
                 OkxPrivateWsActorArgs {
                     credentials,
@@ -100,7 +102,8 @@ impl Actor for OkxActor {
                 mailbox::unbounded(),
             )
             .await;
-            tracing::info!(exchange = "OKX", "PrivateWsActor created");
+            private_ws.wait_for_startup().await;
+            tracing::info!(exchange = "OKX", "PrivateWsActor ready");
             true
         } else {
             false

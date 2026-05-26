@@ -365,8 +365,9 @@ impl Actor for ManagerActor {
                 mailbox::unbounded(),
             )
             .await;
+            binance_ref.wait_for_startup().await;
             exchange_actors.insert(Exchange::Binance, Box::new(binance_ref));
-            tracing::info!(exchange = "Binance", "ExchangeActor created");
+            tracing::info!(exchange = "Binance", "ExchangeActor ready");
         }
 
         if let Some(ref credentials) = args.okx_credentials {
@@ -383,8 +384,9 @@ impl Actor for ManagerActor {
                 mailbox::unbounded(),
             )
             .await;
+            okx_ref.wait_for_startup().await;
             exchange_actors.insert(Exchange::OKX, Box::new(okx_ref));
-            tracing::info!(exchange = "OKX", "ExchangeActor created");
+            tracing::info!(exchange = "OKX", "ExchangeActor ready");
         }
 
         if let Some(ref credentials) = args.hyperliquid_credentials {
@@ -402,8 +404,9 @@ impl Actor for ManagerActor {
                 mailbox::unbounded(),
             )
             .await;
+            hyper_ref.wait_for_startup().await;
             exchange_actors.insert(Exchange::Hyperliquid, Box::new(hyper_ref));
-            tracing::info!(exchange = "Hyperliquid", "ExchangeActor created");
+            tracing::info!(exchange = "Hyperliquid", "ExchangeActor ready");
         }
 
         if let Some((ibkr_auth, ibkr_conids, ibkr_client)) = ibkr_actor_data {
@@ -418,8 +421,9 @@ impl Actor for ManagerActor {
                 mailbox::unbounded(),
             )
             .await;
+            ibkr_ref.wait_for_startup().await;
             exchange_actors.insert(Exchange::IBKR, Box::new(ibkr_ref));
-            tracing::info!(exchange = "IBKR", "ExchangeActor created");
+            tracing::info!(exchange = "IBKR", "ExchangeActor ready");
         }
 
         tracing::info!("ManagerActor started with all child actors linked");
