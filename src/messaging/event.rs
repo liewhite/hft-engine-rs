@@ -64,10 +64,10 @@ impl IncomeEvent {
             ExchangeEventData::Position(pos) => Some(&pos.symbol),
             ExchangeEventData::OrderUpdate(update) => Some(&update.symbol),
             ExchangeEventData::Fill(fill) => Some(&fill.symbol),
+            ExchangeEventData::FundingFee(fee) => Some(&fee.symbol),
             ExchangeEventData::Candle(candle) => Some(&candle.symbol),
             ExchangeEventData::HistoryCandles(candles) => candles.first().map(|c| &c.symbol),
             ExchangeEventData::Balance(_)
-            | ExchangeEventData::FundingFee(_)
             | ExchangeEventData::Greeks(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. }

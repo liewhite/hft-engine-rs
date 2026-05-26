@@ -330,12 +330,14 @@ impl SymbolState {
             ExchangeEventData::Candle(_) | ExchangeEventData::HistoryCandles(_) => {
                 // K线数据由策略层处理，SymbolState 不存储
             }
+            ExchangeEventData::FundingFee(_) => {
+                // 资费事件不修改本地 symbol 状态，下游策略自行去重与统计
+            }
             ExchangeEventData::Clock => {
                 // Clock 事件由策略层处理，这里不需要处理
             }
             ExchangeEventData::Greeks(_)
             | ExchangeEventData::Balance(_)
-            | ExchangeEventData::FundingFee(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. } => {
                 // 已在上面提前返回，这里不会执行

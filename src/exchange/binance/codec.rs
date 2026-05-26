@@ -1,6 +1,6 @@
 use super::from_binance;
 use crate::domain::{
-    Balance, Exchange, Fill, FundingFee, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO,
+    Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -125,9 +125,6 @@ pub struct AccountUpdate {
 
 #[derive(Debug, Deserialize)]
 pub struct AccountData {
-    /// 事件原因（如 "ORDER", "FUNDING_FEE", "DEPOSIT" 等）
-    #[serde(default, rename = "m")]
-    pub reason: Option<String>,
     #[serde(rename = "B")]
     pub balances: Vec<AccountBalance>,
     #[serde(rename = "P")]
@@ -156,19 +153,6 @@ impl AccountBalance {
             asset: self.a.clone(),
             available,
             frozen,
-        })
-    }
-
-    /// 将 `bc` (Balance Change) 解析为 FundingFee
-    /// 正数 = 账户收到资费，负数 = 账户支付资费
-    pub fn to_funding_fee(&self, timestamp: u64) -> Result<FundingFee, String> {
-        let amount = f64::from_str(&self.bc)
-            .map_err(|_| format!("Failed to parse balance change: {}", self.bc))?;
-        Ok(FundingFee {
-            exchange: Exchange::Binance,
-            asset: self.a.clone(),
-            amount,
-            timestamp,
         })
     }
 }

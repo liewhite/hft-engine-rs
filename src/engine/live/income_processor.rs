@@ -69,6 +69,10 @@ impl IncomeProcessorActor {
                 exchange: fill.exchange,
                 symbol: fill.symbol.clone(),
             },
+            ExchangeEventData::FundingFee(fee) => EventRouting::BySymbol {
+                exchange: fee.exchange,
+                symbol: fee.symbol.clone(),
+            },
             ExchangeEventData::Candle(candle) => EventRouting::BySymbol {
                 exchange: candle.exchange,
                 symbol: candle.symbol.clone(),
@@ -84,7 +88,6 @@ impl IncomeProcessorActor {
             }
             // 账户级别数据、ExchangeStatus 和 Clock：广播
             ExchangeEventData::Balance(_)
-            | ExchangeEventData::FundingFee(_)
             | ExchangeEventData::Greeks(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. }

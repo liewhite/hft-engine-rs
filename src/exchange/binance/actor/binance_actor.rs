@@ -14,6 +14,7 @@
 //! └── BinanceEquityPollingActor [spawn_link]
 
 use super::equity_polling::{BinanceEquityPollingActor, BinanceEquityPollingActorArgs};
+use super::funding_fee_polling::{BinanceFundingFeePollingActor, BinanceFundingFeePollingActorArgs};
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta, Timestamp};
@@ -62,11 +63,16 @@ impl Actor for BinanceActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 0. 查询初始持仓并推送到 IncomePubSub（对所有配置 symbol 推送，空仓推 0）
-        if let Some(ref credentials) = args.credentials {
-            let client = BinanceClient::new(Some(credentials.clone()))
-                .expect("Failed to create BinanceClient");
+        // 凭证可用时，构建一个 Arc<BinanceClient> 供初始查询与 FundingFee polling 共用
+        let binance_client: Option<Arc<BinanceClient>> = args.credentials.as_ref().map(|c| {
+            Arc::new(
+                BinanceClient::new(Some(c.clone()))
+                    .expect("Failed to create BinanceClient"),
+            )
+        });
 
+        // 0. 查询初始持仓并推送到 IncomePubSub（对所有配置 symbol 推送，空仓推 0）
+        if let Some(client) = binance_client.as_ref() {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -156,6 +162,21 @@ impl Actor for BinanceActor {
         )
         .await;
         tracing::info!(exchange = "Binance", "EquityPollingActor created");
+
+        // 3.5 创建 FundingFeePollingActor (仅在有凭证时启动；轮询拉取 per-symbol 资费明细)
+        if let Some(client) = binance_client {
+            BinanceFundingFeePollingActor::spawn_link_with_mailbox(
+                &actor_ref,
+                BinanceFundingFeePollingActorArgs {
+                    client,
+                    income_pubsub: args.income_pubsub.clone(),
+                    interval_ms: 60_000, // 1 分钟
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+            tracing::info!(exchange = "Binance", "FundingFeePollingActor created");
+        }
 
         // 4. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
         CryptoStatusActor::spawn_link_with_mailbox(
