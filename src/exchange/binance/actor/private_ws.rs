@@ -9,7 +9,7 @@ use super::listen_key::{BinanceListenKeyActor, BinanceListenKeyActorArgs};
 use crate::domain::{now_ms, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsResponse};
-use crate::exchange::binance::BinanceCredentials;
+use crate::exchange::binance::{BinanceCredentials, WS_PRIVATE_URL};
 use crate::exchange::client::WsError;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -25,9 +25,6 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-
-/// Private WebSocket URL 基础
-const WS_PRIVATE_BASE: &str = "wss://fstream.binance.com/ws";
 
 /// BinancePrivateWsActor 初始化参数
 pub struct BinancePrivateWsActorArgs {
@@ -83,8 +80,8 @@ impl Actor for BinancePrivateWsActor {
             .await
             .expect("Failed to create listen key");
 
-        // 2. 连接私有 WebSocket
-        let url = format!("{}/{}", WS_PRIVATE_BASE, listen_key);
+        // 2. 连接私有 WebSocket（迁移后用 query 参数传 listenKey；未带 events 让交易所推全部事件）
+        let url = format!("{}?listenKey={}", WS_PRIVATE_URL, listen_key);
         let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
             .await
             .expect("Failed to connect to Binance private WebSocket");

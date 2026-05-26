@@ -19,8 +19,10 @@ use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
 use crate::domain::{Symbol, SymbolMeta, Timestamp};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
-use crate::exchange::binance::{BinanceClient, BinanceCredentials};
-use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
+use crate::exchange::binance::{
+    BinanceClient, BinanceCredentials, WS_MARKET_URL, WS_PUBLIC_HIGH_FREQ_URL,
+};
+use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
 use crate::exchange::ExchangeClient;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
@@ -54,8 +56,38 @@ pub struct BinanceActorArgs {
 
 /// BinanceActor - 父 Actor
 pub struct BinanceActor {
-    /// Public WebSocket Actor
+    /// 高频公共 WebSocket（/public/ws：bookTicker、depth、aggTrade 等）
     public_ws: ActorRef<BinancePublicWsActor>,
+    /// 常规市场 WebSocket（/market/ws：markPrice、kline、ticker 等）
+    market_ws: ActorRef<BinancePublicWsActor>,
+}
+
+/// 公共 WS 目标（Binance 迁移后高频与常规市场流分两条连接）
+enum WsTarget {
+    /// /public/ws：高频公共数据（bookTicker、depth、aggTrade 等）
+    PublicHighFreq,
+    /// /market/ws：常规市场数据（markPrice、kline、ticker 等）
+    Market,
+}
+
+/// 按订阅 kind 选择落到哪条公共 WS
+fn pick_ws_target(kind: &SubscriptionKind) -> WsTarget {
+    match kind {
+        SubscriptionKind::BBO { .. } => WsTarget::PublicHighFreq,
+        SubscriptionKind::FundingRate { .. }
+        | SubscriptionKind::MarkPrice { .. }
+        | SubscriptionKind::IndexPrice { .. }
+        | SubscriptionKind::Candle { .. } => WsTarget::Market,
+    }
+}
+
+impl BinanceActor {
+    fn ws_for(&self, target: WsTarget) -> &ActorRef<BinancePublicWsActor> {
+        match target {
+            WsTarget::PublicHighFreq => &self.public_ws,
+            WsTarget::Market => &self.market_ws,
+        }
+    }
 }
 
 impl Actor for BinanceActor {
@@ -117,10 +149,11 @@ impl Actor for BinanceActor {
             }
         }
 
-        // 1. 创建 PublicWsActor (使用 spawn_link_with_mailbox)
+        // 1a. 创建高频公共 WsActor (/public/ws)
         let public_ws = BinancePublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             BinancePublicWsActorArgs {
+                url: WS_PUBLIC_HIGH_FREQ_URL.to_string(),
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
@@ -128,7 +161,21 @@ impl Actor for BinanceActor {
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "Binance", "PublicWsActor created");
+        tracing::info!(exchange = "Binance", url = WS_PUBLIC_HIGH_FREQ_URL, "PublicWsActor created");
+
+        // 1b. 创建常规市场 WsActor (/market/ws)
+        let market_ws = BinancePublicWsActor::spawn_link_with_mailbox(
+            &actor_ref,
+            BinancePublicWsActorArgs {
+                url: WS_MARKET_URL.to_string(),
+                income_pubsub: args.income_pubsub.clone(),
+                symbol_metas: args.symbol_metas.clone(),
+                quote: args.quote.clone(),
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        tracing::info!(exchange = "Binance", url = WS_MARKET_URL, "MarketWsActor created");
 
         // 2. 创建 PrivateWsActor (如果有凭证)
         let has_private_ws = if let Some(credentials) = args.credentials {
@@ -197,7 +244,7 @@ impl Actor for BinanceActor {
             "BinanceActor started"
         );
 
-        Ok(Self { public_ws })
+        Ok(Self { public_ws, market_ws })
     }
 
     async fn on_stop(
@@ -235,9 +282,9 @@ impl Message<Subscribe> for BinanceActor {
         msg: Subscribe,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 转发给 PublicWsActor
-        if let Err(e) = self.public_ws.tell(msg).send().await {
-            tracing::error!(error = %e, "Failed to forward message to BinancePublicWsActor");
+        let target = self.ws_for(pick_ws_target(&msg.kind));
+        if let Err(e) = target.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward Subscribe");
         }
     }
 }
@@ -250,9 +297,35 @@ impl Message<SubscribeBatch> for BinanceActor {
         msg: SubscribeBatch,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 转发给 PublicWsActor
-        if let Err(e) = self.public_ws.tell(msg).send().await {
-            tracing::error!(error = %e, "Failed to forward message to BinancePublicWsActor");
+        // 按目标 WS 拆分批次，避免把 markPrice 流发到 /public/ws 被拒
+        let mut public_kinds = Vec::new();
+        let mut market_kinds = Vec::new();
+        for kind in msg.kinds {
+            match pick_ws_target(&kind) {
+                WsTarget::PublicHighFreq => public_kinds.push(kind),
+                WsTarget::Market => market_kinds.push(kind),
+            }
+        }
+
+        if !public_kinds.is_empty() {
+            if let Err(e) = self
+                .public_ws
+                .tell(SubscribeBatch { kinds: public_kinds })
+                .send()
+                .await
+            {
+                tracing::error!(error = %e, "Failed to forward SubscribeBatch to public_ws");
+            }
+        }
+        if !market_kinds.is_empty() {
+            if let Err(e) = self
+                .market_ws
+                .tell(SubscribeBatch { kinds: market_kinds })
+                .send()
+                .await
+            {
+                tracing::error!(error = %e, "Failed to forward SubscribeBatch to market_ws");
+            }
         }
     }
 }
@@ -265,9 +338,9 @@ impl Message<Unsubscribe> for BinanceActor {
         msg: Unsubscribe,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 转发给 PublicWsActor
-        if let Err(e) = self.public_ws.tell(msg).send().await {
-            tracing::error!(error = %e, "Failed to forward message to BinancePublicWsActor");
+        let target = self.ws_for(pick_ws_target(&msg.kind));
+        if let Err(e) = target.tell(msg).send().await {
+            tracing::error!(error = %e, "Failed to forward Unsubscribe");
         }
     }
 }

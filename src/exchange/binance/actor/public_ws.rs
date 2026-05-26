@@ -24,11 +24,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-/// Public WebSocket URL
-const WS_PUBLIC_URL: &str = "wss://fstream.binance.com/ws";
-
 /// BinancePublicWsActor 初始化参数
 pub struct BinancePublicWsActorArgs {
+    /// WebSocket 基础 URL（迁移后 Binance 把公共流拆为 /public/ws 与 /market/ws，
+    /// 由父 actor 决定本 actor 实例绑定哪个 URL）
+    pub url: String,
     /// Income PubSub (发布事件)
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// Symbol 元数据（公开 WS 目前不需要，但保持一致性）
@@ -108,7 +108,7 @@ impl Actor for BinancePublicWsActor {
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 连接 WebSocket
-        let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PUBLIC_URL)
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&args.url)
             .await
             .expect("Failed to connect to Binance public WebSocket");
 
@@ -127,7 +127,7 @@ impl Actor for BinancePublicWsActor {
         // 启动 ws_loop
         tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
 
-        tracing::info!("BinancePublicWsActor started");
+        tracing::info!(url = %args.url, "BinancePublicWsActor started");
 
         Ok(Self {
             income_pubsub: args.income_pubsub,
