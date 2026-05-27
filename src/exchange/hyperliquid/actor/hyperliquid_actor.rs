@@ -55,7 +55,7 @@ impl Actor for HyperliquidActor {
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let income_pubsub = args.income_pubsub;
 
-        // 1. 创建 PublicWsActor 并等握手完成
+        // 1. 并发 spawn 两个 WS actor
         let public_ws = HyperliquidPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             HyperliquidPublicWsActorArgs {
@@ -67,28 +67,40 @@ impl Actor for HyperliquidActor {
             mailbox::unbounded(),
         )
         .await;
-        public_ws.wait_for_startup().await;
-        tracing::info!(exchange = "Hyperliquid", "PublicWsActor ready");
-
-        // 2. 创建 PrivateWsActor (如果有凭证)，等 WS 握手完成避免错过订单/成交
-        let has_private_ws = if let Some(credentials) = args.credentials {
-            let private_ws = HyperliquidPrivateWsActor::spawn_link_with_mailbox(
-                &actor_ref,
-                HyperliquidPrivateWsActorArgs {
-                    wallet_address: credentials.wallet_address,
-                    dex: credentials.dex,
-                    income_pubsub: income_pubsub.clone(),
-                    symbol_metas: args.symbol_metas,
-                },
-                mailbox::unbounded(),
+        let private_ws_opt = if let Some(credentials) = args.credentials {
+            Some(
+                HyperliquidPrivateWsActor::spawn_link_with_mailbox(
+                    &actor_ref,
+                    HyperliquidPrivateWsActorArgs {
+                        wallet_address: credentials.wallet_address,
+                        dex: credentials.dex,
+                        income_pubsub: income_pubsub.clone(),
+                        symbol_metas: args.symbol_metas,
+                    },
+                    mailbox::unbounded(),
+                )
+                .await,
             )
-            .await;
-            private_ws.wait_for_startup().await;
-            tracing::info!(exchange = "Hyperliquid", "PrivateWsActor ready");
-            true
         } else {
-            false
+            None
         };
+        let has_private_ws = private_ws_opt.is_some();
+
+        // 2. 并发等 WS 全部完成；任一失败 → panic
+        let private_wait = async {
+            if let Some(p) = &private_ws_opt {
+                p.wait_for_startup_result().await
+            } else {
+                Ok(())
+            }
+        };
+        let (public_r, private_r) = tokio::join!(
+            public_ws.wait_for_startup_result(),
+            private_wait,
+        );
+        public_r.expect("HyperliquidPublicWsActor failed to start");
+        private_r.expect("HyperliquidPrivateWsActor failed to start");
+        tracing::info!(exchange = "Hyperliquid", has_private_ws, "WS actors ready");
 
         // 3. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
         CryptoStatusActor::spawn_link_with_mailbox(

@@ -72,8 +72,8 @@ impl Actor for IbkrActor {
             .await
             .expect("Initial tickle failed");
 
-        // 2. 创建 PublicWsActor (传入 session_id)，等 WS 握手完成。
-        //    IBKR 用同一条 WS 同时收行情和订单更新，必须就绪再放行下游
+        // 2. 并发 spawn PublicWsActor 与 TickleActor —— 互无依赖
+        //    IBKR 用同一条 WS 同时收行情和订单更新，必须握手完成再放行下游
         let income_pubsub = args.income_pubsub;
         let public_ws = IbkrPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
@@ -86,10 +86,6 @@ impl Actor for IbkrActor {
             mailbox::unbounded(),
         )
         .await;
-        public_ws.wait_for_startup().await;
-        tracing::info!(exchange = "IBKR", "PublicWsActor ready");
-
-        // 3. 启动 tickle 保活 Actor (spawn_link, 纳入级联退出)
         let tickle = IbkrTickleActor::spawn_link_with_mailbox(
             &actor_ref,
             IbkrTickleActorArgs {
@@ -99,8 +95,15 @@ impl Actor for IbkrActor {
             mailbox::unbounded(),
         )
         .await;
-        tickle.wait_for_startup().await;
-        tracing::info!(exchange = "IBKR", "TickleActor ready");
+
+        // 3. 并发等启动完成；任一失败 → panic
+        let (public_r, tickle_r) = tokio::join!(
+            public_ws.wait_for_startup_result(),
+            tickle.wait_for_startup_result(),
+        );
+        public_r.expect("IbkrPublicWsActor failed to start");
+        tickle_r.expect("IbkrTickleActor failed to start");
+        tracing::info!(exchange = "IBKR", "WS + tickle ready");
 
         // 4. 创建持仓轮询 Actor (每 3 秒)
         let position_polling = IbkrPositionPollingActor::spawn_link_with_mailbox(

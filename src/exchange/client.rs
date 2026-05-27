@@ -2,7 +2,7 @@
 //!
 //! ExchangeClient trait 封装交易所 REST 交互
 
-use crate::domain::{CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderUpdate, Symbol, SymbolMeta};
+use crate::domain::{CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderUpdate, Position, Symbol, SymbolMeta};
 use async_trait::async_trait;
 
 /// 账户信息 (净值 + 总持仓名义价值)
@@ -80,6 +80,16 @@ pub trait ExchangeClient: Send + Sync + 'static {
 
     /// 获取账户信息 (净值 + 总持仓名义价值)
     async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError>;
+
+    /// 启动期查询所有 symbol 的持仓
+    ///
+    /// 用于在 executor 注册之后、市场订阅之前同步初始状态，避免策略基于陈旧 / 缺失的
+    /// position 做出决策。默认返回空 Vec，由各交易所按需实现：
+    /// - REST 直查的交易所（Binance/IBKR）应覆写返回真实持仓
+    /// - 私有 WS 已下发初始持仓的交易所（OKX/HL）暂时可保留默认（注意 race，详见 docs）
+    async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
+        Ok(Vec::new())
+    }
 }
 
 // ============================================================================

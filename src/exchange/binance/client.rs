@@ -218,8 +218,8 @@ impl BinanceClient {
         Ok(metas)
     }
 
-    /// 查询所有持仓
-    pub async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+    /// 查询所有持仓（内部实现；ExchangeClient::fetch_positions 委托到这里）
+    async fn fetch_positions_impl(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
@@ -560,6 +560,10 @@ impl ExchangeClient for BinanceClient {
 
     async fn fetch_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
         self.get_account_info().await
+    }
+
+    async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+        self.fetch_positions_impl().await
     }
 }
 

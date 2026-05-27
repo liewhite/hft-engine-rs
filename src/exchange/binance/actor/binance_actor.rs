@@ -17,20 +17,18 @@ use super::equity_polling::{BinanceEquityPollingActor, BinanceEquityPollingActor
 use super::funding_fee_polling::{BinanceFundingFeePollingActor, BinanceFundingFeePollingActorArgs};
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
-use crate::domain::{Symbol, SymbolMeta, Timestamp};
+use crate::domain::{Symbol, SymbolMeta};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::binance::{
     BinanceClient, BinanceCredentials, WS_MARKET_URL, WS_PUBLIC_HIGH_FREQ_URL,
 };
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
 use crate::exchange::ExchangeClient;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
-use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -95,7 +93,8 @@ impl Actor for BinanceActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 凭证可用时，构建一个 Arc<BinanceClient> 供初始查询与 FundingFee polling 共用
+        // 凭证可用时构建 Arc<BinanceClient>，供 FundingFee polling 使用。
+        // 初始持仓查询已上移至 ManagerActor::add_strategies_batch（executor 注册后），不在此处。
         let binance_client: Option<Arc<BinanceClient>> = args.credentials.as_ref().map(|c| {
             Arc::new(
                 BinanceClient::new(Some(c.clone()))
@@ -103,53 +102,7 @@ impl Actor for BinanceActor {
             )
         });
 
-        // 0. 查询初始持仓并推送到 IncomePubSub（对所有配置 symbol 推送，空仓推 0）
-        if let Some(client) = binance_client.as_ref() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as Timestamp;
-
-            match client.fetch_positions().await {
-                Ok(positions) => {
-                    let position_map: std::collections::HashMap<Symbol, crate::domain::Position> = positions
-                        .into_iter()
-                        .map(|p| (p.symbol.clone(), p))
-                        .collect();
-
-                    for symbol in args.symbol_metas.keys() {
-                        let pos = position_map.get(symbol).cloned().unwrap_or(crate::domain::Position {
-                            exchange: crate::domain::Exchange::Binance,
-                            symbol: symbol.clone(),
-                            size: 0.0,
-                            entry_price: 0.0,
-                            unrealized_pnl: 0.0,
-                        });
-
-                        tracing::info!(
-                            exchange = "Binance",
-                            symbol = %symbol,
-                            size = pos.size,
-                            "Initial position loaded"
-                        );
-
-                        let event = IncomeEvent {
-                            exchange_ts: now,
-                            local_ts: now,
-                            data: ExchangeEventData::Position(pos),
-                        };
-                        if let Err(e) = args.income_pubsub.tell(Publish(event)).send().await {
-                            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(exchange = "Binance", error = %e, "Failed to fetch initial positions");
-                }
-            }
-        }
-
-        // 1a. 创建高频公共 WsActor (/public/ws)，等握手完成再继续
+        // 1. 先并发 spawn 所有 actor（spawn 本身是 instant，on_start 异步跑）
         let public_ws = BinancePublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             BinancePublicWsActorArgs {
@@ -161,10 +114,6 @@ impl Actor for BinanceActor {
             mailbox::unbounded(),
         )
         .await;
-        public_ws.wait_for_startup().await;
-        tracing::info!(exchange = "Binance", url = WS_PUBLIC_HIGH_FREQ_URL, "PublicWsActor ready");
-
-        // 1b. 创建常规市场 WsActor (/market/ws)，等握手完成再继续
         let market_ws = BinancePublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             BinancePublicWsActorArgs {
@@ -176,60 +125,67 @@ impl Actor for BinanceActor {
             mailbox::unbounded(),
         )
         .await;
-        market_ws.wait_for_startup().await;
-        tracing::info!(exchange = "Binance", url = WS_MARKET_URL, "MarketWsActor ready");
-
-        // 2. 创建 PrivateWsActor (如果有凭证)；必须等 listenKey + WS 握手完成，
-        //    否则下游交易信号触发的订单更新会丢
-        let has_private_ws = if let Some(credentials) = args.credentials {
-            let private_ws = BinancePrivateWsActor::spawn_link_with_mailbox(
-                &actor_ref,
-                BinancePrivateWsActorArgs {
-                    credentials,
-                    rest_base_url: args.rest_base_url,
-                    income_pubsub: args.income_pubsub.clone(),
-                    symbol_metas: args.symbol_metas.clone(),
-                    quote: args.quote.clone(),
-                },
-                mailbox::unbounded(),
+        let private_ws_opt = if let Some(credentials) = args.credentials {
+            Some(
+                BinancePrivateWsActor::spawn_link_with_mailbox(
+                    &actor_ref,
+                    BinancePrivateWsActorArgs {
+                        credentials,
+                        rest_base_url: args.rest_base_url,
+                        income_pubsub: args.income_pubsub.clone(),
+                        symbol_metas: args.symbol_metas.clone(),
+                        quote: args.quote.clone(),
+                    },
+                    mailbox::unbounded(),
+                )
+                .await,
             )
-            .await;
-            private_ws.wait_for_startup().await;
-            tracing::info!(exchange = "Binance", "PrivateWsActor ready");
-            true
         } else {
-            false
+            None
         };
+        let has_private_ws = private_ws_opt.is_some();
 
-        // 3. 创建 EquityPollingActor
+        // 2. 并发等三个 WS actor 全部 on_start 完成；任一失败 → panic，避免"假就绪"窗口
+        let private_wait = async {
+            if let Some(p) = &private_ws_opt {
+                p.wait_for_startup_result().await
+            } else {
+                Ok(())
+            }
+        };
+        let (public_r, market_r, private_r) = tokio::join!(
+            public_ws.wait_for_startup_result(),
+            market_ws.wait_for_startup_result(),
+            private_wait,
+        );
+        public_r.expect("BinancePublicWsActor (/public/ws) failed to start");
+        market_r.expect("BinancePublicWsActor (/market/ws) failed to start");
+        private_r.expect("BinancePrivateWsActor failed to start");
+        tracing::info!(exchange = "Binance", has_private_ws, "WS actors ready");
+
+        // 3. polling actor 的 on_start 只 attach_stream（无 IO），wait_for_startup 是 no-op，省略
         BinanceEquityPollingActor::spawn_link_with_mailbox(
             &actor_ref,
             BinanceEquityPollingActorArgs {
                 client: args.client,
                 income_pubsub: args.income_pubsub.clone(),
-                interval_ms: 1000, // 每秒查询一次
+                interval_ms: 1000,
             },
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "Binance", "EquityPollingActor created");
-
-        // 3.5 创建 FundingFeePollingActor (仅在有凭证时启动；轮询拉取 per-symbol 资费明细)
         if let Some(client) = binance_client {
             BinanceFundingFeePollingActor::spawn_link_with_mailbox(
                 &actor_ref,
                 BinanceFundingFeePollingActorArgs {
                     client,
                     income_pubsub: args.income_pubsub.clone(),
-                    interval_ms: 60_000, // 1 分钟
+                    interval_ms: 60_000,
                 },
                 mailbox::unbounded(),
             )
             .await;
-            tracing::info!(exchange = "Binance", "FundingFeePollingActor created");
         }
-
-        // 4. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
         CryptoStatusActor::spawn_link_with_mailbox(
             &actor_ref,
             CryptoStatusActorArgs {
@@ -240,7 +196,6 @@ impl Actor for BinanceActor {
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "Binance", "CryptoStatusActor created");
 
         tracing::info!(
             exchange = "Binance",

@@ -111,7 +111,10 @@ impl Actor for BinancePrivateWsActor {
             mailbox::unbounded(),
         )
         .await;
-        listen_key_actor.wait_for_startup().await;
+        listen_key_actor
+            .wait_for_startup_result()
+            .await
+            .expect("BinanceListenKeyActor failed to start");
         let listen_key_actor_id = listen_key_actor.id();
 
         tracing::info!("BinancePrivateWsActor started");

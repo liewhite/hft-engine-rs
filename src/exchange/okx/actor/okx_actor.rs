@@ -62,7 +62,7 @@ impl Actor for OkxActor {
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let income_pubsub = args.income_pubsub;
 
-        // 1. 创建 PublicWsActor 并等握手完成
+        // 1. 并发 spawn 三个 WS actor（spawn 本身瞬间返回）
         let public_ws = OkxPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             OkxPublicWsActorArgs {
@@ -73,10 +73,6 @@ impl Actor for OkxActor {
             mailbox::unbounded(),
         )
         .await;
-        public_ws.wait_for_startup().await;
-        tracing::info!(exchange = "OKX", "PublicWsActor ready");
-
-        // 2. 创建 BusinessWsActor (K线数据)
         let business_ws = OkxBusinessWsActor::spawn_link_with_mailbox(
             &actor_ref,
             OkxBusinessWsActorArgs {
@@ -87,29 +83,43 @@ impl Actor for OkxActor {
             mailbox::unbounded(),
         )
         .await;
-        business_ws.wait_for_startup().await;
-        tracing::info!(exchange = "OKX", "BusinessWsActor ready");
-
-        // 3. 创建 PrivateWsActor (如果有凭证)，等 login 完成避免错过订单更新
-        let has_private_ws = if let Some(credentials) = args.credentials {
-            let private_ws = OkxPrivateWsActor::spawn_link_with_mailbox(
-                &actor_ref,
-                OkxPrivateWsActorArgs {
-                    credentials,
-                    income_pubsub: income_pubsub.clone(),
-                    symbol_metas: args.symbol_metas,
-                },
-                mailbox::unbounded(),
+        let private_ws_opt = if let Some(credentials) = args.credentials {
+            Some(
+                OkxPrivateWsActor::spawn_link_with_mailbox(
+                    &actor_ref,
+                    OkxPrivateWsActorArgs {
+                        credentials,
+                        income_pubsub: income_pubsub.clone(),
+                        symbol_metas: args.symbol_metas,
+                    },
+                    mailbox::unbounded(),
+                )
+                .await,
             )
-            .await;
-            private_ws.wait_for_startup().await;
-            tracing::info!(exchange = "OKX", "PrivateWsActor ready");
-            true
         } else {
-            false
+            None
         };
+        let has_private_ws = private_ws_opt.is_some();
 
-        // 4. 创建 GreeksPollingActor (如果有 client)
+        // 2. 并发等三个 WS 全部完成；任一失败 → panic
+        let private_wait = async {
+            if let Some(p) = &private_ws_opt {
+                p.wait_for_startup_result().await
+            } else {
+                Ok(())
+            }
+        };
+        let (public_r, business_r, private_r) = tokio::join!(
+            public_ws.wait_for_startup_result(),
+            business_ws.wait_for_startup_result(),
+            private_wait,
+        );
+        public_r.expect("OkxPublicWsActor failed to start");
+        business_r.expect("OkxBusinessWsActor failed to start");
+        private_r.expect("OkxPrivateWsActor failed to start");
+        tracing::info!(exchange = "OKX", has_private_ws, "WS actors ready");
+
+        // 3. polling actor 的 on_start 仅 attach_stream，省略 wait
         if let Some(client) = args.client {
             OkxGreeksPollingActor::spawn_link_with_mailbox(
                 &actor_ref,
@@ -121,10 +131,7 @@ impl Actor for OkxActor {
                 mailbox::unbounded(),
             )
             .await;
-            tracing::info!(exchange = "OKX", interval_ms = GREEKS_POLLING_INTERVAL_MS, "GreeksPollingActor created");
         }
-
-        // 5. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
         CryptoStatusActor::spawn_link_with_mailbox(
             &actor_ref,
             CryptoStatusActorArgs {
@@ -135,7 +142,6 @@ impl Actor for OkxActor {
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "OKX", "CryptoStatusActor created");
 
         tracing::info!(
             exchange = "OKX",

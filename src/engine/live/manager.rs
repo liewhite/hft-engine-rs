@@ -169,14 +169,70 @@ impl ManagerActor {
             }
         }
 
-        // 5. 查询各交易所现有挂单，作为 OrderUpdate 推送给 executor（在行情订阅之前）
-        {
-            // 收集所有策略涉及的 (exchange, symbol) 对
-            let exchange_symbols: HashSet<(Exchange, Symbol)> = all_subscriptions
-                .iter()
-                .map(|(exchange, kind)| (*exchange, kind.symbol().clone()))
-                .collect();
+        // 收集所有策略涉及的 (exchange, symbol) 对（下面 step 5 & 6 共用）
+        let exchange_symbols: HashSet<(Exchange, Symbol)> = all_subscriptions
+            .iter()
+            .map(|(exchange, kind)| (*exchange, kind.symbol().clone()))
+            .collect();
 
+        // 5. 查询各交易所初始持仓，推到 income_pubsub。**必须在 executor 注册之后、
+        //    市场订阅之前**进行——之前发布会被 BestEffort 丢，之后才发就有"开仓信号
+        //    在持仓未对齐"的窗口。对每个 (exchange, symbol) 都推一条：交易所返回的
+        //    用真实数据，未返回的推 size=0 显式清零（保证 SymbolState 一定收到初始值）。
+        {
+            let exchanges: HashSet<Exchange> =
+                exchange_symbols.iter().map(|(e, _)| *e).collect();
+            for exchange in exchanges {
+                let Some(client) = self.clients.get(&exchange) else {
+                    continue;
+                };
+                let positions = match client.fetch_positions().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            %exchange,
+                            error = %e,
+                            "Failed to fetch initial positions on startup, proceeding without"
+                        );
+                        continue;
+                    }
+                };
+                let position_map: HashMap<Symbol, crate::domain::Position> =
+                    positions.into_iter().map(|p| (p.symbol.clone(), p)).collect();
+                let local_ts = now_ms();
+                for (ex, symbol) in exchange_symbols.iter().filter(|(e, _)| *e == exchange) {
+                    let pos = position_map.get(symbol).cloned().unwrap_or(crate::domain::Position {
+                        exchange: *ex,
+                        symbol: symbol.clone(),
+                        size: 0.0,
+                        entry_price: 0.0,
+                        unrealized_pnl: 0.0,
+                    });
+                    tracing::info!(
+                        %exchange,
+                        %symbol,
+                        size = pos.size,
+                        "Initial position loaded"
+                    );
+                    let event = IncomeEvent {
+                        exchange_ts: local_ts,
+                        local_ts,
+                        data: ExchangeEventData::Position(pos),
+                    };
+                    if let Err(e) = self
+                        .income_pubsub
+                        .tell(kameo_actors::pubsub::Publish(event))
+                        .send()
+                        .await
+                    {
+                        tracing::error!(error = %e, "Failed to publish initial position");
+                    }
+                }
+            }
+        }
+
+        // 6. 查询各交易所现有挂单，作为 OrderUpdate 推送给 executor（在行情订阅之前）
+        {
             for (exchange, symbol) in &exchange_symbols {
                 let client = match self.clients.get(exchange) {
                     Some(c) => c,
@@ -227,7 +283,7 @@ impl ManagerActor {
             }
         }
 
-        // 6. 批量向各 ExchangeActors 发送订阅请求
+        // 7. 批量向各 ExchangeActors 发送订阅请求（市场数据从此处开始流动）
         for (exchange, kinds) in exchange_subscriptions {
             if let Some(actor) = self.exchange_actors.get(&exchange) {
                 actor
@@ -343,86 +399,139 @@ impl Actor for ManagerActor {
         .await;
 
         // 7. 创建所有配置了凭证的 ExchangeActors
-        let mut exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>> = HashMap::new();
-
-        if let Some(ref credentials) = args.binance_credentials {
+        //    Phase 1: 顺序 spawn（每个 spawn_link_with_mailbox 本身瞬间返回）
+        //    Phase 2: tokio::join! 并发等所有 on_start 完成（这才是耗时的 IO 部分）
+        let binance_ref_opt = if let Some(ref credentials) = args.binance_credentials {
             let symbol_metas_for_exchange =
                 Self::get_symbol_metas_for(&symbol_metas, Exchange::Binance);
             let client = clients
                 .get(&Exchange::Binance)
                 .ok_or_else(|| ExchangeError::Other("Binance client not found".to_string()))?
                 .clone();
-            let binance_ref = BinanceActor::spawn_link_with_mailbox(
-                &actor_ref,
-                BinanceActorArgs {
-                    credentials: Some(credentials.clone()),
-                    symbol_metas: symbol_metas_for_exchange,
-                    rest_base_url: REST_BASE_URL.to_string(),
-                    income_pubsub: income_pubsub.clone(),
-                    client,
-                    quote: credentials.quote.clone(),
-                },
-                mailbox::unbounded(),
+            Some(
+                BinanceActor::spawn_link_with_mailbox(
+                    &actor_ref,
+                    BinanceActorArgs {
+                        credentials: Some(credentials.clone()),
+                        symbol_metas: symbol_metas_for_exchange,
+                        rest_base_url: REST_BASE_URL.to_string(),
+                        income_pubsub: income_pubsub.clone(),
+                        client,
+                        quote: credentials.quote.clone(),
+                    },
+                    mailbox::unbounded(),
+                )
+                .await,
             )
-            .await;
-            binance_ref.wait_for_startup().await;
-            exchange_actors.insert(Exchange::Binance, Box::new(binance_ref));
-            tracing::info!(exchange = "Binance", "ExchangeActor ready");
-        }
+        } else {
+            None
+        };
 
-        if let Some(ref credentials) = args.okx_credentials {
+        let okx_ref_opt = if let Some(ref credentials) = args.okx_credentials {
             let symbol_metas_for_exchange = Self::get_symbol_metas_for(&symbol_metas, Exchange::OKX);
-            let okx_ref = OkxActor::spawn_link_with_mailbox(
-                &actor_ref,
-                OkxActorArgs {
-                    credentials: Some(credentials.clone()),
-                    client: okx_client.clone(),
-                    symbol_metas: symbol_metas_for_exchange,
-                    income_pubsub: income_pubsub.clone(),
-                    quote: credentials.quote.clone(),
-                },
-                mailbox::unbounded(),
+            Some(
+                OkxActor::spawn_link_with_mailbox(
+                    &actor_ref,
+                    OkxActorArgs {
+                        credentials: Some(credentials.clone()),
+                        client: okx_client.clone(),
+                        symbol_metas: symbol_metas_for_exchange,
+                        income_pubsub: income_pubsub.clone(),
+                        quote: credentials.quote.clone(),
+                    },
+                    mailbox::unbounded(),
+                )
+                .await,
             )
-            .await;
-            okx_ref.wait_for_startup().await;
-            exchange_actors.insert(Exchange::OKX, Box::new(okx_ref));
-            tracing::info!(exchange = "OKX", "ExchangeActor ready");
-        }
+        } else {
+            None
+        };
 
-        if let Some(ref credentials) = args.hyperliquid_credentials {
+        let hyper_ref_opt = if let Some(ref credentials) = args.hyperliquid_credentials {
             let symbol_metas_for_exchange =
                 Self::get_symbol_metas_for(&symbol_metas, Exchange::Hyperliquid);
-            let hyper_ref = HyperliquidActor::spawn_link_with_mailbox(
-                &actor_ref,
-                HyperliquidActorArgs {
-                    credentials: Some(credentials.clone()),
-                    symbol_metas: symbol_metas_for_exchange,
-                    income_pubsub: income_pubsub.clone(),
-                    quote: credentials.quote.clone(),
-                    dex: credentials.dex.clone(),
-                },
-                mailbox::unbounded(),
+            Some(
+                HyperliquidActor::spawn_link_with_mailbox(
+                    &actor_ref,
+                    HyperliquidActorArgs {
+                        credentials: Some(credentials.clone()),
+                        symbol_metas: symbol_metas_for_exchange,
+                        income_pubsub: income_pubsub.clone(),
+                        quote: credentials.quote.clone(),
+                        dex: credentials.dex.clone(),
+                    },
+                    mailbox::unbounded(),
+                )
+                .await,
             )
-            .await;
-            hyper_ref.wait_for_startup().await;
-            exchange_actors.insert(Exchange::Hyperliquid, Box::new(hyper_ref));
+        } else {
+            None
+        };
+
+        let ibkr_ref_opt = if let Some((ibkr_auth, ibkr_conids, ibkr_client)) = ibkr_actor_data {
+            Some(
+                IbkrActor::spawn_link_with_mailbox(
+                    &actor_ref,
+                    IbkrActorArgs {
+                        auth: ibkr_auth,
+                        income_pubsub: income_pubsub.clone(),
+                        conids: ibkr_conids,
+                        client: ibkr_client,
+                    },
+                    mailbox::unbounded(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        // Phase 2: 并发等四家完成；任一失败 → panic（启动期 panic 干净退出）
+        let b_wait = async {
+            match &binance_ref_opt {
+                Some(r) => r.wait_for_startup_result().await,
+                None => Ok(()),
+            }
+        };
+        let o_wait = async {
+            match &okx_ref_opt {
+                Some(r) => r.wait_for_startup_result().await,
+                None => Ok(()),
+            }
+        };
+        let h_wait = async {
+            match &hyper_ref_opt {
+                Some(r) => r.wait_for_startup_result().await,
+                None => Ok(()),
+            }
+        };
+        let i_wait = async {
+            match &ibkr_ref_opt {
+                Some(r) => r.wait_for_startup_result().await,
+                None => Ok(()),
+            }
+        };
+        let (b, o, h, i) = tokio::join!(b_wait, o_wait, h_wait, i_wait);
+        b.expect("BinanceActor failed to start");
+        o.expect("OkxActor failed to start");
+        h.expect("HyperliquidActor failed to start");
+        i.expect("IbkrActor failed to start");
+
+        let mut exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>> = HashMap::new();
+        if let Some(r) = binance_ref_opt {
+            exchange_actors.insert(Exchange::Binance, Box::new(r));
+            tracing::info!(exchange = "Binance", "ExchangeActor ready");
+        }
+        if let Some(r) = okx_ref_opt {
+            exchange_actors.insert(Exchange::OKX, Box::new(r));
+            tracing::info!(exchange = "OKX", "ExchangeActor ready");
+        }
+        if let Some(r) = hyper_ref_opt {
+            exchange_actors.insert(Exchange::Hyperliquid, Box::new(r));
             tracing::info!(exchange = "Hyperliquid", "ExchangeActor ready");
         }
-
-        if let Some((ibkr_auth, ibkr_conids, ibkr_client)) = ibkr_actor_data {
-            let ibkr_ref = IbkrActor::spawn_link_with_mailbox(
-                &actor_ref,
-                IbkrActorArgs {
-                    auth: ibkr_auth,
-                    income_pubsub: income_pubsub.clone(),
-                    conids: ibkr_conids,
-                    client: ibkr_client,
-                },
-                mailbox::unbounded(),
-            )
-            .await;
-            ibkr_ref.wait_for_startup().await;
-            exchange_actors.insert(Exchange::IBKR, Box::new(ibkr_ref));
+        if let Some(r) = ibkr_ref_opt {
+            exchange_actors.insert(Exchange::IBKR, Box::new(r));
             tracing::info!(exchange = "IBKR", "ExchangeActor ready");
         }
 
