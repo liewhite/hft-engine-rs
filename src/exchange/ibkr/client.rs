@@ -485,6 +485,13 @@ impl ExchangeClient for IbkrClient {
 
         Ok(crate::exchange::AccountInfo { equity, notional })
     }
+
+    async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+        // IBKR 由 IbkrPositionPollingActor 每 3 秒轮询 /portfolio/{accountId}/positions，
+        // 启动期由它兜底刷出初始 Position；这里返回空避免与轮询重复发布。
+        // TODO: 若启动期 3 秒延迟不可接受，可改为同步实现一次性查询。
+        Ok(Vec::new())
+    }
 }
 
 /// IBKR snapshot field tag: Bid Price

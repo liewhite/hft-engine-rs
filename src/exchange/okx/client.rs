@@ -611,6 +611,15 @@ impl ExchangeClient for OkxClient {
             notional: 0.0, // OKX 通过 WebSocket 推送 notional
         })
     }
+
+    async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+        // OKX 通过私有 WebSocket 在 login 后下发初始持仓 snapshot，REST 暂不实现。
+        // TODO: 与 ManagerActor::add_strategies_batch 的"executor 注册后才放行事件"
+        //       策略协同——若 WS snapshot 抵达时 executor 尚未注册（启动期 race），
+        //       初始持仓事件会被 BestEffort 丢。可能的修复：在此实现 REST 查询，
+        //       与 Binance 一致地由 manager 统一推送。
+        Ok(Vec::new())
+    }
 }
 
 /// 错误码映射

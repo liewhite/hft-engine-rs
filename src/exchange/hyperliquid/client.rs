@@ -457,6 +457,13 @@ impl ExchangeClient for HyperliquidClient {
             notional: 0.0,
         })
     }
+
+    async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+        // Hyperliquid 通过私有 WebSocket 下发初始持仓 snapshot，REST 暂不实现。
+        // TODO: 同 OKX —— WS snapshot 抵达时若 executor 未注册，初始持仓会丢。
+        //       建议后续接 /info/clearinghouseState 改为 manager 统一推送。
+        Ok(Vec::new())
+    }
 }
 
 /// 将 AssetInfo 转换为 SymbolMeta
