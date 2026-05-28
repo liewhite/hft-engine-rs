@@ -8,10 +8,10 @@
 //! IbkrActor (父)
 //! ├── IbkrPublicWsActor [spawn_link]
 //! ├── IbkrTickleActor [spawn_link]
-//! ├── IbkrPositionPollingActor [spawn_link]
+//! ├── IbkrAccountPollingActor [spawn_link]
 //! └── IbkrStatusPollingActor [spawn_link]
 
-use super::position_polling::{IbkrPositionPollingActor, IbkrPositionPollingActorArgs};
+use super::account_polling::{IbkrAccountPollingActor, IbkrAccountPollingActorArgs};
 use super::public_ws::{IbkrPublicWsActor, IbkrPublicWsActorArgs};
 use super::status_polling::{IbkrStatusPollingActor, IbkrStatusPollingActorArgs};
 use super::tickle::{IbkrTickleActor, IbkrTickleActorArgs};
@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-/// IBKR 持仓轮询间隔 (毫秒)
-const POSITION_POLLING_INTERVAL_MS: u64 = 3000;
+/// IBKR 账户信息轮询间隔 (毫秒)
+const ACCOUNT_POLLING_INTERVAL_MS: u64 = 3000;
 
 /// 市场状态轮询间隔 (毫秒)
 const STATUS_POLLING_INTERVAL_MS: u64 = 5_000;
@@ -52,8 +52,8 @@ pub struct IbkrActor {
     public_ws: ActorRef<IbkrPublicWsActor>,
     /// Tickle 保活 Actor
     _tickle: ActorRef<IbkrTickleActor>,
-    /// 持仓轮询 Actor
-    _position_polling: ActorRef<IbkrPositionPollingActor>,
+    /// 账户净值轮询 Actor
+    _account_polling: ActorRef<IbkrAccountPollingActor>,
     /// 市场状态轮询 Actor
     _status_polling: ActorRef<IbkrStatusPollingActor>,
 }
@@ -105,19 +105,19 @@ impl Actor for IbkrActor {
         tickle_r.expect("IbkrTickleActor failed to start");
         tracing::info!(exchange = "IBKR", "WS + tickle ready");
 
-        // 4. 创建持仓轮询 Actor (每 3 秒)
-        let position_polling = IbkrPositionPollingActor::spawn_link_with_mailbox(
+        // 4. 创建账户净值轮询 Actor (每 3 秒)
+        //    持仓不在此处刷新——初始持仓由 ManagerActor 启动期统一 fetch，运行期靠 Fill 维护
+        let account_polling = IbkrAccountPollingActor::spawn_link_with_mailbox(
             &actor_ref,
-            IbkrPositionPollingActorArgs {
+            IbkrAccountPollingActorArgs {
                 client: args.client.clone(),
                 income_pubsub: income_pubsub.clone(),
-                interval_ms: POSITION_POLLING_INTERVAL_MS,
-                symbols: args.client.conids().keys().cloned().collect(),
+                interval_ms: ACCOUNT_POLLING_INTERVAL_MS,
             },
             mailbox::unbounded(),
         )
         .await;
-        tracing::info!(exchange = "IBKR", "PositionPollingActor created");
+        tracing::info!(exchange = "IBKR", "AccountPollingActor created");
 
         // 5. 创建市场状态轮询 Actor
         let status_polling = IbkrStatusPollingActor::spawn_link_with_mailbox(
@@ -137,7 +137,7 @@ impl Actor for IbkrActor {
         Ok(Self {
             public_ws,
             _tickle: tickle,
-            _position_polling: position_polling,
+            _account_polling: account_polling,
             _status_polling: status_polling,
         })
     }

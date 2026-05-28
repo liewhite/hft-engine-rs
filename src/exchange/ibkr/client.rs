@@ -138,11 +138,11 @@ impl IbkrClient {
         &self.conids
     }
 
-    /// 获取持仓列表
+    /// 查询所有持仓（内部实现；ExchangeClient::fetch_positions 委托到这里）
     ///
-    /// 调用 GET /portfolio/{accountId}/positions/0
+    /// 调用 GET /portfolio2/{accountId}/positions
     /// 返回 Vec<Position>，仅包含已配置的 symbol
-    pub async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+    async fn fetch_positions_impl(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
         let base_url = self.auth.base_url();
 
         // 先预热 portfolio accounts 缓存
@@ -487,10 +487,7 @@ impl ExchangeClient for IbkrClient {
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
-        // IBKR 由 IbkrPositionPollingActor 每 3 秒轮询 /portfolio/{accountId}/positions，
-        // 启动期由它兜底刷出初始 Position；这里返回空避免与轮询重复发布。
-        // TODO: 若启动期 3 秒延迟不可接受，可改为同步实现一次性查询。
-        Ok(Vec::new())
+        self.fetch_positions_impl().await
     }
 }
 
