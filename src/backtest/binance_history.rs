@@ -14,8 +14,11 @@ use chrono::NaiveDate;
 pub struct BinanceHistory;
 
 impl BinanceHistory {
+    /// `symbols` 为内部基础符号 (如 "ETH")，`quote` 为计价币 (如 "USDT")，二者经 `to_binance`
+    /// 还原为币安文件符号；事件统一打内部符号。
     pub fn source(
         symbols: &[Symbol],
+        quote: &str,
         start: NaiveDate,
         end: NaiveDate,
         synthesize_bbo: bool,
@@ -24,7 +27,14 @@ impl BinanceHistory {
     ) -> Result<Box<dyn MarketDataSource>, ExchangeError> {
         let cache = LocalFsDataCache::new(cache_dir);
         let downloader = BinanceHistoryDownloader::new(Box::new(cache))?;
-        let base = BinanceHistorySource::load(&downloader, symbols, start, end, kinds)?;
+        let base = BinanceHistorySource::new(
+            downloader,
+            symbols.to_vec(),
+            quote.to_string(),
+            start,
+            end,
+            kinds.to_vec(),
+        );
         if synthesize_bbo {
             Ok(Box::new(TradePrintBboSource::new(base)))
         } else {

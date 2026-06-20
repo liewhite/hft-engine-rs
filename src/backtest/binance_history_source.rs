@@ -1,7 +1,8 @@
 use crate::backtest::binance_csv;
 use crate::backtest::downloader::BinanceHistoryDownloader;
 use crate::backtest::source::MarketDataSource;
-use crate::domain::{ExchangeError, Symbol};
+use crate::domain::Symbol;
+use crate::exchange::binance::to_binance;
 use crate::messaging::IncomeEvent;
 use chrono::NaiveDate;
 
@@ -21,7 +22,11 @@ impl BinanceDataKind {
         }
     }
 
-    fn parse(self, symbol: &Symbol, zip_bytes: &[u8]) -> Result<Vec<IncomeEvent>, ExchangeError> {
+    fn parse(
+        self,
+        symbol: &Symbol,
+        zip_bytes: &[u8],
+    ) -> Result<Vec<IncomeEvent>, crate::domain::ExchangeError> {
         match self {
             BinanceDataKind::BookTicker => binance_csv::parse_book_ticker(symbol, zip_bytes),
             BinanceDataKind::Trades => binance_csv::parse_trades(symbol, zip_bytes),
@@ -32,55 +37,91 @@ impl BinanceDataKind {
 /// 币安历史数据源：把指定 symbols、日期区间 [start, end] 的若干 [`BinanceDataKind`] 还原为
 /// 全局时间有序的事件流。
 ///
-/// **加载策略**：构造时 (`load`) 按天下载+解析，单日内所有 symbol×kind 合并后按时间戳**稳定排序**
-/// (同时间戳保持文件内相对序 -> 确定性)，逐天串联物化到内存。download/parse 的失败在此 fail-fast
-/// 向上传播 (不静默吞错)，故 `events()` 本身无误。
+/// **惰性按天加载**：`events()` 返回的迭代器逐日加载——单日内所有 symbol×kind 解析后合并、
+/// 按时间戳**稳定排序** (同时间戳保持文件内相对序 -> 确定性) 再产出，该日产完即丢弃。峰值内存
+/// = 单日数据量 (整月 ETH 全量物化会 OOM，故必须按天流式)。
 ///
-/// 注：相比 ox-demo 的逐日惰性加载 (内存上界 = 单日)，此实现整段物化 (内存 = 整区间)。换取
-/// 错误处理与 `MarketDataSource` 契约的简洁；超大区间可后续改为分块迭代器而不动接口。
+/// 错误处理：下载/解析失败在迭代时 **panic fail-fast** (带 key/原因上下文)——回测是离线一次性
+/// 任务，宁可响亮中断也不静默漏数据；缺某日数据 (404) 则跳过该日 (该日无成交)。
+///
+/// 符号约定：`symbols` 为**内部基础符号** (如 "ETH"，与 StateManager/SymbolMeta 一致)；文件路径
+/// 用 `to_binance(symbol, quote)` 还原为币安符号 (如 "ETHUSDT")，事件则统一打内部符号 -> 与实盘
+/// 行情流同构。
 pub struct BinanceHistorySource {
-    events: Vec<IncomeEvent>,
+    downloader: BinanceHistoryDownloader,
+    symbols: Vec<Symbol>,
+    quote: String,
+    start: NaiveDate,
+    end: NaiveDate,
+    kinds: Vec<BinanceDataKind>,
 }
 
 impl BinanceHistorySource {
-    pub fn load(
-        downloader: &BinanceHistoryDownloader,
-        symbols: &[Symbol],
+    pub fn new(
+        downloader: BinanceHistoryDownloader,
+        symbols: Vec<Symbol>,
+        quote: String,
         start: NaiveDate,
         end: NaiveDate,
-        kinds: &[BinanceDataKind],
-    ) -> Result<Self, ExchangeError> {
-        let mut events = Vec::new();
-        let mut date = start;
-        while date <= end {
-            let date_str = date.format("%Y-%m-%d").to_string();
-            let mut day_events = Vec::new();
-            for symbol in symbols {
-                for kind in kinds {
-                    let key = BinanceHistoryDownloader::daily_key(kind.key(), symbol, &date_str);
-                    if let Some(bytes) = downloader.fetch(&key)? {
-                        day_events.extend(kind.parse(symbol, &bytes)?);
-                    }
+        kinds: Vec<BinanceDataKind>,
+    ) -> Self {
+        Self {
+            downloader,
+            symbols,
+            quote,
+            start,
+            end,
+            kinds,
+        }
+    }
+
+    /// 加载单日事件 (合并 symbol×kind、稳定按时间戳排序)。下载/解析失败 panic fail-fast。
+    fn load_day(&self, date: NaiveDate) -> Vec<IncomeEvent> {
+        let date_str = date.format("%Y-%m-%d").to_string();
+        let mut day_events = Vec::new();
+        for symbol in &self.symbols {
+            let binance_symbol = to_binance(symbol, &self.quote);
+            for kind in &self.kinds {
+                let key = BinanceHistoryDownloader::daily_key(kind.key(), &binance_symbol, &date_str);
+                let bytes = self
+                    .downloader
+                    .fetch(&key)
+                    .unwrap_or_else(|e| panic!("fetch {key} failed: {e}"));
+                if let Some(bytes) = bytes {
+                    // 解析时打**内部符号** (非币安符号) -> 与 StateManager/策略订阅一致
+                    let parsed = kind
+                        .parse(symbol, &bytes)
+                        .unwrap_or_else(|e| panic!("parse {key} failed: {e}"));
+                    day_events.extend(parsed);
                 }
             }
-            // 稳定排序: 同时间戳保持文件内相对序 -> 确定性
-            day_events.sort_by_key(|e| e.exchange_ts);
-            tracing::info!(
-                date = %date_str,
-                count = day_events.len(),
-                "loaded day"
-            );
-            events.extend(day_events);
-            date = date.succ_opt().ok_or_else(|| {
-                ExchangeError::Other("date overflow while iterating range".to_string())
-            })?;
         }
-        Ok(Self { events })
+        // 稳定排序: 同时间戳保持文件内相对序 -> 确定性
+        day_events.sort_by_key(|e| e.exchange_ts);
+        tracing::info!(date = %date_str, count = day_events.len(), "loaded day");
+        day_events
+    }
+
+    fn date_range(&self) -> Vec<NaiveDate> {
+        let mut dates = Vec::new();
+        let mut d = self.start;
+        while d <= self.end {
+            dates.push(d);
+            d = match d.succ_opt() {
+                Some(n) => n,
+                None => break,
+            };
+        }
+        dates
     }
 }
 
 impl MarketDataSource for BinanceHistorySource {
     fn events(&self) -> Box<dyn Iterator<Item = IncomeEvent> + '_> {
-        Box::new(self.events.iter().cloned())
+        Box::new(
+            self.date_range()
+                .into_iter()
+                .flat_map(move |date| self.load_day(date).into_iter()),
+        )
     }
 }

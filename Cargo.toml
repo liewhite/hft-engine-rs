@@ -84,3 +84,7 @@ path = "src/bin/funding_arb.rs"
 [[bin]]
 name = "backtest"
 path = "src/bin/backtest.rs"
+
+[[bin]]
+name = "gamma_scalp"
+path = "src/bin/gamma_scalp.rs"

@@ -6,6 +6,7 @@
 mod binance_csv;
 mod binance_history;
 mod binance_history_source;
+mod bs_greeks_source;
 mod data_cache;
 mod downloader;
 mod engine;
@@ -13,6 +14,7 @@ mod source;
 mod trade_print_bbo;
 
 pub use binance_history::BinanceHistory;
+pub use bs_greeks_source::{BsGreeksConfig, BsGreeksSource};
 pub use binance_history_source::{BinanceDataKind, BinanceHistorySource};
 pub use data_cache::{DataCache, LocalFsDataCache};
 pub use downloader::BinanceHistoryDownloader;

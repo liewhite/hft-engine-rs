@@ -105,7 +105,9 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let symbol: Symbol = args.first().cloned().unwrap_or_else(|| "BTCUSDT".to_string());
+    // 内部基础符号 (如 "BTC")，计价币单独给数据源还原币安文件名
+    let symbol: Symbol = args.first().cloned().unwrap_or_else(|| "BTC".to_string());
+    let quote = "USDT";
     let start_str = args.get(1).cloned().unwrap_or_else(|| "2024-01-01".to_string());
     let end_str = args.get(2).cloned().unwrap_or_else(|| start_str.clone());
     let start = NaiveDate::parse_from_str(&start_str, "%Y-%m-%d").context("parse START date")?;
@@ -123,6 +125,7 @@ fn main() -> anyhow::Result<()> {
 
     let source = BinanceHistory::source(
         std::slice::from_ref(&symbol),
+        quote,
         start,
         end,
         false, // trade-native: 直接用真实 trade 撮合

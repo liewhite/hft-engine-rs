@@ -10,7 +10,7 @@
 
 use crate::domain::{Exchange, ExchangeError, MarketTrade, Symbol, BBO};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
-use std::io::{Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor};
 
 /// 解析 bookTicker zip 字节为 BBO 事件。
 pub fn parse_book_ticker(symbol: &Symbol, zip_bytes: &[u8]) -> Result<Vec<IncomeEvent>, ExchangeError> {
@@ -56,7 +56,10 @@ fn historical(ts: u64, data: ExchangeEventData) -> IncomeEvent {
     }
 }
 
-/// 解压 zip 内单一 CSV，逐行切分为字段并映射；自动跳过表头行 (首字段非数字)。
+/// 解压 zip 内单一 CSV，**逐行流式**切分字段并映射；自动跳过表头行 (首字段非数字)。
+///
+/// 用 `BufReader` 逐行读取解压流 (不一次性物化整份 CSV 字符串)，峰值内存 = 压缩 zip + 结果
+/// Vec + 单行，避免整月大文件 OOM。
 fn map_rows(
     zip_bytes: &[u8],
     mut f: impl FnMut(&[&str]) -> Result<IncomeEvent, ExchangeError>,
@@ -66,16 +69,15 @@ fn map_rows(
     if archive.is_empty() {
         return Ok(Vec::new());
     }
-    let mut content = String::new();
-    archive
+    let entry = archive
         .by_index(0)
-        .map_err(|e| ExchangeError::ParseError(format!("zip entry: {e}")))?
-        .read_to_string(&mut content)
-        .map_err(|e| ExchangeError::ParseError(format!("read csv: {e}")))?;
+        .map_err(|e| ExchangeError::ParseError(format!("zip entry: {e}")))?;
+    let reader = BufReader::new(entry);
 
     let mut out = Vec::new();
-    for line in content.lines() {
-        if line.is_empty() || !is_data_row(line) {
+    for line in reader.lines() {
+        let line = line.map_err(|e| ExchangeError::ParseError(format!("read csv line: {e}")))?;
+        if line.is_empty() || !is_data_row(&line) {
             continue;
         }
         let fields: Vec<&str> = line.split(',').collect();
