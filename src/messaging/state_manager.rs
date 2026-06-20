@@ -1,4 +1,4 @@
-use crate::domain::{now_ms, Exchange, Greeks, MarketStatus, Order, Symbol, USDT};
+use crate::domain::{Exchange, Greeks, MarketStatus, Order, Symbol, Timestamp, USDT};
 use crate::exchange::AccountInfo;
 use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
 use std::collections::HashMap;
@@ -42,16 +42,19 @@ impl StateManager {
 
     // ==================== 下单接口 ====================
 
-    /// 添加 pending order (由 Executor 调用，client_order_id 已生成)
+    /// 添加 pending order (由 StrategyRunner 调用，client_order_id 已生成)
+    ///
+    /// `created_at` 由调用方注入 (实盘传接收时刻、回测传虚拟事件时刻)，避免内部读墙钟破坏
+    /// 回测确定性。
     ///
     /// # Panics
     /// symbol 不存在时 panic（表示配置错误）
-    pub fn add_pending_order(&mut self, order: Order) {
+    pub fn add_pending_order(&mut self, order: Order, created_at: Timestamp) {
         let symbol = order.symbol.clone();
         self.states
             .get_mut(&symbol)
             .expect("Symbol not found in StateManager")
-            .add_pending_order(order, now_ms());
+            .add_pending_order(order, created_at);
     }
 
     // ==================== 状态查询 ====================

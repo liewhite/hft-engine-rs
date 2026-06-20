@@ -12,7 +12,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
+reqwest = { version = "0.12", features = ["json", "native-tls", "blocking"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -62,6 +62,10 @@ uuid = { version = "1", features = ["v4"] }
 # Decimal for precise financial calculations
 rust_decimal = "1"
 
+# 回测: 插入序挂单簿 (撮合按到达顺序 = 时间优先) + 历史数据 zip 解压
+indexmap = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 # TLS (for IBKR Gateway self-signed certs)
 native-tls = "0.2"
 
@@ -76,3 +80,7 @@ percent-encoding = "2"
 [[bin]]
 name = "funding_arb"
 path = "src/bin/funding_arb.rs"
+
+[[bin]]
+name = "backtest"
+path = "src/bin/backtest.rs"

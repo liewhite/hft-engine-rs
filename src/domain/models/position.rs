@@ -4,7 +4,7 @@ use crate::domain::types::Quantity;
 /// 仓位信息
 ///
 /// size 为正表示多头，为负表示空头
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Position {
     pub exchange: Exchange,
     pub symbol: Symbol,

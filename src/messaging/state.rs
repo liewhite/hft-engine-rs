@@ -225,6 +225,9 @@ impl SymbolState {
             ExchangeEventData::BBO(bbo) => {
                 self.bbos.insert(bbo.exchange, bbo.clone());
             }
+            ExchangeEventData::MarketTrade(_) => {
+                // 公共成交印记仅作市场信号 (策略自取)，不修改聚合状态
+            }
             ExchangeEventData::Position(position) => {
                 // 仅用于初始加载：本地无仓位时写入，之后完全由 Fill 事件维护
                 if !self.positions.contains_key(&position.exchange) {

@@ -48,6 +48,10 @@ impl IncomeProcessorActor {
                 exchange: bbo.exchange,
                 symbol: bbo.symbol.clone(),
             },
+            ExchangeEventData::MarketTrade(t) => EventRouting::BySymbol {
+                exchange: t.exchange,
+                symbol: t.symbol.clone(),
+            },
             ExchangeEventData::MarkPrice(mp) => EventRouting::BySymbol {
                 exchange: mp.exchange,
                 symbol: mp.symbol.clone(),

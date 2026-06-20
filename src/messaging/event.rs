@@ -1,4 +1,4 @@
-use crate::domain::{Balance, Candle, Exchange, Fill, FundingFee, FundingRate, Greeks, IndexPrice, MarkPrice, MarketStatus, OrderUpdate, Position, Symbol, Timestamp, BBO};
+use crate::domain::{Balance, Candle, Exchange, Fill, FundingFee, FundingRate, Greeks, IndexPrice, MarkPrice, MarketStatus, MarketTrade, OrderUpdate, Position, Symbol, Timestamp, BBO};
 
 /// 统一的交易所事件
 ///
@@ -21,6 +21,8 @@ pub struct IncomeEvent {
 pub enum ExchangeEventData {
     FundingRate(FundingRate),
     BBO(BBO),
+    /// 公共成交印记 (市场匿名成交)；回测撮合的成交来源，实盘暂无该馈送
+    MarketTrade(MarketTrade),
     MarkPrice(MarkPrice),
     IndexPrice(IndexPrice),
     Position(Position),
@@ -59,6 +61,7 @@ impl IncomeEvent {
         match &self.data {
             ExchangeEventData::FundingRate(rate) => Some(&rate.symbol),
             ExchangeEventData::BBO(bbo) => Some(&bbo.symbol),
+            ExchangeEventData::MarketTrade(t) => Some(&t.symbol),
             ExchangeEventData::MarkPrice(mp) => Some(&mp.symbol),
             ExchangeEventData::IndexPrice(ip) => Some(&ip.symbol),
             ExchangeEventData::Position(pos) => Some(&pos.symbol),
@@ -80,6 +83,7 @@ impl IncomeEvent {
         match &self.data {
             ExchangeEventData::FundingRate(rate) => Some(rate.exchange),
             ExchangeEventData::BBO(bbo) => Some(bbo.exchange),
+            ExchangeEventData::MarketTrade(t) => Some(t.exchange),
             ExchangeEventData::MarkPrice(mp) => Some(mp.exchange),
             ExchangeEventData::IndexPrice(ip) => Some(ip.exchange),
             ExchangeEventData::Position(pos) => Some(pos.exchange),
@@ -93,6 +97,15 @@ impl IncomeEvent {
             ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
             ExchangeEventData::ExchangeStatus { exchange, .. } => Some(*exchange),
             ExchangeEventData::Clock => None,
+        }
+    }
+
+    /// 路由键: `Some` 表示按 (exchange, symbol) 定向路由, `None` 表示广播给所有策略。
+    /// 与 `StrategyRunner::accepts` 配套：全局事件广播、symbol 事件仅投订阅范围内的策略。
+    pub fn routing(&self) -> Option<(Exchange, Symbol)> {
+        match (self.exchange(), self.symbol()) {
+            (Some(e), Some(s)) => Some((e, s.clone())),
+            _ => None,
         }
     }
 
