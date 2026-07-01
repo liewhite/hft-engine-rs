@@ -19,7 +19,11 @@ impl RejectReason {
     /// 各适配层若已知错误码，应直接构造具体变体而非依赖此方法。
     pub fn classify(msg: &str) -> Self {
         let lower = msg.to_lowercase();
-        if lower.contains("reduce only") || lower.contains("reduceonly") {
+        // 覆盖各交易所的常见写法: "reduce only" / "reduceonly" / "reduce-only"
+        if lower.contains("reduce only")
+            || lower.contains("reduceonly")
+            || lower.contains("reduce-only")
+        {
             RejectReason::ReduceOnlyClosed
         } else {
             RejectReason::Other(msg.to_string())
@@ -90,5 +94,34 @@ impl From<tokio_tungstenite::tungstenite::Error> for ExchangeError {
 impl From<serde_json::Error> for ExchangeError {
     fn from(e: serde_json::Error) -> Self {
         ExchangeError::ParseError(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_detects_reduce_only_case_insensitive() {
+        assert_eq!(
+            RejectReason::classify("Order failed. reduce only"),
+            RejectReason::ReduceOnlyClosed
+        );
+        assert_eq!(
+            RejectReason::classify("ReduceOnly Order is rejected"),
+            RejectReason::ReduceOnlyClosed
+        );
+        assert_eq!(
+            RejectReason::classify("code=51169, msg=reduce-only positions..."),
+            RejectReason::ReduceOnlyClosed
+        );
+    }
+
+    #[test]
+    fn classify_preserves_other_message() {
+        match RejectReason::classify("Insufficient margin") {
+            RejectReason::Other(m) => assert_eq!(m, "Insufficient margin"),
+            other => panic!("expected Other, got {other:?}"),
+        }
     }
 }
