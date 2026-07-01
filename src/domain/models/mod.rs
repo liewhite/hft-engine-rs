@@ -25,7 +25,7 @@ pub use balance::Balance;
 pub use bbo::BBO;
 pub use candle::{Candle, CandleInterval};
 pub use exchange::Exchange;
-pub use fill::Fill;
+pub use fill::{Fill, FillReason};
 pub use funding_fee::FundingFee;
 pub use funding_rate::FundingRate;
 pub use greeks::Greeks;

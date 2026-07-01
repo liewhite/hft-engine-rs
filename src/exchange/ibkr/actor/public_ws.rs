@@ -466,6 +466,7 @@ impl IbkrPublicWsActor {
                     size,
                     timestamp: local_ts,
                     fee,
+                    reason: crate::domain::FillReason::Normal, // IBKR 执行流不区分强平/ADL
                 };
                 let order_update = self.build_order_update(item, order_ref, &symbol, side, size, local_ts);
                 self.publish_fill(PendingFill { fill, order_update }).await;
@@ -490,6 +491,7 @@ impl IbkrPublicWsActor {
                 size,
                 timestamp: local_ts,
                 fee: 0.0,
+                reason: crate::domain::FillReason::Normal, // IBKR 执行流不区分强平/ADL
             };
             let order_update = self.build_order_update(item, order_ref, &symbol, side, size, local_ts);
             self.pending_fills.insert(execution_id.clone(), PendingFill { fill, order_update });

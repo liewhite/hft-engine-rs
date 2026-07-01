@@ -385,6 +385,7 @@ impl SimState {
             order_id: order_id.clone(),
             timestamp: ts,
             fee,
+            reason: crate::domain::FillReason::Normal, // 回测无强平/ADL
         };
         vec![
             ev_at(ts, ExchangeEventData::OrderUpdate(update)),

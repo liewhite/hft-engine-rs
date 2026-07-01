@@ -308,6 +308,9 @@ impl OrderTradeUpdate {
             order_id: self.o.i.to_string(),
             timestamp: now_ms(),
             fee,
+            // Binance 强平/ADL 也经 ORDER_TRADE_UPDATE 以 fill 到达并如常更新持仓；
+            // 本 codec 暂未解析订单类型区分来源，统一标 Normal。
+            reason: crate::domain::FillReason::Normal,
         }))
     }
 }

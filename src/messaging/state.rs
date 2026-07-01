@@ -229,7 +229,15 @@ impl SymbolState {
                 // 公共成交印记仅作市场信号 (策略自取)，不修改聚合状态
             }
             ExchangeEventData::Position(position) => {
-                // 仅用于初始加载：本地无仓位时写入，之后完全由 Fill 事件维护
+                // 持仓维护模型：**一次性初始化 + 之后全程由 Fill 事件增量维护**。
+                // 本地无该交易所持仓时用快照初始化一次，此后所有变化都靠 Fill 累加
+                // （见下方 Fill 分支）——主动单、手动单、以及**强平/ADL** 都以 fill 形式经
+                // 私有成交流下发，因此持仓不会漏掉被动减仓。
+                //
+                // 为何**不**用 Position 快照周期性"对账校准"：REST/WS 拉取的持仓快照与实时
+                // Fill 流之间存在竞态——快照可能已包含某笔成交，而该成交对应的 Fill 稍后才
+                // 由 WS 送达；若用快照覆写后又叠加这笔晚到的 Fill，就会**重复计算**该笔成交。
+                // 故快照只做首次初始化，绝不在运行期覆写。
                 if !self.positions.contains_key(&position.exchange) {
                     tracing::info!(
                         symbol = %self.symbol,
@@ -309,7 +317,8 @@ impl SymbolState {
                 }
             }
             ExchangeEventData::Fill(fill) => {
-                // Fill 事件用于即时更新仓位（无论是策略订单还是手动订单）
+                // Fill 即时更新仓位——涵盖策略单、手动单、以及强平/ADL（三者都以 fill 形式
+                // 经私有成交流到达，走同一路径，无需快照对账，见上方 Position 分支说明）。
                 let delta = match fill.side {
                     Side::Long => fill.size,
                     Side::Short => -fill.size,
@@ -330,6 +339,7 @@ impl SymbolState {
                     side = ?fill.side,
                     fill_size = fill.size,
                     fill_price = fill.price,
+                    reason = ?fill.reason,
                     new_position_size = pos.size,
                     "Updated position on fill"
                 );
