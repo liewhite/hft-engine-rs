@@ -2310,9 +2310,9 @@ dependencies = [
 
 [[package]]
 name = "kameo"
-version = "0.21.0"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe998b05ae765a040027d9fe3187240cb840e6705fa29d86f3abaa5e96b36291"
+checksum = "aea00bfc3709c5b95be7c9a93289d0c3ff42cf9a3b77d532387242992705bca7"
 dependencies = [
  "downcast-rs",
  "dyn-clone",
@@ -2325,9 +2325,9 @@ dependencies = [
 
 [[package]]
 name = "kameo_actors"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecac96d16d40eddf8a1e50b597109c223695a5c9ad5f0d6b28cb0475b3fee42f"
+checksum = "535f5db40b46b28085ddf4ba0391818e1b388548bf454e6d27a3b5cc805961fa"
 dependencies = [
  "futures",
  "glob",
