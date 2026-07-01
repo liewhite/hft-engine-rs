@@ -43,8 +43,8 @@ anyhow = "1"
 async-trait = "0.1"
 
 # Actor framework
-kameo = "0.19"
-kameo_actors = "0.4"
+kameo = "0.21"
+kameo_actors = "0.6"
 
 # Logging
 tracing = "0.1"
