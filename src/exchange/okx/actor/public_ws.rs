@@ -9,7 +9,7 @@ use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{BboData, FundingRateData, IndexTickerData, MarkPriceData, WsPush};
-use crate::exchange::okx::{to_okx, to_okx_index};
+use crate::exchange::okx::{to_okx, to_okx_index, WS_PUBLIC_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
@@ -23,9 +23,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-
-/// Public WebSocket URL
-const WS_PUBLIC_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 
 /// OkxPublicWsActor 初始化参数
 pub struct OkxPublicWsActorArgs {

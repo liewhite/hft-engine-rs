@@ -7,7 +7,7 @@
 use crate::domain::{Exchange, Symbol, SymbolMeta};
 use crate::engine::StrategyRunner;
 use crate::messaging::IncomeEvent;
-use crate::strategy::{OutcomeEvent, Strategy};
+use crate::strategy::Strategy;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
@@ -40,14 +40,7 @@ impl ExecutorActor {
     /// 处理 IncomeEvent，委托 runner 运行策略并发布返回的信号
     async fn handle_event(&mut self, event: IncomeEvent) {
         for signal in self.runner.on_event(&event) {
-            match signal {
-                place @ OutcomeEvent::PlaceOrders { .. } => {
-                    let _ = self.outcome_pubsub.tell(Publish(place)).send().await;
-                }
-                cancel @ OutcomeEvent::CancelOrder { .. } => {
-                    let _ = self.outcome_pubsub.tell(Publish(cancel)).send().await;
-                }
-            }
+            let _ = self.outcome_pubsub.tell(Publish(signal)).send().await;
         }
     }
 }

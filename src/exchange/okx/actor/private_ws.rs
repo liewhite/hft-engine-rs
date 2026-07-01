@@ -9,7 +9,7 @@ use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Position, Symbol, 
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
 use crate::exchange::okx::codec::{AccountData, OrderPushData, PositionData, WsEvent, WsPush};
-use crate::exchange::okx::OkxCredentials;
+use crate::exchange::okx::{OkxCredentials, WS_PRIVATE_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::{SinkExt, StreamExt};
@@ -25,9 +25,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-
-/// Private WebSocket URL
-const WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
 
 /// 登录响应等待超时 (秒)。超时 → 启动失败受控退出，避免 on_start 永久阻塞。
 const LOGIN_TIMEOUT_SECS: u64 = 10;
