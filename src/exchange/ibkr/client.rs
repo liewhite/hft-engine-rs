@@ -442,7 +442,7 @@ impl ExchangeClient for IbkrClient {
         Ok(())
     }
 
-    async fn fetch_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         let base_url = self.auth.base_url();
 
         // 先 receive brokerage accounts (预热缓存)
@@ -483,7 +483,7 @@ impl ExchangeClient for IbkrClient {
             })
             .abs();
 
-        Ok(crate::exchange::AccountInfo { equity, notional })
+        Ok(crate::domain::AccountInfo { equity, notional })
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {

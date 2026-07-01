@@ -1,5 +1,5 @@
 use crate::domain::{Exchange, Greeks, MarketStatus, Order, Symbol, Timestamp, USDT};
-use crate::exchange::AccountInfo;
+use crate::domain::AccountInfo;
 use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
 use std::collections::HashMap;
 

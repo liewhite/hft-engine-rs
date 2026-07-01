@@ -377,7 +377,7 @@ impl BinanceClient {
     }
 
     /// 查询账户信息 (净值 + 总持仓名义价值)
-    async fn get_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+    async fn get_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
@@ -435,7 +435,7 @@ impl BinanceClient {
             notional += value.abs();
         }
 
-        Ok(crate::exchange::AccountInfo { equity, notional })
+        Ok(crate::domain::AccountInfo { equity, notional })
     }
 }
 
@@ -557,7 +557,7 @@ impl ExchangeClient for BinanceClient {
         Ok(())
     }
 
-    async fn fetch_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         self.get_account_info().await
     }
 

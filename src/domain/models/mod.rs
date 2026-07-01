@@ -1,3 +1,4 @@
+mod account_info;
 mod balance;
 mod bbo;
 mod candle;
@@ -19,6 +20,7 @@ mod side;
 mod symbol_meta;
 mod time_in_force;
 
+pub use account_info::AccountInfo;
 pub use balance::Balance;
 pub use bbo::BBO;
 pub use candle::{Candle, CandleInterval};
