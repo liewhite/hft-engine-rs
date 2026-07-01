@@ -292,8 +292,14 @@ impl SymbolState {
                             }
                         }
                         OrderStatus::Created => {
-                            // 交易所不会推送 Created 状态，这是本地状态
-                            unreachable!("Exchange should never push Created status")
+                            // 交易所不应推送 Created（这是本地状态）。若出现说明 codec 误映射，
+                            // 记录后忽略该条更新（不 panic；pending order 保持原样，等后续有效更新）。
+                            tracing::error!(
+                                symbol = %self.symbol,
+                                exchange = %update.exchange,
+                                order_id = %update.order_id,
+                                "交易所推送了 Created 状态（codec 映射异常），忽略此更新"
+                            );
                         }
                     }
                 }
@@ -343,8 +349,12 @@ impl SymbolState {
             | ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. } => {
-                // 已在上面提前返回，这里不会执行
-                unreachable!()
+                // 全局事件应在 StateManager 层提前拦截、不会进入 SymbolState::apply。
+                // 若到达说明路由逻辑有 bug，记录后忽略（不 panic）。
+                tracing::error!(
+                    symbol = %self.symbol,
+                    "全局事件错误地进入 SymbolState::apply（路由 bug），忽略"
+                );
             }
         }
     }

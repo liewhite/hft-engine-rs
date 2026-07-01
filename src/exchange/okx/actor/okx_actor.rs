@@ -14,12 +14,12 @@ use super::business_ws::{OkxBusinessWsActor, OkxBusinessWsActorArgs};
 use super::greeks_polling::{OkxGreeksPollingActor, OkxGreeksPollingActorArgs};
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
-use crate::domain::{Symbol, SymbolMeta};
+use crate::domain::{ExchangeError, Symbol, SymbolMeta};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
 use crate::exchange::okx::{OkxClient, OkxCredentials};
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
@@ -57,7 +57,7 @@ pub struct OkxActor {
 
 impl Actor for OkxActor {
     type Args = OkxActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let income_pubsub = args.income_pubsub;
@@ -101,7 +101,7 @@ impl Actor for OkxActor {
         };
         let has_private_ws = private_ws_opt.is_some();
 
-        // 2. 并发等三个 WS 全部完成；任一失败 → panic
+        // 2. 并发等三个 WS 全部完成；任一失败 → 向上传播（启动期受控退出，不重试）
         let private_wait = async {
             if let Some(p) = &private_ws_opt {
                 p.wait_for_startup_result().await
@@ -114,9 +114,11 @@ impl Actor for OkxActor {
             business_ws.wait_for_startup_result(),
             private_wait,
         );
-        public_r.expect("OkxPublicWsActor failed to start");
-        business_r.expect("OkxBusinessWsActor failed to start");
-        private_r.expect("OkxPrivateWsActor failed to start");
+        public_r.map_err(|e| ExchangeError::Other(format!("OkxPublicWsActor failed to start: {e}")))?;
+        business_r
+            .map_err(|e| ExchangeError::Other(format!("OkxBusinessWsActor failed to start: {e}")))?;
+        private_r
+            .map_err(|e| ExchangeError::Other(format!("OkxPrivateWsActor failed to start: {e}")))?;
         tracing::info!(exchange = "OKX", has_private_ws, "WS actors ready");
 
         // 3. polling actor 的 on_start 仅 attach_stream，省略 wait

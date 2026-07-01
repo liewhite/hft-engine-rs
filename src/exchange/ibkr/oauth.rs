@@ -152,8 +152,8 @@ impl IbkrAuth for IbkrOAuth {
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))
     }
 
-    fn ws_connector(&self) -> Option<tokio_tungstenite::Connector> {
-        None
+    fn ws_connector(&self) -> anyhow::Result<Option<tokio_tungstenite::Connector>> {
+        Ok(None)
     }
 
     fn format_ws_cookie(&self, session_id: &str) -> String {

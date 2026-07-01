@@ -6,7 +6,7 @@
 //! - 直接解析消息并发布到 IncomePubSub
 
 use super::listen_key::{BinanceListenKeyActor, BinanceListenKeyActorArgs};
-use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsResponse};
 use crate::exchange::binance::{BinanceCredentials, WS_PRIVATE_URL};
@@ -15,7 +15,7 @@ use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::mailbox;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
@@ -72,19 +72,23 @@ impl BinancePrivateWsActor {
 
 impl Actor for BinancePrivateWsActor {
     type Args = BinancePrivateWsActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 1. 获取 ListenKey
+        // 1. 获取 ListenKey（失败向上传播 → 启动期受控退出；属鉴权语义）
         let listen_key = create_listen_key(&args.rest_base_url, &args.credentials.api_key)
             .await
-            .expect("Failed to create listen key");
+            .map_err(|e| {
+                tracing::error!(error = %e, "Failed to create Binance listen key");
+                ExchangeError::AuthenticationFailed(Exchange::Binance)
+            })?;
 
         // 2. 连接私有 WebSocket（迁移后用 query 参数传 listenKey；未带 events 让交易所推全部事件）
+        // 失败向上传播 → 启动期受控退出，不重试/不重连
         let url = format!("{}?listenKey={}", WS_PRIVATE_URL, listen_key);
         let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
             .await
-            .expect("Failed to connect to Binance private WebSocket");
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
 
         let (write, read) = ws_stream.split();
 
@@ -114,7 +118,9 @@ impl Actor for BinancePrivateWsActor {
         listen_key_actor
             .wait_for_startup_result()
             .await
-            .expect("BinanceListenKeyActor failed to start");
+            .map_err(|e| {
+                ExchangeError::Other(format!("BinanceListenKeyActor failed to start: {e}"))
+            })?;
         let listen_key_actor_id = listen_key_actor.id();
 
         tracing::info!("BinancePrivateWsActor started");
@@ -252,11 +258,12 @@ fn parse_private_message(
                 let mut position = pos_data.to_position(quote)
                     ?;
                 // qty 归一化: 张 -> 币
-                // Binance 私有 WS 只会推送已配置 symbol 的仓位（因为只订阅了这些 symbol），
-                // 因此 symbol_metas 查找不会失败
-                let meta = symbol_metas
-                    .get(&position.symbol)
-                    .expect("SymbolMeta not found: Binance private WS should only push configured symbols");
+                // ACCOUNT_UPDATE 是账户级推送，可能包含未配置 symbol（属预期数据）；
+                // 未配置的跳过，不传播不 panic
+                let Some(meta) = symbol_metas.get(&position.symbol) else {
+                    tracing::warn!(symbol = %position.symbol, "Binance ACCOUNT_UPDATE 含未配置 symbol，跳过");
+                    continue;
+                };
                 position.size = meta.qty_to_coin(position.size);
                 events.push(IncomeEvent {
                     exchange_ts,

@@ -37,7 +37,12 @@ pub trait IbkrAuth: Send + Sync + 'static {
         params: Option<&[(&str, &str)]>,
     ) -> anyhow::Result<Option<String>>;
     fn build_http_client(&self) -> anyhow::Result<reqwest::Client>;
-    fn ws_connector(&self) -> Option<tokio_tungstenite::Connector>;
+    /// 构建 WebSocket 连接所用的 TLS connector。
+    ///
+    /// - `Ok(None)`: 使用默认 connector（OAuth 走标准 TLS，无需自定义）。
+    /// - `Ok(Some(_))`: 使用自定义 connector（Gateway 跳过自签名证书验证）。
+    /// - `Err(_)`: 构建 connector 失败，向上传播，不静默降级为默认。
+    fn ws_connector(&self) -> anyhow::Result<Option<tokio_tungstenite::Connector>>;
     /// 格式化 WebSocket 连接所需的 session cookie
     fn format_ws_cookie(&self, session_id: &str) -> String;
 
@@ -56,7 +61,12 @@ pub trait IbkrAuth: Send + Sync + 'static {
             "GET" => http.get(url),
             "POST" => http.post(url),
             "DELETE" => http.delete(url),
-            _ => unreachable!("unsupported HTTP method: {}", method),
+            other => {
+                return Err(crate::domain::ExchangeError::Other(format!(
+                    "unsupported HTTP method: {other}"
+                ))
+                .into())
+            }
         };
 
         let mut req = builder.header("User-Agent", "ibind-rs");

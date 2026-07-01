@@ -17,7 +17,7 @@ use super::equity_polling::{BinanceEquityPollingActor, BinanceEquityPollingActor
 use super::funding_fee_polling::{BinanceFundingFeePollingActor, BinanceFundingFeePollingActorArgs};
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
-use crate::domain::{Symbol, SymbolMeta};
+use crate::domain::{ExchangeError, Symbol, SymbolMeta};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::binance::{
     BinanceClient, BinanceCredentials, WS_MARKET_URL, WS_PUBLIC_HIGH_FREQ_URL,
@@ -25,7 +25,7 @@ use crate::exchange::binance::{
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
 use crate::exchange::ExchangeClient;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
@@ -90,17 +90,19 @@ impl BinanceActor {
 
 impl Actor for BinanceActor {
     type Args = BinanceActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 凭证可用时构建 Arc<BinanceClient>，供 FundingFee polling 使用。
         // 初始持仓查询已上移至 ManagerActor::add_strategies_batch（executor 注册后），不在此处。
-        let binance_client: Option<Arc<BinanceClient>> = args.credentials.as_ref().map(|c| {
-            Arc::new(
+        // 构建失败向上传播 → 启动期受控退出
+        let binance_client: Option<Arc<BinanceClient>> = match args.credentials.as_ref() {
+            Some(c) => Some(Arc::new(
                 BinanceClient::new(Some(c.clone()))
-                    .expect("Failed to create BinanceClient"),
-            )
-        });
+                    .map_err(|e| ExchangeError::Other(format!("Failed to create BinanceClient: {e}")))?,
+            )),
+            None => None,
+        };
 
         // 1. 先并发 spawn 所有 actor（spawn 本身是 instant，on_start 异步跑）
         let public_ws = BinancePublicWsActor::spawn_link_with_mailbox(
@@ -145,7 +147,7 @@ impl Actor for BinanceActor {
         };
         let has_private_ws = private_ws_opt.is_some();
 
-        // 2. 并发等三个 WS actor 全部 on_start 完成；任一失败 → panic，避免"假就绪"窗口
+        // 2. 并发等三个 WS actor 全部 on_start 完成；任一失败 → 向上传播（启动期受控退出，不重试），避免"假就绪"窗口
         let private_wait = async {
             if let Some(p) = &private_ws_opt {
                 p.wait_for_startup_result().await
@@ -158,9 +160,15 @@ impl Actor for BinanceActor {
             market_ws.wait_for_startup_result(),
             private_wait,
         );
-        public_r.expect("BinancePublicWsActor (/public/ws) failed to start");
-        market_r.expect("BinancePublicWsActor (/market/ws) failed to start");
-        private_r.expect("BinancePrivateWsActor failed to start");
+        public_r.map_err(|e| {
+            ExchangeError::Other(format!("BinancePublicWsActor (/public/ws) failed to start: {e}"))
+        })?;
+        market_r.map_err(|e| {
+            ExchangeError::Other(format!("BinancePublicWsActor (/market/ws) failed to start: {e}"))
+        })?;
+        private_r.map_err(|e| {
+            ExchangeError::Other(format!("BinancePrivateWsActor failed to start: {e}"))
+        })?;
         tracing::info!(exchange = "Binance", has_private_ws, "WS actors ready");
 
         // 3. polling actor 的 on_start 只 attach_stream（无 IO），wait_for_startup 是 no-op，省略

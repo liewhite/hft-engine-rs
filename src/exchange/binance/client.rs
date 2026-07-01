@@ -419,22 +419,21 @@ impl BinanceClient {
 
         let account: AccountResponse = resp.json().await.map_err(Self::map_reqwest_error)?;
 
-        let equity: f64 = account
-            .total_margin_balance
-            .parse()
-            .expect("Failed to parse Binance totalMarginBalance");
+        let equity: f64 = account.total_margin_balance.parse().map_err(|_| {
+            ExchangeError::ParseError(format!(
+                "Binance parse totalMarginBalance: {}",
+                account.total_margin_balance
+            ))
+        })?;
 
         // 汇总所有持仓的 notional (取绝对值)
-        let notional: f64 = account
-            .positions
-            .iter()
-            .map(|p| {
-                p.notional
-                    .parse::<f64>()
-                    .expect("Failed to parse Binance position notional")
-                    .abs()
-            })
-            .sum();
+        let mut notional: f64 = 0.0;
+        for p in &account.positions {
+            let value: f64 = p.notional.parse().map_err(|_| {
+                ExchangeError::ParseError(format!("Binance parse notional: {}", p.notional))
+            })?;
+            notional += value.abs();
+        }
 
         Ok(crate::exchange::AccountInfo { equity, notional })
     }

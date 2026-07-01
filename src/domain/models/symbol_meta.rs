@@ -63,11 +63,14 @@ impl SymbolMeta {
 
     /// 使用 Decimal 精确计算，按 step 取整
     ///
-    /// value 和 step 均来自交易所 API 返回的合法浮点数，不会是 NaN/Infinity，
-    /// Decimal::from_f64 对正常浮点数不会返回 None
+    /// value 和 step 正常来自交易所 API 的合法浮点数（非 NaN/Infinity）。若出现非有限值，
+    /// 无法用 Decimal 精确取整，记录后返回原值兜底（不 panic）。
     fn round_to_step(value: f64, step: f64, strategy: RoundingStrategy) -> f64 {
-        let value_dec = Decimal::from_f64(value).unwrap();
-        let step_dec = Decimal::from_f64(step).unwrap();
+        let (Some(value_dec), Some(step_dec)) = (Decimal::from_f64(value), Decimal::from_f64(step))
+        else {
+            tracing::warn!(value, step, "round_to_step: 非有限输入，返回原值不取整");
+            return value;
+        };
 
         let ticks = value_dec / step_dec;
         let rounded_ticks = ticks.round_dp_with_strategy(0, strategy);

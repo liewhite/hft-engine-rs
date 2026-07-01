@@ -12,12 +12,12 @@
 
 use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs};
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
-use crate::domain::{Symbol, SymbolMeta};
+use crate::domain::{ExchangeError, Symbol, SymbolMeta};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::hyperliquid::HyperliquidCredentials;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
@@ -50,7 +50,7 @@ pub struct HyperliquidActor {
 
 impl Actor for HyperliquidActor {
     type Args = HyperliquidActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let income_pubsub = args.income_pubsub;
@@ -86,7 +86,7 @@ impl Actor for HyperliquidActor {
         };
         let has_private_ws = private_ws_opt.is_some();
 
-        // 2. 并发等 WS 全部完成；任一失败 → panic
+        // 2. 并发等 WS 全部完成；任一失败 → 向上传播（受控退出，不重试/不重连）
         let private_wait = async {
             if let Some(p) = &private_ws_opt {
                 p.wait_for_startup_result().await
@@ -98,8 +98,10 @@ impl Actor for HyperliquidActor {
             public_ws.wait_for_startup_result(),
             private_wait,
         );
-        public_r.expect("HyperliquidPublicWsActor failed to start");
-        private_r.expect("HyperliquidPrivateWsActor failed to start");
+        public_r
+            .map_err(|e| ExchangeError::Other(format!("HyperliquidPublicWsActor failed to start: {e}")))?;
+        private_r
+            .map_err(|e| ExchangeError::Other(format!("HyperliquidPrivateWsActor failed to start: {e}")))?;
         tracing::info!(exchange = "Hyperliquid", has_private_ws, "WS actors ready");
 
         // 3. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)

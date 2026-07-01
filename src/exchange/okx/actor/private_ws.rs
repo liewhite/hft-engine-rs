@@ -5,7 +5,7 @@
 //! - 自动订阅私有频道 (positions, account, orders)
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Balance, Exchange, Position, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Position, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
 use crate::exchange::okx::codec::{AccountData, OrderPushData, PositionData, WsEvent, WsPush};
@@ -14,19 +14,23 @@ use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Private WebSocket URL
 const WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
+
+/// 登录响应等待超时 (秒)。超时 → 启动失败受控退出，避免 on_start 永久阻塞。
+const LOGIN_TIMEOUT_SECS: u64 = 10;
 
 /// OkxPrivateWsActor 初始化参数
 pub struct OkxPrivateWsActorArgs {
@@ -66,13 +70,13 @@ impl OkxPrivateWsActor {
 
 impl Actor for OkxPrivateWsActor {
     type Args = OkxPrivateWsActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 1. 连接私有 WebSocket
+        // 1. 连接私有 WebSocket（失败向上传播 → 启动期受控退出）
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PRIVATE_URL)
             .await
-            .expect("Failed to connect to OKX private WebSocket");
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -98,38 +102,51 @@ impl Actor for OkxPrivateWsActor {
         write
             .send(WsMessage::Text(login_msg))
             .await
-            .expect("Failed to send login message");
+            .map_err(|e| ExchangeError::WebSocketError(format!("OKX send login: {e}")))?;
 
-        // 3. 等待 login 响应
-        loop {
-            match read.next().await {
-                Some(Ok(WsMessage::Text(text))) => {
-                    if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
-                        if event.event == "login" {
-                            if event.code.as_deref() == Some("0") {
-                                tracing::info!("OKX private login success");
-                                break;
-                            } else {
-                                panic!("OKX login failed: {:?}", event.msg);
+        // 3. 等待 login 响应（带超时；任何失败向上传播 → 启动期受控退出，不重试）
+        let login_wait = async {
+            loop {
+                match read.next().await {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
+                            if event.event == "login" {
+                                if event.code.as_deref() == Some("0") {
+                                    tracing::info!("OKX private login success");
+                                    return Ok(());
+                                } else {
+                                    return Err(ExchangeError::AuthenticationFailed(Exchange::OKX));
+                                }
                             }
                         }
                     }
+                    Some(Ok(WsMessage::Ping(data))) => {
+                        write.send(WsMessage::Pong(data)).await.map_err(|e| {
+                            ExchangeError::WebSocketError(format!("OKX pong during login: {e}"))
+                        })?;
+                    }
+                    Some(Err(e)) => {
+                        return Err(ExchangeError::WebSocketError(format!(
+                            "OKX WS error during login: {e}"
+                        )));
+                    }
+                    None => {
+                        return Err(ExchangeError::ConnectionFailed(
+                            Exchange::OKX,
+                            "WS closed during login".to_string(),
+                        ));
+                    }
+                    _ => {}
                 }
-                Some(Ok(WsMessage::Ping(data))) => {
-                    write
-                        .send(WsMessage::Pong(data))
-                        .await
-                        .expect("Failed to send pong");
-                }
-                Some(Err(e)) => {
-                    panic!("OKX WebSocket error: {}", e);
-                }
-                None => {
-                    panic!("OKX WebSocket closed unexpectedly");
-                }
-                _ => {}
             }
-        }
+        };
+        tokio::time::timeout(Duration::from_secs(LOGIN_TIMEOUT_SECS), login_wait)
+            .await
+            .map_err(|_| {
+                ExchangeError::Timeout(format!(
+                    "OKX private login timed out after {LOGIN_TIMEOUT_SECS}s"
+                ))
+            })??;
 
         // 4. 订阅私有频道
         let subscribe_msg = json!({
@@ -145,7 +162,7 @@ impl Actor for OkxPrivateWsActor {
         write
             .send(WsMessage::Text(subscribe_msg))
             .await
-            .expect("Failed to send subscribe message");
+            .map_err(|e| ExchangeError::WebSocketError(format!("OKX send private subscribe: {e}")))?;
 
         // 5. 创建出站消息 channel
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);

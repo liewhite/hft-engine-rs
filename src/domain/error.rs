@@ -3,7 +3,10 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// 交易所错误类型
-#[derive(Debug, Error)]
+///
+/// `Clone` 是必需的：kameo `wait_for_startup_result()` 约束 `A::Error: Clone`，
+/// actor 以 `ExchangeError` 作为 `type Error` 时需要能克隆启动错误向上传播。
+#[derive(Debug, Clone, Error)]
 pub enum ExchangeError {
     #[error("Connection failed to {0}: {1}")]
     ConnectionFailed(Exchange, String),

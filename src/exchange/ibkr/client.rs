@@ -645,15 +645,21 @@ impl IbkrClient {
 
 /// 解析 snapshot 响应中的价格字段
 ///
-/// 字段不存在时返回 None（数据未就绪），字段存在但格式异常时 panic（API 不兼容）。
+/// 字段不存在时返回 None（数据未就绪）。字段存在但格式异常（既非 f64、
+/// 也非可解析字符串）时同样返回 None 并 warn，视为该字段数据未就绪，
+/// 不 panic（避免因单个字段格式波动打崩进程）。
 fn parse_snapshot_field(data: &serde_json::Value, field: &str) -> Option<f64> {
     let v = data.get(field)?;
-    Some(v.as_f64().unwrap_or_else(|| {
-        v.as_str()
-            .unwrap_or_else(|| panic!("snapshot field {} 既不是 f64 也不是字符串: {}", field, v))
-            .parse()
-            .unwrap_or_else(|_| panic!("snapshot field {} 字符串无法解析为 f64: {}", field, v))
-    }))
+    if let Some(n) = v.as_f64() {
+        return Some(n);
+    }
+    match v.as_str().and_then(|s| s.parse::<f64>().ok()) {
+        Some(n) => Some(n),
+        None => {
+            tracing::warn!(field = %field, value = %v, "IBKR snapshot 字段格式异常，视为未就绪");
+            None
+        }
+    }
 }
 
 // ============================================================================

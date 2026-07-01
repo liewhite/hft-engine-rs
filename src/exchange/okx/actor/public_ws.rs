@@ -5,7 +5,7 @@
 //! - 处理 Subscribe/Unsubscribe 请求
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{BboData, FundingRateData, IndexTickerData, MarkPriceData, WsPush};
@@ -14,7 +14,7 @@ use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
@@ -64,7 +64,10 @@ impl OkxPublicWsActor {
         })
         .to_string();
 
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        let tx = self
+            .ws_tx
+            .as_ref()
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
@@ -72,14 +75,19 @@ impl OkxPublicWsActor {
 
     /// 发送取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let arg = kind_to_arg(kind, &self.quote);
+        let arg = kind_to_arg(kind, &self.quote).ok_or_else(|| {
+            WsError::ParseError("Candle kind reached OkxPublicWsActor unsubscribe (routing bug)".to_string())
+        })?;
         let msg = json!({
             "op": "unsubscribe",
             "args": [arg]
         })
         .to_string();
 
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        let tx = self
+            .ws_tx
+            .as_ref()
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
@@ -100,13 +108,13 @@ impl OkxPublicWsActor {
 
 impl Actor for OkxPublicWsActor {
     type Args = OkxPublicWsActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 连接 WebSocket
+        // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PUBLIC_URL)
             .await
-            .expect("Failed to connect to OKX public WebSocket");
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
 
         let (write, read) = ws_stream.split();
 
@@ -190,8 +198,15 @@ impl Message<SubscribeBatch> for OkxPublicWsActor {
                 continue;
             }
 
-            new_args.push(kind_to_arg(&kind, &self.quote));
-            new_kinds.push(kind);
+            match kind_to_arg(&kind, &self.quote) {
+                Some(arg) => {
+                    new_args.push(arg);
+                    new_kinds.push(kind);
+                }
+                None => {
+                    tracing::error!(?kind, "Candle routed to OkxPublicWsActor (routing bug), skipping");
+                }
+            }
         }
 
         // 2. 批量发送订阅请求
@@ -380,35 +395,29 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
 // 辅助函数
 // ============================================================================
 
-fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> serde_json::Value {
+/// 把订阅类型转成 OKX 频道 arg。
+///
+/// `Candle` 由 OkxActor 路由到 BusinessWsActor，正常不会到达此处；返回 `None` 表示
+/// 路由错误，由调用方记录并跳过（不 panic，遵循"框架层错误受控处理"约定）。
+fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_json::Value> {
     match kind {
-        SubscriptionKind::FundingRate { symbol } => {
-            json!({
-                "channel": "funding-rate",
-                "instId": to_okx(symbol, quote)
-            })
-        }
-        SubscriptionKind::BBO { symbol } => {
-            json!({
-                "channel": "bbo-tbt",
-                "instId": to_okx(symbol, quote)
-            })
-        }
-        SubscriptionKind::MarkPrice { symbol } => {
-            json!({
-                "channel": "mark-price",
-                "instId": to_okx(symbol, quote)
-            })
-        }
-        SubscriptionKind::IndexPrice { symbol } => {
+        SubscriptionKind::FundingRate { symbol } => Some(json!({
+            "channel": "funding-rate",
+            "instId": to_okx(symbol, quote)
+        })),
+        SubscriptionKind::BBO { symbol } => Some(json!({
+            "channel": "bbo-tbt",
+            "instId": to_okx(symbol, quote)
+        })),
+        SubscriptionKind::MarkPrice { symbol } => Some(json!({
+            "channel": "mark-price",
+            "instId": to_okx(symbol, quote)
+        })),
+        SubscriptionKind::IndexPrice { symbol } => Some(json!({
             // OKX index-tickers 使用指数 ID 格式 (如 BTC-USDT)
-            json!({
-                "channel": "index-tickers",
-                "instId": to_okx_index(symbol, quote)
-            })
-        }
-        SubscriptionKind::Candle { .. } => {
-            panic!("Candle subscriptions should be routed to BusinessWsActor")
-        }
+            "channel": "index-tickers",
+            "instId": to_okx_index(symbol, quote)
+        })),
+        SubscriptionKind::Candle { .. } => None,
     }
 }

@@ -83,11 +83,17 @@ impl IncomeProcessorActor {
             },
             ExchangeEventData::HistoryCandles(candles) => {
                 // HistoryCandles 由 BusinessWsActor 在 REST 成功获取非空数据后才发布，
-                // 空数组在发布前已被过滤，因此这里不会为空
-                let first = candles.first().expect("HistoryCandles must not be empty");
-                EventRouting::BySymbol {
-                    exchange: first.exchange,
-                    symbol: first.symbol.clone(),
+                // 空数组在发布前已被过滤，正常不会为空。若为空则无 symbol 可路由，
+                // 记录后广播（下游遍历零根 K 线，是无害 no-op），不 panic。
+                match candles.first() {
+                    Some(first) => EventRouting::BySymbol {
+                        exchange: first.exchange,
+                        symbol: first.symbol.clone(),
+                    },
+                    None => {
+                        tracing::error!("HistoryCandles 事件为空（上游过滤失效），广播作 no-op 处理");
+                        EventRouting::Broadcast
+                    }
                 }
             }
             // 账户级别数据、ExchangeStatus 和 Clock：广播

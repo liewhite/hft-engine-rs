@@ -5,7 +5,7 @@
 //! - 处理 Subscribe/Unsubscribe 请求
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::hyperliquid::codec::{WsActiveAssetCtx, WsBbo};
@@ -14,7 +14,7 @@ use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
@@ -57,10 +57,18 @@ pub struct HyperliquidPublicWsActor {
 impl HyperliquidPublicWsActor {
     /// 批量发送订阅消息（发送多条消息，无速率限制）
     async fn send_subscribe_batch(&self, kinds: &[SubscriptionKind]) -> Result<(), WsError> {
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        let tx = self
+            .ws_tx
+            .as_ref()
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
 
         for kind in kinds {
-            let subscription = kind_to_subscription(kind, &self.quote, &self.dex);
+            let subscription = kind_to_subscription(kind, &self.quote, &self.dex).ok_or_else(|| {
+                WsError::ParseError(
+                    "Candle kind reached HyperliquidPublicWsActor subscribe (routing bug)"
+                        .to_string(),
+                )
+            })?;
             let msg = json!({
                 "method": "subscribe",
                 "subscription": subscription
@@ -77,14 +85,22 @@ impl HyperliquidPublicWsActor {
 
     /// 发送取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let subscription = kind_to_subscription(kind, &self.quote, &self.dex);
+        let subscription = kind_to_subscription(kind, &self.quote, &self.dex).ok_or_else(|| {
+            WsError::ParseError(
+                "Candle kind reached HyperliquidPublicWsActor unsubscribe (routing bug)"
+                    .to_string(),
+            )
+        })?;
         let msg = json!({
             "method": "unsubscribe",
             "subscription": subscription
         })
         .to_string();
 
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        let tx = self
+            .ws_tx
+            .as_ref()
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
@@ -105,13 +121,13 @@ impl HyperliquidPublicWsActor {
 
 impl Actor for HyperliquidPublicWsActor {
     type Args = HyperliquidPublicWsActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 连接 WebSocket
+        // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_URL)
             .await
-            .expect("Failed to connect to Hyperliquid WebSocket");
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
 
         let (write, read) = ws_stream.split();
 
@@ -198,7 +214,13 @@ impl Message<SubscribeBatch> for HyperliquidPublicWsActor {
                 continue;
             }
 
-            let stream = kind_to_stream(&kind, &self.quote, &self.dex);
+            let stream = match kind_to_stream(&kind, &self.quote, &self.dex) {
+                Some(stream) => stream,
+                None => {
+                    tracing::error!(?kind, "Candle routed to HyperliquidPublicWsActor (routing bug), skipping");
+                    continue;
+                }
+            };
             if !self.subscribed_streams.contains(&stream) {
                 new_stream_kinds.push(kind.clone());
                 self.subscribed_streams.insert(stream);
@@ -241,13 +263,20 @@ impl Message<Unsubscribe> for HyperliquidPublicWsActor {
         }
 
         // 检查是否还有其他 kinds 使用同一个 stream
-        let stream = kind_to_stream(&msg.kind, &self.quote, &self.dex);
+        // Candle 从不进入 subscribed_kinds（订阅期已跳过），此处若为 None 属路由 bug，记录并跳过
+        let stream = match kind_to_stream(&msg.kind, &self.quote, &self.dex) {
+            Some(stream) => stream,
+            None => {
+                tracing::error!(kind = ?msg.kind, "Candle routed to HyperliquidPublicWsActor unsubscribe (routing bug), skipping");
+                return;
+            }
+        };
         let quote = &self.quote;
         let dex = &self.dex;
         let stream_still_needed = self
             .subscribed_kinds
             .iter()
-            .any(|k| kind_to_stream(k, quote, dex) == stream);
+            .any(|k| kind_to_stream(k, quote, dex).as_ref() == Some(&stream));
 
         if !stream_still_needed {
             if let Err(e) = self.send_unsubscribe(&msg.kind).await {
@@ -417,44 +446,48 @@ fn parse_public_message(
 // ============================================================================
 
 /// 将 SubscriptionKind 转换为底层 stream 标识符 (用于去重)
-fn kind_to_stream(kind: &SubscriptionKind, quote: &str, dex: &str) -> String {
+///
+/// 返回 `None` 表示该 kind 无法路由到 Hyperliquid（如 Candle 未实现）；
+/// 调用方应记录并跳过，而非 panic。
+fn kind_to_stream(kind: &SubscriptionKind, quote: &str, dex: &str) -> Option<String> {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用同一个 activeAssetCtx 订阅
         SubscriptionKind::FundingRate { symbol }
         | SubscriptionKind::MarkPrice { symbol }
         | SubscriptionKind::IndexPrice { symbol } => {
-            format!("activeAssetCtx:{}", to_hyperliquid(symbol, quote, dex))
+            Some(format!("activeAssetCtx:{}", to_hyperliquid(symbol, quote, dex)))
         }
         SubscriptionKind::BBO { symbol } => {
-            format!("bbo:{}", to_hyperliquid(symbol, quote, dex))
+            Some(format!("bbo:{}", to_hyperliquid(symbol, quote, dex)))
         }
-        SubscriptionKind::Candle { .. } => {
-            panic!("Hyperliquid Candle subscription not implemented")
-        }
+        SubscriptionKind::Candle { .. } => None,
     }
 }
 
 /// 将 SubscriptionKind 转换为 Hyperliquid 订阅格式
-fn kind_to_subscription(kind: &SubscriptionKind, quote: &str, dex: &str) -> serde_json::Value {
+///
+/// 返回 `None` 表示该 kind 无法路由到 Hyperliquid（如 Candle 未实现）；
+/// 调用方应记录并跳过，而非 panic。
+fn kind_to_subscription(
+    kind: &SubscriptionKind,
+    quote: &str,
+    dex: &str,
+) -> Option<serde_json::Value> {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用 activeAssetCtx 订阅
         SubscriptionKind::FundingRate { symbol }
         | SubscriptionKind::MarkPrice { symbol }
-        | SubscriptionKind::IndexPrice { symbol } => {
-            json!({
-                "type": "activeAssetCtx",
-                "coin": to_hyperliquid(symbol, quote, dex)
-            })
-        }
+        | SubscriptionKind::IndexPrice { symbol } => Some(json!({
+            "type": "activeAssetCtx",
+            "coin": to_hyperliquid(symbol, quote, dex)
+        })),
         SubscriptionKind::BBO { symbol } => {
             // 使用 bbo 获取最优买卖价
-            json!({
+            Some(json!({
                 "type": "bbo",
                 "coin": to_hyperliquid(symbol, quote, dex)
-            })
+            }))
         }
-        SubscriptionKind::Candle { .. } => {
-            panic!("Hyperliquid Candle subscription not implemented")
-        }
+        SubscriptionKind::Candle { .. } => None,
     }
 }
