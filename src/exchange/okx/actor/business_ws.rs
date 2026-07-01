@@ -342,25 +342,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxBusinessWsAc
         msg: StreamMessage<Result<String, WsError>, (), ()>,
         ctx: &mut Context<Self, Self::Reply>,
     ) {
-        match msg {
-            StreamMessage::Next(Ok(data)) => {
-                if let Err(e) = self.handle_message(&data).await {
-                    tracing::error!(exchange = "OKX", error = %e, raw = %data, "Business WS parse error, killing actor");
-                    ctx.actor_ref().kill();
-                }
-            }
-            StreamMessage::Next(Err(e)) => {
-                tracing::error!(error = %e, "Business WebSocket loop exited, killing actor");
-                ctx.actor_ref().kill();
-            }
-            StreamMessage::Started(_) => {
-                tracing::debug!("Business WsIncoming stream started");
-            }
-            StreamMessage::Finished(_) => {
-                tracing::error!("Business WebSocket stream unexpectedly finished, killing actor");
-                ctx.actor_ref().kill();
-            }
-        }
+        crate::dispatch_ws_stream_message!(self, msg, ctx, "OKX");
     }
 }
 

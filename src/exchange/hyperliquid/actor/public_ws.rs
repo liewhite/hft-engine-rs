@@ -298,27 +298,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPubl
         msg: StreamMessage<Result<String, WsError>, (), ()>,
         ctx: &mut Context<Self, Self::Reply>,
     ) {
-        match msg {
-            StreamMessage::Next(Ok(data)) => {
-                // 解析并发布到 IncomePubSub，失败则 kill actor
-                if let Err(e) = self.handle_message(&data).await {
-                    tracing::error!(exchange = "Hyperliquid", error = %e, raw = %data, "Public WS parse error, killing actor");
-                    ctx.actor_ref().kill();
-                }
-            }
-            StreamMessage::Next(Err(e)) => {
-                tracing::error!(error = %e, "WebSocket loop exited, killing actor");
-                ctx.actor_ref().kill();
-            }
-            StreamMessage::Started(_) => {
-                tracing::debug!("WsIncoming stream started");
-            }
-            StreamMessage::Finished(_) => {
-                // ws_loop 异常退出，kill actor 触发级联退出
-                tracing::error!("WebSocket stream unexpectedly finished, killing actor");
-                ctx.actor_ref().kill();
-            }
-        }
+        crate::dispatch_ws_stream_message!(self, msg, ctx, "Hyperliquid");
     }
 }
 
