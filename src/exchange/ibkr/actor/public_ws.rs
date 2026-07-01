@@ -323,6 +323,7 @@ impl IbkrPublicWsActor {
                 side,
                 status,
                 price: 0.0,
+                reduce_only: false, // IBKR 订单推送不含 reduce-only 信息
                 quantity: 0.0,
                 filled_quantity: filled_qty,
                 fill_sz: 0.0, // sor 推送无增量 fill 信息
@@ -534,6 +535,7 @@ impl IbkrPublicWsActor {
             side,
             status: OrderStatus::Filled,
             price: 0.0,
+            reduce_only: false, // IBKR 订单推送不含 reduce-only 信息
             quantity: size,
             filled_quantity: size,
             fill_sz: size,

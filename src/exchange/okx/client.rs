@@ -445,6 +445,7 @@ impl ExchangeClient for OkxClient {
                 side,
                 status,
                 price,
+                reduce_only: false, // OKX REST pending 响应未解析 reduceOnly，外部单元信息以 WS 推送为准
                 quantity: sz,          // 张数，由 manager 转换为币
                 filled_quantity: acc_fill_sz, // 张数，由 manager 转换为币
                 fill_sz: 0.0,

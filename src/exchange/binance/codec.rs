@@ -219,6 +219,9 @@ pub struct OrderData {
     pub rp: String,
     /// 本次成交手续费 (Commission amount)
     pub n: String,
+    /// reduce-only 标志
+    #[serde(rename = "R", default)]
+    pub reduce_only: bool,
 }
 
 impl OrderTradeUpdate {
@@ -262,6 +265,7 @@ impl OrderTradeUpdate {
             side,
             status,
             price,
+            reduce_only: self.o.reduce_only,
             quantity,
             filled_quantity: filled_qty,
             fill_sz,

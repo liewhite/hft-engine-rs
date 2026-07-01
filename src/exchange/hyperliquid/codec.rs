@@ -360,6 +360,7 @@ impl WsOrderUpdate {
             side,
             status,
             price,
+            reduce_only: false, // HL WsBasicOrder 不含 reduceOnly 字段
             quantity: orig_sz,
             filled_quantity,
             fill_sz: filled_quantity,

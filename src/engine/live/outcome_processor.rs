@@ -115,6 +115,7 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                                 side: Side::Long, // 撤单事件中 side 无实际意义
                                 status: OrderStatus::Cancelled,
                                 price: 0.0,
+                                reduce_only: false, // 合成的撤单确认，终态不会触发外部单注册
                                 quantity: 0.0,
                                 filled_quantity: 0.0,
                                 fill_sz: 0.0,
@@ -250,6 +251,7 @@ impl OutcomeProcessorActor {
             side: order.side,
             status: OrderStatus::Error { reason },
             price: 0.0,
+            reduce_only: order.reduce_only,
             quantity: 0.0,
             filled_quantity: 0.0,
             fill_sz: 0.0,

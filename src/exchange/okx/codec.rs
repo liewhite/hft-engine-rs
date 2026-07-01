@@ -262,6 +262,9 @@ pub struct OrderPushData {
     pub cl_ord_id: Option<String>,
     pub side: String, // "buy" or "sell"
     pub state: String,
+    /// reduce-only 标志 ("true"/"false")；部分订单类型可能缺省
+    #[serde(default)]
+    pub reduce_only: Option<String>,
     /// 订单价格 (限价单)
     pub px: String,
     /// 订单总数量 (张)
@@ -314,6 +317,7 @@ impl OrderPushData {
             side,
             status,
             price,
+            reduce_only: self.reduce_only.as_deref() == Some("true"),
             quantity: sz,          // 张数，由 private_ws 转换为币
             filled_quantity: acc_fill_sz, // 张数，由 private_ws 转换为币
             fill_sz,               // 张数，由 private_ws 转换为币

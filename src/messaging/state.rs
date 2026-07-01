@@ -269,6 +269,10 @@ impl SymbolState {
                                 }
                             } else {
                                 // 启动时同步的现有挂单，注册到 pending_orders
+                                // 外部挂单（启动/重连时交易所已存在、本地无记录）重建为 PendingOrder。
+                                // 权威字段直接取自 update：side/price/quantity/reduce_only/status。
+                                // tif 无法从订单更新可靠还原，对 resting 限价单按 GTC 占位——它不参与
+                                // 后续跟踪判断（has_pending_side 看 side、gamma_scalp 看 order_type/price/qty）。
                                 self.pending_orders.insert(
                                     client_id.clone(),
                                     PendingOrder {
@@ -282,7 +286,7 @@ impl SymbolState {
                                                 tif: TimeInForce::GTC,
                                             },
                                             quantity: update.quantity,
-                                            reduce_only: false,
+                                            reduce_only: update.reduce_only,
                                             client_order_id: client_id.clone(),
                                         },
                                         status: update.status.clone(),
