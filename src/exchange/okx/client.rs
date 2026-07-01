@@ -532,9 +532,10 @@ impl ExchangeClient for OkxClient {
         // 先检查 data 中的具体错误信息（更详细）
         if let Some(order_data) = data.data.first() {
             if order_data.s_code != "0" {
+                let msg = format!("code={}, msg={}", order_data.s_code, order_data.s_msg);
                 return Err(ExchangeError::OrderRejected(
                     Exchange::OKX,
-                    format!("code={}, msg={}", order_data.s_code, order_data.s_msg),
+                    crate::domain::RejectReason::classify(&msg),
                 ));
             }
             return Ok(order_data.ord_id.clone());
@@ -547,7 +548,7 @@ impl ExchangeClient for OkxClient {
 
         Err(ExchangeError::OrderRejected(
             Exchange::OKX,
-            "No order data in response".to_string(),
+            crate::domain::RejectReason::Other("No order data in response".to_string()),
         ))
     }
 

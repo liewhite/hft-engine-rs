@@ -2,6 +2,42 @@ use crate::domain::models::Exchange;
 use std::time::Duration;
 use thiserror::Error;
 
+/// 订单被交易所拒绝的结构化原因
+///
+/// 由各交易所适配层在错误边界翻译（已知错误码可直接构造具体变体，只有文本消息时用
+/// [`RejectReason::classify`] 启发式分类）。编排层按枚举判断，不再字符串嗅探。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectReason {
+    /// reduce-only 单因仓位已平而被拒——通常无害（平仓目标已达成）
+    ReduceOnlyClosed,
+    /// 其它拒绝原因，保留原始交易所消息
+    Other(String),
+}
+
+impl RejectReason {
+    /// 从交易所返回的原始消息启发式分类。
+    /// 各适配层若已知错误码，应直接构造具体变体而非依赖此方法。
+    pub fn classify(msg: &str) -> Self {
+        let lower = msg.to_lowercase();
+        if lower.contains("reduce only") || lower.contains("reduceonly") {
+            RejectReason::ReduceOnlyClosed
+        } else {
+            RejectReason::Other(msg.to_string())
+        }
+    }
+}
+
+impl std::fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RejectReason::ReduceOnlyClosed => {
+                write!(f, "reduce-only rejected (position already closed)")
+            }
+            RejectReason::Other(m) => write!(f, "{m}"),
+        }
+    }
+}
+
 /// 交易所错误类型
 ///
 /// `Clone` 是必需的：kameo `wait_for_startup_result()` 约束 `A::Error: Clone`，
@@ -18,7 +54,7 @@ pub enum ExchangeError {
     RateLimited(Exchange, Duration),
 
     #[error("Order rejected on {0}: {1}")]
-    OrderRejected(Exchange, String),
+    OrderRejected(Exchange, RejectReason),
 
     #[error("Insufficient balance on {0}: need {1}, have {2}")]
     InsufficientBalance(Exchange, f64, f64),

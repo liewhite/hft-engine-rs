@@ -2,7 +2,7 @@
 
 use super::symbol::{from_binance, to_binance};
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
+    Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, RejectReason, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
@@ -516,9 +516,12 @@ impl ExchangeClient for BinanceClient {
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(self
-                .parse_error(&text)
-                .unwrap_or(ExchangeError::OrderRejected(Exchange::Binance, text)));
+            return Err(self.parse_error(&text).unwrap_or_else(|| {
+                ExchangeError::OrderRejected(
+                    Exchange::Binance,
+                    crate::domain::RejectReason::classify(&text),
+                )
+            }));
         }
 
         let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
@@ -571,6 +574,8 @@ fn map_binance_error(code: i32, msg: &str) -> ExchangeError {
     match code {
         -1003 => ExchangeError::RateLimited(Exchange::Binance, Duration::from_secs(60)),
         -2010 | -2019 => ExchangeError::InsufficientBalance(Exchange::Binance, 0.0, 0.0),
+        // -2022: "ReduceOnly Order is rejected" —— reduce-only 单因仓位已平被拒
+        -2022 => ExchangeError::OrderRejected(Exchange::Binance, RejectReason::ReduceOnlyClosed),
         -4028 => ExchangeError::ApiError(
             Exchange::Binance,
             code,

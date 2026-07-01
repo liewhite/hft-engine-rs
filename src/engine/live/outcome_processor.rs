@@ -2,7 +2,7 @@
 //!
 //! 订阅 OutcomePubSub 接收策略信号，调用交易所 REST API 执行订单
 
-use crate::domain::{now_ms, Exchange, OrderStatus, OrderUpdate, Side};
+use crate::domain::{now_ms, Exchange, ExchangeError, OrderStatus, OrderUpdate, RejectReason, Side};
 use crate::exchange::ExchangeClient;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::strategy::OutcomeEvent;
@@ -73,6 +73,17 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
         msg: OutcomeEvent,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // 下单/撤单一律 `tokio::spawn` 异步执行，**有意为之**：REST 往返可能上百 ms，
+        // 若在 handler 内 await 会阻塞本 actor 的邮箱，进而拖垮整条 income/outcome 事件流
+        // （行情、成交回报全部积压）。
+        //
+        // 已知取舍（当前不处理，靠上层机制兜底）：
+        // - 同一 symbol 的多笔下单/撤单可能乱序到达交易所——策略层的 rebalance /
+        //   reduce-only 会在后续事件中纠正净敞口，不依赖单条请求的到达序。
+        // - 优雅停机时 `on_stop` 不等待 in-flight 请求，理论上存在"引擎已停但请求仍在途"
+        //   的窗口；接受此风险以换取事件流不阻塞。
+        // - spawned task 内的失败已通过 `send_order_error*` 反馈为 OrderUpdate(Error/Rejected)，
+        //   不会静默丢失。
         match msg {
             OutcomeEvent::CancelOrder { exchange, symbol, order_id } => {
                 let client = match self.clients.get(&exchange) {
@@ -183,26 +194,31 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                                 );
                             }
                             Err(e) => {
-                                let reason = e.to_string();
-                                if reason.contains("Reduce only")
-                                    || reason.contains("reduce only")
-                                {
-                                    tracing::info!(
-                                        exchange = %order.exchange,
-                                        symbol = %order.symbol,
-                                        client_order_id = ?order.client_order_id,
-                                        "Reduce-only order rejected: position already closed"
-                                    );
-                                } else {
-                                    tracing::error!(
-                                        exchange = %order.exchange,
-                                        symbol = %order.symbol,
-                                        client_order_id = ?order.client_order_id,
-                                        error = %reason,
-                                        "Failed to place order"
-                                    );
+                                // 按结构化 RejectReason 判断，不再字符串嗅探：
+                                // reduce-only 因仓位已平被拒是无害的（平仓目标已达成），降级为 info。
+                                match &e {
+                                    ExchangeError::OrderRejected(
+                                        _,
+                                        RejectReason::ReduceOnlyClosed,
+                                    ) => {
+                                        tracing::info!(
+                                            exchange = %order.exchange,
+                                            symbol = %order.symbol,
+                                            client_order_id = ?order.client_order_id,
+                                            "Reduce-only order rejected: position already closed"
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::error!(
+                                            exchange = %order.exchange,
+                                            symbol = %order.symbol,
+                                            client_order_id = ?order.client_order_id,
+                                            error = %e,
+                                            "Failed to place order"
+                                        );
+                                    }
                                 }
-                                Self::send_order_error_static(&income_pubsub, &order, reason)
+                                Self::send_order_error_static(&income_pubsub, &order, e.to_string())
                                     .await;
                             }
                         }

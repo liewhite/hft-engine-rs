@@ -602,13 +602,16 @@ impl IbkrClient {
 
             return Err(ExchangeError::OrderRejected(
                 Exchange::IBKR,
-                format!("Unexpected order response: {}", current_resp),
+                crate::domain::RejectReason::classify(&format!(
+                    "Unexpected order response: {}",
+                    current_resp
+                )),
             ));
         }
 
         Err(ExchangeError::OrderRejected(
             Exchange::IBKR,
-            "Too many reply confirmations".to_string(),
+            crate::domain::RejectReason::Other("Too many reply confirmations".to_string()),
         ))
     }
 
