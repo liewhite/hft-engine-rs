@@ -262,6 +262,12 @@ pub struct OrderPushData {
     pub cl_ord_id: Option<String>,
     pub side: String, // "buy" or "sell"
     pub state: String,
+    /// reduce-only 标志 ("true"/"false")；部分订单类型可能缺省
+    #[serde(default)]
+    pub reduce_only: Option<String>,
+    /// 成交类别: normal / twap / adl / full_liquidation / partial_liquidation / delivery / ddh
+    #[serde(default)]
+    pub category: Option<String>,
     /// 订单价格 (限价单)
     pub px: String,
     /// 订单总数量 (张)
@@ -314,6 +320,7 @@ impl OrderPushData {
             side,
             status,
             price,
+            reduce_only: self.reduce_only.as_deref() == Some("true"),
             quantity: sz,          // 张数，由 private_ws 转换为币
             filled_quantity: acc_fill_sz, // 张数，由 private_ws 转换为币
             fill_sz,               // 张数，由 private_ws 转换为币
@@ -346,6 +353,12 @@ impl OrderPushData {
         let fee = f64::from_str(&self.fee)
             .map_err(|_| format!("Failed to parse fee: {}", self.fee))?;
 
+        let reason = match self.category.as_deref() {
+            Some("adl") => crate::domain::FillReason::Adl,
+            Some(c) if c.contains("liquidation") => crate::domain::FillReason::Liquidation,
+            _ => crate::domain::FillReason::Normal,
+        };
+
         Ok(Some(Fill {
             exchange: Exchange::OKX,
             symbol,
@@ -356,6 +369,7 @@ impl OrderPushData {
             order_id: self.ord_id.clone(),
             timestamp: now_ms(),
             fee: -fee,
+            reason,
         }))
     }
 }

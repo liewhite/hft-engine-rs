@@ -12,6 +12,10 @@ pub struct OrderUpdate {
     pub status: OrderStatus,
     /// 订单价格 (限价单)
     pub price: f64,
+    /// 是否 reduce-only（只减仓）单。
+    /// Binance/OKX 的订单推送含此字段并如实填充；HL/IBKR 的 WS 订单消息不提供，填 `false`。
+    /// 主要用于重连/启动时把交易所现存挂单准确注册为 PendingOrder（避免把平仓单当开仓单）。
+    pub reduce_only: bool,
     /// 订单总数量 (币单位)
     pub quantity: Quantity,
     /// 累计成交量

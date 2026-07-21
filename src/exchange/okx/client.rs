@@ -445,6 +445,7 @@ impl ExchangeClient for OkxClient {
                 side,
                 status,
                 price,
+                reduce_only: false, // OKX REST pending 响应未解析 reduceOnly，外部单元信息以 WS 推送为准
                 quantity: sz,          // 张数，由 manager 转换为币
                 filled_quantity: acc_fill_sz, // 张数，由 manager 转换为币
                 fill_sz: 0.0,
@@ -532,9 +533,10 @@ impl ExchangeClient for OkxClient {
         // 先检查 data 中的具体错误信息（更详细）
         if let Some(order_data) = data.data.first() {
             if order_data.s_code != "0" {
+                let msg = format!("code={}, msg={}", order_data.s_code, order_data.s_msg);
                 return Err(ExchangeError::OrderRejected(
                     Exchange::OKX,
-                    format!("code={}, msg={}", order_data.s_code, order_data.s_msg),
+                    crate::domain::RejectReason::classify(&msg),
                 ));
             }
             return Ok(order_data.ord_id.clone());
@@ -547,7 +549,7 @@ impl ExchangeClient for OkxClient {
 
         Err(ExchangeError::OrderRejected(
             Exchange::OKX,
-            "No order data in response".to_string(),
+            crate::domain::RejectReason::Other("No order data in response".to_string()),
         ))
     }
 
@@ -602,11 +604,11 @@ impl ExchangeClient for OkxClient {
         Ok(())
     }
 
-    async fn fetch_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         // OKX 通过 WebSocket 推送 equity 和 notional，这里仅实现 trait
         // 实际使用中不会调用此方法
         let equity = self.get_equity().await?;
-        Ok(crate::exchange::AccountInfo {
+        Ok(crate::domain::AccountInfo {
             equity,
             notional: 0.0, // OKX 通过 WebSocket 推送 notional
         })

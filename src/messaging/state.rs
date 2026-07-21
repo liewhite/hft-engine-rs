@@ -225,8 +225,19 @@ impl SymbolState {
             ExchangeEventData::BBO(bbo) => {
                 self.bbos.insert(bbo.exchange, bbo.clone());
             }
+            ExchangeEventData::MarketTrade(_) => {
+                // 公共成交印记仅作市场信号 (策略自取)，不修改聚合状态
+            }
             ExchangeEventData::Position(position) => {
-                // 仅用于初始加载：本地无仓位时写入，之后完全由 Fill 事件维护
+                // 持仓维护模型：**一次性初始化 + 之后全程由 Fill 事件增量维护**。
+                // 本地无该交易所持仓时用快照初始化一次，此后所有变化都靠 Fill 累加
+                // （见下方 Fill 分支）——主动单、手动单、以及**强平/ADL** 都以 fill 形式经
+                // 私有成交流下发，因此持仓不会漏掉被动减仓。
+                //
+                // 为何**不**用 Position 快照周期性"对账校准"：REST/WS 拉取的持仓快照与实时
+                // Fill 流之间存在竞态——快照可能已包含某笔成交，而该成交对应的 Fill 稍后才
+                // 由 WS 送达；若用快照覆写后又叠加这笔晚到的 Fill，就会**重复计算**该笔成交。
+                // 故快照只做首次初始化，绝不在运行期覆写。
                 if !self.positions.contains_key(&position.exchange) {
                     tracing::info!(
                         symbol = %self.symbol,
@@ -266,6 +277,10 @@ impl SymbolState {
                                 }
                             } else {
                                 // 启动时同步的现有挂单，注册到 pending_orders
+                                // 外部挂单（启动/重连时交易所已存在、本地无记录）重建为 PendingOrder。
+                                // 权威字段直接取自 update：side/price/quantity/reduce_only/status。
+                                // tif 无法从订单更新可靠还原，对 resting 限价单按 GTC 占位——它不参与
+                                // 后续跟踪判断（has_pending_side 看 side、gamma_scalp 看 order_type/price/qty）。
                                 self.pending_orders.insert(
                                     client_id.clone(),
                                     PendingOrder {
@@ -279,7 +294,7 @@ impl SymbolState {
                                                 tif: TimeInForce::GTC,
                                             },
                                             quantity: update.quantity,
-                                            reduce_only: false,
+                                            reduce_only: update.reduce_only,
                                             client_order_id: client_id.clone(),
                                         },
                                         status: update.status.clone(),
@@ -289,14 +304,21 @@ impl SymbolState {
                             }
                         }
                         OrderStatus::Created => {
-                            // 交易所不会推送 Created 状态，这是本地状态
-                            unreachable!("Exchange should never push Created status")
+                            // 交易所不应推送 Created（这是本地状态）。若出现说明 codec 误映射，
+                            // 记录后忽略该条更新（不 panic；pending order 保持原样，等后续有效更新）。
+                            tracing::error!(
+                                symbol = %self.symbol,
+                                exchange = %update.exchange,
+                                order_id = %update.order_id,
+                                "交易所推送了 Created 状态（codec 映射异常），忽略此更新"
+                            );
                         }
                     }
                 }
             }
             ExchangeEventData::Fill(fill) => {
-                // Fill 事件用于即时更新仓位（无论是策略订单还是手动订单）
+                // Fill 即时更新仓位——涵盖策略单、手动单、以及强平/ADL（三者都以 fill 形式
+                // 经私有成交流到达，走同一路径，无需快照对账，见上方 Position 分支说明）。
                 let delta = match fill.side {
                     Side::Long => fill.size,
                     Side::Short => -fill.size,
@@ -317,6 +339,7 @@ impl SymbolState {
                     side = ?fill.side,
                     fill_size = fill.size,
                     fill_price = fill.price,
+                    reason = ?fill.reason,
                     new_position_size = pos.size,
                     "Updated position on fill"
                 );
@@ -340,8 +363,12 @@ impl SymbolState {
             | ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. } => {
-                // 已在上面提前返回，这里不会执行
-                unreachable!()
+                // 全局事件应在 StateManager 层提前拦截、不会进入 SymbolState::apply。
+                // 若到达说明路由逻辑有 bug，记录后忽略（不 panic）。
+                tracing::error!(
+                    symbol = %self.symbol,
+                    "全局事件错误地进入 SymbolState::apply（路由 bug），忽略"
+                );
             }
         }
     }

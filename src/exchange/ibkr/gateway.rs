@@ -42,12 +42,12 @@ impl IbkrAuth for IbkrGateway {
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))
     }
 
-    fn ws_connector(&self) -> Option<tokio_tungstenite::Connector> {
+    fn ws_connector(&self) -> anyhow::Result<Option<tokio_tungstenite::Connector>> {
         let tls = native_tls::TlsConnector::builder()
             .danger_accept_invalid_certs(true)
             .build()
-            .expect("Failed to build TLS connector");
-        Some(tokio_tungstenite::Connector::NativeTls(tls))
+            .map_err(|e| anyhow::anyhow!("Failed to build TLS connector: {}", e))?;
+        Ok(Some(tokio_tungstenite::Connector::NativeTls(tls)))
     }
 
     fn format_ws_cookie(&self, session_id: &str) -> String {

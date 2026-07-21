@@ -360,6 +360,7 @@ impl WsOrderUpdate {
             side,
             status,
             price,
+            reduce_only: false, // HL WsBasicOrder 不含 reduceOnly 字段
             quantity: orig_sz,
             filled_quantity,
             fill_sz: filled_quantity,
@@ -417,6 +418,9 @@ pub struct WsFill {
     pub cloid: Option<String>,
     pub fee: String,
     pub closed_pnl: String,
+    /// 强平信息对象——仅强平成交时存在 (HL userFills `liquidation` 字段)
+    #[serde(default)]
+    pub liquidation: Option<serde_json::Value>,
 }
 
 impl WsFill {
@@ -437,6 +441,13 @@ impl WsFill {
         let fee = f64::from_str(&self.fee)
             .map_err(|_| format!("Failed to parse fill fee: {}", self.fee))?;
 
+        // HL 强平成交带 `liquidation` 对象；HL 无独立 ADL 语义，故只区分 Liquidation
+        let reason = if self.liquidation.is_some() {
+            crate::domain::FillReason::Liquidation
+        } else {
+            crate::domain::FillReason::Normal
+        };
+
         Ok(Fill {
             exchange: Exchange::Hyperliquid,
             symbol,
@@ -447,6 +458,7 @@ impl WsFill {
             order_id: self.oid.to_string(),
             timestamp: self.time,
             fee,
+            reason,
         })
     }
 }

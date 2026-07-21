@@ -7,7 +7,7 @@
 //!
 //! 注意: Hyperliquid 的账户订阅不需要认证，只需要用户地址
 
-use crate::domain::{now_ms, Balance, Exchange, Position, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Position, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
 use crate::exchange::hyperliquid::codec::{ClearinghouseState, WsOrderUpdate, WsUserFills};
@@ -16,7 +16,7 @@ use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
@@ -67,13 +67,13 @@ impl HyperliquidPrivateWsActor {
 
 impl Actor for HyperliquidPrivateWsActor {
     type Args = HyperliquidPrivateWsActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 1. 连接 WebSocket
+        // 1. 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_URL)
             .await
-            .expect("Failed to connect to Hyperliquid WebSocket");
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
 
         let (write, read) = ws_stream.split();
 
@@ -105,7 +105,7 @@ impl Actor for HyperliquidPrivateWsActor {
         outgoing_tx
             .send(subscribe_clearinghouse)
             .await
-            .expect("Failed to send clearinghouseState subscription");
+            .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid send clearinghouseState: {e}")))?;
 
         // orderUpdates: 订单更新
         let subscribe_orders = json!({
@@ -120,7 +120,7 @@ impl Actor for HyperliquidPrivateWsActor {
         outgoing_tx
             .send(subscribe_orders)
             .await
-            .expect("Failed to send orderUpdates subscription");
+            .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid send orderUpdates: {e}")))?;
 
         // userFills: 成交推送
         let subscribe_fills = json!({
@@ -135,7 +135,7 @@ impl Actor for HyperliquidPrivateWsActor {
         outgoing_tx
             .send(subscribe_fills)
             .await
-            .expect("Failed to send userFills subscription");
+            .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid send userFills: {e}")))?;
 
         tracing::info!(
             wallet = %args.wallet_address,
@@ -173,27 +173,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPriv
         msg: StreamMessage<Result<String, WsError>, (), ()>,
         ctx: &mut Context<Self, Self::Reply>,
     ) {
-        match msg {
-            StreamMessage::Next(Ok(data)) => {
-                // 解析并发布到 IncomePubSub，失败则 kill actor
-                if let Err(e) = self.handle_message(&data).await {
-                    tracing::error!(exchange = "Hyperliquid", error = %e, raw = %data, "Private WS parse error, killing actor");
-                    ctx.actor_ref().kill();
-                }
-            }
-            StreamMessage::Next(Err(e)) => {
-                tracing::error!(error = %e, "Private WebSocket loop exited, killing actor");
-                ctx.actor_ref().kill();
-            }
-            StreamMessage::Started(_) => {
-                tracing::debug!("Private WsIncoming stream started");
-            }
-            StreamMessage::Finished(_) => {
-                // ws_loop 异常退出，kill actor 触发级联退出
-                tracing::error!("Private WebSocket stream unexpectedly finished, killing actor");
-                ctx.actor_ref().kill();
-            }
-        }
+        crate::dispatch_ws_stream_message!(self, msg, ctx, "Hyperliquid");
     }
 }
 

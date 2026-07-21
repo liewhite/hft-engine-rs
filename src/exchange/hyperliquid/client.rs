@@ -449,10 +449,10 @@ impl ExchangeClient for HyperliquidClient {
         Ok(())
     }
 
-    async fn fetch_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         // Hyperliquid 通过 WebSocket 推送 equity 和 notional，这里仅实现 trait
         // 实际使用中不会调用此方法
-        Ok(crate::exchange::AccountInfo {
+        Ok(crate::domain::AccountInfo {
             equity: 0.0,
             notional: 0.0,
         })

@@ -6,7 +6,7 @@
 //! - 收到订阅时先通过 REST 获取 100 根历史 K线并发布，再 WS 订阅实时推送
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{CandleInterval, now_ms, Symbol, SymbolMeta};
+use crate::domain::{CandleInterval, now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{
@@ -18,7 +18,7 @@ use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
@@ -69,7 +69,10 @@ impl OkxBusinessWsActor {
         })
         .to_string();
 
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        let tx = self
+            .ws_tx
+            .as_ref()
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
@@ -77,14 +80,19 @@ impl OkxBusinessWsActor {
 
     /// 发送 WS 取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let arg = kind_to_business_arg(kind, &self.quote);
+        let arg = kind_to_business_arg(kind, &self.quote).ok_or_else(|| {
+            WsError::ParseError("Non-Candle kind reached OkxBusinessWsActor unsubscribe (routing bug)".to_string())
+        })?;
         let msg = json!({
             "op": "unsubscribe",
             "args": [arg]
         })
         .to_string();
 
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        let tx = self
+            .ws_tx
+            .as_ref()
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
@@ -168,13 +176,13 @@ impl OkxBusinessWsActor {
 
 impl Actor for OkxBusinessWsActor {
     type Args = OkxBusinessWsActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 连接 Business WebSocket
+        // 连接 Business WebSocket（失败向上传播 → 启动期受控退出）
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_BUSINESS_URL)
             .await
-            .expect("Failed to connect to OKX business WebSocket");
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
 
         let (write, read) = ws_stream.split();
 
@@ -194,7 +202,7 @@ impl Actor for OkxBusinessWsActor {
         let http_client = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|e| ExchangeError::Other(format!("OKX business HTTP client build: {e}")))?;
 
         tracing::info!("OkxBusinessWsActor started");
 
@@ -262,8 +270,15 @@ impl Message<SubscribeBatch> for OkxBusinessWsActor {
                 continue;
             }
 
-            new_args.push(kind_to_business_arg(&kind, &self.quote));
-            new_kinds.push(kind);
+            match kind_to_business_arg(&kind, &self.quote) {
+                Some(arg) => {
+                    new_args.push(arg);
+                    new_kinds.push(kind);
+                }
+                None => {
+                    tracing::error!(?kind, "Non-Candle routed to OkxBusinessWsActor (routing bug), skipping");
+                }
+            }
         }
 
         // 1. 对每个新订阅先获取历史 K线（阻塞式，保证历史数据先于实时到达）
@@ -327,25 +342,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxBusinessWsAc
         msg: StreamMessage<Result<String, WsError>, (), ()>,
         ctx: &mut Context<Self, Self::Reply>,
     ) {
-        match msg {
-            StreamMessage::Next(Ok(data)) => {
-                if let Err(e) = self.handle_message(&data).await {
-                    tracing::error!(exchange = "OKX", error = %e, raw = %data, "Business WS parse error, killing actor");
-                    ctx.actor_ref().kill();
-                }
-            }
-            StreamMessage::Next(Err(e)) => {
-                tracing::error!(error = %e, "Business WebSocket loop exited, killing actor");
-                ctx.actor_ref().kill();
-            }
-            StreamMessage::Started(_) => {
-                tracing::debug!("Business WsIncoming stream started");
-            }
-            StreamMessage::Finished(_) => {
-                tracing::error!("Business WebSocket stream unexpectedly finished, killing actor");
-                ctx.actor_ref().kill();
-            }
-        }
+        crate::dispatch_ws_stream_message!(self, msg, ctx, "OKX");
     }
 }
 
@@ -411,15 +408,19 @@ fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, 
 // 辅助函数
 // ============================================================================
 
-fn kind_to_business_arg(kind: &SubscriptionKind, quote: &str) -> serde_json::Value {
+/// 把 Candle 订阅转成 OKX business 频道 arg。
+///
+/// 仅处理 `Candle`；其它类型由 OkxActor 路由到 PublicWsActor，正常不会到达此处，
+/// 返回 `None` 表示路由错误，由调用方记录并跳过（不 panic）。
+fn kind_to_business_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_json::Value> {
     match kind {
         SubscriptionKind::Candle { symbol, interval } => {
             let bar = candle_interval_to_okx_bar(*interval);
-            json!({
+            Some(json!({
                 "channel": format!("candle{}", bar),
                 "instId": to_okx(symbol, quote)
-            })
+            }))
         }
-        _ => panic!("BusinessWsActor only handles Candle subscriptions"),
+        _ => None,
     }
 }

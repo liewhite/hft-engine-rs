@@ -6,7 +6,7 @@
 //! - 处理订单状态推送 (sor topic)
 //! - 增量更新 bid/ask 缓存并发布 BBO 到 IncomePubSub
 
-use crate::domain::{now_ms, Exchange, Fill, OrderStatus, OrderUpdate, Side, BBO};
+use crate::domain::{now_ms, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ibkr::auth::IbkrAuth;
@@ -14,7 +14,7 @@ use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
@@ -91,7 +91,7 @@ impl IbkrPublicWsActor {
         let tx = self
             .ws_tx
             .as_ref()
-            .expect("ws_tx must exist after on_start");
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
@@ -103,7 +103,7 @@ impl IbkrPublicWsActor {
         let tx = self
             .ws_tx
             .as_ref()
-            .expect("ws_tx must exist after on_start");
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
@@ -323,6 +323,7 @@ impl IbkrPublicWsActor {
                 side,
                 status,
                 price: 0.0,
+                reduce_only: false, // IBKR 订单推送不含 reduce-only 信息
                 quantity: 0.0,
                 filled_quantity: filled_qty,
                 fill_sz: 0.0, // sor 推送无增量 fill 信息
@@ -465,6 +466,7 @@ impl IbkrPublicWsActor {
                     size,
                     timestamp: local_ts,
                     fee,
+                    reason: crate::domain::FillReason::Normal, // IBKR 执行流不区分强平/ADL
                 };
                 let order_update = self.build_order_update(item, order_ref, &symbol, side, size, local_ts);
                 self.publish_fill(PendingFill { fill, order_update }).await;
@@ -489,6 +491,7 @@ impl IbkrPublicWsActor {
                 size,
                 timestamp: local_ts,
                 fee: 0.0,
+                reason: crate::domain::FillReason::Normal, // IBKR 执行流不区分强平/ADL
             };
             let order_update = self.build_order_update(item, order_ref, &symbol, side, size, local_ts);
             self.pending_fills.insert(execution_id.clone(), PendingFill { fill, order_update });
@@ -534,6 +537,7 @@ impl IbkrPublicWsActor {
             side,
             status: OrderStatus::Filled,
             price: 0.0,
+            reduce_only: false, // IBKR 订单推送不含 reduce-only 信息
             quantity: size,
             filled_quantity: size,
             fill_sz: size,
@@ -587,7 +591,7 @@ impl IbkrPublicWsActor {
 
 impl Actor for IbkrPublicWsActor {
     type Args = IbkrPublicWsActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 构建反向映射
@@ -599,10 +603,17 @@ impl Actor for IbkrPublicWsActor {
 
         // 连接 WebSocket (需要 Cookie + User-Agent + 标准 WebSocket 握手 header)
         let ws_url = args.auth.ws_url();
-        let connector = args.auth.ws_connector();
+        let connector = args
+            .auth
+            .ws_connector()
+            .map_err(|e| ExchangeError::Other(format!("IBKR failed to build WS connector: {e}")))?;
         let cookie = args.auth.format_ws_cookie(&args.session_id);
-        let uri: http::Uri = ws_url.parse().expect("Invalid WS URL");
-        let host = uri.host().expect("WS URL missing host");
+        let uri: http::Uri = ws_url
+            .parse()
+            .map_err(|e| ExchangeError::Other(format!("IBKR invalid WS URL: {e}")))?;
+        let host = uri
+            .host()
+            .ok_or_else(|| ExchangeError::Other("IBKR WS URL missing host".into()))?;
         let ws_key = generate_key();
         let ws_request = http::Request::builder()
             .uri(&ws_url)
@@ -614,26 +625,24 @@ impl Actor for IbkrPublicWsActor {
             .header("Cookie", &cookie)
             .header("User-Agent", "ClientPortalGW/1")
             .body(())
-            .expect("Failed to build WS request");
+            .map_err(|e| ExchangeError::Other(format!("IBKR failed to build WS request: {e}")))?;
 
-        tracing::info!(ws_url = %ws_url, cookie = %cookie, "Connecting IBKR WebSocket");
+        // 安全：ws_url 含 OAuth access_token，cookie 是 session cookie，严禁进日志。
+        // 只打印 host。
+        tracing::info!(host = %host, "Connecting IBKR WebSocket");
 
         let (ws_stream, _) = match connector {
-            Some(conn) => {
-                tokio_tungstenite::connect_async_tls_with_config(
-                    ws_request,
-                    None,
-                    false,
-                    Some(conn),
-                )
+            Some(conn) => tokio_tungstenite::connect_async_tls_with_config(
+                ws_request,
+                None,
+                false,
+                Some(conn),
+            )
+            .await
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?,
+            None => tokio_tungstenite::connect_async(ws_request)
                 .await
-                .expect("Failed to connect to IBKR WebSocket")
-            }
-            None => {
-                tokio_tungstenite::connect_async(ws_request)
-                    .await
-                    .expect("Failed to connect to IBKR WebSocket")
-            }
+                .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?,
         };
 
         let (write, read) = ws_stream.split();

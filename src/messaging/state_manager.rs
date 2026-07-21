@@ -1,5 +1,5 @@
-use crate::domain::{now_ms, Exchange, Greeks, MarketStatus, Order, Symbol, USDT};
-use crate::exchange::AccountInfo;
+use crate::domain::{Exchange, Greeks, MarketStatus, Order, Symbol, Timestamp, USDT};
+use crate::domain::AccountInfo;
 use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
 use std::collections::HashMap;
 
@@ -42,16 +42,22 @@ impl StateManager {
 
     // ==================== 下单接口 ====================
 
-    /// 添加 pending order (由 Executor 调用，client_order_id 已生成)
+    /// 添加 pending order (由 StrategyRunner 调用，client_order_id 已生成)
     ///
-    /// # Panics
-    /// symbol 不存在时 panic（表示配置错误）
-    pub fn add_pending_order(&mut self, order: Order) {
+    /// `created_at` 由调用方注入 (实盘传接收时刻、回测传虚拟事件时刻)，避免内部读墙钟破坏
+    /// 回测确定性。
+    ///
+    /// symbol 未注册（策略对未订阅 symbol 下单）时记录 error 并跳过跟踪，不 panic。
+    pub fn add_pending_order(&mut self, order: Order, created_at: Timestamp) {
         let symbol = order.symbol.clone();
-        self.states
-            .get_mut(&symbol)
-            .expect("Symbol not found in StateManager")
-            .add_pending_order(order, now_ms());
+        let Some(state) = self.states.get_mut(&symbol) else {
+            tracing::error!(
+                symbol = %symbol,
+                "add_pending_order: symbol 未在 StateManager 注册，无法跟踪该订单"
+            );
+            return;
+        };
+        state.add_pending_order(order, created_at);
     }
 
     // ==================== 状态查询 ====================
@@ -186,16 +192,18 @@ impl StateManager {
                 }
             }
             // Symbol 事件: 委托对应 SymbolState 处理
-            // 事件由 IncomeProcessorActor 按 (exchange, symbol) 路由，只有已注册的 symbol 才会到达，
-            // 因此 symbol 查找不会失败（如果失败说明路由逻辑有 bug，应立即暴露）
+            // 事件由 IncomeProcessorActor 按 (exchange, symbol) 路由，正常只有已注册 symbol 会到达。
+            // 若 symbol 缺失或无对应状态，说明路由逻辑有 bug，记录 error 后忽略（不 panic）。
             _ => {
-                let symbol = event
-                    .symbol()
-                    .expect("Symbol event must have symbol");
-                self.states
-                    .get_mut(symbol)
-                    .expect("Symbol not found in StateManager: routing bug")
-                    .apply(event);
+                let Some(symbol) = event.symbol() else {
+                    tracing::error!("symbol 事件缺少 symbol（路由 bug），忽略");
+                    return;
+                };
+                let Some(state) = self.states.get_mut(symbol) else {
+                    tracing::error!(symbol = %symbol, "StateManager 无此 symbol 状态（路由 bug），忽略事件");
+                    return;
+                };
+                state.apply(event);
             }
         }
     }

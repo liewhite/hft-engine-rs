@@ -2,17 +2,8 @@
 //!
 //! ExchangeClient trait 封装交易所 REST 交互
 
-use crate::domain::{CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderUpdate, Position, Symbol, SymbolMeta};
+use crate::domain::{AccountInfo, CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderUpdate, Position, Symbol, SymbolMeta};
 use async_trait::async_trait;
-
-/// 账户信息 (净值 + 总持仓名义价值)
-#[derive(Debug, Clone, Copy)]
-pub struct AccountInfo {
-    /// 账户净值 (balance + unrealized_pnl)
-    pub equity: f64,
-    /// 账户总持仓名义价值 (用于计算杠杆率)
-    pub notional: f64,
-}
 
 // ============================================================================
 // 订阅类型

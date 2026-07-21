@@ -1,8 +1,11 @@
 pub mod bootstrap;
-pub mod config;
 pub mod live;
+mod strategy_runner;
 
 pub use bootstrap::{init_tracing, load_config, wait_for_shutdown};
+pub use strategy_runner::{
+    ClientOrderIdGen, ExchangeUuidGen, SequentialClientOrderIdGen, StrategyRunner,
+};
 pub use live::{
     AddStrategy, AddStrategies, ClockActor, ClockActorArgs,
     CryptoStatusActor, CryptoStatusActorArgs,

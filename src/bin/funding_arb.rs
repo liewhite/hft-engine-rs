@@ -67,6 +67,12 @@ async fn main() -> anyhow::Result<()> {
         mailbox::unbounded(),
     );
 
+    // 等待 Manager 启动完成；启动失败 → 带真实 ExchangeError 上下文受控退出（非零退出码）
+    manager
+        .wait_for_startup_result()
+        .await
+        .map_err(|e| anyhow::anyhow!("Manager startup failed: {e}"))?;
+
     // 获取所有交易所的 symbol metas
     let metas: HashMap<Exchange, Vec<SymbolMeta>> =
         manager.ask(GetAllSymbolMetas).send().await?;

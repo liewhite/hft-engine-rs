@@ -7,6 +7,40 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+/// 统一处理 WS 入站 `StreamMessage` 的四个分支，消除各 WS actor 中逐字重复的样板。
+///
+/// 各 actor 的 `Message<StreamMessage<Result<String, WsError>, (), ()>>` handler 逻辑相同，
+/// 仅交易所标签不同：数据到达 → `handle_message` 解析发布，失败/错误/流结束一律记录并
+/// `kill` actor（触发 `on_link_died` 级联受控停机，不重连——见错误处理约定）。
+///
+/// 要求 `$this` 具备 `async fn handle_message(&self, raw: &str) -> Result<(), WsError>`
+/// （`&self`/`&mut self` 均可）。IBKR public WS 的 `handle_message` 需额外的 actor_ref
+/// 参数，签名不同，故不使用本宏、保留独立实现。
+#[macro_export]
+macro_rules! dispatch_ws_stream_message {
+    ($this:expr, $msg:expr, $ctx:expr, $exchange:literal) => {{
+        match $msg {
+            kameo::message::StreamMessage::Next(Ok(data)) => {
+                if let Err(e) = $this.handle_message(&data).await {
+                    tracing::error!(exchange = $exchange, error = %e, raw = %data, "WS parse error, killing actor");
+                    $ctx.actor_ref().kill();
+                }
+            }
+            kameo::message::StreamMessage::Next(Err(e)) => {
+                tracing::error!(exchange = $exchange, error = %e, "WS loop exited, killing actor");
+                $ctx.actor_ref().kill();
+            }
+            kameo::message::StreamMessage::Started(_) => {
+                tracing::debug!(exchange = $exchange, "WS incoming stream started");
+            }
+            kameo::message::StreamMessage::Finished(_) => {
+                tracing::error!(exchange = $exchange, "WS stream unexpectedly finished, killing actor");
+                $ctx.actor_ref().kill();
+            }
+        }
+    }};
+}
+
 /// 运行 WebSocket 循环
 ///
 /// # 参数
@@ -96,7 +130,7 @@ async fn run_ws_loop_inner(
                     None => {
                         return Err(WsError::ServerClosed("connection dropped".to_string()));
                     }
-                    // Binary, Frame 等忽略
+                    // 其它帧类型 (Pong/Frame 等) 忽略
                     _ => {}
                 }
             }

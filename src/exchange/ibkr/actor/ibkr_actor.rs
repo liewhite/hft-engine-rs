@@ -18,9 +18,10 @@ use super::tickle::{IbkrTickleActor, IbkrTickleActorArgs};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::ibkr::auth::{self, IbkrAuth};
 use crate::exchange::ibkr::IbkrClient;
+use crate::domain::{Exchange, ExchangeError};
 use crate::engine::IncomePubSub;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
@@ -60,17 +61,20 @@ pub struct IbkrActor {
 
 impl Actor for IbkrActor {
     type Args = IbkrActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 1. Tickle 获取 session_id (供 WS Cookie 使用)
         let http = args
             .auth
             .build_http_client()
-            .expect("Failed to build HTTP client");
-        let session_id = auth::tickle(&*args.auth, &http)
-            .await
-            .expect("Initial tickle failed");
+            .map_err(|e| ExchangeError::Other(format!("IBKR failed to build HTTP client: {e}")))?;
+        let session_id = auth::tickle(&*args.auth, &http).await.map_err(|e| {
+            // 保留原始上下文（网络/非 2xx/解析/缺 session 等）便于诊断，
+            // tickle 内部错误信息不含 token/cookie，安全。
+            tracing::error!(exchange = "IBKR", error = %e, "Initial tickle failed");
+            ExchangeError::AuthenticationFailed(Exchange::IBKR)
+        })?;
 
         // 2. 并发 spawn PublicWsActor 与 TickleActor —— 互无依赖
         //    IBKR 用同一条 WS 同时收行情和订单更新，必须握手完成再放行下游
@@ -96,13 +100,15 @@ impl Actor for IbkrActor {
         )
         .await;
 
-        // 3. 并发等启动完成；任一失败 → panic
+        // 3. 并发等启动完成；任一失败 → 向上传播 ExchangeError（受控退出）
         let (public_r, tickle_r) = tokio::join!(
             public_ws.wait_for_startup_result(),
             tickle.wait_for_startup_result(),
         );
-        public_r.expect("IbkrPublicWsActor failed to start");
-        tickle_r.expect("IbkrTickleActor failed to start");
+        public_r
+            .map_err(|e| ExchangeError::Other(format!("IbkrPublicWsActor failed to start: {e}")))?;
+        tickle_r
+            .map_err(|e| ExchangeError::Other(format!("IbkrTickleActor failed to start: {e}")))?;
         tracing::info!(exchange = "IBKR", "WS + tickle ready");
 
         // 4. 创建账户净值轮询 Actor (每 3 秒)

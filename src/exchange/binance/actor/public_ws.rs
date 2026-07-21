@@ -5,7 +5,7 @@
 //! - 处理 Subscribe/Unsubscribe 请求
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::binance::codec::{BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
@@ -14,7 +14,7 @@ use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
@@ -67,7 +67,10 @@ impl BinancePublicWsActor {
         })
         .to_string();
 
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        let tx = self
+            .ws_tx
+            .as_ref()
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
@@ -75,7 +78,11 @@ impl BinancePublicWsActor {
 
     /// 发送取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let stream = kind_to_stream(kind, &self.quote);
+        let stream = kind_to_stream(kind, &self.quote).ok_or_else(|| {
+            WsError::ParseError(
+                "Binance Candle 订阅未实现，无法取消订阅".to_string(),
+            )
+        })?;
         let msg = json!({
             "method": "UNSUBSCRIBE",
             "params": [stream],
@@ -83,7 +90,10 @@ impl BinancePublicWsActor {
         })
         .to_string();
 
-        let tx = self.ws_tx.as_ref().expect("ws_tx must exist after on_start");
+        let tx = self
+            .ws_tx
+            .as_ref()
+            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
@@ -104,13 +114,13 @@ impl BinancePublicWsActor {
 
 impl Actor for BinancePublicWsActor {
     type Args = BinancePublicWsActorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 连接 WebSocket
+        // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
         let (ws_stream, _) = tokio_tungstenite::connect_async(&args.url)
             .await
-            .expect("Failed to connect to Binance public WebSocket");
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
 
         let (write, read) = ws_stream.split();
 
@@ -196,7 +206,13 @@ impl Message<SubscribeBatch> for BinancePublicWsActor {
                 continue;
             }
 
-            let stream = kind_to_stream(&kind, &self.quote);
+            let stream = match kind_to_stream(&kind, &self.quote) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(?kind, "Binance Candle 订阅未实现，忽略");
+                    continue;
+                }
+            };
             if !self.subscribed_streams.contains(&stream) {
                 new_streams.push(stream);
             }
@@ -249,11 +265,17 @@ impl Message<Unsubscribe> for BinancePublicWsActor {
         }
 
         // 检查是否还有其他 kinds 使用同一个 stream
-        let stream = kind_to_stream(&msg.kind, &self.quote);
+        let stream = match kind_to_stream(&msg.kind, &self.quote) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(kind = ?msg.kind, "Binance Candle 订阅未实现，忽略取消订阅");
+                return;
+            }
+        };
         let stream_still_needed = self
             .subscribed_kinds
             .iter()
-            .any(|k| kind_to_stream(k, &self.quote) == stream);
+            .any(|k| kind_to_stream(k, &self.quote).as_deref() == Some(stream.as_str()));
 
         if !stream_still_needed {
             if let Err(e) = self.send_unsubscribe(&msg.kind).await {
@@ -275,27 +297,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePublicWs
         msg: StreamMessage<Result<String, WsError>, (), ()>,
         ctx: &mut Context<Self, Self::Reply>,
     ) {
-        match msg {
-            StreamMessage::Next(Ok(data)) => {
-                // 解析并发布到 IncomePubSub，失败则 kill actor
-                if let Err(e) = self.handle_message(&data).await {
-                    tracing::error!(exchange = "Binance", error = %e, raw = %data, "Public WS parse error, killing actor");
-                    ctx.actor_ref().kill();
-                }
-            }
-            StreamMessage::Next(Err(e)) => {
-                tracing::error!(error = %e, "Public WebSocket loop exited, killing actor");
-                ctx.actor_ref().kill();
-            }
-            StreamMessage::Started(_) => {
-                tracing::debug!("WsIncoming stream started");
-            }
-            StreamMessage::Finished(_) => {
-                // ws_loop 异常退出，kill actor 触发级联退出
-                tracing::error!("WebSocket stream unexpectedly finished, killing actor");
-                ctx.actor_ref().kill();
-            }
-        }
+        crate::dispatch_ws_stream_message!(self, msg, ctx, "Binance");
     }
 }
 
@@ -407,19 +409,23 @@ fn parse_public_message(
 // 辅助函数
 // ============================================================================
 
-fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> String {
+/// 把订阅类型转成 Binance stream 名。
+///
+/// Binance 的 K线（`Candle`）订阅尚未实现：父 actor 会把它路由到本 actor（`market_ws`），
+/// 到达此处返回 `None`，由调用方记录 `warn!` 并跳过（不 panic，遵循"框架层错误受控处理"约定）。
+fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> Option<String> {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用同一个 markPrice@1s 流
         SubscriptionKind::FundingRate { symbol }
         | SubscriptionKind::MarkPrice { symbol }
-        | SubscriptionKind::IndexPrice { symbol } => {
-            format!("{}@markPrice@1s", to_binance(symbol, quote).to_lowercase())
-        }
-        SubscriptionKind::BBO { symbol } => {
-            format!("{}@bookTicker", to_binance(symbol, quote).to_lowercase())
-        }
-        SubscriptionKind::Candle { .. } => {
-            panic!("Binance Candle subscription not implemented")
-        }
+        | SubscriptionKind::IndexPrice { symbol } => Some(format!(
+            "{}@markPrice@1s",
+            to_binance(symbol, quote).to_lowercase()
+        )),
+        SubscriptionKind::BBO { symbol } => Some(format!(
+            "{}@bookTicker",
+            to_binance(symbol, quote).to_lowercase()
+        )),
+        SubscriptionKind::Candle { .. } => None,
     }
 }

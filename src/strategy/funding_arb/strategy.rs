@@ -50,8 +50,11 @@ impl FundingArbStrategy {
     /// 更新指定交易所的 bid/ask EMA
     fn update_exchange_ema(&mut self, exchange: Exchange, state: &SymbolState) {
         if let Some(bbo) = state.bbo(exchange) {
-            let ema = self.exchange_emas.get_mut(&exchange)
-                .expect("exchange must exist in exchange_emas");
+            // 构造时已为每个订阅交易所建 EMA；若收到非订阅交易所的 BBO 则记录后跳过，不 panic。
+            let Some(ema) = self.exchange_emas.get_mut(&exchange) else {
+                tracing::warn!(exchange = %exchange, symbol = %self.symbol, "收到未订阅交易所的 BBO，跳过 EMA 更新");
+                return;
+            };
             ema.bid_ema.update(bbo.bid_price);
             ema.ask_ema.update(bbo.ask_price);
         }
@@ -404,18 +407,22 @@ impl FundingArbStrategy {
         }
 
         // 计算两边交易所的账户杠杆率
-        // account_info 原子包含 equity + notional，上面已通过 equity 检查确认数据已到达
-        let short_notional = state_manager
-            .account_info(signal.short_exchange)
-            .expect("account_info must exist when equity exists")
-            .notional;
-        let short_leverage = short_notional / short_equity;
-
-        let long_notional = state_manager
-            .account_info(signal.long_exchange)
-            .expect("account_info must exist when equity exists")
-            .notional;
-        let long_leverage = long_notional / long_equity;
+        // account_info 原子包含 equity + notional，上面已通过 equity 检查确认数据已到达。
+        // 若此处仍缺失（不应发生），保守处理：本轮不下单，记录后返回，不 panic。
+        let (Some(short_ai), Some(long_ai)) = (
+            state_manager.account_info(signal.short_exchange),
+            state_manager.account_info(signal.long_exchange),
+        ) else {
+            tracing::warn!(
+                symbol = %self.symbol,
+                "account_info 缺失（equity 已到但 notional 未到），本轮不下单"
+            );
+            signal.long_size = 0.0;
+            signal.short_size = 0.0;
+            return;
+        };
+        let short_leverage = short_ai.notional / short_equity;
+        let long_leverage = long_ai.notional / long_equity;
 
         // 获取当前 symbol 在各交易所的仓位
         let short_pos = state.position_size(signal.short_exchange);

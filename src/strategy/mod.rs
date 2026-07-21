@@ -1,6 +1,8 @@
 mod funding_arb;
+mod gamma_scalp;
 
 pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
+pub use gamma_scalp::GammaScalpStrategy;
 
 use crate::domain::{Exchange, Order, OrderId, Symbol};
 use crate::exchange::SubscriptionKind;

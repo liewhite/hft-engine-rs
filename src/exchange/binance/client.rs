@@ -2,7 +2,7 @@
 
 use super::symbol::{from_binance, to_binance};
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
+    Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, RejectReason, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
@@ -377,7 +377,7 @@ impl BinanceClient {
     }
 
     /// 查询账户信息 (净值 + 总持仓名义价值)
-    async fn get_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+    async fn get_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
@@ -419,24 +419,23 @@ impl BinanceClient {
 
         let account: AccountResponse = resp.json().await.map_err(Self::map_reqwest_error)?;
 
-        let equity: f64 = account
-            .total_margin_balance
-            .parse()
-            .expect("Failed to parse Binance totalMarginBalance");
+        let equity: f64 = account.total_margin_balance.parse().map_err(|_| {
+            ExchangeError::ParseError(format!(
+                "Binance parse totalMarginBalance: {}",
+                account.total_margin_balance
+            ))
+        })?;
 
         // 汇总所有持仓的 notional (取绝对值)
-        let notional: f64 = account
-            .positions
-            .iter()
-            .map(|p| {
-                p.notional
-                    .parse::<f64>()
-                    .expect("Failed to parse Binance position notional")
-                    .abs()
-            })
-            .sum();
+        let mut notional: f64 = 0.0;
+        for p in &account.positions {
+            let value: f64 = p.notional.parse().map_err(|_| {
+                ExchangeError::ParseError(format!("Binance parse notional: {}", p.notional))
+            })?;
+            notional += value.abs();
+        }
 
-        Ok(crate::exchange::AccountInfo { equity, notional })
+        Ok(crate::domain::AccountInfo { equity, notional })
     }
 }
 
@@ -517,9 +516,12 @@ impl ExchangeClient for BinanceClient {
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(self
-                .parse_error(&text)
-                .unwrap_or(ExchangeError::OrderRejected(Exchange::Binance, text)));
+            return Err(self.parse_error(&text).unwrap_or_else(|| {
+                ExchangeError::OrderRejected(
+                    Exchange::Binance,
+                    crate::domain::RejectReason::classify(&text),
+                )
+            }));
         }
 
         let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
@@ -558,7 +560,7 @@ impl ExchangeClient for BinanceClient {
         Ok(())
     }
 
-    async fn fetch_account_info(&self) -> Result<crate::exchange::AccountInfo, ExchangeError> {
+    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         self.get_account_info().await
     }
 
@@ -572,6 +574,8 @@ fn map_binance_error(code: i32, msg: &str) -> ExchangeError {
     match code {
         -1003 => ExchangeError::RateLimited(Exchange::Binance, Duration::from_secs(60)),
         -2010 | -2019 => ExchangeError::InsufficientBalance(Exchange::Binance, 0.0, 0.0),
+        // -2022: "ReduceOnly Order is rejected" —— reduce-only 单因仓位已平被拒
+        -2022 => ExchangeError::OrderRejected(Exchange::Binance, RejectReason::ReduceOnlyClosed),
         -4028 => ExchangeError::ApiError(
             Exchange::Binance,
             code,

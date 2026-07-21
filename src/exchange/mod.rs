@@ -7,8 +7,7 @@ pub mod utils;
 pub mod ws_loop;
 
 pub use client::{
-    AccountInfo, ExchangeActorOps, ExchangeClient, Subscribe, SubscribeBatch, SubscriptionKind,
-    Unsubscribe,
+    ExchangeActorOps, ExchangeClient, Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe,
 };
 
 // 为各交易所 Actor 实现 ExchangeActorOps

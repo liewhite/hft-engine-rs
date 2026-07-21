@@ -486,7 +486,7 @@ impl Actor for ManagerActor {
             None
         };
 
-        // Phase 2: 并发等四家完成；任一失败 → panic（启动期 panic 干净退出）
+        // Phase 2: 并发等四家完成；任一失败 → 向上传播 ExchangeError（启动期受控退出）
         let b_wait = async {
             match &binance_ref_opt {
                 Some(r) => r.wait_for_startup_result().await,
@@ -512,10 +512,11 @@ impl Actor for ManagerActor {
             }
         };
         let (b, o, h, i) = tokio::join!(b_wait, o_wait, h_wait, i_wait);
-        b.expect("BinanceActor failed to start");
-        o.expect("OkxActor failed to start");
-        h.expect("HyperliquidActor failed to start");
-        i.expect("IbkrActor failed to start");
+        // 任一交易所启动失败 → 向上传播（受控退出，不重试/不重连）
+        b.map_err(|e| ExchangeError::Other(format!("BinanceActor failed to start: {e}")))?;
+        o.map_err(|e| ExchangeError::Other(format!("OkxActor failed to start: {e}")))?;
+        h.map_err(|e| ExchangeError::Other(format!("HyperliquidActor failed to start: {e}")))?;
+        i.map_err(|e| ExchangeError::Other(format!("IbkrActor failed to start: {e}")))?;
 
         let mut exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>> = HashMap::new();
         if let Some(r) = binance_ref_opt {
