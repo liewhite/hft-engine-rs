@@ -362,7 +362,9 @@ impl SymbolState {
             ExchangeEventData::Greeks(_)
             | ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
-            | ExchangeEventData::ExchangeStatus { .. } => {
+            | ExchangeEventData::ExchangeStatus { .. }
+            | ExchangeEventData::BorrowFee(_)
+            | ExchangeEventData::ExchangeRate(_) => {
                 // 全局事件应在 StateManager 层提前拦截、不会进入 SymbolState::apply。
                 // 若到达说明路由逻辑有 bug，记录后忽略（不 panic）。
                 tracing::error!(

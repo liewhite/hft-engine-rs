@@ -96,11 +96,17 @@ impl IncomeProcessorActor {
                     }
                 }
             }
-            // 账户级别数据、ExchangeStatus 和 Clock：广播
+            // 券源读数带 symbol，按 (exchange, symbol) 路由到关注该腿的策略
+            ExchangeEventData::BorrowFee(bf) => EventRouting::BySymbol {
+                exchange: bf.exchange,
+                symbol: bf.symbol.clone(),
+            },
+            // 账户级别数据、汇率、ExchangeStatus 和 Clock：广播
             ExchangeEventData::Balance(_)
             | ExchangeEventData::Greeks(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. }
+            | ExchangeEventData::ExchangeRate(_)
             | ExchangeEventData::Clock => EventRouting::Broadcast,
         }
     }

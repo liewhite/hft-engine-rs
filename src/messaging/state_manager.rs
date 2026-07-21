@@ -184,6 +184,9 @@ impl StateManager {
             ExchangeEventData::ExchangeStatus { exchange, status } => {
                 self.market_statuses.insert(*exchange, *status);
             }
+            // 全局事件: 券源/汇率读数——策略经 on_borrow_fee/on_exchange_rate 自持，
+            // StateManager 不缓存 (最小改动)；显式空处理，避免落入 symbol 路由分支。
+            ExchangeEventData::BorrowFee(_) | ExchangeEventData::ExchangeRate(_) => {}
             // 全局事件: Clock (检查订单超时)
             ExchangeEventData::Clock => {
                 let now = event.local_ts;

@@ -10,7 +10,7 @@ pub use live::{
     AddStrategy, AddStrategies, ClockActor, ClockActorArgs,
     CryptoStatusActor, CryptoStatusActorArgs,
     ExecutorActor, ExecutorArgs,
-    GetAllSymbolMetas, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
+    GetAllSymbolMetas, GetIbkrClient, PublishIncome, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
     OutcomePubSub, OutcomeProcessorActor, RegisterExecutor, OutcomeProcessorArgs, Stop,
     SubscribeIncome, SubscribeOutcome,
 };

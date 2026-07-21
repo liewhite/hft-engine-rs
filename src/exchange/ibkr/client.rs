@@ -562,6 +562,58 @@ impl IbkrClient {
         Ok((bid + ask) / 2.0)
     }
 
+    /// 通用 snapshot：按 conid + 字段 tag 拉 `/iserver/marketdata/snapshot`，返回首个对象的原始 JSON。
+    ///
+    /// 字段 tag 与 conid 全由调用方给出（本方法不内置任何业务字段语义），故可用于借券费/
+    /// 可借量/外汇等任意字段——调用方自行解析。首次请求可能触发订阅、数据未就绪，故重试。
+    /// 这是 IbkrClient 上的**具体方法**，不进 ExchangeClient trait。
+    pub async fn fetch_snapshot_raw(
+        &self,
+        conid: i64,
+        fields: &[&str],
+    ) -> Result<serde_json::Value, ExchangeError> {
+        let url = format!(
+            "{}iserver/marketdata/snapshot?conids={}&fields={}",
+            self.auth.base_url(),
+            conid,
+            fields.join(",")
+        );
+
+        for attempt in 0..3u8 {
+            let resp = self
+                .authed_request("GET", &url)?
+                .send()
+                .await
+                .map_err(Self::map_reqwest_error)?;
+            let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+            let first = body
+                .as_array()
+                .and_then(|arr| arr.first())
+                .cloned();
+
+            if let Some(obj) = first {
+                // 至少有一个请求字段已就绪才算拿到（否则可能是订阅预热的空壳）
+                let ready = fields.iter().any(|f| obj.get(*f).is_some());
+                if ready {
+                    return Ok(obj);
+                }
+            }
+            tracing::debug!(attempt, conid, "IBKR snapshot 字段未就绪，重试");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+
+        Err(ExchangeError::ConnectionFailed(
+            Exchange::IBKR,
+            format!("3 次尝试后仍无法获取 conid={} 的 snapshot 字段 {:?}", conid, fields),
+        ))
+    }
+
+    /// 按 symbol 解析 conid（用于调用方拿配置里的 symbol 对应 conid；forex 等不在表内的直接用 conid）
+    pub fn conid_of(&self, symbol: &str) -> Option<i64> {
+        self.conids.get(symbol).copied()
+    }
+
     /// 处理下单响应，包括 reply 确认循环 (最多 5 轮)
     async fn handle_order_response(
         &self,

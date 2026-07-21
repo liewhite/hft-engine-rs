@@ -1,4 +1,4 @@
-use crate::domain::{Balance, Candle, Exchange, Fill, FundingFee, FundingRate, Greeks, IndexPrice, MarkPrice, MarketStatus, MarketTrade, OrderUpdate, Position, Symbol, Timestamp, BBO};
+use crate::domain::{Balance, BorrowFee, Candle, Exchange, ExchangeRate, Fill, FundingFee, FundingRate, Greeks, IndexPrice, MarkPrice, MarketStatus, MarketTrade, OrderUpdate, Position, Symbol, Timestamp, BBO};
 
 /// 统一的交易所事件
 ///
@@ -51,6 +51,10 @@ pub enum ExchangeEventData {
     Candle(Candle),
     /// 历史K线批量数据（订阅时一次性推送）
     HistoryCandles(Vec<Candle>),
+    /// 融券券源读数 (借券费 + 可借量)；由外部数据源经注入入口推入，喂 Strategy::on_borrow_fee
+    BorrowFee(BorrowFee),
+    /// 汇率读数 (货币对)；由外部数据源经注入入口推入，喂 Strategy::on_exchange_rate
+    ExchangeRate(ExchangeRate),
     /// 时钟事件 (用于超时检测等定时任务)
     Clock,
 }
@@ -68,12 +72,14 @@ impl IncomeEvent {
             ExchangeEventData::OrderUpdate(update) => Some(&update.symbol),
             ExchangeEventData::Fill(fill) => Some(&fill.symbol),
             ExchangeEventData::FundingFee(fee) => Some(&fee.symbol),
+            ExchangeEventData::BorrowFee(bf) => Some(&bf.symbol),
             ExchangeEventData::Candle(candle) => Some(&candle.symbol),
             ExchangeEventData::HistoryCandles(candles) => candles.first().map(|c| &c.symbol),
             ExchangeEventData::Balance(_)
             | ExchangeEventData::Greeks(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. }
+            | ExchangeEventData::ExchangeRate(_)
             | ExchangeEventData::Clock => None,
         }
     }
@@ -94,6 +100,8 @@ impl IncomeEvent {
             ExchangeEventData::Balance(bal) => Some(bal.exchange),
             ExchangeEventData::FundingFee(fee) => Some(fee.exchange),
             ExchangeEventData::Greeks(g) => Some(g.exchange),
+            ExchangeEventData::BorrowFee(bf) => Some(bf.exchange),
+            ExchangeEventData::ExchangeRate(er) => Some(er.exchange),
             ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
             ExchangeEventData::ExchangeStatus { exchange, .. } => Some(*exchange),
             ExchangeEventData::Clock => None,

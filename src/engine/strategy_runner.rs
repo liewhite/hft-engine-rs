@@ -104,8 +104,18 @@ impl StrategyRunner {
     /// 更新状态并运行策略，返回**已转换为交易所格式**的信号 (下单已分配 id、登记 pending、取整)。
     pub fn on_event(&mut self, event: &IncomeEvent) -> Vec<OutcomeEvent> {
         self.state.apply(event);
-        self.strategy
-            .on_event(event, &self.state)
+        // 按事件类型分发：券源/汇率走各自的 typed 方法，其余走 on_event。
+        // (最小改动：仅这两类拆出，其余保持 enum-match 风格的 on_event。)
+        let raw = match &event.data {
+            crate::messaging::ExchangeEventData::BorrowFee(bf) => {
+                self.strategy.on_borrow_fee(bf, &self.state)
+            }
+            crate::messaging::ExchangeEventData::ExchangeRate(er) => {
+                self.strategy.on_exchange_rate(er, &self.state)
+            }
+            _ => self.strategy.on_event(event, &self.state),
+        };
+        raw
             .into_iter()
             .map(|signal| match signal {
                 OutcomeEvent::PlaceOrders { orders, comment } => {
