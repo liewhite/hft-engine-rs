@@ -68,29 +68,8 @@ pub async fn resolve_conids(
             Some(arr) => arr,
             None => continue,
         };
-
-        for entry in entries {
-            let contracts = match entry.get("contracts").and_then(|c| c.as_array()) {
-                Some(arr) => arr,
-                None => continue,
-            };
-
-            // 过滤 isUS=true 的合约，取第一个
-            for contract in contracts {
-                let is_us = contract.get("isUS").and_then(|v| v.as_bool()).unwrap_or(false);
-                if !is_us {
-                    continue;
-                }
-                if let Some(conid) = contract.get("conid").and_then(|v| v.as_i64()) {
-                    result.insert(symbol.clone(), conid);
-                    break;
-                }
-            }
-
-            // 找到就停止遍历 entries
-            if result.contains_key(symbol) {
-                break;
-            }
+        if let Some(conid) = select_conid(entries) {
+            result.insert(symbol.clone(), conid);
         }
     }
 
@@ -107,4 +86,68 @@ pub async fn resolve_conids(
     }
 
     Ok(result)
+}
+
+/// 从一个 symbol 的 entries（`{"contracts":[{"conid":..,"isUS":..}]}` 列表）里挑 conid。
+///
+/// 优先取 `isUS=true` 的合约（美股/ADR，如 SKHY）；若该 symbol 名下没有任何美股合约
+/// （如韩股 000660 只在 KRX 上市、`isUS=false`），回退到第一个带 conid 的合约——否则非美
+/// 标的永远解析不到 conid，引擎也就订阅不到它的行情。纯函数，便于单测。
+fn select_conid(entries: &[serde_json::Value]) -> Option<i64> {
+    let mut fallback: Option<i64> = None;
+    for entry in entries {
+        let contracts = match entry.get("contracts").and_then(|c| c.as_array()) {
+            Some(arr) => arr,
+            None => continue,
+        };
+        for contract in contracts {
+            let conid = match contract.get("conid").and_then(|v| v.as_i64()) {
+                Some(c) => c,
+                None => continue,
+            };
+            let is_us = contract.get("isUS").and_then(|v| v.as_bool()).unwrap_or(false);
+            if is_us {
+                return Some(conid);
+            }
+            fallback.get_or_insert(conid);
+        }
+    }
+    fallback
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_conid;
+    use serde_json::json;
+
+    #[test]
+    fn prefers_us_contract() {
+        // SKHY：只有一个 US ADR 合约
+        let entries = json!([{"contracts": [{"conid": 899700992, "isUS": true, "exchange": "NASDAQ"}]}]);
+        assert_eq!(select_conid(entries.as_array().unwrap()), Some(899700992));
+    }
+
+    #[test]
+    fn falls_back_to_non_us_when_no_us() {
+        // 000660：只有 KRX 合约，isUS=false —— 旧逻辑会漏掉，新逻辑回退取到
+        let entries = json!([{"contracts": [{"conid": 17382246, "isUS": false, "exchange": "KRX"}]}]);
+        assert_eq!(select_conid(entries.as_array().unwrap()), Some(17382246));
+    }
+
+    #[test]
+    fn us_wins_over_non_us_when_both_present() {
+        // 同一 symbol 兼有非美与美股合约：仍优先美股，与回退顺序无关
+        let entries = json!([{"contracts": [
+            {"conid": 111, "isUS": false, "exchange": "LSE"},
+            {"conid": 222, "isUS": true, "exchange": "NYSE"}
+        ]}]);
+        assert_eq!(select_conid(entries.as_array().unwrap()), Some(222));
+    }
+
+    #[test]
+    fn none_when_no_contract_has_conid() {
+        let entries = json!([{"contracts": [{"isUS": true}]}]);
+        assert_eq!(select_conid(entries.as_array().unwrap()), None);
+        assert_eq!(select_conid(&[]), None);
+    }
 }
