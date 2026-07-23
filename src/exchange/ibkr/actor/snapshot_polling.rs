@@ -88,7 +88,11 @@ impl IbkrSnapshotPollingActor {
                 let shortable = parse_field(&obj, &self.cfg.shortable_field);
                 let fee_raw = parse_field(&obj, &self.cfg.fee_field);
                 match (shortable, fee_raw) {
-                    (Some(sh), Some(fe)) => {
+                    // 有效性校验：借券费/可借量须有限非负。可解析但无效(NaN/负)**不算成功**——
+                    // 否则 poller 自认健康永不 kill，而下游拿到无效值只能丢弃 → 静默降级。
+                    (Some(sh), Some(fe))
+                        if sh.is_finite() && sh >= 0.0 && fe.is_finite() && fe >= 0.0 =>
+                    {
                         let ts = now_ms();
                         self.publish(ExchangeEventData::BorrowFee(BorrowFee {
                             exchange: Exchange::IBKR,
@@ -100,6 +104,11 @@ impl IbkrSnapshotPollingActor {
                         .await;
                         self.last_borrow_ok_ms = Some(ts);
                     }
+                    (Some(sh), Some(fe)) => tracing::error!(
+                        shortable = sh,
+                        fee = fe,
+                        "IBKR 券源 snapshot 值无效 (shortable/fee 应为有限非负)，不计入成功"
+                    ),
                     _ => tracing::error!(
                         obj = %obj,
                         "IBKR 券源 snapshot 字段解析失败 (shortable/fee 缺失)"
@@ -117,8 +126,9 @@ impl IbkrSnapshotPollingActor {
             .fetch_snapshot_raw(self.cfg.fx_conid, &[self.cfg.fx_field.as_str()])
             .await
         {
-            Ok(obj) => {
-                if let Some(rate) = parse_field(&obj, &self.cfg.fx_field) {
+            Ok(obj) => match parse_field(&obj, &self.cfg.fx_field) {
+                // 有效性校验：汇率须为正(与下游 er.rate>0 采纳条件一致)。可解析但无效不算成功。
+                Some(rate) if rate.is_finite() && rate > 0.0 => {
                     let ts = now_ms();
                     self.publish(ExchangeEventData::ExchangeRate(ExchangeRate {
                         exchange: Exchange::IBKR,
@@ -129,10 +139,12 @@ impl IbkrSnapshotPollingActor {
                     }))
                     .await;
                     self.last_fx_ok_ms = Some(ts);
-                } else {
-                    tracing::error!(obj = %obj, "IBKR 汇率 snapshot 字段解析失败");
                 }
-            }
+                Some(rate) => {
+                    tracing::error!(rate, "IBKR 汇率 snapshot 值无效 (应为正)，不计入成功")
+                }
+                None => tracing::error!(obj = %obj, "IBKR 汇率 snapshot 字段解析失败"),
+            },
             Err(e) => tracing::error!(error = %e, "IBKR 汇率 snapshot 拉取失败"),
         }
     }
@@ -177,6 +189,14 @@ impl Actor for IbkrSnapshotPollingActor {
         })?;
         if args.cfg.fx_conid == 0 {
             anyhow::bail!("IBKR snapshot poller: fx_conid 未配置 (=0)");
+        }
+        // 轮询间隔必须显著小于过期阈值，否则一 tick 就过期 → 必然重启循环
+        if args.cfg.poll_interval_ms >= args.cfg.max_staleness_ms {
+            anyhow::bail!(
+                "IBKR snapshot poller: poll_interval_ms ({}) 必须 < max_staleness_ms ({})",
+                args.cfg.poll_interval_ms,
+                args.cfg.max_staleness_ms
+            );
         }
 
         let interval = Duration::from_millis(args.cfg.poll_interval_ms.max(1_000));
