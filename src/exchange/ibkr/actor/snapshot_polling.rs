@@ -1,0 +1,278 @@
+//! IbkrSnapshotPollingActor - 定时轮询 IBKR 借券费/可借量 + USD.KRW 汇率
+//!
+//! 与 account_polling / status_polling 同范式：IbkrActor 的 spawn_link 子 actor，定时按
+//! config 的字段 tag/conid 拉 `/iserver/marketdata/snapshot`，组装成 `BorrowFee`/`ExchangeRate`
+//! 直接 Publish 到 income_pubsub（策略与监控经同一 income 流消费）。
+//!
+//! **没有兜底常量、绝不用假数据**：拉取/解析失败即 ERROR；借券费或汇率距上次成功更新超过
+//! `max_staleness_ms`（含启动宽限）即判定数据源失效 → `kill()` 自己 → 经 IbkrActor 的
+//! link 监管上抛 → ManagerActor `on_link_died` → 整个系统致命退出（宁可重启，绝不糊弄）。
+
+use crate::domain::{now_ms, BorrowFee, Exchange, ExchangeRate};
+use crate::engine::IncomePubSub;
+use crate::exchange::ibkr::IbkrClient;
+use crate::messaging::{ExchangeEventData, IncomeEvent};
+use kameo::actor::{ActorRef, WeakActorRef};
+use kameo::error::ActorStopReason;
+use kameo::message::{Context, Message, StreamMessage};
+use kameo::Actor;
+use kameo_actors::pubsub::Publish;
+use serde::Deserialize;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
+use tokio_stream::wrappers::IntervalStream;
+
+fn default_max_staleness_ms() -> u64 {
+    300_000
+}
+
+/// IBKR snapshot 轮询配置：借券费/可借量/汇率的**唯一来源**，无兜底常量。
+///
+/// 字段 tag / conid 是 IB 账户/合约事实，由使用方填真值。启用后若拉不到或数据过期超过
+/// `max_staleness_ms`，poller 致命退出（见模块文档）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct IbkrSnapshotConfig {
+    /// 拉券源读数的 base symbol（须在 IBKR symbols 内，用它解析 conid），如 "SKHY"
+    pub borrow_symbol: String,
+    /// snapshot 可借量字段 tag（如 "7636"）
+    pub shortable_field: String,
+    /// snapshot 借券费率字段 tag（如 "7637"，年化百分数）
+    pub fee_field: String,
+    /// 费率原值 × fee_scale = 年化小数（如 0.84 → ×0.01 = 0.0084）
+    pub fee_scale: f64,
+    /// USD.KRW 的 conid（forex，不在 symbols 表内，直接给 conid）
+    pub fx_conid: i64,
+    /// snapshot 汇率价格字段 tag（如 "31" last）
+    pub fx_field: String,
+    /// 轮询间隔 (ms)
+    pub poll_interval_ms: u64,
+    /// 数据最大过期时间 (ms)：借券费或汇率距上次成功更新超过此值即致命退出（含启动宽限）。默认 300s。
+    #[serde(default = "default_max_staleness_ms")]
+    pub max_staleness_ms: u64,
+}
+
+/// 初始化参数
+pub struct IbkrSnapshotPollingActorArgs {
+    pub client: Arc<IbkrClient>,
+    pub income_pubsub: ActorRef<IncomePubSub>,
+    pub cfg: IbkrSnapshotConfig,
+}
+
+/// IbkrSnapshotPollingActor
+pub struct IbkrSnapshotPollingActor {
+    client: Arc<IbkrClient>,
+    income_pubsub: ActorRef<IncomePubSub>,
+    cfg: IbkrSnapshotConfig,
+    /// borrow_symbol 解析到的 conid（on_start 解析，解析不到即致命）
+    borrow_conid: i64,
+    /// actor 启动时刻（用于启动宽限内的过期判定）
+    started_ms: u64,
+    /// 借券费/汇率最近一次成功更新时刻（None = 启动后尚未成功）
+    last_borrow_ok_ms: Option<u64>,
+    last_fx_ok_ms: Option<u64>,
+}
+
+impl IbkrSnapshotPollingActor {
+    /// 拉借券费 + 可借量 → BorrowFee 事件；成功则更新 last_borrow_ok_ms
+    async fn poll_borrow(&mut self) {
+        match self
+            .client
+            .fetch_snapshot_raw(
+                self.borrow_conid,
+                &[self.cfg.shortable_field.as_str(), self.cfg.fee_field.as_str()],
+            )
+            .await
+        {
+            Ok(obj) => {
+                let shortable = parse_field(&obj, &self.cfg.shortable_field);
+                let fee_raw = parse_field(&obj, &self.cfg.fee_field);
+                match (shortable, fee_raw) {
+                    (Some(sh), Some(fe)) => {
+                        let ts = now_ms();
+                        self.publish(ExchangeEventData::BorrowFee(BorrowFee {
+                            exchange: Exchange::IBKR,
+                            symbol: self.cfg.borrow_symbol.clone(),
+                            fee_annual: fe * self.cfg.fee_scale,
+                            shortable_shares: sh,
+                            timestamp: ts,
+                        }))
+                        .await;
+                        self.last_borrow_ok_ms = Some(ts);
+                    }
+                    _ => tracing::error!(
+                        obj = %obj,
+                        "IBKR 券源 snapshot 字段解析失败 (shortable/fee 缺失)"
+                    ),
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "IBKR 券源 snapshot 拉取失败"),
+        }
+    }
+
+    /// 拉 USD.KRW → ExchangeRate 事件；成功则更新 last_fx_ok_ms
+    async fn poll_fx(&mut self) {
+        match self
+            .client
+            .fetch_snapshot_raw(self.cfg.fx_conid, &[self.cfg.fx_field.as_str()])
+            .await
+        {
+            Ok(obj) => {
+                if let Some(rate) = parse_field(&obj, &self.cfg.fx_field) {
+                    let ts = now_ms();
+                    self.publish(ExchangeEventData::ExchangeRate(ExchangeRate {
+                        exchange: Exchange::IBKR,
+                        base: "USD".to_string(),
+                        quote: "KRW".to_string(),
+                        rate,
+                        timestamp: ts,
+                    }))
+                    .await;
+                    self.last_fx_ok_ms = Some(ts);
+                } else {
+                    tracing::error!(obj = %obj, "IBKR 汇率 snapshot 字段解析失败");
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "IBKR 汇率 snapshot 拉取失败"),
+        }
+    }
+
+    async fn publish(&self, data: ExchangeEventData) {
+        let ts = now_ms();
+        if let Err(e) = self
+            .income_pubsub
+            .tell(Publish(IncomeEvent {
+                exchange_ts: ts,
+                local_ts: ts,
+                data,
+            }))
+            .send()
+            .await
+        {
+            tracing::error!(error = %e, "Failed to publish IBKR snapshot event to IncomePubSub");
+        }
+    }
+
+    /// 过期判定：借券费或汇率距上次成功更新（未成功过则从启动时刻算）超过 max_staleness_ms
+    /// 即返回 true（数据源失效）。
+    fn is_stale(&self, now: u64) -> bool {
+        let borrow_ref = self.last_borrow_ok_ms.unwrap_or(self.started_ms);
+        let fx_ref = self.last_fx_ok_ms.unwrap_or(self.started_ms);
+        now.saturating_sub(borrow_ref) > self.cfg.max_staleness_ms
+            || now.saturating_sub(fx_ref) > self.cfg.max_staleness_ms
+    }
+}
+
+impl Actor for IbkrSnapshotPollingActor {
+    type Args = IbkrSnapshotPollingActorArgs;
+    type Error = anyhow::Error;
+
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        // 配置即时校验：解析不到 borrow conid、或 fx_conid 未配置 → 致命（不静默降级）
+        let borrow_conid = args.client.conid_of(&args.cfg.borrow_symbol).ok_or_else(|| {
+            anyhow::anyhow!(
+                "IBKR snapshot poller: borrow_symbol '{}' 无法解析到 conid",
+                args.cfg.borrow_symbol
+            )
+        })?;
+        if args.cfg.fx_conid == 0 {
+            anyhow::bail!("IBKR snapshot poller: fx_conid 未配置 (=0)");
+        }
+
+        let interval = Duration::from_millis(args.cfg.poll_interval_ms.max(1_000));
+        actor_ref.attach_stream(IntervalStream::new(tokio::time::interval(interval)), (), ());
+
+        tracing::info!(
+            exchange = "IBKR",
+            borrow_symbol = %args.cfg.borrow_symbol,
+            borrow_conid,
+            fx_conid = args.cfg.fx_conid,
+            interval_ms = interval.as_millis() as u64,
+            max_staleness_ms = args.cfg.max_staleness_ms,
+            "IbkrSnapshotPollingActor started"
+        );
+
+        Ok(Self {
+            client: args.client,
+            income_pubsub: args.income_pubsub,
+            cfg: args.cfg,
+            borrow_conid,
+            started_ms: now_ms(),
+            last_borrow_ok_ms: None,
+            last_fx_ok_ms: None,
+        })
+    }
+
+    async fn on_stop(
+        &mut self,
+        _actor_ref: WeakActorRef<Self>,
+        reason: ActorStopReason,
+    ) -> Result<(), Self::Error> {
+        tracing::info!(reason = ?reason, "IbkrSnapshotPollingActor stopped");
+        Ok(())
+    }
+}
+
+impl Message<StreamMessage<Instant, (), ()>> for IbkrSnapshotPollingActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: StreamMessage<Instant, (), ()>,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        match msg {
+            StreamMessage::Next(_) => {
+                self.poll_borrow().await;
+                self.poll_fx().await;
+                // 过期即致命：kill 自己 → IbkrActor.on_link_died → ManagerActor 整机退出
+                let now = now_ms();
+                if self.is_stale(now) {
+                    tracing::error!(
+                        max_staleness_ms = self.cfg.max_staleness_ms,
+                        last_borrow_ok_ms = ?self.last_borrow_ok_ms,
+                        last_fx_ok_ms = ?self.last_fx_ok_ms,
+                        "IBKR 借券费/汇率数据源失效 (超过 max_staleness)，poller 致命退出"
+                    );
+                    ctx.actor_ref().kill();
+                }
+            }
+            StreamMessage::Started(_) => {}
+            StreamMessage::Finished(_) => {
+                tracing::error!("IBKR snapshot polling stream 意外结束，poller 致命退出");
+                ctx.actor_ref().kill();
+            }
+        }
+    }
+}
+
+/// 解析 snapshot 字段为 f64：支持数字或字符串 (剥离 %、逗号等非数字字符)
+fn parse_field(obj: &serde_json::Value, field: &str) -> Option<f64> {
+    let v = obj.get(field)?;
+    if let Some(f) = v.as_f64() {
+        return Some(f);
+    }
+    if let Some(s) = v.as_str() {
+        let cleaned: String = s
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+            .collect();
+        return cleaned.parse().ok();
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_field_number_and_string() {
+        let obj = json!({"7636": 5000000.0, "7637": "0.84%", "31": "1,479.6"});
+        assert_eq!(parse_field(&obj, "7636"), Some(5_000_000.0));
+        assert!((parse_field(&obj, "7637").unwrap() - 0.84).abs() < 1e-9);
+        assert!((parse_field(&obj, "31").unwrap() - 1479.6).abs() < 1e-9);
+        assert_eq!(parse_field(&obj, "999"), None);
+    }
+}

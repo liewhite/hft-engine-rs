@@ -5,7 +5,7 @@ mod gateway;
 pub mod oauth;
 mod symbol;
 
-pub use actor::{IbkrActor, IbkrActorArgs};
+pub use actor::{IbkrActor, IbkrActorArgs, IbkrSnapshotConfig};
 pub use auth::IbkrAuth;
 pub use client::IbkrClient;
 

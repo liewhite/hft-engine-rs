@@ -19,7 +19,7 @@ use crate::exchange::binance::{
 use crate::exchange::hyperliquid::{
     HyperliquidActor, HyperliquidActorArgs, HyperliquidClient, HyperliquidCredentials,
 };
-use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials};
+use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
 use crate::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::strategy::Strategy;
@@ -44,6 +44,9 @@ pub struct ManagerActorArgs {
     pub hyperliquid_credentials: Option<HyperliquidCredentials>,
     /// IBKR 凭证（可选）
     pub ibkr_credentials: Option<IbkrCredentials>,
+    /// IBKR 借券费/汇率 snapshot 轮询配置（可选）：Some 时 IbkrActor 会 spawn_link 一个
+    /// 轮询子 actor，定时发 BorrowFee/ExchangeRate；数据源失效即致命退出（无兜底常量）。
+    pub ibkr_snapshot: Option<IbkrSnapshotConfig>,
 }
 
 /// ManagerActor - 顶层管理 Actor
@@ -483,6 +486,7 @@ impl Actor for ManagerActor {
                         income_pubsub: income_pubsub.clone(),
                         conids: ibkr_conids,
                         client: ibkr_client,
+                        snapshot: args.ibkr_snapshot,
                     },
                     mailbox::unbounded(),
                 )

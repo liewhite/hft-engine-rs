@@ -13,6 +13,9 @@
 
 use super::account_polling::{IbkrAccountPollingActor, IbkrAccountPollingActorArgs};
 use super::public_ws::{IbkrPublicWsActor, IbkrPublicWsActorArgs};
+use super::snapshot_polling::{
+    IbkrSnapshotConfig, IbkrSnapshotPollingActor, IbkrSnapshotPollingActorArgs,
+};
 use super::status_polling::{IbkrStatusPollingActor, IbkrStatusPollingActorArgs};
 use super::tickle::{IbkrTickleActor, IbkrTickleActorArgs};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
@@ -45,6 +48,9 @@ pub struct IbkrActorArgs {
     pub conids: HashMap<String, i64>,
     /// IBKR 客户端 (用于持仓轮询)
     pub client: Arc<IbkrClient>,
+    /// 借券费/汇率 snapshot 轮询配置；Some 时 spawn_link 一个 IbkrSnapshotPollingActor。
+    /// None = 不轮询（无兜底常量，上层相关读数保持缺失）。
+    pub snapshot: Option<IbkrSnapshotConfig>,
 }
 
 /// IbkrActor - 父 Actor
@@ -57,6 +63,8 @@ pub struct IbkrActor {
     _account_polling: ActorRef<IbkrAccountPollingActor>,
     /// 市场状态轮询 Actor
     _status_polling: ActorRef<IbkrStatusPollingActor>,
+    /// 借券费/汇率 snapshot 轮询 Actor（可选；配置缺省时为 None）
+    _snapshot_polling: Option<ActorRef<IbkrSnapshotPollingActor>>,
 }
 
 impl Actor for IbkrActor {
@@ -129,7 +137,7 @@ impl Actor for IbkrActor {
         let status_polling = IbkrStatusPollingActor::spawn_link_with_mailbox(
             &actor_ref,
             IbkrStatusPollingActorArgs {
-                client: args.client,
+                client: args.client.clone(),
                 income_pubsub: income_pubsub.clone(),
                 interval_ms: STATUS_POLLING_INTERVAL_MS,
             },
@@ -138,6 +146,25 @@ impl Actor for IbkrActor {
         .await;
         tracing::info!(exchange = "IBKR", "StatusPollingActor created");
 
+        // 6. 创建借券费/汇率 snapshot 轮询 Actor（可选）——与上面几个同为 spawn_link 子 actor，
+        //    受本 IbkrActor 监管；它一旦致命退出（数据源失效）会经 on_link_died 上抛、整机重启。
+        let snapshot_polling = if let Some(cfg) = args.snapshot {
+            let actor = IbkrSnapshotPollingActor::spawn_link_with_mailbox(
+                &actor_ref,
+                IbkrSnapshotPollingActorArgs {
+                    client: args.client,
+                    income_pubsub: income_pubsub.clone(),
+                    cfg,
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+            tracing::info!(exchange = "IBKR", "SnapshotPollingActor created");
+            Some(actor)
+        } else {
+            None
+        };
+
         tracing::info!(exchange = "IBKR", "IbkrActor started");
 
         Ok(Self {
@@ -145,6 +172,7 @@ impl Actor for IbkrActor {
             _tickle: tickle,
             _account_polling: account_polling,
             _status_polling: status_polling,
+            _snapshot_polling: snapshot_polling,
         })
     }
 

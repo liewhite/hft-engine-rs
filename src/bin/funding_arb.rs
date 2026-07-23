@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
             okx_credentials: Some(config.exchanges.okx.clone()),
             hyperliquid_credentials: Some(config.exchanges.hyperliquid.clone()),
             ibkr_credentials: config.exchanges.ibkr.clone(),
+            ibkr_snapshot: None,
         },
         mailbox::unbounded(),
     );
