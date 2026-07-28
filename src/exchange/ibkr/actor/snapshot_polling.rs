@@ -1,8 +1,9 @@
-//! IbkrSnapshotPollingActor - 定时轮询 IBKR 借券费/可借量 + USD.KRW 汇率
+//! IbkrSnapshotPollingActor - 定时轮询 IBKR 借券费/可借量 + 现汇汇率
 //!
-//! 与 account_polling / status_polling 同范式：IbkrActor 的 spawn_link 子 actor，定时按
-//! config 的字段 tag/conid 拉 `/iserver/marketdata/snapshot`，组装成 `BorrowFee`/`ExchangeRate`
-//! 直接 Publish 到 income_pubsub（策略与监控经同一 income 流消费）。
+//! 与 account_polling / status_polling 同范式：IbkrActor 的 spawn_link 子 actor，定时拉取——
+//! 借券费/可借量走 `/iserver/marketdata/snapshot`（按 config 字段 tag + borrow_symbol conid），
+//! 汇率走专用端点 `/iserver/exchangerate`（按 config 的 source/target 货币）——组装成
+//! `BorrowFee`/`ExchangeRate` 直接 Publish 到 income_pubsub（策略与监控经同一 income 流消费）。
 //!
 //! **没有兜底常量、绝不用假数据**：拉取/解析失败即 ERROR；借券费或汇率距上次成功更新超过
 //! `max_staleness_ms`（含启动宽限）即判定数据源失效 → `kill()` 自己 → 经 IbkrActor 的
@@ -41,10 +42,10 @@ pub struct IbkrSnapshotConfig {
     pub fee_field: String,
     /// 费率原值 × fee_scale = 年化小数（如 0.84 → ×0.01 = 0.0084）
     pub fee_scale: f64,
-    /// USD.KRW 的 conid（forex，不在 symbols 表内，直接给 conid）
-    pub fx_conid: i64,
-    /// snapshot 汇率价格字段 tag（如 "31" last）
-    pub fx_field: String,
+    /// 汇率目标货币（`/iserver/exchangerate` 的 target，即计价货币，如 "KRW"）
+    pub fx_target: String,
+    /// 汇率源货币（`/iserver/exchangerate` 的 source，即基准货币，如 "USD"）
+    pub fx_source: String,
     /// 轮询间隔 (ms)
     pub poll_interval_ms: u64,
     /// 数据最大过期时间 (ms)：借券费或汇率距上次成功更新超过此值即致命退出（含启动宽限）。默认 300s。
@@ -119,33 +120,31 @@ impl IbkrSnapshotPollingActor {
         }
     }
 
-    /// 拉 USD.KRW → ExchangeRate 事件；成功则更新 last_fx_ok_ms
+    /// 直读现汇参考汇率 (source→target) → ExchangeRate 事件；成功则更新 last_fx_ok_ms。
+    ///
+    /// 用专用汇率端点而非 snapshot last：受限货币休市/冻结时 last 为空、bid/ask 不返回，
+    /// 只有 `/iserver/exchangerate` 盘外仍给参考汇率——否则 7×24 常驻每逢休市即被 is_stale 误杀。
     async fn poll_fx(&mut self) {
         match self
             .client
-            .fetch_snapshot_raw(self.cfg.fx_conid, &[self.cfg.fx_field.as_str()])
+            .fetch_exchange_rate(&self.cfg.fx_target, &self.cfg.fx_source)
             .await
         {
-            Ok(obj) => match parse_field(&obj, &self.cfg.fx_field) {
-                // 有效性校验：汇率须为正(与下游 er.rate>0 采纳条件一致)。可解析但无效不算成功。
-                Some(rate) if rate.is_finite() && rate > 0.0 => {
-                    let ts = now_ms();
-                    self.publish(ExchangeEventData::ExchangeRate(ExchangeRate {
-                        exchange: Exchange::IBKR,
-                        base: "USD".to_string(),
-                        quote: "KRW".to_string(),
-                        rate,
-                        timestamp: ts,
-                    }))
-                    .await;
-                    self.last_fx_ok_ms = Some(ts);
-                }
-                Some(rate) => {
-                    tracing::error!(rate, "IBKR 汇率 snapshot 值无效 (应为正)，不计入成功")
-                }
-                None => tracing::error!(obj = %obj, "IBKR 汇率 snapshot 字段解析失败"),
-            },
-            Err(e) => tracing::error!(error = %e, "IBKR 汇率 snapshot 拉取失败"),
+            // 有效性校验：汇率须为正(与下游 er.rate>0 采纳条件一致)。拿到但无效不算成功。
+            Ok(rate) if rate.is_finite() && rate > 0.0 => {
+                let ts = now_ms();
+                self.publish(ExchangeEventData::ExchangeRate(ExchangeRate {
+                    exchange: Exchange::IBKR,
+                    base: self.cfg.fx_source.clone(),
+                    quote: self.cfg.fx_target.clone(),
+                    rate,
+                    timestamp: ts,
+                }))
+                .await;
+                self.last_fx_ok_ms = Some(ts);
+            }
+            Ok(rate) => tracing::error!(rate, "IBKR 汇率值无效 (应为正)，不计入成功"),
+            Err(e) => tracing::error!(error = %e, "IBKR 汇率拉取失败"),
         }
     }
 
@@ -180,15 +179,15 @@ impl Actor for IbkrSnapshotPollingActor {
     type Error = anyhow::Error;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 配置即时校验：解析不到 borrow conid、或 fx_conid 未配置 → 致命（不静默降级）
+        // 配置即时校验：解析不到 borrow conid、或 fx_target/fx_source 未配置 → 致命（不静默降级）
         let borrow_conid = args.client.conid_of(&args.cfg.borrow_symbol).ok_or_else(|| {
             anyhow::anyhow!(
                 "IBKR snapshot poller: borrow_symbol '{}' 无法解析到 conid",
                 args.cfg.borrow_symbol
             )
         })?;
-        if args.cfg.fx_conid == 0 {
-            anyhow::bail!("IBKR snapshot poller: fx_conid 未配置 (=0)");
+        if args.cfg.fx_target.trim().is_empty() || args.cfg.fx_source.trim().is_empty() {
+            anyhow::bail!("IBKR snapshot poller: fx_target/fx_source 未配置 (不能为空)");
         }
         // 轮询间隔必须显著小于过期阈值，否则一 tick 就过期 → 必然重启循环
         if args.cfg.poll_interval_ms >= args.cfg.max_staleness_ms {
@@ -206,7 +205,8 @@ impl Actor for IbkrSnapshotPollingActor {
             exchange = "IBKR",
             borrow_symbol = %args.cfg.borrow_symbol,
             borrow_conid,
-            fx_conid = args.cfg.fx_conid,
+            fx_source = %args.cfg.fx_source,
+            fx_target = %args.cfg.fx_target,
             interval_ms = interval.as_millis() as u64,
             max_staleness_ms = args.cfg.max_staleness_ms,
             "IbkrSnapshotPollingActor started"

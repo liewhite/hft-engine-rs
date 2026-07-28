@@ -609,6 +609,45 @@ impl IbkrClient {
         ))
     }
 
+    /// 直读现汇参考汇率：GET `/iserver/exchangerate?target={target}&source={source}`，返回 `rate`。
+    ///
+    /// 与 snapshot 的 last(31) 不同，这是**专用汇率端点**：不依赖成交价，盘外/冻结态亦返回参考
+    /// 汇率——受限货币（如 KRW）休市时 last 为空、bid/ask 根本不返回，只有此端点可靠。
+    /// `rate` 语义为「1 单位 source = rate 单位 target」（如 source=USD,target=KRW → 1 USD = rate KRW）。
+    /// 首次请求可能未就绪，故重试。签名口径与 `fetch_snapshot_raw` 一致（query 参与 OAuth 签名）。
+    pub async fn fetch_exchange_rate(
+        &self,
+        target: &str,
+        source: &str,
+    ) -> Result<f64, ExchangeError> {
+        let url = format!(
+            "{}iserver/exchangerate?target={}&source={}",
+            self.auth.base_url(),
+            target,
+            source
+        );
+
+        for attempt in 0..3u8 {
+            let resp = self
+                .authed_request("GET", &url)?
+                .send()
+                .await
+                .map_err(Self::map_reqwest_error)?;
+            let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+            if let Some(rate) = body.get("rate").and_then(|v| v.as_f64()) {
+                return Ok(rate);
+            }
+            tracing::debug!(attempt, target, source, body = %body, "IBKR exchangerate 未就绪，重试");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+
+        Err(ExchangeError::ConnectionFailed(
+            Exchange::IBKR,
+            format!("3 次尝试后仍无法获取 {source}/{target} 汇率"),
+        ))
+    }
+
     /// 按 symbol 解析 conid（用于调用方拿配置里的 symbol 对应 conid；forex 等不在表内的直接用 conid）
     pub fn conid_of(&self, symbol: &str) -> Option<i64> {
         self.conids.get(symbol).copied()
