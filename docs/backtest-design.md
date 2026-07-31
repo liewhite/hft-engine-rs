@@ -956,7 +956,7 @@ let result = BacktestManager::new(BacktestConfig {
     DataType::FundingRate,
     "data/binance_btc_funding.csv",
 )))
-.add_strategy(Box::new(FundingArbStrategy::new(strategy_config)))
+.add_strategy(Box::new(SpreadArbStrategy::new(strategy_config)))
 .run()?;
 
 // 输出结果

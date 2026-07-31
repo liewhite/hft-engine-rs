@@ -40,6 +40,18 @@ impl StateManager {
         }
     }
 
+    /// 追加注册需要跟踪的 symbol（已存在的保持原状态不动）
+    ///
+    /// 用于"symbol 集合在构造之后才确定"的消费者（如指标 actor：它订阅全量事件流，
+    /// 但要跟踪哪些 symbol 由上层策略集合决定）。
+    pub fn register_symbols(&mut self, symbols: &[Symbol]) {
+        for symbol in symbols {
+            self.states
+                .entry(symbol.clone())
+                .or_insert_with(|| SymbolState::new(symbol.clone()));
+        }
+    }
+
     // ==================== 下单接口 ====================
 
     /// 添加 pending order (由 StrategyRunner 调用，client_order_id 已生成)
@@ -65,6 +77,16 @@ impl StateManager {
     /// 获取指定 symbol 的状态
     pub fn symbol_state(&self, symbol: &Symbol) -> Option<&SymbolState> {
         self.states.get(symbol)
+    }
+
+    /// 遍历所有已注册 symbol 的状态（供观测层汇总）
+    pub fn symbol_states(&self) -> impl Iterator<Item = (&Symbol, &SymbolState)> {
+        self.states.iter()
+    }
+
+    /// 遍历所有已收到账户信息的交易所（供观测层汇总）
+    pub fn account_infos(&self) -> impl Iterator<Item = (Exchange, &AccountInfo)> {
+        self.account_infos.iter().map(|(e, i)| (*e, i))
     }
 
     /// 获取指定交易所的 USDT 余额

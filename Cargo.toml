@@ -78,8 +78,8 @@ pkcs8 = { version = "0.10", features = ["pem"] }
 percent-encoding = "2"
 
 [[bin]]
-name = "funding_arb"
-path = "src/bin/funding_arb.rs"
+name = "spread_arb"
+path = "src/bin/spread_arb.rs"
 
 [[bin]]
 name = "backtest"

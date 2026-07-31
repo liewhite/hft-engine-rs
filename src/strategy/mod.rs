@@ -1,7 +1,7 @@
-mod funding_arb;
 mod gamma_scalp;
+mod spread_arb;
 
-pub use funding_arb::{FundingArbConfig, FundingArbStrategy};
+pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy};
 pub use gamma_scalp::GammaScalpStrategy;
 
 use crate::domain::{BorrowFee, Exchange, ExchangeRate, Order, OrderId, Symbol};

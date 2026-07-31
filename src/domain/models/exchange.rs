@@ -3,7 +3,10 @@ use std::fmt;
 use uuid::Uuid;
 
 /// 交易所枚举
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Ord` 按声明顺序排序，仅用于让"交易所集合"有确定的展示/遍历顺序（日志与启动可复现），
+/// 不含业务优先级语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Exchange {
     Binance,
     OKX,

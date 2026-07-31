@@ -18,27 +18,21 @@
     }
   },
   "strategy": {
-    "symbols": ["BTC", "ETH"],
-    "funding_arb": {
+    "symbol_bucket": {
+      "buckets": 4,
+      "index": 0
+    },
+    "spread_arb": {
       "ema_period": 100,
+      "deviation_threshold": 0.004,
       "max_notional": 1000.0,
       "min_notional": 10.0,
       "order_timeout_ms": 10000,
-      "max_exposure_ratio": 0.20,
-      "max_exposure_value": 100.0,
-      "max_symbol_leverage": 0.50,
+      "max_position_notional": 5000.0,
+      "max_symbol_leverage": 0.5,
       "max_account_leverage": 3.0,
-      "deviation_threshold": 0.0005,
-      "ioc_slippage": 0.001
-    },
-    "spread_arb": {
-      "symbols": ["AAPL", "NVDA"],
-      "open_threshold": 0.003,
-      "close_threshold": 0.001,
-      "order_usd_value": 500.0,
-      "max_leverage": 2.0,
       "ioc_slippage": 0.001,
-      "order_timeout_ms": 5000
+      "max_bbo_age_ms": 3000
     }
   }
 }

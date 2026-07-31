@@ -11,6 +11,7 @@ pub use live::{
     CryptoStatusActor, CryptoStatusActorArgs,
     ExecutorActor, ExecutorArgs,
     GetAllSymbolMetas, GetIbkrClient, PublishIncome, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
-    OutcomePubSub, OutcomeProcessorActor, RegisterExecutor, OutcomeProcessorArgs, Stop,
+    MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor, RegisterExecutor,
+    RegisterMetricsSymbols, RegisterSymbols, OutcomeProcessorArgs, Stop,
     SubscribeIncome, SubscribeOutcome,
 };

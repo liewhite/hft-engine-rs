@@ -21,6 +21,7 @@ mod position;
 mod side;
 mod symbol_meta;
 mod time_in_force;
+mod trading_stats;
 
 pub use account_info::AccountInfo;
 pub use balance::Balance;
@@ -45,6 +46,7 @@ pub use position::Position;
 pub use side::Side;
 pub use symbol_meta::SymbolMeta;
 pub use time_in_force::TimeInForce;
+pub use trading_stats::{TradingStats, RECENT_FILL_CAPACITY};
 
 /// 统一交易对符号（只包含 base，quote 由交易所配置决定）
 pub type Symbol = String;

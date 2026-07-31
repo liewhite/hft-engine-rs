@@ -8,8 +8,8 @@
 
 use super::{
     ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
-    IncomeProcessorActor, OutcomePubSub, OutcomeProcessorActor, RegisterExecutor,
-    OutcomeProcessorArgs,
+    IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor,
+    RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, DEFAULT_REPORT_INTERVAL_MS,
 };
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta, now_ms};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -66,6 +66,8 @@ pub struct ManagerActor {
     // === 子 Actors ===
     /// ProcessorActor (订阅 income_pubsub)
     income_processor: ActorRef<IncomeProcessorActor>,
+    /// MetricsActor (订阅 income_pubsub，输出账户/持仓/订单/历史指标)
+    metrics: ActorRef<MetricsActor>,
     /// ExchangeActors (启动时创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
 
@@ -396,6 +398,21 @@ impl Actor for ManagerActor {
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
+        // 5.5 创建 MetricsActor 并订阅 income_pubsub（观测层：只读事件流，不参与决策）
+        let metrics = MetricsActor::spawn_link_with_mailbox(
+            &actor_ref,
+            MetricsActorArgs {
+                interval_ms: DEFAULT_REPORT_INTERVAL_MS,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        income_pubsub
+            .tell(Subscribe(metrics.clone()))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+
         // 6. 创建 ClockActor（发布 Clock 事件到 income_pubsub）
         let _clock_actor = ClockActor::spawn_link_with_mailbox(
             &actor_ref,
@@ -554,6 +571,7 @@ impl Actor for ManagerActor {
             income_pubsub,
             outcome_pubsub,
             income_processor: processor,
+            metrics,
             exchange_actors,
             ibkr_client: ibkr_client_ref,
         })
@@ -615,6 +633,26 @@ impl Message<AddStrategies> for ManagerActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.do_add_strategies(msg.0, ctx.actor_ref().clone()).await
+    }
+}
+
+/// 注册指标 actor 要跟踪的 symbol 集合
+///
+/// 与策略集合同源：上层决定跑哪些 symbol，观测层就跟踪哪些。应在 [`AddStrategies`] **之前**
+/// 发送，否则启动期推送的初始持仓/挂单事件会因 symbol 未注册而被观测层丢弃。
+pub struct RegisterMetricsSymbols(pub Vec<Symbol>);
+
+impl Message<RegisterMetricsSymbols> for ManagerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: RegisterMetricsSymbols,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Err(e) = self.metrics.ask(RegisterSymbols(msg.0)).send().await {
+            tracing::error!(error = %e, "Failed to register symbols on MetricsActor");
+        }
     }
 }
 
