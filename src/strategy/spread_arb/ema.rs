@@ -59,8 +59,4 @@ impl ExchangeEma {
             ask_ema: EmaCalculator::new(period),
         }
     }
-
-    pub fn is_ready(&self) -> bool {
-        self.bid_ema.is_ready() && self.ask_ema.is_ready()
-    }
 }

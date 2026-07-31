@@ -12,6 +12,6 @@ pub use live::{
     ExecutorActor, ExecutorArgs,
     GetAllSymbolMetas, GetIbkrClient, PublishIncome, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
     MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor, RegisterExecutor,
-    RegisterMetricsSymbols, RegisterSymbols, OutcomeProcessorArgs, Stop,
+    RegisterSymbols, OutcomeProcessorArgs, Stop,
     SubscribeIncome, SubscribeOutcome,
 };

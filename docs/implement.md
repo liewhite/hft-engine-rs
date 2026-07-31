@@ -1564,7 +1564,7 @@ src/
 ├── strategy/
 │   ├── mod.rs
 │   ├── api.rs
-│   └── funding_arb.rs
+│   └── spread_arb.rs
 ├── risk/
 │   ├── mod.rs
 │   └── rules.rs
@@ -1654,11 +1654,11 @@ pub struct ExchangesConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StrategyConfig {
-    pub funding_arb: FundingArbConfig,
+    pub spread_arb: SpreadArbConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct FundingArbConfig {
+pub struct SpreadArbConfig {
     pub symbols: Vec<String>,      // ["BTC_USDT", "ETH_USDT"]
     pub min_spread: Decimal,       // 0.0005
     pub max_spread: Decimal,       // 0.002

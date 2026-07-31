@@ -14,7 +14,7 @@ pub const RECENT_FILL_CAPACITY: usize = 50;
 ///
 /// 这样不需要把开仓与平仓配对（跨所、部分成交、强平会让配对逻辑迅速失控），
 /// 对任意成交顺序都成立。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct TradingStats {
     /// 成交笔数
     pub fills: u64,
@@ -28,8 +28,35 @@ pub struct TradingStats {
     pub forced_fills: u64,
     /// 被拒绝或出错的订单数
     pub rejected_orders: u64,
-    /// 最近成交记录（最新在队尾），容量上限 [`RECENT_FILL_CAPACITY`]
+    /// 最近成交记录（最新在队尾），容量由 [`Self::recent_capacity`] 决定
     pub recent_fills: VecDeque<Fill>,
+    /// `recent_fills` 的容量上限
+    ///
+    /// 允许为 0：per-symbol 统计只需要计数与金额，逐笔明细只在全局那一份上保留，
+    /// 否则数百 symbol × N 条 `Fill` 全是没人读的副本。
+    recent_capacity: usize,
+}
+
+impl Default for TradingStats {
+    fn default() -> Self {
+        Self::with_recent_capacity(RECENT_FILL_CAPACITY)
+    }
+}
+
+impl TradingStats {
+    /// 指定逐笔明细容量（0 = 不保留明细）
+    pub fn with_recent_capacity(recent_capacity: usize) -> Self {
+        Self {
+            fills: 0,
+            volume: 0.0,
+            fee: 0.0,
+            cash: 0.0,
+            forced_fills: 0,
+            rejected_orders: 0,
+            recent_fills: VecDeque::new(),
+            recent_capacity,
+        }
+    }
 }
 
 impl TradingStats {
@@ -48,10 +75,12 @@ impl TradingStats {
             self.forced_fills += 1;
         }
 
-        if self.recent_fills.len() == RECENT_FILL_CAPACITY {
-            self.recent_fills.pop_front();
+        if self.recent_capacity > 0 {
+            if self.recent_fills.len() == self.recent_capacity {
+                self.recent_fills.pop_front();
+            }
+            self.recent_fills.push_back(fill.clone());
         }
-        self.recent_fills.push_back(fill.clone());
     }
 
     /// 累加一条订单更新（只统计失败终态）
@@ -129,6 +158,16 @@ mod tests {
         }
         assert_eq!(stats.recent_fills.len(), RECENT_FILL_CAPACITY);
         assert_eq!(stats.fills as usize, RECENT_FILL_CAPACITY + 10);
+    }
+
+    #[test]
+    fn zero_capacity_keeps_counters_but_no_details() {
+        let mut stats = TradingStats::with_recent_capacity(0);
+        stats.apply_fill(&fill(Side::Long, 100.0, 1.0, 0.1, FillReason::Normal));
+
+        assert_eq!(stats.fills, 1);
+        assert!(stats.recent_fills.is_empty());
+        assert!((stats.cash - (-100.1)).abs() < 1e-9);
     }
 
     #[test]

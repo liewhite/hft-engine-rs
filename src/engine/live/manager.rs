@@ -184,6 +184,21 @@ impl ManagerActor {
             .map(|(exchange, kind)| (*exchange, kind.symbol().clone()))
             .collect();
 
+        // 4.5 告知观测层要跟踪哪些 symbol。**必须在推初始持仓之前**——否则观测层会因 symbol
+        //     未注册而丢掉启动快照，进而丢掉盈亏基线。由 manager 自己从策略订阅推导并注册，
+        //     调用方无需（也无从）关心这个时序。
+        {
+            let symbols: Vec<Symbol> = exchange_symbols
+                .iter()
+                .map(|(_, symbol)| symbol.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            if let Err(e) = self.metrics.ask(RegisterSymbols(symbols)).send().await {
+                tracing::error!(error = %e, "Failed to register symbols on MetricsActor");
+            }
+        }
+
         // 5. 查询各交易所初始持仓，推到 income_pubsub。**必须在 executor 注册之后、
         //    市场订阅之前**进行——之前发布会被 BestEffort 丢，之后才发就有"开仓信号
         //    在持仓未对齐"的窗口。对每个 (exchange, symbol) 都推一条：交易所返回的
@@ -633,26 +648,6 @@ impl Message<AddStrategies> for ManagerActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.do_add_strategies(msg.0, ctx.actor_ref().clone()).await
-    }
-}
-
-/// 注册指标 actor 要跟踪的 symbol 集合
-///
-/// 与策略集合同源：上层决定跑哪些 symbol，观测层就跟踪哪些。应在 [`AddStrategies`] **之前**
-/// 发送，否则启动期推送的初始持仓/挂单事件会因 symbol 未注册而被观测层丢弃。
-pub struct RegisterMetricsSymbols(pub Vec<Symbol>);
-
-impl Message<RegisterMetricsSymbols> for ManagerActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: RegisterMetricsSymbols,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        if let Err(e) = self.metrics.ask(RegisterSymbols(msg.0)).send().await {
-            tracing::error!(error = %e, "Failed to register symbols on MetricsActor");
-        }
     }
 }
 

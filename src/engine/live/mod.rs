@@ -22,11 +22,8 @@ pub type OutcomePubSub = PubSub<OutcomeEvent>;
 
 pub use clock::{ClockActor, ClockActorArgs};
 pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
-pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, GetIbkrClient, PublishIncome, ManagerActor, ManagerActorArgs, RegisterMetricsSymbols, Stop, SubscribeIncome, SubscribeOutcome};
+pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, GetIbkrClient, PublishIncome, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome};
 pub use executor::{ExecutorActor, ExecutorArgs};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor};
-pub use metrics::{
-    symbol_exposure, MetricsActor, MetricsActorArgs, RegisterSymbols, SymbolExposure,
-    DEFAULT_REPORT_INTERVAL_MS,
-};
+pub use metrics::{MetricsActor, MetricsActorArgs, RegisterSymbols, DEFAULT_REPORT_INTERVAL_MS};
 pub use outcome_processor::{OutcomeProcessorActor, OutcomeProcessorArgs};

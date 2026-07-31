@@ -27,10 +27,27 @@
 指标层已对此单独告警（`metrics.single_leg_exposure`），先靠人看。
 若要收紧，可加"敞口存续超过 N 秒即强制 reduce-only 平掉"的兜底。
 
+注：风控闸门本身不会制造裸单——`enforce_single_leg_reduces_exposure` 会把"另一腿被拦、
+剩下这腿又会放大净敞口"的单整体作废；只有收敛净敞口的单腿单才放行。裸敞口的来源只有
+IOC 部分/未成交。
+
+### 3.5 风控 pipeline 建议演进为 headroom 模型
+当前六个闸门都是 `&mut TradingSignal` + "size 置 0"，正确性依赖步骤顺序（`is_increasing`
+对下单量不单调，所以增仓类闸门必须排在定量之后）。更干净的形态是每个闸门返回该腿的允许上限
+（headroom），pipeline 取 min：顺序无关、可自由增删闸门、且**接近上限时缩量成交而不是整单拒绝**
+（现在 `max_position_notional` 实际表现为"接近上限就停摆"，而不是真正的上限）。
+不影响当前正确性，属结构优化。
+
 ### 4. 外部指标上报（未做）
 `MetricsActor` 目前只输出结构化日志（`target: "metrics"`），无外部依赖。
 若要接 Prometheus pushgateway / Slack 告警，需要新增上报组件与配置。
 （历史上有过 pushgateway + Slack 实现，commit `a0183e8` 为了保持"纯策略框架"删除。）
+
+另两点已知取舍：
+- `MetricsActor` 订阅全量 income 流，数百 symbol 的 BBO 会多一份 clone + mailbox 投递，
+  而它只在报告时用 mid 估值。若 CPU 吃紧，可改为报告时向 manager 取快照，或对 BBO 采样。
+- 它是 `spawn_link` 到 manager 的（与其他子 actor 一致的 fail-fast 姿态），意味着观测层
+  panic 会拖垮进程。定时器结束已改为只记 error 不自杀，但 panic 路径仍会级联。
 
 ## 二、框架层已知缺口
 

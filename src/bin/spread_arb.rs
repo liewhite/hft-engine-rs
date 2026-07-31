@@ -9,28 +9,27 @@ use std::collections::{BTreeMap, HashMap};
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{
     init_tracing, load_config, wait_for_shutdown, AddStrategies, GetAllSymbolMetas, ManagerActor,
-    ManagerActorArgs, RegisterMetricsSymbols,
+    ManagerActorArgs,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
 use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
-use hft_engine_rs::exchange::ibkr::IbkrCredentials;
 use hft_engine_rs::exchange::okx::OkxCredentials;
-use hft_engine_rs::strategy::{SpreadArbConfig, SpreadArbStrategy};
+use hft_engine_rs::strategy::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
 use kameo::actor::Spawn;
 use kameo::mailbox;
 use md5::{Digest, Md5};
 use serde::Deserialize;
 
-/// 一个 symbol 至少要在这么多交易所上市，才有跨所价差可套
-const MIN_EXCHANGES_PER_SYMBOL: usize = 2;
-
 /// 交易所凭证配置（缺省即该所不参与）
+///
+/// **有意只支持加密永续三所，不接 IBKR**：本策略靠 symbol 同名跨所配对，而美股 ticker 与
+/// 永续 ticker 存在真实重名（SOL / COIN / MARA 等）。把股票和永续配成"跨所价差对"是两个
+/// 无关标的对冲，且股票有交易时段、与 7x24 的永续无法持续对冲。要做跨市场套利应另起策略。
 #[derive(Debug, Clone, Deserialize)]
 struct ExchangesConfig {
     binance: Option<BinanceCredentials>,
     okx: Option<OkxCredentials>,
     hyperliquid: Option<HyperliquidCredentials>,
-    ibkr: Option<IbkrCredentials>,
 }
 
 /// symbol 分桶配置
@@ -131,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
             binance_credentials: config.exchanges.binance.clone(),
             okx_credentials: config.exchanges.okx.clone(),
             hyperliquid_credentials: config.exchanges.hyperliquid.clone(),
-            ibkr_credentials: config.exchanges.ibkr.clone(),
+            ibkr_credentials: None,
             ibkr_snapshot: None,
         },
         mailbox::unbounded(),
@@ -177,8 +176,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let symbols: Vec<Symbol> = tradable.iter().map(|(symbol, _)| symbol.clone()).collect();
-
     let strategies: Vec<Box<dyn hft_engine_rs::strategy::Strategy>> = tradable
         .into_iter()
         .map(|(symbol, exchanges)| {
@@ -192,13 +189,6 @@ async fn main() -> anyhow::Result<()> {
         .collect();
 
     let strategy_count = strategies.len();
-
-    // 指标 actor 需要知道跟踪哪些 symbol（与策略集合同源）
-    manager
-        .ask(RegisterMetricsSymbols(symbols))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to register metrics symbols: {e}"))?;
 
     manager
         .ask(AddStrategies(strategies))
@@ -274,14 +264,28 @@ mod tests {
         assert_eq!(covered, symbols.len());
     }
 
+    /// 分桶必须跨进程稳定，否则重启后同一实例会换一批 symbol、留下无人管理的持仓。
+    /// MD5 是确定性的，这里把期望值钉死，任何改动 hash 口径的行为都会打破它。
     #[test]
-    fn bucket_selection_is_stable() {
-        let bucket = SymbolBucketConfig {
-            buckets: 8,
-            index: 3,
+    fn bucket_assignment_is_pinned() {
+        let assigned = |symbol: &str| {
+            (0..4u64)
+                .find(|&index| SymbolBucketConfig { buckets: 4, index }.contains(&symbol.to_string()))
+                .expect("每个 symbol 必属于某个桶")
         };
-        let symbol = "BTC".to_string();
-        assert_eq!(bucket.contains(&symbol), bucket.contains(&symbol));
+
+        assert_eq!(assigned("BTC"), 3);
+        assert_eq!(assigned("ETH"), 0);
+        assert_eq!(assigned("SOL"), 2);
+        assert_eq!(assigned("DOGE"), 3);
+    }
+
+    #[test]
+    fn single_bucket_takes_everything() {
+        let bucket = full_bucket();
+        for symbol in ["BTC", "ETH", "SOL", "DOGE"] {
+            assert!(bucket.contains(&symbol.to_string()));
+        }
     }
 
     #[test]

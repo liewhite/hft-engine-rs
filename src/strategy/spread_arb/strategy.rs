@@ -1,4 +1,4 @@
-use crate::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce, Timestamp};
+use crate::domain::{Exchange, Order, OrderType, Position, Side, Symbol, TimeInForce, Timestamp};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
@@ -9,11 +9,16 @@ use super::config::SpreadArbConfig;
 use super::ema::ExchangeEma;
 use super::signals::TradingSignal;
 
-/// 仓位比较的 epsilon（用于判断仓位是否为零）
-const POSITION_EPSILON: f64 = 1e-10;
+/// 仓位比较的 epsilon（与 domain 层同一口径，不另立副本）
+const POSITION_EPSILON: f64 = Position::EPSILON;
 
 /// 单笔开仓最多吃掉盘口首档的比例
 const ORDERBOOK_TAKE_RATIO: f64 = 0.5;
+
+/// 跨所价差至少需要两个交易所才成立
+///
+/// 这是策略的固有前提，放在策略模块由上层选币时引用（而不是各调用方各写一份）。
+pub const MIN_EXCHANGES_PER_SYMBOL: usize = 2;
 
 /// 跨所价差套利策略 (单 symbol)
 ///
@@ -51,6 +56,15 @@ pub struct SpreadArbStrategy {
 
 impl SpreadArbStrategy {
     pub fn new(config: SpreadArbConfig, exchanges: Vec<Exchange>, symbol: Symbol) -> Self {
+        // 少于两个交易所时永远配不出 (short, long) 组合，该实例只会空转
+        if exchanges.len() < MIN_EXCHANGES_PER_SYMBOL {
+            tracing::warn!(
+                %symbol,
+                exchanges = exchanges.len(),
+                "交易所少于 2 个，该 symbol 无法产生跨所价差信号"
+            );
+        }
+
         // 为每个交易所创建 bid/ask EMA
         let mut exchange_emas = HashMap::new();
         for &ex in &exchanges {
@@ -126,9 +140,32 @@ impl SpreadArbStrategy {
         }
     }
 
-    /// 检查所有交易所的 EMA 是否都预热完成
-    fn all_emas_ready(&self) -> bool {
-        self.exchange_emas.values().all(|ema| ema.is_ready())
+    /// 行情中断后恢复：重置该交易所的 EMA，强制重新预热
+    ///
+    /// **必须重置**。EMA 是无窗口指数平滑（alpha = 2/(N+1)，N=100 时约 0.02），中断期间不更新，
+    /// 恢复的第一跳只能把它拉动 2%。若中断期市场真实移动了 x%，恢复瞬间算出的偏离度约等于 x%，
+    /// 远超阈值——策略会把"自己错过的行情"当成错价，在**已经反映新价格**的盘口上吃单，
+    /// 这是确定性亏损。新鲜度闸门只挡住了中断期间，恢复瞬间必须靠重置 EMA 挡住。
+    ///
+    /// 放在 BBO 到达路径上判定（而非依赖 Clock 驱动的状态变迁），保证恢复的第一跳一定被拦。
+    fn reset_ema_if_gap_exceeded(&mut self, exchange: Exchange, now: Timestamp) {
+        let Some(&prev_ts) = self.bbo_local_ts.get(&exchange) else {
+            // 首次收到该所行情，正常预热流程
+            return;
+        };
+        let gap_ms = now.saturating_sub(prev_ts);
+        if gap_ms <= self.config.max_bbo_age_ms {
+            return;
+        }
+        tracing::warn!(
+            symbol = %self.symbol,
+            exchange = %exchange,
+            gap_ms = gap_ms,
+            max_bbo_age_ms = self.config.max_bbo_age_ms,
+            "行情中断后恢复，重置 EMA 重新预热（避免用中断前的均值算出假偏离）"
+        );
+        self.exchange_emas
+            .insert(exchange, ExchangeEma::new(self.config.ema_period));
     }
 
     /// 计算单个交易所的 bid deviation
@@ -304,7 +341,11 @@ impl SpreadArbStrategy {
         };
         let ratio = leverage_ratio(raw_leverage, self.config.max_symbol_leverage);
 
-        let effective_threshold = base_threshold * (1.0 + factor * ratio);
+        // 下界取 ioc_slippage：让价幅度是代码里唯一可见的确定成本，阈值低于它就必然亏。
+        // 与 SpreadArbConfig::validate 拒绝 `ioc_slippage >= deviation_threshold` 是同一条口径——
+        // 启动期判为负期望的配置，运行期也不能因为"想减仓"而放行。
+        let effective_threshold =
+            (base_threshold * (1.0 + factor * ratio)).max(self.config.ioc_slippage);
 
         tracing::debug!(
             symbol = %self.symbol,
@@ -381,21 +422,22 @@ impl SpreadArbStrategy {
             return;
         };
 
-        let mid_price = (signal.short_price + signal.long_price) / 2.0;
-
         let short_pos = state.position_size(signal.short_exchange);
         let long_pos = state.position_size(signal.long_exchange);
 
         let new_short_pos = new_position(short_pos, Side::Short, signal.short_size);
         let new_long_pos = new_position(long_pos, Side::Long, signal.long_size);
 
-        let new_short_leverage = (new_short_pos.abs() * mid_price) / short_equity;
-        let new_long_leverage = (new_long_pos.abs() * mid_price) / long_equity;
+        // 各腿用**自己**交易所的价格估值：两所价差正是本策略的信号来源，
+        // 用两所均价给单腿估值会带入系统性偏差
+        let new_short_leverage = (new_short_pos.abs() * signal.short_price) / short_equity;
+        let new_long_leverage = (new_long_pos.abs() * signal.long_price) / long_equity;
 
+        // 边界口径与 check_position_limit / check_account_leverage 统一：恰好打满上限放行，超出才拦
         let short_blocked = is_increasing(short_pos, new_short_pos)
-            && new_short_leverage >= self.config.max_symbol_leverage;
+            && new_short_leverage > self.config.max_symbol_leverage;
         let long_blocked = is_increasing(long_pos, new_long_pos)
-            && new_long_leverage >= self.config.max_symbol_leverage;
+            && new_long_leverage > self.config.max_symbol_leverage;
 
         if short_blocked {
             signal.short_size = 0.0;
@@ -427,8 +469,7 @@ impl SpreadArbStrategy {
     /// 只拦截增仓方向，减仓永不拦截。这是替代"下单限速"的风险闸门——限制的是最终暴露，
     /// 而不是下单频率。
     fn check_position_limit(&self, signal: &mut TradingSignal, state: &SymbolState) {
-        let mid_price = (signal.short_price + signal.long_price) / 2.0;
-        if mid_price <= 0.0 {
+        if signal.short_price <= 0.0 || signal.long_price <= 0.0 {
             return;
         }
 
@@ -439,8 +480,9 @@ impl SpreadArbStrategy {
         let new_long_pos = new_position(long_pos, Side::Long, signal.long_size);
 
         let limit = self.config.max_position_notional;
-        let short_new_notional = new_short_pos.abs() * mid_price;
-        let long_new_notional = new_long_pos.abs() * mid_price;
+        // 各腿用自己交易所的价格估值（同 check_symbol_leverage）
+        let short_new_notional = new_short_pos.abs() * signal.short_price;
+        let long_new_notional = new_long_pos.abs() * signal.long_price;
 
         let short_blocked =
             is_increasing(short_pos, new_short_pos) && short_new_notional > limit;
@@ -470,8 +512,14 @@ impl SpreadArbStrategy {
 
     /// Pipeline：账户杠杆率检查
     ///
-    /// 检查账户级别杠杆率 (account_notional / equity)
-    /// 如果某交易所杠杆率超过阈值，且订单方向与现有仓位方向相同，则将对应侧 size 设为 0
+    /// 检查账户级别杠杆率 (account_notional / equity)。超过阈值时拦截**增仓方向**的腿。
+    ///
+    /// 早期实现的判据是"本 symbol 在该所已有同向仓位"，这在只跑两三个 symbol 时够用，但在
+    /// 按桶跑数百 symbol 时是致命漏洞：本 symbol 空仓即永不拦截，于是账户杠杆可以靠"不断开新
+    /// symbol"无限增长——单 symbol 上界受 max_position_notional / max_symbol_leverage 约束，
+    /// 账户总量却没有任何闸门。且跨所对冲在单个交易所内是**单边方向暴露**（一所全多、另一所
+    /// 全空），两边不能互相提供保证金，单边行情即单所强平。
+    /// 改为按"这笔单是否增仓"判定（空仓开新仓也是增仓），与单边杠杆闸门口径一致。
     fn check_account_leverage(
         &self,
         signal: &mut TradingSignal,
@@ -506,13 +554,14 @@ impl SpreadArbStrategy {
         let short_pos = state.position_size(signal.short_exchange);
         let long_pos = state.position_size(signal.long_exchange);
 
-        // 检查做空方：杠杆率超标 && 已有空头仓位（方向相同，会增加杠杆）
-        let short_blocked =
-            short_leverage >= self.config.max_account_leverage && short_pos < -POSITION_EPSILON;
+        let new_short_pos = new_position(short_pos, Side::Short, signal.short_size);
+        let new_long_pos = new_position(long_pos, Side::Long, signal.long_size);
 
-        // 检查做多方：杠杆率超标 && 已有多头仓位（方向相同，会增加杠杆）
-        let long_blocked =
-            long_leverage >= self.config.max_account_leverage && long_pos > POSITION_EPSILON;
+        // 账户杠杆超标 → 拦截增仓方向的腿（减仓永不拦截）
+        let short_blocked = short_leverage > self.config.max_account_leverage
+            && is_increasing(short_pos, new_short_pos);
+        let long_blocked = long_leverage > self.config.max_account_leverage
+            && is_increasing(long_pos, new_long_pos);
 
         if short_blocked {
             signal.short_size = 0.0;
@@ -637,11 +686,54 @@ impl SpreadArbStrategy {
         }
     }
 
+    /// Pipeline：单腿保护
+    ///
+    /// 前面的风控闸门是逐腿判定的，可能只清零一条腿。此时剩下的单腿单有两种性质：
+    /// - **收敛净敞口**（例如敞口修正故意只开一条腿去中和）→ 放行，这是敞口收敛机制本身
+    /// - **凭空制造方向暴露**（例如某腿被仓位上限挡住，另一腿照开）→ 必须一起清零
+    ///
+    /// 判据只能是"是否收敛 symbol 的净敞口"，不能是"是否减少该交易所自身仓位"：
+    /// 中和敞口的那条腿通常是在另一个所**新开**仓位（自身仓位变大），但净敞口在缩小。
+    fn enforce_single_leg_reduces_exposure(&self, signal: &mut TradingSignal, state: &SymbolState) {
+        let short_active = signal.short_size > POSITION_EPSILON;
+        let long_active = signal.long_size > POSITION_EPSILON;
+
+        // 两腿齐发或两腿全无，都无需干预
+        if short_active == long_active {
+            return;
+        }
+
+        let (long_pos, short_pos) = state.position_sizes();
+        let net_exposure = long_pos + short_pos;
+        let delta = if long_active {
+            signal.long_size
+        } else {
+            -signal.short_size
+        };
+        let new_net_exposure = net_exposure + delta;
+
+        if new_net_exposure.abs() > net_exposure.abs() + POSITION_EPSILON {
+            tracing::info!(
+                symbol = %self.symbol,
+                net_exposure = format!("{:.6}", net_exposure),
+                new_net_exposure = format!("{:.6}", new_net_exposure),
+                long_size = signal.long_size,
+                short_size = signal.short_size,
+                "Signal dropped: 单腿单会放大净敞口（另一腿已被风控拦截）"
+            );
+            signal.long_size = 0.0;
+            signal.short_size = 0.0;
+        }
+    }
+
     /// 运行完整的信号处理 pipeline
     ///
-    /// 顺序：validate → 账户杠杆 → 净敞口修正 → notional 限制 → 单边杠杆 → 单 pair 仓位上限
+    /// 顺序：validate → 净敞口修正 → notional 限制 → 账户杠杆 → 单边杠杆 → 单 pair 仓位
+    /// → 单腿保护
     ///
-    /// 两个"增仓拦截"步骤（单边杠杆、单 pair 仓位）必须排在最后：它们要基于最终下单量判断。
+    /// 三个"增仓拦截"步骤都排在 notional 限制之后：`is_increasing` 对下单量不是单调的
+    /// （在多头上卖 1 是减仓、卖 11 就成了反向增仓），必须基于**最终**下单量判定。
+    /// 单腿保护必须最后跑，它要看的是所有闸门作用完之后的形态。
     /// 各步骤通过将 size 设为 0 表示该侧不下单。
     fn process_signal(
         &self,
@@ -650,11 +742,12 @@ impl SpreadArbStrategy {
         state_manager: &StateManager,
     ) -> TradingSignal {
         self.validate_signal(&mut signal);
-        self.check_account_leverage(&mut signal, state, state_manager);
         self.adjust_for_exposure(&mut signal, state);
         self.set_notional_limits(&mut signal);
+        self.check_account_leverage(&mut signal, state, state_manager);
         self.check_symbol_leverage(&mut signal, state, state_manager);
         self.check_position_limit(&mut signal, state);
+        self.enforce_single_leg_reduces_exposure(&mut signal, state);
         signal
     }
 
@@ -791,6 +884,9 @@ impl Strategy for SpreadArbStrategy {
 
         // BBO 事件时更新该交易所的 bid/ask EMA 与本地接收时刻
         if let ExchangeEventData::BBO(bbo) = &event.data {
+            // 顺序关键：先按"距上一条 BBO 的间隔"判定是否中断恢复并重置 EMA，
+            // 再更新 EMA 与接收时刻——否则时刻已被刷新，就判不出中断了。
+            self.reset_ema_if_gap_exceeded(bbo.exchange, now);
             self.update_exchange_ema(bbo.exchange, symbol_state);
             self.bbo_local_ts.insert(bbo.exchange, now);
         }
@@ -798,10 +894,8 @@ impl Strategy for SpreadArbStrategy {
         // 行情新鲜度状态变迁日志（Clock 事件也会推进，行情停推时能报警）
         self.log_staleness_transitions(now);
 
-        // EMA 未预热完成，不进行交易
-        if !self.all_emas_ready() {
-            return vec![];
-        }
+        // 不做"所有交易所 EMA 都预热完成"的全局门：预热与新鲜度都已在候选筛选阶段逐所过滤
+        // （见 check_signal），全局 AND 会让任一交易所长期无报价就冻结整个 symbol。
 
         // 有未完成订单时等待
         if symbol_state.has_pending_orders() {
@@ -1010,12 +1104,11 @@ mod tests {
         let threshold =
             strategy.calculate_effective_threshold(SHORT_EX, LONG_EX, &state, &manager);
 
+        // ratio clamp 到 1 → base * (1 - 1) = 0，再由 ioc_slippage 托底
         assert!(
-            threshold >= 0.0,
-            "阈值不能为负，否则会在亏损价位成交: {threshold}"
+            threshold >= config().ioc_slippage,
+            "阈值不能低于让价成本，否则会在亏损价位成交: {threshold}"
         );
-        // ratio clamp 到 1 → base * (1 - 1) = 0
-        assert!((threshold - 0.0).abs() < 1e-12);
     }
 
     #[test]
@@ -1220,28 +1313,56 @@ mod tests {
     #[test]
     fn no_signal_before_emas_are_warm() {
         let mut strategy = strategy(config());
-        let manager = state_manager(1000.0, 0.0);
+        let mut manager = state_manager(1000.0, 0.0);
+        let event = IncomeEvent {
+            exchange_ts: 0,
+            local_ts: 0,
+            data: ExchangeEventData::BBO(bbo(SHORT_EX, 100.0, 100.2, 10.0)),
+        };
+        manager.apply(&event);
 
         // 只喂一条，远未满 ema_period
-        let outcome = strategy.on_event(
-            &IncomeEvent {
-                exchange_ts: 0,
-                local_ts: 0,
-                data: ExchangeEventData::BBO(bbo(SHORT_EX, 100.0, 100.2, 10.0)),
-            },
-            &manager,
-        );
+        let outcome = strategy.on_event(&event, &manager);
 
         assert!(outcome.is_empty());
-        assert!(!strategy.all_emas_ready());
+        let state = symbol_state(&[]);
+        assert!(strategy.bid_deviation(SHORT_EX, &state).is_none());
     }
 
     #[test]
-    fn emas_ready_after_warm_up() {
+    fn deviations_available_after_warm_up() {
         let mut strategy = strategy(config());
         let mut manager = state_manager(1000.0, 0.0);
         warm_up(&mut strategy, &mut manager, 0);
-        assert!(strategy.all_emas_ready());
+
+        let state = symbol_state(&[]);
+        for exchange in [SHORT_EX, LONG_EX] {
+            assert!(strategy.bid_deviation(exchange, &state).is_some());
+            assert!(strategy.ask_deviation(exchange, &state).is_some());
+        }
+    }
+
+    /// 一个所长期无报价时，其余所仍应能配对（不再有全所 AND 门）
+    #[test]
+    fn one_unwarmed_exchange_does_not_freeze_the_symbol() {
+        let cfg = config();
+        let mut strategy = SpreadArbStrategy::new(
+            cfg.clone(),
+            vec![SHORT_EX, LONG_EX, Exchange::Hyperliquid],
+            SYMBOL.to_string(),
+        );
+        let mut manager = state_manager(100_000.0, 0.0);
+        // 只预热两个所，Hyperliquid 从未有过行情
+        warm_up(&mut strategy, &mut manager, 0);
+
+        let state = mispriced_state();
+        strategy.bbo_local_ts.insert(SHORT_EX, 0);
+        strategy.bbo_local_ts.insert(LONG_EX, 0);
+
+        assert!(
+            strategy.check_signal(&state, &manager, 0).is_some(),
+            "第三个所无报价不应冻结另两个所的配对"
+        );
     }
 
     #[test]
@@ -1294,6 +1415,190 @@ mod tests {
         assert!(strategy
             .check_signal(&state, &manager, cfg.max_bbo_age_ms + 1)
             .is_none());
+    }
+
+    // ===== 账户杠杆闸门（回归：空仓 symbol 曾能绕过账户杠杆上限） =====
+
+    #[test]
+    fn account_leverage_blocks_opening_on_a_flat_symbol() {
+        let strategy = strategy(config());
+        // 账户杠杆 = notional/equity = 5000/1000 = 5 > 上限 3
+        // 本 symbol 在两所都空仓——旧实现此时完全不拦，账户杠杆可靠"开新 symbol"无限增长
+        let state = symbol_state(&[]);
+        let manager = state_manager(1000.0, 5000.0);
+        let mut sig = signal(1.0, 1.0);
+
+        strategy.check_account_leverage(&mut sig, &state, &manager);
+
+        assert_eq!(sig.long_size, 0.0, "账户杠杆超限时不得在空仓 symbol 上开新仓");
+        assert_eq!(sig.short_size, 0.0);
+    }
+
+    #[test]
+    fn account_leverage_allows_reducing_when_over_limit() {
+        let strategy = strategy(config());
+        // 账户杠杆超限，但两条腿都是减仓方向：short 腿在多头上卖、long 腿在空头上买
+        let state = symbol_state(&[(SHORT_EX, 5.0), (LONG_EX, -5.0)]);
+        let manager = state_manager(1000.0, 5000.0);
+        let mut sig = signal(1.0, 1.0);
+
+        strategy.check_account_leverage(&mut sig, &state, &manager);
+
+        assert_eq!(sig.short_size, 1.0);
+        assert_eq!(sig.long_size, 1.0);
+    }
+
+    #[test]
+    fn account_leverage_under_limit_does_not_block() {
+        let strategy = strategy(config());
+        let state = symbol_state(&[]);
+        // 杠杆 1.0 < 上限 3
+        let manager = state_manager(1000.0, 1000.0);
+        let mut sig = signal(1.0, 1.0);
+
+        strategy.check_account_leverage(&mut sig, &state, &manager);
+
+        assert_eq!(sig.long_size, 1.0);
+        assert_eq!(sig.short_size, 1.0);
+    }
+
+    // ===== 行情中断恢复（回归：恢复第一跳曾用陈旧 EMA 产生假偏离） =====
+
+    #[test]
+    fn ema_is_reset_after_a_data_gap() {
+        let cfg = config();
+        let mut strategy = strategy(cfg.clone());
+        let mut manager = state_manager(100_000.0, 0.0);
+        warm_up(&mut strategy, &mut manager, 0);
+
+        // 中断后恢复：价格已整体上移 10%，但 EMA 还停在 100 附近
+        let gap_end = cfg.max_bbo_age_ms + 1;
+        let recovered = bbo(SHORT_EX, 110.0, 110.2, 10.0);
+        let event = IncomeEvent {
+            exchange_ts: gap_end,
+            local_ts: gap_end,
+            data: ExchangeEventData::BBO(recovered),
+        };
+        manager.apply(&event);
+        let outcome = strategy.on_event(&event, &manager);
+
+        assert!(
+            outcome.is_empty(),
+            "中断恢复的第一跳不得被当成错价下单"
+        );
+        // EMA 已重置 → 该所退出候选，直到重新预热
+        let state = symbol_state(&[]);
+        assert!(strategy.bid_deviation(SHORT_EX, &state).is_none());
+        // 未中断的另一所不受影响
+        assert!(strategy.bid_deviation(LONG_EX, &state).is_some());
+    }
+
+    #[test]
+    fn ema_survives_normal_tick_intervals() {
+        let cfg = config();
+        let mut strategy = strategy(cfg.clone());
+        let mut manager = state_manager(100_000.0, 0.0);
+        warm_up(&mut strategy, &mut manager, 0);
+
+        // 间隔恰好等于上限，属正常范围，不应重置
+        let event = IncomeEvent {
+            exchange_ts: cfg.max_bbo_age_ms,
+            local_ts: cfg.max_bbo_age_ms,
+            data: ExchangeEventData::BBO(bbo(SHORT_EX, 100.0, 100.2, 10.0)),
+        };
+        manager.apply(&event);
+        strategy.on_event(&event, &manager);
+
+        let state = symbol_state(&[]);
+        assert!(strategy.bid_deviation(SHORT_EX, &state).is_some());
+    }
+
+    // ===== 单腿保护 =====
+
+    #[test]
+    fn single_leg_that_would_grow_exposure_is_dropped() {
+        let strategy = strategy(config());
+        // 完全对冲（净敞口 0），只剩 short 腿 → 会造出 -1 的方向暴露
+        let state = symbol_state(&[(LONG_EX, 1.0), (SHORT_EX, -1.0)]);
+        let mut sig = signal(0.0, 1.0);
+
+        strategy.enforce_single_leg_reduces_exposure(&mut sig, &state);
+
+        assert_eq!(sig.short_size, 0.0);
+    }
+
+    #[test]
+    fn single_leg_that_neutralizes_exposure_is_kept() {
+        let strategy = strategy(config());
+        // 净敞口 +3（多头多），只剩 short 腿 → 把敞口压到 +2，属收敛
+        let state = symbol_state(&[(LONG_EX, 3.0)]);
+        let mut sig = signal(0.0, 1.0);
+
+        strategy.enforce_single_leg_reduces_exposure(&mut sig, &state);
+
+        assert_eq!(sig.short_size, 1.0, "中和敞口的单腿单必须放行");
+    }
+
+    #[test]
+    fn paired_legs_are_never_touched_by_single_leg_guard() {
+        let strategy = strategy(config());
+        let state = symbol_state(&[]);
+        let mut sig = signal(1.0, 1.0);
+
+        strategy.enforce_single_leg_reduces_exposure(&mut sig, &state);
+
+        assert_eq!(sig.long_size, 1.0);
+        assert_eq!(sig.short_size, 1.0);
+    }
+
+    // ===== pipeline 整体交互 =====
+
+    #[test]
+    fn pipeline_drops_whole_order_when_one_leg_is_blocked_from_flat() {
+        let cfg = SpreadArbConfig {
+            max_position_notional: 1000.0,
+            ..config()
+        };
+        let strategy = strategy(cfg);
+        // long 腿已有多头 9.9（名义 990），再买就超 1000 上限 → long 腿被拦；
+        // 此时 short 腿单独成交会放大净敞口的反向暴露，必须一起作废
+        let state = symbol_state(&[(LONG_EX, 9.9)]);
+        let manager = state_manager(100_000.0, 0.0);
+        let sig = signal(0.2, 0.2);
+
+        let processed = strategy.process_signal(sig, &state, &manager);
+
+        // 净敞口 +9.9，卖 0.2 → +9.7，属收敛，应放行
+        assert!(processed.short_size > 0.0);
+        assert_eq!(processed.long_size, 0.0);
+    }
+
+    #[test]
+    fn pipeline_yields_nothing_when_equity_is_missing() {
+        let strategy = strategy(config());
+        let state = symbol_state(&[]);
+        let manager = StateManager::new(&[SYMBOL.to_string()], 10_000);
+        let sig = signal(1.0, 1.0);
+
+        let processed = strategy.process_signal(sig, &state, &manager);
+
+        assert_eq!(processed.long_size, 0.0);
+        assert_eq!(processed.short_size, 0.0);
+        assert!(strategy.make_orders(&processed).is_empty());
+    }
+
+    #[test]
+    fn threshold_floor_is_ioc_slippage() {
+        let cfg = config();
+        let strategy = strategy(cfg.clone());
+        // 杠杆远超上限 + 减仓方向 → 公式给出 0，应被 ioc_slippage 托底
+        let state = symbol_state(&[(SHORT_EX, 100.0), (LONG_EX, 100.0)]);
+        let manager = state_manager(1000.0, 0.0);
+
+        let threshold =
+            strategy.calculate_effective_threshold(SHORT_EX, LONG_EX, &state, &manager);
+
+        assert!((threshold - cfg.ioc_slippage).abs() < 1e-12);
     }
 
     // ===== 端到端：pipeline 产出订单 =====

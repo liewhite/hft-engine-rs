@@ -1,7 +1,7 @@
 mod gamma_scalp;
 mod spread_arb;
 
-pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy};
+pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
 pub use gamma_scalp::GammaScalpStrategy;
 
 use crate::domain::{BorrowFee, Exchange, ExchangeRate, Order, OrderId, Symbol};

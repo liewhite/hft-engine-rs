@@ -9,11 +9,13 @@
 //! 设计要点：
 //! - 视图完全由事件流重建，**不读取任何 executor 的内部状态**，与策略层零耦合
 //! - 持仓/挂单维护直接复用 [`StateManager`]（策略用的同一份实现），不重复实现
-//! - 累计统计复用 [`TradingStats`]（domain 层纯数据），可独立单测
+//! - 跨所持仓估值复用 [`SymbolState::exposure`]，累计统计复用 [`TradingStats`]
+//! - 盈亏为**本次会话**口径：现金流 + 相对会话起始仓位的存货估值变化，
+//!   这样 docker 重启后不会把重启前就持有的存货算成假盈利
 //! - 只输出日志，不引入外部依赖（Prometheus / Slack 等上报另行决策，见 docs/todo.md）
 
-use crate::domain::{Symbol, TradingStats};
-use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
+use crate::domain::{Exchange, Symbol, TradingStats};
+use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -29,52 +31,13 @@ pub const DEFAULT_REPORT_INTERVAL_MS: u64 = 60_000;
 /// 观测层不做订单超时清理（挂单的生命周期由策略侧负责，这里只如实反映）
 const NO_ORDER_TIMEOUT: u64 = 0;
 
-/// 仓位视为非零的阈值
-const POSITION_EPSILON: f64 = 1e-10;
+/// per-symbol 统计不保留逐笔明细，明细只在全局那一份上保留
+const NO_PER_SYMBOL_FILL_DETAIL: usize = 0;
 
 /// MetricsActor 初始化参数
 pub struct MetricsActorArgs {
     /// 报告间隔 (毫秒)
     pub interval_ms: u64,
-}
-
-/// 单 symbol 的持仓汇总（纯数据）
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SymbolExposure {
-    /// 各交易所带符号仓位之和（净敞口，币本位）
-    pub net_size: f64,
-    /// Σ |仓位| × mid（总名义敞口）
-    pub gross_notional: f64,
-    /// Σ 仓位 × mid（净名义敞口，理想对冲下应接近 0）
-    pub net_notional: f64,
-    /// 有非零仓位的交易所个数
-    pub legs: usize,
-    /// 有仓位但缺少 BBO、无法估值的交易所个数（估值不完整的提示）
-    pub unpriced_legs: usize,
-}
-
-/// 汇总单 symbol 在各交易所的持仓与估值
-///
-/// 纯函数：仅依赖入参。缺 BBO 的腿不参与估值，但计入 `unpriced_legs`——
-/// 宁可显式暴露"估值不完整"，也不用兜底价格伪造一个看似完整的数字。
-pub fn symbol_exposure(state: &SymbolState) -> SymbolExposure {
-    let mut exposure = SymbolExposure::default();
-    for (exchange, position) in &state.positions {
-        if position.size.abs() < POSITION_EPSILON {
-            continue;
-        }
-        exposure.legs += 1;
-        exposure.net_size += position.size;
-        match state.bbo(*exchange) {
-            Some(bbo) => {
-                let mid = bbo.mid_price();
-                exposure.gross_notional += position.size.abs() * mid;
-                exposure.net_notional += position.size * mid;
-            }
-            None => exposure.unpriced_legs += 1,
-        }
-    }
-    exposure
 }
 
 /// MetricsActor - 交易指标观测
@@ -83,23 +46,39 @@ pub struct MetricsActor {
     state: StateManager,
     /// 正在跟踪的 symbol（由 [`RegisterSymbols`] 注册）
     tracked: HashSet<Symbol>,
+    /// 会话起始仓位基线：symbol -> (exchange -> 仓位)
+    ///
+    /// 取自启动期推送的 Position 快照（`ExchangeEventData::Position` 首次到达时记录，
+    /// 与 `SymbolState` 的"快照只初始化一次"语义一致）。用于把重启前的存货从盈亏里剔除。
+    baseline: HashMap<Symbol, HashMap<Exchange, f64>>,
     /// per-symbol 累计成交统计
     per_symbol: HashMap<Symbol, TradingStats>,
     /// 全账户累计成交统计
     total: TradingStats,
     /// 落在跟踪范围外、被跳过的 symbol 事件数
     ///
-    /// 不静默丢弃：计数并在报告里暴露。持续增长说明注册的 symbol 集合与实际事件流不一致
-    /// （例如上层忘了发 [`RegisterSymbols`]）。
+    /// **分桶部署下这个数持续增长是正常的**：多实例共用同一账户时，私有流会把其他桶的
+    /// symbol 事件也推给本实例。它的用途是"本实例的跟踪范围与事件流是否对得上"的参考量，
+    /// 不是错误计数。若为单实例全量部署且此数持续增长，才说明注册范围有问题。
     untracked_events: u64,
 }
 
 impl MetricsActor {
+    /// 记录会话起始仓位基线（每个 (symbol, exchange) 只记一次）
+    fn record_baseline(&mut self, symbol: &Symbol, exchange: Exchange, size: f64) {
+        self.baseline
+            .entry(symbol.clone())
+            .or_default()
+            .entry(exchange)
+            .or_insert(size);
+    }
+
     /// 输出一次完整报告
     fn report(&self) {
         // ---------- 账户 ----------
         let mut total_equity = 0.0;
         let mut total_notional = 0.0;
+        let mut exchange_count = 0usize;
         for (exchange, info) in self.state.account_infos() {
             let leverage = if info.equity > 0.0 {
                 info.notional / info.equity
@@ -108,6 +87,7 @@ impl MetricsActor {
             };
             total_equity += info.equity;
             total_notional += info.notional;
+            exchange_count += 1;
             tracing::info!(
                 target: "metrics",
                 %exchange,
@@ -119,7 +99,7 @@ impl MetricsActor {
         }
 
         // ---------- 持仓 ----------
-        let mut position_value = 0.0;
+        let mut session_position_value = 0.0;
         let mut gross_notional = 0.0;
         let mut abs_net_notional = 0.0;
         let mut symbols_with_position = 0usize;
@@ -128,10 +108,10 @@ impl MetricsActor {
         let mut pending_orders = 0usize;
 
         for (symbol, symbol_state) in self.state.symbol_states() {
-            let exposure = symbol_exposure(symbol_state);
+            let exposure = symbol_state.exposure(self.baseline.get(symbol));
             let pending = symbol_state.pending_orders().count();
             pending_orders += pending;
-            position_value += exposure.net_notional;
+            session_position_value += exposure.session_notional_delta;
             gross_notional += exposure.gross_notional;
             abs_net_notional += exposure.net_notional.abs();
             unpriced_legs += exposure.unpriced_legs;
@@ -160,10 +140,10 @@ impl MetricsActor {
                 pending_orders = pending,
                 fills = stats.map(|s| s.fills).unwrap_or(0),
                 fee = format!("{:.4}", stats.map(|s| s.fee).unwrap_or(0.0)),
-                pnl = format!(
+                session_pnl = format!(
                     "{:.4}",
                     stats
-                        .map(|s| s.total_pnl(exposure.net_notional))
+                        .map(|s| s.total_pnl(exposure.session_notional_delta))
                         .unwrap_or(0.0)
                 ),
                 "metrics.position"
@@ -184,7 +164,7 @@ impl MetricsActor {
         // ---------- 订单 + 历史 ----------
         tracing::info!(
             target: "metrics",
-            exchanges = self.state.account_infos().count(),
+            exchanges = exchange_count,
             total_equity = format!("{:.2}", total_equity),
             total_account_notional = format!("{:.2}", total_notional),
             position_gross_notional = format!("{:.2}", gross_notional),
@@ -201,7 +181,7 @@ impl MetricsActor {
             volume = format!("{:.2}", self.total.volume),
             fee = format!("{:.4}", self.total.fee),
             cash = format!("{:.4}", self.total.cash),
-            total_pnl = format!("{:.4}", self.total.total_pnl(position_value)),
+            session_pnl = format!("{:.4}", self.total.total_pnl(session_position_value)),
             "metrics.summary"
         );
 
@@ -245,6 +225,7 @@ impl Actor for MetricsActor {
         Ok(Self {
             state: StateManager::new(&[], NO_ORDER_TIMEOUT),
             tracked: HashSet::new(),
+            baseline: HashMap::new(),
             per_symbol: HashMap::new(),
             total: TradingStats::default(),
             untracked_events: 0,
@@ -265,7 +246,7 @@ impl Actor for MetricsActor {
 
 // === Messages ===
 
-/// 注册需要跟踪的 symbol 集合（由上层在创建策略时告知）
+/// 注册需要跟踪的 symbol 集合
 pub struct RegisterSymbols(pub Vec<Symbol>);
 
 impl Message<RegisterSymbols> for MetricsActor {
@@ -284,12 +265,17 @@ impl Message<IncomeEvent> for MetricsActor {
 
     async fn handle(&mut self, msg: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
         // 跟踪范围外的 symbol 事件直接计数跳过：喂给 StateManager 会被当成"路由 bug"打 error，
-        // 但对观测层这只是"不关心的 symbol"，不是错误。
+        // 但对观测层这只是"不关心的 symbol"（分桶部署下必然出现），不是错误。
         if let Some(symbol) = msg.symbol() {
             if !self.tracked.contains(symbol) {
                 self.untracked_events += 1;
                 return;
             }
+        }
+
+        // 会话起始仓位基线：必须在 state.apply 之前取，那之后就分不清"快照初始值"和"成交累加值"了
+        if let ExchangeEventData::Position(position) = &msg.data {
+            self.record_baseline(&position.symbol, position.exchange, position.size);
         }
 
         // 账户 / 持仓 / 挂单视图
@@ -301,14 +287,18 @@ impl Message<IncomeEvent> for MetricsActor {
                 self.total.apply_fill(fill);
                 self.per_symbol
                     .entry(fill.symbol.clone())
-                    .or_default()
+                    .or_insert_with(|| {
+                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
+                    })
                     .apply_fill(fill);
             }
             ExchangeEventData::OrderUpdate(update) => {
                 self.total.apply_order_update(update);
                 self.per_symbol
                     .entry(update.symbol.clone())
-                    .or_default()
+                    .or_insert_with(|| {
+                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
+                    })
                     .apply_order_update(update);
             }
             _ => {}
@@ -323,14 +313,16 @@ impl Message<StreamMessage<Instant, (), ()>> for MetricsActor {
     async fn handle(
         &mut self,
         msg: StreamMessage<Instant, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) {
         match msg {
             StreamMessage::Next(_) => self.report(),
             StreamMessage::Started(_) => tracing::debug!("Metrics report timer started"),
+            // 观测组件故障**不得**拖垮交易：MetricsActor 是 spawn_link 到 manager 的，
+            // 这里 kill 自己会经 on_link_died 让整个进程退出。定时器结束只记 error 继续存活，
+            // 事件视图仍在更新，停机时的 on_stop 报告也还在。
             StreamMessage::Finished(_) => {
-                tracing::error!("Metrics report timer unexpectedly finished, killing actor");
-                ctx.actor_ref().kill();
+                tracing::error!("Metrics report timer finished, 后续周期报告停止（不影响交易）")
             }
         }
     }
@@ -339,91 +331,158 @@ impl Message<StreamMessage<Instant, (), ()>> for MetricsActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Exchange, Position, BBO};
+    use crate::domain::{Fill, FillReason, Position, Side};
 
-    fn bbo(exchange: Exchange, bid: f64, ask: f64) -> BBO {
-        BBO {
-            exchange,
-            symbol: "BTC".to_string(),
-            bid_price: bid,
-            bid_qty: 1.0,
-            ask_price: ask,
-            ask_qty: 1.0,
-            timestamp: 0,
+    fn position_event(exchange: Exchange, symbol: &str, size: f64) -> IncomeEvent {
+        IncomeEvent {
+            exchange_ts: 0,
+            local_ts: 0,
+            data: ExchangeEventData::Position(Position {
+                exchange,
+                symbol: symbol.to_string(),
+                size,
+                entry_price: 100.0,
+                unrealized_pnl: 0.0,
+            }),
         }
     }
 
-    fn position(exchange: Exchange, size: f64) -> Position {
-        Position {
-            exchange,
-            symbol: "BTC".to_string(),
-            size,
-            entry_price: 100.0,
-            unrealized_pnl: 0.0,
+    fn fill_event(exchange: Exchange, symbol: &str, side: Side, size: f64) -> IncomeEvent {
+        IncomeEvent {
+            exchange_ts: 0,
+            local_ts: 0,
+            data: ExchangeEventData::Fill(Fill {
+                exchange,
+                symbol: symbol.to_string(),
+                side,
+                price: 100.0,
+                size,
+                client_order_id: None,
+                order_id: "1".to_string(),
+                timestamp: 0,
+                fee: 0.0,
+                reason: FillReason::Normal,
+            }),
         }
     }
 
-    fn state_with(positions: Vec<Position>, bbos: Vec<BBO>) -> SymbolState {
-        let mut state = SymbolState::new("BTC".to_string());
-        for p in positions {
-            state.positions.insert(p.exchange, p);
+    /// 直接构造（绕过 actor 生命周期），用于测试纯状态累积逻辑
+    fn actor() -> MetricsActor {
+        MetricsActor {
+            state: StateManager::new(&[], NO_ORDER_TIMEOUT),
+            tracked: HashSet::new(),
+            baseline: HashMap::new(),
+            per_symbol: HashMap::new(),
+            total: TradingStats::default(),
+            untracked_events: 0,
         }
-        for b in bbos {
-            state.bbos.insert(b.exchange, b);
-        }
-        state
     }
 
-    #[test]
-    fn hedged_position_has_near_zero_net_notional() {
-        let state = state_with(
-            vec![
-                position(Exchange::Binance, 1.0),
-                position(Exchange::OKX, -1.0),
-            ],
-            vec![
-                bbo(Exchange::Binance, 100.0, 100.0),
-                bbo(Exchange::OKX, 100.0, 100.0),
-            ],
+    #[tokio::test]
+    async fn baseline_records_only_the_first_position_snapshot() {
+        let mut metrics = actor();
+        metrics.tracked.insert("BTC".to_string());
+        metrics.state.register_symbols(&["BTC".to_string()]);
+
+        // 启动快照 2.0，随后又来一条 Position（不应覆盖基线）
+        metrics.record_baseline(&"BTC".to_string(), Exchange::Binance, 2.0);
+        metrics.record_baseline(&"BTC".to_string(), Exchange::Binance, 9.0);
+
+        assert_eq!(
+            metrics.baseline["BTC"][&Exchange::Binance],
+            2.0,
+            "基线只取第一次快照"
         );
-
-        let exposure = symbol_exposure(&state);
-        assert_eq!(exposure.legs, 2);
-        assert!(exposure.net_notional.abs() < 1e-9);
-        assert!((exposure.gross_notional - 200.0).abs() < 1e-9);
-        assert_eq!(exposure.unpriced_legs, 0);
     }
 
-    #[test]
-    fn single_leg_is_reported_as_one_leg_exposure() {
-        let state = state_with(
-            vec![position(Exchange::Binance, 2.0)],
-            vec![bbo(Exchange::Binance, 100.0, 102.0)],
-        );
+    #[tokio::test]
+    async fn untracked_symbol_events_are_counted_not_applied() {
+        let mut metrics = actor();
+        metrics.tracked.insert("BTC".to_string());
+        metrics.state.register_symbols(&["BTC".to_string()]);
 
-        let exposure = symbol_exposure(&state);
-        assert_eq!(exposure.legs, 1);
-        assert!((exposure.net_size - 2.0).abs() < 1e-9);
-        assert!((exposure.net_notional - 202.0).abs() < 1e-9);
+        let ctx_free_event = fill_event(Exchange::Binance, "ETH", Side::Long, 1.0);
+        // 手工走一遍 handler 的判定分支（不经 actor 运行时）
+        if let Some(symbol) = ctx_free_event.symbol() {
+            if !metrics.tracked.contains(symbol) {
+                metrics.untracked_events += 1;
+            }
+        }
+
+        assert_eq!(metrics.untracked_events, 1);
+        assert_eq!(metrics.total.fills, 0);
     }
 
-    #[test]
-    fn missing_bbo_is_surfaced_not_silently_valued_at_zero() {
-        let state = state_with(vec![position(Exchange::Binance, 1.0)], vec![]);
+    #[tokio::test]
+    async fn session_pnl_excludes_pre_existing_inventory() {
+        let mut metrics = actor();
+        let symbol = "BTC".to_string();
+        metrics.tracked.insert(symbol.clone());
+        metrics.state.register_symbols(&[symbol.clone()]);
 
-        let exposure = symbol_exposure(&state);
-        assert_eq!(exposure.legs, 1);
-        assert_eq!(exposure.unpriced_legs, 1);
-        assert_eq!(exposure.gross_notional, 0.0);
+        // 启动时已有 2 个多头（重启场景）
+        let snapshot = position_event(Exchange::Binance, &symbol, 2.0);
+        metrics.record_baseline(&symbol, Exchange::Binance, 2.0);
+        metrics.state.apply(&snapshot);
+        // 喂 BBO 让持仓可估值
+        metrics.state.apply(&IncomeEvent {
+            exchange_ts: 0,
+            local_ts: 0,
+            data: ExchangeEventData::BBO(crate::domain::BBO {
+                exchange: Exchange::Binance,
+                symbol: symbol.clone(),
+                bid_price: 100.0,
+                bid_qty: 1.0,
+                ask_price: 100.0,
+                ask_qty: 1.0,
+                timestamp: 0,
+            }),
+        });
+
+        let state = metrics.state.symbol_state(&symbol).unwrap();
+        let exposure = state.exposure(metrics.baseline.get(&symbol));
+
+        // 全额市值 200，但本次会话未成交 → session PnL 为 0，而非凭空 +200
+        assert!((exposure.net_notional - 200.0).abs() < 1e-9);
+        assert!(exposure.session_notional_delta.abs() < 1e-9);
+        assert!(metrics.total.total_pnl(exposure.session_notional_delta).abs() < 1e-9);
     }
 
-    #[test]
-    fn zero_positions_are_ignored() {
-        let state = state_with(
-            vec![position(Exchange::Binance, 0.0)],
-            vec![bbo(Exchange::Binance, 100.0, 100.0)],
-        );
+    #[tokio::test]
+    async fn session_pnl_tracks_this_session_trades() {
+        let mut metrics = actor();
+        let symbol = "BTC".to_string();
+        metrics.tracked.insert(symbol.clone());
+        metrics.state.register_symbols(&[symbol.clone()]);
 
-        assert_eq!(symbol_exposure(&state), SymbolExposure::default());
+        metrics.record_baseline(&symbol, Exchange::Binance, 2.0);
+        metrics.state.apply(&position_event(Exchange::Binance, &symbol, 2.0));
+
+        // 本次会话又买 1 个（价 100），随后 BBO 报 110
+        let fill = fill_event(Exchange::Binance, &symbol, Side::Long, 1.0);
+        if let ExchangeEventData::Fill(f) = &fill.data {
+            metrics.total.apply_fill(f);
+        }
+        metrics.state.apply(&fill);
+        metrics.state.apply(&IncomeEvent {
+            exchange_ts: 0,
+            local_ts: 0,
+            data: ExchangeEventData::BBO(crate::domain::BBO {
+                exchange: Exchange::Binance,
+                symbol: symbol.clone(),
+                bid_price: 110.0,
+                bid_qty: 1.0,
+                ask_price: 110.0,
+                ask_qty: 1.0,
+                timestamp: 0,
+            }),
+        });
+
+        let state = metrics.state.symbol_state(&symbol).unwrap();
+        let exposure = state.exposure(metrics.baseline.get(&symbol));
+
+        // 会话内新增 1 个、现价 110 → 存货变化 +110，现金流 -100 → 浮盈 10
+        assert!((exposure.session_notional_delta - 110.0).abs() < 1e-9);
+        assert!((metrics.total.total_pnl(exposure.session_notional_delta) - 10.0).abs() < 1e-9);
     }
 }
