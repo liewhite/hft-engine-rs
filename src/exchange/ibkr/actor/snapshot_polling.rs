@@ -72,6 +72,9 @@ pub struct IbkrSnapshotPollingActor {
     /// 借券费/汇率最近一次成功更新时刻（None = 启动后尚未成功）
     last_borrow_ok_ms: Option<u64>,
     last_fx_ok_ms: Option<u64>,
+    /// 最近一次 snapshot 观测到的借券行情是否处于冻结态（美股休市，可借量 7636 不返回）。
+    /// 冻结态下豁免借券腿的新鲜度校验（见 `is_stale`）；未知可用性时保守视为非冻结（强制新鲜）。
+    borrow_frozen: bool,
 }
 
 impl IbkrSnapshotPollingActor {
@@ -81,11 +84,17 @@ impl IbkrSnapshotPollingActor {
             .client
             .fetch_snapshot_raw(
                 self.borrow_conid,
-                &[self.cfg.shortable_field.as_str(), self.cfg.fee_field.as_str()],
+                &[
+                    self.cfg.shortable_field.as_str(),
+                    self.cfg.fee_field.as_str(),
+                    MD_AVAILABILITY_FIELD,
+                ],
             )
             .await
         {
             Ok(obj) => {
+                // 先记录冻结态：美股休市时可借量(7636)不返回，属预期缺口而非数据源失效。
+                self.borrow_frozen = is_market_frozen(&obj);
                 let shortable = parse_field(&obj, &self.cfg.shortable_field);
                 let fee_raw = parse_field(&obj, &self.cfg.fee_field);
                 match (shortable, fee_raw) {
@@ -110,13 +119,23 @@ impl IbkrSnapshotPollingActor {
                         fee = fe,
                         "IBKR 券源 snapshot 值无效 (shortable/fee 应为有限非负)，不计入成功"
                     ),
+                    // 冻结态豁免：休市时可借量本就不返回，沿用最后已知值、不当失败（不触发致命）。
+                    _ if self.borrow_frozen => tracing::info!(
+                        obj = %obj,
+                        "IBKR 券源冻结态 (6509=Z/Y)：可借量休市不返回，豁免新鲜度校验，沿用最后已知值"
+                    ),
                     _ => tracing::error!(
                         obj = %obj,
                         "IBKR 券源 snapshot 字段解析失败 (shortable/fee 缺失)"
                     ),
                 }
             }
-            Err(e) => tracing::error!(error = %e, "IBKR 券源 snapshot 拉取失败"),
+            Err(e) => {
+                // 拉取失败无法确认是否冻结。真正的冻结态一定返回 Ok(obj)（请求带 6509，ready 必真），
+                // 故 Err 绝不代表「仍在冻结」——保守置非冻结，避免旧冻结值掩盖活市期借券端点单独断源。
+                self.borrow_frozen = false;
+                tracing::error!(error = %e, "IBKR 券源 snapshot 拉取失败");
+            }
         }
     }
 
@@ -167,10 +186,14 @@ impl IbkrSnapshotPollingActor {
     /// 过期判定：借券费或汇率距上次成功更新（未成功过则从启动时刻算）超过 max_staleness_ms
     /// 即返回 true（数据源失效）。
     fn is_stale(&self, now: u64) -> bool {
-        let borrow_ref = self.last_borrow_ok_ms.unwrap_or(self.started_ms);
-        let fx_ref = self.last_fx_ok_ms.unwrap_or(self.started_ms);
-        now.saturating_sub(borrow_ref) > self.cfg.max_staleness_ms
-            || now.saturating_sub(fx_ref) > self.cfg.max_staleness_ms
+        eval_stale(
+            now,
+            self.last_borrow_ok_ms,
+            self.last_fx_ok_ms,
+            self.started_ms,
+            self.borrow_frozen,
+            self.cfg.max_staleness_ms,
+        )
     }
 }
 
@@ -220,6 +243,7 @@ impl Actor for IbkrSnapshotPollingActor {
             started_ms: now_ms(),
             last_borrow_ok_ms: None,
             last_fx_ok_ms: None,
+            borrow_frozen: false,
         })
     }
 
@@ -266,6 +290,47 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrSnapshotPollingActor {
     }
 }
 
+/// 过期判定（纯函数，便于单测）：fx 任一超期即致命；借券腿仅在**非冻结**时计入过期。
+///
+/// fx 优先判定，且冻结豁免只作用于借券腿——故 fx 超期即便借券处于冻结豁免中仍会致命
+/// （fx 走独立端点、盘外亦可得，无豁免理由）。
+///
+/// **冻结豁免依赖一条跨层不变量**：无任何入场逻辑消费冻结期的借券数据（策略入场只在活市发生，
+/// 届时 `borrow_frozen=false`、可借量正常返回）。若将来策略把 `shortable_shares` 纳入入场门控，
+/// 冻结期沿用的旧值会悄悄喂给决策，此豁免须重估。
+fn eval_stale(
+    now: u64,
+    last_borrow_ok: Option<u64>,
+    last_fx_ok: Option<u64>,
+    started: u64,
+    borrow_frozen: bool,
+    max_staleness_ms: u64,
+) -> bool {
+    let fx_ref = last_fx_ok.unwrap_or(started);
+    if now.saturating_sub(fx_ref) > max_staleness_ms {
+        return true;
+    }
+    if borrow_frozen {
+        return false;
+    }
+    let borrow_ref = last_borrow_ok.unwrap_or(started);
+    now.saturating_sub(borrow_ref) > max_staleness_ms
+}
+
+/// IBKR 行情可用性字段 tag（协议常量，非账户/合约事实）。首字母表征数据类型：
+/// R=实时 / D=延迟 / Z=冻结(收盘最后值) / Y=冻结延迟 / N=未订阅。
+const MD_AVAILABILITY_FIELD: &str = "6509";
+
+/// 判断 snapshot 是否处于冻结态（美股休市，只余最后值，可借量 7636 不返回）。
+/// 6509 首字母 Z/Y 视为冻结；字段缺失（无法判定可用性）时保守返回 false → 强制新鲜（fail-safe）。
+fn is_market_frozen(obj: &serde_json::Value) -> bool {
+    obj.get(MD_AVAILABILITY_FIELD)
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.chars().next())
+        .map(|c| c == 'Z' || c == 'Y')
+        .unwrap_or(false)
+}
+
 /// 解析 snapshot 字段为 f64：支持数字或字符串 (剥离 %、逗号等非数字字符)
 fn parse_field(obj: &serde_json::Value, field: &str) -> Option<f64> {
     let v = obj.get(field)?;
@@ -294,5 +359,56 @@ mod tests {
         assert!((parse_field(&obj, "7637").unwrap() - 0.84).abs() < 1e-9);
         assert!((parse_field(&obj, "31").unwrap() - 1479.6).abs() < 1e-9);
         assert_eq!(parse_field(&obj, "999"), None);
+    }
+
+    #[test]
+    fn frozen_detection_by_6509() {
+        // 冻结态（Z/Y）→ true；实时/延迟/未订阅 → false
+        assert!(is_market_frozen(&json!({"6509": "ZB"})));
+        assert!(is_market_frozen(&json!({"6509": "Y"})));
+        assert!(!is_market_frozen(&json!({"6509": "RB"})));
+        assert!(!is_market_frozen(&json!({"6509": "DP"})));
+        assert!(!is_market_frozen(&json!({"6509": "N"})));
+        // 字段缺失 → 保守视为非冻结（强制新鲜）
+        assert!(!is_market_frozen(&json!({"7637": "0.60%"})));
+    }
+
+    // eval_stale 决策覆盖：now/started 用绝对毫秒，max=300s。
+    const MAX: u64 = 300_000;
+    const T0: u64 = 1_000_000_000;
+
+    #[test]
+    fn stale_when_borrow_overdue_and_live() {
+        // 活市：借券超期 → 致命
+        let now = T0 + MAX + 1;
+        assert!(eval_stale(now, Some(T0), Some(now), T0, false, MAX));
+    }
+
+    #[test]
+    fn not_stale_when_borrow_overdue_but_frozen() {
+        // 冻结豁免：借券超期但冻结 → 不致命（沿用最后已知值）
+        let now = T0 + MAX + 1;
+        assert!(!eval_stale(now, Some(T0), Some(now), T0, true, MAX));
+    }
+
+    #[test]
+    fn fx_overdue_kills_even_when_frozen() {
+        // canary：fx 超期即便借券冻结豁免仍致命（fx 无豁免理由）
+        let now = T0 + MAX + 1;
+        assert!(eval_stale(now, Some(now), Some(T0), T0, true, MAX));
+    }
+
+    #[test]
+    fn frozen_then_borrow_endpoint_fails_in_live_still_kills() {
+        // Critical 回归：冻结期后借券端点单独故障（Err 分支已置 borrow_frozen=false），
+        // fx 仍健康，活市借券真实断源必须致命——否则借券 kill 线被静默绕过。
+        let now = T0 + MAX + 1;
+        assert!(eval_stale(now, Some(T0), Some(now), T0, /* borrow_frozen */ false, MAX));
+    }
+
+    #[test]
+    fn fresh_within_window_not_stale() {
+        let now = T0 + MAX / 2;
+        assert!(!eval_stale(now, Some(T0), Some(T0), T0, false, MAX));
     }
 }
