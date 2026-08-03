@@ -28,6 +28,4 @@ pub const WS_PRIVATE_URL: &str = "wss://fstream.binance.com/private/ws";
 pub struct BinanceCredentials {
     pub api_key: String,
     pub secret: String,
-    /// 计价币种 (e.g., "USDT", "USDC")
-    pub quote: String,
 }

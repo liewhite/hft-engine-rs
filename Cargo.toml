@@ -86,5 +86,9 @@ name = "backtest"
 path = "src/bin/backtest.rs"
 
 [[bin]]
+name = "paper_trade"
+path = "src/bin/paper_trade.rs"
+
+[[bin]]
 name = "gamma_scalp"
 path = "src/bin/gamma_scalp.rs"

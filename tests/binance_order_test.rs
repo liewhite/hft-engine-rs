@@ -24,7 +24,6 @@ fn get_credentials() -> Option<BinanceCredentials> {
     Some(BinanceCredentials {
         api_key,
         secret,
-        quote: TEST_QUOTE.to_string(),
     })
 }
 
@@ -63,7 +62,7 @@ async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Er
 #[ignore = "需要真实凭证和网络"]
 async fn test_binance_limit_buy() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
-    let client = BinanceClient::new(Some(credentials)).expect("创建客户端失败");
+    let client = BinanceClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
 
     let symbol: Symbol = TEST_BASE.to_string();
 
@@ -109,7 +108,7 @@ async fn test_binance_limit_buy() {
 #[ignore = "需要真实凭证和网络"]
 async fn test_binance_limit_sell() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
-    let client = BinanceClient::new(Some(credentials)).expect("创建客户端失败");
+    let client = BinanceClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
 
     let symbol: Symbol = TEST_BASE.to_string();
 

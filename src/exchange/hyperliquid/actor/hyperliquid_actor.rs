@@ -73,7 +73,7 @@ impl Actor for HyperliquidActor {
                     &actor_ref,
                     HyperliquidPrivateWsActorArgs {
                         wallet_address: credentials.wallet_address,
-                        dex: credentials.dex,
+                        dex: args.dex.clone(),
                         income_pubsub: income_pubsub.clone(),
                         symbol_metas: args.symbol_metas,
                     },

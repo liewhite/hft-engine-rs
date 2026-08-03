@@ -114,7 +114,7 @@ impl Actor for BinanceActor {
         // 构建失败向上传播 → 启动期受控退出
         let binance_client: Option<Arc<BinanceClient>> = match args.credentials.as_ref() {
             Some(c) => Some(Arc::new(
-                BinanceClient::new(Some(c.clone()))
+                BinanceClient::new(args.quote.clone(), Some(c.clone()))
                     .map_err(|e| ExchangeError::Other(format!("Failed to create BinanceClient: {e}")))?,
             )),
             None => None,

@@ -27,7 +27,6 @@ fn get_credentials() -> Option<OkxCredentials> {
         api_key,
         secret,
         passphrase,
-        quote: TEST_QUOTE.to_string(),
     })
 }
 
@@ -77,7 +76,7 @@ async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Er
 #[ignore = "需要真实凭证和网络"]
 async fn test_okx_limit_buy() {
     let credentials = get_credentials().expect("需要设置 OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE");
-    let client = OkxClient::new(Some(credentials)).expect("创建客户端失败");
+    let client = OkxClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
 
     let symbol: Symbol = TEST_BASE.to_string();
 
@@ -123,7 +122,7 @@ async fn test_okx_limit_buy() {
 #[ignore = "需要真实凭证和网络"]
 async fn test_okx_limit_sell() {
     let credentials = get_credentials().expect("需要设置 OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE");
-    let client = OkxClient::new(Some(credentials)).expect("创建客户端失败");
+    let client = OkxClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
 
     let symbol: Symbol = TEST_BASE.to_string();
 

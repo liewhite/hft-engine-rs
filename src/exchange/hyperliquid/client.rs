@@ -48,7 +48,11 @@ pub struct HyperliquidClient {
 
 impl HyperliquidClient {
     /// 创建新的 Hyperliquid 客户端
-    pub fn new(credentials: Option<HyperliquidCredentials>) -> Result<Self, ExchangeError> {
+    pub fn new(
+        quote: String,
+        dex: String,
+        credentials: Option<HyperliquidCredentials>,
+    ) -> Result<Self, ExchangeError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -60,16 +64,6 @@ impl HyperliquidClient {
             .map(|c| create_signer(&c.private_key))
             .transpose()
             .map_err(|e| ExchangeError::Other(format!("Failed to create signer: {}", e)))?;
-
-        let quote = credentials
-            .as_ref()
-            .map(|c| c.quote.clone())
-            .unwrap_or_else(|| "USDC".to_string());
-
-        let dex = credentials
-            .as_ref()
-            .map(|c| c.dex.clone())
-            .unwrap_or_default();
 
         Ok(Self {
             client,

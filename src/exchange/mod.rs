@@ -11,8 +11,8 @@ pub mod ws_loop;
 mod trades_conformance;
 
 pub use client::{
-    ExchangeActorOps, ExchangeClient, ExchangeOrder, Subscribe, SubscribeBatch, SubscriptionKind,
-    Unsubscribe,
+    ExchangeAccess, ExchangeActorOps, ExchangeClient, ExchangeOrder, Subscribe, SubscribeBatch,
+    SubscriptionKind, Unsubscribe,
 };
 
 // 为各交易所 Actor 实现 ExchangeActorOps

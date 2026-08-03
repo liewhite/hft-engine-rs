@@ -39,8 +39,6 @@ fn load_credentials() -> HyperliquidCredentials {
     HyperliquidCredentials {
         wallet_address: config.wallet,
         private_key: config.agent_key,
-        quote: TEST_QUOTE.to_string(),
-        dex: TEST_DEX.to_string(),
     }
 }
 
@@ -49,10 +47,8 @@ fn create_public_client() -> HyperliquidClient {
     let creds = HyperliquidCredentials {
         wallet_address: "0x0000000000000000000000000000000000000000".to_string(),
         private_key: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
-        quote: TEST_QUOTE.to_string(),
-        dex: TEST_DEX.to_string(),
     };
-    HyperliquidClient::new(Some(creds)).expect("创建公开客户端失败")
+    HyperliquidClient::new(TEST_QUOTE.to_string(), TEST_DEX.to_string(), Some(creds)).expect("创建公开客户端失败")
 }
 
 /// L2 订单簿响应
@@ -219,7 +215,7 @@ async fn test_xyz_fetch_meta_and_asset_ctxs() {
 /// 下单测试辅助函数
 async fn place_test_order(side: Side) {
     let credentials = load_credentials();
-    let client = HyperliquidClient::new(Some(credentials)).expect("创建客户端失败");
+    let client = HyperliquidClient::new(TEST_QUOTE.to_string(), TEST_DEX.to_string(), Some(credentials)).expect("创建客户端失败");
 
     let symbol: Symbol = TEST_COIN.to_string();
 

@@ -201,7 +201,7 @@ async fn paper_counter_fills_from_live_trades() {
         .try_init();
 
     // ---- 无凭证 client + 公共 symbol meta ----
-    let client = Arc::new(BinanceClient::new(None).expect("client"));
+    let client = Arc::new(BinanceClient::new("USDT".to_string(), None).expect("client"));
     let symbol = COIN.to_string();
     let metas = client
         .fetch_symbol_meta(std::slice::from_ref(&symbol))

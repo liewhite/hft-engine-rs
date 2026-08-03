@@ -22,7 +22,7 @@ use crate::exchange::hyperliquid::{
 };
 use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
-use crate::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
+use crate::exchange::{ExchangeAccess, ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -60,12 +60,12 @@ impl TradingMode {
 
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
-    /// Binance 凭证（可选）
-    pub binance_credentials: Option<BinanceCredentials>,
-    /// OKX 凭证（可选）
-    pub okx_credentials: Option<OkxCredentials>,
-    /// Hyperliquid 凭证（可选）
-    pub hyperliquid_credentials: Option<HyperliquidCredentials>,
+    /// Binance 接入配置（缺省即该所不参与）
+    pub binance: Option<ExchangeAccess<BinanceCredentials>>,
+    /// OKX 接入配置
+    pub okx: Option<ExchangeAccess<OkxCredentials>>,
+    /// Hyperliquid 接入配置
+    pub hyperliquid: Option<ExchangeAccess<HyperliquidCredentials>>,
     /// IBKR 凭证（可选）
     pub ibkr_credentials: Option<IbkrCredentials>,
     /// IBKR 借券费/汇率 snapshot 轮询配置（可选）：Some 时 IbkrActor 会 spawn_link 一个
@@ -372,21 +372,27 @@ impl Actor for ManagerActor {
         //    模拟盘也需要 client：symbol metas 走公共 REST，与是否有凭证无关
         let mut clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
 
-        if let Some(ref cred) = args.binance_credentials {
-            let client = BinanceClient::new(Some(cred.clone()))?;
+        // 模拟盘下不把凭证交给 client：client 只用于公共 REST（symbol metas），
+        // 且绝不能在模拟盘里具备下单能力
+        if let Some(ref access) = args.binance {
+            let creds = (!paper).then(|| access.credentials.clone()).flatten();
+            let client = BinanceClient::new(access.quote.clone(), creds)?;
             clients.insert(Exchange::Binance, Arc::new(client));
         }
 
-        let okx_client: Option<Arc<OkxClient>> = if let Some(ref cred) = args.okx_credentials {
-            let client = Arc::new(OkxClient::new(Some(cred.clone()))?);
+        let okx_client: Option<Arc<OkxClient>> = if let Some(ref access) = args.okx {
+            let creds = (!paper).then(|| access.credentials.clone()).flatten();
+            let client = Arc::new(OkxClient::new(access.quote.clone(), creds)?);
             clients.insert(Exchange::OKX, client.clone());
             Some(client)
         } else {
             None
         };
 
-        if let Some(ref cred) = args.hyperliquid_credentials {
-            let client = HyperliquidClient::new(Some(cred.clone()))?;
+        if let Some(ref access) = args.hyperliquid {
+            let creds = (!paper).then(|| access.credentials.clone()).flatten();
+            let client =
+                HyperliquidClient::new(access.quote.clone(), access.dex.clone(), creds)?;
             clients.insert(Exchange::Hyperliquid, Arc::new(client));
         }
 
@@ -518,7 +524,7 @@ impl Actor for ManagerActor {
         // 7. 创建所有配置了凭证的 ExchangeActors
         //    Phase 1: 顺序 spawn（每个 spawn_link_with_mailbox 本身瞬间返回）
         //    Phase 2: tokio::join! 并发等所有 on_start 完成（这才是耗时的 IO 部分）
-        let binance_ref_opt = if let Some(ref credentials) = args.binance_credentials {
+        let binance_ref_opt = if let Some(ref access) = args.binance {
             let symbol_metas_for_exchange =
                 Self::get_symbol_metas_for(&symbol_metas, Exchange::Binance);
             let client = clients
@@ -531,12 +537,12 @@ impl Actor for ManagerActor {
                     BinanceActorArgs {
                         // 模拟盘不接私有流：真实成交/持仓若混入同一条 IncomePubSub，
                         // 会污染本地柜台的账本
-                        credentials: (!paper).then(|| credentials.clone()),
+                        credentials: (!paper).then(|| access.credentials.clone()).flatten(),
                         symbol_metas: symbol_metas_for_exchange,
                         rest_base_url: REST_BASE_URL.to_string(),
                         income_pubsub: income_pubsub.clone(),
                         client,
-                        quote: credentials.quote.clone(),
+                        quote: access.quote.clone(),
                     },
                     mailbox::unbounded(),
                 )
@@ -546,17 +552,17 @@ impl Actor for ManagerActor {
             None
         };
 
-        let okx_ref_opt = if let Some(ref credentials) = args.okx_credentials {
+        let okx_ref_opt = if let Some(ref access) = args.okx {
             let symbol_metas_for_exchange = Self::get_symbol_metas_for(&symbol_metas, Exchange::OKX);
             Some(
                 OkxActor::spawn_link_with_mailbox(
                     &actor_ref,
                     OkxActorArgs {
-                        credentials: (!paper).then(|| credentials.clone()),
+                        credentials: (!paper).then(|| access.credentials.clone()).flatten(),
                         client: okx_client.clone(),
                         symbol_metas: symbol_metas_for_exchange,
                         income_pubsub: income_pubsub.clone(),
-                        quote: credentials.quote.clone(),
+                        quote: access.quote.clone(),
                     },
                     mailbox::unbounded(),
                 )
@@ -566,18 +572,18 @@ impl Actor for ManagerActor {
             None
         };
 
-        let hyper_ref_opt = if let Some(ref credentials) = args.hyperliquid_credentials {
+        let hyper_ref_opt = if let Some(ref access) = args.hyperliquid {
             let symbol_metas_for_exchange =
                 Self::get_symbol_metas_for(&symbol_metas, Exchange::Hyperliquid);
             Some(
                 HyperliquidActor::spawn_link_with_mailbox(
                     &actor_ref,
                     HyperliquidActorArgs {
-                        credentials: (!paper).then(|| credentials.clone()),
+                        credentials: (!paper).then(|| access.credentials.clone()).flatten(),
                         symbol_metas: symbol_metas_for_exchange,
                         income_pubsub: income_pubsub.clone(),
-                        quote: credentials.quote.clone(),
-                        dex: credentials.dex.clone(),
+                        quote: access.quote.clone(),
+                        dex: access.dex.clone(),
                     },
                     mailbox::unbounded(),
                 )

@@ -30,16 +30,11 @@ pub struct BinanceClient {
 
 impl BinanceClient {
     /// 创建新的 Binance 客户端
-    pub fn new(credentials: Option<BinanceCredentials>) -> Result<Self, ExchangeError> {
+    pub fn new(quote: String, credentials: Option<BinanceCredentials>) -> Result<Self, ExchangeError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
-
-        let quote = credentials
-            .as_ref()
-            .map(|c| c.quote.clone())
-            .unwrap_or_else(|| "USDT".to_string());
 
         Ok(Self {
             client,

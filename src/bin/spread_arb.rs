@@ -12,6 +12,7 @@ use hft_engine_rs::engine::{
     ManagerActorArgs, TradingMode,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
+use hft_engine_rs::exchange::ExchangeAccess;
 use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
 use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::strategy::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
@@ -27,9 +28,9 @@ use serde::Deserialize;
 /// 无关标的对冲，且股票有交易时段、与 7x24 的永续无法持续对冲。要做跨市场套利应另起策略。
 #[derive(Debug, Clone, Deserialize)]
 struct ExchangesConfig {
-    binance: Option<BinanceCredentials>,
-    okx: Option<OkxCredentials>,
-    hyperliquid: Option<HyperliquidCredentials>,
+    binance: Option<ExchangeAccess<BinanceCredentials>>,
+    okx: Option<ExchangeAccess<OkxCredentials>>,
+    hyperliquid: Option<ExchangeAccess<HyperliquidCredentials>>,
 }
 
 /// symbol 分桶配置
@@ -127,9 +128,9 @@ async fn main() -> anyhow::Result<()> {
 
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
-            binance_credentials: config.exchanges.binance.clone(),
-            okx_credentials: config.exchanges.okx.clone(),
-            hyperliquid_credentials: config.exchanges.hyperliquid.clone(),
+            binance: config.exchanges.binance.clone(),
+            okx: config.exchanges.okx.clone(),
+            hyperliquid: config.exchanges.hyperliquid.clone(),
             ibkr_credentials: None,
             ibkr_snapshot: None,
             trading_mode: TradingMode::Live,

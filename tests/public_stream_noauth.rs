@@ -129,9 +129,9 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
         .try_init();
 
     // ---- 1. 无凭证 client：symbol meta 走公共 REST，不需要签名 ----
-    let binance_client = Arc::new(BinanceClient::new(None).expect("binance client"));
-    let okx_client = Arc::new(OkxClient::new(None).expect("okx client"));
-    let hl_client = Arc::new(HyperliquidClient::new(None).expect("hl client"));
+    let binance_client = Arc::new(BinanceClient::new("USDT".to_string(), None).expect("binance client"));
+    let okx_client = Arc::new(OkxClient::new("USDT".to_string(), None).expect("okx client"));
+    let hl_client = Arc::new(HyperliquidClient::new("USDC".to_string(), String::new(), None).expect("hl client"));
 
     let symbol = COIN.to_string();
     let binance_metas = binance_client

@@ -11,7 +11,9 @@ use hft_engine_rs::engine::{
     AddStrategies, ManagerActor, ManagerActorArgs,
 };
 use hft_engine_rs::exchange::okx::OkxCredentials;
-use hft_engine_rs::exchange::SubscriptionKind;
+use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
+
+const TEST_QUOTE: &str = "USDT";
 use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent, StateManager};
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
 use kameo::actor::Spawn;
@@ -26,7 +28,6 @@ fn get_credentials() -> Option<OkxCredentials> {
         api_key,
         secret,
         passphrase,
-        quote: "USDT".to_string(),
     })
 }
 
@@ -86,9 +87,9 @@ async fn test_okx_greeks_push() {
         ManagerActorArgs {
             ibkr_snapshot: None,
             trading_mode: hft_engine_rs::engine::TradingMode::Live,
-            binance_credentials: None,
-            okx_credentials: Some(credentials),
-            hyperliquid_credentials: None,
+            binance: None,
+            okx: Some(ExchangeAccess { quote: TEST_QUOTE.to_string(), dex: String::new(), credentials: Some(credentials) }),
+            hyperliquid: None,
             ibkr_credentials: None,
         },
         mailbox::unbounded(),
