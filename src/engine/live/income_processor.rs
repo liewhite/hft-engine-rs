@@ -274,6 +274,26 @@ impl Message<AccountIncome> for IncomeProcessorActor {
     }
 }
 
+/// 注销 executor（动态撤下策略实例时使用）
+pub struct UnregisterExecutor {
+    pub executor: ActorRef<ExecutorActor>,
+}
+
+impl Message<UnregisterExecutor> for IncomeProcessorActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: UnregisterExecutor,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let id = msg.executor.id();
+        if self.executors.remove(&id).is_none() {
+            tracing::warn!(?id, "UnregisterExecutor: 该 executor 未注册，忽略");
+        }
+    }
+}
+
 #[cfg(test)]
 mod account_isolation_tests {
     use super::*;

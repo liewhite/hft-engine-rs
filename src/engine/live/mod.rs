@@ -10,6 +10,7 @@ mod income_processor;
 mod metrics;
 mod outcome_processor;
 mod paper_counter;
+mod supervisor;
 
 use crate::domain::AccountId;
 use crate::messaging::IncomeEvent;
@@ -51,9 +52,13 @@ pub type OutcomePubSub = PubSub<AccountOutcome>;
 
 pub use clock::{ClockActor, ClockActorArgs};
 pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
-pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, GetIbkrClient, PublishIncome, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome, StrategySpec};
+pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, GetIbkrClient, PublishIncome, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome, StrategySpec, RemoveStrategies};
 pub use executor::{ExecutorActor, ExecutorArgs};
-pub use income_processor::{IncomeProcessorActor, RegisterExecutor};
+pub use income_processor::{IncomeProcessorActor, RegisterExecutor, UnregisterExecutor};
 pub use metrics::{MetricsActor, MetricsActorArgs, RegisterSymbols, DEFAULT_REPORT_INTERVAL_MS};
 pub use outcome_processor::{OutcomeProcessorActor, OutcomeProcessorArgs};
 pub use paper_counter::{PaperCounterActor, PaperCounterArgs};
+pub use supervisor::{
+    Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,
+    SupervisorArgs, SymbolRecord, SymbolView,
+};

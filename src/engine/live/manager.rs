@@ -10,9 +10,12 @@ use super::{
     AccountOutcome, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
     PaperCounterActor, PaperCounterArgs, PaperPubSub,
     IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor,
-    RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, DEFAULT_REPORT_INTERVAL_MS,
+    RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, UnregisterExecutor,
+    DEFAULT_REPORT_INTERVAL_MS,
 };
-use crate::domain::{AccountId, Exchange, ExchangeError, Symbol, SymbolMeta, now_ms};
+use crate::domain::{
+    now_ms, AccountId, Exchange, ExchangeError, Order, OrderType, Side, Symbol, SymbolMeta,
+};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::exchange::binance::{
     BinanceActor, BinanceActorArgs, BinanceClient, BinanceCredentials, REST_BASE_URL,
@@ -22,7 +25,9 @@ use crate::exchange::hyperliquid::{
 };
 use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
-use crate::exchange::{ExchangeAccess, ExchangeActorOps, ExchangeClient, SubscriptionKind};
+use crate::exchange::{
+    ExchangeAccess, ExchangeActorOps, ExchangeClient, ExchangeOrder, SubscriptionKind,
+};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -82,6 +87,18 @@ pub struct ManagerActor {
     /// **非 ExchangeClient trait** 的具体方法。None = 未配置 IBKR。单会话复用同一 client。
     ibkr_client: Option<Arc<IbkrClient>>,
 
+    /// 已注册的策略实例，供动态撤下使用。
+    ///
+    /// 晋升/降级要求能在运行期增删实例（见 [`RemoveStrategies`]），故必须留存引用；
+    /// 否则实例只能随进程生死。
+    executors: Vec<RegisteredExecutor>,
+}
+
+/// 一个已注册的策略实例
+struct RegisteredExecutor {
+    executor: ActorRef<ExecutorActor>,
+    account: AccountId,
+    symbols: HashSet<Symbol>,
 }
 
 impl ManagerActor {
@@ -188,6 +205,11 @@ impl ManagerActor {
             {
                 tracing::error!(error = %e, "Failed to forward event to executor");
             }
+            self.executors.push(RegisteredExecutor {
+                executor: executor_ref.clone(),
+                account: account.clone(),
+                symbols: subscriptions.iter().map(|(_, k)| k.symbol().clone()).collect(),
+            });
         }
 
         // 收集所有策略涉及的 (exchange, symbol) 对（下面 step 5 & 6 共用）
@@ -646,6 +668,7 @@ impl Actor for ManagerActor {
             metrics,
             exchange_actors,
             ibkr_client: ibkr_client_ref,
+            executors: Vec::new(),
         })
     }
 
@@ -837,5 +860,122 @@ impl Message<GetIbkrClient> for ManagerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.ibkr_client.clone()
+    }
+}
+
+/// 撤下某账户在指定 symbol 上的策略实例，可选立即平仓。
+///
+/// 用于降级：`live 持续亏损 -> 关闭 live`。两步都必要 ——
+/// 只撤实例不平仓会留下无人看管的敞口；只平仓不撤实例会被策略立刻重新开仓。
+pub struct RemoveStrategies {
+    /// 目标账户（降级即 [`AccountId::Live`]）
+    pub account: AccountId,
+    /// 目标 symbol
+    pub symbols: Vec<Symbol>,
+    /// 平仓下到哪个交易所
+    pub exchange: Exchange,
+    /// 是否立即市价平掉存量仓位
+    pub flatten: bool,
+}
+
+impl Message<RemoveStrategies> for ManagerActor {
+    type Reply = Result<(), ExchangeError>;
+
+    async fn handle(
+        &mut self,
+        msg: RemoveStrategies,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let targets: Vec<Symbol> = msg.symbols;
+
+        // 1. 先撤实例，再平仓。顺序不能反：先平仓的话，策略在收到平仓回报后可能立刻重开。
+        let mut removed = 0usize;
+        let mut kept = Vec::new();
+        for reg in std::mem::take(&mut self.executors) {
+            let hit = reg.account == msg.account
+                && targets.iter().any(|s| reg.symbols.contains(s));
+            if !hit {
+                kept.push(reg);
+                continue;
+            }
+            if let Err(e) = self
+                .income_processor
+                .tell(UnregisterExecutor {
+                    executor: reg.executor.clone(),
+                })
+                .send()
+                .await
+            {
+                tracing::error!(error = %e, "Failed to unregister executor");
+            }
+            reg.executor.kill();
+            removed += 1;
+        }
+        self.executors = kept;
+        tracing::info!(
+            account = %msg.account,
+            symbols = ?targets,
+            removed,
+            "Removed strategy instances"
+        );
+
+        if !msg.flatten {
+            return Ok(());
+        }
+
+        // 2. 平仓只对实盘账户有意义：模拟账户的仓位在本地柜台里，随账户一起留存（供继续记账）
+        if msg.account != AccountId::Live {
+            return Ok(());
+        }
+        let Some(client) = self.clients.get(&msg.exchange).cloned() else {
+            return Err(ExchangeError::Other(format!(
+                "No client for {} — cannot flatten",
+                msg.exchange
+            )));
+        };
+
+        // 仓位以交易所为准：本地状态可能因撤下实例而不再更新
+        let positions = client.fetch_positions().await?;
+        for pos in positions {
+            if !targets.contains(&pos.symbol) || pos.is_empty() {
+                continue;
+            }
+            let Some(meta) = self.symbol_metas.get(&(msg.exchange, pos.symbol.clone())) else {
+                tracing::error!(
+                    exchange = %msg.exchange,
+                    symbol = %pos.symbol,
+                    "No SymbolMeta — cannot flatten (数量无法折算为交易所单位)"
+                );
+                continue;
+            };
+            // 反向 reduce-only 市价单：撮合层强制不反向开仓，量算多了也只会平到 0
+            let side = if pos.size > 0.0 { Side::Short } else { Side::Long };
+            let order = Order {
+                id: String::new(),
+                exchange: msg.exchange,
+                symbol: pos.symbol.clone(),
+                side,
+                order_type: OrderType::Market,
+                quantity: pos.size.abs(),
+                reduce_only: true,
+                client_order_id: msg.exchange.new_cli_order_id(),
+            };
+            tracing::warn!(
+                exchange = %msg.exchange,
+                symbol = %pos.symbol,
+                position = pos.size,
+                %side,
+                "[DEMOTE] Flattening live position with reduce-only market order"
+            );
+            let wire = ExchangeOrder::from_domain(order, meta);
+            if let Err(e) = client.place_order(wire).await {
+                tracing::error!(
+                    symbol = %pos.symbol,
+                    error = %e,
+                    "平仓下单失败 —— 实盘仍有敞口，需人工介入"
+                );
+            }
+        }
+        Ok(())
     }
 }
