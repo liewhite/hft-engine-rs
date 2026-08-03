@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
         end,
         false,
         "data-cache",
-        &[BinanceDataKind::Trades],
+        &[BinanceDataKind::AggTrades],
     )
     .map_err(|e| anyhow::anyhow!("build history source: {e}"))?;
 

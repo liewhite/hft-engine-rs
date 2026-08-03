@@ -8,7 +8,7 @@
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::hyperliquid::codec::{WsActiveAssetCtx, WsBbo, WsTrade};
+use crate::exchange::hyperliquid::codec::{aggregate_trades, WsActiveAssetCtx, WsBbo, WsTrade};
 use crate::exchange::hyperliquid::{to_hyperliquid, WS_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -451,15 +451,15 @@ pub(crate) fn parse_public_message(
                 let trades: Vec<WsTrade> = serde_json::from_value(value["data"].clone())
                     .map_err(|e| WsError::ParseError(format!("trades parse: {}", e)))?;
 
-                let mut events = Vec::new();
-                for t in &trades {
-                    let trade = t.to_market_trade()?;
-                    events.push(IncomeEvent {
+                // 归集为 aggTrade 口径（HL 线路逐笔，Binance/OKX 下发的已是归集结果）
+                let events = aggregate_trades(&trades)?
+                    .into_iter()
+                    .map(|trade| IncomeEvent {
                         exchange_ts: trade.timestamp,
                         local_ts,
                         data: ExchangeEventData::MarketTrade(trade),
-                    });
-                }
+                    })
+                    .collect();
                 return Ok(events);
             }
             "allMids" => {

@@ -273,12 +273,9 @@ impl ManagerActor {
                             );
                         }
                         let local_ts = now_ms();
-                        for mut update in updates {
-                            // REST 返回的数量是合约张数，转换为币单位
-                            if let Some(meta) = self.symbol_metas.get(&(*exchange, symbol.clone())) {
-                                update.quantity = meta.qty_to_coin(update.quantity);
-                                update.filled_quantity = meta.qty_to_coin(update.filled_quantity);
-                            }
+                        for update in updates {
+                            // 数量无需在此折算：ExchangeClient 的契约是返回币本位
+                            // (见 crate::domain::Quantity)，各所 client 内部已折算完毕
                             let event = IncomeEvent {
                                 exchange_ts: local_ts,
                                 local_ts,

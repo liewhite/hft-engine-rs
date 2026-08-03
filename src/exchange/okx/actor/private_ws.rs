@@ -8,7 +8,9 @@
 use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Position, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
-use crate::exchange::okx::codec::{AccountData, OrderPushData, PositionData, WsEvent, WsPush};
+use crate::exchange::okx::codec::{
+    resolve_meta, AccountData, OrderPushData, PositionData, WsEvent, WsPush,
+};
 use crate::exchange::okx::{OkxCredentials, WS_PRIVATE_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -264,9 +266,9 @@ fn parse_private_message(
             let mut seen_symbols = std::collections::HashSet::new();
 
             for data in &push.data {
-                let mut position = data.to_position()?;
-                if let Some(meta) = symbol_metas.get(&position.symbol) {
-                    position.size = meta.qty_to_coin(position.size);
+                // 折算由 to_position 的签名强制完成（张 -> 币）
+                if let Some(meta) = resolve_meta(&data.inst_id, symbol_metas) {
+                    let position = data.to_position(meta)?;
                     seen_symbols.insert(position.symbol.clone());
                     events.push(IncomeEvent {
                         exchange_ts: local_ts,
@@ -344,23 +346,21 @@ fn parse_private_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let mut order_update = data.to_order_update()
-                    ?;
-
-                // 获取 meta 转换数量单位（张 -> 币）
-                if let Some(meta) = symbol_metas.get(&order_update.symbol) {
-                    order_update.quantity = meta.qty_to_coin(order_update.quantity);
-                    order_update.filled_quantity = meta.qty_to_coin(order_update.filled_quantity);
-                    order_update.fill_sz = meta.qty_to_coin(order_update.fill_sz);
-                }
+                // 缺 meta 则无法把张数折为币本位，丢弃并告警 —— 绝不能按张数下发（会差 contract_size 倍）
+                let Some(meta) = resolve_meta(&data.inst_id, symbol_metas) else {
+                    tracing::warn!(
+                        exchange = "OKX",
+                        inst_id = %data.inst_id,
+                        "Missing SymbolMeta for order push, dropping"
+                    );
+                    continue;
+                };
+                // 数量折算由签名强制完成（含 status 内嵌的 PartiallyFilled{filled}）
+                let order_update = data.to_order_update(meta)?;
 
                 // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
-                if let Some(mut fill) = data.to_fill()
+                if let Some(fill) = data.to_fill(meta)
                     ? {
-                    // 获取 meta 转换数量单位（张 -> 币）
-                    if let Some(meta) = symbol_metas.get(&fill.symbol) {
-                        fill.size = meta.qty_to_coin(fill.size);
-                    }
                     events.push(IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,

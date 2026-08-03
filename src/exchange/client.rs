@@ -20,14 +20,22 @@ pub enum SubscriptionKind {
     BBO { symbol: Symbol },
     /// 公共成交印记 (成交流)
     ///
-    /// **各所归集粒度不同**，依赖"成交笔数 / 单笔均量 / 到达强度"的因子必须自行归一，
-    /// 否则跨所不可比 (实测口径，见 `crate::exchange::trades_conformance`)：
-    /// - Binance `aggTrade`：按主动单 + 价位**归集** (一条覆盖 `f`..`l` 多笔撮合)
-    /// - OKX `trades`：按主动单 + 价位 + source **归集** (`count` 为合并笔数)
-    /// - Hyperliquid `trades`：**不归集**，同一主动单吃穿多档会拆成多条
-    ///   (`hash`/`time` 相同、对手方不同)
+    /// # 统一口径：aggTrade（同一主动单在同一价位的多笔撮合合并为一条）
     ///
-    /// 价格与成交量在各所口径一致 (量统一为币本位)，故价量类因子不受此影响。
+    /// 各所线路粒度并不相同，差异由**适配层吸收**，上层看到的永远是归集后的口径
+    /// (与"数量一律币本位"同理，见 [`crate::domain::Quantity`])。各所实测情况：
+    /// - Binance `aggTrade`：线路已归集 (一条覆盖 `f`..`l` 多笔撮合)
+    /// - OKX `trades`：线路已归集 (`count` 为合并笔数；注意按 `source` 拆分，
+    ///   同一主动单同一价位若对手方混有 ELP 与普通挂单会分成两条)
+    /// - Hyperliquid `trades`：线路**逐笔**下发，由
+    ///   `crate::exchange::hyperliquid::codec::aggregate_trades` 在单条消息内归集
+    ///   (零额外延迟，不缓冲)
+    ///
+    /// 回测侧同样使用 Binance `aggTrades` 数据集
+    /// (见 [`crate::backtest::BinanceDataKind::AggTrades`])，与实盘同粒度 —— 否则成交流
+    /// 因子在回测里调好的参数上线即漂移。
+    ///
+    /// 口径由 `crate::exchange::trades_conformance` 的联网测试守住。
     Trades { symbol: Symbol },
     /// 标记价格
     MarkPrice { symbol: Symbol },
@@ -58,6 +66,15 @@ impl SubscriptionKind {
 /// 交易所客户端统一接口
 ///
 /// 仅封装交易所的 REST 交互，WebSocket Actor 由 ManagerActor 直接创建
+///
+/// # 数量口径契约
+///
+/// **返回值中的一切数量必须是币本位**（见 [`crate::domain::Quantity`]）。若交易所 REST 用
+/// 合约张数计量（OKX 的 SWAP/FUTURES），折算是各实现自己的责任，不得把张数交给调用方 ——
+/// 那样每个调用点都要记着乘一次，漏一处便静默算错 contract_size 倍。
+///
+/// 反方向（[`ExchangeClient::place_order`] 的入参）例外：订单在
+/// `StrategyRunner::convert_order` 中已按 `SymbolMeta` 转为交易所下单单位。
 #[async_trait]
 pub trait ExchangeClient: Send + Sync + 'static {
     /// 获取交易所标识

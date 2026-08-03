@@ -8,6 +8,7 @@ use super::from_hyperliquid;
 use crate::domain::{
     now_ms, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, Side, BBO,
 };
+use indexmap::IndexMap;
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -156,9 +157,11 @@ impl WsBbo {
 /// (与 [`WsFill`] / 订单推送一致，见 [`parse_side`])。官方文档此处写作 "Buy"/"Sell"，但实测
 /// 线路上是 `"B"`/`"A"`；未观测到的形式不做预留容错，由线路一致性测试守住。
 ///
-/// **本所不做归集**：同一主动单吃穿多档会拆成多条消息（`hash` 与 `time` 相同、对手方不同），
-/// 与 Binance aggTrade / OKX trades 的归集口径不同 —— 实测确认，见
-/// `crate::exchange::trades_conformance`。依赖"成交笔数/单笔均量"的因子必须自行归集。
+/// `users` 为 `[buyer, seller]`，据此可定位**主动方地址**：主动买时是 `users[0]`，
+/// 主动卖时是 `users[1]`。用于 [`aggregate_trades`] 的归集。
+///
+/// **本所线路上不归集**：同一主动单吃穿多档会拆成多条。为让上层看到与 Binance aggTrade /
+/// OKX trades 一致的口径，归集在本适配层完成 —— 见 [`aggregate_trades`]。
 #[derive(Debug, Deserialize)]
 pub struct WsTrade {
     pub coin: String,
@@ -166,27 +169,88 @@ pub struct WsTrade {
     pub px: String,
     pub sz: String,
     pub time: u64,
+    /// L1 交易哈希；尚未上链的撮合为全 0，不能用于识别主动单
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// `[buyer, seller]`
+    #[serde(default)]
+    pub users: Option<Vec<String>>,
 }
 
 impl WsTrade {
-    pub fn to_market_trade(&self) -> Result<MarketTrade, String> {
-        let symbol = from_hyperliquid(&self.coin);
-        let price = f64::from_str(&self.px)
-            .map_err(|_| format!("Failed to parse trade price: {}", self.px))?;
-        let qty = f64::from_str(&self.sz)
-            .map_err(|_| format!("Failed to parse trade size: {}", self.sz))?;
-        // side 是**主动方**方向：主动卖 (A) 时买方为挂单方
-        let is_buyer_maker = parse_side(&self.side)? == Side::Short;
-
-        Ok(MarketTrade {
-            exchange: Exchange::Hyperliquid,
-            symbol,
-            price,
-            qty,
-            is_buyer_maker,
-            timestamp: self.time,
-        })
+    /// 主动方 (taker) 地址：主动买 -> buyer，主动卖 -> seller。
+    fn taker(&self, side: Side) -> Option<&str> {
+        let users = self.users.as_ref()?;
+        let idx = match side {
+            Side::Long => 0,  // 主动买，taker 是 buyer
+            Side::Short => 1, // 主动卖，taker 是 seller
+        };
+        users.get(idx).map(|s| s.as_str())
     }
+
+    /// 非全 0 的 hash 才能标识一笔主动单
+    fn taker_order_hash(&self) -> Option<&str> {
+        let h = self.hash.as_deref()?;
+        h.trim_start_matches("0x")
+            .bytes()
+            .any(|b| b != b'0')
+            .then_some(h)
+    }
+}
+
+/// 把一批线路成交归集为 **aggTrade 口径**：同一主动单在同一价位的多笔撮合合并为一条。
+///
+/// Hyperliquid 逐笔下发，而 Binance/OKX 下发的已是归集结果。若不在此归一，"成交笔数 /
+/// 单笔均量 / 到达强度"这类因子跨所不可比 —— 故归集放在适配层，让 domain 口径统一
+/// (与数量一律币本位同理，差异由适配层吸收，不外泄给策略)。
+///
+/// 归集键为 (主动单 hash, 主动方地址, 价格, 主动方向)：hash 可用时最精确；hash 为全 0
+/// (尚未上链) 时退化为按主动方地址归集。数量求和，时间取该组最后一笔。
+/// 只在**单条 WS 消息内**归集：不缓冲、不等待后续消息，故**零额外延迟**。其完整性依赖
+/// "一笔主动单的成交同批下发"，这与 L1 一次撮合原子产出全部 fill 的语义一致，并已实测验证
+/// (90s / 109 条消息 / 115 个非零 hash，无一跨消息)。该前提由
+/// `crate::exchange::trades_conformance` 中的断言守住。
+///
+/// 若该前提将来被破坏，后果是**笔数偏高**（一单被计为多条），价格与成交量仍然精确 ——
+/// 宁可接受这个有界误差，也不为归集去等时间窗口（那才是延迟敏感策略无法接受的）。
+///
+/// 用 [`IndexMap`] 保持首次出现顺序，保证同一输入必得同一输出顺序 (回测确定性)。
+pub fn aggregate_trades(trades: &[WsTrade]) -> Result<Vec<MarketTrade>, String> {
+    let mut out: IndexMap<(Option<String>, Option<String>, u64, bool), MarketTrade> =
+        IndexMap::new();
+
+    for t in trades {
+        let taker_side = parse_side(&t.side)?;
+        // 主动卖 (A) 时买方为挂单方
+        let is_buyer_maker = taker_side == Side::Short;
+        let price = f64::from_str(&t.px)
+            .map_err(|_| format!("Failed to parse trade price: {}", t.px))?;
+        let qty = f64::from_str(&t.sz)
+            .map_err(|_| format!("Failed to parse trade size: {}", t.sz))?;
+
+        // 价格按位模式作键：f64 不可哈希，且此处只需"完全相同"的语义
+        let key = (
+            t.taker_order_hash().map(str::to_string),
+            t.taker(taker_side).map(str::to_string),
+            price.to_bits(),
+            is_buyer_maker,
+        );
+        out.entry(key)
+            .and_modify(|agg| {
+                agg.qty += qty;
+                agg.timestamp = agg.timestamp.max(t.time);
+            })
+            .or_insert_with(|| MarketTrade {
+                exchange: Exchange::Hyperliquid,
+                symbol: from_hyperliquid(&t.coin),
+                price,
+                qty,
+                is_buyer_maker,
+                timestamp: t.time,
+            });
+    }
+
+    Ok(out.into_values().collect())
 }
 
 /// ActiveAssetCtx 数据 (实时资产上下文)
@@ -513,22 +577,33 @@ impl WsFill {
 mod trade_tests {
     use super::*;
 
-    /// trades 推送样例（含本结构未声明的 hash/tid/users 字段，应被忽略）
-    const TRADE: &str = r#"{
-        "coin":"BTC","side":"A","px":"42219.9","sz":"0.125","time":1630048897897,
-        "hash":"0xabc","tid":123456,"users":["0x1","0x2"]
-    }"#;
+    fn trade(side: &str, px: &str, sz: &str, time: u64, hash: &str, users: [&str; 2]) -> WsTrade {
+        WsTrade {
+            coin: "BTC".to_string(),
+            side: side.to_string(),
+            px: px.to_string(),
+            sz: sz.to_string(),
+            time,
+            hash: Some(hash.to_string()),
+            users: Some(users.iter().map(|s| s.to_string()).collect()),
+        }
+    }
+
+    const ZERO_HASH: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    const TAKER: &str = "0xtaker";
 
     #[test]
-    fn trade_parses_price_qty_and_taker_side() {
-        let t: WsTrade = serde_json::from_str(TRADE).expect("parse trade");
-        let mt = t.to_market_trade().expect("to_market_trade");
-        assert_eq!(mt.exchange, Exchange::Hyperliquid);
-        assert_eq!(mt.symbol, "BTC");
-        assert_eq!(mt.price, 42219.9);
-        assert_eq!(mt.qty, 0.125);
-        assert!(mt.is_buyer_maker, "side=A 是主动卖 -> 买方为挂单方");
-        assert_eq!(mt.timestamp, 1630048897897);
+    fn single_trade_parses_price_qty_and_taker_side() {
+        // side=A 是主动卖 -> 买方为挂单方
+        let t = trade("A", "42219.9", "0.125", 1630048897897, "0xabc", ["0xbuyer", TAKER]);
+        let out = aggregate_trades(&[t]).expect("aggregate");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].exchange, Exchange::Hyperliquid);
+        assert_eq!(out[0].symbol, "BTC");
+        assert_eq!(out[0].price, 42219.9);
+        assert_eq!(out[0].qty, 0.125);
+        assert!(out[0].is_buyer_maker);
+        assert_eq!(out[0].timestamp, 1630048897897);
     }
 
     /// 线路上的编码实测为 `"B"`/`"A"`（官方文档写作 "Buy"/"Sell"，与实际不符）。
@@ -536,35 +611,86 @@ mod trade_tests {
     #[test]
     fn trade_side_uses_b_a_encoding_only() {
         for (side, expect_buyer_maker) in [("B", false), ("A", true)] {
-            let raw =
-                format!(r#"{{"coin":"BTC","side":"{side}","px":"1.0","sz":"1.0","time":1}}"#);
-            let t: WsTrade = serde_json::from_str(&raw).unwrap();
-            assert_eq!(
-                t.to_market_trade().unwrap().is_buyer_maker,
-                expect_buyer_maker,
-                "side={side}"
-            );
+            let t = trade(side, "1.0", "1.0", 1, "0xabc", ["0xb", "0xs"]);
+            let out = aggregate_trades(&[t]).unwrap();
+            assert_eq!(out[0].is_buyer_maker, expect_buyer_maker, "side={side}");
         }
         for side in ["Buy", "Sell", "buy", "sell"] {
-            let raw =
-                format!(r#"{{"coin":"BTC","side":"{side}","px":"1.0","sz":"1.0","time":1}}"#);
-            let t: WsTrade = serde_json::from_str(&raw).unwrap();
-            assert!(t.to_market_trade().is_err(), "side={side} 应被拒绝");
+            let t = trade(side, "1.0", "1.0", 1, "0xabc", ["0xb", "0xs"]);
+            assert!(aggregate_trades(&[t]).is_err(), "side={side} 应被拒绝");
         }
-    }
-
-    #[test]
-    fn trade_unknown_side_is_error_not_silent() {
-        let raw = r#"{"coin":"BTC","side":"X","px":"1.0","sz":"1.0","time":1}"#;
-        let t: WsTrade = serde_json::from_str(raw).unwrap();
-        assert!(t.to_market_trade().is_err());
     }
 
     /// dex 前缀应被剥离为 base symbol
     #[test]
     fn trade_strips_dex_prefix() {
-        let raw = r#"{"coin":"xyz:NVDA","side":"B","px":"1.0","sz":"1.0","time":1}"#;
-        let t: WsTrade = serde_json::from_str(raw).unwrap();
-        assert_eq!(t.to_market_trade().unwrap().symbol, "NVDA");
+        let mut t = trade("B", "1.0", "1.0", 1, "0xabc", ["0xb", "0xs"]);
+        t.coin = "xyz:NVDA".to_string();
+        assert_eq!(aggregate_trades(&[t]).unwrap()[0].symbol, "NVDA");
+    }
+
+    /// 同一主动单在同一价位的多笔撮合合并为一条（aggTrade 口径）
+    #[test]
+    fn same_taker_order_same_price_is_merged() {
+        let trades = vec![
+            trade("A", "62508.0", "0.002", 100, "0xdeal", ["0xm1", TAKER]),
+            trade("A", "62508.0", "0.005", 100, "0xdeal", ["0xm2", TAKER]),
+            trade("A", "62508.0", "0.003", 120, "0xdeal", ["0xm3", TAKER]),
+        ];
+        let out = aggregate_trades(&trades).unwrap();
+        assert_eq!(out.len(), 1, "同单同价应合并为一条");
+        assert!((out[0].qty - 0.010).abs() < 1e-12, "数量应求和, got {}", out[0].qty);
+        assert_eq!(out[0].timestamp, 120, "时间取该组最后一笔");
+    }
+
+    /// 同一主动单吃穿多档：不同价位必须各自成条（与 Binance aggTrade 一致）
+    #[test]
+    fn same_taker_order_different_prices_stay_separate() {
+        let trades = vec![
+            trade("A", "62508.0", "0.002", 100, "0xdeal", ["0xm1", TAKER]),
+            trade("A", "62506.0", "0.004", 100, "0xdeal", ["0xm2", TAKER]),
+        ];
+        let out = aggregate_trades(&trades).unwrap();
+        assert_eq!(out.len(), 2);
+        // 保持首次出现顺序 -> 回测确定性
+        assert_eq!(out[0].price, 62508.0);
+        assert_eq!(out[1].price, 62506.0);
+    }
+
+    /// hash 为全 0（尚未上链）时退化为按主动方地址归集
+    #[test]
+    fn zero_hash_falls_back_to_taker_address() {
+        let trades = vec![
+            trade("A", "62503.0", "0.001", 100, ZERO_HASH, ["0xm1", TAKER]),
+            trade("A", "62503.0", "0.002", 100, ZERO_HASH, ["0xm2", TAKER]),
+            // 同价位但不同主动方 -> 不能合并
+            trade("A", "62503.0", "0.004", 100, ZERO_HASH, ["0xm3", "0xother"]),
+        ];
+        let out = aggregate_trades(&trades).unwrap();
+        assert_eq!(out.len(), 2, "不同主动方不得合并");
+        assert!((out[0].qty - 0.003).abs() < 1e-12);
+        assert!((out[1].qty - 0.004).abs() < 1e-12);
+    }
+
+    /// 方向相反不得合并（主动买与主动卖是两回事）
+    #[test]
+    fn opposite_taker_sides_are_not_merged() {
+        let trades = vec![
+            trade("B", "62503.0", "0.001", 100, ZERO_HASH, [TAKER, "0xm1"]),
+            trade("A", "62503.0", "0.002", 100, ZERO_HASH, ["0xm2", TAKER]),
+        ];
+        assert_eq!(aggregate_trades(&trades).unwrap().len(), 2);
+    }
+
+    /// 缺 users 字段时不按地址归集，但仍按 hash 归集（不 panic、不误合并）
+    #[test]
+    fn missing_users_still_aggregates_by_hash() {
+        let mut a = trade("A", "1.0", "1.0", 1, "0xdeal", ["0xb", "0xs"]);
+        let mut b = trade("A", "1.0", "2.0", 1, "0xdeal", ["0xb", "0xs"]);
+        a.users = None;
+        b.users = None;
+        let out = aggregate_trades(&[a, b]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].qty, 3.0);
     }
 }

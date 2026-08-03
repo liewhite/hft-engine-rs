@@ -1,10 +1,14 @@
 //! 回测入口：用币安官方历史 trades 还原行情，对策略做确定性回测。
 //!
 //! 与实盘**完全相同的策略代码** —— 差异只在驱动层 (单线程虚拟时间 vs 实盘并发墙钟)。
+//! 成交流用 `aggTrades` (归集口径)，与实盘 WS 的 aggTrade 对齐，避免因子在回测/实盘间漂移。
 //! 首跑联网下载历史数据并落 `data-cache`，二跑命中缓存。
 //!
 //! 运行: `cargo run --bin backtest -- [SYMBOL] [START yyyy-mm-dd] [END yyyy-mm-dd]`
-//! 例:   `cargo run --bin backtest -- BTCUSDT 2024-01-01 2024-01-01`
+//! 例:   `cargo run --bin backtest -- BTC 2024-01-01 2024-01-01`
+//!
+//! SYMBOL 是**内部基础符号**（`BTC`），计价币由代码补齐；传 `BTCUSDT` 会被拼成
+//! `BTCUSDTUSDT`，数据源稳定 404 且只 warn，表现为"回测跑完但 0 事件"。
 
 use anyhow::Context;
 use chrono::NaiveDate;
@@ -130,7 +134,7 @@ fn main() -> anyhow::Result<()> {
         end,
         false, // trade-native: 直接用真实 trade 撮合
         "data-cache",
-        &[BinanceDataKind::Trades],
+        &[BinanceDataKind::AggTrades],
     )
     .map_err(|e| anyhow::anyhow!("build history source: {e}"))?;
 

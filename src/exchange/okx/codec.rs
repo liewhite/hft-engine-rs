@@ -1,7 +1,20 @@
 use super::{from_okx, from_okx_index};
-use crate::domain::{Candle, CandleInterval, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice, MarketTrade, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
+use crate::domain::{Candle, CandleInterval, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice, MarketTrade, OrderStatus, OrderUpdate, Position, Side, Symbol, SymbolMeta, now_ms, BBO};
+use std::collections::HashMap;
 use serde::Deserialize;
 use std::str::FromStr;
+
+/// 由 OKX `instId` 解析出内部 symbol 并取其元数据。
+///
+/// 返回 `None` 表示 instId 无法识别或该 symbol 未配置 —— 调用方应跳过该条并告警，
+/// **绝不能**退化为"不折算直接下发"（那会把张数当币数，见 [`crate::domain::Quantity`]）。
+pub(crate) fn resolve_meta<'a>(
+    inst_id: &str,
+    metas: &'a HashMap<Symbol, SymbolMeta>,
+) -> Option<&'a SymbolMeta> {
+    let symbol = from_okx(inst_id)?;
+    metas.get(&symbol)
+}
 
 /// OKX 方向编码：`"buy"` / `"sell"`。
 ///
@@ -81,10 +94,9 @@ pub struct BboData {
 }
 
 impl BboData {
-    pub fn to_bbo(&self, inst_id: &str) -> Result<BBO, String> {
-        let symbol = from_okx(inst_id)
-            .ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
-
+    /// `meta` 既提供 symbol，也提供张->币折算 —— 盘口挂单量 `sz` 与私有流一样是**张数**，
+    /// 必须折算后再进 domain（见 [`crate::domain::Quantity`] 的不变量）。
+    pub fn to_bbo(&self, meta: &SymbolMeta) -> Result<BBO, String> {
         let ask = self.asks.first()
             .ok_or("BBO asks is empty")?;
         if ask.len() < 2 {
@@ -110,11 +122,11 @@ impl BboData {
 
         Ok(BBO {
             exchange: Exchange::OKX,
-            symbol,
+            symbol: meta.symbol.clone(),
             bid_price,
-            bid_qty,
+            bid_qty: meta.qty_to_coin(bid_qty),
             ask_price,
-            ask_qty,
+            ask_qty: meta.qty_to_coin(ask_qty),
             timestamp,
         })
     }
@@ -125,8 +137,8 @@ impl BboData {
 /// 官方字段：`instId`、`tradeId`、`px` 成交价、`sz` 成交量、`side` **主动方**方向
 /// (`buy`/`sell`)、`ts` 成交时间 (毫秒字符串)。其余字段 (`count`/`source` 等) 由 serde 忽略。
 ///
-/// **`sz` 单位是合约张数** (SWAP/FUTURES)，与 OKX 私有流的 `sz` 一致；折算为币本位由
-/// actor 层用 [`crate::domain::SymbolMeta::qty_to_coin`] 完成 (与 private_ws 同一套路)。
+/// **线路上的 `sz` 单位是合约张数** (SWAP/FUTURES)；折算为币本位在本方法内完成，
+/// 由签名强制要求 [`SymbolMeta`]（见 [`crate::domain::Quantity`] 的不变量）。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TradeData {
@@ -139,10 +151,8 @@ pub struct TradeData {
 }
 
 impl TradeData {
-    /// 转为公共成交印记。`qty` 为**张数**，币本位折算由调用方按 SymbolMeta 完成。
-    pub fn to_market_trade(&self, inst_id: &str) -> Result<MarketTrade, String> {
-        let symbol = from_okx(inst_id)
-            .ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
+    /// 转为公共成交印记，数量已折算为币本位。
+    pub fn to_market_trade(&self, meta: &SymbolMeta) -> Result<MarketTrade, String> {
         let price = f64::from_str(&self.px)
             .map_err(|_| format!("Failed to parse trade price: {}", self.px))?;
         let qty = f64::from_str(&self.sz)
@@ -156,9 +166,9 @@ impl TradeData {
 
         Ok(MarketTrade {
             exchange: Exchange::OKX,
-            symbol,
+            symbol: meta.symbol.clone(),
             price,
-            qty,
+            qty: meta.qty_to_coin(qty),
             is_buyer_maker,
             timestamp,
         })
@@ -241,9 +251,8 @@ pub struct PositionData {
 }
 
 impl PositionData {
-    pub fn to_position(&self) -> Result<Position, String> {
-        let symbol = from_okx(&self.inst_id)
-            .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
+    /// 持仓 `pos` 是**张数**，折算由签名强制（见 [`crate::domain::Quantity`]）。
+    pub fn to_position(&self, meta: &SymbolMeta) -> Result<Position, String> {
         let pos_amount = f64::from_str(&self.pos)
             .map_err(|_| format!("Failed to parse position amount: {}", self.pos))?;
         // OKX 空仓时 avg_px/upl 为空字符串，此时为 0.0；非空必须解析成功
@@ -262,8 +271,8 @@ impl PositionData {
 
         Ok(Position {
             exchange: Exchange::OKX,
-            symbol,
-            size: pos_amount, // 正数多头，负数空头
+            symbol: meta.symbol.clone(),
+            size: meta.qty_to_coin(pos_amount), // 正数多头，负数空头
             entry_price: avg_price,
             unrealized_pnl,
         })
@@ -344,9 +353,8 @@ pub struct OrderPushData {
 }
 
 impl OrderPushData {
-    pub fn to_order_update(&self) -> Result<OrderUpdate, String> {
-        let symbol = from_okx(&self.inst_id)
-            .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
+    /// 全部数量字段折算为币本位，折算由签名强制（见 [`crate::domain::Quantity`]）。
+    pub fn to_order_update(&self, meta: &SymbolMeta) -> Result<OrderUpdate, String> {
         // market order px 为空字符串，此时 price 为 0.0
         let price = if self.px.is_empty() {
             0.0
@@ -354,45 +362,52 @@ impl OrderPushData {
             f64::from_str(&self.px)
                 .map_err(|_| format!("Failed to parse px: {}", self.px))?
         };
-        let sz = f64::from_str(&self.sz)
-            .map_err(|_| format!("Failed to parse sz: {}", self.sz))?;
-        let fill_sz = f64::from_str(&self.fill_sz)
-            .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?;
-        let acc_fill_sz = f64::from_str(&self.acc_fill_sz)
-            .map_err(|_| format!("Failed to parse acc_fill_sz: {}", self.acc_fill_sz))?;
+        // 线路上三个数量字段都是张数，此处一次性折算为币本位
+        let sz = meta.qty_to_coin(
+            f64::from_str(&self.sz).map_err(|_| format!("Failed to parse sz: {}", self.sz))?,
+        );
+        let fill_sz = meta.qty_to_coin(
+            f64::from_str(&self.fill_sz)
+                .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?,
+        );
+        let acc_fill_sz = meta.qty_to_coin(
+            f64::from_str(&self.acc_fill_sz)
+                .map_err(|_| format!("Failed to parse acc_fill_sz: {}", self.acc_fill_sz))?,
+        );
 
         let side = parse_side(&self.side)?;
 
+        // 注意 status 内嵌的 PartiallyFilled{filled} 同样是数量，必须用折算后的值
         let status = map_okx_order_state(&self.state, acc_fill_sz);
 
         Ok(OrderUpdate {
             order_id: self.ord_id.clone(),
             client_order_id: self.cl_ord_id.clone(),
             exchange: Exchange::OKX,
-            symbol,
+            symbol: meta.symbol.clone(),
             side,
             status,
             price,
             reduce_only: self.reduce_only.as_deref() == Some("true"),
-            quantity: sz,          // 张数，由 private_ws 转换为币
-            filled_quantity: acc_fill_sz, // 张数，由 private_ws 转换为币
-            fill_sz,               // 张数，由 private_ws 转换为币
+            quantity: sz,
+            filled_quantity: acc_fill_sz,
+            fill_sz,
             timestamp: now_ms(),
         })
     }
 
-    /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）
-    pub fn to_fill(&self) -> Result<Option<Fill>, String> {
-        let fill_sz = f64::from_str(&self.fill_sz)
-            .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?;
+    /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）。数量折算为币本位。
+    pub fn to_fill(&self, meta: &SymbolMeta) -> Result<Option<Fill>, String> {
+        let fill_sz = meta.qty_to_coin(
+            f64::from_str(&self.fill_sz)
+                .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?,
+        );
 
         // 没有成交则不生成 Fill
         if fill_sz == 0.0 {
             return Ok(None);
         }
 
-        let symbol = from_okx(&self.inst_id)
-            .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let fill_px = f64::from_str(&self.fill_px)
             .map_err(|_| format!("Failed to parse fill_px: {}", self.fill_px))?;
 
@@ -410,7 +425,7 @@ impl OrderPushData {
 
         Ok(Some(Fill {
             exchange: Exchange::OKX,
-            symbol,
+            symbol: meta.symbol.clone(),
             side,
             price: fill_px,
             size: fill_sz,
@@ -564,6 +579,22 @@ pub fn okx_channel_to_candle_interval(channel: &str) -> Option<CandleInterval> {
 #[cfg(test)]
 mod trade_tests {
     use super::*;
+    use crate::exchange::utils::StepFormatter;
+    use std::sync::Arc;
+
+    /// BTC-USDT-SWAP: ctVal = 0.01 BTC/张
+    const CONTRACT_SIZE: f64 = 0.01;
+
+    fn btc_meta() -> SymbolMeta {
+        SymbolMeta {
+            exchange: Exchange::OKX,
+            symbol: "BTC".to_string(),
+            price_formatter: Arc::new(StepFormatter::new(0.1)),
+            size_step: 0.01,
+            min_order_size: 0.01,
+            contract_size: CONTRACT_SIZE,
+        }
+    }
 
     /// trades 频道推送样例（含本结构未声明的 count/source 字段，应被忽略）
     const TRADES_PUSH: &str = r#"{
@@ -575,13 +606,15 @@ mod trade_tests {
     #[test]
     fn trade_parses_contracts_and_taker_side() {
         let push: WsPush<TradeData> = serde_json::from_str(TRADES_PUSH).expect("parse trades push");
-        let inst_id = push.arg.inst_id.as_ref().expect("instId");
-        let t = push.data[0].to_market_trade(inst_id).expect("to_market_trade");
+        assert!(push.arg.inst_id.is_some(), "instId 必须存在");
+        let t = push.data[0]
+            .to_market_trade(&btc_meta())
+            .expect("to_market_trade");
         assert_eq!(t.exchange, Exchange::OKX);
         assert_eq!(t.symbol, "BTC");
         assert_eq!(t.price, 42219.9);
-        // qty 仍是**张数**，币本位折算在 actor 层用 SymbolMeta 完成
-        assert_eq!(t.qty, 12.0);
+        // 12 张 x 0.01 = 0.12 BTC —— 折算由签名强制，漏折算会是 12（差 100 倍）
+        assert!((t.qty - 0.12).abs() < 1e-12, "got {}", t.qty);
         assert!(t.is_buyer_maker, "side=sell 是主动卖 -> 买方为挂单方");
         assert_eq!(t.timestamp, 1630048897897);
     }
@@ -590,14 +623,39 @@ mod trade_tests {
     fn trade_buy_side_means_buyer_is_taker() {
         let raw = r#"{"tradeId":"1","px":"1.0","sz":"1","side":"buy","ts":"1"}"#;
         let d: TradeData = serde_json::from_str(raw).unwrap();
-        let t = d.to_market_trade("BTC-USDT-SWAP").unwrap();
+        let t = d.to_market_trade(&btc_meta()).unwrap();
         assert!(!t.is_buyer_maker);
+    }
+
+    /// Critical 回归防线：OKX 盘口挂单量原先未折算，导致 BBO 的 qty 是张数、
+    /// 而 position/fill/trade 是币本位，spread_arb 按币本位使用 ask_qty/bid_qty
+    /// 时 OKX 腿的流动性约束实际失效（差 contract_size 倍）。
+    #[test]
+    fn bbo_quantities_are_converted_to_coin() {
+        let raw = r#"{"asks":[["42220.0","30"]],"bids":[["42219.9","12"]],"ts":"1630048897897"}"#;
+        let d: BboData = serde_json::from_str(raw).unwrap();
+        let bbo = d.to_bbo(&btc_meta()).unwrap();
+        assert_eq!(bbo.symbol, "BTC");
+        assert_eq!(bbo.bid_price, 42219.9);
+        assert!((bbo.bid_qty - 0.12).abs() < 1e-12, "got {}", bbo.bid_qty);
+        assert!((bbo.ask_qty - 0.30).abs() < 1e-12, "got {}", bbo.ask_qty);
+    }
+
+    /// 持仓同样折算，且方向符号保留
+    #[test]
+    fn position_size_is_converted_to_coin_keeping_sign() {
+        let raw = r#"{"instId":"BTC-USDT-SWAP","instType":"SWAP","pos":"-12","posSide":"net",
+                      "avgPx":"42000","upl":"1.5","lever":"3","mgnMode":"cross"}"#;
+        let d: PositionData = serde_json::from_str(raw).unwrap();
+        let p = d.to_position(&btc_meta()).unwrap();
+        assert_eq!(p.symbol, "BTC");
+        assert!((p.size - (-0.12)).abs() < 1e-12, "got {}", p.size);
     }
 
     #[test]
     fn trade_unknown_side_is_error_not_silent() {
         let raw = r#"{"tradeId":"1","px":"1.0","sz":"1","side":"","ts":"1"}"#;
         let d: TradeData = serde_json::from_str(raw).unwrap();
-        assert!(d.to_market_trade("BTC-USDT-SWAP").is_err());
+        assert!(d.to_market_trade(&btc_meta()).is_err());
     }
 }

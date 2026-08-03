@@ -272,7 +272,32 @@ async fn hyperliquid_trades_matches_codec() {
         }
         per_hash.values().any(|&n| n > 1)
     });
-    println!("[Hyperliquid] 观测到同一 hash 拆成多条(不归集): {has_split_taker_order}");
+    println!("[Hyperliquid] 线路上同一 hash 拆成多条(逐笔下发): {has_split_taker_order}");
+
+    // 归集只在单条消息内做（不缓冲、零延迟），其完整性依赖"一笔主动单的成交同批下发"。
+    // 实测 90s / 109 条消息 / 115 个非零 hash，无一跨消息 —— 与 L1 一次撮合原子产出所有
+    // fill 的语义一致。此断言守住该前提：若 HL 改为跨消息下发，这里会立刻失败。
+    let mut hash_to_msg: HashMap<String, usize> = HashMap::new();
+    for (i, raw) in raws.iter().enumerate() {
+        let v: Value = serde_json::from_str(raw).unwrap();
+        for t in v["data"].as_array().cloned().unwrap_or_default() {
+            let Some(h) = t.get("hash").and_then(|h| h.as_str()) else {
+                continue;
+            };
+            if !h.trim_start_matches("0x").bytes().any(|b| b != b'0') {
+                continue;
+            }
+            if let Some(&first) = hash_to_msg.get(h) {
+                assert_eq!(
+                    first, i,
+                    "[Hyperliquid] 主动单 {h} 跨消息下发，单消息内归集不再完整 —— \
+                     需改为跨消息归集（会引入延迟）或接受笔数偏高"
+                );
+            } else {
+                hash_to_msg.insert(h.to_string(), i);
+            }
+        }
+    }
 }
 
 /// OKX BTC-USDT-SWAP 每张合约的币本位数量（ctVal）

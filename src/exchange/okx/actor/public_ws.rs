@@ -9,7 +9,7 @@ use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{
-    BboData, FundingRateData, IndexTickerData, MarkPriceData, TradeData, WsPush,
+    resolve_meta, BboData, FundingRateData, IndexTickerData, MarkPriceData, TradeData, WsPush,
 };
 use crate::exchange::okx::{to_okx, to_okx_index, WS_PUBLIC_URL};
 use crate::exchange::ws_loop;
@@ -324,10 +324,15 @@ pub(crate) fn parse_public_message(
                 .as_ref()
                 .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
 
+            // 盘口量也是张数，需按 meta 折算；缺 meta 无法折算，丢弃并告警
+            let Some(meta) = resolve_meta(inst_id, symbol_metas) else {
+                tracing::warn!(exchange = "OKX", %inst_id, "Missing SymbolMeta for bbo, dropping");
+                return Ok(Vec::new());
+            };
+
             let mut events = Vec::new();
             for data in &push.data {
-                let bbo = data.to_bbo(inst_id)
-                    ?;
+                let bbo = data.to_bbo(meta)?;
                 events.push(IncomeEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,
@@ -345,19 +350,14 @@ pub(crate) fn parse_public_message(
                 .as_ref()
                 .ok_or_else(|| WsError::ParseError("Missing instId in trades".into()))?;
 
+            let Some(meta) = resolve_meta(inst_id, symbol_metas) else {
+                tracing::warn!(exchange = "OKX", %inst_id, "Missing SymbolMeta for trades, dropping");
+                return Ok(Vec::new());
+            };
+
             let mut events = Vec::new();
             for data in &push.data {
-                let mut trade = data.to_market_trade(inst_id)?;
-                // 张 -> 币。缺 meta 无法折算，宁可丢弃并告警，也不把张数当币数发下去
-                let Some(meta) = symbol_metas.get(&trade.symbol) else {
-                    tracing::warn!(
-                        exchange = "OKX",
-                        symbol = %trade.symbol,
-                        "Missing SymbolMeta for trade, dropping (cannot convert contracts to coin)"
-                    );
-                    continue;
-                };
-                trade.qty = meta.qty_to_coin(trade.qty);
+                let trade = data.to_market_trade(meta)?;
                 events.push(IncomeEvent {
                     exchange_ts: trade.timestamp,
                     local_ts,
