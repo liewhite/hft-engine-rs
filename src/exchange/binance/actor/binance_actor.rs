@@ -188,16 +188,21 @@ impl Actor for BinanceActor {
         tracing::info!(exchange = "Binance", has_private_ws, "WS actors ready");
 
         // 3. polling actor 的 on_start 只 attach_stream（无 IO），wait_for_startup 是 no-op，省略
-        BinanceEquityPollingActor::spawn_link_with_mailbox(
-            &actor_ref,
-            BinanceEquityPollingActorArgs {
-                client: args.client,
-                income_pubsub: args.income_pubsub.clone(),
-                interval_ms: 1000,
-            },
-            mailbox::unbounded(),
-        )
-        .await;
+        //
+        // 私有轮询与私有 WS 一样按凭证门控：无凭证时只订阅公共行情（non-auth 模式），
+        // 否则 equity 轮询会每秒失败一次、刷满日志（既是噪音，也会掩盖真实告警）。
+        if has_private_ws {
+            BinanceEquityPollingActor::spawn_link_with_mailbox(
+                &actor_ref,
+                BinanceEquityPollingActorArgs {
+                    client: args.client,
+                    income_pubsub: args.income_pubsub.clone(),
+                    interval_ms: 1000,
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+        }
         if let Some(client) = binance_client {
             BinanceFundingFeePollingActor::spawn_link_with_mailbox(
                 &actor_ref,
