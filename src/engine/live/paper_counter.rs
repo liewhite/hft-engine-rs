@@ -420,15 +420,16 @@ mod tests {
         }
 
         async fn place(&self, side: Side, price: f64, qty: f64) {
+            self.place_tif(side, price, qty, TimeInForce::PostOnly).await;
+        }
+
+        async fn place_tif(&self, side: Side, price: f64, qty: f64, tif: TimeInForce) {
             let order = Order {
                 id: String::new(),
                 exchange: EX,
                 symbol: SYM.to_string(),
                 side,
-                order_type: OrderType::Limit {
-                    price,
-                    tif: TimeInForce::PostOnly,
-                },
+                order_type: OrderType::Limit { price, tif },
                 quantity: qty,
                 reduce_only: false,
                 client_order_id: "c1".to_string(),
@@ -541,6 +542,99 @@ mod tests {
         h.trade(98.0).await;
         h.settle(30).await;
         assert_eq!(h.fills(), vec![(99.0, 0.5)]);
+    }
+
+    /// 延迟到期时若已越过实时盘口 -> 判定为 taker 全量成交（成交价取对手价）
+    #[tokio::test]
+    async fn order_crossing_live_quote_on_arrival_fills_as_taker() {
+        let h = Harness::new(0).await;
+        h.bbo(100.0, 100.1).await;
+        // 买价 101 高于卖价 100.1，到达即可成交
+        h.place_tif(Side::Long, 101.0, 0.5, TimeInForce::GTC).await;
+        h.settle(50).await;
+        // 成交价取对手价 100.1（taker），不是挂单价 101
+        assert_eq!(h.fills(), vec![(100.1, 0.5)]);
+        assert!(h.statuses().contains(&OrderStatus::Filled));
+    }
+
+    /// **关键语义**：可成交性在**延迟到期那一刻**按当时的实时盘口判定。
+    /// 下单时不可成交，延迟期内盘口涨上来越过挂单价 -> 到达时即 taker 成交。
+    #[tokio::test]
+    async fn marketability_is_judged_when_delay_elapses_not_at_submit() {
+        let h = Harness::new(200).await;
+        h.bbo(100.0, 100.1).await;
+        // 提交时 100.05 低于卖价 100.1，不可成交
+        h.place_tif(Side::Long, 100.05, 0.5, TimeInForce::GTC).await;
+
+        // 延迟期内盘口下移，卖价跌到 100.0 <= 100.05 -> 到达时变为可成交
+        h.settle(60).await;
+        h.bbo(99.9, 100.0).await;
+        assert!(h.statuses().is_empty(), "延迟未到不应有回报");
+
+        h.settle(250).await;
+        assert_eq!(
+            h.fills(),
+            vec![(100.0, 0.5)],
+            "应按到达时的实时盘口以 taker 成交于对手价 100.0"
+        );
+    }
+
+    /// 反向：提交时可成交，但延迟期内盘口走开 -> 到达时改为挂单（不成交）
+    #[tokio::test]
+    async fn order_rests_if_quote_moves_away_during_delay() {
+        let h = Harness::new(200).await;
+        h.bbo(100.0, 100.1).await;
+        h.place_tif(Side::Long, 100.2, 0.5, TimeInForce::GTC).await; // 提交时越过卖价
+
+        h.settle(60).await;
+        h.bbo(100.5, 100.6).await; // 盘口涨走，100.2 不再可成交
+
+        h.settle(250).await;
+        assert_eq!(h.statuses(), vec![OrderStatus::Pending], "应改为挂单");
+        assert!(h.fills().is_empty());
+    }
+
+    /// taker 成交按 taker 费率计费（与 maker 不同）
+    #[tokio::test]
+    async fn taker_fill_charges_taker_fee() {
+        let pubsub = IncomePubSub::spawn_with_mailbox(
+            IncomePubSub::new(DeliveryStrategy::Guaranteed),
+            mailbox::unbounded(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Sink::spawn_with_mailbox(events.clone(), mailbox::unbounded());
+        pubsub.tell(Subscribe(sink)).send().await.unwrap();
+        let counter = PaperCounterActor::spawn_with_mailbox(
+            PaperCounterArgs {
+                exchanges: vec![EX],
+                income_pubsub: pubsub,
+                config: SimConfig {
+                    initial_balance_usdt: 10_000.0,
+                    maker_fee_rate: 0.0002,
+                    taker_fee_rate: 0.0005,
+                    order_to_exchange_delay_ms: 0,
+                    exchange_to_strategy_delay_ms: 0,
+                },
+            },
+            mailbox::unbounded(),
+        );
+        let h = Harness { counter, events };
+        h.bbo(100.0, 100.1).await;
+        h.place_tif(Side::Long, 101.0, 2.0, TimeInForce::GTC).await;
+        h.settle(50).await;
+
+        let fee = h
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.data {
+                ExchangeEventData::Fill(f) => Some(f.fee),
+                _ => None,
+            })
+            .expect("fill");
+        // 100.1 * 2 * 0.0005 = 0.1001（若按 maker 费率会是 0.04004）
+        assert!((fee - 0.1001).abs() < 1e-9, "taker 费率应生效，实得 {fee}");
     }
 
     /// 撤单同样经过延迟；撤掉后不再成交
