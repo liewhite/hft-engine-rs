@@ -18,11 +18,16 @@ pub enum SubscriptionKind {
     FundingRate { symbol: Symbol },
     /// Best Bid/Offer
     BBO { symbol: Symbol },
-    /// 公共成交印记 (逐笔成交流)
+    /// 公共成交印记 (成交流)
     ///
-    /// 各所均为**按主动单归集**的成交流 (Binance `aggTrade`、OKX `trades`、
-    /// Hyperliquid `trades`)，而非每笔撮合明细：同一主动单在同一价位的多笔撮合合并为一条。
-    /// 这正是盘口/成交流因子想要的口径 (一次主动行为 = 一个事件)。
+    /// **各所归集粒度不同**，依赖"成交笔数 / 单笔均量 / 到达强度"的因子必须自行归一，
+    /// 否则跨所不可比 (实测口径，见 `crate::exchange::trades_conformance`)：
+    /// - Binance `aggTrade`：按主动单 + 价位**归集** (一条覆盖 `f`..`l` 多笔撮合)
+    /// - OKX `trades`：按主动单 + 价位 + source **归集** (`count` 为合并笔数)
+    /// - Hyperliquid `trades`：**不归集**，同一主动单吃穿多档会拆成多条
+    ///   (`hash`/`time` 相同、对手方不同)
+    ///
+    /// 价格与成交量在各所口径一致 (量统一为币本位)，故价量类因子不受此影响。
     Trades { symbol: Symbol },
     /// 标记价格
     MarkPrice { symbol: Symbol },

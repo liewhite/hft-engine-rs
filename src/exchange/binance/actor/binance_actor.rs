@@ -61,18 +61,30 @@ pub struct BinanceActor {
 }
 
 /// 公共 WS 目标（Binance 迁移后按路由路径分流，两条连接）
-enum WsTarget {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WsTarget {
     /// /public/ws：盘口高频数据（bookTicker、depth）
     PublicHighFreq,
     /// /market/ws：常规市场数据（markPrice、kline、ticker）+ aggTrade
     Market,
 }
 
+impl WsTarget {
+    /// 该目标对应的 WS 端点。kind -> URL 的映射由此处与 [`pick_ws_target`] 共同构成
+    /// 单一来源：spawn 子 actor 与线路测试都经此取 URL，避免两边各写一份而漂移。
+    pub(crate) fn url(self) -> &'static str {
+        match self {
+            WsTarget::PublicHighFreq => WS_PUBLIC_HIGH_FREQ_URL,
+            WsTarget::Market => WS_MARKET_URL,
+        }
+    }
+}
+
 /// 按订阅 kind 选择落到哪条公共 WS
 ///
 /// `Trades` 走 /market/ws —— aggTrade 归属该端点，订到 /public/ws 会被 ack 但永不推数据
 /// （静默无数据，见 [`crate::exchange::binance::WS_PUBLIC_HIGH_FREQ_URL`] 的注释）。
-fn pick_ws_target(kind: &SubscriptionKind) -> WsTarget {
+pub(crate) fn pick_ws_target(kind: &SubscriptionKind) -> WsTarget {
     match kind {
         SubscriptionKind::BBO { .. } => WsTarget::PublicHighFreq,
         SubscriptionKind::Trades { .. }
@@ -112,7 +124,7 @@ impl Actor for BinanceActor {
         let public_ws = BinancePublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             BinancePublicWsActorArgs {
-                url: WS_PUBLIC_HIGH_FREQ_URL.to_string(),
+                url: WsTarget::PublicHighFreq.url().to_string(),
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
@@ -123,7 +135,7 @@ impl Actor for BinanceActor {
         let market_ws = BinancePublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             BinancePublicWsActorArgs {
-                url: WS_MARKET_URL.to_string(),
+                url: WsTarget::Market.url().to_string(),
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),

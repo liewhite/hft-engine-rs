@@ -52,6 +52,14 @@ pub struct HyperliquidPublicWsActor {
     subscribed_streams: HashSet<String>,
     /// 已订阅的 kinds (用于事件分发和取消订阅)
     subscribed_kinds: HashSet<SubscriptionKind>,
+    /// 各 symbol 的 trades 订阅时刻 (毫秒)，用于丢弃订阅前的历史回填
+    ///
+    /// Hyperliquid 在 trades 订阅成功后会先推一批**订阅前**的历史成交 (实测首条消息含
+    /// 30 笔、跨 6.5 秒、最早一笔早于 WS 握手)。这些事件的 `exchange_ts` 落后数秒，若原样
+    /// 下发，策略在启动瞬间会看到一段并不存在于"当下"的成交脉冲，成交流因子被污染。
+    /// 这是 Hyperliquid 独有行为 (Binance/OKX 均只推订阅后的增量)，故在本适配层吸收，
+    /// 不外泄给策略。
+    trades_subscribed_at: HashMap<Symbol, u64>,
 }
 
 impl HyperliquidPublicWsActor {
@@ -111,11 +119,40 @@ impl HyperliquidPublicWsActor {
         let local_ts = now_ms();
         let events = parse_public_message(raw, local_ts, &self.subscribed_kinds)?;
         for event in events {
+            if self.is_trade_backfill(&event) {
+                continue;
+            }
             if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Failed to publish to IncomePubSub");
             }
         }
         Ok(())
+    }
+}
+
+impl HyperliquidPublicWsActor {
+    /// 该事件是否为 trades 订阅前的历史回填 (仅 MarketTrade 适用)。
+    ///
+    /// 判据：成交时间早于本 symbol 的 trades 订阅时刻。无订阅记录时不判为回填
+    /// (宁可放过也不误杀实时成交)。
+    fn is_trade_backfill(&self, event: &IncomeEvent) -> bool {
+        let ExchangeEventData::MarketTrade(trade) = &event.data else {
+            return false;
+        };
+        let Some(&subscribed_at) = self.trades_subscribed_at.get(&trade.symbol) else {
+            return false;
+        };
+        if trade.timestamp >= subscribed_at {
+            return false;
+        }
+        tracing::debug!(
+            exchange = "Hyperliquid",
+            symbol = %trade.symbol,
+            trade_ts = trade.timestamp,
+            subscribed_at,
+            "Dropping pre-subscription trade backfill"
+        );
+        true
     }
 }
 
@@ -154,6 +191,7 @@ impl Actor for HyperliquidPublicWsActor {
             ws_tx: Some(outgoing_tx),
             subscribed_streams: HashSet::new(),
             subscribed_kinds: HashSet::new(),
+            trades_subscribed_at: HashMap::new(),
         })
     }
 
@@ -243,8 +281,13 @@ impl Message<SubscribeBatch> for HyperliquidPublicWsActor {
             }
         }
 
-        // 3. 记录已订阅的 kinds
+        // 3. 记录已订阅的 kinds；trades 额外记录订阅时刻以过滤历史回填
+        let subscribed_at = now_ms();
         for kind in new_kinds {
+            if let SubscriptionKind::Trades { symbol } = &kind {
+                self.trades_subscribed_at
+                    .insert(symbol.clone(), subscribed_at);
+            }
             self.subscribed_kinds.insert(kind);
         }
     }
@@ -258,6 +301,9 @@ impl Message<Unsubscribe> for HyperliquidPublicWsActor {
         msg: Unsubscribe,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        if let SubscriptionKind::Trades { symbol } = &msg.kind {
+            self.trades_subscribed_at.remove(symbol);
+        }
         if !self.subscribed_kinds.remove(&msg.kind) {
             return;
         }
@@ -306,7 +352,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPubl
 // 消息解析
 // ============================================================================
 
-fn parse_public_message(
+pub(crate) fn parse_public_message(
     raw: &str,
     local_ts: u64,
     subscribed_kinds: &HashSet<SubscriptionKind>,
@@ -467,7 +513,7 @@ fn kind_to_stream(kind: &SubscriptionKind, quote: &str, dex: &str) -> Option<Str
 ///
 /// 返回 `None` 表示该 kind 无法路由到 Hyperliquid（如 Candle 未实现）；
 /// 调用方应记录并跳过，而非 panic。
-fn kind_to_subscription(
+pub(crate) fn kind_to_subscription(
     kind: &SubscriptionKind,
     quote: &str,
     dex: &str,
@@ -492,5 +538,91 @@ fn kind_to_subscription(
             "coin": to_hyperliquid(symbol, quote, dex)
         })),
         SubscriptionKind::Candle { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Exchange, MarketTrade};
+
+    const SUBSCRIBED_AT: u64 = 1_785_747_800_000;
+
+    fn trade_event(ts: u64) -> IncomeEvent {
+        IncomeEvent {
+            exchange_ts: ts,
+            local_ts: SUBSCRIBED_AT,
+            data: ExchangeEventData::MarketTrade(MarketTrade {
+                exchange: Exchange::Hyperliquid,
+                symbol: "BTC".to_string(),
+                price: 62_500.0,
+                qty: 0.1,
+                is_buyer_maker: false,
+                timestamp: ts,
+            }),
+        }
+    }
+
+    /// 只构造过滤判定所需的字段；其余字段不参与 `is_trade_backfill`
+    fn actor_with_subscription(subscribed: Option<u64>) -> HyperliquidPublicWsActor {
+        HyperliquidPublicWsActor {
+            income_pubsub: unreachable_pubsub(),
+            symbol_metas: Arc::new(HashMap::new()),
+            quote: "USDC".to_string(),
+            dex: String::new(),
+            ws_tx: None,
+            subscribed_streams: HashSet::new(),
+            subscribed_kinds: HashSet::new(),
+            trades_subscribed_at: match subscribed {
+                Some(ts) => HashMap::from([("BTC".to_string(), ts)]),
+                None => HashMap::new(),
+            },
+        }
+    }
+
+    /// 过滤判定不触碰 pubsub，故这里只需要一个类型正确的引用
+    fn unreachable_pubsub() -> ActorRef<IncomePubSub> {
+        use kameo::actor::Spawn;
+        use kameo_actors::DeliveryStrategy;
+        IncomePubSub::spawn(IncomePubSub::new(DeliveryStrategy::BestEffort))
+    }
+
+    #[tokio::test]
+    async fn pre_subscription_trade_is_dropped_as_backfill() {
+        let actor = actor_with_subscription(Some(SUBSCRIBED_AT));
+        assert!(actor.is_trade_backfill(&trade_event(SUBSCRIBED_AT - 1)));
+    }
+
+    #[tokio::test]
+    async fn trade_at_or_after_subscription_is_kept() {
+        let actor = actor_with_subscription(Some(SUBSCRIBED_AT));
+        assert!(!actor.is_trade_backfill(&trade_event(SUBSCRIBED_AT)));
+        assert!(!actor.is_trade_backfill(&trade_event(SUBSCRIBED_AT + 1)));
+    }
+
+    /// 无订阅记录时不判为回填 —— 宁可放过也不误杀实时成交
+    #[tokio::test]
+    async fn trade_without_subscription_record_is_kept() {
+        let actor = actor_with_subscription(None);
+        assert!(!actor.is_trade_backfill(&trade_event(SUBSCRIBED_AT - 10_000)));
+    }
+
+    #[tokio::test]
+    async fn non_trade_event_is_never_backfill() {
+        let actor = actor_with_subscription(Some(SUBSCRIBED_AT));
+        let clock = IncomeEvent {
+            exchange_ts: 0,
+            local_ts: 0,
+            data: ExchangeEventData::Clock,
+        };
+        assert!(!actor.is_trade_backfill(&clock));
+    }
+
+    #[tokio::test]
+    async fn trades_kind_maps_to_trades_subscription() {
+        let kind = SubscriptionKind::Trades { symbol: "BTC".to_string() };
+        let sub = kind_to_subscription(&kind, "USDC", "").expect("must map");
+        assert_eq!(sub["type"], "trades");
+        assert_eq!(sub["coin"], "BTC");
     }
 }

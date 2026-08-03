@@ -3,6 +3,18 @@ use crate::domain::{Candle, CandleInterval, Exchange, Fill, FundingRate, Greeks,
 use serde::Deserialize;
 use std::str::FromStr;
 
+/// OKX 方向编码：`"buy"` / `"sell"`。
+///
+/// 各推送共用这套编码但**语义不同**：订单/成交推送里是"本账户这一笔的方向"，trades 里是
+/// "主动方 (taker) 的方向"。此处只统一**编码**解析，语义由各调用方自行表达。
+fn parse_side(raw: &str) -> Result<Side, String> {
+    match raw {
+        "buy" => Ok(Side::Long),
+        "sell" => Ok(Side::Short),
+        other => Err(format!("Unknown OKX side: {}", other)),
+    }
+}
+
 /// WebSocket 推送通用格式
 #[derive(Debug, Deserialize)]
 pub struct WsPush<T> {
@@ -139,12 +151,8 @@ impl TradeData {
             .ts
             .parse::<u64>()
             .map_err(|_| format!("Failed to parse trade timestamp: {}", self.ts))?;
-        // side 是**主动方**方向：主动买 -> 卖方为挂单方 -> is_buyer_maker = false
-        let is_buyer_maker = match self.side.as_str() {
-            "buy" => false,
-            "sell" => true,
-            other => return Err(format!("Unknown OKX trade side: {}", other)),
-        };
+        // side 是**主动方**方向：主动卖时买方为挂单方
+        let is_buyer_maker = parse_side(&self.side)? == Side::Short;
 
         Ok(MarketTrade {
             exchange: Exchange::OKX,
@@ -353,11 +361,7 @@ impl OrderPushData {
         let acc_fill_sz = f64::from_str(&self.acc_fill_sz)
             .map_err(|_| format!("Failed to parse acc_fill_sz: {}", self.acc_fill_sz))?;
 
-        let side = match self.side.as_str() {
-            "buy" => Side::Long,
-            "sell" => Side::Short,
-            other => return Err(format!("Unknown OKX side: {}", other)),
-        };
+        let side = parse_side(&self.side)?;
 
         let status = map_okx_order_state(&self.state, acc_fill_sz);
 
@@ -392,11 +396,7 @@ impl OrderPushData {
         let fill_px = f64::from_str(&self.fill_px)
             .map_err(|_| format!("Failed to parse fill_px: {}", self.fill_px))?;
 
-        let side = match self.side.as_str() {
-            "buy" => Side::Long,
-            "sell" => Side::Short,
-            other => return Err(format!("Unknown OKX side: {}", other)),
-        };
+        let side = parse_side(&self.side)?;
 
         // OKX: fee 为负数表示收费，取反统一为正数=收费
         let fee = f64::from_str(&self.fee)

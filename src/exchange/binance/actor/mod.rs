@@ -8,11 +8,11 @@
 //! ├── BinanceEquityPollingActor [spawn_link]
 //! └── BinanceFundingFeePollingActor [spawn_link]
 
-mod binance_actor;
+pub(crate) mod binance_actor;
 mod equity_polling;
 mod funding_fee_polling;
 mod listen_key;
 mod private_ws;
-mod public_ws;
+pub(crate) mod public_ws;
 
 pub use binance_actor::{BinanceActor, BinanceActorArgs};

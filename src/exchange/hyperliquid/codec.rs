@@ -11,6 +11,19 @@ use crate::domain::{
 use serde::Deserialize;
 use std::str::FromStr;
 
+/// Hyperliquid 全站方向编码：`"B"` = bid/买、`"A"` = ask/卖。
+///
+/// 三处推送共用这套编码，但**语义各不相同**：订单/成交推送里是"本账户这一笔的方向"，
+/// trades 里是"主动方 (taker) 的方向"。故此处只统一**编码**解析，语义由各调用方自行表达
+/// —— 合并成一个 "parse_taker_side" 会把两种含义混为一谈。
+fn parse_side(raw: &str) -> Result<Side, String> {
+    match raw {
+        "B" => Ok(Side::Long),
+        "A" => Ok(Side::Short),
+        other => Err(format!("Unknown Hyperliquid side: {}", other)),
+    }
+}
+
 // ============================================================================
 // REST API 响应结构
 // ============================================================================
@@ -140,7 +153,12 @@ impl WsBbo {
 /// API 格式: `{ coin, side, px, sz, time, hash, tid, users }`，本结构只声明所需字段。
 ///
 /// `side` 是**主动方 (taker)** 方向，编码沿用 Hyperliquid 全站约定 `"B"` = 买、`"A"` = 卖
-/// (与 [`WsFill`] / 订单推送一致)；官方文档在此处用 "Buy"/"Sell" 描述，故一并容错接受全词形式。
+/// (与 [`WsFill`] / 订单推送一致，见 [`parse_side`])。官方文档此处写作 "Buy"/"Sell"，但实测
+/// 线路上是 `"B"`/`"A"`；未观测到的形式不做预留容错，由线路一致性测试守住。
+///
+/// **本所不做归集**：同一主动单吃穿多档会拆成多条消息（`hash` 与 `time` 相同、对手方不同），
+/// 与 Binance aggTrade / OKX trades 的归集口径不同 —— 实测确认，见
+/// `crate::exchange::trades_conformance`。依赖"成交笔数/单笔均量"的因子必须自行归集。
 #[derive(Debug, Deserialize)]
 pub struct WsTrade {
     pub coin: String,
@@ -157,12 +175,8 @@ impl WsTrade {
             .map_err(|_| format!("Failed to parse trade price: {}", self.px))?;
         let qty = f64::from_str(&self.sz)
             .map_err(|_| format!("Failed to parse trade size: {}", self.sz))?;
-        // 主动买 -> 卖方为挂单方 -> is_buyer_maker = false
-        let is_buyer_maker = match self.side.as_str() {
-            "B" | "Buy" => false,
-            "A" | "Sell" => true,
-            other => return Err(format!("Unknown Hyperliquid trade side: {}", other)),
-        };
+        // side 是**主动方**方向：主动卖 (A) 时买方为挂单方
+        let is_buyer_maker = parse_side(&self.side)? == Side::Short;
 
         Ok(MarketTrade {
             exchange: Exchange::Hyperliquid,
@@ -371,8 +385,6 @@ pub struct WsBasicOrder {
 
 impl WsOrderUpdate {
     pub fn to_order_update(&self) -> Result<crate::domain::OrderUpdate, String> {
-        use crate::domain::Side;
-
         let symbol = from_hyperliquid(&self.order.coin);
         let orig_sz = f64::from_str(&self.order.orig_sz)
             .map_err(|_| format!("Failed to parse orig_sz: {}", self.order.orig_sz))?;
@@ -380,12 +392,8 @@ impl WsOrderUpdate {
             .map_err(|_| format!("Failed to parse sz: {}", self.order.sz))?;
         let filled_quantity = orig_sz - current_sz;
 
-        // Hyperliquid: "A" = ask/sell, "B" = bid/buy
-        let side = match self.order.side.as_str() {
-            "B" => Side::Long,
-            "A" => Side::Short,
-            other => return Err(format!("Unknown Hyperliquid side: {}", other)),
-        };
+        // 本账户这一笔挂单的方向
+        let side = parse_side(&self.order.side)?;
 
         let status = map_hyperliquid_order_status(&self.status, filled_quantity);
 
@@ -473,12 +481,8 @@ impl WsFill {
         let size = f64::from_str(&self.sz)
             .map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?;
 
-        // Hyperliquid: "B" = bid/buy, "A" = ask/sell
-        let side = match self.side.as_str() {
-            "B" => Side::Long,
-            "A" => Side::Short,
-            other => return Err(format!("Unknown Hyperliquid fill side: {}", other)),
-        };
+        // 本账户这一笔成交的方向
+        let side = parse_side(&self.side)?;
 
         let fee = f64::from_str(&self.fee)
             .map_err(|_| format!("Failed to parse fill fee: {}", self.fee))?;
@@ -527,20 +531,25 @@ mod trade_tests {
         assert_eq!(mt.timestamp, 1630048897897);
     }
 
+    /// 线路上的编码实测为 `"B"`/`"A"`（官方文档写作 "Buy"/"Sell"，与实际不符）。
+    /// 未观测到的形式不做预留容错，避免为想象中的输入写代码。
     #[test]
-    fn trade_side_accepts_both_encodings() {
-        for (side, expect_buyer_maker) in
-            [("B", false), ("Buy", false), ("A", true), ("Sell", true)]
-        {
-            let raw = format!(
-                r#"{{"coin":"BTC","side":"{side}","px":"1.0","sz":"1.0","time":1}}"#
-            );
+    fn trade_side_uses_b_a_encoding_only() {
+        for (side, expect_buyer_maker) in [("B", false), ("A", true)] {
+            let raw =
+                format!(r#"{{"coin":"BTC","side":"{side}","px":"1.0","sz":"1.0","time":1}}"#);
             let t: WsTrade = serde_json::from_str(&raw).unwrap();
             assert_eq!(
                 t.to_market_trade().unwrap().is_buyer_maker,
                 expect_buyer_maker,
                 "side={side}"
             );
+        }
+        for side in ["Buy", "Sell", "buy", "sell"] {
+            let raw =
+                format!(r#"{{"coin":"BTC","side":"{side}","px":"1.0","sz":"1.0","time":1}}"#);
+            let t: WsTrade = serde_json::from_str(&raw).unwrap();
+            assert!(t.to_market_trade().is_err(), "side={side} 应被拒绝");
         }
     }
 
