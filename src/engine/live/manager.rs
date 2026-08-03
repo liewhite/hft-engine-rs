@@ -7,12 +7,12 @@
 //! - 子 Actor 失败时级联退出
 
 use super::{
-    ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
-    PaperCounterActor, PaperCounterArgs,
+    AccountOutcome, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
+    PaperCounterActor, PaperCounterArgs, PaperPubSub,
     IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor,
     RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, DEFAULT_REPORT_INTERVAL_MS,
 };
-use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta, now_ms};
+use crate::domain::{AccountId, Exchange, ExchangeError, Symbol, SymbolMeta, now_ms};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::exchange::binance::{
     BinanceActor, BinanceActorArgs, BinanceClient, BinanceCredentials, REST_BASE_URL,
@@ -35,29 +35,6 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-/// 运行模式：策略信号流向何处。
-///
-/// 两种模式是 OutcomePubSub 的两种订阅者，在**装配时**择一，运行期没有分支判断。
-#[derive(Debug, Clone)]
-pub enum TradingMode {
-    /// 实盘：订单经 [`OutcomeProcessorActor`] 发往交易所
-    Live,
-    /// 模拟盘：订单只落 [`PaperCounterActor`] 的本地柜台，永不发往任何交易所。
-    ///
-    /// 行情仍是真实实盘行情。为避免**真实账户状态污染模拟账本**，本模式下额外强制：
-    /// - 交易所 actor 一律以 `credentials: None` 启动 —— 不接入私有流，否则真实成交/持仓
-    ///   会经同一条 IncomePubSub 混入策略状态
-    /// - 启动期不同步真实持仓，改为从零开始（模拟账户本就是空仓）
-    /// - 启动期不同步真实挂单，否则策略会去撤本地柜台里并不存在的单
-    Paper(crate::sim::SimConfig),
-}
-
-impl TradingMode {
-    fn is_paper(&self) -> bool {
-        matches!(self, TradingMode::Paper(_))
-    }
-}
-
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
     /// Binance 接入配置（缺省即该所不参与）
@@ -71,8 +48,12 @@ pub struct ManagerActorArgs {
     /// IBKR 借券费/汇率 snapshot 轮询配置（可选）：Some 时 IbkrActor 会 spawn_link 一个
     /// 轮询子 actor，定时发 BorrowFee/ExchangeRate；数据源失效即致命退出（无兜底常量）。
     pub ibkr_snapshot: Option<IbkrSnapshotConfig>,
-    /// 实盘 or 模拟盘，见 [`TradingMode`]
-    pub trading_mode: TradingMode,
+    /// 本地柜台（模拟账户）的撮合与账本配置。
+    ///
+    /// 实盘与模拟**并行**：两个 outcome 消费者常驻，各按账户取自己的那份
+    /// （见 [`crate::domain::AccountId`]）。因此不再有"整个进程的运行模式"这一概念 ——
+    /// 一个 symbol 上完全可以模拟先跑、出信号后再拉起实盘，两者互不可见。
+    pub paper: crate::sim::SimConfig,
 }
 
 /// ManagerActor - 顶层管理 Actor
@@ -101,8 +82,6 @@ pub struct ManagerActor {
     /// **非 ExchangeClient trait** 的具体方法。None = 未配置 IBKR。单会话复用同一 client。
     ibkr_client: Option<Arc<IbkrClient>>,
 
-    /// 运行模式：决定启动期是否同步真实账户状态（见 [`TradingMode`]）
-    trading_mode: TradingMode,
 }
 
 impl ManagerActor {
@@ -141,7 +120,7 @@ impl ManagerActor {
     /// 批量添加策略的内部实现
     async fn do_add_strategies(
         &mut self,
-        strategies: Vec<Box<dyn Strategy>>,
+        strategies: Vec<StrategySpec>,
         actor_ref: ActorRef<Self>,
     ) -> Result<(), ExchangeError> {
         if strategies.is_empty() {
@@ -155,8 +134,8 @@ impl ManagerActor {
         let mut all_subscriptions: HashSet<(Exchange, SubscriptionKind)> = HashSet::new();
         let mut strategy_subscriptions: Vec<HashSet<(Exchange, SubscriptionKind)>> = Vec::new();
 
-        for strategy in &strategies {
-            let public_streams = strategy.public_streams();
+        for spec in &strategies {
+            let public_streams = spec.strategy.public_streams();
             let subscriptions: HashSet<(Exchange, SubscriptionKind)> = public_streams
                 .iter()
                 .flat_map(|(exchange, kinds)| {
@@ -178,27 +157,31 @@ impl ManagerActor {
 
         // 3. 批量创建 ExecutorActors
         let mut executor_refs = Vec::new();
-        for strategy in strategies {
+        for spec in strategies {
+            let account = spec.account.clone();
             let executor_ref = ExecutorActor::spawn_link_with_mailbox(
                 &actor_ref,
                 ExecutorArgs {
-                    strategy,
+                    strategy: spec.strategy,
+                    account: spec.account,
                     symbol_metas: Arc::new(self.symbol_metas.clone()),
                     outcome_pubsub: outcome_pubsub.clone(),
                 },
                 mailbox::unbounded(),
             )
             .await;
-            executor_refs.push(executor_ref);
+            executor_refs.push((executor_ref, account));
         }
 
         // 4. 向 ProcessorActor 注册所有 Executor 的订阅
-        for (executor_ref, subscriptions) in executor_refs.iter().zip(strategy_subscriptions.iter())
+        for ((executor_ref, account), subscriptions) in
+            executor_refs.iter().zip(strategy_subscriptions.iter())
         {
             if let Err(e) = processor
                 .tell(RegisterExecutor {
                     executor: executor_ref.clone(),
                     subscriptions: subscriptions.clone(),
+                    account: account.clone(),
                 })
                 .send()
                 .await
@@ -232,11 +215,9 @@ impl ManagerActor {
         //    市场订阅之前**进行——之前发布会被 BestEffort 丢，之后才发就有"开仓信号
         //    在持仓未对齐"的窗口。对每个 (exchange, symbol) 都推一条：交易所返回的
         //    用真实数据，未返回的推 size=0 显式清零（保证 SymbolState 一定收到初始值）。
-        if self.trading_mode.is_paper() {
-            tracing::info!(
-                "[PAPER] Skipping initial position sync — paper account starts flat"
-            );
-        } else {
+        {
+            // 仅实盘账户需要：这些事件走共享 IncomePubSub，只会路由给实盘账户的 executor；
+            // 模拟账户从零起步，不需要也不应该看到真实持仓
             let exchanges: HashSet<Exchange> =
                 exchange_symbols.iter().map(|(e, _)| *e).collect();
             for exchange in exchanges {
@@ -289,11 +270,7 @@ impl ManagerActor {
         }
 
         // 6. 查询各交易所现有挂单，作为 OrderUpdate 推送给 executor（在行情订阅之前）
-        if self.trading_mode.is_paper() {
-            tracing::info!(
-                "[PAPER] Skipping existing order sync — local counter has no pre-existing orders"
-            );
-        } else {
+        {
             for (exchange, symbol) in &exchange_symbols {
                 let client = match self.clients.get(exchange) {
                     Some(c) => c,
@@ -365,23 +342,18 @@ impl Actor for ManagerActor {
     type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let trading_mode = args.trading_mode.clone();
-        let paper = trading_mode.is_paper();
-
         // 1. 创建 Exchange Clients
         //    模拟盘也需要 client：symbol metas 走公共 REST，与是否有凭证无关
         let mut clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
 
-        // 模拟盘下不把凭证交给 client：client 只用于公共 REST（symbol metas），
-        // 且绝不能在模拟盘里具备下单能力
         if let Some(ref access) = args.binance {
-            let creds = (!paper).then(|| access.credentials.clone()).flatten();
+            let creds = access.credentials.clone();
             let client = BinanceClient::new(access.quote.clone(), creds)?;
             clients.insert(Exchange::Binance, Arc::new(client));
         }
 
         let okx_client: Option<Arc<OkxClient>> = if let Some(ref access) = args.okx {
-            let creds = (!paper).then(|| access.credentials.clone()).flatten();
+            let creds = access.credentials.clone();
             let client = Arc::new(OkxClient::new(access.quote.clone(), creds)?);
             clients.insert(Exchange::OKX, client.clone());
             Some(client)
@@ -390,7 +362,7 @@ impl Actor for ManagerActor {
         };
 
         if let Some(ref access) = args.hyperliquid {
-            let creds = (!paper).then(|| access.credentials.clone()).flatten();
+            let creds = access.credentials.clone();
             let client =
                 HyperliquidClient::new(access.quote.clone(), access.dex.clone(), creds)?;
             clients.insert(Exchange::Hyperliquid, Arc::new(client));
@@ -400,13 +372,6 @@ impl Actor for ManagerActor {
         let mut ibkr_actor_data = None;
         let mut ibkr_client_ref: Option<Arc<IbkrClient>> = None;
         if let Some(ref cred) = args.ibkr_credentials {
-            if paper {
-                // IBKR 的行情本身就要先通过 gateway 鉴权，无法只订公共流；与其半支持，
-                // 不如启动期直接拒绝，避免"以为在模拟却动了真账户"
-                return Err(ExchangeError::Other(
-                    "IBKR 暂不支持模拟盘（行情依赖已鉴权的 gateway 会话）".to_string(),
-                ));
-            }
             let ibkr_client = Arc::new(IbkrClient::new(cred).await?);
             ibkr_actor_data = Some((
                 ibkr_client.auth(),
@@ -448,52 +413,62 @@ impl Actor for ManagerActor {
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 5. 创建 OutcomeProcessorActor 并订阅 outcome_pubsub
-        // 5. OutcomePubSub 的消费者：实盘发往交易所，模拟盘落本地柜台。**装配时择一**，
-        //    运行期无分支（两者是同一订阅位上的两种实现）。
-        match &trading_mode {
-            TradingMode::Live => {
-                let processor_ref = OutcomeProcessorActor::spawn_link_with_mailbox(
-                    &actor_ref,
-                    OutcomeProcessorArgs {
-                        clients: clients.clone(),
-                        income_pubsub: income_pubsub.clone(),
-                        // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
-                        symbol_metas: Arc::new(symbol_metas.clone()),
-                        dry_run: false,
-                    },
-                    mailbox::unbounded(),
-                )
-                .await;
-                outcome_pubsub
-                    .tell(Subscribe(processor_ref))
-                    .send()
-                    .await
-                    .map_err(|e| ExchangeError::Other(e.to_string()))?;
-            }
-            TradingMode::Paper(sim_config) => {
-                let counter_ref = PaperCounterActor::spawn_link_with_mailbox(
-                    &actor_ref,
-                    PaperCounterArgs {
-                        exchanges: clients.keys().copied().collect(),
-                        income_pubsub: income_pubsub.clone(),
-                        config: *sim_config,
-                    },
-                    mailbox::unbounded(),
-                )
-                .await;
-                outcome_pubsub
-                    .tell(Subscribe(counter_ref.clone()))
-                    .send()
-                    .await
-                    .map_err(|e| ExchangeError::Other(e.to_string()))?;
-                // 本地柜台还需要行情（撮合）与 Clock（发布净值）
-                income_pubsub
-                    .tell(Subscribe(counter_ref))
-                    .send()
-                    .await
-                    .map_err(|e| ExchangeError::Other(e.to_string()))?;
-            }
-        }
+        // 5. OutcomePubSub 的两个消费者**常驻并存**：实盘账户的订单发往交易所，模拟账户的
+        //    订单落本地柜台。二者互不知情，各按 AccountOutcome 上的账户取自己的那份 ——
+        //    这使得同一 symbol 上模拟与实盘可以并行（模拟先跑，出信号后再拉起实盘）。
+        let live_processor = OutcomeProcessorActor::spawn_link_with_mailbox(
+            &actor_ref,
+            OutcomeProcessorArgs {
+                clients: clients.clone(),
+                income_pubsub: income_pubsub.clone(),
+                // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
+                symbol_metas: Arc::new(symbol_metas.clone()),
+                dry_run: false,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        outcome_pubsub
+            .tell(Subscribe(live_processor))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+
+        // 模拟账户私有事件走独立总线：结构上保证真实账户的成交不可能流进模拟策略的状态
+        let paper_pubsub = PaperPubSub::spawn_link_with_mailbox(
+            &actor_ref,
+            PaperPubSub::new(DeliveryStrategy::BestEffort),
+            mailbox::unbounded(),
+        )
+        .await;
+        let paper_counter = PaperCounterActor::spawn_link_with_mailbox(
+            &actor_ref,
+            PaperCounterArgs {
+                paper_pubsub: paper_pubsub.clone(),
+                config: args.paper,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        outcome_pubsub
+            .tell(Subscribe(paper_counter.clone()))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+        // 柜台需要共享行情（撮合）与 Clock（发布净值）
+        income_pubsub
+            .tell(Subscribe(paper_counter))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+        // **柜台的回报要能回到策略**：IncomeProcessor 订阅 paper 总线，按账户投递给对应
+        // executor。漏掉这一步的表现是"订单永远停在 Created、超时被清理后反复重挂"——
+        // 策略收不到 Pending/Filled，看不见自己的挂单。
+        paper_pubsub
+            .tell(Subscribe(processor.clone()))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 5.5 创建 MetricsActor 并订阅 income_pubsub（观测层：只读事件流，不参与决策）
         let metrics = MetricsActor::spawn_link_with_mailbox(
@@ -535,9 +510,7 @@ impl Actor for ManagerActor {
                 BinanceActor::spawn_link_with_mailbox(
                     &actor_ref,
                     BinanceActorArgs {
-                        // 模拟盘不接私有流：真实成交/持仓若混入同一条 IncomePubSub，
-                        // 会污染本地柜台的账本
-                        credentials: (!paper).then(|| access.credentials.clone()).flatten(),
+                        credentials: access.credentials.clone(),
                         symbol_metas: symbol_metas_for_exchange,
                         rest_base_url: REST_BASE_URL.to_string(),
                         income_pubsub: income_pubsub.clone(),
@@ -558,7 +531,7 @@ impl Actor for ManagerActor {
                 OkxActor::spawn_link_with_mailbox(
                     &actor_ref,
                     OkxActorArgs {
-                        credentials: (!paper).then(|| access.credentials.clone()).flatten(),
+                        credentials: access.credentials.clone(),
                         client: okx_client.clone(),
                         symbol_metas: symbol_metas_for_exchange,
                         income_pubsub: income_pubsub.clone(),
@@ -579,7 +552,7 @@ impl Actor for ManagerActor {
                 HyperliquidActor::spawn_link_with_mailbox(
                     &actor_ref,
                     HyperliquidActorArgs {
-                        credentials: (!paper).then(|| access.credentials.clone()).flatten(),
+                        credentials: access.credentials.clone(),
                         symbol_metas: symbol_metas_for_exchange,
                         income_pubsub: income_pubsub.clone(),
                         quote: access.quote.clone(),
@@ -673,7 +646,6 @@ impl Actor for ManagerActor {
             metrics,
             exchange_actors,
             ibkr_client: ibkr_client_ref,
-            trading_mode,
         })
     }
 
@@ -705,7 +677,33 @@ impl Actor for ManagerActor {
 // ============================================================================
 
 /// 添加策略
-pub struct AddStrategy(pub Box<dyn Strategy>);
+/// 策略实例 + 它绑定的账户。
+///
+/// 同一份策略逻辑可以用不同账户注册两次：一份跑模拟账户、一份跑实盘账户，同时运行。
+pub struct StrategySpec {
+    pub strategy: Box<dyn Strategy>,
+    pub account: AccountId,
+}
+
+impl StrategySpec {
+    /// 绑定到实盘账户
+    pub fn live(strategy: Box<dyn Strategy>) -> Self {
+        Self {
+            strategy,
+            account: AccountId::Live,
+        }
+    }
+
+    /// 绑定到指定标签的模拟账户（本项目按 symbol 分账）
+    pub fn paper(strategy: Box<dyn Strategy>, label: impl Into<String>) -> Self {
+        Self {
+            strategy,
+            account: AccountId::Paper(label.into()),
+        }
+    }
+}
+
+pub struct AddStrategy(pub StrategySpec);
 
 impl Message<AddStrategy> for ManagerActor {
     type Reply = Result<(), ExchangeError>;
@@ -722,7 +720,7 @@ impl Message<AddStrategy> for ManagerActor {
 }
 
 /// 批量添加策略
-pub struct AddStrategies(pub Vec<Box<dyn Strategy>>);
+pub struct AddStrategies(pub Vec<StrategySpec>);
 
 impl Message<AddStrategies> for ManagerActor {
     type Reply = Result<(), ExchangeError>;
@@ -773,7 +771,7 @@ pub struct SubscribeOutcome<A: Actor>(pub ActorRef<A>);
 
 impl<A> Message<SubscribeOutcome<A>> for ManagerActor
 where
-    A: Actor + Message<crate::strategy::OutcomeEvent>,
+    A: Actor + Message<AccountOutcome>,
 {
     type Reply = ();
 

@@ -11,6 +11,7 @@ use crate::domain::{
     SymbolMeta,
 };
 use crate::exchange::{ExchangeClient, ExchangeOrder};
+use crate::domain::AccountId;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -21,7 +22,7 @@ use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::IncomePubSub;
+use super::{AccountOutcome, IncomePubSub};
 
 /// OutcomeProcessorActor 初始化参数
 pub struct OutcomeProcessorArgs {
@@ -77,14 +78,20 @@ impl Actor for OutcomeProcessorActor {
 
 // === Message Handlers ===
 
-impl Message<OutcomeEvent> for OutcomeProcessorActor {
+impl Message<AccountOutcome> for OutcomeProcessorActor {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        msg: OutcomeEvent,
+        tagged: AccountOutcome,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // 只负责实盘账户；模拟账户的订单由 PaperCounterActor 处理。
+        // 二者共用一条 OutcomePubSub，各按账户取自己的那份（见 AccountOutcome）。
+        if tagged.account != AccountId::Live {
+            return;
+        }
+        let msg = tagged.event;
         // 下单/撤单一律 `tokio::spawn` 异步执行，**有意为之**：REST 往返可能上百 ms，
         // 若在 handler 内 await 会阻塞本 actor 的邮箱，进而拖垮整条 income/outcome 事件流
         // （行情、成交回报全部积压）。

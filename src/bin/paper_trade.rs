@@ -28,7 +28,7 @@ use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::engine::{
     init_tracing, load_config, wait_for_shutdown, AddStrategies, ManagerActor, ManagerActorArgs,
-    TradingMode,
+    StrategySpec,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
 use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
             hyperliquid: config.exchanges.hyperliquid.clone(),
             ibkr_credentials: None,
             ibkr_snapshot: None,
-            trading_mode: TradingMode::Paper(config.paper),
+            paper: config.paper,
         },
         mailbox::unbounded(),
     );
@@ -176,7 +176,11 @@ async fn main() -> anyhow::Result<()> {
         order_notional: config.order_notional,
     };
     manager
-        .ask(AddStrategies(vec![Box::new(strategy)]))
+        // 绑定到按 symbol 命名的模拟账户；实盘账户不注册任何策略，故不会有真实下单
+        .ask(AddStrategies(vec![StrategySpec::paper(
+            Box::new(strategy),
+            config.symbols.join(","),
+        )]))
         .send()
         .await
         .context("添加策略失败")?;

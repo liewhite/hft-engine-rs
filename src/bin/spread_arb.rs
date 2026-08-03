@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{
     init_tracing, load_config, wait_for_shutdown, AddStrategies, GetAllSymbolMetas, ManagerActor,
-    ManagerActorArgs, TradingMode,
+    ManagerActorArgs, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
 use hft_engine_rs::exchange::ExchangeAccess;
@@ -133,7 +133,8 @@ async fn main() -> anyhow::Result<()> {
             hyperliquid: config.exchanges.hyperliquid.clone(),
             ibkr_credentials: None,
             ibkr_snapshot: None,
-            trading_mode: TradingMode::Live,
+            // 实盘策略；本 bin 不跑模拟账户，柜台配置用默认值即可
+            paper: Default::default(),
         },
         mailbox::unbounded(),
     );
@@ -193,7 +194,9 @@ async fn main() -> anyhow::Result<()> {
     let strategy_count = strategies.len();
 
     manager
-        .ask(AddStrategies(strategies))
+        .ask(AddStrategies(
+            strategies.into_iter().map(StrategySpec::live).collect(),
+        ))
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;

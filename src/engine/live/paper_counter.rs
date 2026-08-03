@@ -27,7 +27,7 @@
 //! 每个交易所各自持有一份 [`SimState`]（含 [`crate::sim::Ledger`]），因此持仓与净值按所隔离，
 //! 与实盘的 AccountInfo 口径一致；不会把跨所持仓并进一个账本。净值在收到 Clock 时发布。
 
-use crate::domain::{now_ms, Exchange, Order, OrderId, Symbol, Timestamp};
+use crate::domain::{now_ms, AccountId, Exchange, Order, OrderId, Symbol, Timestamp, BBO};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
@@ -39,20 +39,19 @@ use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use super::IncomePubSub;
+use super::{AccountIncome, AccountOutcome, PaperPubSub};
 
 /// PaperCounterActor 初始化参数
 pub struct PaperCounterArgs {
-    /// 参与模拟的交易所（各自独立账本）
-    pub exchanges: Vec<Exchange>,
-    /// Income PubSub：既订阅行情，也向其发布订单回报与成交
-    pub income_pubsub: ActorRef<IncomePubSub>,
-    /// 撮合与账本配置（初始资金、手续费率、下单延迟）
+    /// 模拟账户私有事件的发布总线（**不是**共享行情总线）
+    pub paper_pubsub: ActorRef<PaperPubSub>,
+    /// 撮合与账本配置（每个模拟账户各自按此初始化）
     pub config: SimConfig,
 }
 
 /// 延迟到期后应用下单
 pub struct ApplyPlace {
+    account: AccountId,
     exchange: Exchange,
     order: Order,
     order_id: OrderId,
@@ -60,15 +59,22 @@ pub struct ApplyPlace {
 
 /// 延迟到期后应用撤单
 pub struct ApplyCancel {
+    account: AccountId,
     exchange: Exchange,
     order_id: OrderId,
 }
 
 /// 本地柜台
 pub struct PaperCounterActor {
-    /// 每所一份虚拟柜台状态（账本 + 挂单簿 + 最新行情）
-    states: HashMap<Exchange, SimState>,
-    income_pubsub: ActorRef<IncomePubSub>,
+    /// **每个模拟账户**一份虚拟柜台状态（账本 + 挂单簿 + 该账户视角的最新行情）。
+    ///
+    /// 按账户而非按交易所分账：晋升逻辑需要逐 symbol 的独立盈亏，而每个 symbol 的模拟账户
+    /// 本就是一个独立账户（独立起始资金、独立仓位）。账户在首次收到其订单时惰性创建。
+    states: HashMap<AccountId, SimState>,
+    /// 共享报价缓存：行情没有账户归属，新账户创建时用它播种，避免首单因"还没见过盘口"
+    /// 而无法判定可成交性
+    last_quotes: HashMap<Symbol, BBO>,
+    paper_pubsub: ActorRef<PaperPubSub>,
     config: SimConfig,
     /// 本地订单号发号器（模拟交易所返回的 order_id）
     order_id_gen: u64,
@@ -86,7 +92,7 @@ impl PaperCounterActor {
     /// [`SimState::on_market`] 会把入参行情原样放在返回值首位，而柜台自己也订阅 IncomePubSub，
     /// 若把行情回显再发布出去，就会收到自己发的行情、再次回显 —— **无限循环**。用黑名单逐个
     /// 排除行情类型是脆弱的（新增一种行情事件就漏一个），故按白名单放行。
-    async fn publish_reports(&self, events: Vec<IncomeEvent>) {
+    async fn publish_reports(&self, account: &AccountId, events: Vec<IncomeEvent>) {
         for ev in events {
             if !matches!(
                 ev.data,
@@ -94,27 +100,55 @@ impl PaperCounterActor {
             ) {
                 continue;
             }
-            if let Err(e) = self.income_pubsub.tell(Publish(ev)).send().await {
+            let tagged = AccountIncome {
+                account: account.clone(),
+                event: ev,
+            };
+            if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
                 tracing::error!(error = %e, "Paper counter failed to publish report");
             }
         }
     }
 
+    /// 取账户的柜台状态，不存在则创建并用共享报价播种。
+    fn state_mut(&mut self, account: &AccountId) -> &mut SimState {
+        if !self.states.contains_key(account) {
+            let mut state = SimState::empty(
+                self.config.initial_balance_usdt,
+                self.config.maker_fee_rate,
+                self.config.taker_fee_rate,
+            );
+            for bbo in self.last_quotes.values() {
+                state.observe_bbo(bbo);
+            }
+            tracing::info!(
+                %account,
+                initial_balance = self.config.initial_balance_usdt,
+                "[PAPER] Opened paper account"
+            );
+            self.states.insert(account.clone(), state);
+        }
+        self.states.get_mut(account).expect("just inserted")
+    }
+
     /// 按 symbol 汇总各所净值并发布 AccountInfo（等价实盘的 equity 轮询）
-    async fn publish_account_info(&self, ts: Timestamp) {
-        for (exchange, state) in &self.states {
+    async fn publish_account_info(&self, ts: Timestamp, exchange: Exchange) {
+        for (account, state) in &self.states {
             let equity = state.ledger.equity(|s: &Symbol| state.mark_of(s));
             let notional = state.ledger.notional(|s: &Symbol| state.mark_of(s));
-            let ev = IncomeEvent {
-                exchange_ts: ts,
-                local_ts: ts,
-                data: ExchangeEventData::AccountInfo {
-                    exchange: *exchange,
-                    equity,
-                    notional,
+            let tagged = AccountIncome {
+                account: account.clone(),
+                event: IncomeEvent {
+                    exchange_ts: ts,
+                    local_ts: ts,
+                    data: ExchangeEventData::AccountInfo {
+                        exchange,
+                        equity,
+                        notional,
+                    },
                 },
             };
-            if let Err(e) = self.income_pubsub.tell(Publish(ev)).send().await {
+            if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
                 tracing::error!(error = %e, "Paper counter failed to publish account info");
             }
         }
@@ -145,22 +179,7 @@ impl Actor for PaperCounterActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let states = args
-            .exchanges
-            .iter()
-            .map(|e| {
-                (
-                    *e,
-                    SimState::empty(
-                        args.config.initial_balance_usdt,
-                        args.config.maker_fee_rate,
-                        args.config.taker_fee_rate,
-                    ),
-                )
-            })
-            .collect();
         tracing::warn!(
-            exchanges = ?args.exchanges,
             initial_balance = args.config.initial_balance_usdt,
             maker_fee_rate = args.config.maker_fee_rate,
             taker_fee_rate = args.config.taker_fee_rate,
@@ -168,8 +187,9 @@ impl Actor for PaperCounterActor {
             "PaperCounterActor started — PAPER TRADING, orders are matched locally and never sent to any exchange"
         );
         Ok(Self {
-            states,
-            income_pubsub: args.income_pubsub,
+            states: HashMap::new(),
+            last_quotes: HashMap::new(),
+            paper_pubsub: args.paper_pubsub,
             config: args.config,
             order_id_gen: 0,
         })
@@ -193,29 +213,42 @@ impl Message<IncomeEvent> for PaperCounterActor {
     async fn handle(&mut self, ev: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
         match &ev.data {
             ExchangeEventData::BBO(bbo) => {
-                // 只更新估值与可成交性判断依据，不据此撮合
-                if let Some(state) = self.states.get_mut(&bbo.exchange) {
+                // 行情没有账户归属：缓存一份供新账户播种，并同步给所有已开账户
+                self.last_quotes.insert(bbo.symbol.clone(), bbo.clone());
+                for state in self.states.values_mut() {
                     state.observe_bbo(bbo);
                 }
             }
             ExchangeEventData::MarketTrade(trade) => {
+                // 逐账户撮合：各账户只持有自己 symbol 的挂单，非本 symbol 的账户是空转。
+                // 该 O(账户数) 开销是选择 Top-N 而非全部 530 个 symbol 的原因之一；
+                // 若要放到全量，应把"共享行情"从 SimState 里拆出来只存一份。
                 let exchange = trade.exchange;
-                let Some(state) = self.states.get_mut(&exchange) else {
-                    return;
-                };
-                let reports = state.on_market(exchange, &ev);
-                self.publish_reports(reports).await;
+                let accounts: Vec<AccountId> = self.states.keys().cloned().collect();
+                for account in accounts {
+                    let reports = self
+                        .states
+                        .get_mut(&account)
+                        .expect("account exists")
+                        .on_market(exchange, &ev);
+                    self.publish_reports(&account, reports).await;
+                }
             }
             ExchangeEventData::MarkPrice(mp) => {
-                // 标记价优先用于估值，与 SimState::mark_of 的优先级一致
                 let exchange = mp.exchange;
-                if let Some(state) = self.states.get_mut(&exchange) {
-                    let reports = state.on_market(exchange, &ev);
-                    self.publish_reports(reports).await;
+                let accounts: Vec<AccountId> = self.states.keys().cloned().collect();
+                for account in accounts {
+                    let reports = self
+                        .states
+                        .get_mut(&account)
+                        .expect("account exists")
+                        .on_market(exchange, &ev);
+                    self.publish_reports(&account, reports).await;
                 }
             }
             ExchangeEventData::Clock => {
-                self.publish_account_info(ev.local_ts).await;
+                // 净值按账户分别发布；交易所取自任一已知报价所属的所（模拟盘单所运行）
+                self.publish_account_info(ev.local_ts, Exchange::Binance).await;
             }
             _ => {}
         }
@@ -224,24 +257,23 @@ impl Message<IncomeEvent> for PaperCounterActor {
 
 // === 订单出向：改为落到本地柜台 ===
 
-impl Message<OutcomeEvent> for PaperCounterActor {
+impl Message<AccountOutcome> for PaperCounterActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: OutcomeEvent, ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, tagged: AccountOutcome, ctx: &mut Context<Self, Self::Reply>) {
+        // 只负责模拟账户；实盘账户的订单由 OutcomeProcessorActor 发往交易所
+        if !tagged.account.is_paper() {
+            return;
+        }
+        let account = tagged.account;
+        let msg = tagged.event;
         let delay = self.config.order_to_exchange_delay_ms;
         match msg {
             OutcomeEvent::PlaceOrders { orders, comment } => {
                 for order in orders {
-                    if !self.states.contains_key(&order.exchange) {
-                        tracing::error!(
-                            exchange = %order.exchange,
-                            symbol = %order.symbol,
-                            "Paper counter has no book for this exchange, order dropped"
-                        );
-                        continue;
-                    }
                     let order_id = self.next_order_id();
                     tracing::info!(
+                        %account,
                         exchange = %order.exchange,
                         symbol = %order.symbol,
                         side = %order.side,
@@ -257,6 +289,7 @@ impl Message<OutcomeEvent> for PaperCounterActor {
                         ctx.actor_ref(),
                         delay,
                         ApplyPlace {
+                            account: account.clone(),
                             exchange: order.exchange,
                             order,
                             order_id,
@@ -270,13 +303,14 @@ impl Message<OutcomeEvent> for PaperCounterActor {
                 order_id,
             } => {
                 tracing::info!(
-                    %exchange, %symbol, %order_id, delay_ms = delay,
+                    %account, %exchange, %symbol, %order_id, delay_ms = delay,
                     "[PAPER] Cancel accepted by local counter"
                 );
                 Self::schedule(
                     ctx.actor_ref(),
                     delay,
                     ApplyCancel {
+                        account,
                         exchange,
                         order_id,
                     },
@@ -293,11 +327,10 @@ impl Message<ApplyPlace> for PaperCounterActor {
 
     async fn handle(&mut self, msg: ApplyPlace, _ctx: &mut Context<Self, Self::Reply>) {
         let now = now_ms();
-        let Some(state) = self.states.get_mut(&msg.exchange) else {
-            return;
-        };
-        let reports = state.on_order_arrived(now, msg.exchange, &msg.order, &msg.order_id);
-        self.publish_reports(reports).await;
+        let reports = self
+            .state_mut(&msg.account)
+            .on_order_arrived(now, msg.exchange, &msg.order, &msg.order_id);
+        self.publish_reports(&msg.account, reports).await;
     }
 }
 
@@ -306,18 +339,18 @@ impl Message<ApplyCancel> for PaperCounterActor {
 
     async fn handle(&mut self, msg: ApplyCancel, _ctx: &mut Context<Self, Self::Reply>) {
         let now = now_ms();
-        let Some(state) = self.states.get_mut(&msg.exchange) else {
-            return;
-        };
-        let reports = state.on_cancel_arrived(now, msg.exchange, &msg.order_id);
+        let reports = self
+            .state_mut(&msg.account)
+            .on_cancel_arrived(now, msg.exchange, &msg.order_id);
         if reports.is_empty() {
             tracing::info!(
+                account = %msg.account,
                 exchange = %msg.exchange,
                 order_id = %msg.order_id,
                 "[PAPER] Cancel had no effect (order already filled or unknown)"
             );
         }
-        self.publish_reports(reports).await;
+        self.publish_reports(&msg.account, reports).await;
     }
 }
 
@@ -334,6 +367,10 @@ mod tests {
     const EX: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
 
+    fn account() -> AccountId {
+        AccountId::Paper(SYM.to_string())
+    }
+
     /// 收集柜台回报，供断言
     struct Sink(Arc<Mutex<Vec<IncomeEvent>>>);
 
@@ -345,10 +382,10 @@ mod tests {
         }
     }
 
-    impl Message<IncomeEvent> for Sink {
+    impl Message<AccountIncome> for Sink {
         type Reply = ();
-        async fn handle(&mut self, ev: IncomeEvent, _c: &mut Context<Self, Self::Reply>) {
-            self.0.lock().unwrap().push(ev);
+        async fn handle(&mut self, msg: AccountIncome, _c: &mut Context<Self, Self::Reply>) {
+            self.0.lock().unwrap().push(msg.event);
         }
     }
 
@@ -359,8 +396,8 @@ mod tests {
 
     impl Harness {
         async fn new(order_delay_ms: u64) -> Self {
-            let pubsub = IncomePubSub::spawn_with_mailbox(
-                IncomePubSub::new(DeliveryStrategy::Guaranteed),
+            let pubsub = PaperPubSub::spawn_with_mailbox(
+                PaperPubSub::new(DeliveryStrategy::Guaranteed),
                 mailbox::unbounded(),
             );
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -369,8 +406,7 @@ mod tests {
 
             let counter = PaperCounterActor::spawn_with_mailbox(
                 PaperCounterArgs {
-                    exchanges: vec![EX],
-                    income_pubsub: pubsub,
+                    paper_pubsub: pubsub,
                     config: SimConfig {
                         initial_balance_usdt: 10_000.0,
                         maker_fee_rate: 0.0,
@@ -435,9 +471,12 @@ mod tests {
                 client_order_id: "c1".to_string(),
             };
             self.counter
-                .tell(OutcomeEvent::PlaceOrders {
-                    orders: vec![order],
-                    comment: "t".to_string(),
+                .tell(AccountOutcome {
+                    account: account(),
+                    event: OutcomeEvent::PlaceOrders {
+                        orders: vec![order],
+                        comment: "t".to_string(),
+                    },
                 })
                 .send()
                 .await
@@ -597,8 +636,8 @@ mod tests {
     /// taker 成交按 taker 费率计费（与 maker 不同）
     #[tokio::test]
     async fn taker_fill_charges_taker_fee() {
-        let pubsub = IncomePubSub::spawn_with_mailbox(
-            IncomePubSub::new(DeliveryStrategy::Guaranteed),
+        let pubsub = PaperPubSub::spawn_with_mailbox(
+            PaperPubSub::new(DeliveryStrategy::Guaranteed),
             mailbox::unbounded(),
         );
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -606,8 +645,7 @@ mod tests {
         pubsub.tell(Subscribe(sink)).send().await.unwrap();
         let counter = PaperCounterActor::spawn_with_mailbox(
             PaperCounterArgs {
-                exchanges: vec![EX],
-                income_pubsub: pubsub,
+                paper_pubsub: pubsub,
                 config: SimConfig {
                     initial_balance_usdt: 10_000.0,
                     maker_fee_rate: 0.0002,
@@ -647,10 +685,13 @@ mod tests {
         let order_id = h.order_ids().first().cloned().expect("order id");
 
         h.counter
-            .tell(OutcomeEvent::CancelOrder {
-                exchange: EX,
-                symbol: SYM.to_string(),
-                order_id,
+            .tell(AccountOutcome {
+                account: account(),
+                event: OutcomeEvent::CancelOrder {
+                    exchange: EX,
+                    symbol: SYM.to_string(),
+                    order_id,
+                },
             })
             .send()
             .await
@@ -721,10 +762,15 @@ mod tests {
         );
     }
 
-    /// Clock 触发净值发布（策略依赖 equity 才能动作）
+    /// Clock 按账户发布净值（策略依赖 equity 才能动作）。
+    ///
+    /// 账户是惰性创建的：先下单开出账户，Clock 才有账户可报 —— 没有账户就没有净值可言。
     #[tokio::test]
-    async fn clock_publishes_account_info() {
+    async fn clock_publishes_account_info_per_account() {
         let h = Harness::new(0).await;
+        h.bbo(100.0, 100.1).await;
+        h.place(Side::Long, 99.0, 0.5).await;
+        h.settle(50).await;
         h.counter
             .tell(IncomeEvent {
                 exchange_ts: 5,

@@ -23,11 +23,14 @@
 //! cargo test --test paper_trading_live -- --ignored --nocapture
 //! ```
 
-use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce};
+use hft_engine_rs::domain::{
+    AccountId, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
+};
 use hft_engine_rs::engine::{
     IncomePubSub, IncomeProcessorActor, OutcomePubSub, PaperCounterActor, PaperCounterArgs,
-    RegisterExecutor,
+    PaperPubSub, RegisterExecutor,
 };
+use hft_engine_rs::engine::AccountIncome;
 use hft_engine_rs::engine::live::{ExecutorActor, ExecutorArgs};
 use hft_engine_rs::exchange::binance::{
     BinanceActor, BinanceActorArgs, BinanceClient, REST_BASE_URL,
@@ -48,6 +51,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const EX: Exchange = Exchange::Binance;
+/// 本测试的模拟账户
+static PAPER_ACCOUNT: std::sync::LazyLock<AccountId> =
+    std::sync::LazyLock::new(|| AccountId::Paper("BTC".to_string()));
 const COIN: &str = "BTC";
 /// 挂单相对买价的下偏幅度（bp）。
 ///
@@ -160,6 +166,14 @@ impl Actor for Watcher {
     }
 }
 
+/// 模拟账户的私有事件（柜台回报）走 PaperPubSub
+impl Message<AccountIncome> for Watcher {
+    type Reply = ();
+    async fn handle(&mut self, msg: AccountIncome, c: &mut Context<Self, Self::Reply>) {
+        <Self as Message<IncomeEvent>>::handle(self, msg.event, c).await
+    }
+}
+
 impl Message<IncomeEvent> for Watcher {
     type Reply = ();
     async fn handle(&mut self, ev: IncomeEvent, _c: &mut Context<Self, Self::Reply>) {
@@ -223,10 +237,14 @@ async fn paper_counter_fills_from_live_trades() {
     );
 
     // ---- 本地柜台：订阅 outcome（收订单）与 income（收行情/Clock）----
+    // 模拟账户私有事件走独立总线
+    let paper_pubsub = PaperPubSub::spawn_with_mailbox(
+        PaperPubSub::new(DeliveryStrategy::BestEffort),
+        mailbox::unbounded(),
+    );
     let counter = PaperCounterActor::spawn_with_mailbox(
         PaperCounterArgs {
-            exchanges: vec![EX],
-            income_pubsub: income_pubsub.clone(),
+            paper_pubsub: paper_pubsub.clone(),
             config: SimConfig {
                 initial_balance_usdt: 10_000.0,
                 // 币安标准档：maker 0.02% / taker 0.05%
@@ -259,10 +277,16 @@ async fn paper_counter_fills_from_live_trades() {
         .send()
         .await
         .expect("processor subscribes income");
+    paper_pubsub
+        .tell(Subscribe(processor.clone()))
+        .send()
+        .await
+        .expect("processor subscribes paper");
 
     let executor = ExecutorActor::spawn_with_mailbox(
         ExecutorArgs {
             strategy: Box::new(DipMaker),
+            account: PAPER_ACCOUNT.clone(),
             symbol_metas: metas_by_key.clone(),
             outcome_pubsub: outcome_pubsub.clone(),
         },
@@ -277,6 +301,7 @@ async fn paper_counter_fills_from_live_trades() {
                     symbol: COIN.to_string(),
                 },
             )]),
+            account: PAPER_ACCOUNT.clone(),
         })
         .send()
         .await
@@ -286,10 +311,16 @@ async fn paper_counter_fills_from_live_trades() {
     let log = Arc::new(Mutex::new(Log::default()));
     let watcher = Watcher::spawn_with_mailbox(log.clone(), mailbox::unbounded());
     income_pubsub
+        .tell(Subscribe(watcher.clone()))
+        .send()
+        .await
+        .expect("watcher subscribes income");
+    // 柜台回报走 paper 总线
+    paper_pubsub
         .tell(Subscribe(watcher))
         .send()
         .await
-        .expect("watcher subscribes");
+        .expect("watcher subscribes paper");
 
     // ---- 交易所 actor：无凭证，只订公共行情 ----
     let binance = BinanceActor::spawn_with_mailbox(

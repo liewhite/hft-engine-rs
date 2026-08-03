@@ -8,7 +8,7 @@
 
 use hft_engine_rs::domain::Exchange;
 use hft_engine_rs::engine::{
-    AddStrategies, ManagerActor, ManagerActorArgs,
+    AddStrategies, ManagerActor, ManagerActorArgs, StrategySpec,
 };
 use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
@@ -86,7 +86,7 @@ async fn test_okx_greeks_push() {
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
             ibkr_snapshot: None,
-            trading_mode: hft_engine_rs::engine::TradingMode::Live,
+            paper: Default::default(),
             binance: None,
             okx: Some(ExchangeAccess { quote: TEST_QUOTE.to_string(), dex: String::new(), credentials: Some(credentials) }),
             hyperliquid: None,
@@ -100,7 +100,7 @@ async fn test_okx_greeks_push() {
     };
 
     let result = manager
-        .ask(AddStrategies(vec![Box::new(strategy)]))
+        .ask(AddStrategies(vec![StrategySpec::live(Box::new(strategy))]))
         .send()
         .await;
     result.expect("添加策略失败");
