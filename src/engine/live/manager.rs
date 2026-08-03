@@ -399,6 +399,8 @@ impl Actor for ManagerActor {
             OutcomeProcessorArgs {
                 clients: clients.clone(),
                 income_pubsub: income_pubsub.clone(),
+                // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
+                symbol_metas: Arc::new(symbol_metas.clone()),
                 dry_run: false,
             },
             mailbox::unbounded(),

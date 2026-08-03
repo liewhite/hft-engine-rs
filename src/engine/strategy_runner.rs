@@ -1,14 +1,21 @@
 //! StrategyRunner —— 策略执行的**纯逻辑核心**。
 //!
-//! 把一个事件喂给策略、维护策略独享状态、产出"已按交易所精度转换"的信号。不含任何
+//! 把一个事件喂给策略、维护策略独享状态、产出策略信号。不含任何
 //! 传输/并发设施 (无 actor / channel / pubsub)，因此被两种驱动复用：
 //!   - 实盘 [`crate::engine::ExecutorActor`]：actor 串行消费总线事件，调用 [`StrategyRunner::on_event`]
 //!     后把结果发布到 OutcomePubSub
 //!   - 回测 [`crate::backtest::BacktestEngine`]：单线程虚拟时间循环里同步调用 [`StrategyRunner::accepts`] /
 //!     [`StrategyRunner::on_event`]
 //!
-//! 职责：过滤订阅范围、更新 StateManager、分配 client_order_id、登记 pending、按 SymbolMeta
-//! 转换 (币本位->张数、价格/数量取整)。
+//! 职责：过滤订阅范围、更新 StateManager、分配 client_order_id、登记 pending、按交易所精度
+//! 取整价格与数量。
+//!
+//! **只取整，不换单位**：产出的订单一律**币本位** (见 [`crate::domain::Quantity`])，但价格与
+//! 数量已按交易所精度取整。两件事必须分在两处：
+//!   - 精度取整是**市场规则**，回测/模拟盘也必须遵守，否则 `SimState` 会用非法 tick 价与
+//!     非法步长撮合，结果失真 —— 故留在此处，两条驱动共享
+//!   - 单位折算 (币 -> 张) 是**线路细节**，只发生在实盘出口，见
+//!     [`crate::exchange::ExchangeOrder`]；回测不经过那里，因此全程币本位
 
 use crate::domain::{Exchange, Order, OrderType, Symbol, SymbolMeta};
 use crate::messaging::{IncomeEvent, StateManager};
@@ -49,6 +56,7 @@ impl ClientOrderIdGen for SequentialClientOrderIdGen {
 pub struct StrategyRunner {
     strategy: Box<dyn Strategy>,
     state: StateManager,
+    /// 用于按交易所精度取整（**不**用于单位折算）
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 策略订阅的 (exchange, symbol) 集合，用于事件过滤
     subscriptions: HashSet<(Exchange, Symbol)>,
@@ -101,7 +109,9 @@ impl StrategyRunner {
         }
     }
 
-    /// 更新状态并运行策略，返回**已转换为交易所格式**的信号 (下单已分配 id、登记 pending、取整)。
+    /// 更新状态并运行策略，返回信号 (下单已分配 id、登记 pending、按交易所精度取整)。
+    ///
+    /// 产出订单是**币本位**且已取整；单位折算是出口的职责，见模块文档。
     pub fn on_event(&mut self, event: &IncomeEvent) -> Vec<OutcomeEvent> {
         self.state.apply(event);
         // 按事件类型分发：券源/汇率走各自的 typed 方法，其余走 on_event。
@@ -123,11 +133,11 @@ impl StrategyRunner {
                         .into_iter()
                         .map(|mut order| {
                             order.client_order_id = self.id_gen.next_id(order.exchange);
-                            // 原始订单 (币本位) 登记到 pending，策略端统一看到币的数量；
+                            // 登记未取整的原始订单，与取整前的行为保持一致（策略比对自己
+                            // 的挂单量时看到的仍是它请求的数量）
                             // created_at 取当前事件时刻 (回测=虚拟时间, 确定性), 不读墙钟
                             self.state.add_pending_order(order.clone(), event.local_ts);
-                            // 转换为交易所格式 (合约张数 + 价格/数量取整)
-                            self.convert_order(order)
+                            self.round_to_exchange_precision(order)
                         })
                         .collect();
                     OutcomeEvent::PlaceOrders {
@@ -140,9 +150,12 @@ impl StrategyRunner {
             .collect()
     }
 
-    /// 币本位数量 -> 合约张数，价格/数量按交易所精度取整。
-    /// 缺少 SymbolMeta 说明策略交易了未预加载的 symbol，仅记录告警并按原值发出 (与实盘行为一致)。
-    fn convert_order(&self, order: Order) -> Order {
+    /// 按交易所精度取整价格与数量，**保持币本位**。
+    ///
+    /// 缺少 SymbolMeta 说明策略交易了未预加载的 symbol，仅告警并按原值发出（与改造前一致；
+    /// 真正致命的单位问题由出口的 [`crate::exchange::ExchangeOrder`] 兜住 —— 那里缺 meta 会
+    /// 直接拒单）。
+    fn round_to_exchange_precision(&self, order: Order) -> Order {
         let key = (order.exchange, order.symbol.clone());
         let meta = match self.symbol_metas.get(&key) {
             Some(m) => m,
@@ -150,12 +163,12 @@ impl StrategyRunner {
                 tracing::warn!(
                     exchange = %order.exchange,
                     symbol = %order.symbol,
-                    "SymbolMeta not found, order not converted"
+                    "SymbolMeta not found, order precision not rounded"
                 );
                 return order;
             }
         };
-        let quantity = meta.round_size_down(meta.coin_to_qty(order.quantity));
+        let quantity = meta.round_coin_size_down(order.quantity);
         let order_type = match &order.order_type {
             OrderType::Market => OrderType::Market,
             OrderType::Limit { price, tif } => OrderType::Limit {
@@ -168,5 +181,138 @@ impl StrategyRunner {
             quantity,
             ..order
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{OrderType, Side, TimeInForce};
+    use crate::exchange::utils::StepFormatter;
+    use crate::exchange::SubscriptionKind;
+    use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+    use crate::strategy::{OutcomeEvent, Strategy};
+
+    const EX: Exchange = Exchange::OKX;
+    const SYM: &str = "BTC";
+    /// OKX BTC-USDT-SWAP：每张 0.01 币，数量步长 1 张 -> 合法币量是 0.01 的整数倍
+    const CONTRACT_SIZE: f64 = 0.01;
+
+    fn metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
+        Arc::new(HashMap::from([(
+            (EX, SYM.to_string()),
+            SymbolMeta {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                price_formatter: Arc::new(StepFormatter::new(0.1)),
+                size_step: 1.0,
+                min_order_size: 1.0,
+                contract_size: CONTRACT_SIZE,
+            },
+        )]))
+    }
+
+    /// 一次性下一张指定数量/价格的挂单
+    struct OneShot {
+        quantity: f64,
+        price: f64,
+        placed: bool,
+    }
+
+    impl Strategy for OneShot {
+        fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
+            HashMap::from([(
+                EX,
+                HashSet::from([SubscriptionKind::BBO {
+                    symbol: SYM.to_string(),
+                }]),
+            )])
+        }
+        fn order_timeout_ms(&self) -> u64 {
+            0
+        }
+        fn on_event(&mut self, _e: &IncomeEvent, _s: &StateManager) -> Vec<OutcomeEvent> {
+            if self.placed {
+                return Vec::new();
+            }
+            self.placed = true;
+            vec![OutcomeEvent::PlaceOrders {
+                orders: vec![Order {
+                    id: String::new(),
+                    exchange: EX,
+                    symbol: SYM.to_string(),
+                    side: Side::Long,
+                    order_type: OrderType::Limit {
+                        price: self.price,
+                        tif: TimeInForce::PostOnly,
+                    },
+                    quantity: self.quantity,
+                    reduce_only: false,
+                    client_order_id: String::new(),
+                }],
+                comment: "t".to_string(),
+            }]
+        }
+    }
+
+    fn run_once(quantity: f64, price: f64) -> Order {
+        let mut runner = StrategyRunner::with_id_gen(
+            Box::new(OneShot {
+                quantity,
+                price,
+                placed: false,
+            }),
+            metas(),
+            Box::new(SequentialClientOrderIdGen::default()),
+        );
+        let ev = IncomeEvent {
+            exchange_ts: 1,
+            local_ts: 1,
+            data: ExchangeEventData::Clock,
+        };
+        match runner.on_event(&ev).into_iter().next().expect("signal") {
+            OutcomeEvent::PlaceOrders { orders, .. } => orders.into_iter().next().unwrap(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// 产出订单必须仍是**币本位**（单位折算是出口的事），但已按交易所精度取整。
+    /// 这条同时守住回测：`SimState` 拿到的就是这个订单。
+    #[test]
+    fn emitted_order_is_coin_denominated_and_rounded() {
+        // 0.125 币 = 12.5 张 -> 向下取整 12 张 = 0.12 币（**不是** 12）
+        let order = run_once(0.125, 62_500.17);
+        assert!(
+            (order.quantity - 0.12).abs() < 1e-12,
+            "应为币本位 0.12，若得到 12 说明单位折算错误地留在了 runner 里: {}",
+            order.quantity
+        );
+        match order.order_type {
+            OrderType::Limit { price, .. } => assert!((price - 62_500.2).abs() < 1e-9),
+            OrderType::Market => panic!("expected limit"),
+        }
+    }
+
+    /// pending 登记的是策略请求的原始数量（未取整），与改造前行为一致
+    #[test]
+    fn pending_order_keeps_strategy_requested_quantity() {
+        let mut runner = StrategyRunner::with_id_gen(
+            Box::new(OneShot {
+                quantity: 0.125,
+                price: 62_500.0,
+                placed: false,
+            }),
+            metas(),
+            Box::new(SequentialClientOrderIdGen::default()),
+        );
+        let ev = IncomeEvent {
+            exchange_ts: 1,
+            local_ts: 1,
+            data: ExchangeEventData::Clock,
+        };
+        runner.on_event(&ev);
+        let state = runner.state().symbol_state(&SYM.to_string()).expect("state");
+        let pending: Vec<f64> = state.pending_orders().map(|p| p.order.quantity).collect();
+        assert_eq!(pending, vec![0.125]);
     }
 }

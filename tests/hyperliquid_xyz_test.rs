@@ -14,7 +14,7 @@
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
-use hft_engine_rs::exchange::ExchangeClient;
+use hft_engine_rs::exchange::{ExchangeClient, ExchangeOrder};
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -268,7 +268,7 @@ async fn place_test_order(side: Side) {
 
     println!("提交订单: {:?}", order);
 
-    let order_id = client.place_order(order).await.expect("下单失败");
+    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta)).await.expect("下单失败");
     println!(
         "下单成功，方向={:?}，订单ID: {}, 客户端ID: {}",
         side, order_id, cli_id

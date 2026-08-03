@@ -2,11 +2,11 @@
 
 use super::symbol::{from_okx, to_okx};
 use crate::domain::{
-    Exchange, ExchangeError, Greeks, Order, OrderId, OrderStatus, OrderType, OrderUpdate, Side,
+    Exchange, ExchangeError, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate, Side,
     Symbol, SymbolMeta, TimeInForce, now_ms,
 };
 use crate::exchange::okx::codec::GreeksData;
-use crate::exchange::client::ExchangeClient;
+use crate::exchange::client::{ExchangeClient, ExchangeOrder};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
 use crate::exchange::utils::StepFormatter;
@@ -487,7 +487,9 @@ impl ExchangeClient for OkxClient {
         Ok(updates)
     }
 
-    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+        // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
+        let order = order.inner();
         let path = "/api/v5/trade/order";
         let inst_id = to_okx(&order.symbol, &self.quote);
         let side = side_to_okx(order.side);
@@ -522,7 +524,7 @@ impl ExchangeClient for OkxClient {
             cl_ord_id: if order.client_order_id.is_empty() {
                 None
             } else {
-                Some(order.client_order_id)
+                Some(order.client_order_id.clone())
             },
         };
 

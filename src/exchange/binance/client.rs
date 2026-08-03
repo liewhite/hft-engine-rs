@@ -2,11 +2,11 @@
 
 use super::symbol::{from_binance, to_binance};
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, RejectReason, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
+    Exchange, ExchangeError, FundingFee, OrderId, OrderType, RejectReason, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
-use crate::exchange::client::ExchangeClient;
+use crate::exchange::client::{ExchangeClient, ExchangeOrder};
 use crate::exchange::utils::StepFormatter;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
@@ -463,7 +463,9 @@ impl ExchangeClient for BinanceClient {
         Ok(vec![])
     }
 
-    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+        // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
+        let order = order.inner();
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;

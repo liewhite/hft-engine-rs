@@ -2,7 +2,10 @@
 //!
 //! ExchangeClient trait 封装交易所 REST 交互
 
-use crate::domain::{AccountInfo, CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderUpdate, Position, Symbol, SymbolMeta};
+use crate::domain::{
+    AccountInfo, CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderType, OrderUpdate,
+    Position, Symbol, SymbolMeta,
+};
 use async_trait::async_trait;
 
 // ============================================================================
@@ -60,6 +63,59 @@ impl SubscriptionKind {
 }
 
 // ============================================================================
+// 单位边界：ExchangeOrder
+// ============================================================================
+
+/// 已转换为**交易所下单单位**、并按交易所精度取整的订单。
+///
+/// # 为什么需要一个独立类型
+///
+/// 系统里存在两种数量单位（见 [`crate::domain::Quantity`]）：domain 的币本位、交易所的下单
+/// 单位（OKX 的 SWAP 是张）。两者都是 `f64`，编译器分不开。此前出向折算的产物仍然是
+/// `Order`，于是同一个 `Order.quantity` 在流水线前半段是币、后半段是张 —— 同一字段两种含义，
+/// 靠读代码的人自己记住处在哪一段。这不是注释能解决的问题，因为**错了不会报错，只会静默
+/// 算错 contract_size 倍**。
+///
+/// 用独立类型把这条边界钉在类型系统里：
+/// - domain 里流转的一律是 `Order`（币本位），策略、`StrategyRunner`、`SimState`、回测同理
+/// - 只有 [`ExchangeOrder`] 携带交易所单位，且它**只能**由 [`ExchangeOrder::from_domain`] 产生
+/// - [`ExchangeClient::place_order`] 只收 `ExchangeOrder`，因此不可能把币本位数量直发上线
+///
+/// 与入向的做法对称：入向由 codec 的签名要求 `&SymbolMeta` 来强制折算，出向由本类型的
+/// 构造函数要求 `&SymbolMeta` 来强制折算。两个方向的单位知识都收在本文件。
+#[derive(Debug, Clone)]
+pub struct ExchangeOrder(Order);
+
+impl ExchangeOrder {
+    /// 币本位 -> 交易所下单单位，并按交易所精度取整价格与数量。
+    ///
+    /// 两者的取整方向**有意不同**（沿用改造前的行为，此处只是搬家）：
+    /// - 数量 `round_size_down`：**向下**取整，宁可少下一点，也不超出策略意图的数量
+    /// - 价格 `round_price`：取**最近**的合法 tick（`StepFormatter` 是四舍五入），因为价格
+    ///   向下取整对买单是让价、对卖单是抢价，方向语义不一致，反而更难推理
+    pub fn from_domain(order: Order, meta: &SymbolMeta) -> Self {
+        let quantity = meta.round_size_down(meta.coin_to_qty(order.quantity));
+        let order_type = match &order.order_type {
+            OrderType::Market => OrderType::Market,
+            OrderType::Limit { price, tif } => OrderType::Limit {
+                price: meta.round_price(*price),
+                tif: *tif,
+            },
+        };
+        Self(Order {
+            order_type,
+            quantity,
+            ..order
+        })
+    }
+
+    /// 交易所单位的订单内容（供各 client 组装请求）。
+    pub fn inner(&self) -> &Order {
+        &self.0
+    }
+}
+
+// ============================================================================
 // ExchangeClient trait (仅 REST)
 // ============================================================================
 
@@ -67,14 +123,13 @@ impl SubscriptionKind {
 ///
 /// 仅封装交易所的 REST 交互，WebSocket Actor 由 ManagerActor 直接创建
 ///
-/// # 数量口径契约
+/// # 数量口径契约（双向对称）
 ///
-/// **返回值中的一切数量必须是币本位**（见 [`crate::domain::Quantity`]）。若交易所 REST 用
-/// 合约张数计量（OKX 的 SWAP/FUTURES），折算是各实现自己的责任，不得把张数交给调用方 ——
-/// 那样每个调用点都要记着乘一次，漏一处便静默算错 contract_size 倍。
-///
-/// 反方向（[`ExchangeClient::place_order`] 的入参）例外：订单在
-/// `StrategyRunner::convert_order` 中已按 `SymbolMeta` 转为交易所下单单位。
+/// - **出向**：[`ExchangeClient::place_order`] 只接受 [`ExchangeOrder`] —— 已折算为交易所
+///   下单单位、已取整。类型系统保证币本位数量不可能被直发上线。
+/// - **入向**：返回值中的一切数量**必须是币本位**（见 [`crate::domain::Quantity`]）。若交易所
+///   REST 用张数计量（OKX 的 SWAP/FUTURES），折算是各实现自己的责任，不得把张数交给调用方
+///   —— 那样每个调用点都要记着乘一次，漏一处便静默算错 contract_size 倍。
 #[async_trait]
 pub trait ExchangeClient: Send + Sync + 'static {
     /// 获取交易所标识
@@ -86,8 +141,8 @@ pub trait ExchangeClient: Send + Sync + 'static {
     /// 获取指定交易对元数据
     async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError>;
 
-    /// 下单
-    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError>;
+    /// 下单。入参已是交易所单位，见 [`ExchangeOrder`]。
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError>;
 
     /// 撤单
     async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError>;
@@ -207,4 +262,92 @@ macro_rules! impl_exchange_actor_ops {
             }
         )*
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Side, TimeInForce};
+    use crate::exchange::utils::StepFormatter;
+    use std::sync::Arc;
+
+    /// OKX BTC-USDT-SWAP：每张 0.01 币、价格步长 0.1、数量步长 1 张
+    fn okx_btc_meta() -> SymbolMeta {
+        SymbolMeta {
+            exchange: Exchange::OKX,
+            symbol: "BTC".to_string(),
+            price_formatter: Arc::new(StepFormatter::new(0.1)),
+            size_step: 1.0,
+            min_order_size: 1.0,
+            contract_size: 0.01,
+        }
+    }
+
+    fn coin_order(quantity: f64, price: f64) -> Order {
+        Order {
+            id: String::new(),
+            exchange: Exchange::OKX,
+            symbol: "BTC".to_string(),
+            side: Side::Long,
+            order_type: OrderType::Limit {
+                price,
+                tif: TimeInForce::PostOnly,
+            },
+            quantity,
+            reduce_only: false,
+            client_order_id: "c1".to_string(),
+        }
+    }
+
+    #[test]
+    fn coin_quantity_is_converted_to_contracts() {
+        let order = coin_order(0.12, 62_500.0);
+        let wire = ExchangeOrder::from_domain(order, &okx_btc_meta());
+        // 0.12 币 / 0.01 = 12 张
+        assert!((wire.inner().quantity - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quantity_rounds_down_to_size_step() {
+        // 0.125 币 = 12.5 张 -> 向下取整 12 张（宁可少下，不超出策略意图）
+        let wire = ExchangeOrder::from_domain(coin_order(0.125, 62_500.0), &okx_btc_meta());
+        assert!((wire.inner().quantity - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn price_is_rounded_to_exchange_tick() {
+        let wire = ExchangeOrder::from_domain(coin_order(0.12, 62_500.17), &okx_btc_meta());
+        match wire.inner().order_type {
+            // 价格取**最近** tick（62500.17 -> 62500.2），与数量的向下取整不同
+            OrderType::Limit { price, .. } => assert!((price - 62_500.2).abs() < 1e-9),
+            OrderType::Market => panic!("expected limit"),
+        }
+    }
+
+    /// contract_size = 1 的所（Binance/HL/IBKR）折算是恒等变换，只剩取整
+    #[test]
+    fn unit_contract_size_leaves_quantity_unchanged() {
+        let meta = SymbolMeta {
+            exchange: Exchange::Binance,
+            symbol: "BTC".to_string(),
+            price_formatter: Arc::new(StepFormatter::new(0.1)),
+            size_step: 0.001,
+            min_order_size: 0.001,
+            contract_size: 1.0,
+        };
+        let wire = ExchangeOrder::from_domain(coin_order(0.1234, 62_500.0), &meta);
+        assert!((wire.inner().quantity - 0.123).abs() < 1e-9);
+    }
+
+    /// 其余字段原样透传（方向/reduce_only/client_order_id 不属于单位换算范畴）
+    #[test]
+    fn non_quantity_fields_pass_through() {
+        let mut order = coin_order(0.12, 62_500.0);
+        order.reduce_only = true;
+        order.side = Side::Short;
+        let wire = ExchangeOrder::from_domain(order, &okx_btc_meta());
+        assert!(wire.inner().reduce_only);
+        assert_eq!(wire.inner().side, Side::Short);
+        assert_eq!(wire.inner().client_order_id, "c1");
+    }
 }

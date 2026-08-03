@@ -12,9 +12,9 @@ use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
 use kameo::Actor;
-use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::sync::Arc;
+use kameo_actors::pubsub::Publish;
 
 use super::OutcomePubSub;
 
@@ -22,7 +22,7 @@ use super::OutcomePubSub;
 pub struct ExecutorArgs {
     /// 策略实例
     pub strategy: Box<dyn Strategy>,
-    /// Symbol 元数据 (用于 qty 转换)
+    /// Symbol 元数据 (供 StrategyRunner 按交易所精度取整；单位折算不在此)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// Outcome PubSub 引用 (用于发布信号)
     pub outcome_pubsub: ActorRef<OutcomePubSub>,
