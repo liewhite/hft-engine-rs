@@ -6,6 +6,10 @@ pub mod okx;
 pub mod utils;
 pub mod ws_loop;
 
+/// trades 线路一致性测试（联网，`#[ignore]`）
+#[cfg(test)]
+mod trades_conformance;
+
 pub use client::{
     ExchangeActorOps, ExchangeClient, Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe,
 };

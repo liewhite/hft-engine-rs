@@ -5,7 +5,9 @@
 #![allow(dead_code)]
 
 use super::from_hyperliquid;
-use crate::domain::{now_ms, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, Side, BBO};
+use crate::domain::{
+    now_ms, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, Side, BBO,
+};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -128,6 +130,46 @@ impl WsBbo {
             bid_qty,
             ask_price,
             ask_qty,
+            timestamp: self.time,
+        })
+    }
+}
+
+/// 成交数据 (trades 订阅)
+///
+/// API 格式: `{ coin, side, px, sz, time, hash, tid, users }`，本结构只声明所需字段。
+///
+/// `side` 是**主动方 (taker)** 方向，编码沿用 Hyperliquid 全站约定 `"B"` = 买、`"A"` = 卖
+/// (与 [`WsFill`] / 订单推送一致)；官方文档在此处用 "Buy"/"Sell" 描述，故一并容错接受全词形式。
+#[derive(Debug, Deserialize)]
+pub struct WsTrade {
+    pub coin: String,
+    pub side: String,
+    pub px: String,
+    pub sz: String,
+    pub time: u64,
+}
+
+impl WsTrade {
+    pub fn to_market_trade(&self) -> Result<MarketTrade, String> {
+        let symbol = from_hyperliquid(&self.coin);
+        let price = f64::from_str(&self.px)
+            .map_err(|_| format!("Failed to parse trade price: {}", self.px))?;
+        let qty = f64::from_str(&self.sz)
+            .map_err(|_| format!("Failed to parse trade size: {}", self.sz))?;
+        // 主动买 -> 卖方为挂单方 -> is_buyer_maker = false
+        let is_buyer_maker = match self.side.as_str() {
+            "B" | "Buy" => false,
+            "A" | "Sell" => true,
+            other => return Err(format!("Unknown Hyperliquid trade side: {}", other)),
+        };
+
+        Ok(MarketTrade {
+            exchange: Exchange::Hyperliquid,
+            symbol,
+            price,
+            qty,
+            is_buyer_maker,
             timestamp: self.time,
         })
     }
@@ -460,5 +502,60 @@ impl WsFill {
             fee,
             reason,
         })
+    }
+}
+
+#[cfg(test)]
+mod trade_tests {
+    use super::*;
+
+    /// trades 推送样例（含本结构未声明的 hash/tid/users 字段，应被忽略）
+    const TRADE: &str = r#"{
+        "coin":"BTC","side":"A","px":"42219.9","sz":"0.125","time":1630048897897,
+        "hash":"0xabc","tid":123456,"users":["0x1","0x2"]
+    }"#;
+
+    #[test]
+    fn trade_parses_price_qty_and_taker_side() {
+        let t: WsTrade = serde_json::from_str(TRADE).expect("parse trade");
+        let mt = t.to_market_trade().expect("to_market_trade");
+        assert_eq!(mt.exchange, Exchange::Hyperliquid);
+        assert_eq!(mt.symbol, "BTC");
+        assert_eq!(mt.price, 42219.9);
+        assert_eq!(mt.qty, 0.125);
+        assert!(mt.is_buyer_maker, "side=A 是主动卖 -> 买方为挂单方");
+        assert_eq!(mt.timestamp, 1630048897897);
+    }
+
+    #[test]
+    fn trade_side_accepts_both_encodings() {
+        for (side, expect_buyer_maker) in
+            [("B", false), ("Buy", false), ("A", true), ("Sell", true)]
+        {
+            let raw = format!(
+                r#"{{"coin":"BTC","side":"{side}","px":"1.0","sz":"1.0","time":1}}"#
+            );
+            let t: WsTrade = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                t.to_market_trade().unwrap().is_buyer_maker,
+                expect_buyer_maker,
+                "side={side}"
+            );
+        }
+    }
+
+    #[test]
+    fn trade_unknown_side_is_error_not_silent() {
+        let raw = r#"{"coin":"BTC","side":"X","px":"1.0","sz":"1.0","time":1}"#;
+        let t: WsTrade = serde_json::from_str(raw).unwrap();
+        assert!(t.to_market_trade().is_err());
+    }
+
+    /// dex 前缀应被剥离为 base symbol
+    #[test]
+    fn trade_strips_dex_prefix() {
+        let raw = r#"{"coin":"xyz:NVDA","side":"B","px":"1.0","sz":"1.0","time":1}"#;
+        let t: WsTrade = serde_json::from_str(raw).unwrap();
+        assert_eq!(t.to_market_trade().unwrap().symbol, "NVDA");
     }
 }

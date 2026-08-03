@@ -8,7 +8,7 @@
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::hyperliquid::codec::{WsActiveAssetCtx, WsBbo};
+use crate::exchange::hyperliquid::codec::{WsActiveAssetCtx, WsBbo, WsTrade};
 use crate::exchange::hyperliquid::{to_hyperliquid, WS_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -400,6 +400,22 @@ fn parse_public_message(
                     data: ExchangeEventData::BBO(bbo),
                 }]);
             }
+            "trades" => {
+                // trades 一次推送一个数组
+                let trades: Vec<WsTrade> = serde_json::from_value(value["data"].clone())
+                    .map_err(|e| WsError::ParseError(format!("trades parse: {}", e)))?;
+
+                let mut events = Vec::new();
+                for t in &trades {
+                    let trade = t.to_market_trade()?;
+                    events.push(IncomeEvent {
+                        exchange_ts: trade.timestamp,
+                        local_ts,
+                        data: ExchangeEventData::MarketTrade(trade),
+                    });
+                }
+                return Ok(events);
+            }
             "allMids" => {
                 // 所有中间价，当前不处理
                 return Ok(Vec::new());
@@ -440,6 +456,9 @@ fn kind_to_stream(kind: &SubscriptionKind, quote: &str, dex: &str) -> Option<Str
         SubscriptionKind::BBO { symbol } => {
             Some(format!("bbo:{}", to_hyperliquid(symbol, quote, dex)))
         }
+        SubscriptionKind::Trades { symbol } => {
+            Some(format!("trades:{}", to_hyperliquid(symbol, quote, dex)))
+        }
         SubscriptionKind::Candle { .. } => None,
     }
 }
@@ -468,6 +487,10 @@ fn kind_to_subscription(
                 "coin": to_hyperliquid(symbol, quote, dex)
             }))
         }
+        SubscriptionKind::Trades { symbol } => Some(json!({
+            "type": "trades",
+            "coin": to_hyperliquid(symbol, quote, dex)
+        })),
         SubscriptionKind::Candle { .. } => None,
     }
 }

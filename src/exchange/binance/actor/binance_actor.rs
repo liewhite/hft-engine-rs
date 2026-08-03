@@ -54,25 +54,29 @@ pub struct BinanceActorArgs {
 
 /// BinanceActor - 父 Actor
 pub struct BinanceActor {
-    /// 高频公共 WebSocket（/public/ws：bookTicker、depth、aggTrade 等）
+    /// 盘口高频 WebSocket（/public/ws：bookTicker、depth）
     public_ws: ActorRef<BinancePublicWsActor>,
-    /// 常规市场 WebSocket（/market/ws：markPrice、kline、ticker 等）
+    /// 常规市场 WebSocket（/market/ws：markPrice、kline、ticker、aggTrade）
     market_ws: ActorRef<BinancePublicWsActor>,
 }
 
-/// 公共 WS 目标（Binance 迁移后高频与常规市场流分两条连接）
+/// 公共 WS 目标（Binance 迁移后按路由路径分流，两条连接）
 enum WsTarget {
-    /// /public/ws：高频公共数据（bookTicker、depth、aggTrade 等）
+    /// /public/ws：盘口高频数据（bookTicker、depth）
     PublicHighFreq,
-    /// /market/ws：常规市场数据（markPrice、kline、ticker 等）
+    /// /market/ws：常规市场数据（markPrice、kline、ticker）+ aggTrade
     Market,
 }
 
 /// 按订阅 kind 选择落到哪条公共 WS
+///
+/// `Trades` 走 /market/ws —— aggTrade 归属该端点，订到 /public/ws 会被 ack 但永不推数据
+/// （静默无数据，见 [`crate::exchange::binance::WS_PUBLIC_HIGH_FREQ_URL`] 的注释）。
 fn pick_ws_target(kind: &SubscriptionKind) -> WsTarget {
     match kind {
         SubscriptionKind::BBO { .. } => WsTarget::PublicHighFreq,
-        SubscriptionKind::FundingRate { .. }
+        SubscriptionKind::Trades { .. }
+        | SubscriptionKind::FundingRate { .. }
         | SubscriptionKind::MarkPrice { .. }
         | SubscriptionKind::IndexPrice { .. }
         | SubscriptionKind::Candle { .. } => WsTarget::Market,

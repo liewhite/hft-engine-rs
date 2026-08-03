@@ -7,7 +7,7 @@
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
-use crate::exchange::binance::codec::{BookTicker, MarkPriceUpdate, WsResponse};
+use crate::exchange::binance::codec::{AggTrade, BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ws_loop;
@@ -397,6 +397,17 @@ fn parse_public_message(
                 data: ExchangeEventData::BBO(bbo),
             }])
         }
+        "aggTrade" => {
+            let agg: AggTrade = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("aggTrade parse: {}", e)))?;
+            let trade = agg.to_market_trade(quote)
+                ?;
+            Ok(vec![IncomeEvent {
+                exchange_ts: trade.timestamp,
+                local_ts,
+                data: ExchangeEventData::MarketTrade(trade),
+            }])
+        }
         _ => {
             // 未知事件类型，记录警告但不报错
             tracing::warn!(event_type, raw, "Unknown Binance public event type");
@@ -424,6 +435,10 @@ fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> Option<String> {
         )),
         SubscriptionKind::BBO { symbol } => Some(format!(
             "{}@bookTicker",
+            to_binance(symbol, quote).to_lowercase()
+        )),
+        SubscriptionKind::Trades { symbol } => Some(format!(
+            "{}@aggTrade",
             to_binance(symbol, quote).to_lowercase()
         )),
         SubscriptionKind::Candle { .. } => None,

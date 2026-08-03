@@ -1,6 +1,7 @@
 use super::from_binance;
 use crate::domain::{
-    Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO,
+    Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
+    OrderUpdate, Position, Side, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -110,6 +111,45 @@ impl BookTicker {
             bid_qty,
             ask_price,
             ask_qty,
+            timestamp: self.t as u64,
+        })
+    }
+}
+
+/// 归集成交 (`<symbol>@aggTrade` stream)
+///
+/// 官方字段：`e` 事件类型、`E` 事件时间、`s` 交易对、`a` 归集成交 ID、`p` 价格、
+/// `q` 数量、`f`/`l` 首末成交 ID、`T` 成交时间、`m` 买方是否为挂单方。
+/// 本结构只声明所需字段，其余 (含后续新增的 `nq`/`st`) 由 serde 忽略。
+///
+/// 时间戳取 `T` (成交时间) 而非 `E` (事件推送时间)，与 `BookTicker` 取 `T` 的口径一致。
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct AggTrade {
+    pub e: String,
+    pub s: String,
+    pub p: String,
+    pub q: String,
+    #[serde(rename = "T")]
+    pub t: i64,
+    pub m: bool,
+}
+
+impl AggTrade {
+    pub fn to_market_trade(&self, quote: &str) -> Result<MarketTrade, String> {
+        let symbol = from_binance(&self.s, quote)
+            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
+        let price = f64::from_str(&self.p)
+            .map_err(|_| format!("Failed to parse trade price: {}", self.p))?;
+        let qty = f64::from_str(&self.q)
+            .map_err(|_| format!("Failed to parse trade qty: {}", self.q))?;
+
+        Ok(MarketTrade {
+            exchange: Exchange::Binance,
+            symbol,
+            price,
+            qty,
+            is_buyer_maker: self.m,
             timestamp: self.t as u64,
         })
     }
@@ -329,4 +369,34 @@ pub struct WsResponse {
 pub struct WsError {
     pub code: i32,
     pub msg: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 官方 aggTrade 样例载荷（含本结构未声明的 a/f/l 字段，应被忽略）
+    const AGG_TRADE: &str = r#"{
+        "e":"aggTrade","E":123456789,"s":"BTCUSDT","a":5933014,
+        "p":"42219.90","q":"0.125","f":100,"l":105,"T":123456785,"m":true
+    }"#;
+
+    #[test]
+    fn agg_trade_parses_price_qty_and_taker_side() {
+        let agg: AggTrade = serde_json::from_str(AGG_TRADE).expect("parse aggTrade");
+        let t = agg.to_market_trade("USDT").expect("to_market_trade");
+        assert_eq!(t.exchange, Exchange::Binance);
+        assert_eq!(t.symbol, "BTC");
+        assert_eq!(t.price, 42219.90);
+        assert_eq!(t.qty, 0.125);
+        assert!(t.is_buyer_maker, "m=true -> 买方挂单 -> 主动卖");
+        // 时间戳取 T (成交时间) 而非 E (推送时间)
+        assert_eq!(t.timestamp, 123456785);
+    }
+
+    #[test]
+    fn agg_trade_unknown_quote_is_error_not_silent() {
+        let agg: AggTrade = serde_json::from_str(AGG_TRADE).unwrap();
+        assert!(agg.to_market_trade("USDC").is_err());
+    }
 }

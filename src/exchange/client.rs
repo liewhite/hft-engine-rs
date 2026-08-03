@@ -18,6 +18,12 @@ pub enum SubscriptionKind {
     FundingRate { symbol: Symbol },
     /// Best Bid/Offer
     BBO { symbol: Symbol },
+    /// 公共成交印记 (逐笔成交流)
+    ///
+    /// 各所均为**按主动单归集**的成交流 (Binance `aggTrade`、OKX `trades`、
+    /// Hyperliquid `trades`)，而非每笔撮合明细：同一主动单在同一价位的多笔撮合合并为一条。
+    /// 这正是盘口/成交流因子想要的口径 (一次主动行为 = 一个事件)。
+    Trades { symbol: Symbol },
     /// 标记价格
     MarkPrice { symbol: Symbol },
     /// 指数价格
@@ -32,6 +38,7 @@ impl SubscriptionKind {
         match self {
             SubscriptionKind::FundingRate { symbol }
             | SubscriptionKind::BBO { symbol }
+            | SubscriptionKind::Trades { symbol }
             | SubscriptionKind::MarkPrice { symbol }
             | SubscriptionKind::IndexPrice { symbol }
             | SubscriptionKind::Candle { symbol, .. } => symbol,

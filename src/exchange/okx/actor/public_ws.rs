@@ -8,7 +8,9 @@
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::okx::codec::{BboData, FundingRateData, IndexTickerData, MarkPriceData, WsPush};
+use crate::exchange::okx::codec::{
+    BboData, FundingRateData, IndexTickerData, MarkPriceData, TradeData, WsPush,
+};
 use crate::exchange::okx::{to_okx, to_okx_index, WS_PUBLIC_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -93,7 +95,7 @@ impl OkxPublicWsActor {
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_public_message(raw, local_ts)?;
+        let events = parse_public_message(raw, local_ts, &self.symbol_metas)?;
         for event in events {
             if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Failed to publish to IncomePubSub");
@@ -264,7 +266,12 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPublicWsActo
 // 消息解析
 // ============================================================================
 
-fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+/// `symbol_metas` 用于把 OKX 的**张数**口径折算为币本位 (与 `parse_private_message` 同一套路)。
+fn parse_public_message(
+    raw: &str,
+    local_ts: u64,
+    symbol_metas: &HashMap<Symbol, SymbolMeta>,
+) -> Result<Vec<IncomeEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -329,6 +336,36 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
             }
             Ok(events)
         }
+        "trades" => {
+            let push: WsPush<TradeData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("trades parse: {}", e)))?;
+            let inst_id = push
+                .arg
+                .inst_id
+                .as_ref()
+                .ok_or_else(|| WsError::ParseError("Missing instId in trades".into()))?;
+
+            let mut events = Vec::new();
+            for data in &push.data {
+                let mut trade = data.to_market_trade(inst_id)?;
+                // 张 -> 币。缺 meta 无法折算，宁可丢弃并告警，也不把张数当币数发下去
+                let Some(meta) = symbol_metas.get(&trade.symbol) else {
+                    tracing::warn!(
+                        exchange = "OKX",
+                        symbol = %trade.symbol,
+                        "Missing SymbolMeta for trade, dropping (cannot convert contracts to coin)"
+                    );
+                    continue;
+                };
+                trade.qty = meta.qty_to_coin(trade.qty);
+                events.push(IncomeEvent {
+                    exchange_ts: trade.timestamp,
+                    local_ts,
+                    data: ExchangeEventData::MarketTrade(trade),
+                });
+            }
+            Ok(events)
+        }
         "mark-price" => {
             let push: WsPush<MarkPriceData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("mark-price parse: {}", e)))?;
@@ -384,6 +421,11 @@ fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_json::Value
         })),
         SubscriptionKind::BBO { symbol } => Some(json!({
             "channel": "bbo-tbt",
+            "instId": to_okx(symbol, quote)
+        })),
+        SubscriptionKind::Trades { symbol } => Some(json!({
+            // `trades` 按主动单 + 成交价归集推送；`trades-all` 才是每笔明细，此处不需要
+            "channel": "trades",
             "instId": to_okx(symbol, quote)
         })),
         SubscriptionKind::MarkPrice { symbol } => Some(json!({

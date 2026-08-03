@@ -1,5 +1,5 @@
 use super::{from_okx, from_okx_index};
-use crate::domain::{Candle, CandleInterval, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
+use crate::domain::{Candle, CandleInterval, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice, MarketTrade, OrderStatus, OrderUpdate, Position, Side, now_ms, BBO};
 use serde::Deserialize;
 use std::str::FromStr;
 
@@ -103,6 +103,55 @@ impl BboData {
             bid_qty,
             ask_price,
             ask_qty,
+            timestamp,
+        })
+    }
+}
+
+/// 成交数据 (trades channel)
+///
+/// 官方字段：`instId`、`tradeId`、`px` 成交价、`sz` 成交量、`side` **主动方**方向
+/// (`buy`/`sell`)、`ts` 成交时间 (毫秒字符串)。其余字段 (`count`/`source` 等) 由 serde 忽略。
+///
+/// **`sz` 单位是合约张数** (SWAP/FUTURES)，与 OKX 私有流的 `sz` 一致；折算为币本位由
+/// actor 层用 [`crate::domain::SymbolMeta::qty_to_coin`] 完成 (与 private_ws 同一套路)。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeData {
+    #[allow(dead_code)]
+    pub trade_id: String,
+    pub px: String,
+    pub sz: String,
+    pub side: String,
+    pub ts: String,
+}
+
+impl TradeData {
+    /// 转为公共成交印记。`qty` 为**张数**，币本位折算由调用方按 SymbolMeta 完成。
+    pub fn to_market_trade(&self, inst_id: &str) -> Result<MarketTrade, String> {
+        let symbol = from_okx(inst_id)
+            .ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
+        let price = f64::from_str(&self.px)
+            .map_err(|_| format!("Failed to parse trade price: {}", self.px))?;
+        let qty = f64::from_str(&self.sz)
+            .map_err(|_| format!("Failed to parse trade qty: {}", self.sz))?;
+        let timestamp = self
+            .ts
+            .parse::<u64>()
+            .map_err(|_| format!("Failed to parse trade timestamp: {}", self.ts))?;
+        // side 是**主动方**方向：主动买 -> 卖方为挂单方 -> is_buyer_maker = false
+        let is_buyer_maker = match self.side.as_str() {
+            "buy" => false,
+            "sell" => true,
+            other => return Err(format!("Unknown OKX trade side: {}", other)),
+        };
+
+        Ok(MarketTrade {
+            exchange: Exchange::OKX,
+            symbol,
+            price,
+            qty,
+            is_buyer_maker,
             timestamp,
         })
     }
@@ -509,5 +558,46 @@ pub fn okx_channel_to_candle_interval(channel: &str) -> Option<CandleInterval> {
         "candle1M" => Some(CandleInterval::Month1),
         "candle3M" => Some(CandleInterval::Month3),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod trade_tests {
+    use super::*;
+
+    /// trades 频道推送样例（含本结构未声明的 count/source 字段，应被忽略）
+    const TRADES_PUSH: &str = r#"{
+        "arg":{"channel":"trades","instId":"BTC-USDT-SWAP"},
+        "data":[{"instId":"BTC-USDT-SWAP","tradeId":"130639474","px":"42219.9",
+                 "sz":"12","side":"sell","ts":"1630048897897","count":"3","source":"0"}]
+    }"#;
+
+    #[test]
+    fn trade_parses_contracts_and_taker_side() {
+        let push: WsPush<TradeData> = serde_json::from_str(TRADES_PUSH).expect("parse trades push");
+        let inst_id = push.arg.inst_id.as_ref().expect("instId");
+        let t = push.data[0].to_market_trade(inst_id).expect("to_market_trade");
+        assert_eq!(t.exchange, Exchange::OKX);
+        assert_eq!(t.symbol, "BTC");
+        assert_eq!(t.price, 42219.9);
+        // qty 仍是**张数**，币本位折算在 actor 层用 SymbolMeta 完成
+        assert_eq!(t.qty, 12.0);
+        assert!(t.is_buyer_maker, "side=sell 是主动卖 -> 买方为挂单方");
+        assert_eq!(t.timestamp, 1630048897897);
+    }
+
+    #[test]
+    fn trade_buy_side_means_buyer_is_taker() {
+        let raw = r#"{"tradeId":"1","px":"1.0","sz":"1","side":"buy","ts":"1"}"#;
+        let d: TradeData = serde_json::from_str(raw).unwrap();
+        let t = d.to_market_trade("BTC-USDT-SWAP").unwrap();
+        assert!(!t.is_buyer_maker);
+    }
+
+    #[test]
+    fn trade_unknown_side_is_error_not_silent() {
+        let raw = r#"{"tradeId":"1","px":"1.0","sz":"1","side":"","ts":"1"}"#;
+        let d: TradeData = serde_json::from_str(raw).unwrap();
+        assert!(d.to_market_trade("BTC-USDT-SWAP").is_err());
     }
 }
