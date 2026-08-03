@@ -84,6 +84,18 @@ impl SimState {
 
     // ==================== 上游行情到达 (用于撮合) ====================
 
+    /// 只更新盘口、**不撮合**。
+    ///
+    /// 用于"仅以真实成交判定撮合"的场景（模拟盘）：盘口只作两件事 —— 持仓估值，以及订单
+    /// 到达时的可成交性判断（PostOnly 是否会吃单、市价单有无参考价）；成交与否一律由
+    /// [`Self::on_market`] 收到的真实成交（trade-print）判定。
+    ///
+    /// 与 `on_market(BBO)` 的区别正在于此：后者会把"盘口越过挂单价"也算作成交，对挂单策略
+    /// 偏乐观 —— 盘口触到你的价位只说明队列**前面**的人在成交。
+    pub fn observe_bbo(&mut self, bbo: &BBO) {
+        self.last_bbo.insert(bbo.symbol.clone(), bbo.clone());
+    }
+
     /// 行情到达交易所：更新行情 + 撮合越价挂单。返回要回流策略的事件 (首个为转发行情)。
     pub fn on_market(&mut self, exchange: Exchange, ev: &IncomeEvent) -> Vec<IncomeEvent> {
         match &ev.data {
@@ -622,6 +634,23 @@ mod tests {
         let evs = s.on_market(EX, &market_ev(bbo(50011.0, 50012.0, 2)));
         assert_eq!(fills(&evs).iter().map(|f| f.size).collect::<Vec<_>>(), vec![0.002]); // 截断到多头
         assert_eq!(s.ledger.positions[&sym()].size, 0.0); // 平至 0, 不反手
+    }
+
+    #[test]
+    fn observe_bbo_updates_quote_without_matching() {
+        let mut s = empty();
+        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
+        s.on_order_arrived(1, EX, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        // 盘口越过挂单价（ask 49994 <= 49995），但 observe_bbo 不撮合
+        s.observe_bbo(&bbo(49990.0, 49994.0, 2));
+        assert_eq!(s.resting.len(), 1, "observe_bbo 不应撮合");
+        assert!(s.ledger.positions.get(&sym()).map(|p| p.is_empty()).unwrap_or(true));
+        // 估值口径已更新
+        assert_eq!(s.mark_of(&sym()), (49990.0 + 49994.0) / 2.0);
+        // 真实成交穿过挂单价才成交
+        let evs = s.on_market(EX, &trade_ev(49994.0, 3));
+        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![49995.0]);
+        assert_eq!(s.resting.len(), 0);
     }
 
     #[test]

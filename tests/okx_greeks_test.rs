@@ -85,6 +85,7 @@ async fn test_okx_greeks_push() {
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
             ibkr_snapshot: None,
+            trading_mode: hft_engine_rs::engine::TradingMode::Live,
             binance_credentials: None,
             okx_credentials: Some(credentials),
             hyperliquid_credentials: None,

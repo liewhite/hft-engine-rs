@@ -9,6 +9,7 @@ mod executor;
 mod income_processor;
 mod metrics;
 mod outcome_processor;
+mod paper_counter;
 
 use crate::messaging::IncomeEvent;
 use crate::strategy::OutcomeEvent;
@@ -22,8 +23,9 @@ pub type OutcomePubSub = PubSub<OutcomeEvent>;
 
 pub use clock::{ClockActor, ClockActorArgs};
 pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
-pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, GetIbkrClient, PublishIncome, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome};
+pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, GetIbkrClient, PublishIncome, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome, TradingMode};
 pub use executor::{ExecutorActor, ExecutorArgs};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor};
 pub use metrics::{MetricsActor, MetricsActorArgs, RegisterSymbols, DEFAULT_REPORT_INTERVAL_MS};
 pub use outcome_processor::{OutcomeProcessorActor, OutcomeProcessorArgs};
+pub use paper_counter::{PaperCounterActor, PaperCounterArgs};

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{
     init_tracing, load_config, wait_for_shutdown, AddStrategies, GetAllSymbolMetas, ManagerActor,
-    ManagerActorArgs,
+    ManagerActorArgs, TradingMode,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
 use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
             hyperliquid_credentials: config.exchanges.hyperliquid.clone(),
             ibkr_credentials: None,
             ibkr_snapshot: None,
+            trading_mode: TradingMode::Live,
         },
         mailbox::unbounded(),
     );
