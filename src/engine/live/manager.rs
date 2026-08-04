@@ -7,7 +7,7 @@
 //! - 子 Actor 失败时级联退出
 
 use super::{
-    AccountOutcome, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
+    AccountIncome, AccountOutcome, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
     PaperCounterActor, PaperCounterArgs, PaperPubSub,
     IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor,
     RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, UnregisterExecutor,
@@ -86,6 +86,9 @@ pub struct ManagerActor {
     /// IBKR 具体 client (Arc)，供上层策略经 GetIbkrClient 取引用，调用借券费/外汇等
     /// **非 ExchangeClient trait** 的具体方法。None = 未配置 IBKR。单会话复用同一 client。
     ibkr_client: Option<Arc<IbkrClient>>,
+
+    /// 模拟账户私有事件总线（供 Supervisor 等观察者订阅）
+    paper_pubsub: ActorRef<PaperPubSub>,
 
     /// 已注册的策略实例，供动态撤下使用。
     ///
@@ -487,6 +490,7 @@ impl Actor for ManagerActor {
         // executor。漏掉这一步的表现是"订单永远停在 Created、超时被清理后反复重挂"——
         // 策略收不到 Pending/Filled，看不见自己的挂单。
         paper_pubsub
+            .clone()
             .tell(Subscribe(processor.clone()))
             .send()
             .await
@@ -668,6 +672,7 @@ impl Actor for ManagerActor {
             metrics,
             exchange_actors,
             ibkr_client: ibkr_client_ref,
+            paper_pubsub,
             executors: Vec::new(),
         })
     }
@@ -977,5 +982,25 @@ impl Message<RemoveStrategies> for ManagerActor {
             }
         }
         Ok(())
+    }
+}
+
+/// 订阅模拟账户私有事件总线（Supervisor / 观测层用）
+pub struct SubscribePaper<A: Actor>(pub ActorRef<A>);
+
+impl<A> Message<SubscribePaper<A>> for ManagerActor
+where
+    A: Actor + Message<AccountIncome>,
+{
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribePaper<A>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Err(e) = self.paper_pubsub.tell(Subscribe(msg.0)).send().await {
+            tracing::error!(error = %e, "Failed to subscribe to PaperPubSub");
+        }
     }
 }

@@ -44,6 +44,51 @@ impl BinanceClient {
         })
     }
 
+    /// 拉取各交易对最近 24 小时的**计价币成交额**（USDT 名义额）。
+    ///
+    /// 用于按流动性挑选标的：低流动性 symbol 的盘口很差，在其上跑出的模拟结论本身不可信。
+    ///
+    /// 返回的是**内部基础符号**，且只含当前 quote 的交易对；调用方通常还要与
+    /// [`ExchangeClient::fetch_all_symbol_metas`] 取交集，以排除不可交易的标的
+    /// （本接口按 24h 行情返回，含已停牌/交割品种）。
+    pub async fn fetch_quote_volumes(&self) -> Result<Vec<(Symbol, f64)>, ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Ticker24h {
+            symbol: String,
+            /// 24h 计价币成交额
+            quote_volume: String,
+        }
+
+        let url = format!("{}/fapi/v1/ticker/24hr", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(ExchangeError::Other(format!(
+                "ticker/24hr failed: {status}, body: {}",
+                &text[..text.len().min(500)]
+            )));
+        }
+        let tickers: Vec<Ticker24h> = serde_json::from_str(&text).map_err(|e| {
+            ExchangeError::Other(format!("Failed to parse ticker/24hr: {e}"))
+        })?;
+
+        Ok(tickers
+            .into_iter()
+            .filter_map(|t| {
+                let symbol = from_binance(&t.symbol, &self.quote)?;
+                let volume = t.quote_volume.parse::<f64>().ok()?;
+                Some((symbol, volume))
+            })
+            .collect())
+    }
+
     /// 获取计价币种
     pub fn quote(&self) -> &str {
         &self.quote

@@ -13,7 +13,7 @@ pub use live::{
     GetAllSymbolMetas, GetIbkrClient, PublishIncome, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
     MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor, RegisterExecutor,
     PaperCounterActor, PaperCounterArgs,
-    RegisterSymbols, OutcomeProcessorArgs, RemoveStrategies, Stop, StrategySpec,
+    RegisterSymbols, OutcomeProcessorArgs, RemoveStrategies, Stop, StrategySpec, SubscribePaper,
     Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,
     SupervisorArgs, SymbolRecord, SymbolView, UnregisterExecutor,
     SubscribeIncome, SubscribeOutcome,

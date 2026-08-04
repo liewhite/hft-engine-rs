@@ -4,12 +4,21 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::engine::live::ManagerActor;
 
-/// 初始化 tracing（fmt + EnvFilter，默认 hft_engine_rs=info）
+/// 初始化 tracing（fmt + EnvFilter）
+///
+/// 默认放行**全部 info**，只把已知吵闹的依赖降到 warn。
+///
+/// 曾经的默认是 `hft_engine_rs=info`，只覆盖库 —— 各 bin 自身的 `info!`/`warn!` 全部被静默
+/// 丢弃，包括"订单只落本地柜台""该 symbol 开始真实下单"这类**操作员必须看到**的提示。
+/// 按 target 白名单很容易漏掉新增的 bin，所以改为黑名单式降噪。
 pub fn init_tracing() -> anyhow::Result<()> {
+    const DEFAULT_FILTER: &str = "info,\
+        hyper=warn,hyper_util=warn,reqwest=warn,h2=warn,rustls=warn,\
+        tungstenite=warn,tokio_tungstenite=warn";
     let filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::from_default_env()
     } else {
-        EnvFilter::new("hft_engine_rs=info")
+        EnvFilter::new(DEFAULT_FILTER)
     };
     tracing_subscriber::registry()
         .with(fmt::layer())
