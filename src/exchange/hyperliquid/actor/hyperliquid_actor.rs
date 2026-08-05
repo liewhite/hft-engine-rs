@@ -10,12 +10,15 @@
 //! ├── HyperliquidPublicWsActor [spawn_link]
 //! └── HyperliquidPrivateWsActor [spawn_link] (optional, 需要凭证)
 
+use super::funding_fee_polling::{
+    HyperliquidFundingFeePollingActor, HyperliquidFundingFeePollingActorArgs,
+};
 use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs};
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
 use crate::domain::{ExchangeError, Symbol, SymbolMeta};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
-use crate::exchange::hyperliquid::HyperliquidCredentials;
+use crate::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::ActorStopReason;
 use kameo::mailbox;
@@ -27,6 +30,9 @@ use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
 const STATUS_BROADCAST_INTERVAL_MS: u64 = 5_000;
+
+/// 资费结算轮询间隔 (毫秒)。与 Binance 侧一致：资费按小时结算，1 分钟一次绰绰有余。
+const FUNDING_FEE_POLL_INTERVAL_MS: u64 = 60_000;
 
 /// HyperliquidActor 初始化参数
 pub struct HyperliquidActorArgs {
@@ -54,6 +60,18 @@ impl Actor for HyperliquidActor {
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let income_pubsub = args.income_pubsub;
+
+        // 凭证可用时构建 Arc<HyperliquidClient>，供 FundingFee polling 使用（与 BinanceActor 同构）。
+        // 构建失败向上传播 → 启动期受控退出
+        let hyperliquid_client: Option<Arc<HyperliquidClient>> = match args.credentials.as_ref() {
+            Some(c) => Some(Arc::new(
+                HyperliquidClient::new(args.quote.clone(), args.dex.clone(), Some(c.clone()))
+                    .map_err(|e| {
+                        ExchangeError::Other(format!("Failed to create HyperliquidClient: {e}"))
+                    })?,
+            )),
+            None => None,
+        };
 
         // 1. 并发 spawn 两个 WS actor
         let public_ws = HyperliquidPublicWsActor::spawn_link_with_mailbox(
@@ -103,6 +121,21 @@ impl Actor for HyperliquidActor {
         private_r
             .map_err(|e| ExchangeError::Other(format!("HyperliquidPrivateWsActor failed to start: {e}")))?;
         tracing::info!(exchange = "Hyperliquid", has_private_ws, "WS actors ready");
+
+        // 2.5 资费结算轮询：与私有 WS 一样按凭证门控（userFunding 要带 user 地址）。
+        //     polling actor 的 on_start 只 attach_stream（无 IO），无需 wait_for_startup。
+        if let Some(client) = hyperliquid_client {
+            HyperliquidFundingFeePollingActor::spawn_link_with_mailbox(
+                &actor_ref,
+                HyperliquidFundingFeePollingActorArgs {
+                    client,
+                    income_pubsub: income_pubsub.clone(),
+                    interval_ms: FUNDING_FEE_POLL_INTERVAL_MS,
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+        }
 
         // 3. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
         CryptoStatusActor::spawn_link_with_mailbox(
