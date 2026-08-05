@@ -743,12 +743,15 @@ impl ExchangeClient for HyperliquidClient {
     }
 
     async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
-        // Hyperliquid 通过 WebSocket 推送 equity 和 notional，这里仅实现 trait
-        // 实际使用中不会调用此方法
-        Ok(crate::domain::AccountInfo {
-            equity: 0.0,
-            notional: 0.0,
-        })
+        // Hyperliquid 的 equity/notional 经私有 WS 推送（AccountInfo 事件），此前这里
+        // 返回全零占位。返回编造的数字比报错危险得多 —— 下游拿它算杠杆会静默失效。
+        // 诚实报不支持，调用方要么走 WS 推送，要么在这里补齐真实实现
+        // （clearinghouseState 里有 accountValue，可实现但当前无调用方）。
+        Err(ExchangeError::Other(
+            "Hyperliquid 不支持 REST fetch_account_info（equity/notional 走私有 WS 推送），\
+             拒绝返回编造的数字"
+                .to_string(),
+        ))
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {

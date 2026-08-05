@@ -643,13 +643,15 @@ impl ExchangeClient for OkxClient {
     }
 
     async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
-        // OKX 通过 WebSocket 推送 equity 和 notional，这里仅实现 trait
-        // 实际使用中不会调用此方法
-        let equity = self.get_equity().await?;
-        Ok(crate::domain::AccountInfo {
-            equity,
-            notional: 0.0, // OKX 通过 WebSocket 推送 notional
-        })
+        // OKX 的 equity/notional 经私有 WS 推送（AccountInfo 事件），本方法没有实现完整
+        // 语义（此前 notional 硬编码 0.0）。返回编造的数字比报错危险得多 —— 下游拿它算
+        // account_leverage = notional / equity 会静默失效。诚实报不支持，调用方要么走
+        // WS 推送，要么在这里补齐真实实现。
+        Err(ExchangeError::Other(
+            "OKX 不支持 REST fetch_account_info（equity/notional 走私有 WS 推送），\
+             拒绝返回编造的数字"
+                .to_string(),
+        ))
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
