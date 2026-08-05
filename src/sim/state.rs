@@ -29,6 +29,15 @@ pub struct RestingOrder {
 
 /// 虚拟柜台的全部状态 (账本 + 挂单簿 + 最新行情)。
 ///
+/// # 边界：一份 `SimState` = **一个账户在一个交易所**的柜台
+///
+/// 交易所身份在构造时钉死（[`Self::exchange`]），内部一切状态（挂单簿、持仓、行情）都只属于
+/// 这一个所 —— 跨所隔离由持有方按 (账户, 交易所) 分实例实现（模拟盘
+/// `PaperCounterActor`、回测 `BacktestEngine` 皆如此）。此前 exchange 以方法参数传入、
+/// 只用来给回报贴标签，内部键全按 symbol —— 接口看似有交易所维度实则没有：跨所策略绑到
+/// 一个实例上，A 所挂单会被 B 所的成交撮合、两所持仓并进一条。收进构造参数后，
+/// "喂错所的行情"成为可检测的路由 bug（见 [`Self::on_market`]），而非静默串账。
+///
 /// # 数量口径：全程**币本位**
 ///
 /// 本状态机不参与单位折算，进出一律币本位 (见 [`crate::domain::Quantity`])：订单来自
@@ -47,6 +56,8 @@ pub struct RestingOrder {
 /// 每次转移的首个回流事件是转发行情，其后才是本次触发的成交/状态回报 (保证行情先于成交)。
 #[derive(Debug, Clone)]
 pub struct SimState {
+    /// 本柜台所属的交易所（构造时钉死，见类型文档）
+    pub exchange: Exchange,
     pub ledger: Ledger,
     pub resting: IndexMap<OrderId, RestingOrder>,
     pub last_bbo: HashMap<Symbol, BBO>,
@@ -57,8 +68,9 @@ pub struct SimState {
 }
 
 impl SimState {
-    pub fn empty(cash: f64, maker_fee_rate: f64, taker_fee_rate: f64) -> Self {
+    pub fn empty(exchange: Exchange, cash: f64, maker_fee_rate: f64, taker_fee_rate: f64) -> Self {
         Self {
+            exchange,
             ledger: Ledger::empty(cash),
             resting: IndexMap::new(),
             last_bbo: HashMap::new(),
@@ -97,19 +109,32 @@ impl SimState {
     }
 
     /// 行情到达交易所：更新行情 + 撮合越价挂单。返回要回流策略的事件 (首个为转发行情)。
-    pub fn on_market(&mut self, exchange: Exchange, ev: &IncomeEvent) -> Vec<IncomeEvent> {
+    ///
+    /// 喂进不属于本所的行情是**路由 bug**（持有方应按所分发）：记 error 并只转发不撮合，
+    /// 绝不拿别的所的价格去撮合本所的挂单。
+    pub fn on_market(&mut self, ev: &IncomeEvent) -> Vec<IncomeEvent> {
+        if let Some(ev_exchange) = ev.exchange() {
+            if ev_exchange != self.exchange {
+                tracing::error!(
+                    counter_exchange = %self.exchange,
+                    event_exchange = %ev_exchange,
+                    "SimState 收到其他交易所的行情（路由 bug），只转发不撮合"
+                );
+                return vec![ev.clone()];
+            }
+        }
         match &ev.data {
             ExchangeEventData::BBO(bbo) => {
                 self.last_bbo.insert(bbo.symbol.clone(), bbo.clone());
                 let mut out = vec![ev.clone()];
-                out.extend(self.match_crossing(exchange, &bbo.clone()));
+                out.extend(self.match_crossing(&bbo.clone()));
                 out
             }
             ExchangeEventData::MarketTrade(t) => {
                 // trade-print 撮合：真实成交价严格越过挂单价即成交 (无 bbo 行情时的撮合来源)
                 self.last_trade.insert(t.symbol.clone(), t.price);
                 let mut out = vec![ev.clone()];
-                out.extend(self.match_trade(exchange, &t.clone()));
+                out.extend(self.match_trade(&t.clone()));
                 out
             }
             ExchangeEventData::MarkPrice(mp) => {
@@ -121,15 +146,15 @@ impl SimState {
     }
 
     /// BBO 越过挂单价的全部挂单成交 (maker 成交价取挂单价)，按到达顺序撮合。
-    fn match_crossing(&mut self, exchange: Exchange, bbo: &BBO) -> Vec<IncomeEvent> {
-        self.fill_crossed(exchange, &bbo.symbol, bbo.timestamp, |o| {
+    fn match_crossing(&mut self, bbo: &BBO) -> Vec<IncomeEvent> {
+        self.fill_crossed(&bbo.symbol, bbo.timestamp, |o| {
             matcher::crosses(o.side, o.limit_price, bbo)
         })
     }
 
     /// 真实成交严格越过挂单价的全部挂单成交 (maker 成交价取挂单价)，按到达顺序撮合。
-    fn match_trade(&mut self, exchange: Exchange, t: &MarketTrade) -> Vec<IncomeEvent> {
-        self.fill_crossed(exchange, &t.symbol, t.timestamp, |o| {
+    fn match_trade(&mut self, t: &MarketTrade) -> Vec<IncomeEvent> {
+        self.fill_crossed(&t.symbol, t.timestamp, |o| {
             matcher::trade_crosses(o.side, o.limit_price, t.price)
         })
     }
@@ -139,7 +164,6 @@ impl SimState {
     /// + `fill` 保证不漏单/不重复，且 reduceOnly 截断按成交先后顺序作用于当前持仓。
     fn fill_crossed(
         &mut self,
-        exchange: Exchange,
         symbol: &Symbol,
         ts: Timestamp,
         crossed: impl Fn(&RestingOrder) -> bool,
@@ -154,7 +178,6 @@ impl SimState {
         for o in matched {
             self.resting.shift_remove(&o.order_id);
             out.extend(self.fill(
-                exchange,
                 &o.order_id,
                 &o.client_order_id,
                 &o.symbol,
@@ -176,7 +199,6 @@ impl SimState {
     pub fn on_order_arrived(
         &mut self,
         now: Timestamp,
-        exchange: Exchange,
         order: &Order,
         order_id: &OrderId,
     ) -> Vec<IncomeEvent> {
@@ -187,7 +209,6 @@ impl SimState {
                 Some(b) => {
                     let price = matcher::touch_price(order.side, b);
                     self.fill(
-                        exchange,
                         order_id,
                         &order.client_order_id,
                         &order.symbol,
@@ -200,7 +221,7 @@ impl SimState {
                     )
                 }
                 None => vec![status_event(
-                    exchange,
+                    self.exchange,
                     order,
                     order_id,
                     OrderStatus::Rejected {
@@ -219,7 +240,7 @@ impl SimState {
                 match tif {
                     TimeInForce::PostOnly => match taker_price {
                         Some(_) => vec![status_event(
-                            exchange,
+                            self.exchange,
                             order,
                             order_id,
                             OrderStatus::Rejected {
@@ -228,11 +249,10 @@ impl SimState {
                             *limit,
                             ts,
                         )],
-                        None => self.rest(exchange, order, order_id, *limit, ts),
+                        None => self.rest(order, order_id, *limit, ts),
                     },
                     TimeInForce::GTC => match taker_price {
                         Some(p) => self.fill(
-                            exchange,
                             order_id,
                             &order.client_order_id,
                             &order.symbol,
@@ -243,12 +263,11 @@ impl SimState {
                             Liquidity::Taker,
                             order.reduce_only,
                         ),
-                        None => self.rest(exchange, order, order_id, *limit, ts),
+                        None => self.rest(order, order_id, *limit, ts),
                     },
                     TimeInForce::IOC | TimeInForce::FOK => match taker_price {
                         // 无深度模型, 可成交即全量成交, 否则整单取消 (不 resting)
                         Some(p) => self.fill(
-                            exchange,
                             order_id,
                             &order.client_order_id,
                             &order.symbol,
@@ -260,7 +279,7 @@ impl SimState {
                             order.reduce_only,
                         ),
                         None => vec![status_event(
-                            exchange,
+                            self.exchange,
                             order,
                             order_id,
                             OrderStatus::Cancelled,
@@ -277,7 +296,6 @@ impl SimState {
     pub fn on_cancel_arrived(
         &mut self,
         now: Timestamp,
-        exchange: Exchange,
         order_id: &OrderId,
     ) -> Vec<IncomeEvent> {
         match self.resting.shift_remove(order_id) {
@@ -286,7 +304,7 @@ impl SimState {
                 ExchangeEventData::OrderUpdate(OrderUpdate {
                     order_id: order_id.clone(),
                     client_order_id: Some(o.client_order_id),
-                    exchange,
+                    exchange: self.exchange,
                     symbol: o.symbol,
                     side: o.side,
                     status: OrderStatus::Cancelled,
@@ -306,7 +324,6 @@ impl SimState {
 
     fn rest(
         &mut self,
-        exchange: Exchange,
         order: &Order,
         order_id: &OrderId,
         limit: Price,
@@ -324,7 +341,7 @@ impl SimState {
                 reduce_only: order.reduce_only,
             },
         );
-        vec![status_event(exchange, order, order_id, OrderStatus::Pending, limit, ts)]
+        vec![status_event(self.exchange, order, order_id, OrderStatus::Pending, limit, ts)]
     }
 
     /// 成交落账。reduceOnly 单按当前持仓截断 (卖只平多、买只平空)，撮合层强制不反向开仓；
@@ -332,7 +349,6 @@ impl SimState {
     #[allow(clippy::too_many_arguments)]
     fn fill(
         &mut self,
-        exchange: Exchange,
         order_id: &OrderId,
         client_order_id: &str,
         symbol: &Symbol,
@@ -360,7 +376,7 @@ impl SimState {
                 ExchangeEventData::OrderUpdate(OrderUpdate {
                     order_id: order_id.clone(),
                     client_order_id: Some(client_order_id.to_string()),
-                    exchange,
+                    exchange: self.exchange,
                     symbol: symbol.clone(),
                     side,
                     status: OrderStatus::Cancelled,
@@ -380,12 +396,12 @@ impl SimState {
         };
         let fee = fill_price * effective_qty * fee_rate;
         self.ledger
-            .apply_fill(exchange, symbol, side, fill_price, effective_qty, fee);
+            .apply_fill(self.exchange, symbol, side, fill_price, effective_qty, fee);
 
         let update = OrderUpdate {
             order_id: order_id.clone(),
             client_order_id: Some(client_order_id.to_string()),
-            exchange,
+            exchange: self.exchange,
             symbol: symbol.clone(),
             side,
             status: OrderStatus::Filled,
@@ -397,7 +413,7 @@ impl SimState {
             timestamp: ts,
         };
         let f = Fill {
-            exchange,
+            exchange: self.exchange,
             symbol: symbol.clone(),
             side,
             price: fill_price,
@@ -460,7 +476,7 @@ mod tests {
         "BTCUSDT".to_string()
     }
     fn empty() -> SimState {
-        SimState::empty(10_000.0, 0.0, 0.0)
+        SimState::empty(EX, 10_000.0, 0.0, 0.0)
     }
 
     fn bbo(bid: Price, ask: Price, ts: Timestamp) -> BBO {
@@ -539,8 +555,8 @@ mod tests {
     #[test]
     fn non_marketable_postonly_buy_rests() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
-        let evs = s.on_order_arrived(1, EX, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        let evs = s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
         assert_eq!(statuses(&evs), vec![OrderStatus::Pending]);
         assert!(s.resting.contains_key("1"));
         assert!(fills(&evs).is_empty());
@@ -549,8 +565,8 @@ mod tests {
     #[test]
     fn marketable_postonly_rejected() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
-        let evs = s.on_order_arrived(1, EX, &limit(Side::Long, 50001.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        let evs = s.on_order_arrived(1, &limit(Side::Long, 50001.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
         assert!(statuses(&evs).iter().any(|st| matches!(st, OrderStatus::Rejected { .. })));
         assert!(s.resting.is_empty());
         assert!(fills(&evs).is_empty());
@@ -559,9 +575,9 @@ mod tests {
     #[test]
     fn resting_buy_crossed_fills_at_limit() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, EX, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
-        let evs = s.on_market(EX, &market_ev(bbo(49990.0, 49994.0, 2))); // ask 49994 <= 49995
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        let evs = s.on_market(&market_ev(bbo(49990.0, 49994.0, 2))); // ask 49994 <= 49995
         let f = fills(&evs);
         assert_eq!(f.iter().map(|x| x.price).collect::<Vec<_>>(), vec![49995.0]); // maker 价
         assert_eq!(s.resting.len(), 0);
@@ -571,9 +587,9 @@ mod tests {
     #[test]
     fn market_event_precedes_fill() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, EX, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
-        let evs = s.on_market(EX, &market_ev(bbo(49990.0, 49994.0, 2)));
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        let evs = s.on_market(&market_ev(bbo(49990.0, 49994.0, 2)));
         assert!(matches!(evs[0].data, ExchangeEventData::BBO(_)), "首事件应为行情转发");
         assert!(evs[1..].iter().any(|e| matches!(e.data, ExchangeEventData::Fill(_))), "成交回报排在行情之后");
     }
@@ -581,8 +597,8 @@ mod tests {
     #[test]
     fn gtc_marketable_taker_fills_at_touch() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
-        let evs = s.on_order_arrived(1, EX, &limit(Side::Long, 50005.0, TimeInForce::GTC, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        let evs = s.on_order_arrived(1, &limit(Side::Long, 50005.0, TimeInForce::GTC, "b1"), &"1".to_string());
         assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![50001.0]); // 吃卖价
         assert!(s.resting.is_empty());
     }
@@ -590,8 +606,8 @@ mod tests {
     #[test]
     fn ioc_non_marketable_cancelled() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
-        let evs = s.on_order_arrived(1, EX, &limit(Side::Long, 49000.0, TimeInForce::IOC, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        let evs = s.on_order_arrived(1, &limit(Side::Long, 49000.0, TimeInForce::IOC, "b1"), &"1".to_string());
         assert_eq!(statuses(&evs), vec![OrderStatus::Cancelled]);
         assert!(s.resting.is_empty());
     }
@@ -599,9 +615,9 @@ mod tests {
     #[test]
     fn cancel_arrived_removes_and_reports() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, EX, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
-        let evs = s.on_cancel_arrived(2, EX, &"1".to_string());
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        let evs = s.on_cancel_arrived(2, &"1".to_string());
         assert_eq!(statuses(&evs), vec![OrderStatus::Cancelled]);
         assert!(s.resting.is_empty());
     }
@@ -609,17 +625,17 @@ mod tests {
     #[test]
     fn cancel_arrived_not_in_book_noop() {
         let mut s = empty();
-        let evs = s.on_cancel_arrived(1, EX, &"404".to_string());
+        let evs = s.on_cancel_arrived(1, &"404".to_string());
         assert!(evs.is_empty());
     }
 
     #[test]
     fn reduce_only_sell_no_long_cancelled_no_reverse() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
         // 上方 resting 卖单
-        s.on_order_arrived(1, EX, &limit_ro(Side::Short, 50010.0, TimeInForce::PostOnly, "s1", 0.002), &"1".to_string());
-        let evs = s.on_market(EX, &market_ev(bbo(50011.0, 50012.0, 2))); // bid 50011 >= 50010 -> 越价
+        s.on_order_arrived(1, &limit_ro(Side::Short, 50010.0, TimeInForce::PostOnly, "s1", 0.002), &"1".to_string());
+        let evs = s.on_market(&market_ev(bbo(50011.0, 50012.0, 2))); // bid 50011 >= 50010 -> 越价
         assert!(fills(&evs).is_empty(), "无多头可平, 不应成交");
         assert!(statuses(&evs).contains(&OrderStatus::Cancelled), "reduceOnly 无可平 -> Cancelled");
         assert!(s.ledger.positions.get(&sym()).map(|p| p.is_empty()).unwrap_or(true), "不得反向开出空头");
@@ -628,10 +644,10 @@ mod tests {
     #[test]
     fn reduce_only_sell_truncated_to_position() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, EX, &limit(Side::Long, 50005.0, TimeInForce::GTC, "b1"), &"1".to_string()); // taker 开多 0.002
-        s.on_order_arrived(1, EX, &limit_ro(Side::Short, 50010.0, TimeInForce::PostOnly, "s1", 0.005), &"2".to_string()); // 平仓量 > 持仓
-        let evs = s.on_market(EX, &market_ev(bbo(50011.0, 50012.0, 2)));
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        s.on_order_arrived(1, &limit(Side::Long, 50005.0, TimeInForce::GTC, "b1"), &"1".to_string()); // taker 开多 0.002
+        s.on_order_arrived(1, &limit_ro(Side::Short, 50010.0, TimeInForce::PostOnly, "s1", 0.005), &"2".to_string()); // 平仓量 > 持仓
+        let evs = s.on_market(&market_ev(bbo(50011.0, 50012.0, 2)));
         assert_eq!(fills(&evs).iter().map(|f| f.size).collect::<Vec<_>>(), vec![0.002]); // 截断到多头
         assert_eq!(s.ledger.positions[&sym()].size, 0.0); // 平至 0, 不反手
     }
@@ -639,8 +655,8 @@ mod tests {
     #[test]
     fn observe_bbo_updates_quote_without_matching() {
         let mut s = empty();
-        s.on_market(EX, &market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, EX, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
         // 盘口越过挂单价（ask 49994 <= 49995），但 observe_bbo 不撮合
         s.observe_bbo(&bbo(49990.0, 49994.0, 2));
         assert_eq!(s.resting.len(), 1, "observe_bbo 不应撮合");
@@ -648,7 +664,7 @@ mod tests {
         // 估值口径已更新
         assert_eq!(s.mark_of(&sym()), (49990.0 + 49994.0) / 2.0);
         // 真实成交穿过挂单价才成交
-        let evs = s.on_market(EX, &trade_ev(49994.0, 3));
+        let evs = s.on_market(&trade_ev(49994.0, 3));
         assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![49995.0]);
         assert_eq!(s.resting.len(), 0);
     }
@@ -657,10 +673,10 @@ mod tests {
     fn trade_print_crossing_fills() {
         let mut s = empty();
         // 无 BBO，挂买单 @100 (limit 到达时无行情 -> resting)
-        s.on_order_arrived(1, EX, &limit(Side::Long, 100.0, TimeInForce::GTC, "b1"), &"1".to_string());
+        s.on_order_arrived(1, &limit(Side::Long, 100.0, TimeInForce::GTC, "b1"), &"1".to_string());
         assert!(s.resting.contains_key("1"));
         // 成交价 99 < 100 -> 越价成交 @100 (maker)
-        let evs = s.on_market(EX, &trade_ev(99.0, 2));
+        let evs = s.on_market(&trade_ev(99.0, 2));
         let f = fills(&evs);
         assert_eq!(f.iter().map(|x| x.price).collect::<Vec<_>>(), vec![100.0]);
         assert_eq!(s.ledger.positions[&sym()].size, 0.002);
@@ -673,26 +689,26 @@ mod tests {
 
     #[test]
     fn taker_fee_charged() {
-        let mut s = SimState::empty(10_000.0, 0.001, 0.002);
-        s.on_market(EX, &market_ev(bbo(100.0, 100.0, 1)));
+        let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002);
+        s.on_market(&market_ev(bbo(100.0, 100.0, 1)));
         let mut o = limit(Side::Long, 0.0, TimeInForce::GTC, "o1");
         o.order_type = OrderType::Market;
         o.quantity = 2.0;
-        s.on_order_arrived(1, EX, &o, &"o1".to_string());
+        s.on_order_arrived(1, &o, &"o1".to_string());
         near(s.ledger.cash, 10_000.0 - 0.4); // 100*2*0.002
         near(s.ledger.positions[&sym()].size, 2.0);
     }
 
     #[test]
     fn maker_fee_charged() {
-        let mut s = SimState::empty(10_000.0, 0.001, 0.002);
-        s.on_market(EX, &market_ev(bbo(100.0, 100.0, 1)));
+        let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002);
+        s.on_market(&market_ev(bbo(100.0, 100.0, 1)));
         let mut o = limit(Side::Long, 99.0, TimeInForce::GTC, "o1");
         o.quantity = 2.0;
-        s.on_order_arrived(1, EX, &o, &"o1".to_string());
+        s.on_order_arrived(1, &o, &"o1".to_string());
         assert!(!s.resting.is_empty());
         near(s.ledger.cash, 10_000.0); // resting 不扣费
-        s.on_market(EX, &market_ev(bbo(98.0, 98.0, 2))); // ask 98 <= 99 -> maker 成交 @99
+        s.on_market(&market_ev(bbo(98.0, 98.0, 2))); // ask 98 <= 99 -> maker 成交 @99
         near(s.ledger.cash, 10_000.0 - 99.0 * 2.0 * 0.001);
         near(s.ledger.positions[&sym()].size, 2.0);
     }

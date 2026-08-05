@@ -22,10 +22,13 @@
 //! [`SimConfig::exchange_to_strategy_delay_ms`] 在回测里用于模拟行情/回报的入向时延；模拟盘
 //! 的行情来自真实 WS，本身已带真实网络时延，再叠加会重复计算。故此处只用出向延迟。
 //!
-//! # 账户
+//! # 账户：按 (账户, 交易所) 分柜台
 //!
-//! 每个交易所各自持有一份 [`SimState`]（含 [`crate::sim::Ledger`]），因此持仓与净值按所隔离，
-//! 与实盘的 AccountInfo 口径一致；不会把跨所持仓并进一个账本。净值在收到 Clock 时发布。
+//! 一份 [`SimState`] 只代表**一个账户在一个交易所**的柜台（见其类型文档）。本 actor 按
+//! (AccountId, Exchange) 分实例：行情按所路由，持仓、挂单簿与净值天然按所隔离 —— 跨所
+//! 策略绑一个模拟账户时，A 所挂单不会被 B 所的成交撮合。每个 (账户, 所) 各以
+//! `initial_balance_usdt` 起步（等价"每个所各入金一份"，与实盘各所独立账户一致）。
+//! 净值在收到 Clock 时按各自的所发布 AccountInfo。
 
 use crate::domain::{now_ms, AccountId, Exchange, Order, OrderId, Symbol, Timestamp, BBO};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -66,14 +69,14 @@ pub struct ApplyCancel {
 
 /// 本地柜台
 pub struct PaperCounterActor {
-    /// **每个模拟账户**一份虚拟柜台状态（账本 + 挂单簿 + 该账户视角的最新行情）。
+    /// **每个 (模拟账户, 交易所)** 一份虚拟柜台状态（账本 + 挂单簿 + 该所视角的最新行情）。
     ///
-    /// 按账户而非按交易所分账：晋升逻辑需要逐 symbol 的独立盈亏，而每个 symbol 的模拟账户
-    /// 本就是一个独立账户（独立起始资金、独立仓位）。账户在首次收到其订单时惰性创建。
-    states: HashMap<AccountId, SimState>,
-    /// 共享报价缓存：行情没有账户归属，新账户创建时用它播种，避免首单因"还没见过盘口"
-    /// 而无法判定可成交性
-    last_quotes: HashMap<Symbol, BBO>,
+    /// 按账户分是因为晋升逻辑需要逐 symbol 的独立盈亏；按所分是 SimState 的边界要求
+    /// （一份实例只代表一个所，见其类型文档）。柜台在首次收到其订单时惰性创建。
+    states: HashMap<(AccountId, Exchange), SimState>,
+    /// 共享报价缓存：行情没有账户归属，新柜台创建时用**本所**的报价播种，避免首单因
+    /// "还没见过盘口"而无法判定可成交性
+    last_quotes: HashMap<(Exchange, Symbol), BBO>,
     paper_pubsub: ActorRef<PaperPubSub>,
     config: SimConfig,
     /// 本地订单号发号器（模拟交易所返回的 order_id）
@@ -110,30 +113,37 @@ impl PaperCounterActor {
         }
     }
 
-    /// 取账户的柜台状态，不存在则创建并用共享报价播种。
-    fn state_mut(&mut self, account: &AccountId) -> &mut SimState {
-        if !self.states.contains_key(account) {
+    /// 取 (账户, 交易所) 的柜台状态，不存在则创建并用**本所**的共享报价播种。
+    fn state_mut(&mut self, account: &AccountId, exchange: Exchange) -> &mut SimState {
+        let key = (account.clone(), exchange);
+        if !self.states.contains_key(&key) {
             let mut state = SimState::empty(
+                exchange,
                 self.config.initial_balance_usdt,
                 self.config.maker_fee_rate,
                 self.config.taker_fee_rate,
             );
-            for bbo in self.last_quotes.values() {
-                state.observe_bbo(bbo);
+            for ((ex, _), bbo) in &self.last_quotes {
+                if *ex == exchange {
+                    state.observe_bbo(bbo);
+                }
             }
             tracing::info!(
                 %account,
+                %exchange,
                 initial_balance = self.config.initial_balance_usdt,
                 "[PAPER] Opened paper account"
             );
-            self.states.insert(account.clone(), state);
+            self.states.insert(key.clone(), state);
         }
-        self.states.get_mut(account).expect("just inserted")
+        self.states.get_mut(&key).expect("just inserted")
     }
 
-    /// 按 symbol 汇总各所净值并发布 AccountInfo（等价实盘的 equity 轮询）
-    async fn publish_account_info(&self, ts: Timestamp, exchange: Exchange) {
-        for (account, state) in &self.states {
+    /// 逐 (账户, 交易所) 发布净值 AccountInfo（等价实盘的 equity 轮询）。
+    /// 交易所字段取各柜台自己的所 —— 此前写死 Binance，OKX/HL 模拟盘的策略查自己所的
+    /// equity 恒为 None、永不下单。
+    async fn publish_account_info(&self, ts: Timestamp) {
+        for ((account, _), state) in &self.states {
             let equity = state.ledger.equity(|s: &Symbol| state.mark_of(s));
             let notional = state.ledger.notional(|s: &Symbol| state.mark_of(s));
             let tagged = AccountIncome {
@@ -142,7 +152,7 @@ impl PaperCounterActor {
                     exchange_ts: ts,
                     local_ts: ts,
                     data: ExchangeEventData::AccountInfo {
-                        exchange,
+                        exchange: state.exchange,
                         equity,
                         notional,
                     },
@@ -213,42 +223,54 @@ impl Message<IncomeEvent> for PaperCounterActor {
     async fn handle(&mut self, ev: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
         match &ev.data {
             ExchangeEventData::BBO(bbo) => {
-                // 行情没有账户归属：缓存一份供新账户播种，并同步给所有已开账户
-                self.last_quotes.insert(bbo.symbol.clone(), bbo.clone());
-                for state in self.states.values_mut() {
-                    state.observe_bbo(bbo);
+                // 行情没有账户归属：缓存一份供新柜台播种，并同步给**本所**的已开柜台
+                self.last_quotes
+                    .insert((bbo.exchange, bbo.symbol.clone()), bbo.clone());
+                for ((_, ex), state) in self.states.iter_mut() {
+                    if *ex == bbo.exchange {
+                        state.observe_bbo(bbo);
+                    }
                 }
             }
             ExchangeEventData::MarketTrade(trade) => {
-                // 逐账户撮合：各账户只持有自己 symbol 的挂单，非本 symbol 的账户是空转。
-                // 该 O(账户数) 开销是选择 Top-N 而非全部 530 个 symbol 的原因之一；
-                // 若要放到全量，应把"共享行情"从 SimState 里拆出来只存一份。
+                // 逐柜台撮合（只喂本所的柜台）：各柜台只持有自己 symbol 的挂单，非本
+                // symbol 的柜台是空转。该 O(柜台数) 开销是选择 Top-N 而非全部 530 个
+                // symbol 的原因之一；若要放到全量，应把"共享行情"从 SimState 里拆出来只存一份。
                 let exchange = trade.exchange;
-                let accounts: Vec<AccountId> = self.states.keys().cloned().collect();
-                for account in accounts {
+                let keys: Vec<(AccountId, Exchange)> = self
+                    .states
+                    .keys()
+                    .filter(|(_, ex)| *ex == exchange)
+                    .cloned()
+                    .collect();
+                for key in keys {
                     let reports = self
                         .states
-                        .get_mut(&account)
-                        .expect("account exists")
-                        .on_market(exchange, &ev);
-                    self.publish_reports(&account, reports).await;
+                        .get_mut(&key)
+                        .expect("state exists")
+                        .on_market(&ev);
+                    self.publish_reports(&key.0, reports).await;
                 }
             }
             ExchangeEventData::MarkPrice(mp) => {
                 let exchange = mp.exchange;
-                let accounts: Vec<AccountId> = self.states.keys().cloned().collect();
-                for account in accounts {
+                let keys: Vec<(AccountId, Exchange)> = self
+                    .states
+                    .keys()
+                    .filter(|(_, ex)| *ex == exchange)
+                    .cloned()
+                    .collect();
+                for key in keys {
                     let reports = self
                         .states
-                        .get_mut(&account)
-                        .expect("account exists")
-                        .on_market(exchange, &ev);
-                    self.publish_reports(&account, reports).await;
+                        .get_mut(&key)
+                        .expect("state exists")
+                        .on_market(&ev);
+                    self.publish_reports(&key.0, reports).await;
                 }
             }
             ExchangeEventData::Clock => {
-                // 净值按账户分别发布；交易所取自任一已知报价所属的所（模拟盘单所运行）
-                self.publish_account_info(ev.local_ts, Exchange::Binance).await;
+                self.publish_account_info(ev.local_ts).await;
             }
             _ => {}
         }
@@ -330,8 +352,8 @@ impl Message<ApplyPlace> for PaperCounterActor {
     async fn handle(&mut self, msg: ApplyPlace, _ctx: &mut Context<Self, Self::Reply>) {
         let now = now_ms();
         let reports = self
-            .state_mut(&msg.account)
-            .on_order_arrived(now, msg.exchange, &msg.order, &msg.order_id);
+            .state_mut(&msg.account, msg.exchange)
+            .on_order_arrived(now, &msg.order, &msg.order_id);
         self.publish_reports(&msg.account, reports).await;
     }
 }
@@ -342,8 +364,8 @@ impl Message<ApplyCancel> for PaperCounterActor {
     async fn handle(&mut self, msg: ApplyCancel, _ctx: &mut Context<Self, Self::Reply>) {
         let now = now_ms();
         let reports = self
-            .state_mut(&msg.account)
-            .on_cancel_arrived(now, msg.exchange, &msg.order_id);
+            .state_mut(&msg.account, msg.exchange)
+            .on_cancel_arrived(now, &msg.order_id);
         if reports.is_empty() {
             tracing::info!(
                 account = %msg.account,
@@ -525,6 +547,97 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    /// **跨所隔离**：A 所的挂单绝不被 B 所同 symbol 的成交撮合（柜台按 (账户, 所) 分 SimState）。
+    /// 此前 SimState 无交易所维度、挂单只按 symbol 过滤，跨所策略绑一个模拟账户即串账。
+    #[tokio::test]
+    async fn cross_exchange_trade_never_fills_other_exchanges_order() {
+        let h = Harness::new(0).await;
+        h.bbo(100.0, 100.1).await;
+        // Binance 上挂买单 @99
+        h.place(Side::Long, 99.0, 0.5).await;
+        h.settle(50).await;
+        assert_eq!(h.statuses(), vec![OrderStatus::Pending]);
+        // OKX 上同 symbol 的成交穿过挂单价 —— 不得撮合 Binance 的挂单
+        let okx_trade = IncomeEvent {
+            exchange_ts: 2,
+            local_ts: 2,
+            data: ExchangeEventData::MarketTrade(MarketTrade {
+                exchange: Exchange::OKX,
+                symbol: SYM.to_string(),
+                price: 98.0,
+                qty: 1.0,
+                is_buyer_maker: false,
+                timestamp: 2,
+            }),
+        };
+        h.counter.tell(okx_trade).send().await.unwrap();
+        h.settle(50).await;
+        assert!(h.fills().is_empty(), "OKX 的成交撮合了 Binance 的挂单 —— 跨所串账");
+        // Binance 自己的成交才撮合
+        h.trade(98.0).await;
+        h.settle(50).await;
+        assert_eq!(h.fills(), vec![(99.0, 0.5)]);
+    }
+
+    /// 柜台净值按各自的所发布（此前写死 Binance，OKX/HL 模拟盘的策略查自己所的 equity
+    /// 恒为 None、永不下单）
+    #[tokio::test]
+    async fn account_info_carries_the_counters_own_exchange() {
+        let h = Harness::new(0).await;
+        // 在 OKX 上下一单，惰性开出 (账户, OKX) 柜台
+        let order = Order {
+            id: String::new(),
+            exchange: Exchange::OKX,
+            symbol: SYM.to_string(),
+            side: Side::Long,
+            order_type: OrderType::Limit {
+                price: 99.0,
+                tif: TimeInForce::PostOnly,
+            },
+            quantity: 0.5,
+            reduce_only: false,
+            client_order_id: "c-okx".to_string(),
+        };
+        h.counter
+            .tell(AccountOutcome {
+                account: account(),
+                event: OutcomeEvent::PlaceOrders {
+                    orders: vec![order],
+                    comment: "t".to_string(),
+                },
+            })
+            .send()
+            .await
+            .unwrap();
+        h.settle(50).await;
+        // Clock 触发净值发布
+        h.counter
+            .tell(IncomeEvent {
+                exchange_ts: 3,
+                local_ts: 3,
+                data: ExchangeEventData::Clock,
+            })
+            .send()
+            .await
+            .unwrap();
+        h.settle(50).await;
+        let exchanges: Vec<Exchange> = h
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.data {
+                ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            exchanges,
+            vec![Exchange::OKX],
+            "净值必须带柜台自己的所，不是写死的 Binance"
+        );
     }
 
     /// 成交只由**真实成交越过挂单价**判定；盘口越价不算

@@ -134,7 +134,7 @@ fn main() -> anyhow::Result<()> {
 
     // 借用 source 的引擎放内层作用域，run 后释放借用以便查询 option_pnl
     let result = {
-        let mut engine = BacktestEngine::new(EX, &source, vec![runner], config)
+        let mut engine = BacktestEngine::new(&source, vec![runner], config)
             .with_clock_interval(clock_interval_ms)
             .with_observer(move |ev: &IncomeEvent| {
                 let mut s = sampler_obs.borrow_mut();

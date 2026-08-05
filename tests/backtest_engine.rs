@@ -161,7 +161,7 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
     let sink: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let sink_obs = Rc::clone(&sink);
     let result = {
-        let mut engine = BacktestEngine::new(EX, &source, vec![runner], config)
+        let mut engine = BacktestEngine::new(&source, vec![runner], config)
             .with_observer(move |ev: &IncomeEvent| sink_obs.borrow_mut().push(event_sig(ev)));
         engine.run()
     };
@@ -215,7 +215,7 @@ fn trade_print_matching_fills_resting_limit() {
         initial_balance_usdt: 10_000.0,
         ..SimConfig::default()
     };
-    let mut engine = BacktestEngine::new(EX, &source, vec![runner], config);
+    let mut engine = BacktestEngine::new(&source, vec![runner], config);
     let r = engine.run();
     assert_eq!(r.fills, 1);
     assert_eq!(r.market_events, 3);

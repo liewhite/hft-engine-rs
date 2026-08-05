@@ -156,7 +156,7 @@ fn main() -> anyhow::Result<()> {
         ..SimConfig::default()
     };
 
-    let mut engine = BacktestEngine::new(EX, source.as_ref(), vec![runner], config);
+    let mut engine = BacktestEngine::new(source.as_ref(), vec![runner], config);
     let result = engine.run();
 
     println!("==================== Backtest Result ====================");

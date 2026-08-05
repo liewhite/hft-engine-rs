@@ -19,7 +19,7 @@ use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 
 /// 回测结果汇总。`realized_pnl` 为已实现盈亏 (= 账本现金增量)，`final_equity` 含未实现。
 #[derive(Debug, Clone, PartialEq)]
@@ -43,7 +43,7 @@ enum Action {
     /// 交易所侧事件到达策略/观察者
     Deliver(IncomeEvent),
     OrderArrive(Order, OrderId),
-    CancelArrive(OrderId),
+    CancelArrive(Exchange, OrderId),
     Clock,
 }
 
@@ -73,8 +73,15 @@ impl Ord for Scheduled {
 }
 
 /// 单线程虚拟时间回测引擎。
+///
+/// # 多交易所：按事件自身的 exchange 路由
+///
+/// 每个交易所一份 [`SimState`]（一份实例只代表一个所，见其类型文档），在该所首条行情
+/// 到达时惰性创建、各以 `initial_balance_usdt` 起步（等价"每个所各入金一份"）。行情按
+/// 事件自带的 exchange 送进对应柜台 —— 此前引擎持有单个 exchange 字段并忽略事件自身的
+/// 归属，跨所策略（如 spread_arb）无法回测。`BTreeMap` 保证遍历顺序确定（净值事件的
+/// 投递序影响确定性）。
 pub struct BacktestEngine<'a> {
-    exchange: Exchange,
     source: &'a dyn MarketDataSource,
     runners: Vec<StrategyRunner>,
     config: SimConfig,
@@ -82,7 +89,7 @@ pub struct BacktestEngine<'a> {
     clock_interval_ms: u64,
 
     // ---- 运行期状态 ----
-    state: SimState,
+    states: BTreeMap<Exchange, SimState>,
     pq: BinaryHeap<Reverse<Scheduled>>,
     now: Timestamp,
     seq_gen: u64,
@@ -96,24 +103,17 @@ pub struct BacktestEngine<'a> {
 
 impl<'a> BacktestEngine<'a> {
     pub fn new(
-        exchange: Exchange,
         source: &'a dyn MarketDataSource,
         runners: Vec<StrategyRunner>,
         config: SimConfig,
     ) -> Self {
-        let state = SimState::empty(
-            config.initial_balance_usdt,
-            config.maker_fee_rate,
-            config.taker_fee_rate,
-        );
         Self {
-            exchange,
             source,
             runners,
             config,
             observers: Vec::new(),
             clock_interval_ms: 1000,
-            state,
+            states: BTreeMap::new(),
             pq: BinaryHeap::new(),
             now: 0,
             seq_gen: 0,
@@ -168,8 +168,7 @@ impl<'a> BacktestEngine<'a> {
         };
         self.first_ts = first;
         self.now = first;
-        let init_account = self.account_info_event(self.now);
-        self.deliver(init_account); // 初始净值, 让依赖 equity 的策略可启动
+        // 初始净值随各所柜台的惰性创建投递（见 ensure_state），让依赖 equity 的策略可启动
         self.schedule(self.now + self.clock_interval_ms, Action::Clock);
 
         while src.peek().is_some() || !self.pq.is_empty() {
@@ -194,19 +193,25 @@ impl<'a> BacktestEngine<'a> {
             }
         }
 
-        let mut positions = {
-            let state = &self.state;
-            state.ledger.open_positions(|s| state.mark_of(s))
-        };
-        positions.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-        let final_equity = {
-            let state = &self.state;
-            state.ledger.equity(|s| state.mark_of(s))
-        };
+        let mut positions: Vec<Position> = self
+            .states
+            .values()
+            .flat_map(|state| state.ledger.open_positions(|s| state.mark_of(s)))
+            .collect();
+        positions.sort_by(|a, b| a.symbol.cmp(&b.symbol).then(a.exchange.cmp(&b.exchange)));
+        let final_equity: f64 = self
+            .states
+            .values()
+            .map(|state| state.ledger.equity(|s| state.mark_of(s)))
+            .sum();
+        // 每个所各入金一份，总初始资金随实际出现的所数走（无行情时保持单份，见上方早退分支）
+        let initial_balance =
+            self.config.initial_balance_usdt * (self.states.len().max(1) as f64);
+        let total_cash: f64 = self.states.values().map(|s| s.ledger.cash).sum();
         let result = BacktestResult {
-            initial_balance: self.config.initial_balance_usdt,
+            initial_balance,
             final_equity,
-            realized_pnl: self.state.ledger.cash - self.config.initial_balance_usdt,
+            realized_pnl: total_cash - initial_balance,
             fills: self.fill_count,
             market_events: self.market_events,
             positions,
@@ -223,12 +228,41 @@ impl<'a> BacktestEngine<'a> {
         result
     }
 
-    /// 注入一条历史行情：推进时间、撮合、回流按延迟入队投递。
+    /// 注入一条历史行情：按事件自身的 exchange 路由到对应柜台，撮合、回流按延迟入队投递。
     fn ingest(&mut self, ev: IncomeEvent) {
         self.now = ev.exchange_ts;
         self.market_events += 1;
-        let replies = self.state.on_market(self.exchange, &ev);
+        let Some(exchange) = ev.exchange() else {
+            // 无交易所归属的源事件不参与撮合，直接投递给策略
+            self.schedule(self.now, Action::Deliver(ev));
+            return;
+        };
+        self.ensure_state(exchange);
+        let replies = self
+            .states
+            .get_mut(&exchange)
+            .expect("ensure_state 刚创建")
+            .on_market(&ev);
         self.enqueue_replies(replies);
+    }
+
+    /// 确保该所的柜台存在；首次创建时先投递一次该所的初始净值
+    /// （在该所任何行情/回报之前送达，依赖 equity 的策略才能启动）。
+    fn ensure_state(&mut self, exchange: Exchange) {
+        if self.states.contains_key(&exchange) {
+            return;
+        }
+        self.states.insert(
+            exchange,
+            SimState::empty(
+                exchange,
+                self.config.initial_balance_usdt,
+                self.config.maker_fee_rate,
+                self.config.taker_fee_rate,
+            ),
+        );
+        let info = self.account_info_event(exchange, self.now);
+        self.schedule(self.now, Action::Deliver(info));
     }
 
     /// 把撮合回流事件按 ex->strat 延迟入队投递给策略。
@@ -245,11 +279,24 @@ impl<'a> BacktestEngine<'a> {
         match s.action {
             Action::Deliver(ev) => self.deliver(ev),
             Action::OrderArrive(order, id) => {
-                let replies = self.state.on_order_arrived(self.now, self.exchange, &order, &id);
+                // 按订单自身的 exchange 路由；该所若还没有柜台（无任何行情先行）也照建 ——
+                // 市价单会因"无行情参考价"被柜台如实拒掉，而不是静默落进别的所
+                let exchange = order.exchange;
+                self.ensure_state(exchange);
+                let replies = self
+                    .states
+                    .get_mut(&exchange)
+                    .expect("ensure_state 刚创建")
+                    .on_order_arrived(self.now, &order, &id);
                 self.enqueue_replies(replies);
             }
-            Action::CancelArrive(id) => {
-                let replies = self.state.on_cancel_arrived(self.now, self.exchange, &id);
+            Action::CancelArrive(exchange, id) => {
+                self.ensure_state(exchange);
+                let replies = self
+                    .states
+                    .get_mut(&exchange)
+                    .expect("ensure_state 刚创建")
+                    .on_cancel_arrived(self.now, &id);
                 self.enqueue_replies(replies);
             }
             Action::Clock => {
@@ -259,8 +306,12 @@ impl<'a> BacktestEngine<'a> {
                     data: ExchangeEventData::Clock,
                 };
                 self.deliver(clock);
-                let account = self.account_info_event(self.now);
-                self.deliver(account); // 周期刷新净值, 等价实盘 accountRefresh
+                // 周期刷新各所净值, 等价实盘 accountRefresh（BTreeMap 保证投递序确定）
+                let exchanges: Vec<Exchange> = self.states.keys().copied().collect();
+                for exchange in exchanges {
+                    let account = self.account_info_event(exchange, self.now);
+                    self.deliver(account);
+                }
                 // 仅在仍有行情待注入时续期, 源耗尽则停摆让队列自然排空 -> 保证终止
                 if self.more_data {
                     self.schedule(self.now + self.clock_interval_ms, Action::Clock);
@@ -292,23 +343,26 @@ impl<'a> BacktestEngine<'a> {
                             self.schedule(self.now + order_delay, Action::OrderArrive(o, id));
                         }
                     }
-                    OutcomeEvent::CancelOrder { order_id, .. } => {
-                        self.schedule(self.now + order_delay, Action::CancelArrive(order_id));
+                    OutcomeEvent::CancelOrder { exchange, order_id, .. } => {
+                        self.schedule(
+                            self.now + order_delay,
+                            Action::CancelArrive(exchange, order_id),
+                        );
                     }
                 }
             }
         }
     }
 
-    fn account_info_event(&self, ts: Timestamp) -> IncomeEvent {
-        let state = &self.state;
+    fn account_info_event(&self, exchange: Exchange, ts: Timestamp) -> IncomeEvent {
+        let state = self.states.get(&exchange).expect("柜台已创建");
         let equity = state.ledger.equity(|s: &Symbol| state.mark_of(s));
         let notional = state.ledger.notional(|s: &Symbol| state.mark_of(s));
         IncomeEvent {
             exchange_ts: ts,
             local_ts: ts,
             data: ExchangeEventData::AccountInfo {
-                exchange: self.exchange,
+                exchange,
                 equity,
                 notional,
             },
