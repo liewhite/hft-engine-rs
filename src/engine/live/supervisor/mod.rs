@@ -24,11 +24,11 @@ mod record;
 pub use policy::{Decision, NeverPromote, PromotionPolicy, SymbolView};
 pub use record::{RoundTrip, SymbolRecord};
 
-use crate::domain::{AccountId, Exchange, Symbol, Timestamp};
+use crate::domain::{AccountId, Exchange, ExchangeError, Symbol, Timestamp};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
+use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::HashMap;
@@ -95,8 +95,15 @@ impl SupervisorActor {
         AccountId::Paper(symbol.clone())
     }
 
-    /// 启动期把所有 symbol 的模拟实例挂上去（实盘实例按需再加）
-    async fn start_all_paper(&mut self) {
+    /// 启动期把所有 symbol 的模拟实例挂上去（实盘实例按需再加）。
+    ///
+    /// 失败必须让 Supervisor **启动失败**（进而进程退出），不能只记日志继续跑：
+    /// - 引擎会带着零实例空转 —— 无策略、无对账基线、无人告警；
+    /// - 半途失败可能已在对账/观测镜像里注册了范围（rollback 有意不撤），滞留状态
+    ///   只有进程退出重来才能出清。
+    /// 与 bin 直连路径"投产失败即拒绝启动"的语义对齐。运行期的 `promote` 失败则相反 ——
+    /// 判据下个节拍会自动重试，吞掉并等待重试是有意的。
+    async fn start_all_paper(&mut self) -> Result<(), ExchangeError> {
         let specs: Vec<StrategySpec> = self
             .symbols
             .iter()
@@ -107,13 +114,18 @@ impl SupervisorActor {
             .collect();
         if specs.is_empty() {
             tracing::warn!("Supervisor 没有任何 symbol，不会有模拟账户在跑");
-            return;
+            return Ok(());
         }
         let count = specs.len();
-        match self.manager.ask(AddStrategies(specs)).send().await {
-            Ok(()) => tracing::info!(count, "Supervisor started paper instances"),
-            Err(e) => tracing::error!(error = %e, "Failed to add paper instances"),
-        }
+        self.manager
+            .ask(AddStrategies(specs))
+            .send()
+            .await
+            .map_err(|e| {
+                ExchangeError::Other(format!("Supervisor 启动期投产模拟实例失败: {e}"))
+            })?;
+        tracing::info!(count, "Supervisor started paper instances");
+        Ok(())
     }
 
     /// 把一笔成交记到对应账户的表现里
@@ -245,7 +257,7 @@ impl SupervisorActor {
 
 impl Actor for SupervisorActor {
     type Args = SupervisorArgs;
-    type Error = Infallible;
+    type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let states = args
@@ -266,7 +278,7 @@ impl Actor for SupervisorActor {
             exchange = %me.exchange,
             "SupervisorActor started"
         );
-        me.start_all_paper().await;
+        me.start_all_paper().await?;
         let _ = actor_ref; // 无需自投递：评估由 Clock 事件驱动
         Ok(me)
     }
