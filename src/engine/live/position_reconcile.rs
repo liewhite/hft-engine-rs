@@ -75,6 +75,20 @@ pub struct Reconciler {
     /// per (所, symbol) 的不一致记录；一致一次即整条移除
     mismatches: HashMap<(Exchange, Symbol), MismatchRecord>,
     max_consecutive: u32,
+    /// 已注册、但**基线未到**的 (所, symbol) 上早到的 Fill，基线落地后按序重放。
+    ///
+    /// 投产时序是「注册对账范围 → REST 拉基线 → 经总线发布」，而私有成交流全程在推。
+    /// 落在这个窗口里的 Fill 若直接入镜像，会在 positions 里凭空建出一条仓位，随后到达
+    /// 的基线被判"重复"而丢弃 —— 镜像从此缺掉全部存量，对账在 N 次轮询后**误杀整个引擎**。
+    /// 先缓冲、基线落地后重放，成交一笔不丢也不早算。
+    ///
+    /// 残余窗口如实说明：某笔成交若已含在 REST 快照里、其 Fill 又恰好晚到落进缓冲，
+    /// 重放会把它多算一次（需要私有流延迟超过 REST 往返才可能发生）。没有交易所侧的
+    /// 序号无法根除，但比缓冲前的"必然丢掉全部存量"窄了几个量级。
+    ///
+    /// 不会无界增长：基线拉取/发布失败即拒绝投产（见 `ManagerActor::activate_executors`），
+    /// 已注册的 pair 要么很快收到基线并清空缓冲，要么整个投产失败、进程退出。
+    pending_fills: HashMap<(Exchange, Symbol), Vec<IncomeEvent>>,
 }
 
 /// 某条腿的连续不一致记录。
@@ -110,6 +124,7 @@ impl Reconciler {
             symbol_metas,
             mismatches: HashMap::new(),
             max_consecutive,
+            pending_fills: HashMap::new(),
         }
     }
 
@@ -136,16 +151,41 @@ impl Reconciler {
             // symbol 触发 StateManager 的"路由 bug" error）。
             ExchangeEventData::PositionBaseline(position) => {
                 if self.is_tracked(&position.symbol) {
+                    let key = (position.exchange, position.symbol.clone());
                     self.mirror.apply(event);
                     // 基线到达才让这条腿进入对账范围（见 `baselined` 字段说明）
-                    self.baselined
-                        .insert((position.exchange, position.symbol.clone()));
+                    self.baselined.insert(key.clone());
+                    // 重放基线之前早到的 Fill（见 `pending_fills` 字段说明）
+                    if let Some(buffered) = self.pending_fills.remove(&key) {
+                        tracing::info!(
+                            exchange = %key.0,
+                            symbol = %key.1,
+                            count = buffered.len(),
+                            "基线落地，重放窗口期缓冲的 Fill"
+                        );
+                        for fill_event in &buffered {
+                            self.mirror.apply(fill_event);
+                        }
+                    }
                 }
                 Ok(())
             }
             ExchangeEventData::Fill(fill) => {
                 if self.is_tracked(&fill.symbol) {
-                    self.mirror.apply(event);
+                    let key = (fill.exchange, fill.symbol.clone());
+                    if self.baselined.contains(&key) {
+                        self.mirror.apply(event);
+                    } else {
+                        // 基线未到，此刻本地持仓是"未知"而非 0 —— 直接累加会让随后到达的
+                        // 基线被判"重复"丢弃。缓冲到基线落地后重放。
+                        tracing::info!(
+                            exchange = %key.0,
+                            symbol = %key.1,
+                            size = fill.size,
+                            "基线未到，Fill 先入缓冲"
+                        );
+                        self.pending_fills.entry(key).or_default().push(event.clone());
+                    }
                 }
                 Ok(())
             }
@@ -168,6 +208,8 @@ impl Reconciler {
             symbol_metas,
             mismatches,
             max_consecutive,
+            // 读数比对不碰缓冲：基线未到的腿本就不在 baselined 里，不会被比对
+            pending_fills: _,
         } = self;
 
         let mut confirmed_drift = Vec::new();
@@ -398,8 +440,12 @@ mod tests {
     }
 
     fn fill(side: Side, size: f64) -> IncomeEvent {
+        fill_on(EX, side, size)
+    }
+
+    fn fill_on(exchange: Exchange, side: Side, size: f64) -> IncomeEvent {
         ev(ExchangeEventData::Fill(Fill {
-            exchange: EX,
+            exchange,
             symbol: SYM.to_string(),
             side,
             price: 100.0,
@@ -606,6 +652,42 @@ mod tests {
             .on_event(&report(EX, vec![position(EX, 0.0)]))
             .expect_err("基线之后出现真实分歧才该报");
         assert!(err.contains("本地 123"), "got: {err}");
+    }
+
+    /// **投产窗口竞态**：私有流的 Fill 抢在基线之前到达时先缓冲，基线落地后重放。
+    ///
+    /// 若不缓冲，早到的 Fill 会在镜像里凭空建出仓位，随后的基线被判"重复"丢弃 ——
+    /// 镜像缺掉全部存量，对账在 N 次轮询后误杀整个引擎。
+    #[test]
+    fn fill_before_baseline_is_buffered_and_replayed() {
+        let mut r = reconciler(1);
+        // Fill 先到（此刻本地持仓是"未知"，不是 0）
+        r.on_event(&fill(Side::Long, 1.0)).unwrap();
+        // 基线随后到达，不该被判"重复"；缓冲的 Fill 补上 -> 本地 = 2.0 + 1.0
+        r.on_event(&baseline(2.0)).unwrap();
+        r.on_event(&report(EX, vec![position(EX, 3.0)]))
+            .expect("基线 + 重放 Fill 应与交易所读数一致");
+        // 反证本地确实是 3.0：给一个只含基线的读数，必须立刻判为漂移
+        let err = r
+            .on_event(&report(EX, vec![position(EX, 2.0)]))
+            .expect_err("若 Fill 被丢弃本地会是 2.0，这里就不会报漂移");
+        assert!(err.contains("本地 3"), "got: {err}");
+    }
+
+    /// 缓冲按 (所, symbol) 隔离：一条腿的基线落地只重放**自己**的 Fill
+    #[test]
+    fn buffered_fills_are_scoped_to_their_leg() {
+        let mut r = reconciler(1);
+        // OKX 腿的 Fill 早到（其基线未到）
+        r.on_event(&fill_on(OTHER_EX, Side::Long, 5.0)).unwrap();
+        // Binance 腿基线落地，不该动 OKX 的缓冲
+        r.on_event(&baseline(1.0)).unwrap();
+        r.on_event(&report(EX, vec![position(EX, 1.0)]))
+            .expect("Binance 腿只有自己的基线");
+        // OKX 腿基线落地后，它的缓冲才重放
+        r.on_event(&baseline_on(OTHER_EX, 0.0)).unwrap();
+        r.on_event(&report(OTHER_EX, vec![position(OTHER_EX, 5.0)]))
+            .expect("OKX 腿 = 基线 0 + 重放的 5.0");
     }
 
     /// 跟踪范围外的 symbol 不参与对账（分桶部署下账户级读数含其他桶的 symbol）

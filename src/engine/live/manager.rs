@@ -122,6 +122,14 @@ pub struct ManagerActor {
     ///
     /// 记录意图则没有这个歧义：不在集合里的死亡一律级联退出，与 reason 无关。
     intentionally_stopped: HashSet<ActorId>,
+
+    /// 引擎生命周期内已向总线发布过持仓基线的 (所, symbol)。
+    ///
+    /// 总线上的基线只喂**引擎生命周期**的镜像（对账/观测），每个 pair 只许一次——镜像的
+    /// 「基线 + Fill」账本在策略实例撤下期间也一直在跟 Fill，重发会被判成"重复基线"违约。
+    /// 晋升/降级再晋升时，新 executor 的基线走点对点投递（见 [`Self::activate_executors`]），
+    /// 不依赖总线重发。
+    baselined_positions: HashSet<(Exchange, Symbol)>,
 }
 
 /// 一个已注册的策略实例
@@ -384,8 +392,15 @@ impl ManagerActor {
         Ok(())
     }
 
-    /// 把已创建的 executor 注册进事件流并投产：注册订阅 → 注册观测/对账范围 → 推持仓基线
-    /// → 放行行情。
+    /// 把已创建的 executor 注册进事件流并投产：注册观测/对账范围 → 拉取并发布持仓基线
+    /// → 点对点投递基线 → 注册订阅 → 放行行情。
+    ///
+    /// # 时序不变量：基线必须先于任何流事件抵达消费者
+    ///
+    /// - **executor**：基线在注册（6.5）**之前**点对点投进邮箱（6.4），FIFO 保证它先于
+    ///   任何流事件被处理 —— "Fill 早于基线、基线被判重复而丢掉存量"的竞态结构上不可能。
+    /// - **镜像**（对账/观测）：基线经总线送达（6.3），紧跟范围注册（6.1）发布以压窄窗口；
+    ///   残余窗口由对账层的 Fill 缓冲重放兜住。
     ///
     /// 拆成独立方法只为一件事：让 [`Self::do_add_strategies`] 能在这里失败时统一回滚，
     /// 而不必在每个 `?` 旁边重复一遍回滚代码。
@@ -396,37 +411,7 @@ impl ManagerActor {
         exchange_symbols: &HashSet<(Exchange, Symbol)>,
         exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>>,
     ) -> Result<(), ExchangeError> {
-        let processor = self.income_processor.clone();
-
-        // 6.1 向 ProcessorActor 注册各 Executor 的订阅（自此它们开始收事件）
-        for ((executor_ref, account), subscriptions) in
-            executor_refs.iter().zip(strategy_subscriptions.iter())
-        {
-            // 注册失败必须**向上传播**，不能只打日志：注册不上的实例收不到任何事件
-            // （行情、成交、基线全无），却仍会被 push 进 self.executors 并让本函数返回 Ok ——
-            // SupervisorActor 据此认定晋升成功、置 live=Some，此后既不会重试也不会 demote，
-            // 留下一个"活着却永远收不到事件"的僵尸实例。与"返回 Ok 即已完整投产"的契约相悖。
-            processor
-                .tell(RegisterExecutor {
-                    executor: executor_ref.clone(),
-                    subscriptions: subscriptions.clone(),
-                    account: account.clone(),
-                })
-                .send()
-                .await
-                .map_err(|e| {
-                    ExchangeError::Other(format!(
-                        "向 IncomeProcessor 注册策略实例失败（该实例将收不到任何事件）: {e}"
-                    ))
-                })?;
-            self.executors.push(RegisteredExecutor {
-                executor: executor_ref.clone(),
-                account: account.clone(),
-                symbols: subscriptions.iter().map(|(_, k)| k.symbol().clone()).collect(),
-            });
-        }
-
-        // 6.2 告知观测层与对账层要跟踪哪些 symbol。**必须在推持仓基线之前**——否则观测层会
+        // 6.1 告知观测层与对账层要跟踪哪些 symbol。**必须在发布基线之前**——否则观测层会
         //     因 symbol 未注册而丢掉基线、进而丢掉盈亏基线；对账层的镜像里没有该 symbol 的
         //     状态，基线也落不进去。由 manager 自己从策略订阅推导并注册，调用方无需（也无从）
         //     关心这个时序。用 `ask` 而非 `tell`：必须确认注册完成后才继续推基线。
@@ -460,22 +445,19 @@ impl ManagerActor {
                 })?;
         }
 
-        // 6.3 查询各交易所初始持仓，推到 income_pubsub。**必须在 executor 注册之后、
-        //     行情放行之前**进行——之前发布会被 BestEffort 丢，之后才发就有"开仓信号在持仓
-        //     未对齐"的窗口。对每个 (exchange, symbol) 都推一条：交易所返回的用真实数据，
-        //     未返回的推 size=0 显式清零（保证 SymbolState 一定收到初始值）。
+        // 6.2 REST 查询各交易所初始持仓，构造每个 (exchange, symbol) 的基线事件：交易所
+        //     返回的用真实数据，未返回的构造 size=0 显式清零（保证消费方一定收到初始值）。
+        //     拉取失败即**致命**：持仓基线只有这一次机会，之后全程靠 Fill 累加，
+        //     没有第二个来源能纠正它。跳过的后果是策略从"仓位 0"起算——若账户实际有
+        //     持仓，三道风控闸门（单边杠杆/账户杠杆/仓位上限）会全部基于错误基线放行。
+        //     宁可拒绝启动。
+        let mut baselines: HashMap<(Exchange, Symbol), IncomeEvent> = HashMap::new();
         {
-            // 仅实盘账户需要：这些事件走共享 IncomePubSub，只会路由给实盘账户的 executor；
-            // 模拟账户从零起步，不需要也不应该看到真实持仓
             let exchanges: HashSet<Exchange> = exchange_symbols.iter().map(|(e, _)| *e).collect();
             for exchange in exchanges {
                 let Some(client) = self.clients.get(&exchange) else {
                     continue;
                 };
-                // 拉取失败即**致命**：持仓基线只有这一次机会，之后全程靠 Fill 累加，
-                // 没有第二个来源能纠正它。跳过的后果是策略从"仓位 0"起算——若账户实际有
-                // 持仓，三道风控闸门（单边杠杆/账户杠杆/仓位上限）会全部基于错误基线放行。
-                // 宁可拒绝启动。
                 let positions = client.fetch_positions().await.map_err(|e| {
                     ExchangeError::Other(format!(
                         "无法获取 {exchange} 的初始持仓基线，拒绝启动（基线只有一次机会，\
@@ -495,26 +477,98 @@ impl ManagerActor {
                             unrealized_pnl: 0.0,
                         });
                     tracing::info!(%exchange, %symbol, size = pos.size, "Initial position loaded");
-                    let event = IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::PositionBaseline(pos),
-                    };
-                    // 发布失败与拉取失败等价 —— 基线没送达就是基线缺失，同样只有这一次机会
-                    self.income_pubsub
-                        .tell(kameo_actors::pubsub::Publish(event))
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            ExchangeError::Other(format!(
-                                "发布 {exchange}/{symbol} 的持仓基线失败（基线只有一次机会）: {e}"
-                            ))
-                        })?;
+                    baselines.insert(
+                        (*ex, symbol.clone()),
+                        IncomeEvent {
+                            exchange_ts: local_ts,
+                            local_ts,
+                            data: ExchangeEventData::PositionBaseline(pos),
+                        },
+                    );
                 }
             }
         }
 
-        // 6.4 批量向各 ExchangeActors 发送订阅请求（市场数据从此处开始流动）
+        // 6.3 向总线发布**引擎生命周期内首次出现**的 (exchange, symbol) 基线。总线上的基线
+        //     只喂引擎生命周期的镜像（对账/观测）—— executor 不经总线收基线（路由层对
+        //     PositionBaseline 是 SkipExecutors），它们走 6.4 的点对点。已发布过的 pair
+        //     （降级后再晋升）不重发：镜像的「基线 + Fill」账本在实例撤下期间也一直在跟
+        //     Fill，重发会被判成"重复基线"违约。紧跟 6.1 发布是为了把「镜像已注册、基线
+        //     未到」的窗口压到几次邮箱投递，残余窗口由对账层的 Fill 缓冲重放兜住。
+        for ((exchange, symbol), event) in &baselines {
+            if self.baselined_positions.contains(&(*exchange, symbol.clone())) {
+                continue;
+            }
+            // 发布失败与拉取失败等价 —— 基线没送达就是基线缺失，同样只有这一次机会
+            self.income_pubsub
+                .tell(kameo_actors::pubsub::Publish(event.clone()))
+                .send()
+                .await
+                .map_err(|e| {
+                    ExchangeError::Other(format!(
+                        "发布 {exchange}/{symbol} 的持仓基线失败（基线只有一次机会）: {e}"
+                    ))
+                })?;
+            self.baselined_positions.insert((*exchange, symbol.clone()));
+        }
+
+        // 6.4 点对点把基线投进本批每个**实盘** executor 的邮箱。**必须先于 6.5 注册**：
+        //     邮箱 FIFO 保证基线先于任何流事件被处理 —— "Fill 早于基线到达、基线被判重复
+        //     而丢掉存量"的竞态从结构上不可能发生（这正是不让 executor 从总线收基线的
+        //     原因：总线上基线与私有流的先后无从保证）。模拟账户从零起步，不需要也不应该
+        //     看到真实持仓，不投。
+        for ((executor_ref, account), subscriptions) in
+            executor_refs.iter().zip(strategy_subscriptions.iter())
+        {
+            if *account != AccountId::Live {
+                continue;
+            }
+            let pairs: HashSet<(Exchange, Symbol)> = subscriptions
+                .iter()
+                .map(|(ex, kind)| (*ex, kind.symbol().clone()))
+                .collect();
+            for (exchange, symbol) in pairs {
+                // 缺基线只有一种来路：该所未配置 client（与旧行为一致，无基线可投）
+                let Some(event) = baselines.get(&(exchange, symbol.clone())) else {
+                    continue;
+                };
+                executor_ref.tell(event.clone()).send().await.map_err(|e| {
+                    ExchangeError::Other(format!(
+                        "向策略实例投递 {exchange}/{symbol} 的持仓基线失败: {e}"
+                    ))
+                })?;
+            }
+        }
+
+        // 6.5 向 ProcessorActor 注册各 Executor 的订阅（自此它们开始收流事件）
+        for ((executor_ref, account), subscriptions) in
+            executor_refs.iter().zip(strategy_subscriptions.iter())
+        {
+            // 注册失败必须**向上传播**，不能只打日志：注册不上的实例收不到任何事件
+            // （行情、成交全无），却仍会被 push 进 self.executors 并让本函数返回 Ok ——
+            // SupervisorActor 据此认定晋升成功、置 live=Some，此后既不会重试也不会 demote，
+            // 留下一个"活着却永远收不到事件"的僵尸实例。与"返回 Ok 即已完整投产"的契约相悖。
+            self.income_processor
+                .tell(RegisterExecutor {
+                    executor: executor_ref.clone(),
+                    subscriptions: subscriptions.clone(),
+                    account: account.clone(),
+                })
+                .send()
+                .await
+                .map_err(|e| {
+                    ExchangeError::Other(format!(
+                        "向 IncomeProcessor 注册策略实例失败（该实例将收不到任何事件）: {e}"
+                    ))
+                })?;
+            self.executors.push(RegisteredExecutor {
+                executor: executor_ref.clone(),
+                account: account.clone(),
+                symbols: subscriptions.iter().map(|(_, k)| k.symbol().clone()).collect(),
+            });
+        }
+
+        // 6.6 批量向各 ExchangeActors 发送订阅请求（市场数据从此处开始流动）
         for (exchange, kinds) in exchange_subscriptions {
             if let Some(actor) = self.exchange_actors.get(&exchange) {
                 actor
@@ -929,6 +983,7 @@ impl Actor for ManagerActor {
             paper_pubsub,
             executors: Vec::new(),
             intentionally_stopped: HashSet::new(),
+            baselined_positions: HashSet::new(),
         })
     }
 

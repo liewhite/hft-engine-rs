@@ -25,20 +25,26 @@ pub enum ExchangeEventData {
     MarketTrade(MarketTrade),
     MarkPrice(MarkPrice),
     IndexPrice(IndexPrice),
-    /// 持仓**基线**：本次会话的起始持仓，写入 [`crate::messaging::SymbolState`]。
+    /// 持仓**基线**：起始持仓，写入 [`crate::messaging::SymbolState`]。
     ///
-    /// # 唯一合法产地：`ManagerActor` 启动期的 REST 查询
+    /// # 唯一合法产地：`ManagerActor` 投产期的 REST 查询
     ///
     /// 持仓的维护模型是「一次性基线 + 之后全程由 [`Self::Fill`] 累加」。基线之所以只能来一次，
     /// 是因为持仓快照与实时 Fill 流之间存在竞态：快照可能已含某笔成交，而该成交的 Fill 稍后
     /// 才到；若用快照覆写后再叠加这笔晚到的 Fill，就会**重复计算**。
     ///
-    /// 因此：
-    /// - 每个 `(exchange, symbol)` 上本事件**只允许出现一次**，第二次到达即为违约
-    ///   （[`crate::messaging::SymbolState::apply`] 会打 error 并忽略）
-    /// - 交易所适配层**一律不得**发布本事件。私有 WS 的持仓推送（OKX `positions`、
-    ///   Hyperliquid `clearinghouseState`、Binance `ACCOUNT_UPDATE.P`）都是**读数**而非基线，
-    ///   要用于校验请走 [`Self::PositionReport`]
+    /// # 两条投递路径，各自"只来一次"
+    ///
+    /// - **点对点**：投产时 `ManagerActor` 把基线直接投进新 executor 的邮箱，且在其注册进
+    ///   事件流**之前** —— FIFO 保证基线先于任何 Fill 被处理。每个 executor 一生收一次。
+    /// - **总线**：只喂引擎生命周期的镜像（对账/观测）。每个 `(exchange, symbol)` 在引擎
+    ///   生命周期内至多发布一次（降级后再晋升不重发——镜像的账本在实例撤下期间也在跟 Fill）。
+    ///   路由层对 executor 是 SkipExecutors，不会与点对点那份重复。
+    ///
+    /// 在任一消费者处第二次到达即为违约（[`crate::messaging::SymbolState::apply`] 会打
+    /// error 并忽略）。交易所适配层**一律不得**发布本事件。私有 WS 的持仓推送（OKX
+    /// `positions`、Hyperliquid `clearinghouseState`、Binance `ACCOUNT_UPDATE.P`）都是
+    /// **读数**而非基线，要用于校验请走 [`Self::PositionReport`]
     PositionBaseline(Position),
     /// 持仓**对账读数**：某交易所的**完整**持仓快照，只用于校验，绝不写入本地持仓。
     ///

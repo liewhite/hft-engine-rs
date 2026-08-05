@@ -85,11 +85,11 @@ impl IncomeProcessorActor {
                 exchange: ip.exchange,
                 symbol: ip.symbol.clone(),
             },
-            // Private 数据：持仓基线、OrderUpdate、Fill 按 symbol 路由
-            ExchangeEventData::PositionBaseline(pos) => EventRouting::BySymbol {
-                exchange: pos.exchange,
-                symbol: pos.symbol.clone(),
-            },
+            // 持仓基线不经总线进 executor：ManagerActor 在注册 executor **之前**把基线
+            // 点对点投进其邮箱（FIFO 保证基线先于任何流事件被处理，Fill 不可能抢先），
+            // 总线上的基线只服务引擎生命周期的镜像（对账/观测）。若这里也投递，executor
+            // 会收到第二份基线，把真实的违约信号（"适配层又开始发基线"）淹没在误报里。
+            ExchangeEventData::PositionBaseline(_) => EventRouting::SkipExecutors,
             // 对账读数只给 PositionReconcileActor，不进策略状态（见 EventRouting::SkipExecutors）
             ExchangeEventData::PositionReport { .. } => EventRouting::SkipExecutors,
             ExchangeEventData::OrderUpdate(update) => EventRouting::BySymbol {
@@ -391,17 +391,18 @@ mod account_isolation_tests {
         );
     }
 
-    /// 对照组：持仓**基线**必须照常按 (所, symbol) 投递 —— 它正是策略持仓的起点。
-    /// 与上一条一起，钉住"两个变体虽同源但去向截然不同"。
+    /// 持仓**基线**同样不经总线进 executor：它由 ManagerActor 在注册前点对点投递
+    /// （结构上保证先于任何流事件），总线上的那份只喂引擎生命周期的镜像。若路由层
+    /// 再投一份，executor 会收到重复基线，真实的违约信号（适配层擅自发基线）被误报淹没。
     #[test]
-    fn position_baseline_is_routed_by_symbol() {
-        match IncomeProcessorActor::event_routing(&baseline_event()) {
-            EventRouting::BySymbol { exchange, symbol } => {
-                assert_eq!(exchange, Exchange::Binance);
-                assert_eq!(symbol, "BTC");
-            }
-            _ => panic!("持仓基线必须按 symbol 投递，否则策略拿不到起始仓位"),
-        }
+    fn position_baseline_skips_executors() {
+        assert!(
+            matches!(
+                IncomeProcessorActor::event_routing(&baseline_event()),
+                EventRouting::SkipExecutors
+            ),
+            "基线若经总线投给 executor，会与 manager 的点对点投递重复"
+        );
     }
 
     /// 两者都属账户私有：绝不能把实盘读数/基线投给模拟账户的策略
