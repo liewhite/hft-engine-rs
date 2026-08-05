@@ -4,7 +4,7 @@
 //! 把产出的 OutcomeEvent 发布到 OutcomePubSub。纯策略逻辑集中在 StrategyRunner，
 //! 与回测引擎共享同一份实现。
 
-use crate::domain::{Exchange, Symbol, SymbolMeta};
+use crate::domain::{AccountId, Exchange, Symbol, SymbolMeta};
 use crate::engine::StrategyRunner;
 use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
@@ -12,17 +12,19 @@ use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
 use kameo::Actor;
-use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::sync::Arc;
+use kameo_actors::pubsub::Publish;
 
-use super::OutcomePubSub;
+use super::{AccountOutcome, OutcomePubSub};
 
 /// ExecutorActor 初始化参数
 pub struct ExecutorArgs {
     /// 策略实例
     pub strategy: Box<dyn Strategy>,
-    /// Symbol 元数据 (用于 qty 转换)
+    /// 本实例绑定的账户：决定订单落到实盘还是某个模拟账户
+    pub account: AccountId,
+    /// Symbol 元数据 (供 StrategyRunner 按交易所精度取整；单位折算不在此)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// Outcome PubSub 引用 (用于发布信号)
     pub outcome_pubsub: ActorRef<OutcomePubSub>,
@@ -32,6 +34,8 @@ pub struct ExecutorArgs {
 pub struct ExecutorActor {
     /// 策略执行纯逻辑核心 (状态管理 + 订单转换)
     runner: StrategyRunner,
+    /// 本实例绑定的账户
+    account: AccountId,
     /// Outcome PubSub 引用 (用于发布信号)
     outcome_pubsub: ActorRef<OutcomePubSub>,
 }
@@ -40,7 +44,11 @@ impl ExecutorActor {
     /// 处理 IncomeEvent，委托 runner 运行策略并发布返回的信号
     async fn handle_event(&mut self, event: IncomeEvent) {
         for signal in self.runner.on_event(&event) {
-            let _ = self.outcome_pubsub.tell(Publish(signal)).send().await;
+            let tagged = AccountOutcome {
+                account: self.account.clone(),
+                event: signal,
+            };
+            let _ = self.outcome_pubsub.tell(Publish(tagged)).send().await;
         }
     }
 }
@@ -51,9 +59,11 @@ impl Actor for ExecutorActor {
 
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let runner = StrategyRunner::new(args.strategy, args.symbol_metas);
+        let account = args.account;
         tracing::info!("ExecutorActor started");
         Ok(Self {
             runner,
+            account,
             outcome_pubsub: args.outcome_pubsub,
         })
     }

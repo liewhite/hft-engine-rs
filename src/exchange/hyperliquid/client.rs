@@ -4,7 +4,7 @@
 
 use super::symbol::{from_hyperliquid, to_hyperliquid};
 use crate::domain::{now_ms, Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta};
-use crate::exchange::client::ExchangeClient;
+use crate::exchange::client::{ExchangeClient, ExchangeOrder};
 use crate::exchange::hyperliquid::codec::{size_step, AssetCtx, AssetInfo, MetaResponse};
 use crate::exchange::utils::SignificantFiguresFormatter;
 use std::sync::Arc;
@@ -48,7 +48,11 @@ pub struct HyperliquidClient {
 
 impl HyperliquidClient {
     /// 创建新的 Hyperliquid 客户端
-    pub fn new(credentials: Option<HyperliquidCredentials>) -> Result<Self, ExchangeError> {
+    pub fn new(
+        quote: String,
+        dex: String,
+        credentials: Option<HyperliquidCredentials>,
+    ) -> Result<Self, ExchangeError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -60,16 +64,6 @@ impl HyperliquidClient {
             .map(|c| create_signer(&c.private_key))
             .transpose()
             .map_err(|e| ExchangeError::Other(format!("Failed to create signer: {}", e)))?;
-
-        let quote = credentials
-            .as_ref()
-            .map(|c| c.quote.clone())
-            .unwrap_or_else(|| "USDC".to_string());
-
-        let dex = credentials
-            .as_ref()
-            .map(|c| c.dex.clone())
-            .unwrap_or_default();
 
         Ok(Self {
             client,
@@ -374,7 +368,9 @@ impl ExchangeClient for HyperliquidClient {
         Ok(vec![])
     }
 
-    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+        // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
+        let order = order.inner();
         // 确保有签名器
         let signer = self
             .signer

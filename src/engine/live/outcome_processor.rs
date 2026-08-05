@@ -1,9 +1,17 @@
 //! OutcomeProcessorActor - 处理策略信号并执行下单
 //!
-//! 订阅 OutcomePubSub 接收策略信号，调用交易所 REST API 执行订单
+//! 订阅 OutcomePubSub 接收策略信号，调用交易所 REST API 执行订单。
+//!
+//! **系统的出向单位边界**：策略与 `StrategyRunner` 产出的订单一律币本位，在此转为
+//! [`ExchangeOrder`]（折算 + 按交易所精度取整）后才发给交易所。回测不经过本 actor，
+//! 因此 `SimState` 拿到的同样是币本位订单 —— 两条路径在策略侧口径一致。
 
-use crate::domain::{now_ms, Exchange, ExchangeError, OrderStatus, OrderUpdate, RejectReason, Side};
-use crate::exchange::ExchangeClient;
+use crate::domain::{
+    now_ms, Exchange, ExchangeError, OrderStatus, OrderUpdate, RejectReason, Side, Symbol,
+    SymbolMeta,
+};
+use crate::exchange::{ExchangeClient, ExchangeOrder};
+use crate::domain::AccountId;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -14,7 +22,7 @@ use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::IncomePubSub;
+use super::{AccountOutcome, IncomePubSub};
 
 /// OutcomeProcessorActor 初始化参数
 pub struct OutcomeProcessorArgs {
@@ -22,6 +30,8 @@ pub struct OutcomeProcessorArgs {
     pub clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
     /// Income PubSub（用于发布下单失败事件）
     pub income_pubsub: ActorRef<IncomePubSub>,
+    /// Symbol 元数据：用于把币本位订单折算为交易所下单单位并取整
+    pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// dry-run 模式：只打日志不下单
     pub dry_run: bool,
 }
@@ -32,6 +42,8 @@ pub struct OutcomeProcessorActor {
     clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
     /// Income PubSub
     income_pubsub: ActorRef<IncomePubSub>,
+    /// Symbol 元数据（出向单位折算）
+    symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// dry-run 模式
     dry_run: bool,
 }
@@ -49,6 +61,7 @@ impl Actor for OutcomeProcessorActor {
         Ok(Self {
             clients: args.clients,
             income_pubsub: args.income_pubsub,
+            symbol_metas: args.symbol_metas,
             dry_run: args.dry_run,
         })
     }
@@ -65,14 +78,20 @@ impl Actor for OutcomeProcessorActor {
 
 // === Message Handlers ===
 
-impl Message<OutcomeEvent> for OutcomeProcessorActor {
+impl Message<AccountOutcome> for OutcomeProcessorActor {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        msg: OutcomeEvent,
+        tagged: AccountOutcome,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // 只负责实盘账户；模拟账户的订单由 PaperCounterActor 处理。
+        // 二者共用一条 OutcomePubSub，各按账户取自己的那份（见 AccountOutcome）。
+        if tagged.account != AccountId::Live {
+            return;
+        }
+        let msg = tagged.event;
         // 下单/撤单一律 `tokio::spawn` 异步执行，**有意为之**：REST 往返可能上百 ms，
         // 若在 handler 内 await 会阻塞本 actor 的邮箱，进而拖垮整条 income/outcome 事件流
         // （行情、成交回报全部积压）。
@@ -182,9 +201,28 @@ impl Message<OutcomeEvent> for OutcomeProcessorActor {
                         "Placing order"
                     );
 
+                    // 币本位 -> 交易所单位。缺 SymbolMeta 时无法算出正确数量：
+                    // 若按原值发出，OKX 这类张数计价的所会静默错 contract_size 倍，
+                    // 故宁可丢弃并 error（缺 meta 属启动期配置错误，应当刺眼）。
+                    let Some(meta) = self.symbol_metas.get(&(order.exchange, order.symbol.clone()))
+                    else {
+                        let reason = format!(
+                            "No SymbolMeta for {}/{}, cannot convert order quantity to exchange unit",
+                            order.exchange, order.symbol
+                        );
+                        tracing::error!(
+                            exchange = %order.exchange,
+                            symbol = %order.symbol,
+                            "{}", reason
+                        );
+                        self.send_order_error(&order, reason).await;
+                        continue;
+                    };
+                    let exchange_order = ExchangeOrder::from_domain(order.clone(), meta);
+
                     let income_pubsub = self.income_pubsub.clone();
                     tokio::spawn(async move {
-                        match client.place_order(order.clone()).await {
+                        match client.place_order(exchange_order).await {
                             Ok(order_id) => {
                                 tracing::info!(
                                     exchange = %order.exchange,

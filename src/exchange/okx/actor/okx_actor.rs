@@ -122,7 +122,10 @@ impl Actor for OkxActor {
         tracing::info!(exchange = "OKX", has_private_ws, "WS actors ready");
 
         // 3. polling actor 的 on_start 仅 attach_stream，省略 wait
-        if let Some(client) = args.client {
+        //
+        // Greeks 轮询要签名，故与私有 WS 一样按**凭证**门控（而非仅按 client 是否存在 ——
+        // client 可以在无凭证下构造，只用公共 REST）。否则 non-auth 模式会每秒失败刷日志。
+        if let (Some(client), true) = (args.client, has_private_ws) {
             OkxGreeksPollingActor::spawn_link_with_mailbox(
                 &actor_ref,
                 OkxGreeksPollingActorArgs {

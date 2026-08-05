@@ -3,7 +3,8 @@ use crate::domain::Rate;
 /// 虚拟柜台的延迟与初始资金配置 (与 ox-demo `SimConfig` 同构)。
 ///
 /// 延迟在回测引擎中建模为"入队到 now + 延迟"，撮合本身不依赖墙钟。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(default)]
 pub struct SimConfig {
     /// 交易所 -> 策略 的单向延迟 (行情/订单回报/成交回流)
     pub exchange_to_strategy_delay_ms: u64,

@@ -2,11 +2,11 @@
 
 use super::symbol::{from_okx, to_okx};
 use crate::domain::{
-    Exchange, ExchangeError, Greeks, Order, OrderId, OrderStatus, OrderType, OrderUpdate, Side,
+    Exchange, ExchangeError, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate, Side,
     Symbol, SymbolMeta, TimeInForce, now_ms,
 };
 use crate::exchange::okx::codec::GreeksData;
-use crate::exchange::client::ExchangeClient;
+use crate::exchange::client::{ExchangeClient, ExchangeOrder};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
 use crate::exchange::utils::StepFormatter;
@@ -16,6 +16,7 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::sync::Arc;
@@ -23,6 +24,12 @@ use std::time::Duration;
 
 /// OKX 交易所客户端
 pub struct OkxClient {
+    /// symbol -> 合约乘数 (ctVal) 缓存，惰性拉取一次
+    ///
+    /// [`ExchangeClient`] 的契约是**返回币本位数量** (见 [`crate::domain::Quantity`])，而 OKX
+    /// REST 返回的是张数，故 client 必须自备折算能力，不能把折算责任推给调用方 —— 那样每个
+    /// 调用点都得记着乘一次，漏一处就静默算错 contract_size 倍。
+    contract_sizes: tokio::sync::OnceCell<HashMap<Symbol, f64>>,
     /// HTTP 客户端
     client: Client,
     /// 凭证（可选）
@@ -35,22 +42,37 @@ pub struct OkxClient {
 
 impl OkxClient {
     /// 创建新的 OKX 客户端
-    pub fn new(credentials: Option<OkxCredentials>) -> Result<Self, ExchangeError> {
+    pub fn new(quote: String, credentials: Option<OkxCredentials>) -> Result<Self, ExchangeError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
 
-        let quote = credentials
-            .as_ref()
-            .map(|c| c.quote.clone())
-            .unwrap_or_else(|| "USDT".to_string());
-
         Ok(Self {
+            contract_sizes: tokio::sync::OnceCell::new(),
             client,
             credentials,
             base_url: REST_BASE_URL.to_string(),
             quote,
+        })
+    }
+
+    /// 取该 symbol 的合约乘数 (张 -> 币)，首次调用时拉取并缓存全部合约信息。
+    async fn contract_size_of(&self, symbol: &Symbol) -> Result<f64, ExchangeError> {
+        let sizes = self
+            .contract_sizes
+            .get_or_try_init(|| async {
+                let metas = self.get_all_instruments().await?;
+                Ok::<_, ExchangeError>(
+                    metas
+                        .into_iter()
+                        .map(|m| (m.symbol, m.contract_size))
+                        .collect::<HashMap<_, _>>(),
+                )
+            })
+            .await?;
+        sizes.get(symbol).copied().ok_or_else(|| {
+            ExchangeError::Other(format!("No OKX contract size for symbol {symbol}"))
         })
     }
 
@@ -392,6 +414,9 @@ impl ExchangeClient for OkxClient {
             return Err(map_okx_error(&data.code, &data.msg));
         }
 
+        // 张 -> 币：REST 全程用张数，此处一次取到乘数，下方所有数量字段统一折算
+        let contract_size = self.contract_size_of(symbol).await?;
+
         let mut updates = Vec::new();
         for d in &data.data {
             let sym = match from_okx(&d.inst_id) {
@@ -409,7 +434,7 @@ impl ExchangeClient for OkxClient {
                     continue;
                 }
             };
-            let acc_fill_sz: f64 = match d.acc_fill_sz.parse() {
+            let acc_fill_sz: f64 = match d.acc_fill_sz.parse::<f64>().map(|v| v * contract_size) {
                 Ok(v) => v,
                 Err(_) => {
                     tracing::warn!(ord_id = %d.ord_id, acc_fill_sz = %d.acc_fill_sz, "Failed to parse acc_fill_sz, skipping");
@@ -434,7 +459,8 @@ impl ExchangeClient for OkxClient {
 
             let price: f64 = d.px.parse()
                 .map_err(|_| ExchangeError::Other(format!("Failed to parse px '{}' for order {}", d.px, d.ord_id)))?;
-            let sz: f64 = d.sz.parse()
+            let sz: f64 = d.sz.parse::<f64>()
+                .map(|v| v * contract_size)
                 .map_err(|_| ExchangeError::Other(format!("Failed to parse sz '{}' for order {}", d.sz, d.ord_id)))?;
 
             updates.push(OrderUpdate {
@@ -446,8 +472,8 @@ impl ExchangeClient for OkxClient {
                 status,
                 price,
                 reduce_only: false, // OKX REST pending 响应未解析 reduceOnly，外部单元信息以 WS 推送为准
-                quantity: sz,          // 张数，由 manager 转换为币
-                filled_quantity: acc_fill_sz, // 张数，由 manager 转换为币
+                quantity: sz,
+                filled_quantity: acc_fill_sz,
                 fill_sz: 0.0,
                 timestamp: now_ms(),
             });
@@ -456,7 +482,9 @@ impl ExchangeClient for OkxClient {
         Ok(updates)
     }
 
-    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+        // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
+        let order = order.inner();
         let path = "/api/v5/trade/order";
         let inst_id = to_okx(&order.symbol, &self.quote);
         let side = side_to_okx(order.side);
@@ -491,7 +519,7 @@ impl ExchangeClient for OkxClient {
             cl_ord_id: if order.client_order_id.is_empty() {
                 None
             } else {
-                Some(order.client_order_id)
+                Some(order.client_order_id.clone())
             },
         };
 

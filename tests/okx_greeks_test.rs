@@ -8,10 +8,12 @@
 
 use hft_engine_rs::domain::Exchange;
 use hft_engine_rs::engine::{
-    AddStrategies, ManagerActor, ManagerActorArgs,
+    AddStrategies, ManagerActor, ManagerActorArgs, StrategySpec,
 };
 use hft_engine_rs::exchange::okx::OkxCredentials;
-use hft_engine_rs::exchange::SubscriptionKind;
+use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
+
+const TEST_QUOTE: &str = "USDT";
 use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent, StateManager};
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
 use kameo::actor::Spawn;
@@ -26,7 +28,6 @@ fn get_credentials() -> Option<OkxCredentials> {
         api_key,
         secret,
         passphrase,
-        quote: "USDT".to_string(),
     })
 }
 
@@ -84,9 +85,11 @@ async fn test_okx_greeks_push() {
 
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
-            binance_credentials: None,
-            okx_credentials: Some(credentials),
-            hyperliquid_credentials: None,
+            ibkr_snapshot: None,
+            paper: Default::default(),
+            binance: None,
+            okx: Some(ExchangeAccess { quote: TEST_QUOTE.to_string(), dex: String::new(), credentials: Some(credentials) }),
+            hyperliquid: None,
             ibkr_credentials: None,
         },
         mailbox::unbounded(),
@@ -97,7 +100,7 @@ async fn test_okx_greeks_push() {
     };
 
     let result = manager
-        .ask(AddStrategies(vec![Box::new(strategy)]))
+        .ask(AddStrategies(vec![StrategySpec::live(Box::new(strategy))]))
         .send()
         .await;
     result.expect("添加策略失败");

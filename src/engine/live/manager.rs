@@ -7,11 +7,15 @@
 //! - 子 Actor 失败时级联退出
 
 use super::{
-    ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
+    AccountIncome, AccountOutcome, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
+    PaperCounterActor, PaperCounterArgs, PaperPubSub,
     IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor,
-    RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, DEFAULT_REPORT_INTERVAL_MS,
+    RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, UnregisterExecutor,
+    DEFAULT_REPORT_INTERVAL_MS,
 };
-use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta, now_ms};
+use crate::domain::{
+    now_ms, AccountId, Exchange, ExchangeError, Order, OrderType, Side, Symbol, SymbolMeta,
+};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::exchange::binance::{
     BinanceActor, BinanceActorArgs, BinanceClient, BinanceCredentials, REST_BASE_URL,
@@ -21,7 +25,9 @@ use crate::exchange::hyperliquid::{
 };
 use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
-use crate::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
+use crate::exchange::{
+    ExchangeAccess, ExchangeActorOps, ExchangeClient, ExchangeOrder, SubscriptionKind,
+};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -36,17 +42,23 @@ use std::sync::Arc;
 
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
-    /// Binance 凭证（可选）
-    pub binance_credentials: Option<BinanceCredentials>,
-    /// OKX 凭证（可选）
-    pub okx_credentials: Option<OkxCredentials>,
-    /// Hyperliquid 凭证（可选）
-    pub hyperliquid_credentials: Option<HyperliquidCredentials>,
+    /// Binance 接入配置（缺省即该所不参与）
+    pub binance: Option<ExchangeAccess<BinanceCredentials>>,
+    /// OKX 接入配置
+    pub okx: Option<ExchangeAccess<OkxCredentials>>,
+    /// Hyperliquid 接入配置
+    pub hyperliquid: Option<ExchangeAccess<HyperliquidCredentials>>,
     /// IBKR 凭证（可选）
     pub ibkr_credentials: Option<IbkrCredentials>,
     /// IBKR 借券费/汇率 snapshot 轮询配置（可选）：Some 时 IbkrActor 会 spawn_link 一个
     /// 轮询子 actor，定时发 BorrowFee/ExchangeRate；数据源失效即致命退出（无兜底常量）。
     pub ibkr_snapshot: Option<IbkrSnapshotConfig>,
+    /// 本地柜台（模拟账户）的撮合与账本配置。
+    ///
+    /// 实盘与模拟**并行**：两个 outcome 消费者常驻，各按账户取自己的那份
+    /// （见 [`crate::domain::AccountId`]）。因此不再有"整个进程的运行模式"这一概念 ——
+    /// 一个 symbol 上完全可以模拟先跑、出信号后再拉起实盘，两者互不可见。
+    pub paper: crate::sim::SimConfig,
 }
 
 /// ManagerActor - 顶层管理 Actor
@@ -74,6 +86,22 @@ pub struct ManagerActor {
     /// IBKR 具体 client (Arc)，供上层策略经 GetIbkrClient 取引用，调用借券费/外汇等
     /// **非 ExchangeClient trait** 的具体方法。None = 未配置 IBKR。单会话复用同一 client。
     ibkr_client: Option<Arc<IbkrClient>>,
+
+    /// 模拟账户私有事件总线（供 Supervisor 等观察者订阅）
+    paper_pubsub: ActorRef<PaperPubSub>,
+
+    /// 已注册的策略实例，供动态撤下使用。
+    ///
+    /// 晋升/降级要求能在运行期增删实例（见 [`RemoveStrategies`]），故必须留存引用；
+    /// 否则实例只能随进程生死。
+    executors: Vec<RegisteredExecutor>,
+}
+
+/// 一个已注册的策略实例
+struct RegisteredExecutor {
+    executor: ActorRef<ExecutorActor>,
+    account: AccountId,
+    symbols: HashSet<Symbol>,
 }
 
 impl ManagerActor {
@@ -112,7 +140,7 @@ impl ManagerActor {
     /// 批量添加策略的内部实现
     async fn do_add_strategies(
         &mut self,
-        strategies: Vec<Box<dyn Strategy>>,
+        strategies: Vec<StrategySpec>,
         actor_ref: ActorRef<Self>,
     ) -> Result<(), ExchangeError> {
         if strategies.is_empty() {
@@ -126,8 +154,8 @@ impl ManagerActor {
         let mut all_subscriptions: HashSet<(Exchange, SubscriptionKind)> = HashSet::new();
         let mut strategy_subscriptions: Vec<HashSet<(Exchange, SubscriptionKind)>> = Vec::new();
 
-        for strategy in &strategies {
-            let public_streams = strategy.public_streams();
+        for spec in &strategies {
+            let public_streams = spec.strategy.public_streams();
             let subscriptions: HashSet<(Exchange, SubscriptionKind)> = public_streams
                 .iter()
                 .flat_map(|(exchange, kinds)| {
@@ -149,33 +177,42 @@ impl ManagerActor {
 
         // 3. 批量创建 ExecutorActors
         let mut executor_refs = Vec::new();
-        for strategy in strategies {
+        for spec in strategies {
+            let account = spec.account.clone();
             let executor_ref = ExecutorActor::spawn_link_with_mailbox(
                 &actor_ref,
                 ExecutorArgs {
-                    strategy,
+                    strategy: spec.strategy,
+                    account: spec.account,
                     symbol_metas: Arc::new(self.symbol_metas.clone()),
                     outcome_pubsub: outcome_pubsub.clone(),
                 },
                 mailbox::unbounded(),
             )
             .await;
-            executor_refs.push(executor_ref);
+            executor_refs.push((executor_ref, account));
         }
 
         // 4. 向 ProcessorActor 注册所有 Executor 的订阅
-        for (executor_ref, subscriptions) in executor_refs.iter().zip(strategy_subscriptions.iter())
+        for ((executor_ref, account), subscriptions) in
+            executor_refs.iter().zip(strategy_subscriptions.iter())
         {
             if let Err(e) = processor
                 .tell(RegisterExecutor {
                     executor: executor_ref.clone(),
                     subscriptions: subscriptions.clone(),
+                    account: account.clone(),
                 })
                 .send()
                 .await
             {
                 tracing::error!(error = %e, "Failed to forward event to executor");
             }
+            self.executors.push(RegisteredExecutor {
+                executor: executor_ref.clone(),
+                account: account.clone(),
+                symbols: subscriptions.iter().map(|(_, k)| k.symbol().clone()).collect(),
+            });
         }
 
         // 收集所有策略涉及的 (exchange, symbol) 对（下面 step 5 & 6 共用）
@@ -204,6 +241,8 @@ impl ManagerActor {
         //    在持仓未对齐"的窗口。对每个 (exchange, symbol) 都推一条：交易所返回的
         //    用真实数据，未返回的推 size=0 显式清零（保证 SymbolState 一定收到初始值）。
         {
+            // 仅实盘账户需要：这些事件走共享 IncomePubSub，只会路由给实盘账户的 executor；
+            // 模拟账户从零起步，不需要也不应该看到真实持仓
             let exchanges: HashSet<Exchange> =
                 exchange_symbols.iter().map(|(e, _)| *e).collect();
             for exchange in exchanges {
@@ -273,12 +312,9 @@ impl ManagerActor {
                             );
                         }
                         let local_ts = now_ms();
-                        for mut update in updates {
-                            // REST 返回的数量是合约张数，转换为币单位
-                            if let Some(meta) = self.symbol_metas.get(&(*exchange, symbol.clone())) {
-                                update.quantity = meta.qty_to_coin(update.quantity);
-                                update.filled_quantity = meta.qty_to_coin(update.filled_quantity);
-                            }
+                        for update in updates {
+                            // 数量无需在此折算：ExchangeClient 的契约是返回币本位
+                            // (见 crate::domain::Quantity)，各所 client 内部已折算完毕
                             let event = IncomeEvent {
                                 exchange_ts: local_ts,
                                 local_ts,
@@ -332,23 +368,28 @@ impl Actor for ManagerActor {
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         // 1. 创建 Exchange Clients
+        //    模拟盘也需要 client：symbol metas 走公共 REST，与是否有凭证无关
         let mut clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
 
-        if let Some(ref cred) = args.binance_credentials {
-            let client = BinanceClient::new(Some(cred.clone()))?;
+        if let Some(ref access) = args.binance {
+            let creds = access.credentials.clone();
+            let client = BinanceClient::new(access.quote.clone(), creds)?;
             clients.insert(Exchange::Binance, Arc::new(client));
         }
 
-        let okx_client: Option<Arc<OkxClient>> = if let Some(ref cred) = args.okx_credentials {
-            let client = Arc::new(OkxClient::new(Some(cred.clone()))?);
+        let okx_client: Option<Arc<OkxClient>> = if let Some(ref access) = args.okx {
+            let creds = access.credentials.clone();
+            let client = Arc::new(OkxClient::new(access.quote.clone(), creds)?);
             clients.insert(Exchange::OKX, client.clone());
             Some(client)
         } else {
             None
         };
 
-        if let Some(ref cred) = args.hyperliquid_credentials {
-            let client = HyperliquidClient::new(Some(cred.clone()))?;
+        if let Some(ref access) = args.hyperliquid {
+            let creds = access.credentials.clone();
+            let client =
+                HyperliquidClient::new(access.quote.clone(), access.dex.clone(), creds)?;
             clients.insert(Exchange::Hyperliquid, Arc::new(client));
         }
 
@@ -397,18 +438,60 @@ impl Actor for ManagerActor {
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 5. 创建 OutcomeProcessorActor 并订阅 outcome_pubsub
-        let _signal_processor = OutcomeProcessorActor::spawn_link_with_mailbox(
+        // 5. OutcomePubSub 的两个消费者**常驻并存**：实盘账户的订单发往交易所，模拟账户的
+        //    订单落本地柜台。二者互不知情，各按 AccountOutcome 上的账户取自己的那份 ——
+        //    这使得同一 symbol 上模拟与实盘可以并行（模拟先跑，出信号后再拉起实盘）。
+        let live_processor = OutcomeProcessorActor::spawn_link_with_mailbox(
             &actor_ref,
             OutcomeProcessorArgs {
                 clients: clients.clone(),
                 income_pubsub: income_pubsub.clone(),
+                // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
+                symbol_metas: Arc::new(symbol_metas.clone()),
                 dry_run: false,
             },
             mailbox::unbounded(),
         )
         .await;
         outcome_pubsub
-            .tell(Subscribe(_signal_processor.clone()))
+            .tell(Subscribe(live_processor))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+
+        // 模拟账户私有事件走独立总线：结构上保证真实账户的成交不可能流进模拟策略的状态
+        let paper_pubsub = PaperPubSub::spawn_link_with_mailbox(
+            &actor_ref,
+            PaperPubSub::new(DeliveryStrategy::BestEffort),
+            mailbox::unbounded(),
+        )
+        .await;
+        let paper_counter = PaperCounterActor::spawn_link_with_mailbox(
+            &actor_ref,
+            PaperCounterArgs {
+                paper_pubsub: paper_pubsub.clone(),
+                config: args.paper,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        outcome_pubsub
+            .tell(Subscribe(paper_counter.clone()))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+        // 柜台需要共享行情（撮合）与 Clock（发布净值）
+        income_pubsub
+            .tell(Subscribe(paper_counter))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+        // **柜台的回报要能回到策略**：IncomeProcessor 订阅 paper 总线，按账户投递给对应
+        // executor。漏掉这一步的表现是"订单永远停在 Created、超时被清理后反复重挂"——
+        // 策略收不到 Pending/Filled，看不见自己的挂单。
+        paper_pubsub
+            .clone()
+            .tell(Subscribe(processor.clone()))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
@@ -442,7 +525,7 @@ impl Actor for ManagerActor {
         // 7. 创建所有配置了凭证的 ExchangeActors
         //    Phase 1: 顺序 spawn（每个 spawn_link_with_mailbox 本身瞬间返回）
         //    Phase 2: tokio::join! 并发等所有 on_start 完成（这才是耗时的 IO 部分）
-        let binance_ref_opt = if let Some(ref credentials) = args.binance_credentials {
+        let binance_ref_opt = if let Some(ref access) = args.binance {
             let symbol_metas_for_exchange =
                 Self::get_symbol_metas_for(&symbol_metas, Exchange::Binance);
             let client = clients
@@ -453,12 +536,12 @@ impl Actor for ManagerActor {
                 BinanceActor::spawn_link_with_mailbox(
                     &actor_ref,
                     BinanceActorArgs {
-                        credentials: Some(credentials.clone()),
+                        credentials: access.credentials.clone(),
                         symbol_metas: symbol_metas_for_exchange,
                         rest_base_url: REST_BASE_URL.to_string(),
                         income_pubsub: income_pubsub.clone(),
                         client,
-                        quote: credentials.quote.clone(),
+                        quote: access.quote.clone(),
                     },
                     mailbox::unbounded(),
                 )
@@ -468,17 +551,17 @@ impl Actor for ManagerActor {
             None
         };
 
-        let okx_ref_opt = if let Some(ref credentials) = args.okx_credentials {
+        let okx_ref_opt = if let Some(ref access) = args.okx {
             let symbol_metas_for_exchange = Self::get_symbol_metas_for(&symbol_metas, Exchange::OKX);
             Some(
                 OkxActor::spawn_link_with_mailbox(
                     &actor_ref,
                     OkxActorArgs {
-                        credentials: Some(credentials.clone()),
+                        credentials: access.credentials.clone(),
                         client: okx_client.clone(),
                         symbol_metas: symbol_metas_for_exchange,
                         income_pubsub: income_pubsub.clone(),
-                        quote: credentials.quote.clone(),
+                        quote: access.quote.clone(),
                     },
                     mailbox::unbounded(),
                 )
@@ -488,18 +571,18 @@ impl Actor for ManagerActor {
             None
         };
 
-        let hyper_ref_opt = if let Some(ref credentials) = args.hyperliquid_credentials {
+        let hyper_ref_opt = if let Some(ref access) = args.hyperliquid {
             let symbol_metas_for_exchange =
                 Self::get_symbol_metas_for(&symbol_metas, Exchange::Hyperliquid);
             Some(
                 HyperliquidActor::spawn_link_with_mailbox(
                     &actor_ref,
                     HyperliquidActorArgs {
-                        credentials: Some(credentials.clone()),
+                        credentials: access.credentials.clone(),
                         symbol_metas: symbol_metas_for_exchange,
                         income_pubsub: income_pubsub.clone(),
-                        quote: credentials.quote.clone(),
-                        dex: credentials.dex.clone(),
+                        quote: access.quote.clone(),
+                        dex: access.dex.clone(),
                     },
                     mailbox::unbounded(),
                 )
@@ -589,6 +672,8 @@ impl Actor for ManagerActor {
             metrics,
             exchange_actors,
             ibkr_client: ibkr_client_ref,
+            paper_pubsub,
+            executors: Vec::new(),
         })
     }
 
@@ -620,7 +705,33 @@ impl Actor for ManagerActor {
 // ============================================================================
 
 /// 添加策略
-pub struct AddStrategy(pub Box<dyn Strategy>);
+/// 策略实例 + 它绑定的账户。
+///
+/// 同一份策略逻辑可以用不同账户注册两次：一份跑模拟账户、一份跑实盘账户，同时运行。
+pub struct StrategySpec {
+    pub strategy: Box<dyn Strategy>,
+    pub account: AccountId,
+}
+
+impl StrategySpec {
+    /// 绑定到实盘账户
+    pub fn live(strategy: Box<dyn Strategy>) -> Self {
+        Self {
+            strategy,
+            account: AccountId::Live,
+        }
+    }
+
+    /// 绑定到指定标签的模拟账户（本项目按 symbol 分账）
+    pub fn paper(strategy: Box<dyn Strategy>, label: impl Into<String>) -> Self {
+        Self {
+            strategy,
+            account: AccountId::Paper(label.into()),
+        }
+    }
+}
+
+pub struct AddStrategy(pub StrategySpec);
 
 impl Message<AddStrategy> for ManagerActor {
     type Reply = Result<(), ExchangeError>;
@@ -637,7 +748,7 @@ impl Message<AddStrategy> for ManagerActor {
 }
 
 /// 批量添加策略
-pub struct AddStrategies(pub Vec<Box<dyn Strategy>>);
+pub struct AddStrategies(pub Vec<StrategySpec>);
 
 impl Message<AddStrategies> for ManagerActor {
     type Reply = Result<(), ExchangeError>;
@@ -688,7 +799,7 @@ pub struct SubscribeOutcome<A: Actor>(pub ActorRef<A>);
 
 impl<A> Message<SubscribeOutcome<A>> for ManagerActor
 where
-    A: Actor + Message<crate::strategy::OutcomeEvent>,
+    A: Actor + Message<AccountOutcome>,
 {
     type Reply = ();
 
@@ -754,5 +865,142 @@ impl Message<GetIbkrClient> for ManagerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.ibkr_client.clone()
+    }
+}
+
+/// 撤下某账户在指定 symbol 上的策略实例，可选立即平仓。
+///
+/// 用于降级：`live 持续亏损 -> 关闭 live`。两步都必要 ——
+/// 只撤实例不平仓会留下无人看管的敞口；只平仓不撤实例会被策略立刻重新开仓。
+pub struct RemoveStrategies {
+    /// 目标账户（降级即 [`AccountId::Live`]）
+    pub account: AccountId,
+    /// 目标 symbol
+    pub symbols: Vec<Symbol>,
+    /// 平仓下到哪个交易所
+    pub exchange: Exchange,
+    /// 是否立即市价平掉存量仓位
+    pub flatten: bool,
+}
+
+impl Message<RemoveStrategies> for ManagerActor {
+    type Reply = Result<(), ExchangeError>;
+
+    async fn handle(
+        &mut self,
+        msg: RemoveStrategies,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let targets: Vec<Symbol> = msg.symbols;
+
+        // 1. 先撤实例，再平仓。顺序不能反：先平仓的话，策略在收到平仓回报后可能立刻重开。
+        let mut removed = 0usize;
+        let mut kept = Vec::new();
+        for reg in std::mem::take(&mut self.executors) {
+            let hit = reg.account == msg.account
+                && targets.iter().any(|s| reg.symbols.contains(s));
+            if !hit {
+                kept.push(reg);
+                continue;
+            }
+            if let Err(e) = self
+                .income_processor
+                .tell(UnregisterExecutor {
+                    executor: reg.executor.clone(),
+                })
+                .send()
+                .await
+            {
+                tracing::error!(error = %e, "Failed to unregister executor");
+            }
+            reg.executor.kill();
+            removed += 1;
+        }
+        self.executors = kept;
+        tracing::info!(
+            account = %msg.account,
+            symbols = ?targets,
+            removed,
+            "Removed strategy instances"
+        );
+
+        if !msg.flatten {
+            return Ok(());
+        }
+
+        // 2. 平仓只对实盘账户有意义：模拟账户的仓位在本地柜台里，随账户一起留存（供继续记账）
+        if msg.account != AccountId::Live {
+            return Ok(());
+        }
+        let Some(client) = self.clients.get(&msg.exchange).cloned() else {
+            return Err(ExchangeError::Other(format!(
+                "No client for {} — cannot flatten",
+                msg.exchange
+            )));
+        };
+
+        // 仓位以交易所为准：本地状态可能因撤下实例而不再更新
+        let positions = client.fetch_positions().await?;
+        for pos in positions {
+            if !targets.contains(&pos.symbol) || pos.is_empty() {
+                continue;
+            }
+            let Some(meta) = self.symbol_metas.get(&(msg.exchange, pos.symbol.clone())) else {
+                tracing::error!(
+                    exchange = %msg.exchange,
+                    symbol = %pos.symbol,
+                    "No SymbolMeta — cannot flatten (数量无法折算为交易所单位)"
+                );
+                continue;
+            };
+            // 反向 reduce-only 市价单：撮合层强制不反向开仓，量算多了也只会平到 0
+            let side = if pos.size > 0.0 { Side::Short } else { Side::Long };
+            let order = Order {
+                id: String::new(),
+                exchange: msg.exchange,
+                symbol: pos.symbol.clone(),
+                side,
+                order_type: OrderType::Market,
+                quantity: pos.size.abs(),
+                reduce_only: true,
+                client_order_id: msg.exchange.new_cli_order_id(),
+            };
+            tracing::warn!(
+                exchange = %msg.exchange,
+                symbol = %pos.symbol,
+                position = pos.size,
+                %side,
+                "[DEMOTE] Flattening live position with reduce-only market order"
+            );
+            let wire = ExchangeOrder::from_domain(order, meta);
+            if let Err(e) = client.place_order(wire).await {
+                tracing::error!(
+                    symbol = %pos.symbol,
+                    error = %e,
+                    "平仓下单失败 —— 实盘仍有敞口，需人工介入"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 订阅模拟账户私有事件总线（Supervisor / 观测层用）
+pub struct SubscribePaper<A: Actor>(pub ActorRef<A>);
+
+impl<A> Message<SubscribePaper<A>> for ManagerActor
+where
+    A: Actor + Message<AccountIncome>,
+{
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribePaper<A>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Err(e) = self.paper_pubsub.tell(Subscribe(msg.0)).send().await {
+            tracing::error!(error = %e, "Failed to subscribe to PaperPubSub");
+        }
     }
 }

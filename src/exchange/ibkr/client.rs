@@ -1,9 +1,9 @@
 //! IBKR ExchangeClient 实现 (仅 REST)
 
 use crate::domain::{
-    Exchange, ExchangeError, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
+    Exchange, ExchangeError, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
-use crate::exchange::client::ExchangeClient;
+use crate::exchange::client::{ExchangeClient, ExchangeOrder};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::symbol::resolve_conids;
 use crate::exchange::ibkr::IbkrCredentials;
@@ -373,7 +373,9 @@ impl ExchangeClient for IbkrClient {
         Ok(vec![])
     }
 
-    async fn place_order(&self, order: Order) -> Result<OrderId, ExchangeError> {
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+        // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
+        let order = order.inner();
         let conid = self.conids.get(&order.symbol).ok_or_else(|| {
             ExchangeError::SymbolNotFound(Exchange::IBKR, order.symbol.clone())
         })?;

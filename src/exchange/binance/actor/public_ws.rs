@@ -7,7 +7,7 @@
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
-use crate::exchange::binance::codec::{BookTicker, MarkPriceUpdate, WsResponse};
+use crate::exchange::binance::codec::{AggTrade, BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ws_loop;
@@ -305,7 +305,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePublicWs
 // 消息解析
 // ============================================================================
 
-fn parse_public_message(
+pub(crate) fn parse_public_message(
     raw: &str,
     quote: &str,
     local_ts: u64,
@@ -397,6 +397,17 @@ fn parse_public_message(
                 data: ExchangeEventData::BBO(bbo),
             }])
         }
+        "aggTrade" => {
+            let agg: AggTrade = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("aggTrade parse: {}", e)))?;
+            let trade = agg.to_market_trade(quote)
+                ?;
+            Ok(vec![IncomeEvent {
+                exchange_ts: trade.timestamp,
+                local_ts,
+                data: ExchangeEventData::MarketTrade(trade),
+            }])
+        }
         _ => {
             // 未知事件类型，记录警告但不报错
             tracing::warn!(event_type, raw, "Unknown Binance public event type");
@@ -413,7 +424,7 @@ fn parse_public_message(
 ///
 /// Binance 的 K线（`Candle`）订阅尚未实现：父 actor 会把它路由到本 actor（`market_ws`），
 /// 到达此处返回 `None`，由调用方记录 `warn!` 并跳过（不 panic，遵循"框架层错误受控处理"约定）。
-fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> Option<String> {
+pub(crate) fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> Option<String> {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用同一个 markPrice@1s 流
         SubscriptionKind::FundingRate { symbol }
@@ -426,6 +437,38 @@ fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> Option<String> {
             "{}@bookTicker",
             to_binance(symbol, quote).to_lowercase()
         )),
+        SubscriptionKind::Trades { symbol } => Some(format!(
+            "{}@aggTrade",
+            to_binance(symbol, quote).to_lowercase()
+        )),
         SubscriptionKind::Candle { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exchange::binance::actor::binance_actor::{pick_ws_target, WsTarget};
+
+    /// 这两条是踩过坑的地方：aggTrade 订到 /public/ws 会被 ack 但永不推数据，
+    /// 属"静默无数据"故障，故用单测把 kind -> 端点/stream 的映射钉住。
+    #[test]
+    fn trades_routes_to_market_ws_with_agg_trade_stream() {
+        let kind = SubscriptionKind::Trades { symbol: "BTC".to_string() };
+        assert_eq!(pick_ws_target(&kind), WsTarget::Market);
+        assert_eq!(
+            kind_to_stream(&kind, "USDT").as_deref(),
+            Some("btcusdt@aggTrade")
+        );
+    }
+
+    #[test]
+    fn bbo_routes_to_public_high_freq_ws() {
+        let kind = SubscriptionKind::BBO { symbol: "BTC".to_string() };
+        assert_eq!(pick_ws_target(&kind), WsTarget::PublicHighFreq);
+        assert_eq!(
+            kind_to_stream(&kind, "USDT").as_deref(),
+            Some("btcusdt@bookTicker")
+        );
     }
 }

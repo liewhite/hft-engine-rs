@@ -8,7 +8,9 @@
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::okx::codec::{BboData, FundingRateData, IndexTickerData, MarkPriceData, WsPush};
+use crate::exchange::okx::codec::{
+    resolve_meta, BboData, FundingRateData, IndexTickerData, MarkPriceData, TradeData, WsPush,
+};
 use crate::exchange::okx::{to_okx, to_okx_index, WS_PUBLIC_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -93,7 +95,7 @@ impl OkxPublicWsActor {
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_public_message(raw, local_ts)?;
+        let events = parse_public_message(raw, local_ts, &self.symbol_metas)?;
         for event in events {
             if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Failed to publish to IncomePubSub");
@@ -264,7 +266,12 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPublicWsActo
 // 消息解析
 // ============================================================================
 
-fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+/// `symbol_metas` 用于把 OKX 的**张数**口径折算为币本位 (与 `parse_private_message` 同一套路)。
+pub(crate) fn parse_public_message(
+    raw: &str,
+    local_ts: u64,
+    symbol_metas: &HashMap<Symbol, SymbolMeta>,
+) -> Result<Vec<IncomeEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -317,14 +324,44 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
                 .as_ref()
                 .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
 
+            // 盘口量也是张数，需按 meta 折算；缺 meta 无法折算，丢弃并告警
+            let Some(meta) = resolve_meta(inst_id, symbol_metas) else {
+                tracing::warn!(exchange = "OKX", %inst_id, "Missing SymbolMeta for bbo, dropping");
+                return Ok(Vec::new());
+            };
+
             let mut events = Vec::new();
             for data in &push.data {
-                let bbo = data.to_bbo(inst_id)
-                    ?;
+                let bbo = data.to_bbo(meta)?;
                 events.push(IncomeEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,
                     data: ExchangeEventData::BBO(bbo),
+                });
+            }
+            Ok(events)
+        }
+        "trades" => {
+            let push: WsPush<TradeData> = serde_json::from_str(raw)
+                .map_err(|e| WsError::ParseError(format!("trades parse: {}", e)))?;
+            let inst_id = push
+                .arg
+                .inst_id
+                .as_ref()
+                .ok_or_else(|| WsError::ParseError("Missing instId in trades".into()))?;
+
+            let Some(meta) = resolve_meta(inst_id, symbol_metas) else {
+                tracing::warn!(exchange = "OKX", %inst_id, "Missing SymbolMeta for trades, dropping");
+                return Ok(Vec::new());
+            };
+
+            let mut events = Vec::new();
+            for data in &push.data {
+                let trade = data.to_market_trade(meta)?;
+                events.push(IncomeEvent {
+                    exchange_ts: trade.timestamp,
+                    local_ts,
+                    data: ExchangeEventData::MarketTrade(trade),
                 });
             }
             Ok(events)
@@ -376,7 +413,7 @@ fn parse_public_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, Ws
 ///
 /// `Candle` 由 OkxActor 路由到 BusinessWsActor，正常不会到达此处；返回 `None` 表示
 /// 路由错误，由调用方记录并跳过（不 panic，遵循"框架层错误受控处理"约定）。
-fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_json::Value> {
+pub(crate) fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_json::Value> {
     match kind {
         SubscriptionKind::FundingRate { symbol } => Some(json!({
             "channel": "funding-rate",
@@ -384,6 +421,11 @@ fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_json::Value
         })),
         SubscriptionKind::BBO { symbol } => Some(json!({
             "channel": "bbo-tbt",
+            "instId": to_okx(symbol, quote)
+        })),
+        SubscriptionKind::Trades { symbol } => Some(json!({
+            // `trades` 按主动单 + 成交价归集推送；`trades-all` 才是每笔明细，此处不需要
+            "channel": "trades",
             "instId": to_okx(symbol, quote)
         })),
         SubscriptionKind::MarkPrice { symbol } => Some(json!({
@@ -396,5 +438,69 @@ fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_json::Value
             "instId": to_okx_index(symbol, quote)
         })),
         SubscriptionKind::Candle { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Exchange, MarketTrade};
+    use crate::exchange::utils::StepFormatter;
+
+    const TRADES_PUSH: &str = r#"{
+        "arg":{"channel":"trades","instId":"BTC-USDT-SWAP"},
+        "data":[{"instId":"BTC-USDT-SWAP","tradeId":"1","px":"62500.0",
+                 "sz":"12","side":"buy","ts":"1785747728201","count":"3"}]
+    }"#;
+
+    /// BTC-USDT-SWAP: ctVal = 0.01 BTC/张
+    fn metas(contract_size: f64) -> HashMap<Symbol, SymbolMeta> {
+        HashMap::from([(
+            "BTC".to_string(),
+            SymbolMeta {
+                exchange: Exchange::OKX,
+                symbol: "BTC".to_string(),
+                price_formatter: Arc::new(StepFormatter::new(0.1)),
+                size_step: 0.01,
+                min_order_size: 0.01,
+                contract_size,
+            },
+        )])
+    }
+
+    fn trades_of(events: Vec<IncomeEvent>) -> Vec<MarketTrade> {
+        events
+            .into_iter()
+            .filter_map(|e| match e.data {
+                ExchangeEventData::MarketTrade(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trade_size_is_converted_from_contracts_to_coin() {
+        let events = parse_public_message(TRADES_PUSH, 0, &metas(0.01)).expect("parse");
+        let trades = trades_of(events);
+        assert_eq!(trades.len(), 1);
+        // 12 张 x 0.01 = 0.12 BTC；若漏了折算会是 12（差 100 倍）
+        assert!((trades[0].qty - 0.12).abs() < 1e-12, "got {}", trades[0].qty);
+        assert_eq!(trades[0].price, 62500.0);
+        assert!(!trades[0].is_buyer_maker, "side=buy 是主动买");
+    }
+
+    /// 缺 SymbolMeta 时必须丢弃，绝不能把张数当币数发下去
+    #[test]
+    fn trade_without_symbol_meta_is_dropped_not_passed_through() {
+        let events = parse_public_message(TRADES_PUSH, 0, &HashMap::new()).expect("parse");
+        assert!(trades_of(events).is_empty());
+    }
+
+    #[test]
+    fn trades_kind_maps_to_trades_channel() {
+        let kind = SubscriptionKind::Trades { symbol: "BTC".to_string() };
+        let arg = kind_to_arg(&kind, "USDT").expect("must map");
+        assert_eq!(arg["channel"], "trades");
+        assert_eq!(arg["instId"], "BTC-USDT-SWAP");
     }
 }

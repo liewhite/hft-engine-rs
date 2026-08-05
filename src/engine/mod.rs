@@ -7,11 +7,14 @@ pub use strategy_runner::{
     ClientOrderIdGen, ExchangeUuidGen, SequentialClientOrderIdGen, StrategyRunner,
 };
 pub use live::{
-    AddStrategy, AddStrategies, ClockActor, ClockActorArgs,
+    AccountIncome, AccountOutcome, AddStrategy, AddStrategies, PaperPubSub, ClockActor, ClockActorArgs,
     CryptoStatusActor, CryptoStatusActorArgs,
     ExecutorActor, ExecutorArgs,
     GetAllSymbolMetas, GetIbkrClient, PublishIncome, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
     MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor, RegisterExecutor,
-    RegisterSymbols, OutcomeProcessorArgs, Stop,
+    PaperCounterActor, PaperCounterArgs,
+    RegisterSymbols, OutcomeProcessorArgs, RemoveStrategies, Stop, StrategySpec, SubscribePaper,
+    Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,
+    SupervisorArgs, SymbolRecord, SymbolView, UnregisterExecutor,
     SubscribeIncome, SubscribeOutcome,
 };

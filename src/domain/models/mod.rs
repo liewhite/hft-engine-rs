@@ -1,3 +1,4 @@
+mod account;
 mod account_info;
 mod balance;
 mod bbo;
@@ -23,6 +24,7 @@ mod symbol_meta;
 mod time_in_force;
 mod trading_stats;
 
+pub use account::AccountId;
 pub use account_info::AccountInfo;
 pub use balance::Balance;
 pub use bbo::BBO;

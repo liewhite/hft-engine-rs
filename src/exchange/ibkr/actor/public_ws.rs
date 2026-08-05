@@ -753,10 +753,17 @@ impl Message<SubscribeBatch> for IbkrPublicWsActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         for kind in msg.kinds {
-            // IBKR 只支持 BBO，其他类型静默忽略
+            // IBKR 只支持 BBO；其余类型跳过并告警（静默丢弃会让上游误以为已订阅）
             let symbol = match &kind {
                 SubscriptionKind::BBO { symbol } => symbol.clone(),
-                _ => continue,
+                other => {
+                    tracing::warn!(
+                        exchange = "IBKR",
+                        kind = ?other,
+                        "Unsupported subscription kind, skipping (IBKR only provides BBO)"
+                    );
+                    continue;
+                }
             };
 
             if self.subscribed.contains(&kind) {

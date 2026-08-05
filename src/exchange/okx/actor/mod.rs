@@ -11,6 +11,6 @@ mod business_ws;
 mod greeks_polling;
 mod okx_actor;
 mod private_ws;
-mod public_ws;
+pub(crate) mod public_ws;
 
 pub use okx_actor::{OkxActor, OkxActorArgs};

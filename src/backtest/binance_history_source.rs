@@ -7,18 +7,23 @@ use crate::messaging::IncomeEvent;
 use chrono::NaiveDate;
 
 /// 币安每日历史数据类型：自带数据源路径 key 段与对应解析器。
-/// trade-native 回测只需 [`BinanceDataKind::Trades`]，避免去取已停发/无需的 bookTicker。
+/// trade-native 回测只需 [`BinanceDataKind::AggTrades`]，避免去取已停发/无需的 bookTicker。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinanceDataKind {
     BookTicker,
-    Trades,
+    /// 归集成交（`aggTrades` 数据集）。
+    ///
+    /// **不用逐笔的 `trades` 数据集**：实盘 WS 只提供 `aggTrade`（按主动单+价位归集），
+    /// 若回测喂逐笔明细，总成交量相同但**笔数与单笔量分布差一个量级**，成交流因子在回测里
+    /// 调好的参数上线即漂移。故两侧统一为归集口径（见 `crate::exchange::SubscriptionKind::Trades`）。
+    AggTrades,
 }
 
 impl BinanceDataKind {
     pub fn key(self) -> &'static str {
         match self {
             BinanceDataKind::BookTicker => "bookTicker",
-            BinanceDataKind::Trades => "trades",
+            BinanceDataKind::AggTrades => "aggTrades",
         }
     }
 
@@ -29,7 +34,7 @@ impl BinanceDataKind {
     ) -> Result<Vec<IncomeEvent>, crate::domain::ExchangeError> {
         match self {
             BinanceDataKind::BookTicker => binance_csv::parse_book_ticker(symbol, zip_bytes),
-            BinanceDataKind::Trades => binance_csv::parse_trades(symbol, zip_bytes),
+            BinanceDataKind::AggTrades => binance_csv::parse_agg_trades(symbol, zip_bytes),
         }
     }
 }

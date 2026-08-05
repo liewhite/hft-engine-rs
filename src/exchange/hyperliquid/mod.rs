@@ -22,22 +22,7 @@ pub struct HyperliquidCredentials {
     pub wallet_address: String,
     /// 私钥 (不含 0x 前缀)
     pub private_key: String,
-    /// 计价币种 (e.g., "USDC", "USDE")
-    pub quote: String,
-    /// Perp DEX 名称 (e.g., "xyz" 表示股票永续合约, "" 表示默认 perp DEX)
-    #[serde(default)]
-    pub dex: String,
 }
 
 impl HyperliquidCredentials {
-    /// 将 base symbol (e.g., "AAPL") 转换为 HL 侧 symbol (e.g., "xyz:AAPL")
-    ///
-    /// 当 dex 为空时返回原始 symbol，否则拼接 "{dex}:{symbol}"。
-    pub fn hl_symbol(&self, symbol: &str) -> String {
-        if self.dex.is_empty() {
-            symbol.to_string()
-        } else {
-            format!("{}:{}", self.dex, symbol)
-        }
-    }
 }

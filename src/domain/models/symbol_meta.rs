@@ -56,9 +56,22 @@ impl SymbolMeta {
             .unwrap_or(price)
     }
 
-    /// 将数量调整到合法精度 (向下取整)
+    /// 将**交易所下单单位**的数量调整到合法精度 (向下取整)
     pub fn round_size_down(&self, size: f64) -> f64 {
         Self::round_to_step(size, self.size_step, RoundingStrategy::ToNegativeInfinity)
+    }
+
+    /// 将**币本位**数量调整到交易所允许的合法精度 (向下取整)。
+    ///
+    /// 合法的币数量必然是 `size_step × contract_size` 的整数倍，因此精度约束完全可以在币本位
+    /// 里表达 —— 这让"精度取整"与"单位折算"得以分开：
+    /// - 精度取整是**市场规则**，回测/模拟盘也必须遵守（否则会用非法 tick 价、非法步长成交，
+    ///   撮合结果失真），故留在 domain 路径、用币本位表达
+    /// - 单位折算是**线路细节**，只发生在交易所出口 (见 [`crate::exchange::ExchangeOrder`])
+    ///
+    /// 二者曾被合并在一个函数里，搬到出口后回测就悄悄丢掉了取整（同一天回测 PnL 出现偏差）。
+    pub fn round_coin_size_down(&self, coin_amount: f64) -> f64 {
+        self.qty_to_coin(self.round_size_down(self.coin_to_qty(coin_amount)))
     }
 
     /// 使用 Decimal 精确计算，按 step 取整

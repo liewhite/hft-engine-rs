@@ -11,7 +11,7 @@
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, TimeInForce};
 use hft_engine_rs::exchange::ibkr::{IbkrClient, IbkrCredentials};
 use hft_engine_rs::exchange::ibkr::auth::{tickle, IbkrAuth};
-use hft_engine_rs::exchange::ExchangeClient;
+use hft_engine_rs::exchange::{ExchangeClient, ExchangeOrder};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http, Message as WsMessage};
@@ -160,7 +160,7 @@ async fn ibkr_fill_observe() {
     };
 
     println!("\n下单买入: {} @ {} cOID={}", symbol, buy_price, client_oid);
-    let order_id = client.place_order(order).await.expect("下单失败");
+    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta)).await.expect("下单失败");
     println!("下单成功 order_id={}", order_id);
 
     // 7. 监听所有 WS 消息 30 秒，打印 sor/str 相关的原始 JSON
@@ -230,6 +230,6 @@ async fn ibkr_fill_observe() {
         client_order_id: Exchange::IBKR.new_cli_order_id(),
     };
     println!("\n平仓卖出 {} @ {}", symbol, sell_price);
-    let _ = client.place_order(sell_order).await.expect("卖单失败");
+    let _ = client.place_order(ExchangeOrder::from_domain(sell_order, &meta)).await.expect("卖单失败");
     println!("平仓完成");
 }

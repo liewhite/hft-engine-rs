@@ -1,8 +1,10 @@
 //! data.binance.vision CSV (zip) 解析。
 //!
-//! 官方列定义 (U 本位合约)：
+//! 官方列定义 (U 本位合约)，均已用真实文件核对：
 //!   - bookTicker: `update_id, best_bid_price, best_bid_qty, best_ask_price, best_ask_qty, transaction_time, event_time`
-//!   - trades:     `id, price, qty, quote_qty, time, is_buyer_maker`
+//!   - aggTrades:  `agg_trade_id, price, quantity, first_trade_id, last_trade_id, transact_time, is_buyer_maker`
+//!
+//! 成交一律用 **aggTrades**（归集口径）而非逐笔 `trades`，与实盘 WS 的 `aggTrade` 对齐。
 //!
 //! 部分文件首行为表头：通过"首字段能否解析为数字"探测，非数字即表头跳过。
 //! BBO 时间戳取 event_time (col 6) 以对齐实盘 WS 推送语义。历史事件 local_ts == exchange_ts
@@ -17,9 +19,12 @@ pub fn parse_book_ticker(symbol: &Symbol, zip_bytes: &[u8]) -> Result<Vec<Income
     map_rows(zip_bytes, |f| book_ticker_row(symbol, f))
 }
 
-/// 解析 trades zip 字节为 MarketTrade 事件。
-pub fn parse_trades(symbol: &Symbol, zip_bytes: &[u8]) -> Result<Vec<IncomeEvent>, ExchangeError> {
-    map_rows(zip_bytes, |f| trade_row(symbol, f))
+/// 解析 aggTrades zip 字节为 MarketTrade 事件（归集口径，与实盘 WS aggTrade 一致）。
+pub fn parse_agg_trades(
+    symbol: &Symbol,
+    zip_bytes: &[u8],
+) -> Result<Vec<IncomeEvent>, ExchangeError> {
+    map_rows(zip_bytes, |f| agg_trade_row(symbol, f))
 }
 
 fn book_ticker_row(symbol: &Symbol, f: &[&str]) -> Result<IncomeEvent, ExchangeError> {
@@ -35,14 +40,20 @@ fn book_ticker_row(symbol: &Symbol, f: &[&str]) -> Result<IncomeEvent, ExchangeE
     Ok(historical(bbo.timestamp, ExchangeEventData::BBO(bbo)))
 }
 
-fn trade_row(symbol: &Symbol, f: &[&str]) -> Result<IncomeEvent, ExchangeError> {
+/// `agg_trade_id, price, quantity, first_trade_id, last_trade_id, transact_time, is_buyer_maker`
+///
+/// 时间取 `transact_time` (col 5)，与实盘 aggTrade 取 `T` (成交时间) 同口径。
+fn agg_trade_row(symbol: &Symbol, f: &[&str]) -> Result<IncomeEvent, ExchangeError> {
     let trade = MarketTrade {
         exchange: Exchange::Binance,
         symbol: symbol.clone(),
         price: field_f64(f, 1)?,
         qty: field_f64(f, 2)?,
-        is_buyer_maker: f.get(5).map(|s| s.trim().eq_ignore_ascii_case("true")).unwrap_or(false),
-        timestamp: field_u64(f, 4)?,
+        is_buyer_maker: f
+            .get(6)
+            .map(|s| s.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        timestamp: field_u64(f, 5)?,
     };
     Ok(historical(trade.timestamp, ExchangeEventData::MarketTrade(trade)))
 }
@@ -127,12 +138,16 @@ mod tests {
         buf
     }
 
+    /// 列序取自真实文件（BTCUSDT-aggTrades）：
+    /// `agg_trade_id, price, quantity, first_trade_id, last_trade_id, transact_time, is_buyer_maker`
+    /// 注意 is_buyer_maker 在 col 6、时间在 col 5 —— 与逐笔 trades 数据集的列序不同，
+    /// 用错列会静默把 first_trade_id 当时间戳。
     #[test]
-    fn parse_trades_skips_header() {
-        let csv = "id,price,qty,quote_qty,time,is_buyer_maker\n\
-                   1,100.5,2.0,201.0,1700000000000,true\n\
-                   2,101.0,1.0,101.0,1700000000100,false\n";
-        let evs = parse_trades(&"BTCUSDT".to_string(), &zip_with(csv)).unwrap();
+    fn parse_agg_trades_skips_header() {
+        let csv = "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker\n\
+                   1,100.5,2.0,900,903,1700000000000,true\n\
+                   2,101.0,1.0,904,904,1700000000100,false\n";
+        let evs = parse_agg_trades(&"BTCUSDT".to_string(), &zip_with(csv)).unwrap();
         assert_eq!(evs.len(), 2);
         match &evs[0].data {
             ExchangeEventData::MarketTrade(t) => {
