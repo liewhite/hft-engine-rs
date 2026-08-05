@@ -47,6 +47,9 @@ pub const DEFAULT_MAX_CONSECUTIVE_MISMATCHES: u32 = 3;
 /// 观测层不做订单超时清理（镜像只关心持仓）
 const NO_ORDER_TIMEOUT: u64 = 0;
 
+/// 单条腿缓冲的 Fill 达到该数量即告警（见 `Reconciler::pending_fills`）
+const FILL_BUFFER_WARN_LEN: usize = 256;
+
 // ============================================================================
 // 纯逻辑核心
 // ============================================================================
@@ -75,19 +78,25 @@ pub struct Reconciler {
     /// per (所, symbol) 的不一致记录；一致一次即整条移除
     mismatches: HashMap<(Exchange, Symbol), MismatchRecord>,
     max_consecutive: u32,
-    /// 已注册、但**基线未到**的 (所, symbol) 上早到的 Fill，基线落地后按序重放。
+    /// 已注册、但**基线未到**的 (所, symbol) 上早到的 Fill，基线落地后重放。
     ///
     /// 投产时序是「注册对账范围 → REST 拉基线 → 经总线发布」，而私有成交流全程在推。
     /// 落在这个窗口里的 Fill 若直接入镜像，会在 positions 里凭空建出一条仓位，随后到达
     /// 的基线被判"重复"而丢弃 —— 镜像从此缺掉全部存量，对账在 N 次轮询后**误杀整个引擎**。
     /// 先缓冲、基线落地后重放，成交一笔不丢也不早算。
     ///
-    /// 残余窗口如实说明：某笔成交若已含在 REST 快照里、其 Fill 又恰好晚到落进缓冲，
-    /// 重放会把它多算一次（需要私有流延迟超过 REST 往返才可能发生）。没有交易所侧的
-    /// 序号无法根除，但比缓冲前的"必然丢掉全部存量"窄了几个量级。
+    /// # 重放按快照请求时刻过滤，缓冲因此可以安全地跨越失败的投产
     ///
-    /// 不会无界增长：基线拉取/发布失败即拒绝投产（见 `ManagerActor::activate_executors`），
-    /// 已注册的 pair 要么很快收到基线并清空缓冲，要么整个投产失败、进程退出。
+    /// 基线事件的 `exchange_ts` 是快照的**请求**时刻（见 `ManagerActor::activate_executors`
+    /// 6.2）。在此之前送达（`local_ts <= exchange_ts`）的 Fill，其成交必然已含在快照里，
+    /// 重放会双计 —— 丢弃；之后送达的才补进镜像。这同时覆盖了两种来路的陈旧缓冲：
+    /// - 正常投产窗口内、快照请求之前送达的 Fill；
+    /// - **上一次投产失败**滞留的 Fill（Supervisor 晋升失败会在下个节拍重试，注册范围
+    ///   有意不回滚）—— 重试成功时的新快照必然晚于它们，全部被过滤。
+    ///
+    /// 残余窗口如实说明：成交发生在快照请求之后、REST 在途期间，其 Fill 送达时已含在
+    /// 快照里 —— 重放会多算一次。窗口只有 REST 在途时长，且只可能来自该腿的外部/手动
+    /// 成交（此刻它没有 live 实例在交易）。没有交易所侧序号无法根除。
     pending_fills: HashMap<(Exchange, Symbol), Vec<IncomeEvent>>,
 }
 
@@ -155,15 +164,20 @@ impl Reconciler {
                     self.mirror.apply(event);
                     // 基线到达才让这条腿进入对账范围（见 `baselined` 字段说明）
                     self.baselined.insert(key.clone());
-                    // 重放基线之前早到的 Fill（见 `pending_fills` 字段说明）
+                    // 重放基线之前早到的 Fill。快照请求时刻（event.exchange_ts）之前送达的
+                    // 已含在快照里，重放即双计 —— 丢弃（见 `pending_fills` 字段说明）。
                     if let Some(buffered) = self.pending_fills.remove(&key) {
+                        let (stale, fresh): (Vec<_>, Vec<_>) = buffered
+                            .into_iter()
+                            .partition(|f| f.local_ts <= event.exchange_ts);
                         tracing::info!(
                             exchange = %key.0,
                             symbol = %key.1,
-                            count = buffered.len(),
+                            replayed = fresh.len(),
+                            dropped_as_covered_by_snapshot = stale.len(),
                             "基线落地，重放窗口期缓冲的 Fill"
                         );
-                        for fill_event in &buffered {
+                        for fill_event in &fresh {
                             self.mirror.apply(fill_event);
                         }
                     }
@@ -184,7 +198,18 @@ impl Reconciler {
                             size = fill.size,
                             "基线未到，Fill 先入缓冲"
                         );
-                        self.pending_fills.entry(key).or_default().push(event.clone());
+                        let buf = self.pending_fills.entry(key.clone()).or_default();
+                        buf.push(event.clone());
+                        // 体量告警：基线迟迟不来（如晋升持续失败）而该腿又持续有外部成交。
+                        // 陈旧条目会在基线落地时被过滤，这里只需让堆积可见。
+                        if buf.len() >= FILL_BUFFER_WARN_LEN {
+                            tracing::warn!(
+                                exchange = %key.0,
+                                symbol = %key.1,
+                                buffered = buf.len(),
+                                "基线长期未到，缓冲的 Fill 持续堆积"
+                            );
+                        }
                     }
                 }
                 Ok(())
@@ -419,6 +444,13 @@ mod tests {
             local_ts: 1,
             data,
         }
+    }
+
+    /// 改写事件的时间戳（基线的 exchange_ts = 快照请求时刻，Fill 的 local_ts = 送达时刻）
+    fn at(mut event: IncomeEvent, exchange_ts: u64, local_ts: u64) -> IncomeEvent {
+        event.exchange_ts = exchange_ts;
+        event.local_ts = local_ts;
+        event
     }
 
     fn position(exchange: Exchange, size: f64) -> Position {
@@ -661,8 +693,8 @@ mod tests {
     #[test]
     fn fill_before_baseline_is_buffered_and_replayed() {
         let mut r = reconciler(1);
-        // Fill 先到（此刻本地持仓是"未知"，不是 0）
-        r.on_event(&fill(Side::Long, 1.0)).unwrap();
+        // Fill 先到（此刻本地持仓是"未知"，不是 0）；t=2 送达，晚于快照请求时刻 t=1
+        r.on_event(&at(fill(Side::Long, 1.0), 2, 2)).unwrap();
         // 基线随后到达，不该被判"重复"；缓冲的 Fill 补上 -> 本地 = 2.0 + 1.0
         r.on_event(&baseline(2.0)).unwrap();
         r.on_event(&report(EX, vec![position(EX, 3.0)]))
@@ -678,8 +710,8 @@ mod tests {
     #[test]
     fn buffered_fills_are_scoped_to_their_leg() {
         let mut r = reconciler(1);
-        // OKX 腿的 Fill 早到（其基线未到）
-        r.on_event(&fill_on(OTHER_EX, Side::Long, 5.0)).unwrap();
+        // OKX 腿的 Fill 早到（其基线未到）；t=2 送达，晚于快照请求时刻 t=1
+        r.on_event(&at(fill_on(OTHER_EX, Side::Long, 5.0), 2, 2)).unwrap();
         // Binance 腿基线落地，不该动 OKX 的缓冲
         r.on_event(&baseline(1.0)).unwrap();
         r.on_event(&report(EX, vec![position(EX, 1.0)]))
@@ -688,6 +720,30 @@ mod tests {
         r.on_event(&baseline_on(OTHER_EX, 0.0)).unwrap();
         r.on_event(&report(OTHER_EX, vec![position(OTHER_EX, 5.0)]))
             .expect("OKX 腿 = 基线 0 + 重放的 5.0");
+    }
+
+    /// **重放过滤**：快照请求时刻（基线 exchange_ts）之前送达的缓冲 Fill 已含在快照里，
+    /// 重放即双计 —— 必须丢弃。
+    ///
+    /// 典型来路：上一次投产失败后滞留的缓冲（Supervisor 晋升失败会在下个节拍重试，
+    /// 对账范围注册有意不回滚）。若不过滤，重试成功后镜像 = 快照(已含该笔) + 重放(再加
+    /// 一次)，恒定偏差 → 对账误杀引擎。
+    #[test]
+    fn replay_drops_fills_already_covered_by_snapshot() {
+        let mut r = reconciler(1);
+        // t=5 送达一笔 Fill（此后它会体现在快照里）
+        r.on_event(&at(fill(Side::Long, 1.0), 5, 5)).unwrap();
+        // t=12 又送达一笔，尚不在快照里
+        r.on_event(&at(fill(Side::Long, 4.0), 12, 12)).unwrap();
+        // t=10 请求的快照读到 2.0（已含 t=5 那笔），t=11 作为基线到达
+        r.on_event(&at(baseline(2.0), 10, 11)).unwrap();
+        // 镜像 = 2.0(快照) + 4.0(重放 t=12) = 6.0；t=5 那笔被过滤
+        r.on_event(&report(EX, vec![position(EX, 6.0)]))
+            .expect("快照已含的 Fill 不该重放");
+        let err = r
+            .on_event(&report(EX, vec![position(EX, 7.0)]))
+            .expect_err("若 t=5 的 Fill 也被重放，本地会是 7.0 而这里不会报漂移");
+        assert!(err.contains("本地 6"), "got: {err}");
     }
 
     /// 跟踪范围外的 symbol 不参与对账（分桶部署下账户级读数含其他桶的 symbol）

@@ -458,6 +458,10 @@ impl ManagerActor {
                 let Some(client) = self.clients.get(&exchange) else {
                     continue;
                 };
+                // 快照**请求**时刻，作为基线事件的 exchange_ts：在此之前已由私有流送达的
+                // Fill，其成交必然已包含在快照里 —— 对账镜像重放缓冲 Fill 时据此丢弃，
+                // 避免"快照已含 + 重放再加"的双计（见 Reconciler 的 pending_fills）。
+                let request_ts = now_ms();
                 let positions = client.fetch_positions().await.map_err(|e| {
                     ExchangeError::Other(format!(
                         "无法获取 {exchange} 的初始持仓基线，拒绝启动（基线只有一次机会，\
@@ -480,7 +484,7 @@ impl ManagerActor {
                     baselines.insert(
                         (*ex, symbol.clone()),
                         IncomeEvent {
-                            exchange_ts: local_ts,
+                            exchange_ts: request_ts,
                             local_ts,
                             data: ExchangeEventData::PositionBaseline(pos),
                         },
@@ -517,6 +521,10 @@ impl ManagerActor {
         //     而丢掉存量"的竞态从结构上不可能发生（这正是不让 executor 从总线收基线的
         //     原因：总线上基线与私有流的先后无从保证）。模拟账户从零起步，不需要也不应该
         //     看到真实持仓，不投。
+        //
+        //     如实声明残余窗口：某笔成交若已含在 REST 快照里、其 Fill 又在注册**之后**才
+        //     送达，executor 会双计（快照一次 + Fill 一次）。没有交易所侧序号无法根除，
+        //     但窗口只有 REST 在途时长，且由对账通道兜底检出。
         for ((executor_ref, account), subscriptions) in
             executor_refs.iter().zip(strategy_subscriptions.iter())
         {
