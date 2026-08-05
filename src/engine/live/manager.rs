@@ -1253,8 +1253,12 @@ impl Message<RemoveStrategies> for ManagerActor {
 
         // 模拟账户到此为止：它的挂单与仓位都在本地柜台里，随账户一起留存（供继续记账），
         // 交易所侧没有任何残留需要清理。
+        //
+        // **但仍要走 incomplete 检查**：撤下阶段本身可能已经失败（拒绝部分降级、实例未确认
+        // 停止），在这里直接 `Ok(())` 会把"实例还在跑"谎报成"已干净撤下" —— 正是本分支通篇
+        // 要消灭的那类谎报。
         if !is_live {
-            return Ok(());
+            return Self::finish_removal(&msg.account, msg.exchange, incomplete);
         }
         let Some(client) = self.clients.get(&msg.exchange).cloned() else {
             return Err(ExchangeError::Other(format!(
@@ -1344,16 +1348,28 @@ impl Message<RemoveStrategies> for ManagerActor {
             }
         }
 
-        if !incomplete.is_empty() {
-            // 实例已撤下但仓位没平干净：向上报错，让调用方保留"实盘仍开着"的记账状态。
-            // 说成功会让 SupervisorActor 忘掉这个 symbol，敞口就此无人看管。
-            return Err(ExchangeError::Other(format!(
-                "降级未完成，{} 上仍可能有未平敞口，需人工核对: {}",
-                msg.exchange,
-                incomplete.join("; ")
-            )));
+        Self::finish_removal(&msg.account, msg.exchange, incomplete)
+    }
+}
+
+impl ManagerActor {
+    /// 汇总撤下结果：只要有任何一环没完成，就**向上报错**。
+    ///
+    /// 调用方（`SupervisorActor::demote`）收到 `Ok` 就会把 `live` 置为 `None`、认为已干净
+    /// 降级；若此时实例还在跑、或仓位没平、或遗留挂单没撤掉，那部分敞口就此无人看管 ——
+    /// 正是 supervisor 自己写下的"谎报已关闭比撤下失败更危险"。
+    fn finish_removal(
+        account: &AccountId,
+        exchange: Exchange,
+        incomplete: Vec<String>,
+    ) -> Result<(), ExchangeError> {
+        if incomplete.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        Err(ExchangeError::Other(format!(
+            "撤下未完成（账户 {account}，交易所 {exchange}），需人工核对: {}",
+            incomplete.join("; ")
+        )))
     }
 }
 

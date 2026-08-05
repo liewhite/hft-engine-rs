@@ -496,8 +496,34 @@ impl ExchangeClient for BinanceClient {
         Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
     }
 
-    async fn cancel_order(&self, _symbol: &Symbol, _order_id: &OrderId) -> Result<(), ExchangeError> {
-        Err(ExchangeError::Other("Binance cancel_order not implemented".to_string()))
+    async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
+        let api_key = self
+            .api_key()
+            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+
+        let inst = to_binance(symbol, &self.quote);
+        let query = self
+            .build_signed_query(&[("symbol", &inst), ("orderId", order_id)])
+            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+
+        let resp = self
+            .client
+            .delete(format!("{}/fapi/v1/order?{}", self.base_url, query))
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
+        }
+        Ok(())
     }
 
     async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {

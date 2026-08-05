@@ -174,13 +174,17 @@ impl IbkrClient {
             .map(|(symbol, &conid)| (conid, symbol.as_str()))
             .collect();
 
-        let arr = match body.as_array() {
-            Some(arr) => arr,
-            None => {
-                tracing::warn!(body = %body, "IBKR positions response is not an array");
-                return Ok(Vec::new());
-            }
-        };
+        // 非数组即**报错**，不能退化成空列表。IBKR CPAPI 会以 200 返回 `{"error": ...}`
+        // 这类响应体；而本方法是持仓基线的唯一来源（见 ExchangeClient::fetch_positions 的
+        // 契约：`Ok(vec![])` 只意味着账户确实空仓），静默返回空会让基线变成全零、此后由 Fill
+        // 累加且永不纠正 —— 与 Hyperliquid 那个"过滤全空即报错"守卫防的是同一类静默错账。
+        let arr = body.as_array().ok_or_else(|| {
+            let preview = body.to_string();
+            ExchangeError::ParseError(format!(
+                "IBKR positions 响应不是数组（持仓基线不能以空列表蒙混过去）: {}",
+                &preview[..preview.len().min(500)]
+            ))
+        })?;
 
         let mut positions = Vec::new();
         for item in arr {
@@ -366,8 +370,41 @@ impl ExchangeClient for IbkrClient {
         Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
     }
 
-    async fn cancel_order(&self, _symbol: &Symbol, _order_id: &OrderId) -> Result<(), ExchangeError> {
-        Err(ExchangeError::Other("IBKR cancel_order not implemented".to_string()))
+    async fn cancel_order(&self, _symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
+        // IBKR 按 orderId 撤单，与 symbol 无关（orderId 在账户内唯一）
+        let url = format!(
+            "{}iserver/account/{}/order/{}",
+            self.auth.base_url(),
+            self.account_id,
+            order_id
+        );
+
+        let resp = self
+            .authed_request("DELETE", &url)?
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(ExchangeError::ApiError(
+                Exchange::IBKR,
+                status.as_u16() as i32,
+                text,
+            ));
+        }
+
+        // IBKR 会以 200 返回 `{"error": "..."}`，不展开检查就会把失败当成功 ——
+        // 而调用方（启动期/降级撤单）正是靠返回值判断遗留挂单是否已清理。
+        if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
+                return Err(ExchangeError::Other(format!(
+                    "IBKR cancel order {order_id} failed: {err}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn fetch_pending_orders(

@@ -15,8 +15,9 @@ use crate::exchange::hyperliquid::codec::{
 use crate::exchange::utils::SignificantFiguresFormatter;
 use std::sync::Arc;
 use crate::exchange::hyperliquid::signing::{
-    action_hash, create_signer, sign_l1_action, BulkOrderAction, ExchangeRequest, LimitOrder,
-    OrderResponse, OrderResponseData, OrderStatus, OrderType as WireOrderType, OrderWire,
+    action_hash, create_signer, sign_l1_action, BulkCancelAction, BulkOrderAction, CancelResponse,
+    CancelWire, ExchangeRequest, LimitOrder, OrderResponse, OrderResponseData, OrderStatus,
+    OrderType as WireOrderType, OrderWire,
 };
 use crate::exchange::hyperliquid::{HyperliquidCredentials, REST_BASE_URL};
 use alloy::signers::local::PrivateKeySigner;
@@ -506,8 +507,63 @@ impl ExchangeClient for HyperliquidClient {
             .collect())
     }
 
-    async fn cancel_order(&self, _symbol: &Symbol, _order_id: &OrderId) -> Result<(), ExchangeError> {
-        Err(ExchangeError::Other("Hyperliquid cancel_order not implemented".to_string()))
+    async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| ExchangeError::Other("No credentials configured".to_string()))?;
+
+        // `order_id` 是交易所侧的 oid（见 fetch_pending_orders / private_ws 的映射）
+        let oid: u64 = order_id.parse().map_err(|_| {
+            ExchangeError::ParseError(format!("Hyperliquid order_id 不是合法的 oid: {order_id}"))
+        })?;
+        let coin = to_hyperliquid(symbol, &self.quote, &self.dex);
+        let asset = self.get_asset_index(&coin).await?;
+
+        // 与 place_order 同一条签名链路：msgpack action hash -> EIP-712
+        let action = BulkCancelAction::new(vec![CancelWire { a: asset, o: oid }]);
+        let nonce = now_ms();
+        let connection_id = action_hash(&action, nonce, None)
+            .map_err(|e| ExchangeError::Other(format!("Cancel action hash failed: {e}")))?;
+        let signature = sign_l1_action(signer, connection_id, self.is_mainnet)
+            .await
+            .map_err(|e| ExchangeError::Other(format!("Signing failed: {e}")))?;
+
+        let request = ExchangeRequest {
+            action: serde_json::to_value(&action)
+                .map_err(|e| ExchangeError::Other(format!("Serialize cancel action failed: {e}")))?,
+            nonce,
+            signature: signature.to_api_format(),
+            vault_address: None,
+        };
+
+        let response: CancelResponse = self.post_exchange(&request).await?;
+        if response.status != "ok" {
+            return Err(ExchangeError::Other(format!(
+                "Hyperliquid cancel rejected: {}",
+                response.response.map(|v| v.to_string()).unwrap_or_default()
+            )));
+        }
+
+        // 外层 ok 不代表这一笔撤掉了：statuses 里对应位置可能是 {"error": "..."}。
+        // 不展开检查会把"没撤掉"当成撤掉了 —— 而调用方（启动期/降级撤单）正是靠返回值
+        // 判断要不要继续，谎报成功会让遗留挂单被当成已清理。
+        let statuses = response
+            .response
+            .as_ref()
+            .and_then(|v| v.get("data"))
+            .and_then(|d| d.get("statuses"))
+            .and_then(|s| s.as_array());
+        if let Some(statuses) = statuses {
+            for status in statuses {
+                if let Some(err) = status.get("error").and_then(|e| e.as_str()) {
+                    return Err(ExchangeError::Other(format!(
+                        "Hyperliquid cancel oid={oid} failed: {err}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn fetch_pending_orders(

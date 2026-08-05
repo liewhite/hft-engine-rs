@@ -206,6 +206,48 @@ impl BulkOrderAction {
     }
 }
 
+/// 单笔撤单（按交易所侧的 `oid`）
+///
+/// 字段顺序**必须**与 Hyperliquid 的签名约定一致：action 经 msgpack 序列化后参与
+/// [`action_hash`]，字段顺序变了哈希就变，签名会被拒。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelWire {
+    /// asset index（与下单时同一套编号，见 `HyperliquidClient::get_asset_index`）
+    pub a: u32,
+    /// order id
+    pub o: u64,
+}
+
+/// 批量撤单 action，与 [`BulkOrderAction`] 对位
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkCancelAction {
+    #[serde(rename = "type")]
+    pub action_type: String,
+    pub cancels: Vec<CancelWire>,
+}
+
+impl BulkCancelAction {
+    pub fn new(cancels: Vec<CancelWire>) -> Self {
+        Self {
+            action_type: "cancel".to_string(),
+            cancels,
+        }
+    }
+}
+
+/// 撤单响应。
+///
+/// 成功时 `{"status":"ok","response":{"type":"cancel","data":{"statuses":["success"]}}}`；
+/// 单笔失败时对应位置是 `{"error":"..."}` 而非字符串，故用 `serde_json::Value` 承接后再判。
+#[derive(Debug, Clone, Deserialize)]
+pub struct CancelResponse {
+    pub status: String,
+    #[serde(default)]
+    pub response: Option<serde_json::Value>,
+}
+
 /// Exchange API 请求体
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
