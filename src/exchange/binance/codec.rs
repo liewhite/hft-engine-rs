@@ -219,6 +219,9 @@ pub struct OrderData {
     #[serde(rename = "X")]
     pub status: String,
     pub q: String,
+    /// 委托价 (Original price)。挂单态 ap 是 "0"，OrderUpdate.price 必须用它 ——
+    /// 否则本地按 update 重建挂单时会造出 price=0 的假单
+    pub p: String,
     /// 累计成交量 (Cumulative filled quantity)
     pub z: String,
     /// 本次成交量 (Last filled quantity)
@@ -263,8 +266,11 @@ impl OrderTradeUpdate {
             },
         };
 
-        let price = f64::from_str(&self.o.ap)
-            .map_err(|_| format!("Failed to parse avg price: {}", self.o.ap))?;
+        // OrderUpdate.price 的语义是**委托价**（OKX 用 px、HL 用 limit_px，口径一致）。
+        // 此前误用均价 ap：挂单态（NEW）的 ap 是 "0"，流进 SymbolState 的挂单重建路径
+        // 会造出 price=0 的假单。市价单没有委托价，Binance 推 "0"，如实透传。
+        let price = f64::from_str(&self.o.p)
+            .map_err(|_| format!("Failed to parse order price: {}", self.o.p))?;
         let quantity = f64::from_str(&self.o.q)
             .map_err(|_| format!("Failed to parse quantity: {}", self.o.q))?;
 

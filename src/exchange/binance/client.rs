@@ -275,6 +275,8 @@ impl BinanceClient {
             mark_price: String, // API 返回但不使用
             un_realized_profit: String,
             leverage: String,
+            /// 单向模式恒为 "BOTH"；双向（对冲）模式为 "LONG"/"SHORT"
+            position_side: String,
         }
 
         let query = self
@@ -303,6 +305,17 @@ impl BinanceClient {
 
         let mut result = Vec::new();
         for p in positions {
+            // 双向（对冲）持仓模式下同一 symbol 返回 LONG/SHORT 两行，照单全收会产出
+            // 两条同 symbol 的 Position —— 基线与对账全部串账。本系统按单向净持仓建模，
+            // 检测到双向模式直接报错拒绝（与 OKX 适配层在 codec 里拒绝 long/short
+            // posSide 的立场一致），由使用者去交易所切换持仓模式。
+            if p.position_side != "BOTH" {
+                return Err(ExchangeError::Other(format!(
+                    "Binance 账户处于双向持仓模式（{} positionSide={}），本系统只支持单向\
+                     净持仓，请在交易所切换为单向模式",
+                    p.symbol, p.position_side
+                )));
+            }
             let symbol = match from_binance(&p.symbol, &self.quote) {
                 Some(s) => s,
                 None => continue, // 非当前 quote 的交易对，跳过
