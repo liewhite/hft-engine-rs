@@ -18,10 +18,8 @@ impl Ledger {
         }
     }
 
-    /// 应用一笔成交，就地更新账本：
-    ///   - 新开 / 同向加仓：加权平均成本
-    ///   - 反向平仓：平掉 min(本次, 持仓) 的已实现盈亏入现金
-    ///   - 反手：平掉原仓后，剩余在成交价重新开仓
+    /// 应用一笔成交，就地更新账本。仓位/均价演进复用 [`Position::apply_fill`]
+    /// （与策略侧 `SymbolState` 同一出处），账本只负责把已实现盈亏落进现金。
     ///
     /// `fee` (>=0) 直接从现金扣除；maker/taker 区分与费率换算由调用方 (SimState) 决定。
     pub fn apply_fill(
@@ -33,45 +31,12 @@ impl Ledger {
         qty: Quantity,
         fee: f64,
     ) {
-        let signed = match side {
-            Side::Long => qty,
-            Side::Short => -qty,
-        };
         let pos = self
             .positions
             .entry(symbol.clone())
             .or_insert_with(|| Position::empty(exchange, symbol.clone()));
-        let old_size = pos.size;
-        let new_size = old_size + signed;
-
-        if old_size.abs() < Position::EPSILON || (old_size > 0.0) == (signed > 0.0) {
-            // 新开 / 同向加仓
-            let new_entry = if old_size.abs() < Position::EPSILON {
-                price
-            } else {
-                (old_size.abs() * pos.entry_price + qty * price) / (old_size.abs() + qty)
-            };
-            pos.size = new_size;
-            pos.entry_price = new_entry;
-            self.cash -= fee;
-        } else {
-            // 反向：平仓 (可能反手)
-            let close_qty = qty.min(old_size.abs());
-            let dir = if old_size > 0.0 { 1.0 } else { -1.0 };
-            let realized = (price - pos.entry_price) * close_qty * dir;
-            let new_entry = if signed.abs() <= old_size.abs() {
-                if new_size.abs() < Position::EPSILON {
-                    0.0
-                } else {
-                    pos.entry_price
-                }
-            } else {
-                price // 反手: 剩余在成交价重开
-            };
-            pos.size = new_size;
-            pos.entry_price = new_entry;
-            self.cash += realized - fee;
-        }
+        let realized = pos.apply_fill(side, price, qty);
+        self.cash += realized - fee;
     }
 
     /// 账户净值 = 现金 + 未实现盈亏 (`mark_of` 提供各 symbol 的估值价格)
