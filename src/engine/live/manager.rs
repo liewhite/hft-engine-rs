@@ -1414,7 +1414,20 @@ impl Message<RemoveStrategies> for ManagerActor {
                 %side,
                 "[DEMOTE] Flattening live position with reduce-only market order"
             );
-            let wire = ExchangeOrder::from_domain(order, meta);
+            let wire = match ExchangeOrder::from_domain(order, meta) {
+                Ok(wire) => wire,
+                Err(reason) => {
+                    // 残量不足最小可交易量，订单层面无法平掉 —— 如实计入未完成，交人工处置
+                    tracing::error!(
+                        symbol = %pos.symbol,
+                        position = pos.size,
+                        %reason,
+                        "平仓单未通过出向校验 —— 残量无法用订单平掉"
+                    );
+                    incomplete.push(format!("{}: 平仓单无法构造 ({reason})", pos.symbol));
+                    continue;
+                }
+            };
             if let Err(e) = client.place_order(wire).await {
                 tracing::error!(
                     symbol = %pos.symbol,

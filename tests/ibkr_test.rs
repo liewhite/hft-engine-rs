@@ -242,7 +242,7 @@ async fn test_ibkr_limit_buy() {
 
     println!("提交买单: {:?}", order);
 
-    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta)).await.expect("下单失败");
+    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
     println!("买单成功，订单ID: {}", order_id);
 }
 
@@ -290,7 +290,7 @@ async fn test_ibkr_limit_sell() {
 
     println!("提交卖单: {:?}", order);
 
-    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta)).await.expect("下单失败");
+    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
     println!("卖单成功，订单ID: {}", order_id);
 }
 
@@ -463,7 +463,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
     };
 
     println!("[下单] 买入 {} 股 {} @ {}", TEST_QUANTITY, symbol, buy_price);
-    let buy_order_id = client.place_order(ExchangeOrder::from_domain(buy_order, &meta)).await.expect("买单失败");
+    let buy_order_id = client.place_order(ExchangeOrder::from_domain(buy_order, &meta).expect("订单未通过出向校验")).await.expect("买单失败");
     println!("[下单返回] order_id={}", buy_order_id);
 
     // 4. 查询订单状态确认成交 (首次调用激活订阅，第二次取数据)
@@ -515,7 +515,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
     };
 
     println!("[下单] 卖出 {} 股 {} @ {}", TEST_QUANTITY, symbol, sell_price);
-    let sell_order_id = client.place_order(ExchangeOrder::from_domain(sell_order, &meta)).await.expect("卖单失败");
+    let sell_order_id = client.place_order(ExchangeOrder::from_domain(sell_order, &meta).expect("订单未通过出向校验")).await.expect("卖单失败");
     println!("[成交] 卖单 order_id={}", sell_order_id);
 
     // 7. 查询订单状态 + 等待仓位更新

@@ -218,7 +218,22 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
                         self.send_order_error(&order, reason).await;
                         continue;
                     };
-                    let exchange_order = ExchangeOrder::from_domain(order.clone(), meta);
+                    // 数量下界（取整为 0 / 低于最小下单量）在 from_domain 里拦下：
+                    // 这种单发出去必被交易所拒，本地拦截让失败原因可定位，且不白打 REST
+                    let exchange_order = match ExchangeOrder::from_domain(order.clone(), meta) {
+                        Ok(wire) => wire,
+                        Err(reason) => {
+                            tracing::error!(
+                                exchange = %order.exchange,
+                                symbol = %order.symbol,
+                                client_order_id = ?order.client_order_id,
+                                %reason,
+                                "订单未通过出向校验，未发送"
+                            );
+                            self.send_order_error(&order, reason).await;
+                            continue;
+                        }
+                    };
 
                     let income_pubsub = self.income_pubsub.clone();
                     tokio::spawn(async move {

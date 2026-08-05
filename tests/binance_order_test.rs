@@ -99,7 +99,7 @@ async fn test_binance_limit_buy() {
 
     println!("提交买单: {:?}", order);
 
-    // let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta)).await.expect("下单失败");
+    // let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
     // println!("买单成功，订单ID: {}", order_id);
 }
 
@@ -145,6 +145,6 @@ async fn test_binance_limit_sell() {
 
     println!("提交卖单: {:?}", order);
 
-    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta)).await.expect("下单失败");
+    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
     println!("卖单成功，订单ID: {}", order_id);
 }

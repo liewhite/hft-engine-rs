@@ -119,14 +119,36 @@ impl<C> ExchangeAccess<C> {
 pub struct ExchangeOrder(Order);
 
 impl ExchangeOrder {
-    /// 币本位 -> 交易所下单单位，并按交易所精度取整价格与数量。
+    /// 币本位 -> 交易所下单单位，按交易所精度取整价格与数量，并校验数量下界。
     ///
-    /// 两者的取整方向**有意不同**（沿用改造前的行为，此处只是搬家）：
+    /// 取整方向**有意不同**（沿用改造前的行为，此处只是搬家）：
     /// - 数量 `round_size_down`：**向下**取整，宁可少下一点，也不超出策略意图的数量
     /// - 价格 `round_price`：取**最近**的合法 tick（`StepFormatter` 是四舍五入），因为价格
     ///   向下取整对买单是让价、对卖单是抢价，方向语义不一致，反而更难推理
-    pub fn from_domain(order: Order, meta: &SymbolMeta) -> Self {
+    ///
+    /// # 数量下界校验收口在此
+    ///
+    /// 这里是所有实盘订单的必经之路（`place_order` 只收本类型），故下界校验只此一处：
+    /// - 取整后为 0（请求量不足一个 `size_step`）：照发交易所必拒，且策略会陷入
+    ///   "下单 → 被拒 → pending 清除 → 下个事件再下"的静默重试环
+    /// - 低于 `min_order_size`（交易所最小下单量，交易所单位）：同样必拒
+    ///
+    /// 两者都在本地拦下并返回可定位的原因，由调用方反馈为 `OrderUpdate(Error)` ——
+    /// 策略能看到失败，而不是每个事件白打一次 REST。
+    pub fn from_domain(order: Order, meta: &SymbolMeta) -> Result<Self, String> {
         let quantity = meta.round_size_down(meta.coin_to_qty(order.quantity));
+        if quantity <= 0.0 {
+            return Err(format!(
+                "数量取整后为 0：请求 {} 币不足一个 size_step（step={}, contract_size={}）",
+                order.quantity, meta.size_step, meta.contract_size
+            ));
+        }
+        if quantity < meta.min_order_size {
+            return Err(format!(
+                "数量低于交易所最小下单量：取整后 {quantity}，最小 {}（交易所单位）",
+                meta.min_order_size
+            ));
+        }
         let order_type = match &order.order_type {
             OrderType::Market => OrderType::Market,
             OrderType::Limit { price, tif } => OrderType::Limit {
@@ -134,11 +156,11 @@ impl ExchangeOrder {
                 tif: *tif,
             },
         };
-        Self(Order {
+        Ok(Self(Order {
             order_type,
             quantity,
             ..order
-        })
+        }))
     }
 
     /// 交易所单位的订单内容（供各 client 组装请求）。
@@ -341,7 +363,7 @@ mod tests {
     #[test]
     fn coin_quantity_is_converted_to_contracts() {
         let order = coin_order(0.12, 62_500.0);
-        let wire = ExchangeOrder::from_domain(order, &okx_btc_meta());
+        let wire = ExchangeOrder::from_domain(order, &okx_btc_meta()).expect("合法订单");
         // 0.12 币 / 0.01 = 12 张
         assert!((wire.inner().quantity - 12.0).abs() < 1e-9);
     }
@@ -349,13 +371,13 @@ mod tests {
     #[test]
     fn quantity_rounds_down_to_size_step() {
         // 0.125 币 = 12.5 张 -> 向下取整 12 张（宁可少下，不超出策略意图）
-        let wire = ExchangeOrder::from_domain(coin_order(0.125, 62_500.0), &okx_btc_meta());
+        let wire = ExchangeOrder::from_domain(coin_order(0.125, 62_500.0), &okx_btc_meta()).expect("合法订单");
         assert!((wire.inner().quantity - 12.0).abs() < 1e-9);
     }
 
     #[test]
     fn price_is_rounded_to_exchange_tick() {
-        let wire = ExchangeOrder::from_domain(coin_order(0.12, 62_500.17), &okx_btc_meta());
+        let wire = ExchangeOrder::from_domain(coin_order(0.12, 62_500.17), &okx_btc_meta()).expect("合法订单");
         match wire.inner().order_type {
             // 价格取**最近** tick（62500.17 -> 62500.2），与数量的向下取整不同
             OrderType::Limit { price, .. } => assert!((price - 62_500.2).abs() < 1e-9),
@@ -374,8 +396,29 @@ mod tests {
             min_order_size: 0.001,
             contract_size: 1.0,
         };
-        let wire = ExchangeOrder::from_domain(coin_order(0.1234, 62_500.0), &meta);
+        let wire = ExchangeOrder::from_domain(coin_order(0.1234, 62_500.0), &meta).expect("合法订单");
         assert!((wire.inner().quantity - 0.123).abs() < 1e-9);
+    }
+
+    /// 不足一个 size_step 的量取整为 0，必须本地拒绝 —— 照发必被交易所拒，
+    /// 且策略会陷入"下单 → 被拒 → 重下"的静默重试环
+    #[test]
+    fn quantity_rounding_to_zero_is_rejected() {
+        // 0.004 币 = 0.4 张 -> 向下取整 0 张
+        let err = ExchangeOrder::from_domain(coin_order(0.004, 62_500.0), &okx_btc_meta())
+            .expect_err("取整为 0 的订单必须被拒");
+        assert!(err.contains("取整后为 0"), "got: {err}");
+    }
+
+    /// 低于交易所最小下单量同样本地拒绝（min_order_size 为交易所单位）
+    #[test]
+    fn quantity_below_min_order_size_is_rejected() {
+        let mut meta = okx_btc_meta();
+        meta.min_order_size = 5.0; // 最小 5 张
+        // 0.03 币 = 3 张 < 5 张
+        let err = ExchangeOrder::from_domain(coin_order(0.03, 62_500.0), &meta)
+            .expect_err("低于最小下单量的订单必须被拒");
+        assert!(err.contains("最小下单量"), "got: {err}");
     }
 
     /// 其余字段原样透传（方向/reduce_only/client_order_id 不属于单位换算范畴）
@@ -384,7 +427,7 @@ mod tests {
         let mut order = coin_order(0.12, 62_500.0);
         order.reduce_only = true;
         order.side = Side::Short;
-        let wire = ExchangeOrder::from_domain(order, &okx_btc_meta());
+        let wire = ExchangeOrder::from_domain(order, &okx_btc_meta()).expect("合法订单");
         assert!(wire.inner().reduce_only);
         assert_eq!(wire.inner().side, Side::Short);
         assert_eq!(wire.inner().client_order_id, "c1");
