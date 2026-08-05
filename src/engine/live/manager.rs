@@ -43,6 +43,13 @@ use kameo_actors::DeliveryStrategy;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// 等待一个 executor 有序停下的上限。
+///
+/// `ExecutorActor` 的 handler 是纯策略步进 + 往 unbounded 邮箱投递，都是亚毫秒级工作，
+/// 正常远不到这个量级。留 5 秒是为了不因偶发调度抖动就走异常分支。
+const EXECUTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
@@ -143,6 +150,37 @@ impl ManagerActor {
         )
     }
 
+    /// 有序撤下一个 executor：发出 Stop、并**等它真的停下**。
+    ///
+    /// # 为什么不能用 `kill()`
+    ///
+    /// `kill()` 产生 [`ActorStopReason::Killed`]，与"意外崩溃"在 reason 上无法区分 —— 而
+    /// `ManagerActor::on_link_died` 会把异常终止判为"子 actor 挂了"并整机退出。**有意撤下
+    /// 一个策略实例不该打死引擎**（降级正是这么做的）。`stop_gracefully()` 产生 `Normal`，
+    /// `on_link_died` 据此放行，两种情形就此可分。
+    ///
+    /// # 为什么必须等
+    ///
+    /// `stop_gracefully()` 只是投递 Stop 信号；实例会先排空邮箱才停，期间**仍可能产出订单**。
+    /// 不等就往下走（撤单 / 平仓），会出现"我们撤完单，它才把新单发出去"的竞态 —— 那张新单
+    /// 又成了无人看管的遗留挂单。
+    ///
+    /// 返回 `Err(原因)` 供调用方计入"未完成"；超时不改用 `kill()`（那会打死引擎），而是如实
+    /// 报出 —— 此时该实例已从 IncomeProcessor 注销，收不到新事件，危害有界。
+    async fn stop_executor(executor: &ActorRef<ExecutorActor>) -> Result<(), String> {
+        if let Err(e) = executor.stop_gracefully().await {
+            return Err(format!("发送 Stop 信号失败: {e}"));
+        }
+        tokio::time::timeout(EXECUTOR_STOP_TIMEOUT, executor.wait_for_shutdown())
+            .await
+            .map_err(|_| {
+                format!(
+                    "等待实例停止超时（{}s）",
+                    EXECUTOR_STOP_TIMEOUT.as_secs()
+                )
+            })
+    }
+
     /// 列出**本引擎**在该 (所, symbol) 上的挂单。
     ///
     /// 同一个交易所账户上可能还有人工下单或其他程序下的单，靠 client_order_id 的前缀识别
@@ -229,7 +267,6 @@ impl ManagerActor {
             return Ok(());
         }
 
-        let processor = self.income_processor.clone();
         let outcome_pubsub = self.outcome_pubsub.clone();
 
         // 1. 收集所有策略的订阅，并按交易所分组
@@ -257,7 +294,33 @@ impl ManagerActor {
                 .push(kind.clone());
         }
 
-        // 3. 批量创建 ExecutorActors
+        // 3. 本次涉及的 (exchange, symbol) 对（下面多步共用）
+        let exchange_symbols: HashSet<(Exchange, Symbol)> = all_subscriptions
+            .iter()
+            .map(|(exchange, kind)| (*exchange, kind.symbol().clone()))
+            .collect();
+
+        // 4. 撤掉本引擎在这些 symbol 上遗留的挂单（**不接管**）。
+        //
+        //    为什么撤而不是接管：策略的内存态重启后已经丢了 —— 比如 gamma_scalp 记着"哪张是
+        //    当前对冲单"、以及自己的 cancelling 集合。接管一张挂单还得**伪造 tif**（交易所的
+        //    订单更新不带这个信息），拿半真半假的字段去做 side_changed / qty_drift 判断。
+        //    本项目也没有队列位置模型，撤掉重挂不损失任何东西。
+        //
+        //    不撤的后果是实打实的：本地 pending 为空 → gamma_scalp 的 maintain() 走 None
+        //    分支 → 在旧单旁边**再挂一张**对冲单，而它的契约是"维护单张对冲单"。
+        //
+        //    **刻意放在创建 executor 之前**：这一步只要 client + symbol，不依赖 executor。
+        //    提前的好处是它的失败**根本不需要回滚** —— 此时还没有任何实例被建出来，
+        //    直接返回 Err 就等于"什么都没发生"。
+        for (exchange, symbol) in &exchange_symbols {
+            let Some(client) = self.clients.get(exchange) else {
+                continue;
+            };
+            Self::cancel_leftover_orders(client, *exchange, symbol).await?;
+        }
+
+        // 5. 批量创建 ExecutorActors（此刻它们还没被注册，收不到任何事件）
         let mut executor_refs = Vec::new();
         for spec in strategies {
             let account = spec.account.clone();
@@ -275,7 +338,47 @@ impl ManagerActor {
             executor_refs.push((executor_ref, account));
         }
 
-        // 4. 向 ProcessorActor 注册所有 Executor 的订阅
+        // 6. 注册并投产。**从这里开始产生副作用**，故任一步失败都要回滚已注册的实例 ——
+        //    两个调用方（bin 的 main、SupervisorActor::promote）都把 Err 理解成"什么都没
+        //    发生"：main 会退出进程（残留无所谓），而 Supervisor 会保持 live=None、以为没
+        //    晋升成功。若此时留着一个绑定 AccountId::Live 的实例在跑，它会收私有事件、会真
+        //    下单，而 Supervisor 永远不会去 demote 它 —— 无人看管的实盘实例。
+        if let Err(e) = self
+            .activate_executors(
+                &executor_refs,
+                &strategy_subscriptions,
+                &exchange_symbols,
+                exchange_subscriptions,
+            )
+            .await
+        {
+            self.rollback_executors(&executor_refs).await;
+            return Err(e);
+        }
+
+        tracing::info!(
+            count = executor_refs.len(),
+            "Strategies batch added, ExecutorActors created"
+        );
+
+        Ok(())
+    }
+
+    /// 把已创建的 executor 注册进事件流并投产：注册订阅 → 注册观测/对账范围 → 推持仓基线
+    /// → 放行行情。
+    ///
+    /// 拆成独立方法只为一件事：让 [`Self::do_add_strategies`] 能在这里失败时统一回滚，
+    /// 而不必在每个 `?` 旁边重复一遍回滚代码。
+    async fn activate_executors(
+        &mut self,
+        executor_refs: &[(ActorRef<ExecutorActor>, AccountId)],
+        strategy_subscriptions: &[HashSet<(Exchange, SubscriptionKind)>],
+        exchange_symbols: &HashSet<(Exchange, Symbol)>,
+        exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>>,
+    ) -> Result<(), ExchangeError> {
+        let processor = self.income_processor.clone();
+
+        // 6.1 向 ProcessorActor 注册各 Executor 的订阅（自此它们开始收事件）
         for ((executor_ref, account), subscriptions) in
             executor_refs.iter().zip(strategy_subscriptions.iter())
         {
@@ -288,7 +391,7 @@ impl ManagerActor {
                 .send()
                 .await
             {
-                tracing::error!(error = %e, "Failed to forward event to executor");
+                tracing::error!(error = %e, "Failed to register executor on IncomeProcessor");
             }
             self.executors.push(RegisteredExecutor {
                 executor: executor_ref.clone(),
@@ -297,15 +400,10 @@ impl ManagerActor {
             });
         }
 
-        // 收集所有策略涉及的 (exchange, symbol) 对（下面 step 5 & 6 共用）
-        let exchange_symbols: HashSet<(Exchange, Symbol)> = all_subscriptions
-            .iter()
-            .map(|(exchange, kind)| (*exchange, kind.symbol().clone()))
-            .collect();
-
-        // 4.5 告知观测层要跟踪哪些 symbol。**必须在推初始持仓之前**——否则观测层会因 symbol
-        //     未注册而丢掉启动快照，进而丢掉盈亏基线。由 manager 自己从策略订阅推导并注册，
-        //     调用方无需（也无从）关心这个时序。
+        // 6.2 告知观测层与对账层要跟踪哪些 symbol。**必须在推持仓基线之前**——否则观测层会
+        //     因 symbol 未注册而丢掉基线、进而丢掉盈亏基线；对账层的镜像里没有该 symbol 的
+        //     状态，基线也落不进去。由 manager 自己从策略订阅推导并注册，调用方无需（也无从）
+        //     关心这个时序。用 `ask` 而非 `tell`：必须确认注册完成后才继续推基线。
         {
             let symbols: Vec<Symbol> = exchange_symbols
                 .iter()
@@ -316,8 +414,6 @@ impl ManagerActor {
             if let Err(e) = self.metrics.ask(RegisterSymbols(symbols.clone())).send().await {
                 tracing::error!(error = %e, "Failed to register symbols on MetricsActor");
             }
-            // 对账层同样要先注册再收基线：镜像里没有该 symbol 的状态，基线就落不进去。
-            // 用 ask 而非 tell —— 必须确认注册完成后才继续推基线（见下方 step 5）。
             if let Err(e) = self
                 .position_reconciler
                 .ask(RegisterSymbols(symbols))
@@ -328,15 +424,14 @@ impl ManagerActor {
             }
         }
 
-        // 5. 查询各交易所初始持仓，推到 income_pubsub。**必须在 executor 注册之后、
-        //    市场订阅之前**进行——之前发布会被 BestEffort 丢，之后才发就有"开仓信号
-        //    在持仓未对齐"的窗口。对每个 (exchange, symbol) 都推一条：交易所返回的
-        //    用真实数据，未返回的推 size=0 显式清零（保证 SymbolState 一定收到初始值）。
+        // 6.3 查询各交易所初始持仓，推到 income_pubsub。**必须在 executor 注册之后、
+        //     行情放行之前**进行——之前发布会被 BestEffort 丢，之后才发就有"开仓信号在持仓
+        //     未对齐"的窗口。对每个 (exchange, symbol) 都推一条：交易所返回的用真实数据，
+        //     未返回的推 size=0 显式清零（保证 SymbolState 一定收到初始值）。
         {
             // 仅实盘账户需要：这些事件走共享 IncomePubSub，只会路由给实盘账户的 executor；
             // 模拟账户从零起步，不需要也不应该看到真实持仓
-            let exchanges: HashSet<Exchange> =
-                exchange_symbols.iter().map(|(e, _)| *e).collect();
+            let exchanges: HashSet<Exchange> = exchange_symbols.iter().map(|(e, _)| *e).collect();
             for exchange in exchanges {
                 let Some(client) = self.clients.get(&exchange) else {
                     continue;
@@ -355,19 +450,15 @@ impl ManagerActor {
                     positions.into_iter().map(|p| (p.symbol.clone(), p)).collect();
                 let local_ts = now_ms();
                 for (ex, symbol) in exchange_symbols.iter().filter(|(e, _)| *e == exchange) {
-                    let pos = position_map.get(symbol).cloned().unwrap_or(crate::domain::Position {
-                        exchange: *ex,
-                        symbol: symbol.clone(),
-                        size: 0.0,
-                        entry_price: 0.0,
-                        unrealized_pnl: 0.0,
-                    });
-                    tracing::info!(
-                        %exchange,
-                        %symbol,
-                        size = pos.size,
-                        "Initial position loaded"
-                    );
+                    let pos =
+                        position_map.get(symbol).cloned().unwrap_or(crate::domain::Position {
+                            exchange: *ex,
+                            symbol: symbol.clone(),
+                            size: 0.0,
+                            entry_price: 0.0,
+                            unrealized_pnl: 0.0,
+                        });
+                    tracing::info!(%exchange, %symbol, size = pos.size, "Initial position loaded");
                     let event = IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
@@ -385,25 +476,7 @@ impl ManagerActor {
             }
         }
 
-        // 6. 撤掉本引擎在这些 symbol 上遗留的挂单（**不接管**），在行情订阅之前完成。
-        //
-        //    为什么撤而不是接管：策略的内存态重启后已经丢了 —— 比如 gamma_scalp 记着"哪张是
-        //    当前对冲单"、以及自己的 cancelling 集合。接管一张挂单还得**伪造 tif**（交易所的
-        //    订单更新不带这个信息），拿半真半假的字段去做 side_changed / qty_drift 判断。
-        //    本项目也没有队列位置模型，撤掉重挂不损失任何东西。
-        //
-        //    不撤的后果是实打实的：本地 pending 为空 → gamma_scalp 的 maintain() 走 None
-        //    分支 → 在旧单旁边**再挂一张**对冲单，而它的契约是"维护单张对冲单"。
-        {
-            for (exchange, symbol) in &exchange_symbols {
-                let Some(client) = self.clients.get(exchange) else {
-                    continue;
-                };
-                Self::cancel_leftover_orders(client, *exchange, symbol).await?;
-            }
-        }
-
-        // 7. 批量向各 ExchangeActors 发送订阅请求（市场数据从此处开始流动）
+        // 6.4 批量向各 ExchangeActors 发送订阅请求（市场数据从此处开始流动）
         for (exchange, kinds) in exchange_subscriptions {
             if let Some(actor) = self.exchange_actors.get(&exchange) {
                 actor
@@ -413,12 +486,45 @@ impl ManagerActor {
             }
         }
 
-        tracing::info!(
-            count = executor_refs.len(),
-            "Strategies batch added, ExecutorActors created"
-        );
-
         Ok(())
+    }
+
+    /// 撤下本次刚注册的 executor，使"`AddStrategies` 返回 `Err`"等价于"没有实例在跑"。
+    ///
+    /// # 回滚的语义边界：只保证不留下无人看管的实例，**不是**恢复原状
+    ///
+    /// 下列副作用**有意不回滚**，各有理由：
+    ///
+    /// - **已发出的 `RegisterSymbols`**：对账层比对的是**事件流镜像**，与 executor 无关。
+    ///   即便策略没加上，持仓漂移仍然被监控 —— 撤掉反而是削弱安全网。观测层同理，多跟踪
+    ///   几个 symbol 只是多几行日志。
+    /// - **已推入的持仓基线**：同上，进的是对账层镜像；而被 kill 的 executor 的状态随它消失。
+    /// - **已撤掉的遗留挂单**：不可逆，**也不该逆** —— 撤掉本身就是我们要的结果。
+    /// - **已发出的行情订阅**：多订几路行情无害（没有订阅者就是丢弃）；而且别的策略实例可能
+    ///   订了同一路，贸然退订会把它们的行情一起掐掉。
+    ///
+    /// 这条边界必须写明：否则后来者会把"回滚不彻底"当成缺陷去补，反而补出问题。
+    async fn rollback_executors(&mut self, created: &[(ActorRef<ExecutorActor>, AccountId)]) {
+        let ids: HashSet<ActorId> = created.iter().map(|(r, _)| r.id()).collect();
+        for (executor, account) in created {
+            if let Err(e) = self
+                .income_processor
+                .tell(UnregisterExecutor {
+                    executor: executor.clone(),
+                })
+                .send()
+                .await
+            {
+                tracing::error!(error = %e, "回滚时注销 executor 失败");
+            }
+            if let Err(reason) = Self::stop_executor(executor).await {
+                tracing::error!(%account, %reason, "回滚时未能确认实例已停止");
+            }
+            tracing::warn!(%account, "投产失败，已撤下该策略实例");
+        }
+        // self.executors 里可能已被 6.1 推入，一并摘掉（未推入的 retain 是 no-op）
+        self.executors
+            .retain(|reg| !ids.contains(&reg.executor.id()));
     }
 }
 
@@ -796,12 +902,28 @@ impl Actor for ManagerActor {
         Ok(())
     }
 
+    /// 子 actor 终止时的处置：**区分"有意撤下"与"意外死亡"**。
+    ///
+    /// 这个区分是必需的：降级（[`RemoveStrategies`]）与投产失败回滚都会主动停掉 executor，
+    /// 若一律判为"子 actor 挂了"就会整机退出 —— 撤下一个 symbol 的实例把整个引擎带走，
+    /// 显然不是意图。
+    ///
+    /// 判据取自 kameo 的 stop reason，因此调用方**必须**用 `stop_gracefully()`（→ `Normal`）
+    /// 表达"有意撤下"，而不是 `kill()`（→ `Killed`，与崩溃无法区分）。见
+    /// [`Self::stop_executor`]。
+    ///
+    /// 其余情形（`Killed` / `Panicked` / 级联的 `LinkDied`）一律级联退出：本项目的错误处理
+    /// 约定是"不重连、不降级运行"，一个子系统失效即受控停机，交由外部编排重启。
     async fn on_link_died(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         id: ActorId,
         reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
+        if matches!(reason, ActorStopReason::Normal) {
+            tracing::info!(actor_id = ?id, "子 actor 有序停止（有意撤下），引擎继续运行");
+            return Ok(ControlFlow::Continue(()));
+        }
         tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
         Ok(ControlFlow::Break(ActorStopReason::LinkDied {
             id,
@@ -1060,7 +1182,15 @@ impl Message<RemoveStrategies> for ManagerActor {
             {
                 tracing::error!(error = %e, "Failed to unregister executor");
             }
-            reg.executor.kill();
+            // 有序停下并**等它真的停**：后面要撤单 / 平仓，不能让它在排空邮箱时又下新单
+            if let Err(reason) = Self::stop_executor(&reg.executor).await {
+                tracing::error!(
+                    account = %reg.account,
+                    %reason,
+                    "未能确认实例已停止 —— 它可能仍在产出订单"
+                );
+                incomplete.push(format!("实例未确认停止: {reason}"));
+            }
             removed += 1;
         }
         self.executors = kept;
@@ -1347,5 +1477,98 @@ mod leftover_order_tests {
             .await
             .expect_err("撤不掉必须报错");
         assert!(err.to_string().contains("ex-own"), "错误应指明是哪张单: {err}");
+    }
+}
+
+#[cfg(test)]
+mod stop_semantics_tests {
+    use super::*;
+    use kameo::error::Infallible;
+    use std::sync::Mutex;
+
+    /// 本修复依赖 kameo 的一条行为：`stop_gracefully()` 让子 actor 以
+    /// [`ActorStopReason::Normal`] 停止，而 `kill()` 以 `Killed` 停止 —— 父 actor 正是靠这个
+    /// 区分"有意撤下"与"意外死亡"。若 kameo 改了这个语义，`ManagerActor::on_link_died` 会把
+    /// 降级误判成崩溃、整机退出，而且**没有任何编译错误**。故用一对最小父子把它钉住。
+    struct Child;
+
+    impl Actor for Child {
+        type Args = ();
+        type Error = Infallible;
+        async fn on_start(_: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(Self)
+        }
+    }
+
+    /// 与 `ManagerActor::on_link_died` 同样的判据：Normal 放行、其余级联退出
+    struct Parent {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Actor for Parent {
+        type Args = Arc<Mutex<Vec<String>>>;
+        type Error = Infallible;
+        async fn on_start(args: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(Self { seen: args })
+        }
+        async fn on_link_died(
+            &mut self,
+            _: WeakActorRef<Self>,
+            id: ActorId,
+            reason: ActorStopReason,
+        ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
+            self.seen.lock().unwrap().push(format!("{reason:?}"));
+            if matches!(reason, ActorStopReason::Normal) {
+                return Ok(ControlFlow::Continue(()));
+            }
+            Ok(ControlFlow::Break(ActorStopReason::LinkDied {
+                id,
+                reason: Box::new(reason),
+            }))
+        }
+    }
+
+    async fn run_and_observe(graceful: bool) -> (bool, Vec<String>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let parent = Parent::spawn_with_mailbox(seen.clone(), mailbox::unbounded());
+        let child = Child::spawn_link_with_mailbox(&parent, (), mailbox::unbounded()).await;
+
+        if graceful {
+            child.stop_gracefully().await.expect("发送 Stop");
+        } else {
+            child.kill();
+        }
+        child.wait_for_shutdown().await;
+        // 给 parent 的 on_link_died 一点时间跑完
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let reasons = seen.lock().unwrap().clone();
+        (parent.is_alive(), reasons)
+    }
+
+    /// **有意撤下**：子 actor 以 Normal 停止，父 actor 必须活着。
+    ///
+    /// 这条对应降级（RemoveStrategies）与投产失败回滚 —— 撤下一个 symbol 的实例不该把整个
+    /// 引擎带走。
+    #[tokio::test]
+    async fn graceful_stop_reports_normal_and_parent_survives() {
+        let (parent_alive, reasons) = run_and_observe(true).await;
+        assert_eq!(
+            reasons,
+            vec!["Normal".to_string()],
+            "stop_gracefully 不再产生 Normal —— on_link_died 的区分判据失效了"
+        );
+        assert!(parent_alive, "有意撤下子 actor 却把父 actor 带走了");
+    }
+
+    /// **意外死亡**：`kill()` 以 Killed 停止，父 actor 必须级联退出。
+    ///
+    /// 这条守住另一半：WS actor 解析失败时自 kill，必须能把整机带下去（本项目的约定是
+    /// 不重连、不降级运行）。若两者都判为可继续，故障就会被静默吞掉。
+    #[tokio::test]
+    async fn killed_child_still_takes_the_parent_down() {
+        let (parent_alive, reasons) = run_and_observe(false).await;
+        assert_eq!(reasons, vec!["Killed".to_string()], "kill 的 reason 变了");
+        assert!(!parent_alive, "子 actor 异常死亡却没有级联退出");
     }
 }
