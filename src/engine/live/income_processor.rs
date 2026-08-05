@@ -344,6 +344,73 @@ mod account_isolation_tests {
         }
     }
 
+    fn position_report_event() -> IncomeEvent {
+        IncomeEvent {
+            exchange_ts: 1,
+            local_ts: 1,
+            data: ExchangeEventData::PositionReport {
+                exchange: Exchange::Binance,
+                positions: vec![crate::domain::Position {
+                    exchange: Exchange::Binance,
+                    symbol: "BTC".to_string(),
+                    size: 1.0,
+                    entry_price: 100.0,
+                    unrealized_pnl: 0.0,
+                }],
+            },
+        }
+    }
+
+    fn baseline_event() -> IncomeEvent {
+        IncomeEvent {
+            exchange_ts: 1,
+            local_ts: 1,
+            data: ExchangeEventData::PositionBaseline(crate::domain::Position {
+                exchange: Exchange::Binance,
+                symbol: "BTC".to_string(),
+                size: 1.0,
+                entry_price: 100.0,
+                unrealized_pnl: 0.0,
+            }),
+        }
+    }
+
+    /// **Critical 不变量**：持仓对账读数**绝不**投递给任何 executor。
+    ///
+    /// 它一旦进入策略的 StateManager，就绕过了「基线 + Fill」的持仓维护模型 —— 等于恢复了
+    /// 被明确否掉的"用快照覆写持仓"（会与 Fill 流重复计算同一笔成交）。这条约束此前只由
+    /// `SymbolState` 的一个分支兜着，路由层没有测试守。
+    #[test]
+    fn position_report_is_never_routed_to_executors() {
+        assert!(
+            matches!(
+                IncomeProcessorActor::event_routing(&position_report_event()),
+                EventRouting::SkipExecutors
+            ),
+            "对账读数被投递给了 executor —— 它会绕过「基线 + Fill」的持仓维护模型"
+        );
+    }
+
+    /// 对照组：持仓**基线**必须照常按 (所, symbol) 投递 —— 它正是策略持仓的起点。
+    /// 与上一条一起，钉住"两个变体虽同源但去向截然不同"。
+    #[test]
+    fn position_baseline_is_routed_by_symbol() {
+        match IncomeProcessorActor::event_routing(&baseline_event()) {
+            EventRouting::BySymbol { exchange, symbol } => {
+                assert_eq!(exchange, Exchange::Binance);
+                assert_eq!(symbol, "BTC");
+            }
+            _ => panic!("持仓基线必须按 symbol 投递，否则策略拿不到起始仓位"),
+        }
+    }
+
+    /// 两者都属账户私有：绝不能把实盘读数/基线投给模拟账户的策略
+    #[test]
+    fn both_position_variants_are_account_private() {
+        assert!(is_account_private(&position_report_event()));
+        assert!(is_account_private(&baseline_event()));
+    }
+
     /// 成交/持仓/净值属于某一个账户；行情不属于任何账户。
     /// 这条分类是账户隔离的依据 —— 分错一类，别人的仓位就会被记进自己的状态。
     #[test]

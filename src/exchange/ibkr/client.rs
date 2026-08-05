@@ -1,7 +1,8 @@
 //! IBKR ExchangeClient 实现 (仅 REST)
 
 use crate::domain::{
-    Exchange, ExchangeError, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
+    now_ms, Exchange, ExchangeError, OrderId, OrderStatus, OrderType, Side, Symbol, SymbolMeta,
+    TimeInForce,
 };
 use crate::exchange::client::{ExchangeClient, ExchangeOrder};
 use crate::exchange::ibkr::auth::IbkrAuth;
@@ -369,8 +370,125 @@ impl ExchangeClient for IbkrClient {
         Err(ExchangeError::Other("IBKR cancel_order not implemented".to_string()))
     }
 
-    async fn fetch_pending_orders(&self, _symbol: &Symbol) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
-        Ok(vec![])
+    async fn fetch_pending_orders(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
+        let Some(&target_conid) = self.conids.get(symbol) else {
+            // 未解析出 conid 的 symbol 本就下不了单，自然也不会有挂单
+            return Ok(Vec::new());
+        };
+
+        #[derive(serde::Deserialize)]
+        struct Response {
+            #[serde(default)]
+            orders: Vec<LiveOrder>,
+        }
+
+        /// `GET /iserver/account/orders` 的条目。
+        ///
+        /// 字段一律 `Option` / `default`：IBKR 对不同订单类型返回的字段集并不齐整，
+        /// 缺字段是常态而非异常，不该让整条响应解析失败 —— 那会把启动挡在门外。
+        /// 真正必需的只有 `orderId`（撤单要用）与 `conid`（定位 symbol）。
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LiveOrder {
+            #[serde(default)]
+            order_id: Option<serde_json::Value>,
+            /// 下单时带上的 client_order_id（本引擎用 `cOID` 字段传，见 `place_order`）
+            #[serde(rename = "cOID", default)]
+            coid: Option<String>,
+            #[serde(default)]
+            conid: Option<i64>,
+            #[serde(default)]
+            side: Option<String>,
+            #[serde(default)]
+            status: Option<String>,
+            #[serde(default)]
+            price: Option<f64>,
+            #[serde(default)]
+            total_size: Option<f64>,
+            #[serde(default)]
+            filled_quantity: Option<f64>,
+        }
+
+        let url = format!("{}iserver/account/orders", self.auth.base_url());
+        let resp = self
+            .authed_request("GET", &url)?
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(ExchangeError::ApiError(
+                Exchange::IBKR,
+                status.as_u16() as i32,
+                text,
+            ));
+        }
+        let body: Response = serde_json::from_str(&text).map_err(|e| {
+            ExchangeError::ParseError(format!(
+                "解析 IBKR live orders 失败: {e}; 响应: {}",
+                &text[..text.len().min(500)]
+            ))
+        })?;
+
+        let local_ts = now_ms();
+        let mut updates = Vec::new();
+        for o in body.orders {
+            if o.conid != Some(target_conid) {
+                continue;
+            }
+            // 只保留**未终结**的单：本方法的用途是"还挂在簿上的是哪些"
+            let raw_status = o.status.as_deref().unwrap_or_default();
+            let filled = o.filled_quantity.unwrap_or(0.0);
+            let order_status = match raw_status {
+                "Submitted" if filled > 0.0 => OrderStatus::PartiallyFilled { filled },
+                "PendingSubmit" | "PreSubmitted" | "Submitted" => OrderStatus::Pending,
+                // Filled / Cancelled / Inactive 等终态不属于"挂单"
+                _ => continue,
+            };
+            // IBKR 的 orderId 有时是数字、有时是字符串，两种都接
+            let order_id = match o.order_id {
+                Some(serde_json::Value::Number(n)) => n.to_string(),
+                Some(serde_json::Value::String(s)) => s,
+                _ => {
+                    // 没有 orderId 就撤不掉它 —— 这不能悄悄跳过，否则启动期撤单会
+                    // "复查通过"但实际漏了一张
+                    return Err(ExchangeError::ParseError(format!(
+                        "IBKR live order 缺少 orderId，无法撤单: conid={target_conid} status={raw_status}"
+                    )));
+                }
+            };
+            let side = match o.side.as_deref().unwrap_or_default() {
+                "BUY" | "B" => Side::Long,
+                "SELL" | "S" => Side::Short,
+                other => {
+                    tracing::warn!(side = other, %order_id, "IBKR live order 未知方向，跳过");
+                    continue;
+                }
+            };
+            updates.push(crate::domain::OrderUpdate {
+                order_id,
+                client_order_id: o.coid,
+                exchange: Exchange::IBKR,
+                symbol: symbol.clone(),
+                side,
+                status: order_status,
+                price: o.price.unwrap_or(0.0),
+                // IBKR live orders 不含 reduce-only 信息
+                reduce_only: false,
+                quantity: o.total_size.unwrap_or(0.0),
+                filled_quantity: filled,
+                // 快照没有"本次成交量"这一概念
+                fill_sz: 0.0,
+                timestamp: local_ts,
+            });
+        }
+
+        Ok(updates)
     }
 
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {

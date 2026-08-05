@@ -402,7 +402,11 @@ impl ManagerActor {
         for ((executor_ref, account), subscriptions) in
             executor_refs.iter().zip(strategy_subscriptions.iter())
         {
-            if let Err(e) = processor
+            // 注册失败必须**向上传播**，不能只打日志：注册不上的实例收不到任何事件
+            // （行情、成交、基线全无），却仍会被 push 进 self.executors 并让本函数返回 Ok ——
+            // SupervisorActor 据此认定晋升成功、置 live=Some，此后既不会重试也不会 demote，
+            // 留下一个"活着却永远收不到事件"的僵尸实例。与"返回 Ok 即已完整投产"的契约相悖。
+            processor
                 .tell(RegisterExecutor {
                     executor: executor_ref.clone(),
                     subscriptions: subscriptions.clone(),
@@ -410,9 +414,11 @@ impl ManagerActor {
                 })
                 .send()
                 .await
-            {
-                tracing::error!(error = %e, "Failed to register executor on IncomeProcessor");
-            }
+                .map_err(|e| {
+                    ExchangeError::Other(format!(
+                        "向 IncomeProcessor 注册策略实例失败（该实例将收不到任何事件）: {e}"
+                    ))
+                })?;
             self.executors.push(RegisteredExecutor {
                 executor: executor_ref.clone(),
                 account: account.clone(),
@@ -1167,6 +1173,31 @@ impl Message<RemoveStrategies> for ManagerActor {
             let hit = reg.account == msg.account
                 && targets.iter().any(|s| reg.symbols.contains(s));
             if !hit {
+                kept.push(reg);
+                continue;
+            }
+            // **拒绝部分覆盖**：实例覆盖的 symbol 必须完全落在 targets 内。
+            //
+            // 撤下一个实例就是停掉它管的**所有** symbol，而本次只会为 targets 撤单、平仓。
+            // 若实例还管着 targets 之外的 symbol，它们的挂单不撤、仓位不平，却再无实例维护
+            // —— 恰好制造出本次改动通篇要消灭的"无人看管的仓位"。而且对账层也发现不了：
+            // 基线已建、Fill 不再到达，只要交易所侧不动就永远不告警。
+            //
+            // 扩大范围去撤/平那些 symbol 同样不对：调用方没要求动它们，静默清仓更意外。
+            // 故拒绝并如实报错，让调用方把该实例的 symbol 一次性降完。
+            let uncovered: Vec<&Symbol> =
+                reg.symbols.iter().filter(|s| !targets.contains(s)).collect();
+            if !uncovered.is_empty() {
+                tracing::error!(
+                    account = %reg.account,
+                    ?targets,
+                    ?uncovered,
+                    "拒绝部分降级：该实例还管着 targets 之外的 symbol，撤下它会让那些 symbol \
+                     无人看管；请一次性降完该实例的全部 symbol"
+                );
+                incomplete.push(format!(
+                    "实例覆盖 {uncovered:?} 不在本次 targets 内，拒绝部分降级"
+                ));
                 kept.push(reg);
                 continue;
             }

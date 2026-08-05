@@ -551,6 +551,17 @@ impl ExchangeClient for BinanceClient {
             ExchangeError::ParseError(format!("Failed to parse Binance openOrders: {e}"))
         })?;
 
+        /// 数值字段解析失败即**传播**，不取默认值。
+        ///
+        /// 静默取 0 会让一张真实挂单看起来是 0 价 0 量；虽然眼下 cancel_leftover_orders 只用
+        /// order_id / client_order_id 决策、不读这几个字段，但一旦有代码开始依赖它们，
+        /// 假数据是查不出来的（与 Hyperliquid 同一方法里的处理保持一致）。
+        fn parse_field(raw: &str, field: &str) -> Result<f64, ExchangeError> {
+            raw.parse().map_err(|_| {
+                ExchangeError::ParseError(format!("Binance openOrders {field} 非法: {raw}"))
+            })
+        }
+
         let mut updates = Vec::new();
         for o in orders {
             let side = match o.side.as_str() {
@@ -561,7 +572,7 @@ impl ExchangeClient for BinanceClient {
                     continue;
                 }
             };
-            let filled: f64 = o.executed_qty.parse().unwrap_or(0.0);
+            let filled = parse_field(&o.executed_qty, "executedQty")?;
             // openOrders 只返回未终结的单，故只有这两种状态；其余按未知跳过而非猜测
             let status = match o.status.as_str() {
                 "NEW" => OrderStatus::Pending,
@@ -579,9 +590,9 @@ impl ExchangeClient for BinanceClient {
                 symbol: symbol.clone(),
                 side,
                 status,
-                price: o.price.parse().unwrap_or(0.0),
+                price: parse_field(&o.price, "price")?,
                 reduce_only: o.reduce_only,
-                quantity: o.orig_qty.parse().unwrap_or(0.0),
+                quantity: parse_field(&o.orig_qty, "origQty")?,
                 filled_quantity: filled,
                 // 快照没有"本次成交量"这一概念
                 fill_sz: 0.0,
