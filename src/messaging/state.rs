@@ -317,6 +317,21 @@ impl SymbolState {
                                     client_order_id = %client_id,
                                     "收到非本引擎挂单的更新，不纳入本地 pending"
                                 );
+                            } else if update.price <= 0.0 || update.quantity <= 0.0 {
+                                // 本引擎的单、本地无记录，但 update 的关键字段是无效值 ——
+                                // 数据不足以重建，**宁缺勿假**。真实来路：IBKR 的 sor 推送
+                                // 不含价格与数量（适配层写死 0），若照建就是一张 price=0、
+                                // qty=0 的幽灵挂单：has_pending_orders 从此恒真、策略比对
+                                // price/qty 读到 0。缺席的代价（可能重复挂单）有界且可被
+                                // 交易所拒单/风控拦住；假单的代价（symbol 永久冻结）无界。
+                                tracing::warn!(
+                                    symbol = %self.symbol,
+                                    exchange = %update.exchange,
+                                    client_order_id = %client_id,
+                                    price = update.price,
+                                    quantity = update.quantity,
+                                    "本引擎挂单确认迟到，但更新缺有效价格/数量，不重建本地 pending"
+                                );
                             } else {
                                 // 本引擎的单，但本地已无记录 —— 正常只有一种来路：下单后迟迟未获
                                 // 确认，被 remove_timed_out_orders 当作丢失清掉，之后确认才姗姗来迟。
@@ -692,5 +707,27 @@ mod tests {
         let mut state = SymbolState::new(SYMBOL.to_string());
         state.apply(&fill(Side::Short, 1.5));
         assert_eq!(state.position_size(EX), -1.5);
+    }
+
+    /// **宁缺勿假**：update 缺有效价格/数量（IBKR sor 推送写死 0）时不重建本地 pending。
+    ///
+    /// 照建就是一张 price=0、qty=0 的幽灵挂单：has_pending_orders 从此恒真、
+    /// 策略比对 price/qty 读到 0 —— symbol 被永久冻结。
+    #[test]
+    fn re_registration_requires_valid_price_and_quantity() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        let own_id = EX.new_cli_order_id();
+
+        let mut ghost = order_update(Some(own_id), OrderStatus::Pending);
+        if let ExchangeEventData::OrderUpdate(u) = &mut ghost.data {
+            u.price = 0.0;
+            u.quantity = 0.0;
+        }
+        state.apply(&ghost);
+
+        assert!(
+            !state.has_pending_orders(),
+            "price/qty 为 0 的更新被重建成了幽灵挂单"
+        );
     }
 }

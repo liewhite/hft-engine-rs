@@ -547,7 +547,16 @@ impl ExchangeClient for IbkrClient {
                     TimeInForce::GTC => "GTC",
                     TimeInForce::IOC => "IOC",
                     TimeInForce::FOK => "FOK",
-                    TimeInForce::PostOnly => "GTC",
+                    // IBKR Web API 没有 post-only 语义。此前静默映射成 GTC —— 那会把
+                    // "绝不吃单"的 maker 单变成可能立即成交的吃单，成交行为被悄悄改变
+                    // （其余三所都有对应值：GTX / post_only / Alo）。显式拒绝，让策略
+                    // 作者在选型时就知道该所不支持，而不是上线后从成交明细里发现。
+                    TimeInForce::PostOnly => {
+                        return Err(ExchangeError::Other(
+                            "IBKR 不支持 post-only（Web API 无对应 tif），拒绝把它静默降级为 GTC"
+                                .to_string(),
+                        ))
+                    }
                 };
                 ("LMT", Some(*price), tif_str)
             }
