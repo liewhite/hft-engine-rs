@@ -53,14 +53,20 @@ IOC 部分/未成交。
 
 - **`min_order_size` 未参与校验**：`SymbolMeta.min_order_size` 已解析但无人使用，
   下单只校验 USD 名义值（`min_notional`）。低于交易所最小下单量的单会被交易所拒。
-- **`cancel_order` 未实现**：Binance / Hyperliquid 的 `cancel_order` 直接返回 `Err`。
-  `spread_arb` 只用 IOC 不撤单，但缺少"挂单卡死"的兜底手段。
+  同一问题的另一面：数量按 `size_step` 向下取整可得 0，全链路无人拦截，会发出 qty=0
+  的单进入"被拒 → 重试"的静默循环。
 - **非 `Created` 状态的挂单无超时**：`SymbolState::remove_timed_out_orders` 只清理 `Created`。
   若某订单已被交易所确认（`Pending`）而终态更新丢失，该 symbol 会被 `has_pending_orders` 永久冻结。
   当前依赖"WS 断开即进程退出 + docker 重启"来兜底。
-- **`fetch_pending_orders` 对 Binance / Hyperliquid 返回空**：启动期无法同步交易所已有挂单。
-- **持仓维护为纯增量**（有意为之）：`Position` 快照只做一次初始化，之后全靠 `Fill` 累加。
-  不做运行期对账是为了避免快照与 Fill 流的竞态导致重复计算。代价是漏一条 Fill 则本地仓位永久漂移。
+- **持仓维护为增量 + 独立对账通道**：`Position` 基线一次性写入（manager 投产期点对点 +
+  总线各一条路径），之后全靠 `Fill` 累加；`PositionPollingActor` 周期性 REST 读数经
+  `PositionReconcileActor` 与「基线 + Fill」比对，连续差值稳定即停机。对账**只检测不修复**
+  （无 re-baseline / 自动平仓 / 告警外发），模拟账户与挂单不在对账范围内。
+
+已解决（记录供回溯）：
+- ~~`cancel_order` 未实现~~：四所均已实现（`e6348f1` 补齐 Binance / Hyperliquid / IBKR）。
+- ~~`fetch_pending_orders` 对 Binance / Hyperliquid 返回空~~：已实现（`e06133c`），
+  启动期/降级时用于撤掉本引擎遗留挂单。
 
 ## 三、待评估的策略想法
 
