@@ -574,6 +574,83 @@ impl WsFill {
 }
 
 #[cfg(test)]
+mod clearinghouse_tests {
+    use super::*;
+    use crate::exchange::hyperliquid::symbol::belongs_to_dex;
+
+    /// 取自 `POST /info {"type":"clearinghouseState","user":...,"dex":"xyz"}` 的**真实响应**
+    /// （2026-08 实测股票永续 dex）。
+    ///
+    /// 钉死三个此前只能靠推断的口径：
+    /// - **请求带 `dex` 时，`coin` 仍带 dex 前缀**（`xyz:NVDA`）—— 故客户端的
+    ///   [`belongs_to_dex`] 过滤是必要且正确的；若响应改成不带前缀，本测试会立刻失败，
+    ///   而不是让 `fetch_positions` 静默过滤成空、把持仓基线变成全零
+    /// - `szi` **带符号**（空头为负）
+    /// - `leverage.rawUsd` 只在逐仓时出现，`cumFunding` / `time` 是本结构未声明的额外字段
+    const REAL_CLEARINGHOUSE_STATE: &str = r#"{
+      "marginSummary": {"accountValue":"24217.394304","totalNtlPos":"12100.48",
+                        "totalRawUsd":"36317.874304","totalMarginUsed":"6385.392074"},
+      "crossMarginSummary": {"accountValue":"17832.00223","totalNtlPos":"0.0",
+                             "totalRawUsd":"17832.00223","totalMarginUsed":"0.0"},
+      "crossMaintenanceMarginUsed": "0.0",
+      "withdrawable": "17832.00223",
+      "assetPositions": [
+        {"type":"oneWay","position":{
+          "coin":"xyz:NVDA","szi":"-56.0",
+          "leverage":{"type":"isolated","value":2,"rawUsd":"18485.872074"},
+          "entryPx":"217.057","positionValue":"12100.48","unrealizedPnl":"54.765972",
+          "returnOnEquity":"0.0090110841","liquidationPx":"322.053520453",
+          "marginUsed":"6385.392074","maxLeverage":20,
+          "cumFunding":{"allTime":"-469.942577","sinceOpen":"-310.436405",
+                        "sinceChange":"-27.857483"}}}
+      ],
+      "time": 1785923125277
+    }"#;
+
+    /// 整份响应能解析（任一必需字段缺失都会让持仓基线拿不到，故整体解析必须有测试守着）
+    #[test]
+    fn real_clearinghouse_state_parses() {
+        let state: ClearinghouseState =
+            serde_json::from_str(REAL_CLEARINGHOUSE_STATE).expect("解析真实 clearinghouseState");
+
+        assert_eq!(state.margin_summary.account_value, "24217.394304");
+        assert_eq!(state.margin_summary.total_ntl_pos, "12100.48");
+        assert_eq!(state.withdrawable, "17832.00223");
+        assert_eq!(state.asset_positions.len(), 1);
+    }
+
+    /// **Critical 防线**：请求带 dex 时 coin 仍带前缀，故 `belongs_to_dex` 过滤成立。
+    ///
+    /// 若哪天响应改成不带前缀，过滤会把持仓全部滤掉 → `fetch_positions` 返回空 → 持仓基线
+    /// 变成全零、之后由 Fill 累加且永不纠正。本测试就是那道防线。
+    #[test]
+    fn coin_keeps_dex_prefix_so_filtering_works() {
+        let state: ClearinghouseState =
+            serde_json::from_str(REAL_CLEARINGHOUSE_STATE).unwrap();
+        let coin = &state.asset_positions[0].position.coin;
+
+        assert_eq!(coin, "xyz:NVDA", "响应不再带 dex 前缀，fetch_positions 的过滤会把持仓滤空");
+        assert!(belongs_to_dex(coin, "xyz"), "xyz dex 的持仓必须能通过过滤");
+        assert!(!belongs_to_dex(coin, ""), "带前缀的 coin 不属于默认 perp DEX");
+    }
+
+    /// 空头的 `szi` 带负号，折算后必须保留方向
+    #[test]
+    fn short_position_keeps_negative_sign() {
+        let state: ClearinghouseState =
+            serde_json::from_str(REAL_CLEARINGHOUSE_STATE).unwrap();
+        let position = state.asset_positions[0].position.to_position().unwrap();
+
+        assert_eq!(position.exchange, Exchange::Hyperliquid);
+        // dex 前缀由 from_hyperliquid 剥掉，得到内部 symbol
+        assert_eq!(position.symbol, "NVDA");
+        assert!((position.size - (-56.0)).abs() < 1e-9, "got {}", position.size);
+        assert!((position.entry_price - 217.057).abs() < 1e-9);
+        assert!((position.unrealized_pnl - 54.765972).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
 mod trade_tests {
     use super::*;
 
