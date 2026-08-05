@@ -195,31 +195,41 @@ impl SimState {
     // ==================== 下单到达撮合 ====================
 
     /// 订单到达撮合：按类型/TIF 决定 resting / 成交 / 拒单。
-    /// `now` 为虚拟时间，仅在无 BBO 行情时作回报事件时间戳 (修正 ox-demo 的墙钟污染)。
+    ///
+    /// # 可成交性的参考价：盘口对手价，缺盘口退化用最新成交价
+    ///
+    /// 此前只认 BBO —— trade-native 行情（默认回测路径、模拟盘只订成交流时）下：
+    /// 市价单永远被拒、PostOnly 永不被拒（穿价挂单照挂、还按 maker 费成交）、深度穿价的
+    /// GTC 挂进簿里按 limit 价成交。三者都系统性偏离真实交易所行为，且方向上一致高估
+    /// 挂单策略的收益（回测调好的参数上线即漂移）。
+    ///
+    /// 回报时间戳一律用到达时刻 `now`：此前有盘口时取"最后一条 BBO 的 ts"，行情停推时
+    /// 订单回报的时间被冻在过去，订单超时判定（按回报时间起算）随之失效。
     pub fn on_order_arrived(
         &mut self,
         now: Timestamp,
         order: &Order,
         order_id: &OrderId,
     ) -> Vec<IncomeEvent> {
-        let bbo = self.last_bbo.get(&order.symbol).cloned();
-        let ts = bbo.as_ref().map(|b| b.timestamp).unwrap_or(now);
+        // taker 参考价：对手价 > 最新成交价；两者皆无 = 无从判定可成交性
+        let reference: Option<Price> = match self.last_bbo.get(&order.symbol) {
+            Some(b) => Some(matcher::touch_price(order.side, b)),
+            None => self.last_trade.get(&order.symbol).copied(),
+        };
+        let ts = now;
         match &order.order_type {
-            OrderType::Market => match &bbo {
-                Some(b) => {
-                    let price = matcher::touch_price(order.side, b);
-                    self.fill(
-                        order_id,
-                        &order.client_order_id,
-                        &order.symbol,
-                        order.side,
-                        price,
-                        order.quantity,
-                        ts,
-                        Liquidity::Taker,
-                        order.reduce_only,
-                    )
-                }
+            OrderType::Market => match reference {
+                Some(price) => self.fill(
+                    order_id,
+                    &order.client_order_id,
+                    &order.symbol,
+                    order.side,
+                    price,
+                    order.quantity,
+                    ts,
+                    Liquidity::Taker,
+                    order.reduce_only,
+                ),
                 None => vec![status_event(
                     self.exchange,
                     order,
@@ -232,11 +242,10 @@ impl SimState {
                 )],
             },
             OrderType::Limit { price: limit, tif } => {
-                // 到达即可成交时的对手价 (None = 不可成交)。可成交性与 resting 越价同一判定 (crosses)。
-                let taker_price: Option<Price> = bbo
-                    .as_ref()
-                    .filter(|b| matcher::crosses(order.side, *limit, b))
-                    .map(|b| matcher::touch_price(order.side, b));
+                // 到达即可成交时的成交价 (None = 不可成交)。判定与 resting 越价同口径
+                // （marketable_at 含等，见 matcher）。
+                let taker_price: Option<Price> =
+                    reference.filter(|r| matcher::marketable_at(order.side, *limit, *r));
                 match tif {
                     TimeInForce::PostOnly => match taker_price {
                         Some(_) => vec![status_event(
@@ -680,6 +689,59 @@ mod tests {
         let f = fills(&evs);
         assert_eq!(f.iter().map(|x| x.price).collect::<Vec<_>>(), vec![100.0]);
         assert_eq!(s.ledger.positions[&sym()].size, 0.002);
+    }
+
+    // ===== trade-native 行情下的可成交性（参考价退化用最新成交价） =====
+
+    /// 市价单在只有成交流的行情下按最新成交价成交，不再被"无盘口"误拒
+    #[test]
+    fn market_order_fills_at_last_trade_without_bbo() {
+        let mut s = empty();
+        s.on_market(&trade_ev(100.0, 1));
+        let mut o = limit(Side::Long, 0.0, TimeInForce::GTC, "m1");
+        o.order_type = OrderType::Market;
+        let evs = s.on_order_arrived(2, &o, &"1".to_string());
+        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![100.0]);
+    }
+
+    /// **PostOnly 穿价即拒**（trade-native）：限价触及最新成交价就会吃单，真实交易所会拒。
+    /// 此前无盘口时 PostOnly 永不被拒 —— 穿价挂单照挂、下一笔 print 还按 maker 费成交，
+    /// 系统性放大 maker 策略的回测收益。
+    #[test]
+    fn postonly_crossing_last_trade_is_rejected() {
+        let mut s = empty();
+        s.on_market(&trade_ev(100.0, 1));
+        let evs = s.on_order_arrived(2, &limit(Side::Long, 100.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        assert!(
+            statuses(&evs).iter().any(|st| matches!(st, OrderStatus::Rejected { .. })),
+            "买单限价触及最新成交价，PostOnly 必须被拒: {:?}",
+            statuses(&evs)
+        );
+        assert!(s.resting.is_empty());
+    }
+
+    /// 深度穿价 GTC（trade-native）到达即按参考价 taker 成交，而不是挂进簿里等
+    /// 下一笔 print 按 limit 价收 maker 费（价格与流动性角色双错）
+    #[test]
+    fn deep_crossing_gtc_fills_as_taker_at_reference_price() {
+        let mut s = SimState::empty(EX, 10_000.0, 0.0, 0.002);
+        s.on_market(&trade_ev(100.0, 1));
+        // 买单限价 110 远高于市价 100：应立即以 100 成交、按 taker 计费
+        let evs = s.on_order_arrived(2, &limit(Side::Long, 110.0, TimeInForce::GTC, "b1"), &"1".to_string());
+        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![100.0]);
+        assert!(s.resting.is_empty(), "穿价单不该 resting");
+        near(s.ledger.cash, 10_000.0 - 100.0 * 0.002 * 0.002); // taker 费率
+    }
+
+    /// 回报时间戳用**到达时刻**：此前取"最后一条 BBO 的 ts"，行情停推时订单回报的
+    /// 时间被冻在过去，订单超时判定随之失效
+    #[test]
+    fn order_reports_are_stamped_with_arrival_time_not_stale_quote_time() {
+        let mut s = empty();
+        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1))); // 行情停在 ts=1
+        let evs = s.on_order_arrived(999, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        let ts: Vec<u64> = evs.iter().map(|e| e.local_ts).collect();
+        assert_eq!(ts, vec![999], "回报时间被冻在旧行情的 ts 上: {ts:?}");
     }
 
     // ===== 手续费 (对应 SimStateFeeSpec) =====

@@ -6,9 +6,18 @@ use crate::domain::{Price, Side, BBO};
 /// 到达撮合时的「可成交性 (marketable)」判定与此完全一致 —— 保证「不可成交即 resting、
 /// 下个 BBO 再撮合」自洽。
 pub fn crosses(side: Side, limit_price: Price, bbo: &BBO) -> bool {
+    marketable_at(side, limit_price, touch_price(side, bbo))
+}
+
+/// 限价单相对某个**参考成交价**是否可成交 (marketable，含等)。
+///
+/// 参考价的来源由调用方决定：有盘口时是对手价（此时与 [`crosses`] 完全等价），
+/// trade-native 行情下退化用最新成交价。判定含等 —— 与 BBO 口径一致，PostOnly 从严拒绝
+/// （宁可少挂，不虚增 maker 成交）。
+pub fn marketable_at(side: Side, limit_price: Price, reference: Price) -> bool {
     match side {
-        Side::Long => bbo.ask_price <= limit_price,
-        Side::Short => bbo.bid_price >= limit_price,
+        Side::Long => reference <= limit_price,
+        Side::Short => reference >= limit_price,
     }
 }
 
