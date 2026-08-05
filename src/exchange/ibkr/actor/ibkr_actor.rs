@@ -91,6 +91,7 @@ impl Actor for IbkrActor {
             &actor_ref,
             IbkrPublicWsActorArgs {
                 auth: args.auth.clone(),
+                client: args.client.clone(),
                 income_pubsub: income_pubsub.clone(),
                 conids: args.conids,
                 session_id,

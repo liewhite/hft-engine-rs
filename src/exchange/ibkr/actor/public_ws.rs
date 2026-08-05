@@ -2,7 +2,7 @@
 //!
 //! 职责:
 //! - 维护 WebSocket 连接
-//! - 处理 BBO 订阅 (smd topic)
+//! - 处理 BBO 订阅 (smd topic)：订阅前先做行情预热 (pre-flight snapshot)，见 `send_subscribe`
 //! - 处理订单状态推送 (sor topic)
 //! - 增量更新 bid/ask 缓存并发布 BBO 到 IncomePubSub
 
@@ -10,6 +10,7 @@ use crate::domain::{now_ms, Exchange, ExchangeError, Fill, OrderStatus, OrderUpd
 use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ibkr::auth::IbkrAuth;
+use crate::exchange::ibkr::client::IbkrClient;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
@@ -28,6 +29,8 @@ use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http};
 pub struct IbkrPublicWsActorArgs {
     /// 认证器 (共享，不可变)
     pub auth: Arc<dyn IbkrAuth>,
+    /// REST client (共享)：订阅前的行情预热走它的 `preflight_market_data`
+    pub client: Arc<IbkrClient>,
     /// Income PubSub (发布事件)
     pub income_pubsub: ActorRef<IncomePubSub>,
     /// conid 映射 (symbol → conid)
@@ -49,6 +52,20 @@ const MAX_SEEN_EXECUTIONS: usize = 10_000;
 /// Fill commission 等待超时 (秒)
 const FILL_COMMISSION_TIMEOUT_SECS: u64 = 3;
 
+/// BBO 订阅的 IBKR 字段 tag：84=bid_price 86=ask_price 85=ask_size 88=bid_size。
+/// 预热 (snapshot) 与流式订阅 (smd) 共用同一份，保证"预热的字段"就是"要推的字段"。
+const BBO_FIELDS: [&str; 4] = ["84", "86", "85", "88"];
+
+/// 构造 `smd` 订阅报文：`smd+{conid}+{"fields":[...]}`
+fn smd_message(conid: i64, fields: &[&str]) -> String {
+    format!("smd+{}+{}", conid, serde_json::json!({ "fields": fields }))
+}
+
+/// 构造 `umd` 退订报文
+fn umd_message(conid: i64) -> String {
+    format!("umd+{}+{{}}", conid)
+}
+
 /// 暂存的 Fill (等待 commission 到来)
 struct PendingFill {
     fill: Fill,
@@ -63,6 +80,8 @@ struct FillCommissionTimeout {
 /// IbkrPublicWsActor
 pub struct IbkrPublicWsActor {
     income_pubsub: ActorRef<IncomePubSub>,
+    /// REST client：订阅前行情预热用
+    client: Arc<IbkrClient>,
     /// conid 映射 (symbol → conid)
     conids: HashMap<String, i64>,
     /// 反向映射 (conid → symbol)
@@ -83,11 +102,21 @@ pub struct IbkrPublicWsActor {
 
 impl IbkrPublicWsActor {
     /// 发送 WebSocket 订阅消息
+    ///
+    /// **先预热再订阅**：IBKR 要求先对 conid 打一次 `/iserver/marketdata/snapshot`，IServer 才会
+    /// 开始消费该合约的实时流；未预热就发 `smd` 只能收到订阅瞬间的一份值、之后不再有增量。
+    /// 预热失败不阻断订阅（退化为预热前的行为，总比没有行情好），但留 warn 供定位。
     async fn send_subscribe(&self, conid: i64) -> Result<(), WsError> {
-        let msg = format!(
-            "smd+{}+{{\"fields\":[\"84\",\"86\",\"85\",\"88\"]}}",
-            conid
-        );
+        if let Err(e) = self.client.preflight_market_data(conid, &BBO_FIELDS).await {
+            tracing::warn!(
+                exchange = "IBKR",
+                conid,
+                error = %e,
+                "行情预热失败，仍继续 smd 订阅（该腿可能只收到一次报价、无后续增量）"
+            );
+        }
+
+        let msg = smd_message(conid, &BBO_FIELDS);
         let tx = self
             .ws_tx
             .as_ref()
@@ -99,7 +128,7 @@ impl IbkrPublicWsActor {
 
     /// 发送 WebSocket 取消订阅消息
     async fn send_unsubscribe(&self, conid: i64) -> Result<(), WsError> {
-        let msg = format!("umd+{}+{{}}", conid);
+        let msg = umd_message(conid);
         let tx = self
             .ws_tx
             .as_ref()
@@ -676,6 +705,7 @@ impl Actor for IbkrPublicWsActor {
 
         Ok(Self {
             income_pubsub: args.income_pubsub,
+            client: args.client,
             conids: args.conids,
             conid_to_symbol,
             ws_tx: Some(outgoing_tx),
@@ -857,5 +887,23 @@ fn parse_ib_number(v: &serde_json::Value) -> Option<f64> {
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smd_message_carries_requested_fields() {
+        assert_eq!(
+            smd_message(17382246, &BBO_FIELDS),
+            r#"smd+17382246+{"fields":["84","86","85","88"]}"#
+        );
+    }
+
+    #[test]
+    fn umd_message_has_empty_body() {
+        assert_eq!(umd_message(899700992), "umd+899700992+{}");
     }
 }

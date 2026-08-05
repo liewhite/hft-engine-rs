@@ -496,6 +496,19 @@ const SNAPSHOT_FIELD_BID: &str = "84";
 /// IBKR snapshot field tag: Ask Price
 const SNAPSHOT_FIELD_ASK: &str = "86";
 
+/// 构造 `/iserver/marketdata/snapshot` 的请求 URL（`base_url` 以 `/` 结尾）。
+///
+/// snapshot 与行情预热、ws 订阅共用同一 endpoint 与同一套字段 tag，故 URL 拼装收在此一处
+/// （单一数据源），避免各调用点各写一份 format!。
+fn snapshot_url(base_url: &str, conid: i64, fields: &[&str]) -> String {
+    format!(
+        "{}iserver/marketdata/snapshot?conids={}&fields={}",
+        base_url,
+        conid,
+        fields.join(",")
+    )
+}
+
 impl IbkrClient {
     /// 获取指定 symbol 的 snapshot BBO (bid, ask)
     ///
@@ -506,12 +519,10 @@ impl IbkrClient {
             ExchangeError::SymbolNotFound(Exchange::IBKR, symbol.to_string())
         })?;
 
-        let url = format!(
-            "{}iserver/marketdata/snapshot?conids={}&fields={},{}",
+        let url = snapshot_url(
             self.auth.base_url(),
-            conid,
-            SNAPSHOT_FIELD_BID,
-            SNAPSHOT_FIELD_ASK
+            *conid,
+            &[SNAPSHOT_FIELD_BID, SNAPSHOT_FIELD_ASK],
         );
 
         for attempt in 0..3u8 {
@@ -572,12 +583,7 @@ impl IbkrClient {
         conid: i64,
         fields: &[&str],
     ) -> Result<serde_json::Value, ExchangeError> {
-        let url = format!(
-            "{}iserver/marketdata/snapshot?conids={}&fields={}",
-            self.auth.base_url(),
-            conid,
-            fields.join(",")
-        );
+        let url = snapshot_url(self.auth.base_url(), conid, fields);
 
         for attempt in 0..3u8 {
             let resp = self
@@ -607,6 +613,55 @@ impl IbkrClient {
             Exchange::IBKR,
             format!("3 次尝试后仍无法获取 conid={} 的 snapshot 字段 {:?}", conid, fields),
         ))
+    }
+
+    /// 行情预热 (pre-flight)：对 conid 打一次 `/iserver/marketdata/snapshot`，让 IServer 开始
+    /// 消费该合约的实时数据流。
+    ///
+    /// IBKR 要求这个前置请求：未预热的 conid，ws `smd` 只会回一份订阅瞬间的值、之后不再推增量
+    /// （实测 KRX 腿因此每 2~3 小时才更新一次，而同会话内被 snapshot 轮询"顺带预热"的美股腿
+    /// 一直是毫秒级推送）。故 `smd` 订阅前必须先调本方法。
+    ///
+    /// 按 IBKR 文档，预热请求**本身不保证返回数据**，其价值在于服务端副作用。因此这里只要请求
+    /// 成功送达 (2xx) 即算预热完成，不校验字段就绪——真实行情由 ws 推送提供；字段是否已就绪
+    /// 只记 debug 供排查（要"拿到值"请用 `fetch_snapshot_raw`，它带重试）。
+    pub async fn preflight_market_data(
+        &self,
+        conid: i64,
+        fields: &[&str],
+    ) -> Result<(), ExchangeError> {
+        let url = snapshot_url(self.auth.base_url(), conid, fields);
+        let resp = self
+            .authed_request("GET", &url)?
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(ExchangeError::ConnectionFailed(
+                Exchange::IBKR,
+                format!("行情预热 conid={conid} 返回非成功状态 {status}: {body}"),
+            ));
+        }
+        let ready: Vec<&str> = body
+            .as_array()
+            .and_then(|arr| arr.first())
+            .map(|obj| {
+                fields
+                    .iter()
+                    .copied()
+                    .filter(|f| obj.get(*f).is_some())
+                    .collect()
+            })
+            .unwrap_or_default();
+        tracing::debug!(
+            conid,
+            requested = ?fields,
+            ?ready,
+            "IBKR 行情预热完成 (字段未就绪属正常，数据由 ws 推送)"
+        );
+        Ok(())
     }
 
     /// 直读现汇参考汇率：GET `/iserver/exchangerate?target={target}&source={source}`，返回 `rate`。
@@ -811,4 +866,25 @@ fn extract_summary_value(summary: &serde_json::Value, field_names: &[&str]) -> O
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_url_joins_fields_with_comma() {
+        assert_eq!(
+            snapshot_url("https://api.ibkr.com/v1/api/", 17382246, &["84", "86", "6509"]),
+            "https://api.ibkr.com/v1/api/iserver/marketdata/snapshot?conids=17382246&fields=84,86,6509"
+        );
+    }
+
+    #[test]
+    fn snapshot_url_single_field() {
+        assert_eq!(
+            snapshot_url("https://x/", 1, &["31"]),
+            "https://x/iserver/marketdata/snapshot?conids=1&fields=31"
+        );
+    }
 }
