@@ -524,7 +524,9 @@ impl ManagerActor {
         //
         //     如实声明残余窗口：某笔成交若已含在 REST 快照里、其 Fill 又在注册**之后**才
         //     送达，executor 会双计（快照一次 + Fill 一次）。没有交易所侧序号无法根除，
-        //     但窗口只有 REST 在途时长，且由对账通道兜底检出。
+        //     窗口只有 REST 在途时长。注意该偏差**不在对账覆盖范围内**：对账比对的是
+        //     镜像（它按快照请求时刻过滤了重放）vs 交易所读数，executor 自己的偏差没有
+        //     通道检出。
         for ((executor_ref, account), subscriptions) in
             executor_refs.iter().zip(strategy_subscriptions.iter())
         {

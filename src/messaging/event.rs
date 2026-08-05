@@ -41,6 +41,11 @@ pub enum ExchangeEventData {
     ///   生命周期内至多发布一次（降级后再晋升不重发——镜像的账本在实例撤下期间也在跟 Fill）。
     ///   路由层对 executor 是 SkipExecutors，不会与点对点那份重复。
     ///
+    /// # `exchange_ts` 的契约：快照的**请求**时刻
+    ///
+    /// 不是"交易所时间戳"。生产方（`ManagerActor` 投产期）在发起 REST 查询前取值写入；
+    /// 消费方（对账镜像）据此过滤重放：在该时刻之前送达的 Fill 必已含在快照里，重放即双计。
+    ///
     /// 在任一消费者处第二次到达即为违约（[`crate::messaging::SymbolState::apply`] 会打
     /// error 并忽略）。交易所适配层**一律不得**发布本事件。私有 WS 的持仓推送（OKX
     /// `positions`、Hyperliquid `clearinghouseState`、Binance `ACCOUNT_UPDATE.P`）都是

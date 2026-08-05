@@ -201,8 +201,9 @@ impl Reconciler {
                         let buf = self.pending_fills.entry(key.clone()).or_default();
                         buf.push(event.clone());
                         // 体量告警：基线迟迟不来（如晋升持续失败）而该腿又持续有外部成交。
-                        // 陈旧条目会在基线落地时被过滤，这里只需让堆积可见。
-                        if buf.len() >= FILL_BUFFER_WARN_LEN {
+                        // 陈旧条目会在基线落地时被过滤，这里只需让堆积可见；按阈值整倍数
+                        // 节流，避免堆积场景下日志随 Fill 线性增长。
+                        if buf.len() % FILL_BUFFER_WARN_LEN == 0 {
                             tracing::warn!(
                                 exchange = %key.0,
                                 symbol = %key.1,
