@@ -89,6 +89,10 @@ impl IbkrSnapshotPollingActor {
                     self.cfg.fee_field.as_str(),
                     MD_AVAILABILITY_FIELD,
                 ],
+                // 必需字段只声明费率：活市与冻结态都返回它；可借量在冻结态本就不返回，由下面的
+                // borrow_frozen 豁免处理。**不能把 6509 算进必需**——IBKR 总会返回它，那样重试
+                // 判据恒真、空壳会被当成拿到 (曾因此每轮报"字段缺失")。
+                &[self.cfg.fee_field.as_str()],
             )
             .await
         {

@@ -162,6 +162,11 @@ impl IbkrPublicWsActor {
     ///
     /// 任一腿刷新失败即返回 Err：调用方 kill actor → 整机退出。这条腿刷新不掉就等于 15 分钟后
     /// 静默变成死流，宁可退出重来。
+    ///
+    /// **副作用（踩过）**：IBKR 对每个 conid 只维护一份活跃字段集，snapshot 与 ws 共用它。
+    /// 因此 `umd+` 会连带清掉别的调用方在同一 conid 上注册的字段——借券 poller 请求的
+    /// 7636/7637 会在刷新后短暂消失，其 snapshot 首轮只回 BBO 字段的空壳。那边靠
+    /// `fetch_snapshot_raw` 的必需字段重试等它回来，故此处无需为它做任何特殊处理。
     async fn refresh_subscriptions(&self) -> Result<(), WsError> {
         for kind in &self.subscribed {
             let SubscriptionKind::BBO { symbol } = kind else {

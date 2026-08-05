@@ -502,6 +502,13 @@ const SNAPSHOT_FIELD_ASK: &str = "86";
 ///
 /// snapshot 与行情预热、ws 订阅共用同一 endpoint 与同一套字段 tag，故 URL 拼装收在此一处
 /// （单一数据源），避免各调用点各写一份 format!。
+/// snapshot 响应是否已带齐调用方声明的必需字段。
+///
+/// `required` 为空 = 任何响应都算就绪（诊断用途：拿到什么打什么）。
+fn snapshot_ready(obj: &serde_json::Value, required: &[&str]) -> bool {
+    required.iter().all(|f| obj.get(*f).is_some())
+}
+
 fn snapshot_url(base_url: &str, conid: i64, fields: &[&str]) -> String {
     format!(
         "{}iserver/marketdata/snapshot?conids={}&fields={}",
@@ -578,12 +585,21 @@ impl IbkrClient {
     /// 通用 snapshot：按 conid + 字段 tag 拉 `/iserver/marketdata/snapshot`，返回首个对象的原始 JSON。
     ///
     /// 字段 tag 与 conid 全由调用方给出（本方法不内置任何业务字段语义），故可用于借券费/
-    /// 可借量/外汇等任意字段——调用方自行解析。首次请求可能触发订阅、数据未就绪，故重试。
-    /// 这是 IbkrClient 上的**具体方法**，不进 ExchangeClient trait。
+    /// 可借量/外汇等任意字段——调用方自行解析。这是 IbkrClient 上的**具体方法**，不进
+    /// ExchangeClient trait。
+    ///
+    /// `required`：**由调用方声明哪些字段缺了就得重试**（IBKR 首次请求常只回订阅空壳，字段要
+    /// 下一轮才附上）。空切片 = 拿到任何响应即返回（诊断用途）。
+    ///
+    /// 为什么必须由调用方声明：本方法原先用"任意一个请求字段有值"当就绪判据，而 IBKR **总会**
+    /// 返回 `6509`（行情可用性），于是只要请求里带了 6509，判据恒真、重试形同虚设——空壳被当成
+    /// 拿到，调用方再报"字段缺失"。就绪与否是业务语义（借券腿要的是费率，冻结态可借量本就缺），
+    /// 不该由 client 猜。
     pub async fn fetch_snapshot_raw(
         &self,
         conid: i64,
         fields: &[&str],
+        required: &[&str],
     ) -> Result<serde_json::Value, ExchangeError> {
         let url = snapshot_url(self.auth.base_url(), conid, fields);
 
@@ -601,19 +617,20 @@ impl IbkrClient {
                 .cloned();
 
             if let Some(obj) = first {
-                // 至少有一个请求字段已就绪才算拿到（否则可能是订阅预热的空壳）
-                let ready = fields.iter().any(|f| obj.get(*f).is_some());
-                if ready {
+                if snapshot_ready(&obj, required) {
                     return Ok(obj);
                 }
             }
-            tracing::debug!(attempt, conid, "IBKR snapshot 字段未就绪，重试");
+            tracing::debug!(attempt, conid, ?required, "IBKR snapshot 必需字段未就绪，重试");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
 
         Err(ExchangeError::ConnectionFailed(
             Exchange::IBKR,
-            format!("3 次尝试后仍无法获取 conid={} 的 snapshot 字段 {:?}", conid, fields),
+            format!(
+                "3 次尝试后 conid={} 的 snapshot 仍缺必需字段 {:?} (请求字段 {:?})",
+                conid, required, fields
+            ),
         ))
     }
 
@@ -855,6 +872,27 @@ mod tests {
         assert_eq!(
             snapshot_url("https://api.ibkr.com/v1/api/", 17382246, &["84", "86", "6509"]),
             "https://api.ibkr.com/v1/api/iserver/marketdata/snapshot?conids=17382246&fields=84,86,6509"
+        );
+    }
+
+    #[test]
+    fn snapshot_ready_requires_all_declared_fields() {
+        let obj = serde_json::json!({"6509": "RpB", "84": "155.69", "86": "155.90"});
+        // 回归本次 bug：请求带 6509 时，旧判据 (any) 恒真 → 空壳被当成拿到、重试形同虚设
+        assert!(
+            !snapshot_ready(&obj, &["7637"]),
+            "缺必需字段必须判未就绪，即使响应里有 6509/BBO 字段"
+        );
+        assert!(!snapshot_ready(&obj, &["7636", "7637"]));
+        assert!(snapshot_ready(&obj, &["84", "86"]), "必需字段齐 → 就绪");
+    }
+
+    #[test]
+    fn snapshot_ready_with_no_required_accepts_anything() {
+        let obj = serde_json::json!({"conid": 899700992});
+        assert!(
+            snapshot_ready(&obj, &[]),
+            "诊断用途：不声明必需字段则任何响应都算就绪"
         );
     }
 
