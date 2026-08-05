@@ -1002,8 +1002,10 @@ impl Message<RemoveStrategies> for ManagerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let targets: Vec<Symbol> = msg.symbols;
-        // 平仓只对实盘账户有意义：模拟账户的仓位在本地柜台里，随账户一起留存（供继续记账）
-        let need_flatten = msg.flatten && msg.account == AccountId::Live;
+        // 交易所侧的残留（挂单 / 仓位）只有实盘账户才有：模拟账户的两者都在本地柜台里，
+        // 随账户一起留存（供继续记账）
+        let is_live = msg.account == AccountId::Live;
+        let need_flatten = msg.flatten && is_live;
 
         // 1. 先撤实例，再平仓。顺序不能反：先平仓的话，策略在收到平仓回报后可能立刻重开。
         //
@@ -1069,16 +1071,47 @@ impl Message<RemoveStrategies> for ManagerActor {
             "Removed strategy instances"
         );
 
-        if !need_flatten {
+        // 模拟账户到此为止：它的挂单与仓位都在本地柜台里，随账户一起留存（供继续记账），
+        // 交易所侧没有任何残留需要清理。
+        if !is_live {
             return Ok(());
         }
         let Some(client) = self.clients.get(&msg.exchange).cloned() else {
             return Err(ExchangeError::Other(format!(
-                "No client for {} — cannot flatten",
+                "No client for {} — 既无法撤单也无法平仓",
                 msg.exchange
             )));
         };
 
+        // 2. 撤掉遗留挂单。**位置是关键**：
+        //
+        //    - 必须在 `kill` **之后**：实例还活着时撤单，它会收到 Cancelled 回报，
+        //      gamma_scalp 那类"看到 pending 为空就补挂"的策略会立刻重新挂上来
+        //      （与上面"先撤实例再平仓"是同一个理由）；
+        //    - 必须在平仓**之前**：否则 reduce-only 平仓单下去之后，那张遗留的开仓单还可能
+        //      成交，又开出一个新仓位。
+        //
+        //    与 `flatten` 标志无关，只要是实盘账户就撤：不平仓可能是"想留着仓位人工处理"，
+        //    但留一张**会自己再开仓**的挂单没有任何合理理由 —— 那正是降级要消除的东西。
+        for symbol in &targets {
+            if let Err(e) = Self::cancel_leftover_orders(&client, msg.exchange, symbol).await {
+                tracing::error!(
+                    exchange = %msg.exchange,
+                    %symbol,
+                    error = %e,
+                    "[DEMOTE] 遗留挂单未撤净 —— 它可能成交并重新开出无人看管的仓位"
+                );
+                incomplete.push(format!("{symbol}: 遗留挂单未撤净 ({e})"));
+            }
+        }
+
+        // 3. 平仓。`to_flatten` 只在 `need_flatten` 为真时才被填充，故此处不再判一次；
+        //    用断言把这条不变量钉住 —— 将来若有人为别的目的（如日志）无条件填充它，
+        //    平仓就会在没被要求时触发。
+        debug_assert!(
+            need_flatten || to_flatten.is_empty(),
+            "未要求平仓却收集了待平仓位"
+        );
         for ((exchange, symbol), size) in to_flatten {
             let pos = crate::domain::Position {
                 exchange,
@@ -1161,5 +1194,158 @@ where
         if let Err(e) = self.paper_pubsub.tell(Subscribe(msg.0)).send().await {
             tracing::error!(error = %e, "Failed to subscribe to PaperPubSub");
         }
+    }
+}
+
+#[cfg(test)]
+mod leftover_order_tests {
+    use super::*;
+    use crate::domain::{AccountInfo, OrderId, OrderStatus, Position};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    const EX: Exchange = Exchange::Binance;
+    const SYM: &str = "BTC";
+
+    /// 只实现本组测试用到的方法；其余按"不该被调用"处理 —— 若被调用说明被测逻辑越界了，
+    /// 让它显式失败比返回一个假值更好。
+    /// 已发出的撤单记录，与 client 共享一份，供断言读取
+    type CancelLog = Arc<Mutex<Vec<OrderId>>>;
+
+    struct FakeClient {
+        /// 每次 `fetch_pending_orders` 依次返回一份；用于模拟"撤单前 / 撤单后复查"两次调用
+        pending: Mutex<VecDeque<Vec<OrderUpdate>>>,
+        cancelled: CancelLog,
+    }
+
+    impl FakeClient {
+        fn new(rounds: Vec<Vec<OrderUpdate>>) -> (Arc<dyn ExchangeClient>, CancelLog) {
+            let cancelled: CancelLog = Arc::new(Mutex::new(Vec::new()));
+            let client = Arc::new(Self {
+                pending: Mutex::new(rounds.into()),
+                cancelled: cancelled.clone(),
+            });
+            (client, cancelled)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExchangeClient for FakeClient {
+        fn exchange(&self) -> Exchange {
+            EX
+        }
+        async fn fetch_pending_orders(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<Vec<OrderUpdate>, ExchangeError> {
+            Ok(self.pending.lock().unwrap().pop_front().unwrap_or_default())
+        }
+        async fn cancel_order(
+            &self,
+            _symbol: &Symbol,
+            order_id: &OrderId,
+        ) -> Result<(), ExchangeError> {
+            self.cancelled.lock().unwrap().push(order_id.clone());
+            Ok(())
+        }
+        async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
+            unreachable!("被测逻辑不该查 symbol metas")
+        }
+        async fn fetch_symbol_meta(
+            &self,
+            _symbols: &[Symbol],
+        ) -> Result<Vec<SymbolMeta>, ExchangeError> {
+            unreachable!("被测逻辑不该查 symbol meta")
+        }
+        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+            unreachable!("撤单流程不该下单")
+        }
+        async fn set_leverage(&self, _s: &Symbol, _l: u32) -> Result<(), ExchangeError> {
+            unreachable!("撤单流程不该改杠杆")
+        }
+        async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
+            unreachable!("撤单流程不该查账户")
+        }
+        async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
+            unreachable!("撤单流程不该查持仓")
+        }
+    }
+
+    fn order(client_order_id: &str, order_id: &str) -> OrderUpdate {
+        OrderUpdate {
+            order_id: order_id.to_string(),
+            client_order_id: Some(client_order_id.to_string()),
+            exchange: EX,
+            symbol: SYM.to_string(),
+            side: Side::Long,
+            status: OrderStatus::Pending,
+            price: 100.0,
+            reduce_only: false,
+            quantity: 1.0,
+            filled_quantity: 0.0,
+            fill_sz: 0.0,
+            timestamp: 1,
+        }
+    }
+
+    /// 无 client_order_id 的挂单（人工 UI 单 / 交易所系统单）
+    fn anonymous_order(order_id: &str) -> OrderUpdate {
+        OrderUpdate {
+            client_order_id: None,
+            ..order("", order_id)
+        }
+    }
+
+    /// 没有本引擎的挂单时，一个撤单请求都不该发
+    #[tokio::test]
+    async fn nothing_to_cancel_sends_no_request() {
+        let (client, cancelled) = FakeClient::new(vec![vec![]]);
+        ManagerActor::cancel_leftover_orders(&client, EX, &SYM.to_string())
+            .await
+            .expect("空列表应直接通过");
+        assert!(cancelled.lock().unwrap().is_empty());
+    }
+
+    /// **只撤本引擎的单**：人工单 / 其他程序的单 / 无 cloid 的单都不能动。
+    /// 撤错别人的挂单是不可接受的。
+    #[tokio::test]
+    async fn only_own_orders_are_cancelled() {
+        let own = EX.new_cli_order_id();
+        let foreign = vec![
+            order("web_1a2b", "ex-foreign-1"),
+            order("android_9f8e", "ex-foreign-2"),
+            anonymous_order("ex-anon"),
+        ];
+        let mut first = foreign.clone();
+        first.push(order(&own, "ex-own"));
+
+        // 复查时只剩外部单 —— 本引擎的那张已撤掉
+        let (client, cancelled) = FakeClient::new(vec![first, foreign]);
+        ManagerActor::cancel_leftover_orders(&client, EX, &SYM.to_string())
+            .await
+            .expect("外部单残留不该导致失败");
+
+        assert_eq!(
+            *cancelled.lock().unwrap(),
+            vec!["ex-own".to_string()],
+            "只应撤掉本引擎的那一张"
+        );
+    }
+
+    /// 复查仍有本引擎的挂单 -> 拒绝启动/降级。
+    ///
+    /// 留着无人看管的挂单开跑，策略会在它旁边重复挂单；对降级而言它还可能成交、
+    /// 重新开出一个没人管的仓位。
+    #[tokio::test]
+    async fn still_present_after_cancel_is_an_error() {
+        let own = EX.new_cli_order_id();
+        let leftover = vec![order(&own, "ex-own")];
+        // 两次都返回同一张 —— 模拟撤不掉
+        let (client, _cancelled) = FakeClient::new(vec![leftover.clone(), leftover]);
+
+        let err = ManagerActor::cancel_leftover_orders(&client, EX, &SYM.to_string())
+            .await
+            .expect_err("撤不掉必须报错");
+        assert!(err.to_string().contains("ex-own"), "错误应指明是哪张单: {err}");
     }
 }
