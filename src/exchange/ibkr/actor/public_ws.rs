@@ -50,6 +50,14 @@ pub struct IbkrPublicWsActorArgs {
     pub conids: HashMap<String, i64>,
     /// tickle 返回的 session_id (用于 WS Cookie)
     pub session_id: String,
+    /// 除 BBO 之外、**同一 conid 上其他调用方需要的字段 tag**（如借券 poller 的可借量/费率/
+    /// 可用性）。
+    ///
+    /// 为什么要在这里给：IBKR 对每个 conid 只维护一份活跃字段集，snapshot 与 ws 共用它。本
+    /// actor 的 `umd+`→`smd+` 刷新会把该 conid 的字段集重建成"本次 smd 请求的那套"，别人注册
+    /// 的字段会被连带抹掉（实测每逢刷新，借券 poller 就拿到只有 BBO 字段的空壳）。故字段集必须
+    /// 是**并集**，并且由这一处（唯一重建它的地方）负责完整声明。
+    pub extra_md_fields: Vec<String>,
 }
 
 /// 每个 conid 的 BBO 缓存 (IB 推送增量数据)
@@ -68,6 +76,21 @@ const FILL_COMMISSION_TIMEOUT_SECS: u64 = 3;
 /// BBO 订阅的 IBKR 字段 tag：84=bid_price 86=ask_price 85=ask_size 88=bid_size。
 /// 预热 (snapshot) 与流式订阅 (smd) 共用同一份，保证"预热的字段"就是"要推的字段"。
 const BBO_FIELDS: [&str; 4] = ["84", "86", "85", "88"];
+
+/// 该 conid 上要注册的完整字段集 = BBO ∪ 其他调用方声明的字段（去重、保持顺序）。
+///
+/// IBKR 每个 conid 只有一份活跃字段集，而本 actor 是唯一重建它的地方（`umd+`→`smd+`），
+/// 所以这里必须给全——漏掉谁的字段，谁就会在每次刷新后拿到空壳。
+fn merge_md_fields(base: &[&str], extra: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = base.iter().map(|s| s.to_string()).collect();
+    for f in extra {
+        let f = f.trim();
+        if !f.is_empty() && !out.iter().any(|x| x == f) {
+            out.push(f.to_string());
+        }
+    }
+    out
+}
 
 /// IBKR 服务端终止 smd 订阅的时限：取两个来源里**更紧**的那个（文档 10 分钟 / 实测 15 分钟，
 /// 见模块文档）。取紧的一侧是因为代价不对称：估短了只是多刷几次（一次两条报文），估长了就是
@@ -108,6 +131,8 @@ pub struct IbkrPublicWsActor {
     conids: HashMap<String, i64>,
     /// 反向映射 (conid → symbol)
     conid_to_symbol: HashMap<i64, String>,
+    /// 该 conid 要注册的完整字段集 (BBO ∪ 他方字段)，预热与 smd 共用同一份
+    md_fields: Vec<String>,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的 kinds
@@ -132,12 +157,13 @@ impl IbkrPublicWsActor {
     /// snapshot poller 的"数据源失效即退出"同口径）：没预热的订阅是一条假活的行情线——有价、
     /// 但永远陈旧，比没有行情更危险。宁可退出重来，不留降级分支。
     async fn send_subscribe(&self, conid: i64) -> Result<(), WsError> {
+        let fields: Vec<&str> = self.md_fields.iter().map(|s| s.as_str()).collect();
         self.client
-            .preflight_market_data(conid, &BBO_FIELDS)
+            .preflight_market_data(conid, &fields)
             .await
             .map_err(|e| WsError::Network(format!("行情预热失败 conid={conid}: {e}")))?;
 
-        let msg = smd_message(conid, &BBO_FIELDS);
+        let msg = smd_message(conid, &fields);
         let tx = self
             .ws_tx
             .as_ref()
@@ -168,10 +194,10 @@ impl IbkrPublicWsActor {
     /// 任一腿刷新失败即返回 Err：调用方 kill actor → 整机退出。这条腿刷新不掉就等于服务端 TTL
     /// 到期后静默变成死流，宁可退出重来。
     ///
-    /// **副作用（踩过）**：IBKR 对每个 conid 只维护一份活跃字段集，snapshot 与 ws 共用它。
-    /// 因此 `umd+` 会连带清掉别的调用方在同一 conid 上注册的字段——借券 poller 请求的
-    /// 7636/7637 会在刷新后短暂消失，其 snapshot 首轮只回 BBO 字段的空壳。那边靠
-    /// `fetch_snapshot_raw` 的必需字段重试等它回来，故此处无需为它做任何特殊处理。
+    /// **为什么重建时要带上他方字段**：IBKR 每个 conid 只维护一份活跃字段集（snapshot 与 ws
+    /// 共用），`umd+` 会把它整个拆掉、`smd+` 按本次请求重建。曾经只重建 BBO 四字段，于是每逢
+    /// 刷新借券 poller 就拿到没有 7636/7637 的空壳。现在订阅用的是 `md_fields`（BBO ∪ 他方
+    /// 字段），刷新即把所有人的字段一起重新武装——不留"拆掉再等它自己回来"的窗口。
     async fn refresh_subscriptions(&self) -> Result<(), WsError> {
         for kind in &self.subscribed {
             let SubscriptionKind::BBO { symbol } = kind else {
@@ -771,11 +797,19 @@ impl Actor for IbkrPublicWsActor {
 
         tracing::info!("IbkrPublicWsActor started");
 
+        let md_fields = merge_md_fields(&BBO_FIELDS, &args.extra_md_fields);
+        tracing::info!(
+            exchange = "IBKR",
+            fields = ?md_fields,
+            "IBKR 行情字段集 (BBO ∪ 他方字段；IBKR 每 conid 只维护一份，故必须给全)"
+        );
+
         Ok(Self {
             income_pubsub: args.income_pubsub,
             client: args.client,
             conids: args.conids,
             conid_to_symbol,
+            md_fields,
             ws_tx: Some(outgoing_tx),
             subscribed: HashSet::new(),
             bbo_cache: HashMap::new(),
@@ -1014,6 +1048,26 @@ mod tests {
     #[test]
     fn umd_message_has_empty_body() {
         assert_eq!(umd_message(899700992), "umd+899700992+{}");
+    }
+
+    /// 订阅字段集必须是并集：漏掉他方字段 → 每次 umd+/smd+ 刷新都会把对方的字段抹掉，
+    /// 对方只能拿到空壳（线上表现为每轮一条"券源 snapshot 字段缺失"）。
+    #[test]
+    fn md_fields_union_keeps_bbo_and_appends_others() {
+        let merged = merge_md_fields(&BBO_FIELDS, &["7636".into(), "7637".into(), "6509".into()]);
+        assert_eq!(merged, ["84", "86", "85", "88", "7636", "7637", "6509"]);
+    }
+
+    #[test]
+    fn md_fields_union_dedups_and_ignores_blank() {
+        // 他方字段与 BBO 重叠 / 空串 / 带空白，都不应污染字段集
+        let merged = merge_md_fields(&BBO_FIELDS, &["84".into(), "  ".into(), " 7637 ".into()]);
+        assert_eq!(merged, ["84", "86", "85", "88", "7637"]);
+    }
+
+    #[test]
+    fn md_fields_without_extras_is_just_bbo() {
+        assert_eq!(merge_md_fields(&BBO_FIELDS, &[]), ["84", "86", "85", "88"]);
     }
 
     /// 刷新周期必须显著小于服务端 TTL——否则到期与刷新之间会出现静默断流窗口。

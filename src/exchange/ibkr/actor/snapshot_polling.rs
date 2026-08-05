@@ -323,7 +323,10 @@ fn eval_stale(
 
 /// IBKR 行情可用性字段 tag（协议常量，非账户/合约事实）。首字母表征数据类型：
 /// R=实时 / D=延迟 / Z=冻结(收盘最后值) / Y=冻结延迟 / N=未订阅。
-const MD_AVAILABILITY_FIELD: &str = "6509";
+///
+/// `pub(crate)`：ws 订阅的字段并集也要带上它（见 `IbkrPublicWsActorArgs::extra_md_fields`），
+/// 否则刷新后该 conid 的字段集里没有 6509，本 poller 就判不出冻结态。
+pub(crate) const MD_AVAILABILITY_FIELD: &str = "6509";
 
 /// 判断 snapshot 是否处于冻结态（美股休市，只余最后值，可借量 7636 不返回）。
 /// 6509 首字母 Z/Y 视为冻结；字段缺失（无法判定可用性）时保守返回 false → 强制新鲜（fail-safe）。

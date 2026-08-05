@@ -87,6 +87,20 @@ impl Actor for IbkrActor {
         // 2. 并发 spawn PublicWsActor 与 TickleActor —— 互无依赖
         //    IBKR 用同一条 WS 同时收行情和订单更新，必须握手完成再放行下游
         let income_pubsub = args.income_pubsub;
+        // IBKR 每个 conid 只维护一份活跃字段集（snapshot 与 ws 共用），而重建它的唯一地方是
+        // public_ws 的 smd 订阅/刷新。故把 snapshot poller 需要的字段一并交给它，否则每次刷新
+        // 都会把 poller 的字段抹掉、poller 只能拿到空壳（实测每 8~12 分钟一条券源字段缺失错误）。
+        let extra_md_fields = args
+            .snapshot
+            .as_ref()
+            .map(|c| {
+                vec![
+                    c.shortable_field.clone(),
+                    c.fee_field.clone(),
+                    super::snapshot_polling::MD_AVAILABILITY_FIELD.to_string(),
+                ]
+            })
+            .unwrap_or_default();
         let public_ws = IbkrPublicWsActor::spawn_link_with_mailbox(
             &actor_ref,
             IbkrPublicWsActorArgs {
@@ -95,6 +109,7 @@ impl Actor for IbkrActor {
                 income_pubsub: income_pubsub.clone(),
                 conids: args.conids,
                 session_id,
+                extra_md_fields,
             },
             mailbox::unbounded(),
         )
