@@ -9,7 +9,9 @@ use crate::domain::{
 };
 use md5::{Digest, Md5};
 use crate::exchange::client::{ExchangeClient, ExchangeOrder};
-use crate::exchange::hyperliquid::codec::{size_step, AssetCtx, AssetInfo, MetaResponse};
+use crate::exchange::hyperliquid::codec::{
+    size_step, AssetCtx, AssetInfo, ClearinghouseState, MetaResponse,
+};
 use crate::exchange::utils::SignificantFiguresFormatter;
 use std::sync::Arc;
 use crate::exchange::hyperliquid::signing::{
@@ -570,10 +572,35 @@ impl ExchangeClient for HyperliquidClient {
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
-        // Hyperliquid 通过私有 WebSocket 下发初始持仓 snapshot，REST 暂不实现。
-        // TODO: 同 OKX —— WS snapshot 抵达时若 executor 未注册，初始持仓会丢。
-        //       建议后续接 /info/clearinghouseState 改为 manager 统一推送。
-        Ok(Vec::new())
+        // 无凭证 = 只接公共行情（见 ExchangeAccess），没有账户地址可查
+        let Some(credentials) = self.credentials.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let state: ClearinghouseState = self
+            .post_info(serde_json::json!({
+                "type": "clearinghouseState",
+                "user": credentials.wallet_address,
+                "dex": self.dex,
+            }))
+            .await?;
+
+        let mut positions = Vec::new();
+        for wrapper in &state.asset_positions {
+            // **必须按 dex 过滤**：账户级接口不区分 dex，`coin` 带前缀（如 `xyz:AAPL`）。
+            // 漏掉这一步会把股票永续的持仓算进默认 perp DEX 的账本——与 fetch_funding_fees
+            // 踩过的是同一个坑（见本文件测试里的真实响应样例）。
+            if !belongs_to_dex(&wrapper.position.coin, &self.dex) {
+                continue;
+            }
+            let position = wrapper
+                .position
+                .to_position()
+                .map_err(ExchangeError::ParseError)?;
+            positions.push(position);
+        }
+
+        Ok(positions)
     }
 }
 

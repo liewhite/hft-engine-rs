@@ -249,17 +249,16 @@ impl ManagerActor {
                 let Some(client) = self.clients.get(&exchange) else {
                     continue;
                 };
-                let positions = match client.fetch_positions().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            %exchange,
-                            error = %e,
-                            "Failed to fetch initial positions on startup, proceeding without"
-                        );
-                        continue;
-                    }
-                };
+                // 拉取失败即**致命**：持仓基线只有这一次机会，之后全程靠 Fill 累加，
+                // 没有第二个来源能纠正它。跳过的后果是策略从"仓位 0"起算——若账户实际有
+                // 持仓，三道风控闸门（单边杠杆/账户杠杆/仓位上限）会全部基于错误基线放行。
+                // 宁可拒绝启动。
+                let positions = client.fetch_positions().await.map_err(|e| {
+                    ExchangeError::Other(format!(
+                        "无法获取 {exchange} 的初始持仓基线，拒绝启动（基线只有一次机会，\
+                         错了之后无从纠正）: {e}"
+                    ))
+                })?;
                 let position_map: HashMap<Symbol, crate::domain::Position> =
                     positions.into_iter().map(|p| (p.symbol.clone(), p)).collect();
                 let local_ts = now_ms();
