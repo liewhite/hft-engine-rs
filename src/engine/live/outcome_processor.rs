@@ -146,15 +146,25 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
                             //   终态是成交，其 Fill 独立更新仓位、不经 pending，合成回报
                             //   不会盖掉任何信息。
                             match client.fetch_pending_orders(&symbol).await {
-                                Ok(open_orders) => {
-                                    let still_open =
-                                        open_orders.iter().any(|o| o.order_id == order_id);
-                                    if still_open {
+                                Ok(open_orders) => match cancel_recheck_verdict(
+                                    &open_orders,
+                                    &order_id,
+                                    &client_order_id,
+                                ) {
+                                    CancelRecheckVerdict::StillOpen => {
                                         tracing::error!(
                                             %exchange, %symbol, %order_id, error = %e,
                                             "撤单失败且订单仍挂在交易所，保留本地 pending，待策略重试"
                                         );
-                                    } else {
+                                    }
+                                    CancelRecheckVerdict::Unverifiable => {
+                                        tracing::error!(
+                                            %exchange, %symbol, %order_id, error = %e,
+                                            "撤单失败且挂单列表里存在无法比对身份的挂单，\
+                                             保留本地 pending（误清活单比误留死单危险）"
+                                        );
+                                    }
+                                    CancelRecheckVerdict::Gone => {
                                         tracing::warn!(
                                             %exchange, %symbol, %order_id, error = %e,
                                             "撤单失败但订单已不在挂单列表（已成交或已撤），\
@@ -169,7 +179,7 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
                                         )
                                         .await;
                                     }
-                                }
+                                },
                                 Err(e2) => {
                                     tracing::error!(
                                         %exchange, %symbol, %order_id,
@@ -307,6 +317,48 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
     }
 }
 
+/// 撤单失败复查的判定结果
+#[derive(Debug, PartialEq, Eq)]
+enum CancelRecheckVerdict {
+    /// 订单仍挂在交易所：撤单真失败了，本地 pending 保留是正确的
+    StillOpen,
+    /// 订单确认已不在挂单列表：已终态，可合成 Cancelled 清理本地 pending
+    Gone,
+    /// 无法核实身份：列表里存在与本单无从比对的挂单，宁可保留 pending
+    Unverifiable,
+}
+
+/// 纯判定：撤单失败后，本单是否还挂在交易所上。
+///
+/// 身份匹配以 `client_order_id` 为主 —— 它是本地 pending 的键、由本引擎生成、四所的
+/// `fetch_pending_orders` 都回填；`order_id` 只作辅助且必须非空（IBKR 的推送里它可能
+/// 缺失为空串，空串与任何挂单都不相等，若以它为唯一判据，活单会被误判"已终态"）。
+///
+/// 列表里若存在"两个 id 都无法比对"的挂单（对方无 client_order_id 且本单无 order_id），
+/// 那张匿名挂单可能就是本单 —— 判为无法核实，**绝不**合成 Cancelled：误清活单的代价
+/// （策略重复下单、双重敞口）远大于误留死单（symbol 冻结，可观测、可重启恢复）。
+fn cancel_recheck_verdict(
+    open_orders: &[OrderUpdate],
+    order_id: &str,
+    client_order_id: &str,
+) -> CancelRecheckVerdict {
+    let matches = |o: &&OrderUpdate| {
+        o.client_order_id.as_deref() == Some(client_order_id)
+            || (!order_id.is_empty() && o.order_id == order_id)
+    };
+    if open_orders.iter().any(|o| matches(&o)) {
+        return CancelRecheckVerdict::StillOpen;
+    }
+    let has_anonymous = open_orders
+        .iter()
+        .any(|o| o.client_order_id.is_none() && order_id.is_empty());
+    if has_anonymous {
+        CancelRecheckVerdict::Unverifiable
+    } else {
+        CancelRecheckVerdict::Gone
+    }
+}
+
 impl OutcomeProcessorActor {
     /// 合成撤单确认回报（撤单成功、或复查确认订单已不在挂单列表时）。
     ///
@@ -384,5 +436,74 @@ impl OutcomeProcessorActor {
         {
             tracing::error!(error = %e, "Failed to publish to IncomePubSub");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_order(order_id: &str, client_order_id: Option<&str>) -> OrderUpdate {
+        OrderUpdate {
+            order_id: order_id.to_string(),
+            client_order_id: client_order_id.map(str::to_string),
+            exchange: Exchange::Binance,
+            symbol: "BTC".to_string(),
+            side: Side::Long,
+            status: OrderStatus::Pending,
+            price: 100.0,
+            reduce_only: false,
+            quantity: 1.0,
+            filled_quantity: 0.0,
+            fill_sz: 0.0,
+            timestamp: 1,
+        }
+    }
+
+    /// client_order_id 是主判据：order_id 为空（IBKR 推送可能缺失）也能认出自己的单
+    #[test]
+    fn still_open_is_detected_by_client_order_id_even_with_empty_order_id() {
+        let open = vec![open_order("777", Some("x-abc"))];
+        assert_eq!(
+            cancel_recheck_verdict(&open, "", "x-abc"),
+            CancelRecheckVerdict::StillOpen,
+            "空 order_id 时活单被误判为已终态 —— 会清掉活单的 pending，策略重复下单"
+        );
+    }
+
+    /// order_id 非空时可作辅助判据（交易所没回填 client_order_id 的场景）
+    #[test]
+    fn still_open_is_detected_by_order_id_fallback() {
+        let open = vec![open_order("777", None)];
+        assert_eq!(
+            cancel_recheck_verdict(&open, "777", "x-abc"),
+            CancelRecheckVerdict::StillOpen
+        );
+    }
+
+    /// 两个 id 都无法比对的匿名挂单在场时，绝不合成 Cancelled
+    #[test]
+    fn anonymous_open_order_with_empty_order_id_is_unverifiable() {
+        let open = vec![open_order("777", None)];
+        assert_eq!(
+            cancel_recheck_verdict(&open, "", "x-abc"),
+            CancelRecheckVerdict::Unverifiable,
+            "匿名挂单可能就是本单，判 Gone 会误清活单"
+        );
+    }
+
+    /// 列表里全部身份可比且都不匹配，才允许判定已终态
+    #[test]
+    fn gone_only_when_all_open_orders_are_identifiable_and_none_match() {
+        let open = vec![open_order("888", Some("x-other"))];
+        assert_eq!(
+            cancel_recheck_verdict(&open, "777", "x-abc"),
+            CancelRecheckVerdict::Gone
+        );
+        // 空列表：确认不在
+        assert_eq!(
+            cancel_recheck_verdict(&[], "", "x-abc"),
+            CancelRecheckVerdict::Gone
+        );
     }
 }

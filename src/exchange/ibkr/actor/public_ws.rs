@@ -347,10 +347,17 @@ impl IbkrPublicWsActor {
                 _ => continue, // 跳过非策略订单
             };
 
+            // IBKR 的 orderId 有时是数字、有时是字符串，两种都接（与 REST 侧
+            // fetch_pending_orders 同口径）。若只按 u64 解析，字符串形态会得到空
+            // order_id —— 策略拿它去撤单必失败，撤单复查还会因空 id 匹配不到任何
+            // 挂单而把活单误判成已终态。
             let order_id = item
                 .get("orderId")
-                .and_then(|v| v.as_u64())
-                .map(|v| v.to_string())
+                .map(|v| match v {
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
                 .unwrap_or_default();
 
             let ib_status = match item.get("status").and_then(|v| v.as_str()) {
