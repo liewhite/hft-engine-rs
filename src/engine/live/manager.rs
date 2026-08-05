@@ -437,17 +437,27 @@ impl ManagerActor {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
-            if let Err(e) = self.metrics.ask(RegisterSymbols(symbols.clone())).send().await {
-                tracing::error!(error = %e, "Failed to register symbols on MetricsActor");
-            }
-            if let Err(e) = self
-                .position_reconciler
+            // 注册失败必须向上传播，与 6.1 同理：对账层注册不上，该 symbol 的基线会被
+            // 镜像丢弃（is_tracked 为假），这条腿的对账通道**静默失效** —— 恰是本函数
+            // 通篇要防的"错了没人知道"。观测层同理（盈亏基线丢失，会话口径失真）。
+            self.metrics
+                .ask(RegisterSymbols(symbols.clone()))
+                .send()
+                .await
+                .map_err(|e| {
+                    ExchangeError::Other(format!(
+                        "向 MetricsActor 注册 symbol 失败（盈亏基线将丢失）: {e}"
+                    ))
+                })?;
+            self.position_reconciler
                 .ask(RegisterSymbols(symbols))
                 .send()
                 .await
-            {
-                tracing::error!(error = %e, "Failed to register symbols on PositionReconcileActor");
-            }
+                .map_err(|e| {
+                    ExchangeError::Other(format!(
+                        "向 PositionReconcileActor 注册 symbol 失败（对账通道将静默失效）: {e}"
+                    ))
+                })?;
         }
 
         // 6.3 查询各交易所初始持仓，推到 income_pubsub。**必须在 executor 注册之后、
@@ -490,14 +500,16 @@ impl ManagerActor {
                         local_ts,
                         data: ExchangeEventData::PositionBaseline(pos),
                     };
-                    if let Err(e) = self
-                        .income_pubsub
+                    // 发布失败与拉取失败等价 —— 基线没送达就是基线缺失，同样只有这一次机会
+                    self.income_pubsub
                         .tell(kameo_actors::pubsub::Publish(event))
                         .send()
                         .await
-                    {
-                        tracing::error!(error = %e, "Failed to publish initial position");
-                    }
+                        .map_err(|e| {
+                            ExchangeError::Other(format!(
+                                "发布 {exchange}/{symbol} 的持仓基线失败（基线只有一次机会）: {e}"
+                            ))
+                        })?;
                 }
             }
         }
