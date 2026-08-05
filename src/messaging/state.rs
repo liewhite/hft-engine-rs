@@ -307,9 +307,25 @@ impl SymbolState {
                                 if pending.order.id.is_empty() {
                                     pending.order.id = update.order_id.clone();
                                 }
+                            } else if !update.exchange.owns_cli_order_id(client_id) {
+                                // **不是本引擎下的单**（人工经 UI 下单、其他程序、交易所系统单）。
+                                // 接管它会让它进入策略的 pending 集合，从而影响 has_pending_orders
+                                // 等判断 —— 等于让别人的单左右本策略的动作。只记录，不接管。
+                                tracing::info!(
+                                    symbol = %self.symbol,
+                                    exchange = %update.exchange,
+                                    client_order_id = %client_id,
+                                    "收到非本引擎挂单的更新，不纳入本地 pending"
+                                );
                             } else {
-                                // 启动时同步的现有挂单，注册到 pending_orders
-                                // 外部挂单（启动/重连时交易所已存在、本地无记录）重建为 PendingOrder。
+                                // 本引擎的单，但本地已无记录 —— 正常只有一种来路：下单后迟迟未获
+                                // 确认，被 remove_timed_out_orders 当作丢失清掉，之后确认才姗姗来迟。
+                                // 这时必须重新纳入跟踪，否则它在交易所上活着、在本地却隐形，策略
+                                // 会在它旁边重复挂单。
+                                //
+                                // （启动期交易所已存在的遗留挂单**不走这条路** —— 那些由
+                                // `ManagerActor` 在启动期直接撤掉，见 `cancel_leftover_orders`。）
+                                //
                                 // 权威字段直接取自 update：side/price/quantity/reduce_only/status。
                                 // tif 无法从订单更新可靠还原，对 resting 限价单按 GTC 占位——它不参与
                                 // 后续跟踪判断（has_pending_side 看 side、gamma_scalp 看 order_type/price/qty）。
@@ -609,6 +625,65 @@ mod tests {
         // 覆写若发生，这条 Fill 会把仓位推到 4.0 之外
         state.apply(&fill(Side::Long, 1.0));
         assert_eq!(state.position_size(EX), 4.0);
+    }
+
+    // ===== 外部挂单：只接管本引擎自己的单 =====
+
+    fn order_update(client_order_id: Option<String>, status: OrderStatus) -> IncomeEvent {
+        ev(ExchangeEventData::OrderUpdate(crate::domain::OrderUpdate {
+            order_id: "ex-1".to_string(),
+            client_order_id,
+            exchange: EX,
+            symbol: SYMBOL.to_string(),
+            side: Side::Long,
+            status,
+            price: 100.0,
+            reduce_only: false,
+            quantity: 1.0,
+            filled_quantity: 0.0,
+            fill_sz: 0.0,
+            timestamp: 1,
+        }))
+    }
+
+    /// 本引擎的单在本地无记录时要重新纳入跟踪。
+    ///
+    /// 来路：下单后迟迟未获确认、被超时清理，之后确认姗姗来迟。若不重新纳入，它在交易所上
+    /// 活着、在本地却隐形，策略会在旁边重复挂单。
+    #[test]
+    fn own_order_missing_locally_is_re_registered() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        let own_id = EX.new_cli_order_id();
+
+        state.apply(&order_update(Some(own_id.clone()), OrderStatus::Pending));
+
+        let tracked: Vec<String> = state
+            .pending_orders()
+            .map(|p| p.order.client_order_id.clone())
+            .collect();
+        assert_eq!(tracked, vec![own_id]);
+    }
+
+    /// **不接管别人的单**：人工经 UI 下单 / 其他程序 / 交易所系统单。
+    ///
+    /// 接管会让它进入策略的 pending 集合，从而左右 has_pending_orders 等判断 ——
+    /// 等于让别人的挂单决定本策略的动作。
+    #[test]
+    fn foreign_order_is_not_adopted_into_pending() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+
+        // Binance 网页/App 下单的典型 client_order_id 形态
+        for foreign in ["web_1a2b3c", "android_9f8e", "x-someone-else"] {
+            state.apply(&order_update(
+                Some(foreign.to_string()),
+                OrderStatus::Pending,
+            ));
+        }
+        assert!(
+            !state.has_pending_orders(),
+            "外部挂单被接管进了本地 pending：{:?}",
+            state.pending_orders().map(|p| &p.order.client_order_id).collect::<Vec<_>>()
+        );
     }
 
     /// 没有基线时，第一条 Fill 从 0 起算（策略启动初期确实空仓）

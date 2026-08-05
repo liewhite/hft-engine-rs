@@ -17,7 +17,8 @@ use super::{
     DEFAULT_REPORT_INTERVAL_MS,
 };
 use crate::domain::{
-    now_ms, AccountId, Exchange, ExchangeError, Order, OrderType, Side, Symbol, SymbolMeta,
+    now_ms, AccountId, Exchange, ExchangeError, Order, OrderType, OrderUpdate, Side, Symbol,
+    SymbolMeta,
 };
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::exchange::binance::{
@@ -140,6 +141,82 @@ impl ManagerActor {
                 .map(|((_, s), m)| (s.clone(), m.clone()))
                 .collect(),
         )
+    }
+
+    /// 列出**本引擎**在该 (所, symbol) 上的挂单。
+    ///
+    /// 同一个交易所账户上可能还有人工下单或其他程序下的单，靠 client_order_id 的前缀识别
+    /// （见 [`Exchange::owns_cli_order_id`]）。认不出归属的一律**保留** —— 撤错别人的单
+    /// 不可接受，而漏撤会由调用方的复查兜住。
+    async fn own_pending_orders(
+        client: &Arc<dyn ExchangeClient>,
+        exchange: Exchange,
+        symbol: &Symbol,
+    ) -> Result<Vec<OrderUpdate>, ExchangeError> {
+        let all = client.fetch_pending_orders(symbol).await?;
+        Ok(all
+            .into_iter()
+            .filter(|update| match update.client_order_id.as_deref() {
+                Some(id) if exchange.owns_cli_order_id(id) => true,
+                Some(id) => {
+                    tracing::info!(
+                        %exchange, %symbol, client_order_id = id,
+                        "挂单不属于本引擎，保留不动"
+                    );
+                    false
+                }
+                None => {
+                    tracing::info!(
+                        %exchange, %symbol, order_id = %update.order_id,
+                        "挂单无 client_order_id，无法确认归属，保留不动"
+                    );
+                    false
+                }
+            })
+            .collect())
+    }
+
+    /// 撤掉本引擎在该 (所, symbol) 上遗留的挂单，并**复查确认撤净**。
+    ///
+    /// 单笔撤单失败不直接判死：它可能只是"撤之前那张单刚好成交或已被撤"这类良性竞态。
+    /// 是否真的撤净由**复查**裁定 —— 比按各所错误码猜测"是不是 order not found"可靠得多，
+    /// 也不需要为此在错误类型上增加变体。
+    ///
+    /// 复查后仍有遗留 → 返回 `Err` 拒绝启动。留着一张无人看管的挂单开跑，策略会在它旁边
+    /// 重复挂单；而启动期失败是**最便宜的失败时机**（还没开始交易）。
+    async fn cancel_leftover_orders(
+        client: &Arc<dyn ExchangeClient>,
+        exchange: Exchange,
+        symbol: &Symbol,
+    ) -> Result<(), ExchangeError> {
+        let ours = Self::own_pending_orders(client, exchange, symbol).await?;
+        if ours.is_empty() {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            %exchange, %symbol, count = ours.len(),
+            "[STARTUP] 发现本引擎遗留的挂单，全部撤掉（不接管）"
+        );
+        for order in &ours {
+            if let Err(e) = client.cancel_order(symbol, &order.order_id).await {
+                tracing::warn!(
+                    %exchange, %symbol, order_id = %order.order_id, error = %e,
+                    "撤单请求失败，由复查裁定是否真的还在"
+                );
+            }
+        }
+
+        let remaining = Self::own_pending_orders(client, exchange, symbol).await?;
+        if !remaining.is_empty() {
+            return Err(ExchangeError::Other(format!(
+                "{exchange}/{symbol}: 撤单后复查仍有 {} 张本引擎遗留挂单，拒绝启动\
+                 （留着无人看管的挂单开跑，策略会在旁边重复挂单）；order_id: {:?}",
+                remaining.len(),
+                remaining.iter().map(|o| &o.order_id).collect::<Vec<_>>()
+            )));
+        }
+        Ok(())
     }
 
     /// 批量添加策略的内部实现
@@ -308,52 +385,21 @@ impl ManagerActor {
             }
         }
 
-        // 6. 查询各交易所现有挂单，作为 OrderUpdate 推送给 executor（在行情订阅之前）
+        // 6. 撤掉本引擎在这些 symbol 上遗留的挂单（**不接管**），在行情订阅之前完成。
+        //
+        //    为什么撤而不是接管：策略的内存态重启后已经丢了 —— 比如 gamma_scalp 记着"哪张是
+        //    当前对冲单"、以及自己的 cancelling 集合。接管一张挂单还得**伪造 tif**（交易所的
+        //    订单更新不带这个信息），拿半真半假的字段去做 side_changed / qty_drift 判断。
+        //    本项目也没有队列位置模型，撤掉重挂不损失任何东西。
+        //
+        //    不撤的后果是实打实的：本地 pending 为空 → gamma_scalp 的 maintain() 走 None
+        //    分支 → 在旧单旁边**再挂一张**对冲单，而它的契约是"维护单张对冲单"。
         {
             for (exchange, symbol) in &exchange_symbols {
-                let client = match self.clients.get(exchange) {
-                    Some(c) => c,
-                    None => continue,
+                let Some(client) = self.clients.get(exchange) else {
+                    continue;
                 };
-                match client.fetch_pending_orders(symbol).await {
-                    Ok(updates) => {
-                        if !updates.is_empty() {
-                            tracing::info!(
-                                %exchange,
-                                %symbol,
-                                count = updates.len(),
-                                "Fetched existing pending orders on startup"
-                            );
-                        }
-                        let local_ts = now_ms();
-                        for update in updates {
-                            // 数量无需在此折算：ExchangeClient 的契约是返回币本位
-                            // (见 crate::domain::Quantity)，各所 client 内部已折算完毕
-                            let event = IncomeEvent {
-                                exchange_ts: local_ts,
-                                local_ts,
-                                data: ExchangeEventData::OrderUpdate(update),
-                            };
-                            // 通过 income_pubsub 广播，IncomeProcessor 会路由到对应 executor
-                            if let Err(e) = self
-                                .income_pubsub
-                                .tell(kameo_actors::pubsub::Publish(event))
-                                .send()
-                                .await
-                            {
-                                tracing::error!(error = %e, "Failed to publish existing order update");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            %exchange,
-                            %symbol,
-                            error = %e,
-                            "Failed to fetch pending orders on startup, proceeding without"
-                        );
-                    }
-                }
+                Self::cancel_leftover_orders(client, *exchange, symbol).await?;
             }
         }
 
