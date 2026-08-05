@@ -108,6 +108,20 @@ pub struct ManagerActor {
     /// 晋升/降级要求能在运行期增删实例（见 [`RemoveStrategies`]），故必须留存引用；
     /// 否则实例只能随进程生死。
     executors: Vec<RegisteredExecutor>,
+
+    /// 本 manager **主动**停掉的子 actor id；[`Self::on_link_died`] 只对这些放行。
+    ///
+    /// # 为什么记录意图，而不是从 stop reason 推断
+    ///
+    /// `ActorStopReason::Normal` 不止来自 `stop_gracefully()` —— kameo 在"邮箱所有 sender
+    /// 都被 drop"时同样报 `Normal`。而本进程里有若干子 actor 的 `ActorRef` 是当场丢弃的
+    /// （`ClockActor` / `PositionPollingActor` / 各 polling actor），它们目前靠自身
+    /// `attach_stream` 派生的任务持有强引用而存活。这条依赖一旦变化，它们就会以 `Normal`
+    /// 死掉 —— 若按 reason 放行，"时钟停了""对账停了"会被**静默忽略**，而这类失效恰恰必须
+    /// 整机退出。
+    ///
+    /// 记录意图则没有这个歧义：不在集合里的死亡一律级联退出，与 reason 无关。
+    intentionally_stopped: HashSet<ActorId>,
 }
 
 /// 一个已注册的策略实例
@@ -167,8 +181,14 @@ impl ManagerActor {
     ///
     /// 返回 `Err(原因)` 供调用方计入"未完成"；超时不改用 `kill()`（那会打死引擎），而是如实
     /// 报出 —— 此时该实例已从 IncomeProcessor 注销，收不到新事件，危害有界。
-    async fn stop_executor(executor: &ActorRef<ExecutorActor>) -> Result<(), String> {
+    async fn stop_executor(&mut self, executor: &ActorRef<ExecutorActor>) -> Result<(), String> {
+        // 先登记意图再停：`on_link_died` 据此放行（见 `intentionally_stopped` 的说明）。
+        // 必须先登记 —— 否则实例可能在登记之前就死了，那一瞬的 link 通知会被判成意外死亡。
+        self.intentionally_stopped.insert(executor.id());
         if let Err(e) = executor.stop_gracefully().await {
+            // 信号都没发出去（实例可能已经不在了），不会有 link 通知到来 —— 撤回登记，
+            // 否则集合会无谓增长。
+            self.intentionally_stopped.remove(&executor.id());
             return Err(format!("发送 Stop 信号失败: {e}"));
         }
         tokio::time::timeout(EXECUTOR_STOP_TIMEOUT, executor.wait_for_shutdown())
@@ -517,7 +537,7 @@ impl ManagerActor {
             {
                 tracing::error!(error = %e, "回滚时注销 executor 失败");
             }
-            if let Err(reason) = Self::stop_executor(executor).await {
+            if let Err(reason) = self.stop_executor(executor).await {
                 tracing::error!(%account, %reason, "回滚时未能确认实例已停止");
             }
             tracing::warn!(%account, "投产失败，已撤下该策略实例");
@@ -890,6 +910,7 @@ impl Actor for ManagerActor {
             ibkr_client: ibkr_client_ref,
             paper_pubsub,
             executors: Vec::new(),
+            intentionally_stopped: HashSet::new(),
         })
     }
 
@@ -908,20 +929,18 @@ impl Actor for ManagerActor {
     /// 若一律判为"子 actor 挂了"就会整机退出 —— 撤下一个 symbol 的实例把整个引擎带走，
     /// 显然不是意图。
     ///
-    /// 判据取自 kameo 的 stop reason，因此调用方**必须**用 `stop_gracefully()`（→ `Normal`）
-    /// 表达"有意撤下"，而不是 `kill()`（→ `Killed`，与崩溃无法区分）。见
-    /// [`Self::stop_executor`]。
-    ///
-    /// 其余情形（`Killed` / `Panicked` / 级联的 `LinkDied`）一律级联退出：本项目的错误处理
-    /// 约定是"不重连、不降级运行"，一个子系统失效即受控停机，交由外部编排重启。
+    /// 判据是 [`Self::intentionally_stopped`]（**记录**的意图），不是 stop reason（**推断**的
+    /// 意图）—— 理由见该字段的文档。因此：**只有本 manager 主动停掉的实例会被放行**，其余
+    /// 一切死亡（含以 `Normal` 结束的）都级联退出。这符合本项目的错误处理约定：不重连、
+    /// 不降级运行，一个子系统失效即受控停机，交由外部编排重启。
     async fn on_link_died(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         id: ActorId,
         reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        if matches!(reason, ActorStopReason::Normal) {
-            tracing::info!(actor_id = ?id, "子 actor 有序停止（有意撤下），引擎继续运行");
+        if self.intentionally_stopped.remove(&id) {
+            tracing::info!(actor_id = ?id, reason = ?reason, "策略实例已按预期撤下，引擎继续运行");
             return Ok(ControlFlow::Continue(()));
         }
         tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
@@ -1183,7 +1202,7 @@ impl Message<RemoveStrategies> for ManagerActor {
                 tracing::error!(error = %e, "Failed to unregister executor");
             }
             // 有序停下并**等它真的停**：后面要撤单 / 平仓，不能让它在排空邮箱时又下新单
-            if let Err(reason) = Self::stop_executor(&reg.executor).await {
+            if let Err(reason) = self.stop_executor(&reg.executor).await {
                 tracing::error!(
                     account = %reg.account,
                     %reason,
@@ -1486,10 +1505,10 @@ mod stop_semantics_tests {
     use kameo::error::Infallible;
     use std::sync::Mutex;
 
-    /// 本修复依赖 kameo 的一条行为：`stop_gracefully()` 让子 actor 以
-    /// [`ActorStopReason::Normal`] 停止，而 `kill()` 以 `Killed` 停止 —— 父 actor 正是靠这个
-    /// 区分"有意撤下"与"意外死亡"。若 kameo 改了这个语义，`ManagerActor::on_link_died` 会把
-    /// 降级误判成崩溃、整机退出，而且**没有任何编译错误**。故用一对最小父子把它钉住。
+    /// 复刻 `ManagerActor::on_link_died` 的路由规则，验证其**判据本身**。
+    ///
+    /// 用一对最小父子而非真 `ManagerActor`：后者的 `on_start` 要联网建 client、拉 symbol
+    /// metas，无法在单测里起来。
     struct Child;
 
     impl Actor for Child {
@@ -1500,16 +1519,20 @@ mod stop_semantics_tests {
         }
     }
 
-    /// 与 `ManagerActor::on_link_died` 同样的判据：Normal 放行、其余级联退出
     struct Parent {
+        /// 与 `ManagerActor::intentionally_stopped` 同义
+        intentionally_stopped: HashSet<ActorId>,
         seen: Arc<Mutex<Vec<String>>>,
     }
 
     impl Actor for Parent {
-        type Args = Arc<Mutex<Vec<String>>>;
+        type Args = (HashSet<ActorId>, Arc<Mutex<Vec<String>>>);
         type Error = Infallible;
         async fn on_start(args: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
-            Ok(Self { seen: args })
+            Ok(Self {
+                intentionally_stopped: args.0,
+                seen: args.1,
+            })
         }
         async fn on_link_died(
             &mut self,
@@ -1518,7 +1541,8 @@ mod stop_semantics_tests {
             reason: ActorStopReason,
         ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
             self.seen.lock().unwrap().push(format!("{reason:?}"));
-            if matches!(reason, ActorStopReason::Normal) {
+            // 与 ManagerActor 一致：按**记录的意图**放行，而非 stop reason
+            if self.intentionally_stopped.remove(&id) {
                 return Ok(ControlFlow::Continue(()));
             }
             Ok(ControlFlow::Break(ActorStopReason::LinkDied {
@@ -1528,11 +1552,21 @@ mod stop_semantics_tests {
         }
     }
 
-    async fn run_and_observe(graceful: bool) -> (bool, Vec<String>) {
+    /// `intended` 决定父 actor 是否事先登记了"要停这个子 actor"
+    async fn run(intended: bool, graceful: bool) -> (bool, Vec<String>) {
+        // 登记的 id 必须与真正被停的那个一致，故先 spawn parent（空集合），拿到 child 的 id
+        // 之后再按需告知 parent。
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let parent = Parent::spawn_with_mailbox(seen.clone(), mailbox::unbounded());
+        let parent = Parent::spawn_with_mailbox((HashSet::new(), seen.clone()), mailbox::unbounded());
         let child = Child::spawn_link_with_mailbox(&parent, (), mailbox::unbounded()).await;
 
+        if intended {
+            parent
+                .ask(RegisterIntent(child.id()))
+                .send()
+                .await
+                .expect("登记意图");
+        }
         if graceful {
             child.stop_gracefully().await.expect("发送 Stop");
         } else {
@@ -1546,29 +1580,46 @@ mod stop_semantics_tests {
         (parent.is_alive(), reasons)
     }
 
-    /// **有意撤下**：子 actor 以 Normal 停止，父 actor 必须活着。
+    struct RegisterIntent(ActorId);
+
+    impl Message<RegisterIntent> for Parent {
+        type Reply = ();
+        async fn handle(&mut self, msg: RegisterIntent, _: &mut Context<Self, Self::Reply>) {
+            self.intentionally_stopped.insert(msg.0);
+        }
+    }
+
+    /// **有意撤下**（已登记）→ 父 actor 必须活着。
     ///
-    /// 这条对应降级（RemoveStrategies）与投产失败回滚 —— 撤下一个 symbol 的实例不该把整个
-    /// 引擎带走。
+    /// 对应降级（RemoveStrategies）与投产失败回滚：撤下一个 symbol 的实例不该把整个引擎带走。
     #[tokio::test]
-    async fn graceful_stop_reports_normal_and_parent_survives() {
-        let (parent_alive, reasons) = run_and_observe(true).await;
-        assert_eq!(
-            reasons,
-            vec!["Normal".to_string()],
-            "stop_gracefully 不再产生 Normal —— on_link_died 的区分判据失效了"
-        );
+    async fn intentional_stop_lets_the_parent_survive() {
+        let (parent_alive, reasons) = run(true, true).await;
+        assert_eq!(reasons, vec!["Normal".to_string()]);
         assert!(parent_alive, "有意撤下子 actor 却把父 actor 带走了");
     }
 
-    /// **意外死亡**：`kill()` 以 Killed 停止，父 actor 必须级联退出。
+    /// **Critical 防线**：没登记过的死亡，即使 reason 是 `Normal`，也必须级联退出。
     ///
-    /// 这条守住另一半：WS actor 解析失败时自 kill，必须能把整机带下去（本项目的约定是
-    /// 不重连、不降级运行）。若两者都判为可继续，故障就会被静默吞掉。
+    /// 这是"记录意图"相对"按 reason 推断"的全部价值所在：kameo 在"邮箱所有 sender 被 drop"
+    /// 时同样报 `Normal`，而本进程里 ClockActor / PositionPollingActor / 各 polling actor 的
+    /// ActorRef 都是当场丢弃、靠自身 attach_stream 的任务持引用存活的。那条依赖一旦变化，
+    /// 它们会以 Normal 死掉 —— 若按 reason 放行，"时钟停了""对账停了"就被静默忽略了。
     #[tokio::test]
-    async fn killed_child_still_takes_the_parent_down() {
-        let (parent_alive, reasons) = run_and_observe(false).await;
-        assert_eq!(reasons, vec!["Killed".to_string()], "kill 的 reason 变了");
+    async fn unexpected_normal_stop_still_takes_the_parent_down() {
+        let (parent_alive, reasons) = run(false, true).await;
+        assert_eq!(reasons, vec!["Normal".to_string()], "前提：这次确实是 Normal 停止");
+        assert!(
+            !parent_alive,
+            "非预期的子 actor 停止被静默放行了 —— 时钟/对账停摆会就此无人知晓"
+        );
+    }
+
+    /// 意外死亡（kill）→ 级联退出。守住"WS 解析失败自 kill 即整机受控停机"这条既有约定。
+    #[tokio::test]
+    async fn killed_child_takes_the_parent_down() {
+        let (parent_alive, reasons) = run(false, false).await;
+        assert_eq!(reasons, vec!["Killed".to_string()]);
         assert!(!parent_alive, "子 actor 异常死亡却没有级联退出");
     }
 }
