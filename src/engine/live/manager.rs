@@ -9,7 +9,8 @@
 use super::{
     AccountIncome, AccountOutcome, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
     PaperCounterActor, PaperCounterArgs, PaperPubSub,
-    IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor,
+    GetPositions, IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub,
+    OutcomeProcessorActor,
     PositionPollingActor, PositionPollingActorArgs, PositionReconcileActor, PositionReconcileArgs,
     RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, UnregisterExecutor,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
@@ -955,16 +956,44 @@ impl Message<RemoveStrategies> for ManagerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let targets: Vec<Symbol> = msg.symbols;
+        // 平仓只对实盘账户有意义：模拟账户的仓位在本地柜台里，随账户一起留存（供继续记账）
+        let need_flatten = msg.flatten && msg.account == AccountId::Live;
 
         // 1. 先撤实例，再平仓。顺序不能反：先平仓的话，策略在收到平仓回报后可能立刻重开。
+        //
+        //    平仓量取自 executor 的**本地持仓**，且必须在 `kill` 之前问 —— kill 之后它不再
+        //    消费事件、状态就停更了。不走 REST：持仓由「基线 + Fill」维护，REST 在本项目里
+        //    只作对账（见 PositionReconcileActor）；且本地值比 REST 快照更新（后者可能落后于
+        //    最新到达的 Fill）。真出现本地与交易所不一致时，对账层会先致命退出，走不到这里。
         let mut removed = 0usize;
         let mut kept = Vec::new();
+        // 按 (所, symbol) 去重：同一 symbol 若有多个实例，它们看到的是同一份交易所持仓，
+        // 累加会把平仓量翻倍（reduce-only 虽能兜住，但下单量本身就该是对的）
+        let mut to_flatten: HashMap<(Exchange, Symbol), f64> = HashMap::new();
         for reg in std::mem::take(&mut self.executors) {
             let hit = reg.account == msg.account
                 && targets.iter().any(|s| reg.symbols.contains(s));
             if !hit {
                 kept.push(reg);
                 continue;
+            }
+            if need_flatten {
+                match reg
+                    .executor
+                    .ask(GetPositions(targets.clone()))
+                    .send()
+                    .await
+                {
+                    Ok(positions) => {
+                        for pos in positions {
+                            to_flatten.insert((pos.exchange, pos.symbol), pos.size);
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        error = %e,
+                        "取 executor 本地持仓失败，该实例的仓位无法平掉，需人工介入"
+                    ),
+                }
             }
             if let Err(e) = self
                 .income_processor
@@ -987,12 +1016,7 @@ impl Message<RemoveStrategies> for ManagerActor {
             "Removed strategy instances"
         );
 
-        if !msg.flatten {
-            return Ok(());
-        }
-
-        // 2. 平仓只对实盘账户有意义：模拟账户的仓位在本地柜台里，随账户一起留存（供继续记账）
-        if msg.account != AccountId::Live {
+        if !need_flatten {
             return Ok(());
         }
         let Some(client) = self.clients.get(&msg.exchange).cloned() else {
@@ -1002,10 +1026,17 @@ impl Message<RemoveStrategies> for ManagerActor {
             )));
         };
 
-        // 仓位以交易所为准：本地状态可能因撤下实例而不再更新
-        let positions = client.fetch_positions().await?;
-        for pos in positions {
-            if !targets.contains(&pos.symbol) || pos.is_empty() {
+        for ((exchange, symbol), size) in to_flatten {
+            let pos = crate::domain::Position {
+                exchange,
+                symbol,
+                size,
+                // 平仓只需要方向与数量；均价/浮盈在此无意义，不伪造
+                entry_price: 0.0,
+                unrealized_pnl: 0.0,
+            };
+            // 只平下到本次指定交易所的那些腿；空仓判据用 domain 的口径，不另写一份比较
+            if exchange != msg.exchange || pos.is_empty() {
                 continue;
             }
             let Some(meta) = self.symbol_metas.get(&(msg.exchange, pos.symbol.clone())) else {

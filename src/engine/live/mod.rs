@@ -55,7 +55,7 @@ pub type OutcomePubSub = PubSub<AccountOutcome>;
 pub use clock::{ClockActor, ClockActorArgs};
 pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
 pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, GetIbkrClient, PublishIncome, ManagerActor, ManagerActorArgs, Stop, SubscribeIncome, SubscribeOutcome, SubscribePaper, StrategySpec, RemoveStrategies};
-pub use executor::{ExecutorActor, ExecutorArgs};
+pub use executor::{ExecutorActor, ExecutorArgs, GetPositions};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor, UnregisterExecutor};
 pub use metrics::{MetricsActor, MetricsActorArgs, RegisterSymbols, DEFAULT_REPORT_INTERVAL_MS};
 pub use outcome_processor::{OutcomeProcessorActor, OutcomeProcessorArgs};
