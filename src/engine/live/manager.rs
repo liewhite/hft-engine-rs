@@ -970,6 +970,10 @@ impl Message<RemoveStrategies> for ManagerActor {
         // 按 (所, symbol) 去重：同一 symbol 若有多个实例，它们看到的是同一份交易所持仓，
         // 累加会把平仓量翻倍（reduce-only 虽能兜住，但下单量本身就该是对的）
         let mut to_flatten: HashMap<(Exchange, Symbol), f64> = HashMap::new();
+        // 未能完成的部分：**必须向调用方传播**。SupervisorActor 收到 Ok 就会把 live 置为
+        // None、认为已干净降级，而实盘可能仍有未平的仓位且此后无人看管 —— 那正是
+        // supervisor 自己写下的"谎报已关闭比撤下失败更危险"。
+        let mut incomplete: Vec<String> = Vec::new();
         for reg in std::mem::take(&mut self.executors) {
             let hit = reg.account == msg.account
                 && targets.iter().any(|s| reg.symbols.contains(s));
@@ -989,10 +993,13 @@ impl Message<RemoveStrategies> for ManagerActor {
                             to_flatten.insert((pos.exchange, pos.symbol), pos.size);
                         }
                     }
-                    Err(e) => tracing::error!(
-                        error = %e,
-                        "取 executor 本地持仓失败，该实例的仓位无法平掉，需人工介入"
-                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "取 executor 本地持仓失败，该实例的仓位无法平掉"
+                        );
+                        incomplete.push(format!("取本地持仓失败: {e}"));
+                    }
                 }
             }
             if let Err(e) = self
@@ -1045,6 +1052,7 @@ impl Message<RemoveStrategies> for ManagerActor {
                     symbol = %pos.symbol,
                     "No SymbolMeta — cannot flatten (数量无法折算为交易所单位)"
                 );
+                incomplete.push(format!("{}: 缺 SymbolMeta", pos.symbol));
                 continue;
             };
             // 反向 reduce-only 市价单：撮合层强制不反向开仓，量算多了也只会平到 0
@@ -1071,9 +1079,20 @@ impl Message<RemoveStrategies> for ManagerActor {
                 tracing::error!(
                     symbol = %pos.symbol,
                     error = %e,
-                    "平仓下单失败 —— 实盘仍有敞口，需人工介入"
+                    "平仓下单失败 —— 实盘仍有敞口"
                 );
+                incomplete.push(format!("{}: 平仓下单失败 ({e})", pos.symbol));
             }
+        }
+
+        if !incomplete.is_empty() {
+            // 实例已撤下但仓位没平干净：向上报错，让调用方保留"实盘仍开着"的记账状态。
+            // 说成功会让 SupervisorActor 忘掉这个 symbol，敞口就此无人看管。
+            return Err(ExchangeError::Other(format!(
+                "降级未完成，{} 上仍可能有未平敞口，需人工核对: {}",
+                msg.exchange,
+                incomplete.join("; ")
+            )));
         }
         Ok(())
     }

@@ -600,6 +600,25 @@ impl ExchangeClient for HyperliquidClient {
             positions.push(position);
         }
 
+        // 守卫「响应非空、却被过滤得一个不剩」：这是 dex 前缀口径与预期不符的征兆
+        // （例如请求里已带 dex，响应便不再给 coin 加前缀）。
+        //
+        // 之所以要显式报出来：本方法是持仓基线的**唯一**来源，静默返回空 Vec 会让基线变成
+        // 全零、且此后由 Fill 累加、永不纠正 —— 正是本项目刚修掉的那类静默错账。宁可刺眼。
+        if positions.is_empty() && !state.asset_positions.is_empty() {
+            return Err(ExchangeError::ParseError(format!(
+                "Hyperliquid clearinghouseState 返回 {} 个持仓，但按 dex=\"{}\" 过滤后一个不剩；\
+                 疑似 coin 前缀口径与预期不符（实得: {:?}）。持仓基线不能以空 Vec 蒙混过去。",
+                state.asset_positions.len(),
+                self.dex,
+                state
+                    .asset_positions
+                    .iter()
+                    .map(|w| w.position.coin.as_str())
+                    .collect::<Vec<_>>(),
+            )));
+        }
+
         Ok(positions)
     }
 }
