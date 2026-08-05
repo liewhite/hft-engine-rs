@@ -327,6 +327,35 @@ impl HyperliquidClient {
         })
     }
 
+    /// 查某个 `oid` 的 `cloid`（`POST /info` `type: "orderStatus"`）。
+    ///
+    /// # 为什么要单独一次请求
+    ///
+    /// HL 的挂单列表接口（`openOrders` / `frontendOpenOrders`）**都不返回 `cloid`**，而
+    /// 归属判定必须有它 —— 启动期撤掉遗留挂单时，撤错别人的单是不可接受的。`orderStatus`
+    /// 是能按 oid 拿到 `cloid` 的接口。
+    ///
+    /// 响应是**双层嵌套**（2026-08 实测）：
+    /// `{"status":"order","order":{"order":{...,"cloid":...},"status":...,"statusTimestamp":...}}`
+    ///
+    /// 返回 `None` 表示该单查不到、或它本就没有 cloid（人工经 UI 下单与强平等系统单都是
+    /// `cloid: null`）—— 两种情况调用方都无法证明归属，应当保守地不动那张单。
+    async fn cloid_of(
+        &self,
+        wallet_address: &str,
+        oid: u64,
+    ) -> Result<Option<String>, ExchangeError> {
+        let resp: OrderStatusResponse = self
+            .post_info(serde_json::json!({
+                "type": "orderStatus",
+                "user": wallet_address,
+                "oid": oid,
+            }))
+            .await?;
+
+        Ok(resp.order.and_then(|envelope| envelope.order.cloid))
+    }
+
     /// 拉取账户资费结算明细（`POST /info` `type: "userFunding"`）。
     ///
     /// 与 Binance 的 `GET /fapi/v1/income?incomeType=FUNDING_FEE` 对位：两边都由各自的
@@ -481,8 +510,103 @@ impl ExchangeClient for HyperliquidClient {
         Err(ExchangeError::Other("Hyperliquid cancel_order not implemented".to_string()))
     }
 
-    async fn fetch_pending_orders(&self, _symbol: &Symbol) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
-        Ok(vec![])
+    async fn fetch_pending_orders(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
+        // 无凭证 = 只接公共行情，没有账户地址可查（同 fetch_positions 口径）
+        let Some(credentials) = self.credentials.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        /// `frontendOpenOrders` 的条目。
+        ///
+        /// 用 `frontendOpenOrders` 而非 `openOrders`：后者不返回 `origSz` 与 `reduceOnly`
+        /// （2026-08 实测 + 官方文档）。**两者都不返回 `cloid`**，故归属信息要另外补，
+        /// 见下方 `cloid_of`。
+        ///
+        /// 也**不能**用 `historicalOrders` 代替：它是按状态变更记录的**日志**（同一张单
+        /// 每次状态变化一条），且有条数上限，无法作为"当前挂单"的权威完整列表 ——
+        /// 而完整性正是对账/撤单的前提（漏一张就等于谎报干净）。
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OpenOrder {
+            coin: String,
+            /// `"A"` = ask/卖，`"B"` = bid/买
+            side: String,
+            limit_px: String,
+            /// 剩余未成交量
+            sz: String,
+            /// 原始下单量
+            orig_sz: String,
+            oid: u64,
+            timestamp: u64,
+            #[serde(default)]
+            reduce_only: bool,
+        }
+
+        let orders: Vec<OpenOrder> = self
+            .post_info(serde_json::json!({
+                "type": "frontendOpenOrders",
+                "user": credentials.wallet_address,
+                "dex": self.dex,
+            }))
+            .await?;
+
+        let mut updates = Vec::new();
+        for o in orders {
+            // 与 fetch_positions 同理：账户级接口不按 dex 过滤，`coin` 带前缀
+            if !belongs_to_dex(&o.coin, &self.dex) {
+                continue;
+            }
+            if from_hyperliquid(&o.coin) != *symbol {
+                continue;
+            }
+            let side = match o.side.as_str() {
+                "B" => Side::Long,
+                "A" => Side::Short,
+                other => {
+                    tracing::warn!(side = other, coin = %o.coin, "HL openOrders 未知方向，跳过");
+                    continue;
+                }
+            };
+            let orig_sz: f64 = o
+                .orig_sz
+                .parse()
+                .map_err(|_| ExchangeError::ParseError(format!("HL origSz 非法: {}", o.orig_sz)))?;
+            let remaining: f64 = o
+                .sz
+                .parse()
+                .map_err(|_| ExchangeError::ParseError(format!("HL sz 非法: {}", o.sz)))?;
+            let filled = (orig_sz - remaining).max(0.0);
+
+            // Hyperliquid 是币本位（contract_size = 1），无需折算
+            updates.push(crate::domain::OrderUpdate {
+                order_id: o.oid.to_string(),
+                // 挂单列表接口不带 cloid，逐单补一次。N 是**遗留挂单数**（IOC 策略下几乎
+                // 恒为 0），且只在启动期发生，代价与问题规模成正比。
+                client_order_id: self.cloid_of(&credentials.wallet_address, o.oid).await?,
+                exchange: Exchange::Hyperliquid,
+                symbol: symbol.clone(),
+                side,
+                status: if filled > 0.0 {
+                    crate::domain::OrderStatus::PartiallyFilled { filled }
+                } else {
+                    crate::domain::OrderStatus::Pending
+                },
+                price: o.limit_px.parse().map_err(|_| {
+                    ExchangeError::ParseError(format!("HL limitPx 非法: {}", o.limit_px))
+                })?,
+                reduce_only: o.reduce_only,
+                quantity: orig_sz,
+                filled_quantity: filled,
+                // 快照没有"本次成交量"这一概念
+                fill_sz: 0.0,
+                timestamp: o.timestamp,
+            });
+        }
+
+        Ok(updates)
     }
 
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
@@ -623,6 +747,31 @@ impl ExchangeClient for HyperliquidClient {
     }
 }
 
+/// `POST /info {"type":"orderStatus"}` 的响应。
+///
+/// **双层嵌套**（2026-08 实测）：
+/// `{"status":"order","order":{"order":{...,"cloid":...},"status":...,"statusTimestamp":...}}`
+/// 查不到时是 `{"status":"unknownOid"}`（没有 `order` 字段），故 `order` 为 `Option`。
+///
+/// 提到模块级只为让嵌套层次能被测试锁住 —— 少一层或多一层都会让 `cloid` 静默取不到，
+/// 而那会让启动期撤单认不出自己的单。
+#[derive(Deserialize)]
+struct OrderStatusResponse {
+    #[serde(default)]
+    order: Option<OrderStatusEnvelope>,
+}
+
+#[derive(Deserialize)]
+struct OrderStatusEnvelope {
+    order: OrderStatusOrder,
+}
+
+#[derive(Deserialize)]
+struct OrderStatusOrder {
+    #[serde(default)]
+    cloid: Option<String>,
+}
+
 /// 将 AssetInfo 转换为 SymbolMeta
 fn asset_info_to_symbol_meta(info: &AssetInfo) -> SymbolMeta {
     let symbol = from_hyperliquid(&info.name);
@@ -635,6 +784,64 @@ fn asset_info_to_symbol_meta(info: &AssetInfo) -> SymbolMeta {
         size_step: size_step(info.sz_decimals),
         min_order_size: size_step(info.sz_decimals), // 最小下单量为一个精度单位
         contract_size: 1.0, // Hyperliquid 是币本位，合约乘数为 1
+    }
+}
+
+#[cfg(test)]
+mod order_status_tests {
+    use super::*;
+
+    /// `orderStatus` 的**真实响应**（2026-08 实测，账户地址已抹去）。
+    ///
+    /// 钉死双层嵌套：`order.order.cloid`。少一层或多一层都会让 cloid 静默取不到，
+    /// 而那会让启动期撤单认不出自己的单、把遗留挂单留在簿上。
+    const REAL_ORDER_STATUS: &str = r#"{
+      "status": "order",
+      "order": {
+        "order": {
+          "coin":"xyz:NVDA","side":"B","limitPx":"206.7","sz":"0.0","oid":339288764942,
+          "timestamp":1772722406668,"triggerCondition":"N/A","isTrigger":false,
+          "triggerPx":"0.0","children":[],"isPositionTpsl":false,"reduceOnly":true,
+          "orderType":"Limit","origSz":"1.0","tif":"Gtc",
+          "cloid":"0x3f4b6d0f9d2f452b8eed2858b58959eb"
+        },
+        "status": "filled",
+        "statusTimestamp": 1772722406668
+      }
+    }"#;
+
+    /// 查不到 oid 时的**真实响应**（实测：没有 `order` 字段）
+    const REAL_UNKNOWN_OID: &str = r#"{"status":"unknownOid"}"#;
+
+    #[test]
+    fn cloid_is_extracted_from_double_nested_envelope() {
+        let resp: OrderStatusResponse = serde_json::from_str(REAL_ORDER_STATUS).expect("解析");
+        let cloid = resp.order.and_then(|e| e.order.cloid);
+        assert_eq!(
+            cloid.as_deref(),
+            Some("0x3f4b6d0f9d2f452b8eed2858b58959eb"),
+            "双层嵌套解析错误会让 cloid 静默丢失"
+        );
+        // 该 cloid 是本引擎格式，归属判定应认领它
+        assert!(Exchange::Hyperliquid.owns_cli_order_id(&cloid.unwrap()));
+    }
+
+    #[test]
+    fn unknown_oid_yields_no_cloid_instead_of_parse_error() {
+        let resp: OrderStatusResponse = serde_json::from_str(REAL_UNKNOWN_OID)
+            .expect("unknownOid 不该导致解析失败");
+        assert!(resp.order.is_none());
+    }
+
+    /// 人工经 UI 下单 / 强平等系统单是 `cloid: null` —— 无法证明归属，不该被认领
+    #[test]
+    fn null_cloid_is_not_owned() {
+        let raw = REAL_ORDER_STATUS.replace(
+            r#""cloid":"0x3f4b6d0f9d2f452b8eed2858b58959eb""#,
+            r#""cloid":null"#,
+        );
+        let resp: OrderStatusResponse = serde_json::from_str(&raw).expect("解析");
+        assert!(resp.order.and_then(|e| e.order.cloid).is_none());
     }
 }
 

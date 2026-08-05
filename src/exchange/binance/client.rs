@@ -2,7 +2,8 @@
 
 use super::symbol::{from_binance, to_binance};
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, OrderId, OrderType, RejectReason, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
+    Exchange, ExchangeError, FundingFee, OrderId, OrderStatus, OrderType, RejectReason, Side,
+    Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
@@ -499,8 +500,96 @@ impl ExchangeClient for BinanceClient {
         Err(ExchangeError::Other("Binance cancel_order not implemented".to_string()))
     }
 
-    async fn fetch_pending_orders(&self, _symbol: &Symbol) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
-        Ok(vec![])
+    async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
+        // 无凭证 = 只接公共行情，没有账户就没有挂单（同 fetch_positions 口径）
+        if self.credentials.is_none() {
+            return Ok(Vec::new());
+        }
+        let api_key = self
+            .api_key()
+            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OpenOrder {
+            order_id: i64,
+            client_order_id: String,
+            side: String,
+            status: String,
+            price: String,
+            orig_qty: String,
+            executed_qty: String,
+            #[serde(default)]
+            reduce_only: bool,
+            time: u64,
+        }
+
+        let inst = to_binance(symbol, &self.quote);
+        let query = self
+            .build_signed_query(&[("symbol", &inst)])
+            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+
+        let resp = self
+            .client
+            .get(format!("{}/fapi/v1/openOrders?{}", self.base_url, query))
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
+        }
+
+        let orders: Vec<OpenOrder> = serde_json::from_str(&text).map_err(|e| {
+            ExchangeError::ParseError(format!("Failed to parse Binance openOrders: {e}"))
+        })?;
+
+        let mut updates = Vec::new();
+        for o in orders {
+            let side = match o.side.as_str() {
+                "BUY" => Side::Long,
+                "SELL" => Side::Short,
+                other => {
+                    tracing::warn!(side = other, "Binance openOrders 未知方向，跳过");
+                    continue;
+                }
+            };
+            let filled: f64 = o.executed_qty.parse().unwrap_or(0.0);
+            // openOrders 只返回未终结的单，故只有这两种状态；其余按未知跳过而非猜测
+            let status = match o.status.as_str() {
+                "NEW" => OrderStatus::Pending,
+                "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled { filled },
+                other => {
+                    tracing::warn!(status = other, "Binance openOrders 未预期状态，跳过");
+                    continue;
+                }
+            };
+            // Binance USDⓈ-M 的数量本身就是币本位（contract_size = 1），无需折算
+            updates.push(crate::domain::OrderUpdate {
+                order_id: o.order_id.to_string(),
+                client_order_id: (!o.client_order_id.is_empty()).then_some(o.client_order_id),
+                exchange: Exchange::Binance,
+                symbol: symbol.clone(),
+                side,
+                status,
+                price: o.price.parse().unwrap_or(0.0),
+                reduce_only: o.reduce_only,
+                quantity: o.orig_qty.parse().unwrap_or(0.0),
+                filled_quantity: filled,
+                // 快照没有"本次成交量"这一概念
+                fill_sz: 0.0,
+                timestamp: o.time,
+            });
+        }
+
+        Ok(updates)
     }
 
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
