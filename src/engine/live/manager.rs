@@ -10,7 +10,9 @@ use super::{
     AccountIncome, AccountOutcome, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
     PaperCounterActor, PaperCounterArgs, PaperPubSub,
     IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor,
+    PositionPollingActor, PositionPollingActorArgs, PositionReconcileActor, PositionReconcileArgs,
     RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, UnregisterExecutor,
+    DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
     DEFAULT_REPORT_INTERVAL_MS,
 };
 use crate::domain::{
@@ -80,6 +82,8 @@ pub struct ManagerActor {
     income_processor: ActorRef<IncomeProcessorActor>,
     /// MetricsActor (订阅 income_pubsub，输出账户/持仓/订单/历史指标)
     metrics: ActorRef<MetricsActor>,
+    /// 持仓对账 Actor (订阅 income_pubsub；漂移确认后致命退出)
+    position_reconciler: ActorRef<PositionReconcileActor>,
     /// ExchangeActors (启动时创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
 
@@ -231,8 +235,18 @@ impl ManagerActor {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
-            if let Err(e) = self.metrics.ask(RegisterSymbols(symbols)).send().await {
+            if let Err(e) = self.metrics.ask(RegisterSymbols(symbols.clone())).send().await {
                 tracing::error!(error = %e, "Failed to register symbols on MetricsActor");
+            }
+            // 对账层同样要先注册再收基线：镜像里没有该 symbol 的状态，基线就落不进去。
+            // 用 ask 而非 tell —— 必须确认注册完成后才继续推基线（见下方 step 5）。
+            if let Err(e) = self
+                .position_reconciler
+                .ask(RegisterSymbols(symbols))
+                .send()
+                .await
+            {
+                tracing::error!(error = %e, "Failed to register symbols on PositionReconcileActor");
             }
         }
 
@@ -369,17 +383,25 @@ impl Actor for ManagerActor {
         // 1. 创建 Exchange Clients
         //    模拟盘也需要 client：symbol metas 走公共 REST，与是否有凭证无关
         let mut clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
+        // 有凭证 = 有账户可对账；只接公共行情的所没有持仓可言，不必轮询
+        let mut authed_exchanges: HashSet<Exchange> = HashSet::new();
 
         if let Some(ref access) = args.binance {
             let creds = access.credentials.clone();
             let client = BinanceClient::new(access.quote.clone(), creds)?;
             clients.insert(Exchange::Binance, Arc::new(client));
+            if access.has_credentials() {
+                authed_exchanges.insert(Exchange::Binance);
+            }
         }
 
         let okx_client: Option<Arc<OkxClient>> = if let Some(ref access) = args.okx {
             let creds = access.credentials.clone();
             let client = Arc::new(OkxClient::new(access.quote.clone(), creds)?);
             clients.insert(Exchange::OKX, client.clone());
+            if access.has_credentials() {
+                authed_exchanges.insert(Exchange::OKX);
+            }
             Some(client)
         } else {
             None
@@ -390,6 +412,9 @@ impl Actor for ManagerActor {
             let client =
                 HyperliquidClient::new(access.quote.clone(), access.dex.clone(), creds)?;
             clients.insert(Exchange::Hyperliquid, Arc::new(client));
+            if access.has_credentials() {
+                authed_exchanges.insert(Exchange::Hyperliquid);
+            }
         }
 
         // IBKR 需要额外保存 auth / conids / client 供 Actor 使用
@@ -404,6 +429,8 @@ impl Actor for ManagerActor {
             ));
             ibkr_client_ref = Some(ibkr_client.clone()); // 具体类型引用，供 GetIbkrClient 外传
             clients.insert(Exchange::IBKR, ibkr_client as Arc<dyn ExchangeClient>);
+            // IBKR 的 client 只在有凭证时才构建，走到这里必然有账户
+            authed_exchanges.insert(Exchange::IBKR);
         }
 
         // 2. 预加载所有交易所的 symbol metas
@@ -509,6 +536,42 @@ impl Actor for ManagerActor {
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
+
+        // 5.6 持仓对账（通道 B）：REST 读数 vs 本地「基线 + Fill」。
+        //     与 MetricsActor 分开是刻意的——观测层故障不该拖垮交易，而对账确认漂移必须
+        //     致命退出（本地持仓不可信时，策略的三道风控闸门全部失效）。
+        let position_reconciler = PositionReconcileActor::spawn_link_with_mailbox(
+            &actor_ref,
+            PositionReconcileArgs {
+                symbol_metas: Arc::new(symbol_metas.clone()),
+                max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
+            },
+            mailbox::unbounded(),
+        )
+        .await;
+        income_pubsub
+            .tell(Subscribe(position_reconciler.clone()))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+
+        //     读数的产出者：每个**有凭证**的所一个通用 poller。`fetch_positions` 在
+        //     ExchangeClient trait 上，故这里是个循环而不是逐所硬编码，交易所模块无需改动。
+        for exchange in &authed_exchanges {
+            let Some(client) = clients.get(exchange) else {
+                continue;
+            };
+            PositionPollingActor::spawn_link_with_mailbox(
+                &actor_ref,
+                PositionPollingActorArgs {
+                    client: client.clone(),
+                    income_pubsub: income_pubsub.clone(),
+                    interval_ms: DEFAULT_POSITION_POLL_INTERVAL_MS,
+                },
+                mailbox::unbounded(),
+            )
+            .await;
+        }
 
         // 6. 创建 ClockActor（发布 Clock 事件到 income_pubsub）
         let _clock_actor = ClockActor::spawn_link_with_mailbox(
@@ -669,6 +732,7 @@ impl Actor for ManagerActor {
             outcome_pubsub,
             income_processor: processor,
             metrics,
+            position_reconciler,
             exchange_actors,
             ibkr_client: ibkr_client_ref,
             paper_pubsub,

@@ -607,6 +607,12 @@ impl ExchangeClient for BinanceClient {
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+        // 无凭证 = 只接公共行情（见 ExchangeAccess），没有账户可查，空仓是事实而非缺数据。
+        // 与 OKX / Hyperliquid 口径一致：若在此返回 Err，会让"模拟盘不配凭证"这种正常配置
+        // 在 ManagerActor 拉基线时直接启动失败（基线拉取失败是致命的）。
+        if self.credentials.is_none() {
+            return Ok(Vec::new());
+        }
         self.fetch_positions_impl().await
     }
 }

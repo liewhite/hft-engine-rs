@@ -209,6 +209,10 @@ impl StateManager {
             // 全局事件: 券源/汇率读数——策略经 on_borrow_fee/on_exchange_rate 自持，
             // StateManager 不缓存 (最小改动)；显式空处理，避免落入 symbol 路由分支。
             ExchangeEventData::BorrowFee(_) | ExchangeEventData::ExchangeRate(_) => {}
+            // 全局事件: 持仓对账读数 —— 只服务 `PositionReconcileActor`，不进任何本地状态。
+            // 写进来就等于恢复了 `SymbolState` 明确否掉的"用快照覆写持仓"
+            // （会与 Fill 流重复计算同一笔成交）。
+            ExchangeEventData::PositionReport { .. } => {}
             // 全局事件: Clock (检查订单超时)
             ExchangeEventData::Clock => {
                 let now = event.local_ts;
@@ -231,5 +235,52 @@ impl StateManager {
                 state.apply(event);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::Position;
+    use crate::messaging::ExchangeEventData;
+
+    const EX: Exchange = Exchange::Binance;
+    const SYM: &str = "BTC";
+
+    fn ev(data: ExchangeEventData) -> IncomeEvent {
+        IncomeEvent {
+            exchange_ts: 1,
+            local_ts: 1,
+            data,
+        }
+    }
+
+    fn position(size: f64) -> Position {
+        Position {
+            exchange: EX,
+            symbol: SYM.to_string(),
+            size,
+            entry_price: 100.0,
+            unrealized_pnl: 0.0,
+        }
+    }
+
+    /// 对账读数只供 `PositionReconcileActor` 比对，**绝不**写入本地持仓。
+    ///
+    /// 若写入，就等于恢复了"用快照覆写持仓"——而快照与 Fill 流叠加会重复计算同一笔成交，
+    /// 这正是 `PositionBaseline` 只允许出现一次的原因。
+    #[test]
+    fn position_report_does_not_touch_local_position() {
+        let mut manager = StateManager::new(&[SYM.to_string()], 0);
+        manager.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
+
+        // 交易所报了个不一样的值（这正是"漂移"的样子）——本地持仓不动，由对账层去告警
+        manager.apply(&ev(ExchangeEventData::PositionReport {
+            exchange: EX,
+            positions: vec![position(99.0)],
+        }));
+
+        let state = manager.symbol_state(&SYM.to_string()).expect("state");
+        assert_eq!(state.position_size(EX), 2.0);
     }
 }

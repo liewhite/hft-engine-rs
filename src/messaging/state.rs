@@ -280,10 +280,6 @@ impl SymbolState {
                     ),
                 }
             }
-            ExchangeEventData::PositionReport(_) => {
-                // 对账读数**绝不写入持仓**——它的用途是与本地"基线 + Fill"的结果比对，
-                // 由 PositionReconcileActor 负责。写进来就等于恢复了被上面否掉的快照覆写。
-            }
             ExchangeEventData::OrderUpdate(update) => {
                 tracing::info!(
                     symbol = %self.symbol,
@@ -400,7 +396,10 @@ impl SymbolState {
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. }
             | ExchangeEventData::BorrowFee(_)
-            | ExchangeEventData::ExchangeRate(_) => {
+            | ExchangeEventData::ExchangeRate(_)
+            // 对账读数是按所的整份快照（无单一 symbol），且**绝不写入持仓** ——
+            // 写进来就等于恢复了上面 PositionBaseline 分支否掉的"快照覆写"
+            | ExchangeEventData::PositionReport { .. } => {
                 // 全局事件应在 StateManager 层提前拦截、不会进入 SymbolState::apply。
                 // 若到达说明路由逻辑有 bug，记录后忽略（不 panic）。
                 tracing::error!(
@@ -610,17 +609,6 @@ mod tests {
         // 覆写若发生，这条 Fill 会把仓位推到 4.0 之外
         state.apply(&fill(Side::Long, 1.0));
         assert_eq!(state.position_size(EX), 4.0);
-    }
-
-    /// 对账读数只用于比对，**绝不**写入持仓。
-    #[test]
-    fn position_report_does_not_touch_local_position() {
-        let mut state = SymbolState::new(SYMBOL.to_string());
-        state.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
-
-        // 交易所报了一个不同的值（正是"漂移"的样子）——本地持仓不动，由对账层去告警
-        state.apply(&ev(ExchangeEventData::PositionReport(position(99.0))));
-        assert_eq!(state.position_size(EX), 2.0);
     }
 
     /// 没有基线时，第一条 Fill 从 0 起算（策略启动初期确实空仓）

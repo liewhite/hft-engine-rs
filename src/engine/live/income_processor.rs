@@ -47,7 +47,7 @@ fn is_account_private(event: &IncomeEvent) -> bool {
         ExchangeEventData::OrderUpdate(_)
             | ExchangeEventData::Fill(_)
             | ExchangeEventData::PositionBaseline(_)
-            | ExchangeEventData::PositionReport(_)
+            | ExchangeEventData::PositionReport { .. }
             | ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::FundingFee(_)
@@ -91,7 +91,7 @@ impl IncomeProcessorActor {
                 symbol: pos.symbol.clone(),
             },
             // 对账读数只给 PositionReconcileActor，不进策略状态（见 EventRouting::SkipExecutors）
-            ExchangeEventData::PositionReport(_) => EventRouting::SkipExecutors,
+            ExchangeEventData::PositionReport { .. } => EventRouting::SkipExecutors,
             ExchangeEventData::OrderUpdate(update) => EventRouting::BySymbol {
                 exchange: update.exchange,
                 symbol: update.symbol.clone(),

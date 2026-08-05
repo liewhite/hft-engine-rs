@@ -40,15 +40,25 @@ pub enum ExchangeEventData {
     ///   Hyperliquid `clearinghouseState`、Binance `ACCOUNT_UPDATE.P`）都是**读数**而非基线，
     ///   要用于校验请走 [`Self::PositionReport`]
     PositionBaseline(Position),
-    /// 持仓**对账读数**：交易所侧的当前持仓，**只用于校验，绝不写入本地持仓**。
+    /// 持仓**对账读数**：某交易所的**完整**持仓快照，只用于校验，绝不写入本地持仓。
     ///
-    /// 由 [`crate::engine::PositionPollingActor`] 周期性 REST 拉取，
-    /// 交给 [`crate::engine::PositionReconcileActor`] 与「基线 + Fill 累加」的结果比对。
+    /// 由 [`crate::engine::PositionPollingActor`] 周期性 REST 拉取，交给
+    /// [`crate::engine::PositionReconcileActor`] 与「基线 + Fill 累加」的结果比对。
     ///
-    /// 与 [`Self::PositionBaseline`] 同出一个 `fetch_positions()` 调用，但语义、消费方、
-    /// 出现次数都不同，故分成两个变体 —— 合成一个再靠「第一条特殊」区分，等于把这条规则
-    /// 藏进下游的一个 `if`，上游无从知晓。
-    PositionReport(Position),
+    /// # 为什么是整份快照，而不是逐个 symbol 一条事件
+    ///
+    /// 对账最要抓的一类漂移是**本地有仓、交易所已经没了**（漏了一笔平仓成交、或强平的 Fill
+    /// 没收到）。发现它只能靠「交易所没报告这个 symbol ⇒ 它空仓」这个推断，而该推断**只有
+    /// 完整快照成立**：逐条发的话，某 symbol 不出现既可能是空仓、也可能是这次没查到，
+    /// 二者无法区分 —— 那就退化成了增量推送，也就丢掉了选 REST 而非私有 WS 推送的理由。
+    ///
+    /// 因此 `positions` 必须是该所**全量**（空仓的 symbol 直接不在其中，由消费方按 0 处理），
+    /// 缺一条就等于谎报一个空仓。
+    PositionReport {
+        exchange: Exchange,
+        /// 该交易所的完整持仓列表（币本位，见 [`crate::domain::Quantity`]）
+        positions: Vec<Position>,
+    },
     OrderUpdate(OrderUpdate),
     /// 成交事件 (用于乐观更新仓位)
     Fill(Fill),
@@ -91,8 +101,7 @@ impl IncomeEvent {
             ExchangeEventData::MarketTrade(t) => Some(&t.symbol),
             ExchangeEventData::MarkPrice(mp) => Some(&mp.symbol),
             ExchangeEventData::IndexPrice(ip) => Some(&ip.symbol),
-            ExchangeEventData::PositionBaseline(pos)
-            | ExchangeEventData::PositionReport(pos) => Some(&pos.symbol),
+            ExchangeEventData::PositionBaseline(pos) => Some(&pos.symbol),
             ExchangeEventData::OrderUpdate(update) => Some(&update.symbol),
             ExchangeEventData::Fill(fill) => Some(&fill.symbol),
             ExchangeEventData::FundingFee(fee) => Some(&fee.symbol),
@@ -104,6 +113,8 @@ impl IncomeEvent {
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::ExchangeStatus { .. }
             | ExchangeEventData::ExchangeRate(_)
+            // 对账读数是按**交易所**的整份快照，没有单一 symbol 可言（见变体文档）
+            | ExchangeEventData::PositionReport { .. }
             | ExchangeEventData::Clock => None,
         }
     }
@@ -116,8 +127,7 @@ impl IncomeEvent {
             ExchangeEventData::MarketTrade(t) => Some(t.exchange),
             ExchangeEventData::MarkPrice(mp) => Some(mp.exchange),
             ExchangeEventData::IndexPrice(ip) => Some(ip.exchange),
-            ExchangeEventData::PositionBaseline(pos)
-            | ExchangeEventData::PositionReport(pos) => Some(pos.exchange),
+            ExchangeEventData::PositionBaseline(pos) => Some(pos.exchange),
             ExchangeEventData::OrderUpdate(update) => Some(update.exchange),
             ExchangeEventData::Fill(fill) => Some(fill.exchange),
             ExchangeEventData::Candle(candle) => Some(candle.exchange),
@@ -129,6 +139,7 @@ impl IncomeEvent {
             ExchangeEventData::ExchangeRate(er) => Some(er.exchange),
             ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
             ExchangeEventData::ExchangeStatus { exchange, .. } => Some(*exchange),
+            ExchangeEventData::PositionReport { exchange, .. } => Some(*exchange),
             ExchangeEventData::Clock => None,
         }
     }
