@@ -70,7 +70,7 @@ pub struct Reconciler {
     /// 它同时把对账范围精确到"策略真正订阅的所"：某 symbol 只在 Binance 上市时，
     /// `(OKX, 该 symbol)` 不会有基线，也就不该参与 OKX 的对账。
     baselined: HashSet<(Exchange, Symbol)>,
-    /// 容差来源：`size_step` 是该 symbol 的最小可交易增量，小于它的差值不可能是真实漂移
+    /// 容差来源：`coin_size_step()`（币本位最小可交易增量），小于它的差值不可能是真实漂移
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// per (所, symbol) 的不一致记录；一致一次即整条移除
     mismatches: HashMap<(Exchange, Symbol), MismatchRecord>,
@@ -245,10 +245,16 @@ impl Reconciler {
     }
 }
 
-/// 容差 = 该 symbol 的最小可交易增量。
+/// 容差 = 该 symbol 的最小可交易**币量**增量（`size_step × contract_size`，见
+/// [`SymbolMeta::coin_size_step`]）。
+///
+/// 比对双方（本地持仓与交易所读数）都是币本位，容差必须同口径。直接用 `size_step`
+/// 是单位错误：它是**交易所下单单位**的步长 —— OKX BTC-USDT-SWAP（`size_step=1` 张、
+/// `contract_size=0.01`）会把容差放大成 1.0 BTC，反之 `contract_size > 1` 的品种会
+/// 过紧而误停机。
 ///
 /// 缺 meta 说明该 symbol 未在此所上市（那么两边都是 0，容差取多少都一样），退化为浮点
-/// 误差量级。下界钉在 `Position::EPSILON`：`size_step` 再小也不该小于浮点噪声。
+/// 误差量级。下界钉在 `Position::EPSILON`：步长再小也不该小于浮点噪声。
 fn tolerance_of(
     symbol_metas: &HashMap<(Exchange, Symbol), SymbolMeta>,
     exchange: Exchange,
@@ -256,7 +262,7 @@ fn tolerance_of(
 ) -> f64 {
     symbol_metas
         .get(&(exchange, symbol.clone()))
-        .map(|meta| meta.size_step)
+        .map(|meta| meta.coin_size_step())
         .unwrap_or(Position::EPSILON)
         .max(Position::EPSILON)
 }
@@ -267,7 +273,7 @@ fn tolerance_of(
 
 /// PositionReconcileActor 初始化参数
 pub struct PositionReconcileArgs {
-    /// 用于取 `size_step` 作为对账容差
+    /// 用于取 `coin_size_step()`（币本位最小可交易增量）作为对账容差
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 连续多少次不一致判定为真实漂移
     pub max_consecutive_mismatches: u32,
@@ -433,6 +439,37 @@ mod tests {
         let almost = 1.0 + SIZE_STEP * 0.5;
         r.on_event(&report(EX, vec![position(EX, almost)]))
             .expect("size_step 之内不应判为漂移");
+    }
+
+    /// **容差必须是币本位口径**（`size_step × contract_size`），不能直接用 `size_step`。
+    ///
+    /// OKX BTC-USDT-SWAP：`size_step=1`（张）、`contract_size=0.01`（币/张）——
+    /// 币本位的最小增量是 0.01 BTC。若把 `size_step` 当币量用，容差会被放大成 1.0 BTC，
+    /// 0.5 BTC 的真实漂移就被静默放过。
+    #[test]
+    fn tolerance_is_coin_denominated_not_raw_size_step() {
+        // 每张 0.01 币、数量步长 1 张 -> 币本位最小增量 0.01
+        let metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> = Arc::new(HashMap::from([(
+            (EX, SYM.to_string()),
+            SymbolMeta {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                price_formatter: Arc::new(StepFormatter::new(0.1)),
+                size_step: 1.0,
+                min_order_size: 1.0,
+                contract_size: 0.01,
+            },
+        )]));
+        let mut r = Reconciler::new(metas, 1);
+        r.register_symbols(&[SYM.to_string()]);
+        r.on_event(&baseline(1.0)).unwrap();
+
+        // 差 0.005 币 < 0.01 币：在币本位最小增量之内，是噪声
+        r.on_event(&report(EX, vec![position(EX, 1.005)]))
+            .expect("小于一个币本位最小增量的差值不该判为漂移");
+        // 差 0.5 币 >> 0.01 币：真实漂移。若容差被错当成 1.0（裸 size_step），这里会漏检
+        r.on_event(&report(EX, vec![position(EX, 1.5)]))
+            .expect_err("0.5 币的差值远超币本位最小增量，必须判为漂移");
     }
 
     /// 连续 N 次超出容差才致命；第 N 次才返回 Err
