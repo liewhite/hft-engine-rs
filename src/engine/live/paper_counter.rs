@@ -301,6 +301,8 @@ impl Message<AccountOutcome> for PaperCounterActor {
                 exchange,
                 symbol,
                 order_id,
+                // 柜台的 SimState 以 order_id 为键撮合/撤单，回报里自带 client_order_id
+                client_order_id: _,
             } => {
                 tracing::info!(
                     %account, %exchange, %symbol, %order_id, delay_ms = delay,
@@ -691,6 +693,7 @@ mod tests {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     order_id,
+                    client_order_id: "c1".to_string(),
                 },
             })
             .send()

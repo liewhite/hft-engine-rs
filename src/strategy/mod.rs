@@ -23,7 +23,12 @@ pub enum OutcomeEvent {
     CancelOrder {
         exchange: Exchange,
         symbol: Symbol,
+        /// 交易所订单号：撤单请求发给交易所时用它
         order_id: OrderId,
+        /// 本地订单号：撤单确认回报用它清除本地 pending
+        /// （[`crate::messaging::SymbolState`] 的 pending 以 client_order_id 为键，
+        /// 若合成回报里没有它，撤掉的单会永远留在本地 pending 里）
+        client_order_id: String,
     },
 }
 

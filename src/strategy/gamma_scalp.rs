@@ -174,6 +174,7 @@ impl GammaScalpStrategy {
                 exchange: self.exchange,
                 symbol: self.symbol.clone(),
                 order_id: pending.order.id.clone(),
+                client_order_id: pending.order.client_order_id.clone(),
             })
         } else {
             None

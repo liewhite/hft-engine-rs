@@ -104,7 +104,7 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
         // - spawned task 内的失败已通过 `send_order_error*` 反馈为 OrderUpdate(Error/Rejected)，
         //   不会静默丢失。
         match msg {
-            OutcomeEvent::CancelOrder { exchange, symbol, order_id } => {
+            OutcomeEvent::CancelOrder { exchange, symbol, order_id, client_order_id } => {
                 let client = match self.clients.get(&exchange) {
                     Some(e) => e.clone(),
                     None => {
@@ -124,36 +124,60 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
                     match client.cancel_order(&symbol, &order_id).await {
                         Ok(()) => {
                             tracing::info!(%exchange, %symbol, %order_id, "Order cancelled successfully");
-                            // 撤单成功，反馈 Cancelled 状态让 SymbolState 移除 pending_order
-                            let local_ts = now_ms();
-                            let update = OrderUpdate {
-                                order_id: order_id.clone(),
-                                client_order_id: Some(order_id),
+                            // 撤单成功，合成 Cancelled 回报让 SymbolState 移除 pending。
+                            // 必须携带真实的 client_order_id —— pending 以它为键，填错
+                            // （此前填的是交易所 order_id）会让撤掉的单永远留在本地。
+                            Self::publish_cancelled(
+                                &income_pubsub,
                                 exchange,
                                 symbol,
-                                side: Side::Long, // 撤单事件中 side 无实际意义
-                                status: OrderStatus::Cancelled,
-                                price: 0.0,
-                                reduce_only: false, // 合成的撤单确认，终态不会触发外部单注册
-                                quantity: 0.0,
-                                filled_quantity: 0.0,
-                                fill_sz: 0.0,
-                                timestamp: local_ts,
-                            };
-                            if let Err(e) = income_pubsub
-                                .tell(Publish(IncomeEvent {
-                                    exchange_ts: local_ts,
-                                    local_ts,
-                                    data: ExchangeEventData::OrderUpdate(update),
-                                }))
-                                .send()
-                                .await
-                            {
-                                tracing::error!(error = %e, "Failed to publish cancel confirmation");
-                            }
+                                order_id,
+                                client_order_id,
+                            )
+                            .await;
                         }
                         Err(e) => {
-                            tracing::error!(%exchange, %symbol, %order_id, error = %e, "Failed to cancel order");
+                            // 撤单失败最常见的原因是订单已终态（成交 / 已撤 / 不存在）。
+                            // 若它的终态回报恰好丢失，本地 pending 会让 has_pending_orders
+                            // 恒真、该 symbol 永久冻结（Pending 态没有超时清理）。用挂单
+                            // 列表复查一次把这条路堵上：
+                            // - 单仍挂着：撤单真失败了，pending 保留是正确的，报 error；
+                            // - 单已不在：已终态。合成 Cancelled 清本地 pending —— 若真实
+                            //   终态是成交，其 Fill 独立更新仓位、不经 pending，合成回报
+                            //   不会盖掉任何信息。
+                            match client.fetch_pending_orders(&symbol).await {
+                                Ok(open_orders) => {
+                                    let still_open =
+                                        open_orders.iter().any(|o| o.order_id == order_id);
+                                    if still_open {
+                                        tracing::error!(
+                                            %exchange, %symbol, %order_id, error = %e,
+                                            "撤单失败且订单仍挂在交易所，保留本地 pending，待策略重试"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            %exchange, %symbol, %order_id, error = %e,
+                                            "撤单失败但订单已不在挂单列表（已成交或已撤），\
+                                             合成 Cancelled 清理本地 pending"
+                                        );
+                                        Self::publish_cancelled(
+                                            &income_pubsub,
+                                            exchange,
+                                            symbol,
+                                            order_id,
+                                            client_order_id,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Err(e2) => {
+                                    tracing::error!(
+                                        %exchange, %symbol, %order_id,
+                                        cancel_error = %e, recheck_error = %e2,
+                                        "撤单失败且复查挂单列表也失败，本地 pending 保留，待策略重试"
+                                    );
+                                }
+                            }
                         }
                     }
                 });
@@ -284,6 +308,44 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
 }
 
 impl OutcomeProcessorActor {
+    /// 合成撤单确认回报（撤单成功、或复查确认订单已不在挂单列表时）。
+    ///
+    /// `client_order_id` 必须是**本地订单号**：SymbolState 的 pending 以它为键移除。
+    async fn publish_cancelled(
+        income_pubsub: &ActorRef<IncomePubSub>,
+        exchange: Exchange,
+        symbol: Symbol,
+        order_id: crate::domain::OrderId,
+        client_order_id: String,
+    ) {
+        let local_ts = now_ms();
+        let update = OrderUpdate {
+            order_id,
+            client_order_id: Some(client_order_id),
+            exchange,
+            symbol,
+            side: Side::Long, // 撤单事件中 side 无实际意义
+            status: OrderStatus::Cancelled,
+            price: 0.0,
+            reduce_only: false, // 合成的撤单确认，终态不会触发外部单注册
+            quantity: 0.0,
+            filled_quantity: 0.0,
+            fill_sz: 0.0,
+            timestamp: local_ts,
+        };
+        if let Err(e) = income_pubsub
+            .tell(Publish(IncomeEvent {
+                exchange_ts: local_ts,
+                local_ts,
+                data: ExchangeEventData::OrderUpdate(update),
+            }))
+            .send()
+            .await
+        {
+            tracing::error!(error = %e, "Failed to publish cancel confirmation");
+        }
+    }
+
     /// 发送订单错误事件
     async fn send_order_error(&self, order: &crate::domain::Order, reason: String) {
         Self::send_order_error_static(&self.income_pubsub, order, reason).await;
