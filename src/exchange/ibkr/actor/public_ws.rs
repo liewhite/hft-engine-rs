@@ -2,9 +2,17 @@
 //!
 //! 职责:
 //! - 维护 WebSocket 连接
-//! - 处理 BBO 订阅 (smd topic)：订阅前先做行情预热 (pre-flight snapshot)，见 `send_subscribe`
+//! - 处理 BBO 订阅 (smd topic)：订阅前先行情预热 (pre-flight snapshot)，见 `send_subscribe`；
+//!   订阅后按 `SMD_REFRESH_INTERVAL` 周期性刷新，见 `refresh_subscriptions`
 //! - 处理订单状态推送 (sor topic)
 //! - 增量更新 bid/ask 缓存并发布 BBO 到 IncomePubSub
+//!
+//! **IBKR 的 smd 订阅会在 15 分钟后被服务端自动终止**（2026-04-10 起的行为变更，IBKR 客服
+//! 原话："the topic will terminate automatically after 15 minutes and you will need to send a
+//! new request to continue to retrieve data for the instrument"）。终止时**没有 close 帧、
+//! 没有错误**，流就静默停掉——ws 连接、ping、tickle 全都照常健康，因此完全不可从连接层察觉
+//! (实测：韩股腿恰好 15 分钟后断流，同一条 ws 上另一条腿因被借券 snapshot 轮询顺带续命而
+//! 无恙)。故本 actor 必须在到期前主动重订阅；IBKR 建议先 `umd+` 再 `smd+` 干净刷新。
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO};
 use crate::engine::IncomePubSub;
@@ -21,8 +29,10 @@ use kameo::Actor;
 use kameo_actors::pubsub::Publish;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::time::Instant;
+use tokio_stream::wrappers::{IntervalStream, ReceiverStream};
 use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http};
 
 /// IbkrPublicWsActor 初始化参数
@@ -55,6 +65,13 @@ const FILL_COMMISSION_TIMEOUT_SECS: u64 = 3;
 /// BBO 订阅的 IBKR 字段 tag：84=bid_price 86=ask_price 85=ask_size 88=bid_size。
 /// 预热 (snapshot) 与流式订阅 (smd) 共用同一份，保证"预热的字段"就是"要推的字段"。
 const BBO_FIELDS: [&str; 4] = ["84", "86", "85", "88"];
+
+/// IBKR 服务端终止 smd 订阅的时限（协议事实，见模块文档）
+const SMD_SERVER_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// smd 订阅刷新周期：必须 **显著小于** `SMD_SERVER_TTL`，否则会出现"到期了还没刷新"的静默
+/// 断流窗口。取 12 分钟留 3 分钟余量（覆盖一次刷新失败重来 + REST 预热耗时）。
+const SMD_REFRESH_INTERVAL: Duration = Duration::from_secs(12 * 60);
 
 /// 构造 `smd` 订阅报文：`smd+{conid}+{"fields":[...]}`
 fn smd_message(conid: i64, fields: &[&str]) -> String {
@@ -135,6 +152,37 @@ impl IbkrPublicWsActor {
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
+    }
+
+    /// 在服务端 15 分钟 TTL 到期前重订阅所有已订阅的 BBO 腿。
+    ///
+    /// 按 IBKR 建议的顺序 **先 `umd+` 再 `smd+`**（服务端过期后并不自动 unsubscribe，直接重发
+    /// smd 可能落在一个"服务端认为还在、实际已停"的状态上）。`send_subscribe` 内含预热，因此
+    /// 刷新走的是与首次订阅完全相同的路径——不为刷新另开一套逻辑。
+    ///
+    /// 任一腿刷新失败即返回 Err：调用方 kill actor → 整机退出。这条腿刷新不掉就等于 15 分钟后
+    /// 静默变成死流，宁可退出重来。
+    async fn refresh_subscriptions(&self) -> Result<(), WsError> {
+        for kind in &self.subscribed {
+            let SubscriptionKind::BBO { symbol } = kind else {
+                continue;
+            };
+            let Some(&conid) = self.conids.get(symbol) else {
+                // 订阅时已校验过 conid 存在，此处缺失属不该发生
+                tracing::error!(exchange = "IBKR", symbol = %symbol, "刷新 smd：symbol 无 conid 映射");
+                continue;
+            };
+            self.send_unsubscribe(conid).await?;
+            self.send_subscribe(conid).await?;
+            tracing::info!(
+                exchange = "IBKR",
+                symbol = %symbol,
+                conid,
+                interval_secs = SMD_REFRESH_INTERVAL.as_secs(),
+                "smd 订阅已刷新 (服务端 15 分钟会静默终止订阅)"
+            );
+        }
+        Ok(())
     }
 
     /// 解析并处理 WebSocket 消息
@@ -681,6 +729,17 @@ impl Actor for IbkrPublicWsActor {
         let incoming_stream = ReceiverStream::new(incoming_rx);
         actor_ref.attach_stream(incoming_stream, (), ());
 
+        // smd 刷新定时器：服务端 15 分钟静默终止订阅，必须主动重订阅 (见模块文档)。
+        // 用 interval_at 跳过 tokio::time::interval 的"立即首跳"——刚订阅完不需要马上刷。
+        actor_ref.attach_stream(
+            IntervalStream::new(tokio::time::interval_at(
+                tokio::time::Instant::now() + SMD_REFRESH_INTERVAL,
+                SMD_REFRESH_INTERVAL,
+            )),
+            (),
+            (),
+        );
+
         tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
 
         // 订阅订单状态推送 (sor topic)
@@ -874,6 +933,40 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for IbkrPublicWsAct
     }
 }
 
+/// smd 刷新定时器 tick —— 在服务端 15 分钟 TTL 到期前重订阅所有 BBO 腿。
+///
+/// 刷新失败即致命（kill → on_link_died → 整机退出）：刷不上就等于这条腿 15 分钟后静默死掉，
+/// 而这种死法从连接层完全看不出来（这正是本次故障能潜伏的原因），所以不留降级分支。
+impl Message<StreamMessage<Instant, (), ()>> for IbkrPublicWsActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: StreamMessage<Instant, (), ()>,
+        ctx: &mut Context<Self, Self::Reply>,
+    ) {
+        match msg {
+            StreamMessage::Next(_) => {
+                if let Err(e) = self.refresh_subscriptions().await {
+                    tracing::error!(error = %e, "smd 订阅刷新失败，killing actor");
+                    ctx.actor_ref().kill();
+                }
+            }
+            StreamMessage::Started(_) => {
+                tracing::info!(
+                    interval_secs = SMD_REFRESH_INTERVAL.as_secs(),
+                    ttl_secs = SMD_SERVER_TTL.as_secs(),
+                    "IBKR smd 刷新定时器已启动"
+                );
+            }
+            StreamMessage::Finished(_) => {
+                tracing::error!("IBKR smd 刷新定时器意外结束，killing actor");
+                ctx.actor_ref().kill();
+            }
+        }
+    }
+}
+
 // ============================================================================
 // 辅助函数
 // ============================================================================
@@ -911,5 +1004,23 @@ mod tests {
     #[test]
     fn umd_message_has_empty_body() {
         assert_eq!(umd_message(899700992), "umd+899700992+{}");
+    }
+
+    /// 刷新周期必须显著小于服务端 TTL——否则到期与刷新之间会出现静默断流窗口。
+    /// 这条不变量是本次修复的全部要点，写成测试防止日后被"顺手调大"。
+    #[test]
+    fn refresh_interval_leaves_margin_before_server_ttl() {
+        assert!(
+            SMD_REFRESH_INTERVAL < SMD_SERVER_TTL,
+            "刷新周期 {:?} 必须小于服务端 TTL {:?}",
+            SMD_REFRESH_INTERVAL,
+            SMD_SERVER_TTL
+        );
+        let margin = SMD_SERVER_TTL - SMD_REFRESH_INTERVAL;
+        assert!(
+            margin >= Duration::from_secs(120),
+            "余量 {:?} 太小：一次刷新失败/预热耗时就可能越过 TTL",
+            margin
+        );
     }
 }
