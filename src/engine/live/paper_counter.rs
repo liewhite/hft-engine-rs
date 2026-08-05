@@ -13,7 +13,7 @@
 //! - **只以真实成交判定撮合**：`trade` 价格严格越过挂单价才成交（[`crate::sim::matcher`]）。
 //!   盘口只经 [`SimState::observe_bbo`] 更新，不参与撮合 —— 盘口触到你的价位只说明队列
 //!   **前面**的人在成交，据此判定成交会系统性高估。
-//! - **不做部分成交**：越价即全量成交。
+//! - **部分成交**：一笔 print 按其成交量消耗挂单（时间优先），吃不完的留簿等后续成交。
 //! - **下单延迟**：订单/撤单到达柜台后需等待 `order_delay_ms` 才开始参与撮合，模拟到交易所
 //!   的单程链路时延。延迟期内到达的成交不会打到该单上。
 //!
@@ -661,17 +661,28 @@ mod tests {
         assert!(h.statuses().contains(&OrderStatus::Filled));
     }
 
-    /// 不做部分成交：越价即全量
+    /// **部分成交**：一笔 print 只按其数量消耗挂单（此前 qty 被忽略，任意小的 print
+    /// 可以吃掉全部挂单量，成交量被系统性高估），剩余量留在簿里等后续成交
     #[tokio::test]
-    async fn fill_is_always_full_quantity() {
+    async fn trade_qty_budget_yields_partial_fills() {
         let h = Harness::new(0).await;
         h.bbo(100.0, 100.1).await;
         h.place(Side::Long, 99.0, 7.5).await;
         h.settle(50).await;
-        // 成交量 1.0 远小于挂单量 7.5，仍全量成交
+        // 成交量 1.0 < 挂单量 7.5：只成交 1.0，剩余 6.5 留簿
         h.trade(98.0).await;
         h.settle(30).await;
-        assert_eq!(h.fills(), vec![(99.0, 7.5)]);
+        assert_eq!(h.fills(), vec![(99.0, 1.0)]);
+        assert!(
+            h.statuses()
+                .contains(&OrderStatus::PartiallyFilled { filled: 1.0 }),
+            "部分成交必须以 PartiallyFilled 回报: {:?}",
+            h.statuses()
+        );
+        // 后续 print 继续消耗剩余量
+        h.trade(98.0).await;
+        h.settle(30).await;
+        assert_eq!(h.fills(), vec![(99.0, 1.0), (99.0, 1.0)]);
     }
 
     /// 延迟期内到达的成交打不到该单上

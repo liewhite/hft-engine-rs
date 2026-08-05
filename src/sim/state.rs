@@ -23,8 +23,26 @@ pub struct RestingOrder {
     pub symbol: Symbol,
     pub side: Side,
     pub limit_price: Price,
+    /// 原始委托量（不随成交递减；剩余量 = quantity - filled）
     pub quantity: Quantity,
+    /// 累计成交量
+    pub filled: Quantity,
     pub reduce_only: bool,
+}
+
+impl RestingOrder {
+    /// 剩余未成交量
+    pub fn remaining(&self) -> Quantity {
+        (self.quantity - self.filled).max(0.0)
+    }
+}
+
+/// 一次撮合尝试的结局（供撮合循环决定出簿/留簿与预算消耗）
+enum FillResult {
+    /// 成交了 `effective`；`done` = 累计已达原始委托量（应出簿）
+    Traded { effective: Quantity, done: bool },
+    /// reduce-only 无可平仓位，整单作废（应出簿，不消耗预算）
+    NoPositionToReduce,
 }
 
 /// 虚拟柜台的全部状态 (账本 + 挂单簿 + 最新行情)。
@@ -146,48 +164,80 @@ impl SimState {
     }
 
     /// BBO 越过挂单价的全部挂单成交 (maker 成交价取挂单价)，按到达顺序撮合。
+    ///
+    /// 盘口路径**不限量**（bid/ask qty 是盘口挂量而非成交量，语义不同）——本就是偏乐观的
+    /// 模型，见 `observe_bbo` 的说明。
     fn match_crossing(&mut self, bbo: &BBO) -> Vec<IncomeEvent> {
-        self.fill_crossed(&bbo.symbol, bbo.timestamp, |o| {
+        self.fill_crossed(&bbo.symbol, bbo.timestamp, None, |o| {
             matcher::crosses(o.side, o.limit_price, bbo)
         })
     }
 
-    /// 真实成交严格越过挂单价的全部挂单成交 (maker 成交价取挂单价)，按到达顺序撮合。
+    /// 真实成交严格越过挂单价的挂单成交 (maker 成交价取挂单价)，按到达顺序撮合，
+    /// **成交量以该笔 print 的数量为预算**：一笔 0.001 的成交只能吃掉 0.001 的挂单量，
+    /// 吃不完的部分留在簿里（PartiallyFilled）。此前 qty 被完全忽略 —— 任意小的 print
+    /// 可以吃掉全部越价挂单，成交量被系统性高估。
     fn match_trade(&mut self, t: &MarketTrade) -> Vec<IncomeEvent> {
-        self.fill_crossed(&t.symbol, t.timestamp, |o| {
+        self.fill_crossed(&t.symbol, t.timestamp, Some(t.qty), |o| {
             matcher::trade_crosses(o.side, o.limit_price, t.price)
         })
     }
 
-    /// 撮合公共形态：先按插入序 (到达序=时间优先) collect 满足 `crossed` 谓词的挂单，再逐一
-    /// 出簿成交 (maker 价取挂单价)。先 collect 后变更，避免迭代中修改容器；逐一 `shift_remove`
-    /// + `fill` 保证不漏单/不重复，且 reduceOnly 截断按成交先后顺序作用于当前持仓。
+    /// 撮合公共形态：先按插入序 (到达序=时间优先) collect 满足 `crossed` 谓词的挂单，再
+    /// 逐一成交 (maker 价取挂单价)。先 collect 后变更，避免迭代中修改容器。
+    /// `budget` = 本轮可消耗的成交量上限（None = 不限量，BBO 路径）；按到达顺序分配，
+    /// 耗尽即止 —— 时间优先的队列近似。
     fn fill_crossed(
         &mut self,
         symbol: &Symbol,
         ts: Timestamp,
+        budget: Option<Quantity>,
         crossed: impl Fn(&RestingOrder) -> bool,
     ) -> Vec<IncomeEvent> {
         let matched: Vec<RestingOrder> = self
             .resting
             .values()
-            .filter(|o| &o.symbol == symbol && crossed(o))
+            .filter(|o| &o.symbol == symbol && o.remaining() > Position::EPSILON && crossed(o))
             .cloned()
             .collect();
+        let mut remaining_budget = budget;
         let mut out = Vec::new();
         for o in matched {
-            self.resting.shift_remove(&o.order_id);
-            out.extend(self.fill(
+            let take = match remaining_budget {
+                Some(b) if b <= Position::EPSILON => break, // 预算耗尽
+                Some(b) => o.remaining().min(b),
+                None => o.remaining(),
+            };
+            let (result, events) = self.fill(
                 &o.order_id,
                 &o.client_order_id,
                 &o.symbol,
                 o.side,
                 o.limit_price,
                 o.quantity,
+                o.filled,
+                take,
                 ts,
                 Liquidity::Maker,
                 o.reduce_only,
-            ));
+            );
+            out.extend(events);
+            match result {
+                FillResult::Traded { effective, done } => {
+                    if let Some(b) = remaining_budget.as_mut() {
+                        *b -= effective;
+                    }
+                    if done {
+                        self.resting.shift_remove(&o.order_id);
+                    } else if let Some(entry) = self.resting.get_mut(&o.order_id) {
+                        entry.filled += effective;
+                    }
+                }
+                // reduce-only 无可平：整单作废出簿，不消耗预算
+                FillResult::NoPositionToReduce => {
+                    self.resting.shift_remove(&o.order_id);
+                }
+            }
         }
         out
     }
@@ -219,17 +269,7 @@ impl SimState {
         let ts = now;
         match &order.order_type {
             OrderType::Market => match reference {
-                Some(price) => self.fill(
-                    order_id,
-                    &order.client_order_id,
-                    &order.symbol,
-                    order.side,
-                    price,
-                    order.quantity,
-                    ts,
-                    Liquidity::Taker,
-                    order.reduce_only,
-                ),
+                Some(price) => self.taker_fill(order, order_id, price, ts),
                 None => vec![status_event(
                     self.exchange,
                     order,
@@ -261,32 +301,12 @@ impl SimState {
                         None => self.rest(order, order_id, *limit, ts),
                     },
                     TimeInForce::GTC => match taker_price {
-                        Some(p) => self.fill(
-                            order_id,
-                            &order.client_order_id,
-                            &order.symbol,
-                            order.side,
-                            p,
-                            order.quantity,
-                            ts,
-                            Liquidity::Taker,
-                            order.reduce_only,
-                        ),
+                        Some(p) => self.taker_fill(order, order_id, p, ts),
                         None => self.rest(order, order_id, *limit, ts),
                     },
                     TimeInForce::IOC | TimeInForce::FOK => match taker_price {
                         // 无深度模型, 可成交即全量成交, 否则整单取消 (不 resting)
-                        Some(p) => self.fill(
-                            order_id,
-                            &order.client_order_id,
-                            &order.symbol,
-                            order.side,
-                            p,
-                            order.quantity,
-                            ts,
-                            Liquidity::Taker,
-                            order.reduce_only,
-                        ),
+                        Some(p) => self.taker_fill(order, order_id, p, ts),
                         None => vec![status_event(
                             self.exchange,
                             order,
@@ -331,6 +351,55 @@ impl SimState {
 
     // ==================== 私有构造 ====================
 
+    /// taker 路径（订单到达即成交，**不 resting**）。成交后若有剩余 —— 在无深度模型下
+    /// 只可能来自 reduceOnly 截断 —— 当场作废剩余量并补一条 Cancelled 终态：taker 单
+    /// 没有簿可留，回报必须以终态闭合，否则策略的 pending 永远清不掉。
+    fn taker_fill(
+        &mut self,
+        order: &Order,
+        order_id: &OrderId,
+        price: Price,
+        ts: Timestamp,
+    ) -> Vec<IncomeEvent> {
+        let (result, mut events) = self.fill(
+            order_id,
+            &order.client_order_id,
+            &order.symbol,
+            order.side,
+            price,
+            order.quantity,
+            0.0,
+            order.quantity,
+            ts,
+            Liquidity::Taker,
+            order.reduce_only,
+        );
+        if let FillResult::Traded {
+            effective,
+            done: false,
+        } = result
+        {
+            events.push(ev_at(
+                ts,
+                ExchangeEventData::OrderUpdate(OrderUpdate {
+                    order_id: order_id.clone(),
+                    client_order_id: Some(order.client_order_id.clone()),
+                    exchange: self.exchange,
+                    symbol: order.symbol.clone(),
+                    side: order.side,
+                    status: OrderStatus::Cancelled,
+                    price,
+                    reduce_only: order.reduce_only,
+                    quantity: order.quantity,
+                    filled_quantity: effective,
+                    fill_sz: 0.0,
+                    timestamp: ts,
+                }),
+            ));
+        }
+        events
+    }
+
     fn rest(
         &mut self,
         order: &Order,
@@ -347,14 +416,22 @@ impl SimState {
                 side: order.side,
                 limit_price: limit,
                 quantity: order.quantity,
+                filled: 0.0,
                 reduce_only: order.reduce_only,
             },
         );
         vec![status_event(self.exchange, order, order_id, OrderStatus::Pending, limit, ts)]
     }
 
-    /// 成交落账。reduceOnly 单按当前持仓截断 (卖只平多、买只平空)，撮合层强制不反向开仓；
-    /// 无可平仓位时不成交，回 Cancelled (订单已被调用方移出簿 / 不入簿)。
+    /// 尝试成交 `take` 数量并落账。
+    ///
+    /// - `order_qty` 是**原始委托量**、`already_filled` 是本次之前的累计成交 —— 回报字段
+    ///   如实区分三个量：`quantity` = 原始量、`filled_quantity` = 累计、`fill_sz` = 本次。
+    ///   （此前把截断后的量谎报成订单总量，策略比对"我下了多少"会得到不一致视图。）
+    /// - 累计达到原始量即 `Filled`，否则 `PartiallyFilled`；出簿/留簿由调用方按
+    ///   [`FillResult`] 决定。
+    /// - reduceOnly 单按当前持仓截断 (卖只平多、买只平空)，撮合层强制不反向开仓；
+    ///   无可平仓位时不成交，回 Cancelled（[`FillResult::NoPositionToReduce`]，调用方出簿）。
     #[allow(clippy::too_many_arguments)]
     fn fill(
         &mut self,
@@ -363,24 +440,26 @@ impl SimState {
         symbol: &Symbol,
         side: Side,
         fill_price: Price,
-        qty: Quantity,
+        order_qty: Quantity,
+        already_filled: Quantity,
+        take: Quantity,
         ts: Timestamp,
         liquidity: Liquidity,
         reduce_only: bool,
-    ) -> Vec<IncomeEvent> {
+    ) -> (FillResult, Vec<IncomeEvent>) {
         let effective_qty = if !reduce_only {
-            qty
+            take
         } else {
             let pos_size = self.ledger.positions.get(symbol).map(|p| p.size).unwrap_or(0.0);
             match side {
-                Side::Short => qty.min(pos_size.max(0.0)),    // 卖平多: 至多平掉现有多头
-                Side::Long => qty.min((-pos_size).max(0.0)),  // 买平空: 至多平掉现有空头
+                Side::Short => take.min(pos_size.max(0.0)),    // 卖平多: 至多平掉现有多头
+                Side::Long => take.min((-pos_size).max(0.0)),  // 买平空: 至多平掉现有空头
             }
         };
 
         if reduce_only && effective_qty <= Position::EPSILON {
             // reduceOnly 无可平仓位 -> 不成交，回 Cancelled
-            return vec![ev_at(
+            let events = vec![ev_at(
                 ts,
                 ExchangeEventData::OrderUpdate(OrderUpdate {
                     order_id: order_id.clone(),
@@ -391,12 +470,13 @@ impl SimState {
                     status: OrderStatus::Cancelled,
                     price: fill_price,
                     reduce_only,
-                    quantity: qty,
-                    filled_quantity: 0.0,
+                    quantity: order_qty,
+                    filled_quantity: already_filled,
                     fill_sz: 0.0,
                     timestamp: ts,
                 }),
             )];
+            return (FillResult::NoPositionToReduce, events);
         }
 
         let fee_rate = match liquidity {
@@ -407,17 +487,24 @@ impl SimState {
         self.ledger
             .apply_fill(self.exchange, symbol, side, fill_price, effective_qty, fee);
 
+        let cumulative = already_filled + effective_qty;
+        let done = cumulative + Position::EPSILON >= order_qty;
+        let status = if done {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::PartiallyFilled { filled: cumulative }
+        };
         let update = OrderUpdate {
             order_id: order_id.clone(),
             client_order_id: Some(client_order_id.to_string()),
             exchange: self.exchange,
             symbol: symbol.clone(),
             side,
-            status: OrderStatus::Filled,
+            status,
             price: fill_price,
             reduce_only,
-            quantity: effective_qty,
-            filled_quantity: effective_qty,
+            quantity: order_qty,
+            filled_quantity: cumulative,
             fill_sz: effective_qty,
             timestamp: ts,
         };
@@ -433,10 +520,17 @@ impl SimState {
             fee,
             reason: crate::domain::FillReason::Normal, // 回测无强平/ADL
         };
-        vec![
+        let events = vec![
             ev_at(ts, ExchangeEventData::OrderUpdate(update)),
             ev_at(ts, ExchangeEventData::Fill(f)),
-        ]
+        ];
+        (
+            FillResult::Traded {
+                effective: effective_qty,
+                done,
+            },
+            events,
+        )
     }
 }
 
@@ -507,6 +601,9 @@ mod tests {
         }
     }
     fn trade_ev(price: Price, ts: Timestamp) -> IncomeEvent {
+        trade_ev_qty(price, 1.0, ts)
+    }
+    fn trade_ev_qty(price: Price, qty: Quantity, ts: Timestamp) -> IncomeEvent {
         IncomeEvent {
             exchange_ts: ts,
             local_ts: ts,
@@ -514,7 +611,7 @@ mod tests {
                 exchange: EX,
                 symbol: sym(),
                 price,
-                qty: 1.0,
+                qty,
                 is_buyer_maker: false,
                 timestamp: ts,
             }),
@@ -689,6 +786,48 @@ mod tests {
         let f = fills(&evs);
         assert_eq!(f.iter().map(|x| x.price).collect::<Vec<_>>(), vec![100.0]);
         assert_eq!(s.ledger.positions[&sym()].size, 0.002);
+    }
+
+    // ===== 部分成交：print 数量作为撮合预算 =====
+
+    /// 一笔 print 的数量按**到达顺序**在越价挂单间分配，耗尽即止；吃剩的量留簿。
+    /// 回报字段如实区分：quantity=原始量、filled_quantity=累计、fill_sz=本次。
+    #[test]
+    fn trade_qty_is_consumed_across_orders_in_arrival_order() {
+        let mut s = empty();
+        // 两张买单先后到达：0.7 @100、0.5 @101（都无行情时 resting）
+        let mut o1 = limit(Side::Long, 100.0, TimeInForce::GTC, "b1");
+        o1.quantity = 0.7;
+        let mut o2 = limit(Side::Long, 101.0, TimeInForce::GTC, "b2");
+        o2.quantity = 0.5;
+        s.on_order_arrived(1, &o1, &"1".to_string());
+        s.on_order_arrived(1, &o2, &"2".to_string());
+        // print 1.0 @99 越过两张单：先到的 b1 全吃 0.7，剩余 0.3 给 b2
+        let evs = s.on_market(&trade_ev_qty(99.0, 1.0, 2));
+        let f = fills(&evs);
+        let sizes: Vec<(String, f64)> =
+            f.iter().map(|x| (x.order_id.clone(), x.size)).collect();
+        assert_eq!(sizes.len(), 2, "预算应分给两张单: {sizes:?}");
+        assert_eq!(sizes[0].0, "1");
+        near(sizes[0].1, 0.7);
+        assert_eq!(sizes[1].0, "2");
+        near(sizes[1].1, 0.3);
+        // b1 全成出簿；b2 剩 0.2 留簿，回报 PartiallyFilled(累计 0.3)
+        assert!(!s.resting.contains_key("1"));
+        near(s.resting.get("2").map(|o| o.remaining()).unwrap_or(0.0), 0.2);
+        assert!(statuses(&evs).contains(&OrderStatus::Filled));
+        assert!(
+            statuses(&evs)
+                .iter()
+                .any(|st| matches!(st, OrderStatus::PartiallyFilled { filled } if (filled - 0.3).abs() < 1e-9)),
+            "应有 PartiallyFilled 回报: {:?}",
+            statuses(&evs)
+        );
+        // 下一笔 print 足量吃完 b2 剩余，终态 Filled、累计=原始量
+        let evs = s.on_market(&trade_ev_qty(99.0, 0.25, 3));
+        assert!(statuses(&evs).contains(&OrderStatus::Filled));
+        assert!(s.resting.is_empty());
+        assert!((s.ledger.positions[&sym()].size - 1.2).abs() < 1e-9);
     }
 
     // ===== trade-native 行情下的可成交性（参考价退化用最新成交价） =====
