@@ -365,6 +365,16 @@ impl ExchangeClient for OkxClient {
     }
 
     async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
+        // 无凭证 = 只接公共行情（见 ExchangeAccess），没有账户就没有挂单 —— 与
+        // fetch_positions 同一口径。若在此返回 Err，`ManagerActor` 启动期会**逐 symbol**
+        // 各报一次错（模拟盘跑几百个 symbol 就是几百条 warn），噪音会盖住真实告警。
+        //
+        // 注意：place_order / cancel_order / set_leverage 不该这样处理 —— 那些是"没凭证就
+        // 真的做不到"，报错是正确行为。只有只读查询才能把"没有账户"表达成空结果。
+        if self.credentials.is_none() {
+            return Ok(Vec::new());
+        }
+
         let inst_id = to_okx(symbol, &self.quote);
         let path = format!(
             "/api/v5/trade/orders-pending?instId={}&instType=SWAP",

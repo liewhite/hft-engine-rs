@@ -38,10 +38,10 @@ use std::sync::Arc;
 
 use super::RegisterSymbols;
 
-/// 连续多少次不一致才判定为真实漂移。
+/// 连续多少次**差值稳定**的不一致才判定为真实漂移，见 [`MismatchRecord`]。
 ///
 /// 不能取 1：REST 快照的时点与本地 Fill 流之间必然有间隙（成交已落交易所、Fill 稍后才到），
-/// 单次不一致是正常的飞行窗口。连续多次仍不一致才说明是真漂移而非时序错位。
+/// 单次不一致是正常的飞行窗口。
 pub const DEFAULT_MAX_CONSECUTIVE_MISMATCHES: u32 = 3;
 
 /// 观测层不做订单超时清理（镜像只关心持仓）
@@ -72,9 +72,31 @@ pub struct Reconciler {
     baselined: HashSet<(Exchange, Symbol)>,
     /// 容差来源：`size_step` 是该 symbol 的最小可交易增量，小于它的差值不可能是真实漂移
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// per (所, symbol) 的连续不一致次数；任意一次落回容差内即清零
-    streaks: HashMap<(Exchange, Symbol), u32>,
+    /// per (所, symbol) 的不一致记录；一致一次即整条移除
+    mismatches: HashMap<(Exchange, Symbol), MismatchRecord>,
     max_consecutive: u32,
+}
+
+/// 某条腿的连续不一致记录。
+///
+/// # 为什么要记住差值，而不是只数次数
+///
+/// 只数次数会把**在途成交**误判成漂移：某 symbol 若持续成交，每次轮询都可能正好撞在
+/// "成交已落交易所、Fill 尚未送达"的窗口上，攒够次数就误停机 —— 而误停机比漏报更糟。
+///
+/// 差值本身能区分这两件事：
+/// - **真漂移**（漏算了一笔 X）→ 差值恒为 X。此后即使继续交易，本地与交易所同步移动，
+///   差值仍是 X，不会被"抹平"
+/// - **在途成交** → 差值等于当时在途的量，每次轮询都不一样
+///
+/// 故只在"差值与上次相同"时累加，差值一变就重新从 1 数起。这比单纯提高次数阈值更准：
+/// 既不误伤飞行窗口，也不会在活跃交易期压制真实漂移的检出。
+#[derive(Debug, Clone, Copy)]
+struct MismatchRecord {
+    /// 连续**同一差值**的不一致次数
+    streak: u32,
+    /// 上一次的**带符号**差值 `local - reported`（带符号：+X 与 -X 是不同的漂移）
+    last_diff: f64,
 }
 
 impl Reconciler {
@@ -86,7 +108,7 @@ impl Reconciler {
             mirror: StateManager::new(&[], NO_ORDER_TIMEOUT),
             baselined: HashSet::new(),
             symbol_metas,
-            streaks: HashMap::new(),
+            mismatches: HashMap::new(),
             max_consecutive,
         }
     }
@@ -139,12 +161,12 @@ impl Reconciler {
         let reported: HashMap<&Symbol, f64> =
             positions.iter().map(|p| (&p.symbol, p.size)).collect();
 
-        // 拆开字段以取得互不重叠的借用（baselined 只读、streaks 可变）
+        // 拆开字段以取得互不重叠的借用（baselined 只读、mismatches 可变）
         let Self {
             mirror,
             baselined,
             symbol_metas,
-            streaks,
+            mismatches,
             max_consecutive,
         } = self;
 
@@ -162,19 +184,32 @@ impl Reconciler {
                 .map(|s| s.position_size(exchange))
                 .unwrap_or(0.0);
             let tolerance = tolerance_of(symbol_metas, exchange, symbol);
-            let diff = (local_size - reported_size).abs();
+            // 带符号差值：+X 与 -X 是方向相反的两种漂移，不能混为一谈
+            let diff = local_size - reported_size;
             let key = (exchange, symbol.clone());
 
-            if diff <= tolerance {
-                // 一致即清零：计数器衡量的是"持续不一致"，不是历史累计
-                streaks.remove(&key);
+            if diff.abs() <= tolerance {
+                // 一致即整条移除：记录衡量的是"当前正持续着的不一致"，不是历史累计
+                mismatches.remove(&key);
                 continue;
             }
 
-            let streak = *streaks
-                .entry(key)
-                .and_modify(|count| *count += 1)
-                .or_insert(1);
+            // 差值是否与上次相同 —— 区分真漂移与在途成交，见 MismatchRecord
+            let stable = mismatches
+                .get(&key)
+                .is_some_and(|prev| (diff - prev.last_diff).abs() <= tolerance);
+            let streak = if stable {
+                mismatches.get(&key).map_or(1, |prev| prev.streak + 1)
+            } else {
+                1
+            };
+            mismatches.insert(
+                key,
+                MismatchRecord {
+                    streak,
+                    last_diff: diff,
+                },
+            );
 
             // 打成结构化日志，让漂移成为可观测的趋势，而不是只有停机那一刻才被看到
             tracing::warn!(
@@ -185,6 +220,7 @@ impl Reconciler {
                 reported_size = format!("{reported_size:.8}"),
                 diff = format!("{diff:.8}"),
                 tolerance = format!("{tolerance:.8}"),
+                stable_diff = stable,
                 streak,
                 max_consecutive = *max_consecutive,
                 "metrics.position_drift：本地持仓与交易所读数不一致"
@@ -202,7 +238,7 @@ impl Reconciler {
             return Ok(());
         }
         Err(format!(
-            "持仓对账连续 {} 次不一致，本地「基线 + Fill」已不可信: {}",
+            "持仓对账连续 {} 次差值稳定的不一致，本地「基线 + Fill」已不可信: {}",
             self.max_consecutive,
             confirmed_drift.join("; ")
         ))
@@ -410,7 +446,61 @@ mod tests {
         let err = r
             .on_event(&report(EX, vec![position(EX, 5.0)]))
             .expect_err("连续第 3 次不一致应致命");
-        assert!(err.contains("对账连续 3 次不一致"), "got: {err}");
+        assert!(err.contains("连续 3 次差值稳定的不一致"), "got: {err}");
+    }
+
+    /// **误停机防线**：差值每次都在变 = 在途成交造成的错位，不是固定漂移，不该累加。
+    ///
+    /// 某 symbol 持续成交时，每次轮询都可能正好撞在"成交已落交易所、Fill 尚未送达"的窗口
+    /// 上。只数次数会把它攒成致命 —— 而误停机比漏报更糟。
+    #[test]
+    fn changing_diff_never_accumulates_into_a_fatal() {
+        let mut r = reconciler(3);
+        r.on_event(&baseline(1.0)).unwrap();
+
+        // 本地始终 1.0，交易所读数每次不同 -> 差值每次不同 -> 永远停在 streak=1
+        for reported in [3.0, 7.0, 2.5, 9.0, 4.25, 6.5, 8.75] {
+            r.on_event(&report(EX, vec![position(EX, reported)]))
+                .expect("差值在变说明是在途成交，不该判为漂移");
+        }
+    }
+
+    /// 反面：真漂移的差值**恒定**，即使本地持仓一直在变也能检出。
+    ///
+    /// 漏算一笔 X 之后，本地与交易所会同步移动，差值仍是 X —— 这正是"差值稳定"判据既不
+    /// 误伤飞行窗口、又不会在活跃交易期压制真实漂移的原因。
+    #[test]
+    fn constant_diff_is_detected_even_while_position_keeps_moving() {
+        let mut r = reconciler(3);
+        r.on_event(&baseline(10.0)).unwrap();
+
+        // 交易所比本地少 2（漏算了一笔 -2 的成交），此后持续成交、两边同步移动
+        r.on_event(&report(EX, vec![position(EX, 8.0)])).unwrap();
+        r.on_event(&fill(Side::Long, 1.0)).unwrap(); // 本地 11
+        r.on_event(&report(EX, vec![position(EX, 9.0)])).unwrap(); // 差值仍 +2
+        r.on_event(&fill(Side::Long, 3.0)).unwrap(); // 本地 14
+        let err = r
+            .on_event(&report(EX, vec![position(EX, 12.0)])) // 差值仍 +2
+            .expect_err("差值恒定即真漂移，持续交易不该把它抹掉");
+        assert!(err.contains("本地 14"), "got: {err}");
+    }
+
+    /// 差值反向也算变化：+X 与 -X 是方向相反的两种漂移，不能接续计数
+    #[test]
+    fn sign_flip_in_diff_restarts_the_streak() {
+        let mut r = reconciler(2);
+        r.on_event(&baseline(5.0)).unwrap();
+
+        // 差值 -3（交易所多）
+        r.on_event(&report(EX, vec![position(EX, 8.0)])).unwrap();
+        // 差值 +3（本地多）—— 绝对值相同但方向相反，必须重新从 1 数起
+        r.on_event(&report(EX, vec![position(EX, 2.0)]))
+            .expect("差值反向不该接着上一次的计数");
+        // 再来一次 +3 才够 2 次
+        let err = r
+            .on_event(&report(EX, vec![position(EX, 2.0)]))
+            .expect_err("同方向连续两次应致命");
+        assert!(err.contains("交易所 2"), "got: {err}");
     }
 
     /// **关键**：中间只要一致一次就清零，计数器衡量的是"持续不一致"而非历史累计。
