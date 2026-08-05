@@ -30,7 +30,10 @@
 //! `initial_balance_usdt` 起步（等价"每个所各入金一份"，与实盘各所独立账户一致）。
 //! 净值在收到 Clock 时按各自的所发布 AccountInfo。
 
-use crate::domain::{now_ms, AccountId, Exchange, Order, OrderId, Symbol, Timestamp, BBO};
+use crate::domain::{
+    now_ms, AccountId, Exchange, Order, OrderId, OrderStatus, OrderUpdate, Symbol, SymbolMeta,
+    Timestamp, BBO,
+};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
@@ -50,6 +53,9 @@ pub struct PaperCounterArgs {
     pub paper_pubsub: ActorRef<PaperPubSub>,
     /// 撮合与账本配置（每个模拟账户各自按此初始化）
     pub config: SimConfig,
+    /// Symbol 元数据：下单量下界校验（与实盘出口同一规则，见
+    /// [`SymbolMeta::checked_exchange_qty`]）
+    pub symbol_metas: std::sync::Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
 }
 
 /// 延迟到期后应用下单
@@ -79,6 +85,8 @@ pub struct PaperCounterActor {
     last_quotes: HashMap<(Exchange, Symbol), BBO>,
     paper_pubsub: ActorRef<PaperPubSub>,
     config: SimConfig,
+    /// 下单量下界校验用（与实盘出口同一规则）
+    symbol_metas: std::sync::Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 本地订单号发号器（模拟交易所返回的 order_id）
     order_id_gen: u64,
 }
@@ -164,6 +172,37 @@ impl PaperCounterActor {
         }
     }
 
+    /// 校验失败的拒单回报（Error 终态，清除策略侧 pending），与实盘
+    /// OutcomeProcessor::send_order_error 同语义。
+    async fn publish_order_error(&self, account: &AccountId, order: &Order, reason: String) {
+        let ts = now_ms();
+        let update = OrderUpdate {
+            order_id: String::new(),
+            client_order_id: Some(order.client_order_id.clone()),
+            exchange: order.exchange,
+            symbol: order.symbol.clone(),
+            side: order.side,
+            status: OrderStatus::Error { reason },
+            price: 0.0,
+            reduce_only: order.reduce_only,
+            quantity: order.quantity,
+            filled_quantity: 0.0,
+            fill_sz: 0.0,
+            timestamp: ts,
+        };
+        let tagged = AccountIncome {
+            account: account.clone(),
+            event: IncomeEvent {
+                exchange_ts: ts,
+                local_ts: ts,
+                data: ExchangeEventData::OrderUpdate(update),
+            },
+        };
+        if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
+            tracing::error!(error = %e, "Paper counter failed to publish order error");
+        }
+    }
+
     /// 延迟 `order_delay_ms` 后把消息投回自己，模拟到交易所的单程时延。
     ///
     /// 延迟为常量，故同一 actor 上的投递顺序与到达顺序一致（不会乱序）。
@@ -201,6 +240,7 @@ impl Actor for PaperCounterActor {
             last_quotes: HashMap::new(),
             paper_pubsub: args.paper_pubsub,
             config: args.config,
+            symbol_metas: args.symbol_metas,
             order_id_gen: 0,
         })
     }
@@ -293,6 +333,32 @@ impl Message<AccountOutcome> for PaperCounterActor {
         match msg {
             OutcomeEvent::PlaceOrders { orders, comment } => {
                 for order in orders {
+                    // 与实盘出口同一套下界校验（checked_exchange_qty 是唯一出处）：
+                    // 实盘必拒的单（取整为 0 / 低于最小下单量 / 缺 meta）模拟盘也拒，
+                    // 否则模拟盘会成交实盘发不出去的单，仿真失真。
+                    let validation = match self
+                        .symbol_metas
+                        .get(&(order.exchange, order.symbol.clone()))
+                    {
+                        None => Err(format!(
+                            "no SymbolMeta for {}/{}",
+                            order.exchange, order.symbol
+                        )),
+                        Some(meta) => meta.checked_exchange_qty(order.quantity).map(|_| ()),
+                    };
+                    if let Err(reason) = validation {
+                        tracing::error!(
+                            %account,
+                            exchange = %order.exchange,
+                            symbol = %order.symbol,
+                            quantity = order.quantity,
+                            client_order_id = %order.client_order_id,
+                            %reason,
+                            "[PAPER] 订单未通过出向校验，拒单"
+                        );
+                        self.publish_order_error(&account, &order, reason).await;
+                        continue;
+                    }
                     let order_id = self.next_order_id();
                     tracing::info!(
                         %account,
@@ -395,6 +461,29 @@ mod tests {
         AccountId::Paper(SYM.to_string())
     }
 
+    /// 测试元数据：步长/最小量取得足够小，既有测试的数量不触发下界校验
+    fn test_metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
+        use crate::exchange::utils::StepFormatter;
+        Arc::new(
+            [Exchange::Binance, Exchange::OKX]
+                .into_iter()
+                .map(|exchange| {
+                    (
+                        (exchange, SYM.to_string()),
+                        SymbolMeta {
+                            exchange,
+                            symbol: SYM.to_string(),
+                            price_formatter: Arc::new(StepFormatter::new(0.001)),
+                            size_step: 0.001,
+                            min_order_size: 0.001,
+                            contract_size: 1.0,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
     /// 收集柜台回报，供断言
     struct Sink(Arc<Mutex<Vec<IncomeEvent>>>);
 
@@ -438,6 +527,7 @@ mod tests {
                         order_to_exchange_delay_ms: order_delay_ms,
                         exchange_to_strategy_delay_ms: 0,
                     },
+                    symbol_metas: test_metas(),
                 },
                 mailbox::unbounded(),
             );
@@ -661,6 +751,29 @@ mod tests {
         assert!(h.statuses().contains(&OrderStatus::Filled));
     }
 
+    /// **与实盘同规则的下界校验**：实盘必拒的单（不足一个 size_step）模拟盘也拒，
+    /// 以 Error 终态回报（清策略侧 pending），绝不入簿成交 —— 否则模拟盘会成交
+    /// 实盘发不出去的单，仿真失真
+    #[tokio::test]
+    async fn undersized_order_is_rejected_like_live() {
+        let h = Harness::new(0).await;
+        h.bbo(100.0, 100.1).await;
+        // 0.0004 < size_step 0.001：实盘出口会拒，柜台同样拒
+        h.place(Side::Long, 99.0, 0.0004).await;
+        h.settle(50).await;
+        assert!(
+            h.statuses()
+                .iter()
+                .any(|st| matches!(st, OrderStatus::Error { .. })),
+            "校验失败必须以 Error 终态回报: {:?}",
+            h.statuses()
+        );
+        // 即使成交穿价，也不该有成交（单没入簿）
+        h.trade(98.0).await;
+        h.settle(30).await;
+        assert!(h.fills().is_empty(), "未通过校验的单不该成交");
+    }
+
     /// **部分成交**：一笔 print 只按其数量消耗挂单（此前 qty 被忽略，任意小的 print
     /// 可以吃掉全部挂单量，成交量被系统性高估），剩余量留在簿里等后续成交
     #[tokio::test]
@@ -779,6 +892,7 @@ mod tests {
                     order_to_exchange_delay_ms: 0,
                     exchange_to_strategy_delay_ms: 0,
                 },
+                symbol_metas: test_metas(),
             },
             mailbox::unbounded(),
         );

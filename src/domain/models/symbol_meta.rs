@@ -70,6 +70,32 @@ impl SymbolMeta {
         Self::round_to_step(size, self.size_step, RoundingStrategy::ToNegativeInfinity)
     }
 
+    /// 币本位 -> 交易所下单单位：折算、按精度向下取整，并校验数量下界。
+    ///
+    /// **出向数量校验的唯一出处**：实盘出口（`crate::exchange::ExchangeOrder::from_domain`）
+    /// 与模拟柜台（`PaperCounterActor`）都经此校验 —— 保证"实盘必拒的单，模拟盘也拒"，
+    /// 否则模拟盘会成交实盘发不出去的单，仿真失真。
+    ///
+    /// - 取整后为 0（请求量不足一个 `size_step`）：照发交易所必拒，且策略会陷入
+    ///   "下单 → 被拒 → pending 清除 → 下个事件再下"的静默重试环
+    /// - 低于 `min_order_size`（交易所最小下单量，交易所单位）：同样必拒
+    pub fn checked_exchange_qty(&self, coin_amount: f64) -> Result<f64, String> {
+        let quantity = self.round_size_down(self.coin_to_qty(coin_amount));
+        if quantity <= 0.0 {
+            return Err(format!(
+                "数量取整后为 0：请求 {coin_amount} 币不足一个 size_step（step={}, contract_size={}）",
+                self.size_step, self.contract_size
+            ));
+        }
+        if quantity < self.min_order_size {
+            return Err(format!(
+                "数量低于交易所最小下单量：取整后 {quantity}，最小 {}（交易所单位）",
+                self.min_order_size
+            ));
+        }
+        Ok(quantity)
+    }
+
     /// 将**币本位**数量调整到交易所允许的合法精度 (向下取整)。
     ///
     /// 合法的币数量必然是 `size_step × contract_size` 的整数倍，因此精度约束完全可以在币本位

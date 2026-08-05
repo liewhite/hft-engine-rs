@@ -126,29 +126,14 @@ impl ExchangeOrder {
     /// - 价格 `round_price`：取**最近**的合法 tick（`StepFormatter` 是四舍五入），因为价格
     ///   向下取整对买单是让价、对卖单是抢价，方向语义不一致，反而更难推理
     ///
-    /// # 数量下界校验收口在此
+    /// # 数量下界校验
     ///
-    /// 这里是所有实盘订单的必经之路（`place_order` 只收本类型），故下界校验只此一处：
-    /// - 取整后为 0（请求量不足一个 `size_step`）：照发交易所必拒，且策略会陷入
-    ///   "下单 → 被拒 → pending 清除 → 下个事件再下"的静默重试环
-    /// - 低于 `min_order_size`（交易所最小下单量，交易所单位）：同样必拒
-    ///
-    /// 两者都在本地拦下并返回可定位的原因，由调用方反馈为 `OrderUpdate(Error)` ——
-    /// 策略能看到失败，而不是每个事件白打一次 REST。
+    /// 折算与下界校验统一走 [`SymbolMeta::checked_exchange_qty`]（模拟柜台同一出处，
+    /// 保证实盘必拒的单模拟盘也拒）。取整为 0 / 低于 `min_order_size` 都在本地拦下并
+    /// 返回可定位的原因，由调用方反馈为 `OrderUpdate(Error)` —— 策略能看到失败，
+    /// 而不是每个事件白打一次 REST。
     pub fn from_domain(order: Order, meta: &SymbolMeta) -> Result<Self, String> {
-        let quantity = meta.round_size_down(meta.coin_to_qty(order.quantity));
-        if quantity <= 0.0 {
-            return Err(format!(
-                "数量取整后为 0：请求 {} 币不足一个 size_step（step={}, contract_size={}）",
-                order.quantity, meta.size_step, meta.contract_size
-            ));
-        }
-        if quantity < meta.min_order_size {
-            return Err(format!(
-                "数量低于交易所最小下单量：取整后 {quantity}，最小 {}（交易所单位）",
-                meta.min_order_size
-            ));
-        }
+        let quantity = meta.checked_exchange_qty(order.quantity)?;
         let order_type = match &order.order_type {
             OrderType::Market => OrderType::Market,
             OrderType::Limit { price, tif } => OrderType::Limit {

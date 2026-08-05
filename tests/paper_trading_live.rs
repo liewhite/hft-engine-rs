@@ -245,6 +245,7 @@ async fn paper_counter_fills_from_live_trades() {
     let counter = PaperCounterActor::spawn_with_mailbox(
         PaperCounterArgs {
             paper_pubsub: paper_pubsub.clone(),
+            symbol_metas: metas_by_key.clone(),
             config: SimConfig {
                 initial_balance_usdt: 10_000.0,
                 // 币安标准档：maker 0.02% / taker 0.05%

@@ -752,6 +752,7 @@ impl Actor for ManagerActor {
             PaperCounterArgs {
                 paper_pubsub: paper_pubsub.clone(),
                 config: args.paper,
+                symbol_metas: Arc::new(symbol_metas.clone()),
             },
             mailbox::unbounded(),
         )
