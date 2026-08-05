@@ -7,12 +7,15 @@
 //! - 处理订单状态推送 (sor topic)
 //! - 增量更新 bid/ask 缓存并发布 BBO 到 IncomePubSub
 //!
-//! **IBKR 的 smd 订阅会在 15 分钟后被服务端自动终止**（2026-04-10 起的行为变更，IBKR 客服
-//! 原话："the topic will terminate automatically after 15 minutes and you will need to send a
-//! new request to continue to retrieve data for the instrument"）。终止时**没有 close 帧、
+//! **IBKR 的 smd 订阅会被服务端自动终止**（2026-04-10 起的行为变更）。终止时**没有 close 帧、
 //! 没有错误**，流就静默停掉——ws 连接、ping、tickle 全都照常健康，因此完全不可从连接层察觉
-//! (实测：韩股腿恰好 15 分钟后断流，同一条 ws 上另一条腿因被借券 snapshot 轮询顺带续命而
-//! 无恙)。故本 actor 必须在到期前主动重订阅；IBKR 建议先 `umd+` 再 `smd+` 干净刷新。
+//! (实测：韩股腿断流后报价冻结、且不自愈，同一条 ws 上另一条腿因被借券 snapshot 轮询顺带续命
+//! 而无恙)。故本 actor 必须在到期前主动重订阅；IBKR 建议先 `umd+` 再 `smd+` 干净刷新。
+//!
+//! 到期时限的两个来源不一致：IBKR 文档写 **10 分钟**；社区实测与客服答复是 **15 分钟**
+//! （"the topic will terminate automatically after 15 minutes and you will need to send a new
+//! request to continue to retrieve data for the instrument"，见 Voyz/ibind#145）。故以**更紧
+//! 的 10 分钟**为约束（见 `SMD_SERVER_TTL`），刷新周期取 8 分钟。
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO};
 use crate::engine::IncomePubSub;
@@ -66,12 +69,14 @@ const FILL_COMMISSION_TIMEOUT_SECS: u64 = 3;
 /// 预热 (snapshot) 与流式订阅 (smd) 共用同一份，保证"预热的字段"就是"要推的字段"。
 const BBO_FIELDS: [&str; 4] = ["84", "86", "85", "88"];
 
-/// IBKR 服务端终止 smd 订阅的时限（协议事实，见模块文档）
-const SMD_SERVER_TTL: Duration = Duration::from_secs(15 * 60);
+/// IBKR 服务端终止 smd 订阅的时限：取两个来源里**更紧**的那个（文档 10 分钟 / 实测 15 分钟，
+/// 见模块文档）。取紧的一侧是因为代价不对称：估短了只是多刷几次（一次两条报文），估长了就是
+/// 一段静默断流窗口——而这种断流从连接层看不出来。
+const SMD_SERVER_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// smd 订阅刷新周期：必须 **显著小于** `SMD_SERVER_TTL`，否则会出现"到期了还没刷新"的静默
-/// 断流窗口。取 12 分钟留 3 分钟余量（覆盖一次刷新失败重来 + REST 预热耗时）。
-const SMD_REFRESH_INTERVAL: Duration = Duration::from_secs(12 * 60);
+/// 断流窗口。取 8 分钟留 2 分钟余量（覆盖一次 REST 预热耗时 + 一轮多腿刷新）。
+const SMD_REFRESH_INTERVAL: Duration = Duration::from_secs(8 * 60);
 
 /// 构造 `smd` 订阅报文：`smd+{conid}+{"fields":[...]}`
 fn smd_message(conid: i64, fields: &[&str]) -> String {
@@ -154,14 +159,14 @@ impl IbkrPublicWsActor {
             .map_err(|_| WsError::Network("Channel closed".to_string()))
     }
 
-    /// 在服务端 15 分钟 TTL 到期前重订阅所有已订阅的 BBO 腿。
+    /// 在服务端 TTL (`SMD_SERVER_TTL`) 到期前重订阅所有已订阅的 BBO 腿。
     ///
     /// 按 IBKR 建议的顺序 **先 `umd+` 再 `smd+`**（服务端过期后并不自动 unsubscribe，直接重发
     /// smd 可能落在一个"服务端认为还在、实际已停"的状态上）。`send_subscribe` 内含预热，因此
     /// 刷新走的是与首次订阅完全相同的路径——不为刷新另开一套逻辑。
     ///
-    /// 任一腿刷新失败即返回 Err：调用方 kill actor → 整机退出。这条腿刷新不掉就等于 15 分钟后
-    /// 静默变成死流，宁可退出重来。
+    /// 任一腿刷新失败即返回 Err：调用方 kill actor → 整机退出。这条腿刷新不掉就等于服务端 TTL
+    /// 到期后静默变成死流，宁可退出重来。
     ///
     /// **副作用（踩过）**：IBKR 对每个 conid 只维护一份活跃字段集，snapshot 与 ws 共用它。
     /// 因此 `umd+` 会连带清掉别的调用方在同一 conid 上注册的字段——借券 poller 请求的
@@ -184,7 +189,7 @@ impl IbkrPublicWsActor {
                 symbol = %symbol,
                 conid,
                 interval_secs = SMD_REFRESH_INTERVAL.as_secs(),
-                "smd 订阅已刷新 (服务端 15 分钟会静默终止订阅)"
+                "smd 订阅已刷新 (服务端到期会静默终止订阅，无 close 帧无错误)"
             );
         }
         Ok(())
@@ -734,7 +739,7 @@ impl Actor for IbkrPublicWsActor {
         let incoming_stream = ReceiverStream::new(incoming_rx);
         actor_ref.attach_stream(incoming_stream, (), ());
 
-        // smd 刷新定时器：服务端 15 分钟静默终止订阅，必须主动重订阅 (见模块文档)。
+        // smd 刷新定时器：服务端到期会静默终止订阅，必须主动重订阅 (见模块文档)。
         // 用 interval_at 跳过 tokio::time::interval 的"立即首跳"——刚订阅完不需要马上刷。
         actor_ref.attach_stream(
             IntervalStream::new(tokio::time::interval_at(
@@ -938,9 +943,9 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for IbkrPublicWsAct
     }
 }
 
-/// smd 刷新定时器 tick —— 在服务端 15 分钟 TTL 到期前重订阅所有 BBO 腿。
+/// smd 刷新定时器 tick —— 在服务端 TTL 到期前重订阅所有 BBO 腿。
 ///
-/// 刷新失败即致命（kill → on_link_died → 整机退出）：刷不上就等于这条腿 15 分钟后静默死掉，
+/// 刷新失败即致命（kill → on_link_died → 整机退出）：刷不上就等于这条腿到期后静默死掉，
 /// 而这种死法从连接层完全看不出来（这正是本次故障能潜伏的原因），所以不留降级分支。
 impl Message<StreamMessage<Instant, (), ()>> for IbkrPublicWsActor {
     type Reply = ();
