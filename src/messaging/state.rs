@@ -248,25 +248,41 @@ impl SymbolState {
             ExchangeEventData::MarketTrade(_) => {
                 // 公共成交印记仅作市场信号 (策略自取)，不修改聚合状态
             }
-            ExchangeEventData::Position(position) => {
-                // 持仓维护模型：**一次性初始化 + 之后全程由 Fill 事件增量维护**。
-                // 本地无该交易所持仓时用快照初始化一次，此后所有变化都靠 Fill 累加
-                // （见下方 Fill 分支）——主动单、手动单、以及**强平/ADL** 都以 fill 形式经
-                // 私有成交流下发，因此持仓不会漏掉被动减仓。
+            ExchangeEventData::PositionBaseline(position) => {
+                // 持仓维护模型：**一次性基线 + 之后全程由 Fill 事件增量维护**。
+                // 基线写入一次，此后所有变化都靠 Fill 累加（见下方 Fill 分支）——主动单、
+                // 手动单、以及**强平/ADL** 都以 fill 形式经私有成交流下发，因此持仓不会漏掉
+                // 被动减仓。
                 //
-                // 为何**不**用 Position 快照周期性"对账校准"：REST/WS 拉取的持仓快照与实时
-                // Fill 流之间存在竞态——快照可能已包含某笔成交，而该成交对应的 Fill 稍后才
-                // 由 WS 送达；若用快照覆写后又叠加这笔晚到的 Fill，就会**重复计算**该笔成交。
-                // 故快照只做首次初始化，绝不在运行期覆写。
-                if !self.positions.contains_key(&position.exchange) {
-                    tracing::info!(
+                // 为何**不**用持仓快照周期性覆写校准：快照与实时 Fill 流之间存在竞态——快照
+                // 可能已包含某笔成交，而该成交对应的 Fill 稍后才由 WS 送达；若用快照覆写后又
+                // 叠加这笔晚到的 Fill，就会**重复计算**该笔成交。校验走另一条通道，见
+                // [`ExchangeEventData::PositionReport`] 与 `PositionReconcileActor`。
+                //
+                // 第二次到达是**违约**（唯一合法产地是 ManagerActor 启动期，见事件定义），
+                // 打 error 而非静默忽略：静默忽略会让"某个适配层又开始发基线"这件事无人察觉。
+                match self.positions.get(&position.exchange) {
+                    None => {
+                        tracing::info!(
+                            symbol = %self.symbol,
+                            exchange = %position.exchange,
+                            size = position.size,
+                            "Position baseline initialized"
+                        );
+                        self.positions.insert(position.exchange, position.clone());
+                    }
+                    Some(existing) => tracing::error!(
                         symbol = %self.symbol,
                         exchange = %position.exchange,
-                        size = position.size,
-                        "Position initialized from poll"
-                    );
-                    self.positions.insert(position.exchange, position.clone());
+                        local_size = existing.size,
+                        incoming_size = position.size,
+                        "收到重复的 PositionBaseline（每个 (所, symbol) 只允许一次），已忽略"
+                    ),
                 }
+            }
+            ExchangeEventData::PositionReport(_) => {
+                // 对账读数**绝不写入持仓**——它的用途是与本地"基线 + Fill"的结果比对，
+                // 由 PositionReconcileActor 负责。写进来就等于恢复了被上面否掉的快照覆写。
             }
             ExchangeEventData::OrderUpdate(update) => {
                 tracing::info!(
@@ -338,7 +354,7 @@ impl SymbolState {
             }
             ExchangeEventData::Fill(fill) => {
                 // Fill 即时更新仓位——涵盖策略单、手动单、以及强平/ADL（三者都以 fill 形式
-                // 经私有成交流到达，走同一路径，无需快照对账，见上方 Position 分支说明）。
+                // 经私有成交流到达，走同一路径，见上方 PositionBaseline 分支说明）。
                 let delta = match fill.side {
                     Side::Long => fill.size,
                     Side::Short => -fill.size,
@@ -517,5 +533,101 @@ mod tests {
     fn zero_positions_are_ignored() {
         let state = state_with(&[(Exchange::Binance, 0.0)], &[(Exchange::Binance, 100.0)]);
         assert_eq!(state.exposure(None), SymbolExposure::default());
+    }
+
+    // ===== 持仓维护模型：基线只来一次 + Fill 累加 + 对账读数不写入 =====
+
+    const EX: Exchange = Exchange::Binance;
+
+    fn ev(data: ExchangeEventData) -> IncomeEvent {
+        IncomeEvent {
+            exchange_ts: 1,
+            local_ts: 1,
+            data,
+        }
+    }
+
+    fn position(size: f64) -> Position {
+        Position {
+            exchange: EX,
+            symbol: SYMBOL.to_string(),
+            size,
+            entry_price: 100.0,
+            unrealized_pnl: 0.0,
+        }
+    }
+
+    fn fill(side: Side, size: f64) -> IncomeEvent {
+        ev(ExchangeEventData::Fill(crate::domain::Fill {
+            exchange: EX,
+            symbol: SYMBOL.to_string(),
+            side,
+            price: 100.0,
+            size,
+            client_order_id: None,
+            order_id: "1".to_string(),
+            timestamp: 1,
+            fee: 0.0,
+            reason: crate::domain::FillReason::Normal,
+        }))
+    }
+
+    /// 基线写入一次，之后**只**由 Fill 累加。
+    #[test]
+    fn baseline_initializes_then_fills_accumulate() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+
+        state.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
+        assert_eq!(state.position_size(EX), 2.0);
+
+        state.apply(&fill(Side::Long, 1.0));
+        assert_eq!(state.position_size(EX), 3.0);
+
+        state.apply(&fill(Side::Short, 0.5));
+        assert!((state.position_size(EX) - 2.5).abs() < 1e-12);
+    }
+
+    /// **Critical 回归防线**：第二条基线不得覆写持仓。
+    ///
+    /// 快照覆写 + 晚到的 Fill 会重复计算同一笔成交。历史上 OKX/HL/Binance 的私有 WS 都在
+    /// 持续推送持仓快照，全靠这条判据兜住；现在适配层已不再发基线，这条测试是防止它们
+    /// 哪天又开始发的防线。
+    #[test]
+    fn second_baseline_never_overwrites_position() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        state.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
+        state.apply(&fill(Side::Long, 1.0));
+        assert_eq!(state.position_size(EX), 3.0);
+
+        // 交易所侧的快照（哪怕数值"看起来更新"）也不得覆写
+        state.apply(&ev(ExchangeEventData::PositionBaseline(position(3.0))));
+        assert_eq!(
+            state.position_size(EX),
+            3.0,
+            "第二条基线覆写了持仓——快照与 Fill 流叠加会重复计算成交"
+        );
+
+        // 覆写若发生，这条 Fill 会把仓位推到 4.0 之外
+        state.apply(&fill(Side::Long, 1.0));
+        assert_eq!(state.position_size(EX), 4.0);
+    }
+
+    /// 对账读数只用于比对，**绝不**写入持仓。
+    #[test]
+    fn position_report_does_not_touch_local_position() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        state.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
+
+        // 交易所报了一个不同的值（正是"漂移"的样子）——本地持仓不动，由对账层去告警
+        state.apply(&ev(ExchangeEventData::PositionReport(position(99.0))));
+        assert_eq!(state.position_size(EX), 2.0);
+    }
+
+    /// 没有基线时，第一条 Fill 从 0 起算（策略启动初期确实空仓）
+    #[test]
+    fn fill_without_baseline_starts_from_zero() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        state.apply(&fill(Side::Short, 1.5));
+        assert_eq!(state.position_size(EX), -1.5);
     }
 }

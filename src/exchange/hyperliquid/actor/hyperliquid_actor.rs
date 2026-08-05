@@ -93,7 +93,6 @@ impl Actor for HyperliquidActor {
                         wallet_address: credentials.wallet_address,
                         dex: args.dex.clone(),
                         income_pubsub: income_pubsub.clone(),
-                        symbol_metas: args.symbol_metas,
                     },
                     mailbox::unbounded(),
                 )

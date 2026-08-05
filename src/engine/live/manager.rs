@@ -279,7 +279,7 @@ impl ManagerActor {
                     let event = IncomeEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::Position(pos),
+                        data: ExchangeEventData::PositionBaseline(pos),
                     };
                     if let Err(e) = self
                         .income_pubsub

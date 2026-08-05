@@ -1,7 +1,7 @@
 use super::from_binance;
 use crate::domain::{
     Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
-    OrderUpdate, Position, Side, now_ms, BBO,
+    OrderUpdate, Side, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -163,12 +163,15 @@ pub struct AccountUpdate {
     pub a: AccountData,
 }
 
+/// `ACCOUNT_UPDATE.a`
+///
+/// **有意不声明 `P`（持仓）**：那是持仓快照，而持仓的维护模型是「启动期 REST 基线 + 之后
+/// 全程 Fill 累加」（见 [`crate::messaging::ExchangeEventData::PositionBaseline`]）。校验本地
+/// 持仓是否漂移走 `PositionReport` 通道，不从这条推送取。
 #[derive(Debug, Deserialize)]
 pub struct AccountData {
     #[serde(rename = "B")]
     pub balances: Vec<AccountBalance>,
-    #[serde(rename = "P")]
-    pub positions: Vec<AccountPosition>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,38 +196,6 @@ impl AccountBalance {
             asset: self.a.clone(),
             available,
             frozen,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct AccountPosition {
-    pub s: String,
-    pub pa: String,
-    pub ep: String,
-    pub up: String,
-    pub mt: String,
-    pub ps: String,
-}
-
-impl AccountPosition {
-    pub fn to_position(&self, quote: &str) -> Result<Position, String> {
-        let symbol = from_binance(&self.s, quote)
-            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
-        let pos_amount = f64::from_str(&self.pa)
-            .map_err(|_| format!("Failed to parse position amount: {}", self.pa))?;
-        let entry_price = f64::from_str(&self.ep)
-            .map_err(|_| format!("Failed to parse entry price: {}", self.ep))?;
-        let unrealized_pnl = f64::from_str(&self.up)
-            .map_err(|_| format!("Failed to parse unrealized pnl: {}", self.up))?;
-
-        Ok(Position {
-            exchange: Exchange::Binance,
-            symbol,
-            size: pos_amount, // 正数多头，负数空头
-            entry_price,
-            unrealized_pnl,
         })
     }
 }

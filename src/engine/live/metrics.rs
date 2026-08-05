@@ -48,8 +48,8 @@ pub struct MetricsActor {
     tracked: HashSet<Symbol>,
     /// 会话起始仓位基线：symbol -> (exchange -> 仓位)
     ///
-    /// 取自启动期推送的 Position 快照（`ExchangeEventData::Position` 首次到达时记录，
-    /// 与 `SymbolState` 的"快照只初始化一次"语义一致）。用于把重启前的存货从盈亏里剔除。
+    /// 取自启动期的 [`ExchangeEventData::PositionBaseline`]（每个 (symbol, 所) 只记第一条，
+    /// 与 `SymbolState` 的基线语义一致）。用于把重启前的存货从盈亏里剔除。
     baseline: HashMap<Symbol, HashMap<Exchange, f64>>,
     /// per-symbol 累计成交统计
     per_symbol: HashMap<Symbol, TradingStats>,
@@ -274,7 +274,7 @@ impl Message<IncomeEvent> for MetricsActor {
         }
 
         // 会话起始仓位基线：必须在 state.apply 之前取，那之后就分不清"快照初始值"和"成交累加值"了
-        if let ExchangeEventData::Position(position) = &msg.data {
+        if let ExchangeEventData::PositionBaseline(position) = &msg.data {
             self.record_baseline(&position.symbol, position.exchange, position.size);
         }
 
@@ -337,7 +337,7 @@ mod tests {
         IncomeEvent {
             exchange_ts: 0,
             local_ts: 0,
-            data: ExchangeEventData::Position(Position {
+            data: ExchangeEventData::PositionBaseline(Position {
                 exchange,
                 symbol: symbol.to_string(),
                 size,

@@ -232,49 +232,56 @@ impl IndexTickerData {
     }
 }
 
-/// Position 数据
+/// 单向净持仓模式的 `posSide` 取值。
+///
+/// 本项目**只支持单向净持仓**：双向（long/short 分列）模式下 `pos` 恒为正数、方向靠
+/// `posSide` 表达，按净持仓口径解析会得到**错误的符号**。这属于账户模式配置错误，必须在
+/// 解析处就拒绝——猜错方向的代价是策略朝反方向加仓。
+const POS_SIDE_NET: &str = "net";
+
+/// Position 数据（`GET /api/v5/account/positions` 与旧私有 WS `positions` 频道同构）
+///
+/// 只声明所需字段，其余（`instType` / `lever` / `mgnMode` 等）由 serde 忽略 —— 声明了却不读
+/// 的字段一旦被交易所省略就会让整条解析失败，白担风险。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PositionData {
     pub inst_id: String,
-    #[allow(dead_code)]
-    pub inst_type: String,
-    pub pos: String,
-    #[allow(dead_code)]
+    /// 持仓方向，见 [`POS_SIDE_NET`]
     pub pos_side: String,
+    pub pos: String,
     pub avg_px: String,
     pub upl: String,
-    #[allow(dead_code)]
-    pub lever: String,
-    #[allow(dead_code)]
-    pub mgn_mode: String,
 }
 
 impl PositionData {
-    /// 持仓 `pos` 是**张数**，折算由签名强制（见 [`crate::domain::Quantity`]）。
-    pub fn to_position(&self, meta: &SymbolMeta) -> Result<Position, String> {
-        let pos_amount = f64::from_str(&self.pos)
-            .map_err(|_| format!("Failed to parse position amount: {}", self.pos))?;
-        // OKX 空仓时 avg_px/upl 为空字符串，此时为 0.0；非空必须解析成功
-        let avg_price = if self.avg_px.is_empty() {
-            0.0
-        } else {
-            f64::from_str(&self.avg_px)
-                .map_err(|_| format!("Failed to parse avg_px: {}", self.avg_px))?
-        };
-        let unrealized_pnl = if self.upl.is_empty() {
-            0.0
-        } else {
-            f64::from_str(&self.upl)
-                .map_err(|_| format!("Failed to parse upl: {}", self.upl))?
-        };
+    /// 转为 domain 持仓。`pos` 是**张数**，折算为币本位由 `contract_size` 完成
+    /// （见 [`crate::domain::Quantity`]）。
+    ///
+    /// 空仓时 OKX 用**空串**表示数值字段，一律按 0 处理；非空则必须解析成功。
+    pub fn to_position(&self, symbol: Symbol, contract_size: f64) -> Result<Position, String> {
+        if self.pos_side != POS_SIDE_NET {
+            return Err(format!(
+                "OKX {} 处于双向持仓模式 (posSide={})，本项目仅支持单向净持仓；\
+                 请在 OKX 账户设置中改为「单向持仓」后重启",
+                self.inst_id, self.pos_side
+            ));
+        }
+
+        fn parse_or_zero(raw: &str, field: &str) -> Result<f64, String> {
+            if raw.is_empty() {
+                return Ok(0.0);
+            }
+            f64::from_str(raw).map_err(|_| format!("Failed to parse {field}: {raw}"))
+        }
 
         Ok(Position {
             exchange: Exchange::OKX,
-            symbol: meta.symbol.clone(),
-            size: meta.qty_to_coin(pos_amount), // 正数多头，负数空头
-            entry_price: avg_price,
-            unrealized_pnl,
+            symbol,
+            // 正数多头，负数空头
+            size: parse_or_zero(&self.pos, "pos")? * contract_size,
+            entry_price: parse_or_zero(&self.avg_px, "avgPx")?,
+            unrealized_pnl: parse_or_zero(&self.upl, "upl")?,
         })
     }
 }
@@ -647,9 +654,39 @@ mod trade_tests {
         let raw = r#"{"instId":"BTC-USDT-SWAP","instType":"SWAP","pos":"-12","posSide":"net",
                       "avgPx":"42000","upl":"1.5","lever":"3","mgnMode":"cross"}"#;
         let d: PositionData = serde_json::from_str(raw).unwrap();
-        let p = d.to_position(&btc_meta()).unwrap();
+        let p = d.to_position("BTC".to_string(), CONTRACT_SIZE).unwrap();
         assert_eq!(p.symbol, "BTC");
         assert!((p.size - (-0.12)).abs() < 1e-12, "got {}", p.size);
+        assert_eq!(p.entry_price, 42_000.0);
+    }
+
+    /// 空仓时 OKX 的数值字段是**空串**，按 0 处理而非解析失败
+    #[test]
+    fn flat_position_with_empty_numeric_fields_is_zero() {
+        let raw = r#"{"instId":"BTC-USDT-SWAP","pos":"","posSide":"net","avgPx":"","upl":""}"#;
+        let d: PositionData = serde_json::from_str(raw).unwrap();
+        let p = d.to_position("BTC".to_string(), CONTRACT_SIZE).unwrap();
+        assert_eq!(p.size, 0.0);
+        assert_eq!(p.entry_price, 0.0);
+        assert_eq!(p.unrealized_pnl, 0.0);
+    }
+
+    /// **Critical 防线**：双向持仓模式必须报错，不能按净持仓口径解析。
+    /// 该模式下 `pos` 恒为正数、方向靠 posSide 表达，静默解析会让空头被当成多头，
+    /// 策略随后朝反方向加仓。
+    #[test]
+    fn long_short_mode_is_rejected_not_silently_misread() {
+        for pos_side in ["long", "short"] {
+            let raw = format!(
+                r#"{{"instId":"BTC-USDT-SWAP","pos":"12","posSide":"{pos_side}",
+                     "avgPx":"42000","upl":"0"}}"#
+            );
+            let d: PositionData = serde_json::from_str(&raw).unwrap();
+            let err = d
+                .to_position("BTC".to_string(), CONTRACT_SIZE)
+                .expect_err("双向持仓模式必须报错");
+            assert!(err.contains("单向净持仓"), "错误信息应指出如何修复: {err}");
+        }
     }
 
     #[test]

@@ -151,7 +151,6 @@ impl Actor for BinanceActor {
                         credentials,
                         rest_base_url: args.rest_base_url,
                         income_pubsub: args.income_pubsub.clone(),
-                        symbol_metas: args.symbol_metas.clone(),
                         quote: args.quote.clone(),
                     },
                     mailbox::unbounded(),

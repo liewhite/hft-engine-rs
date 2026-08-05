@@ -20,6 +20,12 @@ enum EventRouting {
     BySymbol { exchange: Exchange, symbol: Symbol },
     /// 广播给所有 executor
     Broadcast,
+    /// **不投递给任何 executor**：账户级事件，只服务于总线上的非 executor 订阅者
+    /// （如 [`crate::engine::PositionReconcileActor`] / [`crate::engine::MetricsActor`]）。
+    ///
+    /// 与 `Broadcast` 的区别是刻意的：这类事件对策略不仅无用，而且**不应可见** ——
+    /// 例如持仓对账读数若流进策略状态，就绕过了「基线 + Fill」的持仓维护模型。
+    SkipExecutors,
 }
 
 /// Executor 订阅信息
@@ -40,7 +46,8 @@ fn is_account_private(event: &IncomeEvent) -> bool {
         event.data,
         ExchangeEventData::OrderUpdate(_)
             | ExchangeEventData::Fill(_)
-            | ExchangeEventData::Position(_)
+            | ExchangeEventData::PositionBaseline(_)
+            | ExchangeEventData::PositionReport(_)
             | ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::FundingFee(_)
@@ -78,11 +85,13 @@ impl IncomeProcessorActor {
                 exchange: ip.exchange,
                 symbol: ip.symbol.clone(),
             },
-            // Private 数据：Position、OrderUpdate、Fill 按 symbol 路由
-            ExchangeEventData::Position(pos) => EventRouting::BySymbol {
+            // Private 数据：持仓基线、OrderUpdate、Fill 按 symbol 路由
+            ExchangeEventData::PositionBaseline(pos) => EventRouting::BySymbol {
                 exchange: pos.exchange,
                 symbol: pos.symbol.clone(),
             },
+            // 对账读数只给 PositionReconcileActor，不进策略状态（见 EventRouting::SkipExecutors）
+            ExchangeEventData::PositionReport(_) => EventRouting::SkipExecutors,
             ExchangeEventData::OrderUpdate(update) => EventRouting::BySymbol {
                 exchange: update.exchange,
                 symbol: update.symbol.clone(),
@@ -240,6 +249,8 @@ impl Message<IncomeEvent> for IncomeProcessorActor {
                     }
                 }
             }
+            // 账户级事件：总线上的其他订阅者已直接收到，这里不做任何投递
+            EventRouting::SkipExecutors => {}
         }
     }
 }

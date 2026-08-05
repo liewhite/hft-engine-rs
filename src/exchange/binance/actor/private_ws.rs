@@ -6,7 +6,7 @@
 //! - 直接解析消息并发布到 IncomePubSub
 
 use super::listen_key::{BinanceListenKeyActor, BinanceListenKeyActorArgs};
-use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, ExchangeError};
 use crate::engine::IncomePubSub;
 use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsResponse};
 use crate::exchange::binance::{BinanceCredentials, WS_PRIVATE_URL};
@@ -20,9 +20,7 @@ use kameo::mailbox;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
-use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -34,8 +32,6 @@ pub struct BinancePrivateWsActorArgs {
     pub rest_base_url: String,
     /// Income PubSub (发布事件)
     pub income_pubsub: ActorRef<IncomePubSub>,
-    /// Symbol 元数据（用于仓位转换）
-    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
     pub quote: String,
 }
@@ -44,8 +40,6 @@ pub struct BinancePrivateWsActorArgs {
 pub struct BinancePrivateWsActor {
     /// Income PubSub (发布事件)
     income_pubsub: ActorRef<IncomePubSub>,
-    /// Symbol 元数据
-    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
     quote: String,
     /// 发送消息到 ws_loop 的 channel
@@ -60,7 +54,7 @@ impl BinancePrivateWsActor {
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_private_message(raw, &self.quote, local_ts, &self.symbol_metas)?;
+        let events = parse_private_message(raw, &self.quote, local_ts)?;
         for event in events {
             if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Failed to publish to IncomePubSub");
@@ -127,7 +121,6 @@ impl Actor for BinancePrivateWsActor {
 
         Ok(Self {
             income_pubsub: args.income_pubsub,
-            symbol_metas: args.symbol_metas,
             quote: args.quote,
             ws_tx: Some(outgoing_tx),
             listen_key_actor: Some(listen_key_actor),
@@ -193,7 +186,6 @@ fn parse_private_message(
     raw: &str,
     quote: &str,
     local_ts: u64,
-    symbol_metas: &HashMap<Symbol, SymbolMeta>,
 ) -> Result<Vec<IncomeEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
@@ -233,24 +225,10 @@ fn parse_private_message(
 
             let mut events = Vec::new();
 
-            // 处理所有 position 更新
-            for pos_data in &update.a.positions {
-                let mut position = pos_data.to_position(quote)
-                    ?;
-                // qty 归一化: 张 -> 币
-                // ACCOUNT_UPDATE 是账户级推送，可能包含未配置 symbol（属预期数据）；
-                // 未配置的跳过，不传播不 panic
-                let Some(meta) = symbol_metas.get(&position.symbol) else {
-                    tracing::warn!(symbol = %position.symbol, "Binance ACCOUNT_UPDATE 含未配置 symbol，跳过");
-                    continue;
-                };
-                position.size = meta.qty_to_coin(position.size);
-                events.push(IncomeEvent {
-                    exchange_ts,
-                    local_ts,
-                    data: ExchangeEventData::Position(position),
-                });
-            }
+            // **不处理 `a.P`（持仓）**：那是持仓**快照**，而持仓的维护模型是「启动期 REST
+            // 基线 + 之后全程 Fill 累加」（见 ExchangeEventData::PositionBaseline）。快照既
+            // 当不了基线（基线只能来自 ManagerActor），也不能参与增量（会与同一条推送里的
+            // ORDER_TRADE_UPDATE 产出的 Fill 重复计算）。校验走 PositionReport 通道。
 
             // 处理所有 balance 更新
             for bal_data in &update.a.balances {

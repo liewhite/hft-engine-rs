@@ -5,12 +5,10 @@
 //! - 自动订阅私有频道 (positions, account, orders)
 //! - 直接解析消息并发布到 IncomePubSub
 
-use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Position, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::WsError;
-use crate::exchange::okx::codec::{
-    resolve_meta, AccountData, OrderPushData, PositionData, WsEvent, WsPush,
-};
+use crate::exchange::okx::codec::{resolve_meta, AccountData, OrderPushData, WsEvent, WsPush};
 use crate::exchange::okx::{OkxCredentials, WS_PRIVATE_URL};
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
@@ -148,10 +146,14 @@ impl Actor for OkxPrivateWsActor {
             })??;
 
         // 4. 订阅私有频道
+        //
+        // **不订阅 `positions`**：持仓的维护模型是「启动期 REST 基线 + 之后全程 Fill 累加」，
+        // 持仓推送既不是基线（基线只能来自 ManagerActor）也不参与增量（增量走 `orders` 频道
+        // 产出的 Fill）。要校验本地持仓是否漂移，走 PositionReport 那条独立通道
+        // （见 crate::engine::PositionReconcileActor），不在这里塞快照。
         let subscribe_msg = json!({
             "op": "subscribe",
             "args": [
-                {"channel": "positions", "instType": "SWAP"},
                 {"channel": "account"},
                 {"channel": "orders", "instType": "SWAP"}
             ]
@@ -258,46 +260,6 @@ fn parse_private_message(
         .ok_or_else(|| WsError::ParseError(format!("Missing channel: {}", raw)))?;
 
     match channel {
-        "positions" => {
-            let push: WsPush<PositionData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("positions parse: {}", e)))?;
-
-            let mut events = Vec::new();
-            let mut seen_symbols = std::collections::HashSet::new();
-
-            for data in &push.data {
-                // 折算由 to_position 的签名强制完成（张 -> 币）
-                if let Some(meta) = resolve_meta(&data.inst_id, symbol_metas) {
-                    let position = data.to_position(meta)?;
-                    seen_symbols.insert(position.symbol.clone());
-                    events.push(IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::Position(position),
-                    });
-                }
-            }
-
-            // 为推送中缺失的配置 symbol 补推 0-position，
-            // 确保策略端能区分 "确认空仓" 和 "未初始化"
-            for symbol in symbol_metas.keys() {
-                if !seen_symbols.contains(symbol) {
-                    events.push(IncomeEvent {
-                        exchange_ts: local_ts,
-                        local_ts,
-                        data: ExchangeEventData::Position(Position {
-                            exchange: Exchange::OKX,
-                            symbol: symbol.clone(),
-                            size: 0.0,
-                            entry_price: 0.0,
-                            unrealized_pnl: 0.0,
-                        }),
-                    });
-                }
-            }
-
-            Ok(events)
-        }
         "account" => {
             let push: WsPush<AccountData> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;

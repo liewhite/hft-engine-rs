@@ -5,7 +5,7 @@ use crate::domain::{
     Exchange, ExchangeError, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate, Side,
     Symbol, SymbolMeta, TimeInForce, now_ms,
 };
-use crate::exchange::okx::codec::GreeksData;
+use crate::exchange::okx::codec::{GreeksData, PositionData};
 use crate::exchange::client::{ExchangeClient, ExchangeOrder};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
@@ -658,20 +658,6 @@ impl ExchangeClient for OkxClient {
             .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
 
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct PositionData {
-            inst_id: String,
-            /// 持仓方向。`net` = 单向净持仓模式（本项目唯一支持的模式，见下方校验）
-            pos_side: String,
-            /// 持仓张数；净持仓模式下带符号（正多负空），空仓时可能为空串
-            pos: String,
-            /// 开仓均价；空仓时为空串
-            avg_px: String,
-            /// 未实现盈亏；空仓时为空串
-            upl: String,
-        }
-
-        #[derive(Deserialize)]
         struct Response {
             code: String,
             msg: String,
@@ -692,46 +678,21 @@ impl ExchangeClient for OkxClient {
             return Err(map_okx_error(&data.code, &data.msg));
         }
 
-        /// 空仓时 OKX 用空串表示数值字段
-        fn parse_or_zero(raw: &str, field: &str) -> Result<f64, ExchangeError> {
-            if raw.is_empty() {
-                return Ok(0.0);
-            }
-            raw.parse().map_err(|_| {
-                ExchangeError::ParseError(format!("OKX position {field} 非法: {raw}"))
-            })
-        }
-
         let mut positions = Vec::new();
         for d in &data.data {
-            // **不支持双向持仓**：long/short 分列模式下 `pos` 恒为正数、方向靠 posSide 表达，
-            // 按净持仓口径解析会得到错误的符号。这属于账户模式配置错误，必须启动期就拒绝
-            // ——猜错方向的代价是策略朝反方向加仓，远大于拒绝启动。
-            if d.pos_side != "net" {
-                return Err(ExchangeError::Other(format!(
-                    "OKX {} 处于双向持仓模式 (posSide={})，本项目仅支持单向净持仓；\
-                     请在 OKX 账户设置中改为「单向持仓」后重启",
-                    d.inst_id, d.pos_side
-                )));
-            }
-
             let Some(symbol) = from_okx(&d.inst_id) else {
                 // 账户里可能有本项目未接入的合约（如交割合约），跳过而非报错
                 tracing::debug!(inst_id = %d.inst_id, "OKX position 的 instId 无法识别，跳过");
                 continue;
             };
 
-            // 张 -> 币：[`ExchangeClient`] 的契约是返回币本位（见 crate::domain::Quantity）
+            // 张 -> 币：[`ExchangeClient`] 的契约是返回币本位（见 crate::domain::Quantity）。
+            // 字段口径（空串=0、张数、双向持仓拒绝）全在 codec 里，不在此处重抄一份。
             let contract_size = self.contract_size_of(&symbol).await?;
-            let pos_contracts = parse_or_zero(&d.pos, "pos")?;
-
-            positions.push(crate::domain::Position {
-                exchange: Exchange::OKX,
-                symbol,
-                size: pos_contracts * contract_size,
-                entry_price: parse_or_zero(&d.avg_px, "avgPx")?,
-                unrealized_pnl: parse_or_zero(&d.upl, "upl")?,
-            });
+            positions.push(
+                d.to_position(symbol, contract_size)
+                    .map_err(ExchangeError::ParseError)?,
+            );
         }
 
         Ok(positions)
