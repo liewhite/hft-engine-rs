@@ -105,16 +105,15 @@ impl IbkrPublicWsActor {
     ///
     /// **先预热再订阅**：IBKR 要求先对 conid 打一次 `/iserver/marketdata/snapshot`，IServer 才会
     /// 开始消费该合约的实时流；未预热就发 `smd` 只能收到订阅瞬间的一份值、之后不再有增量。
-    /// 预热失败不阻断订阅（退化为预热前的行为，总比没有行情好），但留 warn 供定位。
+    ///
+    /// 预热失败即**致命**（Err 上抛 → 调用方 kill actor → 经 on_link_died 整机退出，与借券
+    /// snapshot poller 的"数据源失效即退出"同口径）：没预热的订阅是一条假活的行情线——有价、
+    /// 但永远陈旧，比没有行情更危险。宁可退出重来，不留降级分支。
     async fn send_subscribe(&self, conid: i64) -> Result<(), WsError> {
-        if let Err(e) = self.client.preflight_market_data(conid, &BBO_FIELDS).await {
-            tracing::warn!(
-                exchange = "IBKR",
-                conid,
-                error = %e,
-                "行情预热失败，仍继续 smd 订阅（该腿可能只收到一次报价、无后续增量）"
-            );
-        }
+        self.client
+            .preflight_market_data(conid, &BBO_FIELDS)
+            .await
+            .map_err(|e| WsError::Network(format!("行情预热失败 conid={conid}: {e}")))?;
 
         let msg = smd_message(conid, &BBO_FIELDS);
         let tx = self

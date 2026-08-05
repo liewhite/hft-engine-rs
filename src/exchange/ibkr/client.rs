@@ -622,45 +622,21 @@ impl IbkrClient {
     /// （实测 KRX 腿因此每 2~3 小时才更新一次，而同会话内被 snapshot 轮询"顺带预热"的美股腿
     /// 一直是毫秒级推送）。故 `smd` 订阅前必须先调本方法。
     ///
-    /// 按 IBKR 文档，预热请求**本身不保证返回数据**，其价值在于服务端副作用。因此这里只要请求
-    /// 成功送达 (2xx) 即算预热完成，不校验字段就绪——真实行情由 ws 推送提供；字段是否已就绪
-    /// 只记 debug 供排查（要"拿到值"请用 `fetch_snapshot_raw`，它带重试）。
+    /// 按 IBKR 文档，预热请求**本身不保证返回数据**，其价值在于服务端副作用，故只判 HTTP 状态、
+    /// 不看 body：预热成功 ⇔ IServer 接受了这次请求。要"拿到值"请用 `fetch_snapshot_raw`。
+    /// 失败即数据源不可用，交由调用方致命处理（不在此重试、不降级）。
     pub async fn preflight_market_data(
         &self,
         conid: i64,
         fields: &[&str],
     ) -> Result<(), ExchangeError> {
         let url = snapshot_url(self.auth.base_url(), conid, fields);
-        let resp = self
-            .authed_request("GET", &url)?
+        self.authed_request("GET", &url)?
             .send()
             .await
+            .map_err(Self::map_reqwest_error)?
+            .error_for_status()
             .map_err(Self::map_reqwest_error)?;
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(ExchangeError::ConnectionFailed(
-                Exchange::IBKR,
-                format!("行情预热 conid={conid} 返回非成功状态 {status}: {body}"),
-            ));
-        }
-        let ready: Vec<&str> = body
-            .as_array()
-            .and_then(|arr| arr.first())
-            .map(|obj| {
-                fields
-                    .iter()
-                    .copied()
-                    .filter(|f| obj.get(*f).is_some())
-                    .collect()
-            })
-            .unwrap_or_default();
-        tracing::debug!(
-            conid,
-            requested = ?fields,
-            ?ready,
-            "IBKR 行情预热完成 (字段未就绪属正常，数据由 ws 推送)"
-        );
         Ok(())
     }
 
