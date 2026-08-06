@@ -150,18 +150,33 @@
 
 ---
 
-## 五、修复顺序建议
+## 五、修复记录（六批已全部完成）
 
-| 批次 | 内容 | 对应条目 | 风险主题 |
-|---|---|---|---|
-| 1 | OKX 挂单快照 skip→Err + 不再编造 clOrdId | 2.2、1.1 | 误清活单/双重敞口 |
-| 2 | HL error 频道 + 订阅记账确认;IBKR 成交解析失败致命 | 2.4、2.3 | 静默断流 |
-| 3 | IBKR 持仓逐条守卫;三所 entry_price 统一口径 | 2.5、1.3 | 基线污染(永不可纠正) |
-| 4 | IBKR notional → Err/Option;轮询连续失败守卫 | 1.2、1.8 | 风控失明 |
-| 5 | OKX 元数据剔除可见化 + 缺 meta 私有回报升级 | 2.1 | Fill 丢失 |
-| 6 | IBKR cOID/order_ref 实盘确认后修;Binance serde default;executor 日志;OKX fillFee | 2.6、3.1、2.7、1.4 | 其余 |
+| 批次 | 内容 | 对应条目 | 风险主题 | 提交 |
+|---|---|---|---|---|
+| 1 | OKX 挂单快照 skip→Err + 不再编造 clOrdId + 补分页 | 2.2、1.1 | 误清活单/双重敞口 | `16bf971` |
+| 2 | HL error 频道 + 订阅记账确认;IBKR 成交解析失败致命 | 2.4、2.3 | 静默断流 | `fa559a5` |
+| 3 | `Position::checked` 统一口径;IBKR 持仓逐条守卫 | 2.5、1.3 | 基线污染(永不可纠正) | `d2528a0` |
+| 4 | IBKR notional → Err;`StalenessGuard` 停摆守卫 | 1.2、1.8 | 风控失明 | `1b5ab43` |
+| 5 | 投产期校验 SymbolMeta;元数据剔除留痕 | 2.1 | Fill 丢失 | `2c85220` |
+| 6 | OKX fillFee;Binance schema;IBKR order_ref/orderId;executor 日志 | 1.4、3.1、2.6、2.7 | 其余 | `5419d55` |
 
-每批一个逻辑单元提交 + code review。
+### 修复中确立的三个共享出处（避免同类问题再次分散复发）
+
+- **`Position::checked`**（`src/domain/models/position.rs`）：持仓非零时价格字段必须有值。
+  四个适配层共用，调用方不必各自记住规则。
+- **`StalenessGuard`**（`src/exchange/staleness.rs`）：周期性读数的停摆守卫。账户净值 /
+  希腊值 / 持仓对账四处共用，`position_polling` 原有的手写实现已迁移过来。
+- **`validate_subscriptions` 的第三个判据**（`src/engine/live/manager.rs`）：订阅的
+  (所, symbol) 必须有 SymbolMeta。把"元数据被剔除"从三种分散症状收敛成投产期的一次判定。
+
+### 与原报告的两处判断修正
+
+- **2.6（IBKR 归属字段）**：未做实盘确认，改为 `#[serde(rename = "cOID", alias = "order_ref")]`
+  双取。无论真相如何都正确，且不必等一次实盘窗口。
+- **2.1（OKX 缺 meta 丢私有回报）**：根因不在 OKX 私有流，在投产期校验缺了一条。修好
+  上游后，私有流那条丢弃分支只剩"该 instId 不归本实例管"一种解释（全账户推送里的人工单 /
+  别的分桶实例），丢弃是正确处理，故降为 debug 日志。
 
 ---
 
