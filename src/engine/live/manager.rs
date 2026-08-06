@@ -96,10 +96,6 @@ pub struct ManagerActor {
     /// ExchangeActors (启动时创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
 
-    /// IBKR 具体 client (Arc)，供上层策略经 GetIbkrClient 取引用，调用借券费/外汇等
-    /// **非 ExchangeClient trait** 的具体方法。None = 未配置 IBKR。单会话复用同一 client。
-    ibkr_client: Option<Arc<IbkrClient>>,
-
     /// 模拟账户私有事件总线（供 Supervisor 等观察者订阅）
     paper_pubsub: ActorRef<PaperPubSub>,
 
@@ -674,7 +670,6 @@ impl Actor for ManagerActor {
 
         // IBKR 需要额外保存 auth / conids / client 供 Actor 使用
         let mut ibkr_actor_data = None;
-        let mut ibkr_client_ref: Option<Arc<IbkrClient>> = None;
         if let Some(ref cred) = args.ibkr_credentials {
             let ibkr_client = Arc::new(IbkrClient::new(cred).await?);
             ibkr_actor_data = Some((
@@ -682,7 +677,6 @@ impl Actor for ManagerActor {
                 ibkr_client.conids().clone(),
                 ibkr_client.clone(),
             ));
-            ibkr_client_ref = Some(ibkr_client.clone()); // 具体类型引用，供 GetIbkrClient 外传
             clients.insert(Exchange::IBKR, ibkr_client as Arc<dyn ExchangeClient>);
             // IBKR 的 client 只在有凭证时才构建，走到这里必然有账户
             authed_exchanges.insert(Exchange::IBKR);
@@ -990,7 +984,6 @@ impl Actor for ManagerActor {
             metrics,
             position_reconciler,
             exchange_actors,
-            ibkr_client: ibkr_client_ref,
             paper_pubsub,
             executors: Vec::new(),
             intentionally_stopped: HashSet::new(),
@@ -1165,41 +1158,6 @@ impl Message<GetAllSymbolMetas> for ManagerActor {
             result.entry(*exchange).or_default().push(meta.clone());
         }
         result
-    }
-}
-
-/// 注入一条 income 事件到事件流 (供外部数据源如 SKHY 的 IBKR poller 把借券费/汇率推给策略)。
-/// 事件经 income_pubsub 广播 → IncomeProcessor 按 (exchange,symbol) 路由到策略，
-/// 与交易所 actor 产的行情事件走同一条流。
-pub struct PublishIncome(pub IncomeEvent);
-
-impl Message<PublishIncome> for ManagerActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: PublishIncome, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        if let Err(e) = self
-            .income_pubsub
-            .tell(kameo_actors::pubsub::Publish(msg.0))
-            .send()
-            .await
-        {
-            tracing::error!(error = %e, "Failed to publish injected income event");
-        }
-    }
-}
-
-/// 获取 IBKR 具体 client 引用 (供策略调用借券费/外汇等非 trait 方法)；未配置 IBKR 返回 None
-pub struct GetIbkrClient;
-
-impl Message<GetIbkrClient> for ManagerActor {
-    type Reply = Option<Arc<IbkrClient>>;
-
-    async fn handle(
-        &mut self,
-        _msg: GetIbkrClient,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.ibkr_client.clone()
     }
 }
 
@@ -1546,9 +1504,6 @@ mod leftover_order_tests {
         }
         async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
             unreachable!("撤单流程不该下单")
-        }
-        async fn set_leverage(&self, _s: &Symbol, _l: u32) -> Result<(), ExchangeError> {
-            unreachable!("撤单流程不该改杠杆")
         }
         async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
             unreachable!("撤单流程不该查账户")

@@ -737,11 +737,6 @@ impl ExchangeClient for HyperliquidClient {
         }
     }
 
-    async fn set_leverage(&self, _symbol: &Symbol, _leverage: u32) -> Result<(), ExchangeError> {
-        // Hyperliquid 杠杆在下单时自动处理，此处直接返回成功
-        Ok(())
-    }
-
     async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         // Hyperliquid 的 equity/notional 经私有 WS 推送（AccountInfo 事件），此前这里
         // 返回全零占位。返回编造的数字比报错危险得多 —— 下游拿它算杠杆会静默失效。

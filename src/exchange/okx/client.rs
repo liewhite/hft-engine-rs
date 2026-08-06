@@ -540,57 +540,6 @@ impl ExchangeClient for OkxClient {
         ))
     }
 
-    async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
-        let path = "/api/v5/account/set-leverage";
-        let inst_id = to_okx(symbol, &self.quote);
-
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Request {
-            inst_id: String,
-            lever: String,
-            mgn_mode: String,
-        }
-
-        let request = Request {
-            inst_id,
-            lever: leverage.to_string(),
-            mgn_mode: "cross".to_string(),
-        };
-
-        let body = serde_json::to_string(&request)?;
-        let timestamp = Self::iso_timestamp();
-        let sign = self
-            .sign(&timestamp, "POST", path, &body)
-            .ok_or_else(|| ExchangeError::Other("No credentials".to_string()))?;
-        let headers = self
-            .build_headers(&sign, &timestamp)
-            .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
-
-        #[derive(Deserialize)]
-        struct Response {
-            code: String,
-            msg: String,
-        }
-
-        let resp = self
-            .client
-            .post(format!("{}{}", self.base_url, path))
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
-
-        if data.code != "0" {
-            return Err(map_okx_error(&data.code, &data.msg));
-        }
-
-        Ok(())
-    }
-
     async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         // OKX 的 equity/notional 经私有 WS 推送（AccountInfo 事件），本方法没有实现完整
         // 语义（此前 notional 硬编码 0.0）。返回编造的数字比报错危险得多 —— 下游拿它算

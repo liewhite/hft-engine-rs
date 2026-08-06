@@ -709,38 +709,6 @@ impl ExchangeClient for BinanceClient {
         Ok(data.order_id.to_string())
     }
 
-    async fn set_leverage(&self, symbol: &Symbol, leverage: u32) -> Result<(), ExchangeError> {
-        let api_key = self
-            .api_key()
-            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
-
-        let symbol_str = to_binance(symbol, &self.quote);
-        let leverage_str = leverage.to_string();
-        let params = [("symbol", symbol_str.as_str()), ("leverage", &leverage_str)];
-        let query = self
-            .build_signed_query(&params)
-            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
-
-        let resp = self
-            .client
-            .post(format!("{}/fapi/v1/leverage?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
-                Exchange::Binance,
-                -1,
-                text,
-            )));
-        }
-
-        Ok(())
-    }
-
     async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         self.get_account_info().await
     }

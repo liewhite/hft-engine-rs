@@ -603,11 +603,6 @@ impl ExchangeClient for IbkrClient {
         Ok(order_id)
     }
 
-    async fn set_leverage(&self, _symbol: &Symbol, _leverage: u32) -> Result<(), ExchangeError> {
-        // 股票无杠杆设置
-        Ok(())
-    }
-
     async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         let base_url = self.auth.base_url();
 

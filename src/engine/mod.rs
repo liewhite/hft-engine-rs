@@ -10,7 +10,7 @@ pub use live::{
     AccountIncome, AccountOutcome, AddStrategy, AddStrategies, PaperPubSub, ClockActor, ClockActorArgs,
     CryptoStatusActor, CryptoStatusActorArgs,
     ExecutorActor, ExecutorArgs,
-    GetAllSymbolMetas, GetIbkrClient, PublishIncome, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
+    GetAllSymbolMetas, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
     MetricsActor, MetricsActorArgs, OutcomePubSub, OutcomeProcessorActor, RegisterExecutor,
     PaperCounterActor, PaperCounterArgs,
     PositionPollingActor, PositionPollingActorArgs, DEFAULT_POSITION_POLL_INTERVAL_MS,
