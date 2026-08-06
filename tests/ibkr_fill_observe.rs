@@ -13,7 +13,6 @@ use hft_engine_rs::exchange::ibkr::{IbkrClient, IbkrCredentials};
 use hft_engine_rs::exchange::ibkr::auth::{tickle, IbkrAuth};
 use hft_engine_rs::exchange::{ExchangeClient, ExchangeOrder};
 use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
 use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http, Message as WsMessage};
 
 /// 从项目根目录 config.json 的 ibkr 字段读取凭证
