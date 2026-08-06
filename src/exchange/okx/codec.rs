@@ -445,11 +445,19 @@ fn map_okx_order_state(state: &str) -> OrderStatus {
 }
 
 /// Account Greeks 数据 (account-greeks channel)
+///
+/// OKX 的 `*BS` 后缀是 Black-Scholes 口径（另有 `*PA` 币本位口径，本项目不用）。
 #[derive(Debug, Deserialize)]
 pub struct GreeksData {
     pub ccy: String,
     #[serde(rename = "deltaBS")]
     pub delta_bs: String,
+    #[serde(rename = "gammaBS")]
+    pub gamma_bs: String,
+    #[serde(rename = "thetaBS")]
+    pub theta_bs: String,
+    #[serde(rename = "vegaBS")]
+    pub vega_bs: String,
     pub ts: String,
 }
 
@@ -457,6 +465,12 @@ impl GreeksData {
     pub fn to_greeks(&self) -> Result<Greeks, String> {
         let delta = f64::from_str(&self.delta_bs)
             .map_err(|_| format!("Failed to parse deltaBS: {}", self.delta_bs))?;
+        let gamma = f64::from_str(&self.gamma_bs)
+            .map_err(|_| format!("Failed to parse gammaBS: {}", self.gamma_bs))?;
+        let theta = f64::from_str(&self.theta_bs)
+            .map_err(|_| format!("Failed to parse thetaBS: {}", self.theta_bs))?;
+        let vega = f64::from_str(&self.vega_bs)
+            .map_err(|_| format!("Failed to parse vegaBS: {}", self.vega_bs))?;
         let timestamp = self.ts.parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
@@ -464,6 +478,9 @@ impl GreeksData {
             exchange: Exchange::OKX,
             ccy: self.ccy.clone(),
             delta,
+            gamma,
+            theta,
+            vega,
             timestamp,
         })
     }

@@ -107,6 +107,10 @@ impl<S: MarketDataSource> BsGreeksSource<S> {
             exchange: self.config.exchange,
             ccy: self.config.ccy.clone(),
             delta: n * (call.delta + put.delta),
+            gamma: n * (call.gamma + put.gamma),
+            // 与 OKX 的 thetaBS / vegaBS 同口径（期权行业惯例，见 domain::Greeks）
+            theta: n * (call.theta + put.theta) / DAYS_PER_YEAR, // 每年 -> 每日
+            vega: n * (call.vega + put.vega) / 100.0,            // 对 1.0 -> 对 1%
             timestamp: now,
         }
     }
@@ -276,11 +280,14 @@ mod tests {
             })
             .expect("greeks emitted");
 
-        // per-contract 求和即 delta（gamma/theta/vega 已从 Greeks 删除 —— 零读者，
-        // 连同它们的单位换算一起消失，见 crate::domain::Greeks 的文档）
+        // 期望: per-contract 求和后, theta 每年->每日 (/365)、vega 对1.0->对1% (/100)
+        // —— 与实盘 OKX 的 thetaBS/vegaBS 同口径,回测与实盘的希腊值可直接比对
         let t_y = 30.0 / 365.0;
         let call = option::greeks(OptionRight::Call, 2000.0, 2000.0, t_y, 0.6, 0.0);
         let put = option::greeks(OptionRight::Put, 2000.0, 2000.0, t_y, 0.6, 0.0);
         assert!((g.delta - (call.delta + put.delta)).abs() < 1e-9);
+        assert!((g.gamma - (call.gamma + put.gamma)).abs() < 1e-12);
+        assert!((g.theta - (call.theta + put.theta) / 365.0).abs() < 1e-9);
+        assert!((g.vega - (call.vega + put.vega) / 100.0).abs() < 1e-9);
     }
 }
