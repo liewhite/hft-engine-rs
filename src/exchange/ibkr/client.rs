@@ -624,17 +624,30 @@ impl ExchangeClient for IbkrClient {
         let summary: serde_json::Value =
             resp.json().await.map_err(Self::map_reqwest_error)?;
 
+        // 两个字段都**必须**取到，取不到即报错，绝不兜 0：
+        //
+        // - `notional = 0` 是**危险侧**的谎报：它直接喂给账户杠杆闸门
+        //   （notional / equity），兜 0 会让 `max_account_leverage` 恒定通过，
+        //   无论真实杠杆多高 —— 风控静默失效，而日志里只有一行 warn。
+        // - `equity = 0` 看似安全（策略判净值不足会停手），但两个字段是独立解析的：
+        //   只要 IBKR 单独改掉 grosspositionvalue 的字段名（本就写了两个候选名，
+        //   正因为它变过），就会出现"equity 正常、闸门失效"的组合。
+        //
+        // 调用方 account_polling 有 Err 分支，报错不会静默丢失。
         let equity = extract_summary_value(&summary, &["netliquidation", "netLiquidationValue"])
-            .unwrap_or_else(|| {
-                tracing::warn!(summary = %summary, "Failed to parse equity from IBKR summary");
-                0.0
-            });
+            .ok_or_else(|| {
+                ExchangeError::ParseError(format!(
+                    "IBKR 账户摘要缺 equity（netliquidation/netLiquidationValue）: {summary}"
+                ))
+            })?;
 
         let notional = extract_summary_value(&summary, &["grosspositionvalue", "securitiesGVP"])
-            .unwrap_or_else(|| {
-                tracing::warn!(summary = %summary, "Failed to parse notional from IBKR summary");
-                0.0
-            })
+            .ok_or_else(|| {
+                ExchangeError::ParseError(format!(
+                    "IBKR 账户摘要缺 notional（grosspositionvalue/securitiesGVP）—— \
+                     兜 0 会让账户杠杆闸门恒定通过: {summary}"
+                ))
+            })?
             .abs();
 
         Ok(crate::domain::AccountInfo { equity, notional })

@@ -6,6 +6,7 @@
 use crate::domain::{now_ms, Exchange};
 use crate::engine::IncomePubSub;
 use crate::exchange::okx::OkxClient;
+use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -34,14 +35,19 @@ pub struct OkxGreeksPollingActor {
     income_pubsub: ActorRef<IncomePubSub>,
     /// 缓存每个 ccy 的上次 timestamp，用于去重
     last_ts: HashMap<String, u64>,
+    /// 停摆守卫：希腊值取不到时 `StateManager` 里的旧值原样留着，策略拿它算 delta
+    /// 敞口却无从分辨新鲜度。长期取不到即退出（见 StalenessGuard）。
+    guard: StalenessGuard,
 }
 
 impl OkxGreeksPollingActor {
-    async fn poll_greeks(&mut self) {
+    /// 拉一次希腊值并发布。`Err` = 已停摆过久，调用方应致命退出。
+    async fn poll_greeks(&mut self) -> Result<(), String> {
         let local_ts = now_ms();
 
         match self.client.fetch_greeks().await {
             Ok(greeks_list) => {
+                self.guard.record_success();
                 for greeks in greeks_list {
                     // 跳过未变化的数据 (OKX 数据变化时 ts 会更新)
                     let prev_ts = self.last_ts.get(&greeks.ccy).copied().unwrap_or(0);
@@ -66,13 +72,16 @@ impl OkxGreeksPollingActor {
                 }
             }
             Err(e) => {
+                self.guard.check_failure(&e)?;
                 tracing::warn!(
                     exchange = %Exchange::OKX,
                     error = %e,
-                    "Failed to fetch greeks"
+                    stale_ms = self.guard.stale_ms(),
+                    "Failed to fetch greeks, will retry"
                 );
             }
         }
+        Ok(())
     }
 }
 
@@ -95,6 +104,7 @@ impl Actor for OkxGreeksPollingActor {
             client: args.client,
             income_pubsub: args.income_pubsub,
             last_ts: HashMap::new(),
+            guard: StalenessGuard::new("OKX 账户希腊值", MAX_POLL_STALENESS_MS),
         })
     }
 
@@ -118,7 +128,10 @@ impl Message<StreamMessage<Instant, (), ()>> for OkxGreeksPollingActor {
     ) {
         match msg {
             StreamMessage::Next(_) => {
-                self.poll_greeks().await;
+                if let Err(reason) = self.poll_greeks().await {
+                    tracing::error!(%reason, "OKX 希腊值长期取不到，退出（陈旧读数会让 delta 敞口判断失准）");
+                    ctx.actor_ref().kill();
+                }
             }
             StreamMessage::Started(_) => {
                 tracing::debug!("Greeks polling stream started");

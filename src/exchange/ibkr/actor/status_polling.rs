@@ -44,6 +44,9 @@ impl IbkrStatusPollingActor {
         let schedules = match self.client.fetch_trading_schedule().await {
             Ok(s) => s,
             Err(e) => {
+                // 不接 StalenessGuard：取不到交易时段表时，`StateManager::market_status`
+                // 的缺省与本 actor 的判定都落在 `Closed`（不交易）—— 失败方向本身就是
+                // 安全侧，再加一道致命守卫只会把"该歇着"变成"整机退出"。
                 tracing::warn!(
                     exchange = %Exchange::IBKR,
                     error = %e,

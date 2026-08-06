@@ -63,6 +63,10 @@ impl HyperliquidFundingFeePollingActor {
                     }
                 }
             }
+            // 不接 StalenessGuard（与账户净值/希腊值轮询不同）：资费是**流水累加**而非
+            // 快照读数，取不到就是这段区间的明细还没入账 —— 消费方看到的是"少了几条"，
+            // 不是"一个假的当前值"，也不参与任何交易决策（只进核算）。按"能靠 fail-fast
+            // 兜底的就不必层层设防"，这里保持重试。
             Err(e) => {
                 tracing::warn!(
                     exchange = "Hyperliquid",

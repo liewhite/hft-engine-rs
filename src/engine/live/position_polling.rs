@@ -18,7 +18,8 @@
 //! `on_link_died` 整机受控退出。判据用"距上次成功的时长"而非"连续失败次数"，这样改轮询
 //! 间隔不会连带改变容忍窗口（与 `IbkrSnapshotPollingActor` 的 kill 线同口径）。
 
-use crate::domain::{now_ms, Timestamp};
+use crate::domain::now_ms;
+use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::ExchangeClient;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -40,9 +41,6 @@ use super::IncomePubSub;
 /// REST 快照时点与本地 Fill 流之间必然有间隙，间隔太短会让正常成交被误判成漂移。
 pub const DEFAULT_POSITION_POLL_INTERVAL_MS: u64 = 3_000;
 
-/// 允许对账通道停摆的最长时间，超过即致命退出。
-const MAX_POLL_STALENESS_MS: u64 = 60_000;
-
 /// PositionPollingActor 初始化参数
 pub struct PositionPollingActorArgs {
     /// 目标交易所的 REST client（交易所标识取自 `client.exchange()`，不另传一份）
@@ -57,8 +55,8 @@ pub struct PositionPollingActorArgs {
 pub struct PositionPollingActor {
     client: Arc<dyn ExchangeClient>,
     income_pubsub: ActorRef<IncomePubSub>,
-    /// 上次**成功**拉取的时刻，用于判定对账通道是否已停摆
-    last_success_ms: Timestamp,
+    /// 停摆守卫：对账通道停摆等于风控失效，超过容忍窗口即致命（与账户读数共用组件）
+    guard: StalenessGuard,
 }
 
 impl PositionPollingActor {
@@ -67,8 +65,8 @@ impl PositionPollingActor {
         let exchange = self.client.exchange();
         match self.client.fetch_positions().await {
             Ok(positions) => {
-                self.last_success_ms = now_ms();
-                let local_ts = self.last_success_ms;
+                self.guard.record_success();
+                let local_ts = now_ms();
                 tracing::debug!(%exchange, count = positions.len(), "Position report polled");
                 if let Err(e) = self
                     .income_pubsub
@@ -89,17 +87,11 @@ impl PositionPollingActor {
                 Ok(())
             }
             Err(e) => {
-                let stale_ms = now_ms().saturating_sub(self.last_success_ms);
-                if stale_ms > MAX_POLL_STALENESS_MS {
-                    return Err(format!(
-                        "{exchange} 持仓对账已停摆 {stale_ms}ms（上限 {MAX_POLL_STALENESS_MS}ms），\
-                         最后一次失败: {e}"
-                    ));
-                }
+                self.guard.check_failure(&e)?;
                 tracing::warn!(
                     %exchange,
                     error = %e,
-                    stale_ms,
+                    stale_ms = self.guard.stale_ms(),
                     "Failed to fetch positions for reconciliation, will retry"
                 );
                 Ok(())
@@ -123,11 +115,15 @@ impl Actor for PositionPollingActor {
             "PositionPollingActor started"
         );
 
+        // 窗口从构造时刻起算，避免首次拉取前就被判成停摆
+        let guard = StalenessGuard::new(
+            format!("{} 持仓对账", args.client.exchange()),
+            MAX_POLL_STALENESS_MS,
+        );
         Ok(Self {
             client: args.client,
             income_pubsub: args.income_pubsub,
-            // 从启动时刻起算，避免首次拉取前就被判成停摆
-            last_success_ms: now_ms(),
+            guard,
         })
     }
 

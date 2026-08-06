@@ -4,6 +4,7 @@
 
 use crate::domain::{now_ms, Exchange};
 use crate::engine::IncomePubSub;
+use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::ExchangeClient;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -32,15 +33,19 @@ pub struct BinanceEquityPollingActor {
     client: Arc<dyn ExchangeClient>,
     /// Income PubSub (发布事件)
     income_pubsub: ActorRef<IncomePubSub>,
+    /// 停摆守卫：净值取不到时，`StateManager` 里的旧值会原样留着且无从分辨新鲜度 ——
+    /// 账户杠杆闸门会拿着它一路放行。长期取不到就让本 actor 死掉（见 StalenessGuard）。
+    guard: StalenessGuard,
 }
 
 impl BinanceEquityPollingActor {
-    /// 执行一次账户信息查询 (equity + notional)
-    async fn poll_account_info(&self) {
+    /// 执行一次账户信息查询 (equity + notional)。`Err` = 已停摆过久，调用方应致命退出。
+    async fn poll_account_info(&mut self) -> Result<(), String> {
         let local_ts = now_ms();
 
         match self.client.fetch_account_info().await {
             Ok(info) => {
+                self.guard.record_success();
                 // 发布 AccountInfo 事件
                 if let Err(e) = self
                     .income_pubsub
@@ -60,13 +65,16 @@ impl BinanceEquityPollingActor {
                 }
             }
             Err(e) => {
+                self.guard.check_failure(&e)?;
                 tracing::warn!(
                     exchange = %Exchange::Binance,
                     error = %e,
-                    "Failed to fetch account info"
+                    stale_ms = self.guard.stale_ms(),
+                    "Failed to fetch account info, will retry"
                 );
             }
         }
+        Ok(())
     }
 }
 
@@ -90,6 +98,7 @@ impl Actor for BinanceEquityPollingActor {
         Ok(Self {
             client: args.client,
             income_pubsub: args.income_pubsub,
+            guard: StalenessGuard::new("Binance 账户净值", MAX_POLL_STALENESS_MS),
         })
     }
 
@@ -114,7 +123,10 @@ impl Message<StreamMessage<Instant, (), ()>> for BinanceEquityPollingActor {
     ) {
         match msg {
             StreamMessage::Next(_) => {
-                self.poll_account_info().await;
+                if let Err(reason) = self.poll_account_info().await {
+                    tracing::error!(%reason, "Binance 账户净值长期取不到，退出（陈旧净值会让杠杆闸门失准）");
+                    ctx.actor_ref().kill();
+                }
             }
             StreamMessage::Started(_) => {
                 tracing::debug!("Equity polling stream started");

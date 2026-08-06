@@ -7,6 +7,7 @@ use crate::domain::{now_ms, Exchange};
 use crate::engine::IncomePubSub;
 use crate::exchange::client::ExchangeClient;
 use crate::exchange::ibkr::IbkrClient;
+use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -32,15 +33,19 @@ pub struct IbkrAccountPollingActorArgs {
 pub struct IbkrAccountPollingActor {
     client: Arc<IbkrClient>,
     income_pubsub: ActorRef<IncomePubSub>,
+    /// 停摆守卫：净值/名义值取不到时，`StateManager` 里的旧值会原样留着且无从分辨
+    /// 新鲜度 —— 账户杠杆闸门会拿着它一路放行。长期取不到即退出。
+    guard: StalenessGuard,
 }
 
 impl IbkrAccountPollingActor {
-    /// 执行一次账户信息查询并发布事件
-    async fn poll_account_info(&self) {
+    /// 执行一次账户信息查询并发布事件。`Err` = 已停摆过久，调用方应致命退出。
+    async fn poll_account_info(&mut self) -> Result<(), String> {
         let local_ts = now_ms();
 
         match self.client.fetch_account_info().await {
             Ok(info) => {
+                self.guard.record_success();
                 if let Err(e) = self
                     .income_pubsub
                     .tell(Publish(IncomeEvent {
@@ -59,13 +64,16 @@ impl IbkrAccountPollingActor {
                 }
             }
             Err(e) => {
+                self.guard.check_failure(&e)?;
                 tracing::warn!(
                     exchange = %Exchange::IBKR,
                     error = %e,
-                    "Failed to fetch IBKR account info"
+                    stale_ms = self.guard.stale_ms(),
+                    "Failed to fetch IBKR account info, will retry"
                 );
             }
         }
+        Ok(())
     }
 }
 
@@ -88,6 +96,7 @@ impl Actor for IbkrAccountPollingActor {
         Ok(Self {
             client: args.client,
             income_pubsub: args.income_pubsub,
+            guard: StalenessGuard::new("IBKR 账户净值", MAX_POLL_STALENESS_MS),
         })
     }
 
@@ -112,7 +121,10 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrAccountPollingActor {
     ) {
         match msg {
             StreamMessage::Next(_) => {
-                self.poll_account_info().await;
+                if let Err(reason) = self.poll_account_info().await {
+                    tracing::error!(%reason, "IBKR 账户净值长期取不到，退出（陈旧净值会让杠杆闸门失准）");
+                    ctx.actor_ref().kill();
+                }
             }
             StreamMessage::Started(_) => {
                 tracing::debug!("IBKR account polling stream started");

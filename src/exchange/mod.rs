@@ -3,6 +3,7 @@ pub mod client;
 pub mod hyperliquid;
 pub mod ibkr;
 pub mod okx;
+pub mod staleness;
 pub mod utils;
 pub mod ws_loop;
 
