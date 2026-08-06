@@ -66,7 +66,9 @@ impl Exchange {
     }
 }
 
-/// 全部交易所，供需要逐所遍历的测试与工具使用（新增交易所时编译器会在此处提醒补齐）
+/// 全部交易所，供需要逐所遍历的测试与工具使用（新增交易所时编译器会在此处提醒补齐）。
+/// 当前只有测试在用，故显式 allow —— 它的价值是"新增所时有一处会编译失败"，不是被谁调用。
+#[allow(dead_code)]
 pub const ALL_EXCHANGES: [Exchange; 4] = [
     Exchange::Binance,
     Exchange::OKX,

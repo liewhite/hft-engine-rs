@@ -36,6 +36,7 @@ struct L2Book {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // serde 需要字段齐全，测试只读其中一部分
 struct Level {
     px: String,
     sz: String,
