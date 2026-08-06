@@ -273,14 +273,14 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
         metas(),
         Box::new(SequentialClientOrderIdGen::default()),
     );
-    let seen_by_observer: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen_by_observer: Rc<RefCell<Vec<(usize, f64)>>> = Rc::new(RefCell::new(Vec::new()));
     let obs_sink = Rc::clone(&seen_by_observer);
     {
         let mut engine = BacktestEngine::new(&source, vec![runner], SimConfig::default())
-            .with_observer(move |ev: &IncomeEvent| {
-                if let ExchangeEventData::Custom(c) = &ev.data {
+            .with_outcome_observer(move |runner_idx, outcome| {
+                if let OutcomeEvent::Emit(c) = outcome {
                     let sig = c.get::<PingSignal>().expect("观察者按类型取回 payload");
-                    obs_sink.borrow_mut().push(sig.mid);
+                    obs_sink.borrow_mut().push((runner_idx, sig.mid));
                 }
             });
         engine.run();
@@ -292,7 +292,79 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
     );
     assert_eq!(
         *seen_by_observer.borrow(),
-        vec![100.05, 100.25],
-        "观察者应逐条收到 emit 的事件并能按类型取回内容"
+        vec![(0, 100.05), (0, 100.25)],
+        "outcome 观察者应逐条收到 emit 的事件（带发出者下标）并能按类型取回内容"
     );
+}
+
+/// 记录自己收到的每条 Custom 事件 tag 的探针策略。
+struct CustomProbe {
+    symbol: Symbol,
+    seen: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+impl Strategy for CustomProbe {
+    fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
+        let mut m = HashMap::new();
+        let mut kinds = HashSet::new();
+        kinds.insert(SubscriptionKind::BBO { symbol: self.symbol.clone() });
+        m.insert(EX, kinds);
+        m
+    }
+    fn order_timeout_ms(&self) -> u64 {
+        0
+    }
+    fn on_event(&mut self, event: &IncomeEvent, _state: &StateManager) -> Vec<OutcomeEvent> {
+        if let ExchangeEventData::Custom(c) = &event.data {
+            if let Some(Tag(t)) = c.get::<Tag>() {
+                self.seen.lock().unwrap().push(t);
+            }
+        }
+        Vec::new()
+    }
+}
+
+struct Tag(&'static str);
+
+fn custom_ev(c: hft_engine_rs::messaging::CustomEvent, ts: Timestamp) -> IncomeEvent {
+    IncomeEvent {
+        exchange_ts: ts,
+        local_ts: ts,
+        data: ExchangeEventData::Custom(c),
+    }
+}
+
+/// 入向路由端到端：带 scope 的 Custom 事件只到达订阅了该 symbol 的策略，
+/// 无 scope 的广播到达所有策略 —— 钉住 `accepts()` 对 Custom 的过滤语义。
+#[test]
+fn inbound_custom_events_route_by_scope() {
+    use hft_engine_rs::messaging::CustomEvent;
+    const SYM2: &str = "ETHUSDT";
+    let source = FixedSource {
+        evs: vec![
+            custom_ev(CustomEvent::for_symbol(EX, SYM.to_string(), Tag("btc")), 1000),
+            custom_ev(CustomEvent::for_symbol(EX, SYM2.to_string(), Tag("eth")), 2000),
+            custom_ev(CustomEvent::new(Tag("all")), 3000),
+        ],
+    };
+    let seen_btc = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_eth = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runners = vec![
+        StrategyRunner::with_id_gen(
+            Box::new(CustomProbe { symbol: SYM.to_string(), seen: Arc::clone(&seen_btc) }),
+            metas(),
+            Box::new(SequentialClientOrderIdGen::default()),
+        ),
+        StrategyRunner::with_id_gen(
+            Box::new(CustomProbe { symbol: SYM2.to_string(), seen: Arc::clone(&seen_eth) }),
+            metas(),
+            Box::new(SequentialClientOrderIdGen::default()),
+        ),
+    ];
+    BacktestEngine::new(&source, runners, SimConfig::default()).run();
+    assert_eq!(
+        *seen_btc.lock().unwrap(),
+        vec!["btc", "all"],
+        "BTC 策略应收到自己 symbol 的定向事件 + 广播事件，收不到别的 symbol 的"
+    );
+    assert_eq!(*seen_eth.lock().unwrap(), vec!["eth", "all"]);
 }
