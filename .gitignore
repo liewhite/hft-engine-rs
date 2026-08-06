@@ -4,6 +4,9 @@
 # 回测历史数据缓存 (按需下载, 不入库)
 /data-cache/
 
+# 滚动的审查清单：本地草稿，不入库（历史上被误提交过两次，故显式忽略）
+/review.md
+
 # 回测产物 (PnL 时序 / 成交记录)
 /gamma_pnl.json
 /backtest-fills-*.csv
