@@ -4,6 +4,7 @@ pub(crate) mod client;
 mod gateway;
 pub mod oauth;
 mod symbol;
+pub(crate) mod wire;
 
 pub use actor::{IbkrActor, IbkrActorArgs, IbkrSnapshotConfig};
 pub use auth::IbkrAuth;

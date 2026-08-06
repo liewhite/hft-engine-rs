@@ -7,6 +7,7 @@ use crate::domain::{
 use crate::exchange::client::{ExchangeClient, ExchangeOrder};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::symbol::resolve_conids;
+use crate::exchange::ibkr::wire;
 use crate::exchange::ibkr::IbkrCredentials;
 use crate::exchange::utils::StepFormatter;
 use async_trait::async_trait;
@@ -438,12 +439,34 @@ impl ExchangeClient for IbkrClient {
             side: Option<String>,
             #[serde(default)]
             status: Option<String>,
+            // 用 `Value` 而非 `Option<f64>`：`#[serde(default)]` 只兜"字段缺失"，
+            // **类型不符照样让整条响应反序列化失败** —— IBKR 把价量以字符串
+            // `"155.69"` 下发时，本方法会返回 ParseError，而它是启动期撤遗留挂单的
+            // 唯一数据源，于是整机启动被一个格式差异挡死。数字与字符串两种形态统一
+            // 交给 `wire::optional_number` 判定（见该模块文档）。
             #[serde(default)]
-            price: Option<f64>,
+            price: Option<serde_json::Value>,
             #[serde(default)]
-            total_size: Option<f64>,
+            total_size: Option<serde_json::Value>,
             #[serde(default)]
-            filled_quantity: Option<f64>,
+            filled_quantity: Option<serde_json::Value>,
+        }
+
+        /// 把 LiveOrder 的双态数值字段取成 f64；字段缺失按 `missing` 兜底（那是"交易所
+        /// 没给"，对挂单快照的用途无害：撤单只需要 order_id），**解析失败则报错**。
+        fn order_number(
+            raw: &Option<serde_json::Value>,
+            field: &str,
+            missing: f64,
+        ) -> Result<f64, ExchangeError> {
+            match raw {
+                None | Some(serde_json::Value::Null) => Ok(missing),
+                Some(v) => crate::exchange::ibkr::wire::number(v).ok_or_else(|| {
+                    ExchangeError::ParseError(format!(
+                        "IBKR live order 字段 {field} 无法解析为数字: {v}"
+                    ))
+                }),
+            }
         }
 
         let url = format!("{}iserver/account/orders", self.auth.base_url());
@@ -477,31 +500,32 @@ impl ExchangeClient for IbkrClient {
             }
             // 只保留**未终结**的单：本方法的用途是"还挂在簿上的是哪些"
             let raw_status = o.status.as_deref().unwrap_or_default();
-            let filled = o.filled_quantity.unwrap_or(0.0);
+            let filled = order_number(&o.filled_quantity, "filledQuantity", 0.0)?;
             let order_status = match raw_status {
                 "Submitted" if filled > 0.0 => OrderStatus::PartiallyFilled { filled },
                 "PendingSubmit" | "PreSubmitted" | "Submitted" => OrderStatus::Pending,
                 // Filled / Cancelled / Inactive 等终态不属于"挂单"
                 _ => continue,
             };
-            // IBKR 的 orderId 有时是数字、有时是字符串，两种都接
-            let order_id = match o.order_id {
-                Some(serde_json::Value::Number(n)) => n.to_string(),
-                Some(serde_json::Value::String(s)) => s,
-                _ => {
-                    // 没有 orderId 就撤不掉它 —— 这不能悄悄跳过，否则启动期撤单会
-                    // "复查通过"但实际漏了一张
-                    return Err(ExchangeError::ParseError(format!(
-                        "IBKR live order 缺少 orderId，无法撤单: conid={target_conid} status={raw_status}"
-                    )));
-                }
-            };
+            // 双态解析收在 wire::order_id 一处（WS 两条路径共用，见该模块文档）。
+            // 没有 orderId 就撤不掉它 —— 不能悄悄跳过，否则启动期撤单会"复查通过"
+            // 但实际漏了一张。
+            let order_id = wire::order_id(o.order_id.as_ref()).ok_or_else(|| {
+                ExchangeError::ParseError(format!(
+                    "IBKR live order 缺少 orderId，无法撤单: conid={target_conid} status={raw_status}"
+                ))
+            })?;
+            // 方向认不出**不能跳过**：这份列表的消费方在做「不在列表里 ⇒ 该单已终态」
+            // 的推断（启动期判"遗留单已撤净"、撤单复查合成 Cancelled 清本地 pending），
+            // 跳过一条等于谎报该单不存在 —— 与 OKX 挂单快照同一个模式，同样必须整份报错。
             let side = match o.side.as_deref().unwrap_or_default() {
                 "BUY" | "B" => Side::Long,
                 "SELL" | "S" => Side::Short,
                 other => {
-                    tracing::warn!(side = other, %order_id, "IBKR live order 未知方向，跳过");
-                    continue;
+                    return Err(ExchangeError::ParseError(format!(
+                        "IBKR live order 方向无法识别（'{other}'，orderId={order_id}），\
+                         整份挂单快照不可信"
+                    )));
                 }
             };
             updates.push(crate::domain::OrderUpdate {
@@ -511,10 +535,12 @@ impl ExchangeClient for IbkrClient {
                 symbol: symbol.clone(),
                 side,
                 status: order_status,
-                price: o.price.unwrap_or(0.0),
+                // 缺失按 0：挂单快照的用途是"这张单还在吗 + 怎么撤",价量不参与
+                // 判定（本地 pending 重建对 price<=0 有专门守卫，见 messaging::state）
+                price: order_number(&o.price, "price", 0.0)?,
                 // IBKR live orders 不含 reduce-only 信息
                 reduce_only: false,
-                quantity: o.total_size.unwrap_or(0.0),
+                quantity: order_number(&o.total_size, "totalSize", 0.0)?,
                 filled_quantity: filled,
                 // 快照没有"本次成交量"这一概念
                 fill_sz: 0.0,

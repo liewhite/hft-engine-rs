@@ -22,6 +22,7 @@ use crate::engine::IncomePubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::client::IbkrClient;
+use crate::exchange::ibkr::wire;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
@@ -280,22 +281,22 @@ impl IbkrPublicWsActor {
         // IB 字段映射: "84"→bid_price, "86"→ask_price, "85"→ask_size, "88"→bid_size
         // IB 数字可能含逗号 "1,234.56"
         if let Some(v) = value.get("84") {
-            if let Some(price) = parse_ib_number(v) {
+            if let Some(price) = wire::number(v) {
                 cache.bid_price = price;
             }
         }
         if let Some(v) = value.get("86") {
-            if let Some(price) = parse_ib_number(v) {
+            if let Some(price) = wire::number(v) {
                 cache.ask_price = price;
             }
         }
         if let Some(v) = value.get("85") {
-            if let Some(size) = parse_ib_number(v) {
+            if let Some(size) = wire::number(v) {
                 cache.ask_size = size;
             }
         }
         if let Some(v) = value.get("88") {
-            if let Some(size) = parse_ib_number(v) {
+            if let Some(size) = wire::number(v) {
                 cache.bid_size = size;
             }
         }
@@ -347,18 +348,8 @@ impl IbkrPublicWsActor {
                 _ => continue, // 跳过非策略订单
             };
 
-            // IBKR 的 orderId 有时是数字、有时是字符串，两种都接（与 REST 侧
-            // fetch_pending_orders 同口径）。若只按 u64 解析，字符串形态会得到空
-            // order_id —— 策略拿它去撤单必失败，撤单复查还会因空 id 匹配不到任何
-            // 挂单而把活单误判成已终态。
-            let order_id = item
-                .get("orderId")
-                .map(|v| match v {
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .unwrap_or_default();
+            // 双态解析收在 wire::order_id 一处（三条路径共用，见该模块文档）
+            let order_id = wire::order_id(item.get("orderId")).unwrap_or_default();
 
             let ib_status = match item.get("status").and_then(|v| v.as_str()) {
                 Some(s) => s,
@@ -510,9 +501,9 @@ impl IbkrPublicWsActor {
             }
 
             // IBKR WS str topic 用 "commission" (正确拼写)，REST API 用 "comission" (typo)
-            let commission = match optional_ib_number(item, "commission")? {
+            let commission = match wire_number(item, "commission")? {
                 Some(v) => Some(v),
-                None => optional_ib_number(item, "comission")?,
+                None => wire_number(item, "comission")?,
             };
 
             // 如果已有 pending fill，说明这是第二条消息（带 commission）
@@ -521,7 +512,7 @@ impl IbkrPublicWsActor {
                 // 一旦带了且与第一条不符，说明交易所修正了成交明细 —— 本地持仓均价会算错，
                 // 必须致命而不是 warn 后照旧发布：半吊子的检查比没有更糟，它只会训练运维
                 // 忽略告警。此前两个字段缺失时兜 0，导致每笔成交都误报不一致。
-                if let Some(price2) = optional_ib_number(item, "price")? {
+                if let Some(price2) = wire_number(item, "price")? {
                     if (price2 - pending.fill.price).abs() > FILL_FIELD_EPSILON {
                         return Err(WsError::ParseError(format!(
                             "IBKR 成交 {execution_id} 两条消息价格不一致（{} vs {price2}），\
@@ -530,7 +521,7 @@ impl IbkrPublicWsActor {
                         )));
                     }
                 }
-                if let Some(size2) = optional_ib_number(item, "size")? {
+                if let Some(size2) = wire_number(item, "size")? {
                     if (size2 - pending.fill.size).abs() > FILL_FIELD_EPSILON {
                         return Err(WsError::ParseError(format!(
                             "IBKR 成交 {execution_id} 两条消息数量不一致（{} vs {size2}），\
@@ -588,8 +579,8 @@ impl IbkrPublicWsActor {
             // 价量解析不出来就是这笔成交不可用。此前是 warn + 跳过 —— 守卫本身对
             // （没让 0 进账本），但**丢弃整笔成交**同样致命：本地持仓从此落后于交易所，
             // 只能等对账连续失配后停机兜底。宁可现在就死。
-            let price = optional_ib_number(item, "price")?.unwrap_or(0.0);
-            let size = optional_ib_number(item, "size")?.unwrap_or(0.0);
+            let price = wire_number(item, "price")?.unwrap_or(0.0);
+            let size = wire_number(item, "size")?.unwrap_or(0.0);
             if price <= 0.0 || size <= 0.0 {
                 return Err(WsError::ParseError(format!(
                     "IBKR 成交 {execution_id} 价量非法（price={price}, size={size}）: {item}"
@@ -647,10 +638,20 @@ impl IbkrPublicWsActor {
             let eid = execution_id.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(FILL_COMMISSION_TIMEOUT_SECS)).await;
-                let _ = actor_ref
-                    .tell(FillCommissionTimeout { execution_id: eid })
+                // 这条定时消息是该 fill 的**唯一兜底发布路径**：投递不到就意味着这笔成交
+                // 永远留在 pending_fills 里、永不发布（本地持仓从此落后于交易所）。
+                // actor 已停机时投递失败是预期的（on_stop 会 flush 掉残留），其余情况必须
+                // 留下记录 —— 静默丢一笔成交是本次审计要消灭的那类问题。
+                if let Err(e) = actor_ref
+                    .tell(FillCommissionTimeout { execution_id: eid.clone() })
                     .send()
-                    .await;
+                    .await
+                {
+                    tracing::error!(
+                        execution_id = %eid, error = %e,
+                        "IBKR fill 的 commission 超时消息投递失败，该笔成交可能未发布"
+                    );
+                }
             });
         }
 
@@ -670,17 +671,7 @@ impl IbkrPublicWsActor {
         if order_ref.is_empty() {
             return None;
         }
-        // 与 sor 路径同口径的双态解析（IBKR 的 orderId 有时是数字、有时是字符串）：
-        // 只按 u64 解析会得到空 order_id，撤单复查会因空 id 匹配不到挂单而把活单误判
-        // 成已终态。sor 路径 30 行前刚修过这个坑，str 路径当时漏了。
-        let order_id = item
-            .get("orderId")
-            .map(|v| match v {
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .unwrap_or_default();
+        let order_id = wire::order_id(item.get("orderId")).unwrap_or_default();
         Some(OrderUpdate {
             order_id,
             client_order_id: Some(order_ref.to_string()),
@@ -871,6 +862,20 @@ impl Actor for IbkrPublicWsActor {
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
         self.ws_tx.take();
+        // 停机时把还在等 commission 的成交全部发出去（fee=0）：它们是**已经发生的成交**，
+        // 带着它们静默退出等于让本地持仓少记一笔，而下次启动的基线会把这个缺口固化下来
+        // （基线只写一次、永不纠正）。手续费不准可以事后核对，持仓少一笔不行。
+        let pending: Vec<_> = self.pending_fills.drain().collect();
+        if !pending.is_empty() {
+            tracing::warn!(
+                count = pending.len(),
+                "IbkrPublicWsActor 停机，把等待 commission 的成交以 fee=0 补发"
+            );
+            for (execution_id, fill) in pending {
+                self.publish_fill(fill).await;
+                self.mark_seen(execution_id);
+            }
+        }
         tracing::info!("IbkrPublicWsActor stopped");
         Ok(())
     }
@@ -1065,35 +1070,9 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrPublicWsActor {
 /// 成交明细比对的容差（价量都是交易所回传的精确值，不一致即真不一致）
 const FILL_FIELD_EPSILON: f64 = 1e-9;
 
-/// 三态取数：字段缺失/为 null → `Ok(None)`；字段在但解析不了 → `Err`；有效 → `Ok(Some(v))`。
-///
-/// IBKR 的数字字段是 Number|String 双态且可能带千分位逗号（见 [`parse_ib_number`]）。
-/// "没有这个字段"与"值是 0"是两件事：前者常见且合法（第二条成交消息通常只补
-/// commission），后者若来自解析失败会直接污染账本 —— 所以解析失败绝不兜 0。
-fn optional_ib_number(item: &serde_json::Value, field: &str) -> Result<Option<f64>, WsError> {
-    match item.get(field) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(v) => parse_ib_number(v).map(Some).ok_or_else(|| {
-            WsError::ParseError(format!("IBKR 字段 {field} 无法解析为数字: {v}"))
-        }),
-    }
-}
-
-fn parse_ib_number(v: &serde_json::Value) -> Option<f64> {
-    match v {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => {
-            let cleaned = s.replace(',', "");
-            match cleaned.parse::<f64>() {
-                Ok(n) => Some(n),
-                Err(_) => {
-                    tracing::warn!(raw = %s, "Failed to parse IB number");
-                    None
-                }
-            }
-        }
-        _ => None,
-    }
+/// [`wire::optional_number`] 的 WS 侧封装：解析失败即 `WsError`（→ kill actor）
+fn wire_number(item: &serde_json::Value, field: &str) -> Result<Option<f64>, WsError> {
+    wire::optional_number(item, field).map_err(WsError::ParseError)
 }
 
 #[cfg(test)]
@@ -1151,23 +1130,4 @@ mod tests {
         );
     }
 
-    /// **三态语义**：字段缺失 → None（合法）；字段在但解析不了 → Err（绝不兜 0）。
-    ///
-    /// IBKR 的第二条成交消息通常只补 commission、不重复带 price/size —— 把"没这个
-    /// 字段"读成 0，会让价量一致性检查每笔都误报，也会让手续费静默记成 0。
-    #[test]
-    fn optional_number_separates_missing_from_unparsable() {
-        let item = serde_json::json!({
-            "price": "1,234.5",     // IBKR 的千分位字符串形态
-            "size": serde_json::Value::Null,
-            "commission": "n/a",     // 在，但不是数字
-        });
-        assert_eq!(optional_ib_number(&item, "price").unwrap(), Some(1234.5));
-        assert_eq!(optional_ib_number(&item, "size").unwrap(), None, "null 视为缺失");
-        assert_eq!(optional_ib_number(&item, "absent").unwrap(), None, "缺失就是 None");
-        assert!(
-            optional_ib_number(&item, "commission").is_err(),
-            "字段在但解析不了必须报错，兜 0 会把手续费/价量静默写错"
-        );
-    }
 }
