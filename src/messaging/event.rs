@@ -28,12 +28,20 @@ use std::sync::Arc;
 ///
 /// `event.get::<T>()` 按具体类型取回，类型不符返回 `None` —— 订阅者只对自己认识的
 /// 类型起反应，这也是分发的实际粒度。`name` 由 payload 类型名自动填充，供日志定位。
+///
+/// # 两个静默失败模式（payload 作者须知）
+///
+/// - **跨版本 TypeId**：`get::<T>()` 按 `TypeId` 判别。工作区若同时链入某 payload crate
+///   的两个版本，两边的 `T` 是不同类型，`get` 静默得 `None` —— 表现为"订阅者收到但
+///   不认识"。payload 类型应定义在单一 crate 的单一版本里。
+/// - **payload 应为不可变数据**：同一份 payload 经 `Arc` 在所有订阅者间共享。若其中
+///   藏了内部可变性（`Mutex`/`RefCell` 等），就变成了订阅者之间的共享可变状态 ——
+///   这会绕开"事件是值"的模型，禁止。
 #[derive(Clone)]
 pub struct CustomEvent {
-    /// 事件归属的交易所（与 `symbol` 同时存在才构成定向路由）
-    pub exchange: Option<Exchange>,
-    /// 事件归属的 symbol
-    pub symbol: Option<Symbol>,
+    /// 定向路由的 scope。单字段保证"要么完整、要么没有"——不存在只有 exchange 或
+    /// 只有 symbol 的半 scope 状态（那会静默降级为广播，与构造意图相反）。
+    scope: Option<(Exchange, Symbol)>,
     /// payload 的类型名（自动填充，观测用；类型判别请用 [`Self::get`]，不要比对本字段）
     pub name: &'static str,
     /// 类型擦除的事件内容；`Arc` 使总线广播的 clone 零拷贝
@@ -44,8 +52,7 @@ impl CustomEvent {
     /// 无 scope 的自定义事件：广播给所有策略 executor 与总线订阅者
     pub fn new<T: Any + Send + Sync>(payload: T) -> Self {
         Self {
-            exchange: None,
-            symbol: None,
+            scope: None,
             name: std::any::type_name::<T>(),
             payload: Arc::new(payload),
         }
@@ -54,11 +61,15 @@ impl CustomEvent {
     /// 带 `(exchange, symbol)` scope 的自定义事件：只投递给订阅了该 symbol 的 executor
     pub fn for_symbol<T: Any + Send + Sync>(exchange: Exchange, symbol: Symbol, payload: T) -> Self {
         Self {
-            exchange: Some(exchange),
-            symbol: Some(symbol),
+            scope: Some((exchange, symbol)),
             name: std::any::type_name::<T>(),
             payload: Arc::new(payload),
         }
+    }
+
+    /// 定向路由的 scope；`None` 即广播
+    pub fn scope(&self) -> Option<&(Exchange, Symbol)> {
+        self.scope.as_ref()
     }
 
     /// 按具体类型取回 payload；类型不符返回 `None`
@@ -71,8 +82,7 @@ impl std::fmt::Debug for CustomEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CustomEvent")
             .field("name", &self.name)
-            .field("exchange", &self.exchange)
-            .field("symbol", &self.symbol)
+            .field("scope", &self.scope)
             .finish_non_exhaustive()
     }
 }
@@ -211,7 +221,7 @@ impl IncomeEvent {
             ExchangeEventData::Candle(candle) => Some(&candle.symbol),
             ExchangeEventData::HistoryCandles(candles) => candles.first().map(|c| &c.symbol),
             // 自定义事件的 scope 由构造方决定（for_symbol 定向 / new 广播）
-            ExchangeEventData::Custom(c) => c.symbol.as_ref(),
+            ExchangeEventData::Custom(c) => c.scope().map(|(_, s)| s),
             ExchangeEventData::Balance(_)
             | ExchangeEventData::Greeks(_)
             | ExchangeEventData::AccountInfo { .. }
@@ -244,7 +254,7 @@ impl IncomeEvent {
             ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
             ExchangeEventData::ExchangeStatus { exchange, .. } => Some(*exchange),
             ExchangeEventData::PositionReport { exchange, .. } => Some(*exchange),
-            ExchangeEventData::Custom(c) => c.exchange,
+            ExchangeEventData::Custom(c) => c.scope().map(|(e, _)| *e),
             ExchangeEventData::Clock => None,
         }
     }

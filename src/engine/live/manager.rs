@@ -1217,6 +1217,8 @@ impl Message<PublishCustomEvent> for ManagerActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let ts = now_ms();
+        // 注入留痕：事件"发了没人收"（scope 拼错、订阅缺失、类型不符）时，这是唯一的定位起点
+        tracing::debug!(name = msg.0.name, scope = ?msg.0.scope(), "注入自定义事件");
         let event = IncomeEvent {
             exchange_ts: ts,
             local_ts: ts,
