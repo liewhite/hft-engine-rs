@@ -38,10 +38,11 @@ IOC 部分/未成交。
 （现在 `max_position_notional` 实际表现为"接近上限就停摆"，而不是真正的上限）。
 不影响当前正确性，属结构优化。
 
-### 4. 外部指标上报（未做）
-`MetricsActor` 目前只输出结构化日志（`target: "metrics"`），无外部依赖。
-若要接 Prometheus pushgateway / Slack 告警，需要新增上报组件与配置。
-（历史上有过 pushgateway + Slack 实现，commit `a0183e8` 为了保持"纯策略框架"删除。）
+### 4. 外部指标上报（已做，旁路形态）
+`src/observability/`：告警外送（tracing Layer 捕 WARN/ERROR 推 webhook，
+`ALERT_WEBHOOK_URL` 启用）+ 指标推送（MetricsActor 快照推 pushgateway，
+`PUSHGATEWAY_URL` 启用）。核心不依赖观测出口，未配置时行为与从前一致 ——
+与"纯策略框架"决策（`a0183e8` 删除内置实现）不冲突：出口依赖核心，核心不依赖出口。
 
 另两点已知取舍：
 - `MetricsActor` 订阅全量 income 流，数百 symbol 的 BBO 会多一份 clone + mailbox 投递，
@@ -69,7 +70,8 @@ IOC 部分/未成交。
 - **持仓维护为增量 + 独立对账通道**：`Position` 基线一次性写入（manager 投产期点对点 +
   总线各一条路径），之后全靠 `Fill` 累加；`PositionPollingActor` 周期性 REST 读数经
   `PositionReconcileActor` 与「基线 + Fill」比对，连续差值稳定即停机。对账**只检测不修复**
-  （无 re-baseline / 自动平仓 / 告警外发），模拟账户与挂单不在对账范围内。
+  （无 re-baseline / 自动平仓），模拟账户与挂单不在对账范围内。漂移的 error 日志现在会经
+  告警外送通道推 webhook（若配置了 `ALERT_WEBHOOK_URL`）。
 
 已解决（记录供回溯）：
 - ~~`cancel_order` 未实现~~：四所均已实现（`e6348f1` 补齐 Binance / Hyperliquid / IBKR）。
