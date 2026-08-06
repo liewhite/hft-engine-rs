@@ -73,7 +73,10 @@ const OBSERVE: Duration = Duration::from_secs(60);
 // ============================================================================
 
 /// 最小挂单器：空仓且无挂单时，在当前买价上挂一张 PostOnly 买单，此后不动。
-struct DipMaker;
+///
+/// 挂单价由策略自己写进共享 log：`OrderUpdate` 不带价格（四所里两所是写死的，见
+/// `domain::OrderUpdate` 的文档）。下单方本来就知道自己挂在哪，不需要回报捎带。
+struct DipMaker(Arc<Mutex<Log>>);
 
 impl Strategy for DipMaker {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
@@ -111,6 +114,7 @@ impl Strategy for DipMaker {
             return Vec::new();
         }
         let price = bbo.bid_price * (1.0 - OFFSET_BP / 10_000.0);
+        self.0.lock().unwrap().limit_price = Some(price);
         vec![OutcomeEvent::PlaceOrders {
             orders: vec![Order {
                 id: String::new(),
@@ -144,7 +148,10 @@ struct Log {
     min_trade_price: Option<f64>,
     max_trade_price: Option<f64>,
     /// 挂单入簿后的限价（取整后）
+    /// 策略挂出的价格（由策略自己写入，见 DipMaker）
     limit_price: Option<f64>,
+    /// 挂单已被柜台确认入簿（收到 Pending 回报）
+    resting: bool,
     /// **挂单入簿之后**的最低成交价 —— 蕴含判断只能用这个，入簿前的成交与该单无关
     min_trade_after_rest: Option<f64>,
 }
@@ -182,11 +189,8 @@ impl Message<IncomeEvent> for Watcher {
             ExchangeEventData::OrderUpdate(u) => {
                 log.order_updates
                     .push((u.order_id.clone(), format!("{:?}", u.status)));
-                if log.limit_price.is_none()
-                    && u.price > 0.0
-                    && matches!(u.status, hft_engine_rs::domain::OrderStatus::Pending)
-                {
-                    log.limit_price = Some(u.price);
+                if matches!(u.status, hft_engine_rs::domain::OrderStatus::Pending) {
+                    log.resting = true;
                 }
             }
             ExchangeEventData::Fill(f) => log.fills.push((f.price, f.size)),
@@ -195,7 +199,7 @@ impl Message<IncomeEvent> for Watcher {
                 log.trade_count += 1;
                 log.min_trade_price = Some(log.min_trade_price.map_or(t.price, |m: f64| m.min(t.price)));
                 log.max_trade_price = Some(log.max_trade_price.map_or(t.price, |m: f64| m.max(t.price)));
-                if log.limit_price.is_some() {
+                if log.resting {
                     log.min_trade_after_rest =
                         Some(log.min_trade_after_rest.map_or(t.price, |m: f64| m.min(t.price)));
                 }
@@ -284,9 +288,12 @@ async fn paper_counter_fills_from_live_trades() {
         .await
         .expect("processor subscribes paper");
 
+    // 观测 log 提前创建：策略要把自己的挂单价写进去（回报不再捎带价格）
+    let log = Arc::new(Mutex::new(Log::default()));
+
     let executor = ExecutorActor::spawn_with_mailbox(
         ExecutorArgs {
-            strategy: Box::new(DipMaker),
+            strategy: Box::new(DipMaker(Arc::clone(&log))),
             account: PAPER_ACCOUNT.clone(),
             symbol_metas: metas_by_key.clone(),
             outcome_pubsub: outcome_pubsub.clone(),
@@ -309,7 +316,6 @@ async fn paper_counter_fills_from_live_trades() {
         .expect("register executor");
 
     // ---- 观测者 ----
-    let log = Arc::new(Mutex::new(Log::default()));
     let watcher = Watcher::spawn_with_mailbox(log.clone(), mailbox::unbounded());
     income_pubsub
         .tell(Subscribe(watcher.clone()))

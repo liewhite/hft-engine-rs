@@ -182,12 +182,7 @@ mod tests {
             status: OrderStatus::Rejected {
                 reason: "insufficient margin".to_string(),
             },
-            price: 0.0,
-            reduce_only: false,
             quantity: 0.0,
-            filled_quantity: 0.0,
-            fill_sz: 0.0,
-            timestamp: 0,
         };
         stats.apply_order_update(&update);
         update.status = OrderStatus::Filled;

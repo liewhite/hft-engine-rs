@@ -369,29 +369,15 @@ impl OrderPushData {
     /// 全部数量字段折算为币本位，折算由签名强制（见 [`crate::domain::Quantity`]）。
     pub fn to_order_update(&self, meta: &SymbolMeta) -> Result<OrderUpdate, String> {
         // market order px 为空字符串，此时 price 为 0.0
-        let price = if self.px.is_empty() {
-            0.0
-        } else {
-            f64::from_str(&self.px)
-                .map_err(|_| format!("Failed to parse px: {}", self.px))?
-        };
         // 线路上三个数量字段都是张数，此处一次性折算为币本位
         let sz = meta.qty_to_coin(
             f64::from_str(&self.sz).map_err(|_| format!("Failed to parse sz: {}", self.sz))?,
         );
-        let fill_sz = meta.qty_to_coin(
-            f64::from_str(&self.fill_sz)
-                .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?,
-        );
-        let acc_fill_sz = meta.qty_to_coin(
-            f64::from_str(&self.acc_fill_sz)
-                .map_err(|_| format!("Failed to parse acc_fill_sz: {}", self.acc_fill_sz))?,
-        );
 
         let side = parse_side(&self.side)?;
 
-        // 注意 status 内嵌的 PartiallyFilled{filled} 同样是数量，必须用折算后的值
-        let status = map_okx_order_state(&self.state, acc_fill_sz);
+        // 注意 status 内嵌的 PartiallyFilled 同样是数量，必须用折算后的值
+        let status = map_okx_order_state(&self.state);
 
         Ok(OrderUpdate {
             order_id: self.ord_id.clone(),
@@ -400,12 +386,7 @@ impl OrderPushData {
             symbol: meta.symbol.clone(),
             side,
             status,
-            price,
-            reduce_only: self.reduce_only.as_deref() == Some("true"),
             quantity: sz,
-            filled_quantity: acc_fill_sz,
-            fill_sz,
-            timestamp: now_ms(),
         })
     }
 
@@ -463,10 +444,10 @@ impl OrderPushData {
 }
 
 /// OKX 订单状态映射
-fn map_okx_order_state(state: &str, filled: f64) -> OrderStatus {
+fn map_okx_order_state(state: &str) -> OrderStatus {
     match state {
         "live" => OrderStatus::Pending,
-        "partially_filled" => OrderStatus::PartiallyFilled { filled },
+        "partially_filled" => OrderStatus::PartiallyFilled,
         "filled" => OrderStatus::Filled,
         "canceled" | "cancelled" => OrderStatus::Cancelled,
         other => OrderStatus::Rejected {

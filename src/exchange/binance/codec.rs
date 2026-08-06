@@ -250,11 +250,6 @@ impl OrderTradeUpdate {
     pub fn to_order_update(&self, quote: &str) -> Result<OrderUpdate, String> {
         let symbol = from_binance(&self.o.s, quote)
             .ok_or_else(|| format!("Unknown Binance symbol: {}", self.o.s))?;
-        let filled_qty = f64::from_str(&self.o.z)
-            .map_err(|_| format!("Failed to parse filled qty: {}", self.o.z))?;
-        let fill_sz = f64::from_str(&self.o.l)
-            .map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))?;
-
         let side = match self.o.side.as_str() {
             "BUY" => Side::Long,
             "SELL" => Side::Short,
@@ -263,7 +258,7 @@ impl OrderTradeUpdate {
 
         let status = match self.o.status.as_str() {
             "NEW" => OrderStatus::Pending,
-            "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled { filled: filled_qty },
+            "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
             "FILLED" => OrderStatus::Filled,
             "CANCELED" | "CANCELLED" => OrderStatus::Cancelled,
             "REJECTED" | "EXPIRED" => OrderStatus::Rejected {
@@ -274,11 +269,6 @@ impl OrderTradeUpdate {
             },
         };
 
-        // OrderUpdate.price 的语义是**委托价**（OKX 用 px、HL 用 limit_px，口径一致）。
-        // 此前误用均价 ap：挂单态（NEW）的 ap 是 "0"，流进 SymbolState 的挂单重建路径
-        // 会造出 price=0 的假单。市价单没有委托价，Binance 推 "0"，如实透传。
-        let price = f64::from_str(&self.o.p)
-            .map_err(|_| format!("Failed to parse order price: {}", self.o.p))?;
         let quantity = f64::from_str(&self.o.q)
             .map_err(|_| format!("Failed to parse quantity: {}", self.o.q))?;
 
@@ -289,12 +279,7 @@ impl OrderTradeUpdate {
             symbol,
             side,
             status,
-            price,
-            reduce_only: self.o.reduce_only,
             quantity,
-            filled_quantity: filled_qty,
-            fill_sz,
-            timestamp: now_ms(),
         })
     }
 

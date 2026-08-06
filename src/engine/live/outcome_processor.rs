@@ -380,12 +380,7 @@ impl OutcomeProcessorActor {
             symbol,
             side: Side::Long, // 撤单事件中 side 无实际意义
             status: OrderStatus::Cancelled,
-            price: 0.0,
-            reduce_only: false, // 合成的撤单确认，终态不会触发外部单注册
             quantity: 0.0,
-            filled_quantity: 0.0,
-            fill_sz: 0.0,
-            timestamp: local_ts,
         };
         if let Err(e) = income_pubsub
             .tell(Publish(IncomeEvent {
@@ -419,13 +414,8 @@ impl OutcomeProcessorActor {
             symbol: order.symbol.clone(),
             side: order.side,
             status: OrderStatus::Error { reason },
-            price: 0.0,
-            reduce_only: order.reduce_only,
             // 如实带上委托量（与柜台的拒单回报口径一致），不填 0
             quantity: order.quantity,
-            filled_quantity: 0.0,
-            fill_sz: 0.0,
-            timestamp: local_ts,
         };
 
         if let Err(e) = income_pubsub
@@ -454,12 +444,7 @@ mod tests {
             symbol: "BTC".to_string(),
             side: Side::Long,
             status: OrderStatus::Pending,
-            price: 100.0,
-            reduce_only: false,
             quantity: 1.0,
-            filled_quantity: 0.0,
-            fill_sz: 0.0,
-            timestamp: 1,
         }
     }
 

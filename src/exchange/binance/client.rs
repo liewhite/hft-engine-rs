@@ -611,11 +611,10 @@ impl ExchangeClient for BinanceClient {
                     continue;
                 }
             };
-            let filled = parse_field(&o.executed_qty, "executedQty")?;
             // openOrders 只返回未终结的单，故只有这两种状态；其余按未知跳过而非猜测
             let status = match o.status.as_str() {
                 "NEW" => OrderStatus::Pending,
-                "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled { filled },
+                "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
                 other => {
                     tracing::warn!(status = other, "Binance openOrders 未预期状态，跳过");
                     continue;
@@ -629,13 +628,8 @@ impl ExchangeClient for BinanceClient {
                 symbol: symbol.clone(),
                 side,
                 status,
-                price: parse_field(&o.price, "price")?,
-                reduce_only: o.reduce_only,
                 quantity: parse_field(&o.orig_qty, "origQty")?,
-                filled_quantity: filled,
                 // 快照没有"本次成交量"这一概念
-                fill_sz: 0.0,
-                timestamp: o.time,
             });
         }
 

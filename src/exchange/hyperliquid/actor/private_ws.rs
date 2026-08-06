@@ -423,10 +423,11 @@ fn parse_order_updates(
             );
             continue;
         }
-        let update = order_update.to_order_update()
-            ?;
+        let update = order_update.to_order_update()?;
         events.push(IncomeEvent {
-            exchange_ts: update.timestamp,
+            // 交易所时点取推送自带的 statusTimestamp（OrderUpdate 本身不再捎带时间戳 ——
+            // 四所口径曾混装且无人读，见 crate::domain::OrderUpdate 的文档）
+            exchange_ts: order_update.status_timestamp,
             local_ts,
             data: ExchangeEventData::OrderUpdate(update),
         });

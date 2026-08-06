@@ -363,7 +363,7 @@ impl IbkrPublicWsActor {
 
             let status = match ib_status {
                 "Submitted" if filled_qty > 0.0 => {
-                    OrderStatus::PartiallyFilled { filled: filled_qty }
+                    OrderStatus::PartiallyFilled
                 }
                 "PendingSubmit" | "PreSubmitted" | "Submitted" => OrderStatus::Pending,
                 "Filled" => OrderStatus::Filled,
@@ -432,12 +432,7 @@ impl IbkrPublicWsActor {
                 symbol,
                 side,
                 status,
-                price: 0.0,
-                reduce_only: false, // IBKR 订单推送不含 reduce-only 信息
                 quantity: 0.0,
-                filled_quantity: filled_qty,
-                fill_sz: 0.0, // sor 推送无增量 fill 信息
-                timestamp: local_ts,
             };
 
             let event = IncomeEvent {
@@ -610,7 +605,7 @@ impl IbkrPublicWsActor {
                     fee,
                     reason: crate::domain::FillReason::Normal, // IBKR 执行流不区分强平/ADL
                 };
-                let order_update = self.build_order_update(item, order_ref, &symbol, side, size, local_ts);
+                let order_update = self.build_order_update(item, order_ref, &symbol, side, size);
                 self.publish_fill(PendingFill { fill, order_update }).await;
                 self.mark_seen(execution_id);
                 continue;
@@ -635,7 +630,7 @@ impl IbkrPublicWsActor {
                 fee: 0.0,
                 reason: crate::domain::FillReason::Normal, // IBKR 执行流不区分强平/ADL
             };
-            let order_update = self.build_order_update(item, order_ref, &symbol, side, size, local_ts);
+            let order_update = self.build_order_update(item, order_ref, &symbol, side, size);
             self.pending_fills.insert(execution_id.clone(), PendingFill { fill, order_update });
 
             // 启动超时定时器
@@ -671,7 +666,6 @@ impl IbkrPublicWsActor {
         symbol: &str,
         side: Side,
         size: f64,
-        local_ts: u64,
     ) -> Option<OrderUpdate> {
         if order_ref.is_empty() {
             return None;
@@ -684,12 +678,7 @@ impl IbkrPublicWsActor {
             symbol: symbol.to_string(),
             side,
             status: OrderStatus::Filled,
-            price: 0.0,
-            reduce_only: false, // IBKR 订单推送不含 reduce-only 信息
             quantity: size,
-            filled_quantity: size,
-            fill_sz: size,
-            timestamp: local_ts,
         })
     }
 

@@ -646,19 +646,11 @@ impl ExchangeClient for HyperliquidClient {
                 symbol: symbol.clone(),
                 side,
                 status: if filled > 0.0 {
-                    crate::domain::OrderStatus::PartiallyFilled { filled }
+                    crate::domain::OrderStatus::PartiallyFilled
                 } else {
                     crate::domain::OrderStatus::Pending
                 },
-                price: o.limit_px.parse().map_err(|_| {
-                    ExchangeError::ParseError(format!("HL limitPx 非法: {}", o.limit_px))
-                })?,
-                reduce_only: o.reduce_only,
                 quantity: orig_sz,
-                filled_quantity: filled,
-                // 快照没有"本次成交量"这一概念
-                fill_sz: 0.0,
-                timestamp: o.timestamp,
             });
         }
 

@@ -277,7 +277,6 @@ impl SimState {
                 OrderStatus::Rejected {
                     reason: "order routed to wrong exchange counter".to_string(),
                 },
-                0.0,
                 now,
             )];
         }
@@ -297,7 +296,6 @@ impl SimState {
                     OrderStatus::Rejected {
                         reason: "no market data for market order".to_string(),
                     },
-                    0.0,
                     ts,
                 )],
             },
@@ -308,14 +306,12 @@ impl SimState {
                     reference.filter(|r| matcher::marketable_at(order.side, *limit, *r));
                 match tif {
                     TimeInForce::PostOnly => match taker_price {
-                        Some(_) => vec![status_event(
-                            self.exchange,
+                        Some(_) => vec![status_event(self.exchange,
                             order,
                             order_id,
                             OrderStatus::Rejected {
                                 reason: "post-only would take liquidity".to_string(),
                             },
-                            *limit,
                             ts,
                         )],
                         None => self.rest(order, order_id, *limit, ts),
@@ -332,7 +328,6 @@ impl SimState {
                             order,
                             order_id,
                             OrderStatus::Cancelled,
-                            *limit,
                             ts,
                         )],
                     },
@@ -357,13 +352,8 @@ impl SimState {
                     symbol: o.symbol,
                     side: o.side,
                     status: OrderStatus::Cancelled,
-                    price: o.limit_price,
-                    reduce_only: o.reduce_only,
                     quantity: o.quantity,
                     // 如实带上撤单前的累计成交（部分成交后撤单），不谎报 0
-                    filled_quantity: o.filled,
-                    fill_sz: 0.0,
-                    timestamp: now,
                 }),
             )],
             None => Vec::new(),
@@ -395,10 +385,7 @@ impl SimState {
             Liquidity::Taker,
             order.reduce_only,
         );
-        if let FillResult::Traded {
-            effective,
-            done: false,
-        } = result
+        if let FillResult::Traded { done: false, .. } = result
         {
             events.push(ev_at(
                 ts,
@@ -409,12 +396,7 @@ impl SimState {
                     symbol: order.symbol.clone(),
                     side: order.side,
                     status: OrderStatus::Cancelled,
-                    price,
-                    reduce_only: order.reduce_only,
                     quantity: order.quantity,
-                    filled_quantity: effective,
-                    fill_sz: 0.0,
-                    timestamp: ts,
                 }),
             ));
         }
@@ -441,7 +423,7 @@ impl SimState {
                 reduce_only: order.reduce_only,
             },
         );
-        vec![status_event(self.exchange, order, order_id, OrderStatus::Pending, limit, ts)]
+        vec![status_event(self.exchange, order, order_id, OrderStatus::Pending, ts)]
     }
 
     /// 尝试成交 `take` 数量并落账。
@@ -489,12 +471,7 @@ impl SimState {
                     symbol: symbol.clone(),
                     side,
                     status: OrderStatus::Cancelled,
-                    price: fill_price,
-                    reduce_only,
                     quantity: order_qty,
-                    filled_quantity: already_filled,
-                    fill_sz: 0.0,
-                    timestamp: ts,
                 }),
             )];
             return (FillResult::NoPositionToReduce, events);
@@ -513,7 +490,7 @@ impl SimState {
         let status = if done {
             OrderStatus::Filled
         } else {
-            OrderStatus::PartiallyFilled { filled: cumulative }
+            OrderStatus::PartiallyFilled
         };
         let update = OrderUpdate {
             order_id: order_id.clone(),
@@ -522,12 +499,7 @@ impl SimState {
             symbol: symbol.clone(),
             side,
             status,
-            price: fill_price,
-            reduce_only,
             quantity: order_qty,
-            filled_quantity: cumulative,
-            fill_sz: effective_qty,
-            timestamp: ts,
         };
         let f = Fill {
             exchange: self.exchange,
@@ -569,7 +541,6 @@ fn status_event(
     order: &Order,
     order_id: &OrderId,
     status: OrderStatus,
-    price: Price,
     ts: Timestamp,
 ) -> IncomeEvent {
     ev_at(
@@ -581,12 +552,7 @@ fn status_event(
             symbol: order.symbol.clone(),
             side: order.side,
             status,
-            price,
-            reduce_only: order.reduce_only,
             quantity: order.quantity,
-            filled_quantity: 0.0,
-            fill_sz: 0.0,
-            timestamp: ts,
         }),
     )
 }
@@ -840,7 +806,7 @@ mod tests {
         assert!(
             statuses(&evs)
                 .iter()
-                .any(|st| matches!(st, OrderStatus::PartiallyFilled { filled } if (filled - 0.3).abs() < 1e-9)),
+                .any(|st| matches!(st, OrderStatus::PartiallyFilled)),
             "应有 PartiallyFilled 回报: {:?}",
             statuses(&evs)
         );
@@ -851,9 +817,12 @@ mod tests {
         assert!((s.ledger.positions[&sym()].size - 1.2).abs() < 1e-9);
     }
 
-    /// **部分成交后撤单**：终态 Cancelled 必须如实带上累计成交，不谎报 0
+    /// **部分成交后撤单**：终态 Cancelled 带原始委托量。
+    ///
+    /// 累计成交量不在挂单回报里（见 `crate::domain::OrderUpdate` 的文档）—— 成交明细由
+    /// Fill 流承载，账本由柜台自己维护，回报只负责"这张单结束了"。
     #[test]
-    fn cancel_after_partial_fill_reports_cumulative_filled() {
+    fn cancel_after_partial_fill_reports_original_quantity() {
         let mut s = empty();
         let mut o = limit(Side::Long, 100.0, TimeInForce::GTC, "b1");
         o.quantity = 0.7;
@@ -861,18 +830,19 @@ mod tests {
         // print 0.3 部分成交，剩 0.4 在簿
         s.on_market(&trade_ev_qty(99.0, 0.3, 2));
         let evs = s.on_cancel_arrived(3, &"1".to_string());
-        let cancelled: Vec<(f64, f64)> = evs
+        let cancelled: Vec<f64> = evs
             .iter()
             .filter_map(|e| match &e.data {
                 ExchangeEventData::OrderUpdate(u) if u.status == OrderStatus::Cancelled => {
-                    Some((u.quantity, u.filled_quantity))
+                    Some(u.quantity)
                 }
                 _ => None,
             })
             .collect();
         assert_eq!(cancelled.len(), 1);
-        near(cancelled[0].0, 0.7); // 原始委托量
-        near(cancelled[0].1, 0.3); // 累计成交
+        near(cancelled[0], 0.7); // 原始委托量
+        // 已成交的 0.3 体现在账本持仓上，而不是撤单回报里
+        near(s.ledger.positions[&sym()].size, 0.3);
         assert!(s.resting.is_empty());
     }
 

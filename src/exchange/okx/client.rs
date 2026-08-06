@@ -3,7 +3,7 @@
 use super::symbol::{from_okx, to_okx};
 use crate::domain::{
     Exchange, ExchangeError, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate, Side,
-    Symbol, SymbolMeta, TimeInForce, now_ms,
+    Symbol, SymbolMeta, TimeInForce,
 };
 use crate::exchange::okx::codec::{GreeksData, PositionData};
 use crate::exchange::client::{ExchangeClient, ExchangeOrder};
@@ -288,11 +288,8 @@ struct PendingOrderData {
     cl_ord_id: Option<String>,
     side: String,
     state: String,
-    /// 订单价格
-    px: String,
     /// 订单数量 (张)
     sz: String,
-    acc_fill_sz: String,
 }
 
 #[derive(Deserialize)]
@@ -333,17 +330,11 @@ fn parse_pending_order(
         "sell" => Side::Short,
         other => return Err(fail("side", other)),
     };
-    let acc_fill_sz = d
-        .acc_fill_sz
-        .parse::<f64>()
-        .map(|v| v * contract_size)
-        .map_err(|_| fail("accFillSz", &d.acc_fill_sz))?;
     let status = match d.state.as_str() {
         "live" => OrderStatus::Pending,
-        "partially_filled" => OrderStatus::PartiallyFilled { filled: acc_fill_sz },
+        "partially_filled" => OrderStatus::PartiallyFilled,
         other => return Err(fail("state", other)),
     };
-    let price = d.px.parse::<f64>().map_err(|_| fail("px", &d.px))?;
     let quantity = d
         .sz
         .parse::<f64>()
@@ -360,12 +351,7 @@ fn parse_pending_order(
         symbol,
         side,
         status,
-        price,
-        reduce_only: false, // OKX REST pending 响应未解析 reduceOnly，外部单元信息以 WS 推送为准
         quantity,
-        filled_quantity: acc_fill_sz,
-        fill_sz: 0.0,
-        timestamp: now_ms(),
     })
 }
 
@@ -719,9 +705,7 @@ mod pending_orders_tests {
             cl_ord_id: cl_ord_id.map(str::to_string),
             side: "buy".to_string(),
             state: "live".to_string(),
-            px: "42000.5".to_string(),
             sz: "3".to_string(),
-            acc_fill_sz: "1".to_string(),
         }
     }
 
@@ -732,7 +716,6 @@ mod pending_orders_tests {
         assert_eq!(u.symbol, "BTC");
         assert_eq!(u.side, Side::Long);
         assert!((u.quantity - 0.03).abs() < 1e-12, "sz 3 张 × 0.01 = 0.03 币");
-        assert!((u.filled_quantity - 0.01).abs() < 1e-12);
         assert_eq!(u.client_order_id.as_deref(), Some("x-abc"));
     }
 
@@ -762,9 +745,7 @@ mod pending_orders_tests {
             ("instId", Box::new(|d: &mut PendingOrderData| d.inst_id = "???".to_string())),
             ("side", Box::new(|d: &mut PendingOrderData| d.side = "sideways".to_string())),
             ("state", Box::new(|d: &mut PendingOrderData| d.state = "canceled".to_string())),
-            ("px", Box::new(|d: &mut PendingOrderData| d.px = String::new())),
             ("sz", Box::new(|d: &mut PendingOrderData| d.sz = "n/a".to_string())),
-            ("accFillSz", Box::new(|d: &mut PendingOrderData| d.acc_fill_sz = String::new())),
         ];
         for (field, corrupt) in cases {
             let mut d = raw(Some("x-abc"));

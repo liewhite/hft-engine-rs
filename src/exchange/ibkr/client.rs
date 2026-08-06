@@ -1,7 +1,7 @@
 //! IBKR ExchangeClient 实现 (仅 REST)
 
 use crate::domain::{
-    now_ms, Exchange, ExchangeError, OrderId, OrderStatus, OrderType, Side, Symbol, SymbolMeta,
+    Exchange, ExchangeError, OrderId, OrderStatus, OrderType, Side, Symbol, SymbolMeta,
     TimeInForce,
 };
 use crate::exchange::client::{ExchangeClient, ExchangeOrder};
@@ -486,7 +486,6 @@ impl ExchangeClient for IbkrClient {
             ))
         })?;
 
-        let local_ts = now_ms();
         let mut updates = Vec::new();
         for o in body.orders {
             if o.conid != Some(target_conid) {
@@ -501,7 +500,7 @@ impl ExchangeClient for IbkrClient {
             // Submitted。把它丢掉正好落进消费方"不在列表里 ⇒ 已终态"的推断：启动期判
             // "遗留单已撤净"放行启动、撤单复查合成 Cancelled 清掉一张可能复活的单的 pending。
             let order_status = match raw_status {
-                "Submitted" if filled > 0.0 => OrderStatus::PartiallyFilled { filled },
+                "Submitted" if filled > 0.0 => OrderStatus::PartiallyFilled,
                 // PendingCancel 仍在簿上，按未终结处理
                 "PendingSubmit" | "PreSubmitted" | "Submitted" | "PendingCancel" => {
                     OrderStatus::Pending
@@ -546,14 +545,9 @@ impl ExchangeClient for IbkrClient {
                 status: order_status,
                 // 缺失按 0：挂单快照的用途是"这张单还在吗 + 怎么撤",价量不参与
                 // 判定（本地 pending 重建对 price<=0 有专门守卫，见 messaging::state）
-                price: order_number(&o.price, "price", 0.0)?,
                 // IBKR live orders 不含 reduce-only 信息
-                reduce_only: false,
                 quantity: order_number(&o.total_size, "totalSize", 0.0)?,
-                filled_quantity: filled,
                 // 快照没有"本次成交量"这一概念
-                fill_sz: 0.0,
-                timestamp: local_ts,
             });
         }
 

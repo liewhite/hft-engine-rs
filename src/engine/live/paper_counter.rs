@@ -182,12 +182,7 @@ impl PaperCounterActor {
             symbol: order.symbol.clone(),
             side: order.side,
             status: OrderStatus::Error { reason },
-            price: 0.0,
-            reduce_only: order.reduce_only,
             quantity: order.quantity,
-            filled_quantity: 0.0,
-            fill_sz: 0.0,
-            timestamp: ts,
         };
         let tagged = AccountIncome {
             account: account.clone(),
@@ -796,7 +791,7 @@ mod tests {
         assert_eq!(h.fills(), vec![(99.0, 1.0)]);
         assert!(
             h.statuses()
-                .contains(&OrderStatus::PartiallyFilled { filled: 1.0 }),
+                .contains(&OrderStatus::PartiallyFilled),
             "部分成交必须以 PartiallyFilled 回报: {:?}",
             h.statuses()
         );

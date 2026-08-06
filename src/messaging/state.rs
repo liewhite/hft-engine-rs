@@ -300,7 +300,7 @@ impl SymbolState {
                             // 订单终态，移除 pending order
                             self.pending_orders.remove(client_id);
                         }
-                        OrderStatus::Pending | OrderStatus::PartiallyFilled { .. } => {
+                        OrderStatus::Pending | OrderStatus::PartiallyFilled => {
                             // 交易所已确认订单，更新状态并回填 order_id
                             if let Some(pending) = self.pending_orders.get_mut(client_id) {
                                 pending.status = update.status.clone();
@@ -317,20 +317,19 @@ impl SymbolState {
                                     client_order_id = %client_id,
                                     "收到非本引擎挂单的更新，不纳入本地 pending"
                                 );
-                            } else if update.price <= 0.0 || update.quantity <= 0.0 {
-                                // 本引擎的单、本地无记录，但 update 的关键字段是无效值 ——
+                            } else if update.quantity <= 0.0 {
+                                // 本引擎的单、本地无记录，但 update 的数量是无效值 ——
                                 // 数据不足以重建，**宁缺勿假**。真实来路：IBKR 的 sor 推送
-                                // 不含价格与数量（适配层写死 0），若照建就是一张 price=0、
-                                // qty=0 的幽灵挂单：has_pending_orders 从此恒真、策略比对
-                                // price/qty 读到 0。缺席的代价（可能重复挂单）有界且可被
-                                // 交易所拒单/风控拦住；假单的代价（symbol 永久冻结）无界。
+                                // 不含数量（适配层写死 0），若照建就是一张 qty=0 的幽灵挂单：
+                                // has_pending_orders 从此恒真、策略比对 qty 读到 0。缺席的
+                                // 代价（可能重复挂单）有界且可被交易所拒单/风控拦住；假单的
+                                // 代价（symbol 永久冻结）无界。
                                 tracing::warn!(
                                     symbol = %self.symbol,
                                     exchange = %update.exchange,
                                     client_order_id = %client_id,
-                                    price = update.price,
                                     quantity = update.quantity,
-                                    "本引擎挂单确认迟到，但更新缺有效价格/数量，不重建本地 pending"
+                                    "本引擎挂单确认迟到，但更新缺有效数量，不重建本地 pending"
                                 );
                             } else {
                                 // 本引擎的单，但本地已无记录 —— 正常只有一种来路：下单后迟迟未获
@@ -341,9 +340,14 @@ impl SymbolState {
                                 // （启动期交易所已存在的遗留挂单**不走这条路** —— 那些由
                                 // `ManagerActor` 在启动期直接撤掉，见 `cancel_leftover_orders`。）
                                 //
-                                // 权威字段直接取自 update：side/price/quantity/reduce_only/status。
-                                // tif 无法从订单更新可靠还原，对 resting 限价单按 GTC 占位——它不参与
-                                // 后续跟踪判断（has_pending_side 看 side、gamma_scalp 看 order_type/price/qty）。
+                                // 权威字段直接取自 update：side/quantity/status。
+                                //
+                                // 价格与 reduce_only 无法从订单更新还原（OrderUpdate 不再带这两个
+                                // 字段 —— 四所里两所是写死的，见其文档），故重建的挂单价填 0、
+                                // reduce_only 填 false。这不影响跟踪判断：`has_pending_side` 看
+                                // side、gamma_scalp 看 side 与 quantity，都不读价格；出向的
+                                // reduce_only 只在策略自造订单上有意义，重建的单不会被再次发出。
+                                // tif 同理按 GTC 占位。
                                 self.pending_orders.insert(
                                     client_id.clone(),
                                     PendingOrder {
@@ -353,15 +357,17 @@ impl SymbolState {
                                             symbol: update.symbol.clone(),
                                             side: update.side,
                                             order_type: OrderType::Limit {
-                                                price: update.price,
+                                                price: 0.0,
                                                 tif: TimeInForce::GTC,
                                             },
                                             quantity: update.quantity,
-                                            reduce_only: update.reduce_only,
+                                            reduce_only: false,
                                             client_order_id: client_id.clone(),
                                         },
                                         status: update.status.clone(),
-                                        created_at: update.timestamp,
+                                        // 重建时刻即本地知晓时刻（超时清理只作用于 Created 态，
+                                        // 而重建进来的必是 Pending/PartiallyFilled，不受影响）
+                                        created_at: event.local_ts,
                                     },
                                 );
                             }
@@ -646,12 +652,7 @@ mod tests {
             symbol: SYMBOL.to_string(),
             side: Side::Long,
             status,
-            price: 100.0,
-            reduce_only: false,
             quantity: 1.0,
-            filled_quantity: 0.0,
-            fill_sz: 0.0,
-            timestamp: 1,
         }))
     }
 
@@ -737,23 +738,22 @@ mod tests {
 
     /// **宁缺勿假**：update 缺有效价格/数量（IBKR sor 推送写死 0）时不重建本地 pending。
     ///
-    /// 照建就是一张 price=0、qty=0 的幽灵挂单：has_pending_orders 从此恒真、
-    /// 策略比对 price/qty 读到 0 —— symbol 被永久冻结。
+    /// 照建就是一张 qty=0 的幽灵挂单：has_pending_orders 从此恒真、策略比对数量
+    /// 读到 0 —— symbol 被永久冻结。
     #[test]
-    fn re_registration_requires_valid_price_and_quantity() {
+    fn re_registration_requires_valid_quantity() {
         let mut state = SymbolState::new(SYMBOL.to_string());
         let own_id = EX.new_cli_order_id();
 
         let mut ghost = order_update(Some(own_id), OrderStatus::Pending);
         if let ExchangeEventData::OrderUpdate(u) = &mut ghost.data {
-            u.price = 0.0;
             u.quantity = 0.0;
         }
         state.apply(&ghost);
 
         assert!(
             !state.has_pending_orders(),
-            "price/qty 为 0 的更新被重建成了幽灵挂单"
+            "qty 为 0 的更新被重建成了幽灵挂单"
         );
     }
 }

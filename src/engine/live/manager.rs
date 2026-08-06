@@ -1648,12 +1648,7 @@ mod leftover_order_tests {
             symbol: SYM.to_string(),
             side: Side::Long,
             status: OrderStatus::Pending,
-            price: 100.0,
-            reduce_only: false,
             quantity: 1.0,
-            filled_quantity: 0.0,
-            fill_sz: 0.0,
-            timestamp: 1,
         }
     }
 

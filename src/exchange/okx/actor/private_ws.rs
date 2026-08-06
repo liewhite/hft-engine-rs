@@ -338,7 +338,7 @@ fn parse_private_message(
                     );
                     continue;
                 };
-                // 数量折算由签名强制完成（含 status 内嵌的 PartiallyFilled{filled}）
+                // 数量折算由签名强制完成（含 status 内嵌的 PartiallyFilled）
                 let order_update = data.to_order_update(meta)?;
 
                 // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）

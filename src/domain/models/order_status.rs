@@ -1,4 +1,3 @@
-use crate::domain::types::Quantity;
 use serde::{Deserialize, Serialize};
 
 /// 订单状态
@@ -9,7 +8,9 @@ pub enum OrderStatus {
     /// 交易所已收到，等待成交
     Pending,
     /// 部分成交
-    PartiallyFilled { filled: Quantity },
+    /// 部分成交。**不带成交量载荷**：本地挂单跟踪不区分"部分成交多少"（那要么看
+    /// Fill 流、要么看账本），而载荷会强迫四个所各自解析累计量并对齐口径。
+    PartiallyFilled,
     /// 完全成交
     Filled,
     /// 已取消

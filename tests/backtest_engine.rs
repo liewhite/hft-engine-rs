@@ -123,8 +123,8 @@ impl Strategy for OneShotBuy {
 fn event_sig(ev: &IncomeEvent) -> String {
     match &ev.data {
         ExchangeEventData::OrderUpdate(u) => format!(
-            "OU ts={} cid={:?} {:?} px={} qty={} fsz={}",
-            ev.exchange_ts, u.client_order_id, u.status, u.price, u.quantity, u.fill_sz
+            "OU ts={} cid={:?} {:?} qty={}",
+            ev.exchange_ts, u.client_order_id, u.status, u.quantity
         ),
         ExchangeEventData::Fill(f) => format!(
             "FL ts={} cid={:?} oid={} {:?} px={} sz={} fee={}",
