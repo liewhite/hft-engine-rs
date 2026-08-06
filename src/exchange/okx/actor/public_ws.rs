@@ -427,6 +427,10 @@ pub(crate) fn parse_public_message(
 ///
 /// `Candle` 由 OkxActor 路由到 BusinessWsActor，正常不会到达此处；返回 `None` 表示
 /// 路由错误，由调用方记录并跳过（不 panic，遵循"框架层错误受控处理"约定）。
+///
+/// **Some/None 只准由 kind 变体决定**：quote/dex 只参与报文字符串拼装。
+/// `supports_subscription`（能力查询）依赖此前提传占位参数 —— 若将来按 quote/dex
+/// 分支决定支持与否，能力查询会静默失真。
 pub(crate) fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_json::Value> {
     match kind {
         SubscriptionKind::FundingRate { symbol } => Some(json!({

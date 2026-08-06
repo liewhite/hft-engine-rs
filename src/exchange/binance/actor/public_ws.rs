@@ -430,6 +430,10 @@ pub(crate) fn parse_public_message(
 ///
 /// Binance 的 K线（`Candle`）订阅尚未实现：父 actor 会把它路由到本 actor（`market_ws`），
 /// 到达此处返回 `None`，由调用方记录 `warn!` 并跳过（不 panic，遵循"框架层错误受控处理"约定）。
+///
+/// **Some/None 只准由 kind 变体决定**：quote/dex 只参与报文字符串拼装。
+/// `supports_subscription`（能力查询）依赖此前提传占位参数 —— 若将来按 quote/dex
+/// 分支决定支持与否，能力查询会静默失真。
 pub(crate) fn kind_to_stream(kind: &SubscriptionKind, quote: &str) -> Option<String> {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用同一个 markPrice@1s 流

@@ -391,6 +391,10 @@ pub(crate) fn parse_public_message(
                 }
                 return Ok(Vec::new());
             }
+            // 应用层心跳应答（HL 文档口径：{"channel":"pong"}）
+            "pong" => {
+                return Ok(Vec::new());
+            }
             "activeAssetCtx" => {
                 // 资产上下文（包含资金费率、标记价格、指数价格）
                 let data = &value["data"];
@@ -500,6 +504,10 @@ pub(crate) fn parse_public_message(
 ///
 /// 返回 `None` 表示该 kind 无法路由到 Hyperliquid（如 Candle 未实现）；
 /// 调用方应记录并跳过，而非 panic。
+///
+/// **Some/None 只准由 kind 变体决定**：quote/dex 只参与报文字符串拼装。
+/// `supports_subscription`（能力查询）依赖此前提传占位参数 —— 若将来按 quote/dex
+/// 分支决定支持与否，能力查询会静默失真。
 pub(crate) fn kind_to_stream(kind: &SubscriptionKind, quote: &str, dex: &str) -> Option<String> {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用同一个 activeAssetCtx 订阅
