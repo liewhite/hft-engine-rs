@@ -262,7 +262,11 @@ impl PositionData {
     /// 转为 domain 持仓。`pos` 是**张数**，折算为币本位由 `contract_size` 完成
     /// （见 [`crate::domain::Quantity`]）。
     ///
-    /// 空仓时 OKX 用**空串**表示数值字段，一律按 0 处理；非空则必须解析成功。
+    /// 空仓时 OKX 用**空串**表示数值字段。空串按"交易所没给"（`None`）上交
+    /// [`Position::checked`] 判定 —— 它只在 `size == 0` 时才允许缺失。
+    ///
+    /// 此前是逐字段独立地把空串兜成 0：`pos="12"` 而 `avgPx=""` 时会产出一个
+    /// size 非零、entry_price=0 的持仓，成为永不可纠正的错误基线（见 `checked` 文档）。
     pub fn to_position(&self, symbol: Symbol, contract_size: f64) -> Result<Position, String> {
         if self.pos_side != POS_SIDE_NET {
             return Err(format!(
@@ -272,21 +276,25 @@ impl PositionData {
             ));
         }
 
-        fn parse_or_zero(raw: &str, field: &str) -> Result<f64, String> {
+        /// 空串 = 交易所没给（`None`）；非空则必须解析成功，解析失败绝不兜 0
+        fn optional(raw: &str, field: &str) -> Result<Option<f64>, String> {
             if raw.is_empty() {
-                return Ok(0.0);
+                return Ok(None);
             }
-            f64::from_str(raw).map_err(|_| format!("Failed to parse {field}: {raw}"))
+            f64::from_str(raw)
+                .map(Some)
+                .map_err(|_| format!("Failed to parse {field}: {raw}"))
         }
 
-        Ok(Position {
-            exchange: Exchange::OKX,
+        // 正数多头，负数空头；张 -> 币
+        let size = optional(&self.pos, "pos")?.unwrap_or(0.0) * contract_size;
+        Position::checked(
+            Exchange::OKX,
             symbol,
-            // 正数多头，负数空头
-            size: parse_or_zero(&self.pos, "pos")? * contract_size,
-            entry_price: parse_or_zero(&self.avg_px, "avgPx")?,
-            unrealized_pnl: parse_or_zero(&self.upl, "upl")?,
-        })
+            size,
+            optional(&self.avg_px, "avgPx")?,
+            optional(&self.upl, "upl")?,
+        )
     }
 }
 
@@ -685,6 +693,24 @@ mod trade_tests {
         assert_eq!(p.size, 0.0);
         assert_eq!(p.entry_price, 0.0);
         assert_eq!(p.unrealized_pnl, 0.0);
+    }
+
+    /// **Critical 回归防线**：持仓非零而价格字段是空串 —— 空仓兜底的守卫此前是**逐字段
+    /// 独立**的，于是 `pos="12"` + `avgPx=""` 会产出 size 非零、entry_price=0 的持仓。
+    /// 它会成为持仓基线（只写一次、永不纠正），此后加权均价与已实现盈亏全线失真，
+    /// 而对账只比 size，永远发现不了。
+    #[test]
+    fn non_flat_position_with_empty_price_fields_is_rejected() {
+        for raw in [
+            r#"{"instId":"BTC-USDT-SWAP","pos":"12","posSide":"net","avgPx":"","upl":"0"}"#,
+            r#"{"instId":"BTC-USDT-SWAP","pos":"12","posSide":"net","avgPx":"42000","upl":""}"#,
+        ] {
+            let d: PositionData = serde_json::from_str(raw).unwrap();
+            assert!(
+                d.to_position("BTC".to_string(), CONTRACT_SIZE).is_err(),
+                "持仓非零而价格字段为空串，被静默兜成了 0：{raw}"
+            );
+        }
     }
 
     /// **Critical 防线**：双向持仓模式必须报错，不能按净持仓口径解析。

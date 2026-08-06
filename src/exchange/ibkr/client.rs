@@ -195,50 +195,43 @@ impl IbkrClient {
                 }
                 None => None,
             };
-            let conid = match conid {
-                Some(c) => c,
-                None => {
-                    tracing::warn!(item = %item, "IBKR position missing/invalid conid");
-                    continue;
-                }
-            };
+            // conid 认不出 = 这条持仓归属不明。**不能跳过**：跳过等于把它当成"该
+            // symbol 空仓"，而这份读数既是基线（写一次、永不纠正）又是对账读数
+            // （两条通道共用本函数）—— 字段名/类型一变，基线 0、读数也 0，对账判
+            // "一致"，漂移检测结构性失明。与 Hyperliquid 的"过滤全空即报错"同口径。
+            let conid = conid.ok_or_else(|| {
+                ExchangeError::ParseError(format!(
+                    "IBKR 持仓条目的 conid 缺失或无法解析，整份持仓读数不可信: {item}"
+                ))
+            })?;
 
-            // 跳过未配置的 symbol（不记录 warn，IBKR 账户可能持有其他股票）
+            // 跳过未配置的 symbol：这是合法的"不归本引擎管"（IBKR 账户可能持有其他
+            // 股票），与上面"认不出 conid"是两回事 —— 那是数据坏了，这是范围之外。
             let symbol = match conid_to_symbol.get(&conid) {
                 Some(s) => s,
                 None => continue,
             };
 
-            let size = match item.get("position").and_then(|v| v.as_f64()) {
-                Some(s) => s,
-                None => {
-                    tracing::warn!(item = %item, "IBKR position missing/invalid size");
-                    continue;
-                }
-            };
-
-            let avg_cost = item
-                .get("avgCost")
+            let size = item
+                .get("position")
                 .and_then(|v| v.as_f64())
-                .unwrap_or_else(|| {
-                    tracing::warn!(symbol = %symbol, item = %item, "IBKR position missing/invalid avgCost");
-                    0.0
-                });
-            let unrealized_pnl = item
-                .get("unrealizedPnl")
-                .and_then(|v| v.as_f64())
-                .unwrap_or_else(|| {
-                    tracing::warn!(symbol = %symbol, item = %item, "IBKR position missing/invalid unrealizedPnl");
-                    0.0
-                });
+                .ok_or_else(|| {
+                    ExchangeError::ParseError(format!(
+                        "IBKR {symbol} 持仓数量缺失或无法解析，整份持仓读数不可信: {item}"
+                    ))
+                })?;
 
-            positions.push(crate::domain::Position {
-                exchange: Exchange::IBKR,
-                symbol: symbol.to_string(),
+            // 价格类字段用 Option 如实表达"没给/没解析出来"，由 Position::checked 按
+            // size 判定是否合法（空仓可缺，持仓非零时缺失即错误基线）。
+            let position = crate::domain::Position::checked(
+                Exchange::IBKR,
+                symbol.to_string(),
                 size,
-                entry_price: avg_cost,
-                unrealized_pnl,
-            });
+                item.get("avgCost").and_then(|v| v.as_f64()),
+                item.get("unrealizedPnl").and_then(|v| v.as_f64()),
+            )
+            .map_err(ExchangeError::ParseError)?;
+            positions.push(position);
         }
 
         tracing::debug!(count = positions.len(), "IBKR positions fetched");
