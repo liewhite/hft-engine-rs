@@ -351,6 +351,19 @@ impl<'a> BacktestEngine<'a> {
                             Action::CancelArrive(exchange, order_id),
                         );
                     }
+                    // 与实盘同构：策略 emit 的自定义事件只给旁路观察者（等价 Outcome 总线
+                    // 的外部订阅者），**绝不回流给策略** —— 策略间不能直接通信。
+                    // 观察者的入参类型是 IncomeEvent，包一层 Custom 递过去（时刻 = 当前虚拟时间）。
+                    OutcomeEvent::Emit(custom) => {
+                        let wrapped = IncomeEvent {
+                            exchange_ts: self.now,
+                            local_ts: self.now,
+                            data: ExchangeEventData::Custom(custom),
+                        };
+                        for j in 0..self.observers.len() {
+                            (self.observers[j])(&wrapped);
+                        }
+                    }
                 }
             }
         }

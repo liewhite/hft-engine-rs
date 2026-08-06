@@ -330,6 +330,8 @@ impl Message<AccountOutcome> for PaperCounterActor {
         let msg = tagged.event;
         let delay = self.config.order_to_exchange_delay_ms;
         match msg {
+            // 自定义事件不进柜台：它已随 Outcome 总线到达外部订阅者，柜台只撮合下单/撤单
+            OutcomeEvent::Emit(_) => {}
             OutcomeEvent::PlaceOrders { orders, comment } => {
                 for order in orders {
                     // 与实盘出口同一套下界校验（checked_exchange_qty 是唯一出处）：

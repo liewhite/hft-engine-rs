@@ -138,6 +138,8 @@ impl StrategyRunner {
                     }
                 }
                 cancel @ OutcomeEvent::CancelOrder { .. } => cancel,
+                // 自定义事件原样放行：无订单语义，不登记 pending、不过精度取整
+                emit @ OutcomeEvent::Emit(_) => emit,
             })
             .collect()
     }

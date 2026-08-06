@@ -6,7 +6,7 @@ pub use gamma_scalp::GammaScalpStrategy;
 
 use crate::domain::{Exchange, Order, OrderId, Symbol};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{IncomeEvent, StateManager};
+use crate::messaging::{CustomEvent, IncomeEvent, StateManager};
 use std::collections::{HashMap, HashSet};
 
 /// 策略输出的信号
@@ -30,6 +30,13 @@ pub enum OutcomeEvent {
         /// 若合成回报里没有它，撤掉的单会永远留在本地 pending 里）
         client_order_id: String,
     },
+    /// 向外发布自定义事件（见 [`CustomEvent`] 的方向与路由文档）。
+    ///
+    /// 随其他信号发布到 Outcome 总线，外部处理者经 `SubscribeOutcome` 订阅、
+    /// 按类型 `get::<T>()` 消费；下单/撤单处理器（实盘出口与模拟柜台）对它 no-op。
+    /// **不会回流给任何策略** —— 确需喂给策略的事件走 `ManagerActor` 的
+    /// `PublishCustomEvent` 入向入口。
+    Emit(CustomEvent),
 }
 
 /// 策略 trait

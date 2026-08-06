@@ -104,6 +104,8 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
         // - spawned task 内的失败已通过 `send_order_error*` 反馈为 OrderUpdate(Error/Rejected)，
         //   不会静默丢失。
         match msg {
+            // 自定义事件与交易所无关：它已随 Outcome 总线到达外部订阅者，本处理器只管下单/撤单
+            OutcomeEvent::Emit(_) => {}
             OutcomeEvent::CancelOrder { exchange, symbol, order_id, client_order_id } => {
                 let client = match self.clients.get(&exchange) {
                     Some(e) => e.clone(),

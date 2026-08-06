@@ -224,3 +224,75 @@ fn trade_print_matching_fills_resting_limit() {
     // entry 100, 末次成交价估值 98 -> 未实现 (98-100)*1 = -2; equity = 9998
     assert!((r.final_equity - 9_998.0).abs() < 1e-6);
 }
+
+/// 每个 BBO 都 emit 一条自定义事件的策略，同时统计自己在 on_event 里收到的 Custom 条数。
+struct EmitOnBbo {
+    seen_customs: Arc<std::sync::atomic::AtomicU32>,
+}
+impl Strategy for EmitOnBbo {
+    fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
+        let mut m = HashMap::new();
+        let mut kinds = HashSet::new();
+        kinds.insert(SubscriptionKind::BBO { symbol: SYM.to_string() });
+        m.insert(EX, kinds);
+        m
+    }
+    fn order_timeout_ms(&self) -> u64 {
+        0
+    }
+    fn on_event(&mut self, event: &IncomeEvent, _state: &StateManager) -> Vec<OutcomeEvent> {
+        match &event.data {
+            ExchangeEventData::Custom(_) => {
+                self.seen_customs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Vec::new()
+            }
+            ExchangeEventData::BBO(b) => vec![OutcomeEvent::Emit(
+                hft_engine_rs::messaging::CustomEvent::new(PingSignal { mid: (b.bid_price + b.ask_price) / 2.0 }),
+            )],
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PingSignal {
+    mid: f64,
+}
+
+/// **回环不可能**：策略 emit 的自定义事件只到达旁路观察者（等价实盘 Outcome 总线的
+/// 外部订阅者），绝不回流给任何策略 —— 即便是无 scope 的广播事件。
+/// 若回流，emit-on-event 的策略会形成事件风暴。
+#[test]
+fn emitted_custom_events_reach_observers_but_never_strategies() {
+    let source = FixedSource {
+        evs: vec![bbo_ev(100.0, 100.1, 1000), bbo_ev(100.2, 100.3, 2000)],
+    };
+    let seen_by_strategy = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let runner = StrategyRunner::with_id_gen(
+        Box::new(EmitOnBbo { seen_customs: Arc::clone(&seen_by_strategy) }),
+        metas(),
+        Box::new(SequentialClientOrderIdGen::default()),
+    );
+    let seen_by_observer: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+    let obs_sink = Rc::clone(&seen_by_observer);
+    {
+        let mut engine = BacktestEngine::new(&source, vec![runner], SimConfig::default())
+            .with_observer(move |ev: &IncomeEvent| {
+                if let ExchangeEventData::Custom(c) = &ev.data {
+                    let sig = c.get::<PingSignal>().expect("观察者按类型取回 payload");
+                    obs_sink.borrow_mut().push(sig.mid);
+                }
+            });
+        engine.run();
+    }
+    assert_eq!(
+        seen_by_strategy.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "策略 emit 的自定义事件回流进了策略 —— 回环屏障被打破"
+    );
+    assert_eq!(
+        *seen_by_observer.borrow(),
+        vec![100.05, 100.25],
+        "观察者应逐条收到 emit 的事件并能按类型取回内容"
+    );
+}
