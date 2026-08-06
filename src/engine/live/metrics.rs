@@ -496,8 +496,6 @@ mod tests {
                 exchange,
                 symbol: symbol.to_string(),
                 size,
-                entry_price: 100.0,
-                unrealized_pnl: 0.0,
             }),
         }
     }

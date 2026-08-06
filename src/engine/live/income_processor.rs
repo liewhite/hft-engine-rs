@@ -261,8 +261,6 @@ mod account_isolation_tests {
                     exchange: Exchange::Binance,
                     symbol: "BTC".to_string(),
                     size: 1.0,
-                    entry_price: 100.0,
-                    unrealized_pnl: 0.0,
                 }],
             },
         }
@@ -276,8 +274,6 @@ mod account_isolation_tests {
                 exchange: Exchange::Binance,
                 symbol: "BTC".to_string(),
                 size: 1.0,
-                entry_price: 100.0,
-                unrealized_pnl: 0.0,
             }),
         }
     }

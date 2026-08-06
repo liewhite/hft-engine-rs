@@ -283,9 +283,6 @@ impl BinanceClient {
         struct PositionInfo {
             symbol: String,
             position_amt: String,
-            entry_price: String,
-            mark_price: String, // API 返回但不使用
-            un_realized_profit: String,
             leverage: String,
             /// 单向模式恒为 "BOTH"；双向（对冲）模式为 "LONG"/"SHORT"
             position_side: String,
@@ -339,19 +336,10 @@ impl BinanceClient {
             if size.abs() < 1e-10 {
                 continue;
             }
-            let entry_price: f64 = p.entry_price.parse()
-                .map_err(|_| ExchangeError::Other(format!(
-                    "Failed to parse entry_price '{}' for {}", p.entry_price, p.symbol)))?;
-            let unrealized_pnl: f64 = p.un_realized_profit.parse()
-                .map_err(|_| ExchangeError::Other(format!(
-                    "Failed to parse un_realized_profit '{}' for {}", p.un_realized_profit, p.symbol)))?;
-
             result.push(crate::domain::Position {
                 exchange: Exchange::Binance,
                 symbol,
                 size,
-                entry_price,
-                unrealized_pnl,
             });
         }
 

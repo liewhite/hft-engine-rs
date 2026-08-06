@@ -29,12 +29,19 @@ const EX: Exchange = Exchange::Binance;
 
 /// 最小均值回归 maker 演示策略：仅用于跑通 trade-native 全链路 (非生产策略)。
 ///
-/// 空仓时在最新成交价下方挂 PostOnly 买单 (价格下穿即 maker 成交)；持多后在持仓均价上方挂
-/// reduce-only PostOnly 卖单止盈。有挂单时静默等待，避免重复下单。
+/// 空仓时在最新成交价下方挂 PostOnly 买单 (价格下穿即 maker 成交)；持多后在自己记的开仓价
+/// 上方挂 reduce-only PostOnly 卖单止盈。有挂单时静默等待，避免重复下单。
+///
+/// **开仓价由策略自己从成交流记录**：框架的持仓只有数量（见 `crate::domain::Position`）。
+/// 这不是缺失而是分工 —— "均价"有多种口径（加权平均 / 最后一笔 / FIFO），只有策略自己知道
+/// 它要哪种；框架替所有人猜一种，反而是错的那种的人还得绕开它。
 struct MeanRevertMaker {
     symbol: Symbol,
     offset_ratio: f64,
     order_size: f64,
+    /// 本策略的持仓成本：按成交加权，空仓时清零
+    entry_price: f64,
+    entry_size: f64,
 }
 
 impl MeanRevertMaker {
@@ -73,6 +80,24 @@ impl Strategy for MeanRevertMaker {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+        // 自己跟成交维护开仓成本（加权平均；平完即清零）
+        if let ExchangeEventData::Fill(f) = &event.data {
+            match f.side {
+                Side::Long => {
+                    let total = self.entry_size + f.size;
+                    self.entry_price =
+                        (self.entry_size * self.entry_price + f.size * f.price) / total;
+                    self.entry_size = total;
+                }
+                Side::Short => {
+                    self.entry_size = (self.entry_size - f.size).max(0.0);
+                    if self.entry_size < 1e-12 {
+                        self.entry_price = 0.0;
+                    }
+                }
+            }
+            return Vec::new();
+        }
         let ExchangeEventData::MarketTrade(t) = &event.data else {
             return Vec::new();
         };
@@ -87,11 +112,12 @@ impl Strategy for MeanRevertMaker {
             let price = t.price * (1.0 - self.offset_ratio);
             vec![self.place(Side::Long, price, self.order_size, false, "open_long")]
         } else if pos_size > 0.0 {
-            // 持多：在持仓均价上方挂 reduce-only 卖单止盈
-            let entry = symbol_state
-                .and_then(|s| s.position(EX))
-                .map(|p| p.entry_price)
-                .unwrap_or(t.price);
+            // 持多：在自己记的开仓价上方挂 reduce-only 卖单止盈
+            let entry = if self.entry_price > 0.0 {
+                self.entry_price
+            } else {
+                t.price
+            };
             let price = entry * (1.0 + self.offset_ratio);
             vec![self.place(Side::Short, price, pos_size.abs(), true, "take_profit")]
         } else {
@@ -142,6 +168,8 @@ fn main() -> anyhow::Result<()> {
         symbol: symbol.clone(),
         offset_ratio: 0.0003,
         order_size: 0.01,
+        entry_price: 0.0,
+        entry_size: 0.0,
     };
     // 回测用确定性 id 生成器 -> 同一输入同一逐笔回报序列
     let runner = StrategyRunner::with_id_gen(

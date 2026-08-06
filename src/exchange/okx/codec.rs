@@ -254,19 +254,16 @@ pub struct PositionData {
     /// 持仓方向，见 [`POS_SIDE_NET`]
     pub pos_side: String,
     pub pos: String,
-    pub avg_px: String,
-    pub upl: String,
 }
 
 impl PositionData {
     /// 转为 domain 持仓。`pos` 是**张数**，折算为币本位由 `contract_size` 完成
     /// （见 [`crate::domain::Quantity`]）。
     ///
-    /// 空仓时 OKX 用**空串**表示数值字段。空串按"交易所没给"（`None`）上交
-    /// [`Position::checked`] 判定 —— 它只在 `size == 0` 时才允许缺失。
+    /// 只取**数量**：均价与浮盈不进域模型（见 [`Position`] 的文档）。
     ///
-    /// 此前是逐字段独立地把空串兜成 0：`pos="12"` 而 `avgPx=""` 时会产出一个
-    /// size 非零、entry_price=0 的持仓，成为永不可纠正的错误基线（见 `checked` 文档）。
+    /// 这让"空仓时 OKX 用空串表示数值字段"那套三态守卫整个消失 —— 空串只可能出现在
+    /// `pos` 上，而空仓的数量就是 0，如实且无歧义。
     pub fn to_position(&self, symbol: Symbol, contract_size: f64) -> Result<Position, String> {
         if self.pos_side != POS_SIDE_NET {
             return Err(format!(
@@ -275,26 +272,18 @@ impl PositionData {
                 self.inst_id, self.pos_side
             ));
         }
-
-        /// 空串 = 交易所没给（`None`）；非空则必须解析成功，解析失败绝不兜 0
-        fn optional(raw: &str, field: &str) -> Result<Option<f64>, String> {
-            if raw.is_empty() {
-                return Ok(None);
-            }
-            f64::from_str(raw)
-                .map(Some)
-                .map_err(|_| format!("Failed to parse {field}: {raw}"))
-        }
-
-        // 正数多头，负数空头；张 -> 币
-        let size = optional(&self.pos, "pos")?.unwrap_or(0.0) * contract_size;
-        Position::checked(
-            Exchange::OKX,
+        // 空仓时 pos 为空串 —— 那就是 0 张，如实解析；非空则必须解析成功
+        let contracts = if self.pos.is_empty() {
+            0.0
+        } else {
+            f64::from_str(&self.pos).map_err(|_| format!("Failed to parse pos: {}", self.pos))?
+        };
+        Ok(Position {
+            exchange: Exchange::OKX,
             symbol,
-            size,
-            optional(&self.avg_px, "avgPx")?,
-            optional(&self.upl, "upl")?,
-        )
+            // 正数多头，负数空头；张 -> 币
+            size: contracts * contract_size,
+        })
     }
 }
 
@@ -697,7 +686,6 @@ mod trade_tests {
         let p = d.to_position("BTC".to_string(), CONTRACT_SIZE).unwrap();
         assert_eq!(p.symbol, "BTC");
         assert!((p.size - (-0.12)).abs() < 1e-12, "got {}", p.size);
-        assert_eq!(p.entry_price, 42_000.0);
     }
 
     /// 空仓时 OKX 的数值字段是**空串**，按 0 处理而非解析失败
@@ -707,27 +695,8 @@ mod trade_tests {
         let d: PositionData = serde_json::from_str(raw).unwrap();
         let p = d.to_position("BTC".to_string(), CONTRACT_SIZE).unwrap();
         assert_eq!(p.size, 0.0);
-        assert_eq!(p.entry_price, 0.0);
-        assert_eq!(p.unrealized_pnl, 0.0);
     }
 
-    /// **Critical 回归防线**：持仓非零而价格字段是空串 —— 空仓兜底的守卫此前是**逐字段
-    /// 独立**的，于是 `pos="12"` + `avgPx=""` 会产出 size 非零、entry_price=0 的持仓。
-    /// 它会成为持仓基线（只写一次、永不纠正），此后加权均价与已实现盈亏全线失真，
-    /// 而对账只比 size，永远发现不了。
-    #[test]
-    fn non_flat_position_with_empty_price_fields_is_rejected() {
-        for raw in [
-            r#"{"instId":"BTC-USDT-SWAP","pos":"12","posSide":"net","avgPx":"","upl":"0"}"#,
-            r#"{"instId":"BTC-USDT-SWAP","pos":"12","posSide":"net","avgPx":"42000","upl":""}"#,
-        ] {
-            let d: PositionData = serde_json::from_str(raw).unwrap();
-            assert!(
-                d.to_position("BTC".to_string(), CONTRACT_SIZE).is_err(),
-                "持仓非零而价格字段为空串，被静默兜成了 0：{raw}"
-            );
-        }
-    }
 
     /// **Critical 防线**：双向持仓模式必须报错，不能按净持仓口径解析。
     /// 该模式下 `pos` 恒为正数、方向靠 posSide 表达，静默解析会让空头被当成多头，

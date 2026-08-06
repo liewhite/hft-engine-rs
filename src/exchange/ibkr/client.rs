@@ -222,17 +222,11 @@ impl IbkrClient {
                     ))
                 })?;
 
-            // 价格类字段用 Option 如实表达"没给/没解析出来"，由 Position::checked 按
-            // size 判定是否合法（空仓可缺，持仓非零时缺失即错误基线）。
-            let position = crate::domain::Position::checked(
-                Exchange::IBKR,
-                symbol.to_string(),
+            positions.push(crate::domain::Position {
+                exchange: Exchange::IBKR,
+                symbol: symbol.to_string(),
                 size,
-                item.get("avgCost").and_then(|v| v.as_f64()),
-                item.get("unrealizedPnl").and_then(|v| v.as_f64()),
-            )
-            .map_err(ExchangeError::ParseError)?;
-            positions.push(position);
+            });
         }
 
         tracing::debug!(count = positions.len(), "IBKR positions fetched");

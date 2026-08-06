@@ -13,13 +13,24 @@
 //! accountRefresh)，并在首个事件时先投递一次初始净值，否则依赖净值的策略不会动作。
 
 use crate::backtest::source::MarketDataSource;
-use crate::domain::{Exchange, Order, OrderId, Position, Symbol, Timestamp};
+use crate::domain::{Exchange, Order, OrderId, Price, Symbol, Timestamp};
 use crate::engine::StrategyRunner;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap};
+
+/// 回测结束时的一笔持仓：数量取自账本，均价与浮盈是**本地记账**的结果
+/// （域模型 [`Position`] 只有数量，见其文档）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BacktestPosition {
+    pub exchange: Exchange,
+    pub symbol: Symbol,
+    pub size: crate::domain::Quantity,
+    pub entry_price: Price,
+    pub unrealized_pnl: f64,
+}
 
 /// 回测结果汇总。`realized_pnl` 为已实现盈亏 (= 账本现金增量)，`final_equity` 含未实现。
 #[derive(Debug, Clone, PartialEq)]
@@ -30,7 +41,7 @@ pub struct BacktestResult {
     pub fills: u64,
     pub market_events: u64,
     /// 非空持仓 (按 symbol 升序，保证确定性比对)
-    pub positions: Vec<Position>,
+    pub positions: Vec<BacktestPosition>,
     pub first_ts: Timestamp,
     pub last_ts: Timestamp,
 }
@@ -207,10 +218,24 @@ impl<'a> BacktestEngine<'a> {
             }
         }
 
-        let mut positions: Vec<Position> = self
+        // 回测结果里的持仓带上本地账本的均价与浮盈（BookSnapshot），并补上所属交易所 ——
+        // 域模型 Position 只有数量（见其文档），盈亏是账本概念
+        let mut positions: Vec<BacktestPosition> = self
             .states
-            .values()
-            .flat_map(|state| state.ledger.open_positions(|s| state.mark_of(s)))
+            .iter()
+            .flat_map(|(exchange, state)| {
+                state
+                    .ledger
+                    .open_positions(|s| state.mark_of(s))
+                    .into_iter()
+                    .map(move |p| BacktestPosition {
+                        exchange: *exchange,
+                        symbol: p.symbol,
+                        size: p.size,
+                        entry_price: p.entry_price,
+                        unrealized_pnl: p.unrealized_pnl,
+                    })
+            })
             .collect();
         positions.sort_by(|a, b| a.symbol.cmp(&b.symbol).then(a.exchange.cmp(&b.exchange)));
         let final_equity: f64 = self

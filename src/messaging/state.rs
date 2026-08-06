@@ -383,17 +383,15 @@ impl SymbolState {
                 // Fill 即时更新仓位——涵盖策略单、手动单、以及强平/ADL（三者都以 fill 形式
                 // 经私有成交流到达，走同一路径，见上方 PositionBaseline 分支说明）。
                 //
-                // 仓位/均价演进复用 Position::apply_fill（与 sim 的 Ledger 同一出处）——
-                // 此前这里只累加 size，entry_price 永远停在首笔值，策略拿它算止盈/风控
-                // 读到的是烂数据。已实现盈亏在本路径丢弃（策略侧不记现金账）。
+                // 持仓维护的全部内容就是**累加带符号数量**：策略决策只看数量（还能加多少、
+                // 要平多少、净敞口是否为零）。均价/盈亏不在域模型里 —— 记账需求由模拟柜台的
+                // 账本（sim::BookPosition）与 supervisor 的现金流账本各自完成，见
+                // crate::domain::Position 的文档。
                 let pos = self
                     .positions
                     .entry(fill.exchange)
                     .or_insert_with(|| Position::empty(fill.exchange, self.symbol.clone()));
-                let _realized = pos.apply_fill(fill.side, fill.price, fill.size);
-                // 浮盈以最新成交价近似刷新（本路径没有独立行情输入；基线/读数路径的
-                // unrealized_pnl 是交易所计算值，两种口径都比"永远停在启动快照"诚实）
-                pos.unrealized_pnl = (fill.price - pos.entry_price) * pos.size;
+                pos.add_fill(fill.side, fill.size);
                 tracing::info!(
                     symbol = %self.symbol,
                     exchange = %fill.exchange,
@@ -402,7 +400,6 @@ impl SymbolState {
                     fill_price = fill.price,
                     reason = ?fill.reason,
                     new_position_size = pos.size,
-                    entry_price = pos.entry_price,
                     "Updated position on fill"
                 );
             }
@@ -504,8 +501,6 @@ mod tests {
                     exchange,
                     symbol: SYMBOL.to_string(),
                     size,
-                    entry_price: 100.0,
-                    unrealized_pnl: 0.0,
                 },
             );
         }
@@ -583,8 +578,6 @@ mod tests {
             exchange: EX,
             symbol: SYMBOL.to_string(),
             size,
-            entry_price: 100.0,
-            unrealized_pnl: 0.0,
         }
     }
 
@@ -710,33 +703,36 @@ mod tests {
         assert_eq!(state.position_size(EX), -1.5);
     }
 
-    /// **entry_price 随 Fill 维护加权均价**（与 sim 的 Ledger 同一逻辑）。
-    /// 此前只累加 size、均价永远停在首笔值 —— 拿它算止盈价的策略读到的是烂数据。
+    /// 持仓随 Fill **只累加数量**：买加、卖减、反手翻符号。
+    ///
+    /// 均价不在这里维护（也不在域模型里，见 `crate::domain::Position` 的文档）——
+    /// 需要成本的策略自己从成交流记（口径由它自己定），记账则在 sim 账本与 supervisor
+    /// 的现金流账本里各自完成。
     #[test]
-    fn entry_price_tracks_weighted_average_across_fills() {
+    fn position_accumulates_signed_size_across_fills() {
         let mut state = SymbolState::new(SYMBOL.to_string());
-        // 基线：2.0 @ 100（交易所均价）
+        // 基线 2.0
         state.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
 
-        // 同向加仓 2.0 @ 110 -> 均价 (2*100 + 2*110)/4 = 105
+        // 同向加仓 2.0（成交价不影响持仓数量）
         let mut add = fill(Side::Long, 2.0);
         if let ExchangeEventData::Fill(f) = &mut add.data {
             f.price = 110.0;
         }
         state.apply(&add);
-        let pos = state.position(EX).expect("position");
-        assert!((pos.size - 4.0).abs() < 1e-12);
-        assert!((pos.entry_price - 105.0).abs() < 1e-12, "均价应为 105, got {}", pos.entry_price);
+        assert!((state.position(EX).expect("position").size - 4.0).abs() < 1e-12);
 
-        // 部分平仓 1.0 @ 120 -> 均价不变
+        // 反向平掉 1.0
         let mut close = fill(Side::Short, 1.0);
         if let ExchangeEventData::Fill(f) = &mut close.data {
             f.price = 120.0;
         }
         state.apply(&close);
-        let pos = state.position(EX).expect("position");
-        assert!((pos.size - 3.0).abs() < 1e-12);
-        assert!((pos.entry_price - 105.0).abs() < 1e-12, "部分平仓不该动均价");
+        assert!((state.position(EX).expect("position").size - 3.0).abs() < 1e-12);
+
+        // 反手：卖 5 -> 净空 2
+        state.apply(&fill(Side::Short, 5.0));
+        assert!((state.position(EX).expect("position").size + 2.0).abs() < 1e-12);
     }
 
     /// **宁缺勿假**：update 缺有效价格/数量（IBKR sor 推送写死 0）时不重建本地 pending。

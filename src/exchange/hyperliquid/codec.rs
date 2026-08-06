@@ -405,26 +405,13 @@ impl AssetPosition {
         let symbol = from_hyperliquid(&self.coin);
         let size = f64::from_str(&self.szi)
             .map_err(|_| format!("Failed to parse szi: {}", self.szi))?;
-        // entry_px 在空仓 (size=0) 时可能为 None —— 那是"交易所没给"，合法；
-        // 但字段**在而解析不了**是另一回事，此前被顺手混进同一个 0.0。
-        // 两者的区分与"size 非零时是否允许缺失"的判定统一交给 Position::checked。
-        let entry_price = match self.entry_px.as_deref() {
-            Some(p) => Some(
-                f64::from_str(p)
-                    .map_err(|_| format!("Failed to parse entry_px: {p} (coin={})", self.coin))?,
-            ),
-            None => None,
-        };
-        let unrealized_pnl = f64::from_str(&self.unrealized_pnl)
-            .map_err(|_| format!("Failed to parse unrealized_pnl: {}", self.unrealized_pnl))?;
-
-        crate::domain::Position::checked(
-            Exchange::Hyperliquid,
+        // 只取数量：均价与浮盈不进域模型（见 crate::domain::Position 的文档）——
+        // 这也是 entry_px 的"空仓为 null / 在而解析不了"那套三态守卫可以整个删掉的原因
+        Ok(crate::domain::Position {
+            exchange: Exchange::Hyperliquid,
             symbol,
             size,
-            entry_price,
-            Some(unrealized_pnl),
-        )
+        })
     }
 }
 
@@ -638,38 +625,6 @@ mod clearinghouse_tests {
         assert!(!belongs_to_dex(coin, ""), "带前缀的 coin 不属于默认 perp DEX");
     }
 
-    /// **Critical 回归防线**：`entry_px` 在而解析不了 ≠ 空仓时没有 `entry_px`。
-    ///
-    /// 前者此前被 warn + 兜 0（同文件的 szi/unrealized_pnl 都是上抛，唯独它例外），
-    /// 产出 entry_price=0 的持仓基线：只写一次、永不纠正，加权均价与已实现盈亏全线
-    /// 失真，而对账只比 size 发现不了。空仓时 `null` 仍合法（走 Position::checked）。
-    #[test]
-    fn unparsable_entry_px_is_rejected_but_flat_null_is_fine() {
-        let bad = AssetPosition {
-            coin: "NVDA".to_string(),
-            szi: "1.5".to_string(),
-            entry_px: Some("n/a".to_string()),
-            unrealized_pnl: "0.0".to_string(),
-            ..serde_json::from_str::<AssetPosition>(
-                r#"{"coin":"NVDA","szi":"1.5","entryPx":"1.0","unrealizedPnl":"0.0",
-                    "positionValue":"0","returnOnEquity":"0","marginUsed":"0",
-                    "maxLeverage":10,"leverage":{"type":"cross","value":10}}"#,
-            )
-            .unwrap()
-        };
-        assert!(
-            bad.to_position().is_err(),
-            "entry_px 解析失败被兜成了 0 —— 持仓基线从此永久失真"
-        );
-
-        let flat = AssetPosition {
-            szi: "0.0".to_string(),
-            entry_px: None,
-            ..bad
-        };
-        let p = flat.to_position().expect("空仓没有 entry_px 是交易所的正常表达");
-        assert_eq!(p.entry_price, 0.0);
-    }
 
     /// 空头的 `szi` 带负号，折算后必须保留方向
     #[test]
@@ -682,8 +637,6 @@ mod clearinghouse_tests {
         // dex 前缀由 from_hyperliquid 剥掉，得到内部 symbol
         assert_eq!(position.symbol, "NVDA");
         assert!((position.size - (-56.0)).abs() < 1e-9, "got {}", position.size);
-        assert!((position.entry_price - 217.057).abs() < 1e-9);
-        assert!((position.unrealized_pnl - 54.765972).abs() < 1e-9);
     }
 }
 

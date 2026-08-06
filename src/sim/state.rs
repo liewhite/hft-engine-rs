@@ -506,7 +506,7 @@ impl SimState {
         };
         let fee = fill_price * effective_qty * fee_rate;
         self.ledger
-            .apply_fill(self.exchange, symbol, side, fill_price, effective_qty, fee);
+            .apply_fill(symbol, side, fill_price, effective_qty, fee);
 
         let cumulative = already_filled + effective_qty;
         let done = cumulative + Position::EPSILON >= order_qty;

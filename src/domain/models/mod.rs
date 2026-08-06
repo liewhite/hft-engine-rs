@@ -44,7 +44,7 @@ pub use order::Order;
 pub use order_status::OrderStatus;
 pub use order_type::OrderType;
 pub use order_update::OrderUpdate;
-pub use position::Position;
+pub use position::{signed_qty, Position};
 pub use side::Side;
 pub use symbol_meta::SymbolMeta;
 pub use time_in_force::TimeInForce;

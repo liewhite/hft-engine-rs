@@ -169,10 +169,7 @@ async fn test_ibkr_fetch_positions() {
     let positions = client.fetch_positions().await.expect("获取持仓失败");
     println!("持仓数量: {}", positions.len());
     for pos in &positions {
-        println!(
-            "  {} size={} entry_price={:.2} unrealized_pnl={:.2}",
-            pos.symbol, pos.size, pos.entry_price, pos.unrealized_pnl
-        );
+        println!("  {} size={}", pos.symbol, pos.size);
         assert_eq!(pos.exchange, Exchange::IBKR);
     }
     // 不断言非空 — 账户可能无持仓

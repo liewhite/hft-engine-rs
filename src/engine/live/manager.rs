@@ -521,8 +521,6 @@ impl ManagerActor {
                             exchange: *ex,
                             symbol: symbol.clone(),
                             size: 0.0,
-                            entry_price: 0.0,
-                            unrealized_pnl: 0.0,
                         });
                     tracing::info!(%exchange, %symbol, size = pos.size, "Initial position loaded");
                     baselines.insert(
@@ -1468,8 +1466,6 @@ impl Message<RemoveStrategies> for ManagerActor {
                 symbol,
                 size,
                 // 平仓只需要方向与数量；均价/浮盈在此无意义，不伪造
-                entry_price: 0.0,
-                unrealized_pnl: 0.0,
             };
             // 只平下到本次指定交易所的那些腿；空仓判据用 domain 的口径，不另写一份比较
             if exchange != msg.exchange || pos.is_empty() {

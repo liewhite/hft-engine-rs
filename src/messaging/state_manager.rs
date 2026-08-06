@@ -263,8 +263,6 @@ mod tests {
             exchange: EX,
             symbol: SYM.to_string(),
             size,
-            entry_price: 100.0,
-            unrealized_pnl: 0.0,
         }
     }
 

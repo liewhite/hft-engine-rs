@@ -459,8 +459,6 @@ mod tests {
             exchange,
             symbol: SYM.to_string(),
             size,
-            entry_price: 100.0,
-            unrealized_pnl: 0.0,
         }
     }
 
@@ -756,8 +754,6 @@ mod tests {
             exchange: EX,
             symbol: "ETH".to_string(),
             size: 42.0,
-            entry_price: 1.0,
-            unrealized_pnl: 0.0,
         };
         // 读数里混入其他桶的 symbol；本桶的 BTC 对得上，就不该有漂移
         r.on_event(&report(EX, vec![position(EX, 1.0), other_bucket]))

@@ -978,8 +978,6 @@ mod tests {
                     exchange,
                     symbol: SYMBOL.to_string(),
                     size,
-                    entry_price: 100.0,
-                    unrealized_pnl: 0.0,
                 },
             );
         }
