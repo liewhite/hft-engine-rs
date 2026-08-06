@@ -179,7 +179,13 @@ impl Actor for HyperliquidPublicWsActor {
         actor_ref.attach_stream(incoming_stream, (), ());
 
         // 启动 ws_loop
-        tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
+        tokio::spawn(ws_loop::run_ws_loop(
+            read,
+            write,
+            outgoing_rx,
+            incoming_tx,
+            ws_loop::WsKeepalive::hyperliquid(),
+        ));
 
         tracing::info!("HyperliquidPublicWsActor started");
 

@@ -97,7 +97,13 @@ impl Actor for BinancePrivateWsActor {
         actor_ref.attach_stream(incoming_stream, (), ());
 
         // 5. 启动 ws_loop
-        tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
+        tokio::spawn(ws_loop::run_ws_loop(
+            read,
+            write,
+            outgoing_rx,
+            incoming_tx,
+            ws_loop::WsKeepalive::binance(),
+        ));
 
         // 6. spawn_link ListenKeyActor 并等就绪
         let listen_key_actor = BinanceListenKeyActor::spawn_link_with_mailbox(

@@ -197,7 +197,13 @@ impl Actor for OkxBusinessWsActor {
         actor_ref.attach_stream(incoming_stream, (), ());
 
         // 启动 ws_loop
-        tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
+        tokio::spawn(ws_loop::run_ws_loop(
+            read,
+            write,
+            outgoing_rx,
+            incoming_tx,
+            ws_loop::WsKeepalive::okx(),
+        ));
 
         let http_client = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -351,6 +357,10 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxBusinessWsAc
 // ============================================================================
 
 fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+    // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
+    if raw == "pong" {
+        return Ok(Vec::new());
+    }
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 

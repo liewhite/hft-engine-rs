@@ -87,7 +87,13 @@ impl Actor for HyperliquidPrivateWsActor {
         actor_ref.attach_stream(incoming_stream, (), ());
 
         // 4. 启动 ws_loop
-        tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
+        tokio::spawn(ws_loop::run_ws_loop(
+            read,
+            write,
+            outgoing_rx,
+            incoming_tx,
+            ws_loop::WsKeepalive::hyperliquid(),
+        ));
 
         // 5. 订阅账户频道
         // clearinghouseState: perp 账户状态 (positions, equity, margin)

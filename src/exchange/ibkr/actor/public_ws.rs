@@ -783,7 +783,13 @@ impl Actor for IbkrPublicWsActor {
             (),
         );
 
-        tokio::spawn(ws_loop::run_ws_loop(read, write, outgoing_rx, incoming_tx));
+        tokio::spawn(ws_loop::run_ws_loop(
+            read,
+            write,
+            outgoing_rx,
+            incoming_tx,
+            ws_loop::WsKeepalive::ibkr(),
+        ));
 
         // 订阅订单状态推送 (sor topic)
         if let Err(e) = outgoing_tx.send("sor+{}".to_string()).await {
