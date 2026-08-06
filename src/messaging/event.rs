@@ -95,9 +95,9 @@ pub enum ExchangeEventData {
     Candle(Candle),
     /// 历史K线批量数据（订阅时一次性推送）
     HistoryCandles(Vec<Candle>),
-    /// 融券券源读数 (借券费 + 可借量)；由外部数据源经注入入口推入，喂 Strategy::on_borrow_fee
+    /// 融券券源读数 (借券费 + 可借量)；由外部数据源（IBKR snapshot 轮询）产出，策略在 on_event 里消费
     BorrowFee(BorrowFee),
-    /// 汇率读数 (货币对)；由外部数据源经注入入口推入，喂 Strategy::on_exchange_rate
+    /// 汇率读数 (货币对)；由外部数据源（IBKR snapshot 轮询）产出，策略在 on_event 里消费
     ExchangeRate(ExchangeRate),
     /// 时钟事件 (用于超时检测等定时任务)
     Clock,
@@ -188,6 +188,12 @@ impl IncomeEvent {
             // 基线由 ManagerActor 点对点投递（注册前、先于一切流事件），总线那份只喂镜像；
             // 若再经分发层投递，executor 会收到重复基线（见 PositionBaseline 的文档）
             ExchangeEventData::PositionBaseline(_) => EventRouting::SkipExecutors,
+            // 发布端保证 HistoryCandles 非空（空数组在发布前过滤）。空到达是上游违约，
+            // 保留可见信号；广播是 no-op（下游遍历零根 K 线），无害
+            ExchangeEventData::HistoryCandles(candles) if candles.is_empty() => {
+                tracing::error!("HistoryCandles 事件为空（上游过滤失效），广播作 no-op 处理");
+                EventRouting::Broadcast
+            }
             _ => match self.routing() {
                 Some((exchange, symbol)) => EventRouting::BySymbol { exchange, symbol },
                 None => EventRouting::Broadcast,

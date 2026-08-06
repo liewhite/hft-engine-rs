@@ -1812,24 +1812,30 @@ mod subscription_validation_tests {
             .expect("已配置且支持的订阅应放行");
     }
 
-    /// 能力表现状（维护点提醒：各所 actor 的 kind 映射改了要同步能力表）
+    /// 能力查询的两个**手写例外**（派生部分直接问各所 kind 映射函数，无需测试同步）：
+    /// OKX 的 Candle 由 business WS 承接、IBKR 只实现 BBO —— 这两条不在映射函数里，
+    /// 靠本测试钉住。
     #[test]
-    fn capability_table_matches_adapter_reality() {
+    fn hand_written_capability_exceptions_hold() {
         use crate::exchange::supports_subscription;
-        let trades = SubscriptionKind::Trades { symbol: "BTC".to_string() };
         let candle_kind = SubscriptionKind::Candle {
             symbol: "BTC".to_string(),
             interval: crate::domain::CandleInterval::Min1,
         };
-        // OKX 全支持；Binance/HL 除 Candle 外支持；IBKR 只支持 BBO
-        assert!(supports_subscription(Exchange::OKX, &candle_kind));
-        assert!(!supports_subscription(Exchange::Binance, &candle_kind));
-        assert!(!supports_subscription(Exchange::Hyperliquid, &candle_kind));
-        assert!(supports_subscription(Exchange::Hyperliquid, &trades));
-        assert!(!supports_subscription(Exchange::IBKR, &trades));
+        assert!(
+            supports_subscription(Exchange::OKX, &candle_kind),
+            "OKX 的 Candle 由 business WS 承接，能力查询必须为真"
+        );
         assert!(supports_subscription(
             Exchange::IBKR,
             &SubscriptionKind::BBO { symbol: "AAPL".to_string() }
         ));
+        assert!(
+            !supports_subscription(
+                Exchange::IBKR,
+                &SubscriptionKind::Trades { symbol: "AAPL".to_string() }
+            ),
+            "IBKR 只实现了 BBO"
+        );
     }
 }

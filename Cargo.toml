@@ -96,3 +96,7 @@ path = "src/bin/paper_trade.rs"
 [[bin]]
 name = "gamma_scalp"
 path = "src/bin/gamma_scalp.rs"
+
+[dev-dependencies]
+# 测试用暂停时钟（tokio::test(start_paused)）——keepalive/空闲检测测试无需真实等待
+tokio = { version = "1", features = ["full", "test-util"] }

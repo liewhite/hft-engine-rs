@@ -500,7 +500,7 @@ pub(crate) fn parse_public_message(
 ///
 /// 返回 `None` 表示该 kind 无法路由到 Hyperliquid（如 Candle 未实现）；
 /// 调用方应记录并跳过，而非 panic。
-fn kind_to_stream(kind: &SubscriptionKind, quote: &str, dex: &str) -> Option<String> {
+pub(crate) fn kind_to_stream(kind: &SubscriptionKind, quote: &str, dex: &str) -> Option<String> {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用同一个 activeAssetCtx 订阅
         SubscriptionKind::FundingRate { symbol }

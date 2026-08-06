@@ -199,6 +199,10 @@ fn parse_private_message(raw: &str, dex: &str, local_ts: u64) -> Result<Vec<Inco
                 // 订阅响应，忽略
                 return Ok(Vec::new());
             }
+            // 应用层心跳应答（HL 文档口径：{"channel":"pong"}）
+            "pong" => {
+                return Ok(Vec::new());
+            }
             "clearinghouseState" => {
                 // perp 账户状态：只取 equity / notional / withdrawable，持仓不入事件流
                 let data = &value["data"];

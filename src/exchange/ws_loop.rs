@@ -48,7 +48,8 @@ impl WsKeepalive {
     }
 
     /// Binance：服务端每 ~3 分钟主动 Ping（循环自动回 Pong），客户端无需发 ping；
-    /// 空闲上限取服务端 ping 周期的两倍余量
+    /// 空闲上限 8 分钟的含义是**容忍恰好丢一个服务端 ping**（连丢两个即判定断流）——
+    /// 调小到 6 分钟以内会把偶发的单个 ping 丢失误杀成停机
     pub fn binance() -> Self {
         Self {
             ping_text: None,
@@ -219,6 +220,90 @@ async fn run_ws_loop_inner(
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+    use futures_util::stream;
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_util::sync::PollSender;
+
+    type Frame = Result<WsMessage, tokio_tungstenite::tungstenite::Error>;
+
+    fn keepalive(ping: Option<&str>, interval_s: u64, idle_s: u64) -> WsKeepalive {
+        WsKeepalive {
+            ping_text: ping.map(str::to_string),
+            ping_interval: Duration::from_secs(interval_s),
+            idle_timeout: Duration::from_secs(idle_s),
+        }
+    }
+
+    /// 空闲超时是**整机 kill 路径**：无任何入站帧时必须在 idle_timeout 后以 Err 退出。
+    /// start_paused 下时间自动推进，无需真实等待。
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_exits_with_error() {
+        let read = stream::pending::<Frame>();
+        let (w_tx, _w_rx) = mpsc::channel::<WsMessage>(64);
+        let write = PollSender::new(w_tx);
+        let (_out_tx, out_rx) = mpsc::channel::<String>(8); // 保持 sender 存活，避免正常退出
+        let (in_tx, mut in_rx) = mpsc::channel::<Result<String, WsError>>(8);
+
+        tokio::spawn(run_ws_loop(read, write, out_rx, in_tx, keepalive(None, 1, 3)));
+
+        let msg = in_rx.recv().await.expect("应收到断流错误");
+        let err = msg.expect_err("空闲超时必须是 Err");
+        assert!(err.to_string().contains("idle"), "got: {err}");
+    }
+
+    /// 任何入站帧（含 Ping 控制帧）都重置空闲计时：帧持续到达时绝不误杀
+    #[tokio::test(start_paused = true)]
+    async fn incoming_frames_reset_the_idle_clock() {
+        let (frame_tx, frame_rx) = mpsc::channel::<Frame>(16);
+        let read = ReceiverStream::new(frame_rx);
+        let (w_tx, _w_rx) = mpsc::channel::<WsMessage>(64);
+        let write = PollSender::new(w_tx);
+        let (_out_tx, out_rx) = mpsc::channel::<String>(8);
+        let (in_tx, mut in_rx) = mpsc::channel::<Result<String, WsError>>(16);
+
+        // 每 2 秒来一帧，idle 上限 3 秒：若计时不被重置，第 3 秒就会误杀
+        tokio::spawn(async move {
+            for i in 0..5 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let _ = frame_tx.send(Ok(WsMessage::Text(format!("m{i}")))).await;
+            }
+            // 之后停止喂帧但保持连接（sender 不 drop），等 idle 超时
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            drop(frame_tx);
+        });
+        tokio::spawn(run_ws_loop(read, write, out_rx, in_tx, keepalive(None, 1, 3)));
+
+        // 5 帧全部送达（期间跨了 10 秒 > idle 3 秒，证明计时被入站帧重置）
+        for i in 0..5 {
+            let msg = in_rx.recv().await.expect("帧应送达");
+            assert_eq!(msg.expect("数据帧"), format!("m{i}"));
+        }
+        // 停止喂帧后，才在 idle 上限处退出
+        let err = in_rx.recv().await.expect("应收到断流错误").expect_err("Err");
+        assert!(err.to_string().contains("idle"), "got: {err}");
+    }
+
+    /// 配置了 ping_text 的所（OKX/HL）按周期发送应用层 ping
+    #[tokio::test(start_paused = true)]
+    async fn ping_text_is_sent_periodically() {
+        let read = stream::pending::<Frame>();
+        let (w_tx, mut w_rx) = mpsc::channel::<WsMessage>(64);
+        let write = PollSender::new(w_tx);
+        let (_out_tx, out_rx) = mpsc::channel::<String>(8);
+        let (in_tx, _in_rx) = mpsc::channel::<Result<String, WsError>>(8);
+
+        tokio::spawn(run_ws_loop(read, write, out_rx, in_tx, keepalive(Some("ping"), 1, 3600)));
+
+        for _ in 0..3 {
+            let sent = w_rx.recv().await.expect("应周期性发出 ping");
+            assert_eq!(sent, WsMessage::Text("ping".to_string()));
         }
     }
 }

@@ -4,7 +4,7 @@ use crate::domain::types::Timestamp;
 /// 融券券源读数（借券费 + 可借量）
 ///
 /// 由数据源 (如 IBKR shortableShares snapshot) 周期推送，作为事件喂进策略
-/// (`Strategy::on_borrow_fee`)，与 BBO/funding 同为事件驱动的输入，不走策略侧同步 IO。
+/// (策略在 `on_event` 里消费)，与 BBO/funding 同为事件驱动的输入，不走策略侧同步 IO。
 #[derive(Debug, Clone)]
 pub struct BorrowFee {
     pub exchange: Exchange,

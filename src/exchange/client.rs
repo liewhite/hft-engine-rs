@@ -48,27 +48,31 @@ pub enum SubscriptionKind {
     Candle { symbol: Symbol, interval: CandleInterval },
 }
 
-/// 该交易所的适配层是否实现了这种公共订阅（**能力表**）。
+/// 该交易所的适配层是否实现了这种公共订阅（**能力查询**）。
 ///
 /// 各所 actor 对不支持的 kind 是 warn + 跳过，而 `subscribe` 依旧返回 `Ok(())` ——
 /// 策略订阅了不支持的 kind，上线后只能靠"一直没数据"事后发现（`Trades` 的文档自己写明
-/// 这类故障最难查）。`ManagerActor` 在**投产期**用本表校验，不支持即拒绝投产。
+/// 这类故障最难查）。`ManagerActor` 在**投产期**用本函数校验，不支持即拒绝投产。
 ///
-/// # 维护点
-///
-/// 本表必须与各所 actor 的 kind 映射函数保持一致（那里返回 `None`/跳过的 kind 在这里
-/// 必须是 false）：Binance `kind_to_stream`、OKX `kind_to_arg` + business_ws（Candle）、
-/// Hyperliquid `kind_to_stream`/`kind_to_subscription`、IBKR 只支持 BBO。
-/// 新增支持后同步改这里 —— 改漏的表现是"误拒投产"，启动期即暴露，好于静默无数据。
+/// **单一出处**：直接问各所 actor 的 kind 映射函数（订阅报文由它们生成，返回 None 即
+/// 不支持），不另存一份需要手工同步的能力副本。两个例外手写并注明依据：
+/// - OKX 的 Candle 不在 public 线的 `kind_to_arg` 里 —— 由 business WS 承接（见
+///   `okx::actor::business_ws`），故显式补真；
+/// - IBKR 没有 kind 映射函数（smd 报文按 conid 拼装），其 public_ws 只实现了 BBO。
 pub fn supports_subscription(exchange: Exchange, kind: &SubscriptionKind) -> bool {
+    // 支持与否只取决于 kind 变体，与 quote/dex 无关 —— 传占位值即可
     match exchange {
-        // Candle 未实现（kind_to_stream 返回 None）
-        Exchange::Binance => !matches!(kind, SubscriptionKind::Candle { .. }),
-        // 六种 kind 全部实现（Candle 走 business WS）
-        Exchange::OKX => true,
-        // Candle 未实现
-        Exchange::Hyperliquid => !matches!(kind, SubscriptionKind::Candle { .. }),
-        // 仅实现 BBO（其余在 public_ws 里 warn + 跳过）
+        Exchange::Binance => {
+            crate::exchange::binance::actor::public_ws::kind_to_stream(kind, "USDT").is_some()
+        }
+        Exchange::OKX => {
+            crate::exchange::okx::actor::public_ws::kind_to_arg(kind, "USDT").is_some()
+                || matches!(kind, SubscriptionKind::Candle { .. })
+        }
+        Exchange::Hyperliquid => {
+            crate::exchange::hyperliquid::actor::public_ws::kind_to_stream(kind, "USDC", "")
+                .is_some()
+        }
         Exchange::IBKR => matches!(kind, SubscriptionKind::BBO { .. }),
     }
 }
