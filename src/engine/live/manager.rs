@@ -1198,6 +1198,41 @@ where
     }
 }
 
+/// 外部向策略注入自定义事件（[`crate::messaging::CustomEvent`] 的**入向**入口）。
+///
+/// 事件进入 Income 总线后按 scope 路由：带 `(exchange, symbol)` 的只投递给订阅了
+/// 该 symbol 的策略，无 scope 的广播 —— 与行情同一套分发，无第二条通道。策略在
+/// `on_event` 里 match `ExchangeEventData::Custom` 并按类型 `get::<T>()` 消费。
+///
+/// 自定义事件没有账户归属（如同行情）：实盘与模拟账户的策略都会收到。总线上的
+/// 非 executor 订阅者（观测镜像等）同样可见。时间戳取注入时刻。
+pub struct PublishCustomEvent(pub crate::messaging::CustomEvent);
+
+impl Message<PublishCustomEvent> for ManagerActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: PublishCustomEvent,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let ts = now_ms();
+        let event = IncomeEvent {
+            exchange_ts: ts,
+            local_ts: ts,
+            data: ExchangeEventData::Custom(msg.0),
+        };
+        if let Err(e) = self
+            .income_pubsub
+            .tell(kameo_actors::pubsub::Publish(event))
+            .send()
+            .await
+        {
+            tracing::error!(error = %e, "Failed to publish custom event to IncomePubSub");
+        }
+    }
+}
+
 /// 订阅 Outcome 事件
 /// 退订方式见 [`SubscribeIncome`]（订阅者停机即自动摘除）。
 pub struct SubscribeOutcome<A: Actor>(pub ActorRef<A>);
