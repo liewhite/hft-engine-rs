@@ -318,12 +318,19 @@ fn parse_private_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                // 缺 meta 则无法把张数折为币本位，丢弃并告警 —— 绝不能按张数下发（会差 contract_size 倍）
+                // 缺 meta 无法把张数折为币本位，绝不能按张数下发（会差 contract_size 倍）。
+                //
+                // 丢弃在这里是**安全**的，因为"本引擎在交易的 symbol 缺 meta"已经不可能
+                // 走到运行期：投产期 `validate_subscriptions` 会拒绝任何没有 SymbolMeta
+                // 的订阅，元数据加载处的剔除也已改为 error 留痕。所以走到这条分支只剩一种
+                // 解释 —— **该 instId 不归本引擎管**：OKX 私有流订阅的是 `instType=SWAP`
+                // 全账户推送，同账户里人工下的单、别的进程/分桶实例的成交都会推过来。
+                // 那些成交本就不该进本实例的账本，丢弃是正确处理，不是数据丢失。
                 let Some(meta) = resolve_meta(&data.inst_id, symbol_metas) else {
-                    tracing::warn!(
+                    tracing::debug!(
                         exchange = "OKX",
                         inst_id = %data.inst_id,
-                        "Missing SymbolMeta for order push, dropping"
+                        "私有回报的 instId 不在本实例的交易范围内（同账户的其他单），忽略"
                     );
                     continue;
                 };

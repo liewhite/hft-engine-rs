@@ -130,12 +130,22 @@ pub struct ManagerActor {
 
 /// 投产期订阅可行性校验（纯函数，供单测）。
 ///
-/// 逐条检查策略声明的 (exchange, kind)：交易所未配置（不在 `available` 里）、或适配层
-/// 不支持该 kind（见 [`crate::exchange::supports_subscription`] 能力表），都返回 Err。
-/// 一次性汇总全部问题，不在第一条就停 —— 让策略作者一次看全。
+/// 逐条检查策略声明的 (exchange, kind)：交易所未配置（不在 `available` 里）、适配层
+/// 不支持该 kind（见 [`crate::exchange::supports_subscription`] 能力表）、或该 symbol
+/// **没有 SymbolMeta**，都返回 Err。一次性汇总全部问题，不在第一条就停 —— 让策略作者
+/// 一次看全。
+///
+/// # 为什么 SymbolMeta 缺失必须在这里拦
+///
+/// 各所的元数据加载都会剔除字段异常的合约（OKX 的 `filter_map`、Binance 的 step 解析）。
+/// 被剔掉的 symbol 若正好是策略要交易的，故障会以三种毫不相干的面貌分散出现：下单被
+/// "No SymbolMeta" 拒、私有回报因无法折算张数被丢弃（**持仓从此落后于交易所**）、行情
+/// 订阅被忽略。三处都只是症状，根因是"配置要交易的 symbol 没有元数据"，而这一点在投产
+/// 期一次就能查清 —— 此时尚无任何副作用，Err 即"什么都没发生"。
 fn validate_subscriptions(
     subscriptions: &HashSet<(Exchange, SubscriptionKind)>,
     available: &HashSet<Exchange>,
+    symbol_metas: &HashMap<(Exchange, Symbol), SymbolMeta>,
 ) -> Result<(), String> {
     let mut problems: Vec<String> = Vec::new();
     for (exchange, kind) in subscriptions {
@@ -143,6 +153,12 @@ fn validate_subscriptions(
             problems.push(format!("{exchange} 未配置（{kind:?} 无从订阅）"));
         } else if !crate::exchange::supports_subscription(*exchange, kind) {
             problems.push(format!("{exchange} 的适配层不支持 {kind:?}"));
+        } else if !symbol_metas.contains_key(&(*exchange, kind.symbol().clone())) {
+            problems.push(format!(
+                "{exchange}/{} 没有 SymbolMeta（元数据加载时被剔除或该合约不存在）\
+                 —— 下单会被拒、私有回报会因无法折算张数被丢弃",
+                kind.symbol()
+            ));
         }
     }
     if problems.is_empty() {
@@ -338,7 +354,7 @@ impl ManagerActor {
         //     靠"一直没数据"事后发现（最难查的一类故障）。此时尚无任何副作用，Err 即
         //     "什么都没发生"。
         let available: HashSet<Exchange> = self.exchange_actors.keys().copied().collect();
-        validate_subscriptions(&all_subscriptions, &available)
+        validate_subscriptions(&all_subscriptions, &available, &self.symbol_metas)
             .map_err(ExchangeError::Other)?;
 
         // 2. 按交易所分组订阅
@@ -1849,21 +1865,58 @@ mod subscription_validation_tests {
         )
     }
 
+    /// 构造只含 (Binance, BTC) 的元数据表（订阅校验的第三个判据）
+    fn metas_with_btc() -> HashMap<(Exchange, Symbol), SymbolMeta> {
+        let meta = SymbolMeta {
+            exchange: Exchange::Binance,
+            symbol: "BTC".to_string(),
+            price_formatter: Arc::new(crate::exchange::utils::StepFormatter::new(0.1)),
+            size_step: 0.001,
+            min_order_size: 0.001,
+            contract_size: 1.0,
+        };
+        [((Exchange::Binance, "BTC".to_string()), meta)]
+            .into_iter()
+            .collect()
+    }
+
     /// 未配置的所、不支持的 kind，都在投产期拒绝 —— 不能等上线后"一直没数据"才发现
     #[test]
     fn unavailable_exchange_and_unsupported_kind_are_rejected() {
         let available: HashSet<Exchange> = [Exchange::Binance].into_iter().collect();
+        let metas = metas_with_btc();
         // OKX 未配置
-        let err = validate_subscriptions(&[bbo(Exchange::OKX)].into_iter().collect(), &available)
+        let err = validate_subscriptions(&[bbo(Exchange::OKX)].into_iter().collect(), &available, &metas)
             .expect_err("未配置的所必须拒绝");
         assert!(err.contains("未配置"), "got: {err}");
         // Binance 不支持 Candle
-        let err = validate_subscriptions(&[candle(Exchange::Binance)].into_iter().collect(), &available)
+        let err = validate_subscriptions(&[candle(Exchange::Binance)].into_iter().collect(), &available, &metas)
             .expect_err("不支持的 kind 必须拒绝");
         assert!(err.contains("不支持"), "got: {err}");
         // 合法订阅放行
-        validate_subscriptions(&[bbo(Exchange::Binance)].into_iter().collect(), &available)
+        validate_subscriptions(&[bbo(Exchange::Binance)].into_iter().collect(), &available, &metas)
             .expect("已配置且支持的订阅应放行");
+    }
+
+    /// **Critical 回归防线**：订阅了没有 SymbolMeta 的 symbol 必须拒绝投产。
+    ///
+    /// 各所的元数据加载都会剔除字段异常的合约。被剔掉的 symbol 若正好是策略要交易的，
+    /// 故障会以三种不相干的面貌分散出现：下单被 "No SymbolMeta" 拒、私有回报因无法折算
+    /// 张数被丢弃（持仓从此落后于交易所）、行情订阅被忽略。根因只有一个，且在此刻可查。
+    #[test]
+    fn subscription_without_symbol_meta_is_rejected() {
+        let available: HashSet<Exchange> = [Exchange::Binance].into_iter().collect();
+        let eth = (
+            Exchange::Binance,
+            SubscriptionKind::BBO { symbol: "ETH".to_string() },
+        );
+        let err = validate_subscriptions(
+            &[eth].into_iter().collect(),
+            &available,
+            &metas_with_btc(),
+        )
+        .expect_err("缺 SymbolMeta 的订阅必须在投产期拒绝，而不是上线后三处分别失效");
+        assert!(err.contains("SymbolMeta"), "错误应指明根因: {err}");
     }
 
     /// 能力查询的两个**手写例外**（派生部分直接问各所 kind 映射函数，无需测试同步）：

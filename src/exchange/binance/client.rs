@@ -219,42 +219,54 @@ impl BinanceClient {
             ))
         })?;
 
-        let metas: Vec<SymbolMeta> = info
-            .symbols
-            .into_iter()
-            .filter_map(|s| {
-                let symbol = from_binance(&s.symbol, &self.quote)?;
-                let mut price_step: Option<f64> = None;
-                let mut size_step: Option<f64> = None;
-                let mut min_order_size: Option<f64> = None;
+        // 剔除必须留痕（与 OKX 同口径，见那边的说明）：被剔掉的 symbol 会一路静默失效，
+        // 而三种症状（下单被拒 / 订阅被忽略 / 回报无法折算）看不出共同的根因。
+        // 这里只记录不报错，真正的拦截在投产期 `validate_subscriptions`。
+        let mut metas = Vec::new();
+        for s in info.symbols {
+            let Some(symbol) = from_binance(&s.symbol, &self.quote) else {
+                continue; // 非当前 quote 的交易对，不属于本引擎的宇宙
+            };
+            let mut price_step: Option<f64> = None;
+            let mut size_step: Option<f64> = None;
+            let mut min_order_size: Option<f64> = None;
 
-                for filter in s.filters {
-                    match filter {
-                        Filter::PriceFilter { tick_size } => {
-                            price_step = tick_size.parse().ok();
-                        }
-                        Filter::LotSize { step_size, min_qty } => {
-                            size_step = step_size.parse().ok();
-                            min_order_size = min_qty.parse().ok();
-                        }
-                        Filter::Other => {}
+            for filter in s.filters {
+                match filter {
+                    Filter::PriceFilter { tick_size } => {
+                        price_step = tick_size.parse().ok();
                     }
+                    Filter::LotSize { step_size, min_qty } => {
+                        size_step = step_size.parse().ok();
+                        min_order_size = min_qty.parse().ok();
+                    }
+                    Filter::Other => {}
                 }
+            }
 
-                let price_step = price_step.filter(|&v| v > 0.0)?;
-                let size_step = size_step.filter(|&v| v > 0.0)?;
-                let min_order_size = min_order_size.filter(|&v| v > 0.0)?;
-
-                Some(SymbolMeta {
-                    exchange: Exchange::Binance,
-                    symbol,
-                    price_formatter: Arc::new(StepFormatter::new(price_step)),
-                    size_step,
-                    min_order_size,
-                    contract_size: 1.0,
-                })
-            })
-            .collect();
+            let positive = |v: Option<f64>| v.filter(|&v| v > 0.0);
+            match (
+                positive(price_step),
+                positive(size_step),
+                positive(min_order_size),
+            ) {
+                (Some(price_step), Some(size_step), Some(min_order_size)) => {
+                    metas.push(SymbolMeta {
+                        exchange: Exchange::Binance,
+                        symbol,
+                        price_formatter: Arc::new(StepFormatter::new(price_step)),
+                        size_step,
+                        min_order_size,
+                        contract_size: 1.0,
+                    });
+                }
+                _ => tracing::error!(
+                    binance_symbol = %s.symbol, %symbol,
+                    ?price_step, ?size_step, ?min_order_size,
+                    "Binance 合约过滤器缺少有效的价格/数量步长，该 symbol 不可交易"
+                ),
+            }
+        }
 
         Ok(metas)
     }

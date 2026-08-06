@@ -154,30 +154,40 @@ impl OkxClient {
             return Err(map_okx_error(&data.code, &data.msg));
         }
 
-        let metas: Vec<SymbolMeta> = data
-            .data
-            .into_iter()
-            .filter_map(|d| {
-                // 只处理配置的 quote 对应的品种 (e.g., BTC-USDT-SWAP)
-                if !d.inst_id.contains(&format!("-{}-SWAP", self.quote)) {
-                    return None;
-                }
-                let symbol = from_okx(&d.inst_id)?;
-                let price_step: f64 = d.tick_sz.parse().ok().filter(|&v| v > 0.0)?;
-                let size_step: f64 = d.lot_sz.parse().ok().filter(|&v| v > 0.0)?;
-                let min_order_size: f64 = d.min_sz.parse().ok().filter(|&v| v > 0.0)?;
-                let contract_size: f64 = d.ct_val.parse().ok().filter(|&v| v > 0.0)?;
-
+        // 剔除必须**留痕**：被剔掉的 symbol 会一路静默失效 —— 下单被 "No SymbolMeta" 拒、
+        // 私有回报因无法折算张数被丢弃（持仓从此落后于交易所）、行情订阅被忽略。此前
+        // 整段是 `filter_map` + `?`，一条日志都没有，三种症状看不出共同的根因。
+        //
+        // 这里只记录不报错：OKX 有数百个合约，个别新品种字段异常不该挡住整机启动。真正
+        // 的拦截在投产期 `validate_subscriptions` —— 那里知道哪些 symbol 是**策略要用的**，
+        // 缺了就拒绝投产（分工：加载处负责可见，投产处负责判定）。
+        let mut metas = Vec::new();
+        for d in data.data {
+            // 只处理配置的 quote 对应的品种 (e.g., BTC-USDT-SWAP)
+            if !d.inst_id.contains(&format!("-{}-SWAP", self.quote)) {
+                continue;
+            }
+            let parsed = from_okx(&d.inst_id).and_then(|symbol| {
+                let positive = |raw: &str| raw.parse::<f64>().ok().filter(|&v| v > 0.0);
                 Some(SymbolMeta {
                     exchange: Exchange::OKX,
                     symbol,
-                    price_formatter: Arc::new(StepFormatter::new(price_step)),
-                    size_step,
-                    min_order_size,
-                    contract_size,
+                    price_formatter: Arc::new(StepFormatter::new(positive(&d.tick_sz)?)),
+                    size_step: positive(&d.lot_sz)?,
+                    min_order_size: positive(&d.min_sz)?,
+                    contract_size: positive(&d.ct_val)?,
                 })
-            })
-            .collect();
+            });
+            match parsed {
+                Some(meta) => metas.push(meta),
+                None => tracing::error!(
+                    inst_id = %d.inst_id,
+                    tick_sz = %d.tick_sz, lot_sz = %d.lot_sz,
+                    min_sz = %d.min_sz, ct_val = %d.ct_val,
+                    "OKX 合约元数据字段异常，该 symbol 不可交易（下单会被拒、私有回报会被丢弃）"
+                ),
+            }
+        }
 
         Ok(metas)
     }
