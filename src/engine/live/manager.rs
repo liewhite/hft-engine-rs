@@ -955,6 +955,8 @@ impl Actor for ManagerActor {
             &actor_ref,
             MetricsActorArgs {
                 interval_ms: DEFAULT_REPORT_INTERVAL_MS,
+                // PUSHGATEWAY_URL 环境变量启用，未设置 = 只输出日志
+                push: crate::observability::MetricsPushConfig::from_env(),
             },
             mailbox::unbounded(),
         )

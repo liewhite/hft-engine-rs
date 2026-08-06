@@ -16,6 +16,7 @@
 
 use crate::domain::{Exchange, Symbol, TradingStats};
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+use crate::observability::{prometheus, MetricsPushConfig, PromText};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -38,6 +39,8 @@ const NO_PER_SYMBOL_FILL_DETAIL: usize = 0;
 pub struct MetricsActorArgs {
     /// 报告间隔 (毫秒)
     pub interval_ms: u64,
+    /// 可选的 Prometheus pushgateway 推送（None = 只输出日志，与从前一致）
+    pub push: Option<MetricsPushConfig>,
 }
 
 /// MetricsActor - 交易指标观测
@@ -61,6 +64,8 @@ pub struct MetricsActor {
     /// symbol 事件也推给本实例。它的用途是"本实例的跟踪范围与事件流是否对得上"的参考量，
     /// 不是错误计数。若为单实例全量部署且此数持续增长，才说明注册范围有问题。
     untracked_events: u64,
+    /// 可选的 pushgateway 推送配置
+    push: Option<MetricsPushConfig>,
 }
 
 impl MetricsActor {
@@ -73,8 +78,9 @@ impl MetricsActor {
             .or_insert(size);
     }
 
-    /// 输出一次完整报告
+    /// 输出一次完整报告（结构化日志；配置了 pushgateway 时同一份数字同时推送）
     fn report(&self) {
+        let mut prom = PromText::default();
         // ---------- 账户 ----------
         let mut total_equity = 0.0;
         let mut total_notional = 0.0;
@@ -88,6 +94,10 @@ impl MetricsActor {
             total_equity += info.equity;
             total_notional += info.notional;
             exchange_count += 1;
+            let ex_label = exchange.to_string();
+            prom.gauge("hft_equity", &[("exchange", &ex_label)], info.equity);
+            prom.gauge("hft_account_notional", &[("exchange", &ex_label)], info.notional);
+            prom.gauge("hft_account_leverage", &[("exchange", &ex_label)], leverage);
             tracing::info!(
                 target: "metrics",
                 %exchange,
@@ -129,6 +139,33 @@ impl MetricsActor {
             }
 
             let stats = self.per_symbol.get(symbol);
+            let sym_label: &str = symbol;
+            let session_pnl = stats
+                .map(|s| s.total_pnl(exposure.session_notional_delta))
+                .unwrap_or(0.0);
+            prom.gauge("hft_position_net_size", &[("symbol", sym_label)], exposure.net_size);
+            prom.gauge(
+                "hft_position_gross_notional",
+                &[("symbol", sym_label)],
+                exposure.gross_notional,
+            );
+            prom.gauge(
+                "hft_position_net_notional",
+                &[("symbol", sym_label)],
+                exposure.net_notional,
+            );
+            prom.gauge("hft_pending_orders", &[("symbol", sym_label)], pending as f64);
+            prom.gauge(
+                "hft_symbol_fills",
+                &[("symbol", sym_label)],
+                stats.map(|s| s.fills as f64).unwrap_or(0.0),
+            );
+            prom.gauge("hft_symbol_session_pnl", &[("symbol", sym_label)], session_pnl);
+            prom.gauge(
+                "hft_single_leg",
+                &[("symbol", sym_label)],
+                if exposure.legs == 1 { 1.0 } else { 0.0 },
+            );
             tracing::info!(
                 target: "metrics",
                 %symbol,
@@ -162,6 +199,21 @@ impl MetricsActor {
         }
 
         // ---------- 订单 + 历史 ----------
+        let total_session_pnl = self.total.total_pnl(session_position_value);
+        prom.gauge("hft_total_equity", &[], total_equity);
+        prom.gauge("hft_total_account_notional", &[], total_notional);
+        prom.gauge("hft_position_gross_notional_total", &[], gross_notional);
+        prom.gauge("hft_position_net_notional_abs_total", &[], abs_net_notional);
+        prom.gauge("hft_symbols_with_position", &[], symbols_with_position as f64);
+        prom.gauge("hft_single_leg_symbols", &[], single_leg_symbols as f64);
+        prom.gauge("hft_unpriced_legs", &[], unpriced_legs as f64);
+        prom.gauge("hft_pending_orders_total", &[], pending_orders as f64);
+        prom.gauge("hft_rejected_orders_total", &[], self.total.rejected_orders as f64);
+        prom.gauge("hft_fills_total", &[], self.total.fills as f64);
+        prom.gauge("hft_forced_fills_total", &[], self.total.forced_fills as f64);
+        prom.gauge("hft_volume_total", &[], self.total.volume);
+        prom.gauge("hft_fee_total", &[], self.total.fee);
+        prom.gauge("hft_session_pnl", &[], total_session_pnl);
         tracing::info!(
             target: "metrics",
             exchanges = exchange_count,
@@ -181,9 +233,14 @@ impl MetricsActor {
             volume = format!("{:.2}", self.total.volume),
             fee = format!("{:.4}", self.total.fee),
             cash = format!("{:.4}", self.total.cash),
-            session_pnl = format!("{:.4}", self.total.total_pnl(session_position_value)),
+            session_pnl = format!("{:.4}", total_session_pnl),
             "metrics.summary"
         );
+
+        // 配置了 pushgateway 就把同一份数字推出去（异步、失败只记 warn，不拖垮引擎）
+        if let Some(config) = &self.push {
+            prometheus::spawn_push(config.clone(), prom.into_body());
+        }
 
         if self.total.forced_fills > 0 {
             tracing::warn!(
@@ -229,6 +286,7 @@ impl Actor for MetricsActor {
             per_symbol: HashMap::new(),
             total: TradingStats::default(),
             untracked_events: 0,
+            push: args.push,
         })
     }
 
@@ -375,6 +433,7 @@ mod tests {
             per_symbol: HashMap::new(),
             total: TradingStats::default(),
             untracked_events: 0,
+            push: None,
         }
     }
 
