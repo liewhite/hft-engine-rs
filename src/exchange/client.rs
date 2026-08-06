@@ -48,6 +48,31 @@ pub enum SubscriptionKind {
     Candle { symbol: Symbol, interval: CandleInterval },
 }
 
+/// 该交易所的适配层是否实现了这种公共订阅（**能力表**）。
+///
+/// 各所 actor 对不支持的 kind 是 warn + 跳过，而 `subscribe` 依旧返回 `Ok(())` ——
+/// 策略订阅了不支持的 kind，上线后只能靠"一直没数据"事后发现（`Trades` 的文档自己写明
+/// 这类故障最难查）。`ManagerActor` 在**投产期**用本表校验，不支持即拒绝投产。
+///
+/// # 维护点
+///
+/// 本表必须与各所 actor 的 kind 映射函数保持一致（那里返回 `None`/跳过的 kind 在这里
+/// 必须是 false）：Binance `kind_to_stream`、OKX `kind_to_arg` + business_ws（Candle）、
+/// Hyperliquid `kind_to_stream`/`kind_to_subscription`、IBKR 只支持 BBO。
+/// 新增支持后同步改这里 —— 改漏的表现是"误拒投产"，启动期即暴露，好于静默无数据。
+pub fn supports_subscription(exchange: Exchange, kind: &SubscriptionKind) -> bool {
+    match exchange {
+        // Candle 未实现（kind_to_stream 返回 None）
+        Exchange::Binance => !matches!(kind, SubscriptionKind::Candle { .. }),
+        // 六种 kind 全部实现（Candle 走 business WS）
+        Exchange::OKX => true,
+        // Candle 未实现
+        Exchange::Hyperliquid => !matches!(kind, SubscriptionKind::Candle { .. }),
+        // 仅实现 BBO（其余在 public_ws 里 warn + 跳过）
+        Exchange::IBKR => matches!(kind, SubscriptionKind::BBO { .. }),
+    }
+}
+
 impl SubscriptionKind {
     /// 获取订阅的 symbol
     pub fn symbol(&self) -> &Symbol {

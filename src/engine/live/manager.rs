@@ -128,6 +128,30 @@ pub struct ManagerActor {
     baselined_positions: HashSet<(Exchange, Symbol)>,
 }
 
+/// 投产期订阅可行性校验（纯函数，供单测）。
+///
+/// 逐条检查策略声明的 (exchange, kind)：交易所未配置（不在 `available` 里）、或适配层
+/// 不支持该 kind（见 [`crate::exchange::supports_subscription`] 能力表），都返回 Err。
+/// 一次性汇总全部问题，不在第一条就停 —— 让策略作者一次看全。
+fn validate_subscriptions(
+    subscriptions: &HashSet<(Exchange, SubscriptionKind)>,
+    available: &HashSet<Exchange>,
+) -> Result<(), String> {
+    let mut problems: Vec<String> = Vec::new();
+    for (exchange, kind) in subscriptions {
+        if !available.contains(exchange) {
+            problems.push(format!("{exchange} 未配置（{kind:?} 无从订阅）"));
+        } else if !crate::exchange::supports_subscription(*exchange, kind) {
+            problems.push(format!("{exchange} 的适配层不支持 {kind:?}"));
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    problems.sort(); // 确定的报错顺序
+    Err(format!("策略订阅不可行，拒绝投产: {}", problems.join("; ")))
+}
+
 /// 一个已注册的策略实例
 struct RegisteredExecutor {
     executor: ActorRef<ExecutorActor>,
@@ -308,6 +332,14 @@ impl ManagerActor {
             all_subscriptions.extend(subscriptions.clone());
             strategy_subscriptions.push(subscriptions);
         }
+
+        // 1.5 投产期校验订阅可行性：交易所未配置、或适配层不支持该 kind，都在此刻
+        //     拒绝投产 —— 此前 subscribe 对这两种情况静默返回 Ok(())，策略上线后只能
+        //     靠"一直没数据"事后发现（最难查的一类故障）。此时尚无任何副作用，Err 即
+        //     "什么都没发生"。
+        let available: HashSet<Exchange> = self.exchange_actors.keys().copied().collect();
+        validate_subscriptions(&all_subscriptions, &available)
+            .map_err(ExchangeError::Other)?;
 
         // 2. 按交易所分组订阅
         let mut exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>> = HashMap::new();
@@ -1714,5 +1746,61 @@ mod stop_semantics_tests {
         let (parent_alive, reasons) = run(false, false).await;
         assert_eq!(reasons, vec!["Killed".to_string()]);
         assert!(!parent_alive, "子 actor 异常死亡却没有级联退出");
+    }
+}
+
+#[cfg(test)]
+mod subscription_validation_tests {
+    use super::*;
+
+    fn bbo(ex: Exchange) -> (Exchange, SubscriptionKind) {
+        (ex, SubscriptionKind::BBO { symbol: "BTC".to_string() })
+    }
+    fn candle(ex: Exchange) -> (Exchange, SubscriptionKind) {
+        (
+            ex,
+            SubscriptionKind::Candle {
+                symbol: "BTC".to_string(),
+                interval: crate::domain::CandleInterval::Min1,
+            },
+        )
+    }
+
+    /// 未配置的所、不支持的 kind，都在投产期拒绝 —— 不能等上线后"一直没数据"才发现
+    #[test]
+    fn unavailable_exchange_and_unsupported_kind_are_rejected() {
+        let available: HashSet<Exchange> = [Exchange::Binance].into_iter().collect();
+        // OKX 未配置
+        let err = validate_subscriptions(&[bbo(Exchange::OKX)].into_iter().collect(), &available)
+            .expect_err("未配置的所必须拒绝");
+        assert!(err.contains("未配置"), "got: {err}");
+        // Binance 不支持 Candle
+        let err = validate_subscriptions(&[candle(Exchange::Binance)].into_iter().collect(), &available)
+            .expect_err("不支持的 kind 必须拒绝");
+        assert!(err.contains("不支持"), "got: {err}");
+        // 合法订阅放行
+        validate_subscriptions(&[bbo(Exchange::Binance)].into_iter().collect(), &available)
+            .expect("已配置且支持的订阅应放行");
+    }
+
+    /// 能力表现状（维护点提醒：各所 actor 的 kind 映射改了要同步能力表）
+    #[test]
+    fn capability_table_matches_adapter_reality() {
+        use crate::exchange::supports_subscription;
+        let trades = SubscriptionKind::Trades { symbol: "BTC".to_string() };
+        let candle_kind = SubscriptionKind::Candle {
+            symbol: "BTC".to_string(),
+            interval: crate::domain::CandleInterval::Min1,
+        };
+        // OKX 全支持；Binance/HL 除 Candle 外支持；IBKR 只支持 BBO
+        assert!(supports_subscription(Exchange::OKX, &candle_kind));
+        assert!(!supports_subscription(Exchange::Binance, &candle_kind));
+        assert!(!supports_subscription(Exchange::Hyperliquid, &candle_kind));
+        assert!(supports_subscription(Exchange::Hyperliquid, &trades));
+        assert!(!supports_subscription(Exchange::IBKR, &trades));
+        assert!(supports_subscription(
+            Exchange::IBKR,
+            &SubscriptionKind::BBO { symbol: "AAPL".to_string() }
+        ));
     }
 }
