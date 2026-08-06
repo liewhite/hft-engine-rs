@@ -55,6 +55,10 @@ IOC 部分/未成交。
   下单只校验 USD 名义值（`min_notional`）。低于交易所最小下单量的单会被交易所拒。
   同一问题的另一面：数量按 `size_step` 向下取整可得 0，全链路无人拦截，会发出 qty=0
   的单进入"被拒 → 重试"的静默循环。
+- **事件分发粒度只到 (所, symbol)，不看订阅 kind**：只订 BBO 的策略照收该 symbol 的
+  Trades/MarkPrice 等全部事件。收紧到 kind 有行为风险（策略消费了未声明的 kind 会静默
+  丢事件），需要配套：策略声明修正（如 gamma_scalp 只声明了 BBO 却消费 MarketTrade，
+  注释还错说"框架无 Trades 订阅类型"）+ 回测 accepts 同口径收紧，作为一个整体任务做。
 - **回测引擎不做下单量下界校验**：`SymbolMeta::checked_exchange_qty` 已是唯一出处，
   实盘出口与模拟柜台都接了，但 `BacktestEngine` 没有 SymbolMeta 来源 —— 实盘必拒的
   碎单在回测里照样成交。根治方向是把校验下沉到 SimState 的订单入口（构造时可选携带
