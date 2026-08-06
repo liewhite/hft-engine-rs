@@ -419,7 +419,8 @@ impl OutcomeProcessorActor {
             status: OrderStatus::Error { reason },
             price: 0.0,
             reduce_only: order.reduce_only,
-            quantity: 0.0,
+            // 如实带上委托量（与柜台的拒单回报口径一致），不填 0
+            quantity: order.quantity,
             filled_quantity: 0.0,
             fill_sz: 0.0,
             timestamp: local_ts,

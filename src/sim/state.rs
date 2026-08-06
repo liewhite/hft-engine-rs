@@ -261,6 +261,26 @@ impl SimState {
         order: &Order,
         order_id: &OrderId,
     ) -> Vec<IncomeEvent> {
+        // 与 on_market 同一守卫：喂错所的订单是路由 bug，拒单并记 error ——
+        // 绝不拿本所的行情去撮合别的所的订单
+        if order.exchange != self.exchange {
+            tracing::error!(
+                counter_exchange = %self.exchange,
+                order_exchange = %order.exchange,
+                order_id = %order_id,
+                "SimState 收到其他交易所的订单（路由 bug），拒单"
+            );
+            return vec![status_event(
+                self.exchange,
+                order,
+                order_id,
+                OrderStatus::Rejected {
+                    reason: "order routed to wrong exchange counter".to_string(),
+                },
+                0.0,
+                now,
+            )];
+        }
         // taker 参考价：对手价 > 最新成交价；两者皆无 = 无从判定可成交性
         let reference: Option<Price> = match self.last_bbo.get(&order.symbol) {
             Some(b) => Some(matcher::touch_price(order.side, b)),
@@ -340,7 +360,8 @@ impl SimState {
                     price: o.limit_price,
                     reduce_only: o.reduce_only,
                     quantity: o.quantity,
-                    filled_quantity: 0.0,
+                    // 如实带上撤单前的累计成交（部分成交后撤单），不谎报 0
+                    filled_quantity: o.filled,
                     fill_sz: 0.0,
                     timestamp: now,
                 }),
@@ -828,6 +849,47 @@ mod tests {
         assert!(statuses(&evs).contains(&OrderStatus::Filled));
         assert!(s.resting.is_empty());
         assert!((s.ledger.positions[&sym()].size - 1.2).abs() < 1e-9);
+    }
+
+    /// **部分成交后撤单**：终态 Cancelled 必须如实带上累计成交，不谎报 0
+    #[test]
+    fn cancel_after_partial_fill_reports_cumulative_filled() {
+        let mut s = empty();
+        let mut o = limit(Side::Long, 100.0, TimeInForce::GTC, "b1");
+        o.quantity = 0.7;
+        s.on_order_arrived(1, &o, &"1".to_string());
+        // print 0.3 部分成交，剩 0.4 在簿
+        s.on_market(&trade_ev_qty(99.0, 0.3, 2));
+        let evs = s.on_cancel_arrived(3, &"1".to_string());
+        let cancelled: Vec<(f64, f64)> = evs
+            .iter()
+            .filter_map(|e| match &e.data {
+                ExchangeEventData::OrderUpdate(u) if u.status == OrderStatus::Cancelled => {
+                    Some((u.quantity, u.filled_quantity))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cancelled.len(), 1);
+        near(cancelled[0].0, 0.7); // 原始委托量
+        near(cancelled[0].1, 0.3); // 累计成交
+        assert!(s.resting.is_empty());
+    }
+
+    /// 喂错所的订单是路由 bug：拒单，不按本所行情撮合
+    #[test]
+    fn order_for_another_exchange_is_rejected() {
+        let mut s = empty();
+        s.on_market(&market_ev(bbo(100.0, 100.1, 1)));
+        let mut o = limit(Side::Long, 200.0, TimeInForce::GTC, "b1"); // 深度穿价
+        o.exchange = Exchange::OKX; // 但属于别的所
+        let evs = s.on_order_arrived(1, &o, &"1".to_string());
+        assert!(
+            statuses(&evs).iter().any(|st| matches!(st, OrderStatus::Rejected { .. })),
+            "错所订单必须被拒: {:?}",
+            statuses(&evs)
+        );
+        assert!(fills(&evs).is_empty(), "绝不能按本所行情撮合别的所的订单");
     }
 
     // ===== trade-native 行情下的可成交性（参考价退化用最新成交价） =====

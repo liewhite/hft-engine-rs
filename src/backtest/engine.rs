@@ -233,8 +233,10 @@ impl<'a> BacktestEngine<'a> {
         self.now = ev.exchange_ts;
         self.market_events += 1;
         let Some(exchange) = ev.exchange() else {
-            // 无交易所归属的源事件不参与撮合，直接投递给策略
-            self.schedule(self.now, Action::Deliver(ev));
+            // 无交易所归属的源事件不参与撮合，按入向延迟投递给策略
+            // （与撮合回流同一口径，见 enqueue_replies）
+            let delay = self.config.exchange_to_strategy_delay_ms;
+            self.schedule(self.now + delay, Action::Deliver(ev));
             return;
         };
         self.ensure_state(exchange);

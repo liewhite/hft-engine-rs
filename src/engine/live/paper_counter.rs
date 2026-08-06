@@ -58,10 +58,9 @@ pub struct PaperCounterArgs {
     pub symbol_metas: std::sync::Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
 }
 
-/// 延迟到期后应用下单
+/// 延迟到期后应用下单（交易所身份取 `order.exchange`，不另存会分叉的副本）
 pub struct ApplyPlace {
     account: AccountId,
-    exchange: Exchange,
     order: Order,
     order_id: OrderId,
 }
@@ -336,7 +335,10 @@ impl Message<AccountOutcome> for PaperCounterActor {
                     // 与实盘出口同一套下界校验（checked_exchange_qty 是唯一出处）：
                     // 实盘必拒的单（取整为 0 / 低于最小下单量 / 缺 meta）模拟盘也拒，
                     // 否则模拟盘会成交实盘发不出去的单，仿真失真。
-                    let validation = match self
+                    // 校验通过后按交易所精度**向下取整**再下发（与 from_domain 行为
+                    // 一致）：策略请求 0.0016 而 step=0.001 时实盘只成交 0.001，柜台
+                    // 必须同量 —— 丢弃取整结果会让模拟盘每单多成交至多一个 step。
+                    let rounded = match self
                         .symbol_metas
                         .get(&(order.exchange, order.symbol.clone()))
                     {
@@ -344,21 +346,26 @@ impl Message<AccountOutcome> for PaperCounterActor {
                             "no SymbolMeta for {}/{}",
                             order.exchange, order.symbol
                         )),
-                        Some(meta) => meta.checked_exchange_qty(order.quantity).map(|_| ()),
+                        Some(meta) => meta
+                            .checked_exchange_qty(order.quantity)
+                            .map(|_| meta.round_coin_size_down(order.quantity)),
                     };
-                    if let Err(reason) = validation {
-                        tracing::error!(
-                            %account,
-                            exchange = %order.exchange,
-                            symbol = %order.symbol,
-                            quantity = order.quantity,
-                            client_order_id = %order.client_order_id,
-                            %reason,
-                            "[PAPER] 订单未通过出向校验，拒单"
-                        );
-                        self.publish_order_error(&account, &order, reason).await;
-                        continue;
-                    }
+                    let order = match rounded {
+                        Ok(quantity) => Order { quantity, ..order },
+                        Err(reason) => {
+                            tracing::error!(
+                                %account,
+                                exchange = %order.exchange,
+                                symbol = %order.symbol,
+                                quantity = order.quantity,
+                                client_order_id = %order.client_order_id,
+                                %reason,
+                                "[PAPER] 订单未通过出向校验，拒单"
+                            );
+                            self.publish_order_error(&account, &order, reason).await;
+                            continue;
+                        }
+                    };
                     let order_id = self.next_order_id();
                     tracing::info!(
                         %account,
@@ -378,7 +385,6 @@ impl Message<AccountOutcome> for PaperCounterActor {
                         delay,
                         ApplyPlace {
                             account: account.clone(),
-                            exchange: order.exchange,
                             order,
                             order_id,
                         },
@@ -418,7 +424,7 @@ impl Message<ApplyPlace> for PaperCounterActor {
     async fn handle(&mut self, msg: ApplyPlace, _ctx: &mut Context<Self, Self::Reply>) {
         let now = now_ms();
         let reports = self
-            .state_mut(&msg.account, msg.exchange)
+            .state_mut(&msg.account, msg.order.exchange)
             .on_order_arrived(now, &msg.order, &msg.order_id);
         self.publish_reports(&msg.account, reports).await;
     }
