@@ -114,17 +114,9 @@ impl StrategyRunner {
     /// 产出订单是**币本位**且已取整；单位折算是出口的职责，见模块文档。
     pub fn on_event(&mut self, event: &IncomeEvent) -> Vec<OutcomeEvent> {
         self.state.apply(event);
-        // 按事件类型分发：券源/汇率走各自的 typed 方法，其余走 on_event。
-        // (最小改动：仅这两类拆出，其余保持 enum-match 风格的 on_event。)
-        let raw = match &event.data {
-            crate::messaging::ExchangeEventData::BorrowFee(bf) => {
-                self.strategy.on_borrow_fee(bf, &self.state)
-            }
-            crate::messaging::ExchangeEventData::ExchangeRate(er) => {
-                self.strategy.on_exchange_rate(er, &self.state)
-            }
-            _ => self.strategy.on_event(event, &self.state),
-        };
+        // 单一分发入口：一切事件（含 BorrowFee/ExchangeRate）都走 on_event，
+        // 策略自行 match 关心的变体 —— 不存在第二套 typed 回调。
+        let raw = self.strategy.on_event(event, &self.state);
         raw
             .into_iter()
             .map(|signal| match signal {

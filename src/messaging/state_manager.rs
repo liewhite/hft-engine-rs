@@ -206,8 +206,8 @@ impl StateManager {
             ExchangeEventData::ExchangeStatus { exchange, status } => {
                 self.market_statuses.insert(*exchange, *status);
             }
-            // 全局事件: 券源/汇率读数——策略经 on_borrow_fee/on_exchange_rate 自持，
-            // StateManager 不缓存 (最小改动)；显式空处理，避免落入 symbol 路由分支。
+            // 全局事件: 券源/汇率读数 —— 策略在 on_event 里自行消费并自持，
+            // StateManager 不缓存；显式空处理，避免落入 symbol 路由分支。
             ExchangeEventData::BorrowFee(_) | ExchangeEventData::ExchangeRate(_) => {}
             // 全局事件: 持仓对账读数 —— 只服务 `PositionReconcileActor`，不进任何本地状态。
             // 写进来就等于恢复了 `SymbolState` 明确否掉的"用快照覆写持仓"
