@@ -1172,7 +1172,13 @@ impl Message<Stop> for ManagerActor {
     }
 }
 
-/// 订阅 Income 事件
+/// 订阅 Income 事件（行情/账户事件流，供外部观察者导出指标或通知）
+///
+/// # 退订方式
+///
+/// 底层 PubSub（kameo_actors）没有显式退订原语：**订阅者 actor 停机即自动被摘除**
+/// （投递遇 ActorNotRunning 时移除该订阅者）。外部观察者要摘除自己，stop 掉自己的
+/// actor 即可，不存在也不需要 Unsubscribe 消息。
 pub struct SubscribeIncome<A: Actor>(pub ActorRef<A>);
 
 impl<A> Message<SubscribeIncome<A>> for ManagerActor
@@ -1193,6 +1199,7 @@ where
 }
 
 /// 订阅 Outcome 事件
+/// 退订方式见 [`SubscribeIncome`]（订阅者停机即自动摘除）。
 pub struct SubscribeOutcome<A: Actor>(pub ActorRef<A>);
 
 impl<A> Message<SubscribeOutcome<A>> for ManagerActor
@@ -1492,7 +1499,8 @@ impl ManagerActor {
     }
 }
 
-/// 订阅模拟账户私有事件总线（Supervisor / 观测层用）
+/// 订阅模拟账户私有事件总线（Supervisor / 观测层用）。
+/// 退订方式见 [`SubscribeIncome`]（订阅者停机即自动摘除）。
 pub struct SubscribePaper<A: Actor>(pub ActorRef<A>);
 
 impl<A> Message<SubscribePaper<A>> for ManagerActor
