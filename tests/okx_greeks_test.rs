@@ -58,8 +58,8 @@ impl Strategy for GreeksPrintStrategy {
                 // state.greeks() 返回修正后的 delta (含现货 cashBal)
                 if let Some(g) = state.greeks(Exchange::OKX, &raw.ccy) {
                     println!(
-                        "[GREEKS] ccy={} delta={:.6} (raw={:.6}) gamma={:.6} theta={:.6} vega={:.6} ts={}",
-                        g.ccy, g.delta, raw.delta, g.gamma, g.theta, g.vega, g.timestamp
+                        "[GREEKS] ccy={} delta={:.6} (raw={:.6}) ts={}",
+                        g.ccy, g.delta, raw.delta, g.timestamp
                     );
                 } else {
                     println!(

@@ -389,7 +389,6 @@ fn parse_clearinghouse_state(
             exchange: Exchange::Hyperliquid,
             asset: "USDC".to_string(),
             available: withdrawable,
-            frozen: 0.0,
         }),
     });
 

@@ -336,33 +336,21 @@ pub struct OrderPushData {
     pub cl_ord_id: Option<String>,
     pub side: String, // "buy" or "sell"
     pub state: String,
-    /// reduce-only 标志 ("true"/"false")；部分订单类型可能缺省
-    #[serde(default)]
-    pub reduce_only: Option<String>,
     /// 成交类别: normal / twap / adl / full_liquidation / partial_liquidation / delivery / ddh
     #[serde(default)]
     pub category: Option<String>,
-    /// 订单价格 (限价单)
-    pub px: String,
     /// 订单总数量 (张)
     pub sz: String,
-    /// 本次成交数量
+    /// 本次成交数量 (张)
     pub fill_sz: String,
     /// 本次成交价格
     pub fill_px: String,
-    /// 累计成交数量
-    pub acc_fill_sz: String,
-    #[allow(dead_code)]
-    pub avg_px: String,
-    /// **订单累计**手续费/返佣（不是本次成交的）。保留仅为记录该字段存在，
-    /// 单笔成交的手续费必须用 [`Self::fill_fee`] —— 详见 `to_fill` 的说明。
-    #[allow(dead_code)]
-    pub fee: String,
     /// **本次成交**的手续费（OKX 文档：last filled fee）。无成交的推送里没有该字段。
+    ///
+    /// 注意不要用 `fee` —— 那是该订单**累计**的手续费/返佣，用它当单笔会让分批成交的
+    /// 手续费被反复累加（见 `to_fill` 的说明）。
     #[serde(default)]
     pub fill_fee: Option<String>,
-    #[allow(dead_code)]
-    pub fee_ccy: String,
 }
 
 impl OrderPushData {
@@ -462,12 +450,6 @@ pub struct GreeksData {
     pub ccy: String,
     #[serde(rename = "deltaBS")]
     pub delta_bs: String,
-    #[serde(rename = "gammaBS")]
-    pub gamma_bs: String,
-    #[serde(rename = "thetaBS")]
-    pub theta_bs: String,
-    #[serde(rename = "vegaBS")]
-    pub vega_bs: String,
     pub ts: String,
 }
 
@@ -475,12 +457,6 @@ impl GreeksData {
     pub fn to_greeks(&self) -> Result<Greeks, String> {
         let delta = f64::from_str(&self.delta_bs)
             .map_err(|_| format!("Failed to parse deltaBS: {}", self.delta_bs))?;
-        let gamma = f64::from_str(&self.gamma_bs)
-            .map_err(|_| format!("Failed to parse gammaBS: {}", self.gamma_bs))?;
-        let theta = f64::from_str(&self.theta_bs)
-            .map_err(|_| format!("Failed to parse thetaBS: {}", self.theta_bs))?;
-        let vega = f64::from_str(&self.vega_bs)
-            .map_err(|_| format!("Failed to parse vegaBS: {}", self.vega_bs))?;
         let timestamp = self.ts.parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
@@ -488,9 +464,6 @@ impl GreeksData {
             exchange: Exchange::OKX,
             ccy: self.ccy.clone(),
             delta,
-            gamma,
-            theta,
-            vega,
             timestamp,
         })
     }

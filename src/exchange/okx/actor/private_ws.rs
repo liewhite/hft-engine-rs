@@ -295,9 +295,6 @@ fn parse_private_message(
                     let cash_bal: f64 = detail.cash_bal.parse()
                         .map_err(|_| WsError::ParseError(format!(
                             "Failed to parse cash_bal '{}' for ccy {}", detail.cash_bal, detail.ccy)))?;
-                    let frozen: f64 = detail.frozen_bal.parse()
-                        .map_err(|_| WsError::ParseError(format!(
-                            "Failed to parse frozen_bal '{}' for ccy {}", detail.frozen_bal, detail.ccy)))?;
                     events.push(IncomeEvent {
                         exchange_ts,
                         local_ts,
@@ -305,7 +302,6 @@ fn parse_private_message(
                             exchange: Exchange::OKX,
                             asset: detail.ccy.clone(),
                             available: cash_bal,
-                            frozen,
                         }),
                     });
                 }

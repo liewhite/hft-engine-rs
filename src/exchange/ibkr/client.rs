@@ -439,8 +439,6 @@ impl ExchangeClient for IbkrClient {
             // 唯一数据源，于是整机启动被一个格式差异挡死。数字与字符串两种形态统一
             // 交给 `wire::optional_number` 判定（见该模块文档）。
             #[serde(default)]
-            price: Option<serde_json::Value>,
-            #[serde(default)]
             total_size: Option<serde_json::Value>,
             #[serde(default)]
             filled_quantity: Option<serde_json::Value>,

@@ -187,15 +187,11 @@ impl AccountBalance {
     pub fn to_balance(&self) -> Result<Balance, String> {
         let available = f64::from_str(&self.cw)
             .map_err(|_| format!("Failed to parse available balance: {}", self.cw))?;
-        let wallet_balance = f64::from_str(&self.wb)
-            .map_err(|_| format!("Failed to parse wallet balance: {}", self.wb))?;
-        let frozen = (wallet_balance - available).max(0.0);
 
         Ok(Balance {
             exchange: Exchange::Binance,
             asset: self.a.clone(),
             available,
-            frozen,
         })
     }
 }

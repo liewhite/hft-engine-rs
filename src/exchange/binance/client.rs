@@ -555,12 +555,7 @@ impl ExchangeClient for BinanceClient {
             client_order_id: String,
             side: String,
             status: String,
-            price: String,
             orig_qty: String,
-            executed_qty: String,
-            #[serde(default)]
-            reduce_only: bool,
-            time: u64,
         }
 
         let inst = to_binance(symbol, &self.quote);
