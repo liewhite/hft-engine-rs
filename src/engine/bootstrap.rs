@@ -4,13 +4,17 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::engine::live::ManagerActor;
 
-/// 初始化 tracing（fmt + EnvFilter）
+/// 初始化 tracing（fmt + EnvFilter + 可选告警外送）
 ///
 /// 默认放行**全部 info**，只把已知吵闹的依赖降到 warn。
 ///
 /// 曾经的默认是 `hft_engine_rs=info`，只覆盖库 —— 各 bin 自身的 `info!`/`warn!` 全部被静默
 /// 丢弃，包括"订单只落本地柜台""该 symbol 开始真实下单"这类**操作员必须看到**的提示。
 /// 按 target 白名单很容易漏掉新增的 bin，所以改为黑名单式降噪。
+///
+/// 设置 `ALERT_WEBHOOK_URL` 环境变量即启用告警外送：WARN/ERROR 级事件（对账漂移、
+/// 投产失败、断流退出等既有告警点）旁路推送到该 webhook，见
+/// [`crate::observability::alert`]。未设置 = 行为与从前完全一致。
 pub fn init_tracing() -> anyhow::Result<()> {
     const DEFAULT_FILTER: &str = "info,\
         hyper=warn,hyper_util=warn,reqwest=warn,h2=warn,rustls=warn,\
@@ -20,11 +24,21 @@ pub fn init_tracing() -> anyhow::Result<()> {
     } else {
         EnvFilter::new(DEFAULT_FILTER)
     };
+    let alert_layer = crate::observability::AlertWebhookConfig::from_env()
+        .map(crate::observability::spawn_alert_webhook_layer);
     tracing_subscriber::registry()
         .with(fmt::layer())
+        .with(alert_layer)
         .with(filter)
         .init();
+    if alert_configured() {
+        tracing::info!("告警外送已启用（ALERT_WEBHOOK_URL）");
+    }
     Ok(())
+}
+
+fn alert_configured() -> bool {
+    crate::observability::AlertWebhookConfig::from_env().is_some()
 }
 
 /// 从 CLI 参数读取配置文件并反序列化
