@@ -55,6 +55,10 @@ IOC 部分/未成交。
   下单只校验 USD 名义值（`min_notional`）。低于交易所最小下单量的单会被交易所拒。
   同一问题的另一面：数量按 `size_step` 向下取整可得 0，全链路无人拦截，会发出 qty=0
   的单进入"被拒 → 重试"的静默循环。
+- **回测引擎不做下单量下界校验**：`SymbolMeta::checked_exchange_qty` 已是唯一出处，
+  实盘出口与模拟柜台都接了，但 `BacktestEngine` 没有 SymbolMeta 来源 —— 实盘必拒的
+  碎单在回测里照样成交。根治方向是把校验下沉到 SimState 的订单入口（构造时可选携带
+  该所 metas），让三个持有方自动同规则，而不是每个持有方各自记得调用。
 - **非 `Created` 状态的挂单无超时**：`SymbolState::remove_timed_out_orders` 只清理 `Created`。
   若某订单已被交易所确认（`Pending`）而终态更新丢失，该 symbol 会被 `has_pending_orders` 永久冻结。
   当前依赖"WS 断开即进程退出 + docker 重启"来兜底。
