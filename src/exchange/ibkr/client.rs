@@ -190,12 +190,9 @@ impl IbkrClient {
         let mut positions = Vec::new();
         for item in arr {
             // portfolio2 返回 conid 为字符串，portfolio v1 为数字，兼容两种格式
-            let conid = match item.get("conid") {
-                Some(v) => {
-                    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                }
-                None => None,
-            };
+            let conid = item
+                .get("conid")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
             // conid 认不出 = 这条持仓归属不明。**不能跳过**：跳过等于把它当成"该
             // symbol 空仓"，而这份读数既是基线（写一次、永不纠正）又是对账读数
             // （两条通道共用本函数）—— 字段名/类型一变，基线 0、读数也 0，对账判
@@ -213,9 +210,12 @@ impl IbkrClient {
                 None => continue,
             };
 
+            // 双态解析（Number|String，含千分位）—— 与挂单/成交路径同一出处，见 wire 模块。
+            // 只按 as_f64() 解析会让字符串形态得到 None：这份读数同时是基线与对账读数，
+            // 一个格式差异就能让启动被挡死或对账持续报错。
             let size = item
                 .get("position")
-                .and_then(|v| v.as_f64())
+                .and_then(wire::number)
                 .ok_or_else(|| {
                     ExchangeError::ParseError(format!(
                         "IBKR {symbol} 持仓数量缺失或无法解析，整份持仓读数不可信: {item}"
@@ -495,11 +495,26 @@ impl ExchangeClient for IbkrClient {
             // 只保留**未终结**的单：本方法的用途是"还挂在簿上的是哪些"
             let raw_status = o.status.as_deref().unwrap_or_default();
             let filled = order_number(&o.filled_quantity, "filledQuantity", 0.0)?;
+            // 终态**显式枚举**，未识别的 status 报错 —— 与下面 side 的处理同一姿态。
+            // 通配 `_ => continue` 会把没见过的状态一律当成"已终态"丢弃，而
+            // `PendingCancel`（撤单已请求未确认）的单**仍活在簿上**：撤单若被拒它会回到
+            // Submitted。把它丢掉正好落进消费方"不在列表里 ⇒ 已终态"的推断：启动期判
+            // "遗留单已撤净"放行启动、撤单复查合成 Cancelled 清掉一张可能复活的单的 pending。
             let order_status = match raw_status {
                 "Submitted" if filled > 0.0 => OrderStatus::PartiallyFilled { filled },
-                "PendingSubmit" | "PreSubmitted" | "Submitted" => OrderStatus::Pending,
-                // Filled / Cancelled / Inactive 等终态不属于"挂单"
-                _ => continue,
+                // PendingCancel 仍在簿上，按未终结处理
+                "PendingSubmit" | "PreSubmitted" | "Submitted" | "PendingCancel" => {
+                    OrderStatus::Pending
+                }
+                "Filled" | "Cancelled" | "Inactive" | "ApiCancelled" | "Expired" | "Rejected" => {
+                    continue
+                }
+                other => {
+                    return Err(ExchangeError::ParseError(format!(
+                        "IBKR live order 状态无法识别（'{other}'，conid={target_conid}），\
+                         无法判断它是否还挂在簿上，整份挂单快照不可信"
+                    )));
+                }
             };
             // 双态解析收在 wire::order_id 一处（WS 两条路径共用，见该模块文档）。
             // 没有 orderId 就撤不掉它 —— 不能悄悄跳过，否则启动期撤单会"复查通过"
