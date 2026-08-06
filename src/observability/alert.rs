@@ -51,8 +51,11 @@ impl AlertWebhookConfig {
 
 /// 启动后台发送任务并返回可挂载的 tracing Layer。
 ///
-/// 用法（见 `engine::bootstrap::init_tracing`）：
-/// `registry().with(fmt_layer).with(alert_layer).with(filter).init()`
+/// 用法（见 `engine::bootstrap::init_tracing`，两条 per-layer filter 缺一不可）：
+/// `registry().with(fmt_layer.with_filter(env_filter))
+///     .with(alert_layer.with_filter(LevelFilter::WARN)).init()`
+/// —— EnvFilter 不能全局挂（会连带灭掉告警外送），告警层不能裸挂（无过滤器的 layer
+/// 会把全局 max level hint 退化到 TRACE，依赖库的 trace 事件全部被构造派发）。
 pub fn spawn_alert_webhook_layer(config: AlertWebhookConfig) -> AlertWebhookLayer {
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     // 后台发送任务需要 tokio runtime；同步上下文调用不 panic，降级为禁用外送

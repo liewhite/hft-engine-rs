@@ -29,10 +29,16 @@ pub fn init_tracing() -> anyhow::Result<()> {
     let alert_layer = alert_config.map(crate::observability::spawn_alert_webhook_layer);
     // EnvFilter 必须作为 fmt 层的 **per-layer filter**，不能挂成全局 layer ——
     // 全局挂载是"所有 layer 的 AND"，RUST_LOG=error 会连带把 WARN 挡在告警层外，
-    // 告警外送随控制台冗余度配置静默失效。告警层自带 WARN 级判断，不受控制台过滤影响。
+    // 告警外送随控制台冗余度配置静默失效。
+    //
+    // 告警层同样必须带自己的 per-layer WARN 过滤器：没有过滤器的 layer 会把全局
+    // max level hint 退化到 TRACE —— 依赖库每帧的 trace!/debug! 事件全部被构造派发
+    // （逐条丢弃），热路径真实性能回退，且只在启用告警的生产环境出现。
+    // （不能改在 Layer::enabled 里做级别判断 —— 普通 layer 的 enabled 是全局 AND，
+    // 会把 INFO 从控制台也灭掉，正是上面那个 bug 的镜像。）
     tracing_subscriber::registry()
         .with(fmt::layer().with_filter(filter))
-        .with(alert_layer)
+        .with(alert_layer.map(|l| l.with_filter(tracing_subscriber::filter::LevelFilter::WARN)))
         .init();
     if alert_enabled {
         tracing::info!("告警外送已启用（ALERT_WEBHOOK_URL），不受 RUST_LOG 控制台过滤影响");
