@@ -103,6 +103,17 @@ pub enum ExchangeEventData {
     Clock,
 }
 
+/// 实盘分发层的事件路由方式（见 [`IncomeEvent::executor_routing`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventRouting {
+    /// 按 (exchange, symbol) 路由到订阅了该 symbol 的 executor
+    BySymbol { exchange: Exchange, symbol: Symbol },
+    /// 广播给所有 executor（账户私有的广播事件仍按账户过滤）
+    Broadcast,
+    /// **不投递给任何 executor**：只服务总线上的非 executor 订阅者（对账/观测镜像）
+    SkipExecutors,
+}
+
 impl IncomeEvent {
     /// 获取事件关联的 Symbol
     pub fn symbol(&self) -> Option<&Symbol> {
@@ -161,6 +172,26 @@ impl IncomeEvent {
         match (self.exchange(), self.symbol()) {
             (Some(e), Some(s)) => Some((e, s.clone())),
             _ => None,
+        }
+    }
+
+    /// 实盘分发层（IncomeProcessor -> executor）的路由方式。
+    ///
+    /// **路由知识的单一出处**：由 [`Self::routing`]（symbol/exchange 两个 match）推导，
+    /// 仅对两类持仓事件显式例外 —— 新增事件变体时改 `symbol()`/`exchange()` 即可，
+    /// 不存在需要手工同步的第二份 match（此前实盘分发层自带一份独立 match，新增变体
+    /// 漏改一处的表现是"回测收得到、实盘收不到"，编译照过）。
+    pub fn executor_routing(&self) -> EventRouting {
+        match &self.data {
+            // 对账读数只服务总线上的镜像（对账/观测），流进策略会绕过「基线 + Fill」模型
+            ExchangeEventData::PositionReport { .. } => EventRouting::SkipExecutors,
+            // 基线由 ManagerActor 点对点投递（注册前、先于一切流事件），总线那份只喂镜像；
+            // 若再经分发层投递，executor 会收到重复基线（见 PositionBaseline 的文档）
+            ExchangeEventData::PositionBaseline(_) => EventRouting::SkipExecutors,
+            _ => match self.routing() {
+                Some((exchange, symbol)) => EventRouting::BySymbol { exchange, symbol },
+                None => EventRouting::Broadcast,
+            },
         }
     }
 

@@ -7,26 +7,12 @@
 use super::{AccountIncome, ExecutorActor};
 use crate::domain::{AccountId, Exchange, Symbol};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{EventRouting, ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorId, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::{HashMap, HashSet};
-
-/// 事件路由类型
-enum EventRouting {
-    /// 按 (exchange, symbol) 路由到订阅了该 symbol 的 executor
-    BySymbol { exchange: Exchange, symbol: Symbol },
-    /// 广播给所有 executor
-    Broadcast,
-    /// **不投递给任何 executor**：账户级事件，只服务于总线上的非 executor 订阅者
-    /// （如 [`crate::engine::PositionReconcileActor`] / [`crate::engine::MetricsActor`]）。
-    ///
-    /// 与 `Broadcast` 的区别是刻意的：这类事件对策略不仅无用，而且**不应可见** ——
-    /// 例如持仓对账读数若流进策略状态，就绕过了「基线 + Fill」的持仓维护模型。
-    SkipExecutors,
-}
 
 /// Executor 订阅信息
 struct ExecutorSubscription {
@@ -58,85 +44,6 @@ fn is_account_private(event: &IncomeEvent) -> bool {
 pub struct IncomeProcessorActor {
     /// ActorId -> Executor 订阅信息
     executors: HashMap<ActorId, ExecutorSubscription>,
-}
-
-impl IncomeProcessorActor {
-    /// 确定事件的路由方式
-    fn event_routing(event: &IncomeEvent) -> EventRouting {
-        match &event.data {
-            // Public 数据：按 (exchange, symbol) 路由
-            ExchangeEventData::FundingRate(rate) => EventRouting::BySymbol {
-                exchange: rate.exchange,
-                symbol: rate.symbol.clone(),
-            },
-            ExchangeEventData::BBO(bbo) => EventRouting::BySymbol {
-                exchange: bbo.exchange,
-                symbol: bbo.symbol.clone(),
-            },
-            ExchangeEventData::MarketTrade(t) => EventRouting::BySymbol {
-                exchange: t.exchange,
-                symbol: t.symbol.clone(),
-            },
-            ExchangeEventData::MarkPrice(mp) => EventRouting::BySymbol {
-                exchange: mp.exchange,
-                symbol: mp.symbol.clone(),
-            },
-            ExchangeEventData::IndexPrice(ip) => EventRouting::BySymbol {
-                exchange: ip.exchange,
-                symbol: ip.symbol.clone(),
-            },
-            // 持仓基线不经总线进 executor：ManagerActor 在注册 executor **之前**把基线
-            // 点对点投进其邮箱（FIFO 保证基线先于任何流事件被处理，Fill 不可能抢先），
-            // 总线上的基线只服务引擎生命周期的镜像（对账/观测）。若这里也投递，executor
-            // 会收到第二份基线，把真实的违约信号（"适配层又开始发基线"）淹没在误报里。
-            ExchangeEventData::PositionBaseline(_) => EventRouting::SkipExecutors,
-            // 对账读数只给 PositionReconcileActor，不进策略状态（见 EventRouting::SkipExecutors）
-            ExchangeEventData::PositionReport { .. } => EventRouting::SkipExecutors,
-            ExchangeEventData::OrderUpdate(update) => EventRouting::BySymbol {
-                exchange: update.exchange,
-                symbol: update.symbol.clone(),
-            },
-            ExchangeEventData::Fill(fill) => EventRouting::BySymbol {
-                exchange: fill.exchange,
-                symbol: fill.symbol.clone(),
-            },
-            ExchangeEventData::FundingFee(fee) => EventRouting::BySymbol {
-                exchange: fee.exchange,
-                symbol: fee.symbol.clone(),
-            },
-            ExchangeEventData::Candle(candle) => EventRouting::BySymbol {
-                exchange: candle.exchange,
-                symbol: candle.symbol.clone(),
-            },
-            ExchangeEventData::HistoryCandles(candles) => {
-                // HistoryCandles 由 BusinessWsActor 在 REST 成功获取非空数据后才发布，
-                // 空数组在发布前已被过滤，正常不会为空。若为空则无 symbol 可路由，
-                // 记录后广播（下游遍历零根 K 线，是无害 no-op），不 panic。
-                match candles.first() {
-                    Some(first) => EventRouting::BySymbol {
-                        exchange: first.exchange,
-                        symbol: first.symbol.clone(),
-                    },
-                    None => {
-                        tracing::error!("HistoryCandles 事件为空（上游过滤失效），广播作 no-op 处理");
-                        EventRouting::Broadcast
-                    }
-                }
-            }
-            // 券源读数带 symbol，按 (exchange, symbol) 路由到关注该腿的策略
-            ExchangeEventData::BorrowFee(bf) => EventRouting::BySymbol {
-                exchange: bf.exchange,
-                symbol: bf.symbol.clone(),
-            },
-            // 账户级别数据、汇率、ExchangeStatus 和 Clock：广播
-            ExchangeEventData::Balance(_)
-            | ExchangeEventData::Greeks(_)
-            | ExchangeEventData::AccountInfo { .. }
-            | ExchangeEventData::ExchangeStatus { .. }
-            | ExchangeEventData::ExchangeRate(_)
-            | ExchangeEventData::Clock => EventRouting::Broadcast,
-        }
-    }
 }
 
 impl Default for IncomeProcessorActor {
@@ -224,7 +131,7 @@ impl Message<IncomeEvent> for IncomeProcessorActor {
         // 共享总线上的私有事件来自交易所的 private WS / REST，即**实盘账户**；模拟账户的
         // 私有事件走 PaperPubSub（见 Message<AccountIncome>）。这不是约定，而是来源决定的事实。
         let private_owner = is_account_private(&msg).then_some(AccountId::Live);
-        match Self::event_routing(&msg) {
+        match msg.executor_routing() {
             EventRouting::BySymbol { exchange, symbol } => {
                 // 按 symbol 路由：只发送给订阅了该 (exchange, symbol) 的 executor
                 for sub in self.executors.values() {
@@ -384,7 +291,7 @@ mod account_isolation_tests {
     fn position_report_is_never_routed_to_executors() {
         assert!(
             matches!(
-                IncomeProcessorActor::event_routing(&position_report_event()),
+                position_report_event().executor_routing(),
                 EventRouting::SkipExecutors
             ),
             "对账读数被投递给了 executor —— 它会绕过「基线 + Fill」的持仓维护模型"
@@ -398,7 +305,7 @@ mod account_isolation_tests {
     fn position_baseline_skips_executors() {
         assert!(
             matches!(
-                IncomeProcessorActor::event_routing(&baseline_event()),
+                baseline_event().executor_routing(),
                 EventRouting::SkipExecutors
             ),
             "基线若经总线投给 executor，会与 manager 的点对点投递重复"
