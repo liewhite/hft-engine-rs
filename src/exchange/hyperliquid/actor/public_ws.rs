@@ -366,29 +366,25 @@ pub(crate) fn parse_public_message(
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
-    // 检查是否有错误
-    if let Some(error) = value.get("error") {
-        return Err(WsError::ParseError(format!(
-            "Hyperliquid error: {}",
-            error
-        )));
-    }
-
-    // 检查是否是订阅确认
     if value.get("channel").is_some() {
         let channel = value["channel"].as_str().unwrap_or("");
 
         match channel {
+            // 服务端拒绝/报错：**必须致命**。HL 的错误下发格式是
+            // `{"channel":"error","data":"..."}` —— 此前这里检查的是顶层 `error` 键与
+            // `subscriptionResponse.data.error`，两处都不是 HL 的真实格式（死代码），
+            // 真实错误落进下面的未知分支被 debug 掉：订阅被拒而连接健康、ping/pong
+            // 正常，该 symbol 的行情再也不来却无人知晓。
+            //
+            // 公共流不做私有流那样的逐条订阅记账（订阅是随策略增减的动态集合，记账
+            // 成本高）：错误报文即致命已经覆盖"订阅被拒"这一主要来路。
+            "error" => {
+                return Err(WsError::ParseError(format!(
+                    "Hyperliquid 公共流返回错误: {}",
+                    value.get("data").unwrap_or(&value)
+                )));
+            }
             "subscriptionResponse" => {
-                // 订阅响应，检查是否有错误
-                if let Some(data) = value.get("data") {
-                    if let Some(err) = data.get("error") {
-                        return Err(WsError::ParseError(format!(
-                            "Hyperliquid subscription error: {}",
-                            err
-                        )));
-                    }
-                }
                 return Ok(Vec::new());
             }
             // 应用层心跳应答（HL 文档口径：{"channel":"pong"}）

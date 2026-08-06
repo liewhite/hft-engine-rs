@@ -494,8 +494,13 @@ impl IbkrPublicWsActor {
                 .unwrap_or("")
                 .to_string();
 
+            // execution_id 是这笔成交的身份：去重靠它、两条消息配对也靠它。没有它这笔
+            // 成交既无法发布也无法追回 —— 丢一笔成交 = 本地持仓从此永久落后于交易所，
+            // 必须致命（与本模块"预热失败即致命"同一姿态）。
             if execution_id.is_empty() {
-                continue;
+                return Err(WsError::ParseError(format!(
+                    "IBKR 成交推送缺 execution_id，无法去重与配对，丢弃即持仓失真: {item}"
+                )));
             }
 
             // 已推送过的 execution_id，直接跳过
@@ -505,31 +510,49 @@ impl IbkrPublicWsActor {
             }
 
             // IBKR WS str topic 用 "commission" (正确拼写)，REST API 用 "comission" (typo)
-            let commission = item
-                .get("commission")
-                .or_else(|| item.get("comission"))
-                .and_then(parse_ib_number);
+            let commission = match optional_ib_number(item, "commission")? {
+                Some(v) => Some(v),
+                None => optional_ib_number(item, "comission")?,
+            };
 
             // 如果已有 pending fill，说明这是第二条消息（带 commission）
             if let Some(mut pending) = self.pending_fills.remove(&execution_id) {
-                pending.fill.fee = commission.unwrap_or(0.0);
-                tracing::info!(
-                    execution_id,
-                    fee = pending.fill.fee,
-                    "IBKR fill: commission received, publishing"
-                );
-                // 校验第二条消息的 price/size 是否一致（防御性检查）
-                let price2 = item.get("price").and_then(parse_ib_number).unwrap_or(0.0);
-                let size2 = item.get("size").and_then(parse_ib_number).unwrap_or(0.0);
-                if (price2 - pending.fill.price).abs() > 1e-9
-                    || (size2 - pending.fill.size).abs() > 1e-9
-                {
-                    tracing::warn!(
-                        execution_id,
-                        price1 = pending.fill.price, price2,
-                        size1 = pending.fill.size, size2,
-                        "IBKR fill: second message has different price/size"
-                    );
+                // 第二条消息带了 price/size 才校验（缺失是常态，IBKR 多数只补 commission）。
+                // 一旦带了且与第一条不符，说明交易所修正了成交明细 —— 本地持仓均价会算错，
+                // 必须致命而不是 warn 后照旧发布：半吊子的检查比没有更糟，它只会训练运维
+                // 忽略告警。此前两个字段缺失时兜 0，导致每笔成交都误报不一致。
+                if let Some(price2) = optional_ib_number(item, "price")? {
+                    if (price2 - pending.fill.price).abs() > FILL_FIELD_EPSILON {
+                        return Err(WsError::ParseError(format!(
+                            "IBKR 成交 {execution_id} 两条消息价格不一致（{} vs {price2}），\
+                             本地持仓均价会失真",
+                            pending.fill.price
+                        )));
+                    }
+                }
+                if let Some(size2) = optional_ib_number(item, "size")? {
+                    if (size2 - pending.fill.size).abs() > FILL_FIELD_EPSILON {
+                        return Err(WsError::ParseError(format!(
+                            "IBKR 成交 {execution_id} 两条消息数量不一致（{} vs {size2}），\
+                             本地持仓会失真",
+                            pending.fill.size
+                        )));
+                    }
+                }
+                match commission {
+                    Some(fee) => {
+                        pending.fill.fee = fee;
+                        tracing::info!(execution_id, fee, "IBKR fill: commission received, publishing");
+                    }
+                    // 字段缺失是"这条没带手续费"，不是"手续费为 0" —— 按 0 发布与超时
+                    // 路径同口径，但日志必须如实说明，不能谎报 "commission received"
+                    None => {
+                        pending.fill.fee = 0.0;
+                        tracing::warn!(
+                            execution_id,
+                            "IBKR fill: 第二条成交消息未带 commission，以 fee=0 发布"
+                        );
+                    }
                 }
                 self.publish_fill(pending).await;
                 self.mark_seen(execution_id);
@@ -556,17 +579,21 @@ impl IbkrPublicWsActor {
                 "BUY" | "B" => Side::Long,
                 "SELL" | "S" => Side::Short,
                 other => {
-                    tracing::warn!(side = other, raw = %item, "IBKR trade: unknown side");
-                    continue;
+                    return Err(WsError::ParseError(format!(
+                        "IBKR 成交 {execution_id} 方向无法识别（'{other}'），丢弃即持仓失真"
+                    )));
                 }
             };
 
-            let price = item.get("price").and_then(parse_ib_number).unwrap_or(0.0);
-            let size = item.get("size").and_then(parse_ib_number).unwrap_or(0.0);
-
+            // 价量解析不出来就是这笔成交不可用。此前是 warn + 跳过 —— 守卫本身对
+            // （没让 0 进账本），但**丢弃整笔成交**同样致命：本地持仓从此落后于交易所，
+            // 只能等对账连续失配后停机兜底。宁可现在就死。
+            let price = optional_ib_number(item, "price")?.unwrap_or(0.0);
+            let size = optional_ib_number(item, "size")?.unwrap_or(0.0);
             if price <= 0.0 || size <= 0.0 {
-                tracing::warn!(price, size, raw = %item, "IBKR trade: invalid price/size");
-                continue;
+                return Err(WsError::ParseError(format!(
+                    "IBKR 成交 {execution_id} 价量非法（price={price}, size={size}）: {item}"
+                )));
             }
 
             // 如果第一条就带了 commission（罕见），直接推送
@@ -1029,6 +1056,23 @@ impl Message<StreamMessage<Instant, (), ()>> for IbkrPublicWsActor {
 // ============================================================================
 
 /// 解析 IB 返回的数字 (可能含逗号 "1,234.56")
+/// 成交明细比对的容差（价量都是交易所回传的精确值，不一致即真不一致）
+const FILL_FIELD_EPSILON: f64 = 1e-9;
+
+/// 三态取数：字段缺失/为 null → `Ok(None)`；字段在但解析不了 → `Err`；有效 → `Ok(Some(v))`。
+///
+/// IBKR 的数字字段是 Number|String 双态且可能带千分位逗号（见 [`parse_ib_number`]）。
+/// "没有这个字段"与"值是 0"是两件事：前者常见且合法（第二条成交消息通常只补
+/// commission），后者若来自解析失败会直接污染账本 —— 所以解析失败绝不兜 0。
+fn optional_ib_number(item: &serde_json::Value, field: &str) -> Result<Option<f64>, WsError> {
+    match item.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => parse_ib_number(v).map(Some).ok_or_else(|| {
+            WsError::ParseError(format!("IBKR 字段 {field} 无法解析为数字: {v}"))
+        }),
+    }
+}
+
 fn parse_ib_number(v: &serde_json::Value) -> Option<f64> {
     match v {
         serde_json::Value::Number(n) => n.as_f64(),
@@ -1098,6 +1142,26 @@ mod tests {
             margin >= Duration::from_secs(120),
             "余量 {:?} 太小：一次刷新失败/预热耗时就可能越过 TTL",
             margin
+        );
+    }
+
+    /// **三态语义**：字段缺失 → None（合法）；字段在但解析不了 → Err（绝不兜 0）。
+    ///
+    /// IBKR 的第二条成交消息通常只补 commission、不重复带 price/size —— 把"没这个
+    /// 字段"读成 0，会让价量一致性检查每笔都误报，也会让手续费静默记成 0。
+    #[test]
+    fn optional_number_separates_missing_from_unparsable() {
+        let item = serde_json::json!({
+            "price": "1,234.5",     // IBKR 的千分位字符串形态
+            "size": serde_json::Value::Null,
+            "commission": "n/a",     // 在，但不是数字
+        });
+        assert_eq!(optional_ib_number(&item, "price").unwrap(), Some(1234.5));
+        assert_eq!(optional_ib_number(&item, "size").unwrap(), None, "null 视为缺失");
+        assert_eq!(optional_ib_number(&item, "absent").unwrap(), None, "缺失就是 None");
+        assert!(
+            optional_ib_number(&item, "commission").is_err(),
+            "字段在但解析不了必须报错，兜 0 会把手续费/价量静默写错"
         );
     }
 }
