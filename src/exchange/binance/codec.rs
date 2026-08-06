@@ -231,8 +231,16 @@ pub struct OrderData {
     pub last_price: String,
     pub ap: String,
     pub rp: String,
-    /// 本次成交手续费 (Commission amount)
-    pub n: String,
+    /// 本次成交手续费 (Commission amount)。
+    ///
+    /// **可能缺失**：Binance 文档对 `n`/`N` 明确写着 "will not push if no commission"
+    /// —— NEW / CANCELED 这类无成交事件不带该字段。此前声明为必填 `String`，于是一条
+    /// **完全合法**的回报会让整个 `OrderTradeUpdate` 反序列化失败 → `WsError::ParseError`
+    /// → kill actor → 级联整机停机。schema 必须如实描述交易所会发什么。
+    ///
+    /// 有成交时它必然存在，所以 [`OrderTradeUpdate::to_fill`] 里缺失即报错（那才是真违约）。
+    #[serde(default)]
+    pub n: Option<String>,
     /// reduce-only 标志
     #[serde(rename = "R", default)]
     pub reduce_only: bool,
@@ -312,8 +320,13 @@ impl OrderTradeUpdate {
         };
 
         // Binance: n 为正数表示收费
-        let fee = f64::from_str(&self.o.n)
-            .map_err(|_| format!("Failed to parse commission: {}", self.o.n))?;
+        // 走到这里说明确实有成交（上面已对 fill_sz == 0 提前返回），此时 Binance 必推
+        // commission —— 缺失是交易所违约，如实报错而不是兜 0（兜 0 会让净利长期高估）
+        let fee_raw = self.o.n.as_deref().ok_or_else(|| {
+            format!("Binance 成交回报缺 commission 字段（订单 {}）", self.o.i)
+        })?;
+        let fee = f64::from_str(fee_raw)
+            .map_err(|_| format!("Failed to parse commission: {fee_raw}"))?;
 
         Ok(Some(Fill {
             exchange: Exchange::Binance,

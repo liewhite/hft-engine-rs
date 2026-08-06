@@ -48,7 +48,12 @@ impl ExecutorActor {
                 account: self.account.clone(),
                 event: signal,
             };
-            let _ = self.outcome_pubsub.tell(Publish(tagged)).send().await;
+            // 投递失败 = 这条策略信号（下单/撤单/自定义事件）没有任何人收到。总线挂掉
+            // 本就会经 on_link_died 整机退出，这里不重试也不吞 —— 但必须留下记录，
+            // 否则"策略明明发了单却什么都没发生"无从查起。
+            if let Err(e) = self.outcome_pubsub.tell(Publish(tagged)).send().await {
+                tracing::error!(error = %e, account = %self.account, "策略信号发布失败，该信号已丢失");
+            }
         }
     }
 }

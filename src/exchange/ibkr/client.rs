@@ -425,8 +425,12 @@ impl ExchangeClient for IbkrClient {
         struct LiveOrder {
             #[serde(default)]
             order_id: Option<serde_json::Value>,
-            /// 下单时带上的 client_order_id（本引擎用 `cOID` 字段传，见 `place_order`）
-            #[serde(rename = "cOID", default)]
+            /// 下单时带上的 client_order_id：请求里叫 `cOID`，而**响应里 IBKR 用
+            /// `order_ref` 回传**（本仓库 WS 侧两个处理器都是取 order_ref，见
+            /// `actor/public_ws.rs`）。两个名字都接，缺一就会让归属识别全线失效：
+            /// `own_pending_orders` 认不出自己的单 → 启动期"撤净遗留挂单"谎报成功、
+            /// 撤单复查因 client_order_id 全为 None 而无法核实。
+            #[serde(rename = "cOID", alias = "order_ref", default)]
             coid: Option<String>,
             #[serde(default)]
             conid: Option<i64>,

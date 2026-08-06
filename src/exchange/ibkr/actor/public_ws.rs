@@ -670,10 +670,16 @@ impl IbkrPublicWsActor {
         if order_ref.is_empty() {
             return None;
         }
+        // 与 sor 路径同口径的双态解析（IBKR 的 orderId 有时是数字、有时是字符串）：
+        // 只按 u64 解析会得到空 order_id，撤单复查会因空 id 匹配不到挂单而把活单误判
+        // 成已终态。sor 路径 30 行前刚修过这个坑，str 路径当时漏了。
         let order_id = item
             .get("orderId")
-            .and_then(|v| v.as_u64())
-            .map(|v| v.to_string())
+            .map(|v| match v {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
             .unwrap_or_default();
         Some(OrderUpdate {
             order_id,
