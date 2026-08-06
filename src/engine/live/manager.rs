@@ -966,6 +966,13 @@ impl Actor for ManagerActor {
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
+        // 模拟账户的成交/拒单/净值也要进指标（此前是观测盲区）；MetricsActor 内部
+        // 按账户分账，绝不与实盘视图混淆
+        paper_pubsub
+            .tell(Subscribe(metrics.clone()))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 5.6 持仓对账（通道 B）：REST 读数 vs 本地「基线 + Fill」。
         //     与 MetricsActor 分开是刻意的——观测层故障不该拖垮交易，而对账确认漂移必须

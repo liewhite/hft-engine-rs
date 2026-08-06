@@ -14,7 +14,7 @@
 //!   这样 docker 重启后不会把重启前就持有的存货算成假盈利
 //! - 只输出日志，不引入外部依赖（Prometheus / Slack 等上报另行决策，见 docs/todo.md）
 
-use crate::domain::{Exchange, Symbol, TradingStats};
+use crate::domain::{AccountId, Exchange, Symbol, TradingStats};
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager};
 use crate::observability::{prometheus, MetricsPushConfig, PromText};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -25,6 +25,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_stream::wrappers::IntervalStream;
+
+use super::AccountIncome;
 
 /// 默认指标报告间隔
 pub const DEFAULT_REPORT_INTERVAL_MS: u64 = 60_000;
@@ -66,6 +68,14 @@ pub struct MetricsActor {
     untracked_events: u64,
     /// 可选的 pushgateway 推送配置
     push: Option<MetricsPushConfig>,
+    /// 模拟账户累计成交统计（来自 PaperPubSub）。
+    ///
+    /// **与实盘视图分账**：模拟事件绝不喂进 `state`（StateManager 按 exchange 键控，
+    /// 柜台的 AccountInfo 会覆盖实盘净值、Fill 会污染实盘持仓镜像）。此前模拟账户的
+    /// 成交/拒单/净值完全不进指标，是观测盲区。
+    paper_stats: HashMap<AccountId, TradingStats>,
+    /// 各模拟账户柜台的最新净值：(账户, 所) -> (equity, notional)
+    paper_accounts: HashMap<(AccountId, Exchange), (f64, f64)>,
 }
 
 impl MetricsActor {
@@ -237,6 +247,51 @@ impl MetricsActor {
             "metrics.summary"
         );
 
+        // ---------- 模拟账户 ----------
+        for (account, stats) in &self.paper_stats {
+            let account_label = account.to_string();
+            prom.gauge("hft_paper_fills", &[("account", &account_label)], stats.fills as f64);
+            prom.gauge("hft_paper_fee", &[("account", &account_label)], stats.fee);
+            prom.gauge("hft_paper_cash", &[("account", &account_label)], stats.cash);
+            prom.gauge(
+                "hft_paper_rejected_orders",
+                &[("account", &account_label)],
+                stats.rejected_orders as f64,
+            );
+            tracing::info!(
+                target: "metrics",
+                %account,
+                fills = stats.fills,
+                volume = format!("{:.2}", stats.volume),
+                fee = format!("{:.4}", stats.fee),
+                cash = format!("{:.4}", stats.cash),
+                rejected_orders = stats.rejected_orders,
+                "metrics.paper_account"
+            );
+        }
+        for ((account, exchange), (equity, notional)) in &self.paper_accounts {
+            let account_label = account.to_string();
+            let ex_label = exchange.to_string();
+            prom.gauge(
+                "hft_paper_equity",
+                &[("account", &account_label), ("exchange", &ex_label)],
+                *equity,
+            );
+            prom.gauge(
+                "hft_paper_notional",
+                &[("account", &account_label), ("exchange", &ex_label)],
+                *notional,
+            );
+            tracing::info!(
+                target: "metrics",
+                %account,
+                %exchange,
+                equity = format!("{:.2}", equity),
+                notional = format!("{:.2}", notional),
+                "metrics.paper_equity"
+            );
+        }
+
         // 配置了 pushgateway 就把同一份数字推出去（异步、失败只记 warn，不拖垮引擎）
         if let Some(config) = &self.push {
             prometheus::spawn_push(config.clone(), prom.into_body());
@@ -287,6 +342,8 @@ impl Actor for MetricsActor {
             total: TradingStats::default(),
             untracked_events: 0,
             push: args.push,
+            paper_stats: HashMap::new(),
+            paper_accounts: HashMap::new(),
         })
     }
 
@@ -364,6 +421,41 @@ impl Message<IncomeEvent> for MetricsActor {
     }
 }
 
+/// 模拟账户私有事件（PaperPubSub）：按账户聚统计，绝不喂进实盘视图
+impl Message<AccountIncome> for MetricsActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: AccountIncome, _ctx: &mut Context<Self, Self::Reply>) {
+        match &msg.event.data {
+            ExchangeEventData::Fill(fill) => {
+                self.paper_stats
+                    .entry(msg.account.clone())
+                    .or_insert_with(|| {
+                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
+                    })
+                    .apply_fill(fill);
+            }
+            ExchangeEventData::OrderUpdate(update) => {
+                self.paper_stats
+                    .entry(msg.account.clone())
+                    .or_insert_with(|| {
+                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
+                    })
+                    .apply_order_update(update);
+            }
+            ExchangeEventData::AccountInfo {
+                exchange,
+                equity,
+                notional,
+            } => {
+                self.paper_accounts
+                    .insert((msg.account.clone(), *exchange), (*equity, *notional));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// 定时器：输出报告
 impl Message<StreamMessage<Instant, (), ()>> for MetricsActor {
     type Reply = ();
@@ -434,7 +526,43 @@ mod tests {
             total: TradingStats::default(),
             untracked_events: 0,
             push: None,
+            paper_stats: HashMap::new(),
+            paper_accounts: HashMap::new(),
         }
+    }
+
+    /// 模拟账户事件按账户分账，**绝不**混进实盘视图（total/state）
+    #[tokio::test]
+    async fn paper_events_never_leak_into_live_view() {
+        let mut metrics = actor();
+        metrics.tracked.insert("BTC".to_string());
+        metrics.state.register_symbols(&["BTC".to_string()]);
+
+        let account = crate::domain::AccountId::Paper("BTC".to_string());
+        let msg = AccountIncome {
+            account: account.clone(),
+            event: fill_event(Exchange::Binance, "BTC", Side::Long, 1.0),
+        };
+        // 手工走 handler 的分账逻辑（不经 actor 运行时）
+        if let ExchangeEventData::Fill(fill) = &msg.event.data {
+            metrics
+                .paper_stats
+                .entry(msg.account.clone())
+                .or_insert_with(|| TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL))
+                .apply_fill(fill);
+        }
+
+        assert_eq!(metrics.paper_stats[&account].fills, 1);
+        assert_eq!(metrics.total.fills, 0, "模拟成交不得计入实盘累计");
+        assert_eq!(
+            metrics
+                .state
+                .symbol_state(&"BTC".to_string())
+                .unwrap()
+                .position_size(Exchange::Binance),
+            0.0,
+            "模拟成交不得进实盘持仓镜像"
+        );
     }
 
     #[tokio::test]
