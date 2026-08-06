@@ -579,8 +579,13 @@ impl IbkrPublicWsActor {
             // 价量解析不出来就是这笔成交不可用。此前是 warn + 跳过 —— 守卫本身对
             // （没让 0 进账本），但**丢弃整笔成交**同样致命：本地持仓从此落后于交易所，
             // 只能等对账连续失配后停机兜底。宁可现在就死。
-            let price = wire_number(item, "price")?.unwrap_or(0.0);
-            let size = wire_number(item, "size")?.unwrap_or(0.0);
+            // 措辞区分"字段缺失"与"值非法"：两者都致命，但归因时不该把缺失说成 0
+            let (Some(price), Some(size)) = (wire_number(item, "price")?, wire_number(item, "size")?)
+            else {
+                return Err(WsError::ParseError(format!(
+                    "IBKR 成交 {execution_id} 缺 price/size 字段，丢弃即持仓失真: {item}"
+                )));
+            };
             if price <= 0.0 || size <= 0.0 {
                 return Err(WsError::ParseError(format!(
                     "IBKR 成交 {execution_id} 价量非法（price={price}, size={size}）: {item}"

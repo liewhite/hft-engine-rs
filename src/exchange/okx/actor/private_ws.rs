@@ -326,6 +326,10 @@ fn parse_private_message(
                 // 解释 —— **该 instId 不归本引擎管**：OKX 私有流订阅的是 `instType=SWAP`
                 // 全账户推送，同账户里人工下的单、别的进程/分桶实例的成交都会推过来。
                 // 那些成交本就不该进本实例的账本，丢弃是正确处理，不是数据丢失。
+                //
+                // 唯一的残余角落 —— "被元数据剔除的合约上恰好有手工持仓" —— 由另一条
+                // 路径响亮兜住：该 symbol 一旦进入持仓/对账流程，`contract_size_of`
+                // 查不到乘数会直接报错（见 okx/client.rs 的 contract_size_of）。
                 let Some(meta) = resolve_meta(&data.inst_id, symbol_metas) else {
                     tracing::debug!(
                         exchange = "OKX",

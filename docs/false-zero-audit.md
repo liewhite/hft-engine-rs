@@ -150,7 +150,7 @@
 
 ---
 
-## 五、修复记录（六批已全部完成）
+## 五、修复记录（计划内条目已完成；遗留清单见 5.3）
 
 | 批次 | 内容 | 对应条目 | 风险主题 | 提交 |
 |---|---|---|---|---|
@@ -169,6 +169,41 @@
   希腊值 / 持仓对账四处共用，`position_polling` 原有的手写实现已迁移过来。
 - **`validate_subscriptions` 的第三个判据**（`src/engine/live/manager.rs`）：订阅的
   (所, symbol) 必须有 SymbolMeta。把"元数据被剔除"从三种分散症状收敛成投产期的一次判定。
+
+### 5.1 复审补做的一批（`16b2758` 及后续）
+
+第一轮复审(0 Critical)指出三个 Major，都是"修了 A、同类 B 没修"的残留，已补：
+
+- IBKR 的 Number|String 双态解析有**三份手抄**（两条 WS 路径 + REST，行为还不一致）→
+  收敛为 `src/exchange/ibkr/wire.rs`（第四个共享出处）。顺带修掉旧写法把 `null` 变成
+  字符串 `"null"` 的编造问题——它会绕过撤单复查对空 id 的保守分支。
+- IBKR REST 挂单快照：`price/totalSize/filledQuantity` 从 `Option<f64>` 改双态解析
+  （`serde(default)` 只兜字段缺失，类型不符照样让整条响应失败 → 启动被格式差异挡死，
+  即条目 3.2）；`side` 认不出由 skip 改 Err（模式乙在 IBKR 侧的同款残留）。
+- `pending_fills` 两条丢失路径：commission 超时消息的 `let _ = tell` 改 error 日志
+  （它是该 fill 唯一的兜底发布路径）；`on_stop` 补 flush（已发生的成交不能随停机蒸发，
+  否则下次启动的基线会把缺口固化）。
+- HL 订阅记账改为"回执**或**该频道数据到达"两个等效判据：原实现依赖"HL 一定对三条
+  订阅都回 `subscriptionResponse`"这个未经实盘验证的假设（`clearinghouseState` 不在
+  HL 公开文档的订阅主列表里），假设错则上线即 15 秒自杀循环。数据到达是更硬的证据。
+
+### 5.2 一处**有意不改**的复审建议
+
+复审建议把 `unrealized_pnl` 从 `Position::checked` 的强制项里拆出（理由：uPnL 每轮
+重算可自愈，而 IBKR 在无行情时段可能对非零持仓回 `null`，会导致对账持续 Err → 60 秒
+后整机退出）。**不采纳**：兜 0 就是假值，与原则 1 直接冲突；而该场景是未经证实的推测，
+若真发生，失败是响亮的（error 日志直接指明字段与 symbol），几分钟内即可定位并按实际
+行为调整——这比现在就为一个假想场景放宽规则更符合原则 4。列为上线初期观察项。
+
+### 5.3 遗留未修条目（本次六批**不含**，按需另立任务）
+
+| 条目 | 内容 | 未修原因 |
+|---|---|---|
+| 1.6 | IBKR 非美股 SymbolMeta 硬编码（price step 0.01 等） | 需要接 IBKR 合约详情接口取真实精度，是新增能力而非修补 |
+| 1.7 | OKX 私有事件 `exchange_ts` 填本地时间（丢弃 uTime/fillTime） | 影响面是时延观测，不影响账本；改动需同时校准所有时延指标 |
+| 1.9 | Binance `Balance.frozen` 推导伪 0；`available` 两所口径不同源 | `total()` 目前无调用方；跨所汇总的口径统一应与账户模型一起做 |
+| 2.7 残留 | IBKR 未处理 `sts`(authenticated=false)/`system` topic | 需要确认 IBKR 各 topic 的实际报文形态，宜与一次实盘窗口一起做 |
+| 2.7 残留 | IBKR conid 解析失败静默剔除 symbol | 投产期已由 `validate_subscriptions` 的 SymbolMeta 判据间接拦住；剩下的是加载处的日志留痕 |
 
 ### 与原报告的两处判断修正
 

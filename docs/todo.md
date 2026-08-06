@@ -54,6 +54,13 @@ IOC 部分/未成交。
 
 ## 二、框架层已知缺口
 
+### 虚假 0 值 / 吞错专项审计的遗留条目
+见 `docs/false-zero-audit.md` 第 5.3 节。六批修复已消灭全部 Critical 与主要 Major
+（三个共享出处：`Position::checked`、`StalenessGuard`、`validate_subscriptions` 的
+SymbolMeta 判据，加复审补的 `ibkr/wire.rs`）。遗留五项按需另立任务，其中两项要配合一次
+实盘窗口（IBKR 的 `sts` topic 形态、非美股真实精度）。第 5.2 节记了一处**有意不改**的
+复审建议（`unrealized_pnl` 保持强制）及其观察方式。
+
 - **`min_order_size` 未参与校验**：`SymbolMeta.min_order_size` 已解析但无人使用，
   下单只校验 USD 名义值（`min_notional`）。低于交易所最小下单量的单会被交易所拒。
   同一问题的另一面：数量按 `size_step` 向下取整可得 0，全链路无人拦截，会发出 qty=0

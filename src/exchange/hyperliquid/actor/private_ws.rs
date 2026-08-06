@@ -46,9 +46,13 @@ pub struct HyperliquidPrivateWsActor {
     /// dex 上的成交会被剥掉前缀后当成本 dex 同名标的的 Fill，直接污染「基线 + Fill」
     /// 维护的持仓。
     dex: String,
-    /// 尚未收到确认回执的订阅。三条订阅（见 [`REQUIRED_SUBSCRIPTIONS`]）必须全部被
-    /// 服务端确认，否则 [`SubscriptionDeadline`] 到期即自杀 —— **连接活着不等于订阅
-    /// 活着**：HL 的 keepalive 只证明链路通，订阅被悄悄拒掉时 ping/pong 照常。
+    /// 尚未确认生效的订阅。三条订阅（见 [`REQUIRED_SUBSCRIPTIONS`]）必须全部确认，
+    /// 否则 [`SubscriptionDeadline`] 到期即自杀 —— **连接活着不等于订阅活着**：HL 的
+    /// keepalive 只证明链路通，订阅被悄悄拒掉时 ping/pong 照常。
+    ///
+    /// 确认有两个等效来源（见 [`Self::confirm_subscription`]）：服务端的
+    /// `subscriptionResponse` 回执，或该频道的数据到达。后者是更硬的证据，也让记账
+    /// 不依赖"HL 一定对这三个订阅都回回执"这个未经实盘验证的假设。
     pending_subscriptions: HashSet<&'static str>,
     /// 发送消息到 ws_loop 的 channel
     #[allow(dead_code)]
@@ -67,18 +71,13 @@ impl HyperliquidPrivateWsActor {
         let local_ts = now_ms();
         match parse_private_message(raw, &self.dex, local_ts)? {
             PrivateMessage::SubscriptionAck(sub_type) => {
-                if self.pending_subscriptions.remove(sub_type.as_str()) {
-                    tracing::info!(
-                        subscription = %sub_type,
-                        remaining = self.pending_subscriptions.len(),
-                        "Hyperliquid 私有订阅已确认"
-                    );
-                } else {
-                    // 非必需订阅的回执，或重复确认：记录即可，不影响记账结果
-                    tracing::debug!(subscription = %sub_type, "Hyperliquid 收到非必需订阅的确认");
-                }
+                self.confirm_subscription(&sub_type);
             }
-            PrivateMessage::Events(events) => {
+            PrivateMessage::Events { channel, events } => {
+                // 数据到达即订阅生效 —— 不依赖"HL 一定会对这三个订阅都回确认回执"这个
+                // 假设（`clearinghouseState` 不在 HL 公开文档的订阅主列表里，回执格式
+                // 未经实盘验证）。两个判据取或：收到回执、或收到该频道的数据。
+                self.confirm_subscription(channel);
                 for event in events {
                     if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
                         tracing::error!(error = %e, "Failed to publish to IncomePubSub");
@@ -87,6 +86,17 @@ impl HyperliquidPrivateWsActor {
             }
         }
         Ok(())
+    }
+
+    /// 记下"这个订阅确实活着"。两个来源等效：服务端的确认回执，或该频道的数据到达。
+    fn confirm_subscription(&mut self, subscription: &str) {
+        if self.pending_subscriptions.remove(subscription) {
+            tracing::info!(
+                subscription,
+                remaining = self.pending_subscriptions.len(),
+                "Hyperliquid 私有订阅已确认生效"
+            );
+        }
     }
 }
 
@@ -251,8 +261,12 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPriv
 /// 解析保持纯函数，订阅记账（需要跨报文的状态）留给 actor —— 见
 /// [`HyperliquidPrivateWsActor::pending_subscriptions`]。
 enum PrivateMessage {
-    /// 携带零到多条事件（pong / 未知频道即空）
-    Events(Vec<IncomeEvent>),
+    /// 携带零到多条事件。`channel` 供订阅记账使用 —— **该频道有数据到达，就是订阅
+    /// 生效的最硬证据**（比确认回执更直接）。pong / 未知频道给空串。
+    Events {
+        channel: &'static str,
+        events: Vec<IncomeEvent>,
+    },
     /// 某个订阅的确认回执，值为订阅类型（如 `orderUpdates`）
     SubscriptionAck(String),
 }
@@ -285,38 +299,42 @@ fn parse_private_message(raw: &str, dex: &str, local_ts: u64) -> Result<PrivateM
             }
             // 应用层心跳应答（HL 文档口径：{"channel":"pong"}）
             "pong" => {
-                return Ok(PrivateMessage::Events(Vec::new()));
+                return Ok(PrivateMessage::Events { channel: "", events: Vec::new() });
             }
             "clearinghouseState" => {
                 // perp 账户状态：只取 equity / notional / withdrawable，持仓不入事件流
                 let data = &value["data"];
-                return parse_clearinghouse_state(data, local_ts).map(PrivateMessage::Events);
+                return parse_clearinghouse_state(data, local_ts).map(|events| {
+                    PrivateMessage::Events { channel: "clearinghouseState", events }
+                });
             }
             "orderUpdates" => {
                 // 订单更新
                 let data = &value["data"];
-                return parse_order_updates(data, dex, local_ts).map(PrivateMessage::Events);
+                return parse_order_updates(data, dex, local_ts)
+                    .map(|events| PrivateMessage::Events { channel: "orderUpdates", events });
             }
             "userFills" => {
                 // 成交推送
                 let data = &value["data"];
-                return parse_user_fills(data, dex, local_ts).map(PrivateMessage::Events);
+                return parse_user_fills(data, dex, local_ts)
+                    .map(|events| PrivateMessage::Events { channel: "userFills", events });
             }
             _ => {
                 tracing::debug!(channel, "Unknown Hyperliquid private channel");
-                return Ok(PrivateMessage::Events(Vec::new()));
+                return Ok(PrivateMessage::Events { channel: "", events: Vec::new() });
             }
         }
     }
 
     // pong 消息
     if value.get("method").map(|v| v.as_str()) == Some(Some("pong")) {
-        return Ok(PrivateMessage::Events(Vec::new()));
+        return Ok(PrivateMessage::Events { channel: "", events: Vec::new() });
     }
 
     // 其他未知消息
     tracing::debug!(raw, "Unhandled Hyperliquid private message");
-    Ok(PrivateMessage::Events(Vec::new()))
+    Ok(PrivateMessage::Events { channel: "", events: Vec::new() })
 }
 
 /// 解析 clearinghouseState 消息 (perp 账户状态)
@@ -538,6 +556,20 @@ mod tests {
         match parse_private_message(raw, "", 1).unwrap() {
             PrivateMessage::SubscriptionAck(t) => assert_eq!(t, "orderUpdates"),
             _ => panic!("订阅确认必须能被识别，否则记账永远凑不齐、启动 15 秒后自杀"),
+        }
+    }
+
+    /// 数据到达同样算订阅生效：不依赖回执格式的假设（clearinghouseState 的回执未经
+    /// 实盘验证；若它不回回执而只推数据，仅靠回执记账会在 15 秒后误杀）
+    #[test]
+    fn incoming_data_also_confirms_the_subscription() {
+        let raw = r#"{"channel":"userFills","data":{"user":"0xabc","fills":[]}}"#;
+        match parse_private_message(raw, "", 1).unwrap() {
+            PrivateMessage::Events { channel, .. } => assert_eq!(
+                channel, "userFills",
+                "数据报文必须带回频道名，否则无法用它推进订阅记账"
+            ),
+            _ => panic!("userFills 数据应解析为 Events"),
         }
     }
 
