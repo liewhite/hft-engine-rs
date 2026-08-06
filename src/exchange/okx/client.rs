@@ -227,6 +227,136 @@ impl OkxClient {
 
         Ok(result)
     }
+
+    /// 取一页挂单（`after` 为游标 = 上一页最后一条的 ordId，`None` 即首页）
+    async fn fetch_pending_orders_page(
+        &self,
+        inst_id: &str,
+        after: Option<&str>,
+    ) -> Result<Vec<PendingOrderData>, ExchangeError> {
+        let mut path = format!(
+            "/api/v5/trade/orders-pending?instId={inst_id}&instType=SWAP&limit={PENDING_ORDERS_PAGE_LIMIT}"
+        );
+        if let Some(cursor) = after {
+            path.push_str(&format!("&after={cursor}"));
+        }
+        let timestamp = Self::iso_timestamp();
+        let sign = self
+            .sign(&timestamp, "GET", &path, "")
+            .ok_or_else(|| ExchangeError::Other("No credentials".to_string()))?;
+        let headers = self
+            .build_headers(&sign, &timestamp)
+            .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
+
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        let data: PendingOrdersResponse = resp.json().await.map_err(Self::map_reqwest_error)?;
+        if data.code != "0" {
+            return Err(map_okx_error(&data.code, &data.msg));
+        }
+        Ok(data.data)
+    }
+}
+
+/// OKX `orders-pending` 的单页条数上限（交易所固定值）
+const PENDING_ORDERS_PAGE_LIMIT: usize = 100;
+/// 分页拉取的页数上限。用尽即报错而非静默截断 —— 1 万张挂单远超任何正常策略规模，
+/// 走到这里说明游标没有推进（交易所行为变化），继续循环只会挂死。
+const PENDING_ORDERS_MAX_PAGES: usize = 100;
+
+/// OKX 挂单快照的单条记录（REST `orders-pending`）
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingOrderData {
+    inst_id: String,
+    ord_id: String,
+    cl_ord_id: Option<String>,
+    side: String,
+    state: String,
+    /// 订单价格
+    px: String,
+    /// 订单数量 (张)
+    sz: String,
+    acc_fill_sz: String,
+}
+
+#[derive(Deserialize)]
+struct PendingOrdersResponse {
+    code: String,
+    msg: String,
+    data: Vec<PendingOrderData>,
+}
+
+/// 解析一条挂单记录，数量字段按 `contract_size` 折算为币本位。
+///
+/// # 一条解析不了 = 整份快照不可信 = `Err`（绝不跳过该条继续）
+///
+/// 挂单快照的消费方都在做「不在列表里 ⇒ 该单已终态」的推断：
+/// - 启动期 `ManagerActor::cancel_leftover_orders` 据此判定"遗留挂单已撤净"；
+/// - 运行期撤单失败复查（[`crate::engine::live`] 的 `cancel_recheck_verdict`）据此
+///   合成 Cancelled、清掉本地 pending。
+///
+/// 跳过一条就是对这两处谎报"这张单不存在"：轻则带着无人看管的活单开跑，重则**误清
+/// 活单**让策略在它旁边重复下单、形成双重敞口。返回 `Err` 时两处都有正确的失败分支
+/// （拒绝启动 / 保留 pending 待重试），所以报错是安全的，静默少一条不是。
+///
+/// 已知取舍：市价单的 `px` 为空串，在此判为解析失败。市价单不会 resting，出现在挂单
+/// 列表里本身就是异常，报错优于猜一个价格。
+fn parse_pending_order(
+    d: &PendingOrderData,
+    contract_size: f64,
+) -> Result<OrderUpdate, ExchangeError> {
+    let fail = |field: &str, raw: &str| {
+        ExchangeError::Other(format!(
+            "OKX 挂单快照字段 {field} 无法解析（'{raw}'，ordId={}），整份快照不可信",
+            d.ord_id
+        ))
+    };
+    let symbol = from_okx(&d.inst_id).ok_or_else(|| fail("instId", &d.inst_id))?;
+    let side = match d.side.as_str() {
+        "buy" => Side::Long,
+        "sell" => Side::Short,
+        other => return Err(fail("side", other)),
+    };
+    let acc_fill_sz = d
+        .acc_fill_sz
+        .parse::<f64>()
+        .map(|v| v * contract_size)
+        .map_err(|_| fail("accFillSz", &d.acc_fill_sz))?;
+    let status = match d.state.as_str() {
+        "live" => OrderStatus::Pending,
+        "partially_filled" => OrderStatus::PartiallyFilled { filled: acc_fill_sz },
+        other => return Err(fail("state", other)),
+    };
+    let price = d.px.parse::<f64>().map_err(|_| fail("px", &d.px))?;
+    let quantity = d
+        .sz
+        .parse::<f64>()
+        .map(|v| v * contract_size)
+        .map_err(|_| fail("sz", &d.sz))?;
+
+    Ok(OrderUpdate {
+        order_id: d.ord_id.clone(),
+        // 缺失就是缺失，**绝不用 ord_id 顶替**：撤单复查的 `Unverifiable` 安全分支判据
+        // 正是 `client_order_id.is_none()` —— 编造一个非 None 值会让该分支永不触发，
+        // 无法比对身份的活单被判 `Gone`、合成 Cancelled 误清本地 pending。
+        client_order_id: d.cl_ord_id.clone().filter(|s| !s.is_empty()),
+        exchange: Exchange::OKX,
+        symbol,
+        side,
+        status,
+        price,
+        reduce_only: false, // OKX REST pending 响应未解析 reduceOnly，外部单元信息以 WS 推送为准
+        quantity,
+        filled_quantity: acc_fill_sz,
+        fill_sz: 0.0,
+        timestamp: now_ms(),
+    })
 }
 
 #[async_trait]
@@ -313,6 +443,11 @@ impl ExchangeClient for OkxClient {
         Ok(())
     }
 
+    /// 拉取该 symbol 在 OKX 上的**全部**挂单。
+    ///
+    /// 完整性是这个接口的全部价值所在（见 [`parse_pending_order`] 与
+    /// [`PENDING_ORDERS_MAX_PAGES`]）：分页取不全、或有一条解析不了，都返回 `Err`，
+    /// 绝不返回一份"少了几张"的列表。
     async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
         // 无凭证 = 只接公共行情（见 ExchangeAccess），没有账户就没有挂单 —— 与
         // fetch_positions 同一口径。若在此返回 Err，`ManagerActor` 启动期会**逐 symbol**
@@ -325,120 +460,32 @@ impl ExchangeClient for OkxClient {
         }
 
         let inst_id = to_okx(symbol, &self.quote);
-        let path = format!(
-            "/api/v5/trade/orders-pending?instId={}&instType=SWAP",
-            inst_id
-        );
-        let timestamp = Self::iso_timestamp();
-        let sign = self
-            .sign(&timestamp, "GET", &path, "")
-            .ok_or_else(|| ExchangeError::Other("No credentials".to_string()))?;
-        let headers = self
-            .build_headers(&sign, &timestamp)
-            .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct PendingOrderData {
-            inst_id: String,
-            ord_id: String,
-            cl_ord_id: Option<String>,
-            side: String,
-            state: String,
-            /// 订单价格
-            px: String,
-            /// 订单数量 (张)
-            sz: String,
-            acc_fill_sz: String,
-        }
-
-        #[derive(Deserialize)]
-        struct Response {
-            code: String,
-            msg: String,
-            data: Vec<PendingOrderData>,
-        }
-
-        let resp = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
-            .headers(headers)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
-
-        if data.code != "0" {
-            return Err(map_okx_error(&data.code, &data.msg));
-        }
-
-        // 张 -> 币：REST 全程用张数，此处一次取到乘数，下方所有数量字段统一折算
+        // 张 -> 币：REST 全程用张数，此处一次取到乘数，所有数量字段统一折算
         let contract_size = self.contract_size_of(symbol).await?;
 
         let mut updates = Vec::new();
-        for d in &data.data {
-            let sym = match from_okx(&d.inst_id) {
-                Some(s) => s,
-                None => {
-                    tracing::warn!(inst_id = %d.inst_id, "Unknown inst_id in pending orders, skipping");
-                    continue;
-                }
-            };
-            let side = match d.side.as_str() {
-                "buy" => Side::Long,
-                "sell" => Side::Short,
-                other => {
-                    tracing::warn!(side = %other, ord_id = %d.ord_id, "Unknown side in pending order, skipping");
-                    continue;
-                }
-            };
-            let acc_fill_sz: f64 = match d.acc_fill_sz.parse::<f64>().map(|v| v * contract_size) {
-                Ok(v) => v,
-                Err(_) => {
-                    tracing::warn!(ord_id = %d.ord_id, acc_fill_sz = %d.acc_fill_sz, "Failed to parse acc_fill_sz, skipping");
-                    continue;
-                }
-            };
-            let status = match d.state.as_str() {
-                "live" => OrderStatus::Pending,
-                "partially_filled" => OrderStatus::PartiallyFilled { filled: acc_fill_sz },
-                other => {
-                    tracing::warn!(state = %other, ord_id = %d.ord_id, "Unexpected state in pending orders, skipping");
-                    continue;
-                }
-            };
-
-            // 用 cl_ord_id 或 fallback 到 ord_id，确保 pending_orders 能跟踪
-            let client_order_id = d
-                .cl_ord_id
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| d.ord_id.clone());
-
-            let price: f64 = d.px.parse()
-                .map_err(|_| ExchangeError::Other(format!("Failed to parse px '{}' for order {}", d.px, d.ord_id)))?;
-            let sz: f64 = d.sz.parse::<f64>()
-                .map(|v| v * contract_size)
-                .map_err(|_| ExchangeError::Other(format!("Failed to parse sz '{}' for order {}", d.sz, d.ord_id)))?;
-
-            updates.push(OrderUpdate {
-                order_id: d.ord_id.clone(),
-                client_order_id: Some(client_order_id),
-                exchange: Exchange::OKX,
-                symbol: sym,
-                side,
-                status,
-                price,
-                reduce_only: false, // OKX REST pending 响应未解析 reduceOnly，外部单元信息以 WS 推送为准
-                quantity: sz,
-                filled_quantity: acc_fill_sz,
-                fill_sz: 0.0,
-                timestamp: now_ms(),
-            });
+        let mut after: Option<String> = None;
+        for _ in 0..PENDING_ORDERS_MAX_PAGES {
+            let page = self
+                .fetch_pending_orders_page(&inst_id, after.as_deref())
+                .await?;
+            // 取满一页说明后面还有：OKX 按 ordId 倒序返回，游标传本页最后一条
+            let page_full = page.len() >= PENDING_ORDERS_PAGE_LIMIT;
+            let last_ord_id = page.last().map(|d| d.ord_id.clone());
+            for d in &page {
+                updates.push(parse_pending_order(d, contract_size)?);
+            }
+            match last_ord_id {
+                Some(cursor) if page_full => after = Some(cursor),
+                // 未取满 或 空页：已到末页
+                _ => return Ok(updates),
+            }
         }
-
-        Ok(updates)
+        // 页数上限用尽仍未取完：宁可报错，也不返回一份被截断的"挂单全集"
+        // —— 消费方会把"不在列表里"当成"该单已终态"（见 parse_pending_order）。
+        Err(ExchangeError::Other(format!(
+            "OKX {inst_id} 挂单分页超过 {PENDING_ORDERS_MAX_PAGES} 页仍未取完，快照不可信"
+        )))
     }
 
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
@@ -647,6 +694,76 @@ fn order_type_to_okx(order_type: &OrderType) -> (&'static str, Option<String>) {
                 TimeInForce::PostOnly => "post_only",
             };
             (ord_type, Some(price.to_string()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod pending_orders_tests {
+    use super::*;
+
+    fn raw(cl_ord_id: Option<&str>) -> PendingOrderData {
+        PendingOrderData {
+            inst_id: "BTC-USDT-SWAP".to_string(),
+            ord_id: "312269865356374016".to_string(),
+            cl_ord_id: cl_ord_id.map(str::to_string),
+            side: "buy".to_string(),
+            state: "live".to_string(),
+            px: "42000.5".to_string(),
+            sz: "3".to_string(),
+            acc_fill_sz: "1".to_string(),
+        }
+    }
+
+    /// 张 -> 币折算贯穿数量字段（ExchangeClient 的契约是币本位）
+    #[test]
+    fn quantities_are_converted_to_coin_unit() {
+        let u = parse_pending_order(&raw(Some("x-abc")), 0.01).unwrap();
+        assert_eq!(u.symbol, "BTC");
+        assert_eq!(u.side, Side::Long);
+        assert!((u.quantity - 0.03).abs() < 1e-12, "sz 3 张 × 0.01 = 0.03 币");
+        assert!((u.filled_quantity - 0.01).abs() < 1e-12);
+        assert_eq!(u.client_order_id.as_deref(), Some("x-abc"));
+    }
+
+    /// **Critical 回归防线**：clOrdId 缺失/为空时必须是 `None`，绝不用 ord_id 顶替。
+    ///
+    /// 撤单复查的 `Unverifiable` 安全分支判据正是 `client_order_id.is_none()`：编造一个
+    /// 非 None 值会让该分支永不触发，无法比对身份的活单被判 `Gone` → 合成 Cancelled
+    /// 误清本地 pending → 策略重复下单、双重敞口。
+    #[test]
+    fn missing_client_order_id_stays_none() {
+        for missing in [None, Some("")] {
+            let u = parse_pending_order(&raw(missing), 1.0).unwrap();
+            assert_eq!(
+                u.client_order_id, None,
+                "clOrdId 缺失时被编造成了 {:?} —— 撤单复查的活单保护会失效",
+                u.client_order_id
+            );
+        }
+    }
+
+    /// **Critical 回归防线**：任一字段解析不了 → 整份快照 `Err`，绝不跳过该条。
+    ///
+    /// 跳过一条 = 对"启动期撤净遗留单"与"撤单复查"谎报该单不存在（见函数文档）。
+    #[test]
+    fn any_unparsable_field_fails_the_whole_snapshot() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut PendingOrderData)>)> = vec![
+            ("instId", Box::new(|d: &mut PendingOrderData| d.inst_id = "???".to_string())),
+            ("side", Box::new(|d: &mut PendingOrderData| d.side = "sideways".to_string())),
+            ("state", Box::new(|d: &mut PendingOrderData| d.state = "canceled".to_string())),
+            ("px", Box::new(|d: &mut PendingOrderData| d.px = String::new())),
+            ("sz", Box::new(|d: &mut PendingOrderData| d.sz = "n/a".to_string())),
+            ("accFillSz", Box::new(|d: &mut PendingOrderData| d.acc_fill_sz = String::new())),
+        ];
+        for (field, corrupt) in cases {
+            let mut d = raw(Some("x-abc"));
+            corrupt(&mut d);
+            let err = parse_pending_order(&d, 1.0).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "{field} 解析失败应让整份快照报错（含字段名以便定位），实际: {err}"
+            );
         }
     }
 }
