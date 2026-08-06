@@ -63,17 +63,15 @@ impl PromText {
 
 /// 异步推送一份快照（spawn，不阻塞调用方；失败只记 warn —— 观测出口绝不拖垮引擎）
 pub fn spawn_push(config: MetricsPushConfig, body: String) {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "pushgateway client 构建失败，本次推送跳过");
-                return;
-            }
-        };
+        let client = CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("默认 reqwest client 构建不该失败")
+        });
         let endpoint = format!("{}/metrics/job/{}", config.url.trim_end_matches('/'), config.job);
         match client.post(&endpoint).body(body).send().await {
             Ok(resp) if !resp.status().is_success() => {

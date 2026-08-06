@@ -41,8 +41,10 @@ IOC 部分/未成交。
 ### 4. 外部指标上报（已做，旁路形态）
 `src/observability/`：告警外送（tracing Layer 捕 WARN/ERROR 推 webhook，
 `ALERT_WEBHOOK_URL` 启用）+ 指标推送（MetricsActor 快照推 pushgateway，
-`PUSHGATEWAY_URL` 启用）。核心不依赖观测出口，未配置时行为与从前一致 ——
-与"纯策略框架"决策（`a0183e8` 删除内置实现）不冲突：出口依赖核心，核心不依赖出口。
+`PUSHGATEWAY_URL` 启用）。未配置时行为与从前完全一致，出口全部旁路（异步、失败
+降级、限流），不拖垮交易 —— 与"纯策略框架"决策（`a0183e8` 删除内置实现）不冲突。
+多实例部署需各配不同 `PUSHGATEWAY_JOB`。遗留结构优化：report() 的日志与 PromText
+双写同一份数字，宜先聚合快照 struct 再分别渲染（见 code review 记录）。
 
 另两点已知取舍：
 - `MetricsActor` 订阅全量 income 流，数百 symbol 的 BBO 会多一份 clone + mailbox 投递，

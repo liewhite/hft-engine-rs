@@ -24,21 +24,20 @@ pub fn init_tracing() -> anyhow::Result<()> {
     } else {
         EnvFilter::new(DEFAULT_FILTER)
     };
-    let alert_layer = crate::observability::AlertWebhookConfig::from_env()
-        .map(crate::observability::spawn_alert_webhook_layer);
+    let alert_config = crate::observability::AlertWebhookConfig::from_env();
+    let alert_enabled = alert_config.is_some();
+    let alert_layer = alert_config.map(crate::observability::spawn_alert_webhook_layer);
+    // EnvFilter 必须作为 fmt 层的 **per-layer filter**，不能挂成全局 layer ——
+    // 全局挂载是"所有 layer 的 AND"，RUST_LOG=error 会连带把 WARN 挡在告警层外，
+    // 告警外送随控制台冗余度配置静默失效。告警层自带 WARN 级判断，不受控制台过滤影响。
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(fmt::layer().with_filter(filter))
         .with(alert_layer)
-        .with(filter)
         .init();
-    if alert_configured() {
-        tracing::info!("告警外送已启用（ALERT_WEBHOOK_URL）");
+    if alert_enabled {
+        tracing::info!("告警外送已启用（ALERT_WEBHOOK_URL），不受 RUST_LOG 控制台过滤影响");
     }
     Ok(())
-}
-
-fn alert_configured() -> bool {
-    crate::observability::AlertWebhookConfig::from_env().is_some()
 }
 
 /// 从 CLI 参数读取配置文件并反序列化

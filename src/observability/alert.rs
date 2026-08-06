@@ -22,7 +22,9 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
-/// 本模块自己产生的日志所用 target 前缀：Layer 据此排除，防自激回环
+/// 本模块自己产生的日志所用 target：Layer 据此**精确匹配**排除，防自激回环。
+/// 注意排除只覆盖本 target —— webhook 失败若引发依赖库自身的 WARN（hyper/rustls 等），
+/// 仍会进入告警通道，**窗口限流是回环的最终兜底**。
 const SELF_TARGET: &str = "hft_alert_sender";
 
 /// 限流窗口
@@ -53,7 +55,16 @@ impl AlertWebhookConfig {
 /// `registry().with(fmt_layer).with(alert_layer).with(filter).init()`
 pub fn spawn_alert_webhook_layer(config: AlertWebhookConfig) -> AlertWebhookLayer {
     let (tx, rx) = mpsc::unbounded_channel::<String>();
-    tokio::spawn(sender_task(config, rx));
+    // 后台发送任务需要 tokio runtime；同步上下文调用不 panic，降级为禁用外送
+    // （channel 无接收端，Layer 的 send 静默失败），并在 stderr 留一条可见提示。
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(sender_task(config, rx));
+        }
+        Err(_) => {
+            eprintln!("ALERT_WEBHOOK_URL 已设置，但当前不在 tokio runtime 内，告警外送被禁用");
+        }
+    }
     AlertWebhookLayer { tx }
 }
 
@@ -69,16 +80,28 @@ impl<S: Subscriber> Layer<S> for AlertWebhookLayer {
         if *meta.level() > Level::WARN {
             return;
         }
-        // 防自激回环：发送任务自己的失败日志不再外送
-        if meta.target().starts_with(SELF_TARGET) {
+        // 防自激回环：发送任务自己的失败日志不再外送（精确匹配即可，无别的 target 同名）
+        if meta.target() == SELF_TARGET {
             return;
         }
-        let mut text = format!("[{}] {}: ", meta.level(), meta.target());
+        let mut text = format!("[{}][{}] {}: ", instance_label(), meta.level(), meta.target());
         let mut visitor = TextVisitor(&mut text);
         event.record(&mut visitor);
         // 接收端关闭（发送任务退出）时静默丢弃 —— 告警通道绝不反向影响引擎
         let _ = self.tx.send(text);
     }
+}
+
+/// 实例标识（多实例部署时区分告警来源）：进程可执行文件名，取不到则 "hft"
+fn instance_label() -> &'static str {
+    use std::sync::OnceLock;
+    static LABEL: OnceLock<String> = OnceLock::new();
+    LABEL.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "hft".to_string())
+    })
 }
 
 /// 把事件字段拼成一行文本（message 在前，其余 `key=value`）
@@ -108,6 +131,8 @@ async fn sender_task(config: AlertWebhookConfig, mut rx: mpsc::UnboundedReceiver
     };
     let mut window_start = tokio::time::Instant::now();
     let mut sent_in_window: u32 = 0;
+    // 已知取舍：抑制数随下一条告警补报 —— 风暴收尾后若再无新告警，最后一批抑制数
+    // 不会单独上报（值班者已经收到了满窗的同类告警，损失可接受）
     let mut suppressed: u64 = 0;
 
     while let Some(mut text) = rx.recv().await {
@@ -135,15 +160,21 @@ async fn sender_task(config: AlertWebhookConfig, mut rx: mpsc::UnboundedReceiver
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
     use tracing_subscriber::prelude::*;
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut got = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            got.push(msg);
+        }
+        got
+    }
 
     /// Layer 只捕 WARN/ERROR、排除发送器自身 target；文本含 message 与字段
     #[test]
     fn layer_captures_warn_and_error_only() {
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let layer = AlertWebhookLayer { tx };
-        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
@@ -152,12 +183,33 @@ mod tests {
             tracing::error!(target: "t", "漂移确认");
             tracing::error!(target: "hft_alert_sender", "发送失败自身日志不回环");
         });
-        while let Ok(msg) = rx.try_recv() {
-            captured.lock().unwrap().push(msg);
-        }
-        let got = captured.lock().unwrap();
+        let got = drain(&mut rx);
         assert_eq!(got.len(), 2, "只外送 WARN/ERROR 且排除自身: {got:?}");
         assert!(got[0].contains("单腿裸敞口") && got[0].contains("symbol=\"BTC\""), "{}", got[0]);
         assert!(got[1].contains("漂移确认"));
+    }
+
+    /// **Critical 回归防线**：控制台的 EnvFilter 收紧（如 RUST_LOG=error）绝不能连带
+    /// 关掉告警外送 —— 过滤必须是 fmt 层的 per-layer filter，不是全局 layer。
+    /// 本测试按 init_tracing 的真实叠放结构构造 subscriber。
+    #[test]
+    fn console_filter_does_not_silence_alerts() {
+        use tracing_subscriber::filter::EnvFilter;
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let layer = AlertWebhookLayer { tx };
+        // 与 bootstrap::init_tracing 同构：fmt 层带 per-layer EnvFilter("error")，告警层独立
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::sink)
+                    .with_filter(EnvFilter::new("error")),
+            )
+            .with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "t", "控制台被 error 级过滤，但告警必须外送");
+        });
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 1, "RUST_LOG=error 把 WARN 告警外送也灭掉了: {got:?}");
     }
 }

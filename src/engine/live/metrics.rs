@@ -12,7 +12,8 @@
 //! - 跨所持仓估值复用 [`SymbolState::exposure`]，累计统计复用 [`TradingStats`]
 //! - 盈亏为**本次会话**口径：现金流 + 相对会话起始仓位的存货估值变化，
 //!   这样 docker 重启后不会把重启前就持有的存货算成假盈利
-//! - 只输出日志，不引入外部依赖（Prometheus / Slack 等上报另行决策，见 docs/todo.md）
+//! - 默认只输出日志；配置 `PUSHGATEWAY_URL` 后同一份数字推送 pushgateway
+//!   （见 [`crate::observability`]，未配置时无外部依赖、行为与从前一致）
 
 use crate::domain::{AccountId, Exchange, Symbol, TradingStats};
 use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager};
@@ -74,11 +75,40 @@ pub struct MetricsActor {
     /// 柜台的 AccountInfo 会覆盖实盘净值、Fill 会污染实盘持仓镜像）。此前模拟账户的
     /// 成交/拒单/净值完全不进指标，是观测盲区。
     paper_stats: HashMap<AccountId, TradingStats>,
-    /// 各模拟账户柜台的最新净值：(账户, 所) -> (equity, notional)
+    /// 各模拟账户柜台的最新净值：(账户, 所) -> (equity, notional)。
+    /// 已知取舍：账户撤下后条目残留（= 最后一次快照，持续上报），生命周期内不清理
     paper_accounts: HashMap<(AccountId, Exchange), (f64, f64)>,
 }
 
 impl MetricsActor {
+    /// 模拟账户事件的分账逻辑（纯状态转移，供 handler 委托与单测直调）。
+    /// **绝不**触碰实盘视图（total / state）—— 串账防线，见 paper_stats 字段说明。
+    fn apply_paper_event(&mut self, account: &AccountId, data: &ExchangeEventData) {
+        match data {
+            ExchangeEventData::Fill(fill) => {
+                self.paper_stats_mut(account).apply_fill(fill);
+            }
+            ExchangeEventData::OrderUpdate(update) => {
+                self.paper_stats_mut(account).apply_order_update(update);
+            }
+            ExchangeEventData::AccountInfo {
+                exchange,
+                equity,
+                notional,
+            } => {
+                self.paper_accounts
+                    .insert((account.clone(), *exchange), (*equity, *notional));
+            }
+            _ => {}
+        }
+    }
+
+    fn paper_stats_mut(&mut self, account: &AccountId) -> &mut TradingStats {
+        self.paper_stats
+            .entry(account.clone())
+            .or_insert_with(|| TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL))
+    }
+
     /// 记录会话起始仓位基线（每个 (symbol, exchange) 只记一次）
     fn record_baseline(&mut self, symbol: &Symbol, exchange: Exchange, size: f64) {
         self.baseline
@@ -251,6 +281,7 @@ impl MetricsActor {
         for (account, stats) in &self.paper_stats {
             let account_label = account.to_string();
             prom.gauge("hft_paper_fills", &[("account", &account_label)], stats.fills as f64);
+            prom.gauge("hft_paper_volume", &[("account", &account_label)], stats.volume);
             prom.gauge("hft_paper_fee", &[("account", &account_label)], stats.fee);
             prom.gauge("hft_paper_cash", &[("account", &account_label)], stats.cash);
             prom.gauge(
@@ -426,33 +457,7 @@ impl Message<AccountIncome> for MetricsActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: AccountIncome, _ctx: &mut Context<Self, Self::Reply>) {
-        match &msg.event.data {
-            ExchangeEventData::Fill(fill) => {
-                self.paper_stats
-                    .entry(msg.account.clone())
-                    .or_insert_with(|| {
-                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
-                    })
-                    .apply_fill(fill);
-            }
-            ExchangeEventData::OrderUpdate(update) => {
-                self.paper_stats
-                    .entry(msg.account.clone())
-                    .or_insert_with(|| {
-                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
-                    })
-                    .apply_order_update(update);
-            }
-            ExchangeEventData::AccountInfo {
-                exchange,
-                equity,
-                notional,
-            } => {
-                self.paper_accounts
-                    .insert((msg.account.clone(), *exchange), (*equity, *notional));
-            }
-            _ => {}
-        }
+        self.apply_paper_event(&msg.account, &msg.event.data);
     }
 }
 
@@ -539,18 +544,9 @@ mod tests {
         metrics.state.register_symbols(&["BTC".to_string()]);
 
         let account = crate::domain::AccountId::Paper("BTC".to_string());
-        let msg = AccountIncome {
-            account: account.clone(),
-            event: fill_event(Exchange::Binance, "BTC", Side::Long, 1.0),
-        };
-        // 手工走 handler 的分账逻辑（不经 actor 运行时）
-        if let ExchangeEventData::Fill(fill) = &msg.event.data {
-            metrics
-                .paper_stats
-                .entry(msg.account.clone())
-                .or_insert_with(|| TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL))
-                .apply_fill(fill);
-        }
+        let event = fill_event(Exchange::Binance, "BTC", Side::Long, 1.0);
+        // 调 handler 委托的真实分账方法：将来有人在里面误加 state.apply，本测试会红
+        metrics.apply_paper_event(&account, &event.data);
 
         assert_eq!(metrics.paper_stats[&account].fills, 1);
         assert_eq!(metrics.total.fills, 0, "模拟成交不得计入实盘累计");
