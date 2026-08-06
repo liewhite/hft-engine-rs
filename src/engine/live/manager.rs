@@ -658,61 +658,207 @@ impl ManagerActor {
     }
 }
 
+// ============================================================================
+// 交易所装配：每所一个 setup_*，manager 只做收集与循环
+// ============================================================================
+
+/// 交易所 WS actor 装配的执行环境（metas 预加载完成后可用）
+struct SpawnCtx {
+    manager: ActorRef<ManagerActor>,
+    income_pubsub: ActorRef<IncomePubSub>,
+    /// 该所的 symbol -> meta
+    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+}
+
+type SpawnFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn ExchangeActorOps>, ExchangeError>> + Send>>;
+
+/// 单个交易所的装配产物。
+///
+/// 装配天然分两阶段：**建 client** 必须先于 symbol metas 预加载（预加载要用它），
+/// **spawn WS actor 集**必须后于预加载（actor 要用 metas）。每所把两阶段封进一个
+/// `setup_*` 函数：阶段 1 立即执行产出 client，阶段 2 以闭包延迟到 metas 就绪。
+///
+/// **加一个新交易所只需**：写一个 `setup_*`、`ManagerActorArgs` 加一个配置字段、
+/// `on_start` 里加一行 push —— 此前建 client / spawn / join 等待 / 插 map 四段都是
+/// 逐所硬编码，加一个所要改六处。
+struct ExchangeSetup {
+    exchange: Exchange,
+    client: Arc<dyn ExchangeClient>,
+    /// 有凭证 = 有账户（决定是否跑持仓轮询/对账）
+    authed: bool,
+    /// 延迟执行的 actor 装配：spawn + 等 on_start 完成，返回类型擦除的操作接口。
+    /// 各 setup 的 future 由 on_start 并发 join —— spawn 瞬间返回，等待是并发的。
+    spawn_actor: Box<dyn FnOnce(SpawnCtx) -> SpawnFuture + Send>,
+}
+
+fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<ExchangeSetup, ExchangeError> {
+    let client = Arc::new(BinanceClient::new(
+        access.quote.clone(),
+        access.credentials.clone(),
+    )?);
+    let authed = access.has_credentials();
+    let client_dyn: Arc<dyn ExchangeClient> = client.clone();
+    Ok(ExchangeSetup {
+        exchange: Exchange::Binance,
+        client: client_dyn.clone(),
+        authed,
+        spawn_actor: Box::new(move |ctx| {
+            Box::pin(async move {
+                let actor = BinanceActor::spawn_link_with_mailbox(
+                    &ctx.manager,
+                    BinanceActorArgs {
+                        credentials: access.credentials,
+                        symbol_metas: ctx.symbol_metas,
+                        rest_base_url: REST_BASE_URL.to_string(),
+                        income_pubsub: ctx.income_pubsub,
+                        client: client_dyn,
+                        quote: access.quote,
+                    },
+                    mailbox::unbounded(),
+                )
+                .await;
+                actor.wait_for_startup_result().await.map_err(|e| {
+                    ExchangeError::Other(format!("BinanceActor failed to start: {e}"))
+                })?;
+                Ok(Box::new(actor) as Box<dyn ExchangeActorOps>)
+            })
+        }),
+    })
+}
+
+fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup, ExchangeError> {
+    let client = Arc::new(OkxClient::new(access.quote.clone(), access.credentials.clone())?);
+    let authed = access.has_credentials();
+    Ok(ExchangeSetup {
+        exchange: Exchange::OKX,
+        client: client.clone(),
+        authed,
+        spawn_actor: Box::new(move |ctx| {
+            Box::pin(async move {
+                let actor = OkxActor::spawn_link_with_mailbox(
+                    &ctx.manager,
+                    OkxActorArgs {
+                        credentials: access.credentials,
+                        client: Some(client),
+                        symbol_metas: ctx.symbol_metas,
+                        income_pubsub: ctx.income_pubsub,
+                        quote: access.quote,
+                    },
+                    mailbox::unbounded(),
+                )
+                .await;
+                actor
+                    .wait_for_startup_result()
+                    .await
+                    .map_err(|e| ExchangeError::Other(format!("OkxActor failed to start: {e}")))?;
+                Ok(Box::new(actor) as Box<dyn ExchangeActorOps>)
+            })
+        }),
+    })
+}
+
+fn setup_hyperliquid(
+    access: ExchangeAccess<HyperliquidCredentials>,
+) -> Result<ExchangeSetup, ExchangeError> {
+    let client = Arc::new(HyperliquidClient::new(
+        access.quote.clone(),
+        access.dex.clone(),
+        access.credentials.clone(),
+    )?);
+    let authed = access.has_credentials();
+    Ok(ExchangeSetup {
+        exchange: Exchange::Hyperliquid,
+        client: client.clone(),
+        authed,
+        spawn_actor: Box::new(move |ctx| {
+            Box::pin(async move {
+                let actor = HyperliquidActor::spawn_link_with_mailbox(
+                    &ctx.manager,
+                    HyperliquidActorArgs {
+                        credentials: access.credentials,
+                        symbol_metas: ctx.symbol_metas,
+                        income_pubsub: ctx.income_pubsub,
+                        quote: access.quote,
+                        dex: access.dex,
+                    },
+                    mailbox::unbounded(),
+                )
+                .await;
+                actor.wait_for_startup_result().await.map_err(|e| {
+                    ExchangeError::Other(format!("HyperliquidActor failed to start: {e}"))
+                })?;
+                Ok(Box::new(actor) as Box<dyn ExchangeActorOps>)
+            })
+        }),
+    })
+}
+
+/// IBKR 的构造是异步的（要打网关），且配置形状与其他三所不同（无 quote、另带
+/// snapshot 轮询配置）—— 差异封在本函数内，manager 不感知。
+async fn setup_ibkr(
+    cred: IbkrCredentials,
+    snapshot: Option<IbkrSnapshotConfig>,
+) -> Result<ExchangeSetup, ExchangeError> {
+    let client = Arc::new(IbkrClient::new(&cred).await?);
+    let auth = client.auth();
+    let conids = client.conids().clone();
+    Ok(ExchangeSetup {
+        exchange: Exchange::IBKR,
+        client: client.clone(),
+        // IBKR 的 client 只在有凭证时才构建，走到这里必然有账户
+        authed: true,
+        spawn_actor: Box::new(move |ctx| {
+            Box::pin(async move {
+                let actor = IbkrActor::spawn_link_with_mailbox(
+                    &ctx.manager,
+                    IbkrActorArgs {
+                        auth,
+                        income_pubsub: ctx.income_pubsub,
+                        conids,
+                        client,
+                        snapshot,
+                    },
+                    mailbox::unbounded(),
+                )
+                .await;
+                actor
+                    .wait_for_startup_result()
+                    .await
+                    .map_err(|e| ExchangeError::Other(format!("IbkrActor failed to start: {e}")))?;
+                Ok(Box::new(actor) as Box<dyn ExchangeActorOps>)
+            })
+        }),
+    })
+}
+
 impl Actor for ManagerActor {
     type Args = ManagerActorArgs;
     type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 1. 创建 Exchange Clients
+        // 1. 装配各配置了的交易所（阶段 1：建 client；阶段 2 的 actor 装配延迟到
+        //    metas 就绪后并发执行）。加新交易所：写 setup_*、args 加字段、这里加一行。
+        let mut setups: Vec<ExchangeSetup> = Vec::new();
+        if let Some(access) = args.binance {
+            setups.push(setup_binance(access)?);
+        }
+        if let Some(access) = args.okx {
+            setups.push(setup_okx(access)?);
+        }
+        if let Some(access) = args.hyperliquid {
+            setups.push(setup_hyperliquid(access)?);
+        }
+        if let Some(cred) = args.ibkr_credentials {
+            setups.push(setup_ibkr(cred, args.ibkr_snapshot).await?);
+        }
+
         //    模拟盘也需要 client：symbol metas 走公共 REST，与是否有凭证无关
-        let mut clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = HashMap::new();
+        let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> =
+            setups.iter().map(|s| (s.exchange, s.client.clone())).collect();
         // 有凭证 = 有账户可对账；只接公共行情的所没有持仓可言，不必轮询
-        let mut authed_exchanges: HashSet<Exchange> = HashSet::new();
-
-        if let Some(ref access) = args.binance {
-            let creds = access.credentials.clone();
-            let client = BinanceClient::new(access.quote.clone(), creds)?;
-            clients.insert(Exchange::Binance, Arc::new(client));
-            if access.has_credentials() {
-                authed_exchanges.insert(Exchange::Binance);
-            }
-        }
-
-        let okx_client: Option<Arc<OkxClient>> = if let Some(ref access) = args.okx {
-            let creds = access.credentials.clone();
-            let client = Arc::new(OkxClient::new(access.quote.clone(), creds)?);
-            clients.insert(Exchange::OKX, client.clone());
-            if access.has_credentials() {
-                authed_exchanges.insert(Exchange::OKX);
-            }
-            Some(client)
-        } else {
-            None
-        };
-
-        if let Some(ref access) = args.hyperliquid {
-            let creds = access.credentials.clone();
-            let client =
-                HyperliquidClient::new(access.quote.clone(), access.dex.clone(), creds)?;
-            clients.insert(Exchange::Hyperliquid, Arc::new(client));
-            if access.has_credentials() {
-                authed_exchanges.insert(Exchange::Hyperliquid);
-            }
-        }
-
-        // IBKR 需要额外保存 auth / conids / client 供 Actor 使用
-        let mut ibkr_actor_data = None;
-        if let Some(ref cred) = args.ibkr_credentials {
-            let ibkr_client = Arc::new(IbkrClient::new(cred).await?);
-            ibkr_actor_data = Some((
-                ibkr_client.auth(),
-                ibkr_client.conids().clone(),
-                ibkr_client.clone(),
-            ));
-            clients.insert(Exchange::IBKR, ibkr_client as Arc<dyn ExchangeClient>);
-            // IBKR 的 client 只在有凭证时才构建，走到这里必然有账户
-            authed_exchanges.insert(Exchange::IBKR);
-        }
+        let authed_exchanges: HashSet<Exchange> =
+            setups.iter().filter(|s| s.authed).map(|s| s.exchange).collect();
 
         // 2. 预加载所有交易所的 symbol metas
         let symbol_metas = Self::preload_all_symbol_metas(&clients).await?;
@@ -866,143 +1012,26 @@ impl Actor for ManagerActor {
         )
         .await;
 
-        // 7. 创建所有配置了凭证的 ExchangeActors
-        //    Phase 1: 顺序 spawn（每个 spawn_link_with_mailbox 本身瞬间返回）
-        //    Phase 2: tokio::join! 并发等所有 on_start 完成（这才是耗时的 IO 部分）
-        let binance_ref_opt = if let Some(ref access) = args.binance {
-            let symbol_metas_for_exchange =
-                Self::get_symbol_metas_for(&symbol_metas, Exchange::Binance);
-            let client = clients
-                .get(&Exchange::Binance)
-                .ok_or_else(|| ExchangeError::Other("Binance client not found".to_string()))?
-                .clone();
-            Some(
-                BinanceActor::spawn_link_with_mailbox(
-                    &actor_ref,
-                    BinanceActorArgs {
-                        credentials: access.credentials.clone(),
-                        symbol_metas: symbol_metas_for_exchange,
-                        rest_base_url: REST_BASE_URL.to_string(),
-                        income_pubsub: income_pubsub.clone(),
-                        client,
-                        quote: access.quote.clone(),
-                    },
-                    mailbox::unbounded(),
-                )
-                .await,
-            )
-        } else {
-            None
-        };
-
-        let okx_ref_opt = if let Some(ref access) = args.okx {
-            let symbol_metas_for_exchange = Self::get_symbol_metas_for(&symbol_metas, Exchange::OKX);
-            Some(
-                OkxActor::spawn_link_with_mailbox(
-                    &actor_ref,
-                    OkxActorArgs {
-                        credentials: access.credentials.clone(),
-                        client: okx_client.clone(),
-                        symbol_metas: symbol_metas_for_exchange,
-                        income_pubsub: income_pubsub.clone(),
-                        quote: access.quote.clone(),
-                    },
-                    mailbox::unbounded(),
-                )
-                .await,
-            )
-        } else {
-            None
-        };
-
-        let hyper_ref_opt = if let Some(ref access) = args.hyperliquid {
-            let symbol_metas_for_exchange =
-                Self::get_symbol_metas_for(&symbol_metas, Exchange::Hyperliquid);
-            Some(
-                HyperliquidActor::spawn_link_with_mailbox(
-                    &actor_ref,
-                    HyperliquidActorArgs {
-                        credentials: access.credentials.clone(),
-                        symbol_metas: symbol_metas_for_exchange,
-                        income_pubsub: income_pubsub.clone(),
-                        quote: access.quote.clone(),
-                        dex: access.dex.clone(),
-                    },
-                    mailbox::unbounded(),
-                )
-                .await,
-            )
-        } else {
-            None
-        };
-
-        let ibkr_ref_opt = if let Some((ibkr_auth, ibkr_conids, ibkr_client)) = ibkr_actor_data {
-            Some(
-                IbkrActor::spawn_link_with_mailbox(
-                    &actor_ref,
-                    IbkrActorArgs {
-                        auth: ibkr_auth,
-                        income_pubsub: income_pubsub.clone(),
-                        conids: ibkr_conids,
-                        client: ibkr_client,
-                        snapshot: args.ibkr_snapshot,
-                    },
-                    mailbox::unbounded(),
-                )
-                .await,
-            )
-        } else {
-            None
-        };
-
-        // Phase 2: 并发等四家完成；任一失败 → 向上传播 ExchangeError（启动期受控退出）
-        let b_wait = async {
-            match &binance_ref_opt {
-                Some(r) => r.wait_for_startup_result().await,
-                None => Ok(()),
-            }
-        };
-        let o_wait = async {
-            match &okx_ref_opt {
-                Some(r) => r.wait_for_startup_result().await,
-                None => Ok(()),
-            }
-        };
-        let h_wait = async {
-            match &hyper_ref_opt {
-                Some(r) => r.wait_for_startup_result().await,
-                None => Ok(()),
-            }
-        };
-        let i_wait = async {
-            match &ibkr_ref_opt {
-                Some(r) => r.wait_for_startup_result().await,
-                None => Ok(()),
-            }
-        };
-        let (b, o, h, i) = tokio::join!(b_wait, o_wait, h_wait, i_wait);
-        // 任一交易所启动失败 → 向上传播（受控退出，不重试/不重连）
-        b.map_err(|e| ExchangeError::Other(format!("BinanceActor failed to start: {e}")))?;
-        o.map_err(|e| ExchangeError::Other(format!("OkxActor failed to start: {e}")))?;
-        h.map_err(|e| ExchangeError::Other(format!("HyperliquidActor failed to start: {e}")))?;
-        i.map_err(|e| ExchangeError::Other(format!("IbkrActor failed to start: {e}")))?;
-
+        // 7. 并发装配各所的 WS actor 集：spawn 瞬间返回，各 setup 的 future 里等
+        //    on_start 完成（耗时的 IO 部分），join_all 让四家并发。任一失败 -> 向上
+        //    传播 ExchangeError（启动期受控退出，不重试/不重连）。
+        let spawn_futures: Vec<_> = setups
+            .into_iter()
+            .map(|setup| {
+                let ctx = SpawnCtx {
+                    manager: actor_ref.clone(),
+                    income_pubsub: income_pubsub.clone(),
+                    symbol_metas: Self::get_symbol_metas_for(&symbol_metas, setup.exchange),
+                };
+                let exchange = setup.exchange;
+                async move { (setup.spawn_actor)(ctx).await.map(|ops| (exchange, ops)) }
+            })
+            .collect();
         let mut exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>> = HashMap::new();
-        if let Some(r) = binance_ref_opt {
-            exchange_actors.insert(Exchange::Binance, Box::new(r));
-            tracing::info!(exchange = "Binance", "ExchangeActor ready");
-        }
-        if let Some(r) = okx_ref_opt {
-            exchange_actors.insert(Exchange::OKX, Box::new(r));
-            tracing::info!(exchange = "OKX", "ExchangeActor ready");
-        }
-        if let Some(r) = hyper_ref_opt {
-            exchange_actors.insert(Exchange::Hyperliquid, Box::new(r));
-            tracing::info!(exchange = "Hyperliquid", "ExchangeActor ready");
-        }
-        if let Some(r) = ibkr_ref_opt {
-            exchange_actors.insert(Exchange::IBKR, Box::new(r));
-            tracing::info!(exchange = "IBKR", "ExchangeActor ready");
+        for result in futures_util::future::join_all(spawn_futures).await {
+            let (exchange, ops) = result?;
+            tracing::info!(%exchange, "ExchangeActor ready");
+            exchange_actors.insert(exchange, ops);
         }
 
         tracing::info!("ManagerActor started with all child actors linked");
