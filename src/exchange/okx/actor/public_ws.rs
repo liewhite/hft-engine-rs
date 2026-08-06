@@ -332,7 +332,11 @@ pub(crate) fn parse_public_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let bbo = data.to_bbo(meta)?;
+                // Ok(None) = 单边盘口（稀薄品种的合法状态），跳过该条即可
+                let Some(bbo) = data.to_bbo(meta)? else {
+                    tracing::debug!(symbol = %meta.symbol, "OKX 单边盘口，跳过该条 BBO");
+                    continue;
+                };
                 events.push(IncomeEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,

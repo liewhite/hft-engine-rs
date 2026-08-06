@@ -96,9 +96,15 @@ pub struct BboData {
 impl BboData {
     /// `meta` 既提供 symbol，也提供张->币折算 —— 盘口挂单量 `sz` 与私有流一样是**张数**，
     /// 必须折算后再进 domain（见 [`crate::domain::Quantity`] 的不变量）。
-    pub fn to_bbo(&self, meta: &SymbolMeta) -> Result<BBO, String> {
-        let ask = self.asks.first()
-            .ok_or("BBO asks is empty")?;
+    ///
+    /// 返回 `Ok(None)` = **单边盘口**（bids 或 asks 为空）：流动性稀薄品种上的合法市场
+    /// 状态，不是坏报文 —— 调用方跳过该条即可（domain 的 BBO 要求双边齐）。此前按解析
+    /// 错误返回 Err，会经 fail-fast 链路 kill actor、级联整机停机。`Err` 只留给真正的
+    /// 报文损坏（字段解析失败）。
+    pub fn to_bbo(&self, meta: &SymbolMeta) -> Result<Option<BBO>, String> {
+        let (Some(ask), Some(bid)) = (self.asks.first(), self.bids.first()) else {
+            return Ok(None); // 单边盘口
+        };
         if ask.len() < 2 {
             return Err(format!("BBO ask data incomplete: {:?}", ask));
         }
@@ -107,8 +113,6 @@ impl BboData {
         let ask_qty = f64::from_str(&ask[1])
             .map_err(|_| format!("Failed to parse ask qty: {}", ask[1]))?;
 
-        let bid = self.bids.first()
-            .ok_or("BBO bids is empty")?;
         if bid.len() < 2 {
             return Err(format!("BBO bid data incomplete: {:?}", bid));
         }
@@ -120,7 +124,7 @@ impl BboData {
         let timestamp = self.ts.parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
-        Ok(BBO {
+        Ok(Some(BBO {
             exchange: Exchange::OKX,
             symbol: meta.symbol.clone(),
             bid_price,
@@ -128,7 +132,7 @@ impl BboData {
             ask_price,
             ask_qty: meta.qty_to_coin(ask_qty),
             timestamp,
-        })
+        }))
     }
 }
 
@@ -634,6 +638,18 @@ mod trade_tests {
         assert!(!t.is_buyer_maker);
     }
 
+    /// **单边盘口是合法状态**：bids/asks 为空返回 Ok(None) 跳过，绝不能按坏报文
+    /// 返回 Err —— 那会经 fail-fast 链路 kill actor、级联整机停机
+    #[test]
+    fn one_sided_book_is_skipped_not_fatal() {
+        let raw = r#"{"asks":[],"bids":[["42219.9","12"]],"ts":"1630048897897"}"#;
+        let d: BboData = serde_json::from_str(raw).unwrap();
+        assert!(d.to_bbo(&btc_meta()).expect("不是错误").is_none());
+        let raw = r#"{"asks":[["42220.0","30"]],"bids":[],"ts":"1630048897897"}"#;
+        let d: BboData = serde_json::from_str(raw).unwrap();
+        assert!(d.to_bbo(&btc_meta()).expect("不是错误").is_none());
+    }
+
     /// Critical 回归防线：OKX 盘口挂单量原先未折算，导致 BBO 的 qty 是张数、
     /// 而 position/fill/trade 是币本位，spread_arb 按币本位使用 ask_qty/bid_qty
     /// 时 OKX 腿的流动性约束实际失效（差 contract_size 倍）。
@@ -641,7 +657,7 @@ mod trade_tests {
     fn bbo_quantities_are_converted_to_coin() {
         let raw = r#"{"asks":[["42220.0","30"]],"bids":[["42219.9","12"]],"ts":"1630048897897"}"#;
         let d: BboData = serde_json::from_str(raw).unwrap();
-        let bbo = d.to_bbo(&btc_meta()).unwrap();
+        let bbo = d.to_bbo(&btc_meta()).unwrap().expect("双边盘口");
         assert_eq!(bbo.symbol, "BTC");
         assert_eq!(bbo.bid_price, 42219.9);
         assert!((bbo.bid_qty - 0.12).abs() < 1e-12, "got {}", bbo.bid_qty);

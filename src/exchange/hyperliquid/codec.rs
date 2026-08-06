@@ -120,13 +120,15 @@ pub struct WsLevel {
 }
 
 impl WsBbo {
-    pub fn to_bbo(&self) -> Result<BBO, String> {
+    /// 返回 `Ok(None)` = **单边盘口**（bid 或 ask 为 null）：稀薄品种的合法市场状态，
+    /// 不是坏报文 —— 调用方跳过即可。此前按解析错误返回 Err，会经 fail-fast 链路
+    /// kill actor、级联整机停机。`Err` 只留给真正的报文损坏。
+    pub fn to_bbo(&self) -> Result<Option<BBO>, String> {
         let symbol = from_hyperliquid(&self.coin);
 
-        let bid = self.bbo[0].as_ref()
-            .ok_or("BBO bid is null")?;
-        let ask = self.bbo[1].as_ref()
-            .ok_or("BBO ask is null")?;
+        let (Some(bid), Some(ask)) = (self.bbo[0].as_ref(), self.bbo[1].as_ref()) else {
+            return Ok(None); // 单边盘口
+        };
 
         let bid_price = f64::from_str(&bid.px)
             .map_err(|_| format!("Failed to parse bid price: {}", bid.px))?;
@@ -137,7 +139,7 @@ impl WsBbo {
         let ask_qty = f64::from_str(&ask.sz)
             .map_err(|_| format!("Failed to parse ask size: {}", ask.sz))?;
 
-        Ok(BBO {
+        Ok(Some(BBO {
             exchange: Exchange::Hyperliquid,
             symbol,
             bid_price,
@@ -145,7 +147,7 @@ impl WsBbo {
             ask_price,
             ask_qty,
             timestamp: self.time,
-        })
+        }))
     }
 }
 
@@ -769,5 +771,29 @@ mod trade_tests {
         let out = aggregate_trades(&[a, b]).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].qty, 3.0);
+    }
+}
+
+#[cfg(test)]
+mod bbo_tests {
+    use super::*;
+
+    /// **单边盘口是合法状态**：bid/ask 为 null 返回 Ok(None) 跳过，绝不能按坏报文
+    /// 返回 Err —— 那会经 fail-fast 链路 kill actor、级联整机停机
+    #[test]
+    fn one_sided_book_is_skipped_not_fatal() {
+        let raw = r#"{"coin":"ETH","time":1,"bbo":[null,{"px":"100.0","sz":"1.0","n":1}]}"#;
+        let d: WsBbo = serde_json::from_str(raw).unwrap();
+        assert!(d.to_bbo().expect("不是错误").is_none());
+
+        let raw = r#"{"coin":"ETH","time":1,"bbo":[{"px":"99.0","sz":"1.0","n":1},null]}"#;
+        let d: WsBbo = serde_json::from_str(raw).unwrap();
+        assert!(d.to_bbo().expect("不是错误").is_none());
+
+        let raw = r#"{"coin":"ETH","time":1,"bbo":[{"px":"99.0","sz":"1.0","n":1},{"px":"100.0","sz":"1.0","n":1}]}"#;
+        let d: WsBbo = serde_json::from_str(raw).unwrap();
+        let bbo = d.to_bbo().expect("不是错误").expect("双边盘口");
+        assert_eq!(bbo.bid_price, 99.0);
+        assert_eq!(bbo.ask_price, 100.0);
     }
 }

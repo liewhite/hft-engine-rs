@@ -438,8 +438,11 @@ pub(crate) fn parse_public_message(
                 let bbo_data: WsBbo = serde_json::from_value(data.clone())
                     .map_err(|e| WsError::ParseError(format!("bbo parse: {}", e)))?;
 
-                let bbo = bbo_data.to_bbo()
-                    ?;
+                // Ok(None) = 单边盘口（稀薄品种的合法状态），跳过即可
+                let Some(bbo) = bbo_data.to_bbo()? else {
+                    tracing::debug!(coin = %bbo_data.coin, "Hyperliquid 单边盘口，跳过该条 BBO");
+                    return Ok(Vec::new());
+                };
                 return Ok(vec![IncomeEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,
