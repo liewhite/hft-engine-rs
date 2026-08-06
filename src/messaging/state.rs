@@ -427,6 +427,8 @@ impl SymbolState {
             | ExchangeEventData::ExchangeStatus { .. }
             | ExchangeEventData::BorrowFee(_)
             | ExchangeEventData::ExchangeRate(_)
+            // 自定义事件不进状态层：框架只运送不理解（见 CustomEvent）
+            | ExchangeEventData::Custom(_)
             // 对账读数是按所的整份快照（无单一 symbol），且**绝不写入持仓** ——
             // 写进来就等于恢复了上面 PositionBaseline 分支否掉的"快照覆写"
             | ExchangeEventData::PositionReport { .. } => {

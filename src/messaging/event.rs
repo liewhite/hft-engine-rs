@@ -1,4 +1,81 @@
 use crate::domain::{Balance, BorrowFee, Candle, Exchange, ExchangeRate, Fill, FundingFee, FundingRate, Greeks, IndexPrice, MarkPrice, MarketStatus, MarketTrade, OrderUpdate, Position, Symbol, Timestamp, BBO};
+use std::any::Any;
+use std::sync::Arc;
+
+/// 用户域自定义事件：框架只负责运送与路由，不理解其内容。
+///
+/// 框架事件枚举（[`ExchangeEventData`] 其余变体）是**封闭**的 —— 引擎必须穷尽处理它们；
+/// 本类型是枚举上唯一的**开放**扩展点：新事件类型只需定义一个 payload struct，
+/// 不改框架任何代码。
+///
+/// # 两个方向、两条既有总线（不新增分发机制）
+///
+/// - **策略向外**：策略返回 [`crate::strategy::OutcomeEvent::Emit`]，事件随其他信号发布
+///   到 Outcome 总线，外部处理者经 `SubscribeOutcome` 订阅（带账户归属）。**不会回流给
+///   任何策略** —— 策略间不能直接通信，回环在结构上不可能；确需转发时由外部处理者显式
+///   经入向入口注入，转发点可见可控。
+/// - **外部向策略**：经 `ManagerActor` 的 `PublishCustomEvent` 注入 Income 总线，
+///   按 scope 路由（见下）后进入订阅者的 `Strategy::on_event`。
+///
+/// # 路由与账户归属
+///
+/// - 带 `(exchange, symbol)` scope 的事件按既有订阅关系定向投递，无 scope 的广播 ——
+///   复用 [`IncomeEvent::executor_routing`] 的推导，无第二套路由。
+/// - 自定义事件**没有账户归属**（如同行情）：实盘与模拟账户的策略都会收到。
+///   需要区分时在 payload 里自带判别字段。
+///
+/// # 消费方式
+///
+/// `event.get::<T>()` 按具体类型取回，类型不符返回 `None` —— 订阅者只对自己认识的
+/// 类型起反应，这也是分发的实际粒度。`name` 由 payload 类型名自动填充，供日志定位。
+#[derive(Clone)]
+pub struct CustomEvent {
+    /// 事件归属的交易所（与 `symbol` 同时存在才构成定向路由）
+    pub exchange: Option<Exchange>,
+    /// 事件归属的 symbol
+    pub symbol: Option<Symbol>,
+    /// payload 的类型名（自动填充，观测用；类型判别请用 [`Self::get`]，不要比对本字段）
+    pub name: &'static str,
+    /// 类型擦除的事件内容；`Arc` 使总线广播的 clone 零拷贝
+    payload: Arc<dyn Any + Send + Sync>,
+}
+
+impl CustomEvent {
+    /// 无 scope 的自定义事件：广播给所有策略 executor 与总线订阅者
+    pub fn new<T: Any + Send + Sync>(payload: T) -> Self {
+        Self {
+            exchange: None,
+            symbol: None,
+            name: std::any::type_name::<T>(),
+            payload: Arc::new(payload),
+        }
+    }
+
+    /// 带 `(exchange, symbol)` scope 的自定义事件：只投递给订阅了该 symbol 的 executor
+    pub fn for_symbol<T: Any + Send + Sync>(exchange: Exchange, symbol: Symbol, payload: T) -> Self {
+        Self {
+            exchange: Some(exchange),
+            symbol: Some(symbol),
+            name: std::any::type_name::<T>(),
+            payload: Arc::new(payload),
+        }
+    }
+
+    /// 按具体类型取回 payload；类型不符返回 `None`
+    pub fn get<T: Any>(&self) -> Option<&T> {
+        self.payload.downcast_ref::<T>()
+    }
+}
+
+impl std::fmt::Debug for CustomEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomEvent")
+            .field("name", &self.name)
+            .field("exchange", &self.exchange)
+            .field("symbol", &self.symbol)
+            .finish_non_exhaustive()
+    }
+}
 
 /// 统一的交易所事件
 ///
@@ -101,6 +178,9 @@ pub enum ExchangeEventData {
     ExchangeRate(ExchangeRate),
     /// 时钟事件 (用于超时检测等定时任务)
     Clock,
+    /// 用户域自定义事件（唯一的开放扩展点，见 [`CustomEvent`]）。
+    /// 框架的状态层（`StateManager`/`SymbolState`）对它一律 no-op —— 只运送，不理解。
+    Custom(CustomEvent),
 }
 
 /// 实盘分发层的事件路由方式（见 [`IncomeEvent::executor_routing`]）
@@ -130,6 +210,8 @@ impl IncomeEvent {
             ExchangeEventData::BorrowFee(bf) => Some(&bf.symbol),
             ExchangeEventData::Candle(candle) => Some(&candle.symbol),
             ExchangeEventData::HistoryCandles(candles) => candles.first().map(|c| &c.symbol),
+            // 自定义事件的 scope 由构造方决定（for_symbol 定向 / new 广播）
+            ExchangeEventData::Custom(c) => c.symbol.as_ref(),
             ExchangeEventData::Balance(_)
             | ExchangeEventData::Greeks(_)
             | ExchangeEventData::AccountInfo { .. }
@@ -162,6 +244,7 @@ impl IncomeEvent {
             ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
             ExchangeEventData::ExchangeStatus { exchange, .. } => Some(*exchange),
             ExchangeEventData::PositionReport { exchange, .. } => Some(*exchange),
+            ExchangeEventData::Custom(c) => c.exchange,
             ExchangeEventData::Clock => None,
         }
     }
@@ -209,5 +292,59 @@ impl IncomeEvent {
     /// 获取本地时间戳
     pub fn local_ts(&self) -> Timestamp {
         self.local_ts
+    }
+}
+
+#[cfg(test)]
+mod custom_event_tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    struct AlphaSignal {
+        score: f64,
+    }
+    struct OtherType;
+
+    fn wrap(c: CustomEvent) -> IncomeEvent {
+        IncomeEvent {
+            exchange_ts: 1,
+            local_ts: 1,
+            data: ExchangeEventData::Custom(c),
+        }
+    }
+
+    /// 消费方按具体类型取回 payload；类型不符得 None —— 这是分发的实际粒度，
+    /// 订阅者只对自己认识的类型起反应
+    #[test]
+    fn downcast_roundtrip_and_type_mismatch() {
+        let ev = CustomEvent::new(AlphaSignal { score: 0.7 });
+        assert_eq!(ev.get::<AlphaSignal>(), Some(&AlphaSignal { score: 0.7 }));
+        assert!(ev.get::<OtherType>().is_none(), "类型不符必须得 None，而不是错误的值");
+        assert!(ev.name.contains("AlphaSignal"), "name 供日志定位: {}", ev.name);
+    }
+
+    /// 带 scope 的自定义事件走既有的 (exchange, symbol) 定向路由 —— 复用订阅关系，
+    /// 只投给订阅了该 symbol 的 executor
+    #[test]
+    fn scoped_custom_event_routes_by_symbol() {
+        let ev = wrap(CustomEvent::for_symbol(
+            Exchange::Binance,
+            "BTC".to_string(),
+            AlphaSignal { score: 1.0 },
+        ));
+        assert_eq!(
+            ev.executor_routing(),
+            EventRouting::BySymbol {
+                exchange: Exchange::Binance,
+                symbol: "BTC".to_string()
+            }
+        );
+    }
+
+    /// 无 scope 的自定义事件广播给所有 executor
+    #[test]
+    fn unscoped_custom_event_broadcasts() {
+        let ev = wrap(CustomEvent::new(AlphaSignal { score: 1.0 }));
+        assert_eq!(ev.executor_routing(), EventRouting::Broadcast);
     }
 }

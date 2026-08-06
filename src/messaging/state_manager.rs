@@ -213,6 +213,9 @@ impl StateManager {
             // 写进来就等于恢复了 `SymbolState` 明确否掉的"用快照覆写持仓"
             // （会与 Fill 流重复计算同一笔成交）。
             ExchangeEventData::PositionReport { .. } => {}
+            // 自定义事件：框架只运送不理解，策略在 on_event 里自行消费并自持。
+            // 必须显式空处理 —— 无 scope 的自定义事件会被兜底分支误报"缺少 symbol 的路由 bug"。
+            ExchangeEventData::Custom(_) => {}
             // 全局事件: Clock (检查订单超时)
             ExchangeEventData::Clock => {
                 let now = event.local_ts;
