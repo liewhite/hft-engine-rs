@@ -6,6 +6,8 @@
 //! - 通过 add_strategy 动态添加策略和相关 Actor
 //! - 子 Actor 失败时级联退出
 
+use crate::actor_lifecycle::{ChildGroup, ChildStop};
+use crate::engine::bootstrap::Supervised;
 use super::{
     AccountIncome, AccountOutcome, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
     PaperCounterActor, PaperCounterArgs, PaperPubSub,
@@ -105,19 +107,18 @@ pub struct ManagerActor {
     /// 否则实例只能随进程生死。
     executors: Vec<RegisteredExecutor>,
 
-    /// 本 manager **主动**停掉的子 actor id；[`Self::on_link_died`] 只对这些放行。
+    /// **产生**事件的子 actor：交易所 actor、时钟、对账轮询、策略实例。
+    /// 停机时先停这一段 —— 它们的 `on_stop` 还会往总线上发最后一批事件
+    /// （`IbkrPublicWsActor` 要补发等 commission 的成交），那时管线必须还活着。
+    producers: ChildGroup,
+
+    /// **传递与消费**事件的子 actor：两条 PubSub、两个 Processor、模拟柜台、
+    /// 观测与对账、以及外部注册的观察者。在生产者全部停完之后才停，
+    /// 这样最后一批事件仍有人接收（`Signal::Stop` 排在消息之后，会先排空）。
     ///
-    /// # 为什么记录意图，而不是从 stop reason 推断
-    ///
-    /// `ActorStopReason::Normal` 不止来自 `stop_gracefully()` —— kameo 在"邮箱所有 sender
-    /// 都被 drop"时同样报 `Normal`。而本进程里有若干子 actor 的 `ActorRef` 是当场丢弃的
-    /// （`ClockActor` / `PositionPollingActor` / 各 polling actor），它们目前靠自身
-    /// `attach_stream` 派生的任务持有强引用而存活。这条依赖一旦变化，它们就会以 `Normal`
-    /// 死掉 —— 若按 reason 放行，"时钟停了""对账停了"会被**静默忽略**，而这类失效恰恰必须
-    /// 整机退出。
-    ///
-    /// 记录意图则没有这个歧义：不在集合里的死亡一律级联退出，与 reason 无关。
-    intentionally_stopped: HashSet<ActorId>,
+    /// 组内顺序同样有讲究：PubSub 先停（排空自己的队列、转发给订阅者），
+    /// 订阅者后停（再排空自己的）。登记顺序即停机顺序。
+    pipeline: ChildGroup,
 
     /// 引擎生命周期内已向总线发布过持仓基线的 (所, symbol)。
     ///
@@ -226,13 +227,12 @@ impl ManagerActor {
     /// 返回 `Err(原因)` 供调用方计入"未完成"；超时不改用 `kill()`（那会打死引擎），而是如实
     /// 报出 —— 此时该实例已从 IncomeProcessor 注销，收不到新事件，危害有界。
     async fn stop_executor(&mut self, executor: &ActorRef<ExecutorActor>) -> Result<(), String> {
-        // 先登记意图再停：`on_link_died` 据此放行（见 `intentionally_stopped` 的说明）。
-        // 必须先登记 —— 否则实例可能在登记之前就死了，那一瞬的 link 通知会被判成意外死亡。
-        self.intentionally_stopped.insert(executor.id());
+        // 主动撤下的实例不再属于停机链：留着虽无害（等一个已死的 actor 立即返回），
+        // 但那份强引用会一直攒着 —— 晋升/降级反复几轮就成了泄漏。
+        self.producers.remove(executor);
+        // 必须是 stop_gracefully 而非 kill：前者产生 `Normal`，`on_link_died` 据此放行；
+        // kill 产生 `Killed`，会被判成事故、把整个引擎带走。
         if let Err(e) = executor.stop_gracefully().await {
-            // 信号都没发出去（实例可能已经不在了），不会有 link 通知到来 —— 撤回登记，
-            // 否则集合会无谓增长。
-            self.intentionally_stopped.remove(&executor.id());
             return Err(format!("发送 Stop 信号失败: {e}"));
         }
         tokio::time::timeout(EXECUTOR_STOP_TIMEOUT, executor.wait_for_shutdown())
@@ -396,17 +396,19 @@ impl ManagerActor {
         let mut executor_refs = Vec::new();
         for spec in strategies {
             let account = spec.account.clone();
-            let executor_ref = ExecutorActor::spawn_link_with_mailbox(
-                &actor_ref,
-                ExecutorArgs {
-                    strategy: spec.strategy,
-                    account: spec.account,
-                    symbol_metas: Arc::new(self.symbol_metas.clone()),
-                    outcome_pubsub: outcome_pubsub.clone(),
-                },
-                mailbox::unbounded(),
-            )
-            .await;
+            let executor_ref = self
+                .producers
+                .spawn::<ExecutorActor, _>(
+                    &actor_ref,
+                    "ExecutorActor",
+                    ExecutorArgs {
+                        strategy: spec.strategy,
+                        account: spec.account,
+                        symbol_metas: Arc::new(self.symbol_metas.clone()),
+                        outcome_pubsub: outcome_pubsub.clone(),
+                    },
+                )
+                .await;
             executor_refs.push((executor_ref, account));
         }
 
@@ -684,8 +686,16 @@ struct SpawnCtx {
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
-type SpawnFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn ExchangeActorOps>, ExchangeError>> + Send>>;
+/// 装配产物：类型擦除的操作接口 + 停机句柄。
+///
+/// 句柄必须在这里造：出了这个闭包，actor 就只剩 `Box<dyn ExchangeActorOps>`，
+/// 拿不到具体的 `ActorRef<A>`，也就造不出"停它并等它收尾完"的闭包了。
+type SpawnFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<(Box<dyn ExchangeActorOps>, ChildStop), ExchangeError>>
+            + Send,
+    >,
+>;
 
 /// 单个交易所的装配产物。
 ///
@@ -735,7 +745,8 @@ fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<ExchangeS
                 actor.wait_for_startup_result().await.map_err(|e| {
                     ExchangeError::Other(format!("BinanceActor failed to start: {e}"))
                 })?;
-                Ok(Box::new(actor) as Box<dyn ExchangeActorOps>)
+                let stop = ChildStop::new("BinanceActor", actor.clone());
+                Ok((Box::new(actor) as Box<dyn ExchangeActorOps>, stop))
             })
         }),
     })
@@ -766,7 +777,8 @@ fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup, Ex
                     .wait_for_startup_result()
                     .await
                     .map_err(|e| ExchangeError::Other(format!("OkxActor failed to start: {e}")))?;
-                Ok(Box::new(actor) as Box<dyn ExchangeActorOps>)
+                let stop = ChildStop::new("OkxActor", actor.clone());
+                Ok((Box::new(actor) as Box<dyn ExchangeActorOps>, stop))
             })
         }),
     })
@@ -802,7 +814,8 @@ fn setup_hyperliquid(
                 actor.wait_for_startup_result().await.map_err(|e| {
                     ExchangeError::Other(format!("HyperliquidActor failed to start: {e}"))
                 })?;
-                Ok(Box::new(actor) as Box<dyn ExchangeActorOps>)
+                let stop = ChildStop::new("HyperliquidActor", actor.clone());
+                Ok((Box::new(actor) as Box<dyn ExchangeActorOps>, stop))
             })
         }),
     })
@@ -840,7 +853,8 @@ async fn setup_ibkr(
                     .wait_for_startup_result()
                     .await
                     .map_err(|e| ExchangeError::Other(format!("IbkrActor failed to start: {e}")))?;
-                Ok(Box::new(actor) as Box<dyn ExchangeActorOps>)
+                let stop = ChildStop::new("IbkrActor", actor.clone());
+                Ok((Box::new(actor) as Box<dyn ExchangeActorOps>, stop))
             })
         }),
     })
@@ -878,24 +892,26 @@ impl Actor for ManagerActor {
         let symbol_metas = Self::preload_all_symbol_metas(&clients).await?;
 
         // 3. 创建 PubSub Actors (使用 spawn_link_with_mailbox)
-        let income_pubsub = IncomePubSub::spawn_link_with_mailbox(
+        let mut pipeline = ChildGroup::default();
+        let mut producers = ChildGroup::default();
+        let income_pubsub = pipeline.spawn::<IncomePubSub, _>(
             &actor_ref,
+            "IncomePubSub",
             IncomePubSub::new(DeliveryStrategy::BestEffort),
-            mailbox::unbounded(),
         )
         .await;
-        let outcome_pubsub = OutcomePubSub::spawn_link_with_mailbox(
+        let outcome_pubsub = pipeline.spawn::<OutcomePubSub, _>(
             &actor_ref,
+            "OutcomePubSub",
             OutcomePubSub::new(DeliveryStrategy::BestEffort),
-            mailbox::unbounded(),
         )
         .await;
 
         // 4. 创建 ProcessorActor 并订阅 income_pubsub
-        let processor = IncomeProcessorActor::spawn_link_with_mailbox(
+        let processor = pipeline.spawn::<IncomeProcessorActor, _>(
             &actor_ref,
+            "IncomeProcessorActor",
             IncomeProcessorActor::default(),
-            mailbox::unbounded(),
         )
         .await;
         income_pubsub
@@ -908,8 +924,9 @@ impl Actor for ManagerActor {
         // 5. OutcomePubSub 的两个消费者**常驻并存**：实盘账户的订单发往交易所，模拟账户的
         //    订单落本地柜台。二者互不知情，各按 AccountOutcome 上的账户取自己的那份 ——
         //    这使得同一 symbol 上模拟与实盘可以并行（模拟先跑，出信号后再拉起实盘）。
-        let live_processor = OutcomeProcessorActor::spawn_link_with_mailbox(
+        let live_processor = pipeline.spawn::<OutcomeProcessorActor, _>(
             &actor_ref,
+            "OutcomeProcessorActor",
             OutcomeProcessorArgs {
                 clients: clients.clone(),
                 income_pubsub: income_pubsub.clone(),
@@ -917,7 +934,6 @@ impl Actor for ManagerActor {
                 symbol_metas: Arc::new(symbol_metas.clone()),
                 dry_run: false,
             },
-            mailbox::unbounded(),
         )
         .await;
         outcome_pubsub
@@ -927,20 +943,20 @@ impl Actor for ManagerActor {
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 模拟账户私有事件走独立总线：结构上保证真实账户的成交不可能流进模拟策略的状态
-        let paper_pubsub = PaperPubSub::spawn_link_with_mailbox(
+        let paper_pubsub = pipeline.spawn::<PaperPubSub, _>(
             &actor_ref,
+            "PaperPubSub",
             PaperPubSub::new(DeliveryStrategy::BestEffort),
-            mailbox::unbounded(),
         )
         .await;
-        let paper_counter = PaperCounterActor::spawn_link_with_mailbox(
+        let paper_counter = pipeline.spawn::<PaperCounterActor, _>(
             &actor_ref,
+            "PaperCounterActor",
             PaperCounterArgs {
                 paper_pubsub: paper_pubsub.clone(),
                 config: args.paper,
                 symbol_metas: Arc::new(symbol_metas.clone()),
             },
-            mailbox::unbounded(),
         )
         .await;
         outcome_pubsub
@@ -950,7 +966,7 @@ impl Actor for ManagerActor {
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
         // 柜台需要共享行情（撮合）与 Clock（发布净值）
         income_pubsub
-            .tell(Subscribe(paper_counter))
+            .tell(Subscribe(paper_counter.clone()))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
@@ -965,14 +981,14 @@ impl Actor for ManagerActor {
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 5.5 创建 MetricsActor 并订阅 income_pubsub（观测层：只读事件流，不参与决策）
-        let metrics = MetricsActor::spawn_link_with_mailbox(
+        let metrics = pipeline.spawn::<MetricsActor, _>(
             &actor_ref,
+            "MetricsActor",
             MetricsActorArgs {
                 interval_ms: DEFAULT_REPORT_INTERVAL_MS,
                 // PUSHGATEWAY_URL 环境变量启用，未设置 = 只输出日志
                 push: crate::observability::MetricsPushConfig::from_env(),
             },
-            mailbox::unbounded(),
         )
         .await;
         income_pubsub
@@ -991,13 +1007,13 @@ impl Actor for ManagerActor {
         // 5.6 持仓对账（通道 B）：REST 读数 vs 本地「基线 + Fill」。
         //     与 MetricsActor 分开是刻意的——观测层故障不该拖垮交易，而对账确认漂移必须
         //     致命退出（本地持仓不可信时，策略的三道风控闸门全部失效）。
-        let position_reconciler = PositionReconcileActor::spawn_link_with_mailbox(
+        let position_reconciler = pipeline.spawn::<PositionReconcileActor, _>(
             &actor_ref,
+            "PositionReconcileActor",
             PositionReconcileArgs {
                 symbol_metas: Arc::new(symbol_metas.clone()),
                 max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
             },
-            mailbox::unbounded(),
         )
         .await;
         income_pubsub
@@ -1012,26 +1028,26 @@ impl Actor for ManagerActor {
             let Some(client) = clients.get(exchange) else {
                 continue;
             };
-            PositionPollingActor::spawn_link_with_mailbox(
+            producers.spawn::<PositionPollingActor, _>(
                 &actor_ref,
+            "PositionPollingActor",
                 PositionPollingActorArgs {
                     client: client.clone(),
                     income_pubsub: income_pubsub.clone(),
                     interval_ms: DEFAULT_POSITION_POLL_INTERVAL_MS,
                 },
-                mailbox::unbounded(),
             )
             .await;
         }
 
         // 6. 创建 ClockActor（发布 Clock 事件到 income_pubsub）
-        let _clock_actor = ClockActor::spawn_link_with_mailbox(
+        producers.spawn::<ClockActor, _>(
             &actor_ref,
+            "ClockActor",
             ClockActorArgs {
                 interval_ms: 1000,
                 income_pubsub: income_pubsub.clone(),
             },
-            mailbox::unbounded(),
         )
         .await;
 
@@ -1047,14 +1063,15 @@ impl Actor for ManagerActor {
                     symbol_metas: Self::get_symbol_metas_for(&symbol_metas, setup.exchange),
                 };
                 let exchange = setup.exchange;
-                async move { (setup.spawn_actor)(ctx).await.map(|ops| (exchange, ops)) }
+                async move { (setup.spawn_actor)(ctx).await.map(|(ops, stop)| (exchange, ops, stop)) }
             })
             .collect();
         let mut exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>> = HashMap::new();
         for result in futures_util::future::join_all(spawn_futures).await {
-            let (exchange, ops) = result?;
+            let (exchange, ops, stop) = result?;
             tracing::info!(%exchange, "ExchangeActor ready");
             exchange_actors.insert(exchange, ops);
+            producers.push_handle(stop);
         }
 
         tracing::info!("ManagerActor started with all child actors linked");
@@ -1070,7 +1087,8 @@ impl Actor for ManagerActor {
             exchange_actors,
             paper_pubsub,
             executors: Vec::new(),
-            intentionally_stopped: HashSet::new(),
+            producers,
+            pipeline,
             baselined_positions: HashSet::new(),
         })
     }
@@ -1080,31 +1098,52 @@ impl Actor for ManagerActor {
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
+        // 先停生产端、再停管线。顺序反了的话，生产者 on_stop 里补发的最后一批事件
+        // （如 IbkrPublicWsActor 等 commission 的成交）会发进一个已经死掉的总线 ——
+        // 那正是本次停机链要防的失效。
+        //
+        // 递归自动成立：每个交易所 actor 的 on_stop 又在等它自己那批 WS / 轮询子 actor。
+        self.producers.shutdown().await;
+        self.pipeline.shutdown().await;
         tracing::info!(reason = ?reason, "ManagerActor stopped");
         Ok(())
     }
 
-    /// 子 actor 终止时的处置：**区分"有意撤下"与"意外死亡"**。
+    /// 监督树上的 actor 终止时的处置：**主动退出放行，出错级联退出**。
     ///
-    /// 这个区分是必需的：降级（[`RemoveStrategies`]）与投产失败回滚都会主动停掉 executor，
-    /// 若一律判为"子 actor 挂了"就会整机退出 —— 撤下一个 symbol 的实例把整个引擎带走，
-    /// 显然不是意图。
+    /// 判据就是 kameo 给的 [`ActorStopReason`]：`Normal` 意味着有人调用了
+    /// `stop_gracefully()`（降级 [`RemoveStrategies`]、投产失败回滚、外部观察者收工），
+    /// 引擎继续运行；`Killed` / `Panicked` / `LinkDied` 都是事故，一律受控停机，交由外部
+    /// 编排重启 —— 本项目不重连、不降级运行。
     ///
-    /// 判据是 [`Self::intentionally_stopped`]（**记录**的意图），不是 stop reason（**推断**的
-    /// 意图）—— 理由见该字段的文档。因此：**只有本 manager 主动停掉的实例会被放行**，其余
-    /// 一切死亡（含以 `Normal` 结束的）都级联退出。这符合本项目的错误处理约定：不重连、
-    /// 不降级运行，一个子系统失效即受控停机，交由外部编排重启。
+    /// # 这条判据成立的前提：没有 actor 会悄悄以 `Normal` 死掉
+    ///
+    /// `Normal` 在 kameo 里有两个来源：`stop_gracefully()`，以及**邮箱所有 sender 被 drop**
+    /// （`kind.rs` 里 `next()` 返回 `None` 那条）。后者若可达，"时钟停了""对账停了"就会被
+    /// 当成正常退出而静默忽略 —— 判据也就废了。
+    ///
+    /// 引擎靠两条保证把后者堵死，**新增 actor 时必须继续满足其一**：
+    ///
+    /// - **流驱动的 actor 在流结束时 `kill()` 自己**（`Killed`，响亮）。`attach_stream` 会在
+    ///   任务丢引用**之前**先投递 `StreamMessage::Finished`，所以这一步一定来得及。WS 类由
+    ///   [`crate::dispatch_ws_stream_message`] 统一保证，各 polling actor 在自己的 `Finished`
+    ///   分支里做同样的事。
+    /// - **manager 持有强引用**（`exchange_actors` / `metrics` / `income_processor` /
+    ///   `position_reconciler` / `executors`），压根饿不死。
+    ///
+    /// 外部注册的观察者由 [`crate::engine::spawn_supervised`] 挂进来，调用方持有返回的
+    /// ActorRef，同样不会饿死。
     async fn on_link_died(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         id: ActorId,
         reason: ActorStopReason,
     ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        if self.intentionally_stopped.remove(&id) {
-            tracing::info!(actor_id = ?id, reason = ?reason, "策略实例已按预期撤下，引擎继续运行");
+        if reason.is_normal() {
+            tracing::info!(actor_id = ?id, "受监督 actor 已主动退出，引擎继续运行");
             return Ok(ControlFlow::Continue(()));
         }
-        tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
+        tracing::error!(actor_id = ?id, reason = ?reason, "受监督 actor 出错终止，整机退出");
         Ok(ControlFlow::Break(ActorStopReason::LinkDied {
             id,
             reason: Box::new(reason),
@@ -1174,26 +1213,43 @@ impl Message<AddStrategies> for ManagerActor {
     }
 }
 
-/// 停止管理器
-pub struct Stop;
 
-impl Message<Stop> for ManagerActor {
+
+/// 把一个外部受监督 actor 登记进 manager 的停机链，供 [`crate::engine::spawn_supervised`]
+/// 使用，不要直接发。
+///
+/// 缺了这一步，观察者虽然 link 在监督树上（出错会级联），停机时却没人等它收尾 ——
+/// 它会一直活到 runtime drop 才被硬砍。
+pub struct RegisterSupervisedChild(pub ChildStop);
+
+impl Message<RegisterSupervisedChild> for ManagerActor {
     type Reply = ();
 
-    async fn handle(&mut self, _msg: Stop, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
-        tracing::info!("Stopping ManagerActor...");
-        ctx.actor_ref().stop_gracefully().await.ok();
+    async fn handle(
+        &mut self,
+        msg: RegisterSupervisedChild,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.pipeline.push_handle(msg.0);
     }
 }
 
 /// 订阅 Income 事件（行情/账户事件流，供外部观察者导出指标或通知）
 ///
+/// # 只收受监督的 actor
+///
+/// 入参是 [`Supervised<A>`]，只能由 [`crate::engine::spawn_supervised`] 产出 —— 于是
+/// "订一个没人看着的 actor"在类型上就写不出来。这道门是必要的：订阅本身不建立任何
+/// 监督关系，订阅者若已经死了（或订阅之后死掉），投递遇 `ActorNotRunning` 会把它
+/// **静默摘除**，事件从此不再送达，而调用方一无所知。
+///
 /// # 退订方式
 ///
 /// 底层 PubSub（kameo_actors）没有显式退订原语：**订阅者 actor 停机即自动被摘除**
-/// （投递遇 ActorNotRunning 时移除该订阅者）。外部观察者要摘除自己，stop 掉自己的
-/// actor 即可，不存在也不需要 Unsubscribe 消息。
-pub struct SubscribeIncome<A: Actor>(pub ActorRef<A>);
+/// （投递遇 ActorNotRunning 时移除该订阅者）。受监督的订阅者要收工，对自己的
+/// [`Supervised::actor_ref`] 调 `stop_gracefully()` 即可 —— 那产生 `Normal`，
+/// [`ManagerActor::on_link_died`] 据此放行，引擎照常运行，不需要另行声明什么。
+pub struct SubscribeIncome<A: Actor>(pub Supervised<A>);
 
 impl<A> Message<SubscribeIncome<A>> for ManagerActor
 where
@@ -1206,7 +1262,7 @@ where
         msg: SubscribeIncome<A>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Err(e) = self.income_pubsub.tell(Subscribe(msg.0)).send().await {
+        if let Err(e) = self.income_pubsub.tell(Subscribe(msg.0.into_inner())).send().await {
             tracing::error!(error = %e, "Failed to publish to IncomePubSub");
         }
     }
@@ -1251,7 +1307,7 @@ impl Message<PublishCustomEvent> for ManagerActor {
 
 /// 订阅 Outcome 事件
 /// 退订方式见 [`SubscribeIncome`]（订阅者停机即自动摘除）。
-pub struct SubscribeOutcome<A: Actor>(pub ActorRef<A>);
+pub struct SubscribeOutcome<A: Actor>(pub Supervised<A>);
 
 impl<A> Message<SubscribeOutcome<A>> for ManagerActor
 where
@@ -1264,7 +1320,7 @@ where
         msg: SubscribeOutcome<A>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Err(e) = self.outcome_pubsub.tell(Subscribe(msg.0)).send().await {
+        if let Err(e) = self.outcome_pubsub.tell(Subscribe(msg.0.into_inner())).send().await {
             tracing::error!(error = %e, "Failed to publish to OutcomePubSub");
         }
     }
@@ -1550,7 +1606,7 @@ impl ManagerActor {
 
 /// 订阅模拟账户私有事件总线（Supervisor / 观测层用）。
 /// 退订方式见 [`SubscribeIncome`]（订阅者停机即自动摘除）。
-pub struct SubscribePaper<A: Actor>(pub ActorRef<A>);
+pub struct SubscribePaper<A: Actor>(pub Supervised<A>);
 
 impl<A> Message<SubscribePaper<A>> for ManagerActor
 where
@@ -1563,7 +1619,7 @@ where
         msg: SubscribePaper<A>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Err(e) = self.paper_pubsub.tell(Subscribe(msg.0)).send().await {
+        if let Err(e) = self.paper_pubsub.tell(Subscribe(msg.0.into_inner())).send().await {
             tracing::error!(error = %e, "Failed to subscribe to PaperPubSub");
         }
     }
@@ -1735,19 +1791,14 @@ mod stop_semantics_tests {
     }
 
     struct Parent {
-        /// 与 `ManagerActor::intentionally_stopped` 同义
-        intentionally_stopped: HashSet<ActorId>,
         seen: Arc<Mutex<Vec<String>>>,
     }
 
     impl Actor for Parent {
-        type Args = (HashSet<ActorId>, Arc<Mutex<Vec<String>>>);
+        type Args = Arc<Mutex<Vec<String>>>;
         type Error = Infallible;
         async fn on_start(args: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
-            Ok(Self {
-                intentionally_stopped: args.0,
-                seen: args.1,
-            })
+            Ok(Self { seen: args })
         }
         async fn on_link_died(
             &mut self,
@@ -1756,8 +1807,8 @@ mod stop_semantics_tests {
             reason: ActorStopReason,
         ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
             self.seen.lock().unwrap().push(format!("{reason:?}"));
-            // 与 ManagerActor 一致：按**记录的意图**放行，而非 stop reason
-            if self.intentionally_stopped.remove(&id) {
+            // 与 ManagerActor 一致：按 stop reason 判 —— 主动退出放行，出错级联
+            if reason.is_normal() {
                 return Ok(ControlFlow::Continue(()));
             }
             Ok(ControlFlow::Break(ActorStopReason::LinkDied {
@@ -1767,21 +1818,12 @@ mod stop_semantics_tests {
         }
     }
 
-    /// `intended` 决定父 actor 是否事先登记了"要停这个子 actor"
-    async fn run(intended: bool, graceful: bool) -> (bool, Vec<String>) {
-        // 登记的 id 必须与真正被停的那个一致，故先 spawn parent（空集合），拿到 child 的 id
-        // 之后再按需告知 parent。
+    /// `graceful` 决定子 actor 是主动停（Normal）还是被 kill（Killed）
+    async fn run(graceful: bool) -> (bool, Vec<String>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let parent = Parent::spawn_with_mailbox((HashSet::new(), seen.clone()), mailbox::unbounded());
+        let parent = Parent::spawn_with_mailbox(seen.clone(), mailbox::unbounded());
         let child = Child::spawn_link_with_mailbox(&parent, (), mailbox::unbounded()).await;
 
-        if intended {
-            parent
-                .ask(RegisterIntent(child.id()))
-                .send()
-                .await
-                .expect("登记意图");
-        }
         if graceful {
             child.stop_gracefully().await.expect("发送 Stop");
         } else {
@@ -1795,45 +1837,25 @@ mod stop_semantics_tests {
         (parent.is_alive(), reasons)
     }
 
-    struct RegisterIntent(ActorId);
-
-    impl Message<RegisterIntent> for Parent {
-        type Reply = ();
-        async fn handle(&mut self, msg: RegisterIntent, _: &mut Context<Self, Self::Reply>) {
-            self.intentionally_stopped.insert(msg.0);
-        }
-    }
-
-    /// **有意撤下**（已登记）→ 父 actor 必须活着。
+    /// **主动退出**（stop_gracefully → Normal）→ 父 actor 必须活着。
     ///
-    /// 对应降级（RemoveStrategies）与投产失败回滚：撤下一个 symbol 的实例不该把整个引擎带走。
+    /// 对应降级（RemoveStrategies）、投产失败回滚，以及外部观察者收工：
+    /// 撤下一个实例不该把整个引擎带走。
     #[tokio::test]
-    async fn intentional_stop_lets_the_parent_survive() {
-        let (parent_alive, reasons) = run(true, true).await;
+    async fn graceful_stop_lets_the_parent_survive() {
+        let (parent_alive, reasons) = run(true).await;
         assert_eq!(reasons, vec!["Normal".to_string()]);
-        assert!(parent_alive, "有意撤下子 actor 却把父 actor 带走了");
+        assert!(parent_alive, "主动撤下子 actor 却把父 actor 带走了");
     }
 
-    /// **Critical 防线**：没登记过的死亡，即使 reason 是 `Normal`，也必须级联退出。
+    /// **出错死亡**（kill → Killed）→ 级联退出。
     ///
-    /// 这是"记录意图"相对"按 reason 推断"的全部价值所在：kameo 在"邮箱所有 sender 被 drop"
-    /// 时同样报 `Normal`，而本进程里 ClockActor / PositionPollingActor / 各 polling actor 的
-    /// ActorRef 都是当场丢弃、靠自身 attach_stream 的任务持引用存活的。那条依赖一旦变化，
-    /// 它们会以 Normal 死掉 —— 若按 reason 放行，"时钟停了""对账停了"就被静默忽略了。
-    #[tokio::test]
-    async fn unexpected_normal_stop_still_takes_the_parent_down() {
-        let (parent_alive, reasons) = run(false, true).await;
-        assert_eq!(reasons, vec!["Normal".to_string()], "前提：这次确实是 Normal 停止");
-        assert!(
-            !parent_alive,
-            "非预期的子 actor 停止被静默放行了 —— 时钟/对账停摆会就此无人知晓"
-        );
-    }
-
-    /// 意外死亡（kill）→ 级联退出。守住"WS 解析失败自 kill 即整机受控停机"这条既有约定。
+    /// 守住"WS 解析失败 / 流意外结束自 kill 即整机受控停机"这条既有约定 ——
+    /// 各流驱动 actor 的 `StreamMessage::Finished` 分支正是靠 kill 把静默的
+    /// `Normal` 变成响亮的 `Killed`，判据才敢只看 reason（见 `on_link_died` 文档）。
     #[tokio::test]
     async fn killed_child_takes_the_parent_down() {
-        let (parent_alive, reasons) = run(false, false).await;
+        let (parent_alive, reasons) = run(false).await;
         assert_eq!(reasons, vec!["Killed".to_string()]);
         assert!(!parent_alive, "子 actor 异常死亡却没有级联退出");
     }

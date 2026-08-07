@@ -10,6 +10,7 @@
 //! ├── HyperliquidPublicWsActor [spawn_link]
 //! └── HyperliquidPrivateWsActor [spawn_link] (optional, 需要凭证)
 
+use crate::actor_lifecycle::ChildGroup;
 use super::funding_fee_polling::{
     HyperliquidFundingFeePollingActor, HyperliquidFundingFeePollingActorArgs,
 };
@@ -19,13 +20,11 @@ use crate::domain::{ExchangeError, Symbol, SymbolMeta};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
-use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
+use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
-use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::HashMap;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
@@ -52,6 +51,8 @@ pub struct HyperliquidActorArgs {
 pub struct HyperliquidActor {
     /// Public WebSocket Actor
     public_ws: ActorRef<HyperliquidPublicWsActor>,
+    /// 全部子 actor：谁 spawn 的谁负责等（见 [`crate::actor_lifecycle`]）
+    children: ChildGroup,
 }
 
 impl Actor for HyperliquidActor {
@@ -74,27 +75,28 @@ impl Actor for HyperliquidActor {
         };
 
         // 1. 并发 spawn 两个 WS actor
-        let public_ws = HyperliquidPublicWsActor::spawn_link_with_mailbox(
+        let mut children = ChildGroup::default();
+        let public_ws = children.spawn::<HyperliquidPublicWsActor, _>(
             &actor_ref,
+            "HyperliquidPublicWsActor",
             HyperliquidPublicWsActorArgs {
                 income_pubsub: income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
                 dex: args.dex.clone(),
             },
-            mailbox::unbounded(),
         )
         .await;
         let private_ws_opt = if let Some(credentials) = args.credentials {
             Some(
-                HyperliquidPrivateWsActor::spawn_link_with_mailbox(
+                children.spawn::<HyperliquidPrivateWsActor, _>(
                     &actor_ref,
+                    "HyperliquidPrivateWsActor",
                     HyperliquidPrivateWsActorArgs {
                         wallet_address: credentials.wallet_address,
                         dex: args.dex.clone(),
                         income_pubsub: income_pubsub.clone(),
                     },
-                    mailbox::unbounded(),
                 )
                 .await,
             )
@@ -124,27 +126,27 @@ impl Actor for HyperliquidActor {
         // 2.5 资费结算轮询：与私有 WS 一样按凭证门控（userFunding 要带 user 地址）。
         //     polling actor 的 on_start 只 attach_stream（无 IO），无需 wait_for_startup。
         if let Some(client) = hyperliquid_client {
-            HyperliquidFundingFeePollingActor::spawn_link_with_mailbox(
+            children.spawn::<HyperliquidFundingFeePollingActor, _>(
                 &actor_ref,
+                "HyperliquidFundingFeePollingActor",
                 HyperliquidFundingFeePollingActorArgs {
                     client,
                     income_pubsub: income_pubsub.clone(),
                     interval_ms: FUNDING_FEE_POLL_INTERVAL_MS,
                 },
-                mailbox::unbounded(),
             )
             .await;
         }
 
         // 3. 创建 CryptoStatusActor (加密货币 7x24 始终 Liquid)
-        CryptoStatusActor::spawn_link_with_mailbox(
+        children.spawn::<CryptoStatusActor, _>(
             &actor_ref,
+            "CryptoStatusActor",
             CryptoStatusActorArgs {
                 exchange: crate::domain::Exchange::Hyperliquid,
                 income_pubsub,
                 interval_ms: STATUS_BROADCAST_INTERVAL_MS,
             },
-            mailbox::unbounded(),
         )
         .await;
         tracing::info!(exchange = "Hyperliquid", "CryptoStatusActor created");
@@ -155,7 +157,7 @@ impl Actor for HyperliquidActor {
             "HyperliquidActor started"
         );
 
-        Ok(Self { public_ws })
+        Ok(Self { public_ws, children })
     }
 
     async fn on_stop(
@@ -163,21 +165,10 @@ impl Actor for HyperliquidActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
+        // 谁 spawn 的谁负责等（见 actor_lifecycle 模块文档）
+        self.children.shutdown().await;
         tracing::info!("HyperliquidActor stopped");
         Ok(())
-    }
-
-    async fn on_link_died(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        id: ActorId,
-        reason: ActorStopReason,
-    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
-        Ok(ControlFlow::Break(ActorStopReason::LinkDied {
-            id,
-            reason: Box::new(reason),
-        }))
     }
 }
 

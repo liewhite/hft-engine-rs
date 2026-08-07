@@ -1,3 +1,4 @@
+pub mod actor_lifecycle;
 pub mod backtest;
 pub mod domain;
 pub mod engine;

@@ -28,7 +28,8 @@
 use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::engine::{
-    init_tracing, load_config, wait_for_shutdown, Decision, ManagerActor, ManagerActorArgs,
+    init_tracing, load_config, spawn_supervised, wait_for_shutdown, Decision, ManagerActor,
+    ManagerActorArgs,
     PromotionPolicy, SubscribeIncome, SubscribePaper, SupervisorActor, SupervisorArgs, SymbolView,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
@@ -258,7 +259,9 @@ async fn main() -> anyhow::Result<()> {
         }) as Box<dyn Strategy>
     });
 
-    let supervisor = SupervisorActor::spawn_with_mailbox(
+    // 挂进引擎的监督树：它出错要整机退出，而不是留下一个没人看着的第二个根
+    let supervisor = spawn_supervised::<SupervisorActor>(
+        &manager,
         SupervisorArgs {
             symbols: symbols.clone(),
             exchange: EXCHANGE,
@@ -266,12 +269,9 @@ async fn main() -> anyhow::Result<()> {
             policy: Box::new(MyPolicy { _reserved: () }),
             manager: manager.clone(),
         },
-        mailbox::unbounded(),
-    );
-    supervisor
-        .wait_for_startup_result()
-        .await
-        .context("SupervisorActor 启动失败")?;
+    )
+    .await
+    .context("SupervisorActor 启动失败")?;
 
     // 两条总线都要订阅：共享总线给实盘成交与 Clock 节拍，paper 总线给各模拟账户的成交
     manager
@@ -285,6 +285,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("订阅模拟总线失败")?;
 
-    wait_for_shutdown(manager).await;
-    Ok(())
+    // 停机信号 → Ok；manager 意外终止 → Err，进程带着原因非零退出
+    wait_for_shutdown(manager).await
 }

@@ -13,6 +13,7 @@
 //! │   └── BinanceListenKeyActor [spawn_link]
 //! └── BinanceEquityPollingActor [spawn_link]
 
+use crate::actor_lifecycle::ChildGroup;
 use super::equity_polling::{BinanceEquityPollingActor, BinanceEquityPollingActorArgs};
 use super::funding_fee_polling::{BinanceFundingFeePollingActor, BinanceFundingFeePollingActorArgs};
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
@@ -24,13 +25,11 @@ use crate::exchange::binance::{
 };
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
 use crate::exchange::ExchangeClient;
-use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
+use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
-use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::HashMap;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
@@ -58,6 +57,8 @@ pub struct BinanceActor {
     public_ws: ActorRef<BinancePublicWsActor>,
     /// 常规市场 WebSocket（/market/ws：markPrice、kline、ticker、aggTrade）
     market_ws: ActorRef<BinancePublicWsActor>,
+    /// 全部子 actor：谁 spawn 的谁负责等（见 [`crate::actor_lifecycle`]）
+    children: ChildGroup,
 }
 
 /// 公共 WS 目标（Binance 迁移后按路由路径分流，两条连接）
@@ -121,39 +122,40 @@ impl Actor for BinanceActor {
         };
 
         // 1. 先并发 spawn 所有 actor（spawn 本身是 instant，on_start 异步跑）
-        let public_ws = BinancePublicWsActor::spawn_link_with_mailbox(
+        let mut children = ChildGroup::default();
+        let public_ws = children.spawn::<BinancePublicWsActor, _>(
             &actor_ref,
+            "BinancePublicWsActor",
             BinancePublicWsActorArgs {
                 url: WsTarget::PublicHighFreq.url().to_string(),
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
-            mailbox::unbounded(),
         )
         .await;
-        let market_ws = BinancePublicWsActor::spawn_link_with_mailbox(
+        let market_ws = children.spawn::<BinancePublicWsActor, _>(
             &actor_ref,
+            "BinanceMarketWsActor",
             BinancePublicWsActorArgs {
                 url: WsTarget::Market.url().to_string(),
                 income_pubsub: args.income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
-            mailbox::unbounded(),
         )
         .await;
         let private_ws_opt = if let Some(credentials) = args.credentials {
             Some(
-                BinancePrivateWsActor::spawn_link_with_mailbox(
+                children.spawn::<BinancePrivateWsActor, _>(
                     &actor_ref,
+                    "BinancePrivateWsActor",
                     BinancePrivateWsActorArgs {
                         credentials,
                         rest_base_url: args.rest_base_url,
                         income_pubsub: args.income_pubsub.clone(),
                         quote: args.quote.clone(),
                     },
-                    mailbox::unbounded(),
                 )
                 .await,
             )
@@ -191,37 +193,37 @@ impl Actor for BinanceActor {
         // 私有轮询与私有 WS 一样按凭证门控：无凭证时只订阅公共行情（non-auth 模式），
         // 否则 equity 轮询会每秒失败一次、刷满日志（既是噪音，也会掩盖真实告警）。
         if has_private_ws {
-            BinanceEquityPollingActor::spawn_link_with_mailbox(
+            children.spawn::<BinanceEquityPollingActor, _>(
                 &actor_ref,
+                "BinanceEquityPollingActor",
                 BinanceEquityPollingActorArgs {
                     client: args.client,
                     income_pubsub: args.income_pubsub.clone(),
                     interval_ms: 1000,
                 },
-                mailbox::unbounded(),
             )
             .await;
         }
         if let Some(client) = binance_client {
-            BinanceFundingFeePollingActor::spawn_link_with_mailbox(
+            children.spawn::<BinanceFundingFeePollingActor, _>(
                 &actor_ref,
+                "BinanceFundingFeePollingActor",
                 BinanceFundingFeePollingActorArgs {
                     client,
                     income_pubsub: args.income_pubsub.clone(),
                     interval_ms: 60_000,
                 },
-                mailbox::unbounded(),
             )
             .await;
         }
-        CryptoStatusActor::spawn_link_with_mailbox(
+        children.spawn::<CryptoStatusActor, _>(
             &actor_ref,
+            "CryptoStatusActor",
             CryptoStatusActorArgs {
                 exchange: crate::domain::Exchange::Binance,
                 income_pubsub: args.income_pubsub,
                 interval_ms: STATUS_BROADCAST_INTERVAL_MS,
             },
-            mailbox::unbounded(),
         )
         .await;
 
@@ -231,7 +233,7 @@ impl Actor for BinanceActor {
             "BinanceActor started"
         );
 
-        Ok(Self { public_ws, market_ws })
+        Ok(Self { public_ws, market_ws, children })
     }
 
     async fn on_stop(
@@ -239,21 +241,10 @@ impl Actor for BinanceActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
+        // 谁 spawn 的谁负责等（见 actor_lifecycle 模块文档）
+        self.children.shutdown().await;
         tracing::info!("BinanceActor stopped");
         Ok(())
-    }
-
-    async fn on_link_died(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        id: ActorId,
-        reason: ActorStopReason,
-    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
-        Ok(ControlFlow::Break(ActorStopReason::LinkDied {
-            id,
-            reason: Box::new(reason),
-        }))
     }
 }
 

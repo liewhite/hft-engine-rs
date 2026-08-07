@@ -10,6 +10,7 @@
 //! ├── OkxPublicWsActor [spawn_link]
 //! └── OkxPrivateWsActor [spawn_link] (optional, 需要凭证)
 
+use crate::actor_lifecycle::ChildGroup;
 use super::business_ws::{OkxBusinessWsActor, OkxBusinessWsActorArgs};
 use super::greeks_polling::{OkxGreeksPollingActor, OkxGreeksPollingActorArgs};
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
@@ -18,13 +19,11 @@ use crate::domain::{ExchangeError, Symbol, SymbolMeta};
 use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
 use crate::exchange::okx::{OkxClient, OkxCredentials};
-use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
+use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
-use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::HashMap;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
@@ -53,6 +52,8 @@ pub struct OkxActor {
     public_ws: ActorRef<OkxPublicWsActor>,
     /// Business WebSocket Actor (K线)
     business_ws: ActorRef<OkxBusinessWsActor>,
+    /// 全部子 actor：谁 spawn 的谁负责等（见 [`crate::actor_lifecycle`]）
+    children: ChildGroup,
 }
 
 impl Actor for OkxActor {
@@ -63,36 +64,37 @@ impl Actor for OkxActor {
         let income_pubsub = args.income_pubsub;
 
         // 1. 并发 spawn 三个 WS actor（spawn 本身瞬间返回）
-        let public_ws = OkxPublicWsActor::spawn_link_with_mailbox(
+        let mut children = ChildGroup::default();
+        let public_ws = children.spawn::<OkxPublicWsActor, _>(
             &actor_ref,
+            "OkxPublicWsActor",
             OkxPublicWsActorArgs {
                 income_pubsub: income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
-            mailbox::unbounded(),
         )
         .await;
-        let business_ws = OkxBusinessWsActor::spawn_link_with_mailbox(
+        let business_ws = children.spawn::<OkxBusinessWsActor, _>(
             &actor_ref,
+            "OkxBusinessWsActor",
             OkxBusinessWsActorArgs {
                 income_pubsub: income_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
-            mailbox::unbounded(),
         )
         .await;
         let private_ws_opt = if let Some(credentials) = args.credentials {
             Some(
-                OkxPrivateWsActor::spawn_link_with_mailbox(
+                children.spawn::<OkxPrivateWsActor, _>(
                     &actor_ref,
+                    "OkxPrivateWsActor",
                     OkxPrivateWsActorArgs {
                         credentials,
                         income_pubsub: income_pubsub.clone(),
                         symbol_metas: args.symbol_metas,
                     },
-                    mailbox::unbounded(),
                 )
                 .await,
             )
@@ -126,25 +128,25 @@ impl Actor for OkxActor {
         // Greeks 轮询要签名，故与私有 WS 一样按**凭证**门控（而非仅按 client 是否存在 ——
         // client 可以在无凭证下构造，只用公共 REST）。否则 non-auth 模式会每秒失败刷日志。
         if let (Some(client), true) = (args.client, has_private_ws) {
-            OkxGreeksPollingActor::spawn_link_with_mailbox(
+            children.spawn::<OkxGreeksPollingActor, _>(
                 &actor_ref,
+                "OkxGreeksPollingActor",
                 OkxGreeksPollingActorArgs {
                     client,
                     income_pubsub: income_pubsub.clone(),
                     interval_ms: GREEKS_POLLING_INTERVAL_MS,
                 },
-                mailbox::unbounded(),
             )
             .await;
         }
-        CryptoStatusActor::spawn_link_with_mailbox(
+        children.spawn::<CryptoStatusActor, _>(
             &actor_ref,
+            "CryptoStatusActor",
             CryptoStatusActorArgs {
                 exchange: crate::domain::Exchange::OKX,
                 income_pubsub,
                 interval_ms: STATUS_BROADCAST_INTERVAL_MS,
             },
-            mailbox::unbounded(),
         )
         .await;
 
@@ -154,7 +156,7 @@ impl Actor for OkxActor {
             "OkxActor started"
         );
 
-        Ok(Self { public_ws, business_ws })
+        Ok(Self { public_ws, business_ws, children })
     }
 
     async fn on_stop(
@@ -162,21 +164,10 @@ impl Actor for OkxActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
+        // 谁 spawn 的谁负责等（见 actor_lifecycle 模块文档）
+        self.children.shutdown().await;
         tracing::info!("OkxActor stopped");
         Ok(())
-    }
-
-    async fn on_link_died(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        id: ActorId,
-        reason: ActorStopReason,
-    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
-        Ok(ControlFlow::Break(ActorStopReason::LinkDied {
-            id,
-            reason: Box::new(reason),
-        }))
     }
 }
 

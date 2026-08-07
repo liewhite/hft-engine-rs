@@ -11,6 +11,7 @@
 //! ├── IbkrAccountPollingActor [spawn_link]
 //! └── IbkrStatusPollingActor [spawn_link]
 
+use crate::actor_lifecycle::ChildGroup;
 use super::account_polling::{IbkrAccountPollingActor, IbkrAccountPollingActorArgs};
 use super::public_ws::{IbkrPublicWsActor, IbkrPublicWsActorArgs};
 use super::snapshot_polling::{
@@ -23,13 +24,11 @@ use crate::exchange::ibkr::auth::{self, IbkrAuth};
 use crate::exchange::ibkr::IbkrClient;
 use crate::domain::{Exchange, ExchangeError};
 use crate::engine::IncomePubSub;
-use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
+use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
-use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::HashMap;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// IBKR 账户信息轮询间隔 (毫秒)
@@ -57,14 +56,10 @@ pub struct IbkrActorArgs {
 pub struct IbkrActor {
     /// Public WebSocket Actor
     public_ws: ActorRef<IbkrPublicWsActor>,
-    /// Tickle 保活 Actor
-    _tickle: ActorRef<IbkrTickleActor>,
-    /// 账户净值轮询 Actor
-    _account_polling: ActorRef<IbkrAccountPollingActor>,
-    /// 市场状态轮询 Actor
-    _status_polling: ActorRef<IbkrStatusPollingActor>,
-    /// 借券费/汇率 snapshot 轮询 Actor（可选；配置缺省时为 None）
-    _snapshot_polling: Option<ActorRef<IbkrSnapshotPollingActor>>,
+    /// 全部子 actor：谁 spawn 的谁负责等（见 [`crate::actor_lifecycle`]）。
+    /// 它同时替代了从前那几个 `_` 前缀字段 —— 那些只为"持住引用别让它饿死"而存在，
+    /// 现在保命与停机是同一件事。
+    children: ChildGroup,
 }
 
 impl Actor for IbkrActor {
@@ -101,8 +96,10 @@ impl Actor for IbkrActor {
                 ]
             })
             .unwrap_or_default();
-        let public_ws = IbkrPublicWsActor::spawn_link_with_mailbox(
+        let mut children = ChildGroup::default();
+        let public_ws = children.spawn::<IbkrPublicWsActor, _>(
             &actor_ref,
+            "IbkrPublicWsActor",
             IbkrPublicWsActorArgs {
                 auth: args.auth.clone(),
                 client: args.client.clone(),
@@ -111,16 +108,15 @@ impl Actor for IbkrActor {
                 session_id,
                 extra_md_fields,
             },
-            mailbox::unbounded(),
         )
         .await;
-        let tickle = IbkrTickleActor::spawn_link_with_mailbox(
+        let tickle = children.spawn::<IbkrTickleActor, _>(
             &actor_ref,
+            "IbkrTickleActor",
             IbkrTickleActorArgs {
                 auth: args.auth.clone(),
                 http,
             },
-            mailbox::unbounded(),
         )
         .await;
 
@@ -137,59 +133,50 @@ impl Actor for IbkrActor {
 
         // 4. 创建账户净值轮询 Actor (每 3 秒)
         //    持仓不在此处刷新——初始持仓由 ManagerActor 启动期统一 fetch，运行期靠 Fill 维护
-        let account_polling = IbkrAccountPollingActor::spawn_link_with_mailbox(
+        children.spawn::<IbkrAccountPollingActor, _>(
             &actor_ref,
+            "IbkrAccountPollingActor",
             IbkrAccountPollingActorArgs {
                 client: args.client.clone(),
                 income_pubsub: income_pubsub.clone(),
                 interval_ms: ACCOUNT_POLLING_INTERVAL_MS,
             },
-            mailbox::unbounded(),
         )
         .await;
         tracing::info!(exchange = "IBKR", "AccountPollingActor created");
 
         // 5. 创建市场状态轮询 Actor
-        let status_polling = IbkrStatusPollingActor::spawn_link_with_mailbox(
+        children.spawn::<IbkrStatusPollingActor, _>(
             &actor_ref,
+            "IbkrStatusPollingActor",
             IbkrStatusPollingActorArgs {
                 client: args.client.clone(),
                 income_pubsub: income_pubsub.clone(),
                 interval_ms: STATUS_POLLING_INTERVAL_MS,
             },
-            mailbox::unbounded(),
         )
         .await;
         tracing::info!(exchange = "IBKR", "StatusPollingActor created");
 
         // 6. 创建借券费/汇率 snapshot 轮询 Actor（可选）——与上面几个同为 spawn_link 子 actor，
         //    受本 IbkrActor 监管；它一旦致命退出（数据源失效）会经 on_link_died 上抛、整机重启。
-        let snapshot_polling = if let Some(cfg) = args.snapshot {
-            let actor = IbkrSnapshotPollingActor::spawn_link_with_mailbox(
+        if let Some(cfg) = args.snapshot {
+            children.spawn::<IbkrSnapshotPollingActor, _>(
                 &actor_ref,
+                "IbkrSnapshotPollingActor",
                 IbkrSnapshotPollingActorArgs {
                     client: args.client,
                     income_pubsub: income_pubsub.clone(),
                     cfg,
                 },
-                mailbox::unbounded(),
             )
             .await;
             tracing::info!(exchange = "IBKR", "SnapshotPollingActor created");
-            Some(actor)
-        } else {
-            None
-        };
+        }
 
         tracing::info!(exchange = "IBKR", "IbkrActor started");
 
-        Ok(Self {
-            public_ws,
-            _tickle: tickle,
-            _account_polling: account_polling,
-            _status_polling: status_polling,
-            _snapshot_polling: snapshot_polling,
-        })
+        Ok(Self { public_ws, children })
     }
 
     async fn on_stop(
@@ -197,21 +184,11 @@ impl Actor for IbkrActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
+        // 谁 spawn 的谁负责等。IbkrPublicWsActor 的 on_stop 要把还在等 commission 的
+        // 成交补发出去，漏掉会让本地持仓少记一笔并被下次基线固化。
+        self.children.shutdown().await;
         tracing::info!("IbkrActor stopped");
         Ok(())
-    }
-
-    async fn on_link_died(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        id: ActorId,
-        reason: ActorStopReason,
-    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        tracing::error!(actor_id = ?id, reason = ?reason, "Child actor died, shutting down");
-        Ok(ControlFlow::Break(ActorStopReason::LinkDied {
-            id,
-            reason: Box::new(reason),
-        }))
     }
 }
 

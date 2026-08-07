@@ -185,6 +185,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("添加策略失败")?;
 
-    wait_for_shutdown(manager).await;
-    Ok(())
+    // 停机信号 → Ok；manager 意外终止 → Err，进程带着原因非零退出
+    wait_for_shutdown(manager).await
 }

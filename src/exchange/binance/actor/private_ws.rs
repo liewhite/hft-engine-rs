@@ -5,6 +5,7 @@
 //! - 管理 BinanceListenKeyActor 子 actor (定时刷新 ListenKey)
 //! - 直接解析消息并发布到 IncomePubSub
 
+use crate::actor_lifecycle::ChildGroup;
 use super::listen_key::{BinanceListenKeyActor, BinanceListenKeyActorArgs};
 use crate::domain::{now_ms, Exchange, ExchangeError};
 use crate::engine::IncomePubSub;
@@ -14,13 +15,11 @@ use crate::exchange::client::WsError;
 use crate::exchange::ws_loop;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use futures_util::StreamExt;
-use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
+use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
-use kameo::mailbox;
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
-use std::ops::ControlFlow;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -44,10 +43,8 @@ pub struct BinancePrivateWsActor {
     quote: String,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
-    /// ListenKey 子 actor
-    listen_key_actor: Option<ActorRef<BinanceListenKeyActor>>,
-    /// 子 actor ID 映射
-    listen_key_actor_id: Option<ActorId>,
+    /// 全部子 actor：谁 spawn 的谁负责等（见 [`crate::actor_lifecycle`]）
+    children: ChildGroup,
 }
 
 impl BinancePrivateWsActor {
@@ -106,13 +103,14 @@ impl Actor for BinancePrivateWsActor {
         ));
 
         // 6. spawn_link ListenKeyActor 并等就绪
-        let listen_key_actor = BinanceListenKeyActor::spawn_link_with_mailbox(
+        let mut children = ChildGroup::default();
+        let listen_key_actor = children.spawn::<BinanceListenKeyActor, _>(
             &actor_ref,
+            "BinanceListenKeyActor",
             BinanceListenKeyActorArgs {
                 rest_base_url: args.rest_base_url,
                 api_key: args.credentials.api_key,
             },
-            mailbox::unbounded(),
         )
         .await;
         listen_key_actor
@@ -121,7 +119,6 @@ impl Actor for BinancePrivateWsActor {
             .map_err(|e| {
                 ExchangeError::Other(format!("BinanceListenKeyActor failed to start: {e}"))
             })?;
-        let listen_key_actor_id = listen_key_actor.id();
 
         tracing::info!("BinancePrivateWsActor started");
 
@@ -129,8 +126,7 @@ impl Actor for BinancePrivateWsActor {
             income_pubsub: args.income_pubsub,
             quote: args.quote,
             ws_tx: Some(outgoing_tx),
-            listen_key_actor: Some(listen_key_actor),
-            listen_key_actor_id: Some(listen_key_actor_id),
+            children,
         })
     }
 
@@ -141,29 +137,10 @@ impl Actor for BinancePrivateWsActor {
     ) -> Result<(), Self::Error> {
         // Drop ws_tx 会导致 ws_loop 退出
         self.ws_tx.take();
+        // 谁 spawn 的谁负责等（见 actor_lifecycle 模块文档）
+        self.children.shutdown().await;
         tracing::info!("BinancePrivateWsActor stopped");
         Ok(())
-    }
-
-    async fn on_link_died(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        id: ActorId,
-        reason: ActorStopReason,
-    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
-        // ListenKeyActor 死亡 -> 级联退出
-        if Some(id) == self.listen_key_actor_id {
-            tracing::error!(reason = ?reason, "BinanceListenKeyActor died, shutting down");
-            self.listen_key_actor = None;
-            self.listen_key_actor_id = None;
-            return Ok(ControlFlow::Break(ActorStopReason::LinkDied {
-                id,
-                reason: Box::new(reason),
-            }));
-        }
-
-        tracing::warn!(actor_id = ?id, reason = ?reason, "Unknown linked actor died");
-        Ok(ControlFlow::Continue(()))
     }
 }
 

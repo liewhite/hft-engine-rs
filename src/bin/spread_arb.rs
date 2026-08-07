@@ -203,8 +203,8 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(count = strategy_count, "Strategies batch added");
 
-    wait_for_shutdown(manager).await;
-    Ok(())
+    // 停机信号 → Ok；manager 意外终止 → Err，进程带着原因非零退出
+    wait_for_shutdown(manager).await
 }
 
 #[cfg(test)]
