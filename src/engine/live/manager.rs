@@ -227,22 +227,24 @@ impl ManagerActor {
     /// 返回 `Err(原因)` 供调用方计入"未完成"；超时不改用 `kill()`（那会打死引擎），而是如实
     /// 报出 —— 此时该实例已从 IncomeProcessor 注销，收不到新事件，危害有界。
     async fn stop_executor(&mut self, executor: &ActorRef<ExecutorActor>) -> Result<(), String> {
-        // 主动撤下的实例不再属于停机链：留着虽无害（等一个已死的 actor 立即返回），
-        // 但那份强引用会一直攒着 —— 晋升/降级反复几轮就成了泄漏。
-        self.producers.remove(executor);
         // 必须是 stop_gracefully 而非 kill：前者产生 `Normal`，`on_link_died` 据此放行；
         // kill 产生 `Killed`，会被判成事故、把整个引擎带走。
         if let Err(e) = executor.stop_gracefully().await {
             return Err(format!("发送 Stop 信号失败: {e}"));
         }
-        tokio::time::timeout(EXECUTOR_STOP_TIMEOUT, executor.wait_for_shutdown())
+        let stopped = tokio::time::timeout(EXECUTOR_STOP_TIMEOUT, executor.wait_for_shutdown())
             .await
-            .map_err(|_| {
-                format!(
-                    "等待实例停止超时（{}s）",
-                    EXECUTOR_STOP_TIMEOUT.as_secs()
-                )
-            })
+            .map_err(|_| format!("等待实例停止超时（{}s）", EXECUTOR_STOP_TIMEOUT.as_secs()));
+
+        // **确认停下来了**才摘出停机链：撤下的实例不该再攒着强引用（晋升/降级反复
+        // 几轮就是泄漏）。但没停下来的必须留着 —— 摘掉等于进程停机时没人再等它，
+        // 那它的收尾就会被 runtime drop 砍断，而这正是这套停机链要防的事。
+        // 留着的代价有界：它已从 IncomeProcessor 注销、收不到新事件，最坏是让停机
+        // 多等一会儿，并由根部的总 deadline 如实报出来。
+        if stopped.is_ok() {
+            self.producers.remove(executor);
+        }
+        stopped
     }
 
     /// 列出**本引擎**在该 (所, symbol) 上的挂单。
