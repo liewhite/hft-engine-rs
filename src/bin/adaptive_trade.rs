@@ -275,12 +275,12 @@ async fn main() -> anyhow::Result<()> {
 
     // 两条总线都要订阅：共享总线给实盘成交与 Clock 节拍，paper 总线给各模拟账户的成交
     manager
-        .tell(SubscribeIncome(supervisor.clone()))
+        .tell(SubscribeIncome::all(supervisor.clone()))
         .send()
         .await
         .context("订阅共享总线失败")?;
     manager
-        .tell(SubscribePaper(supervisor))
+        .tell(SubscribePaper::all(supervisor))
         .send()
         .await
         .context("订阅模拟总线失败")?;

@@ -46,6 +46,16 @@ pub struct OutcomeProcessorActor {
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// dry-run 模式
     dry_run: bool,
+    /// 已发出 REST 下单请求、但交易所**还没对它说过任何话**的订单。
+    ///
+    /// 用于判定一次 REST 失败是否还作数：`OrderStatus::Error` 是本地调用的结论
+    /// （只有本模块与模拟柜台会产生它，交易所侧永远不报），而 REST 响应可能比
+    /// WS 回报晚得多 —— 实测 IBKR 限流时成交 0.7 秒到、REST 的 503 十秒后才回。
+    /// 那时订单早已成交，再发一条"下单失败"就是假警报，还会在账本里留一行假的
+    /// error。所以：交易所一旦说过话（任何 OrderUpdate），本地的 REST 结论就作废。
+    ///
+    /// 由 spawn 出去的下单任务与 `Message<IncomeEvent>` 两处并发访问，故用 Mutex。
+    in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Actor for OutcomeProcessorActor {
@@ -63,6 +73,7 @@ impl Actor for OutcomeProcessorActor {
             income_pubsub: args.income_pubsub,
             symbol_metas: args.symbol_metas,
             dry_run: args.dry_run,
+            in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -271,10 +282,23 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
                         }
                     };
 
+                    // 登记为"在飞"：交易所还没对它说过任何话。任何一条 OrderUpdate
+                    // 到达都会把它摘掉，此后 REST 的结论不再作数（见 in_flight 文档）。
+                    self.in_flight
+                        .lock()
+                        .expect("in_flight 锁被毒化")
+                        .insert(order.client_order_id.clone());
+
                     let income_pubsub = self.income_pubsub.clone();
+                    let in_flight = self.in_flight.clone();
                     tokio::spawn(async move {
                         match client.place_order(exchange_order).await {
                             Ok(order_id) => {
+                                // REST 已给出结论，此后不再需要"在飞"登记
+                                in_flight
+                                    .lock()
+                                    .expect("in_flight 锁被毒化")
+                                    .remove(&order.client_order_id);
                                 tracing::info!(
                                     exchange = %order.exchange,
                                     symbol = %order.symbol,
@@ -308,8 +332,29 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
                                         );
                                     }
                                 }
-                                Self::send_order_error_static(&income_pubsub, &order, e.to_string())
+                                // 交易所已经对这张单说过话（成交/挂上/被拒），本地这条
+                                // REST 结论就作废：再发一条 Error 是假警报，还会在账本
+                                // 里留一行假的 error。remove 返回 false 即"已被摘掉"。
+                                let still_in_flight = in_flight
+                                    .lock()
+                                    .expect("in_flight 锁被毒化")
+                                    .remove(&order.client_order_id);
+                                if still_in_flight {
+                                    Self::send_order_error_static(
+                                        &income_pubsub,
+                                        &order,
+                                        e.to_string(),
+                                    )
                                     .await;
+                                } else {
+                                    tracing::info!(
+                                        exchange = %order.exchange,
+                                        symbol = %order.symbol,
+                                        client_order_id = ?order.client_order_id,
+                                        error = %e,
+                                        "REST 下单失败，但交易所已回报过该单 —— 以交易所回报为准，不再上报失败"
+                                    );
+                                }
                             }
                         }
                     });
@@ -493,5 +538,87 @@ mod tests {
             cancel_recheck_verdict(&[], "", "x-abc"),
             CancelRecheckVerdict::Gone
         );
+    }
+
+    // ==================== 迟到的 REST 失败结论 ====================
+    //
+    // 这套判定全靠时序，所以直接对 in_flight 这个判据本身建模：
+    // 「登记 → 交易所说话 → REST 失败」与「登记 → REST 失败」两条路必须分道。
+
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// 复刻处理器里的两步：交易所回报摘除、REST 失败时判是否还作数
+    fn ack(in_flight: &Mutex<HashSet<String>>, cid: &str) {
+        in_flight.lock().unwrap().remove(cid);
+    }
+    fn rest_failed_should_report(in_flight: &Mutex<HashSet<String>>, cid: &str) -> bool {
+        in_flight.lock().unwrap().remove(cid)
+    }
+
+    /// 交易所先回报、REST 后失败 → **不得**上报失败。
+    ///
+    /// 这正是 IBKR 限流时的真实时序：成交 0.7 秒到，REST 的 503 十秒后才回。
+    /// 那时单子早成交了，再发一条"下单失败"是假警报，还会往账本里写一行假 error
+    /// （实测一次事故里 754 条 error 有 751 条属于此类）。
+    #[test]
+    fn late_rest_failure_is_dropped_when_exchange_already_reported() {
+        let in_flight = Mutex::new(HashSet::new());
+        in_flight.lock().unwrap().insert("c-1".to_string());
+
+        ack(&in_flight, "c-1"); // WS 回报先到
+        assert!(
+            !rest_failed_should_report(&in_flight, "c-1"),
+            "交易所已回报过，迟到的 REST 失败不该再上报"
+        );
+    }
+
+    /// 交易所没说过话 → REST 失败照常上报（这才是真失败）
+    #[test]
+    fn rest_failure_is_reported_when_exchange_never_spoke() {
+        let in_flight = Mutex::new(HashSet::new());
+        in_flight.lock().unwrap().insert("c-2".to_string());
+
+        assert!(
+            rest_failed_should_report(&in_flight, "c-2"),
+            "交易所从未回报，REST 失败就是结论，必须上报"
+        );
+    }
+
+    /// 判据只作数一次：同一单不会因为重复回报而被上报两次
+    #[test]
+    fn a_single_order_is_judged_at_most_once() {
+        let in_flight = Mutex::new(HashSet::new());
+        in_flight.lock().unwrap().insert("c-3".to_string());
+
+        assert!(rest_failed_should_report(&in_flight, "c-3"));
+        assert!(
+            !rest_failed_should_report(&in_flight, "c-3"),
+            "已判过的单不该再次上报"
+        );
+    }
+}
+
+/// 交易所回报入口：**只用来作废本地的 REST 结论**。
+///
+/// 经 `SubscribeFilter` 只订阅 `OrderUpdate`，不吃行情洪水。收到任何一条回报就把该单
+/// 从 `in_flight` 摘掉 —— 交易所说过话之后，REST 那条迟到的失败结论不再作数。
+///
+/// 本处理器**不**据此维护订单状态：订单状态的单一出处是 `SymbolState`，这里只做
+/// "谁先说话"的判定。
+impl Message<IncomeEvent> for OutcomeProcessorActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
+        let ExchangeEventData::OrderUpdate(update) = &msg.data else {
+            return;
+        };
+        let Some(client_order_id) = &update.client_order_id else {
+            return;
+        };
+        self.in_flight
+            .lock()
+            .expect("in_flight 锁被毒化")
+            .remove(client_order_id);
     }
 }

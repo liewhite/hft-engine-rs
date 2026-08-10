@@ -40,7 +40,7 @@ use kameo::error::ActorStopReason;
 use kameo::mailbox;
 use kameo::message::{Context, Message};
 use kameo::Actor;
-use kameo_actors::pubsub::Subscribe;
+use kameo_actors::pubsub::{Subscribe, SubscribeFilter};
 use kameo_actors::DeliveryStrategy;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
@@ -939,7 +939,16 @@ impl Actor for ManagerActor {
         )
         .await;
         outcome_pubsub
-            .tell(Subscribe(live_processor))
+            .tell(Subscribe(live_processor.clone()))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+        // 出向处理器还要看**交易所回报**，用来作废迟到的 REST 失败结论
+        // （见 OutcomeProcessorActor::in_flight）。只订 OrderUpdate，不吃行情洪水。
+        income_pubsub
+            .tell(SubscribeFilter(live_processor, |e: &IncomeEvent| {
+                matches!(e.data, ExchangeEventData::OrderUpdate(_))
+            }))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
@@ -1251,7 +1260,28 @@ impl Message<RegisterSupervisedChild> for ManagerActor {
 /// （投递遇 ActorNotRunning 时移除该订阅者）。受监督的订阅者要收工，对自己的
 /// [`Supervised::actor_ref`] 调 `stop_gracefully()` 即可 —— 那产生 `Normal`，
 /// [`ManagerActor::on_link_died`] 据此放行，引擎照常运行，不需要另行声明什么。
-pub struct SubscribeIncome<A: Actor>(pub Supervised<A>);
+pub struct SubscribeIncome<A: Actor> {
+    actor: Supervised<A>,
+    filter: fn(&IncomeEvent) -> bool,
+}
+
+impl<A: Actor> SubscribeIncome<A> {
+    /// 订阅全部事件
+    pub fn all(actor: Supervised<A>) -> Self {
+        Self { actor, filter: |_| true }
+    }
+
+    /// 只订阅 `filter` 返回 true 的事件。
+    ///
+    /// 过滤在 PubSub 自己的任务里执行：不通过的事件**连 clone 都省掉**，订阅者也不会
+    /// 被唤醒。观测类订阅者往往只关心少数几种事件（如告警只看订单回报与成交），全收等于每个行情 tick 都白唤醒一次。
+    ///
+    /// `filter` 是 `fn` 指针不是闭包，**不能捕获**任何东西 —— 判据必须只看事件本身，
+    /// 这样"我订了什么"是一段可以直接读懂的静态声明，而不是运行期才知道的行为。
+    pub fn only(actor: Supervised<A>, filter: fn(&IncomeEvent) -> bool) -> Self {
+        Self { actor, filter }
+    }
+}
 
 impl<A> Message<SubscribeIncome<A>> for ManagerActor
 where
@@ -1264,7 +1294,12 @@ where
         msg: SubscribeIncome<A>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Err(e) = self.income_pubsub.tell(Subscribe(msg.0.into_inner())).send().await {
+        if let Err(e) = self
+            .income_pubsub
+            .tell(SubscribeFilter(msg.actor.into_inner(), msg.filter))
+            .send()
+            .await
+        {
             tracing::error!(error = %e, "Failed to publish to IncomePubSub");
         }
     }
@@ -1309,7 +1344,28 @@ impl Message<PublishCustomEvent> for ManagerActor {
 
 /// 订阅 Outcome 事件
 /// 退订方式见 [`SubscribeIncome`]（订阅者停机即自动摘除）。
-pub struct SubscribeOutcome<A: Actor>(pub Supervised<A>);
+pub struct SubscribeOutcome<A: Actor> {
+    actor: Supervised<A>,
+    filter: fn(&AccountOutcome) -> bool,
+}
+
+impl<A: Actor> SubscribeOutcome<A> {
+    /// 订阅全部事件
+    pub fn all(actor: Supervised<A>) -> Self {
+        Self { actor, filter: |_| true }
+    }
+
+    /// 只订阅 `filter` 返回 true 的事件。
+    ///
+    /// 过滤在 PubSub 自己的任务里执行：不通过的事件**连 clone 都省掉**，订阅者也不会
+    /// 被唤醒。
+    ///
+    /// `filter` 是 `fn` 指针不是闭包，**不能捕获**任何东西 —— 判据必须只看事件本身，
+    /// 这样"我订了什么"是一段可以直接读懂的静态声明，而不是运行期才知道的行为。
+    pub fn only(actor: Supervised<A>, filter: fn(&AccountOutcome) -> bool) -> Self {
+        Self { actor, filter }
+    }
+}
 
 impl<A> Message<SubscribeOutcome<A>> for ManagerActor
 where
@@ -1322,7 +1378,12 @@ where
         msg: SubscribeOutcome<A>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Err(e) = self.outcome_pubsub.tell(Subscribe(msg.0.into_inner())).send().await {
+        if let Err(e) = self
+            .outcome_pubsub
+            .tell(SubscribeFilter(msg.actor.into_inner(), msg.filter))
+            .send()
+            .await
+        {
             tracing::error!(error = %e, "Failed to publish to OutcomePubSub");
         }
     }
@@ -1608,7 +1669,28 @@ impl ManagerActor {
 
 /// 订阅模拟账户私有事件总线（Supervisor / 观测层用）。
 /// 退订方式见 [`SubscribeIncome`]（订阅者停机即自动摘除）。
-pub struct SubscribePaper<A: Actor>(pub Supervised<A>);
+pub struct SubscribePaper<A: Actor> {
+    actor: Supervised<A>,
+    filter: fn(&AccountIncome) -> bool,
+}
+
+impl<A: Actor> SubscribePaper<A> {
+    /// 订阅全部事件
+    pub fn all(actor: Supervised<A>) -> Self {
+        Self { actor, filter: |_| true }
+    }
+
+    /// 只订阅 `filter` 返回 true 的事件。
+    ///
+    /// 过滤在 PubSub 自己的任务里执行：不通过的事件**连 clone 都省掉**，订阅者也不会
+    /// 被唤醒。
+    ///
+    /// `filter` 是 `fn` 指针不是闭包，**不能捕获**任何东西 —— 判据必须只看事件本身，
+    /// 这样"我订了什么"是一段可以直接读懂的静态声明，而不是运行期才知道的行为。
+    pub fn only(actor: Supervised<A>, filter: fn(&AccountIncome) -> bool) -> Self {
+        Self { actor, filter }
+    }
+}
 
 impl<A> Message<SubscribePaper<A>> for ManagerActor
 where
@@ -1621,7 +1703,12 @@ where
         msg: SubscribePaper<A>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Err(e) = self.paper_pubsub.tell(Subscribe(msg.0.into_inner())).send().await {
+        if let Err(e) = self
+            .paper_pubsub
+            .tell(SubscribeFilter(msg.actor.into_inner(), msg.filter))
+            .send()
+            .await
+        {
             tracing::error!(error = %e, "Failed to subscribe to PaperPubSub");
         }
     }
