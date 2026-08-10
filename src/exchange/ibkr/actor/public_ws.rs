@@ -12,6 +12,29 @@
 //! (实测：韩股腿断流后报价冻结、且不自愈，同一条 ws 上另一条腿因被借券 snapshot 轮询顺带续命
 //! 而无恙)。故本 actor 必须在到期前主动重订阅；IBKR 建议先 `umd+` 再 `smd+` 干净刷新。
 //!
+//! # BBO 只在价量真的变化时发布
+//!
+//! IBKR 的行情报文**不带交易所侧时间戳**，发布时只能盖本地时刻。若"收到报文"就发一条，
+//! 这个本地时刻表达的就是**收包时刻**而不是**报价时刻**——而这条 ws 上还跑着周期性重订阅
+//! （见 `refresh_subscriptions`）和他方字段（借券可借量/费率）的推送，两者都会带着 conid
+//! 路由进 `handle_bbo`。结果是闭市期间源源不断发出"上一个交易日的收盘价 + 此刻的时间戳"。
+//!
+//! 下游（`spread_arb`）的三道闸门全部建立在 **"收到 BBO ≡ 有新报价"** 之上：陈旧的腿剔出
+//! 候选、中断恢复时重置 EMA、陈旧告警。等价一破三道全塌，其中最坏的一幕是 EMA 因为"从未
+//! 观测到中断"而永不重置——跳空开盘时，策略会把整段跳空幅度当成错价，在已经反映了新价格的
+//! 盘口上吃单。故判据收在 [`BboCache::merge`] 一处：**价量没变就不发**。这样本地时刻重新
+//! 等于"该报价第一次被观测到的时刻"，语义自洽。
+//!
+//! 代价是"行情静止"与"链路断流"在 BBO 流上不再可分。这是对的——链路存活本就不该由行情流
+//! 兼职承担：ws keepalive、tickle、以及本 actor 的 smd 周期刷新（失败即致命）已经独立证明它。
+//! 反过来，一个几分钟没动过的盘口本来就该被判为陈旧，策略不该在上面算偏离度。
+//!
+//! 该不变量**不覆盖进程重启后的第一条回包**：缓存是 actor 内存态，重启即清空，于是首条回包
+//! 哪怕带的还是上一个交易日的收盘价，也会被判为"变化"而发布一次。这里不额外设防，因为本
+//! actor 致命会经 `on_link_died` 整机退出——策略的 EMA 随之清零，需重新预热满 `ema_period`
+//! 条才产出偏离度，闭市期间单条 BBO 撑不起任何信号。写在这里是为了说明它是**有条件的**
+//! 不变量，别让后来者以为"发出来的每一条都必定是新报价"。
+//!
 //! 到期时限的两个来源不一致：IBKR 文档写 **10 分钟**；社区实测与客服答复是 **15 分钟**
 //! （"the topic will terminate automatically after 15 minutes and you will need to send a new
 //! request to continue to retrieve data for the instrument"，见 Voyz/ibind#145）。故以**更紧
@@ -68,6 +91,37 @@ struct BboCache {
     ask_price: f64,
     bid_size: f64,
     ask_size: f64,
+}
+
+impl BboCache {
+    /// 把报文里出现的 BBO 字段并进缓存，返回**是否有字段真的变了**。
+    ///
+    /// 返回值就是"这条报文算不算一次新报价"的唯一判据（见 `handle_bbo`）。缺失的字段保持
+    /// 缓存原值——IBKR 推的是增量，"这条没带 bid" 不等于 "bid 没了"。
+    ///
+    /// 精确比较、不设容差：两侧的值来自同一套解析路径，同一个报价必然解析出同一个 f64，
+    /// 容差只会把真实的最小价位跳动吞成"没变"。非有限值已在 [`wire::number`] 判死，
+    /// 不会以 `NaN != NaN` 的形式伪造出变化。
+    fn merge(&mut self, value: &serde_json::Value) -> bool {
+        // IB 字段映射: "84"→bid_price, "86"→ask_price, "85"→ask_size, "88"→bid_size
+        // IB 数字可能含逗号 "1,234.56"
+        let mut changed = false;
+        for (tag, slot) in [
+            ("84", &mut self.bid_price),
+            ("86", &mut self.ask_price),
+            ("85", &mut self.ask_size),
+            ("88", &mut self.bid_size),
+        ] {
+            let Some(n) = value.get(tag).and_then(wire::number) else {
+                continue;
+            };
+            if *slot != n {
+                *slot = n;
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 const MAX_SEEN_EXECUTIONS: usize = 10_000;
@@ -278,27 +332,14 @@ impl IbkrPublicWsActor {
 
         let cache = self.bbo_cache.entry(conid).or_default();
 
-        // IB 字段映射: "84"→bid_price, "86"→ask_price, "85"→ask_size, "88"→bid_size
-        // IB 数字可能含逗号 "1,234.56"
-        if let Some(v) = value.get("84") {
-            if let Some(price) = wire::number(v) {
-                cache.bid_price = price;
-            }
-        }
-        if let Some(v) = value.get("86") {
-            if let Some(price) = wire::number(v) {
-                cache.ask_price = price;
-            }
-        }
-        if let Some(v) = value.get("85") {
-            if let Some(size) = wire::number(v) {
-                cache.ask_size = size;
-            }
-        }
-        if let Some(v) = value.get("88") {
-            if let Some(size) = wire::number(v) {
-                cache.bid_size = size;
-            }
+        // 价量没有任何变化 → 这不是一次新报价，不发布（见模块文档"BBO 只在价量真的变化时发布"）。
+        // 会走到这里的两类报文：smd 周期重订阅的回包、以及同一 conid 上他方字段（借券可借量/
+        // 费率/可用性）的推送——它们都带 conid、都会路由进来，但都不代表盘口动了。
+        if !cache.merge(value) {
+            // debug 级：默认不输出，开了就是为了分辨"报文根本没到"与"到了但盘口没动"——
+            // 这条腿静默时，这两者是完全不同的故障（前者是断流，后者是闭市/静市）。
+            tracing::debug!(conid, symbol = %symbol, "IBKR BBO: 价量无变化，不发布");
+            return Ok(());
         }
 
         // 当 bid > 0 && ask > 0 时发布 BBO
@@ -1104,6 +1145,68 @@ mod tests {
     #[test]
     fn md_fields_without_extras_is_just_bbo() {
         assert_eq!(merge_md_fields(&BBO_FIELDS, &[]), ["84", "86", "85", "88"]);
+    }
+
+    /// 首次收齐价量算一次新报价（缓存从零到有）
+    #[test]
+    fn merge_reports_change_on_first_quote() {
+        let mut cache = BboCache::default();
+        assert!(cache.merge(&serde_json::json!({"84": "1,234.5", "86": 1235.0, "88": 100, "85": 200})));
+        assert_eq!(cache.bid_price, 1234.5);
+        assert_eq!(cache.ask_price, 1235.0);
+        assert_eq!(cache.bid_size, 100.0);
+        assert_eq!(cache.ask_size, 200.0);
+    }
+
+    /// **本次修复的核心**：重订阅回包带的是同一份收盘价，不能算作一次新报价。
+    /// 若算，本地时刻被刷新 → 下游"行情有多久没动过"当场失真 → 闭市期间用陈旧价出信号。
+    #[test]
+    fn merge_rejects_identical_requote() {
+        let mut cache = BboCache::default();
+        let quote = serde_json::json!({"84": 1234.5, "86": 1235.0, "88": 100, "85": 200});
+        assert!(cache.merge(&quote));
+        assert!(!cache.merge(&quote), "同值回包不是新报价");
+        assert!(!cache.merge(&serde_json::json!({"84": "1,234.5"})), "换个线路形态也还是同一个值");
+    }
+
+    /// 同一 conid 上他方字段（借券可借量/费率/可用性）的推送同样会路由进 handle_bbo，
+    /// 但它不带任何 BBO 字段——不能冒充一次新报价。
+    #[test]
+    fn merge_ignores_foreign_fields() {
+        let mut cache = BboCache::default();
+        assert!(cache.merge(&serde_json::json!({"84": 1234.5, "86": 1235.0})));
+        assert!(!cache.merge(&serde_json::json!({"7636": 50000, "7637": "1.25", "6509": "RB"})));
+        assert_eq!(cache.bid_price, 1234.5, "他方字段不得污染缓存");
+    }
+
+    /// 增量语义：这条没带 bid ≠ bid 没了，缺失字段保持原值；带来的新值才算变化。
+    #[test]
+    fn merge_keeps_absent_fields_and_detects_real_move() {
+        let mut cache = BboCache::default();
+        cache.merge(&serde_json::json!({"84": 1234.5, "86": 1235.0, "88": 100, "85": 200}));
+        assert!(cache.merge(&serde_json::json!({"86": 1235.5})));
+        assert_eq!(cache.bid_price, 1234.5, "未提及的 bid 保持原值");
+        assert_eq!(cache.ask_price, 1235.5);
+    }
+
+    /// 只有盘口量变化也是真实行情：它直接决定信号的下单量，不能当成"没变"吞掉。
+    #[test]
+    fn merge_treats_size_only_move_as_change() {
+        let mut cache = BboCache::default();
+        cache.merge(&serde_json::json!({"84": 1234.5, "86": 1235.0, "88": 100, "85": 200}));
+        assert!(cache.merge(&serde_json::json!({"88": 150})));
+        assert_eq!(cache.bid_size, 150.0);
+    }
+
+    /// 非有限值必须在解析层就判死：否则 `NaN != NaN` 会让每一条报文都被判成"有变化"，
+    /// 把本次修复从正门堵上的假新鲜从窗户放回来。
+    #[test]
+    fn merge_is_not_fooled_by_non_finite_values() {
+        let mut cache = BboCache::default();
+        cache.merge(&serde_json::json!({"84": 1234.5, "86": 1235.0, "88": 100, "85": 200}));
+        assert!(!cache.merge(&serde_json::json!({"88": "NaN", "85": "inf"})));
+        assert_eq!(cache.bid_size, 100.0, "垃圾值不得进缓存");
+        assert_eq!(cache.ask_size, 200.0);
     }
 
     /// 刷新周期必须显著小于服务端 TTL——否则到期与刷新之间会出现静默断流窗口。

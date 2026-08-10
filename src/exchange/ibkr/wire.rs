@@ -14,9 +14,9 @@
 /// 把一个 JSON 值取成数字：接受 Number 与 String（含千分位逗号）两种形态。
 ///
 /// 返回 `None` 表示**这个值不是数字**（而非"字段不存在"，那由调用方区分，
-/// 见 [`optional_number`]）。
+/// 见 [`optional_number`]）。**非有限值（NaN/inf）也归入 `None`**，理由见函数体注释。
 pub(crate) fn number(v: &serde_json::Value) -> Option<f64> {
-    match v {
+    let parsed = match v {
         serde_json::Value::Number(n) => n.as_f64(),
         serde_json::Value::String(s) => {
             let cleaned = s.replace(',', "");
@@ -29,6 +29,18 @@ pub(crate) fn number(v: &serde_json::Value) -> Option<f64> {
             }
         }
         _ => None,
+    };
+
+    // Rust 的 f64 解析会**成功**接受 "NaN" / "inf"，但非有限值不是行情或账本里的合法读数：
+    // 它会把下游算术整段污染成 NaN，且 NaN 与任何值（包括自己）都不相等——BBO 的"是否变化"
+    // 判定会因此恒为真，等于把"没有新报价"重新说成"有新报价"。在唯一的解析出口判死，
+    // 各调用方现成的 `None` 分支（跳过 / 报错）就是正确处置，无需各自再防一遍。
+    match parsed {
+        Some(n) if !n.is_finite() => {
+            tracing::warn!(raw = %v, "IB number 解析出非有限值 (NaN/inf)，按解析失败处理");
+            None
+        }
+        other => other,
     }
 }
 
@@ -73,6 +85,17 @@ mod tests {
         assert_eq!(number(&json!("1,234.5")), Some(1234.5));
         assert_eq!(number(&json!("n/a")), None);
         assert_eq!(number(&json!(null)), None);
+    }
+
+    /// Rust 的 `parse::<f64>()` 会**成功**接受这些字面量。放行非有限值的后果：账本被 NaN
+    /// 污染，且 `NaN != NaN` 会让 BBO 的"是否变化"判定恒为真（假新鲜）。一律按解析失败处理。
+    #[test]
+    fn numbers_reject_non_finite() {
+        for raw in ["NaN", "nan", "inf", "-inf", "infinity"] {
+            assert_eq!(number(&json!(raw)), None, "{raw} 必须按解析失败处理");
+        }
+        // 走 optional_number 时，"字段在但解析不了" 的既有姿态是 Err（致命），不得兜 0
+        assert!(optional_number(&json!({"price": "NaN"}), "price").is_err());
     }
 
     /// **三态**：缺失是合法的 None，字段在但坏是 Err —— 绝不兜 0
