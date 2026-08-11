@@ -572,11 +572,6 @@ impl SymbolState {
         }
     }
 
-    /// 移除指定的待处理订单
-    pub fn remove_pending_order(&mut self, client_order_id: &str) {
-        self.pending_orders.remove(client_order_id);
-    }
-
     /// 汇总跨所持仓与估值
     ///
     /// `baseline` 为各所的会话起始仓位（缺失视为 0）。缺 BBO 的腿不参与估值但计入

@@ -40,6 +40,8 @@ pub struct BacktestResult {
     pub final_equity: f64,
     pub realized_pnl: f64,
     pub fills: u64,
+    /// 回放的**行情**事件数。数据源合成的账户事件（BsGreeksSource 的 Greeks/Balance）
+    /// 不计入 —— 那不是行情，计进来会按合成频率成倍放大这个数字。
     pub market_events: u64,
     /// 非空持仓 (按 symbol 升序，保证确定性比对)
     pub positions: Vec<BacktestPosition>,
@@ -279,15 +281,18 @@ impl<'a> BacktestEngine<'a> {
     /// 直接按入向延迟投递。
     fn ingest(&mut self, ev: IncomeEvent) {
         self.now = ev.exchange_ts();
-        self.market_events += 1;
         let market = match &ev {
             IncomeEvent::Market(m) => m,
             IncomeEvent::Account(_) => {
+                // **不计入 market_events**：数据源合成的账户事件（如 BsGreeksSource 每秒
+                // 一条 Greeks）不是行情。计进去会把"回放了多少行情"这个数字按合成频率
+                // 成倍放大 —— 30 天回测里 260 万条合成 Greeks 会把真实成交笔数淹掉。
                 let delay = self.config.exchange_to_strategy_delay_ms;
                 self.schedule(self.now + delay, Action::Deliver(ev));
                 return;
             }
         };
+        self.market_events += 1;
         let Some(exchange) = market.data.exchange() else {
             // 无交易所归属的行情（如无 scope 的 Custom）不参与撮合，按入向延迟投递
             let delay = self.config.exchange_to_strategy_delay_ms;

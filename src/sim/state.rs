@@ -140,6 +140,16 @@ impl SimState {
         self.last_bbo.insert(bbo.symbol.clone(), bbo.clone());
     }
 
+    /// 只更新最新成交价、**不撮合** —— [`Self::observe_bbo`] 的成交流对偶。
+    ///
+    /// 用于给**惰性新建**的柜台播种参考价：撮合时的可成交性判定是"盘口对手价 > 最新成交价"
+    /// 二选一（见 [`Self::on_order_arrived`]），只播种盘口的话，纯成交流行情下新柜台的第一张
+    /// 订单会因"两者皆无"被错判 —— 市价单被拒、穿价的 PostOnly 该拒却挂上、穿价 GTC 该
+    /// taker 成交却挂进簿里。
+    pub fn observe_trade(&mut self, symbol: &Symbol, price: Price) {
+        self.last_trade.insert(symbol.clone(), price);
+    }
+
     /// 行情到达交易所：更新行情 + 撮合越价挂单。返回本次触发的成交/状态回报。
     ///
     /// 喂进不属于本所的行情是**路由 bug**（持有方应按所分发）：记 error 不撮合，
