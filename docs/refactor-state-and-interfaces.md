@@ -106,6 +106,27 @@ AccountClient 对象"在装配处被堵死，下游拿到 `Option` 即是权威�
 3. **三个测试替身瘦身**。`FakeClient` / `FaultyClient` 不必再桩掉 `fetch_all_symbol_metas`
    与 `fetch_symbol_meta` 两个它们永远不碰的方法 —— 接口收窄的收益在测试里立刻兑现。
 
+### 审查发现的 Critical（已修）
+
+拆分暴露了一个**既有的判据分叉**：投产的撤残单遇到"无账户所"跳过，而撤下的清理遇到同样
+情形返回 `Err`。同一事实两套结论。无凭证配置（`adaptive_trade` 明文支持"只跑模拟"）下一旦
+降级：executor 已停并移出登记，而 supervisor 收到 `Err` 会保持 `live = Some(..)` ——
+记账与事实背离，该 symbol 此后晋升被拒、降级重试永远撞同一个 `Err`，**永久卡死**。
+
+审查建议的首选修法是"投产处拒绝 Live + 无账户所"，**未采纳**：`exchange_symbols` 来自
+`public_streams()`，是策略**读**的所而非**交易**的所。按它拒绝会误伤合法配置 ——
+从 Binance 读盘口、只在 HL 下单。
+
+实际修法是把判据收敛成一个函数 `ManagerActor::exchange_side_cleanup`，两条路径共用：
+无账户 ⇒ 交易所侧不可能有本引擎的残留（下不了单、收不到私有流）⇒ 走 `finish_removal`
+干净收尾（仍如实上报此前累积的 `incomplete`）。
+
+**测试覆盖的是判据，不是完整撤下路径** —— `ManagerActor::on_start` 要联网建 client、
+拉 symbol metas，单测里起不来（同 `stop_semantics_tests` 的既有取舍）。
+
+顺带对齐的遗留：OKX 适配层的 `client: Option<_>` 现在也直接源于凭证（此前无条件传 `Some`
+再用元组 bool 门控），与 Binance 同一模式。
+
 ---
 
 ## R2 拆 `StateManager`

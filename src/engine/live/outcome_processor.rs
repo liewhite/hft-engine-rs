@@ -103,7 +103,7 @@ impl OrderGateway {
     /// 总线路径 spawn 后忽略返回值不会丢失信息。
     pub async fn place(&self, order: Order, comment: &str) -> Result<PlaceVerdict, String> {
         let Some(client) = self.accounts.get(&order.exchange).cloned() else {
-            let reason = format!("No client found for exchange {}", order.exchange);
+            let reason = format!("{} 没有账户（未配置凭证），无法下单", order.exchange);
             tracing::error!(exchange = %order.exchange, "{}", reason);
             self.send_order_error(&order, reason.clone()).await;
             return Err(reason);
@@ -257,7 +257,7 @@ impl OrderGateway {
         client_order_id: String,
     ) -> Result<(), String> {
         let Some(client) = self.accounts.get(&exchange).cloned() else {
-            let reason = format!("No client found for cancel_order on {exchange}");
+            let reason = format!("{exchange} 没有账户（未配置凭证），无法撤单");
             tracing::error!(%exchange, "{}", reason);
             return Err(reason);
         };

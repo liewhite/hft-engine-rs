@@ -126,9 +126,10 @@ impl Actor for OkxActor {
 
         // 3. polling actor 的 on_start 仅 attach_stream，省略 wait
         //
-        // Greeks 轮询要签名，故与私有 WS 一样按**凭证**门控（而非仅按 client 是否存在 ——
-        // client 可以在无凭证下构造，只用公共 REST）。否则 non-auth 模式会每秒失败刷日志。
-        if let (Some(client), true) = (args.client, has_private_ws) {
+        // Greeks 轮询要签名，故按**凭证**门控：装配处只在有凭证时才给 client
+        // （见 assembly::setup_okx），所以这里 `Some` 即"可轮询"，不必再判一次 bool。
+        // 无凭证时不起它 —— 否则 non-auth 模式会每秒失败刷日志。
+        if let Some(client) = args.client {
             children.spawn::<OkxGreeksPollingActor, _>(
                 &actor_ref,
                 "OkxGreeksPollingActor",

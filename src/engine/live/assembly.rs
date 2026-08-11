@@ -118,8 +118,10 @@ pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup
                 let actor = OkxActor::spawn_link_with_mailbox(
                     &ctx.manager,
                     OkxActorArgs {
-                        credentials: access.credentials,
-                        client: Some(client),
+                        credentials: access.credentials.clone(),
+                        // 只在有凭证时给 —— Greeks 轮询是账户私有能力，
+                        // "能不能轮询"由 Option 表达，不再靠 actor 内部另判 bool
+                        client: access.credentials.is_some().then_some(client),
                         symbol_metas: ctx.symbol_metas,
                         market_pubsub: ctx.market_pubsub,
                         account_pubsub: ctx.account_pubsub,
