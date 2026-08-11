@@ -205,9 +205,14 @@ metrics 用「持仓 × 价格 + 挂单 + 账户」。**一个类型有三组互
 fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent>;
 ```
 
-仓内全部四个策略实现的实际调用面并集只有 **8 个方法**（`symbol_state` / `position_size` /
-`position_sizes` / `positions` / `pending_orders` / `has_pending_orders` / `bbo` / `bbos`），
-而交出去的是 39 个。
+仓内全部策略实现的实际调用面并集是 **11 个方法**：`symbol_state` / `position_size` /
+`position_sizes` / `positions` / `pending_orders` / `has_pending_orders` / `bbo` / `bbos`
+（per-symbol），加 `equity` / `account_info` / `greeks`（账户级 —— `spread_arb` 的杠杆闸门
+与 `gamma_scalp` 的 delta 都要）。而交出去的是 39 个。
+
+> **一处更正**：本节初稿写的是 8 个方法，漏了账户级那三个 —— 当时的统计只扫了
+> 变量名叫 `state` 的调用点，而策略里那三处的变量名是 `state_manager`。
+> 这对 R3 的设计有实质影响：策略视图**必须**包含账户投影，不能只给 per-symbol 那三份。
 
 策略能读到其他 symbol 的状态、其他所的余额与希腊值、任意 symbol 的挂单，无机制阻止。
 连带后果：「策略是纯函数」实际是「对一个巨大可变历史投影的纯函数」；往 `StateManager`

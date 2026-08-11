@@ -12,7 +12,7 @@
 | 阶段 | 目标 | 对应违反 | 状态 |
 |---|---|---|---|
 | R1 | 拆 `ExchangeClient`：公共 / 账户两个 trait | V3 | **已完成** |
-| R2 | 拆 `StateManager`：四个单一职责投影 | V1 | 未开始 |
+| R2 | 拆 `StateManager`：四个单一职责投影 | V1 | **R2a 已完成**，R2b 未开始 |
 | R3 | 策略只拿受限视图 | V2 | 未开始（依赖 R2） |
 | R4 | 下单出口的分发判据收敛到一处 | V4 | **已完成** |
 | R5 | 收尾：投产编排独立、观测口径移出领域层 | V6 / V7 | 未开始 |
@@ -203,8 +203,39 @@ pub struct AccountView { balances, account_infos, greeks, cash_balances }
 `SymbolState::apply` 的拆法：按 variant 分派给对应投影，**保留"未知 symbol 事件 = 路由 bug"
 的 error 日志**（现在这条判断在门面上，拆完仍应在门面上，不要让三个投影各自静默忽略）。
 
-**R2b 切换消费者**：逐个消费者改为只持它需要的子结构，`StateManager` 退化为组合容器或删除。
-`SymbolState` 随之拆解——它现在是"per-symbol 的一切"，拆后每个投影自己按 symbol 索引。
+**R2b 切换消费者**：逐个消费者改为只持它需要的子结构。首要目标是持仓账本 ——
+它现在持整个 `StateManager`，而只用得到持仓那一份。
+
+### R2a 完成记录
+
+四个投影已落地并导出：`SymbolMarket` / `SymbolPositions` / `SymbolOrders`（per symbol，
+由 `SymbolState` 门面组合）+ `AccountView`（账户级，挂在 `StateManager` 上）。
+既有调用面全部保留为委托方法，故消费者改动极小。335 用例通过，clippy 净增 0。
+
+三处实现决定：
+
+1. 两个方法（`seed` / `remove_timed_out`）的日志要 symbol，改为**传参**，而不是让三个投影
+   各存一份 symbol 副本。
+2. `SymbolPositions::all()`（全部腿，含未 seed）与 `seeded_positions()`（仅已 seed）并存，
+   语义分明：前者供降级平仓取量（"本实例账上有什么"），后者供对账与对外快照
+   （"哪些可参与比对" —— 未 seed 是未知，不是空仓）。
+3. `apply` 的路由 bug 判断（"未知 symbol 事件"）留在**门面**上，不下放给三个投影 ——
+   否则每个投影都要各判一次，判漏了会静默忽略。
+
+`market_statuses` 留在 `StateManager` 上，没有并进 `AccountView`：它是公共行情
+（不属于账户），又是 per-exchange 而非 per-symbol（进不了 `SymbolMarket`）。
+
+**测试夹具改走生产路径**：`state.rs` 与 `spread_arb` 的夹具此前直接写 `pub` 字段
+（`state.bbos.insert` / `state.positions.insert`）。字段私有化后改为盘口走 `apply(行情事件)`、
+仓位走 `seed_position`。直接写字段更省事，但那样测的就不是线上跑的那条路。
+
+### 一处影响 R3 的更正
+
+统计策略依赖面时我漏了账户级方法（当时只扫了变量名 `state` 的调用点，而策略里那三处叫
+`state_manager`）。实际是 **11 个**而非 8 个：per-symbol 八个之外，还有 `equity` /
+`account_info`（`spread_arb` 的杠杆闸门）与 `greeks`（`gamma_scalp` 的 delta）。
+
+**R3 的策略视图必须包含 `AccountView`**，不能只给 per-symbol 那三份。
 
 ### 验收
 
