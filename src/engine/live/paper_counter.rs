@@ -49,6 +49,8 @@ use kameo::Actor;
 use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use super::{AccountOutcome, AccountPubSub};
 
@@ -92,6 +94,8 @@ pub struct PaperCounterActor {
     symbol_metas: std::sync::Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 本地订单号发号器（模拟交易所返回的 order_id）
     order_id_gen: u64,
+    /// 延迟管道的入口（顺序保证见 [`Self::schedule`]）
+    delay_tx: mpsc::UnboundedSender<(Instant, Delayed)>,
 }
 
 impl PaperCounterActor {
@@ -167,29 +171,45 @@ impl PaperCounterActor {
 
     /// 延迟 `order_delay_ms` 后把消息投回自己，模拟到交易所的单程时延。
     ///
-    /// 延迟为常量，故同一 actor 上的投递顺序与到达顺序一致（不会乱序）。
-    fn schedule<M>(actor_ref: &ActorRef<PaperCounterActor>, delay_ms: u64, msg: M)
-    where
-        PaperCounterActor: Message<M>,
-        M: Send + 'static,
-    {
-        let actor_ref = actor_ref.clone();
-        tokio::spawn(async move {
-            if delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            if let Err(e) = actor_ref.tell(msg).send().await {
-                tracing::warn!(error = %e, "Paper counter delayed message dropped (actor stopped)");
-            }
-        });
+    /// # 顺序保证：到达柜台的顺序 == 提交顺序
+    ///
+    /// 走**单条 FIFO 管道 + 单消费者**（见 [`Self::on_start`] 起的那个任务），而不是每条
+    /// 消息各 `tokio::spawn` 一个 sleep —— 后者**不保证顺序**：同一延迟的两个 sleep 落在
+    /// 同一个定时器槽里时，唤醒次序由 tokio 内部的槽内链表决定，与提交序无关（此前这里
+    /// 的注释断言"延迟为常量故不会乱序"，那是没有依据的）。
+    ///
+    /// # 它实际防住什么（如实说明，别高估）
+    ///
+    /// **不是**"撤单抢在下单前到达"：撤单要带交易所订单号，而该号只在下单入簿后的
+    /// `Pending` 回报里才有（gamma_scalp 的 `cancel_confirmed` 也显式要求先确认），
+    /// 所以撤单在因果上必然晚于它那张单的入簿，这条竞态**不可达**。
+    ///
+    /// 真正受影响的是**同时提交的多张挂单之间的时间优先**：`SimState::resting` 是
+    /// `IndexMap`，插入序即撮合序（时间优先的近似）。乱序入簿会把后提交的单排到前面，
+    /// 使部分成交的预算分配偏离真实交易所。影响有界（都是本策略自己的单），但既然
+    /// "按到达顺序撮合"是撮合层写明的语义，就该让它真的成立。
+    ///
+    /// 所有延迟同为常量，故入队序即到期序，逐条 `sleep_until` 即兑现该语义；
+    /// 顺带省掉每条消息一个 spawn。
+    fn schedule(&self, delay_ms: u64, msg: Delayed) {
+        let due = Instant::now() + Duration::from_millis(delay_ms);
+        if self.delay_tx.send((due, msg)).is_err() {
+            tracing::warn!("Paper counter 延迟管道已关闭，消息丢弃（actor 正在停机）");
+        }
     }
+}
+
+/// 经延迟管道投回本 actor 的消息（见 [`PaperCounterActor::schedule`]）
+enum Delayed {
+    Place(ApplyPlace),
+    Cancel(ApplyCancel),
 }
 
 impl Actor for PaperCounterActor {
     type Args = PaperCounterArgs;
     type Error = Infallible;
 
-    async fn on_start(args: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::warn!(
             initial_balance = args.config.initial_balance_usdt,
             maker_fee_rate = args.config.maker_fee_rate,
@@ -197,6 +217,23 @@ impl Actor for PaperCounterActor {
             order_delay_ms = args.config.order_to_exchange_delay_ms,
             "PaperCounterActor started — PAPER TRADING, orders are matched locally and never sent to any exchange"
         );
+        // 延迟管道的单消费者：按 FIFO 逐条等到期再投回本 actor，兑现"到达柜台的顺序 ==
+        // 提交顺序"（见 Self::schedule）。管道随 actor 一同结束：actor 被 drop → delay_tx
+        // 关闭 → recv 得 None → 本任务退出并释放它持有的 ActorRef。
+        let (delay_tx, mut delay_rx) = mpsc::unbounded_channel::<(Instant, Delayed)>();
+        tokio::spawn(async move {
+            while let Some((due, msg)) = delay_rx.recv().await {
+                tokio::time::sleep_until(due).await;
+                let sent = match msg {
+                    Delayed::Place(p) => actor_ref.tell(p).send().await.map_err(|e| e.to_string()),
+                    Delayed::Cancel(c) => actor_ref.tell(c).send().await.map_err(|e| e.to_string()),
+                };
+                if let Err(e) = sent {
+                    tracing::warn!(error = %e, "Paper counter 延迟消息投递失败（actor 已停机），停止管道");
+                    break;
+                }
+            }
+        });
         Ok(Self {
             states: HashMap::new(),
             last_quotes: HashMap::new(),
@@ -204,6 +241,7 @@ impl Actor for PaperCounterActor {
             config: args.config,
             symbol_metas: args.symbol_metas,
             order_id_gen: 0,
+            delay_tx,
         })
     }
 
@@ -284,7 +322,7 @@ impl Message<MarketEvent> for PaperCounterActor {
 impl Message<AccountOutcome> for PaperCounterActor {
     type Reply = ();
 
-    async fn handle(&mut self, tagged: AccountOutcome, ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, tagged: AccountOutcome, _ctx: &mut Context<Self, Self::Reply>) {
         // 只负责模拟账户；实盘账户的订单由 OutcomeProcessorActor 发往交易所
         if !tagged.account.is_paper() {
             return;
@@ -314,14 +352,13 @@ impl Message<AccountOutcome> for PaperCounterActor {
                         delay_ms = delay,
                         "[PAPER] Order accepted by local counter"
                     );
-                    Self::schedule(
-                        ctx.actor_ref(),
+                    self.schedule(
                         delay,
-                        ApplyPlace {
+                        Delayed::Place(ApplyPlace {
                             account: account.clone(),
                             order,
                             order_id,
-                        },
+                        }),
                     );
                 }
             }
@@ -336,14 +373,13 @@ impl Message<AccountOutcome> for PaperCounterActor {
                     %account, %exchange, %symbol, %order_id, delay_ms = delay,
                     "[PAPER] Cancel accepted by local counter"
                 );
-                Self::schedule(
-                    ctx.actor_ref(),
+                self.schedule(
                     delay,
-                    ApplyCancel {
+                    Delayed::Cancel(ApplyCancel {
                         account,
                         exchange,
                         order_id,
-                    },
+                    }),
                 );
             }
         }

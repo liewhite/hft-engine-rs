@@ -1,6 +1,12 @@
 use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, OrderType, Position, Side, Symbol, Timestamp, TimeInForce, BBO};
 use crate::messaging::event::{AccountData, AccountEvent, IncomeEvent, MarketData};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+/// 记住多少个最近到达**权威终态**的订单号（见 [`SymbolState::recent_terminal`]）。
+///
+/// 只需覆盖"终态回报"与"迟到的非终态回报"之间的重排窗口 —— 那是跨投递路径的秒级错位，
+/// 512 远够用；环形淘汰让长会话下的内存有界。
+const TERMINAL_MEMORY: usize = 512;
 
 /// 待处理订单信息（保存完整订单 + 运行时状态）
 #[derive(Debug, Clone)]
@@ -42,6 +48,16 @@ pub struct SymbolState {
     pub positions: HashMap<Exchange, Position>,
     /// 待处理订单 (以 client_order_id 为 key)
     pending_orders: HashMap<String, PendingOrder>,
+    /// 已到达**权威终态**的 client_order_id 环形记录（容量 [`TERMINAL_MEMORY`]）。
+    ///
+    /// 用途只有一个：拦住"迟到的非终态回报把已结束的订单复活成**永久** pending"
+    /// （见 [`Self::apply_account_data`] 的重建分支）。
+    ///
+    /// 只记权威终态 —— `Filled`/`Cancelled`/`Rejected`，即交易所说的、或撤单后复查确认
+    /// 订单已不在挂单列表时合成的。**不记 `Error`**：那是本地 REST 调用的结论
+    /// （见 `crate::engine::OrderGateway`），订单可能实际活在交易所上，此时让随后到达的
+    /// 真实确认把它重新纳入跟踪正是我们要的。
+    recent_terminal: VecDeque<String>,
     /// 各所持仓基线的**快照请求时刻**（见 [`Self::seed_position`]）。
     ///
     /// 兼作"该所已播种"的判据：在表内 = 基线已写入，Fill 按时刻过滤后累加；
@@ -59,8 +75,17 @@ impl SymbolState {
             index_prices: HashMap::new(),
             positions: HashMap::new(),
             pending_orders: HashMap::new(),
+            recent_terminal: VecDeque::new(),
             position_seeded_at: HashMap::new(),
         }
+    }
+
+    /// 记下一个到达权威终态的订单号（环形淘汰，见 [`Self::recent_terminal`]）
+    fn remember_terminal(&mut self, client_order_id: &str) {
+        if self.recent_terminal.len() >= TERMINAL_MEMORY {
+            self.recent_terminal.pop_front();
+        }
+        self.recent_terminal.push_back(client_order_id.to_string());
     }
 
     /// 写入持仓**基线**（投产握手的载荷，不是事件 —— 见 [`crate::messaging::PositionBaseline`]）。
@@ -375,9 +400,18 @@ impl SymbolState {
                     match update.status {
                         OrderStatus::Filled
                         | OrderStatus::Cancelled
-                        | OrderStatus::Rejected { .. }
-                        | OrderStatus::Error { .. } => {
-                            // 订单终态，移除 pending order
+                        | OrderStatus::Rejected { .. } => {
+                            // **权威**终态（交易所说的，或撤单后复查确认已不在挂单列表时
+                            // 合成的）：移除 pending，并记下订单号 —— 此后任何非终态回报
+                            // 都是迟到的陈旧消息，不得据此复活它（见下方重建分支）。
+                            self.pending_orders.remove(client_id);
+                            self.remember_terminal(client_id);
+                        }
+                        OrderStatus::Error { .. } => {
+                            // 本地 REST 调用的结论（交易所侧永不上报此状态，见
+                            // `crate::engine::OrderGateway`）：订单**可能仍活在交易所上**，
+                            // 故移除 pending 但**不记**权威终态 —— 随后到达的真实确认应当
+                            // 把它重新纳入跟踪，否则它在交易所上活着、本地却隐形。
                             self.pending_orders.remove(client_id);
                         }
                         OrderStatus::Pending | OrderStatus::PartiallyFilled => {
@@ -396,6 +430,25 @@ impl SymbolState {
                                     exchange = %update.exchange,
                                     client_order_id = %client_id,
                                     "收到非本引擎挂单的更新，不纳入本地 pending"
+                                );
+                            } else if self.recent_terminal.iter().any(|id| id == client_id) {
+                                // 该单已到达权威终态，这条非终态回报是**迟到的陈旧消息**。
+                                //
+                                // 来路是跨投递路径的重排：撤单成功由 `OrderGateway` 在
+                                // spawn 出去的 REST 任务里合成 `Cancelled` 发布，而同一张
+                                // 单的 `PartiallyFilled` 由私有 WS 发布 —— 两条路径之间没有
+                                // 顺序保证，"先合成 Cancelled、后到达部分成交回报"完全可能。
+                                //
+                                // 若照重建，得到的是一张**永不消失**的 pending：终态已经过去
+                                // 不会再来，而超时清理只作用于 `Created` 态。后果是
+                                // `has_pending_orders` 恒真 —— spread_arb 直接以它为门
+                                // （`return vec![]`）且从不撤单，该 symbol 就此冻结到进程重启。
+                                tracing::warn!(
+                                    symbol = %self.symbol,
+                                    exchange = %update.exchange,
+                                    client_order_id = %client_id,
+                                    status = ?update.status,
+                                    "收到已终态订单的迟到非终态回报，忽略（不复活本地 pending）"
                                 );
                             } else if update.quantity <= 0.0 {
                                 // 本引擎的单、本地无记录，但 update 的数量是无效值 ——
@@ -835,6 +888,64 @@ mod tests {
         // 反手：卖 5 -> 净空 2
         state.apply(&fill(Side::Short, 5.0));
         assert!((state.position(EX).expect("position").size + 2.0).abs() < 1e-12);
+    }
+
+    /// **Critical 回归防线**：已到达权威终态的订单，不得被迟到的非终态回报复活。
+    ///
+    /// 真实来路是跨投递路径的重排：撤单成功由 `OrderGateway` 在 spawn 出去的 REST 任务里
+    /// 合成 `Cancelled`，而同一张单的 `PartiallyFilled` 由私有 WS 发布 —— 两条路径无顺序
+    /// 保证。若复活，得到的是一张**永不消失**的 pending（终态不会再来，而超时清理只作用于
+    /// `Created` 态），`has_pending_orders` 就此恒真：spread_arb 以它为硬门且从不撤单，
+    /// 该 symbol 冻结到进程重启。
+    #[test]
+    fn stale_non_terminal_never_resurrects_a_finished_order() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        let own_id = EX.new_cli_order_id();
+
+        // 下单 → 交易所确认 → 撤单成功（合成 Cancelled，权威终态）
+        state.add_pending_order(
+            Order {
+                id: String::new(),
+                exchange: EX,
+                symbol: SYMBOL.to_string(),
+                side: Side::Long,
+                order_type: OrderType::Limit { price: 100.0, tif: TimeInForce::GTC },
+                quantity: 1.0,
+                reduce_only: false,
+                client_order_id: own_id.clone(),
+            },
+            0,
+        );
+        state.apply(&order_update(Some(own_id.clone()), OrderStatus::Pending));
+        state.apply(&order_update(Some(own_id.clone()), OrderStatus::Cancelled));
+        assert!(!state.has_pending_orders(), "撤单确认后应无挂单");
+
+        // 迟到的部分成交回报（撤单前那一刻发生的成交，WS 走另一条路径后到）
+        state.apply(&order_update(Some(own_id), OrderStatus::PartiallyFilled));
+        assert!(
+            !state.has_pending_orders(),
+            "已终态订单被迟到回报复活成永久 pending —— 该 symbol 将冻结到进程重启"
+        );
+    }
+
+    /// 反面：`Error` 是**本地** REST 结论（交易所侧永不上报），订单可能仍活在交易所上 ——
+    /// 随后到达的真实确认必须能把它重新纳入跟踪，否则它在交易所上活着、本地却隐形，
+    /// 策略会在它旁边重复挂单。
+    #[test]
+    fn local_rest_error_still_allows_rebuild_on_late_confirmation() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        let own_id = EX.new_cli_order_id();
+
+        state.apply(&order_update(
+            Some(own_id.clone()),
+            OrderStatus::Error { reason: "REST timeout".to_string() },
+        ));
+        // 交易所其实收到了这张单，确认姗姗来迟
+        state.apply(&order_update(Some(own_id), OrderStatus::Pending));
+        assert!(
+            state.has_pending_orders(),
+            "本地 REST 失败后到达的真实确认必须重新纳入跟踪"
+        );
     }
 
     /// **宁缺勿假**：update 缺有效价格/数量（IBKR sor 推送写死 0）时不重建本地 pending。
