@@ -79,10 +79,13 @@ impl SymbolState {
     ///
     /// # 如实声明的残余窗口（没有交易所侧序号无法根除）
     ///
-    /// 成交发生在快照请求**之后**、其 Fill 在快照请求之前就送达 —— 不可能（因果）。
-    /// 反向：成交发生在快照**之前**（已含在快照）、Fill 在快照请求之后才送达
-    /// （`local_ts > snapshot_req_ts`）—— 会双计，窗口 = 交易所撮合到 Fill 送达的时延。
-    /// 该窗口与旧的总线投递方案等宽，只可能来自投产瞬间的外部/手动成交。
+    /// - 成交发生在快照**之前**（已含在快照）、Fill 在快照请求之后才送达
+    ///   （`local_ts > snapshot_req_ts`）—— 会双计，窗口 = 交易所撮合到 Fill 送达的时延。
+    /// - 再晋升时新 executor 用**新**快照 seed 而镜像沿用旧账本：新快照到注册完成之间的
+    ///   外部成交会造成 executor 与镜像分歧且对账不可见（见 `activate_executors` 的
+    ///   窗口清单）。
+    ///
+    /// 都只可能来自投产瞬间的外部/手动成交，与旧的总线投递方案等宽。
     pub fn seed_position(&mut self, position: &Position, snapshot_req_ts: Timestamp) -> bool {
         match self.position_seeded_at.get(&position.exchange) {
             Some(_) => {
@@ -95,6 +98,20 @@ impl SymbolState {
                 false
             }
             None => {
+                // 覆写"未 seed 但已被 Fill 累加出的仓位"是合法的（快照权威；可达场景：
+                // 前一批策略只订了别的所、本所的外部 Fill 已按 symbol 进入镜像累加），
+                // 但覆写非零值必须可见 —— 静默覆写会掩盖"累加值与快照不一致"的线索。
+                if let Some(existing) = self.positions.get(&position.exchange) {
+                    if !existing.is_empty() {
+                        tracing::warn!(
+                            symbol = %self.symbol,
+                            exchange = %position.exchange,
+                            accumulated_size = existing.size,
+                            snapshot_size = position.size,
+                            "seed 覆写了此前由 Fill 累加出的非零仓位（快照权威）"
+                        );
+                    }
+                }
                 tracing::info!(
                     symbol = %self.symbol,
                     exchange = %position.exchange,
@@ -697,6 +714,24 @@ mod tests {
         fresh.local_ts = 11;
         state.apply(&fresh);
         assert_eq!(state.position_size(EX), 3.0);
+    }
+
+    /// **seed 过滤按所隔离**：只 seed 了一个所时，另一个所的早时刻 Fill 不得被误过滤
+    /// （guard 按 `fill.exchange` 查表，不是按 symbol 全局生效）
+    #[test]
+    fn seed_filter_is_scoped_to_its_exchange() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        // 只 seed Binance（快照请求时刻 t=10）
+        state.seed_position(&position(2.0), 10);
+
+        // OKX 未 seed：t=1 送达的 Fill 照常从 0 累加，不受 Binance 的过滤时刻影响
+        let mut okx_fill = fill(Side::Long, 1.5);
+        if let ExchangeEventData::Fill(f) = &mut okx_fill.data {
+            f.exchange = Exchange::OKX;
+        }
+        state.apply(&okx_fill);
+        assert_eq!(state.position_size(Exchange::OKX), 1.5, "未 seed 的所不得被误过滤");
+        assert_eq!(state.position_size(EX), 2.0, "Binance 腿不受影响");
     }
 
     // ===== 外部挂单：只接管本引擎自己的单 =====

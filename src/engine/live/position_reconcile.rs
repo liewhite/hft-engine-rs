@@ -37,7 +37,7 @@
 //! "已注册、基线未到"的窗口不存在，历史上为它建的 Fill 缓冲 + 按快照时刻过滤重放的
 //! 机制随之删除；快照与 Fill 流的竞态由 seed 内置的时刻过滤统一兜住。
 
-use crate::domain::{now_ms, Exchange, Position, Symbol, SymbolMeta};
+use crate::domain::{Exchange, Position, Symbol, SymbolMeta};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::ExchangeClient;
 use crate::messaging::{ExchangeEventData, IncomeEvent, PositionBaseline, StateManager};
@@ -287,7 +287,9 @@ pub struct PositionReconcileActor {
 impl PositionReconcileActor {
     /// 拉一轮全部所的读数并比对。`Err` = 确认漂移或通道停摆过久，调用方应致命退出。
     async fn poll_and_reconcile(&mut self) -> Result<(), String> {
-        // 并发拉取各所（单所 REST 挂起不拖累其它所的对账节拍）
+        // 并发**发起**各所拉取，但整轮以最慢者为界（join_all）：单所 REST 挂到 client
+        // 超时（各所 client 均已配置）会把本轮所有所的比对与 Fill 摄入一起推迟至多一个
+        // 超时周期 —— 有界且自愈；积压导致的瞬时差值每轮都变，攒不成"差值稳定"的误杀。
         let fetches = self.clients.iter().map(|(exchange, client)| {
             let exchange = *exchange;
             let client = client.clone();
@@ -405,7 +407,6 @@ impl Message<StreamMessage<Instant, (), ()>> for PositionReconcileActor {
                 if self.clients.is_empty() {
                     return;
                 }
-                let _ = now_ms(); // 保持与其它轮询 actor 相同的时间来源约定（读数不带时戳）
                 if let Err(reason) = self.poll_and_reconcile().await {
                     // 本地持仓已不可信：策略的三道风控闸门（单边杠杆 / 账户杠杆 / 仓位上限）
                     // 全部基于它计算，继续跑等于无风控裸奔。受控退出交人工介入。
@@ -700,6 +701,25 @@ mod tests {
             .reconcile(EX, &[position(EX, 7.0)])
             .expect_err("若旧 Fill 也被累加，本地会是 7.0 而这里不会报漂移");
         assert!(err.contains("本地 6"), "got: {err}");
+    }
+
+    /// **注册前到达的 Fill 被丢弃，且不污染其后的 seed**（删缓冲重放后的核心行为）。
+    ///
+    /// 未注册 symbol 的 Fill 属于别的桶或尚未投产的 symbol，镜像无从归属只能丢弃；
+    /// 随后注册携带的快照（已含该成交，若它属于本账户）是权威值，从快照起算即正确。
+    #[test]
+    fn fill_before_registration_is_dropped_and_does_not_pollute_seed() {
+        let mut r = Reconciler::new(metas(), 1);
+        // 尚未注册任何 symbol：Fill 到达被丢弃
+        r.on_event(&fill_on(EX, Side::Long, 5.0, SNAPSHOT_TS + 1));
+        // 随后注册并 seed（快照读到 2.0）—— 之前丢弃的 Fill 不得出现在镜像里
+        r.register(&[SYM.to_string()], &[baseline_on(EX, 2.0)]);
+        r.reconcile(EX, &[position(EX, 2.0)])
+            .expect("镜像应恰为快照值 2.0，注册前的 Fill 不得混入");
+        let err = r
+            .reconcile(EX, &[position(EX, 7.0)])
+            .expect_err("若被丢弃的 Fill 混入了镜像，本地会是 7.0 而这里不会报漂移");
+        assert!(err.contains("本地 2"), "got: {err}");
     }
 
     /// 重复注册（再晋升）不得覆写镜像存量：镜像在实例撤下期间也一直在跟 Fill

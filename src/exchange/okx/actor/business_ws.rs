@@ -141,6 +141,13 @@ impl OkxBusinessWsActor {
             candles.pop();
         }
 
+        // 空批不发布：下游依赖 `HistoryCandles` 非空推导 symbol 路由（首根 K 线），
+        // 空数组只会静默落入广播作 no-op —— 在源头拦住并留下可见信号
+        if candles.is_empty() {
+            tracing::warn!(%inst_id, "历史 K 线为空（全部未 confirm 或交易所返回空），不发布");
+            return Ok(());
+        }
+
         let count = candles.len();
         let local_ts = now_ms();
         let event = IncomeEvent {
