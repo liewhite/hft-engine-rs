@@ -11,7 +11,8 @@
 use crate::actor_lifecycle::{ChildGroup, ChildStop};
 use crate::engine::bootstrap::Supervised;
 use super::{
-    AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs, ExecutorActor,
+    to_live_outlet, to_paper_outlet, AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs,
+    ExecutorActor,
     IncomeProcessorActor, MarketPubSub, MetricsActor, MetricsActorArgs, OrderGateway,
     OutcomePubSub, OutcomeProcessorActor, PaperCounterActor, PaperCounterArgs,
     GetLivePositions, PositionLedgerActor, PositionLedgerArgs,
@@ -279,8 +280,10 @@ impl Actor for ManagerActor {
             order_gateway.clone(),
         )
         .await;
+        //    分发判据在订阅处一次说清（两个 SubscribeFilter 紧挨着写），出口自己不再判
+        //    "这条是不是我的" —— 判据只有 `outlet_for` 一处，新增账户类型时它编译失败
         outcome_pubsub
-            .tell(Subscribe(live_processor.clone()))
+            .tell(SubscribeFilter(live_processor.clone(), to_live_outlet))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
@@ -307,7 +310,7 @@ impl Actor for ManagerActor {
         )
         .await;
         outcome_pubsub
-            .tell(Subscribe(paper_counter.clone()))
+            .tell(SubscribeFilter(paper_counter.clone(), to_paper_outlet))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;

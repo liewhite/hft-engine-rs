@@ -438,9 +438,17 @@ impl Message<AccountEvent> for MetricsActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: AccountEvent, _ctx: &mut Context<Self, Self::Reply>) {
-        if msg.account != AccountId::Live {
-            self.apply_paper_event(&msg.account.clone(), &msg.data);
-            return;
+        // 穷举而非 `!= Live`：新增账户类型时这里编译失败（原则 P6）。用否定条件的话
+        // 新类型会被静默并进模拟账本 —— 观测口径出错且没有任何症状。
+        //
+        // 这里**不复用** `outlet_for`：那是"订单发往哪个执行出口"，与"记进哪本账"是
+        // 两件事，恰好同形不等于同一个概念，合并会是假抽象。
+        match msg.account {
+            AccountId::Paper(_) => {
+                self.apply_paper_event(&msg.account.clone(), &msg.data);
+                return;
+            }
+            AccountId::Live => {}
         }
         if let Some(symbol) = msg.data.symbol() {
             if !self.tracked.contains(symbol) {

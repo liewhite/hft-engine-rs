@@ -223,17 +223,17 @@ fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<Outcome
 `ExchangeSetup.account: Option<Arc<dyn AccountClient>>`，`authed` 字段删除。
 装配处只在配了凭证时才装入，因此"持有该对象"即"有账户"，一处表达、编译期可查。
 
-### V4 两个下单出口各自用否定条件过滤同一条总线 —— 违反 P4
+### ~~V4 两个下单出口各自用否定条件过滤同一条总线~~ —— **已修复（R4）**
 
-```rust
-// outcome_processor.rs:447
-if tagged.account != AccountId::Live { return; }
-// paper_counter.rs:348
-if !tagged.account.is_paper() { return; }
-```
+原状：两个出口各在自己的 handler 里写否定条件（`!= Live` / `!is_paper()`）。
+`AccountId` 只有两个 variant 时互补成立，但新增第三类账户时两处都不会编译失败，
+结果要么静默双执行、要么静默不执行。
 
-`AccountId` 目前只有两个 variant，互补成立。风险在**新增第三类账户**时：两处否定条件都不会
-编译失败，结果要么静默双执行、要么静默不执行。→ 计划 R4
+现状：判据收敛为 `outlet_for` 的穷举 `match`（新增 variant 即编译失败），
+订阅过滤器 `to_live_outlet` / `to_paper_outlet` 在装配处紧挨着写，
+`outlet_dispatch_tests` 用这两个函数本身断言"每条信号恰有一个出口接受"。
+两个出口保留一句基于同一判据的**到站断言**（装配写错时响亮失败，而非静默双执行）——
+投递路径在类型上收不死，这是品味 1.1 阶梯的第二级。
 
 ### V5 停机三段模型盖不住回灌边 —— 已知并接受
 

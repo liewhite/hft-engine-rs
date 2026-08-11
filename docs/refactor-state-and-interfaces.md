@@ -14,7 +14,7 @@
 | R1 | 拆 `ExchangeClient`：公共 / 账户两个 trait | V3 | **已完成** |
 | R2 | 拆 `StateManager`：四个单一职责投影 | V1 | 未开始 |
 | R3 | 策略只拿受限视图 | V2 | 未开始（依赖 R2） |
-| R4 | 下单出口的分发判据收敛到一处 | V4 | 未开始 |
+| R4 | 下单出口的分发判据收敛到一处 | V4 | **已完成** |
 | R5 | 收尾：投产编排独立、观测口径移出领域层 | V6 / V7 | 未开始 |
 
 顺序理由：R1 独立性最好（只动适配层与装配），先做能立刻消掉一类"空值当事实"的补丁；
@@ -286,6 +286,30 @@ outcome_pubsub.tell(SubscribeFilter(paper_counter,    |o| matches!(outlet_for(&o
 
 低。但要注意：删掉 handler 里的早退等于把正确性完全押在订阅过滤上，
 **必须确认没有第二条路径能把 `AccountOutcome` 送进这两个 actor**（目前只有 OutcomePubSub 一条）。
+
+### 完成记录
+
+335 用例通过，零编译告警，clippy 净增 0。
+
+- `Outlet` + `outlet_for` 落在 `engine/live/mod.rs`（`AccountOutcome` 旁边），
+  订阅过滤器提成具名函数 `to_live_outlet` / `to_paper_outlet` —— 这样测试断言的是
+  **装配处真正用的那两个函数**，而不是测试里复写一遍的等价表达式。
+- 投递路径唯一性已核实：`AccountOutcome` 的生产路径只有 `ExecutorActor` 经
+  `OutcomePubSub` 一条；`paper_counter.rs` 里三处直发都在它自己的测试模块内。
+- 穷举保护已实测：临时给 `AccountId` 加一个 variant，`outlet_for` 与
+  `MetricsActor` 的账户分支都编译失败。
+
+**与计划的两处偏离**：
+
+1. **保留了到站断言**，没有裸删早退。删掉自判之后投递路径在类型上收不死
+   （`SubscribeFilter` 是运行期的），装配写错就会静默双执行。所以两个出口各留一句
+   `if outlet_for(..) != 本出口 { error!; return }`。这**不是**重新分发 ——
+   判据仍是同一个 `outlet_for`，新增账户类型时它编译失败，不存在"两处各判各的"
+   静默漏改；这是品味 1.1 阶梯上的第二级（运行时断言），因为第一级够不着。
+2. **顺带把 `MetricsActor` 的账户分支也改成穷举**（原为 `if account != Live`）。
+   它不是出口分发，但同样会在新增账户类型时把新类型静默并进模拟账本。
+   **没有**复用 `outlet_for` —— "订单发往哪个执行出口"与"记进哪本账"是两件事，
+   恰好同形不等于同一个概念，合并会是假抽象。
 
 ---
 

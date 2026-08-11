@@ -52,7 +52,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use super::{AccountOutcome, AccountPubSub};
+use super::{outlet_for, AccountOutcome, AccountPubSub, Outlet};
 
 /// PaperCounterActor 初始化参数
 pub struct PaperCounterArgs {
@@ -344,8 +344,15 @@ impl Message<AccountOutcome> for PaperCounterActor {
     type Reply = ();
 
     async fn handle(&mut self, tagged: AccountOutcome, _ctx: &mut Context<Self, Self::Reply>) {
-        // 只负责模拟账户；实盘账户的订单由 OutcomeProcessorActor 发往交易所
-        if !tagged.account.is_paper() {
+        // 归属由订阅过滤器保证（见 ManagerActor 装配）。这里再验一次**不是**重新分发：
+        // 判据仍是同一个 `outlet_for`，新增账户类型时它编译失败，不存在"两处各判各的"
+        // 那种静默漏改。留这道是因为投递路径本身没法在类型上收死（`SubscribeFilter` 是
+        // 运行期的），而装配写错时"响亮失败"远好过静默双执行 —— 品味 1.1 的第二级。
+        if outlet_for(&tagged.account) != Outlet::Paper {
+            tracing::error!(
+                account = %tagged.account,
+                "非模拟账户的信号到达本地柜台 —— 订阅过滤器装配错误，丢弃"
+            );
             return;
         }
         let account = tagged.account;

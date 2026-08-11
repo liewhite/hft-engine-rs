@@ -20,7 +20,7 @@ use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{AccountOutcome, AccountPubSub};
+use super::{outlet_for, AccountOutcome, AccountPubSub, Outlet};
 
 // ============================================================================
 // OrderGateway —— 唯一的实盘下单出口
@@ -443,9 +443,15 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
         tagged: AccountOutcome,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 只负责实盘账户；模拟账户的订单由 PaperCounterActor 处理。
-        // 二者共用一条 OutcomePubSub，各按账户取自己的那份（见 AccountOutcome）。
-        if tagged.account != AccountId::Live {
+        // 归属由订阅过滤器保证（见 ManagerActor 装配）。这里再验一次**不是**重新分发：
+        // 判据仍是同一个 `outlet_for`，新增账户类型时它编译失败，不存在"两处各判各的"
+        // 那种静默漏改。留这道是因为投递路径本身没法在类型上收死（`SubscribeFilter` 是
+        // 运行期的），而装配写错时"响亮失败"远好过静默双执行 —— 品味 1.1 的第二级。
+        if outlet_for(&tagged.account) != Outlet::Live {
+            tracing::error!(
+                account = %tagged.account,
+                "非实盘账户的信号到达实盘出口 —— 订阅过滤器装配错误，丢弃"
+            );
             return;
         }
         // 下单/撤单一律 `tokio::spawn` 异步执行，**有意为之**：REST 往返可能上百 ms，
