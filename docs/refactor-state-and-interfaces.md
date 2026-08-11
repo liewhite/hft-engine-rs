@@ -163,8 +163,45 @@ metrics 仍需本地持仓，理由未变（`on_stop` 最终快照不能依赖�
 
 ### 改动清单（分两步，中间保持可发布）
 
-**R2a 纯搬运**：`StateManager` 内部把字段分组为四个子结构，公开方法全部委托给子结构。
-行为零变化，测试零改动。这一步让四个投影的边界在代码里先成立。
+**R2a 纯搬运**：把字段分组为投影，公开方法全部委托。行为零变化。
+
+**已勘定的分解**（动手前的实测，避免下次重新摸底）：
+
+要拆的字段**大部分在 `SymbolState` 里，不在 `StateManager` 里**，所以刀口要切进 `SymbolState`：
+
+```rust
+// per symbol，三个投影
+pub struct SymbolMarket   { funding_rates, bbos, mark_prices, index_prices }
+pub struct SymbolPositions{ positions, seeded_at }
+pub struct SymbolOrders   { pending_orders, recent_terminal }
+
+// 门面保留 —— "一个 symbol 跨所的全貌"确实是策略推理的单位
+pub struct SymbolState { symbol, market, positions, orders }
+
+// StateManager 自己的字段归 AccountView
+pub struct AccountView { balances, account_infos, greeks, cash_balances }
+```
+
+方法归属：
+
+| 投影 | 方法 |
+|---|---|
+| `SymbolMarket` | `bbo` / `mark_price` / `index_price` / `unified_time_base` / `best_short_exchange` / `best_long_exchange` / 行情侧 `apply` |
+| `SymbolPositions` | `seed_position` / `is_position_seeded` / `seeded_positions` / `has_positions` / `position` / `position_size` / `position_sizes` / Fill 累加（含 `snapshot_req_ts` 过滤） |
+| `SymbolOrders` | `add_pending_order` / `remove_timed_out_orders` / `has_pending_orders` / `has_pending_side` / `pending_orders` / `remember_terminal` / OrderUpdate 侧 `apply` |
+
+**两处要注意**：
+
+1. 几个方法的日志里读 `self.symbol`，而投影不该持有 symbol（那会让三份各存一个副本）。
+   改为把 `&Symbol` 作为参数传入 —— 只有 `seed_position` 与 `remove_timed_out_orders`
+   两个方法需要。
+2. `SymbolState` 的 `pub` 字段外部只有 **2 处**直接访问（实测）：
+   `executor.rs` 的 `symbol_state.positions.values()`、`spread_arb` 测试里的
+   `state.bbos.insert(..)`。所以"零消费者改动"做不到，但改动面就这么大 ——
+   后者更应该改成走 `apply` 喂事件，与生产路径一致。
+
+`SymbolState::apply` 的拆法：按 variant 分派给对应投影，**保留"未知 symbol 事件 = 路由 bug"
+的 error 日志**（现在这条判断在门面上，拆完仍应在门面上，不要让三个投影各自静默忽略）。
 
 **R2b 切换消费者**：逐个消费者改为只持它需要的子结构，`StateManager` 退化为组合容器或删除。
 `SymbolState` 随之拆解——它现在是"per-symbol 的一切"，拆后每个投影自己按 symbol 索引。
