@@ -5,10 +5,10 @@
 //! API 失败时 warn 并跳过本轮，等待下次轮询重试。
 
 use crate::domain::{now_ms, Exchange, MarketStatus};
-use crate::engine::IncomePubSub;
+use crate::engine::MarketPubSub;
 use crate::exchange::ibkr::client::TradingSchedule;
 use crate::exchange::ibkr::IbkrClient;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{MarketData, MarketEvent};
 use chrono::{Datelike, Timelike};
 use chrono_tz::US::Eastern;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -26,7 +26,7 @@ pub struct IbkrStatusPollingActorArgs {
     /// IBKR client (用于查询交易时间表)
     pub client: Arc<IbkrClient>,
     /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    pub market_pubsub: ActorRef<MarketPubSub>,
     /// 查询间隔 (毫秒)
     pub interval_ms: u64,
 }
@@ -34,7 +34,7 @@ pub struct IbkrStatusPollingActorArgs {
 /// IbkrStatusPollingActor - 定时轮询 IBKR 市场状态
 pub struct IbkrStatusPollingActor {
     client: Arc<IbkrClient>,
-    income_pubsub: ActorRef<IncomePubSub>,
+    market_pubsub: ActorRef<MarketPubSub>,
     last_status: Option<MarketStatus>,
 }
 
@@ -70,11 +70,11 @@ impl IbkrStatusPollingActor {
 
         let local_ts = now_ms();
         if let Err(e) = self
-            .income_pubsub
-            .tell(Publish(IncomeEvent {
+            .market_pubsub
+            .tell(Publish(MarketEvent {
                 exchange_ts: local_ts,
                 local_ts,
-                data: ExchangeEventData::ExchangeStatus {
+                data: MarketData::ExchangeStatus {
                     exchange: Exchange::IBKR,
                     status,
                 },
@@ -82,7 +82,7 @@ impl IbkrStatusPollingActor {
             .send()
             .await
         {
-            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            tracing::error!(error = %e, "Failed to publish to MarketPubSub");
         }
     }
 }
@@ -105,7 +105,7 @@ impl Actor for IbkrStatusPollingActor {
 
         Ok(Self {
             client: args.client,
-            income_pubsub: args.income_pubsub,
+            market_pubsub: args.market_pubsub,
             last_status: None,
         })
     }

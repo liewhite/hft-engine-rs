@@ -18,7 +18,7 @@ use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::ExchangeClient;
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::GammaScalpStrategy;
 use std::cell::RefCell;
@@ -140,18 +140,21 @@ fn main() -> anyhow::Result<()> {
             .with_clock_interval(clock_interval_ms)
             .with_observer(move |ev: &IncomeEvent| {
                 let mut s = sampler_obs.borrow_mut();
-                match &ev.data {
-                    ExchangeEventData::MarketTrade(t) => {
-                        s.last_price = t.price;
-                    }
-                    ExchangeEventData::AccountInfo { equity, .. } => {
-                        // 首笔成交之前 (price=0) 不采样
-                        if s.last_price > 0.0 {
-                            let p = s.last_price;
-                            s.samples.push((ev.exchange_ts, *equity, p));
+                match ev {
+                    IncomeEvent::Market(m) => {
+                        if let MarketData::MarketTrade(t) = &m.data {
+                            s.last_price = t.price;
                         }
                     }
-                    _ => {}
+                    IncomeEvent::Account(a) => {
+                        if let AccountData::AccountInfo { equity, .. } = &a.data {
+                            // 首笔成交之前 (price=0) 不采样
+                            if s.last_price > 0.0 {
+                                let p = s.last_price;
+                                s.samples.push((a.exchange_ts, *equity, p));
+                            }
+                        }
+                    }
                 }
             });
         engine.run()

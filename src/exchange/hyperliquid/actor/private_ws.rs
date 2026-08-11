@@ -3,18 +3,18 @@
 //! 职责:
 //! - 维护 WebSocket 连接
 //! - 自动订阅账户频道 (webData3, orderUpdates)
-//! - 直接解析消息并发布到 IncomePubSub
+//! - 直接解析消息并发布到对应总线
 //!
 //! 注意: Hyperliquid 的账户订阅不需要认证，只需要用户地址
 
 use crate::domain::{now_ms, Balance, Exchange, ExchangeError};
-use crate::engine::IncomePubSub;
+use crate::engine::AccountPubSub;
 use crate::exchange::client::WsError;
 use crate::exchange::hyperliquid::codec::{ClearinghouseState, WsOrderUpdate, WsUserFills};
 use crate::exchange::hyperliquid::symbol::belongs_to_dex;
 use crate::exchange::hyperliquid::WS_URL;
 use crate::exchange::ws_loop;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -31,16 +31,16 @@ use tokio_stream::wrappers::ReceiverStream;
 pub struct HyperliquidPrivateWsActorArgs {
     /// 用户钱包地址 (0x...)
     pub wallet_address: String,
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 账户私有事件总线（发布事件，标 Live）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// Perp DEX 名称 ("" = 默认 perp DEX)
     pub dex: String,
 }
 
 /// HyperliquidPrivateWsActor - 账户 WebSocket Actor
 pub struct HyperliquidPrivateWsActor {
-    /// Income PubSub (发布事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    /// 账户私有事件总线（发布事件，标 Live）
+    account_pubsub: ActorRef<AccountPubSub>,
     /// 本 client 接入的 perp DEX：**账户级**推送（orderUpdates / userFills）不按 dex
     /// 下发，必须自己过滤（与 REST 侧 `belongs_to_dex` 同口径），否则同一钱包在其他
     /// dex 上的成交会被剥掉前缀后当成本 dex 同名标的的 Fill，直接污染「基线 + Fill」
@@ -79,8 +79,8 @@ impl HyperliquidPrivateWsActor {
                 // 未经实盘验证）。两个判据取或：收到回执、或收到该频道的数据。
                 self.confirm_subscription(channel);
                 for event in events {
-                    if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-                        tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                    if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
+                        tracing::error!(error = %e, "Failed to publish to AccountPubSub");
                     }
                 }
             }
@@ -217,7 +217,7 @@ impl Actor for HyperliquidPrivateWsActor {
         );
 
         Ok(Self {
-            income_pubsub: args.income_pubsub,
+            account_pubsub: args.account_pubsub,
             dex: args.dex,
             pending_subscriptions: REQUIRED_SUBSCRIPTIONS.into_iter().collect(),
             ws_tx: Some(outgoing_tx),
@@ -265,7 +265,7 @@ enum PrivateMessage {
     /// 生效的最硬证据**（比确认回执更直接）。pong / 未知频道给空串。
     Events {
         channel: &'static str,
-        events: Vec<IncomeEvent>,
+        events: Vec<AccountEvent>,
     },
     /// 某个订阅的确认回执，值为订阅类型（如 `orderUpdates`）
     SubscriptionAck(String),
@@ -349,7 +349,7 @@ fn parse_private_message(raw: &str, dex: &str, local_ts: u64) -> Result<PrivateM
 fn parse_clearinghouse_state(
     data: &serde_json::Value,
     local_ts: u64,
-) -> Result<Vec<IncomeEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, WsError> {
     let mut events = Vec::new();
 
     // clearinghouseState 订阅返回结构: { clearinghouseState: {...}, user: "...", dex: "..." }
@@ -369,10 +369,12 @@ fn parse_clearinghouse_state(
         .map_err(|_| WsError::ParseError(format!("Failed to parse Hyperliquid accountValue: {}", state.margin_summary.account_value)))?;
     let notional = f64::from_str(&state.margin_summary.total_ntl_pos)
         .map_err(|_| WsError::ParseError(format!("Failed to parse Hyperliquid total_ntl_pos: {}", state.margin_summary.total_ntl_pos)))?;
-    events.push(IncomeEvent {
+    events.push(AccountEvent {
+        // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+        account: crate::domain::AccountId::Live,
         exchange_ts: local_ts,
         local_ts,
-        data: ExchangeEventData::AccountInfo {
+        data: AccountData::AccountInfo {
             exchange: Exchange::Hyperliquid,
             equity,
             notional,
@@ -382,10 +384,12 @@ fn parse_clearinghouse_state(
     // 解析可用余额
     let withdrawable = f64::from_str(&state.withdrawable)
         .map_err(|_| WsError::ParseError(format!("invalid withdrawable: {}", state.withdrawable)))?;
-    events.push(IncomeEvent {
+    events.push(AccountEvent {
+        // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+        account: crate::domain::AccountId::Live,
         exchange_ts: local_ts,
         local_ts,
-        data: ExchangeEventData::Balance(Balance {
+        data: AccountData::Balance(Balance {
             exchange: Exchange::Hyperliquid,
             asset: "USDC".to_string(),
             available: withdrawable,
@@ -404,7 +408,7 @@ fn parse_order_updates(
     data: &serde_json::Value,
     dex: &str,
     local_ts: u64,
-) -> Result<Vec<IncomeEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, WsError> {
     let mut events = Vec::new();
 
     // orderUpdates 必须是一个数组
@@ -423,12 +427,14 @@ fn parse_order_updates(
             continue;
         }
         let update = order_update.to_order_update()?;
-        events.push(IncomeEvent {
+        events.push(AccountEvent {
+            // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+            account: crate::domain::AccountId::Live,
             // 交易所时点取推送自带的 statusTimestamp（OrderUpdate 本身不再捎带时间戳 ——
             // 四所口径曾混装且无人读，见 crate::domain::OrderUpdate 的文档）
             exchange_ts: order_update.status_timestamp,
             local_ts,
-            data: ExchangeEventData::OrderUpdate(update),
+            data: AccountData::OrderUpdate(update),
         });
     }
 
@@ -444,7 +450,7 @@ fn parse_user_fills(
     data: &serde_json::Value,
     dex: &str,
     local_ts: u64,
-) -> Result<Vec<IncomeEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, WsError> {
     let user_fills: WsUserFills = serde_json::from_value(data.clone())
         .map_err(|e| WsError::ParseError(format!("userFills parse: {}", e)))?;
 
@@ -466,10 +472,12 @@ fn parse_user_fills(
         }
         let fill = ws_fill.to_fill()
             ?;
-        events.push(IncomeEvent {
+        events.push(AccountEvent {
+            // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+            account: crate::domain::AccountId::Live,
             exchange_ts: fill.timestamp,
             local_ts,
-            data: ExchangeEventData::Fill(fill),
+            data: AccountData::Fill(fill),
         });
     }
 
@@ -525,7 +533,7 @@ mod tests {
         let events = parse_user_fills(&data, "xyz", 1).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0].data {
-            ExchangeEventData::Fill(f) => assert_eq!(f.symbol, "AAPL"),
+            AccountData::Fill(f) => assert_eq!(f.symbol, "AAPL"),
             other => panic!("expected fill, got {other:?}"),
         }
     }
@@ -592,7 +600,7 @@ mod tests {
         let events = parse_order_updates(&data, "xyz", 1).unwrap();
         assert_eq!(events.len(), 1);
         match &events[0].data {
-            ExchangeEventData::OrderUpdate(u) => assert_eq!(u.symbol, "AAPL"),
+            AccountData::OrderUpdate(u) => assert_eq!(u.symbol, "AAPL"),
             other => panic!("expected order update, got {other:?}"),
         }
     }

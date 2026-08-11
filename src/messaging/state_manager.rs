@@ -1,6 +1,6 @@
 use crate::domain::{Exchange, Greeks, MarketStatus, Order, Position, Symbol, Timestamp, USDT};
 use crate::domain::AccountInfo;
-use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
+use crate::messaging::{AccountData, IncomeEvent, MarketData, SymbolState};
 use std::collections::HashMap;
 
 /// 一份持仓基线：某 (所, symbol) 的起始持仓 + 其 REST 快照的**请求**时刻。
@@ -199,76 +199,85 @@ impl StateManager {
 
     /// 处理事件，更新状态
     pub fn apply(&mut self, event: &IncomeEvent) {
-        match &event.data {
-            // 全局事件: Balance
-            ExchangeEventData::Balance(balance) => {
-                if balance.asset == USDT {
-                    tracing::debug!(
-                        exchange = %balance.exchange,
-                        available = balance.available,
-                        "USDT balance updated"
+        match event {
+            IncomeEvent::Market(m) => match &m.data {
+                // 全局事件: ExchangeStatus
+                MarketData::ExchangeStatus { exchange, status } => {
+                    self.market_statuses.insert(*exchange, *status);
+                }
+                // 全局事件: 券源/汇率读数 —— 策略在 on_event 里自行消费并自持，
+                // StateManager 不缓存；显式空处理，避免落入 symbol 路由分支。
+                MarketData::BorrowFee(_) | MarketData::ExchangeRate(_) => {}
+                // 自定义事件：框架只运送不理解，策略在 on_event 里自行消费并自持。
+                // 必须显式空处理 —— 无 scope 的自定义事件会被兜底分支误报"缺少 symbol 的路由 bug"。
+                MarketData::Custom(_) => {}
+                // 全局事件: Clock (检查订单超时)
+                MarketData::Clock => {
+                    let now = m.local_ts;
+                    for state in self.states.values_mut() {
+                        state.remove_timed_out_orders(now, self.order_timeout_ms);
+                    }
+                }
+                // Symbol 行情: 委托对应 SymbolState 处理
+                _ => self.route_to_symbol_state(event),
+            },
+            IncomeEvent::Account(a) => match &a.data {
+                // 账户级事件: Balance
+                AccountData::Balance(balance) => {
+                    if balance.asset == USDT {
+                        tracing::debug!(
+                            exchange = %balance.exchange,
+                            available = balance.available,
+                            "USDT balance updated"
+                        );
+                        self.balances.insert(balance.exchange, balance.available);
+                    }
+                    // 存储币种现金余额 (用于修正 greeks delta)
+                    self.cash_balances.insert(
+                        (balance.exchange, balance.asset.clone()),
+                        balance.available,
                     );
-                    self.balances.insert(balance.exchange, balance.available);
                 }
-                // 存储币种现金余额 (用于修正 greeks delta)
-                self.cash_balances.insert(
-                    (balance.exchange, balance.asset.clone()),
-                    balance.available,
-                );
-            }
-            // 全局事件: AccountInfo (equity + notional 原子写入)
-            ExchangeEventData::AccountInfo {
-                exchange,
-                equity,
-                notional,
-            } => {
-                tracing::debug!(
-                    exchange = %exchange,
-                    equity = equity,
-                    notional = notional,
-                    "AccountInfo updated"
-                );
-                self.account_infos.insert(*exchange, AccountInfo {
-                    equity: *equity,
-                    notional: *notional,
-                });
-            }
-            // 全局事件: Greeks
-            ExchangeEventData::Greeks(g) => {
-                self.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
-            }
-            // 全局事件: ExchangeStatus
-            ExchangeEventData::ExchangeStatus { exchange, status } => {
-                self.market_statuses.insert(*exchange, *status);
-            }
-            // 全局事件: 券源/汇率读数 —— 策略在 on_event 里自行消费并自持，
-            // StateManager 不缓存；显式空处理，避免落入 symbol 路由分支。
-            ExchangeEventData::BorrowFee(_) | ExchangeEventData::ExchangeRate(_) => {}
-            // 自定义事件：框架只运送不理解，策略在 on_event 里自行消费并自持。
-            // 必须显式空处理 —— 无 scope 的自定义事件会被兜底分支误报"缺少 symbol 的路由 bug"。
-            ExchangeEventData::Custom(_) => {}
-            // 全局事件: Clock (检查订单超时)
-            ExchangeEventData::Clock => {
-                let now = event.local_ts;
-                for state in self.states.values_mut() {
-                    state.remove_timed_out_orders(now, self.order_timeout_ms);
+                // 账户级事件: AccountInfo (equity + notional 原子写入)
+                AccountData::AccountInfo {
+                    exchange,
+                    equity,
+                    notional,
+                } => {
+                    tracing::debug!(
+                        exchange = %exchange,
+                        equity = equity,
+                        notional = notional,
+                        "AccountInfo updated"
+                    );
+                    self.account_infos.insert(*exchange, AccountInfo {
+                        equity: *equity,
+                        notional: *notional,
+                    });
                 }
-            }
-            // Symbol 事件: 委托对应 SymbolState 处理
-            // 事件由 IncomeProcessorActor 按 (exchange, symbol) 路由，正常只有已注册 symbol 会到达。
-            // 若 symbol 缺失或无对应状态，说明路由逻辑有 bug，记录 error 后忽略（不 panic）。
-            _ => {
-                let Some(symbol) = event.symbol() else {
-                    tracing::error!("symbol 事件缺少 symbol（路由 bug），忽略");
-                    return;
-                };
-                let Some(state) = self.states.get_mut(symbol) else {
-                    tracing::error!(symbol = %symbol, "StateManager 无此 symbol 状态（路由 bug），忽略事件");
-                    return;
-                };
-                state.apply(event);
-            }
+                // 账户级事件: Greeks
+                AccountData::Greeks(g) => {
+                    self.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
+                }
+                // Symbol 私有事件 (OrderUpdate/Fill/FundingFee): 委托对应 SymbolState
+                _ => self.route_to_symbol_state(event),
+            },
         }
+    }
+
+    /// 按 symbol 路由到对应 SymbolState。
+    /// 事件由 IncomeProcessorActor 按 (exchange, symbol) 路由，正常只有已注册 symbol 会到达。
+    /// 若 symbol 缺失或无对应状态，说明路由逻辑有 bug，记录 error 后忽略（不 panic）。
+    fn route_to_symbol_state(&mut self, event: &IncomeEvent) {
+        let Some(symbol) = event.symbol() else {
+            tracing::error!("symbol 事件缺少 symbol（路由 bug），忽略");
+            return;
+        };
+        let Some(state) = self.states.get_mut(symbol) else {
+            tracing::error!(symbol = %symbol, "StateManager 无此 symbol 状态（路由 bug），忽略事件");
+            return;
+        };
+        state.apply(event);
     }
 }
 
@@ -276,7 +285,6 @@ impl StateManager {
 mod tests {
     use super::*;
     use crate::domain::{Fill, FillReason, Side};
-    use crate::messaging::ExchangeEventData;
 
     const EX: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
@@ -297,10 +305,11 @@ mod tests {
     }
 
     fn fill_at(size: f64, local_ts: Timestamp) -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: local_ts,
+        IncomeEvent::account(
+            crate::domain::AccountId::Live,
             local_ts,
-            data: ExchangeEventData::Fill(Fill {
+            local_ts,
+            AccountData::Fill(Fill {
                 exchange: EX,
                 symbol: SYM.to_string(),
                 side: Side::Long,
@@ -312,7 +321,7 @@ mod tests {
                 fee: 0.0,
                 reason: FillReason::Normal,
             }),
-        }
+        )
     }
 
     /// 基线只写一次：第二次 seed 静默跳过（再晋升时的正常形态），存量不被覆写

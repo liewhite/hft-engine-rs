@@ -9,17 +9,17 @@ pub use strategy_runner::{
     ClientOrderIdGen, ExchangeUuidGen, SequentialClientOrderIdGen, StrategyRunner,
 };
 pub use live::{
-    AccountIncome, AccountOutcome, AddStrategy, AddStrategies, PaperPubSub, ClockActor, ClockActorArgs,
+    AccountOutcome, AccountPubSub, AddStrategy, AddStrategies, ClockActor, ClockActorArgs,
     CryptoStatusActor, CryptoStatusActorArgs,
     ExecutorActor, ExecutorArgs,
-    GetAllSymbolMetas, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
+    GetAllSymbolMetas, IncomeProcessorActor, ManagerActor, ManagerActorArgs, MarketPubSub,
     MetricsActor, MetricsActorArgs, OrderGateway, OutcomePubSub, OutcomeProcessorActor, PlaceVerdict,
     RegisterExecutor,
     PaperCounterActor, PaperCounterArgs,
     PositionReconcileActor, PositionReconcileArgs, Reconciler,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
-    RegisterSymbols, RemoveStrategies, StrategySpec, SubscribePaper,
+    RegisterSymbols, RemoveStrategies, StrategySpec,
     Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,
     SupervisorArgs, SymbolRecord, SymbolView, UnregisterExecutor,
-    SubscribeIncome, SubscribeOutcome,
+    SubscribeAccount, SubscribeMarket, SubscribeOutcome,
 };

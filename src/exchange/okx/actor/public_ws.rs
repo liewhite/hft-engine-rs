@@ -3,17 +3,17 @@
 //! 职责:
 //! - 维护公开 WebSocket 连接
 //! - 处理 Subscribe/Unsubscribe 请求
-//! - 直接解析消息并发布到 IncomePubSub
+//! - 直接解析消息并发布到对应总线
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::engine::IncomePubSub;
+use crate::engine::MarketPubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{
     resolve_meta, BboData, FundingRateData, IndexTickerData, MarkPriceData, TradeData, WsPush,
 };
 use crate::exchange::okx::{to_okx, to_okx_index, WS_PUBLIC_URL};
 use crate::exchange::ws_loop;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{MarketData, MarketEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -28,8 +28,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 /// OkxPublicWsActor 初始化参数
 pub struct OkxPublicWsActorArgs {
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 行情总线（发布事件）
+    pub market_pubsub: ActorRef<MarketPubSub>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
@@ -38,8 +38,8 @@ pub struct OkxPublicWsActorArgs {
 
 /// OkxPublicWsActor - 公开 WebSocket Actor
 pub struct OkxPublicWsActor {
-    /// Income PubSub (发布事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    /// 行情总线（发布事件）
+    market_pubsub: ActorRef<MarketPubSub>,
     /// Symbol 元数据（用于过滤不存在的 symbol）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
@@ -97,8 +97,8 @@ impl OkxPublicWsActor {
         let local_ts = now_ms();
         let events = parse_public_message(raw, local_ts, &self.symbol_metas)?;
         for event in events {
-            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to MarketPubSub");
             }
         }
         Ok(())
@@ -139,7 +139,7 @@ impl Actor for OkxPublicWsActor {
         tracing::info!("OkxPublicWsActor started");
 
         Ok(Self {
-            income_pubsub: args.income_pubsub,
+            market_pubsub: args.market_pubsub,
             symbol_metas: args.symbol_metas,
             quote: args.quote,
             ws_tx: Some(outgoing_tx),
@@ -277,7 +277,7 @@ pub(crate) fn parse_public_message(
     raw: &str,
     local_ts: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
-) -> Result<Vec<IncomeEvent>, WsError> {
+) -> Result<Vec<MarketEvent>, WsError> {
     // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
     if raw == "pong" {
         return Ok(Vec::new());
@@ -317,10 +317,10 @@ pub(crate) fn parse_public_message(
             for data in &push.data {
                 let rate = data.to_funding_rate(local_ts)
                     ?;
-                events.push(IncomeEvent {
+                events.push(MarketEvent {
                     exchange_ts: local_ts,
                     local_ts,
-                    data: ExchangeEventData::FundingRate(rate),
+                    data: MarketData::FundingRate(rate),
                 });
             }
             Ok(events)
@@ -347,10 +347,10 @@ pub(crate) fn parse_public_message(
                     tracing::debug!(symbol = %meta.symbol, "OKX 单边盘口，跳过该条 BBO");
                     continue;
                 };
-                events.push(IncomeEvent {
+                events.push(MarketEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,
-                    data: ExchangeEventData::BBO(bbo),
+                    data: MarketData::BBO(bbo),
                 });
             }
             Ok(events)
@@ -372,10 +372,10 @@ pub(crate) fn parse_public_message(
             let mut events = Vec::new();
             for data in &push.data {
                 let trade = data.to_market_trade(meta)?;
-                events.push(IncomeEvent {
+                events.push(MarketEvent {
                     exchange_ts: trade.timestamp,
                     local_ts,
-                    data: ExchangeEventData::MarketTrade(trade),
+                    data: MarketData::MarketTrade(trade),
                 });
             }
             Ok(events)
@@ -388,10 +388,10 @@ pub(crate) fn parse_public_message(
             for data in &push.data {
                 let mp = data.to_mark_price()
                     ?;
-                events.push(IncomeEvent {
+                events.push(MarketEvent {
                     exchange_ts: mp.timestamp,
                     local_ts,
-                    data: ExchangeEventData::MarkPrice(mp),
+                    data: MarketData::MarkPrice(mp),
                 });
             }
             Ok(events)
@@ -404,10 +404,10 @@ pub(crate) fn parse_public_message(
             for data in &push.data {
                 let ip = data.to_index_price()
                     ?;
-                events.push(IncomeEvent {
+                events.push(MarketEvent {
                     exchange_ts: ip.timestamp,
                     local_ts,
-                    data: ExchangeEventData::IndexPrice(ip),
+                    data: MarketData::IndexPrice(ip),
                 });
             }
             Ok(events)
@@ -486,11 +486,11 @@ mod tests {
         )])
     }
 
-    fn trades_of(events: Vec<IncomeEvent>) -> Vec<MarketTrade> {
+    fn trades_of(events: Vec<MarketEvent>) -> Vec<MarketTrade> {
         events
             .into_iter()
             .filter_map(|e| match e.data {
-                ExchangeEventData::MarketTrade(t) => Some(t),
+                MarketData::MarketTrade(t) => Some(t),
                 _ => None,
             })
             .collect()

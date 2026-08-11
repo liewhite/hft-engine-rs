@@ -22,6 +22,12 @@
 //! [`SimConfig::exchange_to_strategy_delay_ms`] 在回测里用于模拟行情/回报的入向时延；模拟盘
 //! 的行情来自真实 WS，本身已带真实网络时延，再叠加会重复计算。故此处只用出向延迟。
 //!
+//! # 回报直接以 AccountEvent（带 Paper 标签）发布到共享的 AccountBus
+//!
+//! 与实盘适配层发布**同一个类型**，只是 account 字段不同 —— 账户隔离由字段值保证。
+//! SimState 只产回报不回显行情（历史上回显行情曾迫使本 actor 维护"哪些事件可外发"的
+//! 白名单来防自订阅回环，类型拆分后该机制整体消失）。
+//!
 //! # 账户：按 (账户, 交易所) 分柜台
 //!
 //! 一份 [`SimState`] 只代表**一个账户在一个交易所**的柜台（见其类型文档）。本 actor 按
@@ -33,7 +39,7 @@
 use crate::domain::{
     now_ms, AccountId, Exchange, Order, OrderId, Symbol, SymbolMeta, Timestamp, BBO,
 };
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -44,12 +50,12 @@ use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use super::{AccountIncome, AccountOutcome, PaperPubSub};
+use super::{AccountOutcome, AccountPubSub};
 
 /// PaperCounterActor 初始化参数
 pub struct PaperCounterArgs {
-    /// 模拟账户私有事件的发布总线（**不是**共享行情总线）
-    pub paper_pubsub: ActorRef<PaperPubSub>,
+    /// 账户私有事件总线（柜台回报以 Paper 标签发布，与实盘适配层同一条总线）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// 撮合与账本配置（每个模拟账户各自按此初始化）
     pub config: SimConfig,
     /// Symbol 元数据：透传给各柜台的 [`SimState`]（市场规则校验在那里统一执行）
@@ -80,7 +86,7 @@ pub struct PaperCounterActor {
     /// 共享报价缓存：行情没有账户归属，新柜台创建时用**本所**的报价播种，避免首单因
     /// "还没见过盘口"而无法判定可成交性
     last_quotes: HashMap<(Exchange, Symbol), BBO>,
-    paper_pubsub: ActorRef<PaperPubSub>,
+    account_pubsub: ActorRef<AccountPubSub>,
     config: SimConfig,
     /// 透传给各柜台 SimState（市场规则校验在状态机内统一执行）
     symbol_metas: std::sync::Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
@@ -94,25 +100,16 @@ impl PaperCounterActor {
         format!("paper-{}", self.order_id_gen)
     }
 
-    /// 发布柜台产生的回报。
-    ///
-    /// **白名单**：只发 `OrderUpdate` 与 `Fill` —— 柜台的职责就是这两类。
-    /// [`SimState::on_market`] 会把入参行情原样放在返回值首位，而柜台自己也订阅 IncomePubSub，
-    /// 若把行情回显再发布出去，就会收到自己发的行情、再次回显 —— **无限循环**。用黑名单逐个
-    /// 排除行情类型是脆弱的（新增一种行情事件就漏一个），故按白名单放行。
-    async fn publish_reports(&self, account: &AccountId, events: Vec<IncomeEvent>) {
-        for ev in events {
-            if !matches!(
-                ev.data,
-                ExchangeEventData::OrderUpdate(_) | ExchangeEventData::Fill(_)
-            ) {
-                continue;
-            }
-            let tagged = AccountIncome {
+    /// 发布柜台产生的回报（SimState 只产 OrderUpdate/Fill，天生无需过滤）。
+    async fn publish_reports(&self, account: &AccountId, reports: Vec<(Timestamp, AccountData)>) {
+        for (ts, data) in reports {
+            let event = AccountEvent {
                 account: account.clone(),
-                event: ev,
+                exchange_ts: ts,
+                local_ts: ts,
+                data,
             };
-            if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
+            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Paper counter failed to publish report");
             }
         }
@@ -152,19 +149,17 @@ impl PaperCounterActor {
         for ((account, _), state) in &self.states {
             let equity = state.ledger.equity(|s: &Symbol| state.mark_of(s));
             let notional = state.ledger.notional(|s: &Symbol| state.mark_of(s));
-            let tagged = AccountIncome {
+            let event = AccountEvent {
                 account: account.clone(),
-                event: IncomeEvent {
-                    exchange_ts: ts,
-                    local_ts: ts,
-                    data: ExchangeEventData::AccountInfo {
-                        exchange: state.exchange,
-                        equity,
-                        notional,
-                    },
+                exchange_ts: ts,
+                local_ts: ts,
+                data: AccountData::AccountInfo {
+                    exchange: state.exchange,
+                    equity,
+                    notional,
                 },
             };
-            if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
+            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Paper counter failed to publish account info");
             }
         }
@@ -205,7 +200,7 @@ impl Actor for PaperCounterActor {
         Ok(Self {
             states: HashMap::new(),
             last_quotes: HashMap::new(),
-            paper_pubsub: args.paper_pubsub,
+            account_pubsub: args.account_pubsub,
             config: args.config,
             symbol_metas: args.symbol_metas,
             order_id_gen: 0,
@@ -224,12 +219,12 @@ impl Actor for PaperCounterActor {
 
 // === 行情入向：只更新盘口，用真实成交撮合 ===
 
-impl Message<IncomeEvent> for PaperCounterActor {
+impl Message<MarketEvent> for PaperCounterActor {
     type Reply = ();
 
-    async fn handle(&mut self, ev: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, ev: MarketEvent, _ctx: &mut Context<Self, Self::Reply>) {
         match &ev.data {
-            ExchangeEventData::BBO(bbo) => {
+            MarketData::BBO(bbo) => {
                 // 行情没有账户归属：缓存一份供新柜台播种，并同步给**本所**的已开柜台
                 self.last_quotes
                     .insert((bbo.exchange, bbo.symbol.clone()), bbo.clone());
@@ -239,7 +234,7 @@ impl Message<IncomeEvent> for PaperCounterActor {
                     }
                 }
             }
-            ExchangeEventData::MarketTrade(trade) => {
+            MarketData::MarketTrade(trade) => {
                 // 逐柜台撮合（只喂本所的柜台）：各柜台只持有自己 symbol 的挂单，非本
                 // symbol 的柜台是空转。该 O(柜台数) 开销是选择 Top-N 而非全部 530 个
                 // symbol 的原因之一；若要放到全量，应把"共享行情"从 SimState 里拆出来只存一份。
@@ -259,7 +254,7 @@ impl Message<IncomeEvent> for PaperCounterActor {
                     self.publish_reports(&key.0, reports).await;
                 }
             }
-            ExchangeEventData::MarkPrice(mp) => {
+            MarketData::MarkPrice(mp) => {
                 let exchange = mp.exchange;
                 let keys: Vec<(AccountId, Exchange)> = self
                     .states
@@ -276,7 +271,7 @@ impl Message<IncomeEvent> for PaperCounterActor {
                     self.publish_reports(&key.0, reports).await;
                 }
             }
-            ExchangeEventData::Clock => {
+            MarketData::Clock => {
                 self.publish_account_info(ev.local_ts).await;
             }
             _ => {}
@@ -430,32 +425,32 @@ mod tests {
     }
 
     /// 收集柜台回报，供断言
-    struct Sink(Arc<Mutex<Vec<IncomeEvent>>>);
+    struct Sink(Arc<Mutex<Vec<AccountEvent>>>);
 
     impl Actor for Sink {
-        type Args = Arc<Mutex<Vec<IncomeEvent>>>;
+        type Args = Arc<Mutex<Vec<AccountEvent>>>;
         type Error = Infallible;
         async fn on_start(a: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
             Ok(Self(a))
         }
     }
 
-    impl Message<AccountIncome> for Sink {
+    impl Message<AccountEvent> for Sink {
         type Reply = ();
-        async fn handle(&mut self, msg: AccountIncome, _c: &mut Context<Self, Self::Reply>) {
-            self.0.lock().unwrap().push(msg.event);
+        async fn handle(&mut self, msg: AccountEvent, _c: &mut Context<Self, Self::Reply>) {
+            self.0.lock().unwrap().push(msg);
         }
     }
 
     struct Harness {
         counter: ActorRef<PaperCounterActor>,
-        events: Arc<Mutex<Vec<IncomeEvent>>>,
+        events: Arc<Mutex<Vec<AccountEvent>>>,
     }
 
     impl Harness {
         async fn new(order_delay_ms: u64) -> Self {
-            let pubsub = PaperPubSub::spawn_with_mailbox(
-                PaperPubSub::new(DeliveryStrategy::Guaranteed),
+            let pubsub = AccountPubSub::spawn_with_mailbox(
+                AccountPubSub::new(DeliveryStrategy::Guaranteed),
                 mailbox::unbounded(),
             );
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -464,7 +459,7 @@ mod tests {
 
             let counter = PaperCounterActor::spawn_with_mailbox(
                 PaperCounterArgs {
-                    paper_pubsub: pubsub,
+                    account_pubsub: pubsub,
                     config: SimConfig {
                         initial_balance_usdt: 10_000.0,
                         maker_fee_rate: 0.0,
@@ -481,10 +476,10 @@ mod tests {
 
         /// 送一条 BBO（只更新盘口，不应撮合）
         async fn bbo(&self, bid: f64, ask: f64) {
-            let ev = IncomeEvent {
+            let ev = MarketEvent {
                 exchange_ts: 1,
                 local_ts: 1,
-                data: ExchangeEventData::BBO(BBO {
+                data: MarketData::BBO(BBO {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     bid_price: bid,
@@ -499,10 +494,10 @@ mod tests {
 
         /// 送一条真实成交
         async fn trade(&self, price: f64) {
-            let ev = IncomeEvent {
+            let ev = MarketEvent {
                 exchange_ts: 2,
                 local_ts: 2,
-                data: ExchangeEventData::MarketTrade(MarketTrade {
+                data: MarketData::MarketTrade(MarketTrade {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     price,
@@ -553,7 +548,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    ExchangeEventData::OrderUpdate(u) => Some(u.status.clone()),
+                    AccountData::OrderUpdate(u) => Some(u.status.clone()),
                     _ => None,
                 })
                 .collect()
@@ -565,7 +560,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    ExchangeEventData::Fill(f) => Some((f.price, f.size)),
+                    AccountData::Fill(f) => Some((f.price, f.size)),
                     _ => None,
                 })
                 .collect()
@@ -577,7 +572,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    ExchangeEventData::OrderUpdate(u) => Some(u.order_id.clone()),
+                    AccountData::OrderUpdate(u) => Some(u.order_id.clone()),
                     _ => None,
                 })
                 .collect()
@@ -595,10 +590,10 @@ mod tests {
         h.settle(50).await;
         assert_eq!(h.statuses(), vec![OrderStatus::Pending]);
         // OKX 上同 symbol 的成交穿过挂单价 —— 不得撮合 Binance 的挂单
-        let okx_trade = IncomeEvent {
+        let okx_trade = MarketEvent {
             exchange_ts: 2,
             local_ts: 2,
-            data: ExchangeEventData::MarketTrade(MarketTrade {
+            data: MarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::OKX,
                 symbol: SYM.to_string(),
                 price: 98.0,
@@ -649,10 +644,10 @@ mod tests {
         h.settle(50).await;
         // Clock 触发净值发布
         h.counter
-            .tell(IncomeEvent {
+            .tell(MarketEvent {
                 exchange_ts: 3,
                 local_ts: 3,
-                data: ExchangeEventData::Clock,
+                data: MarketData::Clock,
             })
             .send()
             .await
@@ -664,7 +659,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match &e.data {
-                ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
+                AccountData::AccountInfo { exchange, .. } => Some(*exchange),
                 _ => None,
             })
             .collect();
@@ -820,8 +815,8 @@ mod tests {
     /// taker 成交按 taker 费率计费（与 maker 不同）
     #[tokio::test]
     async fn taker_fill_charges_taker_fee() {
-        let pubsub = PaperPubSub::spawn_with_mailbox(
-            PaperPubSub::new(DeliveryStrategy::Guaranteed),
+        let pubsub = AccountPubSub::spawn_with_mailbox(
+            AccountPubSub::new(DeliveryStrategy::Guaranteed),
             mailbox::unbounded(),
         );
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -829,7 +824,7 @@ mod tests {
         pubsub.tell(Subscribe(sink)).send().await.unwrap();
         let counter = PaperCounterActor::spawn_with_mailbox(
             PaperCounterArgs {
-                paper_pubsub: pubsub,
+                account_pubsub: pubsub,
                 config: SimConfig {
                     initial_balance_usdt: 10_000.0,
                     maker_fee_rate: 0.0002,
@@ -852,7 +847,7 @@ mod tests {
             .unwrap()
             .iter()
             .find_map(|e| match &e.data {
-                ExchangeEventData::Fill(f) => Some(f.fee),
+                AccountData::Fill(f) => Some(f.fee),
                 _ => None,
             })
             .expect("fill");
@@ -915,10 +910,10 @@ mod tests {
         h.trade(100.0).await;
         // 标记价同样经 on_market（用于估值），其回显也不得外发
         h.counter
-            .tell(IncomeEvent {
+            .tell(MarketEvent {
                 exchange_ts: 3,
                 local_ts: 3,
-                data: ExchangeEventData::MarkPrice(crate::domain::MarkPrice {
+                data: MarketData::MarkPrice(crate::domain::MarkPrice {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     price: 100.0,
@@ -936,10 +931,9 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match &e.data {
-                ExchangeEventData::BBO(_) => Some("BBO"),
-                ExchangeEventData::MarketTrade(_) => Some("MarketTrade"),
-                ExchangeEventData::MarkPrice(_) => Some("MarkPrice"),
-                _ => None,
+                // AccountData 枚举里根本没有行情变体 —— 回显在类型上不可表达，
+                // 这里保留探针只为文档意图（永远匹配不到）
+                _ => None::<&'static str>,
             })
             .collect();
         assert!(
@@ -958,17 +952,17 @@ mod tests {
         h.place(Side::Long, 99.0, 0.5).await;
         h.settle(50).await;
         h.counter
-            .tell(IncomeEvent {
+            .tell(MarketEvent {
                 exchange_ts: 5,
                 local_ts: 5,
-                data: ExchangeEventData::Clock,
+                data: MarketData::Clock,
             })
             .send()
             .await
             .unwrap();
         h.settle(30).await;
         let equity = h.events.lock().unwrap().iter().find_map(|e| match &e.data {
-            ExchangeEventData::AccountInfo { equity, .. } => Some(*equity),
+            AccountData::AccountInfo { equity, .. } => Some(*equity),
             _ => None,
         });
         assert_eq!(equity, Some(10_000.0));

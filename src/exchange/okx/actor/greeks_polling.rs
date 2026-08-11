@@ -4,10 +4,10 @@
 //! 官方限速 10/2s，配置为每秒 3 次。
 
 use crate::domain::{now_ms, Exchange};
-use crate::engine::IncomePubSub;
+use crate::engine::AccountPubSub;
 use crate::exchange::okx::OkxClient;
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -24,7 +24,7 @@ pub struct OkxGreeksPollingActorArgs {
     /// OKX REST client
     pub client: Arc<OkxClient>,
     /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// 查询间隔 (毫秒)
     pub interval_ms: u64,
 }
@@ -32,7 +32,7 @@ pub struct OkxGreeksPollingActorArgs {
 /// OkxGreeksPollingActor - 定时查询希腊值
 pub struct OkxGreeksPollingActor {
     client: Arc<OkxClient>,
-    income_pubsub: ActorRef<IncomePubSub>,
+    account_pubsub: ActorRef<AccountPubSub>,
     /// 缓存每个 ccy 的上次 timestamp，用于去重
     last_ts: HashMap<String, u64>,
     /// 停摆守卫：希腊值取不到时 `StateManager` 里的旧值原样留着，策略拿它算 delta
@@ -58,16 +58,18 @@ impl OkxGreeksPollingActor {
 
                     let exchange_ts = greeks.timestamp;
                     if let Err(e) = self
-                        .income_pubsub
-                        .tell(Publish(IncomeEvent {
+                        .account_pubsub
+                        .tell(Publish(AccountEvent {
+                            // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                            account: crate::domain::AccountId::Live,
                             exchange_ts,
                             local_ts,
-                            data: ExchangeEventData::Greeks(greeks),
+                            data: AccountData::Greeks(greeks),
                         }))
                         .send()
                         .await
                     {
-                        tracing::error!(error = %e, "Failed to publish Greeks to IncomePubSub");
+                        tracing::error!(error = %e, "Failed to publish Greeks to AccountPubSub");
                     }
                 }
             }
@@ -102,7 +104,7 @@ impl Actor for OkxGreeksPollingActor {
 
         Ok(Self {
             client: args.client,
-            income_pubsub: args.income_pubsub,
+            account_pubsub: args.account_pubsub,
             last_ts: HashMap::new(),
             guard: StalenessGuard::new("OKX 账户希腊值", MAX_POLL_STALENESS_MS),
         })

@@ -5,7 +5,7 @@
 //! - 处理 BBO 订阅 (smd topic)：订阅前先行情预热 (pre-flight snapshot)，见 `send_subscribe`；
 //!   订阅后按 `SMD_REFRESH_INTERVAL` 周期性刷新，见 `refresh_subscriptions`
 //! - 处理订单状态推送 (sor topic)
-//! - 增量更新 bid/ask 缓存并发布 BBO 到 IncomePubSub
+//! - 增量更新 bid/ask 缓存并发布 BBO 到 MarketPubSub
 //!
 //! **IBKR 的 smd 订阅会被服务端自动终止**（2026-04-10 起的行为变更）。终止时**没有 close 帧、
 //! 没有错误**，流就静默停掉——ws 连接、ping、tickle 全都照常健康，因此完全不可从连接层察觉
@@ -41,13 +41,13 @@
 //! 的 10 分钟**为约束（见 `SMD_SERVER_TTL`），刷新周期取 8 分钟。
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO};
-use crate::engine::IncomePubSub;
+use crate::engine::{AccountPubSub, MarketPubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::client::IbkrClient;
 use crate::exchange::ibkr::wire;
 use crate::exchange::ws_loop;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -68,8 +68,11 @@ pub struct IbkrPublicWsActorArgs {
     pub auth: Arc<dyn IbkrAuth>,
     /// REST client (共享)：订阅前的行情预热走它的 `preflight_market_data`
     pub client: Arc<IbkrClient>,
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 行情总线（发布事件）
+    /// 公共行情总线（BBO）
+    pub market_pubsub: ActorRef<MarketPubSub>,
+    /// 账户私有事件总线（sor 订单更新 / str 成交 —— IBKR 用同一条 WS 混发公私两类 topic）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// conid 映射 (symbol → conid)
     pub conids: HashMap<String, i64>,
     /// tickle 返回的 session_id (用于 WS Cookie)
@@ -179,7 +182,8 @@ struct FillCommissionTimeout {
 
 /// IbkrPublicWsActor
 pub struct IbkrPublicWsActor {
-    income_pubsub: ActorRef<IncomePubSub>,
+    market_pubsub: ActorRef<MarketPubSub>,
+    account_pubsub: ActorRef<AccountPubSub>,
     /// REST client：订阅前行情预热用
     client: Arc<IbkrClient>,
     /// conid 映射 (symbol → conid)
@@ -354,14 +358,14 @@ impl IbkrPublicWsActor {
                 timestamp: local_ts,
             };
 
-            let event = IncomeEvent {
+            let event = MarketEvent {
                 exchange_ts: local_ts,
                 local_ts,
-                data: ExchangeEventData::BBO(bbo),
+                data: MarketData::BBO(bbo),
             };
 
-            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to MarketPubSub");
             }
         }
 
@@ -476,14 +480,16 @@ impl IbkrPublicWsActor {
                 quantity: 0.0,
             };
 
-            let event = IncomeEvent {
+            let event = AccountEvent {
+                // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                account: crate::domain::AccountId::Live,
                 exchange_ts: local_ts,
                 local_ts,
-                data: ExchangeEventData::OrderUpdate(update),
+                data: AccountData::OrderUpdate(update),
             };
 
-            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to AccountPubSub");
             }
         }
 
@@ -727,30 +733,32 @@ impl IbkrPublicWsActor {
     async fn publish_fill(&self, pending: PendingFill) {
         let local_ts = pending.fill.timestamp;
         if let Err(e) = self
-            .income_pubsub
-            .tell(Publish(IncomeEvent {
+            .account_pubsub
+            .tell(Publish(AccountEvent {
+                account: crate::domain::AccountId::Live,
                 exchange_ts: local_ts,
                 local_ts,
-                data: ExchangeEventData::Fill(pending.fill),
+                data: AccountData::Fill(pending.fill),
             }))
             .send()
             .await
         {
-            tracing::error!(error = %e, "Failed to publish Fill to IncomePubSub");
+            tracing::error!(error = %e, "Failed to publish Fill to AccountPubSub");
         }
 
         if let Some(order_update) = pending.order_update {
             if let Err(e) = self
-                .income_pubsub
-                .tell(Publish(IncomeEvent {
+                .account_pubsub
+                .tell(Publish(AccountEvent {
+                    account: crate::domain::AccountId::Live,
                     exchange_ts: local_ts,
                     local_ts,
-                    data: ExchangeEventData::OrderUpdate(order_update),
+                    data: AccountData::OrderUpdate(order_update),
                 }))
                 .send()
                 .await
             {
-                tracing::error!(error = %e, "Failed to publish OrderUpdate to IncomePubSub");
+                tracing::error!(error = %e, "Failed to publish OrderUpdate to AccountPubSub");
             }
         }
     }
@@ -877,7 +885,8 @@ impl Actor for IbkrPublicWsActor {
         );
 
         Ok(Self {
-            income_pubsub: args.income_pubsub,
+            market_pubsub: args.market_pubsub,
+            account_pubsub: args.account_pubsub,
             client: args.client,
             conids: args.conids,
             conid_to_symbol,

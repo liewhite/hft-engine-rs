@@ -16,7 +16,7 @@
 //!   （见 [`crate::observability`]，未配置时无外部依赖、行为与从前一致）
 
 use crate::domain::{AccountId, Exchange, Symbol, TradingStats};
-use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+use crate::messaging::{AccountData, AccountEvent, IncomeEvent, MarketEvent, StateManager};
 use crate::observability::{prometheus, MetricsPushConfig, PromText};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -27,7 +27,6 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_stream::wrappers::IntervalStream;
 
-use super::AccountIncome;
 
 /// 默认指标报告间隔
 pub const DEFAULT_REPORT_INTERVAL_MS: u64 = 60_000;
@@ -83,15 +82,15 @@ pub struct MetricsActor {
 impl MetricsActor {
     /// 模拟账户事件的分账逻辑（纯状态转移，供 handler 委托与单测直调）。
     /// **绝不**触碰实盘视图（total / state）—— 串账防线，见 paper_stats 字段说明。
-    fn apply_paper_event(&mut self, account: &AccountId, data: &ExchangeEventData) {
+    fn apply_paper_event(&mut self, account: &AccountId, data: &AccountData) {
         match data {
-            ExchangeEventData::Fill(fill) => {
+            AccountData::Fill(fill) => {
                 self.paper_stats_mut(account).apply_fill(fill);
             }
-            ExchangeEventData::OrderUpdate(update) => {
+            AccountData::OrderUpdate(update) => {
                 self.paper_stats_mut(account).apply_order_update(update);
             }
-            ExchangeEventData::AccountInfo {
+            AccountData::AccountInfo {
                 exchange,
                 equity,
                 notional,
@@ -416,26 +415,42 @@ impl Message<RegisterSymbols> for MetricsActor {
     }
 }
 
-/// 全量事件流入口
-impl Message<IncomeEvent> for MetricsActor {
+/// 行情事件入口（持仓估值 / 市场状态视图）
+impl Message<MarketEvent> for MetricsActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, msg: MarketEvent, _ctx: &mut Context<Self, Self::Reply>) {
         // 跟踪范围外的 symbol 事件直接计数跳过：喂给 StateManager 会被当成"路由 bug"打 error，
         // 但对观测层这只是"不关心的 symbol"（分桶部署下必然出现），不是错误。
-        if let Some(symbol) = msg.symbol() {
+        if let Some(symbol) = msg.data.symbol() {
             if !self.tracked.contains(symbol) {
                 self.untracked_events += 1;
                 return;
             }
         }
+        self.state.apply(&IncomeEvent::Market(msg));
+    }
+}
 
-        // 账户 / 持仓 / 挂单视图
-        self.state.apply(&msg);
+/// 账户事件入口：实盘进实盘视图（state/total），模拟账户按账户分账 —— 分道由事件
+/// 自带的账户标签决定，不再依赖"来源总线"区分
+impl Message<AccountEvent> for MetricsActor {
+    type Reply = ();
 
+    async fn handle(&mut self, msg: AccountEvent, _ctx: &mut Context<Self, Self::Reply>) {
+        if msg.account != AccountId::Live {
+            self.apply_paper_event(&msg.account.clone(), &msg.data);
+            return;
+        }
+        if let Some(symbol) = msg.data.symbol() {
+            if !self.tracked.contains(symbol) {
+                self.untracked_events += 1;
+                return;
+            }
+        }
         // 累计统计
         match &msg.data {
-            ExchangeEventData::Fill(fill) => {
+            AccountData::Fill(fill) => {
                 self.total.apply_fill(fill);
                 self.per_symbol
                     .entry(fill.symbol.clone())
@@ -444,7 +459,7 @@ impl Message<IncomeEvent> for MetricsActor {
                     })
                     .apply_fill(fill);
             }
-            ExchangeEventData::OrderUpdate(update) => {
+            AccountData::OrderUpdate(update) => {
                 self.total.apply_order_update(update);
                 self.per_symbol
                     .entry(update.symbol.clone())
@@ -455,15 +470,8 @@ impl Message<IncomeEvent> for MetricsActor {
             }
             _ => {}
         }
-    }
-}
-
-/// 模拟账户私有事件（PaperPubSub）：按账户聚统计，绝不喂进实盘视图
-impl Message<AccountIncome> for MetricsActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: AccountIncome, _ctx: &mut Context<Self, Self::Reply>) {
-        self.apply_paper_event(&msg.account, &msg.event.data);
+        // 账户 / 持仓 / 挂单视图
+        self.state.apply(&IncomeEvent::Account(msg));
     }
 }
 
@@ -506,23 +514,19 @@ mod tests {
         }
     }
 
-    fn fill_event(exchange: Exchange, symbol: &str, side: Side, size: f64) -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: 0,
-            local_ts: 0,
-            data: ExchangeEventData::Fill(Fill {
-                exchange,
-                symbol: symbol.to_string(),
-                side,
-                price: 100.0,
-                size,
-                client_order_id: None,
-                order_id: "1".to_string(),
-                timestamp: 0,
-                fee: 0.0,
-                reason: FillReason::Normal,
-            }),
-        }
+    fn fill_data(exchange: Exchange, symbol: &str, side: Side, size: f64) -> AccountData {
+        AccountData::Fill(Fill {
+            exchange,
+            symbol: symbol.to_string(),
+            side,
+            price: 100.0,
+            size,
+            client_order_id: None,
+            order_id: "1".to_string(),
+            timestamp: 0,
+            fee: 0.0,
+            reason: FillReason::Normal,
+        })
     }
 
     /// 直接构造（绕过 actor 生命周期），用于测试纯状态累积逻辑
@@ -548,9 +552,9 @@ mod tests {
         metrics.state.register_symbols(&["BTC".to_string()]);
 
         let account = crate::domain::AccountId::Paper("BTC".to_string());
-        let event = fill_event(Exchange::Binance, "BTC", Side::Long, 1.0);
+        let data = fill_data(Exchange::Binance, "BTC", Side::Long, 1.0);
         // 调 handler 委托的真实分账方法：将来有人在里面误加 state.apply，本测试会红
-        metrics.apply_paper_event(&account, &event.data);
+        metrics.apply_paper_event(&account, &data);
 
         assert_eq!(metrics.paper_stats[&account].fills, 1);
         assert_eq!(metrics.total.fills, 0, "模拟成交不得计入实盘累计");
@@ -588,9 +592,9 @@ mod tests {
         metrics.tracked.insert("BTC".to_string());
         metrics.state.register_symbols(&["BTC".to_string()]);
 
-        let ctx_free_event = fill_event(Exchange::Binance, "ETH", Side::Long, 1.0);
+        let ctx_free_data = fill_data(Exchange::Binance, "ETH", Side::Long, 1.0);
         // 手工走一遍 handler 的判定分支（不经 actor 运行时）
-        if let Some(symbol) = ctx_free_event.symbol() {
+        if let Some(symbol) = ctx_free_data.symbol() {
             if !metrics.tracked.contains(symbol) {
                 metrics.untracked_events += 1;
             }
@@ -611,10 +615,10 @@ mod tests {
         metrics.record_baseline(&symbol, Exchange::Binance, 2.0);
         metrics.state.seed_positions(&[baseline_of(&symbol, 2.0)]);
         // 喂 BBO 让持仓可估值
-        metrics.state.apply(&IncomeEvent {
-            exchange_ts: 0,
-            local_ts: 0,
-            data: ExchangeEventData::BBO(crate::domain::BBO {
+        metrics.state.apply(&IncomeEvent::market(
+            0,
+            0,
+            crate::messaging::MarketData::BBO(crate::domain::BBO {
                 exchange: Exchange::Binance,
                 symbol: symbol.clone(),
                 bid_price: 100.0,
@@ -623,7 +627,7 @@ mod tests {
                 ask_qty: 1.0,
                 timestamp: 0,
             }),
-        });
+        ));
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
         let exposure = state.exposure(metrics.baseline.get(&symbol));
@@ -646,16 +650,20 @@ mod tests {
 
         // 本次会话又买 1 个（价 100），随后 BBO 报 110；
         // local_ts 晚于快照请求时刻，不会被 seed 的防双计过滤
-        let mut fill = fill_event(Exchange::Binance, &symbol, Side::Long, 1.0);
-        fill.local_ts = 1;
-        if let ExchangeEventData::Fill(f) = &fill.data {
+        let data = fill_data(Exchange::Binance, &symbol, Side::Long, 1.0);
+        if let AccountData::Fill(f) = &data {
             metrics.total.apply_fill(f);
         }
-        metrics.state.apply(&fill);
-        metrics.state.apply(&IncomeEvent {
-            exchange_ts: 0,
-            local_ts: 0,
-            data: ExchangeEventData::BBO(crate::domain::BBO {
+        metrics.state.apply(&IncomeEvent::account(
+            crate::domain::AccountId::Live,
+            1,
+            1,
+            data,
+        ));
+        metrics.state.apply(&IncomeEvent::market(
+            0,
+            0,
+            crate::messaging::MarketData::BBO(crate::domain::BBO {
                 exchange: Exchange::Binance,
                 symbol: symbol.clone(),
                 bid_price: 110.0,
@@ -664,7 +672,7 @@ mod tests {
                 ask_qty: 1.0,
                 timestamp: 0,
             }),
-        });
+        ));
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
         let exposure = state.exposure(metrics.baseline.get(&symbol));

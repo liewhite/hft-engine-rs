@@ -3,7 +3,7 @@
 //! 职责:
 //! - 管理 PublicWsActor 和 PrivateWsActor 子 actor
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
-//! - WsActors 直接解析消息并发布到 IncomePubSub
+//! - WsActors 直接解析消息并发布到对应总线
 //!
 //! 架构:
 //! HyperliquidActor (父)
@@ -17,7 +17,7 @@ use super::funding_fee_polling::{
 use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs};
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
 use crate::domain::{ExchangeError, Symbol, SymbolMeta};
-use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
+use crate::engine::{AccountPubSub, CryptoStatusActor, CryptoStatusActorArgs, MarketPubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -39,8 +39,10 @@ pub struct HyperliquidActorArgs {
     pub credentials: Option<HyperliquidCredentials>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 公共行情总线（public WS / 状态广播用）
+    pub market_pubsub: ActorRef<MarketPubSub>,
+    /// 账户私有事件总线（private WS / 账户轮询用）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// 计价币种 (e.g., "USDC", "USDE")
     pub quote: String,
     /// Perp DEX 名称 ("" = 默认, "xyz" = 股票永续等)
@@ -60,7 +62,6 @@ impl Actor for HyperliquidActor {
     type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let income_pubsub = args.income_pubsub;
 
         // 凭证可用时构建 Arc<HyperliquidClient>，供 FundingFee polling 使用（与 BinanceActor 同构）。
         // 构建失败向上传播 → 启动期受控退出
@@ -80,7 +81,7 @@ impl Actor for HyperliquidActor {
             &actor_ref,
             "HyperliquidPublicWsActor",
             HyperliquidPublicWsActorArgs {
-                income_pubsub: income_pubsub.clone(),
+                market_pubsub: args.market_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
                 dex: args.dex.clone(),
@@ -95,7 +96,7 @@ impl Actor for HyperliquidActor {
                     HyperliquidPrivateWsActorArgs {
                         wallet_address: credentials.wallet_address,
                         dex: args.dex.clone(),
-                        income_pubsub: income_pubsub.clone(),
+                        account_pubsub: args.account_pubsub.clone(),
                     },
                 )
                 .await,
@@ -131,7 +132,7 @@ impl Actor for HyperliquidActor {
                 "HyperliquidFundingFeePollingActor",
                 HyperliquidFundingFeePollingActorArgs {
                     client,
-                    income_pubsub: income_pubsub.clone(),
+                    account_pubsub: args.account_pubsub.clone(),
                     interval_ms: FUNDING_FEE_POLL_INTERVAL_MS,
                 },
             )
@@ -144,7 +145,7 @@ impl Actor for HyperliquidActor {
             "CryptoStatusActor",
             CryptoStatusActorArgs {
                 exchange: crate::domain::Exchange::Hyperliquid,
-                income_pubsub,
+                market_pubsub: args.market_pubsub.clone(),
                 interval_ms: STATUS_BROADCAST_INTERVAL_MS,
             },
         )

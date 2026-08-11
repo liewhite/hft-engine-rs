@@ -40,7 +40,7 @@
 use crate::domain::{Exchange, Position, Symbol, SymbolMeta};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::ExchangeClient;
-use crate::messaging::{ExchangeEventData, IncomeEvent, PositionBaseline, StateManager};
+use crate::messaging::{AccountData, AccountEvent, IncomeEvent, PositionBaseline, StateManager};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -139,11 +139,16 @@ impl Reconciler {
         self.mirror.symbol_state(symbol).is_some()
     }
 
-    /// 喂入一条 income 事件（镜像只吃 Fill —— 通道 A 的增量输入就它一个）。
-    pub fn on_event(&mut self, event: &IncomeEvent) {
-        if let ExchangeEventData::Fill(fill) = &event.data {
+    /// 喂入一条账户事件（镜像只吃**实盘**的 Fill —— 通道 A 的增量输入就它一个；
+    /// 模拟账户的成交绝不能进实盘持仓镜像）。
+    pub fn on_event(&mut self, event: &AccountEvent) {
+        if event.account != crate::domain::AccountId::Live {
+            return;
+        }
+        if let AccountData::Fill(fill) = &event.data {
             if self.is_tracked(&fill.symbol) {
-                self.mirror.apply(event);
+                self.mirror
+                    .apply(&IncomeEvent::Account(event.clone()));
             }
         }
     }
@@ -383,11 +388,11 @@ impl Message<super::RegisterSymbols> for PositionReconcileActor {
     }
 }
 
-/// income 流入口：镜像只吃 Fill（经 SubscribeFilter 过滤，见 manager 装配）
-impl Message<IncomeEvent> for PositionReconcileActor {
+/// 账户事件入口：镜像只吃实盘 Fill（经 SubscribeFilter 预过滤 + on_event 内按账户再过滤）
+impl Message<AccountEvent> for PositionReconcileActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, msg: AccountEvent, _ctx: &mut Context<Self, Self::Reply>) {
         self.reconciler.on_event(&msg);
     }
 }
@@ -484,11 +489,12 @@ mod tests {
         }
     }
 
-    fn fill_on(exchange: Exchange, side: Side, size: f64, local_ts: u64) -> IncomeEvent {
-        IncomeEvent {
+    fn fill_on(exchange: Exchange, side: Side, size: f64, local_ts: u64) -> AccountEvent {
+        AccountEvent {
+            account: crate::domain::AccountId::Live,
             exchange_ts: local_ts,
             local_ts,
-            data: ExchangeEventData::Fill(Fill {
+            data: AccountData::Fill(Fill {
                 exchange,
                 symbol: SYM.to_string(),
                 side,
@@ -503,7 +509,7 @@ mod tests {
         }
     }
 
-    fn fill(side: Side, size: f64) -> IncomeEvent {
+    fn fill(side: Side, size: f64) -> AccountEvent {
         fill_on(EX, side, size, SNAPSHOT_TS + 1)
     }
 

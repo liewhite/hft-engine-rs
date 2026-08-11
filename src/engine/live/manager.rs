@@ -9,8 +9,8 @@
 use crate::actor_lifecycle::{ChildGroup, ChildStop};
 use crate::engine::bootstrap::Supervised;
 use super::{
-    AccountIncome, AccountOutcome, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs, IncomePubSub,
-    PaperCounterActor, PaperCounterArgs, PaperPubSub,
+    AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs, ExecutorActor, ExecutorArgs,
+    MarketPubSub, PaperCounterActor, PaperCounterArgs,
     GetPositions, IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub,
     OutcomeProcessorActor,
     PositionReconcileActor, PositionReconcileArgs,
@@ -22,7 +22,7 @@ use crate::domain::{
     now_ms, AccountId, Exchange, ExchangeError, Order, OrderType, OrderUpdate, Side, Symbol,
     SymbolMeta,
 };
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
 use crate::exchange::binance::{
     BinanceActor, BinanceActorArgs, BinanceClient, BinanceCredentials, REST_BASE_URL,
 };
@@ -84,22 +84,21 @@ pub struct ManagerActor {
 
     // === PubSub Actors ===
     /// Income PubSub (行情/账户事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    market_pubsub: ActorRef<MarketPubSub>,
+    /// 账户私有事件总线（实盘适配层 + 本地柜台共用，见 [`AccountPubSub`]）
+    account_pubsub: ActorRef<AccountPubSub>,
     /// Outcome PubSub (策略信号)
     outcome_pubsub: ActorRef<OutcomePubSub>,
 
     // === 子 Actors ===
-    /// ProcessorActor (订阅 income_pubsub)
+    /// ProcessorActor (订阅两条入向总线)
     income_processor: ActorRef<IncomeProcessorActor>,
-    /// MetricsActor (订阅 income_pubsub，输出账户/持仓/订单/历史指标)
+    /// MetricsActor (订阅两条入向总线，输出账户/持仓/订单/历史指标)
     metrics: ActorRef<MetricsActor>,
-    /// 持仓对账 Actor (订阅 income_pubsub；漂移确认后致命退出)
+    /// 持仓对账 Actor (订阅账户总线的实盘 Fill；漂移确认后致命退出)
     position_reconciler: ActorRef<PositionReconcileActor>,
     /// ExchangeActors (启动时创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
-
-    /// 模拟账户私有事件总线（供 Supervisor 等观察者订阅）
-    paper_pubsub: ActorRef<PaperPubSub>,
 
     /// 唯一的实盘下单出口（与 OutcomeProcessorActor 共享同一实例）。
     /// 降级平仓经此下单 —— in_flight 判据、失败反馈、dry_run 语义与策略信号一致。
@@ -664,7 +663,9 @@ impl ManagerActor {
 /// 交易所 WS actor 装配的执行环境（metas 预加载完成后可用）
 struct SpawnCtx {
     manager: ActorRef<ManagerActor>,
-    income_pubsub: ActorRef<IncomePubSub>,
+    market_pubsub: ActorRef<MarketPubSub>,
+    /// 账户私有事件总线（实盘适配层 + 本地柜台共用，见 [`AccountPubSub`]）
+    account_pubsub: ActorRef<AccountPubSub>,
     /// 该所的 symbol -> meta
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
@@ -718,7 +719,8 @@ fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<ExchangeS
                         credentials: access.credentials,
                         symbol_metas: ctx.symbol_metas,
                         rest_base_url: REST_BASE_URL.to_string(),
-                        income_pubsub: ctx.income_pubsub,
+                        market_pubsub: ctx.market_pubsub,
+                        account_pubsub: ctx.account_pubsub,
                         client: client_dyn,
                         quote: access.quote,
                     },
@@ -750,7 +752,8 @@ fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup, Ex
                         credentials: access.credentials,
                         client: Some(client),
                         symbol_metas: ctx.symbol_metas,
-                        income_pubsub: ctx.income_pubsub,
+                        market_pubsub: ctx.market_pubsub,
+                        account_pubsub: ctx.account_pubsub,
                         quote: access.quote,
                     },
                     mailbox::unbounded(),
@@ -787,7 +790,8 @@ fn setup_hyperliquid(
                     HyperliquidActorArgs {
                         credentials: access.credentials,
                         symbol_metas: ctx.symbol_metas,
-                        income_pubsub: ctx.income_pubsub,
+                        market_pubsub: ctx.market_pubsub,
+                        account_pubsub: ctx.account_pubsub,
                         quote: access.quote,
                         dex: access.dex,
                     },
@@ -824,7 +828,8 @@ async fn setup_ibkr(
                     &ctx.manager,
                     IbkrActorArgs {
                         auth,
-                        income_pubsub: ctx.income_pubsub,
+                        market_pubsub: ctx.market_pubsub,
+                        account_pubsub: ctx.account_pubsub,
                         conids,
                         client,
                         snapshot,
@@ -874,13 +879,21 @@ impl Actor for ManagerActor {
         // 2. 预加载所有交易所的 symbol metas
         let symbol_metas = Self::preload_all_symbol_metas(&clients).await?;
 
-        // 3. 创建 PubSub Actors (使用 spawn_link_with_mailbox)
+        // 3. 创建 PubSub Actors：行情 / 账户 / 信号 三条总线。
+        //    账户事件（实盘适配层标 Live + 本地柜台标 Paper）走同一条 AccountPubSub，
+        //    账户隔离由事件自带的 account 字段保证 —— 不靠总线拓扑，也不靠来源推断。
         let mut pipeline = ChildGroup::default();
         let mut producers = ChildGroup::default();
-        let income_pubsub = pipeline.spawn::<IncomePubSub, _>(
+        let market_pubsub = pipeline.spawn::<MarketPubSub, _>(
             &actor_ref,
-            "IncomePubSub",
-            IncomePubSub::new(DeliveryStrategy::BestEffort),
+            "MarketPubSub",
+            MarketPubSub::new(DeliveryStrategy::BestEffort),
+        )
+        .await;
+        let account_pubsub = pipeline.spawn::<AccountPubSub, _>(
+            &actor_ref,
+            "AccountPubSub",
+            AccountPubSub::new(DeliveryStrategy::BestEffort),
         )
         .await;
         let outcome_pubsub = pipeline.spawn::<OutcomePubSub, _>(
@@ -890,14 +903,19 @@ impl Actor for ManagerActor {
         )
         .await;
 
-        // 4. 创建 ProcessorActor 并订阅 income_pubsub
+        // 4. 创建 ProcessorActor：订阅两条入向总线，按订阅关系/账户分发给 executor
         let processor = pipeline.spawn::<IncomeProcessorActor, _>(
             &actor_ref,
             "IncomeProcessorActor",
             IncomeProcessorActor::default(),
         )
         .await;
-        income_pubsub
+        market_pubsub
+            .tell(Subscribe(processor.clone()))
+            .send()
+            .await
+            .map_err(|e| ExchangeError::Other(e.to_string()))?;
+        account_pubsub
             .tell(Subscribe(processor.clone()))
             .send()
             .await
@@ -913,7 +931,7 @@ impl Actor for ManagerActor {
         //    dry_run 语义对一切下单一致，系统不存在第二个下单出口。
         let order_gateway = Arc::new(OrderGateway::new(
             clients.clone(),
-            income_pubsub.clone(),
+            account_pubsub.clone(),
             // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
             Arc::new(symbol_metas.clone()),
             /* dry_run */ false,
@@ -930,27 +948,22 @@ impl Actor for ManagerActor {
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
         // 出向处理器还要看**交易所回报**，用来作废迟到的 REST 失败结论
-        // （见 OrderGateway::in_flight）。只订 OrderUpdate，不吃行情洪水。
-        income_pubsub
-            .tell(SubscribeFilter(live_processor, |e: &IncomeEvent| {
-                matches!(e.data, ExchangeEventData::OrderUpdate(_))
+        // （见 OrderGateway::in_flight）。只订 OrderUpdate，不吃全量账户事件。
+        account_pubsub
+            .tell(SubscribeFilter(live_processor, |e: &AccountEvent| {
+                matches!(e.data, AccountData::OrderUpdate(_))
             }))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
-        // 模拟账户私有事件走独立总线：结构上保证真实账户的成交不可能流进模拟策略的状态
-        let paper_pubsub = pipeline.spawn::<PaperPubSub, _>(
-            &actor_ref,
-            "PaperPubSub",
-            PaperPubSub::new(DeliveryStrategy::BestEffort),
-        )
-        .await;
+        // 本地柜台：订阅信号总线（认领 Paper 账户的订单）与行情总线（撮合 + Clock 发净值），
+        // 回报以 Paper 标签发布到 AccountPubSub —— 与实盘适配层同一条总线、同一个类型
         let paper_counter = pipeline.spawn::<PaperCounterActor, _>(
             &actor_ref,
             "PaperCounterActor",
             PaperCounterArgs {
-                paper_pubsub: paper_pubsub.clone(),
+                account_pubsub: account_pubsub.clone(),
                 config: args.paper,
                 symbol_metas: Arc::new(symbol_metas.clone()),
             },
@@ -961,23 +974,13 @@ impl Actor for ManagerActor {
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
-        // 柜台需要共享行情（撮合）与 Clock（发布净值）
-        income_pubsub
+        market_pubsub
             .tell(Subscribe(paper_counter.clone()))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
-        // **柜台的回报要能回到策略**：IncomeProcessor 订阅 paper 总线，按账户投递给对应
-        // executor。漏掉这一步的表现是"订单永远停在 Created、超时被清理后反复重挂"——
-        // 策略收不到 Pending/Filled，看不见自己的挂单。
-        paper_pubsub
-            .clone()
-            .tell(Subscribe(processor.clone()))
-            .send()
-            .await
-            .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
-        // 5.5 创建 MetricsActor 并订阅 income_pubsub（观测层：只读事件流，不参与决策）
+        // 5.5 创建 MetricsActor 并订阅两条入向总线（观测层：只读事件流，不参与决策）
         let metrics = pipeline.spawn::<MetricsActor, _>(
             &actor_ref,
             "MetricsActor",
@@ -988,14 +991,14 @@ impl Actor for ManagerActor {
             },
         )
         .await;
-        income_pubsub
+        market_pubsub
             .tell(Subscribe(metrics.clone()))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
-        // 模拟账户的成交/拒单/净值也要进指标（此前是观测盲区）；MetricsActor 内部
-        // 按账户分账，绝不与实盘视图混淆
-        paper_pubsub
+        // 账户事件（实盘 + 全部模拟账户）一次订阅；MetricsActor 按事件自带的账户分账，
+        // 绝不与实盘视图混淆
+        account_pubsub
             .tell(Subscribe(metrics.clone()))
             .send()
             .await
@@ -1024,22 +1027,22 @@ impl Actor for ManagerActor {
             },
         )
         .await;
-        // 镜像的增量输入只有 Fill：按类型过滤订阅，不吃行情洪水
-        income_pubsub
-            .tell(SubscribeFilter(position_reconciler.clone(), |e: &IncomeEvent| {
-                matches!(e.data, ExchangeEventData::Fill(_))
+        // 镜像的增量输入只有实盘 Fill：按类型+账户过滤订阅（模拟成交绝不进实盘镜像）
+        account_pubsub
+            .tell(SubscribeFilter(position_reconciler.clone(), |e: &AccountEvent| {
+                e.account == AccountId::Live && matches!(e.data, AccountData::Fill(_))
             }))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
-        // 6. 创建 ClockActor（发布 Clock 事件到 income_pubsub）
+        // 6. 创建 ClockActor（发布 Clock 事件到行情总线）
         producers.spawn::<ClockActor, _>(
             &actor_ref,
             "ClockActor",
             ClockActorArgs {
                 interval_ms: 1000,
-                income_pubsub: income_pubsub.clone(),
+                market_pubsub: market_pubsub.clone(),
             },
         )
         .await;
@@ -1052,7 +1055,8 @@ impl Actor for ManagerActor {
             .map(|setup| {
                 let ctx = SpawnCtx {
                     manager: actor_ref.clone(),
-                    income_pubsub: income_pubsub.clone(),
+                    market_pubsub: market_pubsub.clone(),
+                    account_pubsub: account_pubsub.clone(),
                     symbol_metas: Self::get_symbol_metas_for(&symbol_metas, setup.exchange),
                 };
                 let exchange = setup.exchange;
@@ -1072,13 +1076,13 @@ impl Actor for ManagerActor {
         Ok(Self {
             symbol_metas,
             clients,
-            income_pubsub,
+            market_pubsub,
+            account_pubsub,
             outcome_pubsub,
             income_processor: processor,
             metrics,
             position_reconciler,
             exchange_actors,
-            paper_pubsub,
             order_gateway,
             executors: Vec::new(),
             producers,
@@ -1242,13 +1246,13 @@ impl Message<RegisterSupervisedChild> for ManagerActor {
 /// （投递遇 ActorNotRunning 时移除该订阅者）。受监督的订阅者要收工，对自己的
 /// [`Supervised::actor_ref`] 调 `stop_gracefully()` 即可 —— 那产生 `Normal`，
 /// [`ManagerActor::on_link_died`] 据此放行，引擎照常运行，不需要另行声明什么。
-pub struct SubscribeIncome<A: Actor> {
+pub struct SubscribeMarket<A: Actor> {
     actor: Supervised<A>,
-    filter: fn(&IncomeEvent) -> bool,
+    filter: fn(&MarketEvent) -> bool,
 }
 
-impl<A: Actor> SubscribeIncome<A> {
-    /// 订阅全部事件
+impl<A: Actor> SubscribeMarket<A> {
+    /// 订阅全部行情事件
     pub fn all(actor: Supervised<A>) -> Self {
         Self { actor, filter: |_| true }
     }
@@ -1256,42 +1260,84 @@ impl<A: Actor> SubscribeIncome<A> {
     /// 只订阅 `filter` 返回 true 的事件。
     ///
     /// 过滤在 PubSub 自己的任务里执行：不通过的事件**连 clone 都省掉**，订阅者也不会
-    /// 被唤醒。观测类订阅者往往只关心少数几种事件（如告警只看订单回报与成交），全收等于每个行情 tick 都白唤醒一次。
+    /// 被唤醒。观测类订阅者往往只关心少数几种事件，全收等于每个行情 tick 都白唤醒一次。
     ///
     /// `filter` 是 `fn` 指针不是闭包，**不能捕获**任何东西 —— 判据必须只看事件本身，
     /// 这样"我订了什么"是一段可以直接读懂的静态声明，而不是运行期才知道的行为。
-    pub fn only(actor: Supervised<A>, filter: fn(&IncomeEvent) -> bool) -> Self {
+    pub fn only(actor: Supervised<A>, filter: fn(&MarketEvent) -> bool) -> Self {
         Self { actor, filter }
     }
 }
 
-impl<A> Message<SubscribeIncome<A>> for ManagerActor
+impl<A> Message<SubscribeMarket<A>> for ManagerActor
 where
-    A: Actor + Message<crate::messaging::IncomeEvent>,
+    A: Actor + Message<MarketEvent>,
 {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        msg: SubscribeIncome<A>,
+        msg: SubscribeMarket<A>,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if let Err(e) = self
-            .income_pubsub
+            .market_pubsub
             .tell(SubscribeFilter(msg.actor.into_inner(), msg.filter))
             .send()
             .await
         {
-            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            tracing::error!(error = %e, "Failed to subscribe to MarketPubSub");
+        }
+    }
+}
+
+/// 订阅账户私有事件（实盘 + 全部模拟账户在同一条总线上，按事件自带的 `account`
+/// 字段区分）。退订方式见 [`SubscribeMarket`]（订阅者停机即自动摘除）。
+pub struct SubscribeAccount<A: Actor> {
+    actor: Supervised<A>,
+    filter: fn(&AccountEvent) -> bool,
+}
+
+impl<A: Actor> SubscribeAccount<A> {
+    /// 订阅全部账户事件（实盘与全部模拟账户）
+    pub fn all(actor: Supervised<A>) -> Self {
+        Self { actor, filter: |_| true }
+    }
+
+    /// 只订阅 `filter` 返回 true 的事件（可按 `account` 与事件类型过滤）。
+    /// `filter` 是 `fn` 指针不是闭包，**不能捕获**任何东西，同 [`SubscribeMarket::only`]。
+    pub fn only(actor: Supervised<A>, filter: fn(&AccountEvent) -> bool) -> Self {
+        Self { actor, filter }
+    }
+}
+
+impl<A> Message<SubscribeAccount<A>> for ManagerActor
+where
+    A: Actor + Message<AccountEvent>,
+{
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: SubscribeAccount<A>,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if let Err(e) = self
+            .account_pubsub
+            .tell(SubscribeFilter(msg.actor.into_inner(), msg.filter))
+            .send()
+            .await
+        {
+            tracing::error!(error = %e, "Failed to subscribe to AccountPubSub");
         }
     }
 }
 
 /// 外部向策略注入自定义事件（[`crate::messaging::CustomEvent`] 的**入向**入口）。
 ///
-/// 事件进入 Income 总线后按 scope 路由：带 `(exchange, symbol)` 的只投递给订阅了
+/// 事件进入行情总线后按 scope 路由：带 `(exchange, symbol)` 的只投递给订阅了
 /// 该 symbol 的策略，无 scope 的广播 —— 与行情同一套分发，无第二条通道。策略在
-/// `on_event` 里 match `ExchangeEventData::Custom` 并按类型 `get::<T>()` 消费。
+/// `on_event` 里 match `MarketData::Custom` 并按类型 `get::<T>()` 消费。
 ///
 /// 自定义事件没有账户归属（如同行情）：实盘与模拟账户的策略都会收到。总线上的
 /// 非 executor 订阅者（观测镜像等）同样可见。时间戳取注入时刻。
@@ -1308,18 +1354,18 @@ impl Message<PublishCustomEvent> for ManagerActor {
         let ts = now_ms();
         // 注入留痕：事件"发了没人收"（scope 拼错、订阅缺失、类型不符）时，这是唯一的定位起点
         tracing::debug!(name = msg.0.name, scope = ?msg.0.scope(), "注入自定义事件");
-        let event = IncomeEvent {
+        let event = MarketEvent {
             exchange_ts: ts,
             local_ts: ts,
-            data: ExchangeEventData::Custom(msg.0),
+            data: MarketData::Custom(msg.0),
         };
         if let Err(e) = self
-            .income_pubsub
+            .market_pubsub
             .tell(kameo_actors::pubsub::Publish(event))
             .send()
             .await
         {
-            tracing::error!(error = %e, "Failed to publish custom event to IncomePubSub");
+            tracing::error!(error = %e, "Failed to publish custom event to MarketPubSub");
         }
     }
 }
@@ -1647,53 +1693,6 @@ impl ManagerActor {
             "撤下未完成（账户 {account}，交易所 {exchange}），需人工核对: {}",
             incomplete.join("; ")
         )))
-    }
-}
-
-/// 订阅模拟账户私有事件总线（Supervisor / 观测层用）。
-/// 退订方式见 [`SubscribeIncome`]（订阅者停机即自动摘除）。
-pub struct SubscribePaper<A: Actor> {
-    actor: Supervised<A>,
-    filter: fn(&AccountIncome) -> bool,
-}
-
-impl<A: Actor> SubscribePaper<A> {
-    /// 订阅全部事件
-    pub fn all(actor: Supervised<A>) -> Self {
-        Self { actor, filter: |_| true }
-    }
-
-    /// 只订阅 `filter` 返回 true 的事件。
-    ///
-    /// 过滤在 PubSub 自己的任务里执行：不通过的事件**连 clone 都省掉**，订阅者也不会
-    /// 被唤醒。
-    ///
-    /// `filter` 是 `fn` 指针不是闭包，**不能捕获**任何东西 —— 判据必须只看事件本身，
-    /// 这样"我订了什么"是一段可以直接读懂的静态声明，而不是运行期才知道的行为。
-    pub fn only(actor: Supervised<A>, filter: fn(&AccountIncome) -> bool) -> Self {
-        Self { actor, filter }
-    }
-}
-
-impl<A> Message<SubscribePaper<A>> for ManagerActor
-where
-    A: Actor + Message<AccountIncome>,
-{
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: SubscribePaper<A>,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        if let Err(e) = self
-            .paper_pubsub
-            .tell(SubscribeFilter(msg.actor.into_inner(), msg.filter))
-            .send()
-            .await
-        {
-            tracing::error!(error = %e, "Failed to subscribe to PaperPubSub");
-        }
     }
 }
 

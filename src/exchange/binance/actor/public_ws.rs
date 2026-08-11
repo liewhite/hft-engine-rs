@@ -3,15 +3,15 @@
 //! 职责:
 //! - 维护公开 WebSocket 连接
 //! - 处理 Subscribe/Unsubscribe 请求
-//! - 直接解析消息并发布到 IncomePubSub
+//! - 直接解析消息并发布到对应总线
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::engine::IncomePubSub;
+use crate::engine::MarketPubSub;
 use crate::exchange::binance::codec::{AggTrade, BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::ws_loop;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{MarketData, MarketEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -29,8 +29,8 @@ pub struct BinancePublicWsActorArgs {
     /// WebSocket 基础 URL（迁移后 Binance 把公共流拆为 /public/ws 与 /market/ws，
     /// 由父 actor 决定本 actor 实例绑定哪个 URL）
     pub url: String,
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 行情总线（发布事件）
+    pub market_pubsub: ActorRef<MarketPubSub>,
     /// Symbol 元数据（公开 WS 目前不需要，但保持一致性）
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
@@ -39,8 +39,8 @@ pub struct BinancePublicWsActorArgs {
 
 /// BinancePublicWsActor - 公开 WebSocket Actor
 pub struct BinancePublicWsActor {
-    /// Income PubSub (发布事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    /// 行情总线（发布事件）
+    market_pubsub: ActorRef<MarketPubSub>,
     /// Symbol 元数据（用于过滤不存在的 symbol）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
@@ -104,8 +104,8 @@ impl BinancePublicWsActor {
         let local_ts = now_ms();
         let events = parse_public_message(raw, &self.quote, local_ts, &self.subscribed_kinds)?;
         for event in events {
-            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to MarketPubSub");
             }
         }
         Ok(())
@@ -146,7 +146,7 @@ impl Actor for BinancePublicWsActor {
         tracing::info!(url = %args.url, "BinancePublicWsActor started");
 
         Ok(Self {
-            income_pubsub: args.income_pubsub,
+            market_pubsub: args.market_pubsub,
             symbol_metas: args.symbol_metas,
             quote: args.quote,
             ws_tx: Some(outgoing_tx),
@@ -316,7 +316,7 @@ pub(crate) fn parse_public_message(
     quote: &str,
     local_ts: u64,
     subscribed_kinds: &HashSet<SubscriptionKind>,
-) -> Result<Vec<IncomeEvent>, WsError> {
+) -> Result<Vec<MarketEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -360,30 +360,30 @@ pub(crate) fn parse_public_message(
             // 根据订阅的 kinds 生成对应的事件
             if subscribed_kinds.contains(&SubscriptionKind::FundingRate { symbol: symbol.clone() })
             {
-                events.push(IncomeEvent {
+                events.push(MarketEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::FundingRate(
+                    data: MarketData::FundingRate(
                         update.to_funding_rate(quote, exchange_ts)
                             ?,
                     ),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() }) {
-                events.push(IncomeEvent {
+                events.push(MarketEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::MarkPrice(
+                    data: MarketData::MarkPrice(
                         update.to_mark_price(quote, exchange_ts)
                             ?,
                     ),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
-                events.push(IncomeEvent {
+                events.push(MarketEvent {
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::IndexPrice(
+                    data: MarketData::IndexPrice(
                         update.to_index_price(quote, exchange_ts)
                             ?,
                     ),
@@ -397,10 +397,10 @@ pub(crate) fn parse_public_message(
                 .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
             let bbo = ticker.to_bbo(quote)
                 ?;
-            Ok(vec![IncomeEvent {
+            Ok(vec![MarketEvent {
                 exchange_ts,
                 local_ts,
-                data: ExchangeEventData::BBO(bbo),
+                data: MarketData::BBO(bbo),
             }])
         }
         "aggTrade" => {
@@ -408,10 +408,10 @@ pub(crate) fn parse_public_message(
                 .map_err(|e| WsError::ParseError(format!("aggTrade parse: {}", e)))?;
             let trade = agg.to_market_trade(quote)
                 ?;
-            Ok(vec![IncomeEvent {
+            Ok(vec![MarketEvent {
                 exchange_ts: trade.timestamp,
                 local_ts,
-                data: ExchangeEventData::MarketTrade(trade),
+                data: MarketData::MarketTrade(trade),
             }])
         }
         _ => {

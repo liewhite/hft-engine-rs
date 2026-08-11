@@ -3,8 +3,8 @@
 //! 职责:
 //! - 管理 PublicWsActor、PrivateWsActor 和 EquityPollingActor 子 actor
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
-//! - WsActors 直接解析消息并发布到 IncomePubSub
-//! - 启动时查询持仓并推送到 IncomePubSub
+//! - WsActors 直接解析消息并发布到对应总线
+//! - 启动时查询持仓并推送到对应总线
 //!
 //! 架构:
 //! BinanceActor (父)
@@ -19,7 +19,7 @@ use super::funding_fee_polling::{BinanceFundingFeePollingActor, BinanceFundingFe
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
 use crate::domain::{ExchangeError, Symbol, SymbolMeta};
-use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
+use crate::engine::{AccountPubSub, CryptoStatusActor, CryptoStatusActorArgs, MarketPubSub};
 use crate::exchange::binance::{
     BinanceClient, BinanceCredentials, WS_MARKET_URL, WS_PUBLIC_HIGH_FREQ_URL,
 };
@@ -43,8 +43,10 @@ pub struct BinanceActorArgs {
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// REST 基础 URL（用于 ListenKey）
     pub rest_base_url: String,
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 公共行情总线（public WS / 状态广播用）
+    pub market_pubsub: ActorRef<MarketPubSub>,
+    /// 账户私有事件总线（private WS / 账户轮询用）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// Exchange client（用于查询 equity）
     pub client: Arc<dyn ExchangeClient>,
     /// 计价币种 (e.g., "USDT")
@@ -128,7 +130,7 @@ impl Actor for BinanceActor {
             "BinancePublicWsActor",
             BinancePublicWsActorArgs {
                 url: WsTarget::PublicHighFreq.url().to_string(),
-                income_pubsub: args.income_pubsub.clone(),
+                market_pubsub: args.market_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
@@ -139,7 +141,7 @@ impl Actor for BinanceActor {
             "BinanceMarketWsActor",
             BinancePublicWsActorArgs {
                 url: WsTarget::Market.url().to_string(),
-                income_pubsub: args.income_pubsub.clone(),
+                market_pubsub: args.market_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
@@ -153,7 +155,7 @@ impl Actor for BinanceActor {
                     BinancePrivateWsActorArgs {
                         credentials,
                         rest_base_url: args.rest_base_url,
-                        income_pubsub: args.income_pubsub.clone(),
+                        account_pubsub: args.account_pubsub.clone(),
                         quote: args.quote.clone(),
                     },
                 )
@@ -198,7 +200,7 @@ impl Actor for BinanceActor {
                 "BinanceEquityPollingActor",
                 BinanceEquityPollingActorArgs {
                     client: args.client,
-                    income_pubsub: args.income_pubsub.clone(),
+                    account_pubsub: args.account_pubsub.clone(),
                     interval_ms: 1000,
                 },
             )
@@ -210,7 +212,7 @@ impl Actor for BinanceActor {
                 "BinanceFundingFeePollingActor",
                 BinanceFundingFeePollingActorArgs {
                     client,
-                    income_pubsub: args.income_pubsub.clone(),
+                    account_pubsub: args.account_pubsub.clone(),
                     interval_ms: 60_000,
                 },
             )
@@ -221,7 +223,7 @@ impl Actor for BinanceActor {
             "CryptoStatusActor",
             CryptoStatusActorArgs {
                 exchange: crate::domain::Exchange::Binance,
-                income_pubsub: args.income_pubsub,
+                market_pubsub: args.market_pubsub.clone(),
                 interval_ms: STATUS_BROADCAST_INTERVAL_MS,
             },
         )

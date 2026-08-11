@@ -19,7 +19,7 @@ use hft_engine_rs::domain::{
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, StateManager};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
 use std::collections::{HashMap, HashSet};
@@ -81,7 +81,10 @@ impl Strategy for MeanRevertMaker {
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
         // 自己跟成交维护开仓成本（加权平均；平完即清零）
-        if let ExchangeEventData::Fill(f) = &event.data {
+        if let IncomeEvent::Account(a) = event {
+            let AccountData::Fill(f) = &a.data else {
+                return Vec::new();
+            };
             match f.side {
                 Side::Long => {
                     let total = self.entry_size + f.size;
@@ -98,7 +101,10 @@ impl Strategy for MeanRevertMaker {
             }
             return Vec::new();
         }
-        let ExchangeEventData::MarketTrade(t) = &event.data else {
+        let IncomeEvent::Market(m) = event else {
+            return Vec::new();
+        };
+        let MarketData::MarketTrade(t) = &m.data else {
             return Vec::new();
         };
         if state.has_pending_orders(&self.symbol) {

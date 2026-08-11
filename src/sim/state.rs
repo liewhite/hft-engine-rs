@@ -2,7 +2,7 @@ use crate::domain::{
     Exchange, Fill, MarketTrade, Order, OrderId, OrderType, OrderUpdate, OrderStatus, Position,
     Price, Quantity, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
 };
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, MarketData, MarketEvent};
 use crate::sim::ledger::Ledger;
 use crate::sim::matcher;
 use indexmap::IndexMap;
@@ -71,8 +71,9 @@ enum FillResult {
 ///   2. **撮合顺序**：`resting` 用插入序 `IndexMap`，越价成交按**到达顺序** (时间优先) 撮合，
 ///      而非依赖 HashMap 哈希序 (Rust 的 `HashMap` 迭代序进程内随机，照搬会破坏跨运行确定性)。
 ///
-/// 转移采用 `&mut self -> Vec<IncomeEvent>` (就地变更，免 clone；纯度足够脱离线程单测)。
-/// 每次转移的首个回流事件是转发行情，其后才是本次触发的成交/状态回报 (保证行情先于成交)。
+/// 转移采用 `&mut self -> Vec<(Timestamp, AccountData)>` (就地变更，免 clone；纯度足够脱离
+/// 线程单测)。**只产回报，不回显行情**：行情的转发是调用方（回测引擎）的职责 —— 历史上
+/// 回显行情曾迫使模拟柜台维护一份"哪些事件可以外发"的白名单来防自订阅回环。
 #[derive(Debug, Clone)]
 pub struct SimState {
     /// 本柜台所属的交易所（构造时钉死，见类型文档）
@@ -139,40 +140,36 @@ impl SimState {
         self.last_bbo.insert(bbo.symbol.clone(), bbo.clone());
     }
 
-    /// 行情到达交易所：更新行情 + 撮合越价挂单。返回要回流策略的事件 (首个为转发行情)。
+    /// 行情到达交易所：更新行情 + 撮合越价挂单。返回本次触发的成交/状态回报。
     ///
-    /// 喂进不属于本所的行情是**路由 bug**（持有方应按所分发）：记 error 并只转发不撮合，
+    /// 喂进不属于本所的行情是**路由 bug**（持有方应按所分发）：记 error 不撮合，
     /// 绝不拿别的所的价格去撮合本所的挂单。
-    pub fn on_market(&mut self, ev: &IncomeEvent) -> Vec<IncomeEvent> {
-        if let Some(ev_exchange) = ev.exchange() {
+    pub fn on_market(&mut self, ev: &MarketEvent) -> Vec<(Timestamp, AccountData)> {
+        if let Some(ev_exchange) = ev.data.exchange() {
             if ev_exchange != self.exchange {
                 tracing::error!(
                     counter_exchange = %self.exchange,
                     event_exchange = %ev_exchange,
-                    "SimState 收到其他交易所的行情（路由 bug），只转发不撮合"
+                    "SimState 收到其他交易所的行情（路由 bug），忽略不撮合"
                 );
-                return vec![ev.clone()];
+                return Vec::new();
             }
         }
         match &ev.data {
-            ExchangeEventData::BBO(bbo) => {
+            MarketData::BBO(bbo) => {
                 self.last_bbo.insert(bbo.symbol.clone(), bbo.clone());
-                let mut out = vec![ev.clone()];
-                out.extend(self.match_crossing(&bbo.clone()));
-                out
+                self.match_crossing(&bbo.clone())
             }
-            ExchangeEventData::MarketTrade(t) => {
+            MarketData::MarketTrade(t) => {
                 // trade-print 撮合：真实成交价严格越过挂单价即成交 (无 bbo 行情时的撮合来源)
                 self.last_trade.insert(t.symbol.clone(), t.price);
-                let mut out = vec![ev.clone()];
-                out.extend(self.match_trade(&t.clone()));
-                out
+                self.match_trade(&t.clone())
             }
-            ExchangeEventData::MarkPrice(mp) => {
+            MarketData::MarkPrice(mp) => {
                 self.last_mark.insert(mp.symbol.clone(), mp.price);
-                vec![ev.clone()]
+                Vec::new()
             }
-            _ => vec![ev.clone()],
+            _ => Vec::new(),
         }
     }
 
@@ -180,7 +177,7 @@ impl SimState {
     ///
     /// 盘口路径**不限量**（bid/ask qty 是盘口挂量而非成交量，语义不同）——本就是偏乐观的
     /// 模型，见 `observe_bbo` 的说明。
-    fn match_crossing(&mut self, bbo: &BBO) -> Vec<IncomeEvent> {
+    fn match_crossing(&mut self, bbo: &BBO) -> Vec<(Timestamp, AccountData)> {
         self.fill_crossed(&bbo.symbol, bbo.timestamp, None, |o| {
             matcher::crosses(o.side, o.limit_price, bbo)
         })
@@ -190,7 +187,7 @@ impl SimState {
     /// **成交量以该笔 print 的数量为预算**：一笔 0.001 的成交只能吃掉 0.001 的挂单量，
     /// 吃不完的部分留在簿里（PartiallyFilled）。此前 qty 被完全忽略 —— 任意小的 print
     /// 可以吃掉全部越价挂单，成交量被系统性高估。
-    fn match_trade(&mut self, t: &MarketTrade) -> Vec<IncomeEvent> {
+    fn match_trade(&mut self, t: &MarketTrade) -> Vec<(Timestamp, AccountData)> {
         self.fill_crossed(&t.symbol, t.timestamp, Some(t.qty), |o| {
             matcher::trade_crosses(o.side, o.limit_price, t.price)
         })
@@ -206,7 +203,7 @@ impl SimState {
         ts: Timestamp,
         budget: Option<Quantity>,
         crossed: impl Fn(&RestingOrder) -> bool,
-    ) -> Vec<IncomeEvent> {
+    ) -> Vec<(Timestamp, AccountData)> {
         let matched: Vec<RestingOrder> = self
             .resting
             .values()
@@ -282,7 +279,7 @@ impl SimState {
         now: Timestamp,
         order: &Order,
         order_id: &OrderId,
-    ) -> Vec<IncomeEvent> {
+    ) -> Vec<(Timestamp, AccountData)> {
         // 与 on_market 同一守卫：喂错所的订单是路由 bug，拒单并记 error ——
         // 绝不拿本所的行情去撮合别的所的订单
         if order.exchange != self.exchange {
@@ -390,11 +387,11 @@ impl SimState {
         &mut self,
         now: Timestamp,
         order_id: &OrderId,
-    ) -> Vec<IncomeEvent> {
+    ) -> Vec<(Timestamp, AccountData)> {
         match self.resting.shift_remove(order_id) {
-            Some(o) => vec![ev_at(
+            Some(o) => vec![(
                 now,
-                ExchangeEventData::OrderUpdate(OrderUpdate {
+                AccountData::OrderUpdate(OrderUpdate {
                     order_id: order_id.clone(),
                     client_order_id: Some(o.client_order_id),
                     exchange: self.exchange,
@@ -420,7 +417,7 @@ impl SimState {
         order_id: &OrderId,
         price: Price,
         ts: Timestamp,
-    ) -> Vec<IncomeEvent> {
+    ) -> Vec<(Timestamp, AccountData)> {
         let (result, mut events) = self.fill(
             order_id,
             &order.client_order_id,
@@ -436,9 +433,9 @@ impl SimState {
         );
         if let FillResult::Traded { done: false, .. } = result
         {
-            events.push(ev_at(
+            events.push((
                 ts,
-                ExchangeEventData::OrderUpdate(OrderUpdate {
+                AccountData::OrderUpdate(OrderUpdate {
                     order_id: order_id.clone(),
                     client_order_id: Some(order.client_order_id.clone()),
                     exchange: self.exchange,
@@ -458,7 +455,7 @@ impl SimState {
         order_id: &OrderId,
         limit: Price,
         ts: Timestamp,
-    ) -> Vec<IncomeEvent> {
+    ) -> Vec<(Timestamp, AccountData)> {
         self.resting.insert(
             order_id.clone(),
             RestingOrder {
@@ -498,7 +495,7 @@ impl SimState {
         ts: Timestamp,
         liquidity: Liquidity,
         reduce_only: bool,
-    ) -> (FillResult, Vec<IncomeEvent>) {
+    ) -> (FillResult, Vec<(Timestamp, AccountData)>) {
         let effective_qty = if !reduce_only {
             take
         } else {
@@ -511,9 +508,9 @@ impl SimState {
 
         if reduce_only && effective_qty <= Position::EPSILON {
             // reduceOnly 无可平仓位 -> 不成交，回 Cancelled
-            let events = vec![ev_at(
+            let events = vec![(
                 ts,
-                ExchangeEventData::OrderUpdate(OrderUpdate {
+                AccountData::OrderUpdate(OrderUpdate {
                     order_id: order_id.clone(),
                     client_order_id: Some(client_order_id.to_string()),
                     exchange: self.exchange,
@@ -563,8 +560,8 @@ impl SimState {
             reason: crate::domain::FillReason::Normal, // 回测无强平/ADL
         };
         let events = vec![
-            ev_at(ts, ExchangeEventData::OrderUpdate(update)),
-            ev_at(ts, ExchangeEventData::Fill(f)),
+            (ts, AccountData::OrderUpdate(update)),
+            (ts, AccountData::Fill(f)),
         ];
         (
             FillResult::Traded {
@@ -576,25 +573,17 @@ impl SimState {
     }
 }
 
-/// 构造回流事件：exchange_ts == local_ts == ts (一律取确定性时间，杜绝墙钟)。
-fn ev_at(ts: Timestamp, data: ExchangeEventData) -> IncomeEvent {
-    IncomeEvent {
-        exchange_ts: ts,
-        local_ts: ts,
-        data,
-    }
-}
-
+/// 构造状态回报：时间戳一律取确定性的 ts，杜绝墙钟。
 fn status_event(
     exchange: Exchange,
     order: &Order,
     order_id: &OrderId,
     status: OrderStatus,
     ts: Timestamp,
-) -> IncomeEvent {
-    ev_at(
+) -> (Timestamp, AccountData) {
+    (
         ts,
-        ExchangeEventData::OrderUpdate(OrderUpdate {
+        AccountData::OrderUpdate(OrderUpdate {
             order_id: order_id.clone(),
             client_order_id: Some(order.client_order_id.clone()),
             exchange,
@@ -644,21 +633,21 @@ mod tests {
             timestamp: ts,
         }
     }
-    fn market_ev(b: BBO) -> IncomeEvent {
-        IncomeEvent {
+    fn market_ev(b: BBO) -> MarketEvent {
+        MarketEvent {
             exchange_ts: b.timestamp,
             local_ts: b.timestamp,
-            data: ExchangeEventData::BBO(b),
+            data: MarketData::BBO(b),
         }
     }
-    fn trade_ev(price: Price, ts: Timestamp) -> IncomeEvent {
+    fn trade_ev(price: Price, ts: Timestamp) -> MarketEvent {
         trade_ev_qty(price, 1.0, ts)
     }
-    fn trade_ev_qty(price: Price, qty: Quantity, ts: Timestamp) -> IncomeEvent {
-        IncomeEvent {
+    fn trade_ev_qty(price: Price, qty: Quantity, ts: Timestamp) -> MarketEvent {
+        MarketEvent {
             exchange_ts: ts,
             local_ts: ts,
-            data: ExchangeEventData::MarketTrade(MarketTrade {
+            data: MarketData::MarketTrade(MarketTrade {
                 exchange: EX,
                 symbol: sym(),
                 price,
@@ -692,18 +681,18 @@ mod tests {
             client_order_id: cid.to_string(),
         }
     }
-    fn statuses(evs: &[IncomeEvent]) -> Vec<OrderStatus> {
+    fn statuses(evs: &[(Timestamp, AccountData)]) -> Vec<OrderStatus> {
         evs.iter()
-            .filter_map(|e| match &e.data {
-                ExchangeEventData::OrderUpdate(u) => Some(u.status.clone()),
+            .filter_map(|(_, d)| match d {
+                AccountData::OrderUpdate(u) => Some(u.status.clone()),
                 _ => None,
             })
             .collect()
     }
-    fn fills(evs: &[IncomeEvent]) -> Vec<Fill> {
+    fn fills(evs: &[(Timestamp, AccountData)]) -> Vec<Fill> {
         evs.iter()
-            .filter_map(|e| match &e.data {
-                ExchangeEventData::Fill(f) => Some(f.clone()),
+            .filter_map(|(_, d)| match d {
+                AccountData::Fill(f) => Some(f.clone()),
                 _ => None,
             })
             .collect()
@@ -741,14 +730,19 @@ mod tests {
         assert_eq!(s.ledger.positions[&sym()].size, 0.002);
     }
 
+    /// 柜台只产回报、不回显行情（行情转发是调用方的职责）
     #[test]
-    fn market_event_precedes_fill() {
+    fn on_market_returns_reports_only() {
         let mut s = empty();
         s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
         s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
         let evs = s.on_market(&market_ev(bbo(49990.0, 49994.0, 2)));
-        assert!(matches!(evs[0].data, ExchangeEventData::BBO(_)), "首事件应为行情转发");
-        assert!(evs[1..].iter().any(|e| matches!(e.data, ExchangeEventData::Fill(_))), "成交回报排在行情之后");
+        assert!(
+            evs.iter().any(|(_, d)| matches!(d, AccountData::Fill(_))),
+            "越价应产出成交回报"
+        );
+        // 回报时间戳取行情时刻（确定性）
+        assert!(evs.iter().all(|(ts, _)| *ts == 2));
     }
 
     #[test]
@@ -896,8 +890,8 @@ mod tests {
         let evs = s.on_cancel_arrived(3, &"1".to_string());
         let cancelled: Vec<f64> = evs
             .iter()
-            .filter_map(|e| match &e.data {
-                ExchangeEventData::OrderUpdate(u) if u.status == OrderStatus::Cancelled => {
+            .filter_map(|(_, d)| match d {
+                AccountData::OrderUpdate(u) if u.status == OrderStatus::Cancelled => {
                     Some(u.quantity)
                 }
                 _ => None,
@@ -1031,7 +1025,7 @@ mod tests {
         let mut s = empty();
         s.on_market(&market_ev(bbo(50000.0, 50001.0, 1))); // 行情停在 ts=1
         let evs = s.on_order_arrived(999, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
-        let ts: Vec<u64> = evs.iter().map(|e| e.local_ts).collect();
+        let ts: Vec<u64> = evs.iter().map(|(ts, _)| *ts).collect();
         assert_eq!(ts, vec![999], "回报时间被冻在旧行情的 ts 上: {ts:?}");
     }
 

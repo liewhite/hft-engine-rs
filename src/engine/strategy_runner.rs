@@ -134,7 +134,7 @@ impl StrategyRunner {
                             // 登记未取整的原始订单，与取整前的行为保持一致（策略比对自己
                             // 的挂单量时看到的仍是它请求的数量）
                             // created_at 取当前事件时刻 (回测=虚拟时间, 确定性), 不读墙钟
-                            self.state.add_pending_order(order.clone(), event.local_ts);
+                            self.state.add_pending_order(order.clone(), event.local_ts());
                             self.round_to_exchange_precision(order)
                         })
                         .collect();
@@ -190,7 +190,7 @@ mod tests {
     use crate::domain::{OrderType, Side, TimeInForce};
     use crate::exchange::utils::StepFormatter;
     use crate::exchange::SubscriptionKind;
-    use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+    use crate::messaging::{IncomeEvent, MarketData, StateManager};
     use crate::strategy::{OutcomeEvent, Strategy};
 
     const EX: Exchange = Exchange::OKX;
@@ -265,11 +265,7 @@ mod tests {
             metas(),
             Box::new(SequentialClientOrderIdGen::default()),
         );
-        let ev = IncomeEvent {
-            exchange_ts: 1,
-            local_ts: 1,
-            data: ExchangeEventData::Clock,
-        };
+        let ev = IncomeEvent::market(1, 1, MarketData::Clock);
         match runner.on_event(&ev).into_iter().next().expect("signal") {
             OutcomeEvent::PlaceOrders { orders, .. } => orders.into_iter().next().unwrap(),
             other => panic!("unexpected {other:?}"),
@@ -305,11 +301,7 @@ mod tests {
             metas(),
             Box::new(SequentialClientOrderIdGen::default()),
         );
-        let ev = IncomeEvent {
-            exchange_ts: 1,
-            local_ts: 1,
-            data: ExchangeEventData::Clock,
-        };
+        let ev = IncomeEvent::market(1, 1, MarketData::Clock);
         runner.on_event(&ev);
         let state = runner.state().symbol_state(&SYM.to_string()).expect("state");
         let pending: Vec<f64> = state.pending_orders().map(|p| p.order.quantity).collect();

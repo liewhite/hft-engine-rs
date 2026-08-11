@@ -102,7 +102,7 @@ impl BinanceHistorySource {
             }
         }
         // 稳定排序: 同时间戳保持文件内相对序 -> 确定性
-        day_events.sort_by_key(|e| e.exchange_ts);
+        day_events.sort_by_key(|e| e.exchange_ts());
         tracing::info!(date = %date_str, count = day_events.len(), "loaded day");
         day_events
     }

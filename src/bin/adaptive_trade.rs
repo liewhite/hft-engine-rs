@@ -30,13 +30,13 @@ use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForc
 use hft_engine_rs::engine::{
     init_tracing, load_config, spawn_supervised, wait_for_shutdown, Decision, ManagerActor,
     ManagerActorArgs,
-    PromotionPolicy, SubscribeIncome, SubscribePaper, SupervisorActor, SupervisorArgs, SymbolView,
+    PromotionPolicy, SubscribeAccount, SubscribeMarket, SupervisorActor, SupervisorArgs, SymbolView,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
 use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
 use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent, StateManager};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
 use kameo::actor::Spawn;
@@ -139,7 +139,11 @@ impl Strategy for DipMaker {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
-        let ExchangeEventData::BBO(bbo) = &event.data else {
+        let IncomeEvent::Market(MarketEvent {
+            data: MarketData::BBO(bbo),
+            ..
+        }) = event
+        else {
             return Vec::new();
         };
         let Some(symbol_state) = state.symbol_state(&bbo.symbol) else {
@@ -273,17 +277,18 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("SupervisorActor 启动失败")?;
 
-    // 两条总线都要订阅：共享总线给实盘成交与 Clock 节拍，paper 总线给各模拟账户的成交
+    // 行情总线给 Clock 节拍；账户总线一次订阅覆盖实盘与全部模拟账户的成交
+    // （账户由事件自带标签区分，见 AccountEvent）
     manager
-        .tell(SubscribeIncome::all(supervisor.clone()))
+        .tell(SubscribeMarket::all(supervisor.clone()))
         .send()
         .await
-        .context("订阅共享总线失败")?;
+        .context("订阅行情总线失败")?;
     manager
-        .tell(SubscribePaper::all(supervisor))
+        .tell(SubscribeAccount::all(supervisor))
         .send()
         .await
-        .context("订阅模拟总线失败")?;
+        .context("订阅账户总线失败")?;
 
     // 停机信号 → Ok；manager 意外终止 → Err，进程带着原因非零退出
     wait_for_shutdown(manager).await

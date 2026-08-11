@@ -25,7 +25,7 @@ pub use policy::{Decision, NeverPromote, PromotionPolicy, SymbolView};
 pub use record::{RoundTrip, SymbolRecord};
 
 use crate::domain::{AccountId, Exchange, ExchangeError, Symbol, Timestamp};
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -33,7 +33,7 @@ use kameo::message::{Context, Message};
 use kameo::Actor;
 use std::collections::HashMap;
 
-use super::{AccountIncome, AddStrategies, ManagerActor, RemoveStrategies, StrategySpec};
+use super::{AddStrategies, ManagerActor, RemoveStrategies, StrategySpec};
 
 /// 每 symbol 保留多少次往返供判据使用
 const DEFAULT_ROUND_TRIP_CAPACITY: usize = 512;
@@ -128,11 +128,13 @@ impl SupervisorActor {
         Ok(())
     }
 
-    /// 把一笔成交记到对应账户的表现里
-    fn record_fill(&mut self, account: &AccountId, event: &IncomeEvent) {
-        let ExchangeEventData::Fill(fill) = &event.data else {
+    /// 把一笔成交记到对应账户的表现里（账户从事件自带的标签取 —— 一条总线一次订阅，
+    /// 实盘与全部模拟账户的成交都经此，替代旧的共享总线 + Paper 总线双订阅）
+    fn record_fill(&mut self, event: &AccountEvent) {
+        let AccountData::Fill(fill) = &event.data else {
             return;
         };
+        let account = &event.account;
         let Some(state) = self.states.get_mut(&fill.symbol) else {
             return; // 不在调度范围内的 symbol
         };
@@ -293,24 +295,22 @@ impl Actor for SupervisorActor {
     }
 }
 
-/// 共享总线：实盘账户的成交 + Clock 节拍
-impl Message<IncomeEvent> for SupervisorActor {
+/// 行情总线：Clock 节拍驱动评估
+impl Message<MarketEvent> for SupervisorActor {
     type Reply = ();
 
-    async fn handle(&mut self, ev: IncomeEvent, _c: &mut Context<Self, Self::Reply>) {
-        match &ev.data {
-            ExchangeEventData::Fill(_) => self.record_fill(&AccountId::Live, &ev),
-            ExchangeEventData::Clock => self.evaluate(ev.local_ts).await,
-            _ => {}
+    async fn handle(&mut self, ev: MarketEvent, _c: &mut Context<Self, Self::Reply>) {
+        if matches!(ev.data, MarketData::Clock) {
+            self.evaluate(ev.local_ts).await;
         }
     }
 }
 
-/// 模拟账户总线：各模拟账户的成交
-impl Message<AccountIncome> for SupervisorActor {
+/// 账户总线：实盘与全部模拟账户的成交（账户由事件自带标签区分）
+impl Message<AccountEvent> for SupervisorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: AccountIncome, _c: &mut Context<Self, Self::Reply>) {
-        self.record_fill(&msg.account, &msg.event);
+    async fn handle(&mut self, ev: AccountEvent, _c: &mut Context<Self, Self::Reply>) {
+        self.record_fill(&ev);
     }
 }

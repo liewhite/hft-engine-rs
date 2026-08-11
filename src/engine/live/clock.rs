@@ -3,7 +3,7 @@
 //! 每秒发布 Clock 事件到 IncomePubSub
 
 use crate::domain::now_ms;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{MarketData, MarketEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -13,14 +13,14 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_stream::wrappers::IntervalStream;
 
-use super::IncomePubSub;
+use super::MarketPubSub;
 
 /// ClockActor 初始化参数
 pub struct ClockActorArgs {
     /// 时钟间隔 (毫秒)
     pub interval_ms: u64,
     /// Income PubSub (用于发布 Clock 事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    pub market_pubsub: ActorRef<MarketPubSub>,
 }
 
 /// ClockActor - 时钟信号广播器
@@ -28,7 +28,7 @@ pub struct ClockActor {
     /// 时钟间隔
     interval: Duration,
     /// Income PubSub (发布 Clock 事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    market_pubsub: ActorRef<MarketPubSub>,
 }
 
 impl ClockActor {
@@ -38,16 +38,16 @@ impl ClockActor {
 
         // 发布 Clock 事件到 IncomePubSub
         if let Err(e) = self
-            .income_pubsub
-            .tell(Publish(IncomeEvent {
+            .market_pubsub
+            .tell(Publish(MarketEvent {
                 exchange_ts: local_ts,
                 local_ts,
-                data: ExchangeEventData::Clock,
+                data: MarketData::Clock,
             }))
             .send()
             .await
         {
-            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            tracing::error!(error = %e, "Failed to publish to MarketPubSub");
         }
     }
 }
@@ -62,7 +62,7 @@ impl Actor for ClockActor {
     ) -> Result<Self, Self::Error> {
         let actor = Self {
             interval: Duration::from_millis(args.interval_ms),
-            income_pubsub: args.income_pubsub,
+            market_pubsub: args.market_pubsub,
         };
 
         // 使用 attach_stream 管理 ticker 生命周期

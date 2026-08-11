@@ -3,15 +3,15 @@
 //! 职责:
 //! - 维护 WebSocket 连接
 //! - 处理 Subscribe/Unsubscribe 请求
-//! - 直接解析消息并发布到 IncomePubSub
+//! - 直接解析消息并发布到对应总线
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::engine::IncomePubSub;
+use crate::engine::MarketPubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::hyperliquid::codec::{aggregate_trades, WsActiveAssetCtx, WsBbo, WsTrade};
 use crate::exchange::hyperliquid::{to_hyperliquid, WS_URL};
 use crate::exchange::ws_loop;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{MarketData, MarketEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -26,8 +26,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 /// HyperliquidPublicWsActor 初始化参数
 pub struct HyperliquidPublicWsActorArgs {
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 行情总线（发布事件）
+    pub market_pubsub: ActorRef<MarketPubSub>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDC", "USDE")
@@ -38,8 +38,8 @@ pub struct HyperliquidPublicWsActorArgs {
 
 /// HyperliquidPublicWsActor - WebSocket Actor
 pub struct HyperliquidPublicWsActor {
-    /// Income PubSub (发布事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    /// 行情总线（发布事件）
+    market_pubsub: ActorRef<MarketPubSub>,
     /// Symbol 元数据（用于过滤不存在的 symbol）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDC", "USDE")
@@ -122,8 +122,8 @@ impl HyperliquidPublicWsActor {
             if self.is_trade_backfill(&event) {
                 continue;
             }
-            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to MarketPubSub");
             }
         }
         Ok(())
@@ -135,8 +135,8 @@ impl HyperliquidPublicWsActor {
     ///
     /// 判据：成交时间早于本 symbol 的 trades 订阅时刻。无订阅记录时不判为回填
     /// (宁可放过也不误杀实时成交)。
-    fn is_trade_backfill(&self, event: &IncomeEvent) -> bool {
-        let ExchangeEventData::MarketTrade(trade) = &event.data else {
+    fn is_trade_backfill(&self, event: &MarketEvent) -> bool {
+        let MarketData::MarketTrade(trade) = &event.data else {
             return false;
         };
         let Some(&subscribed_at) = self.trades_subscribed_at.get(&trade.symbol) else {
@@ -190,7 +190,7 @@ impl Actor for HyperliquidPublicWsActor {
         tracing::info!("HyperliquidPublicWsActor started");
 
         Ok(Self {
-            income_pubsub: args.income_pubsub,
+            market_pubsub: args.market_pubsub,
             symbol_metas: args.symbol_metas,
             quote: args.quote,
             dex: args.dex,
@@ -362,7 +362,7 @@ pub(crate) fn parse_public_message(
     raw: &str,
     local_ts: u64,
     subscribed_kinds: &HashSet<SubscriptionKind>,
-) -> Result<Vec<IncomeEvent>, WsError> {
+) -> Result<Vec<MarketEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -404,10 +404,10 @@ pub(crate) fn parse_public_message(
                 if subscribed_kinds
                     .contains(&SubscriptionKind::FundingRate { symbol: symbol.clone() })
                 {
-                    events.push(IncomeEvent {
+                    events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::FundingRate(
+                        data: MarketData::FundingRate(
                             ctx.to_funding_rate(local_ts)
                                 ?,
                         ),
@@ -416,20 +416,20 @@ pub(crate) fn parse_public_message(
                 if subscribed_kinds
                     .contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() })
                 {
-                    events.push(IncomeEvent {
+                    events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::MarkPrice(
+                        data: MarketData::MarkPrice(
                             ctx.to_mark_price(local_ts)
                                 ?,
                         ),
                     });
                 }
                 if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
-                    events.push(IncomeEvent {
+                    events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::IndexPrice(
+                        data: MarketData::IndexPrice(
                             ctx.to_index_price(local_ts)
                                 ?,
                         ),
@@ -449,10 +449,10 @@ pub(crate) fn parse_public_message(
                     tracing::debug!(coin = %bbo_data.coin, "Hyperliquid 单边盘口，跳过该条 BBO");
                     return Ok(Vec::new());
                 };
-                return Ok(vec![IncomeEvent {
+                return Ok(vec![MarketEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,
-                    data: ExchangeEventData::BBO(bbo),
+                    data: MarketData::BBO(bbo),
                 }]);
             }
             "trades" => {
@@ -463,10 +463,10 @@ pub(crate) fn parse_public_message(
                 // 归集为 aggTrade 口径（HL 线路逐笔，Binance/OKX 下发的已是归集结果）
                 let events = aggregate_trades(&trades)?
                     .into_iter()
-                    .map(|trade| IncomeEvent {
+                    .map(|trade| MarketEvent {
                         exchange_ts: trade.timestamp,
                         local_ts,
-                        data: ExchangeEventData::MarketTrade(trade),
+                        data: MarketData::MarketTrade(trade),
                     })
                     .collect();
                 return Ok(events);
@@ -561,11 +561,11 @@ mod tests {
 
     const SUBSCRIBED_AT: u64 = 1_785_747_800_000;
 
-    fn trade_event(ts: u64) -> IncomeEvent {
-        IncomeEvent {
+    fn trade_event(ts: u64) -> MarketEvent {
+        MarketEvent {
             exchange_ts: ts,
             local_ts: SUBSCRIBED_AT,
-            data: ExchangeEventData::MarketTrade(MarketTrade {
+            data: MarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Hyperliquid,
                 symbol: "BTC".to_string(),
                 price: 62_500.0,
@@ -579,7 +579,7 @@ mod tests {
     /// 只构造过滤判定所需的字段；其余字段不参与 `is_trade_backfill`
     fn actor_with_subscription(subscribed: Option<u64>) -> HyperliquidPublicWsActor {
         HyperliquidPublicWsActor {
-            income_pubsub: unreachable_pubsub(),
+            market_pubsub: unreachable_pubsub(),
             symbol_metas: Arc::new(HashMap::new()),
             quote: "USDC".to_string(),
             dex: String::new(),
@@ -594,10 +594,10 @@ mod tests {
     }
 
     /// 过滤判定不触碰 pubsub，故这里只需要一个类型正确的引用
-    fn unreachable_pubsub() -> ActorRef<IncomePubSub> {
+    fn unreachable_pubsub() -> ActorRef<MarketPubSub> {
         use kameo::actor::Spawn;
         use kameo_actors::DeliveryStrategy;
-        IncomePubSub::spawn(IncomePubSub::new(DeliveryStrategy::BestEffort))
+        MarketPubSub::spawn(MarketPubSub::new(DeliveryStrategy::BestEffort))
     }
 
     #[tokio::test]
@@ -623,10 +623,10 @@ mod tests {
     #[tokio::test]
     async fn non_trade_event_is_never_backfill() {
         let actor = actor_with_subscription(Some(SUBSCRIBED_AT));
-        let clock = IncomeEvent {
+        let clock = MarketEvent {
             exchange_ts: 0,
             local_ts: 0,
-            data: ExchangeEventData::Clock,
+            data: MarketData::Clock,
         };
         assert!(!actor.is_trade_backfill(&clock));
     }

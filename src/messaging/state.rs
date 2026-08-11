@@ -1,5 +1,5 @@
 use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, OrderType, Position, Side, Symbol, Timestamp, TimeInForce, BBO};
-use crate::messaging::event::{ExchangeEventData, IncomeEvent};
+use crate::messaging::event::{AccountData, AccountEvent, IncomeEvent, MarketData};
 use std::collections::HashMap;
 
 /// 待处理订单信息（保存完整订单 + 运行时状态）
@@ -313,17 +313,54 @@ impl SymbolState {
             return;
         }
 
-        match &event.data {
-            ExchangeEventData::FundingRate(rate) => {
+        match event {
+            IncomeEvent::Market(m) => self.apply_market_data(&m.data),
+            IncomeEvent::Account(a) => self.apply_account_data(a),
+        }
+    }
+
+    /// 行情类事件的状态转移（BBO/标记价/指数价/资金费率入缓存，其余策略自取）
+    fn apply_market_data(&mut self, data: &MarketData) {
+        match data {
+            MarketData::FundingRate(rate) => {
                 self.funding_rates.insert(rate.exchange, rate.clone());
             }
-            ExchangeEventData::BBO(bbo) => {
+            MarketData::BBO(bbo) => {
                 self.bbos.insert(bbo.exchange, bbo.clone());
             }
-            ExchangeEventData::MarketTrade(_) => {
+            MarketData::MarketTrade(_) => {
                 // 公共成交印记仅作市场信号 (策略自取)，不修改聚合状态
             }
-            ExchangeEventData::OrderUpdate(update) => {
+            MarketData::MarkPrice(mp) => {
+                self.mark_prices.insert(mp.exchange, mp.clone());
+            }
+            MarketData::IndexPrice(ip) => {
+                self.index_prices.insert(ip.exchange, ip.clone());
+            }
+            MarketData::Candle(_) | MarketData::HistoryCandles(_) => {
+                // K线数据由策略层处理，SymbolState 不存储
+            }
+            MarketData::BorrowFee(_) => {
+                // 券源读数由策略自行消费，SymbolState 不缓存
+            }
+            // 其余变体无 symbol（Status/汇率/Clock）或由 StateManager 提前拦截（Custom），
+            // 到达即路由 bug：记录后忽略（不 panic）
+            MarketData::ExchangeStatus { .. }
+            | MarketData::ExchangeRate(_)
+            | MarketData::Clock
+            | MarketData::Custom(_) => {
+                tracing::error!(
+                    symbol = %self.symbol,
+                    "全局行情事件错误地进入 SymbolState（路由 bug），忽略"
+                );
+            }
+        }
+    }
+
+    /// 账户私有事件的状态转移（挂单跟踪 + 持仓累加）
+    fn apply_account_data(&mut self, event: &AccountEvent) {
+        match &event.data {
+            AccountData::OrderUpdate(update) => {
                 tracing::info!(
                     symbol = %self.symbol,
                     exchange = %update.exchange,
@@ -428,7 +465,7 @@ impl SymbolState {
                     }
                 }
             }
-            ExchangeEventData::Fill(fill) => {
+            AccountData::Fill(fill) => {
                 // Fill 即时更新仓位——涵盖策略单、手动单、以及强平/ADL（三者都以 fill 形式
                 // 经私有成交流到达，走同一路径，见 [`Self::seed_position`] 的模型说明）。
                 //
@@ -468,34 +505,15 @@ impl SymbolState {
                     "Updated position on fill"
                 );
             }
-            ExchangeEventData::MarkPrice(mp) => {
-                self.mark_prices.insert(mp.exchange, mp.clone());
-            }
-            ExchangeEventData::IndexPrice(ip) => {
-                self.index_prices.insert(ip.exchange, ip.clone());
-            }
-            ExchangeEventData::Candle(_) | ExchangeEventData::HistoryCandles(_) => {
-                // K线数据由策略层处理，SymbolState 不存储
-            }
-            ExchangeEventData::FundingFee(_) => {
+            AccountData::FundingFee(_) => {
                 // 资费事件不修改本地 symbol 状态，下游策略自行去重与统计
             }
-            ExchangeEventData::Clock => {
-                // Clock 事件由策略层处理，这里不需要处理
-            }
-            ExchangeEventData::Greeks(_)
-            | ExchangeEventData::Balance(_)
-            | ExchangeEventData::AccountInfo { .. }
-            | ExchangeEventData::ExchangeStatus { .. }
-            | ExchangeEventData::BorrowFee(_)
-            | ExchangeEventData::ExchangeRate(_)
-            // 自定义事件不进状态层：框架只运送不理解（见 CustomEvent）
-            | ExchangeEventData::Custom(_) => {
-                // 全局事件应在 StateManager 层提前拦截、不会进入 SymbolState::apply。
-                // 若到达说明路由逻辑有 bug，记录后忽略（不 panic）。
+            // 账户级事件（Balance/Greeks/AccountInfo）无 symbol，由 StateManager 提前
+            // 拦截；到达即路由 bug：记录后忽略（不 panic）
+            AccountData::Balance(_) | AccountData::Greeks(_) | AccountData::AccountInfo { .. } => {
                 tracing::error!(
                     symbol = %self.symbol,
-                    "全局事件错误地进入 SymbolState::apply（路由 bug），忽略"
+                    "账户级事件错误地进入 SymbolState（路由 bug），忽略"
                 );
             }
         }
@@ -627,12 +645,8 @@ mod tests {
 
     const EX: Exchange = Exchange::Binance;
 
-    fn ev(data: ExchangeEventData) -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: 1,
-            local_ts: 1,
-            data,
-        }
+    fn ev(data: AccountData) -> IncomeEvent {
+        IncomeEvent::account(crate::domain::AccountId::Live, 1, 1, data)
     }
 
     fn position(size: f64) -> Position {
@@ -644,18 +658,27 @@ mod tests {
     }
 
     fn fill(side: Side, size: f64) -> IncomeEvent {
-        ev(ExchangeEventData::Fill(crate::domain::Fill {
-            exchange: EX,
-            symbol: SYMBOL.to_string(),
-            side,
-            price: 100.0,
-            size,
-            client_order_id: None,
-            order_id: "1".to_string(),
-            timestamp: 1,
-            fee: 0.0,
-            reason: crate::domain::FillReason::Normal,
-        }))
+        fill_at(EX, side, size, 1)
+    }
+
+    fn fill_at(exchange: Exchange, side: Side, size: f64, local_ts: u64) -> IncomeEvent {
+        IncomeEvent::account(
+            crate::domain::AccountId::Live,
+            local_ts,
+            local_ts,
+            AccountData::Fill(crate::domain::Fill {
+                exchange,
+                symbol: SYMBOL.to_string(),
+                side,
+                price: 100.0,
+                size,
+                client_order_id: None,
+                order_id: "1".to_string(),
+                timestamp: local_ts,
+                fee: 0.0,
+                reason: crate::domain::FillReason::Normal,
+            }),
+        )
     }
 
     /// 基线写入一次，之后**只**由 Fill 累加。
@@ -710,9 +733,7 @@ mod tests {
         assert_eq!(state.position_size(EX), 2.0, "快照已含的 Fill 不得再累加");
 
         // t=11 送达：快照之后的新成交，累加
-        let mut fresh = fill(Side::Long, 1.0);
-        fresh.local_ts = 11;
-        state.apply(&fresh);
+        state.apply(&fill_at(EX, Side::Long, 1.0, 11));
         assert_eq!(state.position_size(EX), 3.0);
     }
 
@@ -725,11 +746,7 @@ mod tests {
         state.seed_position(&position(2.0), 10);
 
         // OKX 未 seed：t=1 送达的 Fill 照常从 0 累加，不受 Binance 的过滤时刻影响
-        let mut okx_fill = fill(Side::Long, 1.5);
-        if let ExchangeEventData::Fill(f) = &mut okx_fill.data {
-            f.exchange = Exchange::OKX;
-        }
-        state.apply(&okx_fill);
+        state.apply(&fill_at(Exchange::OKX, Side::Long, 1.5, 1));
         assert_eq!(state.position_size(Exchange::OKX), 1.5, "未 seed 的所不得被误过滤");
         assert_eq!(state.position_size(EX), 2.0, "Binance 腿不受影响");
     }
@@ -737,7 +754,7 @@ mod tests {
     // ===== 外部挂单：只接管本引擎自己的单 =====
 
     fn order_update(client_order_id: Option<String>, status: OrderStatus) -> IncomeEvent {
-        ev(ExchangeEventData::OrderUpdate(crate::domain::OrderUpdate {
+        ev(AccountData::OrderUpdate(crate::domain::OrderUpdate {
             order_id: "ex-1".to_string(),
             client_order_id,
             exchange: EX,
@@ -808,19 +825,11 @@ mod tests {
         state.seed_position(&position(2.0), 0);
 
         // 同向加仓 2.0（成交价不影响持仓数量）
-        let mut add = fill(Side::Long, 2.0);
-        if let ExchangeEventData::Fill(f) = &mut add.data {
-            f.price = 110.0;
-        }
-        state.apply(&add);
+        state.apply(&fill(Side::Long, 2.0));
         assert!((state.position(EX).expect("position").size - 4.0).abs() < 1e-12);
 
-        // 反向平掉 1.0
-        let mut close = fill(Side::Short, 1.0);
-        if let ExchangeEventData::Fill(f) = &mut close.data {
-            f.price = 120.0;
-        }
-        state.apply(&close);
+        // 反向平掉 1.0（价格同样不影响数量）
+        state.apply(&fill(Side::Short, 1.0));
         assert!((state.position(EX).expect("position").size - 3.0).abs() < 1e-12);
 
         // 反手：卖 5 -> 净空 2
@@ -838,8 +847,10 @@ mod tests {
         let own_id = EX.new_cli_order_id();
 
         let mut ghost = order_update(Some(own_id), OrderStatus::Pending);
-        if let ExchangeEventData::OrderUpdate(u) = &mut ghost.data {
-            u.quantity = 0.0;
+        if let IncomeEvent::Account(a) = &mut ghost {
+            if let AccountData::OrderUpdate(u) = &mut a.data {
+                u.quantity = 0.0;
+            }
         }
         state.apply(&ghost);
 

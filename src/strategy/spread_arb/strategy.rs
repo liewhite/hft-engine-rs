@@ -1,6 +1,6 @@
 use crate::domain::{Exchange, Order, OrderType, Position, Side, Symbol, TimeInForce, Timestamp};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{ExchangeEventData, IncomeEvent, StateManager, SymbolState};
+use crate::messaging::{IncomeEvent, MarketData, MarketEvent, StateManager, SymbolState};
 use crate::strategy::{OutcomeEvent, Strategy};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -880,10 +880,14 @@ impl Strategy for SpreadArbStrategy {
             return vec![];
         };
 
-        let now = event.local_ts;
+        let now = event.local_ts();
 
         // BBO 事件时更新该交易所的 bid/ask EMA 与本地接收时刻
-        if let ExchangeEventData::BBO(bbo) = &event.data {
+        if let IncomeEvent::Market(MarketEvent {
+            data: MarketData::BBO(bbo),
+            ..
+        }) = event
+        {
             // 顺序关键：先按"距上一条 BBO 的间隔"判定是否中断恢复并重置 EMA，
             // 再更新 EMA 与接收时刻——否则时刻已被刷新，就判不出中断了。
             self.reset_ema_if_gap_exceeded(bbo.exchange, now);
@@ -929,7 +933,7 @@ impl Strategy for SpreadArbStrategy {
 mod tests {
     use super::*;
     use crate::domain::{Position, BBO};
-    use crate::messaging::ExchangeEventData;
+    use crate::messaging::AccountData;
 
     const SYMBOL: &str = "BTC";
     const SHORT_EX: Exchange = Exchange::Binance;
@@ -988,15 +992,16 @@ mod tests {
     fn state_manager(equity: f64, notional: f64) -> StateManager {
         let mut manager = StateManager::new(&[SYMBOL.to_string()], 10_000);
         for exchange in [SHORT_EX, LONG_EX] {
-            manager.apply(&IncomeEvent {
-                exchange_ts: 0,
-                local_ts: 0,
-                data: ExchangeEventData::AccountInfo {
+            manager.apply(&IncomeEvent::account(
+                crate::domain::AccountId::Live,
+                0,
+                0,
+                AccountData::AccountInfo {
                     exchange,
                     equity,
                     notional,
                 },
-            });
+            ));
         }
         manager
     }
@@ -1026,11 +1031,8 @@ mod tests {
                 } else {
                     (99.8, 100.0)
                 };
-                let event = IncomeEvent {
-                    exchange_ts: local_ts,
-                    local_ts,
-                    data: ExchangeEventData::BBO(bbo(exchange, bid, ask, 10.0)),
-                };
+                let event =
+                    IncomeEvent::market(local_ts, local_ts, MarketData::BBO(bbo(exchange, bid, ask, 10.0)));
                 manager.apply(&event);
                 strategy.on_event(&event, manager);
             }
@@ -1312,11 +1314,7 @@ mod tests {
     fn no_signal_before_emas_are_warm() {
         let mut strategy = strategy(config());
         let mut manager = state_manager(1000.0, 0.0);
-        let event = IncomeEvent {
-            exchange_ts: 0,
-            local_ts: 0,
-            data: ExchangeEventData::BBO(bbo(SHORT_EX, 100.0, 100.2, 10.0)),
-        };
+        let event = IncomeEvent::market(0, 0, MarketData::BBO(bbo(SHORT_EX, 100.0, 100.2, 10.0)));
         manager.apply(&event);
 
         // 只喂一条，远未满 ema_period
@@ -1472,11 +1470,7 @@ mod tests {
         // 中断后恢复：价格已整体上移 10%，但 EMA 还停在 100 附近
         let gap_end = cfg.max_bbo_age_ms + 1;
         let recovered = bbo(SHORT_EX, 110.0, 110.2, 10.0);
-        let event = IncomeEvent {
-            exchange_ts: gap_end,
-            local_ts: gap_end,
-            data: ExchangeEventData::BBO(recovered),
-        };
+        let event = IncomeEvent::market(gap_end, gap_end, MarketData::BBO(recovered));
         manager.apply(&event);
         let outcome = strategy.on_event(&event, &manager);
 
@@ -1499,11 +1493,7 @@ mod tests {
         warm_up(&mut strategy, &mut manager, 0);
 
         // 间隔恰好等于上限，属正常范围，不应重置
-        let event = IncomeEvent {
-            exchange_ts: cfg.max_bbo_age_ms,
-            local_ts: cfg.max_bbo_age_ms,
-            data: ExchangeEventData::BBO(bbo(SHORT_EX, 100.0, 100.2, 10.0)),
-        };
+        let event = IncomeEvent::market(cfg.max_bbo_age_ms, cfg.max_bbo_age_ms, MarketData::BBO(bbo(SHORT_EX, 100.0, 100.2, 10.0)));
         manager.apply(&event);
         strategy.on_event(&event, &manager);
 

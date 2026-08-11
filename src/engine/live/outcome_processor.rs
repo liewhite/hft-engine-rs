@@ -10,7 +10,7 @@ use crate::domain::{
 };
 use crate::exchange::{ExchangeClient, ExchangeOrder};
 use crate::domain::AccountId;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent};
 use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -20,7 +20,7 @@ use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{AccountOutcome, IncomePubSub};
+use super::{AccountOutcome, AccountPubSub};
 
 // ============================================================================
 // OrderGateway —— 唯一的实盘下单出口
@@ -38,8 +38,8 @@ use super::{AccountOutcome, IncomePubSub};
 pub struct OrderGateway {
     /// 交易所客户端映射
     clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
-    /// Income PubSub（用于发布下单失败/撤单确认事件）
-    income_pubsub: ActorRef<IncomePubSub>,
+    /// 账户事件总线（用于发布下单失败/撤单确认回报，标 Live）
+    account_pubsub: ActorRef<AccountPubSub>,
     /// Symbol 元数据：用于把币本位订单折算为交易所下单单位并取整
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// dry-run 模式：只打日志不下单
@@ -77,13 +77,13 @@ pub enum PlaceVerdict {
 impl OrderGateway {
     pub fn new(
         clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
-        income_pubsub: ActorRef<IncomePubSub>,
+        account_pubsub: ActorRef<AccountPubSub>,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
         dry_run: bool,
     ) -> Self {
         Self {
             clients,
-            income_pubsub,
+            account_pubsub,
             symbol_metas,
             dry_run,
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -358,11 +358,12 @@ impl OrderGateway {
             quantity: 0.0,
         };
         if let Err(e) = self
-            .income_pubsub
-            .tell(Publish(IncomeEvent {
+            .account_pubsub
+            .tell(Publish(AccountEvent {
+                account: AccountId::Live,
                 exchange_ts: local_ts,
                 local_ts,
-                data: ExchangeEventData::OrderUpdate(update),
+                data: AccountData::OrderUpdate(update),
             }))
             .send()
             .await
@@ -386,16 +387,17 @@ impl OrderGateway {
         };
 
         if let Err(e) = self
-            .income_pubsub
-            .tell(Publish(IncomeEvent {
+            .account_pubsub
+            .tell(Publish(AccountEvent {
+                account: AccountId::Live,
                 exchange_ts: local_ts, // 本地错误，没有交易所时间戳
                 local_ts,
-                data: ExchangeEventData::OrderUpdate(update),
+                data: AccountData::OrderUpdate(update),
             }))
             .send()
             .await
         {
-            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            tracing::error!(error = %e, "Failed to publish to AccountPubSub");
         }
     }
 }
@@ -492,11 +494,11 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
 ///
 /// 本处理器**不**据此维护订单状态：订单状态的单一出处是 `SymbolState`，这里只做
 /// "谁先说话"的判定。
-impl Message<IncomeEvent> for OutcomeProcessorActor {
+impl Message<AccountEvent> for OutcomeProcessorActor {
     type Reply = ();
 
-    async fn handle(&mut self, msg: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
-        let ExchangeEventData::OrderUpdate(update) = &msg.data else {
+    async fn handle(&mut self, msg: AccountEvent, _ctx: &mut Context<Self, Self::Reply>) {
+        let AccountData::OrderUpdate(update) = &msg.data else {
             return;
         };
         let Some(client_order_id) = &update.client_order_id else {
@@ -735,18 +737,18 @@ mod place_verdict_tests {
         }
     }
 
-    /// 收集 income 总线上的回报，供断言"是否发了 Error 回报"
-    struct Sink(Arc<Mutex<Vec<IncomeEvent>>>);
+    /// 收集账户总线上的回报，供断言"是否发了 Error 回报"
+    struct Sink(Arc<Mutex<Vec<AccountEvent>>>);
     impl Actor for Sink {
-        type Args = Arc<Mutex<Vec<IncomeEvent>>>;
+        type Args = Arc<Mutex<Vec<AccountEvent>>>;
         type Error = Infallible;
         async fn on_start(a: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
             Ok(Self(a))
         }
     }
-    impl Message<IncomeEvent> for Sink {
+    impl Message<AccountEvent> for Sink {
         type Reply = ();
-        async fn handle(&mut self, m: IncomeEvent, _c: &mut Context<Self, Self::Reply>) {
+        async fn handle(&mut self, m: AccountEvent, _c: &mut Context<Self, Self::Reply>) {
             self.0.lock().unwrap().push(m);
         }
     }
@@ -783,13 +785,13 @@ mod place_verdict_tests {
 
     struct Harness {
         gateway: Arc<OrderGateway>,
-        events: Arc<Mutex<Vec<IncomeEvent>>>,
+        events: Arc<Mutex<Vec<AccountEvent>>>,
     }
 
     impl Harness {
         async fn new(client: FakeClient) -> Self {
-            let pubsub = IncomePubSub::spawn_with_mailbox(
-                IncomePubSub::new(DeliveryStrategy::Guaranteed),
+            let pubsub = AccountPubSub::spawn_with_mailbox(
+                AccountPubSub::new(DeliveryStrategy::Guaranteed),
                 mailbox::unbounded(),
             );
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -808,7 +810,7 @@ mod place_verdict_tests {
             self.events.lock().unwrap().iter().any(|e| {
                 matches!(
                     &e.data,
-                    ExchangeEventData::OrderUpdate(u)
+                    AccountData::OrderUpdate(u)
                         if matches!(u.status, OrderStatus::Error { .. })
                 )
             })

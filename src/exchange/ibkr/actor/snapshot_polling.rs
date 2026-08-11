@@ -3,16 +3,16 @@
 //! 与 account_polling / status_polling 同范式：IbkrActor 的 spawn_link 子 actor，定时拉取——
 //! 借券费/可借量走 `/iserver/marketdata/snapshot`（按 config 字段 tag + borrow_symbol conid），
 //! 汇率走专用端点 `/iserver/exchangerate`（按 config 的 source/target 货币）——组装成
-//! `BorrowFee`/`ExchangeRate` 直接 Publish 到 income_pubsub（策略与监控经同一 income 流消费）。
+//! `BorrowFee`/`ExchangeRate` 直接 Publish 到 market_pubsub（策略与监控经同一 income 流消费）。
 //!
 //! **没有兜底常量、绝不用假数据**：拉取/解析失败即 ERROR；借券费或汇率距上次成功更新超过
 //! `max_staleness_ms`（含启动宽限）即判定数据源失效 → `kill()` 自己 → 经 IbkrActor 的
 //! link 监管上抛 → ManagerActor `on_link_died` → 整个系统致命退出（宁可重启，绝不糊弄）。
 
 use crate::domain::{now_ms, BorrowFee, Exchange, ExchangeRate};
-use crate::engine::IncomePubSub;
+use crate::engine::MarketPubSub;
 use crate::exchange::ibkr::IbkrClient;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{MarketData, MarketEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message, StreamMessage};
@@ -56,14 +56,14 @@ pub struct IbkrSnapshotConfig {
 /// 初始化参数
 pub struct IbkrSnapshotPollingActorArgs {
     pub client: Arc<IbkrClient>,
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    pub market_pubsub: ActorRef<MarketPubSub>,
     pub cfg: IbkrSnapshotConfig,
 }
 
 /// IbkrSnapshotPollingActor
 pub struct IbkrSnapshotPollingActor {
     client: Arc<IbkrClient>,
-    income_pubsub: ActorRef<IncomePubSub>,
+    market_pubsub: ActorRef<MarketPubSub>,
     cfg: IbkrSnapshotConfig,
     /// borrow_symbol 解析到的 conid（on_start 解析，解析不到即致命）
     borrow_conid: i64,
@@ -108,7 +108,7 @@ impl IbkrSnapshotPollingActor {
                         if sh.is_finite() && sh >= 0.0 && fe.is_finite() && fe >= 0.0 =>
                     {
                         let ts = now_ms();
-                        self.publish(ExchangeEventData::BorrowFee(BorrowFee {
+                        self.publish(MarketData::BorrowFee(BorrowFee {
                             exchange: Exchange::IBKR,
                             symbol: self.cfg.borrow_symbol.clone(),
                             fee_annual: fe * self.cfg.fee_scale,
@@ -156,7 +156,7 @@ impl IbkrSnapshotPollingActor {
             // 有效性校验：汇率须为正(与下游 er.rate>0 采纳条件一致)。拿到但无效不算成功。
             Ok(rate) if rate.is_finite() && rate > 0.0 => {
                 let ts = now_ms();
-                self.publish(ExchangeEventData::ExchangeRate(ExchangeRate {
+                self.publish(MarketData::ExchangeRate(ExchangeRate {
                     exchange: Exchange::IBKR,
                     base: self.cfg.fx_source.clone(),
                     quote: self.cfg.fx_target.clone(),
@@ -171,11 +171,11 @@ impl IbkrSnapshotPollingActor {
         }
     }
 
-    async fn publish(&self, data: ExchangeEventData) {
+    async fn publish(&self, data: MarketData) {
         let ts = now_ms();
         if let Err(e) = self
-            .income_pubsub
-            .tell(Publish(IncomeEvent {
+            .market_pubsub
+            .tell(Publish(MarketEvent {
                 exchange_ts: ts,
                 local_ts: ts,
                 data,
@@ -183,7 +183,7 @@ impl IbkrSnapshotPollingActor {
             .send()
             .await
         {
-            tracing::error!(error = %e, "Failed to publish IBKR snapshot event to IncomePubSub");
+            tracing::error!(error = %e, "Failed to publish IBKR snapshot event to MarketPubSub");
         }
     }
 
@@ -241,7 +241,7 @@ impl Actor for IbkrSnapshotPollingActor {
 
         Ok(Self {
             client: args.client,
-            income_pubsub: args.income_pubsub,
+            market_pubsub: args.market_pubsub,
             cfg: args.cfg,
             borrow_conid,
             started_ms: now_ms(),

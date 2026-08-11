@@ -34,7 +34,7 @@ use hft_engine_rs::exchange::binance::BinanceCredentials;
 use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
 use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent, StateManager};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
 use kameo::actor::Spawn;
@@ -92,7 +92,11 @@ impl Strategy for DipMaker {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
-        let ExchangeEventData::BBO(bbo) = &event.data else {
+        let IncomeEvent::Market(MarketEvent {
+            data: MarketData::BBO(bbo),
+            ..
+        }) = event
+        else {
             return Vec::new();
         };
         let Some(symbol_state) = state.symbol_state(&bbo.symbol) else {
