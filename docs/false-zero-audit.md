@@ -219,7 +219,7 @@
 
 1. **合成回报的 0 字段**(撤单确认 price/quantity=0、REST 快照 fill_sz=0):有契约注释;且 `OrderUpdate.fill_sz`/`filled_quantity` 全引擎无读取方(已 grep 核实),pending 完全由 client_order_id + status 驱动。
 2. **`SymbolState` 挂单重建守卫**(`state.rs:320-334`):注释点名 IBKR 的 0 值推送,"宁缺勿假",有回归测试——正是原则 1 的正面示例。
-3. **对账"快照里没有 = 空仓"**(`position_reconcile.rs:249`):全量快照契约成立的合法推断,变体文档写明。
+3. **对账"快照里没有 = 空仓"**(`position_ledger.rs` 的 `Reconciler::reconcile`):全量快照契约成立的合法推断,变体文档写明。
 4. **单边盘口 `Ok(None)`**(OKX/HL codec):合法市场状态,有注释与单测。
 5. **无凭证 `fetch_positions` 返回空 Vec**:"没账户 = 空仓是事实",契约注释划清了 place/cancel 不适用。
 6. **OKX/HL `fetch_account_info` 显式 `Err`**:拒绝编造 notional=0,正是 1.2 应有的姿势。

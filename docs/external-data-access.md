@@ -47,8 +47,13 @@
 **契约**（每一项都必须满足，否则不该进这个面）
 
 1. **纯内存读**。应答路径上不许有任何 IO —— 不打 REST、不读文件、不推送。
-2. **不阻塞邮箱**。宿主 actor 的**所有** handler 都不得 `await` 在 IO 上，否则查询会排在一次网络超时后面。
-   这条约束反向淘汰了宿主候选：见下文"为什么持仓查询挂在账本 actor 上"。
+2. **不阻塞邮箱**。**数据宿主**（真正持有状态、被 manager 转发到的那个 actor）的**所有** handler
+   都不得 `await` 在 IO 上，否则查询会排在一次网络超时后面。这条约束反向淘汰了宿主候选：
+   见下文"为什么持仓查询挂在账本 actor 上"。
+
+   这条只约束数据宿主，不约束 manager 自己 —— manager 在投产期确实会 `await` 在 REST 上，
+   代价见本节末尾。两者的区别在于：manager 的阻塞是有界且一次性的（投产），
+   数据宿主的阻塞是周期性的（每个轮询节拍）。
 3. **由 `ManagerActor` 应答**，外部只需持有 manager 的 `ActorRef`。内部子 actor 的引用不外泄 ——
    否则外部能给它发任何消息，监督树的边界就形同虚设。
 4. **不许合并成一条通用查询**。`Query { kind: Positions | SymbolMetas } -> QueryResult` 是"流程强行合并后
@@ -113,7 +118,26 @@
 
 - 节拍到达 → `tokio::spawn` 各所拉取 → 结果回投为 `PositionsFetched { exchange, result }` 消息
 - `in_flight: HashSet<Exchange>` 防重入：某所上一轮未回则本轮跳过并 warn（否则慢 REST 会堆积并发请求）
-- 停摆守卫、连续不一致判据、致命退出语义全部不变
+- 连续不一致判据与致命退出语义不变
+
+**停摆守卫必须补两道，否则这次改动会架空它**（审查发现的 Critical，已修）：
+
+`StalenessGuard` 原本只有两个触点 —— `record_success` 与 `check_failure`，**都在结果回投的路径上**。
+把拉取移出 handler 之后，"结果永不回投"变成可达状态：拉取任务 panic（被 `tokio::spawn` 吞掉）、
+或 client 超时失效导致请求真挂死。那时 `in_flight` 永久占位、每个节拍只是跳过，守卫永远不被评估 ——
+**该所对账静默永久失效，而引擎继续无校验交易**。这比漏报单次漂移严重得多，因为它没有任何外在症状；
+相对旧实现还是个回归（旧代码里 panic 发生在 handler 内，actor 以 `Panicked` 终止、级联整机退出，是可见的）。
+
+两道各管一段：
+
+1. **在途即过守卫**（`check_in_flight_staleness`）：节拍发现某所仍在途时，对它调用
+   `check_failure` —— "在途未回"与"拉取失败"同等对待，都是没拿到读数。判据仍是"距上次成功的时长"。
+   这一道兜住"连回投本身都没发生"的一切成因。
+2. **panic 转 Err 回投**：拉取再套一层 `tokio::spawn`，`JoinError`（panic 或取消）被翻译成
+   `Err` 回投。adapter 里的 `unwrap` 本该是**立即可诊断**的故障，不该退化成 60 秒后一句"通道停摆"。
+
+**不再加超时层**：各所 client 自己配了超时，请求挂死属于 client 的缺陷，第 1 道已经兜住后果。
+在这里再叠一个超时是把同一个职责实现两遍。
 
 **行为变化（如实声明）**：此前 `join_all` 期间 Fill 排队不入镜像，比对用的镜像时点**早于**快照，
 偏差方向是"本地滞后交易所"；改后 Fill 连续摄入，镜像时点**晚于**快照，偏差方向反转为"本地领先交易所"。
@@ -147,8 +171,21 @@
 改造后：**删掉 `position_state` 与 `baselined` 两个字段**，推送前查一次：
 
 ```rust
-// actor 的 Args 里加上 manager 的引用（bootstrap 处本来就持有）
-let positions = self.manager.ask(GetLivePositions).send().await?;
+// actor 的 Args 里加上 manager 的引用（bootstrap 处本来就持有）。
+// 两层错误都必须处理：外层是投递失败，内层是账本不可达 —— 两者都意味着**取不到**，
+// 绝不能当成"没有持仓"。取不到时正确的动作是这一轮不更新 gauge（保留上一次的值），
+// 而不是把它们清零。
+let positions = match self.manager.ask(GetLivePositions).send().await {
+    Ok(Ok(positions)) => positions,
+    Ok(Err(reason)) => {
+        tracing::error!(%reason, "持仓快照取不到，本轮不更新持仓 gauge");
+        return;
+    }
+    Err(e) => {
+        tracing::error!(error = %e, "manager 不可达，本轮不更新持仓 gauge");
+        return;
+    }
+};
 
 for p in &positions {
     self.position_gauge

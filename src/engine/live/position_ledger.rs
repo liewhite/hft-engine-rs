@@ -325,11 +325,38 @@ pub struct PositionsFetched {
 }
 
 impl PositionLedgerActor {
+    /// 在途未回的所是否已停摆过久。`Err` = 应致命退出。
+    ///
+    /// # 为什么这条判据必须存在
+    ///
+    /// [`StalenessGuard`] 的两个触点（`record_success` / `check_failure`）都在**结果回投**的
+    /// 路径上。而"永不回投"是可达的：拉取任务 panic（被 `tokio::spawn` 吞掉）、或 client 的
+    /// 超时失效导致请求真挂死。那时 `in_flight` 永久占位，此后每个节拍都只是跳过 ——
+    /// **该所对账静默永久失效，而引擎继续无校验地交易**。
+    ///
+    /// 所以"在途未回"必须与"拉取失败"同等对待：都是没拿到读数，都要过守卫。判据仍是
+    /// "距上次成功的时长"，与在途了几轮无关。
+    ///
+    /// （回投侧另有一道兜底：panic 会被转成 `Err` 回投，见 [`Self::spawn_fetches`]。两道
+    /// 各管一段 —— 那道让 panic 立即可诊断，这道兜住"连回投本身都没发生"。）
+    fn check_in_flight_staleness(&self) -> Result<(), String> {
+        for exchange in &self.in_flight {
+            let guard = self.guards.get(exchange).expect("guard 与 client 同建");
+            guard.check_failure(format!("{exchange} 上一轮持仓读数始终未返回"))?;
+            tracing::warn!(
+                %exchange,
+                stale_ms = guard.stale_ms(),
+                "上一轮持仓读数尚未返回，本轮跳过（REST 慢于轮询间隔）"
+            );
+        }
+        Ok(())
+    }
+
     /// 为每个**当前没有在途请求**的所发起一次拉取，结果稍后回投为 [`PositionsFetched`]。
     ///
     /// 跳过在途的所（而非并发再发一次）：REST 慢于轮询间隔时，堆积并发请求既压垮限流额度，
-    /// 又让"最新读数"的时点无从判断。跳过会被 warn 记下 —— 拉取长期慢于节拍是需要知道的事，
-    /// 而真正的停摆由 [`StalenessGuard`] 按"距上次成功的时长"判定，与本次跳过无关。
+    /// 又让"最新读数"的时点无从判断。跳过是否已到停摆程度由
+    /// [`Self::check_in_flight_staleness`] 判定，节拍 handler 先过那道再进本函数。
     fn spawn_fetches(&mut self, me: &ActorRef<Self>) {
         let due: Vec<(Exchange, Arc<dyn ExchangeClient>)> = self
             .clients
@@ -338,28 +365,38 @@ impl PositionLedgerActor {
             .map(|(exchange, client)| (*exchange, client.clone()))
             .collect();
 
-        for exchange in self.clients.keys() {
-            if self.in_flight.contains(exchange) {
-                tracing::warn!(
-                    %exchange,
-                    stale_ms = self.guards.get(exchange).map(|g| g.stale_ms()).unwrap_or(0),
-                    "上一轮持仓读数尚未返回，本轮跳过（REST 慢于轮询间隔）"
-                );
-            }
-        }
-
         for (exchange, client) in due {
             self.in_flight.insert(exchange);
             let me = me.clone();
             tokio::spawn(async move {
-                let result = client
-                    .fetch_positions()
-                    .await
-                    .map_err(|e| e.to_string());
+                // 再套一层 spawn 只为一件事：把拉取的 panic 变成一条 `Err` 回投。
+                // 直接在本任务里 await，panic 会连投递一起带走 —— 那正是"结果永不回投"，
+                // 而 adapter 里的 unwrap 本该是**立即可诊断**的故障，不该退化成 60 秒后的
+                // "通道停摆"。取消同理（JoinError 两种成因都在这里被翻译成人话）。
+                let fetch = tokio::spawn(async move { client.fetch_positions().await });
+                let result = match fetch.await {
+                    Ok(Ok(positions)) => Ok(positions),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(join_err) => {
+                        Err(format!("持仓拉取任务异常终止（panic 或被取消）: {join_err}"))
+                    }
+                };
                 // 投递失败只可能是 actor 已停止（整机正在退出），此时无人需要这份读数
                 let _ = me.tell(PositionsFetched { exchange, result }).send().await;
             });
         }
+    }
+
+    /// 本地持仓已不可信，受控退出。
+    ///
+    /// 策略的三道风控闸门（单边杠杆 / 账户杠杆 / 仓位上限）全部基于它计算，继续跑等于
+    /// 无风控裸奔。退出后交人工核对，容器编排负责拉起。
+    fn fatal(actor_ref: &ActorRef<Self>, reason: &str) {
+        tracing::error!(
+            %reason,
+            "持仓对账确认漂移或通道停摆，退出（本地持仓不可信，风控闸门已失效，需人工核对后重启）"
+        );
+        actor_ref.kill();
     }
 
     /// 处理一所的读数：更新守卫、比对。`Err` = 确认漂移或通道停摆过久，调用方应致命退出。
@@ -482,13 +519,7 @@ impl Message<PositionsFetched> for PositionLedgerActor {
     async fn handle(&mut self, msg: PositionsFetched, ctx: &mut Context<Self, Self::Reply>) {
         self.in_flight.remove(&msg.exchange);
         if let Err(reason) = self.ingest(msg.exchange, msg.result) {
-            // 本地持仓已不可信：策略的三道风控闸门（单边杠杆 / 账户杠杆 / 仓位上限）
-            // 全部基于它计算，继续跑等于无风控裸奔。受控退出交人工介入。
-            tracing::error!(
-                %reason,
-                "持仓对账确认漂移或通道停摆，退出（本地持仓不可信，风控闸门已失效，需人工核对后重启）"
-            );
-            ctx.actor_ref().kill();
+            Self::fatal(ctx.actor_ref(), &reason);
         }
     }
 }
@@ -506,6 +537,11 @@ impl Message<StreamMessage<Instant, (), ()>> for PositionLedgerActor {
             StreamMessage::Next(_) => {
                 // 没有任何 authed 所时无事可做（引擎只接公共行情）
                 if self.clients.is_empty() {
+                    return;
+                }
+                // 先判在途停摆：结果永不回投时，守卫够不到，只有这里能发现
+                if let Err(reason) = self.check_in_flight_staleness() {
+                    Self::fatal(ctx.actor_ref(), &reason);
                     return;
                 }
                 self.spawn_fetches(ctx.actor_ref());
@@ -943,20 +979,28 @@ mod mailbox_tests {
     /// 大到测试期间不会自行触发第二次节拍（首次节拍由 `interval` 立即产生，无法关掉）
     const NEVER_AGAIN_MS: u64 = 3_600_000;
 
-    /// `fetch_positions` 永不返回（卡在一个永不放行的信号量上）。
-    ///
-    /// 不用 `sleep` 制造卡死：`start_paused` 之外的运行时里 sleep 会真的等，而 paused 运行时
-    /// 空闲时会自动推进时钟把 sleep 走完 —— 两种情况都测不到"卡死"。信号量不涉及时钟。
-    struct HungClient {
+    /// `fetch_positions` 的故障形态。两种共用一个 client，避免把 7 个
+    /// `unreachable!` 的方法抄两遍。
+    enum Faulty {
+        /// 永不返回。不用 `sleep` 制造卡死：普通运行时里 sleep 会真的等，而 paused 运行时
+        /// 空闲时会自动推进时钟把 sleep 走完 —— 两种都测不到"卡死"。信号量不涉及时钟。
+        Hang,
+        /// 拉取过程中 panic（adapter 里的 unwrap 之类）
+        Panic,
+    }
+
+    struct FaultyClient {
+        mode: Faulty,
         gate: Semaphore,
         calls: Arc<AtomicUsize>,
     }
 
-    impl HungClient {
+    impl FaultyClient {
         /// 返回 (client, 调用计数) 两个句柄 —— 计数由测试持有，用于断言发起了几次拉取
-        fn pair() -> (Arc<dyn ExchangeClient>, Arc<AtomicUsize>) {
+        fn pair(mode: Faulty) -> (Arc<dyn ExchangeClient>, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
             let client = Arc::new(Self {
+                mode,
                 gate: Semaphore::new(0),
                 calls: calls.clone(),
             });
@@ -965,14 +1009,19 @@ mod mailbox_tests {
     }
 
     #[async_trait::async_trait]
-    impl ExchangeClient for HungClient {
+    impl ExchangeClient for FaultyClient {
         fn exchange(&self) -> Exchange {
             EX
         }
         async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let _permit = self.gate.acquire().await;
-            unreachable!("信号量永不放行")
+            match self.mode {
+                Faulty::Panic => panic!("模拟 adapter 内的 panic"),
+                Faulty::Hang => {
+                    let _permit = self.gate.acquire().await;
+                    unreachable!("信号量永不放行")
+                }
+            }
         }
         async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
             unreachable!("账本不查 symbol metas")
@@ -1020,7 +1069,7 @@ mod mailbox_tests {
 
     /// 起一个账本 actor 并完成投产注册（基线 2.0）
     async fn ledger_with_hung_rest() -> (ActorRef<PositionLedgerActor>, Arc<AtomicUsize>) {
-        let (client, calls) = HungClient::pair();
+        let (client, calls) = FaultyClient::pair(Faulty::Hang);
         let ledger = PositionLedgerActor::spawn(PositionLedgerArgs {
             clients: HashMap::from([(EX, client)]),
             symbol_metas: metas(),
@@ -1043,6 +1092,77 @@ mod mailbox_tests {
             .await
             .expect("注册应成功");
         (ledger, calls)
+    }
+
+    /// **回归防线（Critical）**：在途请求永不返回时，停摆守卫必须仍能判定致命。
+    ///
+    /// 守卫的两个触点都在"结果回投"的路径上。若节拍只是跳过在途的所而不过守卫，
+    /// 拉取任务 panic 或真挂死会让该所对账**静默永久失效**，引擎继续无校验交易 ——
+    /// 这比漏报单次漂移严重得多，因为它没有任何外在症状。
+    #[test]
+    fn an_in_flight_fetch_that_never_returns_still_trips_the_staleness_guard() {
+        let (client, _calls) = FaultyClient::pair(Faulty::Hang);
+        let mut ledger = PositionLedgerActor {
+            reconciler: Reconciler::new(metas(), DEFAULT_MAX_CONSECUTIVE_MISMATCHES),
+            clients: HashMap::from([(EX, client)]),
+            guards: HashMap::from([(
+                EX,
+                StalenessGuard::new(format!("{EX} 持仓对账"), MAX_POLL_STALENESS_MS),
+            )]),
+            in_flight: HashSet::from([EX]),
+        };
+
+        // 刚发出、还在容忍窗口内：只是慢，不该停机
+        ledger
+            .check_in_flight_staleness()
+            .expect("窗口内的在途请求只是慢，不该判致命");
+
+        // 在途已超出容忍窗口 —— 与"拉取持续失败"同等对待
+        ledger
+            .guards
+            .get_mut(&EX)
+            .unwrap()
+            .rewind(MAX_POLL_STALENESS_MS + 1);
+        let err = ledger
+            .check_in_flight_staleness()
+            .expect_err("在途超窗必须致命，否则对账通道静默永久失效");
+        assert!(err.contains("已停摆"), "got: {err}");
+    }
+
+    /// **回归防线**：拉取任务 panic 必须被翻译成一条 `Err` 回投，而不是让结果凭空消失。
+    ///
+    /// 若 panic 连投递一起带走，`in_flight` 永久占位、后续节拍全部跳过。这里用
+    /// "第二轮节拍还能不能发起拉取"来观测 —— 能，就说明第一轮的 panic 已被回投消化。
+    #[tokio::test]
+    async fn a_panicking_fetch_is_reported_back_instead_of_vanishing() {
+        let (client, calls) = FaultyClient::pair(Faulty::Panic);
+        let ledger = PositionLedgerActor::spawn(PositionLedgerArgs {
+            clients: HashMap::from([(EX, client)]),
+            symbol_metas: metas(),
+            interval_ms: NEVER_AGAIN_MS,
+            max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
+        });
+
+        // 两轮节拍之间留出调度机会，让第一轮的 panic 走完"回投 -> 清 in_flight"
+        for _ in 0..2 {
+            ledger
+                .tell(StreamMessage::Next(Instant::now()))
+                .send()
+                .await
+                .expect("节拍投递应成功");
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // 不断言确切次数：`interval` 的首次立即节拍也算一轮，总数取决于节拍来源。
+        // 要证明的只是"panic 之后还能再发起" —— 若 panic 吞掉了回投，in_flight 永久占位，
+        // 计数会永远停在 1。
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "panic 若吞掉了回投，in_flight 会永久占位，此后任何节拍都发不出拉取（实际 {} 次）",
+            calls.load(Ordering::SeqCst)
+        );
     }
 
     /// **回归防线**：REST 拉取卡死时，快照查询仍须应答。
