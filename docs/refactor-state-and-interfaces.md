@@ -11,7 +11,7 @@
 
 | 阶段 | 目标 | 对应违反 | 状态 |
 |---|---|---|---|
-| R1 | 拆 `ExchangeClient`：公共 / 账户两个 trait | V3 | 未开始 |
+| R1 | 拆 `ExchangeClient`：公共 / 账户两个 trait | V3 | **已完成** |
 | R2 | 拆 `StateManager`：四个单一职责投影 | V1 | 未开始 |
 | R3 | 策略只拿受限视图 | V2 | 未开始（依赖 R2） |
 | R4 | 下单出口的分发判据收敛到一处 | V4 | 未开始 |
@@ -90,9 +90,21 @@ AccountClient 对象"在装配处被堵死，下游拿到 `Option` 即是权威�
 
 ### 风险
 
-低。改动面大但机械，编译器会指出每一处。唯一需要人判断的是 IBKR：它的公共行情本身就要
-连接会话，确认它在无凭证配置下是否真能只跑公共流（若不能，`setup_ibkr` 应直接拒绝无凭证配置，
-这比返回空值诚实）。
+低。改动面大但机械，编译器会指出每一处。IBKR 无需判断：`IbkrClient::new` 本就要打网关鉴权，
+只在有凭证时才构建，故 `account: Some(..)` 恒成立。
+
+### 完成记录
+
+332 用例通过，零编译告警，clippy 净增 0（改动前后同为 19 条既有告警）。
+
+三处计划外但顺手的收获：
+
+1. **`ManagerActor.clients` 字段变成死代码被删**。拆分后它的唯一用途（metas 预加载）只发生在
+   `on_start` 的局部变量上，私有调用全部改走 `accounts` —— 编译器直接报 never read。
+2. **`BinanceActorArgs.client` 字段删除**。它只为 equity 轮询而存在，而那是账户私有能力；
+   actor 内部本就另建了一个带凭证的 `Arc<BinanceClient>`，改用它之后这个字段成了重复通道。
+3. **三个测试替身瘦身**。`FakeClient` / `FaultyClient` 不必再桩掉 `fetch_all_symbol_metas`
+   与 `fetch_symbol_meta` 两个它们永远不碰的方法 —— 接口收窄的收益在测试里立刻兑现。
 
 ---
 

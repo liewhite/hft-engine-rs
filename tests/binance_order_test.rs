@@ -6,7 +6,7 @@
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
-use hft_engine_rs::exchange::{ExchangeClient, ExchangeOrder};
+use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder};
 use reqwest::Client;
 use serde::Deserialize;
 

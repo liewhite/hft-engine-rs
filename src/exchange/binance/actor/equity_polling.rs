@@ -5,7 +5,7 @@
 use crate::domain::{now_ms, Exchange};
 use crate::engine::AccountPubSub;
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
-use crate::exchange::ExchangeClient;
+use crate::exchange::AccountClient;
 use crate::messaging::{AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -20,7 +20,7 @@ use tokio_stream::wrappers::IntervalStream;
 /// BinanceEquityPollingActor 初始化参数
 pub struct BinanceEquityPollingActorArgs {
     /// Binance client (用于查询 equity)
-    pub client: Arc<dyn ExchangeClient>,
+    pub client: Arc<dyn AccountClient>,
     /// Income PubSub (发布事件)
     pub account_pubsub: ActorRef<AccountPubSub>,
     /// 查询间隔 (毫秒)
@@ -30,7 +30,7 @@ pub struct BinanceEquityPollingActorArgs {
 /// BinanceEquityPollingActor - 定时查询 equity
 pub struct BinanceEquityPollingActor {
     /// Binance client
-    client: Arc<dyn ExchangeClient>,
+    client: Arc<dyn AccountClient>,
     /// Income PubSub (发布事件)
     account_pubsub: ActorRef<AccountPubSub>,
     /// 停摆守卫：净值取不到时，`StateManager` 里的旧值会原样留着且无从分辨新鲜度 ——

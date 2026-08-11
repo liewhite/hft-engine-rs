@@ -184,7 +184,6 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
             rest_base_url: REST_BASE_URL.to_string(),
             market_pubsub: market_pubsub.clone(),
             account_pubsub: account_pubsub.clone(),
-            client: binance_client.clone(),
             quote: "USDT".to_string(),
         },
         mailbox::unbounded(),

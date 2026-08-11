@@ -221,7 +221,8 @@
 2. **`SymbolState` 挂单重建守卫**(`state.rs:320-334`):注释点名 IBKR 的 0 值推送,"宁缺勿假",有回归测试——正是原则 1 的正面示例。
 3. **对账"快照里没有 = 空仓"**(`position_ledger.rs` 的 `Reconciler::reconcile`):全量快照契约成立的合法推断,变体文档写明。
 4. **单边盘口 `Ok(None)`**(OKX/HL codec):合法市场状态,有注释与单测。
-5. **无凭证 `fetch_positions` 返回空 Vec**:"没账户 = 空仓是事实",契约注释划清了 place/cancel 不适用。
+5. ~~**无凭证 `fetch_positions` 返回空 Vec**~~ —— **已消除**(R1)。`fetch_positions` 移到
+   `AccountClient`,而该对象只在配了凭证时才存在,"没账户"这一情形由类型排除,不再需要空值表达。
 6. **OKX/HL `fetch_account_info` 显式 `Err`**:拒绝编造 notional=0,正是 1.2 应有的姿势。
 7. **HL 私有 WS 解析失败全部 `?` 上抛 kill**:2.3 应对齐的范式。
 8. **HL "过滤后一个不剩即报错"守卫 + 真实响应固化测试**:2.5/2.6 应对齐的范式。

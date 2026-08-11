@@ -4,7 +4,7 @@ use crate::domain::{
     Exchange, ExchangeError, OrderId, OrderStatus, OrderType, Side, Symbol, SymbolMeta,
     TimeInForce,
 };
-use crate::exchange::client::{ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::symbol::resolve_conids;
 use crate::exchange::ibkr::wire;
@@ -356,6 +356,13 @@ impl ExchangeClient for IbkrClient {
         let all = self.fetch_all_symbol_metas().await?;
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
         Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
+    }
+}
+
+#[async_trait]
+impl AccountClient for IbkrClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::IBKR
     }
 
     async fn cancel_order(&self, _symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {

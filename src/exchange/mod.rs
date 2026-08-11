@@ -12,7 +12,7 @@ pub mod ws_loop;
 mod trades_conformance;
 
 pub use client::{
-    ExchangeAccess, ExchangeActorOps, ExchangeClient, ExchangeOrder,
+    AccountClient, ExchangeAccess, ExchangeActorOps, ExchangeClient, ExchangeOrder,
     Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe,
 };
 

@@ -213,14 +213,15 @@ fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<Outcome
 连带后果：「策略是纯函数」实际是「对一个巨大可变历史投影的纯函数」；往 `StateManager`
 加字段会自动扩大所有策略的可见面，编译器不报警。→ 计划 R3
 
-### V3 `ExchangeClient` 用返回空值表达"没有能力" —— 违反 P2
+### ~~V3 `ExchangeClient` 用返回空值表达"没有能力"~~ —— **已修复（R1）**
 
-8 个方法把公共行情与私有账户混在一个 trait。无凭证的所 `fetch_positions` 返回 `Ok(vec![])`、
-`fetch_pending_orders` 返回空（`binance/client.rs:706`、`okx/client.rs:599`、
-`hyperliquid/client.rs:745`）。
+原状：8 个方法把公共行情与私有账户混在一个 trait，无凭证的所把"没有账户"表达成
+`fetch_positions` 返回 `Ok(vec![])`；"有没有账户"同时存在于返回值语义与
+`ExchangeSetup.authed: bool` 两处。
 
-调用方分不清"真的空仓"与"根本不该问"；"有没有账户"这一事实同时存在于 client 的返回值语义
-和 `ExchangeSetup.authed: bool` 两处。→ 计划 R1
+现状：拆成 [`ExchangeClient`]（公共）与 [`AccountClient`]（私有），
+`ExchangeSetup.account: Option<Arc<dyn AccountClient>>`，`authed` 字段删除。
+装配处只在配了凭证时才装入，因此"持有该对象"即"有账户"，一处表达、编译期可查。
 
 ### V4 两个下单出口各自用否定条件过滤同一条总线 —— 违反 P4
 

@@ -16,7 +16,7 @@ use crate::domain::{
     now_ms, AccountId, Exchange, ExchangeError, Order, OrderType, OrderUpdate, Side, Symbol,
     SymbolMeta,
 };
-use crate::exchange::{ExchangeClient, SubscriptionKind};
+use crate::exchange::{AccountClient, SubscriptionKind};
 use kameo::actor::{ActorId, ActorRef};
 use kameo::message::{Context, Message};
 use std::collections::{HashMap, HashSet};
@@ -117,7 +117,7 @@ impl ManagerActor {
     /// （见 [`Exchange::owns_cli_order_id`]）。认不出归属的一律**保留** —— 撤错别人的单
     /// 不可接受，而漏撤会由调用方的复查兜住。
     async fn own_pending_orders(
-        client: &Arc<dyn ExchangeClient>,
+        client: &Arc<dyn AccountClient>,
         exchange: Exchange,
         symbol: &Symbol,
     ) -> Result<Vec<OrderUpdate>, ExchangeError> {
@@ -153,7 +153,7 @@ impl ManagerActor {
     /// 复查后仍有遗留 → 返回 `Err` 拒绝启动。留着一张无人看管的挂单开跑，策略会在它旁边
     /// 重复挂单；而启动期失败是**最便宜的失败时机**（还没开始交易）。
     async fn cancel_leftover_orders(
-        client: &Arc<dyn ExchangeClient>,
+        client: &Arc<dyn AccountClient>,
         exchange: Exchange,
         symbol: &Symbol,
     ) -> Result<(), ExchangeError> {
@@ -251,10 +251,11 @@ impl ManagerActor {
         //    提前的好处是它的失败**根本不需要回滚** —— 此时还没有任何实例被建出来，
         //    直接返回 Err 就等于"什么都没发生"。
         for (exchange, symbol) in &exchange_symbols {
-            let Some(client) = self.clients.get(exchange) else {
+            // 没有账户的所不可能有本引擎的挂单（下不了单），跳过
+            let Some(account) = self.accounts.get(exchange) else {
                 continue;
             };
-            Self::cancel_leftover_orders(client, *exchange, symbol).await?;
+            Self::cancel_leftover_orders(account, *exchange, symbol).await?;
         }
 
         // 5. 拉取持仓基线：**一次快照喂全部账本消费者**（executor / 对账镜像 / 观测镜像
@@ -341,7 +342,7 @@ impl ManagerActor {
         let mut baselines = HashMap::new();
         let exchanges: HashSet<Exchange> = exchange_symbols.iter().map(|(e, _)| *e).collect();
         for exchange in exchanges {
-            let Some(client) = self.clients.get(&exchange) else {
+            let Some(client) = self.accounts.get(&exchange) else {
                 continue;
             };
             // 快照**请求**时刻：在此之前已由私有流送达的 Fill，其成交必然已包含在快照里
@@ -659,9 +660,9 @@ impl Message<RemoveStrategies> for ManagerActor {
         if !is_live {
             return Self::finish_removal(&msg.account, msg.exchange, incomplete);
         }
-        let Some(client) = self.clients.get(&msg.exchange).cloned() else {
+        let Some(client) = self.accounts.get(&msg.exchange).cloned() else {
             return Err(ExchangeError::Other(format!(
-                "No client for {} — 既无法撤单也无法平仓",
+                "{} 没有账户（未配置凭证）—— 既无法撤单也无法平仓",
                 msg.exchange
             )));
         };
@@ -808,7 +809,7 @@ mod leftover_order_tests {
     }
 
     impl FakeClient {
-        fn new(rounds: Vec<Vec<OrderUpdate>>) -> (Arc<dyn ExchangeClient>, CancelLog) {
+        fn new(rounds: Vec<Vec<OrderUpdate>>) -> (Arc<dyn AccountClient>, CancelLog) {
             let cancelled: CancelLog = Arc::new(Mutex::new(Vec::new()));
             let client = Arc::new(Self {
                 pending: Mutex::new(rounds.into()),
@@ -819,7 +820,7 @@ mod leftover_order_tests {
     }
 
     #[async_trait::async_trait]
-    impl ExchangeClient for FakeClient {
+    impl AccountClient for FakeClient {
         fn exchange(&self) -> Exchange {
             EX
         }
@@ -836,15 +837,6 @@ mod leftover_order_tests {
         ) -> Result<(), ExchangeError> {
             self.cancelled.lock().unwrap().push(order_id.clone());
             Ok(())
-        }
-        async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-            unreachable!("被测逻辑不该查 symbol metas")
-        }
-        async fn fetch_symbol_meta(
-            &self,
-            _symbols: &[Symbol],
-        ) -> Result<Vec<SymbolMeta>, ExchangeError> {
-            unreachable!("被测逻辑不该查 symbol meta")
         }
         async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
             unreachable!("撤单流程不该下单")

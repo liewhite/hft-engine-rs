@@ -8,7 +8,7 @@ use crate::domain::{
     now_ms, Exchange, ExchangeError, Order, OrderStatus, OrderUpdate, RejectReason, Side, Symbol,
     SymbolMeta,
 };
-use crate::exchange::{ExchangeClient, ExchangeOrder};
+use crate::exchange::{AccountClient, ExchangeOrder};
 use crate::domain::AccountId;
 use crate::messaging::{AccountData, AccountEvent};
 use crate::strategy::OutcomeEvent;
@@ -36,8 +36,9 @@ use super::{AccountOutcome, AccountPubSub};
 /// 没有 in_flight 假警报防护、失败不合成回报、无视 dry_run。收敛为单一出口后，
 /// 这些语义对一切下单一致。
 pub struct OrderGateway {
-    /// 交易所客户端映射
-    clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
+    /// 各所的账户私有能力。键集 = 配了凭证的所 —— 不在表里就是"该所只接公共行情"，
+    /// 下单请求会被拒绝并合成失败回报，而不是静默丢弃。
+    accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 账户事件总线（用于发布下单失败/撤单确认回报，标 Live）
     account_pubsub: ActorRef<AccountPubSub>,
     /// Symbol 元数据：用于把币本位订单折算为交易所下单单位并取整
@@ -76,13 +77,13 @@ pub enum PlaceVerdict {
 
 impl OrderGateway {
     pub fn new(
-        clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
+        accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
         account_pubsub: ActorRef<AccountPubSub>,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
         dry_run: bool,
     ) -> Self {
         Self {
-            clients,
+            accounts,
             account_pubsub,
             symbol_metas,
             dry_run,
@@ -101,7 +102,7 @@ impl OrderGateway {
     /// 一切失败路径都已通过 [`Self::send_order_error`] 反馈为 `OrderUpdate(Error)`，
     /// 总线路径 spawn 后忽略返回值不会丢失信息。
     pub async fn place(&self, order: Order, comment: &str) -> Result<PlaceVerdict, String> {
-        let Some(client) = self.clients.get(&order.exchange).cloned() else {
+        let Some(client) = self.accounts.get(&order.exchange).cloned() else {
             let reason = format!("No client found for exchange {}", order.exchange);
             tracing::error!(exchange = %order.exchange, "{}", reason);
             self.send_order_error(&order, reason.clone()).await;
@@ -255,7 +256,7 @@ impl OrderGateway {
         order_id: crate::domain::OrderId,
         client_order_id: String,
     ) -> Result<(), String> {
-        let Some(client) = self.clients.get(&exchange).cloned() else {
+        let Some(client) = self.accounts.get(&exchange).cloned() else {
             let reason = format!("No client found for cancel_order on {exchange}");
             tracing::error!(%exchange, "{}", reason);
             return Err(reason);
@@ -706,7 +707,7 @@ mod place_verdict_tests {
     }
 
     #[async_trait::async_trait]
-    impl ExchangeClient for FakeClient {
+    impl AccountClient for FakeClient {
         fn exchange(&self) -> Exchange {
             EX
         }
@@ -719,12 +720,6 @@ mod place_verdict_tests {
         }
         async fn cancel_order(&self, _s: &Symbol, _o: &OrderId) -> Result<(), ExchangeError> {
             unreachable!("place 契约测试不撤单")
-        }
-        async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-            unreachable!()
-        }
-        async fn fetch_symbol_meta(&self, _s: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
-            unreachable!()
         }
         async fn fetch_pending_orders(&self, _s: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
             unreachable!()
@@ -797,8 +792,8 @@ mod place_verdict_tests {
             let events = Arc::new(Mutex::new(Vec::new()));
             let sink = Sink::spawn_with_mailbox(events.clone(), mailbox::unbounded());
             pubsub.tell(Subscribe(sink)).send().await.unwrap();
-            let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> =
-                HashMap::from([(EX, Arc::new(client) as Arc<dyn ExchangeClient>)]);
+            let clients: HashMap<Exchange, Arc<dyn AccountClient>> =
+                HashMap::from([(EX, Arc::new(client) as Arc<dyn AccountClient>)]);
             let gateway = Arc::new(OrderGateway::new(clients, pubsub, metas(), false));
             Self { gateway, events }
         }

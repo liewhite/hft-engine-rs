@@ -8,7 +8,7 @@
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce, BBO};
 use hft_engine_rs::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials};
 use hft_engine_rs::exchange::ibkr::auth::tickle;
-use hft_engine_rs::exchange::{ExchangeOrder, ExchangeClient, SubscribeBatch, SubscriptionKind};
+use hft_engine_rs::exchange::{AccountClient, ExchangeOrder, ExchangeClient, SubscribeBatch, SubscriptionKind};
 use hft_engine_rs::engine::{AccountPubSub, MarketPubSub};
 use hft_engine_rs::messaging::{MarketData, MarketEvent};
 use kameo::actor::{ActorRef, Spawn};
