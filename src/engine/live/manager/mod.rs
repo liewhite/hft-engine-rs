@@ -14,12 +14,12 @@ use super::{
     AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs, ExecutorActor,
     IncomeProcessorActor, MarketPubSub, MetricsActor, MetricsActorArgs, OrderGateway,
     OutcomePubSub, OutcomeProcessorActor, PaperCounterActor, PaperCounterArgs,
-    PositionReconcileActor, PositionReconcileArgs,
+    GetLivePositions, PositionLedgerActor, PositionLedgerArgs,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
     DEFAULT_REPORT_INTERVAL_MS,
 };
 use crate::domain::{
-    now_ms, AccountId, Exchange, ExchangeError, Symbol, SymbolMeta,
+    now_ms, AccountId, Exchange, ExchangeError, Position, Symbol, SymbolMeta,
 };
 use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
 use super::assembly::{ExchangeSetup, SpawnCtx};
@@ -76,8 +76,11 @@ pub struct ManagerActor {
     income_processor: ActorRef<IncomeProcessorActor>,
     /// MetricsActor (订阅两条入向总线，输出账户/持仓/订单/历史指标)
     metrics: ActorRef<MetricsActor>,
-    /// 持仓对账 Actor (订阅账户总线的实盘 Fill；漂移确认后致命退出)
-    position_reconciler: ActorRef<PositionReconcileActor>,
+    /// 实盘持仓账本 (订阅账户总线的实盘 Fill；REST 校验，漂移确认后致命退出)。
+    ///
+    /// 同时是快照面 [`GetLivePositions`] 的数据源 —— 它是唯一被持续校验的那份折叠，
+    /// 外部读到的数字与风控守卫看到的数字必须是同一个。
+    position_ledger: ActorRef<PositionLedgerActor>,
     /// ExchangeActors (启动时创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
 
@@ -344,10 +347,10 @@ impl Actor for ManagerActor {
             .filter(|(e, _)| authed_exchanges.contains(e))
             .map(|(e, c)| (*e, c.clone()))
             .collect();
-        let position_reconciler = consumers.spawn::<PositionReconcileActor, _>(
+        let position_ledger = consumers.spawn::<PositionLedgerActor, _>(
             &actor_ref,
-            "PositionReconcileActor",
-            PositionReconcileArgs {
+            "PositionLedgerActor",
+            PositionLedgerArgs {
                 clients: authed_clients,
                 symbol_metas: Arc::new(symbol_metas.clone()),
                 interval_ms: DEFAULT_POSITION_POLL_INTERVAL_MS,
@@ -357,7 +360,7 @@ impl Actor for ManagerActor {
         .await;
         // 镜像的增量输入只有实盘 Fill：按类型+账户过滤订阅（模拟成交绝不进实盘镜像）
         account_pubsub
-            .tell(SubscribeFilter(position_reconciler.clone(), |e: &AccountEvent| {
+            .tell(SubscribeFilter(position_ledger.clone(), |e: &AccountEvent| {
                 e.account == AccountId::Live && matches!(e.data, AccountData::Fill(_))
             }))
             .send()
@@ -410,7 +413,7 @@ impl Actor for ManagerActor {
             outcome_pubsub,
             income_processor: processor,
             metrics,
-            position_reconciler,
+            position_ledger,
             exchange_actors,
             order_gateway,
             executors: Vec::new(),
@@ -465,7 +468,7 @@ impl Actor for ManagerActor {
     ///   [`crate::dispatch_ws_stream_message`] 统一保证，各 polling actor 在自己的 `Finished`
     ///   分支里做同样的事。
     /// - **manager 持有强引用**（`exchange_actors` / `metrics` / `income_processor` /
-    ///   `position_reconciler` / `executors`），压根饿不死。
+    ///   `position_ledger` / `executors`），压根饿不死。
     ///
     /// 外部注册的观察者由 [`crate::engine::spawn_supervised`] 挂进来，调用方持有返回的
     /// ActorRef，同样不会饿死。
@@ -756,6 +759,17 @@ where
     }
 }
 
+// ============================================================================
+// 快照面（拉）—— 契约见 `docs/external-data-access.md`
+//
+// 这一面上的每条消息都必须：纯内存读、不打 REST、不阻塞邮箱、由本 actor 应答。
+// 新增一类快照 = 新增一条消息 + 一个 `impl Message`，**不改既有分支** ——
+// 绝不合并成 `Query { kind }` 那种用 match 分发的假抽象。
+//
+// 已知代价：投产期本 actor 忙于 REST 快照与订阅装配（秒级），此间查询会排队。
+// 对采样式消费者可接受；要求毫秒应答的需求应走流面（`Subscribe*`）。
+// ============================================================================
+
 /// 获取所有交易所的 SymbolMeta
 pub struct GetAllSymbolMetas;
 
@@ -772,6 +786,32 @@ impl Message<GetAllSymbolMetas> for ManagerActor {
             result.entry(*exchange).or_default().push(meta.clone());
         }
         result
+    }
+}
+
+/// 实盘持仓真值快照，转发给 [`PositionLedgerActor`]（唯一被 REST 持续校验的那份折叠）。
+///
+/// 应答为**基线已写入**的全部腿（含 `size == 0` 的空仓腿）；未 seed 的腿不在结果里 ——
+/// 那是"未知"而非"空仓"。
+///
+/// 账本不可达时返回 `Err` 而**不是空 vec**：同一条"未知不得伪装成空仓"的规矩，对单条腿成立
+/// 就对整份快照成立。空 vec 在下游会被当成"全部已平仓"，而账本不可达时真实持仓可能是任意值。
+impl Message<GetLivePositions> for ManagerActor {
+    type Reply = Result<Vec<Position>, String>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetLivePositions,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.position_ledger
+            .ask(GetLivePositions)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "持仓账本不可达，快照查询失败（取不到 ≠ 没有持仓）");
+                format!("持仓账本不可达: {e}")
+            })
     }
 }
 

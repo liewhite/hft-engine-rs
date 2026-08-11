@@ -149,8 +149,8 @@ impl Actor for OkxPrivateWsActor {
         //
         // **不订阅 `positions`**：持仓的维护模型是「启动期 REST 基线 + 之后全程 Fill 累加」，
         // 持仓推送既不是基线（基线只能来自 ManagerActor）也不参与增量（增量走 `orders` 频道
-        // 产出的 Fill）。要校验本地持仓是否漂移，走 PositionReconcileActor 那条独立轮询通道
-        // （见 crate::engine::PositionReconcileActor），不在这里塞快照。
+        // 产出的 Fill）。要校验本地持仓是否漂移，走 PositionLedgerActor 那条独立轮询通道
+        // （见 crate::engine::PositionLedgerActor），不在这里塞快照。
         let subscribe_msg = json!({
             "op": "subscribe",
             "args": [

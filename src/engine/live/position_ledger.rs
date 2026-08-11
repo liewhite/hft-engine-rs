@@ -1,9 +1,18 @@
-//! PositionReconcileActor —— 持仓对账（本地「基线 + Fill」 vs 交易所读数）。
+//! PositionLedgerActor —— 实盘持仓账本：维护真值、用 REST 校验、对外供查。
+//!
+//! # 三件事是同一件事
+//!
+//! 本 actor 持有的镜像是**进程内唯一被持续校验的持仓折叠**，因此也是唯一有资格对外称作
+//! 「真值」的那一份（另两份本地派生及其保留理由见 `docs/external-data-access.md`）。
+//! 校验与供查不是两个职责：账本没有守卫就是负债，守卫没有账本无物可守，而外部读到的数字
+//! 与风控守卫看到的数字**必须是同一个**，否则看板绿着、引擎却在停机边缘。
+//!
+//! 对外入口是 [`GetLivePositions`]，经 `ManagerActor` 转发（快照面契约见同一份文档）。
 //!
 //! 持仓的权威值由「投产期 REST 基线 + 之后全程 Fill 累加」维护
 //! （见 [`crate::messaging::PositionBaseline`]）。这条通道会错：Fill 可能丢、可能被重复
-//! 计算、codec 可能算错单位或符号、也可能出现不伴随 Fill 的交易所侧变动。本 actor 是**独立
-//! 的第二条通道**，用周期性 REST 读数校验第一条：
+//! 计算、codec 可能算错单位或符号、也可能出现不伴随 Fill 的交易所侧变动。本 actor 用**独立
+//! 的第二条通道** —— 周期性 REST 读数 —— 校验第一条：
 //!
 //! ```text
 //!   通道 A（权威）  基线 ──> Fill 累加 ──> 策略看到的持仓
@@ -22,6 +31,13 @@
 //!
 //! `MetricsActor` 明确声明"观测组件故障不得拖垮交易"，连定时器挂掉都不 kill 自己。而对账
 //! 连续失败要**致命退出**，那是风控语义而非观测语义。混在一起会破坏它已经写明的边界。
+//! 同理，持仓查询也不挂在它上面：让观测组件当权威数据源会反转这条边界。
+//!
+//! # 拉取不在 handler 里做
+//!
+//! 节拍到达时 `spawn` 各所拉取，结果回投为 [`PositionsFetched`]。**邮箱在任何时刻都不阻塞在
+//! IO 上**，这既是快照面契约的硬性要求，也修掉了一个既有缺陷：此前 handler 里 `join_all`
+//! 各所 REST，最长一个 client 超时期间**本轮比对与 Fill 摄入一起停摆**。
 //!
 //! # 比对的是「事件流镜像」而非「各 executor 的内部状态」
 //!
@@ -45,7 +61,7 @@ use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -132,6 +148,14 @@ impl Reconciler {
     pub fn register(&mut self, symbols: &[Symbol], baselines: &[PositionBaseline]) {
         self.mirror.register_symbols(symbols);
         self.mirror.seed_positions(baselines);
+    }
+
+    /// 当前账本快照：全部**基线已写入**的腿（含 `size == 0` 的空仓腿）。
+    ///
+    /// 未 seed 的腿不出现在结果里 —— 那是"未知"而不是"空仓"，见
+    /// [`SymbolState::seeded_positions`](crate::messaging::SymbolState::seeded_positions)。
+    pub fn positions(&self) -> Vec<Position> {
+        self.mirror.seeded_positions().cloned().collect()
     }
 
     /// 该 symbol 是否属于本实例（镜像已注册即属于，见 `mirror` 字段说明）
@@ -268,8 +292,8 @@ fn tolerance_of(
 // Actor 包装（含读数轮询）
 // ============================================================================
 
-/// PositionReconcileActor 初始化参数
-pub struct PositionReconcileArgs {
+/// PositionLedgerActor 初始化参数
+pub struct PositionLedgerArgs {
     /// 各 **authed** 所的 REST client（读数的来源；无凭证的所没有持仓可言，不轮询）
     pub clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
     /// 用于取 `coin_size_step()`（币本位最小可交易增量）作为对账容差
@@ -280,59 +304,94 @@ pub struct PositionReconcileArgs {
     pub max_consecutive_mismatches: u32,
 }
 
-/// 持仓对账 actor（比对逻辑在 [`Reconciler`]，本层负责轮询与停摆守卫）
-pub struct PositionReconcileActor {
+/// 持仓账本 actor（账本与比对逻辑在 [`Reconciler`]，本层负责轮询、停摆守卫与对外应答）
+pub struct PositionLedgerActor {
     reconciler: Reconciler,
     clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
     /// 停摆守卫（每所一个）：对账通道停摆等于风控失效，超过容忍窗口即致命。
     /// 判据用"距上次成功的时长"而非"连续失败次数"，改轮询间隔不会连带改变容忍窗口。
     guards: HashMap<Exchange, StalenessGuard>,
+    /// 已发出、尚未回投结果的所（见 [`Self::spawn_fetches`]）
+    in_flight: HashSet<Exchange>,
 }
 
-impl PositionReconcileActor {
-    /// 拉一轮全部所的读数并比对。`Err` = 确认漂移或通道停摆过久，调用方应致命退出。
-    async fn poll_and_reconcile(&mut self) -> Result<(), String> {
-        // 并发**发起**各所拉取，但整轮以最慢者为界（join_all）：单所 REST 挂到 client
-        // 超时（各所 client 均已配置）会把本轮所有所的比对与 Fill 摄入一起推迟至多一个
-        // 超时周期 —— 有界且自愈；积压导致的瞬时差值每轮都变，攒不成"差值稳定"的误杀。
-        let fetches = self.clients.iter().map(|(exchange, client)| {
-            let exchange = *exchange;
-            let client = client.clone();
-            async move { (exchange, client.fetch_positions().await) }
-        });
-        for (exchange, result) in futures_util::future::join_all(fetches).await {
-            match result {
-                Ok(positions) => {
-                    self.guards
-                        .get_mut(&exchange)
-                        .expect("guard 与 client 同建")
-                        .record_success();
-                    tracing::debug!(%exchange, count = positions.len(), "Position report polled");
-                    self.reconciler.reconcile(exchange, &positions)?;
-                }
-                Err(e) => {
-                    // REST 抖动（超时、限流、5xx）是常态，单次失败只 warn；
-                    // 长期停摆由 guard 判定致命
-                    let guard = self
-                        .guards
-                        .get_mut(&exchange)
-                        .expect("guard 与 client 同建");
-                    guard.check_failure(&e)?;
-                    tracing::warn!(
-                        %exchange,
-                        error = %e,
-                        stale_ms = guard.stale_ms(),
-                        "Failed to fetch positions for reconciliation, will retry"
-                    );
-                }
+/// 一所读数拉取的结果回投。
+///
+/// 拉取在 actor **之外**进行（见模块文档「拉取不在 handler 里做」），本消息把结果送回邮箱，
+/// 使比对仍然串行发生在 actor 内部 —— 镜像不需要任何锁。
+pub struct PositionsFetched {
+    exchange: Exchange,
+    result: Result<Vec<Position>, String>,
+}
+
+impl PositionLedgerActor {
+    /// 为每个**当前没有在途请求**的所发起一次拉取，结果稍后回投为 [`PositionsFetched`]。
+    ///
+    /// 跳过在途的所（而非并发再发一次）：REST 慢于轮询间隔时，堆积并发请求既压垮限流额度，
+    /// 又让"最新读数"的时点无从判断。跳过会被 warn 记下 —— 拉取长期慢于节拍是需要知道的事，
+    /// 而真正的停摆由 [`StalenessGuard`] 按"距上次成功的时长"判定，与本次跳过无关。
+    fn spawn_fetches(&mut self, me: &ActorRef<Self>) {
+        let due: Vec<(Exchange, Arc<dyn ExchangeClient>)> = self
+            .clients
+            .iter()
+            .filter(|(exchange, _)| !self.in_flight.contains(exchange))
+            .map(|(exchange, client)| (*exchange, client.clone()))
+            .collect();
+
+        for exchange in self.clients.keys() {
+            if self.in_flight.contains(exchange) {
+                tracing::warn!(
+                    %exchange,
+                    stale_ms = self.guards.get(exchange).map(|g| g.stale_ms()).unwrap_or(0),
+                    "上一轮持仓读数尚未返回，本轮跳过（REST 慢于轮询间隔）"
+                );
             }
         }
-        Ok(())
+
+        for (exchange, client) in due {
+            self.in_flight.insert(exchange);
+            let me = me.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .fetch_positions()
+                    .await
+                    .map_err(|e| e.to_string());
+                // 投递失败只可能是 actor 已停止（整机正在退出），此时无人需要这份读数
+                let _ = me.tell(PositionsFetched { exchange, result }).send().await;
+            });
+        }
+    }
+
+    /// 处理一所的读数：更新守卫、比对。`Err` = 确认漂移或通道停摆过久，调用方应致命退出。
+    fn ingest(&mut self, exchange: Exchange, result: Result<Vec<Position>, String>) -> Result<(), String> {
+        let guard = self
+            .guards
+            .get_mut(&exchange)
+            .expect("guard 与 client 同建");
+        match result {
+            Ok(positions) => {
+                guard.record_success();
+                tracing::debug!(%exchange, count = positions.len(), "Position report polled");
+                self.reconciler.reconcile(exchange, &positions)
+            }
+            Err(e) => {
+                // REST 抖动（超时、限流、5xx）是常态，单次失败只 warn；
+                // 长期停摆由 guard 判定致命
+                guard.check_failure(&e)?;
+                tracing::warn!(
+                    %exchange,
+                    error = %e,
+                    stale_ms = guard.stale_ms(),
+                    "Failed to fetch positions for reconciliation, will retry"
+                );
+                Ok(())
+            }
+        }
     }
 }
 
-impl Actor for PositionReconcileActor {
-    type Args = PositionReconcileArgs;
+impl Actor for PositionLedgerActor {
+    type Args = PositionLedgerArgs;
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
@@ -355,12 +414,13 @@ impl Actor for PositionReconcileActor {
             exchanges = args.clients.len(),
             interval_ms = args.interval_ms,
             max_consecutive_mismatches = args.max_consecutive_mismatches,
-            "PositionReconcileActor started"
+            "PositionLedgerActor started"
         );
         Ok(Self {
             reconciler: Reconciler::new(args.symbol_metas, args.max_consecutive_mismatches),
             clients: args.clients,
             guards,
+            in_flight: HashSet::new(),
         })
     }
 
@@ -369,13 +429,13 @@ impl Actor for PositionReconcileActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
-        tracing::info!("PositionReconcileActor stopped");
+        tracing::info!("PositionLedgerActor stopped");
         Ok(())
     }
 }
 
 /// 投产注册握手：symbol 集合 + 持仓基线原子到达（与 [`super::RegisterSymbols`] 同形）。
-impl Message<super::RegisterSymbols> for PositionReconcileActor {
+impl Message<super::RegisterSymbols> for PositionLedgerActor {
     type Reply = ();
 
     async fn handle(
@@ -383,13 +443,13 @@ impl Message<super::RegisterSymbols> for PositionReconcileActor {
         msg: super::RegisterSymbols,
         _ctx: &mut Context<Self, Self::Reply>,
     ) {
-        tracing::info!(count = msg.symbols.len(), "PositionReconcileActor tracking symbols");
+        tracing::info!(count = msg.symbols.len(), "PositionLedgerActor tracking symbols");
         self.reconciler.register(&msg.symbols, &msg.baselines);
     }
 }
 
-/// 账户事件入口：镜像只吃实盘 Fill（经 SubscribeFilter 预过滤 + on_event 内按账户再过滤）
-impl Message<AccountEvent> for PositionReconcileActor {
+/// 账户事件入口：账本只吃实盘 Fill（经 SubscribeFilter 预过滤 + on_event 内按账户再过滤）
+impl Message<AccountEvent> for PositionLedgerActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: AccountEvent, _ctx: &mut Context<Self, Self::Reply>) {
@@ -397,8 +457,44 @@ impl Message<AccountEvent> for PositionReconcileActor {
     }
 }
 
-/// 轮询节拍：拉读数、比对；确认漂移或通道停摆即致命退出
-impl Message<StreamMessage<Instant, (), ()>> for PositionReconcileActor {
+/// 对外快照查询：实盘持仓真值。经 `ManagerActor` 转发，契约见 `docs/external-data-access.md`。
+///
+/// 应答为**基线已写入**的全部腿（含 `size == 0` 的空仓腿）。未 seed 的腿不在结果里 ——
+/// 那是"未知"而非"空仓"，调用方应当**不上报**这类腿，而不是当 0 处理。
+pub struct GetLivePositions;
+
+impl Message<GetLivePositions> for PositionLedgerActor {
+    type Reply = Vec<Position>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetLivePositions,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.reconciler.positions()
+    }
+}
+
+/// 一所读数返回：比对；确认漂移或通道停摆即致命退出
+impl Message<PositionsFetched> for PositionLedgerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: PositionsFetched, ctx: &mut Context<Self, Self::Reply>) {
+        self.in_flight.remove(&msg.exchange);
+        if let Err(reason) = self.ingest(msg.exchange, msg.result) {
+            // 本地持仓已不可信：策略的三道风控闸门（单边杠杆 / 账户杠杆 / 仓位上限）
+            // 全部基于它计算，继续跑等于无风控裸奔。受控退出交人工介入。
+            tracing::error!(
+                %reason,
+                "持仓对账确认漂移或通道停摆，退出（本地持仓不可信，风控闸门已失效，需人工核对后重启）"
+            );
+            ctx.actor_ref().kill();
+        }
+    }
+}
+
+/// 轮询节拍：发起各所拉取（结果异步回投，本 handler 不碰 IO）
+impl Message<StreamMessage<Instant, (), ()>> for PositionLedgerActor {
     type Reply = ();
 
     async fn handle(
@@ -412,15 +508,7 @@ impl Message<StreamMessage<Instant, (), ()>> for PositionReconcileActor {
                 if self.clients.is_empty() {
                     return;
                 }
-                if let Err(reason) = self.poll_and_reconcile().await {
-                    // 本地持仓已不可信：策略的三道风控闸门（单边杠杆 / 账户杠杆 / 仓位上限）
-                    // 全部基于它计算，继续跑等于无风控裸奔。受控退出交人工介入。
-                    tracing::error!(
-                        %reason,
-                        "持仓对账确认漂移或通道停摆，退出（本地持仓不可信，风控闸门已失效，需人工核对后重启）"
-                    );
-                    ctx.actor_ref().kill();
-                }
+                self.spawn_fetches(ctx.actor_ref());
             }
             StreamMessage::Started(_) => {
                 tracing::debug!("Position reconcile polling started");
@@ -791,6 +879,40 @@ mod tests {
         assert!(!err.contains("OKX"), "不该牵连对得上的 OKX 腿: {err}");
     }
 
+    /// 对外快照只含**基线已写入**的腿，且空仓腿必须如实报出 0。
+    ///
+    /// 两个方向都要守：漏报空仓腿会让下游把"已平仓"看成"未知"；把未 seed 的腿当 0 报出去
+    /// 则相反 —— 下游会据此算出假的对冲完整性。
+    #[test]
+    fn snapshot_contains_seeded_legs_only_including_flat_ones() {
+        let mut r = reconciler_with(1, &[baseline_on(EX, 2.0), baseline_on(OTHER_EX, 0.0)]);
+        r.on_event(&fill(Side::Long, 1.0)); // EX 腿 -> 3.0
+
+        let snapshot = r.positions();
+        assert_eq!(snapshot.len(), 2, "两条腿都已 seed，都该出现: {snapshot:?}");
+        let ex_leg = snapshot.iter().find(|p| p.exchange == EX).expect("EX 腿");
+        let other_leg = snapshot
+            .iter()
+            .find(|p| p.exchange == OTHER_EX)
+            .expect("空仓腿也必须报出，否则下游分不清「已平仓」与「未知」");
+        assert_eq!(ex_leg.size, 3.0);
+        assert_eq!(other_leg.size, 0.0);
+    }
+
+    /// 未 seed 的腿绝不出现在快照里：那是"未知"，不是"空仓"。
+    #[test]
+    fn snapshot_omits_unseeded_legs() {
+        // 注册了 symbol 但没有任何基线（该所未配置凭证）
+        let mut r = reconciler_with(1, &[]);
+        // 即便 Fill 已经累加出仓位，未 seed 也不外报 —— 起点未知，这个数没有意义
+        r.on_event(&fill(Side::Long, 1.0));
+        assert!(
+            r.positions().is_empty(),
+            "未 seed 的腿不得进入对外快照: {:?}",
+            r.positions()
+        );
+    }
+
     /// 镜像只吃基线与成交：对账读数本身绝不能写进镜像（否则漂移会被自我抹平）
     #[test]
     fn report_never_feeds_the_mirror() {
@@ -802,5 +924,188 @@ mod tests {
             .reconcile(EX, &[position(EX, 7.0)])
             .expect_err("读数若写进镜像，漂移会被自我抹平");
         assert!(err.contains("本地 1"), "镜像被读数污染了: {err}");
+    }
+}
+
+/// actor 层：邮箱在任何时刻都不阻塞在 REST 上（快照面契约的硬性要求）
+#[cfg(test)]
+mod mailbox_tests {
+    use super::*;
+    use crate::domain::{AccountInfo, ExchangeError, OrderId, OrderUpdate};
+    use crate::exchange::utils::StepFormatter;
+    use crate::exchange::ExchangeOrder;
+    use kameo::actor::Spawn;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+
+    const EX: Exchange = Exchange::Binance;
+    const SYM: &str = "BTC";
+    /// 大到测试期间不会自行触发第二次节拍（首次节拍由 `interval` 立即产生，无法关掉）
+    const NEVER_AGAIN_MS: u64 = 3_600_000;
+
+    /// `fetch_positions` 永不返回（卡在一个永不放行的信号量上）。
+    ///
+    /// 不用 `sleep` 制造卡死：`start_paused` 之外的运行时里 sleep 会真的等，而 paused 运行时
+    /// 空闲时会自动推进时钟把 sleep 走完 —— 两种情况都测不到"卡死"。信号量不涉及时钟。
+    struct HungClient {
+        gate: Semaphore,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl HungClient {
+        /// 返回 (client, 调用计数) 两个句柄 —— 计数由测试持有，用于断言发起了几次拉取
+        fn pair() -> (Arc<dyn ExchangeClient>, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let client = Arc::new(Self {
+                gate: Semaphore::new(0),
+                calls: calls.clone(),
+            });
+            (client, calls)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExchangeClient for HungClient {
+        fn exchange(&self) -> Exchange {
+            EX
+        }
+        async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _permit = self.gate.acquire().await;
+            unreachable!("信号量永不放行")
+        }
+        async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
+            unreachable!("账本不查 symbol metas")
+        }
+        async fn fetch_symbol_meta(
+            &self,
+            _symbols: &[Symbol],
+        ) -> Result<Vec<SymbolMeta>, ExchangeError> {
+            unreachable!("账本不查 symbol meta")
+        }
+        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+            unreachable!("账本不下单")
+        }
+        async fn cancel_order(
+            &self,
+            _symbol: &Symbol,
+            _order_id: &OrderId,
+        ) -> Result<(), ExchangeError> {
+            unreachable!("账本不撤单")
+        }
+        async fn fetch_pending_orders(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<Vec<OrderUpdate>, ExchangeError> {
+            unreachable!("账本不查挂单")
+        }
+        async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
+            unreachable!("账本不查账户")
+        }
+    }
+
+    fn metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
+        Arc::new(HashMap::from([(
+            (EX, SYM.to_string()),
+            SymbolMeta {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                price_formatter: Arc::new(StepFormatter::new(0.1)),
+                size_step: 0.001,
+                min_order_size: 0.001,
+                contract_size: 1.0,
+            },
+        )]))
+    }
+
+    /// 起一个账本 actor 并完成投产注册（基线 2.0）
+    async fn ledger_with_hung_rest() -> (ActorRef<PositionLedgerActor>, Arc<AtomicUsize>) {
+        let (client, calls) = HungClient::pair();
+        let ledger = PositionLedgerActor::spawn(PositionLedgerArgs {
+            clients: HashMap::from([(EX, client)]),
+            symbol_metas: metas(),
+            interval_ms: NEVER_AGAIN_MS,
+            max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
+        });
+        ledger
+            .ask(super::super::RegisterSymbols {
+                symbols: vec![SYM.to_string()],
+                baselines: vec![PositionBaseline {
+                    position: Position {
+                        exchange: EX,
+                        symbol: SYM.to_string(),
+                        size: 2.0,
+                    },
+                    snapshot_req_ts: 1,
+                }],
+            })
+            .send()
+            .await
+            .expect("注册应成功");
+        (ledger, calls)
+    }
+
+    /// **回归防线**：REST 拉取卡死时，快照查询仍须应答。
+    ///
+    /// 拉取一旦回到 handler 里 `await`（本次改动之前的形态），这个 `ask` 会永远排在
+    /// 那次网络超时后面，测试超时失败。
+    #[tokio::test]
+    async fn a_hung_rest_fetch_never_blocks_the_snapshot_query() {
+        let (ledger, _calls) = ledger_with_hung_rest().await;
+
+        // 发起一轮拉取（会卡死在信号量上）
+        ledger
+            .tell(StreamMessage::Next(Instant::now()))
+            .send()
+            .await
+            .expect("节拍投递应成功");
+
+        let positions = tokio::time::timeout(
+            Duration::from_secs(2),
+            ledger.ask(GetLivePositions).send(),
+        )
+        .await
+        .expect("拉取卡死时快照查询必须仍能应答")
+        .expect("应答应成功");
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].size, 2.0, "应答的是账本真值（基线 2.0）");
+    }
+
+    /// 同一所在途期间不重复发起：慢 REST 不该堆积并发请求。
+    ///
+    /// 计数与节拍来源无关 —— `interval` 的首次立即节拍与手工投递的节拍谁先到都一样，
+    /// 第一个进入在途，其余全部跳过，故断言是确定的。
+    #[tokio::test]
+    async fn an_in_flight_exchange_is_not_fetched_again() {
+        let (ledger, calls) = ledger_with_hung_rest().await;
+
+        for _ in 0..3 {
+            ledger
+                .tell(StreamMessage::Next(Instant::now()))
+                .send()
+                .await
+                .expect("节拍投递应成功");
+        }
+        // 用一次 ask 确保前面的 tell 都已被处理（同一邮箱 FIFO）——
+        // 在途判据在 handler 里同步生效，故此刻"发起了几次拉取"已成定局
+        ledger.ask(GetLivePositions).send().await.expect("应答应成功");
+        // spawn 出去的拉取任务需要被调度到才会计数；有界等待，不依赖具体调度时序
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // 再给足调度机会：若在途判据失效，多余的拉取会在此期间冒出来
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "在途期间的后续节拍必须跳过，否则慢 REST 会堆积并发请求"
+        );
     }
 }

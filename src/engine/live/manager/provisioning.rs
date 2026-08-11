@@ -432,13 +432,14 @@ impl ManagerActor {
                         "向 MetricsActor 注册 symbol 失败（盈亏基线将丢失）: {e}"
                     ))
                 })?;
-            self.position_reconciler
+            self.position_ledger
                 .ask(RegisterSymbols { symbols, baselines })
                 .send()
                 .await
                 .map_err(|e| {
                     ExchangeError::Other(format!(
-                        "向 PositionReconcileActor 注册 symbol 失败（对账通道将静默失效）: {e}"
+                        "向 PositionLedgerActor 注册 symbol 失败（对账通道静默失效，\
+                         且这批 symbol 不会出现在对外持仓快照里）: {e}"
                     ))
                 })?;
         }
@@ -556,7 +557,7 @@ impl Message<RemoveStrategies> for ManagerActor {
         //
         //    平仓量取自 executor 的**本地持仓**，且必须在 `kill` 之前问 —— kill 之后它不再
         //    消费事件、状态就停更了。不走 REST：持仓由「基线 + Fill」维护，REST 在本项目里
-        //    只作对账（见 PositionReconcileActor）；且本地值比 REST 快照更新（后者可能落后于
+        //    只作对账（见 PositionLedgerActor）；且本地值比 REST 快照更新（后者可能落后于
         //    最新到达的 Fill）。真出现本地与交易所不一致时，对账层会先致命退出，走不到这里。
         let mut removed = 0usize;
         let mut kept = Vec::new();

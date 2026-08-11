@@ -17,7 +17,7 @@ pub use live::{
     MetricsActor, MetricsActorArgs, OrderGateway, OutcomePubSub, OutcomeProcessorActor, PlaceVerdict,
     RegisterExecutor,
     PaperCounterActor, PaperCounterArgs,
-    PositionReconcileActor, PositionReconcileArgs, Reconciler,
+    GetLivePositions, PositionLedgerActor, PositionLedgerArgs, Reconciler,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
     RegisterSymbols, RemoveStrategies, StrategySpec,
     Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,

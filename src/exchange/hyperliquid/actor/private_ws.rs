@@ -343,7 +343,7 @@ fn parse_private_message(raw: &str, dex: &str, local_ts: u64) -> Result<PrivateM
 /// 本推送里的 `assetPositions` 是持仓**快照**，而持仓的维护模型是「启动期 REST 基线 +
 /// 之后全程 Fill 累加」（见 [`crate::messaging::PositionBaseline`]）：快照既当不了基线
 /// （基线只能来自 ManagerActor），也不能参与增量（会与 Fill 重复计算）。要校验本地持仓
-/// 是否漂移，走 `PositionReconcileActor` 那条独立轮询通道。
+/// 是否漂移，走 `PositionLedgerActor` 那条独立轮询通道。
 ///
 /// 之所以不能像 OKX 那样干脆退订整个频道：equity / notional / withdrawable 都只有这里有。
 fn parse_clearinghouse_state(

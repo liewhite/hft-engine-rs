@@ -92,7 +92,7 @@ OutcomeBus : executor ──→ 两种柜台按账户认领（实盘出口 / 本
   不存在任何投递窗口（比现状"注册前点对点 tell"更强）。
 - **镜像**（reconciler / metrics）：`RegisterSymbols` 改为携带 baselines 的注册握手，
   注册与基线原子到达，`pending_fills` 缓冲重放机制整体删除。
-- **对账读数**：`PositionPollingActor` 并入 `PositionReconcileActor`——reconciler 持有
+- **对账读数**：`PositionPollingActor` 并入 `PositionLedgerActor`——reconciler 持有
   authed clients，由 Clock 驱动自行轮询比对。读数只有一个消费者，不该经过总线。
 
 ### 1.4 出向：一条出口、一处规则

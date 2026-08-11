@@ -182,7 +182,7 @@ impl Message<IncomeEvent> for ExecutorActor {
 ///
 /// 用于降级平仓取量，见 [`crate::engine::RemoveStrategies`]。读的是「基线 + Fill」维护的
 /// **权威**持仓，**不打 REST**：
-/// - REST 在本项目里只作对账用途（见 [`crate::engine::PositionReconcileActor`]），
+/// - REST 在本项目里只作对账用途（见 [`crate::engine::PositionLedgerActor`]），
 ///   持仓维护模型不允许它参与；
 /// - 本地值比 REST 快照更**新** —— 后者可能落后于最新到达的 Fill。
 ///
