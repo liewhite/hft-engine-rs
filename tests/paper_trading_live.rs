@@ -343,7 +343,6 @@ async fn paper_counter_fills_from_live_trades() {
             rest_base_url: REST_BASE_URL.to_string(),
             market_pubsub: market_pubsub.clone(),
             account_pubsub: account_pubsub.clone(),
-            client,
             quote: "USDT".to_string(),
         },
         mailbox::unbounded(),

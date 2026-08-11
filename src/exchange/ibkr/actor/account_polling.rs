@@ -5,7 +5,7 @@
 
 use crate::domain::{now_ms, Exchange};
 use crate::engine::AccountPubSub;
-use crate::exchange::client::ExchangeClient;
+use crate::exchange::client::AccountClient;
 use crate::exchange::ibkr::IbkrClient;
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::messaging::{AccountData, AccountEvent};

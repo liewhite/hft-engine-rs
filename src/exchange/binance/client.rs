@@ -7,7 +7,7 @@ use crate::domain::{
 };
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
-use crate::exchange::client::{ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
 use crate::exchange::utils::StepFormatter;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
@@ -508,6 +508,13 @@ impl ExchangeClient for BinanceClient {
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
         Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
     }
+}
+
+#[async_trait]
+impl AccountClient for BinanceClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::Binance
+    }
 
     async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
         let api_key = self
@@ -540,10 +547,6 @@ impl ExchangeClient for BinanceClient {
     }
 
     async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
-        // 无凭证 = 只接公共行情，没有账户就没有挂单（同 fetch_positions 口径）
-        if self.credentials.is_none() {
-            return Ok(Vec::new());
-        }
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
@@ -703,12 +706,6 @@ impl ExchangeClient for BinanceClient {
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
-        // 无凭证 = 只接公共行情（见 ExchangeAccess），没有账户可查，空仓是事实而非缺数据。
-        // 与 OKX / Hyperliquid 口径一致：若在此返回 Err，会让"模拟盘不配凭证"这种正常配置
-        // 在 ManagerActor 拉基线时直接启动失败（基线拉取失败是致命的）。
-        if self.credentials.is_none() {
-            return Ok(Vec::new());
-        }
         self.fetch_positions_impl().await
     }
 }

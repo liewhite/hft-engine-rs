@@ -8,7 +8,7 @@ use crate::domain::{
     SymbolMeta, Timestamp,
 };
 use md5::{Digest, Md5};
-use crate::exchange::client::{ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
 use crate::exchange::hyperliquid::codec::{
     size_step, AssetCtx, AssetInfo, ClearinghouseState, MetaResponse,
 };
@@ -506,6 +506,13 @@ impl ExchangeClient for HyperliquidClient {
             .filter(|m| symbol_set.contains(&m.symbol))
             .collect())
     }
+}
+
+#[async_trait]
+impl AccountClient for HyperliquidClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::Hyperliquid
+    }
 
     async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
         let signer = self
@@ -570,9 +577,9 @@ impl ExchangeClient for HyperliquidClient {
         &self,
         symbol: &Symbol,
     ) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
-        // 无凭证 = 只接公共行情，没有账户地址可查（同 fetch_positions 口径）
+        // 本 trait 只在配了凭证时才存在（见 AccountClient），走到这里说明装配处漏了约束
         let Some(credentials) = self.credentials.as_ref() else {
-            return Ok(Vec::new());
+            return Err(ExchangeError::AuthenticationFailed(Exchange::Hyperliquid));
         };
 
         /// `frontendOpenOrders` 的条目。
@@ -742,9 +749,9 @@ impl ExchangeClient for HyperliquidClient {
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
-        // 无凭证 = 只接公共行情（见 ExchangeAccess），没有账户地址可查
+        // 本 trait 只在配了凭证时才存在（见 AccountClient），走到这里说明装配处漏了约束
         let Some(credentials) = self.credentials.as_ref() else {
-            return Ok(Vec::new());
+            return Err(ExchangeError::AuthenticationFailed(Exchange::Hyperliquid));
         };
 
         let state: ClearinghouseState = self

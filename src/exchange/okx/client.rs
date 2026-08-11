@@ -6,7 +6,7 @@ use crate::domain::{
     Symbol, SymbolMeta, TimeInForce,
 };
 use crate::exchange::okx::codec::{GreeksData, PositionData};
-use crate::exchange::client::{ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
 use crate::exchange::utils::StepFormatter;
@@ -370,6 +370,13 @@ impl ExchangeClient for OkxClient {
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
         Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
     }
+}
+
+#[async_trait]
+impl AccountClient for OkxClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::OKX
+    }
 
     async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
         let path = "/api/v5/trade/cancel-order";
@@ -445,16 +452,6 @@ impl ExchangeClient for OkxClient {
     /// [`PENDING_ORDERS_MAX_PAGES`]）：分页取不全、或有一条解析不了，都返回 `Err`，
     /// 绝不返回一份"少了几张"的列表。
     async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
-        // 无凭证 = 只接公共行情（见 ExchangeAccess），没有账户就没有挂单 —— 与
-        // fetch_positions 同一口径。若在此返回 Err，`ManagerActor` 启动期会**逐 symbol**
-        // 各报一次错（模拟盘跑几百个 symbol 就是几百条 warn），噪音会盖住真实告警。
-        //
-        // 注意：place_order / cancel_order / set_leverage 不该这样处理 —— 那些是"没凭证就
-        // 真的做不到"，报错是正确行为。只有只读查询才能把"没有账户"表达成空结果。
-        if self.credentials.is_none() {
-            return Ok(Vec::new());
-        }
-
         let inst_id = to_okx(symbol, &self.quote);
         // 张 -> 币：REST 全程用张数，此处一次取到乘数，所有数量字段统一折算
         let contract_size = self.contract_size_of(symbol).await?;
@@ -596,11 +593,6 @@ impl ExchangeClient for OkxClient {
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
-        // 无凭证 = 只接公共行情（见 ExchangeAccess），没有账户可查，空仓是事实而非缺数据
-        if self.credentials.is_none() {
-            return Ok(Vec::new());
-        }
-
         let path = "/api/v5/account/positions?instType=SWAP";
         let timestamp = Self::iso_timestamp();
         let sign = self

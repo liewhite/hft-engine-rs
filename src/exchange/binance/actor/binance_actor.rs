@@ -24,7 +24,6 @@ use crate::exchange::binance::{
     BinanceClient, BinanceCredentials, WS_MARKET_URL, WS_PUBLIC_HIGH_FREQ_URL,
 };
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
-use crate::exchange::ExchangeClient;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message};
@@ -47,8 +46,6 @@ pub struct BinanceActorArgs {
     pub market_pubsub: ActorRef<MarketPubSub>,
     /// 账户私有事件总线（private WS / 账户轮询用）
     pub account_pubsub: ActorRef<AccountPubSub>,
-    /// Exchange client（用于查询 equity）
-    pub client: Arc<dyn ExchangeClient>,
     /// 计价币种 (e.g., "USDT")
     pub quote: String,
 }
@@ -194,12 +191,14 @@ impl Actor for BinanceActor {
         //
         // 私有轮询与私有 WS 一样按凭证门控：无凭证时只订阅公共行情（non-auth 模式），
         // 否则 equity 轮询会每秒失败一次、刷满日志（既是噪音，也会掩盖真实告警）。
-        if has_private_ws {
+        // 用同一个带凭证的 client（`binance_client` 与 `has_private_ws` 同源于凭证是否存在）：
+        // 净值查询是账户私有能力，只有 AccountClient 提供
+        if let Some(client) = binance_client.clone() {
             children.spawn::<BinanceEquityPollingActor, _>(
                 &actor_ref,
                 "BinanceEquityPollingActor",
                 BinanceEquityPollingActorArgs {
-                    client: args.client,
+                    client,
                     account_pubsub: args.account_pubsub.clone(),
                     interval_ms: 1000,
                 },

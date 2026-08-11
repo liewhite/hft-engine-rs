@@ -15,7 +15,7 @@ use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient, Bi
 use crate::exchange::hyperliquid::{HyperliquidActor, HyperliquidActorArgs, HyperliquidClient, HyperliquidCredentials};
 use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
-use crate::exchange::{ExchangeAccess, ExchangeActorOps, ExchangeClient, SubscriptionKind};
+use crate::exchange::{AccountClient, ExchangeAccess, ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use kameo::actor::{ActorRef, Spawn};
 use kameo::mailbox;
 use std::collections::HashMap;
@@ -53,8 +53,12 @@ pub(crate) type SpawnFuture = std::pin::Pin<
 pub struct ExchangeSetup {
     pub(crate) exchange: Exchange,
     pub(crate) client: Arc<dyn ExchangeClient>,
-    /// 有凭证 = 有账户（决定是否跑持仓轮询/对账）
-    pub(crate) authed: bool,
+    /// 账户私有能力。`None` = 只接公共行情。
+    ///
+    /// "有没有账户"就由这个 `Option` 表达，不另存 bool（见 `docs/architecture.md` P2）：
+    /// 只有 [`ExchangeAccess::has_credentials`] 为真时才装进来，因此下游拿到 `Some`
+    /// 即可直接下单/对账，不必再问一次"配了凭证没有"。
+    pub(crate) account: Option<Arc<dyn AccountClient>>,
     /// 能力查询：该所适配层是否实现某种公共订阅（知识在各适配层的
     /// `supports_subscription`，随 setup 携带 —— 投产校验用，无集中能力表）
     pub(crate) supports: fn(&SubscriptionKind) -> bool,
@@ -68,12 +72,12 @@ pub fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<Excha
         access.quote.clone(),
         access.credentials.clone(),
     )?);
-    let authed = access.has_credentials();
-    let client_dyn: Arc<dyn ExchangeClient> = client.clone();
+    let account: Option<Arc<dyn AccountClient>> =
+        access.has_credentials().then(|| client.clone() as Arc<dyn AccountClient>);
     Ok(ExchangeSetup {
         exchange: Exchange::Binance,
-        client: client_dyn.clone(),
-        authed,
+        client: client.clone(),
+        account,
         supports: crate::exchange::binance::supports_subscription,
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
@@ -85,7 +89,6 @@ pub fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<Excha
                         rest_base_url: REST_BASE_URL.to_string(),
                         market_pubsub: ctx.market_pubsub,
                         account_pubsub: ctx.account_pubsub,
-                        client: client_dyn,
                         quote: access.quote,
                     },
                     mailbox::unbounded(),
@@ -103,19 +106,22 @@ pub fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<Excha
 
 pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup, ExchangeError> {
     let client = Arc::new(OkxClient::new(access.quote.clone(), access.credentials.clone())?);
-    let authed = access.has_credentials();
+    let account: Option<Arc<dyn AccountClient>> =
+        access.has_credentials().then(|| client.clone() as Arc<dyn AccountClient>);
     Ok(ExchangeSetup {
         exchange: Exchange::OKX,
         client: client.clone(),
-        authed,
+        account,
         supports: crate::exchange::okx::supports_subscription,
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
                 let actor = OkxActor::spawn_link_with_mailbox(
                     &ctx.manager,
                     OkxActorArgs {
-                        credentials: access.credentials,
-                        client: Some(client),
+                        credentials: access.credentials.clone(),
+                        // 只在有凭证时给 —— Greeks 轮询是账户私有能力，
+                        // "能不能轮询"由 Option 表达，不再靠 actor 内部另判 bool
+                        client: access.credentials.is_some().then_some(client),
                         symbol_metas: ctx.symbol_metas,
                         market_pubsub: ctx.market_pubsub,
                         account_pubsub: ctx.account_pubsub,
@@ -143,11 +149,12 @@ pub fn setup_hyperliquid(
         access.dex.clone(),
         access.credentials.clone(),
     )?);
-    let authed = access.has_credentials();
+    let account: Option<Arc<dyn AccountClient>> =
+        access.has_credentials().then(|| client.clone() as Arc<dyn AccountClient>);
     Ok(ExchangeSetup {
         exchange: Exchange::Hyperliquid,
         client: client.clone(),
-        authed,
+        account,
         supports: crate::exchange::hyperliquid::supports_subscription,
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
@@ -186,8 +193,9 @@ pub async fn setup_ibkr(
     Ok(ExchangeSetup {
         exchange: Exchange::IBKR,
         client: client.clone(),
-        // IBKR 的 client 只在有凭证时才构建，走到这里必然有账户
-        authed: true,
+        // IBKR 的 client 只在有凭证时才构建（`IbkrClient::new` 要打网关鉴权），
+        // 走到这里必然有账户
+        account: Some(client.clone()),
         supports: crate::exchange::ibkr::supports_subscription,
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {

@@ -155,20 +155,27 @@ impl ExchangeOrder {
 }
 
 // ============================================================================
-// ExchangeClient trait (仅 REST)
+// REST 接口：公共 / 账户两个 trait
 // ============================================================================
 
-/// 交易所客户端统一接口
+/// **公共**数据接口：不需要凭证，任何接入的交易所都提供。
 ///
-/// 仅封装交易所的 REST 交互，WebSocket Actor 由 ManagerActor 直接创建
+/// 仅封装 REST 交互，WebSocket Actor 由各适配层的 `setup_*` 创建。
 ///
-/// # 数量口径契约（双向对称）
+/// # 为什么与 [`AccountClient`] 分开
 ///
-/// - **出向**：[`ExchangeClient::place_order`] 只接受 [`ExchangeOrder`] —— 已折算为交易所
-///   下单单位、已取整。类型系统保证币本位数量不可能被直发上线。
-/// - **入向**：返回值中的一切数量**必须是币本位**（见 [`crate::domain::Quantity`]）。若交易所
-///   REST 用张数计量（OKX 的 SWAP/FUTURES），折算是各实现自己的责任，不得把张数交给调用方
-///   —— 那样每个调用点都要记着乘一次，漏一处便静默算错 contract_size 倍。
+/// "这个所有没有账户"是**能力**问题，必须由类型表达，不能由返回值表达
+/// （见 `docs/architecture.md` 原则 P2）。合成一个 trait 时，无凭证的所只能让
+/// `fetch_positions` 返回 `Ok(vec![])` —— 调用方从此分不清"真的空仓"与"根本不该问"，
+/// 而"有没有账户"这一事实又要靠另一个 `bool` 字段另存一份。
+///
+/// 拆开之后：有没有账户 = `ExchangeSetup.account` 是不是 `None`，一处表达，编译期可查。
+///
+/// # 入向数量口径
+///
+/// 返回值中的一切数量**必须是币本位**（见 [`crate::domain::Quantity`]）。若交易所
+/// REST 用张数计量（OKX 的 SWAP/FUTURES），折算是各实现自己的责任，不得把张数交给调用方
+/// —— 那样每个调用点都要记着乘一次，漏一处便静默算错 contract_size 倍。
 #[async_trait]
 pub trait ExchangeClient: Send + Sync + 'static {
     /// 获取交易所标识
@@ -179,6 +186,22 @@ pub trait ExchangeClient: Send + Sync + 'static {
 
     /// 获取指定交易对元数据
     async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError>;
+}
+
+/// **账户私有**接口：只有配了凭证的所才有这个对象。
+///
+/// 持有一个 `Arc<dyn AccountClient>` 即意味着"该所有账户可用"—— 这是能力的**唯一**表达，
+/// 约束点在各 `setup_*`：仅当 [`ExchangeAccess::has_credentials`] 为真时才装进
+/// `ExchangeSetup.account`。因此本 trait 的任何方法都**不得**为"没有凭证"返回占位值。
+///
+/// # 出向数量口径
+///
+/// [`AccountClient::place_order`] 只接受 [`ExchangeOrder`] —— 已折算为交易所下单单位、
+/// 已取整。类型系统保证币本位数量不可能被直发上线。入向口径同 [`ExchangeClient`]。
+#[async_trait]
+pub trait AccountClient: Send + Sync + 'static {
+    /// 获取交易所标识
+    fn exchange(&self) -> Exchange;
 
     /// 下单。入参已是交易所单位，见 [`ExchangeOrder`]。
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError>;
@@ -200,9 +223,8 @@ pub trait ExchangeClient: Send + Sync + 'static {
     ///   之后持仓全程由 `Fill` 累加，没有第二个来源能纠正它，故拉取失败即拒绝启动。
     /// - **对账**：`PositionLedgerActor` 周期性调用，作为读数与「基线 + Fill」的结果比对。
     ///
-    /// 因此返回 `Ok(vec![])` 只有一个合法含义：**该账户确实没有任何持仓**（含"未配置凭证、
-    /// 只接公共行情"的情形）。用空 Vec 表示"数据在别处（私有 WS）"会让基线静默变成全零、
-    /// 且对账把真实持仓判成漂移。
+    /// 因此返回 `Ok(vec![])` 只有一个合法含义：**该账户确实没有任何持仓**。
+    /// "未配置凭证"这一情形已由类型排除 —— 那时根本不存在本对象。
     ///
     /// 数量口径为币本位，见 trait 级文档。
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError>;

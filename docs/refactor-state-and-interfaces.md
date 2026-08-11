@@ -11,10 +11,10 @@
 
 | 阶段 | 目标 | 对应违反 | 状态 |
 |---|---|---|---|
-| R1 | 拆 `ExchangeClient`：公共 / 账户两个 trait | V3 | 未开始 |
+| R1 | 拆 `ExchangeClient`：公共 / 账户两个 trait | V3 | **已完成** |
 | R2 | 拆 `StateManager`：四个单一职责投影 | V1 | 未开始 |
 | R3 | 策略只拿受限视图 | V2 | 未开始（依赖 R2） |
-| R4 | 下单出口的分发判据收敛到一处 | V4 | 未开始 |
+| R4 | 下单出口的分发判据收敛到一处 | V4 | **已完成** |
 | R5 | 收尾：投产编排独立、观测口径移出领域层 | V6 / V7 | 未开始 |
 
 顺序理由：R1 独立性最好（只动适配层与装配），先做能立刻消掉一类"空值当事实"的补丁；
@@ -90,9 +90,42 @@ AccountClient 对象"在装配处被堵死，下游拿到 `Option` 即是权威�
 
 ### 风险
 
-低。改动面大但机械，编译器会指出每一处。唯一需要人判断的是 IBKR：它的公共行情本身就要
-连接会话，确认它在无凭证配置下是否真能只跑公共流（若不能，`setup_ibkr` 应直接拒绝无凭证配置，
-这比返回空值诚实）。
+低。改动面大但机械，编译器会指出每一处。IBKR 无需判断：`IbkrClient::new` 本就要打网关鉴权，
+只在有凭证时才构建，故 `account: Some(..)` 恒成立。
+
+### 完成记录
+
+332 用例通过，零编译告警，clippy 净增 0（改动前后同为 19 条既有告警）。
+
+三处计划外但顺手的收获：
+
+1. **`ManagerActor.clients` 字段变成死代码被删**。拆分后它的唯一用途（metas 预加载）只发生在
+   `on_start` 的局部变量上，私有调用全部改走 `accounts` —— 编译器直接报 never read。
+2. **`BinanceActorArgs.client` 字段删除**。它只为 equity 轮询而存在，而那是账户私有能力；
+   actor 内部本就另建了一个带凭证的 `Arc<BinanceClient>`，改用它之后这个字段成了重复通道。
+3. **三个测试替身瘦身**。`FakeClient` / `FaultyClient` 不必再桩掉 `fetch_all_symbol_metas`
+   与 `fetch_symbol_meta` 两个它们永远不碰的方法 —— 接口收窄的收益在测试里立刻兑现。
+
+### 审查发现的 Critical（已修）
+
+拆分暴露了一个**既有的判据分叉**：投产的撤残单遇到"无账户所"跳过，而撤下的清理遇到同样
+情形返回 `Err`。同一事实两套结论。无凭证配置（`adaptive_trade` 明文支持"只跑模拟"）下一旦
+降级：executor 已停并移出登记，而 supervisor 收到 `Err` 会保持 `live = Some(..)` ——
+记账与事实背离，该 symbol 此后晋升被拒、降级重试永远撞同一个 `Err`，**永久卡死**。
+
+审查建议的首选修法是"投产处拒绝 Live + 无账户所"，**未采纳**：`exchange_symbols` 来自
+`public_streams()`，是策略**读**的所而非**交易**的所。按它拒绝会误伤合法配置 ——
+从 Binance 读盘口、只在 HL 下单。
+
+实际修法是把判据收敛成一个函数 `ManagerActor::exchange_side_cleanup`，两条路径共用：
+无账户 ⇒ 交易所侧不可能有本引擎的残留（下不了单、收不到私有流）⇒ 走 `finish_removal`
+干净收尾（仍如实上报此前累积的 `incomplete`）。
+
+**测试覆盖的是判据，不是完整撤下路径** —— `ManagerActor::on_start` 要联网建 client、
+拉 symbol metas，单测里起不来（同 `stop_semantics_tests` 的既有取舍）。
+
+顺带对齐的遗留：OKX 适配层的 `client: Option<_>` 现在也直接源于凭证（此前无条件传 `Some`
+再用元组 bool 门控），与 Binance 同一模式。
 
 ---
 
@@ -130,8 +163,45 @@ metrics 仍需本地持仓，理由未变（`on_stop` 最终快照不能依赖�
 
 ### 改动清单（分两步，中间保持可发布）
 
-**R2a 纯搬运**：`StateManager` 内部把字段分组为四个子结构，公开方法全部委托给子结构。
-行为零变化，测试零改动。这一步让四个投影的边界在代码里先成立。
+**R2a 纯搬运**：把字段分组为投影，公开方法全部委托。行为零变化。
+
+**已勘定的分解**（动手前的实测，避免下次重新摸底）：
+
+要拆的字段**大部分在 `SymbolState` 里，不在 `StateManager` 里**，所以刀口要切进 `SymbolState`：
+
+```rust
+// per symbol，三个投影
+pub struct SymbolMarket   { funding_rates, bbos, mark_prices, index_prices }
+pub struct SymbolPositions{ positions, seeded_at }
+pub struct SymbolOrders   { pending_orders, recent_terminal }
+
+// 门面保留 —— "一个 symbol 跨所的全貌"确实是策略推理的单位
+pub struct SymbolState { symbol, market, positions, orders }
+
+// StateManager 自己的字段归 AccountView
+pub struct AccountView { balances, account_infos, greeks, cash_balances }
+```
+
+方法归属：
+
+| 投影 | 方法 |
+|---|---|
+| `SymbolMarket` | `bbo` / `mark_price` / `index_price` / `unified_time_base` / `best_short_exchange` / `best_long_exchange` / 行情侧 `apply` |
+| `SymbolPositions` | `seed_position` / `is_position_seeded` / `seeded_positions` / `has_positions` / `position` / `position_size` / `position_sizes` / Fill 累加（含 `snapshot_req_ts` 过滤） |
+| `SymbolOrders` | `add_pending_order` / `remove_timed_out_orders` / `has_pending_orders` / `has_pending_side` / `pending_orders` / `remember_terminal` / OrderUpdate 侧 `apply` |
+
+**两处要注意**：
+
+1. 几个方法的日志里读 `self.symbol`，而投影不该持有 symbol（那会让三份各存一个副本）。
+   改为把 `&Symbol` 作为参数传入 —— 只有 `seed_position` 与 `remove_timed_out_orders`
+   两个方法需要。
+2. `SymbolState` 的 `pub` 字段外部只有 **2 处**直接访问（实测）：
+   `executor.rs` 的 `symbol_state.positions.values()`、`spread_arb` 测试里的
+   `state.bbos.insert(..)`。所以"零消费者改动"做不到，但改动面就这么大 ——
+   后者更应该改成走 `apply` 喂事件，与生产路径一致。
+
+`SymbolState::apply` 的拆法：按 variant 分派给对应投影，**保留"未知 symbol 事件 = 路由 bug"
+的 error 日志**（现在这条判断在门面上，拆完仍应在门面上，不要让三个投影各自静默忽略）。
 
 **R2b 切换消费者**：逐个消费者改为只持它需要的子结构，`StateManager` 退化为组合容器或删除。
 `SymbolState` 随之拆解——它现在是"per-symbol 的一切"，拆后每个投影自己按 symbol 索引。
@@ -253,6 +323,30 @@ outcome_pubsub.tell(SubscribeFilter(paper_counter,    |o| matches!(outlet_for(&o
 
 低。但要注意：删掉 handler 里的早退等于把正确性完全押在订阅过滤上，
 **必须确认没有第二条路径能把 `AccountOutcome` 送进这两个 actor**（目前只有 OutcomePubSub 一条）。
+
+### 完成记录
+
+335 用例通过，零编译告警，clippy 净增 0。
+
+- `Outlet` + `outlet_for` 落在 `engine/live/mod.rs`（`AccountOutcome` 旁边），
+  订阅过滤器提成具名函数 `to_live_outlet` / `to_paper_outlet` —— 这样测试断言的是
+  **装配处真正用的那两个函数**，而不是测试里复写一遍的等价表达式。
+- 投递路径唯一性已核实：`AccountOutcome` 的生产路径只有 `ExecutorActor` 经
+  `OutcomePubSub` 一条；`paper_counter.rs` 里三处直发都在它自己的测试模块内。
+- 穷举保护已实测：临时给 `AccountId` 加一个 variant，`outlet_for` 与
+  `MetricsActor` 的账户分支都编译失败。
+
+**与计划的两处偏离**：
+
+1. **保留了到站断言**，没有裸删早退。删掉自判之后投递路径在类型上收不死
+   （`SubscribeFilter` 是运行期的），装配写错就会静默双执行。所以两个出口各留一句
+   `if outlet_for(..) != 本出口 { error!; return }`。这**不是**重新分发 ——
+   判据仍是同一个 `outlet_for`，新增账户类型时它编译失败，不存在"两处各判各的"
+   静默漏改；这是品味 1.1 阶梯上的第二级（运行时断言），因为第一级够不着。
+2. **顺带把 `MetricsActor` 的账户分支也改成穷举**（原为 `if account != Live`）。
+   它不是出口分发，但同样会在新增账户类型时把新类型静默并进模拟账本。
+   **没有**复用 `outlet_for` —— "订单发往哪个执行出口"与"记进哪本账"是两件事，
+   恰好同形不等于同一个概念，合并会是假抽象。
 
 ---
 

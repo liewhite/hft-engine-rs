@@ -11,7 +11,7 @@
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, TimeInForce};
 use hft_engine_rs::exchange::ibkr::{IbkrClient, IbkrCredentials};
 use hft_engine_rs::exchange::ibkr::auth::{tickle, IbkrAuth};
-use hft_engine_rs::exchange::{ExchangeClient, ExchangeOrder};
+use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http, Message as WsMessage};
 

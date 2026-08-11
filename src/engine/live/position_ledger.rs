@@ -23,7 +23,7 @@
 //! # 读数自产自销：轮询就在本 actor 里
 //!
 //! 读数（某所的**完整**持仓快照）只有一个消费者 —— 本 actor。它不是事件，不上总线：
-//! 本 actor 持有各 authed 所的 client，按节拍并发拉取、就地比对。完整快照的意义在于
+//! 本 actor 持有各所的 `AccountClient`，按节拍并发拉取、就地比对。完整快照的意义在于
 //! "交易所没报告这个 symbol ⇒ 它空仓"这个推断 —— 对账最要抓的一类漂移正是**本地有仓、
 //! 交易所已经没了**（漏了平仓成交/强平回报），只有全量快照能发现它。
 //!
@@ -55,7 +55,7 @@
 
 use crate::domain::{Exchange, Position, Symbol, SymbolMeta};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
-use crate::exchange::ExchangeClient;
+use crate::exchange::AccountClient;
 use crate::messaging::{AccountData, AccountEvent, IncomeEvent, PositionBaseline, StateManager};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -96,7 +96,7 @@ pub struct Reconciler {
     /// 同时充当两个判据的单一数据源，不另存副本：
     /// - "本实例负责哪些 symbol"：symbol 是否已注册直接问它。分桶部署下多实例共用同一
     ///   账户，交易所读数是**账户级全量**、含其他桶的 symbol，靠这个判据过滤。
-    /// - "哪条腿可参与对账"：`is_position_seeded` —— 基线未到（该所未配置 client）时
+    /// - "哪条腿可参与对账"：`is_position_seeded` —— 基线未到（该所未配置凭证、无账户）时
     ///   本地持仓是"未知"而不是 0，拿未知去比对必然误判。
     mirror: StateManager,
     /// 容差来源：`coin_size_step()`（币本位最小可交易增量），小于它的差值不可能是真实漂移
@@ -294,8 +294,9 @@ fn tolerance_of(
 
 /// PositionLedgerActor 初始化参数
 pub struct PositionLedgerArgs {
-    /// 各 **authed** 所的 REST client（读数的来源；无凭证的所没有持仓可言，不轮询）
-    pub clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
+    /// 各所的账户私有能力（读数的来源）。键集 = 配了凭证的所 —— "没有账户的所不轮询"
+    /// 由类型表达，本层不再过滤。
+    pub accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 用于取 `coin_size_step()`（币本位最小可交易增量）作为对账容差
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 轮询间隔（毫秒）
@@ -307,7 +308,7 @@ pub struct PositionLedgerArgs {
 /// 持仓账本 actor（账本与比对逻辑在 [`Reconciler`]，本层负责轮询、停摆守卫与对外应答）
 pub struct PositionLedgerActor {
     reconciler: Reconciler,
-    clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
+    accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 停摆守卫（每所一个）：对账通道停摆等于风控失效，超过容忍窗口即致命。
     /// 判据用"距上次成功的时长"而非"连续失败次数"，改轮询间隔不会连带改变容忍窗口。
     guards: HashMap<Exchange, StalenessGuard>,
@@ -358,8 +359,8 @@ impl PositionLedgerActor {
     /// 又让"最新读数"的时点无从判断。跳过是否已到停摆程度由
     /// [`Self::check_in_flight_staleness`] 判定，节拍 handler 先过那道再进本函数。
     fn spawn_fetches(&mut self, me: &ActorRef<Self>) {
-        let due: Vec<(Exchange, Arc<dyn ExchangeClient>)> = self
-            .clients
+        let due: Vec<(Exchange, Arc<dyn AccountClient>)> = self
+            .accounts
             .iter()
             .filter(|(exchange, _)| !self.in_flight.contains(exchange))
             .map(|(exchange, client)| (*exchange, client.clone()))
@@ -437,7 +438,7 @@ impl Actor for PositionLedgerActor {
 
         // 窗口从构造时刻起算，避免首次拉取前就被判成停摆
         let guards = args
-            .clients
+            .accounts
             .keys()
             .map(|exchange| {
                 (
@@ -448,14 +449,14 @@ impl Actor for PositionLedgerActor {
             .collect();
 
         tracing::info!(
-            exchanges = args.clients.len(),
+            exchanges = args.accounts.len(),
             interval_ms = args.interval_ms,
             max_consecutive_mismatches = args.max_consecutive_mismatches,
             "PositionLedgerActor started"
         );
         Ok(Self {
             reconciler: Reconciler::new(args.symbol_metas, args.max_consecutive_mismatches),
-            clients: args.clients,
+            accounts: args.accounts,
             guards,
             in_flight: HashSet::new(),
         })
@@ -535,8 +536,8 @@ impl Message<StreamMessage<Instant, (), ()>> for PositionLedgerActor {
     ) {
         match msg {
             StreamMessage::Next(_) => {
-                // 没有任何 authed 所时无事可做（引擎只接公共行情）
-                if self.clients.is_empty() {
+                // 没有任何配了凭证的所时无事可做（引擎只接公共行情）
+                if self.accounts.is_empty() {
                     return;
                 }
                 // 先判在途停摆：结果永不回投时，守卫够不到，只有这里能发现
@@ -997,7 +998,7 @@ mod mailbox_tests {
 
     impl FaultyClient {
         /// 返回 (client, 调用计数) 两个句柄 —— 计数由测试持有，用于断言发起了几次拉取
-        fn pair(mode: Faulty) -> (Arc<dyn ExchangeClient>, Arc<AtomicUsize>) {
+        fn pair(mode: Faulty) -> (Arc<dyn AccountClient>, Arc<AtomicUsize>) {
             let calls = Arc::new(AtomicUsize::new(0));
             let client = Arc::new(Self {
                 mode,
@@ -1009,7 +1010,7 @@ mod mailbox_tests {
     }
 
     #[async_trait::async_trait]
-    impl ExchangeClient for FaultyClient {
+    impl AccountClient for FaultyClient {
         fn exchange(&self) -> Exchange {
             EX
         }
@@ -1022,15 +1023,6 @@ mod mailbox_tests {
                     unreachable!("信号量永不放行")
                 }
             }
-        }
-        async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-            unreachable!("账本不查 symbol metas")
-        }
-        async fn fetch_symbol_meta(
-            &self,
-            _symbols: &[Symbol],
-        ) -> Result<Vec<SymbolMeta>, ExchangeError> {
-            unreachable!("账本不查 symbol meta")
         }
         async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
             unreachable!("账本不下单")
@@ -1071,7 +1063,7 @@ mod mailbox_tests {
     async fn ledger_with_hung_rest() -> (ActorRef<PositionLedgerActor>, Arc<AtomicUsize>) {
         let (client, calls) = FaultyClient::pair(Faulty::Hang);
         let ledger = PositionLedgerActor::spawn(PositionLedgerArgs {
-            clients: HashMap::from([(EX, client)]),
+            accounts: HashMap::from([(EX, client)]),
             symbol_metas: metas(),
             interval_ms: NEVER_AGAIN_MS,
             max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
@@ -1104,7 +1096,7 @@ mod mailbox_tests {
         let (client, _calls) = FaultyClient::pair(Faulty::Hang);
         let mut ledger = PositionLedgerActor {
             reconciler: Reconciler::new(metas(), DEFAULT_MAX_CONSECUTIVE_MISMATCHES),
-            clients: HashMap::from([(EX, client)]),
+            accounts: HashMap::from([(EX, client)]),
             guards: HashMap::from([(
                 EX,
                 StalenessGuard::new(format!("{EX} 持仓对账"), MAX_POLL_STALENESS_MS),
@@ -1137,7 +1129,7 @@ mod mailbox_tests {
     async fn a_panicking_fetch_is_reported_back_instead_of_vanishing() {
         let (client, calls) = FaultyClient::pair(Faulty::Panic);
         let ledger = PositionLedgerActor::spawn(PositionLedgerArgs {
-            clients: HashMap::from([(EX, client)]),
+            accounts: HashMap::from([(EX, client)]),
             symbol_metas: metas(),
             interval_ms: NEVER_AGAIN_MS,
             max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,

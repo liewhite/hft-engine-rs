@@ -16,7 +16,7 @@ use crate::domain::{
     now_ms, AccountId, Exchange, ExchangeError, Order, OrderType, OrderUpdate, Side, Symbol,
     SymbolMeta,
 };
-use crate::exchange::{ExchangeClient, SubscriptionKind};
+use crate::exchange::{AccountClient, SubscriptionKind};
 use kameo::actor::{ActorId, ActorRef};
 use kameo::message::{Context, Message};
 use std::collections::{HashMap, HashSet};
@@ -111,13 +111,33 @@ impl ManagerActor {
         stopped
     }
 
+    /// 该所交易所侧**可能有本引擎的残留**（挂单 / 持仓）时，返回清理所需的账户句柄。
+    ///
+    /// 判据只有一条：**有没有账户**。没有 [`AccountClient`] 就下不了单
+    /// （`OrderGateway` 拿不到句柄）、也收不到私有流，因此交易所侧不可能有本引擎的
+    /// 任何东西 —— 既无挂单，也无成交、故持仓恒为未 seed 的空。
+    ///
+    /// # 投产与撤下必须共用这一个判据
+    ///
+    /// 曾经两处各判各的：投产的撤残单遇到无账户所**跳过**，撤下的清理遇到同样情形
+    /// **返回 `Err`**。同一事实两套结论，后果是无凭证配置（`adaptive_trade` 明文支持
+    /// 「只跑模拟」）下一旦降级：executor 已停并移出登记，而 supervisor 收到 `Err`
+    /// 会保持 `live = Some(..)` —— 记账与事实背离，该 symbol 此后晋升被拒、降级重试
+    /// 永远撞同一个 `Err`，**永久卡死**。
+    fn exchange_side_cleanup(
+        accounts: &HashMap<Exchange, Arc<dyn AccountClient>>,
+        exchange: Exchange,
+    ) -> Option<&Arc<dyn AccountClient>> {
+        accounts.get(&exchange)
+    }
+
     /// 列出**本引擎**在该 (所, symbol) 上的挂单。
     ///
     /// 同一个交易所账户上可能还有人工下单或其他程序下的单，靠 client_order_id 的前缀识别
     /// （见 [`Exchange::owns_cli_order_id`]）。认不出归属的一律**保留** —— 撤错别人的单
     /// 不可接受，而漏撤会由调用方的复查兜住。
     async fn own_pending_orders(
-        client: &Arc<dyn ExchangeClient>,
+        client: &Arc<dyn AccountClient>,
         exchange: Exchange,
         symbol: &Symbol,
     ) -> Result<Vec<OrderUpdate>, ExchangeError> {
@@ -153,7 +173,7 @@ impl ManagerActor {
     /// 复查后仍有遗留 → 返回 `Err` 拒绝启动。留着一张无人看管的挂单开跑，策略会在它旁边
     /// 重复挂单；而启动期失败是**最便宜的失败时机**（还没开始交易）。
     async fn cancel_leftover_orders(
-        client: &Arc<dyn ExchangeClient>,
+        client: &Arc<dyn AccountClient>,
         exchange: Exchange,
         symbol: &Symbol,
     ) -> Result<(), ExchangeError> {
@@ -251,10 +271,11 @@ impl ManagerActor {
         //    提前的好处是它的失败**根本不需要回滚** —— 此时还没有任何实例被建出来，
         //    直接返回 Err 就等于"什么都没发生"。
         for (exchange, symbol) in &exchange_symbols {
-            let Some(client) = self.clients.get(exchange) else {
+            // 无账户 = 交易所侧不可能有残留，跳过（判据见 exchange_side_cleanup）
+            let Some(account) = Self::exchange_side_cleanup(&self.accounts, *exchange) else {
                 continue;
             };
-            Self::cancel_leftover_orders(client, *exchange, symbol).await?;
+            Self::cancel_leftover_orders(account, *exchange, symbol).await?;
         }
 
         // 5. 拉取持仓基线：**一次快照喂全部账本消费者**（executor / 对账镜像 / 观测镜像
@@ -341,7 +362,7 @@ impl ManagerActor {
         let mut baselines = HashMap::new();
         let exchanges: HashSet<Exchange> = exchange_symbols.iter().map(|(e, _)| *e).collect();
         for exchange in exchanges {
-            let Some(client) = self.clients.get(&exchange) else {
+            let Some(client) = self.accounts.get(&exchange) else {
                 continue;
             };
             // 快照**请求**时刻：在此之前已由私有流送达的 Fill，其成交必然已包含在快照里
@@ -659,11 +680,25 @@ impl Message<RemoveStrategies> for ManagerActor {
         if !is_live {
             return Self::finish_removal(&msg.account, msg.exchange, incomplete);
         }
-        let Some(client) = self.clients.get(&msg.exchange).cloned() else {
-            return Err(ExchangeError::Other(format!(
-                "No client for {} — 既无法撤单也无法平仓",
-                msg.exchange
-            )));
+        // 没有账户的所：交易所侧不可能有本引擎的任何残留 —— 下不了单（`OrderGateway` 拿不到
+        // `AccountClient`），也收不到私有流，故既无挂单也无成交、持仓恒为未 seed 的空。
+        // 与投产路径的撤残单同一口径（见本文件"没有账户的所不可能有本引擎的挂单"）。
+        //
+        // **不能返回 `Err`**：此刻 executor 已经停下并移出 `self.executors`，而 supervisor
+        // 收到 `Err` 会保持 `live = Some(..)`（"实盘可能仍在运行"）。记账与事实就此背离 ——
+        // 此后晋升被 `live.is_some()` 拒绝、降级重试永远撞同一个 `Err`，该 symbol 永久卡死。
+        // 无凭证运行是 `adaptive_trade` 明文支持的配置（只跑模拟时的期望状态），可达。
+        //
+        // 仍走 `finish_removal`：撤下阶段本身可能已经失败（拒绝部分降级、实例未确认停止），
+        // 那些必须如实上报，理由同上面的模拟账户分支。
+        let Some(client) = Self::exchange_side_cleanup(&self.accounts, msg.exchange).cloned()
+        else {
+            tracing::info!(
+                account = %msg.account,
+                exchange = %msg.exchange,
+                "该所未配置凭证，交易所侧无残留可清理，撤下就此收尾"
+            );
+            return Self::finish_removal(&msg.account, msg.exchange, incomplete);
         };
 
         // 2. 撤掉遗留挂单。**位置是关键**：
@@ -808,7 +843,7 @@ mod leftover_order_tests {
     }
 
     impl FakeClient {
-        fn new(rounds: Vec<Vec<OrderUpdate>>) -> (Arc<dyn ExchangeClient>, CancelLog) {
+        fn new(rounds: Vec<Vec<OrderUpdate>>) -> (Arc<dyn AccountClient>, CancelLog) {
             let cancelled: CancelLog = Arc::new(Mutex::new(Vec::new()));
             let client = Arc::new(Self {
                 pending: Mutex::new(rounds.into()),
@@ -819,7 +854,7 @@ mod leftover_order_tests {
     }
 
     #[async_trait::async_trait]
-    impl ExchangeClient for FakeClient {
+    impl AccountClient for FakeClient {
         fn exchange(&self) -> Exchange {
             EX
         }
@@ -837,15 +872,6 @@ mod leftover_order_tests {
             self.cancelled.lock().unwrap().push(order_id.clone());
             Ok(())
         }
-        async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-            unreachable!("被测逻辑不该查 symbol metas")
-        }
-        async fn fetch_symbol_meta(
-            &self,
-            _symbols: &[Symbol],
-        ) -> Result<Vec<SymbolMeta>, ExchangeError> {
-            unreachable!("被测逻辑不该查 symbol meta")
-        }
         async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
             unreachable!("撤单流程不该下单")
         }
@@ -855,6 +881,41 @@ mod leftover_order_tests {
         async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
             unreachable!("撤单流程不该查持仓")
         }
+    }
+
+    /// **回归防线（Critical）**：投产与撤下对"无账户所"必须得出同一个结论。
+    ///
+    /// 曾经两处各判各的 —— 投产跳过、撤下返回 `Err`。无凭证配置下一旦降级，executor 已停
+    /// 并移出登记，而 supervisor 收到 `Err` 会保持 `live = Some(..)`：记账与事实背离，
+    /// 该 symbol 此后晋升被拒、降级重试永远撞同一个 `Err`，永久卡死。
+    ///
+    /// 判据收敛到 [`ManagerActor::exchange_side_cleanup`] 之后，两条路径不可能再分叉 ——
+    /// 本测试钉住判据本身。
+    ///
+    /// **未覆盖**：`do_remove_strategies` 的完整路径。`ManagerActor::on_start` 要联网建
+    /// client、拉 symbol metas，单测里起不来（同 `stop_semantics_tests` 的取舍）。
+    #[test]
+    fn provisioning_and_removal_agree_on_an_exchange_without_account() {
+        let mut accounts: HashMap<Exchange, Arc<dyn AccountClient>> = HashMap::new();
+
+        // 无账户：两条路径都拿到 None，即"交易所侧无残留可清理"
+        assert!(
+            ManagerActor::exchange_side_cleanup(&accounts, EX).is_none(),
+            "没有账户的所必须判为无残留 —— 撤下路径据此干净收尾，而不是报错卡死"
+        );
+
+        // 有账户：两条路径都拿到句柄，照常清理
+        let (client, _log) = FakeClient::new(vec![]);
+        accounts.insert(EX, client);
+        assert!(
+            ManagerActor::exchange_side_cleanup(&accounts, EX).is_some(),
+            "有账户的所必须照常清理"
+        );
+        // 判据是 per-exchange 的：别的所有账户不代表本所有
+        assert!(
+            ManagerActor::exchange_side_cleanup(&accounts, Exchange::Hyperliquid).is_none(),
+            "判据必须按所独立"
+        );
     }
 
     fn order(client_order_id: &str, order_id: &str) -> OrderUpdate {

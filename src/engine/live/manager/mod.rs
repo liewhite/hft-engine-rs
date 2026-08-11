@@ -11,7 +11,8 @@
 use crate::actor_lifecycle::{ChildGroup, ChildStop};
 use crate::engine::bootstrap::Supervised;
 use super::{
-    AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs, ExecutorActor,
+    to_live_outlet, to_paper_outlet, AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs,
+    ExecutorActor,
     IncomeProcessorActor, MarketPubSub, MetricsActor, MetricsActorArgs, OrderGateway,
     OutcomePubSub, OutcomeProcessorActor, PaperCounterActor, PaperCounterArgs,
     GetLivePositions, PositionLedgerActor, PositionLedgerArgs,
@@ -23,7 +24,7 @@ use crate::domain::{
 };
 use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
 use super::assembly::{ExchangeSetup, SpawnCtx};
-use crate::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
+use crate::exchange::{AccountClient, ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorId, ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -58,7 +59,10 @@ pub struct ManagerActor {
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
 
     // === Exchange Clients (REST) ===
-    clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
+
+    /// 各所的**账户私有**能力。键集 = 配了凭证的所（见 [`ExchangeSetup::account`]）；
+    /// 缺席即"该所只接公共行情"，不必再问一次有没有凭证。
+    accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
 
     /// 各所的订阅能力查询（知识在适配层，随 ExchangeSetup 携带；投产校验用）
     capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
@@ -199,9 +203,12 @@ impl Actor for ManagerActor {
         //    模拟盘也需要 client：symbol metas 走公共 REST，与是否有凭证无关
         let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> =
             setups.iter().map(|s| (s.exchange, s.client.clone())).collect();
-        // 有凭证 = 有账户可对账；只接公共行情的所没有持仓可言，不必轮询
-        let authed_exchanges: HashSet<Exchange> =
-            setups.iter().filter(|s| s.authed).map(|s| s.exchange).collect();
+        //    账户私有能力：装配处只在配了凭证时才装进 `setup.account`，故此表的键集
+        //    就是"有账户的所"—— 不另存 authed 标记（见 ExchangeSetup::account）
+        let accounts: HashMap<Exchange, Arc<dyn AccountClient>> = setups
+            .iter()
+            .filter_map(|s| s.account.clone().map(|a| (s.exchange, a)))
+            .collect();
         // 能力表：投产校验用（知识在各适配层的 supports_subscription，随 setup 携带）
         let capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool> =
             setups.iter().map(|s| (s.exchange, s.supports)).collect();
@@ -261,7 +268,7 @@ impl Actor for ManagerActor {
         //    降级平仓（RemoveStrategies）共享同一实例 —— in_flight 判据、失败反馈、
         //    dry_run 语义对一切下单一致，系统不存在第二个下单出口。
         let order_gateway = Arc::new(OrderGateway::new(
-            clients.clone(),
+            accounts.clone(),
             account_pubsub.clone(),
             // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
             Arc::new(symbol_metas.clone()),
@@ -273,8 +280,10 @@ impl Actor for ManagerActor {
             order_gateway.clone(),
         )
         .await;
+        //    分发判据在订阅处一次说清（两个 SubscribeFilter 紧挨着写），出口自己不再判
+        //    "这条是不是我的" —— 判据只有 `outlet_for` 一处，新增账户类型时它编译失败
         outcome_pubsub
-            .tell(Subscribe(live_processor.clone()))
+            .tell(SubscribeFilter(live_processor.clone(), to_live_outlet))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
@@ -301,7 +310,7 @@ impl Actor for ManagerActor {
         )
         .await;
         outcome_pubsub
-            .tell(Subscribe(paper_counter.clone()))
+            .tell(SubscribeFilter(paper_counter.clone(), to_paper_outlet))
             .send()
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
@@ -339,19 +348,13 @@ impl Actor for ManagerActor {
         //     与 MetricsActor 分开是刻意的——观测层故障不该拖垮交易，而对账确认漂移必须
         //     致命退出（本地持仓不可信时，策略的三道风控闸门全部失效）。
         //
-        //     读数由它**自行轮询**：读数只有这一个消费者，不上总线；每个有凭证的所一个
-        //     client（无凭证的所没有持仓可言）。`fetch_positions` 在 ExchangeClient trait
-        //     上，交易所模块无需改动。
-        let authed_clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = clients
-            .iter()
-            .filter(|(e, _)| authed_exchanges.contains(e))
-            .map(|(e, c)| (*e, c.clone()))
-            .collect();
+        //     读数由它**自行轮询**：读数只有这一个消费者，不上总线。收 `accounts` 而非
+        //     全部 client —— "没有账户的所不必轮询"由类型表达，无需过滤。
         let position_ledger = consumers.spawn::<PositionLedgerActor, _>(
             &actor_ref,
             "PositionLedgerActor",
             PositionLedgerArgs {
-                clients: authed_clients,
+                accounts: accounts.clone(),
                 symbol_metas: Arc::new(symbol_metas.clone()),
                 interval_ms: DEFAULT_POSITION_POLL_INTERVAL_MS,
                 max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
@@ -406,7 +409,7 @@ impl Actor for ManagerActor {
 
         Ok(Self {
             symbol_metas,
-            clients,
+            accounts,
             capabilities,
             market_pubsub,
             account_pubsub,
