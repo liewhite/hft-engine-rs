@@ -205,6 +205,52 @@ impl SymbolMarket {
 }
 
 impl SymbolPositions {
+    /// 累加一笔成交。**持仓维护的增量输入只有这一条路。**
+    ///
+    /// Fill 涵盖策略单、手动单、以及强平/ADL —— 三者都以 fill 形式经私有成交流到达，
+    /// 走同一路径（模型说明见 [`Self::seed`]）。
+    ///
+    /// # 防双计：已 seed 的所按快照请求时刻过滤
+    ///
+    /// 在快照请求时刻**之前**送达的 Fill，其成交必已含在基线快照里，再累加即双计。
+    /// 这条规则对全部基线消费者（executor / 持仓账本 / 观测镜像）**必须是同一份** ——
+    /// 所以它安在这里，与 `seeded_at` 同一个结构，而不是各消费者自己写一遍。
+    ///
+    /// 持仓维护的全部内容就是**累加带符号数量**：策略决策只看数量（还能加多少、要平多少、
+    /// 净敞口是否为零）。均价/盈亏不在域模型里 —— 记账需求由模拟柜台的账本
+    /// （`sim::BookPosition`）与 supervisor 的现金流账本各自完成，
+    /// 见 [`crate::domain::Position`] 的文档。
+    pub fn apply_fill(&mut self, symbol: &Symbol, fill: &crate::domain::Fill, local_ts: Timestamp) {
+        if let Some(&seeded_ts) = self.seeded_at.get(&fill.exchange) {
+            if local_ts <= seeded_ts {
+                tracing::info!(
+                    %symbol,
+                    exchange = %fill.exchange,
+                    fill_size = fill.size,
+                    fill_local_ts = local_ts,
+                    snapshot_req_ts = seeded_ts,
+                    "Fill 早于基线快照请求时刻送达（已含在快照里），丢弃避免双计"
+                );
+                return;
+            }
+        }
+        let pos = self
+            .positions
+            .entry(fill.exchange)
+            .or_insert_with(|| Position::empty(fill.exchange, symbol.clone()));
+        pos.add_fill(fill.side, fill.size);
+        tracing::info!(
+            %symbol,
+            exchange = %fill.exchange,
+            side = ?fill.side,
+            fill_size = fill.size,
+            fill_price = fill.price,
+            reason = ?fill.reason,
+            new_position_size = pos.size,
+            "Updated position on fill"
+        );
+    }
+
     /// **全部**腿，含未 seed 的（供降级平仓取量：那时要的是"本实例账上有什么"，
     /// 而不是"哪些可参与对账"。对外快照请用 [`Self::seeded_positions`]）。
     pub fn all(&self) -> impl Iterator<Item = &Position> {
@@ -573,46 +619,8 @@ impl SymbolState {
                 }
             }
             AccountData::Fill(fill) => {
-                // Fill 即时更新仓位——涵盖策略单、手动单、以及强平/ADL（三者都以 fill 形式
-                // 经私有成交流到达，走同一路径，见 [`Self::seed_position`] 的模型说明）。
-                //
-                // 已 seed 的所按快照请求时刻过滤：在此之前送达的 Fill 必已含在基线快照里，
-                // 再累加即双计（这条规则对 executor / 对账镜像 / 观测镜像同一份）。
-                if let Some(&seeded_ts) = self.position_book.seeded_at.get(&fill.exchange) {
-                    if event.local_ts <= seeded_ts {
-                        tracing::info!(
-                            symbol = %self.symbol,
-                            exchange = %fill.exchange,
-                            fill_size = fill.size,
-                            fill_local_ts = event.local_ts,
-                            snapshot_req_ts = seeded_ts,
-                            "Fill 早于基线快照请求时刻送达（已含在快照里），丢弃避免双计"
-                        );
-                        return;
-                    }
-                }
-                //
-                // 持仓维护的全部内容就是**累加带符号数量**：策略决策只看数量（还能加多少、
-                // 要平多少、净敞口是否为零）。均价/盈亏不在域模型里 —— 记账需求由模拟柜台的
-                // 账本（sim::BookPosition）与 supervisor 的现金流账本各自完成，见
-                // crate::domain::Position 的文档。
                 let symbol = self.symbol.clone();
-                let pos = self
-                    .position_book
-                    .positions
-                    .entry(fill.exchange)
-                    .or_insert_with(|| Position::empty(fill.exchange, symbol));
-                pos.add_fill(fill.side, fill.size);
-                tracing::info!(
-                    symbol = %self.symbol,
-                    exchange = %fill.exchange,
-                    side = ?fill.side,
-                    fill_size = fill.size,
-                    fill_price = fill.price,
-                    reason = ?fill.reason,
-                    new_position_size = pos.size,
-                    "Updated position on fill"
-                );
+                self.position_book.apply_fill(&symbol, fill, event.local_ts);
             }
             AccountData::FundingFee(_) => {
                 // 资费事件不修改本地 symbol 状态，下游策略自行去重与统计

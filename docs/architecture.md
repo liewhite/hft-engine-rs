@@ -187,7 +187,23 @@ actor"。见 [external-data-access.md](./external-data-access.md) §四。
 
 按严重程度排。每条注明违反哪条原则、实证、以及在重构计划里的编号。
 
-### V1 `StateManager` / `SymbolState` 是共享大对象 —— 违反 P1、P3
+### ~~V1 `StateManager` / `SymbolState` 是共享大对象~~ —— **已修复（R2）**
+
+原状与理由见下方保留的原文。现状：拆成四个投影 ——
+`SymbolMarket` / `SymbolPositions` / `SymbolOrders`（per symbol，由 `SymbolState` 门面组合）
++ `AccountView`（账户级）。跨 symbol 的持仓容器 `PositionBook` 供只要持仓的消费者使用：
+持仓账本的可达方法从 **39 个收到 8 个**。
+
+「seed 之后、快照请求时刻之前的 Fill 要丢弃」这条防双计规则提取到
+`SymbolPositions::apply_fill`，与 `seeded_at` 同住一处 —— 账本与策略门面共用一份，
+不会各自演化出差别（那种差别的表现是"对账偶尔误报漂移"，最难查）。
+
+**持仓折叠仍是三份宿主**（账本 / executor / metrics），数量没变但性质变了：
+账本那份现在最瘦最专一，而它正是唯一被 REST 持续校验的那份。
+executor 与 metrics 的保留理由见 [external-data-access.md](./external-data-access.md) §四。
+
+<details><summary>原文（保留以便对照判断标准）</summary>
+
 
 `StateManager` 19 个公开方法 + `SymbolState` 20 个，装着六类互不相干的东西：per-symbol 行情
 （bbo / mark / index / funding）、持仓 + seed 标记、挂单 + 终态记忆 + 超时清理、余额、
@@ -198,6 +214,8 @@ metrics 用「持仓 × 价格 + 挂单 + 账户」。**一个类型有三组互
 
 这是"持仓折叠有三份宿主"的根因：因为持仓和价格被焊在同一结构里，`SymbolState::exposure`
 必须在结构内部 join，metrics 才没法只查持仓。→ 计划 R2
+
+</details>
 
 ### V2 `Strategy::on_event` 交出全量状态视图 —— 违反 P3
 

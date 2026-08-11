@@ -56,7 +56,7 @@
 use crate::domain::{Exchange, Position, Symbol, SymbolMeta};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
-use crate::messaging::{AccountData, AccountEvent, IncomeEvent, PositionBaseline, StateManager};
+use crate::messaging::{AccountEvent, PositionBaseline, PositionBook};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -80,9 +80,6 @@ pub const DEFAULT_POSITION_POLL_INTERVAL_MS: u64 = 3_000;
 /// 单次不一致是正常的飞行窗口。
 pub const DEFAULT_MAX_CONSECUTIVE_MISMATCHES: u32 = 3;
 
-/// 观测层不做订单超时清理（镜像只关心持仓）
-const NO_ORDER_TIMEOUT: u64 = 0;
-
 // ============================================================================
 // 纯逻辑核心
 // ============================================================================
@@ -91,14 +88,17 @@ const NO_ORDER_TIMEOUT: u64 = 0;
 ///
 /// 与 [`crate::engine::StrategyRunner`] 同样的分层：纯核心 + 薄 actor 包装。
 pub struct Reconciler {
-    /// 镜像持仓：投产握手 seed 基线 + income 流的 `Fill` 驱动（复用策略侧同一实现）。
+    /// 持仓账本：投产握手 seed 基线 + income 流的 `Fill` 驱动。
+    ///
+    /// 类型就是职责声明 —— 它只有持仓。此前这里是整个 `StateManager`（行情缓存、挂单
+    /// 跟踪、账户净值、希腊值一个都不碰却全都拿着），见 `docs/architecture.md` 原则 P3。
     ///
     /// 同时充当两个判据的单一数据源，不另存副本：
-    /// - "本实例负责哪些 symbol"：symbol 是否已注册直接问它。分桶部署下多实例共用同一
-    ///   账户，交易所读数是**账户级全量**、含其他桶的 symbol，靠这个判据过滤。
-    /// - "哪条腿可参与对账"：`is_position_seeded` —— 基线未到（该所未配置凭证、无账户）时
+    /// - "本实例负责哪些 symbol"：`is_tracked`。分桶部署下多实例共用同一账户，
+    ///   交易所读数是**账户级全量**、含其他桶的 symbol，靠这个判据过滤。
+    /// - "哪条腿可参与对账"：`is_seeded` —— 基线未到（该所未配置凭证、无账户）时
     ///   本地持仓是"未知"而不是 0，拿未知去比对必然误判。
-    mirror: StateManager,
+    mirror: PositionBook,
     /// 容差来源：`coin_size_step()`（币本位最小可交易增量），小于它的差值不可能是真实漂移
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// per (所, symbol) 的不一致记录；一致一次即整条移除
@@ -134,7 +134,7 @@ impl Reconciler {
         max_consecutive: u32,
     ) -> Self {
         Self {
-            mirror: StateManager::new(&[], NO_ORDER_TIMEOUT),
+            mirror: PositionBook::default(),
             symbol_metas,
             mismatches: HashMap::new(),
             max_consecutive,
@@ -147,7 +147,7 @@ impl Reconciler {
     /// 正常形态）；快照与 Fill 流的竞态由 seed 内置的时刻过滤兜住。
     pub fn register(&mut self, symbols: &[Symbol], baselines: &[PositionBaseline]) {
         self.mirror.register_symbols(symbols);
-        self.mirror.seed_positions(baselines);
+        self.mirror.seed(baselines);
     }
 
     /// 当前账本快照：全部**基线已写入**的腿（含 `size == 0` 的空仓腿）。
@@ -158,23 +158,10 @@ impl Reconciler {
         self.mirror.seeded_positions().cloned().collect()
     }
 
-    /// 该 symbol 是否属于本实例（镜像已注册即属于，见 `mirror` 字段说明）
-    fn is_tracked(&self, symbol: &Symbol) -> bool {
-        self.mirror.symbol_state(symbol).is_some()
-    }
-
-    /// 喂入一条账户事件（镜像只吃**实盘**的 Fill —— 通道 A 的增量输入就它一个；
-    /// 模拟账户的成交绝不能进实盘持仓镜像）。
+    /// 喂入一条账户事件（账本只吃**实盘**的 Fill、且只吃跟踪范围内的 —— 判据与丢弃
+    /// 语义都在 [`PositionBook::apply`] 里，本层不再重复一遍）。
     pub fn on_event(&mut self, event: &AccountEvent) {
-        if event.account != crate::domain::AccountId::Live {
-            return;
-        }
-        if let AccountData::Fill(fill) = &event.data {
-            if self.is_tracked(&fill.symbol) {
-                self.mirror
-                    .apply(&IncomeEvent::Account(event.clone()));
-            }
-        }
+        self.mirror.apply(event);
     }
 
     /// 比对某所的一份完整读数。
@@ -198,8 +185,8 @@ impl Reconciler {
         let mut confirmed_drift = Vec::new();
 
         // 只比对**该所**基线已写入的腿（基线未到 = 本地未知，不是 0）
-        for (symbol, state) in mirror.symbol_states() {
-            if !state.is_position_seeded(exchange) {
+        for (symbol, state) in mirror.iter() {
+            if !state.is_seeded(exchange) {
                 continue;
             }
             let reported_size = reported.get(symbol).copied().unwrap_or(0.0);
@@ -562,6 +549,7 @@ impl Message<StreamMessage<Instant, (), ()>> for PositionLedgerActor {
 mod tests {
     use super::*;
     use crate::domain::{Fill, FillReason, Side};
+    use crate::messaging::AccountData;
     use crate::exchange::utils::StepFormatter;
 
     const EX: Exchange = Exchange::Binance;

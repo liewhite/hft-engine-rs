@@ -12,7 +12,7 @@
 | 阶段 | 目标 | 对应违反 | 状态 |
 |---|---|---|---|
 | R1 | 拆 `ExchangeClient`：公共 / 账户两个 trait | V3 | **已完成** |
-| R2 | 拆 `StateManager`：四个单一职责投影 | V1 | **R2a 已完成**，R2b 未开始 |
+| R2 | 拆 `StateManager`：四个单一职责投影 | V1 | **已完成** |
 | R3 | 策略只拿受限视图 | V2 | 未开始（依赖 R2） |
 | R4 | 下单出口的分发判据收敛到一处 | V4 | **已完成** |
 | R5 | 收尾：投产编排独立、观测口径移出领域层 | V6 / V7 | 未开始 |
@@ -203,8 +203,27 @@ pub struct AccountView { balances, account_infos, greeks, cash_balances }
 `SymbolState::apply` 的拆法：按 variant 分派给对应投影，**保留"未知 symbol 事件 = 路由 bug"
 的 error 日志**（现在这条判断在门面上，拆完仍应在门面上，不要让三个投影各自静默忽略）。
 
-**R2b 切换消费者**：逐个消费者改为只持它需要的子结构。首要目标是持仓账本 ——
-它现在持整个 `StateManager`，而只用得到持仓那一份。
+**R2b 切换消费者**：逐个消费者改为只持它需要的子结构。
+
+### R2b 完成记录
+
+**持仓账本从 39 个方法收到 8 个。** 新增 `PositionBook`（跨 symbol 的 `SymbolPositions`
+容器），`Reconciler.mirror` 的类型从 `StateManager` 改为它 —— 类型就是职责声明，
+编译器保证账本碰不到行情缓存、挂单跟踪、账户净值、希腊值。
+
+**防双计规则单一化**（这一步的正确性前提）：「seed 之后、快照请求时刻之前送达的 Fill
+要丢弃」原先写在 `SymbolState::apply_account_data` 的 Fill 分支里。账本独立之后若不动它，
+这条规则就会有两份 —— 而两份的差异表现为"对账偶尔误报漂移"，是最难查的一类。
+故提取为 `SymbolPositions::apply_fill`，与 `seeded_at` 同住一个结构，门面与账本共用。
+
+**其余两个消费者不动，理由已核实**：
+
+- `StrategyRunner` 需要全部四个投影（策略实测用 11 个方法，跨四个投影）
+- `MetricsActor` 同样需要四个：`account_infos()` 走账户投影、`exposure()` 要
+  持仓 × 价格的 join、`pending_orders()` 要挂单。它是全景观测，本就该看全。
+
+所以"持仓折叠三份宿主"的数量没变，但**性质变了**：账本那份现在是最瘦、最专一的，
+而它正是唯一被 REST 持续校验的那份。这与 architecture.md §4 V1 的记录一致。
 
 ### R2a 完成记录
 
