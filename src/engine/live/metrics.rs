@@ -54,8 +54,8 @@ pub struct MetricsActor {
     tracked: HashSet<Symbol>,
     /// 会话起始仓位基线：symbol -> (exchange -> 仓位)
     ///
-    /// 取自启动期的 [`ExchangeEventData::PositionBaseline`]（每个 (symbol, 所) 只记第一条，
-    /// 与 `SymbolState` 的基线语义一致）。用于把重启前的存货从盈亏里剔除。
+    /// 取自投产握手 [`RegisterSymbols`] 携带的基线（每个 (symbol, 所) 只记第一条，
+    /// 与 `SymbolState` 的 seed 语义一致）。用于把重启前的存货从盈亏里剔除。
     baseline: HashMap<Symbol, HashMap<Exchange, f64>>,
     /// per-symbol 累计成交统计
     per_symbol: HashMap<Symbol, TradingStats>,
@@ -392,16 +392,27 @@ impl Actor for MetricsActor {
 
 // === Messages ===
 
-/// 注册需要跟踪的 symbol 集合
-pub struct RegisterSymbols(pub Vec<Symbol>);
+/// 投产注册握手：要跟踪的 symbol 集合 + 它们的持仓基线（同一份快照，与 executor /
+/// 对账镜像口径一致）。注册与基线**原子**到达 —— 不存在"已注册、基线未到"的窗口，
+/// 也就不需要缓冲重放机制。
+pub struct RegisterSymbols {
+    pub symbols: Vec<Symbol>,
+    pub baselines: Vec<crate::messaging::PositionBaseline>,
+}
 
 impl Message<RegisterSymbols> for MetricsActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: RegisterSymbols, _ctx: &mut Context<Self, Self::Reply>) {
-        tracing::info!(count = msg.0.len(), "MetricsActor tracking symbols");
-        self.state.register_symbols(&msg.0);
-        self.tracked.extend(msg.0);
+        tracing::info!(count = msg.symbols.len(), "MetricsActor tracking symbols");
+        self.state.register_symbols(&msg.symbols);
+        self.tracked.extend(msg.symbols);
+        // 会话起始仓位基线（盈亏口径）与持仓镜像各记一份；重复注册（再晋升）由
+        // record_baseline 的 or_insert 与 seed 的幂等各自兜住，首次值不被覆写
+        for b in &msg.baselines {
+            self.record_baseline(&b.position.symbol, b.position.exchange, b.position.size);
+        }
+        self.state.seed_positions(&msg.baselines);
     }
 }
 
@@ -417,11 +428,6 @@ impl Message<IncomeEvent> for MetricsActor {
                 self.untracked_events += 1;
                 return;
             }
-        }
-
-        // 会话起始仓位基线：必须在 state.apply 之前取，那之后就分不清"快照初始值"和"成交累加值"了
-        if let ExchangeEventData::PositionBaseline(position) = &msg.data {
-            self.record_baseline(&position.symbol, position.exchange, position.size);
         }
 
         // 账户 / 持仓 / 挂单视图
@@ -488,15 +494,15 @@ mod tests {
     use super::*;
     use crate::domain::{Fill, FillReason, Position, Side};
 
-    fn position_event(exchange: Exchange, symbol: &str, size: f64) -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: 0,
-            local_ts: 0,
-            data: ExchangeEventData::PositionBaseline(Position {
-                exchange,
+    /// 投产握手的基线载荷（snapshot_req_ts=0；需要累加的 Fill 应带 local_ts > 0）
+    fn baseline_of(symbol: &str, size: f64) -> crate::messaging::PositionBaseline {
+        crate::messaging::PositionBaseline {
+            position: Position {
+                exchange: Exchange::Binance,
                 symbol: symbol.to_string(),
                 size,
-            }),
+            },
+            snapshot_req_ts: 0,
         }
     }
 
@@ -601,10 +607,9 @@ mod tests {
         metrics.tracked.insert(symbol.clone());
         metrics.state.register_symbols(&[symbol.clone()]);
 
-        // 启动时已有 2 个多头（重启场景）
-        let snapshot = position_event(Exchange::Binance, &symbol, 2.0);
+        // 启动时已有 2 个多头（重启场景）：投产握手 seed 基线
         metrics.record_baseline(&symbol, Exchange::Binance, 2.0);
-        metrics.state.apply(&snapshot);
+        metrics.state.seed_positions(&[baseline_of(&symbol, 2.0)]);
         // 喂 BBO 让持仓可估值
         metrics.state.apply(&IncomeEvent {
             exchange_ts: 0,
@@ -637,10 +642,12 @@ mod tests {
         metrics.state.register_symbols(&[symbol.clone()]);
 
         metrics.record_baseline(&symbol, Exchange::Binance, 2.0);
-        metrics.state.apply(&position_event(Exchange::Binance, &symbol, 2.0));
+        metrics.state.seed_positions(&[baseline_of(&symbol, 2.0)]);
 
-        // 本次会话又买 1 个（价 100），随后 BBO 报 110
-        let fill = fill_event(Exchange::Binance, &symbol, Side::Long, 1.0);
+        // 本次会话又买 1 个（价 100），随后 BBO 报 110；
+        // local_ts 晚于快照请求时刻，不会被 seed 的防双计过滤
+        let mut fill = fill_event(Exchange::Binance, &symbol, Side::Long, 1.0);
+        fill.local_ts = 1;
         if let ExchangeEventData::Fill(f) = &fill.data {
             metrics.total.apply_fill(f);
         }

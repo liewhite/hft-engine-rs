@@ -7,7 +7,7 @@
 use super::{AccountIncome, ExecutorActor};
 use crate::domain::{AccountId, Exchange, Symbol};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{EventRouting, ExchangeEventData, IncomeEvent};
+use crate::messaging::{ExchangeEventData, IncomeEvent};
 use kameo::actor::{ActorId, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
@@ -32,8 +32,6 @@ fn is_account_private(event: &IncomeEvent) -> bool {
         event.data,
         ExchangeEventData::OrderUpdate(_)
             | ExchangeEventData::Fill(_)
-            | ExchangeEventData::PositionBaseline(_)
-            | ExchangeEventData::PositionReport { .. }
             | ExchangeEventData::Balance(_)
             | ExchangeEventData::AccountInfo { .. }
             | ExchangeEventData::FundingFee(_)
@@ -131,9 +129,9 @@ impl Message<IncomeEvent> for IncomeProcessorActor {
         // 共享总线上的私有事件来自交易所的 private WS / REST，即**实盘账户**；模拟账户的
         // 私有事件走 PaperPubSub（见 Message<AccountIncome>）。这不是约定，而是来源决定的事实。
         let private_owner = is_account_private(&msg).then_some(AccountId::Live);
-        match msg.executor_routing() {
-            EventRouting::BySymbol { exchange, symbol } => {
-                // 按 symbol 路由：只发送给订阅了该 (exchange, symbol) 的 executor
+        match msg.routing() {
+            // 按 symbol 路由：只发送给订阅了该 (exchange, symbol) 的 executor
+            Some((exchange, symbol)) => {
                 for sub in self.executors.values() {
                     if private_owner.as_ref().is_some_and(|o| &sub.account != o) {
                         continue;
@@ -145,8 +143,8 @@ impl Message<IncomeEvent> for IncomeProcessorActor {
                     }
                 }
             }
-            EventRouting::Broadcast => {
-                // 广播给所有 executor（账户私有的广播事件如 Balance/AccountInfo 仍按账户过滤）
+            // 广播给所有 executor（账户私有的广播事件如 Balance/AccountInfo 仍按账户过滤）
+            None => {
                 for sub in self.executors.values() {
                     if private_owner.as_ref().is_some_and(|o| &sub.account != o) {
                         continue;
@@ -156,8 +154,6 @@ impl Message<IncomeEvent> for IncomeProcessorActor {
                     }
                 }
             }
-            // 账户级事件：总线上的其他订阅者已直接收到，这里不做任何投递
-            EventRouting::SkipExecutors => {}
         }
     }
 }
@@ -251,69 +247,9 @@ mod account_isolation_tests {
         }
     }
 
-    fn position_report_event() -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: 1,
-            local_ts: 1,
-            data: ExchangeEventData::PositionReport {
-                exchange: Exchange::Binance,
-                positions: vec![crate::domain::Position {
-                    exchange: Exchange::Binance,
-                    symbol: "BTC".to_string(),
-                    size: 1.0,
-                }],
-            },
-        }
-    }
-
-    fn baseline_event() -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: 1,
-            local_ts: 1,
-            data: ExchangeEventData::PositionBaseline(crate::domain::Position {
-                exchange: Exchange::Binance,
-                symbol: "BTC".to_string(),
-                size: 1.0,
-            }),
-        }
-    }
-
-    /// **Critical 不变量**：持仓对账读数**绝不**投递给任何 executor。
-    ///
-    /// 它一旦进入策略的 StateManager，就绕过了「基线 + Fill」的持仓维护模型 —— 等于恢复了
-    /// 被明确否掉的"用快照覆写持仓"（会与 Fill 流重复计算同一笔成交）。这条约束此前只由
-    /// `SymbolState` 的一个分支兜着，路由层没有测试守。
-    #[test]
-    fn position_report_is_never_routed_to_executors() {
-        assert!(
-            matches!(
-                position_report_event().executor_routing(),
-                EventRouting::SkipExecutors
-            ),
-            "对账读数被投递给了 executor —— 它会绕过「基线 + Fill」的持仓维护模型"
-        );
-    }
-
-    /// 持仓**基线**同样不经总线进 executor：它由 ManagerActor 在注册前点对点投递
-    /// （结构上保证先于任何流事件），总线上的那份只喂引擎生命周期的镜像。若路由层
-    /// 再投一份，executor 会收到重复基线，真实的违约信号（适配层擅自发基线）被误报淹没。
-    #[test]
-    fn position_baseline_skips_executors() {
-        assert!(
-            matches!(
-                baseline_event().executor_routing(),
-                EventRouting::SkipExecutors
-            ),
-            "基线若经总线投给 executor，会与 manager 的点对点投递重复"
-        );
-    }
-
-    /// 两者都属账户私有：绝不能把实盘读数/基线投给模拟账户的策略
-    #[test]
-    fn both_position_variants_are_account_private() {
-        assert!(is_account_private(&position_report_event()));
-        assert!(is_account_private(&baseline_event()));
-    }
+    // 注：历史上这里有"PositionBaseline / PositionReport 绝不路由给 executor"的守恒测试。
+    // 两者已退出事件枚举（基线是投产握手载荷、读数由对账 actor 自行轮询），这条不变量
+    // 从"测试守着的约定"升级成了"类型上不可表达"—— 测试随之删除。
 
     /// 成交/持仓/净值属于某一个账户；行情不属于任何账户。
     /// 这条分类是账户隔离的依据 —— 分错一类，别人的仓位就会被记进自己的状态。

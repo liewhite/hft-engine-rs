@@ -296,6 +296,8 @@ async fn paper_counter_fills_from_live_trades() {
             strategy: Box::new(DipMaker(Arc::clone(&log))),
             account: PAPER_ACCOUNT.clone(),
             symbol_metas: metas_by_key.clone(),
+            // 模拟账户从零起步，无基线
+            baselines: Vec::new(),
             outcome_pubsub: outcome_pubsub.clone(),
         },
         mailbox::unbounded(),

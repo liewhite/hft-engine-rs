@@ -10,7 +10,6 @@ mod income_processor;
 mod metrics;
 mod outcome_processor;
 mod paper_counter;
-mod position_polling;
 mod position_reconcile;
 mod supervisor;
 
@@ -60,12 +59,9 @@ pub use income_processor::{IncomeProcessorActor, RegisterExecutor, UnregisterExe
 pub use metrics::{MetricsActor, MetricsActorArgs, RegisterSymbols, DEFAULT_REPORT_INTERVAL_MS};
 pub use outcome_processor::{OrderGateway, OutcomeProcessorActor, PlaceVerdict};
 pub use paper_counter::{PaperCounterActor, PaperCounterArgs};
-pub use position_polling::{
-    PositionPollingActor, PositionPollingActorArgs, DEFAULT_POSITION_POLL_INTERVAL_MS,
-};
 pub use position_reconcile::{
     PositionReconcileActor, PositionReconcileArgs, Reconciler,
-    DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
+    DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
 };
 pub use supervisor::{
     Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,

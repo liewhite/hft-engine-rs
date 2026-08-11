@@ -209,9 +209,9 @@ fn parse_private_message(
             let mut events = Vec::new();
 
             // **不处理 `a.P`（持仓）**：那是持仓**快照**，而持仓的维护模型是「启动期 REST
-            // 基线 + 之后全程 Fill 累加」（见 ExchangeEventData::PositionBaseline）。快照既
+            // 基线 + 之后全程 Fill 累加」（见 crate::messaging::PositionBaseline）。快照既
             // 当不了基线（基线只能来自 ManagerActor），也不能参与增量（会与同一条推送里的
-            // ORDER_TRADE_UPDATE 产出的 Fill 重复计算）。校验走 PositionReport 通道。
+            // ORDER_TRADE_UPDATE 产出的 Fill 重复计算）。校验走 PositionReconcileActor 的独立轮询。
 
             // 处理所有 balance 更新
             for bal_data in &update.a.balances {

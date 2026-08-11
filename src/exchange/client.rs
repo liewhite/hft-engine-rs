@@ -224,11 +224,10 @@ pub trait ExchangeClient: Send + Sync + 'static {
     /// 查询账户当前持仓（**必须真实请求交易所**，不得返回空占位）
     ///
     /// 本方法服务于持仓维护模型的**两条通道**，两者都不容许假数据：
-    /// - **基线**：`ManagerActor` 启动期调用一次，产出
-    ///   [`crate::messaging::ExchangeEventData::PositionBaseline`]。基线只有这一次机会——
+    /// - **基线**：`ManagerActor` 投产期调用一次，产出
+    ///   [`crate::messaging::PositionBaseline`]（投产握手载荷）。基线只有这一次机会——
     ///   之后持仓全程由 `Fill` 累加，没有第二个来源能纠正它，故拉取失败即拒绝启动。
-    /// - **对账**：`PositionPollingActor` 周期性调用，产出
-    ///   [`crate::messaging::ExchangeEventData::PositionReport`]，与「基线 + Fill」的结果比对。
+    /// - **对账**：`PositionReconcileActor` 周期性调用，作为读数与「基线 + Fill」的结果比对。
     ///
     /// 因此返回 `Ok(vec![])` 只有一个合法含义：**该账户确实没有任何持仓**（含"未配置凭证、
     /// 只接公共行情"的情形）。用空 Vec 表示"数据在别处（私有 WS）"会让基线静默变成全零、

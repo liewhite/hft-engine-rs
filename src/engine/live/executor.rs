@@ -26,6 +26,9 @@ pub struct ExecutorArgs {
     pub account: AccountId,
     /// Symbol 元数据 (供 StrategyRunner 按交易所精度取整；单位折算不在此)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+    /// 持仓基线（投产握手）：实例**出生即带基线**，在收到任何流事件之前写入 ——
+    /// "Fill 早于基线、存量被丢"的竞态在结构上不可能。模拟账户从 0 起算，传空。
+    pub baselines: Vec<crate::messaging::PositionBaseline>,
     /// Outcome PubSub 引用 (用于发布信号)
     pub outcome_pubsub: ActorRef<OutcomePubSub>,
 }
@@ -63,9 +66,11 @@ impl Actor for ExecutorActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let runner = StrategyRunner::new(args.strategy, args.symbol_metas);
+        let mut runner = StrategyRunner::new(args.strategy, args.symbol_metas);
+        // 基线先于一切流事件写入（on_start 完成前邮箱消息不会被处理）
+        runner.seed_positions(&args.baselines);
         let account = args.account;
-        tracing::info!("ExecutorActor started");
+        tracing::info!(baselines = args.baselines.len(), "ExecutorActor started");
         Ok(Self {
             runner,
             account,
