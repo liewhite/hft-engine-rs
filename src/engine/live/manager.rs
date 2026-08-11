@@ -14,7 +14,7 @@ use super::{
     GetPositions, IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub,
     OutcomeProcessorActor,
     PositionPollingActor, PositionPollingActorArgs, PositionReconcileActor, PositionReconcileArgs,
-    RegisterExecutor, RegisterSymbols, OutcomeProcessorArgs, UnregisterExecutor,
+    OrderGateway, RegisterExecutor, RegisterSymbols, UnregisterExecutor,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
     DEFAULT_REPORT_INTERVAL_MS,
 };
@@ -32,7 +32,7 @@ use crate::exchange::hyperliquid::{
 use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
 use crate::exchange::{
-    ExchangeAccess, ExchangeActorOps, ExchangeClient, ExchangeOrder, SubscriptionKind,
+    ExchangeAccess, ExchangeActorOps, ExchangeClient, SubscriptionKind,
 };
 use crate::strategy::Strategy;
 use kameo::actor::{ActorId, ActorRef, Spawn, WeakActorRef};
@@ -100,6 +100,10 @@ pub struct ManagerActor {
 
     /// 模拟账户私有事件总线（供 Supervisor 等观察者订阅）
     paper_pubsub: ActorRef<PaperPubSub>,
+
+    /// 唯一的实盘下单出口（与 OutcomeProcessorActor 共享同一实例）。
+    /// 降级平仓经此下单 —— in_flight 判据、失败反馈、dry_run 语义与策略信号一致。
+    order_gateway: Arc<OrderGateway>,
 
     /// 已注册的策略实例，供动态撤下使用。
     ///
@@ -926,16 +930,21 @@ impl Actor for ManagerActor {
         // 5. OutcomePubSub 的两个消费者**常驻并存**：实盘账户的订单发往交易所，模拟账户的
         //    订单落本地柜台。二者互不知情，各按 AccountOutcome 上的账户取自己的那份 ——
         //    这使得同一 symbol 上模拟与实盘可以并行（模拟先跑，出信号后再拉起实盘）。
+        //
+        //    OrderGateway 是**唯一**的实盘下单出口：总线路径（OutcomeProcessorActor）与
+        //    降级平仓（RemoveStrategies）共享同一实例 —— in_flight 判据、失败反馈、
+        //    dry_run 语义对一切下单一致，系统不存在第二个下单出口。
+        let order_gateway = Arc::new(OrderGateway::new(
+            clients.clone(),
+            income_pubsub.clone(),
+            // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
+            Arc::new(symbol_metas.clone()),
+            false,
+        ));
         let live_processor = pipeline.spawn::<OutcomeProcessorActor, _>(
             &actor_ref,
             "OutcomeProcessorActor",
-            OutcomeProcessorArgs {
-                clients: clients.clone(),
-                income_pubsub: income_pubsub.clone(),
-                // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
-                symbol_metas: Arc::new(symbol_metas.clone()),
-                dry_run: false,
-            },
+            order_gateway.clone(),
         )
         .await;
         outcome_pubsub
@@ -1097,6 +1106,7 @@ impl Actor for ManagerActor {
             position_reconciler,
             exchange_actors,
             paper_pubsub,
+            order_gateway,
             executors: Vec::new(),
             producers,
             pipeline,
@@ -1590,15 +1600,6 @@ impl Message<RemoveStrategies> for ManagerActor {
             if exchange != msg.exchange || pos.is_empty() {
                 continue;
             }
-            let Some(meta) = self.symbol_metas.get(&(msg.exchange, pos.symbol.clone())) else {
-                tracing::error!(
-                    exchange = %msg.exchange,
-                    symbol = %pos.symbol,
-                    "No SymbolMeta — cannot flatten (数量无法折算为交易所单位)"
-                );
-                incomplete.push(format!("{}: 缺 SymbolMeta", pos.symbol));
-                continue;
-            };
             // 反向 reduce-only 市价单：撮合层强制不反向开仓，量算多了也只会平到 0
             let side = if pos.size > 0.0 { Side::Short } else { Side::Long };
             let order = Order {
@@ -1618,27 +1619,18 @@ impl Message<RemoveStrategies> for ManagerActor {
                 %side,
                 "[DEMOTE] Flattening live position with reduce-only market order"
             );
-            let wire = match ExchangeOrder::from_domain(order, meta) {
-                Ok(wire) => wire,
-                Err(reason) => {
-                    // 残量不足最小可交易量，订单层面无法平掉 —— 如实计入未完成，交人工处置
-                    tracing::error!(
-                        symbol = %pos.symbol,
-                        position = pos.size,
-                        %reason,
-                        "平仓单未通过出向校验 —— 残量无法用订单平掉"
-                    );
-                    incomplete.push(format!("{}: 平仓单无法构造 ({reason})", pos.symbol));
-                    continue;
-                }
-            };
-            if let Err(e) = client.place_order(wire).await {
+            // 经**唯一下单出口**下发（缺 meta、残量不足最小可交易量等失败都从这里
+            // 如实返回）。`Ok` 已含两种"目标已达成"情形：reduce-only 因仓位已平被拒、
+            // REST 失败但交易所已回报 —— 见 OrderGateway::place 的返回值契约。
+            let symbol = pos.symbol.clone();
+            if let Err(reason) = self.order_gateway.place(order, "demote_flatten").await {
                 tracing::error!(
-                    symbol = %pos.symbol,
-                    error = %e,
+                    %symbol,
+                    position = pos.size,
+                    %reason,
                     "平仓下单失败 —— 实盘仍有敞口"
                 );
-                incomplete.push(format!("{}: 平仓下单失败 ({e})", pos.symbol));
+                incomplete.push(format!("{symbol}: 平仓下单失败 ({reason})"));
             }
         }
 
@@ -1718,6 +1710,7 @@ where
 mod leftover_order_tests {
     use super::*;
     use crate::domain::{AccountInfo, OrderId, OrderStatus, Position};
+    use crate::exchange::ExchangeOrder;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
