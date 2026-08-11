@@ -130,11 +130,22 @@ impl ChildGroup {
 
     /// 停掉并等完本组全部子 actor。在 `on_stop` 里调一次。
     ///
-    /// 逐个串行：停机顺序是有意义的（登记顺序即停机顺序），并发停会让超时告警交织在
-    /// 一起，看不出到底是谁卡住的。
+    /// # 组内并发，组间由调用方排序
+    ///
+    /// 同组的子 actor **必须互无停机先后依赖** —— 这就是"分组"的定义：有依赖就该分成两个
+    /// 组，由 `on_stop` 里两次 `shutdown().await` 表达先后（`ManagerActor` 正是这么把
+    /// 生产者 / 总线 / 消费者分成三组的）。因此组内一律并发停，本组耗时 = 最慢的那一个，
+    /// 而非全部之和。
+    ///
+    /// 此前是串行的，理由写作"登记顺序即停机顺序"。那让**依赖藏在登记顺序里** —— 换个
+    /// push 位置就悄悄改变停机语义，而编译器和测试都看不见；代价还是实打实的：
+    /// `IbkrPublicWsActor` 的 `on_stop` 要为等 commission 的成交做网络往返，四个所串起来
+    /// 就是四倍。
+    ///
+    /// 每个子 actor 的超时告警各自独立计时、**带自己的名字**，所以并发下依然看得出谁卡住。
     pub async fn shutdown(&mut self) {
         self.shut_down = true;
-        for child in &self.children {
+        let waits = self.children.iter().map(|child| async move {
             let mut stop = std::pin::pin!((child.stop)());
             let mut waited = Duration::ZERO;
             loop {
@@ -152,7 +163,8 @@ impl ChildGroup {
                     }
                 }
             }
-        }
+        });
+        futures_util::future::join_all(waits).await;
     }
 }
 
@@ -321,6 +333,38 @@ mod tests {
             DELIVERED.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "生产者 on_stop 补发的事件必须在消费者停机前送达"
+        );
+        holder.stop_gracefully().await.ok();
+    }
+
+    /// **组内并发**：本组耗时 = 最慢的那一个，不是全部之和。
+    ///
+    /// 串行版本的代价是实打实的：`IbkrPublicWsActor` 的 `on_stop` 要为等 commission 的
+    /// 成交做网络往返，四个所串起来就是四倍，直逼根部 30 秒的总预算。
+    ///
+    /// 暂停时钟下时间自动推进，故本判据是确定性的（不测墙钟、不看抖动）。
+    #[tokio::test(start_paused = true)]
+    async fn children_in_one_group_stop_concurrently() {
+        const SLOW: Duration = Duration::from_millis(300);
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let holder = Node::spawn_with_mailbox(("holder", 0, log.clone()), mailbox::unbounded());
+
+        // 三个各自收尾 300ms 的叶子（Node 在 depth==0 时 on_stop 里睡 300ms）
+        let mut group = ChildGroup::default();
+        for _ in 0..3 {
+            group
+                .spawn::<Node, _>(&holder, "slow", ("slow", 0, log.clone()))
+                .await;
+        }
+
+        let started = tokio::time::Instant::now();
+        group.shutdown().await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(log.lock().unwrap().len(), 3, "三个都该停完");
+        assert!(
+            elapsed < SLOW * 2,
+            "组内应并发停机（期望约 {SLOW:?}，串行会是 3 倍），实测 {elapsed:?}"
         );
         holder.stop_gracefully().await.ok();
     }
