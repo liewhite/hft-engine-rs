@@ -91,13 +91,32 @@ pub struct ManagerActor {
     /// 否则实例只能随进程生死。
     executors: Vec<RegisteredExecutor>,
 
-    /// **产生**事件的子 actor：交易所 actor、时钟、对账轮询、策略实例。
+    /// **产生**事件的子 actor：交易所 actor、时钟、策略实例。
     /// 停机时先停这一段 —— 它们的 `on_stop` 还会往总线上发最后一批事件
     /// （`IbkrPublicWsActor` 要补发等 commission 的成交），那时管线必须还活着。
+    ///
+    /// 组内并发的一处语义收窄：executors 与交易所 actor 同时收到 Stop，故**不保证
+    /// executor 能消费到交易所补发的那最后一批回报**（此前串行、且 executor 登记在
+    /// 交易所之后时它有机会）。无实害 —— executor 的 `on_stop` 不持久化任何状态，
+    /// 持仓下次启动走 REST 基线重建。
     producers: ChildGroup,
 
     /// **三条总线**。在生产者全部停完之后才停，这样生产者 `on_stop` 里补发的最后一批
     /// 事件仍进得来（`Signal::Stop` 排在消息之后，总线会先排空、转发给订阅者）。
+    ///
+    /// # 如实声明：三段线性模型盖不住一条回灌边
+    ///
+    /// 真实拓扑不是一条直线 —— Outcome 总线的两个消费者会**倒回来**往 Account 总线发：
+    /// 本地柜台发撮合回报、`OrderGateway` 发合成的失败/撤单回报。而本组三条总线同时
+    /// 收 Stop，AccountPubSub 往往先停死，于是停机瞬间在途的这批回报会丢
+    /// （日志里表现为 `Paper counter failed to publish report`），影响是**最终一次指标
+    /// 快照少记一笔**。
+    ///
+    /// 不为它再切一刀分组，理由是那样也救不回来：柜台的延迟管道是 spawn 出去的，
+    /// `PaperCounterActor::on_stop` 并不排空它，仍在 sleep 的那张单无论分组怎么排都会
+    /// 丢；`OrderGateway` 的在途 REST 任务同理（那是既有的、已声明接受的取舍）。
+    /// 真要救得让柜台在 `on_stop` 里排空延迟管道 —— 而这批数据一个字节都不持久化
+    /// （paper 账户每次启动从零起步、实盘持仓走 REST 基线重建），不值得。
     buses: ChildGroup,
 
     /// **消费**事件的子 actor：两个 Processor、模拟柜台、观测与对账、以及外部注册的
@@ -412,7 +431,8 @@ impl Actor for ManagerActor {
         // - 生产者先停 —— 它们的 on_stop 还会往总线发东西（IbkrPublicWsActor 要补发等
         //   commission 的成交），此刻总线必须还活着；
         // - 总线次之 —— Stop 信号排在消息之后，它会先把队列排空、转发给订阅者；
-        // - 消费者最后 —— 那时该收的都已进了它们的邮箱，再各自排空。
+        // - 消费者最后 —— 该经总线转发过来的都已进了它们的邮箱，再各自排空。
+        //   （唯一例外是柜台/网关倒回 Account 总线的那批在途回报，见 buses 字段说明。）
         //
         // 这三段此前是「生产者」+「管线」两组，段内顺序靠登记顺序隐含表达 —— 依赖藏在
         // push 位置里，改一行就悄悄变语义。现在由分组本身表达。

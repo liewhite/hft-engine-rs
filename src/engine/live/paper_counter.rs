@@ -111,11 +111,18 @@ impl PaperCounterActor {
 
     /// 发布柜台产生的回报（SimState 只产 OrderUpdate/Fill，天生无需过滤）。
     async fn publish_reports(&self, account: &AccountId, reports: Vec<(Timestamp, AccountData)>) {
+        // `local_ts` 必须是**本地时刻**，不能沿用撮合时间戳：行情触发的成交，其 ts 取自
+        // 撮合它的那条行情（`bbo.timestamp` / `trade.timestamp`），而那是**交易所打点**。
+        // 拿交易所时钟当本地接收时刻有两处实害：`ExecutorActor::check_pipeline_lag` 会把
+        // 对端时钟偏移误诊成"本实例跟不上事件流"，`add_pending_order` 的 created_at 与
+        // Clock 里的 `now_ms()` 混算会让订单超时判定偏移。
+        // `exchange_ts` 保留撮合时刻 —— 那一栏问的正是"交易所侧什么时候发生的"。
+        let local_ts = now_ms();
         for (ts, data) in reports {
             let event = AccountEvent {
                 account: account.clone(),
                 exchange_ts: ts,
-                local_ts: ts,
+                local_ts,
                 data,
             };
             if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
