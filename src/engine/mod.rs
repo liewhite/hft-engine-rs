@@ -13,7 +13,7 @@ pub use live::{
     CryptoStatusActor, CryptoStatusActorArgs,
     ExecutorActor, ExecutorArgs,
     GetAllSymbolMetas, IncomePubSub, IncomeProcessorActor, ManagerActor, ManagerActorArgs,
-    MetricsActor, MetricsActorArgs, OrderGateway, OutcomePubSub, OutcomeProcessorActor,
+    MetricsActor, MetricsActorArgs, OrderGateway, OutcomePubSub, OutcomeProcessorActor, PlaceVerdict,
     RegisterExecutor,
     PaperCounterActor, PaperCounterArgs,
     PositionPollingActor, PositionPollingActorArgs, DEFAULT_POSITION_POLL_INTERVAL_MS,

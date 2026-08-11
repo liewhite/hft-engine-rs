@@ -939,7 +939,7 @@ mod tests {
         s.on_market(&market_ev(bbo(100.0, 100.1, 1)));
         let mut o = limit(Side::Long, 99.0, TimeInForce::GTC, "b1");
         o.symbol = "UNKNOWN".to_string();
-        // 行情键按 symbol，先喂一条该 symbol 的行情以免"无参考价"干扰判定
+        // meta 校验在参考价判定之前，无该 symbol 的行情也应以"缺 SymbolMeta"被拒
         let evs = s.on_order_arrived(1, &o, &"1".to_string());
         assert!(
             statuses(&evs)

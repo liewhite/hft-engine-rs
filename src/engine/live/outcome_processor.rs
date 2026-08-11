@@ -56,6 +56,24 @@ pub struct OrderGateway {
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+/// [`OrderGateway::place`] 的结构化结论，给**编排方**消费（策略侧的闭环走事件回报，
+/// 两者语义不同，不能压扁成一个 bool —— 尤其 [`Self::ExchangeSpoke`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceVerdict {
+    /// REST 确认已受理
+    Accepted,
+    /// dry-run 模式，未发送
+    DryRun,
+    /// reduce-only 单因仓位已平被拒 —— 平仓语义下目标已达成
+    ReduceOnlyAlreadyClosed,
+    /// REST 失败，但交易所已经通过回报流对该单表过态，**内容未知** —— 可能是成交、
+    /// 挂上，也可能是拒单。策略路径以回报为准（`SymbolState` 会消费它闭环）；编排路径
+    /// （降级平仓：executor 已撤、回报无人消费）**不得**据此认定目标达成，须如实上报
+    /// 或复核事实 —— 把它折算成"成功"曾是一个 Critical：WS 拒单先到、REST 错误后到时，
+    /// 平仓被谎报为完成，敞口无人看管。
+    ExchangeSpoke,
+}
+
 impl OrderGateway {
     pub fn new(
         clients: HashMap<Exchange, Arc<dyn ExchangeClient>>,
@@ -74,15 +92,15 @@ impl OrderGateway {
 
     /// 下一张单：出向校验（折算 + 取整 + 下界）→ 登记 in_flight → REST → 失败反馈。
     ///
-    /// # 返回值是给**编排方**的结论（策略侧的闭环走事件回报，两者语义不同）
+    /// # 返回值是给**编排方**的结论（策略侧的闭环走事件回报）
     ///
-    /// - `Ok`：已受理；或 dry_run 跳过；或 reduce-only 因仓位已平被拒（**平仓目标
-    ///   已达成**）；或 REST 失败但交易所已回报过该单（以回报为准，见 `in_flight`）。
+    /// - `Ok(verdict)`：见 [`PlaceVerdict`] 各变体 —— 特别地，`ExchangeSpoke` 不是成功，
+    ///   只是"REST 的失败结论已被交易所回报作废"。
     /// - `Err`：这张单确定没挂上，且原因作数 —— 调用方（降级平仓）据此如实计入"未完成"。
     ///
     /// 一切失败路径都已通过 [`Self::send_order_error`] 反馈为 `OrderUpdate(Error)`，
     /// 总线路径 spawn 后忽略返回值不会丢失信息。
-    pub async fn place(&self, order: Order, comment: &str) -> Result<(), String> {
+    pub async fn place(&self, order: Order, comment: &str) -> Result<PlaceVerdict, String> {
         let Some(client) = self.clients.get(&order.exchange).cloned() else {
             let reason = format!("No client found for exchange {}", order.exchange);
             tracing::error!(exchange = %order.exchange, "{}", reason);
@@ -101,7 +119,7 @@ impl OrderGateway {
                 signal = %comment,
                 "[DRY-RUN] Order NOT placed"
             );
-            return Ok(());
+            return Ok(PlaceVerdict::DryRun);
         }
 
         tracing::info!(
@@ -169,7 +187,7 @@ impl OrderGateway {
                     client_order_id = ?order.client_order_id,
                     "Order placed successfully"
                 );
-                Ok(())
+                Ok(PlaceVerdict::Accepted)
             }
             Err(e) => {
                 // 按结构化 RejectReason 判断，不再字符串嗅探：
@@ -213,9 +231,12 @@ impl OrderGateway {
                         "REST 下单失败，但交易所已回报过该单 —— 以交易所回报为准，不再上报失败"
                     );
                 }
-                // 编排方视角：仓位已平 = 平仓目标达成；交易所已回报 = 以回报为准
-                if reduce_only_closed || !still_in_flight {
-                    Ok(())
+                // 编排方视角的三种分道（不可压扁，见 PlaceVerdict）：
+                // 仓位已平 = 目标达成；交易所已表态 = 内容未知、由调用方裁断；其余 = 真失败
+                if reduce_only_closed {
+                    Ok(PlaceVerdict::ReduceOnlyAlreadyClosed)
+                } else if !still_in_flight {
+                    Ok(PlaceVerdict::ExchangeSpoke)
                 } else {
                     Err(e.to_string())
                 }
@@ -649,6 +670,224 @@ mod tests {
         assert!(
             !rest_failed_should_report(&in_flight, "c-3"),
             "已判过的单不该再次上报"
+        );
+    }
+}
+
+/// 对 [`OrderGateway::place`] 的返回值契约直测（不是复刻实现）。
+///
+/// 这份契约被降级平仓消费：把 `ExchangeSpoke` 折算成"成功"曾是一个 Critical ——
+/// WS 拒单先到、REST 错误后到时，平仓被谎报为完成、敞口无人看管。
+#[cfg(test)]
+mod place_verdict_tests {
+    use super::*;
+    use crate::domain::{
+        AccountInfo, OrderId, OrderType, Position, RejectReason, Side, TimeInForce,
+    };
+    use crate::exchange::utils::StepFormatter;
+    use kameo::actor::Spawn;
+    use kameo::mailbox;
+    use kameo_actors::pubsub::Subscribe;
+    use kameo_actors::DeliveryStrategy;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    const EX: Exchange = Exchange::Binance;
+    const SYM: &str = "BTC";
+    const CID: &str = "x-test-1";
+
+    /// place_order 的可编程行为：测试注入结果；`gate` 存在时先通知已进入、再等放行
+    /// （用于在 REST 在途期间模拟"WS 回报先到"）。
+    struct FakeClient {
+        result: Mutex<Option<Result<OrderId, ExchangeError>>>,
+        gate: Option<(mpsc::Sender<()>, tokio::sync::Mutex<mpsc::Receiver<()>>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExchangeClient for FakeClient {
+        fn exchange(&self) -> Exchange {
+            EX
+        }
+        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+            if let Some((entered_tx, proceed_rx)) = &self.gate {
+                entered_tx.send(()).await.expect("通知已进入 place_order");
+                proceed_rx.lock().await.recv().await.expect("等待放行");
+            }
+            self.result.lock().unwrap().take().expect("结果只取一次")
+        }
+        async fn cancel_order(&self, _s: &Symbol, _o: &OrderId) -> Result<(), ExchangeError> {
+            unreachable!("place 契约测试不撤单")
+        }
+        async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
+            unreachable!()
+        }
+        async fn fetch_symbol_meta(&self, _s: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+            unreachable!()
+        }
+        async fn fetch_pending_orders(&self, _s: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
+            unreachable!()
+        }
+        async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
+            unreachable!()
+        }
+        async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
+            unreachable!()
+        }
+    }
+
+    /// 收集 income 总线上的回报，供断言"是否发了 Error 回报"
+    struct Sink(Arc<Mutex<Vec<IncomeEvent>>>);
+    impl Actor for Sink {
+        type Args = Arc<Mutex<Vec<IncomeEvent>>>;
+        type Error = Infallible;
+        async fn on_start(a: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(Self(a))
+        }
+    }
+    impl Message<IncomeEvent> for Sink {
+        type Reply = ();
+        async fn handle(&mut self, m: IncomeEvent, _c: &mut Context<Self, Self::Reply>) {
+            self.0.lock().unwrap().push(m);
+        }
+    }
+
+    fn order() -> Order {
+        Order {
+            id: String::new(),
+            exchange: EX,
+            symbol: SYM.to_string(),
+            side: Side::Short,
+            order_type: OrderType::Limit {
+                price: 100.0,
+                tif: TimeInForce::GTC,
+            },
+            quantity: 1.0,
+            reduce_only: true,
+            client_order_id: CID.to_string(),
+        }
+    }
+
+    fn metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
+        Arc::new(HashMap::from([(
+            (EX, SYM.to_string()),
+            SymbolMeta {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                price_formatter: Arc::new(StepFormatter::new(0.1)),
+                size_step: 0.001,
+                min_order_size: 0.001,
+                contract_size: 1.0,
+            },
+        )]))
+    }
+
+    struct Harness {
+        gateway: Arc<OrderGateway>,
+        events: Arc<Mutex<Vec<IncomeEvent>>>,
+    }
+
+    impl Harness {
+        async fn new(client: FakeClient) -> Self {
+            let pubsub = IncomePubSub::spawn_with_mailbox(
+                IncomePubSub::new(DeliveryStrategy::Guaranteed),
+                mailbox::unbounded(),
+            );
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = Sink::spawn_with_mailbox(events.clone(), mailbox::unbounded());
+            pubsub.tell(Subscribe(sink)).send().await.unwrap();
+            let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> =
+                HashMap::from([(EX, Arc::new(client) as Arc<dyn ExchangeClient>)]);
+            let gateway = Arc::new(OrderGateway::new(clients, pubsub, metas(), false));
+            Self { gateway, events }
+        }
+
+        /// 是否发出了 Error 终态回报（策略侧失败闭环）
+        async fn error_reported(&self) -> bool {
+            // 给总线转发留时间
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.events.lock().unwrap().iter().any(|e| {
+                matches!(
+                    &e.data,
+                    ExchangeEventData::OrderUpdate(u)
+                        if matches!(u.status, OrderStatus::Error { .. })
+                )
+            })
+        }
+    }
+
+    /// REST 受理 → Accepted，无失败回报
+    #[tokio::test]
+    async fn rest_accept_is_accepted() {
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(Some(Ok("ex-1".to_string()))),
+            gate: None,
+        })
+        .await;
+        let verdict = h.gateway.place(order(), "t").await;
+        assert_eq!(verdict, Ok(PlaceVerdict::Accepted));
+        assert!(!h.error_reported().await, "受理成功不该发失败回报");
+    }
+
+    /// reduce-only 因仓位已平被拒 → 编排方得"目标已达成"，策略侧照常收 Error 闭环
+    #[tokio::test]
+    async fn reduce_only_closed_is_already_closed() {
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(Some(Err(ExchangeError::OrderRejected(
+                EX,
+                RejectReason::ReduceOnlyClosed,
+            )))),
+            gate: None,
+        })
+        .await;
+        let verdict = h.gateway.place(order(), "t").await;
+        assert_eq!(verdict, Ok(PlaceVerdict::ReduceOnlyAlreadyClosed));
+        assert!(h.error_reported().await, "策略侧仍需 Error 回报清 pending");
+    }
+
+    /// 纯 REST 失败（交易所从未回报）→ Err，且发 Error 回报
+    #[tokio::test]
+    async fn pure_rest_failure_is_err_with_feedback() {
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(Some(Err(ExchangeError::Other("boom".to_string())))),
+            gate: None,
+        })
+        .await;
+        let verdict = h.gateway.place(order(), "t").await;
+        assert!(verdict.is_err(), "真失败必须是 Err: {verdict:?}");
+        assert!(h.error_reported().await, "真失败必须反馈 Error 回报");
+    }
+
+    /// **Critical 回归防线**：REST 在途期间交易所已回报（内容未知，可能是拒单）→
+    /// 结论必须是 `ExchangeSpoke` 而不是"成功"，且不再发假的 Error 回报。
+    /// 降级平仓据此把该腿计入"未完成"，绝不谎报已关闭。
+    #[tokio::test]
+    async fn ws_report_during_rest_flight_is_exchange_spoke_not_success() {
+        let (entered_tx, mut entered_rx) = mpsc::channel(1);
+        let (proceed_tx, proceed_rx) = mpsc::channel(1);
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(Some(Err(ExchangeError::Other("late 503".to_string())))),
+            gate: Some((entered_tx, tokio::sync::Mutex::new(proceed_rx))),
+        })
+        .await;
+
+        let task = tokio::spawn({
+            let gateway = h.gateway.clone();
+            async move { gateway.place(order(), "t").await }
+        });
+        // REST 在途：交易所的回报（此处可能是 Rejected！）先到，作废本地结论
+        entered_rx.recv().await.expect("place_order 已进入");
+        h.gateway.ack(CID);
+        proceed_tx.send(()).await.expect("放行 REST 返回失败");
+
+        let verdict = task.await.expect("task");
+        assert_eq!(
+            verdict,
+            Ok(PlaceVerdict::ExchangeSpoke),
+            "交易所已表态但内容未知 —— 不是成功，也不是可上报的失败"
+        );
+        assert!(
+            !h.error_reported().await,
+            "交易所已回报过，迟到的 REST 失败不该再发假 Error"
         );
     }
 }

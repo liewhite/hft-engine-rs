@@ -14,7 +14,7 @@ use super::{
     GetPositions, IncomeProcessorActor, MetricsActor, MetricsActorArgs, OutcomePubSub,
     OutcomeProcessorActor,
     PositionPollingActor, PositionPollingActorArgs, PositionReconcileActor, PositionReconcileArgs,
-    OrderGateway, RegisterExecutor, RegisterSymbols, UnregisterExecutor,
+    OrderGateway, PlaceVerdict, RegisterExecutor, RegisterSymbols, UnregisterExecutor,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
     DEFAULT_REPORT_INTERVAL_MS,
 };
@@ -939,7 +939,7 @@ impl Actor for ManagerActor {
             income_pubsub.clone(),
             // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
             Arc::new(symbol_metas.clone()),
-            false,
+            /* dry_run */ false,
         ));
         let live_processor = pipeline.spawn::<OutcomeProcessorActor, _>(
             &actor_ref,
@@ -953,7 +953,7 @@ impl Actor for ManagerActor {
             .await
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
         // 出向处理器还要看**交易所回报**，用来作废迟到的 REST 失败结论
-        // （见 OutcomeProcessorActor::in_flight）。只订 OrderUpdate，不吃行情洪水。
+        // （见 OrderGateway::in_flight）。只订 OrderUpdate，不吃行情洪水。
         income_pubsub
             .tell(SubscribeFilter(live_processor, |e: &IncomeEvent| {
                 matches!(e.data, ExchangeEventData::OrderUpdate(_))
@@ -1620,17 +1620,36 @@ impl Message<RemoveStrategies> for ManagerActor {
                 "[DEMOTE] Flattening live position with reduce-only market order"
             );
             // 经**唯一下单出口**下发（缺 meta、残量不足最小可交易量等失败都从这里
-            // 如实返回）。`Ok` 已含两种"目标已达成"情形：reduce-only 因仓位已平被拒、
-            // REST 失败但交易所已回报 —— 见 OrderGateway::place 的返回值契约。
+            // 如实返回），按结构化结论裁断 —— 见 [`PlaceVerdict`]。
             let symbol = pos.symbol.clone();
-            if let Err(reason) = self.order_gateway.place(order, "demote_flatten").await {
-                tracing::error!(
-                    %symbol,
-                    position = pos.size,
-                    %reason,
-                    "平仓下单失败 —— 实盘仍有敞口"
-                );
-                incomplete.push(format!("{symbol}: 平仓下单失败 ({reason})"));
+            match self.order_gateway.place(order, "demote_flatten").await {
+                Ok(PlaceVerdict::Accepted
+                | PlaceVerdict::DryRun
+                | PlaceVerdict::ReduceOnlyAlreadyClosed) => {}
+                // 交易所对平仓单表过态但**内容未知**（可能成交、也可能拒单）。executor
+                // 已撤、回报无人消费，此处无从判定 —— 如实计入未完成（假告警可接受，
+                // 假成功不可接受：谎报已关闭会让 supervisor 置 live=None，敞口无人看管）。
+                // 若实际已成交，supervisor 下个节拍重试 demote 时实例已不在、无仓可平，
+                // 第二轮自然收敛为 Ok。
+                Ok(PlaceVerdict::ExchangeSpoke) => {
+                    tracing::error!(
+                        %symbol,
+                        position = pos.size,
+                        "平仓单已被交易所回报但结论未知（可能已成交也可能被拒），计入未完成待复核"
+                    );
+                    incomplete.push(format!(
+                        "{symbol}: 平仓单结论未知（交易所已回报，REST 失败），需复核"
+                    ));
+                }
+                Err(reason) => {
+                    tracing::error!(
+                        %symbol,
+                        position = pos.size,
+                        %reason,
+                        "平仓下单失败 —— 实盘仍有敞口"
+                    );
+                    incomplete.push(format!("{symbol}: 平仓下单失败 ({reason})"));
+                }
             }
         }
 

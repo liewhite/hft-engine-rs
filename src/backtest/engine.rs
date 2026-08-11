@@ -103,7 +103,8 @@ pub struct BacktestEngine<'a> {
     runners: Vec<StrategyRunner>,
     config: SimConfig,
     /// 市场规则来源，透传给各所柜台（[`SimState`] 在订单到达时校验下界并取整 ——
-    /// 保证实盘必拒的单回测也拒）。与 `StrategyRunner` 持有的是同一张表。
+    /// 保证实盘必拒的单回测也拒）。调用方**应**与 `StrategyRunner` 传同一张表，
+    /// 否则策略侧取整与柜台校验会按两套规则各行其是（bin 侧统一构建一份 Arc）。
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     observers: Vec<Observer<'a>>,
     outcome_observers: Vec<OutcomeObserver<'a>>,
