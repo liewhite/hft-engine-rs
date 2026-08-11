@@ -161,7 +161,7 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
     let sink: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let sink_obs = Rc::clone(&sink);
     let result = {
-        let mut engine = BacktestEngine::new(&source, vec![runner], config)
+        let mut engine = BacktestEngine::new(&source, vec![runner], config, metas())
             .with_observer(move |ev: &IncomeEvent| sink_obs.borrow_mut().push(event_sig(ev)));
         engine.run()
     };
@@ -215,7 +215,7 @@ fn trade_print_matching_fills_resting_limit() {
         initial_balance_usdt: 10_000.0,
         ..SimConfig::default()
     };
-    let mut engine = BacktestEngine::new(&source, vec![runner], config);
+    let mut engine = BacktestEngine::new(&source, vec![runner], config, metas());
     let r = engine.run();
     assert_eq!(r.fills, 1);
     assert_eq!(r.market_events, 3);
@@ -276,7 +276,7 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
     let seen_by_observer: Rc<RefCell<Vec<(usize, f64)>>> = Rc::new(RefCell::new(Vec::new()));
     let obs_sink = Rc::clone(&seen_by_observer);
     {
-        let mut engine = BacktestEngine::new(&source, vec![runner], SimConfig::default())
+        let mut engine = BacktestEngine::new(&source, vec![runner], SimConfig::default(), metas())
             .with_outcome_observer(move |runner_idx, outcome| {
                 if let OutcomeEvent::Emit(c) = outcome {
                     let sig = c.get::<PingSignal>().expect("观察者按类型取回 payload");
@@ -360,7 +360,7 @@ fn inbound_custom_events_route_by_scope() {
             Box::new(SequentialClientOrderIdGen::default()),
         ),
     ];
-    BacktestEngine::new(&source, runners, SimConfig::default()).run();
+    BacktestEngine::new(&source, runners, SimConfig::default(), metas()).run();
     assert_eq!(
         *seen_btc.lock().unwrap(),
         vec!["btc", "all"],

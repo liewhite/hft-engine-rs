@@ -13,13 +13,14 @@
 //! accountRefresh)，并在首个事件时先投递一次初始净值，否则依赖净值的策略不会动作。
 
 use crate::backtest::source::MarketDataSource;
-use crate::domain::{Exchange, Order, OrderId, Price, Symbol, Timestamp};
+use crate::domain::{Exchange, Order, OrderId, Price, Symbol, SymbolMeta, Timestamp};
 use crate::engine::StrategyRunner;
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::sync::Arc;
 
 /// 回测结束时的一笔持仓：数量取自账本，均价与浮盈是**本地记账**的结果
 /// （域模型 [`Position`] 只有数量，见其文档）。
@@ -101,6 +102,9 @@ pub struct BacktestEngine<'a> {
     source: &'a dyn MarketDataSource,
     runners: Vec<StrategyRunner>,
     config: SimConfig,
+    /// 市场规则来源，透传给各所柜台（[`SimState`] 在订单到达时校验下界并取整 ——
+    /// 保证实盘必拒的单回测也拒）。与 `StrategyRunner` 持有的是同一张表。
+    symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     observers: Vec<Observer<'a>>,
     outcome_observers: Vec<OutcomeObserver<'a>>,
     clock_interval_ms: u64,
@@ -123,11 +127,13 @@ impl<'a> BacktestEngine<'a> {
         source: &'a dyn MarketDataSource,
         runners: Vec<StrategyRunner>,
         config: SimConfig,
+        symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     ) -> Self {
         Self {
             source,
             runners,
             config,
+            symbol_metas,
             observers: Vec::new(),
             outcome_observers: Vec::new(),
             clock_interval_ms: 1000,
@@ -300,6 +306,7 @@ impl<'a> BacktestEngine<'a> {
                 self.config.initial_balance_usdt,
                 self.config.maker_fee_rate,
                 self.config.taker_fee_rate,
+                self.symbol_metas.clone(),
             ),
         );
         let info = self.account_info_event(exchange, self.now);

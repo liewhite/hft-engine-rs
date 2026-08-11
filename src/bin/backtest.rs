@@ -148,10 +148,12 @@ fn main() -> anyhow::Result<()> {
     let metas_vec = tokio::runtime::Runtime::new()?
         .block_on(client.fetch_all_symbol_metas())
         .map_err(|e| anyhow::anyhow!("fetch symbol metas: {e}"))?;
-    let symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta> = metas_vec
-        .into_iter()
-        .map(|m| ((m.exchange, m.symbol.clone()), m))
-        .collect();
+    let symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> = Arc::new(
+        metas_vec
+            .into_iter()
+            .map(|m| ((m.exchange, m.symbol.clone()), m))
+            .collect(),
+    );
 
     let source = BinanceHistory::source(
         std::slice::from_ref(&symbol),
@@ -174,7 +176,7 @@ fn main() -> anyhow::Result<()> {
     // 回测用确定性 id 生成器 -> 同一输入同一逐笔回报序列
     let runner = StrategyRunner::with_id_gen(
         Box::new(strategy),
-        Arc::new(symbol_metas),
+        symbol_metas.clone(),
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {
@@ -184,7 +186,7 @@ fn main() -> anyhow::Result<()> {
         ..SimConfig::default()
     };
 
-    let mut engine = BacktestEngine::new(source.as_ref(), vec![runner], config);
+    let mut engine = BacktestEngine::new(source.as_ref(), vec![runner], config, symbol_metas);
     let result = engine.run();
 
     println!("==================== Backtest Result ====================");

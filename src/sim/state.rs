@@ -1,12 +1,13 @@
 use crate::domain::{
     Exchange, Fill, MarketTrade, Order, OrderId, OrderType, OrderUpdate, OrderStatus, Position,
-    Price, Quantity, Side, Symbol, TimeInForce, Timestamp, BBO,
+    Price, Quantity, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
 };
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::sim::ledger::Ledger;
 use crate::sim::matcher;
 use indexmap::IndexMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// 成交的流动性角色：maker (resting 单被越价成交) / taker (到达即吃单成交)，决定手续费率。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,10 +84,21 @@ pub struct SimState {
     pub last_trade: HashMap<Symbol, f64>,
     pub maker_fee_rate: f64,
     pub taker_fee_rate: f64,
+    /// 市场规则来源（下界校验 + 数量取整）。柜台像真实交易所一样强制执行市场规则 ——
+    /// 这是三条驱动（实盘出口 / 模拟盘 / 回测）共享的唯一校验点安放处，见
+    /// [`Self::on_order_arrived`]。键含 Exchange 只为与调用方（回测引擎、模拟柜台）持有的
+    /// 全量表同形，免去每所过滤一份的转换；查询一律用 `self.exchange`。
+    symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
 }
 
 impl SimState {
-    pub fn empty(exchange: Exchange, cash: f64, maker_fee_rate: f64, taker_fee_rate: f64) -> Self {
+    pub fn empty(
+        exchange: Exchange,
+        cash: f64,
+        maker_fee_rate: f64,
+        taker_fee_rate: f64,
+        symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+    ) -> Self {
         Self {
             exchange,
             ledger: Ledger::empty(cash),
@@ -96,6 +108,7 @@ impl SimState {
             last_trade: HashMap::new(),
             maker_fee_rate,
             taker_fee_rate,
+            symbol_metas,
         }
     }
 
@@ -255,6 +268,15 @@ impl SimState {
     ///
     /// 回报时间戳一律用到达时刻 `now`：此前有盘口时取"最后一条 BBO 的 ts"，行情停推时
     /// 订单回报的时间被冻在过去，订单超时判定（按回报时间起算）随之失效。
+    ///
+    /// # 市场规则在柜台强制执行（与真实交易所一致）
+    ///
+    /// 数量下界（取整为 0 / 低于 `min_order_size`）与精度取整在此校验，规则出处是
+    /// [`SymbolMeta::checked_exchange_qty`] —— 与实盘出口
+    /// [`crate::exchange::ExchangeOrder::from_domain`] 同一个函数。这保证**实盘必拒的单，
+    /// 模拟盘与回测也拒**；此前回测路径没有这道校验，小额残单在回测里照常成交、
+    /// 实盘却被拒 —— 回测调好的参数上线即漂移。缺 SymbolMeta 同样拒单（真实交易所
+    /// 不存在"没有元数据的合约"，缺失属装配错误，应当刺眼）。
     pub fn on_order_arrived(
         &mut self,
         now: Timestamp,
@@ -280,6 +302,33 @@ impl SimState {
                 now,
             )];
         }
+        // 市场规则校验 + 按交易所精度向下取整（策略请求 0.0016 而 step=0.001 时，
+        // 实盘只会成交 0.001，柜台必须同量 —— 否则模拟盘每单多成交至多一个 step）
+        let key = (self.exchange, order.symbol.clone());
+        let checked = match self.symbol_metas.get(&key) {
+            None => Err(format!(
+                "no SymbolMeta for {}/{}",
+                order.exchange, order.symbol
+            )),
+            Some(meta) => meta
+                .checked_exchange_qty(order.quantity)
+                .map(|_| meta.round_coin_size_down(order.quantity)),
+        };
+        let order = &match checked {
+            Ok(quantity) => Order {
+                quantity,
+                ..order.clone()
+            },
+            Err(reason) => {
+                return vec![status_event(
+                    self.exchange,
+                    order,
+                    order_id,
+                    OrderStatus::Rejected { reason },
+                    now,
+                )];
+            }
+        };
         // taker 参考价：对手价 > 最新成交价；两者皆无 = 无从判定可成交性
         let reference: Option<Price> = match self.last_bbo.get(&order.symbol) {
             Some(b) => Some(matcher::touch_price(order.side, b)),
@@ -565,8 +614,23 @@ mod tests {
     fn sym() -> Symbol {
         "BTCUSDT".to_string()
     }
+    /// 测试元数据：步长/最小量取得足够小，既有测试的数量不触发下界校验
+    fn test_metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
+        use crate::exchange::utils::StepFormatter;
+        Arc::new(HashMap::from([(
+            (EX, sym()),
+            SymbolMeta {
+                exchange: EX,
+                symbol: sym(),
+                price_formatter: Arc::new(StepFormatter::new(0.001)),
+                size_step: 0.001,
+                min_order_size: 0.001,
+                contract_size: 1.0,
+            },
+        )]))
+    }
     fn empty() -> SimState {
-        SimState::empty(EX, 10_000.0, 0.0, 0.0)
+        SimState::empty(EX, 10_000.0, 0.0, 0.0, test_metas())
     }
 
     fn bbo(bid: Price, ask: Price, ts: Timestamp) -> BBO {
@@ -846,6 +910,62 @@ mod tests {
         assert!(s.resting.is_empty());
     }
 
+    // ===== 市场规则校验（与实盘出口同一规则出处 checked_exchange_qty） =====
+
+    /// **实盘必拒的单，柜台也拒**：不足一个 size_step 的量拒单（Rejected 终态），绝不入簿。
+    /// 此前回测路径没有这道校验 —— 小额残单回测照常成交、实盘被拒，参数上线即漂移。
+    #[test]
+    fn undersized_order_is_rejected_not_matched() {
+        let mut s = empty();
+        s.on_market(&market_ev(bbo(100.0, 100.1, 1)));
+        let mut o = limit(Side::Long, 99.0, TimeInForce::GTC, "b1");
+        o.quantity = 0.0004; // < size_step 0.001
+        let evs = s.on_order_arrived(1, &o, &"1".to_string());
+        assert!(
+            statuses(&evs).iter().any(|st| matches!(st, OrderStatus::Rejected { .. })),
+            "低于下界必须拒单: {:?}",
+            statuses(&evs)
+        );
+        assert!(s.resting.is_empty(), "未通过校验的单不得入簿");
+        // 即使成交穿价也不得成交
+        let evs = s.on_market(&trade_ev(98.0, 2));
+        assert!(fills(&evs).is_empty());
+    }
+
+    /// 缺 SymbolMeta 拒单：真实交易所不存在"没有元数据的合约"，缺失属装配错误
+    #[test]
+    fn missing_symbol_meta_is_rejected() {
+        let mut s = empty();
+        s.on_market(&market_ev(bbo(100.0, 100.1, 1)));
+        let mut o = limit(Side::Long, 99.0, TimeInForce::GTC, "b1");
+        o.symbol = "UNKNOWN".to_string();
+        // 行情键按 symbol，先喂一条该 symbol 的行情以免"无参考价"干扰判定
+        let evs = s.on_order_arrived(1, &o, &"1".to_string());
+        assert!(
+            statuses(&evs)
+                .iter()
+                .any(|st| matches!(st, OrderStatus::Rejected { reason } if reason.contains("SymbolMeta"))),
+            "缺元数据必须拒单并指明原因: {:?}",
+            statuses(&evs)
+        );
+    }
+
+    /// 数量按交易所精度**向下取整**后撮合：策略请求 0.0016 而 step=0.001 时，
+    /// 实盘只会成交 0.001，柜台必须同量
+    #[test]
+    fn quantity_is_rounded_down_before_matching() {
+        let mut s = empty();
+        s.on_market(&market_ev(bbo(100.0, 100.1, 1)));
+        let mut o = limit(Side::Long, 100.5, TimeInForce::GTC, "b1"); // 穿价 taker
+        o.quantity = 0.0016;
+        let evs = s.on_order_arrived(1, &o, &"1".to_string());
+        assert_eq!(
+            fills(&evs).iter().map(|f| f.size).collect::<Vec<_>>(),
+            vec![0.001],
+            "应按取整后的量成交"
+        );
+    }
+
     /// 喂错所的订单是路由 bug：拒单，不按本所行情撮合
     #[test]
     fn order_for_another_exchange_is_rejected() {
@@ -895,7 +1015,7 @@ mod tests {
     /// 下一笔 print 按 limit 价收 maker 费（价格与流动性角色双错）
     #[test]
     fn deep_crossing_gtc_fills_as_taker_at_reference_price() {
-        let mut s = SimState::empty(EX, 10_000.0, 0.0, 0.002);
+        let mut s = SimState::empty(EX, 10_000.0, 0.0, 0.002, test_metas());
         s.on_market(&trade_ev(100.0, 1));
         // 买单限价 110 远高于市价 100：应立即以 100 成交、按 taker 计费
         let evs = s.on_order_arrived(2, &limit(Side::Long, 110.0, TimeInForce::GTC, "b1"), &"1".to_string());
@@ -922,7 +1042,7 @@ mod tests {
 
     #[test]
     fn taker_fee_charged() {
-        let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002);
+        let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002, test_metas());
         s.on_market(&market_ev(bbo(100.0, 100.0, 1)));
         let mut o = limit(Side::Long, 0.0, TimeInForce::GTC, "o1");
         o.order_type = OrderType::Market;
@@ -934,7 +1054,7 @@ mod tests {
 
     #[test]
     fn maker_fee_charged() {
-        let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002);
+        let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002, test_metas());
         s.on_market(&market_ev(bbo(100.0, 100.0, 1)));
         let mut o = limit(Side::Long, 99.0, TimeInForce::GTC, "o1");
         o.quantity = 2.0;

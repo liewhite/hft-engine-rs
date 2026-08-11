@@ -31,8 +31,7 @@
 //! 净值在收到 Clock 时按各自的所发布 AccountInfo。
 
 use crate::domain::{
-    now_ms, AccountId, Exchange, Order, OrderId, OrderStatus, OrderUpdate, Symbol, SymbolMeta,
-    Timestamp, BBO,
+    now_ms, AccountId, Exchange, Order, OrderId, Symbol, SymbolMeta, Timestamp, BBO,
 };
 use crate::messaging::{ExchangeEventData, IncomeEvent};
 use crate::sim::{SimConfig, SimState};
@@ -53,8 +52,7 @@ pub struct PaperCounterArgs {
     pub paper_pubsub: ActorRef<PaperPubSub>,
     /// 撮合与账本配置（每个模拟账户各自按此初始化）
     pub config: SimConfig,
-    /// Symbol 元数据：下单量下界校验（与实盘出口同一规则，见
-    /// [`SymbolMeta::checked_exchange_qty`]）
+    /// Symbol 元数据：透传给各柜台的 [`SimState`]（市场规则校验在那里统一执行）
     pub symbol_metas: std::sync::Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
 }
 
@@ -84,7 +82,7 @@ pub struct PaperCounterActor {
     last_quotes: HashMap<(Exchange, Symbol), BBO>,
     paper_pubsub: ActorRef<PaperPubSub>,
     config: SimConfig,
-    /// 下单量下界校验用（与实盘出口同一规则）
+    /// 透传给各柜台 SimState（市场规则校验在状态机内统一执行）
     symbol_metas: std::sync::Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 本地订单号发号器（模拟交易所返回的 order_id）
     order_id_gen: u64,
@@ -129,6 +127,7 @@ impl PaperCounterActor {
                 self.config.initial_balance_usdt,
                 self.config.maker_fee_rate,
                 self.config.taker_fee_rate,
+                self.symbol_metas.clone(),
             );
             for ((ex, _), bbo) in &self.last_quotes {
                 if *ex == exchange {
@@ -168,32 +167,6 @@ impl PaperCounterActor {
             if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
                 tracing::error!(error = %e, "Paper counter failed to publish account info");
             }
-        }
-    }
-
-    /// 校验失败的拒单回报（Error 终态，清除策略侧 pending），与实盘
-    /// OutcomeProcessor::send_order_error 同语义。
-    async fn publish_order_error(&self, account: &AccountId, order: &Order, reason: String) {
-        let ts = now_ms();
-        let update = OrderUpdate {
-            order_id: String::new(),
-            client_order_id: Some(order.client_order_id.clone()),
-            exchange: order.exchange,
-            symbol: order.symbol.clone(),
-            side: order.side,
-            status: OrderStatus::Error { reason },
-            quantity: order.quantity,
-        };
-        let tagged = AccountIncome {
-            account: account.clone(),
-            event: IncomeEvent {
-                exchange_ts: ts,
-                local_ts: ts,
-                data: ExchangeEventData::OrderUpdate(update),
-            },
-        };
-        if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
-            tracing::error!(error = %e, "Paper counter failed to publish order error");
         }
     }
 
@@ -329,40 +302,9 @@ impl Message<AccountOutcome> for PaperCounterActor {
             OutcomeEvent::Emit(_) => {}
             OutcomeEvent::PlaceOrders { orders, comment } => {
                 for order in orders {
-                    // 与实盘出口同一套下界校验（checked_exchange_qty 是唯一出处）：
-                    // 实盘必拒的单（取整为 0 / 低于最小下单量 / 缺 meta）模拟盘也拒，
-                    // 否则模拟盘会成交实盘发不出去的单，仿真失真。
-                    // 校验通过后按交易所精度**向下取整**再下发（与 from_domain 行为
-                    // 一致）：策略请求 0.0016 而 step=0.001 时实盘只成交 0.001，柜台
-                    // 必须同量 —— 丢弃取整结果会让模拟盘每单多成交至多一个 step。
-                    let rounded = match self
-                        .symbol_metas
-                        .get(&(order.exchange, order.symbol.clone()))
-                    {
-                        None => Err(format!(
-                            "no SymbolMeta for {}/{}",
-                            order.exchange, order.symbol
-                        )),
-                        Some(meta) => meta
-                            .checked_exchange_qty(order.quantity)
-                            .map(|_| meta.round_coin_size_down(order.quantity)),
-                    };
-                    let order = match rounded {
-                        Ok(quantity) => Order { quantity, ..order },
-                        Err(reason) => {
-                            tracing::error!(
-                                %account,
-                                exchange = %order.exchange,
-                                symbol = %order.symbol,
-                                quantity = order.quantity,
-                                client_order_id = %order.client_order_id,
-                                %reason,
-                                "[PAPER] 订单未通过出向校验，拒单"
-                            );
-                            self.publish_order_error(&account, &order, reason).await;
-                            continue;
-                        }
-                    };
+                    // 市场规则校验（下界 + 取整）不在此处：柜台状态机 SimState 在订单
+                    // 到达时统一执行（与实盘出口同一规则出处 checked_exchange_qty），
+                    // 校验失败以 Rejected 终态回报 —— 回测与模拟盘因此天然同规。
                     let order_id = self.next_order_id();
                     tracing::info!(
                         %account,
@@ -755,8 +697,8 @@ mod tests {
     }
 
     /// **与实盘同规则的下界校验**：实盘必拒的单（不足一个 size_step）模拟盘也拒，
-    /// 以 Error 终态回报（清策略侧 pending），绝不入簿成交 —— 否则模拟盘会成交
-    /// 实盘发不出去的单，仿真失真
+    /// 以 Rejected 终态回报（清策略侧 pending），绝不入簿成交 —— 否则模拟盘会成交
+    /// 实盘发不出去的单，仿真失真。校验由柜台状态机 SimState 统一执行（回测同一份）。
     #[tokio::test]
     async fn undersized_order_is_rejected_like_live() {
         let h = Harness::new(0).await;
@@ -767,8 +709,8 @@ mod tests {
         assert!(
             h.statuses()
                 .iter()
-                .any(|st| matches!(st, OrderStatus::Error { .. })),
-            "校验失败必须以 Error 终态回报: {:?}",
+                .any(|st| matches!(st, OrderStatus::Rejected { .. })),
+            "校验失败必须以 Rejected 终态回报: {:?}",
             h.statuses()
         );
         // 即使成交穿价，也不该有成交（单没入簿）
