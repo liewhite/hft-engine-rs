@@ -32,7 +32,7 @@ const EXECUTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 投产期订阅可行性校验（纯函数，供单测）。
 ///
 /// 逐条检查策略声明的 (exchange, kind)：交易所未配置（不在 `capabilities` 里）、适配层
-/// 不支持该 kind（能力函数由各适配层提供、随 [`ExchangeSetup`] 携带）、或该 symbol
+/// 不支持该 kind（能力函数由各适配层提供、随 [`crate::engine::live::assembly::ExchangeSetup`] 携带）、或该 symbol
 /// **没有 SymbolMeta**，都返回 Err。一次性汇总全部问题，不在第一条就停 —— 让策略作者
 /// 一次看全。
 ///

@@ -46,13 +46,9 @@ pub(crate) type SpawnFuture = std::pin::Pin<
     >,
 >;
 
-/// 单个交易所的装配产物。
+/// 单个交易所的装配产物（两阶段划分的理由见模块文档）。
 ///
-/// 装配天然分两阶段：**建 client** 必须先于 symbol metas 预加载（预加载要用它），
-/// **spawn WS actor 集**必须后于预加载（actor 要用 metas）。每所把两阶段封进一个
-/// `setup_*` 函数：阶段 1 立即执行产出 client，阶段 2 以闭包延迟到 metas 就绪。
-///
-/// **加一个新交易所只需**：本文件写一个 `setup_*`、bin 的装配处加一行 push ——
+/// **加一个新交易所只需**：本文件写一个 `setup_*`、各 bin 的装配处加一行 push ——
 /// manager 对"有哪些所"彻底无知（`ManagerActorArgs` 收 `Vec<ExchangeSetup>`）。
 pub struct ExchangeSetup {
     pub(crate) exchange: Exchange,

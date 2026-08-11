@@ -111,8 +111,10 @@ OutcomeBus : executor ──→ 两种柜台按账户认领（实盘出口 / 本
 
 - `setup_*` 迁至各交易所模块；`ManagerActorArgs { exchanges: Vec<ExchangeSetup>, paper }`，
   bin 侧组装。**加新交易所 = 新增 exchange 模块 + bin 里一行**，manager 零改动。
-- `supports_subscription` 的集中 match 删除，下放为 `ExchangeActorOps::supports(kind)`
-  ——能力知识回到各适配层自己手里。
+- `supports_subscription` 的集中 match 删除，能力知识下放各适配层。
+  **实做偏离**：不是 `ExchangeActorOps::supports(kind)`（trait 方法要 actor 实例），而是
+  各所模块的 `pub fn supports_subscription` + `ExchangeSetup.supports` fn 指针 —— 能力是
+  适配层的静态属性，测试无需 spawn actor 即可用生产同款函数。不要按原计划"改回去"。
 - `manager.rs` 拆为 `assembly` / `provisioning` / `api` 子模块。**不新增 actor**：
   投产编排必须经同一邮箱串行化，这正是 actor 的用途；瘦的是文件与职责边界，不是拆邮箱。
 
@@ -184,7 +186,11 @@ metas；删 `paper_counter.rs` 预校验。
 
 ### 阶段 5：Manager 瘦身与装配收敛（~1 天）
 按 1.5 实施。无行为变化，纯结构迁移。
-**验收**：各 bin 启动路径不变；`manager.rs` 主文件 < 500 行。
+**验收**：各 bin 启动路径不变；manager 拆为 mod.rs（823 行，含订阅门面与 90 行测试）+
+provisioning.rs —— 原定"< 500 行 / 三个子模块"改为两文件方案：订阅门面消息与
+"总线持有者"职责同体，再拆第三个文件只挪行数不清边界。
+**后续可选**：三个 bin 的装配块（`if let Some → push` × 3 所）与同构的 `ExchangesConfig`
+可提为 assembly.rs 里的 `ExchangesConfig::assemble()`，加新加密所时不必改三个 bin。
 
 ### 阶段 6：后续（另行排期，不在本轮）
 - MarketBus conflation：状态类事件（BBO/Mark/AccountInfo）最新值语义 + 合并计数指标，
