@@ -82,14 +82,16 @@ async fn test_okx_greeks_push() {
 
     let credentials = get_credentials().expect("需要设置 OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE");
 
+    let okx = hft_engine_rs::engine::setup_okx(ExchangeAccess {
+        quote: TEST_QUOTE.to_string(),
+        dex: String::new(),
+        credentials: Some(credentials),
+    })
+    .expect("装配 OKX");
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
-            ibkr_snapshot: None,
+            exchanges: vec![okx],
             paper: Default::default(),
-            binance: None,
-            okx: Some(ExchangeAccess { quote: TEST_QUOTE.to_string(), dex: String::new(), credentials: Some(credentials) }),
-            hyperliquid: None,
-            ibkr_credentials: None,
         },
         mailbox::unbounded(),
     );

@@ -38,3 +38,12 @@ impl OkxCredentials {
         general_purpose::STANDARD.encode(result.into_bytes())
     }
 }
+
+/// 本所适配层是否实现了这种公共订阅（**能力查询**，装配期由 `ExchangeSetup` 携带）。
+///
+/// 派生自 public WS 的 kind 映射函数；一个手写例外并注明依据：Candle 不在 public 线的
+/// `kind_to_arg` 里 —— 由 business WS 承接（见 `actor::business_ws`），故显式补真。
+pub fn supports_subscription(kind: &crate::exchange::SubscriptionKind) -> bool {
+    actor::public_ws::kind_to_arg(kind, "USDT").is_some()
+        || matches!(kind, crate::exchange::SubscriptionKind::Candle { .. })
+}

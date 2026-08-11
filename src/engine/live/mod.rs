@@ -2,6 +2,7 @@
 //!
 //! 包含引擎中各个 Actor 的实现
 
+pub mod assembly;
 mod clock;
 mod crypto_status;
 mod manager;
@@ -42,6 +43,7 @@ pub struct AccountOutcome {
 /// Outcome 事件的 PubSub Actor 类型
 pub type OutcomePubSub = PubSub<AccountOutcome>;
 
+pub use assembly::{setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup};
 pub use clock::{ClockActor, ClockActorArgs};
 pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
 pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, PublishCustomEvent, RegisterSupervisedChild, SubscribeAccount, SubscribeMarket, SubscribeOutcome, StrategySpec, RemoveStrategies};

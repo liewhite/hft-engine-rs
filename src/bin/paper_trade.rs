@@ -28,6 +28,7 @@ use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::engine::{
     init_tracing, load_config, wait_for_shutdown, AddStrategies, ManagerActor, ManagerActorArgs,
+    setup_binance, setup_hyperliquid, setup_okx,
     StrategySpec,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
@@ -157,13 +158,21 @@ async fn main() -> anyhow::Result<()> {
         "PAPER TRADING — 订单只落本地柜台，不会发往任何交易所"
     );
 
+    // 装配参与的交易所（缺省即该所不参与）—— manager 对"有哪些所"无知
+    let mut exchanges = Vec::new();
+    if let Some(access) = config.exchanges.binance.clone() {
+        exchanges.push(setup_binance(access)?);
+    }
+    if let Some(access) = config.exchanges.okx.clone() {
+        exchanges.push(setup_okx(access)?);
+    }
+    if let Some(access) = config.exchanges.hyperliquid.clone() {
+        exchanges.push(setup_hyperliquid(access)?);
+    }
+
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
-            binance: config.exchanges.binance.clone(),
-            okx: config.exchanges.okx.clone(),
-            hyperliquid: config.exchanges.hyperliquid.clone(),
-            ibkr_credentials: None,
-            ibkr_snapshot: None,
+            exchanges,
             paper: config.paper,
         },
         mailbox::unbounded(),
