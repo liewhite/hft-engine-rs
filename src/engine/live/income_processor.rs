@@ -66,10 +66,7 @@ impl IncomeProcessorActor {
         }
     }
 
-    async fn forward(&self, id: ActorId, event: &IncomeEvent) {
-        let Some(sub) = self.executors.get(&id) else {
-            return;
-        };
+    async fn forward(sub: &ExecutorSubscription, event: &IncomeEvent) {
         if let Err(e) = sub.executor.tell(event.clone()).send().await {
             tracing::error!(error = %e, "Failed to forward event to executor");
         }
@@ -116,6 +113,10 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let actor_id = msg.executor.id();
+        // 幂等：同一 executor 重复注册时先摘净旧索引 —— 否则 by_symbol/by_account 里
+        // 出现重复 id，每条事件双份投递、Fill 双计仓位（危险侧、静默）。今天注册点单一
+        // 且 ActorId 唯一，但这不该是巧合保护，而是结构保证。
+        self.remove_from_indexes(actor_id);
 
         // 从 subscriptions 提取 (exchange, symbol) 集合
         let symbols: HashSet<(Exchange, Symbol)> = msg
@@ -160,18 +161,19 @@ impl Message<MarketEvent> for IncomeProcessorActor {
         let event = IncomeEvent::Market(msg);
         match event.routing() {
             Some(key) => {
-                // 定向：索引 O(1)。clone id 列表以避免借用冲突（列表很短）
+                // 定向：索引 O(1)
                 if let Some(ids) = self.by_symbol.get(&key) {
-                    for id in ids.clone() {
-                        self.forward(id, &event).await;
+                    for id in ids {
+                        if let Some(sub) = self.executors.get(id) {
+                            Self::forward(sub, &event).await;
+                        }
                     }
                 }
             }
             None => {
                 // 广播（Clock / ExchangeStatus / 无 scope 的 Custom）
-                let ids: Vec<ActorId> = self.executors.keys().copied().collect();
-                for id in ids {
-                    self.forward(id, &event).await;
+                for sub in self.executors.values() {
+                    Self::forward(sub, &event).await;
                 }
             }
         }
@@ -194,17 +196,29 @@ impl Message<AccountEvent> for IncomeProcessorActor {
             return;
         };
         let routing = event.routing();
-        for id in ids.clone() {
+        for id in ids {
+            let Some(sub) = self.executors.get(id) else {
+                continue;
+            };
             if let Some(key) = &routing {
-                let subscribed = self
-                    .executors
-                    .get(&id)
-                    .is_some_and(|sub| sub.symbols.contains(key));
-                if !subscribed {
+                if !sub.symbols.contains(key) {
+                    // 该账户的私有事件、但 executor 没订这个 symbol。
+                    // - Live：分桶部署的常态（账户级全量私有流含其他桶的 symbol），静默跳过；
+                    // - Paper：柜台只为本进程策略的订单产回报，被过滤即异常 —— 策略对未订阅
+                    //   symbol 下了单，回报回不来，订单会停在 Created、超时清理后反复重挂。
+                    //   丢弃点必须可见。
+                    if account != AccountId::Live {
+                        tracing::warn!(
+                            %account,
+                            exchange = %key.0,
+                            symbol = %key.1,
+                            "模拟账户的私有回报被 symbol 订阅过滤丢弃 —— 策略在未订阅的 symbol 上下了单？"
+                        );
+                    }
                     continue;
                 }
             }
-            self.forward(id, &event).await;
+            Self::forward(sub, &event).await;
         }
     }
 }

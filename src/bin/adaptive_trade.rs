@@ -280,7 +280,9 @@ async fn main() -> anyhow::Result<()> {
     // 行情总线给 Clock 节拍；账户总线一次订阅覆盖实盘与全部模拟账户的成交
     // （账户由事件自带标签区分，见 AccountEvent）
     manager
-        .tell(SubscribeMarket::all(supervisor.clone()))
+        .tell(SubscribeMarket::only(supervisor.clone(), |e| {
+            matches!(e.data, MarketData::Clock)
+        }))
         .send()
         .await
         .context("订阅行情总线失败")?;
