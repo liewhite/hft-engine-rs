@@ -1,6 +1,12 @@
 use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, OrderType, Position, Side, Symbol, Timestamp, TimeInForce, BBO};
-use crate::messaging::event::{ExchangeEventData, IncomeEvent};
-use std::collections::HashMap;
+use crate::messaging::event::{AccountData, AccountEvent, IncomeEvent, MarketData};
+use std::collections::{HashMap, VecDeque};
+
+/// 记住多少个最近到达**权威终态**的订单号（见 [`SymbolState::recent_terminal`]）。
+///
+/// 只需覆盖"终态回报"与"迟到的非终态回报"之间的重排窗口 —— 那是跨投递路径的秒级错位，
+/// 512 远够用；环形淘汰让长会话下的内存有界。
+const TERMINAL_MEMORY: usize = 512;
 
 /// 待处理订单信息（保存完整订单 + 运行时状态）
 #[derive(Debug, Clone)]
@@ -42,6 +48,21 @@ pub struct SymbolState {
     pub positions: HashMap<Exchange, Position>,
     /// 待处理订单 (以 client_order_id 为 key)
     pending_orders: HashMap<String, PendingOrder>,
+    /// 已到达**权威终态**的 client_order_id 环形记录（容量 [`TERMINAL_MEMORY`]）。
+    ///
+    /// 用途只有一个：拦住"迟到的非终态回报把已结束的订单复活成**永久** pending"
+    /// （见 [`Self::apply_account_data`] 的重建分支）。
+    ///
+    /// 只记权威终态 —— `Filled`/`Cancelled`/`Rejected`，即交易所说的、或撤单后复查确认
+    /// 订单已不在挂单列表时合成的。**不记 `Error`**：那是本地 REST 调用的结论
+    /// （见 `crate::engine::OrderGateway`），订单可能实际活在交易所上，此时让随后到达的
+    /// 真实确认把它重新纳入跟踪正是我们要的。
+    recent_terminal: VecDeque<String>,
+    /// 各所持仓基线的**快照请求时刻**（见 [`Self::seed_position`]）。
+    ///
+    /// 兼作"该所已播种"的判据：在表内 = 基线已写入，Fill 按时刻过滤后累加；
+    /// 不在表内 = 从 0 起算（模拟账户、以及未配置凭证的所）。
+    position_seeded_at: HashMap<Exchange, Timestamp>,
 }
 
 impl SymbolState {
@@ -54,7 +75,86 @@ impl SymbolState {
             index_prices: HashMap::new(),
             positions: HashMap::new(),
             pending_orders: HashMap::new(),
+            recent_terminal: VecDeque::new(),
+            position_seeded_at: HashMap::new(),
         }
+    }
+
+    /// 记下一个到达权威终态的订单号（环形淘汰，见 [`Self::recent_terminal`]）
+    fn remember_terminal(&mut self, client_order_id: &str) {
+        if self.recent_terminal.len() >= TERMINAL_MEMORY {
+            self.recent_terminal.pop_front();
+        }
+        self.recent_terminal.push_back(client_order_id.to_string());
+    }
+
+    /// 写入持仓**基线**（投产握手的载荷，不是事件 —— 见 [`crate::messaging::PositionBaseline`]）。
+    ///
+    /// 持仓维护模型：**一次性基线 + 之后全程由 Fill 累加**。基线只能写一次，因为快照与
+    /// 实时 Fill 流之间存在竞态：快照可能已含某笔成交，其 Fill 稍后才到 —— 若覆写后再叠加
+    /// 就会重复计算。为此：
+    ///
+    /// - `snapshot_req_ts` 是 REST 快照的**请求**时刻。在此之前送达（`local_ts <=`）的
+    ///   Fill 必已含在快照里，seed 之后到达时被 [`Self::apply`] 的 Fill 分支丢弃 ——
+    ///   这条过滤规则对所有基线消费者（executor、对账镜像、观测镜像）同一份。
+    /// - 同一所第二次 seed **静默跳过**并返回 `false`：镜像在每次投产注册时都会收到
+    ///   该批 symbol 的基线（降级后再晋升会重复），首次写入后的重复是流程的正常形态。
+    ///   （历史上"重复基线 = 违约"针对的是总线上适配层乱发；基线退出事件流后，
+    ///   seed 只能来自投产握手，违约面已不存在。）
+    ///
+    /// # 如实声明的残余窗口（没有交易所侧序号无法根除）
+    ///
+    /// - 成交发生在快照**之前**（已含在快照）、Fill 在快照请求之后才送达
+    ///   （`local_ts > snapshot_req_ts`）—— 会双计，窗口 = 交易所撮合到 Fill 送达的时延。
+    /// - 再晋升时新 executor 用**新**快照 seed 而镜像沿用旧账本：新快照到注册完成之间的
+    ///   外部成交会造成 executor 与镜像分歧且对账不可见（见 `activate_executors` 的
+    ///   窗口清单）。
+    ///
+    /// 都只可能来自投产瞬间的外部/手动成交，与旧的总线投递方案等宽。
+    pub fn seed_position(&mut self, position: &Position, snapshot_req_ts: Timestamp) -> bool {
+        match self.position_seeded_at.get(&position.exchange) {
+            Some(_) => {
+                tracing::debug!(
+                    symbol = %self.symbol,
+                    exchange = %position.exchange,
+                    incoming_size = position.size,
+                    "持仓基线已存在，跳过重复 seed（再晋升时的正常形态）"
+                );
+                false
+            }
+            None => {
+                // 覆写"未 seed 但已被 Fill 累加出的仓位"是合法的（快照权威；可达场景：
+                // 前一批策略只订了别的所、本所的外部 Fill 已按 symbol 进入镜像累加），
+                // 但覆写非零值必须可见 —— 静默覆写会掩盖"累加值与快照不一致"的线索。
+                if let Some(existing) = self.positions.get(&position.exchange) {
+                    if !existing.is_empty() {
+                        tracing::warn!(
+                            symbol = %self.symbol,
+                            exchange = %position.exchange,
+                            accumulated_size = existing.size,
+                            snapshot_size = position.size,
+                            "seed 覆写了此前由 Fill 累加出的非零仓位（快照权威）"
+                        );
+                    }
+                }
+                tracing::info!(
+                    symbol = %self.symbol,
+                    exchange = %position.exchange,
+                    size = position.size,
+                    snapshot_req_ts,
+                    "Position baseline seeded"
+                );
+                self.position_seeded_at
+                    .insert(position.exchange, snapshot_req_ts);
+                self.positions.insert(position.exchange, position.clone());
+                true
+            }
+        }
+    }
+
+    /// 该所的持仓基线是否已写入（写入后该腿才可参与对账，见 `PositionReconcileActor`）
+    pub fn is_position_seeded(&self, exchange: Exchange) -> bool {
+        self.position_seeded_at.contains_key(&exchange)
     }
 
     /// 添加待处理订单 (发送订单信号时调用)
@@ -238,49 +338,54 @@ impl SymbolState {
             return;
         }
 
-        match &event.data {
-            ExchangeEventData::FundingRate(rate) => {
+        match event {
+            IncomeEvent::Market(m) => self.apply_market_data(&m.data),
+            IncomeEvent::Account(a) => self.apply_account_data(a),
+        }
+    }
+
+    /// 行情类事件的状态转移（BBO/标记价/指数价/资金费率入缓存，其余策略自取）
+    fn apply_market_data(&mut self, data: &MarketData) {
+        match data {
+            MarketData::FundingRate(rate) => {
                 self.funding_rates.insert(rate.exchange, rate.clone());
             }
-            ExchangeEventData::BBO(bbo) => {
+            MarketData::BBO(bbo) => {
                 self.bbos.insert(bbo.exchange, bbo.clone());
             }
-            ExchangeEventData::MarketTrade(_) => {
+            MarketData::MarketTrade(_) => {
                 // 公共成交印记仅作市场信号 (策略自取)，不修改聚合状态
             }
-            ExchangeEventData::PositionBaseline(position) => {
-                // 持仓维护模型：**一次性基线 + 之后全程由 Fill 事件增量维护**。
-                // 基线写入一次，此后所有变化都靠 Fill 累加（见下方 Fill 分支）——主动单、
-                // 手动单、以及**强平/ADL** 都以 fill 形式经私有成交流下发，因此持仓不会漏掉
-                // 被动减仓。
-                //
-                // 为何**不**用持仓快照周期性覆写校准：快照与实时 Fill 流之间存在竞态——快照
-                // 可能已包含某笔成交，而该成交对应的 Fill 稍后才由 WS 送达；若用快照覆写后又
-                // 叠加这笔晚到的 Fill，就会**重复计算**该笔成交。校验走另一条通道，见
-                // [`ExchangeEventData::PositionReport`] 与 `PositionReconcileActor`。
-                //
-                // 第二次到达是**违约**（唯一合法产地是 ManagerActor 启动期，见事件定义），
-                // 打 error 而非静默忽略：静默忽略会让"某个适配层又开始发基线"这件事无人察觉。
-                match self.positions.get(&position.exchange) {
-                    None => {
-                        tracing::info!(
-                            symbol = %self.symbol,
-                            exchange = %position.exchange,
-                            size = position.size,
-                            "Position baseline initialized"
-                        );
-                        self.positions.insert(position.exchange, position.clone());
-                    }
-                    Some(existing) => tracing::error!(
-                        symbol = %self.symbol,
-                        exchange = %position.exchange,
-                        local_size = existing.size,
-                        incoming_size = position.size,
-                        "收到重复的 PositionBaseline（每个 (所, symbol) 只允许一次），已忽略"
-                    ),
-                }
+            MarketData::MarkPrice(mp) => {
+                self.mark_prices.insert(mp.exchange, mp.clone());
             }
-            ExchangeEventData::OrderUpdate(update) => {
+            MarketData::IndexPrice(ip) => {
+                self.index_prices.insert(ip.exchange, ip.clone());
+            }
+            MarketData::Candle(_) | MarketData::HistoryCandles(_) => {
+                // K线数据由策略层处理，SymbolState 不存储
+            }
+            MarketData::BorrowFee(_) => {
+                // 券源读数由策略自行消费，SymbolState 不缓存
+            }
+            // 其余变体无 symbol（Status/汇率/Clock）或由 StateManager 提前拦截（Custom），
+            // 到达即路由 bug：记录后忽略（不 panic）
+            MarketData::ExchangeStatus { .. }
+            | MarketData::ExchangeRate(_)
+            | MarketData::Clock
+            | MarketData::Custom(_) => {
+                tracing::error!(
+                    symbol = %self.symbol,
+                    "全局行情事件错误地进入 SymbolState（路由 bug），忽略"
+                );
+            }
+        }
+    }
+
+    /// 账户私有事件的状态转移（挂单跟踪 + 持仓累加）
+    fn apply_account_data(&mut self, event: &AccountEvent) {
+        match &event.data {
+            AccountData::OrderUpdate(update) => {
                 tracing::info!(
                     symbol = %self.symbol,
                     exchange = %update.exchange,
@@ -295,9 +400,18 @@ impl SymbolState {
                     match update.status {
                         OrderStatus::Filled
                         | OrderStatus::Cancelled
-                        | OrderStatus::Rejected { .. }
-                        | OrderStatus::Error { .. } => {
-                            // 订单终态，移除 pending order
+                        | OrderStatus::Rejected { .. } => {
+                            // **权威**终态（交易所说的，或撤单后复查确认已不在挂单列表时
+                            // 合成的）：移除 pending，并记下订单号 —— 此后任何非终态回报
+                            // 都是迟到的陈旧消息，不得据此复活它（见下方重建分支）。
+                            self.pending_orders.remove(client_id);
+                            self.remember_terminal(client_id);
+                        }
+                        OrderStatus::Error { .. } => {
+                            // 本地 REST 调用的结论（交易所侧永不上报此状态，见
+                            // `crate::engine::OrderGateway`）：订单**可能仍活在交易所上**，
+                            // 故移除 pending 但**不记**权威终态 —— 随后到达的真实确认应当
+                            // 把它重新纳入跟踪，否则它在交易所上活着、本地却隐形。
                             self.pending_orders.remove(client_id);
                         }
                         OrderStatus::Pending | OrderStatus::PartiallyFilled => {
@@ -316,6 +430,25 @@ impl SymbolState {
                                     exchange = %update.exchange,
                                     client_order_id = %client_id,
                                     "收到非本引擎挂单的更新，不纳入本地 pending"
+                                );
+                            } else if self.recent_terminal.iter().any(|id| id == client_id) {
+                                // 该单已到达权威终态，这条非终态回报是**迟到的陈旧消息**。
+                                //
+                                // 来路是跨投递路径的重排：撤单成功由 `OrderGateway` 在
+                                // spawn 出去的 REST 任务里合成 `Cancelled` 发布，而同一张
+                                // 单的 `PartiallyFilled` 由私有 WS 发布 —— 两条路径之间没有
+                                // 顺序保证，"先合成 Cancelled、后到达部分成交回报"完全可能。
+                                //
+                                // 若照重建，得到的是一张**永不消失**的 pending：终态已经过去
+                                // 不会再来，而超时清理只作用于 `Created` 态。后果是
+                                // `has_pending_orders` 恒真 —— spread_arb 直接以它为门
+                                // （`return vec![]`）且从不撤单，该 symbol 就此冻结到进程重启。
+                                tracing::warn!(
+                                    symbol = %self.symbol,
+                                    exchange = %update.exchange,
+                                    client_order_id = %client_id,
+                                    status = ?update.status,
+                                    "收到已终态订单的迟到非终态回报，忽略（不复活本地 pending）"
                                 );
                             } else if update.quantity <= 0.0 {
                                 // 本引擎的单、本地无记录，但 update 的数量是无效值 ——
@@ -385,9 +518,25 @@ impl SymbolState {
                     }
                 }
             }
-            ExchangeEventData::Fill(fill) => {
+            AccountData::Fill(fill) => {
                 // Fill 即时更新仓位——涵盖策略单、手动单、以及强平/ADL（三者都以 fill 形式
-                // 经私有成交流到达，走同一路径，见上方 PositionBaseline 分支说明）。
+                // 经私有成交流到达，走同一路径，见 [`Self::seed_position`] 的模型说明）。
+                //
+                // 已 seed 的所按快照请求时刻过滤：在此之前送达的 Fill 必已含在基线快照里，
+                // 再累加即双计（这条规则对 executor / 对账镜像 / 观测镜像同一份）。
+                if let Some(&seeded_ts) = self.position_seeded_at.get(&fill.exchange) {
+                    if event.local_ts <= seeded_ts {
+                        tracing::info!(
+                            symbol = %self.symbol,
+                            exchange = %fill.exchange,
+                            fill_size = fill.size,
+                            fill_local_ts = event.local_ts,
+                            snapshot_req_ts = seeded_ts,
+                            "Fill 早于基线快照请求时刻送达（已含在快照里），丢弃避免双计"
+                        );
+                        return;
+                    }
+                }
                 //
                 // 持仓维护的全部内容就是**累加带符号数量**：策略决策只看数量（还能加多少、
                 // 要平多少、净敞口是否为零）。均价/盈亏不在域模型里 —— 记账需求由模拟柜台的
@@ -409,37 +558,15 @@ impl SymbolState {
                     "Updated position on fill"
                 );
             }
-            ExchangeEventData::MarkPrice(mp) => {
-                self.mark_prices.insert(mp.exchange, mp.clone());
-            }
-            ExchangeEventData::IndexPrice(ip) => {
-                self.index_prices.insert(ip.exchange, ip.clone());
-            }
-            ExchangeEventData::Candle(_) | ExchangeEventData::HistoryCandles(_) => {
-                // K线数据由策略层处理，SymbolState 不存储
-            }
-            ExchangeEventData::FundingFee(_) => {
+            AccountData::FundingFee(_) => {
                 // 资费事件不修改本地 symbol 状态，下游策略自行去重与统计
             }
-            ExchangeEventData::Clock => {
-                // Clock 事件由策略层处理，这里不需要处理
-            }
-            ExchangeEventData::Greeks(_)
-            | ExchangeEventData::Balance(_)
-            | ExchangeEventData::AccountInfo { .. }
-            | ExchangeEventData::ExchangeStatus { .. }
-            | ExchangeEventData::BorrowFee(_)
-            | ExchangeEventData::ExchangeRate(_)
-            // 自定义事件不进状态层：框架只运送不理解（见 CustomEvent）
-            | ExchangeEventData::Custom(_)
-            // 对账读数是按所的整份快照（无单一 symbol），且**绝不写入持仓** ——
-            // 写进来就等于恢复了上面 PositionBaseline 分支否掉的"快照覆写"
-            | ExchangeEventData::PositionReport { .. } => {
-                // 全局事件应在 StateManager 层提前拦截、不会进入 SymbolState::apply。
-                // 若到达说明路由逻辑有 bug，记录后忽略（不 panic）。
+            // 账户级事件（Balance/Greeks/AccountInfo）无 symbol，由 StateManager 提前
+            // 拦截；到达即路由 bug：记录后忽略（不 panic）
+            AccountData::Balance(_) | AccountData::Greeks(_) | AccountData::AccountInfo { .. } => {
                 tracing::error!(
                     symbol = %self.symbol,
-                    "全局事件错误地进入 SymbolState::apply（路由 bug），忽略"
+                    "账户级事件错误地进入 SymbolState（路由 bug），忽略"
                 );
             }
         }
@@ -571,12 +698,8 @@ mod tests {
 
     const EX: Exchange = Exchange::Binance;
 
-    fn ev(data: ExchangeEventData) -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: 1,
-            local_ts: 1,
-            data,
-        }
+    fn ev(data: AccountData) -> IncomeEvent {
+        IncomeEvent::account(crate::domain::AccountId::Live, 1, 1, data)
     }
 
     fn position(size: f64) -> Position {
@@ -588,18 +711,27 @@ mod tests {
     }
 
     fn fill(side: Side, size: f64) -> IncomeEvent {
-        ev(ExchangeEventData::Fill(crate::domain::Fill {
-            exchange: EX,
-            symbol: SYMBOL.to_string(),
-            side,
-            price: 100.0,
-            size,
-            client_order_id: None,
-            order_id: "1".to_string(),
-            timestamp: 1,
-            fee: 0.0,
-            reason: crate::domain::FillReason::Normal,
-        }))
+        fill_at(EX, side, size, 1)
+    }
+
+    fn fill_at(exchange: Exchange, side: Side, size: f64, local_ts: u64) -> IncomeEvent {
+        IncomeEvent::account(
+            crate::domain::AccountId::Live,
+            local_ts,
+            local_ts,
+            AccountData::Fill(crate::domain::Fill {
+                exchange,
+                symbol: SYMBOL.to_string(),
+                side,
+                price: 100.0,
+                size,
+                client_order_id: None,
+                order_id: "1".to_string(),
+                timestamp: local_ts,
+                fee: 0.0,
+                reason: crate::domain::FillReason::Normal,
+            }),
+        )
     }
 
     /// 基线写入一次，之后**只**由 Fill 累加。
@@ -607,7 +739,7 @@ mod tests {
     fn baseline_initializes_then_fills_accumulate() {
         let mut state = SymbolState::new(SYMBOL.to_string());
 
-        state.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
+        assert!(state.seed_position(&position(2.0), 0), "首次 seed 应成功");
         assert_eq!(state.position_size(EX), 2.0);
 
         state.apply(&fill(Side::Long, 1.0));
@@ -617,24 +749,23 @@ mod tests {
         assert!((state.position_size(EX) - 2.5).abs() < 1e-12);
     }
 
-    /// **Critical 回归防线**：第二条基线不得覆写持仓。
+    /// **Critical 回归防线**：第二次 seed 不得覆写持仓（幂等，返回 false）。
     ///
-    /// 快照覆写 + 晚到的 Fill 会重复计算同一笔成交。历史上 OKX/HL/Binance 的私有 WS 都在
-    /// 持续推送持仓快照，全靠这条判据兜住；现在适配层已不再发基线，这条测试是防止它们
-    /// 哪天又开始发的防线。
+    /// 快照覆写 + 晚到的 Fill 会重复计算同一笔成交。再晋升时镜像会收到重复基线，
+    /// 全靠这条幂等判据兜住存量。
     #[test]
     fn second_baseline_never_overwrites_position() {
         let mut state = SymbolState::new(SYMBOL.to_string());
-        state.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
+        state.seed_position(&position(2.0), 0);
         state.apply(&fill(Side::Long, 1.0));
         assert_eq!(state.position_size(EX), 3.0);
 
-        // 交易所侧的快照（哪怕数值"看起来更新"）也不得覆写
-        state.apply(&ev(ExchangeEventData::PositionBaseline(position(3.0))));
+        // 第二次 seed（哪怕数值"看起来更新"）也不得覆写
+        assert!(!state.seed_position(&position(3.0), 5), "重复 seed 应返回 false");
         assert_eq!(
             state.position_size(EX),
             3.0,
-            "第二条基线覆写了持仓——快照与 Fill 流叠加会重复计算成交"
+            "第二次 seed 覆写了持仓——快照与 Fill 流叠加会重复计算成交"
         );
 
         // 覆写若发生，这条 Fill 会把仓位推到 4.0 之外
@@ -642,10 +773,41 @@ mod tests {
         assert_eq!(state.position_size(EX), 4.0);
     }
 
+    /// **防双计**：seed 之后到达、但送达时刻早于快照请求时刻的 Fill 已含在快照里，丢弃；
+    /// 之后的照常累加。未 seed 的所不受过滤影响。
+    #[test]
+    fn fills_covered_by_snapshot_are_dropped() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        // 快照请求时刻 t=10
+        state.seed_position(&position(2.0), 10);
+
+        // t=1 送达（fill() 的 local_ts=1 <= 10）：已含在快照里，丢弃
+        state.apply(&fill(Side::Long, 1.0));
+        assert_eq!(state.position_size(EX), 2.0, "快照已含的 Fill 不得再累加");
+
+        // t=11 送达：快照之后的新成交，累加
+        state.apply(&fill_at(EX, Side::Long, 1.0, 11));
+        assert_eq!(state.position_size(EX), 3.0);
+    }
+
+    /// **seed 过滤按所隔离**：只 seed 了一个所时，另一个所的早时刻 Fill 不得被误过滤
+    /// （guard 按 `fill.exchange` 查表，不是按 symbol 全局生效）
+    #[test]
+    fn seed_filter_is_scoped_to_its_exchange() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        // 只 seed Binance（快照请求时刻 t=10）
+        state.seed_position(&position(2.0), 10);
+
+        // OKX 未 seed：t=1 送达的 Fill 照常从 0 累加，不受 Binance 的过滤时刻影响
+        state.apply(&fill_at(Exchange::OKX, Side::Long, 1.5, 1));
+        assert_eq!(state.position_size(Exchange::OKX), 1.5, "未 seed 的所不得被误过滤");
+        assert_eq!(state.position_size(EX), 2.0, "Binance 腿不受影响");
+    }
+
     // ===== 外部挂单：只接管本引擎自己的单 =====
 
     fn order_update(client_order_id: Option<String>, status: OrderStatus) -> IncomeEvent {
-        ev(ExchangeEventData::OrderUpdate(crate::domain::OrderUpdate {
+        ev(AccountData::OrderUpdate(crate::domain::OrderUpdate {
             order_id: "ex-1".to_string(),
             client_order_id,
             exchange: EX,
@@ -712,28 +874,78 @@ mod tests {
     #[test]
     fn position_accumulates_signed_size_across_fills() {
         let mut state = SymbolState::new(SYMBOL.to_string());
-        // 基线 2.0
-        state.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
+        // 基线 2.0（快照请求时刻 0，fill() 的 local_ts=1 晚于它，不被过滤）
+        state.seed_position(&position(2.0), 0);
 
         // 同向加仓 2.0（成交价不影响持仓数量）
-        let mut add = fill(Side::Long, 2.0);
-        if let ExchangeEventData::Fill(f) = &mut add.data {
-            f.price = 110.0;
-        }
-        state.apply(&add);
+        state.apply(&fill(Side::Long, 2.0));
         assert!((state.position(EX).expect("position").size - 4.0).abs() < 1e-12);
 
-        // 反向平掉 1.0
-        let mut close = fill(Side::Short, 1.0);
-        if let ExchangeEventData::Fill(f) = &mut close.data {
-            f.price = 120.0;
-        }
-        state.apply(&close);
+        // 反向平掉 1.0（价格同样不影响数量）
+        state.apply(&fill(Side::Short, 1.0));
         assert!((state.position(EX).expect("position").size - 3.0).abs() < 1e-12);
 
         // 反手：卖 5 -> 净空 2
         state.apply(&fill(Side::Short, 5.0));
         assert!((state.position(EX).expect("position").size + 2.0).abs() < 1e-12);
+    }
+
+    /// **Critical 回归防线**：已到达权威终态的订单，不得被迟到的非终态回报复活。
+    ///
+    /// 真实来路是跨投递路径的重排：撤单成功由 `OrderGateway` 在 spawn 出去的 REST 任务里
+    /// 合成 `Cancelled`，而同一张单的 `PartiallyFilled` 由私有 WS 发布 —— 两条路径无顺序
+    /// 保证。若复活，得到的是一张**永不消失**的 pending（终态不会再来，而超时清理只作用于
+    /// `Created` 态），`has_pending_orders` 就此恒真：spread_arb 以它为硬门且从不撤单，
+    /// 该 symbol 冻结到进程重启。
+    #[test]
+    fn stale_non_terminal_never_resurrects_a_finished_order() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        let own_id = EX.new_cli_order_id();
+
+        // 下单 → 交易所确认 → 撤单成功（合成 Cancelled，权威终态）
+        state.add_pending_order(
+            Order {
+                id: String::new(),
+                exchange: EX,
+                symbol: SYMBOL.to_string(),
+                side: Side::Long,
+                order_type: OrderType::Limit { price: 100.0, tif: TimeInForce::GTC },
+                quantity: 1.0,
+                reduce_only: false,
+                client_order_id: own_id.clone(),
+            },
+            0,
+        );
+        state.apply(&order_update(Some(own_id.clone()), OrderStatus::Pending));
+        state.apply(&order_update(Some(own_id.clone()), OrderStatus::Cancelled));
+        assert!(!state.has_pending_orders(), "撤单确认后应无挂单");
+
+        // 迟到的部分成交回报（撤单前那一刻发生的成交，WS 走另一条路径后到）
+        state.apply(&order_update(Some(own_id), OrderStatus::PartiallyFilled));
+        assert!(
+            !state.has_pending_orders(),
+            "已终态订单被迟到回报复活成永久 pending —— 该 symbol 将冻结到进程重启"
+        );
+    }
+
+    /// 反面：`Error` 是**本地** REST 结论（交易所侧永不上报），订单可能仍活在交易所上 ——
+    /// 随后到达的真实确认必须能把它重新纳入跟踪，否则它在交易所上活着、本地却隐形，
+    /// 策略会在它旁边重复挂单。
+    #[test]
+    fn local_rest_error_still_allows_rebuild_on_late_confirmation() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        let own_id = EX.new_cli_order_id();
+
+        state.apply(&order_update(
+            Some(own_id.clone()),
+            OrderStatus::Error { reason: "REST timeout".to_string() },
+        ));
+        // 交易所其实收到了这张单，确认姗姗来迟
+        state.apply(&order_update(Some(own_id), OrderStatus::Pending));
+        assert!(
+            state.has_pending_orders(),
+            "本地 REST 失败后到达的真实确认必须重新纳入跟踪"
+        );
     }
 
     /// **宁缺勿假**：update 缺有效价格/数量（IBKR sor 推送写死 0）时不重建本地 pending。
@@ -746,8 +958,10 @@ mod tests {
         let own_id = EX.new_cli_order_id();
 
         let mut ghost = order_update(Some(own_id), OrderStatus::Pending);
-        if let ExchangeEventData::OrderUpdate(u) = &mut ghost.data {
-            u.quantity = 0.0;
+        if let IncomeEvent::Account(a) = &mut ghost {
+            if let AccountData::OrderUpdate(u) = &mut a.data {
+                u.quantity = 0.0;
+            }
         }
         state.apply(&ghost);
 

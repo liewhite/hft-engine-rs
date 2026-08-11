@@ -26,3 +26,9 @@ pub struct HyperliquidCredentials {
 
 impl HyperliquidCredentials {
 }
+
+/// 本所适配层是否实现了这种公共订阅（**能力查询**，装配期由 `ExchangeSetup` 携带）。
+/// 派生自 public WS 的 kind 映射函数，见各所同名函数的约定。
+pub fn supports_subscription(kind: &crate::exchange::SubscriptionKind) -> bool {
+    actor::public_ws::kind_to_stream(kind, "USDC", "").is_some()
+}

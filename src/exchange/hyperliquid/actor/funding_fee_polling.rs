@@ -10,9 +10,9 @@
 //! （`hash` 恒为全零），但至少能由 `(time, coin)` 稳定派生，且拉取窗口可控。
 
 use crate::domain::now_ms;
-use crate::engine::IncomePubSub;
+use crate::engine::AccountPubSub;
 use crate::exchange::hyperliquid::HyperliquidClient;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -29,14 +29,14 @@ const FUNDING_FEE_LOOKBACK_MS: u64 = 24 * 60 * 60 * 1000;
 /// 初始化参数
 pub struct HyperliquidFundingFeePollingActorArgs {
     pub client: Arc<HyperliquidClient>,
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// 轮询间隔 (毫秒)
     pub interval_ms: u64,
 }
 
 pub struct HyperliquidFundingFeePollingActor {
     client: Arc<HyperliquidClient>,
-    income_pubsub: ActorRef<IncomePubSub>,
+    account_pubsub: ActorRef<AccountPubSub>,
 }
 
 impl HyperliquidFundingFeePollingActor {
@@ -50,16 +50,18 @@ impl HyperliquidFundingFeePollingActor {
                 for fee in fees {
                     let exchange_ts = fee.timestamp;
                     if let Err(e) = self
-                        .income_pubsub
-                        .tell(Publish(IncomeEvent {
+                        .account_pubsub
+                        .tell(Publish(AccountEvent {
+                            // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                            account: crate::domain::AccountId::Live,
                             exchange_ts,
                             local_ts,
-                            data: ExchangeEventData::FundingFee(fee),
+                            data: AccountData::FundingFee(fee),
                         }))
                         .send()
                         .await
                     {
-                        tracing::error!(error = %e, "Failed to publish FundingFee to IncomePubSub");
+                        tracing::error!(error = %e, "Failed to publish FundingFee to AccountPubSub");
                     }
                 }
             }
@@ -95,7 +97,7 @@ impl Actor for HyperliquidFundingFeePollingActor {
 
         Ok(Self {
             client: args.client,
-            income_pubsub: args.income_pubsub,
+            account_pubsub: args.account_pubsub,
         })
     }
 

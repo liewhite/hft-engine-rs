@@ -4,10 +4,10 @@
 //! - 维护 Business WebSocket 连接 (wss://ws.okx.com:8443/ws/v5/business)
 //! - 处理 Candle 类型的 Subscribe/Unsubscribe 请求
 //! - 收到订阅时先通过 REST 获取 100 根历史 K线并发布，再 WS 订阅实时推送
-//! - 直接解析消息并发布到 IncomePubSub
+//! - 直接解析消息并发布到对应总线
 
 use crate::domain::{CandleInterval, now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::engine::IncomePubSub;
+use crate::engine::MarketPubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{
     CandleRawData, WsPush, candle_interval_to_okx_bar, okx_channel_to_candle_interval,
@@ -15,7 +15,7 @@ use crate::exchange::okx::codec::{
 };
 use crate::exchange::okx::{to_okx, REST_BASE_URL, WS_BUSINESS_URL};
 use crate::exchange::ws_loop;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{MarketData, MarketEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -32,8 +32,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 /// OkxBusinessWsActor 初始化参数
 pub struct OkxBusinessWsActorArgs {
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 行情总线（发布事件）
+    pub market_pubsub: ActorRef<MarketPubSub>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
@@ -42,8 +42,8 @@ pub struct OkxBusinessWsActorArgs {
 
 /// OkxBusinessWsActor - Business WebSocket Actor (K线)
 pub struct OkxBusinessWsActor {
-    /// Income PubSub (发布事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    /// 行情总线（发布事件）
+    market_pubsub: ActorRef<MarketPubSub>,
     /// Symbol 元数据（用于过滤不存在的 symbol）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
@@ -141,15 +141,22 @@ impl OkxBusinessWsActor {
             candles.pop();
         }
 
+        // 空批不发布：下游依赖 `HistoryCandles` 非空推导 symbol 路由（首根 K 线），
+        // 空数组只会静默落入广播作 no-op —— 在源头拦住并留下可见信号
+        if candles.is_empty() {
+            tracing::warn!(%inst_id, "历史 K 线为空（全部未 confirm 或交易所返回空），不发布");
+            return Ok(());
+        }
+
         let count = candles.len();
         let local_ts = now_ms();
-        let event = IncomeEvent {
+        let event = MarketEvent {
             exchange_ts: local_ts,
             local_ts,
-            data: ExchangeEventData::HistoryCandles(candles),
+            data: MarketData::HistoryCandles(candles),
         };
-        if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-            tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+        if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
+            tracing::error!(error = %e, "Failed to publish to MarketPubSub");
         }
 
         tracing::info!(
@@ -166,8 +173,8 @@ impl OkxBusinessWsActor {
         let local_ts = now_ms();
         let events = parse_business_message(raw, local_ts)?;
         for event in events {
-            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to MarketPubSub");
             }
         }
         Ok(())
@@ -213,7 +220,7 @@ impl Actor for OkxBusinessWsActor {
         tracing::info!("OkxBusinessWsActor started");
 
         Ok(Self {
-            income_pubsub: args.income_pubsub,
+            market_pubsub: args.market_pubsub,
             symbol_metas: args.symbol_metas,
             quote: args.quote,
             ws_tx: Some(outgoing_tx),
@@ -356,7 +363,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxBusinessWsAc
 // 消息解析
 // ============================================================================
 
-fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, WsError> {
+fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<MarketEvent>, WsError> {
     // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
     if raw == "pong" {
         return Ok(Vec::new());
@@ -401,10 +408,10 @@ fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<IncomeEvent>, 
         for raw_data in &push.data {
             let candle = parse_candle_data(raw_data, inst_id, interval)
                 ?;
-            events.push(IncomeEvent {
+            events.push(MarketEvent {
                 exchange_ts: candle.open_time,
                 local_ts,
-                data: ExchangeEventData::Candle(candle),
+                data: MarketData::Candle(candle),
             });
         }
         return Ok(events);

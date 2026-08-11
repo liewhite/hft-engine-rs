@@ -9,8 +9,8 @@ use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForc
 use hft_engine_rs::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials};
 use hft_engine_rs::exchange::ibkr::auth::tickle;
 use hft_engine_rs::exchange::{ExchangeOrder, ExchangeClient, SubscribeBatch, SubscriptionKind};
-use hft_engine_rs::engine::IncomePubSub;
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent};
+use hft_engine_rs::engine::{AccountPubSub, MarketPubSub};
+use hft_engine_rs::messaging::{MarketData, MarketEvent};
 use kameo::actor::{ActorRef, Spawn};
 use kameo::error::Infallible;
 use kameo::mailbox;
@@ -43,11 +43,11 @@ impl Actor for BboCollector {
     }
 }
 
-impl Message<IncomeEvent> for BboCollector {
+impl Message<MarketEvent> for BboCollector {
     type Reply = ();
 
-    async fn handle(&mut self, msg: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
-        if let ExchangeEventData::BBO(bbo) = msg.data {
+    async fn handle(&mut self, msg: MarketEvent, _ctx: &mut Context<Self, Self::Reply>) {
+        if let MarketData::BBO(bbo) = msg.data {
             println!("收到 BBO: {} bid={} ask={}", bbo.symbol, bbo.bid_price, bbo.ask_price);
             self.collected.lock().unwrap().push(bbo);
             self.notify.notify_one();
@@ -314,8 +314,12 @@ async fn test_ibkr_ws_bbo() {
     println!("连接成功，conids: {:?}", conids);
 
     // 2. 创建 IncomePubSub
-    let income_pubsub = IncomePubSub::spawn_with_mailbox(
-        IncomePubSub::new(DeliveryStrategy::BestEffort),
+    let market_pubsub = MarketPubSub::spawn_with_mailbox(
+        MarketPubSub::new(DeliveryStrategy::BestEffort),
+        mailbox::unbounded(),
+    );
+    let account_pubsub = AccountPubSub::spawn_with_mailbox(
+        AccountPubSub::new(DeliveryStrategy::BestEffort),
         mailbox::unbounded(),
     );
 
@@ -326,18 +330,19 @@ async fn test_ibkr_ws_bbo() {
         (collected.clone(), notify.clone()),
         mailbox::unbounded(),
     );
-    income_pubsub
+    market_pubsub
         .tell(PubSubSubscribe(collector))
         .send()
         .await
-        .expect("订阅 IncomePubSub 失败");
+        .expect("订阅 MarketPubSub 失败");
 
     // 4. 启动 IbkrActor (含 WebSocket 连接)
     let ibkr_actor = IbkrActor::spawn_with_mailbox(
         IbkrActorArgs {
             snapshot: None,
             auth,
-            income_pubsub,
+            market_pubsub,
+            account_pubsub,
             conids,
             client,
         },

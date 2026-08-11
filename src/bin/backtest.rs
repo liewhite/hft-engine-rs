@@ -19,7 +19,7 @@ use hft_engine_rs::domain::{
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, StateManager};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
 use std::collections::{HashMap, HashSet};
@@ -81,7 +81,10 @@ impl Strategy for MeanRevertMaker {
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
         // 自己跟成交维护开仓成本（加权平均；平完即清零）
-        if let ExchangeEventData::Fill(f) = &event.data {
+        if let IncomeEvent::Account(a) = event {
+            let AccountData::Fill(f) = &a.data else {
+                return Vec::new();
+            };
             match f.side {
                 Side::Long => {
                     let total = self.entry_size + f.size;
@@ -98,7 +101,10 @@ impl Strategy for MeanRevertMaker {
             }
             return Vec::new();
         }
-        let ExchangeEventData::MarketTrade(t) = &event.data else {
+        let IncomeEvent::Market(m) = event else {
+            return Vec::new();
+        };
+        let MarketData::MarketTrade(t) = &m.data else {
             return Vec::new();
         };
         if state.has_pending_orders(&self.symbol) {
@@ -148,10 +154,12 @@ fn main() -> anyhow::Result<()> {
     let metas_vec = tokio::runtime::Runtime::new()?
         .block_on(client.fetch_all_symbol_metas())
         .map_err(|e| anyhow::anyhow!("fetch symbol metas: {e}"))?;
-    let symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta> = metas_vec
-        .into_iter()
-        .map(|m| ((m.exchange, m.symbol.clone()), m))
-        .collect();
+    let symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> = Arc::new(
+        metas_vec
+            .into_iter()
+            .map(|m| ((m.exchange, m.symbol.clone()), m))
+            .collect(),
+    );
 
     let source = BinanceHistory::source(
         std::slice::from_ref(&symbol),
@@ -174,7 +182,7 @@ fn main() -> anyhow::Result<()> {
     // 回测用确定性 id 生成器 -> 同一输入同一逐笔回报序列
     let runner = StrategyRunner::with_id_gen(
         Box::new(strategy),
-        Arc::new(symbol_metas),
+        symbol_metas.clone(),
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {
@@ -184,7 +192,7 @@ fn main() -> anyhow::Result<()> {
         ..SimConfig::default()
     };
 
-    let mut engine = BacktestEngine::new(source.as_ref(), vec![runner], config);
+    let mut engine = BacktestEngine::new(source.as_ref(), vec![runner], config, symbol_metas);
     let result = engine.run();
 
     println!("==================== Backtest Result ====================");

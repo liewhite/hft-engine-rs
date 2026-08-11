@@ -23,7 +23,7 @@ use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::ibkr::auth::{self, IbkrAuth};
 use crate::exchange::ibkr::IbkrClient;
 use crate::domain::{Exchange, ExchangeError};
-use crate::engine::IncomePubSub;
+use crate::engine::{AccountPubSub, MarketPubSub};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message};
@@ -41,8 +41,10 @@ const STATUS_POLLING_INTERVAL_MS: u64 = 5_000;
 pub struct IbkrActorArgs {
     /// 认证器 (共享，不可变)
     pub auth: Arc<dyn IbkrAuth>,
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 公共行情总线（public WS / 状态广播用）
+    pub market_pubsub: ActorRef<MarketPubSub>,
+    /// 账户私有事件总线（private WS / 账户轮询用）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// conid 映射 (symbol → conid)
     pub conids: HashMap<String, i64>,
     /// IBKR 客户端 (用于持仓轮询)
@@ -81,7 +83,6 @@ impl Actor for IbkrActor {
 
         // 2. 并发 spawn PublicWsActor 与 TickleActor —— 互无依赖
         //    IBKR 用同一条 WS 同时收行情和订单更新，必须握手完成再放行下游
-        let income_pubsub = args.income_pubsub;
         // IBKR 每个 conid 只维护一份活跃字段集（snapshot 与 ws 共用），而重建它的唯一地方是
         // public_ws 的 smd 订阅/刷新。故把 snapshot poller 需要的字段一并交给它，否则每次刷新
         // 都会把 poller 的字段抹掉、poller 只能拿到空壳（实测每 8~12 分钟一条券源字段缺失错误）。
@@ -103,7 +104,8 @@ impl Actor for IbkrActor {
             IbkrPublicWsActorArgs {
                 auth: args.auth.clone(),
                 client: args.client.clone(),
-                income_pubsub: income_pubsub.clone(),
+                market_pubsub: args.market_pubsub.clone(),
+                account_pubsub: args.account_pubsub.clone(),
                 conids: args.conids,
                 session_id,
                 extra_md_fields,
@@ -138,7 +140,7 @@ impl Actor for IbkrActor {
             "IbkrAccountPollingActor",
             IbkrAccountPollingActorArgs {
                 client: args.client.clone(),
-                income_pubsub: income_pubsub.clone(),
+                account_pubsub: args.account_pubsub.clone(),
                 interval_ms: ACCOUNT_POLLING_INTERVAL_MS,
             },
         )
@@ -151,7 +153,7 @@ impl Actor for IbkrActor {
             "IbkrStatusPollingActor",
             IbkrStatusPollingActorArgs {
                 client: args.client.clone(),
-                income_pubsub: income_pubsub.clone(),
+                market_pubsub: args.market_pubsub.clone(),
                 interval_ms: STATUS_POLLING_INTERVAL_MS,
             },
         )
@@ -166,7 +168,7 @@ impl Actor for IbkrActor {
                 "IbkrSnapshotPollingActor",
                 IbkrSnapshotPollingActorArgs {
                     client: args.client,
-                    income_pubsub: income_pubsub.clone(),
+                    market_pubsub: args.market_pubsub.clone(),
                     cfg,
                 },
             )

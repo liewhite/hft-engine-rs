@@ -13,13 +13,14 @@
 //! accountRefresh)，并在首个事件时先投递一次初始净值，否则依赖净值的策略不会动作。
 
 use crate::backtest::source::MarketDataSource;
-use crate::domain::{Exchange, Order, OrderId, Price, Symbol, Timestamp};
+use crate::domain::{Exchange, Order, OrderId, Price, Symbol, SymbolMeta, Timestamp};
 use crate::engine::StrategyRunner;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, IncomeEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::sync::Arc;
 
 /// 回测结束时的一笔持仓：数量取自账本，均价与浮盈是**本地记账**的结果
 /// （域模型 [`Position`] 只有数量，见其文档）。
@@ -101,6 +102,10 @@ pub struct BacktestEngine<'a> {
     source: &'a dyn MarketDataSource,
     runners: Vec<StrategyRunner>,
     config: SimConfig,
+    /// 市场规则来源，透传给各所柜台（[`SimState`] 在订单到达时校验下界并取整 ——
+    /// 保证实盘必拒的单回测也拒）。调用方**应**与 `StrategyRunner` 传同一张表，
+    /// 否则策略侧取整与柜台校验会按两套规则各行其是（bin 侧统一构建一份 Arc）。
+    symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     observers: Vec<Observer<'a>>,
     outcome_observers: Vec<OutcomeObserver<'a>>,
     clock_interval_ms: u64,
@@ -123,11 +128,13 @@ impl<'a> BacktestEngine<'a> {
         source: &'a dyn MarketDataSource,
         runners: Vec<StrategyRunner>,
         config: SimConfig,
+        symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     ) -> Self {
         Self {
             source,
             runners,
             config,
+            symbol_metas,
             observers: Vec::new(),
             outcome_observers: Vec::new(),
             clock_interval_ms: 1000,
@@ -175,7 +182,7 @@ impl<'a> BacktestEngine<'a> {
     pub fn run(&mut self) -> BacktestResult {
         let mut src = self.source.events().peekable();
         let first = match src.peek() {
-            Some(ev) => ev.exchange_ts,
+            Some(ev) => ev.exchange_ts(),
             None => {
                 tracing::warn!("no market data; empty backtest");
                 let bal = self.config.initial_balance_usdt;
@@ -198,7 +205,7 @@ impl<'a> BacktestEngine<'a> {
 
         while src.peek().is_some() || !self.pq.is_empty() {
             self.more_data = src.peek().is_some();
-            let src_ts = src.peek().map(|e| e.exchange_ts);
+            let src_ts = src.peek().map(|e| e.exchange_ts());
             let pq_ts = self.pq.peek().map(|r| r.0.time);
             match (src_ts, pq_ts) {
                 (Some(st), Some(pt)) => {
@@ -267,13 +274,22 @@ impl<'a> BacktestEngine<'a> {
         result
     }
 
-    /// 注入一条历史行情：按事件自身的 exchange 路由到对应柜台，撮合、回流按延迟入队投递。
+    /// 注入一条历史源事件：行情按事件自身的 exchange 路由到对应柜台撮合，行情本身与
+    /// 撮合回报都按入向延迟投递；账户事件（如 BS 合成的 Greeks/Balance）不参与撮合，
+    /// 直接按入向延迟投递。
     fn ingest(&mut self, ev: IncomeEvent) {
-        self.now = ev.exchange_ts;
+        self.now = ev.exchange_ts();
         self.market_events += 1;
-        let Some(exchange) = ev.exchange() else {
-            // 无交易所归属的源事件不参与撮合，按入向延迟投递给策略
-            // （与撮合回流同一口径，见 enqueue_replies）
+        let market = match &ev {
+            IncomeEvent::Market(m) => m,
+            IncomeEvent::Account(_) => {
+                let delay = self.config.exchange_to_strategy_delay_ms;
+                self.schedule(self.now + delay, Action::Deliver(ev));
+                return;
+            }
+        };
+        let Some(exchange) = market.data.exchange() else {
+            // 无交易所归属的行情（如无 scope 的 Custom）不参与撮合，按入向延迟投递
             let delay = self.config.exchange_to_strategy_delay_ms;
             self.schedule(self.now + delay, Action::Deliver(ev));
             return;
@@ -283,7 +299,10 @@ impl<'a> BacktestEngine<'a> {
             .states
             .get_mut(&exchange)
             .expect("ensure_state 刚创建")
-            .on_market(&ev);
+            .on_market(market);
+        // 行情本身按入向延迟转发给策略（柜台只产回报、不回显行情）
+        let delay = self.config.exchange_to_strategy_delay_ms;
+        self.schedule(self.now + delay, Action::Deliver(ev));
         self.enqueue_replies(replies);
     }
 
@@ -300,17 +319,19 @@ impl<'a> BacktestEngine<'a> {
                 self.config.initial_balance_usdt,
                 self.config.maker_fee_rate,
                 self.config.taker_fee_rate,
+                self.symbol_metas.clone(),
             ),
         );
         let info = self.account_info_event(exchange, self.now);
         self.schedule(self.now, Action::Deliver(info));
     }
 
-    /// 把撮合回流事件按 ex->strat 延迟入队投递给策略。
-    fn enqueue_replies(&mut self, replies: Vec<IncomeEvent>) {
+    /// 把撮合回报按 ex->strat 延迟入队投递给策略（统一归属回测账户）。
+    fn enqueue_replies(&mut self, replies: Vec<(Timestamp, AccountData)>) {
         let delay = self.config.exchange_to_strategy_delay_ms;
-        for r in replies {
-            self.schedule(self.now + delay, Action::Deliver(r));
+        for (ts, data) in replies {
+            let ev = IncomeEvent::account(crate::backtest::backtest_account(), ts, ts, data);
+            self.schedule(self.now + delay, Action::Deliver(ev));
         }
     }
 
@@ -341,11 +362,8 @@ impl<'a> BacktestEngine<'a> {
                 self.enqueue_replies(replies);
             }
             Action::Clock => {
-                let clock = IncomeEvent {
-                    exchange_ts: self.now,
-                    local_ts: self.now,
-                    data: ExchangeEventData::Clock,
-                };
+                let clock =
+                    IncomeEvent::market(self.now, self.now, crate::messaging::MarketData::Clock);
                 self.deliver(clock);
                 // 周期刷新各所净值, 等价实盘 accountRefresh（BTreeMap 保证投递序确定）
                 let exchanges: Vec<Exchange> = self.states.keys().copied().collect();
@@ -363,7 +381,7 @@ impl<'a> BacktestEngine<'a> {
 
     /// 把事件投递给观察者与各策略；策略产出的信号按下单延迟入队到达撮合。
     fn deliver(&mut self, ev: IncomeEvent) {
-        if matches!(ev.data, ExchangeEventData::Fill(_)) {
+        if matches!(&ev, IncomeEvent::Account(a) if matches!(a.data, AccountData::Fill(_))) {
             self.fill_count += 1;
         }
         for i in 0..self.observers.len() {
@@ -406,14 +424,15 @@ impl<'a> BacktestEngine<'a> {
         let state = self.states.get(&exchange).expect("柜台已创建");
         let equity = state.ledger.equity(|s: &Symbol| state.mark_of(s));
         let notional = state.ledger.notional(|s: &Symbol| state.mark_of(s));
-        IncomeEvent {
-            exchange_ts: ts,
-            local_ts: ts,
-            data: ExchangeEventData::AccountInfo {
+        IncomeEvent::account(
+            crate::backtest::backtest_account(),
+            ts,
+            ts,
+            AccountData::AccountInfo {
                 exchange,
                 equity,
                 notional,
             },
-        }
+        )
     }
 }

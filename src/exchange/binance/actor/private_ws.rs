@@ -3,17 +3,17 @@
 //! 职责:
 //! - 获取 ListenKey 并建立私有 WebSocket 连接
 //! - 管理 BinanceListenKeyActor 子 actor (定时刷新 ListenKey)
-//! - 直接解析消息并发布到 IncomePubSub
+//! - 直接解析消息并发布到对应总线
 
 use crate::actor_lifecycle::ChildGroup;
 use super::listen_key::{BinanceListenKeyActor, BinanceListenKeyActorArgs};
 use crate::domain::{now_ms, Exchange, ExchangeError};
-use crate::engine::IncomePubSub;
+use crate::engine::AccountPubSub;
 use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsResponse};
 use crate::exchange::binance::{BinanceCredentials, WS_PRIVATE_URL};
 use crate::exchange::client::WsError;
 use crate::exchange::ws_loop;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -29,16 +29,16 @@ pub struct BinancePrivateWsActorArgs {
     pub credentials: BinanceCredentials,
     /// REST API 基础 URL
     pub rest_base_url: String,
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 账户私有事件总线（发布事件，标 Live）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// 计价币种 (e.g., "USDT")
     pub quote: String,
 }
 
 /// BinancePrivateWsActor - 私有 WebSocket Actor
 pub struct BinancePrivateWsActor {
-    /// Income PubSub (发布事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    /// 账户私有事件总线（发布事件，标 Live）
+    account_pubsub: ActorRef<AccountPubSub>,
     /// 计价币种 (e.g., "USDT")
     quote: String,
     /// 发送消息到 ws_loop 的 channel
@@ -53,8 +53,8 @@ impl BinancePrivateWsActor {
         let local_ts = now_ms();
         let events = parse_private_message(raw, &self.quote, local_ts)?;
         for event in events {
-            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to AccountPubSub");
             }
         }
         Ok(())
@@ -123,7 +123,7 @@ impl Actor for BinancePrivateWsActor {
         tracing::info!("BinancePrivateWsActor started");
 
         Ok(Self {
-            income_pubsub: args.income_pubsub,
+            account_pubsub: args.account_pubsub,
             quote: args.quote,
             ws_tx: Some(outgoing_tx),
             children,
@@ -169,7 +169,7 @@ fn parse_private_message(
     raw: &str,
     quote: &str,
     local_ts: u64,
-) -> Result<Vec<IncomeEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -209,18 +209,20 @@ fn parse_private_message(
             let mut events = Vec::new();
 
             // **不处理 `a.P`（持仓）**：那是持仓**快照**，而持仓的维护模型是「启动期 REST
-            // 基线 + 之后全程 Fill 累加」（见 ExchangeEventData::PositionBaseline）。快照既
+            // 基线 + 之后全程 Fill 累加」（见 crate::messaging::PositionBaseline）。快照既
             // 当不了基线（基线只能来自 ManagerActor），也不能参与增量（会与同一条推送里的
-            // ORDER_TRADE_UPDATE 产出的 Fill 重复计算）。校验走 PositionReport 通道。
+            // ORDER_TRADE_UPDATE 产出的 Fill 重复计算）。校验走 PositionReconcileActor 的独立轮询。
 
             // 处理所有 balance 更新
             for bal_data in &update.a.balances {
                 let balance = bal_data.to_balance()
                     ?;
-                events.push(IncomeEvent {
+                events.push(AccountEvent {
+                    // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                    account: crate::domain::AccountId::Live,
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::Balance(balance),
+                    data: AccountData::Balance(balance),
                 });
             }
 
@@ -235,17 +237,21 @@ fn parse_private_message(
             // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
             if let Some(fill) = update.to_fill(quote)
                 ? {
-                events.push(IncomeEvent {
+                events.push(AccountEvent {
+                    // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                    account: crate::domain::AccountId::Live,
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::Fill(fill),
+                    data: AccountData::Fill(fill),
                 });
             }
 
-            events.push(IncomeEvent {
+            events.push(AccountEvent {
+                // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                account: crate::domain::AccountId::Live,
                 exchange_ts,
                 local_ts,
-                data: ExchangeEventData::OrderUpdate(
+                data: AccountData::OrderUpdate(
                     update.to_order_update(quote)
                         ?,
                 ),

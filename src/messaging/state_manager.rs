@@ -1,7 +1,22 @@
-use crate::domain::{Exchange, Greeks, MarketStatus, Order, Symbol, Timestamp, USDT};
+use crate::domain::{Exchange, Greeks, MarketStatus, Order, Position, Symbol, Timestamp, USDT};
 use crate::domain::AccountInfo;
-use crate::messaging::{ExchangeEventData, IncomeEvent, SymbolState};
+use crate::messaging::{AccountData, IncomeEvent, MarketData, SymbolState};
 use std::collections::HashMap;
+
+/// 一份持仓基线：某 (所, symbol) 的起始持仓 + 其 REST 快照的**请求**时刻。
+///
+/// 这是**投产握手的载荷，不是事件** —— 它只属于特定消费者（executor 出生时随
+/// `ExecutorArgs`、镜像随 `RegisterSymbols`），不上广播总线。生产者只有一个：
+/// `ManagerActor` 投产期的一次 REST 快照，同一份快照喂给全部账本消费者
+/// （executor / 对账镜像 / 观测镜像），三者口径一致。
+///
+/// `snapshot_req_ts` 的用途见 [`SymbolState::seed_position`]：seed 之后、该时刻
+/// 之前送达的 Fill 已含在快照里，丢弃避免双计。
+#[derive(Debug, Clone)]
+pub struct PositionBaseline {
+    pub position: Position,
+    pub snapshot_req_ts: Timestamp,
+}
 
 /// 状态管理器 - 管理所有交易状态
 pub struct StateManager {
@@ -49,6 +64,26 @@ impl StateManager {
             self.states
                 .entry(symbol.clone())
                 .or_insert_with(|| SymbolState::new(symbol.clone()));
+        }
+    }
+
+    /// 写入一批持仓基线（投产握手，见 [`PositionBaseline`]）。
+    ///
+    /// symbol 未注册的基线直接跳过并记 error（基线属于策略订阅范围内的 symbol，
+    /// 范围外到达说明调用方拼装错了）；已 seed 的 (所, symbol) 静默跳过
+    /// （再晋升时的正常形态，见 [`SymbolState::seed_position`]）。
+    pub fn seed_positions(&mut self, baselines: &[PositionBaseline]) {
+        for baseline in baselines {
+            let symbol = &baseline.position.symbol;
+            let Some(state) = self.states.get_mut(symbol) else {
+                tracing::error!(
+                    %symbol,
+                    exchange = %baseline.position.exchange,
+                    "seed_positions: symbol 未在 StateManager 注册，基线被跳过"
+                );
+                continue;
+            };
+            state.seed_position(&baseline.position, baseline.snapshot_req_ts);
         }
     }
 
@@ -164,99 +199,95 @@ impl StateManager {
 
     /// 处理事件，更新状态
     pub fn apply(&mut self, event: &IncomeEvent) {
-        match &event.data {
-            // 全局事件: Balance
-            ExchangeEventData::Balance(balance) => {
-                if balance.asset == USDT {
-                    tracing::debug!(
-                        exchange = %balance.exchange,
-                        available = balance.available,
-                        "USDT balance updated"
+        match event {
+            IncomeEvent::Market(m) => match &m.data {
+                // 全局事件: ExchangeStatus
+                MarketData::ExchangeStatus { exchange, status } => {
+                    self.market_statuses.insert(*exchange, *status);
+                }
+                // 全局事件: 券源/汇率读数 —— 策略在 on_event 里自行消费并自持，
+                // StateManager 不缓存；显式空处理，避免落入 symbol 路由分支。
+                MarketData::BorrowFee(_) | MarketData::ExchangeRate(_) => {}
+                // 自定义事件：框架只运送不理解，策略在 on_event 里自行消费并自持。
+                // 必须显式空处理 —— 无 scope 的自定义事件会被兜底分支误报"缺少 symbol 的路由 bug"。
+                MarketData::Custom(_) => {}
+                // 全局事件: Clock (检查订单超时)
+                MarketData::Clock => {
+                    let now = m.local_ts;
+                    for state in self.states.values_mut() {
+                        state.remove_timed_out_orders(now, self.order_timeout_ms);
+                    }
+                }
+                // Symbol 行情: 委托对应 SymbolState 处理
+                _ => self.route_to_symbol_state(event),
+            },
+            IncomeEvent::Account(a) => match &a.data {
+                // 账户级事件: Balance
+                AccountData::Balance(balance) => {
+                    if balance.asset == USDT {
+                        tracing::debug!(
+                            exchange = %balance.exchange,
+                            available = balance.available,
+                            "USDT balance updated"
+                        );
+                        self.balances.insert(balance.exchange, balance.available);
+                    }
+                    // 存储币种现金余额 (用于修正 greeks delta)
+                    self.cash_balances.insert(
+                        (balance.exchange, balance.asset.clone()),
+                        balance.available,
                     );
-                    self.balances.insert(balance.exchange, balance.available);
                 }
-                // 存储币种现金余额 (用于修正 greeks delta)
-                self.cash_balances.insert(
-                    (balance.exchange, balance.asset.clone()),
-                    balance.available,
-                );
-            }
-            // 全局事件: AccountInfo (equity + notional 原子写入)
-            ExchangeEventData::AccountInfo {
-                exchange,
-                equity,
-                notional,
-            } => {
-                tracing::debug!(
-                    exchange = %exchange,
-                    equity = equity,
-                    notional = notional,
-                    "AccountInfo updated"
-                );
-                self.account_infos.insert(*exchange, AccountInfo {
-                    equity: *equity,
-                    notional: *notional,
-                });
-            }
-            // 全局事件: Greeks
-            ExchangeEventData::Greeks(g) => {
-                self.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
-            }
-            // 全局事件: ExchangeStatus
-            ExchangeEventData::ExchangeStatus { exchange, status } => {
-                self.market_statuses.insert(*exchange, *status);
-            }
-            // 全局事件: 券源/汇率读数 —— 策略在 on_event 里自行消费并自持，
-            // StateManager 不缓存；显式空处理，避免落入 symbol 路由分支。
-            ExchangeEventData::BorrowFee(_) | ExchangeEventData::ExchangeRate(_) => {}
-            // 全局事件: 持仓对账读数 —— 只服务 `PositionReconcileActor`，不进任何本地状态。
-            // 写进来就等于恢复了 `SymbolState` 明确否掉的"用快照覆写持仓"
-            // （会与 Fill 流重复计算同一笔成交）。
-            ExchangeEventData::PositionReport { .. } => {}
-            // 自定义事件：框架只运送不理解，策略在 on_event 里自行消费并自持。
-            // 必须显式空处理 —— 无 scope 的自定义事件会被兜底分支误报"缺少 symbol 的路由 bug"。
-            ExchangeEventData::Custom(_) => {}
-            // 全局事件: Clock (检查订单超时)
-            ExchangeEventData::Clock => {
-                let now = event.local_ts;
-                for state in self.states.values_mut() {
-                    state.remove_timed_out_orders(now, self.order_timeout_ms);
+                // 账户级事件: AccountInfo (equity + notional 原子写入)
+                AccountData::AccountInfo {
+                    exchange,
+                    equity,
+                    notional,
+                } => {
+                    tracing::debug!(
+                        exchange = %exchange,
+                        equity = equity,
+                        notional = notional,
+                        "AccountInfo updated"
+                    );
+                    self.account_infos.insert(*exchange, AccountInfo {
+                        equity: *equity,
+                        notional: *notional,
+                    });
                 }
-            }
-            // Symbol 事件: 委托对应 SymbolState 处理
-            // 事件由 IncomeProcessorActor 按 (exchange, symbol) 路由，正常只有已注册 symbol 会到达。
-            // 若 symbol 缺失或无对应状态，说明路由逻辑有 bug，记录 error 后忽略（不 panic）。
-            _ => {
-                let Some(symbol) = event.symbol() else {
-                    tracing::error!("symbol 事件缺少 symbol（路由 bug），忽略");
-                    return;
-                };
-                let Some(state) = self.states.get_mut(symbol) else {
-                    tracing::error!(symbol = %symbol, "StateManager 无此 symbol 状态（路由 bug），忽略事件");
-                    return;
-                };
-                state.apply(event);
-            }
+                // 账户级事件: Greeks
+                AccountData::Greeks(g) => {
+                    self.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
+                }
+                // Symbol 私有事件 (OrderUpdate/Fill/FundingFee): 委托对应 SymbolState
+                _ => self.route_to_symbol_state(event),
+            },
         }
+    }
+
+    /// 按 symbol 路由到对应 SymbolState。
+    /// 事件由 IncomeProcessorActor 按 (exchange, symbol) 路由，正常只有已注册 symbol 会到达。
+    /// 若 symbol 缺失或无对应状态，说明路由逻辑有 bug，记录 error 后忽略（不 panic）。
+    fn route_to_symbol_state(&mut self, event: &IncomeEvent) {
+        let Some(symbol) = event.symbol() else {
+            tracing::error!("symbol 事件缺少 symbol（路由 bug），忽略");
+            return;
+        };
+        let Some(state) = self.states.get_mut(symbol) else {
+            tracing::error!(symbol = %symbol, "StateManager 无此 symbol 状态（路由 bug），忽略事件");
+            return;
+        };
+        state.apply(event);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Position;
-    use crate::messaging::ExchangeEventData;
+    use crate::domain::{Fill, FillReason, Side};
 
     const EX: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
-
-    fn ev(data: ExchangeEventData) -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: 1,
-            local_ts: 1,
-            data,
-        }
-    }
 
     fn position(size: f64) -> Position {
         Position {
@@ -266,22 +297,75 @@ mod tests {
         }
     }
 
-    /// 对账读数只供 `PositionReconcileActor` 比对，**绝不**写入本地持仓。
-    ///
-    /// 若写入，就等于恢复了"用快照覆写持仓"——而快照与 Fill 流叠加会重复计算同一笔成交，
-    /// 这正是 `PositionBaseline` 只允许出现一次的原因。
-    #[test]
-    fn position_report_does_not_touch_local_position() {
-        let mut manager = StateManager::new(&[SYM.to_string()], 0);
-        manager.apply(&ev(ExchangeEventData::PositionBaseline(position(2.0))));
+    fn baseline(size: f64, snapshot_req_ts: Timestamp) -> PositionBaseline {
+        PositionBaseline {
+            position: position(size),
+            snapshot_req_ts,
+        }
+    }
 
-        // 交易所报了个不一样的值（这正是"漂移"的样子）——本地持仓不动，由对账层去告警
-        manager.apply(&ev(ExchangeEventData::PositionReport {
-            exchange: EX,
-            positions: vec![position(99.0)],
-        }));
+    fn fill_at(size: f64, local_ts: Timestamp) -> IncomeEvent {
+        IncomeEvent::account(
+            crate::domain::AccountId::Live,
+            local_ts,
+            local_ts,
+            AccountData::Fill(Fill {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                side: Side::Long,
+                price: 100.0,
+                size,
+                client_order_id: None,
+                order_id: "1".to_string(),
+                timestamp: local_ts,
+                fee: 0.0,
+                reason: FillReason::Normal,
+            }),
+        )
+    }
+
+    /// 基线只写一次：第二次 seed 静默跳过（再晋升时的正常形态），存量不被覆写
+    #[test]
+    fn seed_is_idempotent_and_never_overwrites() {
+        let mut manager = StateManager::new(&[SYM.to_string()], 0);
+        manager.seed_positions(&[baseline(2.0, 10)]);
+        manager.seed_positions(&[baseline(99.0, 20)]);
 
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(state.position_size(EX), 2.0);
+        assert_eq!(state.position_size(EX), 2.0, "重复 seed 不得覆写存量");
+    }
+
+    /// **防双计**：快照请求时刻之前送达的 Fill 已含在快照里，seed 之后到达必须丢弃；
+    /// 之后送达的照常累加。这条规则对 executor / 对账镜像 / 观测镜像同一份。
+    #[test]
+    fn fills_covered_by_snapshot_are_dropped_after_seed() {
+        let mut manager = StateManager::new(&[SYM.to_string()], 0);
+        // 快照请求时刻 t=10，读到存量 2.0
+        manager.seed_positions(&[baseline(2.0, 10)]);
+
+        // t=5 送达的 Fill（成交已含在快照里）迟到进入 —— 丢弃
+        manager.apply(&fill_at(1.0, 5));
+        // t=15 送达的 Fill 是快照之后的新成交 —— 累加
+        manager.apply(&fill_at(1.0, 15));
+
+        let state = manager.symbol_state(&SYM.to_string()).expect("state");
+        assert_eq!(state.position_size(EX), 3.0, "应为 2.0(快照) + 1.0(新成交)");
+    }
+
+    /// 未 seed 的所从 0 起算（模拟账户、未配置凭证的所）：Fill 直接累加，不受过滤影响
+    #[test]
+    fn unseeded_exchange_accumulates_from_zero() {
+        let mut manager = StateManager::new(&[SYM.to_string()], 0);
+        manager.apply(&fill_at(1.5, 5));
+        let state = manager.symbol_state(&SYM.to_string()).expect("state");
+        assert_eq!(state.position_size(EX), 1.5);
+    }
+
+    /// 未注册 symbol 的基线被跳过（不 panic、不隐式建状态）
+    #[test]
+    fn baseline_for_unregistered_symbol_is_skipped() {
+        let mut manager = StateManager::new(&[], 0);
+        manager.seed_positions(&[baseline(2.0, 10)]);
+        assert!(manager.symbol_state(&SYM.to_string()).is_none());
     }
 }

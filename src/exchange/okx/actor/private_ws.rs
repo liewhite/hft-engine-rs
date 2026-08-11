@@ -3,15 +3,15 @@
 //! 职责:
 //! - 建立私有 WebSocket 连接并完成登录
 //! - 自动订阅私有频道 (positions, account, orders)
-//! - 直接解析消息并发布到 IncomePubSub
+//! - 直接解析消息并发布到对应总线
 
 use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::engine::IncomePubSub;
+use crate::engine::AccountPubSub;
 use crate::exchange::client::WsError;
-use crate::exchange::okx::codec::{resolve_meta, AccountData, OrderPushData, WsEvent, WsPush};
+use crate::exchange::okx::codec::{resolve_meta, AccountData as OkxAccountPush, OrderPushData, WsEvent, WsPush};
 use crate::exchange::okx::{OkxCredentials, WS_PRIVATE_URL};
 use crate::exchange::ws_loop;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent};
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -33,16 +33,16 @@ const LOGIN_TIMEOUT_SECS: u64 = 10;
 pub struct OkxPrivateWsActorArgs {
     /// 凭证
     pub credentials: OkxCredentials,
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 账户私有事件总线（发布事件，标 Live）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// Symbol 元数据（用于仓位转换）
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
 /// OkxPrivateWsActor - 私有 WebSocket Actor
 pub struct OkxPrivateWsActor {
-    /// Income PubSub (发布事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    /// 账户私有事件总线（发布事件，标 Live）
+    account_pubsub: ActorRef<AccountPubSub>,
     /// Symbol 元数据
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 发送消息到 ws_loop 的 channel
@@ -57,8 +57,8 @@ impl OkxPrivateWsActor {
         let events = parse_private_message(raw, local_ts, &self.symbol_metas)?;
         tracing::debug!(count = events.len(), "OKX private events parsed");
         for event in events {
-            if let Err(e) = self.income_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to AccountPubSub");
             }
         }
         Ok(())
@@ -149,7 +149,7 @@ impl Actor for OkxPrivateWsActor {
         //
         // **不订阅 `positions`**：持仓的维护模型是「启动期 REST 基线 + 之后全程 Fill 累加」，
         // 持仓推送既不是基线（基线只能来自 ManagerActor）也不参与增量（增量走 `orders` 频道
-        // 产出的 Fill）。要校验本地持仓是否漂移，走 PositionReport 那条独立通道
+        // 产出的 Fill）。要校验本地持仓是否漂移，走 PositionReconcileActor 那条独立轮询通道
         // （见 crate::engine::PositionReconcileActor），不在这里塞快照。
         let subscribe_msg = json!({
             "op": "subscribe",
@@ -187,7 +187,7 @@ impl Actor for OkxPrivateWsActor {
         tracing::info!("OkxPrivateWsActor started");
 
         Ok(Self {
-            income_pubsub: args.income_pubsub,
+            account_pubsub: args.account_pubsub,
             symbol_metas: args.symbol_metas,
             ws_tx: Some(outgoing_tx),
         })
@@ -229,7 +229,7 @@ fn parse_private_message(
     raw: &str,
     local_ts: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
-) -> Result<Vec<IncomeEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, WsError> {
     // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
     if raw == "pong" {
         return Ok(Vec::new());
@@ -271,7 +271,7 @@ fn parse_private_message(
 
     match channel {
         "account" => {
-            let push: WsPush<AccountData> = serde_json::from_str(raw)
+            let push: WsPush<OkxAccountPush> = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;
 
             let mut events = Vec::new();
@@ -280,10 +280,12 @@ fn parse_private_message(
                     .u_time
                     .parse::<u64>()
                     .map_err(|_| WsError::ParseError(format!("Failed to parse OKX account timestamp: {}", data.u_time)))?;
-                events.push(IncomeEvent {
+                events.push(AccountEvent {
+                    // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                    account: crate::domain::AccountId::Live,
                     exchange_ts,
                     local_ts,
-                    data: ExchangeEventData::AccountInfo {
+                    data: AccountData::AccountInfo {
                         exchange: Exchange::OKX,
                         equity: data.to_equity()?,
                         notional: data.to_notional()?,
@@ -295,10 +297,12 @@ fn parse_private_message(
                     let cash_bal: f64 = detail.cash_bal.parse()
                         .map_err(|_| WsError::ParseError(format!(
                             "Failed to parse cash_bal '{}' for ccy {}", detail.cash_bal, detail.ccy)))?;
-                    events.push(IncomeEvent {
+                    events.push(AccountEvent {
+                        // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                        account: crate::domain::AccountId::Live,
                         exchange_ts,
                         local_ts,
-                        data: ExchangeEventData::Balance(Balance {
+                        data: AccountData::Balance(Balance {
                             exchange: Exchange::OKX,
                             asset: detail.ccy.clone(),
                             available: cash_bal,
@@ -340,18 +344,22 @@ fn parse_private_message(
                 // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
                 if let Some(fill) = data.to_fill(meta)
                     ? {
-                    events.push(IncomeEvent {
+                    events.push(AccountEvent {
+                        // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                        account: crate::domain::AccountId::Live,
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::Fill(fill),
+                        data: AccountData::Fill(fill),
                     });
                 }
 
                 // OrderUpdate 事件
-                events.push(IncomeEvent {
+                events.push(AccountEvent {
+                    // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                    account: crate::domain::AccountId::Live,
                     exchange_ts: local_ts,
                     local_ts,
-                    data: ExchangeEventData::OrderUpdate(order_update),
+                    data: AccountData::OrderUpdate(order_update),
                 });
             }
             Ok(events)

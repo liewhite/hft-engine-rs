@@ -3,10 +3,10 @@
 //! Binance 的 WebSocket 不推送 equity，需要通过 REST API 定时查询
 
 use crate::domain::{now_ms, Exchange};
-use crate::engine::IncomePubSub;
+use crate::engine::AccountPubSub;
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::ExchangeClient;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -22,7 +22,7 @@ pub struct BinanceEquityPollingActorArgs {
     /// Binance client (用于查询 equity)
     pub client: Arc<dyn ExchangeClient>,
     /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// 查询间隔 (毫秒)
     pub interval_ms: u64,
 }
@@ -32,7 +32,7 @@ pub struct BinanceEquityPollingActor {
     /// Binance client
     client: Arc<dyn ExchangeClient>,
     /// Income PubSub (发布事件)
-    income_pubsub: ActorRef<IncomePubSub>,
+    account_pubsub: ActorRef<AccountPubSub>,
     /// 停摆守卫：净值取不到时，`StateManager` 里的旧值会原样留着且无从分辨新鲜度 ——
     /// 账户杠杆闸门会拿着它一路放行。长期取不到就让本 actor 死掉（见 StalenessGuard）。
     guard: StalenessGuard,
@@ -48,11 +48,13 @@ impl BinanceEquityPollingActor {
                 self.guard.record_success();
                 // 发布 AccountInfo 事件
                 if let Err(e) = self
-                    .income_pubsub
-                    .tell(Publish(IncomeEvent {
+                    .account_pubsub
+                    .tell(Publish(AccountEvent {
+                        // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                        account: crate::domain::AccountId::Live,
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::AccountInfo {
+                        data: AccountData::AccountInfo {
                             exchange: Exchange::Binance,
                             equity: info.equity,
                             notional: info.notional,
@@ -61,7 +63,7 @@ impl BinanceEquityPollingActor {
                     .send()
                     .await
                 {
-                    tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                    tracing::error!(error = %e, "Failed to publish to AccountPubSub");
                 }
             }
             Err(e) => {
@@ -97,7 +99,7 @@ impl Actor for BinanceEquityPollingActor {
 
         Ok(Self {
             client: args.client,
-            income_pubsub: args.income_pubsub,
+            account_pubsub: args.account_pubsub,
             guard: StalenessGuard::new("Binance 账户净值", MAX_POLL_STALENESS_MS),
         })
     }

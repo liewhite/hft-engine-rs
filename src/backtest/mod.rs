@@ -21,3 +21,11 @@ pub use downloader::BinanceHistoryDownloader;
 pub use engine::{BacktestEngine, BacktestResult};
 pub use source::MarketDataSource;
 pub use trade_print_bbo::TradePrintBboSource;
+
+/// 回测的统一模拟账户标签。
+///
+/// 回测是单账户世界：柜台回报、合成的账户数据（BS Greeks/Balance）、净值快照都归属
+/// 这一个账户 —— 与实盘/模拟盘共用同一事件模型（AccountEvent 必须带账户）。
+pub fn backtest_account() -> crate::domain::AccountId {
+    crate::domain::AccountId::Paper("backtest".to_string())
+}

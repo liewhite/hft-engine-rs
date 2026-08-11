@@ -22,6 +22,12 @@
 //! [`SimConfig::exchange_to_strategy_delay_ms`] 在回测里用于模拟行情/回报的入向时延；模拟盘
 //! 的行情来自真实 WS，本身已带真实网络时延，再叠加会重复计算。故此处只用出向延迟。
 //!
+//! # 回报直接以 AccountEvent（带 Paper 标签）发布到共享的 AccountBus
+//!
+//! 与实盘适配层发布**同一个类型**，只是 account 字段不同 —— 账户隔离由字段值保证。
+//! SimState 只产回报不回显行情（历史上回显行情曾迫使本 actor 维护"哪些事件可外发"的
+//! 白名单来防自订阅回环，类型拆分后该机制整体消失）。
+//!
 //! # 账户：按 (账户, 交易所) 分柜台
 //!
 //! 一份 [`SimState`] 只代表**一个账户在一个交易所**的柜台（见其类型文档）。本 actor 按
@@ -31,10 +37,9 @@
 //! 净值在收到 Clock 时按各自的所发布 AccountInfo。
 
 use crate::domain::{
-    now_ms, AccountId, Exchange, Order, OrderId, OrderStatus, OrderUpdate, Symbol, SymbolMeta,
-    Timestamp, BBO,
+    now_ms, AccountId, Exchange, Order, OrderId, Symbol, SymbolMeta, Timestamp, BBO,
 };
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -44,17 +49,18 @@ use kameo::Actor;
 use kameo_actors::pubsub::Publish;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 
-use super::{AccountIncome, AccountOutcome, PaperPubSub};
+use super::{AccountOutcome, AccountPubSub};
 
 /// PaperCounterActor 初始化参数
 pub struct PaperCounterArgs {
-    /// 模拟账户私有事件的发布总线（**不是**共享行情总线）
-    pub paper_pubsub: ActorRef<PaperPubSub>,
+    /// 账户私有事件总线（柜台回报以 Paper 标签发布，与实盘适配层同一条总线）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// 撮合与账本配置（每个模拟账户各自按此初始化）
     pub config: SimConfig,
-    /// Symbol 元数据：下单量下界校验（与实盘出口同一规则，见
-    /// [`SymbolMeta::checked_exchange_qty`]）
+    /// Symbol 元数据：透传给各柜台的 [`SimState`]（市场规则校验在那里统一执行）
     pub symbol_metas: std::sync::Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
 }
 
@@ -82,12 +88,14 @@ pub struct PaperCounterActor {
     /// 共享报价缓存：行情没有账户归属，新柜台创建时用**本所**的报价播种，避免首单因
     /// "还没见过盘口"而无法判定可成交性
     last_quotes: HashMap<(Exchange, Symbol), BBO>,
-    paper_pubsub: ActorRef<PaperPubSub>,
+    account_pubsub: ActorRef<AccountPubSub>,
     config: SimConfig,
-    /// 下单量下界校验用（与实盘出口同一规则）
+    /// 透传给各柜台 SimState（市场规则校验在状态机内统一执行）
     symbol_metas: std::sync::Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 本地订单号发号器（模拟交易所返回的 order_id）
     order_id_gen: u64,
+    /// 延迟管道的入口（顺序保证见 [`Self::schedule`]）
+    delay_tx: mpsc::UnboundedSender<(Instant, Delayed)>,
 }
 
 impl PaperCounterActor {
@@ -96,25 +104,16 @@ impl PaperCounterActor {
         format!("paper-{}", self.order_id_gen)
     }
 
-    /// 发布柜台产生的回报。
-    ///
-    /// **白名单**：只发 `OrderUpdate` 与 `Fill` —— 柜台的职责就是这两类。
-    /// [`SimState::on_market`] 会把入参行情原样放在返回值首位，而柜台自己也订阅 IncomePubSub，
-    /// 若把行情回显再发布出去，就会收到自己发的行情、再次回显 —— **无限循环**。用黑名单逐个
-    /// 排除行情类型是脆弱的（新增一种行情事件就漏一个），故按白名单放行。
-    async fn publish_reports(&self, account: &AccountId, events: Vec<IncomeEvent>) {
-        for ev in events {
-            if !matches!(
-                ev.data,
-                ExchangeEventData::OrderUpdate(_) | ExchangeEventData::Fill(_)
-            ) {
-                continue;
-            }
-            let tagged = AccountIncome {
+    /// 发布柜台产生的回报（SimState 只产 OrderUpdate/Fill，天生无需过滤）。
+    async fn publish_reports(&self, account: &AccountId, reports: Vec<(Timestamp, AccountData)>) {
+        for (ts, data) in reports {
+            let event = AccountEvent {
                 account: account.clone(),
-                event: ev,
+                exchange_ts: ts,
+                local_ts: ts,
+                data,
             };
-            if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
+            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Paper counter failed to publish report");
             }
         }
@@ -129,6 +128,7 @@ impl PaperCounterActor {
                 self.config.initial_balance_usdt,
                 self.config.maker_fee_rate,
                 self.config.taker_fee_rate,
+                self.symbol_metas.clone(),
             );
             for ((ex, _), bbo) in &self.last_quotes {
                 if *ex == exchange {
@@ -153,75 +153,63 @@ impl PaperCounterActor {
         for ((account, _), state) in &self.states {
             let equity = state.ledger.equity(|s: &Symbol| state.mark_of(s));
             let notional = state.ledger.notional(|s: &Symbol| state.mark_of(s));
-            let tagged = AccountIncome {
+            let event = AccountEvent {
                 account: account.clone(),
-                event: IncomeEvent {
-                    exchange_ts: ts,
-                    local_ts: ts,
-                    data: ExchangeEventData::AccountInfo {
-                        exchange: state.exchange,
-                        equity,
-                        notional,
-                    },
+                exchange_ts: ts,
+                local_ts: ts,
+                data: AccountData::AccountInfo {
+                    exchange: state.exchange,
+                    equity,
+                    notional,
                 },
             };
-            if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
+            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Paper counter failed to publish account info");
             }
         }
     }
 
-    /// 校验失败的拒单回报（Error 终态，清除策略侧 pending），与实盘
-    /// OutcomeProcessor::send_order_error 同语义。
-    async fn publish_order_error(&self, account: &AccountId, order: &Order, reason: String) {
-        let ts = now_ms();
-        let update = OrderUpdate {
-            order_id: String::new(),
-            client_order_id: Some(order.client_order_id.clone()),
-            exchange: order.exchange,
-            symbol: order.symbol.clone(),
-            side: order.side,
-            status: OrderStatus::Error { reason },
-            quantity: order.quantity,
-        };
-        let tagged = AccountIncome {
-            account: account.clone(),
-            event: IncomeEvent {
-                exchange_ts: ts,
-                local_ts: ts,
-                data: ExchangeEventData::OrderUpdate(update),
-            },
-        };
-        if let Err(e) = self.paper_pubsub.tell(Publish(tagged)).send().await {
-            tracing::error!(error = %e, "Paper counter failed to publish order error");
-        }
-    }
-
     /// 延迟 `order_delay_ms` 后把消息投回自己，模拟到交易所的单程时延。
     ///
-    /// 延迟为常量，故同一 actor 上的投递顺序与到达顺序一致（不会乱序）。
-    fn schedule<M>(actor_ref: &ActorRef<PaperCounterActor>, delay_ms: u64, msg: M)
-    where
-        PaperCounterActor: Message<M>,
-        M: Send + 'static,
-    {
-        let actor_ref = actor_ref.clone();
-        tokio::spawn(async move {
-            if delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            if let Err(e) = actor_ref.tell(msg).send().await {
-                tracing::warn!(error = %e, "Paper counter delayed message dropped (actor stopped)");
-            }
-        });
+    /// # 顺序保证：到达柜台的顺序 == 提交顺序
+    ///
+    /// 走**单条 FIFO 管道 + 单消费者**（见 [`Self::on_start`] 起的那个任务），而不是每条
+    /// 消息各 `tokio::spawn` 一个 sleep —— 后者**不保证顺序**：同一延迟的两个 sleep 落在
+    /// 同一个定时器槽里时，唤醒次序由 tokio 内部的槽内链表决定，与提交序无关（此前这里
+    /// 的注释断言"延迟为常量故不会乱序"，那是没有依据的）。
+    ///
+    /// # 它实际防住什么（如实说明，别高估）
+    ///
+    /// **不是**"撤单抢在下单前到达"：撤单要带交易所订单号，而该号只在下单入簿后的
+    /// `Pending` 回报里才有（gamma_scalp 的 `cancel_confirmed` 也显式要求先确认），
+    /// 所以撤单在因果上必然晚于它那张单的入簿，这条竞态**不可达**。
+    ///
+    /// 真正受影响的是**同时提交的多张挂单之间的时间优先**：`SimState::resting` 是
+    /// `IndexMap`，插入序即撮合序（时间优先的近似）。乱序入簿会把后提交的单排到前面，
+    /// 使部分成交的预算分配偏离真实交易所。影响有界（都是本策略自己的单），但既然
+    /// "按到达顺序撮合"是撮合层写明的语义，就该让它真的成立。
+    ///
+    /// 所有延迟同为常量，故入队序即到期序，逐条 `sleep_until` 即兑现该语义；
+    /// 顺带省掉每条消息一个 spawn。
+    fn schedule(&self, delay_ms: u64, msg: Delayed) {
+        let due = Instant::now() + Duration::from_millis(delay_ms);
+        if self.delay_tx.send((due, msg)).is_err() {
+            tracing::warn!("Paper counter 延迟管道已关闭，消息丢弃（actor 正在停机）");
+        }
     }
+}
+
+/// 经延迟管道投回本 actor 的消息（见 [`PaperCounterActor::schedule`]）
+enum Delayed {
+    Place(ApplyPlace),
+    Cancel(ApplyCancel),
 }
 
 impl Actor for PaperCounterActor {
     type Args = PaperCounterArgs;
     type Error = Infallible;
 
-    async fn on_start(args: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         tracing::warn!(
             initial_balance = args.config.initial_balance_usdt,
             maker_fee_rate = args.config.maker_fee_rate,
@@ -229,13 +217,31 @@ impl Actor for PaperCounterActor {
             order_delay_ms = args.config.order_to_exchange_delay_ms,
             "PaperCounterActor started — PAPER TRADING, orders are matched locally and never sent to any exchange"
         );
+        // 延迟管道的单消费者：按 FIFO 逐条等到期再投回本 actor，兑现"到达柜台的顺序 ==
+        // 提交顺序"（见 Self::schedule）。管道随 actor 一同结束：actor 被 drop → delay_tx
+        // 关闭 → recv 得 None → 本任务退出并释放它持有的 ActorRef。
+        let (delay_tx, mut delay_rx) = mpsc::unbounded_channel::<(Instant, Delayed)>();
+        tokio::spawn(async move {
+            while let Some((due, msg)) = delay_rx.recv().await {
+                tokio::time::sleep_until(due).await;
+                let sent = match msg {
+                    Delayed::Place(p) => actor_ref.tell(p).send().await.map_err(|e| e.to_string()),
+                    Delayed::Cancel(c) => actor_ref.tell(c).send().await.map_err(|e| e.to_string()),
+                };
+                if let Err(e) = sent {
+                    tracing::warn!(error = %e, "Paper counter 延迟消息投递失败（actor 已停机），停止管道");
+                    break;
+                }
+            }
+        });
         Ok(Self {
             states: HashMap::new(),
             last_quotes: HashMap::new(),
-            paper_pubsub: args.paper_pubsub,
+            account_pubsub: args.account_pubsub,
             config: args.config,
             symbol_metas: args.symbol_metas,
             order_id_gen: 0,
+            delay_tx,
         })
     }
 
@@ -251,12 +257,12 @@ impl Actor for PaperCounterActor {
 
 // === 行情入向：只更新盘口，用真实成交撮合 ===
 
-impl Message<IncomeEvent> for PaperCounterActor {
+impl Message<MarketEvent> for PaperCounterActor {
     type Reply = ();
 
-    async fn handle(&mut self, ev: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, ev: MarketEvent, _ctx: &mut Context<Self, Self::Reply>) {
         match &ev.data {
-            ExchangeEventData::BBO(bbo) => {
+            MarketData::BBO(bbo) => {
                 // 行情没有账户归属：缓存一份供新柜台播种，并同步给**本所**的已开柜台
                 self.last_quotes
                     .insert((bbo.exchange, bbo.symbol.clone()), bbo.clone());
@@ -266,7 +272,7 @@ impl Message<IncomeEvent> for PaperCounterActor {
                     }
                 }
             }
-            ExchangeEventData::MarketTrade(trade) => {
+            MarketData::MarketTrade(trade) => {
                 // 逐柜台撮合（只喂本所的柜台）：各柜台只持有自己 symbol 的挂单，非本
                 // symbol 的柜台是空转。该 O(柜台数) 开销是选择 Top-N 而非全部 530 个
                 // symbol 的原因之一；若要放到全量，应把"共享行情"从 SimState 里拆出来只存一份。
@@ -286,7 +292,7 @@ impl Message<IncomeEvent> for PaperCounterActor {
                     self.publish_reports(&key.0, reports).await;
                 }
             }
-            ExchangeEventData::MarkPrice(mp) => {
+            MarketData::MarkPrice(mp) => {
                 let exchange = mp.exchange;
                 let keys: Vec<(AccountId, Exchange)> = self
                     .states
@@ -303,7 +309,7 @@ impl Message<IncomeEvent> for PaperCounterActor {
                     self.publish_reports(&key.0, reports).await;
                 }
             }
-            ExchangeEventData::Clock => {
+            MarketData::Clock => {
                 self.publish_account_info(ev.local_ts).await;
             }
             _ => {}
@@ -316,7 +322,7 @@ impl Message<IncomeEvent> for PaperCounterActor {
 impl Message<AccountOutcome> for PaperCounterActor {
     type Reply = ();
 
-    async fn handle(&mut self, tagged: AccountOutcome, ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, tagged: AccountOutcome, _ctx: &mut Context<Self, Self::Reply>) {
         // 只负责模拟账户；实盘账户的订单由 OutcomeProcessorActor 发往交易所
         if !tagged.account.is_paper() {
             return;
@@ -329,40 +335,9 @@ impl Message<AccountOutcome> for PaperCounterActor {
             OutcomeEvent::Emit(_) => {}
             OutcomeEvent::PlaceOrders { orders, comment } => {
                 for order in orders {
-                    // 与实盘出口同一套下界校验（checked_exchange_qty 是唯一出处）：
-                    // 实盘必拒的单（取整为 0 / 低于最小下单量 / 缺 meta）模拟盘也拒，
-                    // 否则模拟盘会成交实盘发不出去的单，仿真失真。
-                    // 校验通过后按交易所精度**向下取整**再下发（与 from_domain 行为
-                    // 一致）：策略请求 0.0016 而 step=0.001 时实盘只成交 0.001，柜台
-                    // 必须同量 —— 丢弃取整结果会让模拟盘每单多成交至多一个 step。
-                    let rounded = match self
-                        .symbol_metas
-                        .get(&(order.exchange, order.symbol.clone()))
-                    {
-                        None => Err(format!(
-                            "no SymbolMeta for {}/{}",
-                            order.exchange, order.symbol
-                        )),
-                        Some(meta) => meta
-                            .checked_exchange_qty(order.quantity)
-                            .map(|_| meta.round_coin_size_down(order.quantity)),
-                    };
-                    let order = match rounded {
-                        Ok(quantity) => Order { quantity, ..order },
-                        Err(reason) => {
-                            tracing::error!(
-                                %account,
-                                exchange = %order.exchange,
-                                symbol = %order.symbol,
-                                quantity = order.quantity,
-                                client_order_id = %order.client_order_id,
-                                %reason,
-                                "[PAPER] 订单未通过出向校验，拒单"
-                            );
-                            self.publish_order_error(&account, &order, reason).await;
-                            continue;
-                        }
-                    };
+                    // 市场规则校验（下界 + 取整）不在此处：柜台状态机 SimState 在订单
+                    // 到达时统一执行（与实盘出口同一规则出处 checked_exchange_qty），
+                    // 校验失败以 Rejected 终态回报 —— 回测与模拟盘因此天然同规。
                     let order_id = self.next_order_id();
                     tracing::info!(
                         %account,
@@ -377,14 +352,13 @@ impl Message<AccountOutcome> for PaperCounterActor {
                         delay_ms = delay,
                         "[PAPER] Order accepted by local counter"
                     );
-                    Self::schedule(
-                        ctx.actor_ref(),
+                    self.schedule(
                         delay,
-                        ApplyPlace {
+                        Delayed::Place(ApplyPlace {
                             account: account.clone(),
                             order,
                             order_id,
-                        },
+                        }),
                     );
                 }
             }
@@ -399,14 +373,13 @@ impl Message<AccountOutcome> for PaperCounterActor {
                     %account, %exchange, %symbol, %order_id, delay_ms = delay,
                     "[PAPER] Cancel accepted by local counter"
                 );
-                Self::schedule(
-                    ctx.actor_ref(),
+                self.schedule(
                     delay,
-                    ApplyCancel {
+                    Delayed::Cancel(ApplyCancel {
                         account,
                         exchange,
                         order_id,
-                    },
+                    }),
                 );
             }
         }
@@ -488,32 +461,32 @@ mod tests {
     }
 
     /// 收集柜台回报，供断言
-    struct Sink(Arc<Mutex<Vec<IncomeEvent>>>);
+    struct Sink(Arc<Mutex<Vec<AccountEvent>>>);
 
     impl Actor for Sink {
-        type Args = Arc<Mutex<Vec<IncomeEvent>>>;
+        type Args = Arc<Mutex<Vec<AccountEvent>>>;
         type Error = Infallible;
         async fn on_start(a: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
             Ok(Self(a))
         }
     }
 
-    impl Message<AccountIncome> for Sink {
+    impl Message<AccountEvent> for Sink {
         type Reply = ();
-        async fn handle(&mut self, msg: AccountIncome, _c: &mut Context<Self, Self::Reply>) {
-            self.0.lock().unwrap().push(msg.event);
+        async fn handle(&mut self, msg: AccountEvent, _c: &mut Context<Self, Self::Reply>) {
+            self.0.lock().unwrap().push(msg);
         }
     }
 
     struct Harness {
         counter: ActorRef<PaperCounterActor>,
-        events: Arc<Mutex<Vec<IncomeEvent>>>,
+        events: Arc<Mutex<Vec<AccountEvent>>>,
     }
 
     impl Harness {
         async fn new(order_delay_ms: u64) -> Self {
-            let pubsub = PaperPubSub::spawn_with_mailbox(
-                PaperPubSub::new(DeliveryStrategy::Guaranteed),
+            let pubsub = AccountPubSub::spawn_with_mailbox(
+                AccountPubSub::new(DeliveryStrategy::Guaranteed),
                 mailbox::unbounded(),
             );
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -522,7 +495,7 @@ mod tests {
 
             let counter = PaperCounterActor::spawn_with_mailbox(
                 PaperCounterArgs {
-                    paper_pubsub: pubsub,
+                    account_pubsub: pubsub,
                     config: SimConfig {
                         initial_balance_usdt: 10_000.0,
                         maker_fee_rate: 0.0,
@@ -539,10 +512,10 @@ mod tests {
 
         /// 送一条 BBO（只更新盘口，不应撮合）
         async fn bbo(&self, bid: f64, ask: f64) {
-            let ev = IncomeEvent {
+            let ev = MarketEvent {
                 exchange_ts: 1,
                 local_ts: 1,
-                data: ExchangeEventData::BBO(BBO {
+                data: MarketData::BBO(BBO {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     bid_price: bid,
@@ -557,10 +530,10 @@ mod tests {
 
         /// 送一条真实成交
         async fn trade(&self, price: f64) {
-            let ev = IncomeEvent {
+            let ev = MarketEvent {
                 exchange_ts: 2,
                 local_ts: 2,
-                data: ExchangeEventData::MarketTrade(MarketTrade {
+                data: MarketData::MarketTrade(MarketTrade {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     price,
@@ -611,7 +584,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    ExchangeEventData::OrderUpdate(u) => Some(u.status.clone()),
+                    AccountData::OrderUpdate(u) => Some(u.status.clone()),
                     _ => None,
                 })
                 .collect()
@@ -623,7 +596,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    ExchangeEventData::Fill(f) => Some((f.price, f.size)),
+                    AccountData::Fill(f) => Some((f.price, f.size)),
                     _ => None,
                 })
                 .collect()
@@ -635,7 +608,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    ExchangeEventData::OrderUpdate(u) => Some(u.order_id.clone()),
+                    AccountData::OrderUpdate(u) => Some(u.order_id.clone()),
                     _ => None,
                 })
                 .collect()
@@ -653,10 +626,10 @@ mod tests {
         h.settle(50).await;
         assert_eq!(h.statuses(), vec![OrderStatus::Pending]);
         // OKX 上同 symbol 的成交穿过挂单价 —— 不得撮合 Binance 的挂单
-        let okx_trade = IncomeEvent {
+        let okx_trade = MarketEvent {
             exchange_ts: 2,
             local_ts: 2,
-            data: ExchangeEventData::MarketTrade(MarketTrade {
+            data: MarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::OKX,
                 symbol: SYM.to_string(),
                 price: 98.0,
@@ -707,10 +680,10 @@ mod tests {
         h.settle(50).await;
         // Clock 触发净值发布
         h.counter
-            .tell(IncomeEvent {
+            .tell(MarketEvent {
                 exchange_ts: 3,
                 local_ts: 3,
-                data: ExchangeEventData::Clock,
+                data: MarketData::Clock,
             })
             .send()
             .await
@@ -722,7 +695,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match &e.data {
-                ExchangeEventData::AccountInfo { exchange, .. } => Some(*exchange),
+                AccountData::AccountInfo { exchange, .. } => Some(*exchange),
                 _ => None,
             })
             .collect();
@@ -755,8 +728,8 @@ mod tests {
     }
 
     /// **与实盘同规则的下界校验**：实盘必拒的单（不足一个 size_step）模拟盘也拒，
-    /// 以 Error 终态回报（清策略侧 pending），绝不入簿成交 —— 否则模拟盘会成交
-    /// 实盘发不出去的单，仿真失真
+    /// 以 Rejected 终态回报（清策略侧 pending），绝不入簿成交 —— 否则模拟盘会成交
+    /// 实盘发不出去的单，仿真失真。校验由柜台状态机 SimState 统一执行（回测同一份）。
     #[tokio::test]
     async fn undersized_order_is_rejected_like_live() {
         let h = Harness::new(0).await;
@@ -767,8 +740,8 @@ mod tests {
         assert!(
             h.statuses()
                 .iter()
-                .any(|st| matches!(st, OrderStatus::Error { .. })),
-            "校验失败必须以 Error 终态回报: {:?}",
+                .any(|st| matches!(st, OrderStatus::Rejected { .. })),
+            "校验失败必须以 Rejected 终态回报: {:?}",
             h.statuses()
         );
         // 即使成交穿价，也不该有成交（单没入簿）
@@ -878,8 +851,8 @@ mod tests {
     /// taker 成交按 taker 费率计费（与 maker 不同）
     #[tokio::test]
     async fn taker_fill_charges_taker_fee() {
-        let pubsub = PaperPubSub::spawn_with_mailbox(
-            PaperPubSub::new(DeliveryStrategy::Guaranteed),
+        let pubsub = AccountPubSub::spawn_with_mailbox(
+            AccountPubSub::new(DeliveryStrategy::Guaranteed),
             mailbox::unbounded(),
         );
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -887,7 +860,7 @@ mod tests {
         pubsub.tell(Subscribe(sink)).send().await.unwrap();
         let counter = PaperCounterActor::spawn_with_mailbox(
             PaperCounterArgs {
-                paper_pubsub: pubsub,
+                account_pubsub: pubsub,
                 config: SimConfig {
                     initial_balance_usdt: 10_000.0,
                     maker_fee_rate: 0.0002,
@@ -910,7 +883,7 @@ mod tests {
             .unwrap()
             .iter()
             .find_map(|e| match &e.data {
-                ExchangeEventData::Fill(f) => Some(f.fee),
+                AccountData::Fill(f) => Some(f.fee),
                 _ => None,
             })
             .expect("fill");
@@ -973,10 +946,10 @@ mod tests {
         h.trade(100.0).await;
         // 标记价同样经 on_market（用于估值），其回显也不得外发
         h.counter
-            .tell(IncomeEvent {
+            .tell(MarketEvent {
                 exchange_ts: 3,
                 local_ts: 3,
-                data: ExchangeEventData::MarkPrice(crate::domain::MarkPrice {
+                data: MarketData::MarkPrice(crate::domain::MarkPrice {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     price: 100.0,
@@ -994,10 +967,9 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match &e.data {
-                ExchangeEventData::BBO(_) => Some("BBO"),
-                ExchangeEventData::MarketTrade(_) => Some("MarketTrade"),
-                ExchangeEventData::MarkPrice(_) => Some("MarkPrice"),
-                _ => None,
+                // AccountData 枚举里根本没有行情变体 —— 回显在类型上不可表达，
+                // 这里保留探针只为文档意图（永远匹配不到）
+                _ => None::<&'static str>,
             })
             .collect();
         assert!(
@@ -1016,17 +988,17 @@ mod tests {
         h.place(Side::Long, 99.0, 0.5).await;
         h.settle(50).await;
         h.counter
-            .tell(IncomeEvent {
+            .tell(MarketEvent {
                 exchange_ts: 5,
                 local_ts: 5,
-                data: ExchangeEventData::Clock,
+                data: MarketData::Clock,
             })
             .send()
             .await
             .unwrap();
         h.settle(30).await;
         let equity = h.events.lock().unwrap().iter().find_map(|e| match &e.data {
-            ExchangeEventData::AccountInfo { equity, .. } => Some(*equity),
+            AccountData::AccountInfo { equity, .. } => Some(*equity),
             _ => None,
         });
         assert_eq!(equity, Some(10_000.0));

@@ -19,7 +19,7 @@
 use crate::domain::{Exchange, MarketTrade, Symbol, SymbolMeta};
 use crate::exchange::utils::StepFormatter;
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{MarketData, MarketEvent};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -52,7 +52,7 @@ async fn observe(
     exchange_name: &str,
     url: &str,
     subscribe: Value,
-    mut parse: impl FnMut(&str) -> Result<Vec<IncomeEvent>, String>,
+    mut parse: impl FnMut(&str) -> Result<Vec<MarketEvent>, String>,
 ) -> (Vec<MarketTrade>, Vec<String>) {
     println!("[{exchange_name}] url={url} subscribe={subscribe}");
     let (mut ws, _) = connect_async(url)
@@ -87,7 +87,7 @@ async fn observe(
         let parsed: Vec<MarketTrade> = events
             .into_iter()
             .filter_map(|ev| match ev.data {
-                ExchangeEventData::MarketTrade(t) => Some(t),
+                MarketData::MarketTrade(t) => Some(t),
                 _ => None,
             })
             .collect();

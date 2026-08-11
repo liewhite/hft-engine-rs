@@ -17,7 +17,7 @@
 
 use crate::domain::{Exchange, Order, OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{ExchangeEventData, IncomeEvent, PendingOrder, StateManager};
+use crate::messaging::{AccountData, IncomeEvent, MarketData, PendingOrder, StateManager};
 use crate::strategy::{OutcomeEvent, Strategy};
 use std::collections::{HashMap, HashSet};
 
@@ -200,22 +200,27 @@ impl Strategy for GammaScalpStrategy {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
-        match &event.data {
+        match event {
             // 逐笔成交：以最新成交价为基准评估对冲
-            ExchangeEventData::MarketTrade(t)
-                if t.exchange == self.exchange && t.symbol == self.symbol =>
-            {
-                self.last_price = Some(t.price);
-                self.hedge(t.price, state)
-            }
-            // greeks 变化 (delta 漂移) 也即时触发，用最新成交价为基准
-            ExchangeEventData::Greeks(g) if g.exchange == self.exchange && g.ccy == self.ccy => {
-                match self.last_price {
-                    Some(p) => self.hedge(p, state),
-                    None => Vec::new(),
+            IncomeEvent::Market(m) => match &m.data {
+                MarketData::MarketTrade(t)
+                    if t.exchange == self.exchange && t.symbol == self.symbol =>
+                {
+                    self.last_price = Some(t.price);
+                    self.hedge(t.price, state)
                 }
-            }
-            _ => Vec::new(),
+                _ => Vec::new(),
+            },
+            // greeks 变化 (delta 漂移) 也即时触发，用最新成交价为基准
+            IncomeEvent::Account(a) => match &a.data {
+                AccountData::Greeks(g) if g.exchange == self.exchange && g.ccy == self.ccy => {
+                    match self.last_price {
+                        Some(p) => self.hedge(p, state),
+                        None => Vec::new(),
+                    }
+                }
+                _ => Vec::new(),
+            },
         }
     }
 }

@@ -18,14 +18,14 @@
 //! ```
 
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
-use hft_engine_rs::engine::IncomePubSub;
+use hft_engine_rs::engine::{AccountPubSub, MarketPubSub};
 use hft_engine_rs::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient, REST_BASE_URL};
 use hft_engine_rs::exchange::hyperliquid::{
     HyperliquidActor, HyperliquidActorArgs, HyperliquidClient,
 };
 use hft_engine_rs::exchange::okx::{OkxActor, OkxActorArgs, OkxClient};
 use hft_engine_rs::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent};
+use hft_engine_rs::messaging::{MarketData, MarketEvent};
 use kameo::actor::{ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::mailbox;
@@ -81,18 +81,18 @@ impl Actor for Collector {
     }
 }
 
-impl Message<IncomeEvent> for Collector {
+impl Message<MarketEvent> for Collector {
     type Reply = ();
 
-    async fn handle(&mut self, ev: IncomeEvent, _ctx: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, ev: MarketEvent, _ctx: &mut Context<Self, Self::Reply>) {
         let mut guard = self.shared.lock().expect("collector mutex");
         match &ev.data {
-            ExchangeEventData::BBO(b) => {
+            MarketData::BBO(b) => {
                 let e = guard.entry(b.exchange).or_default();
                 e.bbo_count += 1;
                 e.last_bbo = Some((b.bid_price, b.bid_qty, b.ask_qty));
             }
-            ExchangeEventData::MarketTrade(t) => {
+            MarketData::MarketTrade(t) => {
                 let e = guard.entry(t.exchange).or_default();
                 e.trade_count += 1;
                 e.trade_qtys.push(t.qty);
@@ -160,13 +160,17 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
     );
 
     // ---- 2. PubSub + 收集者 ----
-    let income_pubsub = IncomePubSub::spawn_with_mailbox(
-        IncomePubSub::new(DeliveryStrategy::BestEffort),
+    let market_pubsub = MarketPubSub::spawn_with_mailbox(
+        MarketPubSub::new(DeliveryStrategy::BestEffort),
+        mailbox::unbounded(),
+    );
+    let account_pubsub = AccountPubSub::spawn_with_mailbox(
+        AccountPubSub::new(DeliveryStrategy::BestEffort),
         mailbox::unbounded(),
     );
     let shared: Shared = Arc::new(Mutex::new(HashMap::new()));
     let collector = Collector::spawn_with_mailbox(shared.clone(), mailbox::unbounded());
-    income_pubsub
+    market_pubsub
         .tell(Subscribe(collector.clone()))
         .send()
         .await
@@ -178,7 +182,8 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
             credentials: None,
             symbol_metas: metas_of(binance_metas),
             rest_base_url: REST_BASE_URL.to_string(),
-            income_pubsub: income_pubsub.clone(),
+            market_pubsub: market_pubsub.clone(),
+            account_pubsub: account_pubsub.clone(),
             client: binance_client.clone(),
             quote: "USDT".to_string(),
         },
@@ -189,7 +194,8 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
             credentials: None,
             client: Some(okx_client.clone()),
             symbol_metas: metas_of(okx_metas),
-            income_pubsub: income_pubsub.clone(),
+            market_pubsub: market_pubsub.clone(),
+            account_pubsub: account_pubsub.clone(),
             quote: "USDT".to_string(),
         },
         mailbox::unbounded(),
@@ -198,7 +204,8 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
         HyperliquidActorArgs {
             credentials: None,
             symbol_metas: metas_of(hl_metas),
-            income_pubsub: income_pubsub.clone(),
+            market_pubsub: market_pubsub.clone(),
+            account_pubsub: account_pubsub.clone(),
             quote: "USDC".to_string(),
             dex: String::new(),
         },

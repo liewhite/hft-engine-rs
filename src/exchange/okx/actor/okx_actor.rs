@@ -3,7 +3,7 @@
 //! 职责:
 //! - 管理 PublicWsActor 和 PrivateWsActor 子 actor
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
-//! - WsActors 直接解析消息并发布到 IncomePubSub
+//! - WsActors 直接解析消息并发布到对应总线
 //!
 //! 架构:
 //! OkxActor (父)
@@ -16,7 +16,7 @@ use super::greeks_polling::{OkxGreeksPollingActor, OkxGreeksPollingActorArgs};
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
 use crate::domain::{ExchangeError, Symbol, SymbolMeta};
-use crate::engine::{CryptoStatusActor, CryptoStatusActorArgs, IncomePubSub};
+use crate::engine::{AccountPubSub, CryptoStatusActor, CryptoStatusActorArgs, MarketPubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
 use crate::exchange::okx::{OkxClient, OkxCredentials};
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -40,8 +40,10 @@ pub struct OkxActorArgs {
     pub client: Option<Arc<OkxClient>>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    /// 公共行情总线（public WS / 状态广播用）
+    pub market_pubsub: ActorRef<MarketPubSub>,
+    /// 账户私有事件总线（private WS / 账户轮询用）
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// 计价币种 (e.g., "USDT")
     pub quote: String,
 }
@@ -61,7 +63,6 @@ impl Actor for OkxActor {
     type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let income_pubsub = args.income_pubsub;
 
         // 1. 并发 spawn 三个 WS actor（spawn 本身瞬间返回）
         let mut children = ChildGroup::default();
@@ -69,7 +70,7 @@ impl Actor for OkxActor {
             &actor_ref,
             "OkxPublicWsActor",
             OkxPublicWsActorArgs {
-                income_pubsub: income_pubsub.clone(),
+                market_pubsub: args.market_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
@@ -79,7 +80,7 @@ impl Actor for OkxActor {
             &actor_ref,
             "OkxBusinessWsActor",
             OkxBusinessWsActorArgs {
-                income_pubsub: income_pubsub.clone(),
+                market_pubsub: args.market_pubsub.clone(),
                 symbol_metas: args.symbol_metas.clone(),
                 quote: args.quote.clone(),
             },
@@ -92,7 +93,7 @@ impl Actor for OkxActor {
                     "OkxPrivateWsActor",
                     OkxPrivateWsActorArgs {
                         credentials,
-                        income_pubsub: income_pubsub.clone(),
+                        account_pubsub: args.account_pubsub.clone(),
                         symbol_metas: args.symbol_metas,
                     },
                 )
@@ -133,7 +134,7 @@ impl Actor for OkxActor {
                 "OkxGreeksPollingActor",
                 OkxGreeksPollingActorArgs {
                     client,
-                    income_pubsub: income_pubsub.clone(),
+                    account_pubsub: args.account_pubsub.clone(),
                     interval_ms: GREEKS_POLLING_INTERVAL_MS,
                 },
             )
@@ -144,7 +145,7 @@ impl Actor for OkxActor {
             "CryptoStatusActor",
             CryptoStatusActorArgs {
                 exchange: crate::domain::Exchange::OKX,
-                income_pubsub,
+                market_pubsub: args.market_pubsub.clone(),
                 interval_ms: STATUS_BROADCAST_INTERVAL_MS,
             },
         )

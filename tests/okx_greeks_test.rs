@@ -14,7 +14,7 @@ use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
 
 const TEST_QUOTE: &str = "USDT";
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent, StateManager};
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
 use kameo::actor::Spawn;
 use kameo::mailbox;
@@ -53,8 +53,8 @@ impl Strategy for GreeksPrintStrategy {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
-        match &event.data {
-            ExchangeEventData::Greeks(raw) => {
+        if let IncomeEvent::Account(a) = event {
+            if let AccountData::Greeks(raw) = &a.data {
                 // state.greeks() 返回修正后的 delta (含现货 cashBal)
                 if let Some(g) = state.greeks(Exchange::OKX, &raw.ccy) {
                     println!(
@@ -68,7 +68,6 @@ impl Strategy for GreeksPrintStrategy {
                     );
                 }
             }
-            _ => {}
         }
         vec![]
     }
@@ -83,14 +82,16 @@ async fn test_okx_greeks_push() {
 
     let credentials = get_credentials().expect("需要设置 OKX_API_KEY, OKX_SECRET, OKX_PASSPHRASE");
 
+    let okx = hft_engine_rs::engine::setup_okx(ExchangeAccess {
+        quote: TEST_QUOTE.to_string(),
+        dex: String::new(),
+        credentials: Some(credentials),
+    })
+    .expect("装配 OKX");
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
-            ibkr_snapshot: None,
+            exchanges: vec![okx],
             paper: Default::default(),
-            binance: None,
-            okx: Some(ExchangeAccess { quote: TEST_QUOTE.to_string(), dex: String::new(), credentials: Some(credentials) }),
-            hyperliquid: None,
-            ibkr_credentials: None,
         },
         mailbox::unbounded(),
     );

@@ -11,7 +11,7 @@
 //! (源数据无网络延迟，延迟由回测引擎建模)，保证确定性。
 
 use crate::domain::{Exchange, ExchangeError, MarketTrade, Symbol, BBO};
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{IncomeEvent, MarketData};
 use std::io::{BufRead, BufReader, Cursor};
 
 /// 解析 bookTicker zip 字节为 BBO 事件。
@@ -37,7 +37,7 @@ fn book_ticker_row(symbol: &Symbol, f: &[&str]) -> Result<IncomeEvent, ExchangeE
         ask_qty: field_f64(f, 4)?,
         timestamp: field_u64(f, 6)?,
     };
-    Ok(historical(bbo.timestamp, ExchangeEventData::BBO(bbo)))
+    Ok(historical(bbo.timestamp, MarketData::BBO(bbo)))
 }
 
 /// `agg_trade_id, price, quantity, first_trade_id, last_trade_id, transact_time, is_buyer_maker`
@@ -55,16 +55,12 @@ fn agg_trade_row(symbol: &Symbol, f: &[&str]) -> Result<IncomeEvent, ExchangeErr
             .unwrap_or(false),
         timestamp: field_u64(f, 5)?,
     };
-    Ok(historical(trade.timestamp, ExchangeEventData::MarketTrade(trade)))
+    Ok(historical(trade.timestamp, MarketData::MarketTrade(trade)))
 }
 
 /// 历史事件构造：local_ts == exchange_ts。
-fn historical(ts: u64, data: ExchangeEventData) -> IncomeEvent {
-    IncomeEvent {
-        exchange_ts: ts,
-        local_ts: ts,
-        data,
-    }
+fn historical(ts: u64, data: MarketData) -> IncomeEvent {
+    IncomeEvent::market(ts, ts, data)
 }
 
 /// 解压 zip 内单一 CSV，**逐行流式**切分字段并映射；自动跳过表头行 (首字段非数字)。
@@ -149,20 +145,26 @@ mod tests {
                    2,101.0,1.0,904,904,1700000000100,false\n";
         let evs = parse_agg_trades(&"BTCUSDT".to_string(), &zip_with(csv)).unwrap();
         assert_eq!(evs.len(), 2);
-        match &evs[0].data {
-            ExchangeEventData::MarketTrade(t) => {
-                assert_eq!(t.price, 100.5);
-                assert_eq!(t.qty, 2.0);
-                assert!(t.is_buyer_maker);
-                assert_eq!(t.timestamp, 1700000000000);
-                assert_eq!(evs[0].exchange_ts, 1700000000000);
-                assert_eq!(evs[0].local_ts, 1700000000000);
-            }
-            _ => panic!("expected MarketTrade"),
+        match &evs[0] {
+            IncomeEvent::Market(m) => match &m.data {
+                MarketData::MarketTrade(t) => {
+                    assert_eq!(t.price, 100.5);
+                    assert_eq!(t.qty, 2.0);
+                    assert!(t.is_buyer_maker);
+                    assert_eq!(t.timestamp, 1700000000000);
+                    assert_eq!(m.exchange_ts, 1700000000000);
+                    assert_eq!(m.local_ts, 1700000000000);
+                }
+                _ => panic!("expected MarketTrade"),
+            },
+            _ => panic!("expected market event"),
         }
-        match &evs[1].data {
-            ExchangeEventData::MarketTrade(t) => assert!(!t.is_buyer_maker),
-            _ => panic!("expected MarketTrade"),
+        match &evs[1] {
+            IncomeEvent::Market(m) => match &m.data {
+                MarketData::MarketTrade(t) => assert!(!t.is_buyer_maker),
+                _ => panic!("expected MarketTrade"),
+            },
+            _ => panic!("expected market event"),
         }
     }
 
@@ -172,13 +174,16 @@ mod tests {
         let csv = "100,99.0,1.0,101.0,2.0,1700000000000,1700000000050\n";
         let evs = parse_book_ticker(&"BTCUSDT".to_string(), &zip_with(csv)).unwrap();
         assert_eq!(evs.len(), 1);
-        match &evs[0].data {
-            ExchangeEventData::BBO(b) => {
-                assert_eq!(b.bid_price, 99.0);
-                assert_eq!(b.ask_price, 101.0);
-                assert_eq!(b.timestamp, 1700000000050); // event_time
-            }
-            _ => panic!("expected BBO"),
+        match &evs[0] {
+            IncomeEvent::Market(m) => match &m.data {
+                MarketData::BBO(b) => {
+                    assert_eq!(b.bid_price, 99.0);
+                    assert_eq!(b.ask_price, 101.0);
+                    assert_eq!(b.timestamp, 1700000000050); // event_time
+                }
+                _ => panic!("expected BBO"),
+            },
+            _ => panic!("expected market event"),
         }
     }
 }

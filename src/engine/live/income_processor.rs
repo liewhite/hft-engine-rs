@@ -1,13 +1,25 @@
-//! ProcessorActor - 事件分发 Actor
+//! IncomeProcessorActor - 事件分发 Actor
 //!
-//! 职责：
-//! - 订阅 IncomePubSub 接收事件
-//! - 根据订阅关系分发到对应的 ExecutorActor
+//! 订阅 MarketBus 与 AccountBus，按订阅关系与账户归属分发到对应的 ExecutorActor：
+//! - 行情（[`MarketEvent`]）：一份服务所有账户 —— 有 symbol 的按 (exchange, symbol)
+//!   定向投给订阅者，无 symbol 的（Clock/ExchangeStatus/无 scope 的 Custom）广播；
+//! - 账户事件（[`AccountEvent`]）：只投给**该账户**的 executor —— 有 symbol 的再按
+//!   订阅过滤，账户级的（Balance/AccountInfo/Greeks）投给该账户全部 executor。
+//!
+//! 账户归属由事件自带的 `account` 字段决定（类型保证），不存在需要维护的分类表 ——
+//! 历史上这里有一张手工的 `is_account_private` 变体清单，新增私有变体漏改一行的
+//! 失效方向是"实盘私有事件广播给模拟策略"（危险侧、编译器不报）。
+//!
+//! # 路由索引
+//!
+//! 分发是热路径（每条 BBO 都经过），按 (exchange, symbol) 与账户建反向索引做 O(1)
+//! 查找 —— 此前对每条事件线性扫描全部 executor，数百 symbol 的部署下每个行情 tick
+//! 都是 O(n) 扫描。
 
-use super::{AccountIncome, ExecutorActor};
+use super::ExecutorActor;
 use crate::domain::{AccountId, Exchange, Symbol};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{EventRouting, ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountEvent, IncomeEvent, MarketEvent};
 use kameo::actor::{ActorId, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
@@ -19,37 +31,44 @@ struct ExecutorSubscription {
     executor: ActorRef<ExecutorActor>,
     /// 订阅的 (exchange, symbol) 集合
     symbols: HashSet<(Exchange, Symbol)>,
-    /// 该 executor 绑定的账户：**私有事件只投给账户匹配者**
+    /// 该 executor 绑定的账户
     account: AccountId,
 }
 
-/// 该事件是否属于某个账户私有（而非共享行情）。
-///
-/// 私有事件只对**一个账户**有意义：把实盘的成交投给模拟策略，会让它把别人的仓位记成自己的。
-/// 行情相反 —— 一份数据服务所有账户。
-fn is_account_private(event: &IncomeEvent) -> bool {
-    matches!(
-        event.data,
-        ExchangeEventData::OrderUpdate(_)
-            | ExchangeEventData::Fill(_)
-            | ExchangeEventData::PositionBaseline(_)
-            | ExchangeEventData::PositionReport { .. }
-            | ExchangeEventData::Balance(_)
-            | ExchangeEventData::AccountInfo { .. }
-            | ExchangeEventData::FundingFee(_)
-    )
-}
-
 /// ProcessorActor - 事件分发
+#[derive(Default)]
 pub struct IncomeProcessorActor {
     /// ActorId -> Executor 订阅信息
     executors: HashMap<ActorId, ExecutorSubscription>,
+    /// 反向索引：(exchange, symbol) -> 订阅者（热路径 O(1) 查找）
+    by_symbol: HashMap<(Exchange, Symbol), Vec<ActorId>>,
+    /// 反向索引：账户 -> 该账户的全部 executor
+    by_account: HashMap<AccountId, Vec<ActorId>>,
 }
 
-impl Default for IncomeProcessorActor {
-    fn default() -> Self {
-        Self {
-            executors: HashMap::new(),
+impl IncomeProcessorActor {
+    fn remove_from_indexes(&mut self, id: ActorId) {
+        if let Some(sub) = self.executors.remove(&id) {
+            for key in &sub.symbols {
+                if let Some(v) = self.by_symbol.get_mut(key) {
+                    v.retain(|x| *x != id);
+                    if v.is_empty() {
+                        self.by_symbol.remove(key);
+                    }
+                }
+            }
+            if let Some(v) = self.by_account.get_mut(&sub.account) {
+                v.retain(|x| *x != id);
+                if v.is_empty() {
+                    self.by_account.remove(&sub.account);
+                }
+            }
+        }
+    }
+
+    async fn forward(sub: &ExecutorSubscription, event: &IncomeEvent) {
+        if let Err(e) = sub.executor.tell(event.clone()).send().await {
+            tracing::error!(error = %e, "Failed to forward event to executor");
         }
     }
 }
@@ -94,6 +113,10 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let actor_id = msg.executor.id();
+        // 幂等：同一 executor 重复注册时先摘净旧索引 —— 否则 by_symbol/by_account 里
+        // 出现重复 id，每条事件双份投递、Fill 双计仓位（危险侧、静默）。今天注册点单一
+        // 且 ActorId 唯一，但这不该是巧合保护，而是结构保证。
+        self.remove_from_indexes(actor_id);
 
         // 从 subscriptions 提取 (exchange, symbol) 集合
         let symbols: HashSet<(Exchange, Symbol)> = msg
@@ -108,6 +131,13 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
             "Executor registered"
         );
 
+        for key in &symbols {
+            self.by_symbol.entry(key.clone()).or_default().push(actor_id);
+        }
+        self.by_account
+            .entry(msg.account.clone())
+            .or_default()
+            .push(actor_id);
         self.executors.insert(
             actor_id,
             ExecutorSubscription {
@@ -119,75 +149,76 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
     }
 }
 
-/// IncomeEvent 消息 - 从 IncomePubSub 接收
-impl Message<IncomeEvent> for IncomeProcessorActor {
+/// 行情事件：一份服务所有账户。有 symbol 的定向投给订阅者，无 symbol 的广播。
+impl Message<MarketEvent> for IncomeProcessorActor {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        msg: IncomeEvent,
+        msg: MarketEvent,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // 共享总线上的私有事件来自交易所的 private WS / REST，即**实盘账户**；模拟账户的
-        // 私有事件走 PaperPubSub（见 Message<AccountIncome>）。这不是约定，而是来源决定的事实。
-        let private_owner = is_account_private(&msg).then_some(AccountId::Live);
-        match msg.executor_routing() {
-            EventRouting::BySymbol { exchange, symbol } => {
-                // 按 symbol 路由：只发送给订阅了该 (exchange, symbol) 的 executor
-                for sub in self.executors.values() {
-                    if private_owner.as_ref().is_some_and(|o| &sub.account != o) {
-                        continue;
-                    }
-                    if sub.symbols.contains(&(exchange, symbol.clone())) {
-                        if let Err(e) = sub.executor.tell(msg.clone()).send().await {
-                            tracing::error!(error = %e, "Failed to forward event to executor");
+        let event = IncomeEvent::Market(msg);
+        match event.routing() {
+            Some(key) => {
+                // 定向：索引 O(1)
+                if let Some(ids) = self.by_symbol.get(&key) {
+                    for id in ids {
+                        if let Some(sub) = self.executors.get(id) {
+                            Self::forward(sub, &event).await;
                         }
                     }
                 }
             }
-            EventRouting::Broadcast => {
-                // 广播给所有 executor（账户私有的广播事件如 Balance/AccountInfo 仍按账户过滤）
+            None => {
+                // 广播（Clock / ExchangeStatus / 无 scope 的 Custom）
                 for sub in self.executors.values() {
-                    if private_owner.as_ref().is_some_and(|o| &sub.account != o) {
-                        continue;
-                    }
-                    if let Err(e) = sub.executor.tell(msg.clone()).send().await {
-                        tracing::error!(error = %e, "Failed to forward event to executor");
-                    }
+                    Self::forward(sub, &event).await;
                 }
             }
-            // 账户级事件：总线上的其他订阅者已直接收到，这里不做任何投递
-            EventRouting::SkipExecutors => {}
         }
     }
 }
 
-/// 模拟账户的私有事件：只投给**该账户**的 executor。
-///
-/// 与共享总线的处理构成对称：那边的私有事件必属实盘账户，这边的必属某个模拟账户。
-/// 行情不走这条 —— 行情共享一份，由 [`Message<IncomeEvent>`] 分发给所有账户。
-impl Message<AccountIncome> for IncomeProcessorActor {
+/// 账户事件：只投给**该账户**的 executor（账户由事件自带标签决定，类型保证）。
+/// 有 symbol 的再按订阅过滤，账户级的投给该账户全部 executor。
+impl Message<AccountEvent> for IncomeProcessorActor {
     type Reply = ();
 
     async fn handle(
         &mut self,
-        msg: AccountIncome,
+        msg: AccountEvent,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if !is_account_private(&msg.event) {
-            tracing::error!(
-                account = %msg.account,
-                "PaperPubSub 上出现了非私有事件（行情应走共享总线），已忽略"
-            );
+        let account = msg.account.clone();
+        let event = IncomeEvent::Account(msg);
+        let Some(ids) = self.by_account.get(&account) else {
             return;
-        }
-        for sub in self.executors.values() {
-            if sub.account != msg.account {
+        };
+        let routing = event.routing();
+        for id in ids {
+            let Some(sub) = self.executors.get(id) else {
                 continue;
+            };
+            if let Some(key) = &routing {
+                if !sub.symbols.contains(key) {
+                    // 该账户的私有事件、但 executor 没订这个 symbol。
+                    // - Live：分桶部署的常态（账户级全量私有流含其他桶的 symbol），静默跳过；
+                    // - Paper：柜台只为本进程策略的订单产回报，被过滤即异常 —— 策略对未订阅
+                    //   symbol 下了单，回报回不来，订单会停在 Created、超时清理后反复重挂。
+                    //   丢弃点必须可见。
+                    if account != AccountId::Live {
+                        tracing::warn!(
+                            %account,
+                            exchange = %key.0,
+                            symbol = %key.1,
+                            "模拟账户的私有回报被 symbol 订阅过滤丢弃 —— 策略在未订阅的 symbol 上下了单？"
+                        );
+                    }
+                    continue;
+                }
             }
-            if let Err(e) = sub.executor.tell(msg.event.clone()).send().await {
-                tracing::error!(error = %e, "Failed to forward paper event to executor");
-            }
+            Self::forward(sub, &event).await;
         }
     }
 }
@@ -206,22 +237,26 @@ impl Message<UnregisterExecutor> for IncomeProcessorActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let id = msg.executor.id();
-        if self.executors.remove(&id).is_none() {
+        if self.executors.contains_key(&id) {
+            self.remove_from_indexes(id);
+        } else {
             tracing::warn!(?id, "UnregisterExecutor: 该 executor 未注册，忽略");
         }
     }
 }
 
 #[cfg(test)]
-mod account_isolation_tests {
+mod routing_tests {
     use super::*;
     use crate::domain::{Exchange, Fill, FillReason, MarketTrade, Side};
+    use crate::messaging::{AccountData, MarketData};
 
-    fn fill_event() -> IncomeEvent {
-        IncomeEvent {
+    fn fill_event(account: AccountId) -> AccountEvent {
+        AccountEvent {
+            account,
             exchange_ts: 1,
             local_ts: 1,
-            data: ExchangeEventData::Fill(Fill {
+            data: AccountData::Fill(Fill {
                 exchange: Exchange::Binance,
                 symbol: "BTC".to_string(),
                 side: Side::Long,
@@ -236,11 +271,11 @@ mod account_isolation_tests {
         }
     }
 
-    fn trade_event() -> IncomeEvent {
-        IncomeEvent {
+    fn trade_event() -> MarketEvent {
+        MarketEvent {
             exchange_ts: 1,
             local_ts: 1,
-            data: ExchangeEventData::MarketTrade(MarketTrade {
+            data: MarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Binance,
                 symbol: "BTC".to_string(),
                 price: 100.0,
@@ -251,82 +286,27 @@ mod account_isolation_tests {
         }
     }
 
-    fn position_report_event() -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: 1,
-            local_ts: 1,
-            data: ExchangeEventData::PositionReport {
-                exchange: Exchange::Binance,
-                positions: vec![crate::domain::Position {
-                    exchange: Exchange::Binance,
-                    symbol: "BTC".to_string(),
-                    size: 1.0,
-                }],
-            },
-        }
-    }
-
-    fn baseline_event() -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: 1,
-            local_ts: 1,
-            data: ExchangeEventData::PositionBaseline(crate::domain::Position {
-                exchange: Exchange::Binance,
-                symbol: "BTC".to_string(),
-                size: 1.0,
-            }),
-        }
-    }
-
-    /// **Critical 不变量**：持仓对账读数**绝不**投递给任何 executor。
-    ///
-    /// 它一旦进入策略的 StateManager，就绕过了「基线 + Fill」的持仓维护模型 —— 等于恢复了
-    /// 被明确否掉的"用快照覆写持仓"（会与 Fill 流重复计算同一笔成交）。这条约束此前只由
-    /// `SymbolState` 的一个分支兜着，路由层没有测试守。
+    /// 账户隔离的核心：账户事件的归属是**结构字段**，路由按它分道 —— "实盘私有事件
+    /// 广播给模拟策略"在类型上已不可表达，这里钉住路由推导本身。
     #[test]
-    fn position_report_is_never_routed_to_executors() {
-        assert!(
-            matches!(
-                position_report_event().executor_routing(),
-                EventRouting::SkipExecutors
-            ),
-            "对账读数被投递给了 executor —— 它会绕过「基线 + Fill」的持仓维护模型"
+    fn account_event_carries_its_owner_and_routes_by_symbol() {
+        let live = fill_event(AccountId::Live);
+        assert_eq!(live.account, AccountId::Live);
+        let ev = IncomeEvent::Account(live);
+        assert_eq!(
+            ev.routing(),
+            Some((Exchange::Binance, "BTC".to_string())),
+            "Fill 有 symbol，应定向路由"
         );
     }
 
-    /// 持仓**基线**同样不经总线进 executor：它由 ManagerActor 在注册前点对点投递
-    /// （结构上保证先于任何流事件），总线上的那份只喂引擎生命周期的镜像。若路由层
-    /// 再投一份，executor 会收到重复基线，真实的违约信号（适配层擅自发基线）被误报淹没。
+    /// 行情无账户归属，按 symbol 定向；Clock 无 symbol，广播
     #[test]
-    fn position_baseline_skips_executors() {
-        assert!(
-            matches!(
-                baseline_event().executor_routing(),
-                EventRouting::SkipExecutors
-            ),
-            "基线若经总线投给 executor，会与 manager 的点对点投递重复"
-        );
-    }
+    fn market_events_route_by_symbol_or_broadcast() {
+        let ev = IncomeEvent::Market(trade_event());
+        assert_eq!(ev.routing(), Some((Exchange::Binance, "BTC".to_string())));
 
-    /// 两者都属账户私有：绝不能把实盘读数/基线投给模拟账户的策略
-    #[test]
-    fn both_position_variants_are_account_private() {
-        assert!(is_account_private(&position_report_event()));
-        assert!(is_account_private(&baseline_event()));
-    }
-
-    /// 成交/持仓/净值属于某一个账户；行情不属于任何账户。
-    /// 这条分类是账户隔离的依据 —— 分错一类，别人的仓位就会被记进自己的状态。
-    #[test]
-    fn account_private_events_are_classified_correctly() {
-        assert!(is_account_private(&fill_event()), "成交是账户私有");
-        assert!(!is_account_private(&trade_event()), "公共成交印记是行情，不是私有");
-
-        let clock = IncomeEvent {
-            exchange_ts: 0,
-            local_ts: 0,
-            data: ExchangeEventData::Clock,
-        };
-        assert!(!is_account_private(&clock), "Clock 对所有账户可见");
+        let clock = IncomeEvent::market(0, 0, MarketData::Clock);
+        assert_eq!(clock.routing(), None, "Clock 对所有账户广播");
     }
 }

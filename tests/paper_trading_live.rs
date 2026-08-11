@@ -27,16 +27,15 @@ use hft_engine_rs::domain::{
     AccountId, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
 use hft_engine_rs::engine::{
-    IncomePubSub, IncomeProcessorActor, OutcomePubSub, PaperCounterActor, PaperCounterArgs,
-    PaperPubSub, RegisterExecutor,
+    AccountPubSub, IncomeProcessorActor, MarketPubSub, OutcomePubSub, PaperCounterActor,
+    PaperCounterArgs, RegisterExecutor,
 };
-use hft_engine_rs::engine::AccountIncome;
 use hft_engine_rs::engine::live::{ExecutorActor, ExecutorArgs};
 use hft_engine_rs::exchange::binance::{
     BinanceActor, BinanceActorArgs, BinanceClient, REST_BASE_URL,
 };
 use hft_engine_rs::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+use hft_engine_rs::messaging::{AccountData, AccountEvent, IncomeEvent, MarketData, MarketEvent, StateManager};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
 use kameo::actor::{ActorRef, Spawn, WeakActorRef};
@@ -98,7 +97,11 @@ impl Strategy for DipMaker {
     }
 
     fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
-        let ExchangeEventData::BBO(bbo) = &event.data else {
+        let IncomeEvent::Market(MarketEvent {
+            data: MarketData::BBO(bbo),
+            ..
+        }) = event
+        else {
             return Vec::new();
         };
         let symbol = COIN.to_string();
@@ -173,38 +176,39 @@ impl Actor for Watcher {
     }
 }
 
-/// 模拟账户的私有事件（柜台回报）走 PaperPubSub
-impl Message<AccountIncome> for Watcher {
+/// 柜台回报（账户事件，带 Paper 标签）
+impl Message<AccountEvent> for Watcher {
     type Reply = ();
-    async fn handle(&mut self, msg: AccountIncome, c: &mut Context<Self, Self::Reply>) {
-        <Self as Message<IncomeEvent>>::handle(self, msg.event, c).await
-    }
-}
-
-impl Message<IncomeEvent> for Watcher {
-    type Reply = ();
-    async fn handle(&mut self, ev: IncomeEvent, _c: &mut Context<Self, Self::Reply>) {
+    async fn handle(&mut self, ev: AccountEvent, _c: &mut Context<Self, Self::Reply>) {
         let mut log = self.0.lock().unwrap();
         match &ev.data {
-            ExchangeEventData::OrderUpdate(u) => {
+            AccountData::OrderUpdate(u) => {
                 log.order_updates
                     .push((u.order_id.clone(), format!("{:?}", u.status)));
                 if matches!(u.status, hft_engine_rs::domain::OrderStatus::Pending) {
                     log.resting = true;
                 }
             }
-            ExchangeEventData::Fill(f) => log.fills.push((f.price, f.size)),
-            ExchangeEventData::AccountInfo { equity, .. } => log.equity = Some(*equity),
-            ExchangeEventData::MarketTrade(t) => {
-                log.trade_count += 1;
-                log.min_trade_price = Some(log.min_trade_price.map_or(t.price, |m: f64| m.min(t.price)));
-                log.max_trade_price = Some(log.max_trade_price.map_or(t.price, |m: f64| m.max(t.price)));
-                if log.resting {
-                    log.min_trade_after_rest =
-                        Some(log.min_trade_after_rest.map_or(t.price, |m: f64| m.min(t.price)));
-                }
-            }
+            AccountData::Fill(f) => log.fills.push((f.price, f.size)),
+            AccountData::AccountInfo { equity, .. } => log.equity = Some(*equity),
             _ => {}
+        }
+    }
+}
+
+/// 行情观测（成交价区间诊断）
+impl Message<MarketEvent> for Watcher {
+    type Reply = ();
+    async fn handle(&mut self, ev: MarketEvent, _c: &mut Context<Self, Self::Reply>) {
+        let mut log = self.0.lock().unwrap();
+        if let MarketData::MarketTrade(t) = &ev.data {
+            log.trade_count += 1;
+            log.min_trade_price = Some(log.min_trade_price.map_or(t.price, |m: f64| m.min(t.price)));
+            log.max_trade_price = Some(log.max_trade_price.map_or(t.price, |m: f64| m.max(t.price)));
+            if log.resting {
+                log.min_trade_after_rest =
+                    Some(log.min_trade_after_rest.map_or(t.price, |m: f64| m.min(t.price)));
+            }
         }
     }
 }
@@ -231,8 +235,12 @@ async fn paper_counter_fills_from_live_trades() {
         Arc::new(metas.into_iter().map(|m| ((EX, m.symbol.clone()), m)).collect());
 
     // ---- 总线 ----
-    let income_pubsub = IncomePubSub::spawn_with_mailbox(
-        IncomePubSub::new(DeliveryStrategy::BestEffort),
+    let market_pubsub = MarketPubSub::spawn_with_mailbox(
+        MarketPubSub::new(DeliveryStrategy::BestEffort),
+        mailbox::unbounded(),
+    );
+    let account_pubsub = AccountPubSub::spawn_with_mailbox(
+        AccountPubSub::new(DeliveryStrategy::BestEffort),
         mailbox::unbounded(),
     );
     let outcome_pubsub = OutcomePubSub::spawn_with_mailbox(
@@ -242,13 +250,9 @@ async fn paper_counter_fills_from_live_trades() {
 
     // ---- 本地柜台：订阅 outcome（收订单）与 income（收行情/Clock）----
     // 模拟账户私有事件走独立总线
-    let paper_pubsub = PaperPubSub::spawn_with_mailbox(
-        PaperPubSub::new(DeliveryStrategy::BestEffort),
-        mailbox::unbounded(),
-    );
     let counter = PaperCounterActor::spawn_with_mailbox(
         PaperCounterArgs {
-            paper_pubsub: paper_pubsub.clone(),
+            account_pubsub: account_pubsub.clone(),
             symbol_metas: metas_by_key.clone(),
             config: SimConfig {
                 initial_balance_usdt: 10_000.0,
@@ -266,7 +270,7 @@ async fn paper_counter_fills_from_live_trades() {
         .send()
         .await
         .expect("counter subscribes outcome");
-    income_pubsub
+    market_pubsub
         .tell(Subscribe(counter))
         .send()
         .await
@@ -277,12 +281,12 @@ async fn paper_counter_fills_from_live_trades() {
         IncomeProcessorActor::default(),
         mailbox::unbounded(),
     );
-    income_pubsub
+    market_pubsub
         .tell(Subscribe(processor.clone()))
         .send()
         .await
         .expect("processor subscribes income");
-    paper_pubsub
+    account_pubsub
         .tell(Subscribe(processor.clone()))
         .send()
         .await
@@ -296,6 +300,8 @@ async fn paper_counter_fills_from_live_trades() {
             strategy: Box::new(DipMaker(Arc::clone(&log))),
             account: PAPER_ACCOUNT.clone(),
             symbol_metas: metas_by_key.clone(),
+            // 模拟账户从零起步，无基线
+            baselines: Vec::new(),
             outcome_pubsub: outcome_pubsub.clone(),
         },
         mailbox::unbounded(),
@@ -317,13 +323,13 @@ async fn paper_counter_fills_from_live_trades() {
 
     // ---- 观测者 ----
     let watcher = Watcher::spawn_with_mailbox(log.clone(), mailbox::unbounded());
-    income_pubsub
+    market_pubsub
         .tell(Subscribe(watcher.clone()))
         .send()
         .await
         .expect("watcher subscribes income");
     // 柜台回报走 paper 总线
-    paper_pubsub
+    account_pubsub
         .tell(Subscribe(watcher))
         .send()
         .await
@@ -335,7 +341,8 @@ async fn paper_counter_fills_from_live_trades() {
             credentials: None,
             symbol_metas: metas_by_symbol,
             rest_base_url: REST_BASE_URL.to_string(),
-            income_pubsub: income_pubsub.clone(),
+            market_pubsub: market_pubsub.clone(),
+            account_pubsub: account_pubsub.clone(),
             client,
             quote: "USDT".to_string(),
         },
@@ -358,16 +365,16 @@ async fn paper_counter_fills_from_live_trades() {
         .expect("subscribe");
 
     // 柜台需要 Clock 才发布净值；这里自己推几拍，不必拉起 ClockActor
-    let clock_pubsub = income_pubsub.clone();
+    let clock_pubsub = market_pubsub.clone();
     let clock = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let ts = hft_engine_rs::domain::now_ms();
             let _ = clock_pubsub
-                .tell(kameo_actors::pubsub::Publish(IncomeEvent {
+                .tell(kameo_actors::pubsub::Publish(MarketEvent {
                     exchange_ts: ts,
                     local_ts: ts,
-                    data: ExchangeEventData::Clock,
+                    data: MarketData::Clock,
                 }))
                 .send()
                 .await;

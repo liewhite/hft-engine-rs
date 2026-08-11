@@ -48,35 +48,6 @@ pub enum SubscriptionKind {
     Candle { symbol: Symbol, interval: CandleInterval },
 }
 
-/// 该交易所的适配层是否实现了这种公共订阅（**能力查询**）。
-///
-/// 各所 actor 对不支持的 kind 是 warn + 跳过，而 `subscribe` 依旧返回 `Ok(())` ——
-/// 策略订阅了不支持的 kind，上线后只能靠"一直没数据"事后发现（`Trades` 的文档自己写明
-/// 这类故障最难查）。`ManagerActor` 在**投产期**用本函数校验，不支持即拒绝投产。
-///
-/// **单一出处**：直接问各所 actor 的 kind 映射函数（订阅报文由它们生成，返回 None 即
-/// 不支持），不另存一份需要手工同步的能力副本。两个例外手写并注明依据：
-/// - OKX 的 Candle 不在 public 线的 `kind_to_arg` 里 —— 由 business WS 承接（见
-///   `okx::actor::business_ws`），故显式补真；
-/// - IBKR 没有 kind 映射函数（smd 报文按 conid 拼装），其 public_ws 只实现了 BBO。
-pub fn supports_subscription(exchange: Exchange, kind: &SubscriptionKind) -> bool {
-    // 支持与否只取决于 kind 变体，与 quote/dex 无关 —— 传占位值即可
-    match exchange {
-        Exchange::Binance => {
-            crate::exchange::binance::actor::public_ws::kind_to_stream(kind, "USDT").is_some()
-        }
-        Exchange::OKX => {
-            crate::exchange::okx::actor::public_ws::kind_to_arg(kind, "USDT").is_some()
-                || matches!(kind, SubscriptionKind::Candle { .. })
-        }
-        Exchange::Hyperliquid => {
-            crate::exchange::hyperliquid::actor::public_ws::kind_to_stream(kind, "USDC", "")
-                .is_some()
-        }
-        Exchange::IBKR => matches!(kind, SubscriptionKind::BBO { .. }),
-    }
-}
-
 impl SubscriptionKind {
     /// 获取订阅的 symbol
     pub fn symbol(&self) -> &Symbol {
@@ -224,11 +195,10 @@ pub trait ExchangeClient: Send + Sync + 'static {
     /// 查询账户当前持仓（**必须真实请求交易所**，不得返回空占位）
     ///
     /// 本方法服务于持仓维护模型的**两条通道**，两者都不容许假数据：
-    /// - **基线**：`ManagerActor` 启动期调用一次，产出
-    ///   [`crate::messaging::ExchangeEventData::PositionBaseline`]。基线只有这一次机会——
+    /// - **基线**：`ManagerActor` 投产期调用一次，产出
+    ///   [`crate::messaging::PositionBaseline`]（投产握手载荷）。基线只有这一次机会——
     ///   之后持仓全程由 `Fill` 累加，没有第二个来源能纠正它，故拉取失败即拒绝启动。
-    /// - **对账**：`PositionPollingActor` 周期性调用，产出
-    ///   [`crate::messaging::ExchangeEventData::PositionReport`]，与「基线 + Fill」的结果比对。
+    /// - **对账**：`PositionReconcileActor` 周期性调用，作为读数与「基线 + Fill」的结果比对。
     ///
     /// 因此返回 `Ok(vec![])` 只有一个合法含义：**该账户确实没有任何持仓**（含"未配置凭证、
     /// 只接公共行情"的情形）。用空 Vec 表示"数据在别处（私有 WS）"会让基线静默变成全零、

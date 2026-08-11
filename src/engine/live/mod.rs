@@ -2,6 +2,7 @@
 //!
 //! 包含引擎中各个 Actor 的实现
 
+pub mod assembly;
 mod clock;
 mod crypto_status;
 mod manager;
@@ -10,33 +11,23 @@ mod income_processor;
 mod metrics;
 mod outcome_processor;
 mod paper_counter;
-mod position_polling;
 mod position_reconcile;
 mod supervisor;
 
 use crate::domain::AccountId;
-use crate::messaging::IncomeEvent;
+use crate::messaging::{AccountEvent, MarketEvent};
 use crate::strategy::OutcomeEvent;
 use kameo_actors::pubsub::PubSub;
 
-/// Income 事件的 PubSub Actor 类型。
-///
-/// 承载**共享行情** + **实盘账户**的私有事件（后者由各所 private WS 发布，其来源即
-/// 意味着归属 [`AccountId::Live`]）。模拟账户的私有事件走 [`PaperPubSub`]。
-pub type IncomePubSub = PubSub<IncomeEvent>;
+/// 公共行情总线：承载 [`MarketEvent`]（无账户归属，一份服务所有账户）。
+pub type MarketPubSub = PubSub<MarketEvent>;
 
-/// 模拟账户私有事件的 PubSub。
+/// 账户私有事件总线：承载 [`AccountEvent`]（账户是必填结构字段）。
 ///
-/// 与 [`IncomePubSub`] 分开，是为了让"实盘账户的成交"在结构上不可能流进模拟策略的状态
-/// （见 [`AccountId`]）。行情不走这条 —— 行情共享一份，没有账户归属。
-pub type PaperPubSub = PubSub<AccountIncome>;
-
-/// 带账户归属的私有事件
-#[derive(Debug, Clone)]
-pub struct AccountIncome {
-    pub account: AccountId,
-    pub event: IncomeEvent,
-}
+/// 实盘适配层（标 [`AccountId::Live`]）与本地柜台 `PaperCounterActor`（标 `Paper(x)`）
+/// 发布**同一个类型**到这一条总线，消费者按 `account` 字段取自己的那份 ——
+/// 账户隔离由类型与字段值保证，不靠总线拓扑，也不靠"来源即 Live"的推断。
+pub type AccountPubSub = PubSub<AccountEvent>;
 
 /// 带账户归属的策略信号。
 ///
@@ -52,20 +43,18 @@ pub struct AccountOutcome {
 /// Outcome 事件的 PubSub Actor 类型
 pub type OutcomePubSub = PubSub<AccountOutcome>;
 
+pub use assembly::{setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup};
 pub use clock::{ClockActor, ClockActorArgs};
 pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
-pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, PublishCustomEvent, RegisterSupervisedChild, SubscribeIncome, SubscribeOutcome, SubscribePaper, StrategySpec, RemoveStrategies};
+pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, PublishCustomEvent, RegisterSupervisedChild, SubscribeAccount, SubscribeMarket, SubscribeOutcome, StrategySpec, RemoveStrategies};
 pub use executor::{ExecutorActor, ExecutorArgs, GetPositions};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor, UnregisterExecutor};
 pub use metrics::{MetricsActor, MetricsActorArgs, RegisterSymbols, DEFAULT_REPORT_INTERVAL_MS};
-pub use outcome_processor::{OutcomeProcessorActor, OutcomeProcessorArgs};
+pub use outcome_processor::{OrderGateway, OutcomeProcessorActor, PlaceVerdict};
 pub use paper_counter::{PaperCounterActor, PaperCounterArgs};
-pub use position_polling::{
-    PositionPollingActor, PositionPollingActorArgs, DEFAULT_POSITION_POLL_INTERVAL_MS,
-};
 pub use position_reconcile::{
     PositionReconcileActor, PositionReconcileArgs, Reconciler,
-    DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
+    DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
 };
 pub use supervisor::{
     Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,

@@ -81,3 +81,9 @@ impl IbkrCredentials {
         }
     }
 }
+
+/// 本所适配层是否实现了这种公共订阅（**能力查询**，装配期由 `ExchangeSetup` 携带）。
+/// IBKR 没有 kind 映射函数（smd 报文按 conid 拼装），public WS 只实现了 BBO —— 手写并钉测试。
+pub fn supports_subscription(kind: &crate::exchange::SubscriptionKind) -> bool {
+    matches!(kind, crate::exchange::SubscriptionKind::BBO { .. })
+}

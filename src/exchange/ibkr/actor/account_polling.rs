@@ -4,11 +4,11 @@
 //! 持仓不在此处刷新——初始持仓由 ManagerActor 启动期统一 fetch，运行期由 Fill 维护。
 
 use crate::domain::{now_ms, Exchange};
-use crate::engine::IncomePubSub;
+use crate::engine::AccountPubSub;
 use crate::exchange::client::ExchangeClient;
 use crate::exchange::ibkr::IbkrClient;
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -24,7 +24,7 @@ pub struct IbkrAccountPollingActorArgs {
     /// IBKR client (用于查询账户信息)
     pub client: Arc<IbkrClient>,
     /// Income PubSub (发布事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    pub account_pubsub: ActorRef<AccountPubSub>,
     /// 查询间隔 (毫秒)
     pub interval_ms: u64,
 }
@@ -32,7 +32,7 @@ pub struct IbkrAccountPollingActorArgs {
 /// IbkrAccountPollingActor - 定时轮询 IBKR 账户净值
 pub struct IbkrAccountPollingActor {
     client: Arc<IbkrClient>,
-    income_pubsub: ActorRef<IncomePubSub>,
+    account_pubsub: ActorRef<AccountPubSub>,
     /// 停摆守卫：净值/名义值取不到时，`StateManager` 里的旧值会原样留着且无从分辨
     /// 新鲜度 —— 账户杠杆闸门会拿着它一路放行。长期取不到即退出。
     guard: StalenessGuard,
@@ -47,11 +47,13 @@ impl IbkrAccountPollingActor {
             Ok(info) => {
                 self.guard.record_success();
                 if let Err(e) = self
-                    .income_pubsub
-                    .tell(Publish(IncomeEvent {
+                    .account_pubsub
+                    .tell(Publish(AccountEvent {
+                        // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                        account: crate::domain::AccountId::Live,
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::AccountInfo {
+                        data: AccountData::AccountInfo {
                             exchange: Exchange::IBKR,
                             equity: info.equity,
                             notional: info.notional,
@@ -60,7 +62,7 @@ impl IbkrAccountPollingActor {
                     .send()
                     .await
                 {
-                    tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                    tracing::error!(error = %e, "Failed to publish to AccountPubSub");
                 }
             }
             Err(e) => {
@@ -95,7 +97,7 @@ impl Actor for IbkrAccountPollingActor {
 
         Ok(Self {
             client: args.client,
-            income_pubsub: args.income_pubsub,
+            account_pubsub: args.account_pubsub,
             guard: StalenessGuard::new("IBKR 账户净值", MAX_POLL_STALENESS_MS),
         })
     }

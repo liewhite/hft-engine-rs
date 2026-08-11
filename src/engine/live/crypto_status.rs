@@ -8,7 +8,7 @@
 //! - 未来加密交易所可能有维护停机等非 Liquid 状态，届时可在此扩展判定逻辑
 
 use crate::domain::{now_ms, Exchange, MarketStatus};
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{MarketData, MarketEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -18,14 +18,14 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_stream::wrappers::IntervalStream;
 
-use super::IncomePubSub;
+use super::MarketPubSub;
 
 /// CryptoStatusActor 初始化参数
 pub struct CryptoStatusActorArgs {
     /// 交易所标识
     pub exchange: Exchange,
     /// Income PubSub (用于发布 ExchangeStatus 事件)
-    pub income_pubsub: ActorRef<IncomePubSub>,
+    pub market_pubsub: ActorRef<MarketPubSub>,
     /// 发布间隔 (毫秒)
     pub interval_ms: u64,
 }
@@ -33,7 +33,7 @@ pub struct CryptoStatusActorArgs {
 /// CryptoStatusActor - 加密货币市场状态广播器
 pub struct CryptoStatusActor {
     exchange: Exchange,
-    income_pubsub: ActorRef<IncomePubSub>,
+    market_pubsub: ActorRef<MarketPubSub>,
 }
 
 impl Actor for CryptoStatusActor {
@@ -52,7 +52,7 @@ impl Actor for CryptoStatusActor {
 
         Ok(Self {
             exchange: args.exchange,
-            income_pubsub: args.income_pubsub,
+            market_pubsub: args.market_pubsub,
         })
     }
 
@@ -79,11 +79,11 @@ impl Message<StreamMessage<Instant, (), ()>> for CryptoStatusActor {
             StreamMessage::Next(_) => {
                 let local_ts = now_ms();
                 if let Err(e) = self
-                    .income_pubsub
-                    .tell(Publish(IncomeEvent {
+                    .market_pubsub
+                    .tell(Publish(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: ExchangeEventData::ExchangeStatus {
+                        data: MarketData::ExchangeStatus {
                             exchange: self.exchange,
                             status: MarketStatus::Liquid,
                         },
@@ -91,7 +91,7 @@ impl Message<StreamMessage<Instant, (), ()>> for CryptoStatusActor {
                     .send()
                     .await
                 {
-                    tracing::error!(error = %e, "Failed to publish to IncomePubSub");
+                    tracing::error!(error = %e, "Failed to publish to MarketPubSub");
                 }
             }
             StreamMessage::Started(_) => {

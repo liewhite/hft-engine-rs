@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{
     init_tracing, load_config, wait_for_shutdown, AddStrategies, GetAllSymbolMetas, ManagerActor,
-    ManagerActorArgs, StrategySpec,
+    ManagerActorArgs, setup_binance, setup_hyperliquid, setup_okx, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
 use hft_engine_rs::exchange::ExchangeAccess;
@@ -126,13 +126,21 @@ async fn main() -> anyhow::Result<()> {
         .validate()
         .map_err(|e| anyhow::anyhow!("strategy.spread_arb 配置非法: {e}"))?;
 
+    // 装配参与的交易所（缺省即该所不参与）—— manager 对"有哪些所"无知
+    let mut exchanges = Vec::new();
+    if let Some(access) = config.exchanges.binance.clone() {
+        exchanges.push(setup_binance(access)?);
+    }
+    if let Some(access) = config.exchanges.okx.clone() {
+        exchanges.push(setup_okx(access)?);
+    }
+    if let Some(access) = config.exchanges.hyperliquid.clone() {
+        exchanges.push(setup_hyperliquid(access)?);
+    }
+
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
-            binance: config.exchanges.binance.clone(),
-            okx: config.exchanges.okx.clone(),
-            hyperliquid: config.exchanges.hyperliquid.clone(),
-            ibkr_credentials: None,
-            ibkr_snapshot: None,
+            exchanges,
             // 实盘策略；本 bin 不跑模拟账户，柜台配置用默认值即可
             paper: Default::default(),
         },

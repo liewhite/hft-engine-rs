@@ -8,7 +8,7 @@ use hft_engine_rs::domain::{
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::utils::StepFormatter;
 use hft_engine_rs::exchange::SubscriptionKind;
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent, StateManager};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, StateManager};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
 use std::cell::RefCell;
@@ -34,10 +34,10 @@ fn metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
 }
 
 fn bbo_ev(bid: Price, ask: Price, ts: Timestamp) -> IncomeEvent {
-    IncomeEvent {
-        exchange_ts: ts,
-        local_ts: ts,
-        data: ExchangeEventData::BBO(BBO {
+    IncomeEvent::market(
+        ts,
+        ts,
+        MarketData::BBO(BBO {
             exchange: EX,
             symbol: SYM.to_string(),
             bid_price: bid,
@@ -46,14 +46,14 @@ fn bbo_ev(bid: Price, ask: Price, ts: Timestamp) -> IncomeEvent {
             ask_qty: 1.0,
             timestamp: ts,
         }),
-    }
+    )
 }
 
 fn trade_ev(price: Price, ts: Timestamp) -> IncomeEvent {
-    IncomeEvent {
-        exchange_ts: ts,
-        local_ts: ts,
-        data: ExchangeEventData::MarketTrade(hft_engine_rs::domain::MarketTrade {
+    IncomeEvent::market(
+        ts,
+        ts,
+        MarketData::MarketTrade(hft_engine_rs::domain::MarketTrade {
             exchange: EX,
             symbol: SYM.to_string(),
             price,
@@ -61,7 +61,7 @@ fn trade_ev(price: Price, ts: Timestamp) -> IncomeEvent {
             is_buyer_maker: false,
             timestamp: ts,
         }),
-    }
+    )
 }
 
 /// 假数据源：手造事件序列。
@@ -93,8 +93,8 @@ impl Strategy for OneShotBuy {
     }
     fn on_event(&mut self, event: &IncomeEvent, _state: &StateManager) -> Vec<OutcomeEvent> {
         let is_market = matches!(
-            event.data,
-            ExchangeEventData::BBO(_) | ExchangeEventData::MarketTrade(_)
+            event,
+            IncomeEvent::Market(m) if matches!(m.data, MarketData::BBO(_) | MarketData::MarketTrade(_))
         );
         if is_market && !self.placed {
             self.placed = true;
@@ -121,18 +121,27 @@ impl Strategy for OneShotBuy {
 
 /// 把投递事件压成可比对的签名 (含 client_order_id / 状态 / 价量)，用于逐笔确定性断言。
 fn event_sig(ev: &IncomeEvent) -> String {
-    match &ev.data {
-        ExchangeEventData::OrderUpdate(u) => format!(
-            "OU ts={} cid={:?} {:?} qty={}",
-            ev.exchange_ts, u.client_order_id, u.status, u.quantity
-        ),
-        ExchangeEventData::Fill(f) => format!(
-            "FL ts={} cid={:?} oid={} {:?} px={} sz={} fee={}",
-            ev.exchange_ts, f.client_order_id, f.order_id, f.side, f.price, f.size, f.fee
-        ),
-        ExchangeEventData::BBO(b) => format!("BBO ts={} bid={} ask={}", ev.exchange_ts, b.bid_price, b.ask_price),
-        ExchangeEventData::AccountInfo { equity, .. } => format!("ACC ts={} eq={}", ev.exchange_ts, equity),
-        other => format!("{:?}", other),
+    match ev {
+        IncomeEvent::Account(a) => match &a.data {
+            AccountData::OrderUpdate(u) => format!(
+                "OU ts={} cid={:?} {:?} qty={}",
+                a.exchange_ts, u.client_order_id, u.status, u.quantity
+            ),
+            AccountData::Fill(f) => format!(
+                "FL ts={} cid={:?} oid={} {:?} px={} sz={} fee={}",
+                a.exchange_ts, f.client_order_id, f.order_id, f.side, f.price, f.size, f.fee
+            ),
+            AccountData::AccountInfo { equity, .. } => {
+                format!("ACC ts={} eq={}", a.exchange_ts, equity)
+            }
+            other => format!("{other:?}"),
+        },
+        IncomeEvent::Market(m) => match &m.data {
+            MarketData::BBO(b) => {
+                format!("BBO ts={} bid={} ask={}", m.exchange_ts, b.bid_price, b.ask_price)
+            }
+            other => format!("{other:?}"),
+        },
     }
 }
 
@@ -161,7 +170,7 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
     let sink: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let sink_obs = Rc::clone(&sink);
     let result = {
-        let mut engine = BacktestEngine::new(&source, vec![runner], config)
+        let mut engine = BacktestEngine::new(&source, vec![runner], config, metas())
             .with_observer(move |ev: &IncomeEvent| sink_obs.borrow_mut().push(event_sig(ev)));
         engine.run()
     };
@@ -215,7 +224,7 @@ fn trade_print_matching_fills_resting_limit() {
         initial_balance_usdt: 10_000.0,
         ..SimConfig::default()
     };
-    let mut engine = BacktestEngine::new(&source, vec![runner], config);
+    let mut engine = BacktestEngine::new(&source, vec![runner], config, metas());
     let r = engine.run();
     assert_eq!(r.fills, 1);
     assert_eq!(r.market_events, 3);
@@ -241,12 +250,15 @@ impl Strategy for EmitOnBbo {
         0
     }
     fn on_event(&mut self, event: &IncomeEvent, _state: &StateManager) -> Vec<OutcomeEvent> {
-        match &event.data {
-            ExchangeEventData::Custom(_) => {
+        let IncomeEvent::Market(m) = event else {
+            return Vec::new();
+        };
+        match &m.data {
+            MarketData::Custom(_) => {
                 self.seen_customs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Vec::new()
             }
-            ExchangeEventData::BBO(b) => vec![OutcomeEvent::Emit(
+            MarketData::BBO(b) => vec![OutcomeEvent::Emit(
                 hft_engine_rs::messaging::CustomEvent::new(PingSignal { mid: (b.bid_price + b.ask_price) / 2.0 }),
             )],
             _ => Vec::new(),
@@ -276,7 +288,7 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
     let seen_by_observer: Rc<RefCell<Vec<(usize, f64)>>> = Rc::new(RefCell::new(Vec::new()));
     let obs_sink = Rc::clone(&seen_by_observer);
     {
-        let mut engine = BacktestEngine::new(&source, vec![runner], SimConfig::default())
+        let mut engine = BacktestEngine::new(&source, vec![runner], SimConfig::default(), metas())
             .with_outcome_observer(move |runner_idx, outcome| {
                 if let OutcomeEvent::Emit(c) = outcome {
                     let sig = c.get::<PingSignal>().expect("观察者按类型取回 payload");
@@ -314,9 +326,11 @@ impl Strategy for CustomProbe {
         0
     }
     fn on_event(&mut self, event: &IncomeEvent, _state: &StateManager) -> Vec<OutcomeEvent> {
-        if let ExchangeEventData::Custom(c) = &event.data {
-            if let Some(Tag(t)) = c.get::<Tag>() {
-                self.seen.lock().unwrap().push(t);
+        if let IncomeEvent::Market(m) = event {
+            if let MarketData::Custom(c) = &m.data {
+                if let Some(Tag(t)) = c.get::<Tag>() {
+                    self.seen.lock().unwrap().push(t);
+                }
             }
         }
         Vec::new()
@@ -326,11 +340,7 @@ impl Strategy for CustomProbe {
 struct Tag(&'static str);
 
 fn custom_ev(c: hft_engine_rs::messaging::CustomEvent, ts: Timestamp) -> IncomeEvent {
-    IncomeEvent {
-        exchange_ts: ts,
-        local_ts: ts,
-        data: ExchangeEventData::Custom(c),
-    }
+    IncomeEvent::market(ts, ts, MarketData::Custom(c))
 }
 
 /// 入向路由端到端：带 scope 的 Custom 事件只到达订阅了该 symbol 的策略，
@@ -360,7 +370,7 @@ fn inbound_custom_events_route_by_scope() {
             Box::new(SequentialClientOrderIdGen::default()),
         ),
     ];
-    BacktestEngine::new(&source, runners, SimConfig::default()).run();
+    BacktestEngine::new(&source, runners, SimConfig::default(), metas()).run();
     assert_eq!(
         *seen_btc.lock().unwrap(),
         vec!["btc", "all"],

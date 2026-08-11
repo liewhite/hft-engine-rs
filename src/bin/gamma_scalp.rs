@@ -18,7 +18,7 @@ use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::ExchangeClient;
-use hft_engine_rs::messaging::{ExchangeEventData, IncomeEvent};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::GammaScalpStrategy;
 use std::cell::RefCell;
@@ -76,10 +76,12 @@ fn main() -> anyhow::Result<()> {
     let metas_vec = tokio::runtime::Runtime::new()?
         .block_on(client.fetch_all_symbol_metas())
         .map_err(|e| anyhow::anyhow!("fetch symbol metas: {e}"))?;
-    let symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta> = metas_vec
-        .into_iter()
-        .map(|m| ((m.exchange, m.symbol.clone()), m))
-        .collect();
+    let symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> = Arc::new(
+        metas_vec
+            .into_iter()
+            .map(|m| ((m.exchange, m.symbol.clone()), m))
+            .collect(),
+    );
 
     // trade-native 数据源 (按天惰性流式，峰值=单日)
     let trade_source = BinanceHistory::source(
@@ -118,7 +120,7 @@ fn main() -> anyhow::Result<()> {
     let strategy = GammaScalpStrategy::new(EX, symbol.clone(), ccy.clone(), delta_band, base_offset_ratio);
     let runner = StrategyRunner::with_id_gen(
         Box::new(strategy),
-        Arc::new(symbol_metas),
+        symbol_metas.clone(),
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {
@@ -134,22 +136,25 @@ fn main() -> anyhow::Result<()> {
 
     // 借用 source 的引擎放内层作用域，run 后释放借用以便查询 option_pnl
     let result = {
-        let mut engine = BacktestEngine::new(&source, vec![runner], config)
+        let mut engine = BacktestEngine::new(&source, vec![runner], config, symbol_metas)
             .with_clock_interval(clock_interval_ms)
             .with_observer(move |ev: &IncomeEvent| {
                 let mut s = sampler_obs.borrow_mut();
-                match &ev.data {
-                    ExchangeEventData::MarketTrade(t) => {
-                        s.last_price = t.price;
-                    }
-                    ExchangeEventData::AccountInfo { equity, .. } => {
-                        // 首笔成交之前 (price=0) 不采样
-                        if s.last_price > 0.0 {
-                            let p = s.last_price;
-                            s.samples.push((ev.exchange_ts, *equity, p));
+                match ev {
+                    IncomeEvent::Market(m) => {
+                        if let MarketData::MarketTrade(t) = &m.data {
+                            s.last_price = t.price;
                         }
                     }
-                    _ => {}
+                    IncomeEvent::Account(a) => {
+                        if let AccountData::AccountInfo { equity, .. } = &a.data {
+                            // 首笔成交之前 (price=0) 不采样
+                            if s.last_price > 0.0 {
+                                let p = s.last_price;
+                                s.samples.push((a.exchange_ts, *equity, p));
+                            }
+                        }
+                    }
                 }
             });
         engine.run()

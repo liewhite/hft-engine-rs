@@ -10,7 +10,7 @@
 
 use crate::backtest::source::MarketDataSource;
 use crate::domain::{Balance, Exchange, Greeks, Symbol, Timestamp};
-use crate::messaging::{ExchangeEventData, IncomeEvent};
+use crate::messaging::{AccountData, IncomeEvent, MarketData};
 use crate::option::{self, OptionRight, MILLIS_PER_YEAR};
 use std::cell::RefCell;
 
@@ -136,11 +136,14 @@ impl<S: MarketDataSource> MarketDataSource for BsGreeksSource<S> {
         let mut balance_emitted = false;
         Box::new(self.underlying.events().flat_map(move |ev| {
             // 仅对标的逐笔成交合成希腊字母，其余事件原样透传
-            let trade = match &ev.data {
-                ExchangeEventData::MarketTrade(t) if t.symbol == self.config.underlying_symbol => {
-                    Some((t.price, ev.exchange_ts))
-                }
-                _ => None,
+            let trade = match &ev {
+                IncomeEvent::Market(m) => match &m.data {
+                    MarketData::MarketTrade(t) if t.symbol == self.config.underlying_symbol => {
+                        Some((t.price, m.exchange_ts))
+                    }
+                    _ => None,
+                },
+                IncomeEvent::Account(_) => None,
             };
             let Some((s, now)) = trade else {
                 return vec![ev];
@@ -178,24 +181,26 @@ impl<S: MarketDataSource> MarketDataSource for BsGreeksSource<S> {
                 let st = *self.state.borrow();
                 self.greeks_at(&st, s, now)
             };
-            let greeks_ev = IncomeEvent {
-                exchange_ts: now,
-                local_ts: now,
-                data: ExchangeEventData::Greeks(greeks),
-            };
+            let greeks_ev = IncomeEvent::account(
+                crate::backtest::backtest_account(),
+                now,
+                now,
+                AccountData::Greeks(greeks),
+            );
             if balance_emitted {
                 vec![ev, greeks_ev]
             } else {
                 balance_emitted = true;
-                let balance_ev = IncomeEvent {
-                    exchange_ts: now,
-                    local_ts: now,
-                    data: ExchangeEventData::Balance(Balance {
+                let balance_ev = IncomeEvent::account(
+                    crate::backtest::backtest_account(),
+                    now,
+                    now,
+                    AccountData::Balance(Balance {
                         exchange: self.config.exchange,
                         asset: self.config.ccy.clone(),
                         available: self.config.spot_holding,
                     }),
-                };
+                );
                 vec![ev, balance_ev, greeks_ev]
             }
         }))
@@ -216,10 +221,10 @@ mod tests {
     }
 
     fn trade_ev(price: f64, ts: u64) -> IncomeEvent {
-        IncomeEvent {
-            exchange_ts: ts,
-            local_ts: ts,
-            data: ExchangeEventData::MarketTrade(MarketTrade {
+        IncomeEvent::market(
+            ts,
+            ts,
+            MarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Binance,
                 symbol: "ETH".to_string(),
                 price,
@@ -227,7 +232,7 @@ mod tests {
                 is_buyer_maker: false,
                 timestamp: ts,
             }),
-        }
+        )
     }
 
     fn cfg(now0: u64) -> BsGreeksConfig {
@@ -259,10 +264,10 @@ mod tests {
         // 首笔注入 trade + balance + greeks 三事件
         let balances = evs
             .iter()
-            .filter(|e| matches!(&e.data, ExchangeEventData::Balance(b) if b.asset == "ETH"))
+            .filter(|e| matches!(e, IncomeEvent::Account(a) if matches!(&a.data, AccountData::Balance(b) if b.asset == "ETH")))
             .count();
         assert_eq!(balances, 1, "balance 只发一次");
-        assert!(evs.iter().any(|e| matches!(e.data, ExchangeEventData::Greeks(_))));
+        assert!(evs.iter().any(|e| matches!(e, IncomeEvent::Account(a) if matches!(a.data, AccountData::Greeks(_)))));
     }
 
     #[test]
@@ -274,8 +279,11 @@ mod tests {
         let evs: Vec<_> = bs.events().collect();
         let g = evs
             .iter()
-            .find_map(|e| match &e.data {
-                ExchangeEventData::Greeks(g) => Some(g.clone()),
+            .find_map(|e| match e {
+                IncomeEvent::Account(a) => match &a.data {
+                    AccountData::Greeks(g) => Some(g.clone()),
+                    _ => None,
+                },
                 _ => None,
             })
             .expect("greeks emitted");
