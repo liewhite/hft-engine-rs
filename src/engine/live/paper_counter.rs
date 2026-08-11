@@ -88,6 +88,11 @@ pub struct PaperCounterActor {
     /// 共享报价缓存：行情没有账户归属，新柜台创建时用**本所**的报价播种，避免首单因
     /// "还没见过盘口"而无法判定可成交性
     last_quotes: HashMap<(Exchange, Symbol), BBO>,
+    /// 共享成交价缓存，与 [`Self::last_quotes`] 同一用途的成交流对偶。
+    ///
+    /// 两者都要缓存，因为可成交性判定是"盘口对手价 > 最新成交价"二选一：只播种盘口的话，
+    /// 纯成交流行情（策略只订 Trades）下新柜台的首单会因两者皆无而被错判。
+    last_trades: HashMap<(Exchange, Symbol), crate::domain::Price>,
     account_pubsub: ActorRef<AccountPubSub>,
     config: SimConfig,
     /// 透传给各柜台 SimState（市场规则校验在状态机内统一执行）
@@ -106,11 +111,18 @@ impl PaperCounterActor {
 
     /// 发布柜台产生的回报（SimState 只产 OrderUpdate/Fill，天生无需过滤）。
     async fn publish_reports(&self, account: &AccountId, reports: Vec<(Timestamp, AccountData)>) {
+        // `local_ts` 必须是**本地时刻**，不能沿用撮合时间戳：行情触发的成交，其 ts 取自
+        // 撮合它的那条行情（`bbo.timestamp` / `trade.timestamp`），而那是**交易所打点**。
+        // 拿交易所时钟当本地接收时刻有两处实害：`ExecutorActor::check_pipeline_lag` 会把
+        // 对端时钟偏移误诊成"本实例跟不上事件流"，`add_pending_order` 的 created_at 与
+        // Clock 里的 `now_ms()` 混算会让订单超时判定偏移。
+        // `exchange_ts` 保留撮合时刻 —— 那一栏问的正是"交易所侧什么时候发生的"。
+        let local_ts = now_ms();
         for (ts, data) in reports {
             let event = AccountEvent {
                 account: account.clone(),
                 exchange_ts: ts,
-                local_ts: ts,
+                local_ts,
                 data,
             };
             if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
@@ -133,6 +145,11 @@ impl PaperCounterActor {
             for ((ex, _), bbo) in &self.last_quotes {
                 if *ex == exchange {
                     state.observe_bbo(bbo);
+                }
+            }
+            for ((ex, symbol), price) in &self.last_trades {
+                if *ex == exchange {
+                    state.observe_trade(symbol, *price);
                 }
             }
             tracing::info!(
@@ -237,6 +254,7 @@ impl Actor for PaperCounterActor {
         Ok(Self {
             states: HashMap::new(),
             last_quotes: HashMap::new(),
+            last_trades: HashMap::new(),
             account_pubsub: args.account_pubsub,
             config: args.config,
             symbol_metas: args.symbol_metas,
@@ -273,6 +291,9 @@ impl Message<MarketEvent> for PaperCounterActor {
                 }
             }
             MarketData::MarketTrade(trade) => {
+                // 缓存一份供**新柜台**播种参考价（与 BBO 同理，见 last_trades 字段说明）
+                self.last_trades
+                    .insert((trade.exchange, trade.symbol.clone()), trade.price);
                 // 逐柜台撮合（只喂本所的柜台）：各柜台只持有自己 symbol 的挂单，非本
                 // symbol 的柜台是空转。该 O(柜台数) 开销是选择 Top-N 而非全部 530 个
                 // symbol 的原因之一；若要放到全量，应把"共享行情"从 SimState 里拆出来只存一份。

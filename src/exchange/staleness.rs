@@ -64,9 +64,12 @@ impl StalenessGuard {
         now_ms().saturating_sub(self.last_success_ms)
     }
 
-    /// 测试专用：把上次成功时刻回拨 `ms` 毫秒，模拟长期失败
+    /// 测试专用：把上次成功时刻回拨 `ms` 毫秒，模拟长期失败。
+    ///
+    /// `pub(crate)`：守卫的消费者（如 `PositionLedgerActor` 的在途停摆判据）也要能测
+    /// "超窗即致命"这条路径，而窗口是全局常量、时钟又直接读墙钟。
     #[cfg(test)]
-    fn rewind(&mut self, ms: u64) {
+    pub(crate) fn rewind(&mut self, ms: u64) {
         self.last_success_ms = self.last_success_ms.saturating_sub(ms);
     }
 }

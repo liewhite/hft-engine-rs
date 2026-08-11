@@ -31,3 +31,12 @@ tests/ibkr_config.json
 ibkr_config.json
 hype_config.json
 spread_arb_config.json
+
+# 误入库的一次性文件（已从索引移除，本地保留）：
+# AWSCLIV2.pkg 是 52MB 的 AWS CLI 安装包，与本项目无关；
+# 三个 python 脚本是查资费的一次性草稿，功能早已由 FundingFee 事件通道覆盖。
+# 注意：blob 仍在 git 历史里，真要瘦身得重写历史，本次不做。
+/AWSCLIV2.pkg
+/check_funding.py
+/funding_test.py
+/get_funding.py

@@ -119,6 +119,13 @@ impl StateManager {
         self.states.iter()
     }
 
+    /// 遍历全部 symbol 中**基线已写入**的持仓腿（见 [`SymbolState::seeded_positions`]）。
+    ///
+    /// 供持仓账本对外应答快照查询：未 seed 的腿是「未知」，不出现在结果里。
+    pub fn seeded_positions(&self) -> impl Iterator<Item = &Position> {
+        self.states.values().flat_map(|s| s.seeded_positions())
+    }
+
     /// 遍历所有已收到账户信息的交易所（供观测层汇总）
     pub fn account_infos(&self) -> impl Iterator<Item = (Exchange, &AccountInfo)> {
         self.account_infos.iter().map(|(e, i)| (*e, i))

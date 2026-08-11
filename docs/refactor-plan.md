@@ -92,7 +92,7 @@ OutcomeBus : executor ──→ 两种柜台按账户认领（实盘出口 / 本
   不存在任何投递窗口（比现状"注册前点对点 tell"更强）。
 - **镜像**（reconciler / metrics）：`RegisterSymbols` 改为携带 baselines 的注册握手，
   注册与基线原子到达，`pending_fills` 缓冲重放机制整体删除。
-- **对账读数**：`PositionPollingActor` 并入 `PositionReconcileActor`——reconciler 持有
+- **对账读数**：`PositionPollingActor` 并入 `PositionLedgerActor`——reconciler 持有
   authed clients，由 Clock 驱动自行轮询比对。读数只有一个消费者，不该经过总线。
 
 ### 1.4 出向：一条出口、一处规则
@@ -192,17 +192,33 @@ provisioning.rs —— 原定"< 500 行 / 三个子模块"改为两文件方案�
 **后续可选**：三个 bin 的装配块（`if let Some → push` × 3 所）与同构的 `ExchangesConfig`
 可提为 assembly.rs 里的 `ExchangesConfig::assemble()`，加新加密所时不必改三个 bin。
 
-### 阶段 6：后续（另行排期，不在本轮）
-- MarketBus conflation：状态类事件（BBO/Mark/AccountInfo）最新值语义 + 合并计数指标，
-  替代"unbounded 内存涨 vs bounded 静默丢"的二选一。
-- `ChildGroup` 组内并行停机（保组间顺序，超时者单独点名）。
-- 仓库清理：`AWSCLIV2.pkg`（52MB）、根目录散落 python 脚本出库。
+### 阶段 6（已完成）
+- ~~MarketBus conflation~~ → **改为管线滞后可观测，见下方"有意不做"第 4 条**。
+- `ChildGroup` 组内并发停机：已做。前提"同组互无停机依赖"原先不成立（manager 的
+  pipeline 靠登记顺序隐含表达 PubSub→订阅者的先后），故顺带把它拆成
+  `buses` + `consumers`，停机变成 生产者 → 总线 → 消费者 三段，段内并发、段间有序。
+- 仓库清理：已做（`git rm --cached` + gitignore，本地副本保留；blob 仍在历史里，
+  瘦身需重写历史，未做）。
+- 顺带清掉审计遗留的三个 Minor：柜台惰性新建时补播种成交价、回测 `market_events`
+  不再把合成的账户事件算进行情数、删死代码 `remove_pending_order`。
 
 ## 3. 有意不做（奥卡姆）
 
 - **多实盘账户**：只留适配层的账户注入点，不建配置面——无现实需求。
 - **`Exchange` 枚举换注册表**：4 所规模下，封闭枚举的穷尽 match 安全性更值钱。
 - **actor 框架 / 总线替换**：kameo + pubsub 工作良好，问题全在其上的使用方式。
+- **状态类事件的 conflation（只保留最新值）**：阶段 6 原计划要做，实现前验证发现它与
+  更强的不变量冲突，**放弃**。`spread_arb` 把 BBO 当**流**消费 —— `EmaCalculator` 每条
+  BBO 更新一次、`is_ready()` 数的是 tick 次数。丢掉中间 tick 会让 EMA 的值与预热时机
+  变成**负载的函数**：同一段行情，机器忙时和闲时算出不同的 EMA，且与逐 tick 回放的
+  回测必然背离 —— 正是阶段 1 花力气消除的"回测调好的参数上线即漂移"。
+  真正要解决的也不是"丢还是涨"，而是**积压当前完全不可见**（没有日志、没有指标，
+  只有内存悄悄涨）。故改为让它可见：`ExecutorActor::check_pipeline_lag` 在策略消费到
+  滞后超 1 秒的事件时 warn（按整倍数节流，`ALERT_WEBHOOK_URL` 会外送成告警），
+  与 `StalenessGuard` 同一姿态 —— 读数流的问题要能被发现，而不是被静默吸收。
+  不 kill：偶发调度抖动不该打死引擎，持续积压会持续告警。
+  哪天真有策略需要"最新值"语义，正确做法是让**那个策略**声明它按快照消费，
+  而不是在总线上对所有消费者一律丢 tick。
 
 ## 4. 风险与对策
 

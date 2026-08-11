@@ -167,7 +167,7 @@ pub struct AccountUpdate {
 ///
 /// **有意不声明 `P`（持仓）**：那是持仓快照，而持仓的维护模型是「启动期 REST 基线 + 之后
 /// 全程 Fill 累加」（见 [`crate::messaging::PositionBaseline`]）。校验本地
-/// 持仓是否漂移走 `PositionReconcileActor` 的独立轮询通道，不从这条推送取。
+/// 持仓是否漂移走 `PositionLedgerActor` 的独立轮询通道，不从这条推送取。
 #[derive(Debug, Deserialize)]
 pub struct AccountData {
     #[serde(rename = "B")]

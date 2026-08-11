@@ -152,9 +152,20 @@ impl SymbolState {
         }
     }
 
-    /// 该所的持仓基线是否已写入（写入后该腿才可参与对账，见 `PositionReconcileActor`）
+    /// 该所的持仓基线是否已写入（写入后该腿才可参与对账，见 `PositionLedgerActor`）
     pub fn is_position_seeded(&self, exchange: Exchange) -> bool {
         self.position_seeded_at.contains_key(&exchange)
+    }
+
+    /// 基线已写入的各所持仓（**含 `size == 0` 的空仓腿**）。
+    ///
+    /// 未 seed 的腿被排除：那时本地持仓是「未知」而不是 0。这条区分对两个消费者都是必须的 ——
+    /// 对账不能拿未知去比（必然误判漂移），对外查询也不能把未知当空仓报出去
+    /// （下游会据此算出假的对冲完整性）。规则的家安在这里，与 seed 标记同一处。
+    pub fn seeded_positions(&self) -> impl Iterator<Item = &Position> {
+        self.positions
+            .values()
+            .filter(|p| self.is_position_seeded(p.exchange))
     }
 
     /// 添加待处理订单 (发送订单信号时调用)
@@ -570,11 +581,6 @@ impl SymbolState {
                 );
             }
         }
-    }
-
-    /// 移除指定的待处理订单
-    pub fn remove_pending_order(&mut self, client_order_id: &str) {
-        self.pending_orders.remove(client_order_id);
     }
 
     /// 汇总跨所持仓与估值

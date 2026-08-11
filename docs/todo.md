@@ -78,7 +78,7 @@ SymbolMeta 判据，加复审补的 `ibkr/wire.rs`）。遗留五项按需另立
   当前依赖"WS 断开即进程退出 + docker 重启"来兜底。
 - **持仓维护为增量 + 独立对账通道**：`Position` 基线一次性写入（manager 投产期点对点 +
   总线各一条路径），之后全靠 `Fill` 累加；`PositionPollingActor` 周期性 REST 读数经
-  `PositionReconcileActor` 与「基线 + Fill」比对，连续差值稳定即停机。对账**只检测不修复**
+  `PositionLedgerActor` 与「基线 + Fill」比对，连续差值稳定即停机。对账**只检测不修复**
   （无 re-baseline / 自动平仓），模拟账户与挂单不在对账范围内。漂移的 error 日志现在会经
   告警外送通道推 webhook（若配置了 `ALERT_WEBHOOK_URL`）。
 

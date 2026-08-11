@@ -4,7 +4,7 @@
 //! 把产出的 OutcomeEvent 发布到 OutcomePubSub。纯策略逻辑集中在 StrategyRunner，
 //! 与回测引擎共享同一份实现。
 
-use crate::domain::{AccountId, Exchange, Symbol, SymbolMeta};
+use crate::domain::{now_ms, AccountId, Exchange, Symbol, SymbolMeta, Timestamp};
 use crate::engine::StrategyRunner;
 use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
@@ -17,6 +17,28 @@ use std::sync::Arc;
 use kameo_actors::pubsub::Publish;
 
 use super::{AccountOutcome, OutcomePubSub};
+
+/// 策略消费一条事件时，距适配层收到它的最大容忍时长（见
+/// [`ExecutorActor::check_pipeline_lag`]）。
+///
+/// 取 1 秒：正常路径上这个值是几毫秒（三跳进程内邮箱），到秒级只有一个解释 —— 本实例
+/// 跟不上事件流。它同时是策略决策的陈旧度上限：spread_arb 的行情新鲜度门是秒级，
+/// 拿超过 1 秒的报价去算价差已经没有意义。
+const MAX_PIPELINE_LAG_MS: u64 = 1_000;
+
+/// 滞后告警的最小间隔。积压时超限事件成千上万，逐条打日志会让告警本身变成负载。
+///
+/// 用**时间**节流而非"每 N 条报一次"：后者是相位判断（`count % N == 1`），计数器又不
+/// 跨积压期重置 —— 上一次积压停在 1002 条，下一次持续不到 1000 条的积压就整段静默，
+/// 漏报与否取决于历史计数的余数。而滞后本就是个持续时长的问题，按时间节流才对得上。
+const LAG_WARN_INTERVAL_MS: u64 = 5_000;
+
+/// 时间节流判据（纯函数，便于单测）：距上次告警是否已够久。
+///
+/// `last_warn_ms == 0` 表示从未告警过 —— 差值必然超阈值，故首条必报。
+fn lag_warn_due(now: Timestamp, last_warn_ms: Timestamp) -> bool {
+    now.saturating_sub(last_warn_ms) >= LAG_WARN_INTERVAL_MS
+}
 
 /// ExecutorActor 初始化参数
 pub struct ExecutorArgs {
@@ -41,11 +63,16 @@ pub struct ExecutorActor {
     account: AccountId,
     /// Outcome PubSub 引用 (用于发布信号)
     outcome_pubsub: ActorRef<OutcomePubSub>,
+    /// 累计消费到的超限滞后事件数（进告警看趋势，见 [`Self::check_pipeline_lag`]）
+    lagging_events: u64,
+    /// 上次滞后告警的时刻；0 = 从未告警（见 [`lag_warn_due`]）
+    last_lag_warn_ms: Timestamp,
 }
 
 impl ExecutorActor {
     /// 处理 IncomeEvent，委托 runner 运行策略并发布返回的信号
     async fn handle_event(&mut self, event: IncomeEvent) {
+        self.check_pipeline_lag(&event);
         for signal in self.runner.on_event(&event) {
             let tagged = AccountOutcome {
                 account: self.account.clone(),
@@ -58,6 +85,52 @@ impl ExecutorActor {
                 tracing::error!(error = %e, account = %self.account, "策略信号发布失败，该信号已丢失");
             }
         }
+    }
+
+    /// 管线滞后自查：策略此刻拿到的这条事件，距适配层收到它已经过了多久。
+    ///
+    /// # 为什么需要它，以及为什么不是 conflation
+    ///
+    /// 三条总线都是 unbounded 邮箱 + `BestEffort`。消费者跟不上时，后果不是丢事件而是
+    /// **积压**：策略排着队消费几秒前的报价做决策，而这件事目前**完全不可见** —— 没有
+    /// 日志、没有指标，只有内存悄悄涨。
+    ///
+    /// 计划里原本想用"状态类事件只保留最新值"（conflation）来解决。**不能这么做**：
+    /// `spread_arb` 把 BBO 当**流**消费 —— `EmaCalculator` 每条 BBO 更新一次、
+    /// `is_ready()` 数的是 tick 次数。丢掉中间 tick 会让 EMA 的值与预热时机变成**负载的
+    /// 函数**：同一段行情，机器忙时和闲时算出不同的 EMA，且与逐 tick 回放的回测必然背离
+    /// —— 那正是"回测调好的参数上线即漂移"，本次重构阶段 1 刚花力气消除的东西。
+    ///
+    /// 所以改为让积压**可见**（与 [`crate::exchange::staleness`] 同一姿态：读数流的问题
+    /// 要能被发现，而不是被静默吸收）：超过阈值即 warn（按时间节流，见
+    /// [`LAG_WARN_INTERVAL_MS`]），`ALERT_WEBHOOK_URL` 会把 WARN 外送成告警
+    /// （见 [`crate::engine::init_tracing`]）。
+    ///
+    /// 不 kill：偶发的 GC / 调度抖动不该打死引擎，而持续积压会持续告警。
+    ///
+    /// # 只在实盘路径
+    ///
+    /// 本 actor 只用于实盘/模拟盘（回测直接驱动 `StrategyRunner`），故 `local_ts` 必是
+    /// 墙钟；回测里它是虚拟时间，拿来减 `now_ms()` 会得到无意义的巨值 —— 这也是判据
+    /// 放在这里、而不是放进两条驱动共享的 `StrategyRunner` 的原因。
+    fn check_pipeline_lag(&mut self, event: &IncomeEvent) {
+        let now = now_ms();
+        let lag_ms = now.saturating_sub(event.local_ts());
+        if lag_ms <= MAX_PIPELINE_LAG_MS {
+            return;
+        }
+        self.lagging_events += 1;
+        if !lag_warn_due(now, self.last_lag_warn_ms) {
+            return;
+        }
+        self.last_lag_warn_ms = now;
+        tracing::warn!(
+            account = %self.account,
+            lag_ms,
+            threshold_ms = MAX_PIPELINE_LAG_MS,
+            lagging_events = self.lagging_events,
+            "策略正在消费积压事件（决策依据已经陈旧），本实例跟不上事件流"
+        );
     }
 }
 
@@ -75,6 +148,8 @@ impl Actor for ExecutorActor {
             runner,
             account,
             outcome_pubsub: args.outcome_pubsub,
+            lagging_events: 0,
+            last_lag_warn_ms: 0,
         })
     }
 
@@ -107,7 +182,7 @@ impl Message<IncomeEvent> for ExecutorActor {
 ///
 /// 用于降级平仓取量，见 [`crate::engine::RemoveStrategies`]。读的是「基线 + Fill」维护的
 /// **权威**持仓，**不打 REST**：
-/// - REST 在本项目里只作对账用途（见 [`crate::engine::PositionReconcileActor`]），
+/// - REST 在本项目里只作对账用途（见 [`crate::engine::PositionLedgerActor`]），
 ///   持仓维护模型不允许它参与；
 /// - 本地值比 REST 快照更**新** —— 后者可能落后于最新到达的 Fill。
 ///
@@ -128,5 +203,38 @@ impl Message<GetPositions> for ExecutorActor {
             .filter_map(|symbol| state.symbol_state(symbol))
             .flat_map(|symbol_state| symbol_state.positions.values().cloned())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod lag_throttle_tests {
+    use super::*;
+
+    /// 从未告警过 -> 首条必报
+    #[test]
+    fn first_lagging_event_always_warns() {
+        assert!(lag_warn_due(1_700_000_000_000, 0));
+    }
+
+    /// 间隔内不重复报（积压时超限事件成千上万，告警自己会变成负载）
+    #[test]
+    fn within_interval_stays_quiet() {
+        let last = 1_700_000_000_000;
+        assert!(!lag_warn_due(last + LAG_WARN_INTERVAL_MS - 1, last));
+        assert!(lag_warn_due(last + LAG_WARN_INTERVAL_MS, last));
+    }
+
+    /// **回归防线**：第二段积压的首条必须能报出来。
+    ///
+    /// 此前用"每 N 条报一次"的相位判据（`count % N == 1`）且计数器不跨积压期重置：
+    /// 上一段积压停在 1002 条，下一段只要持续不到 1000 条，区间内就没有 ≡1 (mod N) 的
+    /// 点 —— 整段静默，漏报与否取决于历史计数的余数。改按时间节流后，只要距上次告警
+    /// 够久就一定报，与历史条数无关。
+    #[test]
+    fn a_later_burst_is_never_silenced_by_history() {
+        let first_burst_warn_at = 1_700_000_000_000;
+        // 中间恢复正常一分钟，随后第二段积压 —— 无论此前报过多少条，都该报
+        let second_burst = first_burst_warn_at + 60_000;
+        assert!(lag_warn_due(second_burst, first_burst_warn_at));
     }
 }

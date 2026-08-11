@@ -5,7 +5,8 @@
 //!   起三条总线与全部核心子 actor —— 对"有哪些交易所"彻底无知；
 //! - **投产/撤下编排**：见 [`provisioning`] 子模块（同一 actor 的方法，经邮箱串行化）；
 //! - **监督**：子 actor 主动退出放行、出错级联整机退出（见 `on_link_died`）；
-//! - **停机**：先停生产端、再停管线（见 `on_stop` 与 `crate::actor_lifecycle`）。
+//! - **停机**：生产者 -> 总线 -> 消费者三段依次停（见 `on_stop` 与
+//!   `crate::actor_lifecycle`），组内并发、组间有序。
 
 use crate::actor_lifecycle::{ChildGroup, ChildStop};
 use crate::engine::bootstrap::Supervised;
@@ -13,12 +14,12 @@ use super::{
     AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs, ExecutorActor,
     IncomeProcessorActor, MarketPubSub, MetricsActor, MetricsActorArgs, OrderGateway,
     OutcomePubSub, OutcomeProcessorActor, PaperCounterActor, PaperCounterArgs,
-    PositionReconcileActor, PositionReconcileArgs,
+    GetLivePositions, PositionLedgerActor, PositionLedgerArgs,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
     DEFAULT_REPORT_INTERVAL_MS,
 };
 use crate::domain::{
-    now_ms, AccountId, Exchange, ExchangeError, Symbol, SymbolMeta,
+    now_ms, AccountId, Exchange, ExchangeError, Position, Symbol, SymbolMeta,
 };
 use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
 use super::assembly::{ExchangeSetup, SpawnCtx};
@@ -75,8 +76,11 @@ pub struct ManagerActor {
     income_processor: ActorRef<IncomeProcessorActor>,
     /// MetricsActor (订阅两条入向总线，输出账户/持仓/订单/历史指标)
     metrics: ActorRef<MetricsActor>,
-    /// 持仓对账 Actor (订阅账户总线的实盘 Fill；漂移确认后致命退出)
-    position_reconciler: ActorRef<PositionReconcileActor>,
+    /// 实盘持仓账本 (订阅账户总线的实盘 Fill；REST 校验，漂移确认后致命退出)。
+    ///
+    /// 同时是快照面 [`GetLivePositions`] 的数据源 —— 它是唯一被持续校验的那份折叠，
+    /// 外部读到的数字与风控守卫看到的数字必须是同一个。
+    position_ledger: ActorRef<PositionLedgerActor>,
     /// ExchangeActors (启动时创建，类型擦除)
     exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
 
@@ -90,19 +94,41 @@ pub struct ManagerActor {
     /// 否则实例只能随进程生死。
     executors: Vec<RegisteredExecutor>,
 
-    /// **产生**事件的子 actor：交易所 actor、时钟、对账轮询、策略实例。
+    /// **产生**事件的子 actor：交易所 actor、时钟、策略实例。
     /// 停机时先停这一段 —— 它们的 `on_stop` 还会往总线上发最后一批事件
     /// （`IbkrPublicWsActor` 要补发等 commission 的成交），那时管线必须还活着。
+    ///
+    /// 组内并发的一处语义收窄：executors 与交易所 actor 同时收到 Stop，故**不保证
+    /// executor 能消费到交易所补发的那最后一批回报**（此前串行、且 executor 登记在
+    /// 交易所之后时它有机会）。无实害 —— executor 的 `on_stop` 不持久化任何状态，
+    /// 持仓下次启动走 REST 基线重建。
     producers: ChildGroup,
 
-    /// **传递与消费**事件的子 actor：两条 PubSub、两个 Processor、模拟柜台、
-    /// 观测与对账、以及外部注册的观察者。在生产者全部停完之后才停，
-    /// 这样最后一批事件仍有人接收（`Signal::Stop` 排在消息之后，会先排空）。
+    /// **三条总线**。在生产者全部停完之后才停，这样生产者 `on_stop` 里补发的最后一批
+    /// 事件仍进得来（`Signal::Stop` 排在消息之后，总线会先排空、转发给订阅者）。
     ///
-    /// 组内顺序同样有讲究：PubSub 先停（排空自己的队列、转发给订阅者），
-    /// 订阅者后停（再排空自己的）。登记顺序即停机顺序。
-    pipeline: ChildGroup,
+    /// # 如实声明：三段线性模型盖不住一条回灌边
+    ///
+    /// 真实拓扑不是一条直线 —— Outcome 总线的两个消费者会**倒回来**往 Account 总线发：
+    /// 本地柜台发撮合回报、`OrderGateway` 发合成的失败/撤单回报。而本组三条总线同时
+    /// 收 Stop，AccountPubSub 往往先停死，于是停机瞬间在途的这批回报会丢
+    /// （日志里表现为 `Paper counter failed to publish report`），影响是**最终一次指标
+    /// 快照少记一笔**。
+    ///
+    /// 不为它再切一刀分组，理由是那样也救不回来：柜台的延迟管道是 spawn 出去的，
+    /// `PaperCounterActor::on_stop` 并不排空它，仍在 sleep 的那张单无论分组怎么排都会
+    /// 丢；`OrderGateway` 的在途 REST 任务同理（那是既有的、已声明接受的取舍）。
+    /// 真要救得让柜台在 `on_stop` 里排空延迟管道 —— 而这批数据一个字节都不持久化
+    /// （paper 账户每次启动从零起步、实盘持仓走 REST 基线重建），不值得。
+    buses: ChildGroup,
 
+    /// **消费**事件的子 actor：两个 Processor、模拟柜台、观测与对账、以及外部注册的
+    /// 观察者。在总线全部停完之后才停 —— 那时总线已把队列排空转发过来，消费者再排空
+    /// 自己的。
+    ///
+    /// 与 `buses` 分成两组而不是靠登记顺序：依赖一旦藏在登记顺序里，换个 push 位置就
+    /// 悄悄改变停机语义，而编译器和测试都看不见（见 [`ChildGroup::shutdown`]）。
+    consumers: ChildGroup,
 }
 
 /// 一个已注册的策略实例
@@ -186,21 +212,22 @@ impl Actor for ManagerActor {
         // 3. 创建 PubSub Actors：行情 / 账户 / 信号 三条总线。
         //    账户事件（实盘适配层标 Live + 本地柜台标 Paper）走同一条 AccountPubSub，
         //    账户隔离由事件自带的 account 字段保证 —— 不靠总线拓扑，也不靠来源推断。
-        let mut pipeline = ChildGroup::default();
+        let mut buses = ChildGroup::default();
+        let mut consumers = ChildGroup::default();
         let mut producers = ChildGroup::default();
-        let market_pubsub = pipeline.spawn::<MarketPubSub, _>(
+        let market_pubsub = buses.spawn::<MarketPubSub, _>(
             &actor_ref,
             "MarketPubSub",
             MarketPubSub::new(DeliveryStrategy::BestEffort),
         )
         .await;
-        let account_pubsub = pipeline.spawn::<AccountPubSub, _>(
+        let account_pubsub = buses.spawn::<AccountPubSub, _>(
             &actor_ref,
             "AccountPubSub",
             AccountPubSub::new(DeliveryStrategy::BestEffort),
         )
         .await;
-        let outcome_pubsub = pipeline.spawn::<OutcomePubSub, _>(
+        let outcome_pubsub = buses.spawn::<OutcomePubSub, _>(
             &actor_ref,
             "OutcomePubSub",
             OutcomePubSub::new(DeliveryStrategy::BestEffort),
@@ -208,7 +235,7 @@ impl Actor for ManagerActor {
         .await;
 
         // 4. 创建 ProcessorActor：订阅两条入向总线，按订阅关系/账户分发给 executor
-        let processor = pipeline.spawn::<IncomeProcessorActor, _>(
+        let processor = consumers.spawn::<IncomeProcessorActor, _>(
             &actor_ref,
             "IncomeProcessorActor",
             IncomeProcessorActor::default(),
@@ -240,7 +267,7 @@ impl Actor for ManagerActor {
             Arc::new(symbol_metas.clone()),
             /* dry_run */ false,
         ));
-        let live_processor = pipeline.spawn::<OutcomeProcessorActor, _>(
+        let live_processor = consumers.spawn::<OutcomeProcessorActor, _>(
             &actor_ref,
             "OutcomeProcessorActor",
             order_gateway.clone(),
@@ -263,7 +290,7 @@ impl Actor for ManagerActor {
 
         // 本地柜台：订阅信号总线（认领 Paper 账户的订单）与行情总线（撮合 + Clock 发净值），
         // 回报以 Paper 标签发布到 AccountPubSub —— 与实盘适配层同一条总线、同一个类型
-        let paper_counter = pipeline.spawn::<PaperCounterActor, _>(
+        let paper_counter = consumers.spawn::<PaperCounterActor, _>(
             &actor_ref,
             "PaperCounterActor",
             PaperCounterArgs {
@@ -285,7 +312,7 @@ impl Actor for ManagerActor {
             .map_err(|e| ExchangeError::Other(e.to_string()))?;
 
         // 5.5 创建 MetricsActor 并订阅两条入向总线（观测层：只读事件流，不参与决策）
-        let metrics = pipeline.spawn::<MetricsActor, _>(
+        let metrics = consumers.spawn::<MetricsActor, _>(
             &actor_ref,
             "MetricsActor",
             MetricsActorArgs {
@@ -320,10 +347,10 @@ impl Actor for ManagerActor {
             .filter(|(e, _)| authed_exchanges.contains(e))
             .map(|(e, c)| (*e, c.clone()))
             .collect();
-        let position_reconciler = pipeline.spawn::<PositionReconcileActor, _>(
+        let position_ledger = consumers.spawn::<PositionLedgerActor, _>(
             &actor_ref,
-            "PositionReconcileActor",
-            PositionReconcileArgs {
+            "PositionLedgerActor",
+            PositionLedgerArgs {
                 clients: authed_clients,
                 symbol_metas: Arc::new(symbol_metas.clone()),
                 interval_ms: DEFAULT_POSITION_POLL_INTERVAL_MS,
@@ -333,7 +360,7 @@ impl Actor for ManagerActor {
         .await;
         // 镜像的增量输入只有实盘 Fill：按类型+账户过滤订阅（模拟成交绝不进实盘镜像）
         account_pubsub
-            .tell(SubscribeFilter(position_reconciler.clone(), |e: &AccountEvent| {
+            .tell(SubscribeFilter(position_ledger.clone(), |e: &AccountEvent| {
                 e.account == AccountId::Live && matches!(e.data, AccountData::Fill(_))
             }))
             .send()
@@ -386,12 +413,13 @@ impl Actor for ManagerActor {
             outcome_pubsub,
             income_processor: processor,
             metrics,
-            position_reconciler,
+            position_ledger,
             exchange_actors,
             order_gateway,
             executors: Vec::new(),
             producers,
-            pipeline,
+            buses,
+            consumers,
         })
     }
 
@@ -400,13 +428,22 @@ impl Actor for ManagerActor {
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
-        // 先停生产端、再停管线。顺序反了的话，生产者 on_stop 里补发的最后一批事件
-        // （如 IbkrPublicWsActor 等 commission 的成交）会发进一个已经死掉的总线 ——
-        // 那正是本次停机链要防的失效。
+        // 生产者 -> 总线 -> 消费者，三段依次停；**每段内部并发**（见 ChildGroup::shutdown）。
+        //
+        // 顺序是事件在管线里的流向，反了就会丢掉最后一批事件：
+        // - 生产者先停 —— 它们的 on_stop 还会往总线发东西（IbkrPublicWsActor 要补发等
+        //   commission 的成交），此刻总线必须还活着；
+        // - 总线次之 —— Stop 信号排在消息之后，它会先把队列排空、转发给订阅者；
+        // - 消费者最后 —— 该经总线转发过来的都已进了它们的邮箱，再各自排空。
+        //   （唯一例外是柜台/网关倒回 Account 总线的那批在途回报，见 buses 字段说明。）
+        //
+        // 这三段此前是「生产者」+「管线」两组，段内顺序靠登记顺序隐含表达 —— 依赖藏在
+        // push 位置里，改一行就悄悄变语义。现在由分组本身表达。
         //
         // 递归自动成立：每个交易所 actor 的 on_stop 又在等它自己那批 WS / 轮询子 actor。
         self.producers.shutdown().await;
-        self.pipeline.shutdown().await;
+        self.buses.shutdown().await;
+        self.consumers.shutdown().await;
         tracing::info!(reason = ?reason, "ManagerActor stopped");
         Ok(())
     }
@@ -431,7 +468,7 @@ impl Actor for ManagerActor {
     ///   [`crate::dispatch_ws_stream_message`] 统一保证，各 polling actor 在自己的 `Finished`
     ///   分支里做同样的事。
     /// - **manager 持有强引用**（`exchange_actors` / `metrics` / `income_processor` /
-    ///   `position_reconciler` / `executors`），压根饿不死。
+    ///   `position_ledger` / `executors`），压根饿不死。
     ///
     /// 外部注册的观察者由 [`crate::engine::spawn_supervised`] 挂进来，调用方持有返回的
     /// ActorRef，同样不会饿死。
@@ -532,7 +569,7 @@ impl Message<RegisterSupervisedChild> for ManagerActor {
         msg: RegisterSupervisedChild,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.pipeline.push_handle(msg.0);
+        self.consumers.push_handle(msg.0);
     }
 }
 
@@ -722,6 +759,17 @@ where
     }
 }
 
+// ============================================================================
+// 快照面（拉）—— 契约见 `docs/external-data-access.md`
+//
+// 这一面上的每条消息都必须：纯内存读、不打 REST、不阻塞邮箱、由本 actor 应答。
+// 新增一类快照 = 新增一条消息 + 一个 `impl Message`，**不改既有分支** ——
+// 绝不合并成 `Query { kind }` 那种用 match 分发的假抽象。
+//
+// 已知代价：投产期本 actor 忙于 REST 快照与订阅装配（秒级），此间查询会排队。
+// 对采样式消费者可接受；要求毫秒应答的需求应走流面（`Subscribe*`）。
+// ============================================================================
+
 /// 获取所有交易所的 SymbolMeta
 pub struct GetAllSymbolMetas;
 
@@ -738,6 +786,32 @@ impl Message<GetAllSymbolMetas> for ManagerActor {
             result.entry(*exchange).or_default().push(meta.clone());
         }
         result
+    }
+}
+
+/// 实盘持仓真值快照，转发给 [`PositionLedgerActor`]（唯一被 REST 持续校验的那份折叠）。
+///
+/// 应答为**基线已写入**的全部腿（含 `size == 0` 的空仓腿）；未 seed 的腿不在结果里 ——
+/// 那是"未知"而非"空仓"。
+///
+/// 账本不可达时返回 `Err` 而**不是空 vec**：同一条"未知不得伪装成空仓"的规矩，对单条腿成立
+/// 就对整份快照成立。空 vec 在下游会被当成"全部已平仓"，而账本不可达时真实持仓可能是任意值。
+impl Message<GetLivePositions> for ManagerActor {
+    type Reply = Result<Vec<Position>, String>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetLivePositions,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.position_ledger
+            .ask(GetLivePositions)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "持仓账本不可达，快照查询失败（取不到 ≠ 没有持仓）");
+                format!("持仓账本不可达: {e}")
+            })
     }
 }
 
