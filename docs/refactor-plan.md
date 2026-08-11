@@ -2,6 +2,24 @@
 
 > 2026-08-11 制定。原则：SSOT / 实体最少化 / 无特殊逻辑。不考虑向后兼容。
 > 对照基准：六环节目标架构（交易所 trait → 聚合分发 → 纯函数策略 → 决策出口 → 虚拟柜台 → 外部订阅）。
+>
+> **执行状态（2026-08-11，分支 refactor/stage1-counter-validation）：阶段 1–5 全部完成。**
+>
+> | 阶段 | commit | 审查 |
+> |---|---|---|
+> | 1 柜台校验收敛 | 762bb6f | 与阶段 2 合并审查：1 Critical（place 假成功）已修（76c49a5，PlaceVerdict + 契约直测） |
+> | 2 单一下单出口 | 73a2c1b | 同上；改进：共享 OrderGateway 组件替代计划中的 Execute ask（不占 outcome 邮箱） |
+> | 3 基线退出总线 | ef0ec81 | 0 Critical；文档诚实性修正 + 补 2 测试（230cecd） |
+> | 4 事件模型拆分 | f6dbfeb | 0 Critical、2 Major（注册幂等/丢弃点可见）已修（d4edbce） |
+> | 5 Manager 瘦身 | b0237f7 | （审查中） |
+>
+> 与计划的偏离（均为改进，理由见各 commit）：
+> - 阶段 2 用共享 `OrderGateway` 组件替代 `Execute` ask 消息 —— 平仓 REST 不阻塞 outcome 邮箱；
+> - 阶段 3 顺带把对账盲区收窄（executor 与镜像 seed 语义同构），残余窗口在
+>   `activate_executors` 文档如实列明；
+> - 阶段 4 顺带完成 B5（路由索引化）与 Supervisor 账户侧单订阅；
+> - Greeks 归入 AccountData 零行为变化（见事实核查：paper gamma_scalp 原本就因缺 cashBal 不可用）。
+> 阶段 6（conflation / 并行停机 / 仓库清理）未动，按需另排。
 
 ## 0. 诊断归因
 
