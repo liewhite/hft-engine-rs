@@ -696,7 +696,7 @@ mod tests {
         ));
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
-        let exposure = exposure_of(&state, metrics.baseline.get(&symbol));
+        let exposure = exposure_of(state, metrics.baseline.get(&symbol));
 
         // 全额市值 200，但本次会话未成交 → session PnL 为 0，而非凭空 +200
         assert!((exposure.net_notional - 200.0).abs() < 1e-9);
@@ -741,7 +741,7 @@ mod tests {
         ));
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
-        let exposure = exposure_of(&state, metrics.baseline.get(&symbol));
+        let exposure = exposure_of(state, metrics.baseline.get(&symbol));
 
         // 会话内新增 1 个、现价 110 → 存货变化 +110，现金流 -100 → 浮盈 10
         assert!((exposure.session_notional_delta - 110.0).abs() < 1e-9);
