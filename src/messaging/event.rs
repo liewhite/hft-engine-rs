@@ -260,6 +260,28 @@ impl AccountData {
 // 统一视图（策略 / 状态层）
 // ============================================================================
 
+/// 一条事件的投递范围。
+///
+/// 消费者（executor / 回测 runner）声明的订阅范围是 `(交易所, symbol)` 的集合，
+/// 而事件的定位精度有三档，正好对应本枚举的三个变体：
+///
+/// - [`Delivery::Symbol`]：行情与 symbol 级私有回报（BBO / OrderUpdate / Fill…）
+/// - [`Delivery::Exchange`]：某个所的**所级读数**，无 symbol —— 账户私有的
+///   `Balance` / `AccountInfo` / `Greeks`，以及公共的 `ExchangeStatus` / `ExchangeRate`。
+///   只投给订了这个所的消费者：一个策略拿不到自己没订的所的净值与希腊值。
+/// - [`Delivery::Broadcast`]：与交易所无关的全局事件（`Clock`、无 scope 的自定义事件）
+///
+/// 穷举 `match` 是刻意的（原则 P6）：新增一档投递范围时，分发层与 `accepts` 都会编译失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    /// 定向到 (所, symbol)
+    Symbol(Exchange, Symbol),
+    /// 定向到所
+    Exchange(Exchange),
+    /// 广播
+    Broadcast,
+}
+
 /// 策略与状态层的统一事件视图。
 ///
 /// 总线上不存在这个类型（MarketBus 传 [`MarketEvent`]、AccountBus 传 [`AccountEvent`]），
@@ -312,17 +334,21 @@ impl IncomeEvent {
         }
     }
 
-    /// 路由键: `Some` 表示按 (exchange, symbol) 定向路由, `None` 表示广播。
+    /// 这条事件该投给谁。
     ///
     /// **路由知识的单一出处**：实盘分发层（IncomeProcessor → executor）与回测
     /// （`StrategyRunner::accepts`）都由本方法推导 —— 新增事件变体时改 `symbol()`/
     /// `exchange()` 即可，没有第二份 match，也没有任何例外变体。
     ///
-    /// 注意账户事件的"广播"仍限于**该账户**的 executor（分发层按 `account` 先过滤）。
-    pub fn routing(&self) -> Option<(Exchange, Symbol)> {
+    /// 注意账户事件的投递仍先限于**该账户**的 executor（分发层按 `account` 先过滤）。
+    pub fn delivery(&self) -> Delivery {
         match (self.exchange(), self.symbol()) {
-            (Some(e), Some(s)) => Some((e, s.clone())),
-            _ => None,
+            (Some(e), Some(s)) => Delivery::Symbol(e, s.clone()),
+            (Some(e), None) => Delivery::Exchange(e),
+            // 无来源交易所 = 与具体交易所无关的全局事件（Clock、无 scope 的自定义事件）。
+            // `(None, Some(_))` 今天不存在任何变体（有 symbol 必有 exchange），
+            // 真出现了当广播处理也是安全侧：宁可多投一个消费者，不可静默丢事件。
+            (None, _) => Delivery::Broadcast,
         }
     }
 
@@ -388,13 +414,16 @@ mod custom_event_tests {
             "BTC".to_string(),
             AlphaSignal { score: 1.0 },
         ));
-        assert_eq!(ev.routing(), Some((Exchange::Binance, "BTC".to_string())));
+        assert_eq!(
+            ev.delivery(),
+            Delivery::Symbol(Exchange::Binance, "BTC".to_string())
+        );
     }
 
-    /// 无 scope 的自定义事件广播给所有 executor（routing = None 即广播）
+    /// 无 scope 的自定义事件广播给所有 executor
     #[test]
     fn unscoped_custom_event_broadcasts() {
         let ev = wrap(CustomEvent::new(AlphaSignal { score: 1.0 }));
-        assert_eq!(ev.routing(), None);
+        assert_eq!(ev.delivery(), Delivery::Broadcast);
     }
 }

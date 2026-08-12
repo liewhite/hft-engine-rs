@@ -982,7 +982,6 @@ mod tests {
     /// 都过不去，正好把它修正过来。
     struct Fixture {
         manager: StateManager,
-        exchanges: HashSet<Exchange>,
     }
 
     /// 两所各一条 BBO + 指定仓位，无账户读数（equity 缺失）。
@@ -1007,11 +1006,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
         );
-        Fixture {
-            manager,
-            // 账户级读数的裁剪范围：本策略订阅的就是这两个所
-            exchanges: HashSet::from([SHORT_EX, LONG_EX]),
-        }
+        Fixture { manager }
     }
 
     impl Fixture {
@@ -1045,7 +1040,7 @@ mod tests {
         }
 
         fn view(&self) -> StrategyView<'_> {
-            StrategyView::new(&self.manager, &self.exchanges)
+            StrategyView::new(&self.manager)
         }
 
         /// 本夹具只有一个 symbol，直接借出它的视图

@@ -320,14 +320,26 @@ impl SymbolView<'_> {
 `has_pending_orders` / `pending_orders`）。`Strategy::on_event` 的第二个参数按值传入
 `StrategyView<'_>`（两个视图都是 `Copy` 的引用包装，无分配、无 dyn 分发）。
 
-**账户级读数按订阅交易所裁剪。** 这是本步唯一真正新增的约束 —— per-symbol 数据早已由
-`StrategyRunner::accepts` 按 `(exchange, symbol)` 过滤，视图不再重复过滤一遍（同一条
-"什么算范围内"的判据只能有一处）；而 `Balance` / `AccountInfo` / `Greeks` 没有路由键、
-`accepts` 一律放行，此前策略确实能读到未订阅所的净值。测试 `account_reads_are_cropped_to_
-subscribed_exchanges` 先断言"底层状态里确实有未订阅所的读数"再断言视图挡掉它 ——
-否则这条测试可能测了个空。
+**越界投递堵在分发层，不在视图上。** 新增 `IncomeEvent::delivery() -> Delivery`
+（`Symbol(所, symbol)` / `Exchange(所)` / `Broadcast` 三档，取代原来的
+`routing() -> Option<(Exchange, Symbol)>`）与 `SubscriptionScope::accepts`。
+实盘 `IncomeProcessorActor` 与回测循环调同一份判据；`by_symbol` 反向索引降级为纯粹的
+热路径扇出优化，键由 `SubscriptionScope::pairs()` 灌，与判据同源。
 
-**顺手删掉的死接口**：`StateManager` 上九个账户转发方法（`equity` / `account_info` /
+中间那档是这次真正堵住的东西：`Balance` / `AccountInfo` / `Greeks` /
+`ExchangeStatus` / `ExchangeRate` 没有 symbol，此前一律广播。
+
+> **第一版走错了方向，记在这里。** 我先把裁剪做在 `StrategyView` 上（查询时按订阅所
+> 过滤），并在 architecture.md 里把 V2 整条标成"已修复"。审查指出：那既是第三处
+> "什么算范围内"的实现（P1/P4），又**根本挡不住** —— 越界的读数照样随 `&IncomeEvent`
+> 推给策略，payload 里就带着净值，只堵查询不堵投递等于没堵。
+>
+> 教训与品味 1.5 是同一条：**堵了一半就声称堵住，比不堵更糟**——后来的人会以为这条
+> 已经关死。判断一个"防线"是否成立，要问的是**数据还有没有别的路到达**，
+> 而不是"我拦的这条路拦住了吗"。
+
+**顺手删掉的死接口**：`IncomeEvent::routing()`（被 `delivery()` 取代）、
+`StateManager` 上九个账户转发方法（`equity` / `account_info` /
 `greeks` / `usdt_balance` / `total_usdt_balance` / `total_equity` / `account_notional` /
 `total_account_notional` / `account_infos`）、`has_pending_orders`、`seeded_positions`。
 前九个是 R2 为"保持既有调用面不变"留的过渡层，策略改走视图后同一个事实有两个入口

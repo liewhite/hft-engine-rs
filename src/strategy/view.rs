@@ -11,24 +11,25 @@
 //!
 //! 视图把契约钉死成实测的调用面：策略读不到的东西，编译期就不存在。
 //!
-//! # 裁剪只做一件事：账户数据按订阅交易所裁剪
+//! # 视图**不做**范围裁剪
 //!
-//! per-symbol 数据（行情/持仓/挂单）**已经**是裁剪过的 —— `StrategyRunner::accepts`
-//! 按 `(exchange, symbol)` 过滤事件，`StateManager` 里压根不会出现范围外的读数。
-//! 视图不再重复过滤一遍：同一条"什么算范围内"的判据只能有一处（原则 P1），
-//! 在视图里再写一遍就成了第二份、且会与 `accepts` 各自演化。
+//! 底层 `StateManager` 里本来就只有订阅范围内的读数 —— 事件在**分发层**按
+//! [`crate::messaging::Delivery`] 过滤（`StrategyRunner::accepts` 与
+//! `IncomeProcessorActor` 同据一份判据），范围外的东西根本进不来。
 //!
-//! 真正没被裁剪的是**账户级读数**：`Balance` / `AccountInfo` / `Greeks` 没有路由键，
-//! `accepts` 一律放行，于是策略能读到自己压根没订阅的交易所的净值与希腊值。
-//! 这是确实存在的越界，由 [`StrategyView`] 按订阅交易所集合堵住。
+//! 视图初版曾在这里按订阅交易所再裁剪一遍账户读数。那是错的，两个原因：
+//! 同一条"什么算范围内"的判据成了第三处实现（原则 P1/P4）；而且它**挡不住**——
+//! 越界的读数照样随 `&IncomeEvent` 推给策略，payload 里就带着净值，
+//! 只堵查询不堵投递等于没堵（品味 1.5：只堵一半却声称堵住了，比不堵更糟）。
 //!
-//! # 范围外返回 `None`，不返回默认值
+//! 正确的位置是分发层，改在那里之后这里就无事可做了。
+//!
+//! # 取不到返回 `None`，不返回默认值
 //!
 //! 见品味 1.3：净值取不到与净值为零是两回事，前者伪装成后者会让杠杆闸门直接放行。
 
 use crate::domain::{AccountInfo, Exchange, Greeks, Symbol, BBO};
 use crate::messaging::{PendingOrder, StateManager, SymbolState};
-use std::collections::HashSet;
 
 /// 策略视图：本策略订阅范围内的状态。
 ///
@@ -37,14 +38,11 @@ use std::collections::HashSet;
 #[derive(Clone, Copy)]
 pub struct StrategyView<'a> {
     state: &'a StateManager,
-    /// 本策略订阅的交易所集合，账户级读数的裁剪依据
-    exchanges: &'a HashSet<Exchange>,
 }
 
 impl<'a> StrategyView<'a> {
-    /// 构造视图。`exchanges` 应当来自策略自己的 `public_streams()`。
-    pub fn new(state: &'a StateManager, exchanges: &'a HashSet<Exchange>) -> Self {
-        Self { state, exchanges }
+    pub fn new(state: &'a StateManager) -> Self {
+        Self { state }
     }
 
     /// 某个 symbol 的跨所全貌。范围外（未订阅）返回 `None`。
@@ -52,35 +50,19 @@ impl<'a> StrategyView<'a> {
         self.state.symbol_state(symbol).map(SymbolView::new)
     }
 
-    /// 某所账户净值。未订阅该所、或读数尚未到达，都返回 `None`。
+    /// 某所账户净值。读数尚未到达返回 `None`。
     pub fn equity(&self, exchange: Exchange) -> Option<f64> {
-        self.subscribed(exchange)?;
         self.state.account_view().equity(exchange)
     }
 
-    /// 某所账户信息（净值 + 名义价值，原子写入）。裁剪同 [`Self::equity`]。
+    /// 某所账户信息（净值 + 名义价值，原子写入）
     pub fn account_info(&self, exchange: Exchange) -> Option<&'a AccountInfo> {
-        self.subscribed(exchange)?;
         self.state.account_view().account_info(exchange)
     }
 
-    /// 某所某币种的希腊值（delta 已按现货余额修正）。裁剪同 [`Self::equity`]。
+    /// 某所某币种的希腊值（delta 已按现货余额修正）
     pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
-        self.subscribed(exchange)?;
         self.state.account_view().greeks(exchange, ccy)
-    }
-
-    /// 订阅范围判据。返回 `Option` 而非 `bool` 是为了让上面三个方法用 `?` 直接短路，
-    /// 不必每处写一遍 `if !... { return None }`。
-    fn subscribed(&self, exchange: Exchange) -> Option<()> {
-        if self.exchanges.contains(&exchange) {
-            return Some(());
-        }
-        tracing::warn!(
-            %exchange,
-            "策略读取了未订阅交易所的账户读数，返回 None（订阅范围由 public_streams 决定）"
-        );
-        None
     }
 }
 
@@ -135,64 +117,18 @@ impl<'a> SymbolView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::AccountId;
-    use crate::messaging::{AccountData, IncomeEvent};
+    use crate::messaging::StateManager;
 
-    const SUBSCRIBED: Exchange = Exchange::OKX;
-    const OUTSIDE: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
 
-    fn manager() -> StateManager {
-        let mut m = StateManager::new(&[SYM.to_string()], 0);
-        for exchange in [SUBSCRIBED, OUTSIDE] {
-            m.apply(&IncomeEvent::account(
-                AccountId::Live,
-                0,
-                0,
-                AccountData::AccountInfo {
-                    exchange,
-                    equity: 1000.0,
-                    notional: 500.0,
-                },
-            ));
-        }
-        m
-    }
-
-    fn scope() -> HashSet<Exchange> {
-        HashSet::from([SUBSCRIBED])
-    }
-
-    /// 范围外 symbol 拿不到视图（而不是拿到一个空状态）
+    /// 注册范围外的 symbol 拿不到视图 —— 而不是拿到一个空状态。
+    ///
+    /// 空状态会让策略以为该 symbol 空仓、无挂单，进而照常下单（品味 1.3）。
     #[test]
-    fn symbols_outside_the_subscription_are_not_visible() {
-        let m = manager();
-        let scope = scope();
-        let view = StrategyView::new(&m, &scope);
+    fn symbols_outside_the_registered_set_are_not_visible() {
+        let m = StateManager::new(&[SYM.to_string()], 0);
+        let view = StrategyView::new(&m);
         assert!(view.symbol(&SYM.to_string()).is_some());
-        assert!(
-            view.symbol(&"ETH".to_string()).is_none(),
-            "未订阅的 symbol 必须是 None，不能是空状态 —— 空状态会让策略以为该 symbol 空仓"
-        );
-    }
-
-    /// **越界防线**：账户级读数没有路由键，`accepts` 一律放行，所以 `StateManager` 里
-    /// 确实存着未订阅所的净值。视图必须把它挡掉，否则策略的杠杆闸门会拿别人的净值算。
-    #[test]
-    fn account_reads_are_cropped_to_subscribed_exchanges() {
-        let m = manager();
-        let scope = scope();
-        let view = StrategyView::new(&m, &scope);
-
-        assert_eq!(view.equity(SUBSCRIBED), Some(1000.0));
-        assert!(view.account_info(SUBSCRIBED).is_some());
-
-        assert!(
-            m.account_view().equity(OUTSIDE).is_some(),
-            "前提：底层状态里确实有未订阅所的读数，否则这条测试测了个空"
-        );
-        assert_eq!(view.equity(OUTSIDE), None, "未订阅所的净值不得可见");
-        assert!(view.account_info(OUTSIDE).is_none(), "未订阅所的账户信息不得可见");
-        assert!(view.greeks(OUTSIDE, "BTC").is_none(), "未订阅所的希腊值不得可见");
+        assert!(view.symbol(&"ETH".to_string()).is_none());
     }
 }

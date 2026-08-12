@@ -18,9 +18,9 @@
 //!     [`crate::exchange::ExchangeOrder`]；回测不经过那里，因此全程币本位
 
 use crate::domain::{Exchange, Order, OrderType, Symbol, SymbolMeta};
-use crate::messaging::{IncomeEvent, StateManager};
+use crate::messaging::{IncomeEvent, StateManager, SubscriptionScope};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// client_order_id 生成策略 (注入点)。
@@ -58,13 +58,8 @@ pub struct StrategyRunner {
     state: StateManager,
     /// 用于按交易所精度取整（**不**用于单位折算）
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// 策略订阅的 (exchange, symbol) 集合，用于事件过滤
-    subscriptions: HashSet<(Exchange, Symbol)>,
-    /// 订阅交易所集合，由 `subscriptions` 派生。
-    ///
-    /// 派生而非重新推导：它是 [`StrategyView`] 裁剪账户级读数的依据，与事件过滤
-    /// 必须同一个"范围内"判据（原则 P1）。存成字段只为免去每次事件重算一遍。
-    exchanges: HashSet<Exchange>,
+    /// 策略订阅范围（判据实现见 [`SubscriptionScope::accepts`]，与实盘分发层同一份）
+    subscriptions: SubscriptionScope,
     /// client_order_id 生成策略 (生产 UUID / 回测确定性计数)
     id_gen: Box<dyn ClientOrderIdGen>,
 }
@@ -84,21 +79,20 @@ impl StrategyRunner {
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
         id_gen: Box<dyn ClientOrderIdGen>,
     ) -> Self {
-        // 从 public_streams 推导订阅的 (exchange, symbol) 集合
-        let subscriptions: HashSet<(Exchange, Symbol)> = strategy
-            .public_streams()
-            .iter()
-            .flat_map(|(ex, kinds)| kinds.iter().map(move |k| (*ex, k.symbol().clone())))
-            .collect();
-        let symbols: Vec<Symbol> = subscriptions.iter().map(|(_, s)| s.clone()).collect();
-        let exchanges: HashSet<Exchange> = subscriptions.iter().map(|(e, _)| *e).collect();
+        // 从 public_streams 推导订阅范围
+        let subscriptions = SubscriptionScope::from_pairs(
+            strategy
+                .public_streams()
+                .iter()
+                .flat_map(|(ex, kinds)| kinds.iter().map(move |k| (*ex, k.symbol().clone()))),
+        );
+        let symbols: Vec<Symbol> = subscriptions.symbols().cloned().collect();
         let state = StateManager::new(&symbols, strategy.order_timeout_ms());
         Self {
             strategy,
             state,
             symbol_metas,
             subscriptions,
-            exchanges,
             id_gen,
         }
     }
@@ -114,12 +108,9 @@ impl StrategyRunner {
         self.state.seed_positions(baselines);
     }
 
-    /// 全局事件 (无路由键) 广播；symbol 事件仅接收订阅范围内的。
+    /// 这条事件在本策略的订阅范围内吗（判据与实盘分发层共用，见 [`SubscriptionScope`]）
     pub fn accepts(&self, event: &IncomeEvent) -> bool {
-        match event.routing() {
-            Some(route) => self.subscriptions.contains(&route),
-            None => true,
-        }
+        self.subscriptions.accepts(event)
     }
 
     /// 更新状态并运行策略，返回信号 (下单已分配 id、登记 pending、按交易所精度取整)。
@@ -129,9 +120,7 @@ impl StrategyRunner {
         self.state.apply(event);
         // 单一分发入口：一切事件（含 BorrowFee/ExchangeRate）都走 on_event，
         // 策略自行 match 关心的变体 —— 不存在第二套 typed 回调。
-        let raw = self
-            .strategy
-            .on_event(event, StrategyView::new(&self.state, &self.exchanges));
+        let raw = self.strategy.on_event(event, StrategyView::new(&self.state));
         raw
             .into_iter()
             .map(|signal| match signal {
@@ -200,6 +189,7 @@ mod tests {
     use crate::exchange::utils::StepFormatter;
     use crate::exchange::SubscriptionKind;
     use crate::messaging::{IncomeEvent, MarketData};
+    use std::collections::HashSet;
     use crate::strategy::{OutcomeEvent, Strategy};
 
     const EX: Exchange = Exchange::OKX;
@@ -315,5 +305,68 @@ mod tests {
         let state = runner.state().symbol_state(&SYM.to_string()).expect("state");
         let pending: Vec<f64> = state.pending_orders().map(|p| p.order.quantity).collect();
         assert_eq!(pending, vec![0.125]);
+    }
+
+    /// **范围是从 `public_streams()` 推导出来的**。
+    ///
+    /// 判据本身在 [`SubscriptionScope`] 里测（三档投递范围各一条）；这里测的是接线 ——
+    /// runner 把策略声明的订阅正确地变成了范围，尤其是"所级读数只收订了的所"这一档
+    /// 依赖的所集合，它是 `public_streams()` 的键集而非另存的副本。
+    #[test]
+    fn the_scope_is_derived_from_the_strategys_declared_streams() {
+        let runner = StrategyRunner::new(
+            Box::new(OneShot {
+                quantity: 1.0,
+                price: 1.0,
+                placed: false,
+            }),
+            metas(),
+        );
+
+        let bbo = |exchange: Exchange, symbol: &str| {
+            IncomeEvent::market(
+                0,
+                0,
+                MarketData::BBO(crate::domain::BBO {
+                    exchange,
+                    symbol: symbol.to_string(),
+                    bid_price: 1.0,
+                    bid_qty: 1.0,
+                    ask_price: 1.0,
+                    ask_qty: 1.0,
+                    timestamp: 0,
+                }),
+            )
+        };
+        let account_info = |exchange: Exchange| {
+            IncomeEvent::account(
+                crate::domain::AccountId::Live,
+                0,
+                0,
+                crate::messaging::AccountData::AccountInfo {
+                    exchange,
+                    equity: 1.0,
+                    notional: 0.0,
+                },
+            )
+        };
+
+        // 定向档：只收本策略订的 (所, symbol)
+        assert!(runner.accepts(&bbo(EX, SYM)));
+        assert!(!runner.accepts(&bbo(EX, "ETH")), "未订阅的 symbol 不该收");
+        assert!(
+            !runner.accepts(&bbo(Exchange::Binance, SYM)),
+            "未订阅的所不该收"
+        );
+
+        // 所级档：只收本策略订的所
+        assert!(runner.accepts(&account_info(EX)));
+        assert!(
+            !runner.accepts(&account_info(Exchange::Binance)),
+            "未订阅所的净值不该到达策略"
+        );
+
+        // 广播档：与交易所无关的全局事件一律放行
+        assert!(runner.accepts(&IncomeEvent::market(0, 0, MarketData::Clock)));
     }
 }
