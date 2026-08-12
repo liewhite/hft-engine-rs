@@ -332,10 +332,15 @@ impl SymbolPositions {
         self.positions.get(&exchange)
     }
 
-    /// 获取某个交易所的仓位大小
+    /// 获取某个交易所的仓位大小。**无记录与空仓都返回 `0.0`**。
     ///
-    /// 无仓位记录等价于空仓（size = 0.0），这是正确的业务语义：
-    /// 策略启动初期确实没有仓位。
+    /// 压平在"算下单量"这个用途上永远安全（理由见
+    /// [`crate::strategy::SymbolView::position_size`]）；要拿"有没有这条记录"当交易前置
+    /// 条件，用 [`Self::position`] —— 它保留了 `Option`，那里也写清了 `None` 的三种来路。
+    ///
+    /// 此前这里的注释写的是"无仓位记录等价于空仓，这是正确的业务语义"。那句话在下单量
+    /// 场景下成立，但它没有限定用途，读起来像是断言两者在任何场景下都等价 —— 而模拟策略
+    /// 首笔成交前、以及无凭证的所，恰恰是需要分辨的。
     pub fn position_size(&self, exchange: Exchange) -> f64 {
         self.positions.get(&exchange).map(|p| p.size).unwrap_or(0.0)
     }
