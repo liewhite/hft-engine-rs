@@ -16,7 +16,7 @@
 //! 分发与注册范围管理 —— 规则只能有一份，否则账本与 executor 会各自演化出细微差别，
 //! 而那种差别的表现形式是"对账偶尔误报漂移"，最难查。
 
-use crate::domain::{Exchange, Position, Symbol};
+use crate::domain::{Position, Symbol};
 use crate::messaging::state_manager::PositionBaseline;
 use crate::messaging::{AccountData, AccountEvent, SymbolPositions};
 use std::collections::HashMap;
@@ -86,11 +86,6 @@ impl PositionBook {
         self.symbols.iter()
     }
 
-    /// 某 symbol 的持仓投影（未注册返回 `None`）
-    pub fn get(&self, symbol: &Symbol) -> Option<&SymbolPositions> {
-        self.symbols.get(symbol)
-    }
-
     /// 全部**基线已写入**的腿（含 `size == 0` 的空仓腿）。
     ///
     /// 未 seed 的腿不在结果里 —— 那是"未知"而非"空仓"，见
@@ -98,12 +93,77 @@ impl PositionBook {
     pub fn seeded_positions(&self) -> impl Iterator<Item = &Position> {
         self.symbols.values().flat_map(|p| p.seeded_positions())
     }
+}
 
-    /// 某 (所, symbol) 的仓位大小；未注册视为 0
-    pub fn position_size(&self, exchange: Exchange, symbol: &Symbol) -> f64 {
-        self.symbols
-            .get(symbol)
-            .map(|p| p.position_size(exchange))
-            .unwrap_or(0.0)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{AccountId, Exchange, Fill, FillReason, Position, Side};
+
+    const EX: Exchange = Exchange::Binance;
+    const SYM: &str = "BTC";
+
+    fn fill_event(account: AccountId, size: f64, local_ts: u64) -> AccountEvent {
+        AccountEvent {
+            account,
+            exchange_ts: local_ts,
+            local_ts,
+            data: AccountData::Fill(Fill {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                side: Side::Long,
+                price: 100.0,
+                size,
+                client_order_id: None,
+                order_id: "1".to_string(),
+                timestamp: local_ts,
+                fee: 0.0,
+                reason: FillReason::Normal,
+            }),
+        }
+    }
+
+    fn book() -> PositionBook {
+        let mut b = PositionBook::default();
+        b.register_symbols(&[SYM.to_string()]);
+        b.seed(&[PositionBaseline {
+            position: Position {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                size: 2.0,
+            },
+            snapshot_req_ts: 1,
+        }]);
+        b
+    }
+
+    fn size_of(b: &PositionBook) -> f64 {
+        b.seeded_positions().map(|p| p.size).sum()
+    }
+
+    /// **串账防线**：模拟账户的成交绝不能进实盘持仓账本。
+    ///
+    /// 这条判据原本写在 `Reconciler::on_event` 里、无直接测试；搬进共享类型后测它只要几行，
+    /// 而漏掉的后果是实盘持仓被模拟成交污染 —— 对账会把它判成漂移并停机。
+    #[test]
+    fn paper_fills_never_touch_the_live_book() {
+        let mut b = book();
+        b.apply(&fill_event(AccountId::Paper(SYM.to_string()), 5.0, 10));
+        assert_eq!(size_of(&b), 2.0, "模拟成交不得改变实盘账本");
+
+        b.apply(&fill_event(AccountId::Live, 5.0, 10));
+        assert_eq!(size_of(&b), 7.0, "实盘成交照常累加");
+    }
+
+    /// 跟踪范围外的 symbol 静默丢弃（分桶部署下账户级私有流必然带来其他桶的成交）
+    #[test]
+    fn fills_for_untracked_symbols_are_dropped() {
+        let mut b = book();
+        let mut ev = fill_event(AccountId::Live, 5.0, 10);
+        if let AccountData::Fill(f) = &mut ev.data {
+            f.symbol = "ETH".to_string();
+        }
+        b.apply(&ev);
+        assert_eq!(size_of(&b), 2.0, "别的桶的成交不得进本实例账本");
     }
 }

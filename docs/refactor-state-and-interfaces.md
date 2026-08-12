@@ -324,7 +324,16 @@ impl SymbolView<'_> {
 
 中。改动集中在 trait 与四个实现，但 `spread_arb` 有 1648 行，需要逐个调用点核对。
 
-### 一次未完成的尝试留下的结论
+### 一次未完成的尝试留下的结论（附一处自己犯的错）
+
+**回滚没滚干净**：`git checkout -- .` 只回滚**已跟踪**的修改文件，新建的
+`src/strategy/view.rs` 是未跟踪文件、没被回滚，随后 `git add -A` 把它扫进了那个
+docs commit —— 于是仓库里躺了一个 109 行、没在 `mod.rs` 里声明、**不参与编译**的孤儿文件，
+而 commit message 明写着"代码已回滚，未留半成品"。
+
+这正是品味 1.5 说的"比不写更糟"的那类声明。教训写在这里：
+**声称回滚之后要 `git status` 确认，未跟踪文件不在 `checkout --` 的射程内。**
+
 
 生产代码部分改完是顺的（trait 签名、`StrategyRunner` 构造视图、`gamma_scalp`、
 `spread_arb`、三个 bin 策略），**卡点在 `spread_arb` 的测试夹具**：

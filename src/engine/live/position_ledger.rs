@@ -44,7 +44,7 @@
 //! 本 actor 自建一份镜像（复用 [`StateManager`]，与策略侧同一份实现），由投产握手的基线
 //! + income 流的 `Fill` 驱动。因此它证明的是"**事件流**与交易所一致"，而不是"某个
 //! executor 的 StateManager 与交易所一致"。executor 是同一事件流的确定性消费者、且与镜像
-//! 用同一份 seed 语义与同一条防双计规则（见 [`SymbolState::seed_position`]）——流对了它
+//! 用同一份 seed 语义与同一条防双计规则（同一个 [`SymbolPositions::apply_fill`]）——流对了它
 //! 就对了。
 //!
 //! # 注册与基线原子到达，无缓冲重放
@@ -805,7 +805,9 @@ mod tests {
     }
 
     /// **防双计**：快照请求时刻之前送达的 Fill 已含在快照里，seed 后到达必须被过滤。
-    /// （这条规则在 SymbolState::seed_position 内置，镜像与 executor 同一份。）
+    ///
+    /// 规则住在 `SymbolPositions::apply_fill`，账本与策略门面调的是**同一个函数** ——
+    /// 不是"两处各写一遍、约定保持一致"。
     #[test]
     fn fills_covered_by_snapshot_are_not_double_counted() {
         let mut r = reconciler_with(1, &[baseline_on(EX, 2.0)]);

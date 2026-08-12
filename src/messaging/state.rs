@@ -619,8 +619,9 @@ impl SymbolState {
                 }
             }
             AccountData::Fill(fill) => {
-                let symbol = self.symbol.clone();
-                self.position_book.apply_fill(&symbol, fill, event.local_ts);
+                // 不相交字段借用：symbol 与 position_book 是两个字段，无需为每条 Fill 克隆
+                self.position_book
+                    .apply_fill(&self.symbol, fill, event.local_ts);
             }
             AccountData::FundingFee(_) => {
                 // 资费事件不修改本地 symbol 状态，下游策略自行去重与统计
