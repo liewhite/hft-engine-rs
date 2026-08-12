@@ -28,7 +28,7 @@
 //!
 //! 见品味 1.3：净值取不到与净值为零是两回事，前者伪装成后者会让杠杆闸门直接放行。
 
-use crate::domain::{AccountInfo, Exchange, Greeks, MarketStatus, Position, Symbol, BBO};
+use crate::domain::{AccountInfo, Exchange, Greeks, MarketStatus, Symbol, BBO};
 use crate::messaging::{PendingOrder, StateManager, SymbolState};
 
 /// 策略视图：本策略订阅范围内的状态。
@@ -106,49 +106,20 @@ impl<'a> SymbolView<'a> {
         self.state.bbo(exchange)
     }
 
-    /// 某所持仓记录。**`None` = 没有这条腿的记录**，与 `size == 0`（确定空仓）不是一回事。
+    /// 某所持仓大小（带符号，正多负空）。
     ///
-    /// 需要区分"未知"与"空仓"时用它，别用 [`Self::position_size`] —— 后者把两者压成
-    /// 同一个 `0.0`。
+    /// # 没有"未查询到"这个状态
     ///
-    /// # `None` 到底什么时候出现
+    /// 作用域内的每条 (所, symbol)，在策略消费第一条事件**之前**就已经有持仓记录了 ——
+    /// executor 出生时由投产握手写满（见 `manager/provisioning.rs` 的
+    /// `executor_baselines`）。所以这里返回的 `0.0` 永远是"确定空仓"，不会是"还不知道"。
     ///
-    /// 持仓记录由投产握手的基线建立，之后 Fill 到达也会建（首笔成交即建条目）。所以：
+    /// 这条不变量是刻意建立的：此前缺记录的腿要靠 `Option` 让调用方分辨，而那个分支
+    /// 写对了是冗余、写错了（当它空仓照常开仓）是事故。把状态消灭掉，比让每个调用点
+    /// 去检查它更可靠（品味 1.1）。
     ///
-    /// | 场景 | 结果 |
-    /// |---|---|
-    /// | 实盘策略 + 该所配了凭证 | **恒 `Some`** —— 投产必 seed，拉不到基线直接拒绝启动 |
-    /// | 实盘策略 + 该所无凭证 | **恒 `None`** —— 不 seed，也收不到私有流 |
-    /// | 模拟策略 | **首笔成交前 `None`** —— 模拟账户从零起步，不 seed |
-    ///
-    /// # 拿它当"停手"判据时先看清自己在哪一行
-    ///
-    /// 「拿不到某条腿的持仓就停手」对第二行是**正确**的（那个所根本下不了单，
-    /// 当它空仓照常开仓会开出无法对冲的裸腿）；但对第三行是**陷阱** ——
-    /// 模拟策略首笔成交前所有腿都是 `None`，这个判据会让它永远不下第一单。
-    ///
-    /// 同一份策略代码常常既跑实盘又跑模拟（本框架的模拟与实盘并行，见
-    /// [`crate::domain::AccountId`]），所以这不是假想情形。要么在判据里放行"从未成交"
-    /// 的情况，要么确认这份策略只会绑到实盘账户。
-    pub fn position(&self, exchange: Exchange) -> Option<&'a Position> {
-        self.state.position(exchange)
-    }
-
-    /// 某所持仓大小（带符号，正多负空）。**无记录与空仓都返回 `0.0`** ——
-    /// 要区分两者见 [`Self::position`]。
-    ///
-    /// # 为什么这里压平是可以的
-    ///
-    /// 对**实盘策略**：投产握手对每个有 `AccountClient` 的所都拉基线，拉取失败直接拒绝
-    /// 启动（见 `manager/provisioning.rs` 的 `fetch_baselines`），所以可下单的所必然已
-    /// seed；没有 `AccountClient` 的所引擎从来不会也不能下单，"本地持仓 0" 是事实而非
-    /// 缺数据。两种情况下 `0.0` 都不是"未知伪装成默认值"。
-    ///
-    /// 对**模拟策略**：账户从零起步，`0.0` 就是真值。
-    ///
-    /// 也就是说，压平在**下单量计算**这个用途上永远安全。它不安全的用途只有一个 ——
-    /// 拿"是否有记录"当交易前置条件，那个用途请改用 [`Self::position`] 并读那里的
-    /// 场景表，两个方法的取舍在那里讲全了。
+    /// 作用域**外**的所返回 `0.0` —— 那是策略问了自己没订阅的东西，与读未订阅 symbol
+    /// 的盘口同类，属调用方的 bug。
     pub fn position_size(&self, exchange: Exchange) -> f64 {
         self.state.position_size(exchange)
     }
@@ -185,35 +156,6 @@ mod tests {
         let view = StrategyView::new(&m);
         assert!(view.symbol(&SYM.to_string()).is_some());
         assert!(view.symbol(&"ETH".to_string()).is_none());
-    }
-
-    /// **未知与空仓必须可分**：`position` 返回 `None`，`position_size` 返回 `0.0`。
-    ///
-    /// 跨所对冲策略拿不到某条腿的持仓时应当停手，而不是当它空仓照常开仓。只给
-    /// `position_size` 的话这个判断做不出来 —— 这正是本方法存在的理由。
-    #[test]
-    fn an_absent_leg_is_distinguishable_from_a_flat_one() {
-        let mut m = StateManager::new(&[SYM.to_string()], 0);
-        m.seed_positions(&[crate::messaging::PositionBaseline {
-            position: Position {
-                exchange: Exchange::OKX,
-                symbol: SYM.to_string(),
-                size: 0.0,
-            },
-            snapshot_req_ts: 1,
-        }]);
-        let view = StrategyView::new(&m);
-        let sym = view.symbol(&SYM.to_string()).expect("已注册");
-
-        assert!(sym.position(Exchange::OKX).is_some(), "已 seed 的空仓腿是「确定空仓」");
-        assert_eq!(sym.position_size(Exchange::OKX), 0.0);
-
-        assert!(sym.position(Exchange::Binance).is_none(), "没记录的腿是「未知」");
-        assert_eq!(
-            sym.position_size(Exchange::Binance),
-            0.0,
-            "position_size 把未知压成 0 —— 所以要区分就得用 position()"
-        );
     }
 
     /// 市场状态默认 `Closed`（安全侧）：读数未到达与休市导向同一个动作，不下单

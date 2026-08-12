@@ -128,6 +128,55 @@ fn validate_subscriptions(
 }
 
 
+/// 一个 executor 出生时要写入的持仓基线：**作用域内每条 (所, symbol) 都有一条**。
+///
+/// # 为什么必须每条都有
+///
+/// 缺一条，策略就能观察到"这条腿的持仓未查询到"这个中间状态 —— 而那个状态对策略毫无
+/// 用处：它既不能据此下单（缺的腿要么是模拟账户、要么是该所没凭证，两种都不可交易），
+/// 又逼着每个调用点写一次 `Option` 分支。分支写对了是冗余，写错了（当它空仓照常开仓）
+/// 是事故。
+///
+/// 把它填满之后，"未查询到"在策略消费第一条事件之前就已经不存在了 ——
+/// 这是品味 1.1 的做法：让错误不可表达，优先于让错误被发现。
+///
+/// # 三种来源，各自是什么真值
+///
+/// | 情形 | 基线 | 它是什么的真值 |
+/// |---|---|---|
+/// | 实盘 + 该所配了凭证 | REST 快照 | 该账户在该所的**真实持仓** |
+/// | 实盘 + 该所无凭证 | `0` | **本引擎**在该所的持仓 —— 下不了单也收不到私有流，恒为 0 |
+/// | 模拟账户 | `0` | 模拟账户从零起步，不看也不该看真实持仓 |
+///
+/// 第二行是唯一需要留神的：`0` 说的是"本引擎没在这儿建过仓"，**不是**"这个账户在这儿
+/// 没有持仓"（用户手工持有的仓位引擎看不见）。但引擎在该所既不能下单也收不到成交，
+/// 这两个量对策略的可行动性没有差别 —— 而这也正是改动前的行为（无记录时
+/// `position_size` 返回 `0`），本函数只是把它从"碰巧如此"变成"写明如此"。
+///
+/// `snapshot_req_ts` 对补 0 的两行取 `0`：没有快照可言，因此不过滤任何 Fill
+/// （防双计规则见 `SymbolPositions::apply_fill`）。
+fn executor_baselines(
+    account: &AccountId,
+    scope: &HashSet<(Exchange, Symbol)>,
+    rest: &HashMap<(Exchange, Symbol), crate::messaging::PositionBaseline>,
+) -> Vec<crate::messaging::PositionBaseline> {
+    let flat = |(exchange, symbol): &(Exchange, Symbol)| crate::messaging::PositionBaseline {
+        position: crate::domain::Position {
+            exchange: *exchange,
+            symbol: symbol.clone(),
+            size: 0.0,
+        },
+        snapshot_req_ts: 0,
+    };
+    scope
+        .iter()
+        .map(|key| match account {
+            AccountId::Live => rest.get(key).cloned().unwrap_or_else(|| flat(key)),
+            AccountId::Paper(_) => flat(key),
+        })
+        .collect()
+}
+
 impl Provisioner {
     /// 装配期构造。
     ///
@@ -380,19 +429,11 @@ impl Provisioner {
         let mut executor_refs = Vec::new();
         for (spec, subscriptions) in strategies.into_iter().zip(strategy_subscriptions.iter()) {
             let account = spec.account.clone();
-            let exec_baselines: Vec<crate::messaging::PositionBaseline> =
-                if account == AccountId::Live {
-                    subscriptions
-                        .iter()
-                        .map(|(ex, kind)| (*ex, kind.symbol().clone()))
-                        .collect::<HashSet<_>>()
-                        .into_iter()
-                        // 缺基线只有一种来路：该所未配置 client（无基线可 seed，从 0 起算）
-                        .filter_map(|key| baselines.get(&key).cloned())
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+            let scope: HashSet<(Exchange, Symbol)> = subscriptions
+                .iter()
+                .map(|(ex, kind)| (*ex, kind.symbol().clone()))
+                .collect();
+            let exec_baselines = executor_baselines(&account, &scope, &baselines);
             let executor_ref = producers
                 .spawn::<ExecutorActor, _>(
                     manager,
@@ -1201,5 +1242,82 @@ mod subscription_validation_tests {
             ),
             "IBKR 只实现了 BBO"
         );
+    }
+
+    // ===== 投产基线：作用域内每条腿都要有 =====
+
+    mod executor_baseline_tests {
+        use super::*;
+
+        const SYM: &str = "BTC";
+        const WITH_ACCOUNT: Exchange = Exchange::Binance;
+        const NO_ACCOUNT: Exchange = Exchange::OKX;
+
+        fn scope() -> HashSet<(Exchange, Symbol)> {
+            HashSet::from([
+                (WITH_ACCOUNT, SYM.to_string()),
+                (NO_ACCOUNT, SYM.to_string()),
+            ])
+        }
+
+        /// 只有 WITH_ACCOUNT 能拉到 REST 快照；NO_ACCOUNT 没配凭证，不产基线
+        fn rest() -> HashMap<(Exchange, Symbol), crate::messaging::PositionBaseline> {
+            HashMap::from([(
+                (WITH_ACCOUNT, SYM.to_string()),
+                crate::messaging::PositionBaseline {
+                    position: crate::domain::Position {
+                        exchange: WITH_ACCOUNT,
+                        symbol: SYM.to_string(),
+                        size: 7.0,
+                    },
+                    snapshot_req_ts: 1_000,
+                },
+            )])
+        }
+
+        fn size_at(
+            baselines: &[crate::messaging::PositionBaseline],
+            exchange: Exchange,
+        ) -> Option<f64> {
+            baselines
+                .iter()
+                .find(|b| b.position.exchange == exchange)
+                .map(|b| b.position.size)
+        }
+
+        /// **核心不变量**：无论账户类型，作用域内每条腿都拿到基线 ——
+        /// 于是策略永远观察不到"这条腿的持仓未查询到"。
+        #[test]
+        fn every_leg_in_scope_gets_a_baseline() {
+            for account in [AccountId::Live, AccountId::Paper("x".to_string())] {
+                let b = executor_baselines(&account, &scope(), &rest());
+                assert_eq!(b.len(), scope().len(), "{account}: 作用域内的腿必须全部有基线");
+                assert!(size_at(&b, WITH_ACCOUNT).is_some());
+                assert!(size_at(&b, NO_ACCOUNT).is_some());
+            }
+        }
+
+        /// 实盘用 REST 真值；拉不到的（该所无凭证）补 0
+        #[test]
+        fn live_takes_the_rest_snapshot_and_zeroes_the_rest() {
+            let b = executor_baselines(&AccountId::Live, &scope(), &rest());
+            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(7.0), "有凭证的所用 REST 真值");
+            assert_eq!(size_at(&b, NO_ACCOUNT), Some(0.0), "无凭证的所补 0");
+        }
+
+        /// **模拟账户绝不能看到真实持仓**：即便 REST 快照就在手边，也一律从 0 起步
+        #[test]
+        fn paper_never_sees_real_positions() {
+            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest());
+            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(0.0), "模拟账户不得继承实盘存量");
+            assert_eq!(size_at(&b, NO_ACCOUNT), Some(0.0));
+        }
+
+        /// 补 0 的基线取 `snapshot_req_ts = 0`：没有快照可言，不该过滤掉任何 Fill
+        #[test]
+        fn synthesised_baselines_filter_no_fills() {
+            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest());
+            assert!(b.iter().all(|x| x.snapshot_req_ts == 0));
+        }
     }
 }

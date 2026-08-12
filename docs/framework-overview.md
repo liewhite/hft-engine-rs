@@ -104,19 +104,15 @@ pub trait Strategy: Send + Sync {
 | 类型 | 方法 |
 |---|---|
 | `StrategyView<'_>` | `symbol(&Symbol) -> Option<SymbolView>` / `equity(Exchange)` / `account_notional(Exchange)` / `account_info(Exchange)` / `greeks(Exchange, ccy)` / `market_status(Exchange)` |
-| `SymbolView<'_>` | `bbo(Exchange)` / `position(Exchange)` / `position_size(Exchange)` / `position_sizes()` / `has_pending_orders()` / `pending_orders()` |
+| `SymbolView<'_>` | `bbo(Exchange)` / `position_size(Exchange)` / `position_sizes()` / `has_pending_orders()` / `pending_orders()` |
 
 读数取不到一律 `None`，不返回默认值——净值取不到与净值为零是两回事。
 
 **两个要留意的**：
 
-- `position(ex)` 返回 `Option<&Position>`，`None` = 这条腿**没有记录**（未知）；
-  `position_size(ex)` 把未知与空仓都压成 `0.0`。**但 `None` 只在两种情况出现**：
-  该所没配凭证（引擎在那儿下不了单），或**模拟策略首笔成交前**（模拟账户不 seed 基线）。
-  实盘 + 有凭证的所恒为 `Some`。
-
-  拿它当"停手"判据前先分清自己在哪种情况：对无凭证的所是对的，对模拟策略是陷阱 ——
-  会让它永远不下第一单。同一份策略常常既跑实盘又跑模拟，这不是假想情形。
+- **持仓没有"未查询到"这个状态**。作用域内每条 (所, symbol) 在策略消费第一条事件之前
+  就已写入基线（executor 出生时由投产握手写满），所以 `position_size()` 返回的 `0.0`
+  永远是"确定空仓"。策略不必、也无法检查"这条腿查到了没有"。
 - `market_status(ex)` 是唯一有默认值的读数（默认 `Closed`）。这里的默认是刻意的：
   休市判据只有"要不要下单"一个用途，"不知道开没开"与"确定没开"应导向同一个动作。
 
@@ -311,7 +307,7 @@ mailbox 层的 `Err`（manager 不可达）与业务层的 `Err`（账本不可�
   存起来会读到陈旧状态（编译器会拦）。
 - **持仓靠「一次 REST 基线 + Fill 永久累加」维护**，不是每次查 REST。
   对账层（`PositionLedgerActor`）持续用 REST 校验，确认漂移后**致命退出**。
-- **未 seed 的腿是"未知"不是"空仓"**。没有 `AccountClient` 的所不 seed，
-  但引擎在那里也下不了单，所以 `position_size` 报 0 是事实。
+- **持仓在策略看到第一条事件前就已就绪**。三种来源：有凭证的所用 REST 快照（账户真实
+  持仓），无凭证的所补 0（本引擎在那儿下不了单，恒为 0），模拟账户补 0（从零起步）。
 - **停机分三段**：生产者 → 总线 → 消费者。新增消费者时先问它会不会往回灌事件
   （见 architecture.md V5，那条残余窗口是已知并接受的）。

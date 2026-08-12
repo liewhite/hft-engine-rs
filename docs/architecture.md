@@ -233,7 +233,7 @@ metrics 用「持仓 × 价格 + 挂单 + 账户」。**一个类型有三组互
 fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent>;
 ```
 
-[`StrategyView`] 6 个方法 + [`SymbolView`] 6 个，共 **12 个**。
+[`StrategyView`] 6 个方法 + [`SymbolView`] 5 个，共 **11 个**。
 `StateManager` 上那九个账户转发方法一并删除，账户读数只剩 `account_view()` 一条路。
 
 越界投递堵在**分发层**：`IncomeEvent::delivery()` 把投递范围分成
@@ -258,6 +258,11 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 > 而只给 `position_size` 会把两者压成同一个 `0.0`。
 >
 > 教训：**"实测"的说服力取决于样本覆盖了谁**。库的调用面要连库外的消费者一起数。
+>
+> **后续**：`position()` 加进去之后又被删掉了 —— 与其让每个调用点检查 `Option`，
+> 不如让"持仓未查询到"这个状态根本不存在。投产握手现在把作用域内**每条腿**都写满
+> （无凭证的所与模拟账户补 0），策略消费第一条事件时持仓已就绪。品味 1.1 的阶梯：
+> 让错误不可表达，优先于让错误被发现。
 >
 > 另一处更正：初稿还写过"策略能看到其他 symbol 的状态"，那是错的。
 > `StrategyRunner` 用策略自己 `public_streams()` 推导的 symbol 集合去建 `StateManager`，
