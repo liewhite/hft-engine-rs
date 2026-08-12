@@ -9,14 +9,14 @@
 //! 设计要点：
 //! - 视图完全由事件流重建，**不读取任何 executor 的内部状态**，与策略层零耦合
 //! - 持仓/挂单维护直接复用 [`StateManager`]（策略用的同一份实现），不重复实现
-//! - 跨所持仓估值复用 [`SymbolState::exposure`]，累计统计复用 [`TradingStats`]
+//! - 跨所持仓估值由本模块的 [`SymbolExposure`] 算，累计统计复用 [`TradingStats`]
 //! - 盈亏为**本次会话**口径：现金流 + 相对会话起始仓位的存货估值变化，
 //!   这样 docker 重启后不会把重启前就持有的存货算成假盈利
 //! - 默认只输出日志；配置 `PUSHGATEWAY_URL` 后同一份数字推送 pushgateway
 //!   （见 [`crate::observability`]，未配置时无外部依赖、行为与从前一致）
 
 use crate::domain::{AccountId, Exchange, Symbol, TradingStats};
-use crate::messaging::{AccountData, AccountEvent, IncomeEvent, MarketEvent, StateManager};
+use crate::messaging::{AccountData, AccountEvent, IncomeEvent, MarketEvent, StateManager, SymbolState};
 use crate::observability::{prometheus, MetricsPushConfig, PromText};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -36,6 +36,64 @@ const NO_ORDER_TIMEOUT: u64 = 0;
 
 /// per-symbol 统计不保留逐笔明细，明细只在全局那一份上保留
 const NO_PER_SYMBOL_FILL_DETAIL: usize = 0;
+
+/// 单 symbol 跨所持仓与估值汇总 —— **观测口径，只属于本模块**。
+///
+/// # 为什么住在这里而不在 `SymbolState` 上
+///
+/// 它的每个字段都是观测概念：`session_notional_delta` 是"把重启前的存货从盈亏里剔除"，
+/// `unpriced_legs` 是"估值不完整的提示"。这些对策略与对账都无意义 —— 领域状态里放一个
+/// 只有指标层看得懂的汇总，就是观测口径泄漏进领域层（`docs/architecture.md` V7 / P3）。
+///
+/// 它需要的东西 `SymbolState` 都已公开（持仓投影 + 盘口），所以搬过来是纯移动，
+/// 领域层不必为观测保留任何接口。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SymbolExposure {
+    /// 各交易所带符号仓位之和（净敞口，币本位）
+    pub net_size: f64,
+    /// Σ |仓位| × mid（总名义敞口）
+    pub gross_notional: f64,
+    /// Σ 仓位 × mid（净名义敞口，理想对冲下应接近 0）
+    pub net_notional: f64,
+    /// 相对**基线仓位**的名义变化：Σ (仓位 − 基线) × mid
+    ///
+    /// 基线 = 本次会话开始时的既有仓位。用于把"重启前就持有的存货"从盈亏里剔除，
+    /// 否则 `cash`（本次会话从 0 起算）加上全额存货市值，会凭空多出一笔等于存货市值的假盈利。
+    pub session_notional_delta: f64,
+    /// 有非零仓位的交易所个数
+    pub legs: usize,
+    /// 有仓位但缺少 BBO、无法估值的交易所个数（估值不完整的提示）
+    pub unpriced_legs: usize,
+}
+
+/// 汇总一个 symbol 的跨所持仓与估值。
+///
+/// `baseline` 为各所的会话起始仓位（缺失视为 0）。缺 BBO 的腿不参与估值但计入
+/// `unpriced_legs` —— 宁可显式暴露"估值不完整"，也不用兜底价格伪造一个看似完整的数字。
+fn exposure_of(state: &SymbolState, baseline: Option<&HashMap<Exchange, f64>>) -> SymbolExposure {
+    let mut exposure = SymbolExposure::default();
+    for position in state.position_book().all() {
+        if position.is_empty() {
+            continue;
+        }
+        exposure.legs += 1;
+        exposure.net_size += position.size;
+        match state.bbo(position.exchange) {
+            Some(bbo) => {
+                let mid = bbo.mid_price();
+                let base = baseline
+                    .and_then(|b| b.get(&position.exchange))
+                    .copied()
+                    .unwrap_or(0.0);
+                exposure.gross_notional += position.size.abs() * mid;
+                exposure.net_notional += position.size * mid;
+                exposure.session_notional_delta += (position.size - base) * mid;
+            }
+            None => exposure.unpriced_legs += 1,
+        }
+    }
+    exposure
+}
 
 /// MetricsActor 初始化参数
 pub struct MetricsActorArgs {
@@ -157,7 +215,7 @@ impl MetricsActor {
         let mut pending_orders = 0usize;
 
         for (symbol, symbol_state) in self.state.symbol_states() {
-            let exposure = symbol_state.exposure(self.baseline.get(symbol));
+            let exposure = exposure_of(symbol_state, self.baseline.get(symbol));
             let pending = symbol_state.pending_orders().count();
             pending_orders += pending;
             session_position_value += exposure.session_notional_delta;
@@ -638,7 +696,7 @@ mod tests {
         ));
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
-        let exposure = state.exposure(metrics.baseline.get(&symbol));
+        let exposure = exposure_of(&state, metrics.baseline.get(&symbol));
 
         // 全额市值 200，但本次会话未成交 → session PnL 为 0，而非凭空 +200
         assert!((exposure.net_notional - 200.0).abs() < 1e-9);
@@ -683,10 +741,102 @@ mod tests {
         ));
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
-        let exposure = state.exposure(metrics.baseline.get(&symbol));
+        let exposure = exposure_of(&state, metrics.baseline.get(&symbol));
 
         // 会话内新增 1 个、现价 110 → 存货变化 +110，现金流 -100 → 浮盈 10
         assert!((exposure.session_notional_delta - 110.0).abs() < 1e-9);
         assert!((metrics.total.total_pnl(exposure.session_notional_delta) - 10.0).abs() < 1e-9);
+    }
+
+    // ===== 跨所估值（V7 之前住在 SymbolState 上，随口径一起搬来） =====
+
+    const EXPOSURE_SYMBOL: &str = "BTC";
+
+    fn exposure_bbo(exchange: Exchange, mid: f64) -> crate::domain::BBO {
+        crate::domain::BBO {
+            exchange,
+            symbol: EXPOSURE_SYMBOL.to_string(),
+            bid_price: mid,
+            bid_qty: 1.0,
+            ask_price: mid,
+            ask_qty: 1.0,
+            timestamp: 0,
+        }
+    }
+
+    /// 经**生产路径**构造夹具：仓位走投产 seed、盘口走行情事件。
+    /// 直接写字段更省事，但那样测的就不是线上跑的那条路。
+    fn state_with(positions: &[(Exchange, f64)], priced: &[(Exchange, f64)]) -> SymbolState {
+        let mut state = SymbolState::new(EXPOSURE_SYMBOL.to_string());
+        for &(exchange, size) in positions {
+            state.seed_position(
+                &Position {
+                    exchange,
+                    symbol: EXPOSURE_SYMBOL.to_string(),
+                    size,
+                },
+                0,
+            );
+        }
+        for &(exchange, mid) in priced {
+            state.apply(&IncomeEvent::market(
+                0,
+                0,
+                crate::messaging::MarketData::BBO(exposure_bbo(exchange, mid)),
+            ));
+        }
+        state
+    }
+
+    #[test]
+    fn hedged_position_has_near_zero_net_notional() {
+        let state = state_with(
+            &[(Exchange::Binance, 1.0), (Exchange::OKX, -1.0)],
+            &[(Exchange::Binance, 100.0), (Exchange::OKX, 100.0)],
+        );
+
+        let exposure = exposure_of(&state, None);
+
+        assert_eq!(exposure.legs, 2);
+        assert!(exposure.net_notional.abs() < 1e-9);
+        assert!((exposure.gross_notional - 200.0).abs() < 1e-9);
+        assert_eq!(exposure.unpriced_legs, 0);
+    }
+
+    #[test]
+    fn baseline_position_is_excluded_from_session_delta() {
+        let state = state_with(&[(Exchange::Binance, 3.0)], &[(Exchange::Binance, 100.0)]);
+        let baseline = HashMap::from([(Exchange::Binance, 2.0)]);
+
+        let exposure = exposure_of(&state, Some(&baseline));
+
+        // 全额估值 300，但本次会话只新增了 1 个 → 100
+        assert!((exposure.net_notional - 300.0).abs() < 1e-9);
+        assert!((exposure.session_notional_delta - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_baseline_defaults_to_zero() {
+        let state = state_with(&[(Exchange::Binance, 3.0)], &[(Exchange::Binance, 100.0)]);
+        let exposure = exposure_of(&state, Some(&HashMap::new()));
+        assert!((exposure.session_notional_delta - 300.0).abs() < 1e-9);
+    }
+
+    /// 缺 BBO 的腿显式暴露成 `unpriced_legs`，不用兜底价格伪造一个看似完整的估值
+    #[test]
+    fn missing_bbo_is_surfaced_not_silently_valued_at_zero() {
+        let state = state_with(&[(Exchange::Binance, 1.0)], &[]);
+
+        let exposure = exposure_of(&state, None);
+
+        assert_eq!(exposure.legs, 1);
+        assert_eq!(exposure.unpriced_legs, 1);
+        assert_eq!(exposure.gross_notional, 0.0);
+    }
+
+    #[test]
+    fn zero_positions_are_ignored() {
+        let state = state_with(&[(Exchange::Binance, 0.0)], &[(Exchange::Binance, 100.0)]);
+        assert_eq!(exposure_of(&state, None), SymbolExposure::default());
     }
 }

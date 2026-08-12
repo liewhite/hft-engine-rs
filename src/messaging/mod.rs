@@ -11,6 +11,6 @@ mod scope;
 pub use position_book::PositionBook;
 pub use scope::SubscriptionScope;
 pub use state::{
-    PendingOrder, SymbolExposure, SymbolMarket, SymbolOrders, SymbolPositions, SymbolState,
+    PendingOrder, SymbolMarket, SymbolOrders, SymbolPositions, SymbolState,
 };
 pub use state_manager::{AccountView, PositionBaseline, StateManager};
