@@ -3,11 +3,11 @@
 //! IBKR WebSocket 不推送账户级 equity/notional，需要 REST 周期同步。
 //! 持仓不在此处刷新——初始持仓由 ManagerActor 启动期统一 fetch，运行期由 Fill 维护。
 
-use crate::domain::{now_ms, Exchange};
+use crate::domain::Exchange;
 use crate::messaging::AccountPubSub;
 use crate::exchange::client::AccountClient;
 use crate::exchange::ibkr::IbkrClient;
-use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
+use crate::exchange::staleness::{stamped_on_receipt, StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::messaging::{AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -41,9 +41,11 @@ pub struct IbkrAccountPollingActor {
 impl IbkrAccountPollingActor {
     /// 执行一次账户信息查询并发布事件。`Err` = 已停摆过久，调用方应致命退出。
     async fn poll_account_info(&mut self) -> Result<(), String> {
-        let local_ts = now_ms();
+        // 戳在响应到手之后取（理由见 `stamped_on_receipt`）：IBKR 这个接口往返常在 1 秒
+        // 上下，早一步盖就会把整段往返算成管线滞后。
+        let (read, local_ts) = stamped_on_receipt(self.client.fetch_account_info()).await;
 
-        match self.client.fetch_account_info().await {
+        match read {
             Ok(info) => {
                 self.guard.record_success();
                 if let Err(e) = self
