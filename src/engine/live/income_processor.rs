@@ -19,7 +19,7 @@
 use super::ExecutorActor;
 use crate::domain::{AccountId, Exchange, Symbol};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{AccountEvent, IncomeEvent, MarketEvent};
+use crate::messaging::{AccountEvent, Delivery, IncomeEvent, MarketEvent, SubscriptionScope};
 use kameo::actor::{ActorId, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message};
@@ -29,8 +29,9 @@ use std::collections::{HashMap, HashSet};
 /// Executor 订阅信息
 struct ExecutorSubscription {
     executor: ActorRef<ExecutorActor>,
-    /// 订阅的 (exchange, symbol) 集合
-    symbols: HashSet<(Exchange, Symbol)>,
+    /// 订阅范围。"这条事件归不归它"一律问 [`SubscriptionScope::accepts`]，
+    /// 与回测驱动同一份判据 —— 下面的 `by_symbol` 反向索引只是热路径的扇出优化。
+    scope: SubscriptionScope,
     /// 该 executor 绑定的账户
     account: AccountId,
 }
@@ -49,11 +50,12 @@ pub struct IncomeProcessorActor {
 impl IncomeProcessorActor {
     fn remove_from_indexes(&mut self, id: ActorId) {
         if let Some(sub) = self.executors.remove(&id) {
-            for key in &sub.symbols {
-                if let Some(v) = self.by_symbol.get_mut(key) {
+            for (exchange, symbol) in sub.scope.pairs() {
+                let key = (exchange, symbol.clone());
+                if let Some(v) = self.by_symbol.get_mut(&key) {
                     v.retain(|x| *x != id);
                     if v.is_empty() {
-                        self.by_symbol.remove(key);
+                        self.by_symbol.remove(&key);
                     }
                 }
             }
@@ -118,21 +120,23 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
         // 且 ActorId 唯一，但这不该是巧合保护，而是结构保证。
         self.remove_from_indexes(actor_id);
 
-        // 从 subscriptions 提取 (exchange, symbol) 集合
-        let symbols: HashSet<(Exchange, Symbol)> = msg
-            .subscriptions
-            .iter()
-            .map(|(ex, kind)| (*ex, kind.symbol().clone()))
-            .collect();
+        let scope = SubscriptionScope::from_pairs(
+            msg.subscriptions
+                .iter()
+                .map(|(ex, kind)| (*ex, kind.symbol().clone())),
+        );
 
         tracing::info!(
             executor_id = ?actor_id,
-            symbols = ?symbols,
+            scope = ?scope,
             "Executor registered"
         );
 
-        for key in &symbols {
-            self.by_symbol.entry(key.clone()).or_default().push(actor_id);
+        for (exchange, symbol) in scope.pairs() {
+            self.by_symbol
+                .entry((exchange, symbol.clone()))
+                .or_default()
+                .push(actor_id);
         }
         self.by_account
             .entry(msg.account.clone())
@@ -142,7 +146,7 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
             actor_id,
             ExecutorSubscription {
                 executor: msg.executor,
-                symbols,
+                scope,
                 account: msg.account,
             },
         );
@@ -159,21 +163,33 @@ impl Message<MarketEvent> for IncomeProcessorActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let event = IncomeEvent::Market(msg);
-        match event.routing() {
-            Some(key) => {
-                // 定向：索引 O(1)
-                if let Some(ids) = self.by_symbol.get(&key) {
+        let delivery = event.delivery();
+        match &delivery {
+            Delivery::Symbol(exchange, symbol) => {
+                // 定向：索引 O(1)。索引的键由 `SubscriptionScope::pairs()` 灌，与判据同源，
+                // 所以这里不再问一遍 accepts —— 但那是**结构约定**，不是编译期保证，
+                // 故留一条 debug 断言：索引一旦与范围失配（例如日后有人给 scope 加了
+                // mutator 却忘了同步索引），回测与测试里会立刻响，而不是静默错投。
+                if let Some(ids) = self.by_symbol.get(&(*exchange, symbol.clone())) {
                     for id in ids {
                         if let Some(sub) = self.executors.get(id) {
+                            debug_assert!(
+                                sub.scope.accepts_delivery(&delivery),
+                                "by_symbol 索引与订阅范围失配：事件被投给了范围外的 executor"
+                            );
                             Self::forward(sub, &event).await;
                         }
                     }
                 }
             }
-            None => {
-                // 广播（Clock / ExchangeStatus / 无 scope 的 Custom）
+            // 所级公共读数（ExchangeStatus / ExchangeRate）只投给订了该所的；
+            // 与交易所无关的全局事件（Clock / 无 scope 的 Custom）广播。
+            // 两档都由同一个判据回答，不在这里重写一遍。
+            Delivery::Exchange(_) | Delivery::Broadcast => {
                 for sub in self.executors.values() {
-                    Self::forward(sub, &event).await;
+                    if sub.scope.accepts_delivery(&delivery) {
+                        Self::forward(sub, &event).await;
+                    }
                 }
             }
         }
@@ -195,28 +211,33 @@ impl Message<AccountEvent> for IncomeProcessorActor {
         let Some(ids) = self.by_account.get(&account) else {
             return;
         };
-        let routing = event.routing();
+        let delivery = event.delivery();
         for id in ids {
             let Some(sub) = self.executors.get(id) else {
                 continue;
             };
-            if let Some(key) = &routing {
-                if !sub.symbols.contains(key) {
-                    // 该账户的私有事件、但 executor 没订这个 symbol。
-                    // - Live：分桶部署的常态（账户级全量私有流含其他桶的 symbol），静默跳过；
-                    // - Paper：柜台只为本进程策略的订单产回报，被过滤即异常 —— 策略对未订阅
-                    //   symbol 下了单，回报回不来，订单会停在 Created、超时清理后反复重挂。
-                    //   丢弃点必须可见。
-                    if account != AccountId::Live {
+            if !sub.scope.accepts_delivery(&delivery) {
+                // 该账户的私有事件、但不在这个 executor 的订阅范围内。
+                // - Live：分桶部署的常态（账户级全量私有流含其他桶的 symbol），静默跳过；
+                // - Paper：柜台只为本进程策略的订单产回报，被过滤即异常 —— 策略对未订阅
+                //   symbol 下了单，回报回不来，订单会停在 Created、超时清理后反复重挂。
+                //   丢弃点必须可见。
+                //
+                // **只对 Symbol 档 warn，所级档刻意不 warn**：Paper 的所级事件只有柜台按
+                // (账户, 所) 发的 AccountInfo，它被丢弃的两种来路都不值得报 —— 多策略共享
+                // 同一模拟账户时丢的是别人的所（纯噪声）；策略真在范围外的所下了单时，
+                // 那张单的 OrderUpdate 是 Symbol 档、已经在下面 warn 过了，可行动的信号没丢。
+                if account != AccountId::Live {
+                    if let Delivery::Symbol(exchange, symbol) = &delivery {
                         tracing::warn!(
                             %account,
-                            exchange = %key.0,
-                            symbol = %key.1,
-                            "模拟账户的私有回报被 symbol 订阅过滤丢弃 —— 策略在未订阅的 symbol 上下了单？"
+                            %exchange,
+                            %symbol,
+                            "模拟账户的私有回报被订阅范围过滤丢弃 —— 策略在未订阅的 symbol 上下了单？"
                         );
                     }
-                    continue;
                 }
+                continue;
             }
             Self::forward(sub, &event).await;
         }
@@ -294,19 +315,42 @@ mod routing_tests {
         assert_eq!(live.account, AccountId::Live);
         let ev = IncomeEvent::Account(live);
         assert_eq!(
-            ev.routing(),
-            Some((Exchange::Binance, "BTC".to_string())),
+            ev.delivery(),
+            Delivery::Symbol(Exchange::Binance, "BTC".to_string()),
             "Fill 有 symbol，应定向路由"
         );
     }
 
-    /// 行情无账户归属，按 symbol 定向；Clock 无 symbol，广播
+    /// 三档投递范围各取一个代表，钉住分发层与 `accepts` 共用的这份推导。
+    ///
+    /// 尤其是中间那档：**所级账户读数按所定向，不是广播**。写成广播的那版里，
+    /// 策略能读到自己压根没订的所的净值，而杠杆闸门就是拿净值算的。
     #[test]
-    fn market_events_route_by_symbol_or_broadcast() {
+    fn delivery_scope_matches_the_events_locating_precision() {
         let ev = IncomeEvent::Market(trade_event());
-        assert_eq!(ev.routing(), Some((Exchange::Binance, "BTC".to_string())));
+        assert_eq!(
+            ev.delivery(),
+            Delivery::Symbol(Exchange::Binance, "BTC".to_string()),
+            "有 symbol 的行情按 (所, symbol) 定向"
+        );
+
+        let account_info = IncomeEvent::account(
+            AccountId::Live,
+            0,
+            0,
+            crate::messaging::AccountData::AccountInfo {
+                exchange: Exchange::Binance,
+                equity: 1.0,
+                notional: 0.0,
+            },
+        );
+        assert_eq!(
+            account_info.delivery(),
+            Delivery::Exchange(Exchange::Binance),
+            "所级账户读数按所定向 —— 广播会把净值泄漏给没订这个所的策略"
+        );
 
         let clock = IncomeEvent::market(0, 0, MarketData::Clock);
-        assert_eq!(clock.routing(), None, "Clock 对所有账户广播");
+        assert_eq!(clock.delivery(), Delivery::Broadcast, "Clock 与交易所无关，广播");
     }
 }

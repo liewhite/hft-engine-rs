@@ -8,11 +8,10 @@
 //! - **停机**：生产者 -> 总线 -> 消费者三段依次停（见 `on_stop` 与
 //!   `crate::actor_lifecycle`），组内并发、组间有序。
 
-use crate::actor_lifecycle::{ChildGroup, ChildStop};
+use crate::actor_lifecycle::{ChildGroup, ChildRegistrar, ChildStop};
 use crate::engine::bootstrap::Supervised;
 use super::{
     to_live_outlet, to_paper_outlet, AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs,
-    ExecutorActor,
     IncomeProcessorActor, MarketPubSub, MetricsActor, MetricsActorArgs, OrderGateway,
     OutcomePubSub, OutcomeProcessorActor, PaperCounterActor, PaperCounterArgs,
     GetLivePositions, PositionLedgerActor, PositionLedgerArgs,
@@ -39,6 +38,7 @@ use std::sync::Arc;
 mod provisioning;
 
 pub use provisioning::RemoveStrategies;
+use provisioning::Provisioner;
 
 /// ManagerActor 初始化参数
 pub struct ManagerActorArgs {
@@ -58,14 +58,14 @@ pub struct ManagerActor {
     // === Symbol Metas 缓存 ===
     symbol_metas: HashMap<(Exchange, Symbol), SymbolMeta>,
 
-    // === Exchange Clients (REST) ===
-
-    /// 各所的**账户私有**能力。键集 = 配了凭证的所（见 [`ExchangeSetup::account`]）；
-    /// 缺席即"该所只接公共行情"，不必再问一次有没有凭证。
-    accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
-
-    /// 各所的订阅能力查询（知识在适配层，随 ExchangeSetup 携带；投产校验用）
-    capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
+    /// 策略投产与撤下的编排器。
+    ///
+    /// 它独占 manager 原有 15 个字段里只有它用的那 7 个（账户句柄、能力表、分发层、
+    /// 两个镜像、下单出口、交易所适配层、实例列表）—— 字段归属即职责声明。
+    ///
+    /// 三条总线与三个停机分组不在其中，也不作为参数传入，因此编排**在类型上**够不着；
+    /// 生产者组按 [`ChildRegistrar`] 借出，能力面只有 spawn / remove。见 `provisioning.rs`。
+    provisioner: Provisioner,
 
     // === PubSub Actors ===
     /// 公共行情总线
@@ -76,27 +76,12 @@ pub struct ManagerActor {
     outcome_pubsub: ActorRef<OutcomePubSub>,
 
     // === 子 Actors ===
-    /// ProcessorActor (订阅两条入向总线)
-    income_processor: ActorRef<IncomeProcessorActor>,
-    /// MetricsActor (订阅两条入向总线，输出账户/持仓/订单/历史指标)
-    metrics: ActorRef<MetricsActor>,
     /// 实盘持仓账本 (订阅账户总线的实盘 Fill；REST 校验，漂移确认后致命退出)。
     ///
     /// 同时是快照面 [`GetLivePositions`] 的数据源 —— 它是唯一被持续校验的那份折叠，
     /// 外部读到的数字与风控守卫看到的数字必须是同一个。
+    /// （编排也持一份句柄用于投产注册；`ActorRef` 是句柄不是状态，不构成副本。）
     position_ledger: ActorRef<PositionLedgerActor>,
-    /// ExchangeActors (启动时创建，类型擦除)
-    exchange_actors: HashMap<Exchange, Box<dyn ExchangeActorOps>>,
-
-    /// 唯一的实盘下单出口（与 OutcomeProcessorActor 共享同一实例）。
-    /// 降级平仓经此下单 —— in_flight 判据、失败反馈、dry_run 语义与策略信号一致。
-    order_gateway: Arc<OrderGateway>,
-
-    /// 已注册的策略实例，供动态撤下使用。
-    ///
-    /// 晋升/降级要求能在运行期增删实例（见 [`RemoveStrategies`]），故必须留存引用；
-    /// 否则实例只能随进程生死。
-    executors: Vec<RegisteredExecutor>,
 
     /// **产生**事件的子 actor：交易所 actor、时钟、策略实例。
     /// 停机时先停这一段 —— 它们的 `on_stop` 还会往总线上发最后一批事件
@@ -133,13 +118,6 @@ pub struct ManagerActor {
     /// 与 `buses` 分成两组而不是靠登记顺序：依赖一旦藏在登记顺序里，换个 push 位置就
     /// 悄悄改变停机语义，而编译器和测试都看不见（见 [`ChildGroup::shutdown`]）。
     consumers: ChildGroup,
-}
-
-/// 一个已注册的策略实例
-struct RegisteredExecutor {
-    executor: ActorRef<ExecutorActor>,
-    account: AccountId,
-    symbols: HashSet<Symbol>,
 }
 
 impl ManagerActor {
@@ -409,17 +387,20 @@ impl Actor for ManagerActor {
 
         Ok(Self {
             symbol_metas,
-            accounts,
-            capabilities,
+            provisioner: Provisioner::new(
+                accounts,
+                capabilities,
+                processor,
+                metrics,
+                position_ledger.clone(),
+                outcome_pubsub.clone(),
+                order_gateway,
+                exchange_actors,
+            ),
             market_pubsub,
             account_pubsub,
             outcome_pubsub,
-            income_processor: processor,
-            metrics,
             position_ledger,
-            exchange_actors,
-            order_gateway,
-            executors: Vec::new(),
             producers,
             buses,
             consumers,
@@ -535,7 +516,13 @@ impl Message<AddStrategy> for ManagerActor {
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         // 委托给批量添加
-        self.do_add_strategies(vec![msg.0], ctx.actor_ref().clone())
+        self.provisioner
+            .add(
+                vec![msg.0],
+                &self.symbol_metas,
+                ChildRegistrar::new(&mut self.producers),
+                ctx.actor_ref(),
+            )
             .await
     }
 }
@@ -551,7 +538,14 @@ impl Message<AddStrategies> for ManagerActor {
         msg: AddStrategies,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.do_add_strategies(msg.0, ctx.actor_ref().clone()).await
+        self.provisioner
+            .add(
+                msg.0,
+                &self.symbol_metas,
+                ChildRegistrar::new(&mut self.producers),
+                ctx.actor_ref(),
+            )
+            .await
     }
 }
 

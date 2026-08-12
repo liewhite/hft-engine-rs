@@ -217,31 +217,44 @@ metrics 用「持仓 × 价格 + 挂单 + 账户」。**一个类型有三组互
 
 </details>
 
-### V2 `Strategy::on_event` 交出全量状态视图 —— 违反 P3
+### ~~V2 策略拿得到不属于它的东西~~ —— **已修复（R3）**
+
+原状两条，性质不同：
+
+1. **接口过宽**。`fn on_event(&mut self, event: &IncomeEvent, state: &StateManager)`
+   交出 39 个方法。往 `StateManager` 加读方法会自动扩大所有策略的可见面，编译器不报警。
+2. **越界投递**。所级读数（`Balance` / `AccountInfo` / `Greeks` / `ExchangeStatus` /
+   `ExchangeRate`）没有 symbol，分发层一律**广播** —— 策略读得到自己压根没订阅的所的
+   净值与希腊值，而杠杆闸门与 delta 对冲就是拿这些算的。
+
+现状：
 
 ```rust
-fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent>;
+fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent>;
 ```
 
-仓内全部策略实现的实际调用面并集是 **11 个方法**：`symbol_state` / `position_size` /
-`position_sizes` / `positions` / `pending_orders` / `has_pending_orders` / `bbo` / `bbos`
-（per-symbol），加 `equity` / `account_info` / `greeks`（账户级 —— `spread_arb` 的杠杆闸门
-与 `gamma_scalp` 的 delta 都要）。而交出去的是 39 个。
+[`StrategyView`] 4 个方法 + [`SymbolView`] 5 个，共 **9 个**，就是实测的调用面。
+`StateManager` 上那九个账户转发方法一并删除，账户读数只剩 `account_view()` 一条路。
 
-> **一处更正**：本节初稿写的是 8 个方法，漏了账户级那三个 —— 当时的统计只扫了
-> 变量名叫 `state` 的调用点，而策略里那三处的变量名是 `state_manager`。
-> 这对 R3 的设计有实质影响：策略视图**必须**包含账户投影，不能只给 per-symbol 那三份。
+越界投递堵在**分发层**：`IncomeEvent::delivery()` 把投递范围分成
+`Symbol(所, symbol)` / `Exchange(所)` / `Broadcast` 三档，
+[`SubscriptionScope::accepts`] 据此判定，实盘 `IncomeProcessorActor` 与回测循环调的是
+同一份实现。范围外的读数根本进不了策略的 `StateManager`。
 
-连带后果：往 `StateManager` 加字段会自动扩大所有策略的可见面，编译器不报警；
-而账户级数据（`equity` / `account_info` / `greeks`）按交易所索引且**不按订阅范围过滤** ——
-策略可以读到它压根没订阅的交易所的净值。
+> **一次走错方向的记录**。第一版把裁剪做在 `StrategyView` 上（查询时按订阅所过滤）。
+> 那是错的，两个原因：它成了"什么算范围内"的第三处实现（P1/P4）；而且**它挡不住**——
+> 越界的读数照样随 `&IncomeEvent` 推给策略，payload 里就带着净值，
+> 只堵查询不堵投递等于没堵，却在文档里写成了"已修复"（正是品味 1.5 说的那种声明）。
+> 审查指出后改到分发层，视图里的裁剪整个删掉。
 
-> **一处更正**：本节初稿还写过"策略能看到其他 symbol 的状态"，那是错的。
+> **三次统计更正**。本节初稿说调用面是 8 个方法，后更正为 11 个（漏了账户级三个：
+> 当时只扫了变量名叫 `state` 的调用点，而策略里那三处叫 `state_manager`）。
+> R3 动手时逐个方法核实，**实际是 9 个** —— 之前的 8 与 11 都把"调用点数"和"方法数"
+> 混着数了。三次统计两次错，说明这类数字必须逐个方法 grep 后再写，不能凭印象。
+>
+> 另一处更正：初稿还写过"策略能看到其他 symbol 的状态"，那是错的。
 > `StrategyRunner` 用策略自己 `public_streams()` 推导的 symbol 集合去建 `StateManager`，
-> 它能查到的 symbol 本来就只有自己订的。R3 的收益是接口最小化与账户数据裁剪两条，
-> 不含 symbol 隔离。
-
-→ 计划 R3
+> 它能查到的 symbol 本来就只有自己订的。
 
 ### ~~V3 `ExchangeClient` 用返回空值表达"没有能力"~~ —— **已修复（R1）**
 
@@ -273,17 +286,53 @@ fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<Outcome
 
 **不修**。列在这里是为了提醒：新增消费者时先问它会不会回灌。
 
-### V6 manager 承担四件事，1951 行 —— 违反 P3（弱）
+### ~~V6 manager 什么都干~~ —— **已修复（R5）**
 
-装配 / 投产撤下编排 / 监督树根 / 停机链根 / 总线持有 / 快照面应答。
-`provisioning.rs` 那 1039 行的投产编排是独立领域流程，与监督/停机没有内在联系，
-只是恰好都需要子 actor 句柄。不阻碍扩展，但它是全系统最难改的一处。→ 计划 R5
+原状：`ManagerActor` 15 个字段，装配 / 投产撤下编排 / 监督树根 / 停机链根 / 总线持有 /
+快照面应答全在一处，两个文件合计 2015 行。
 
-### V7 观测口径泄漏进领域状态 —— 违反 P3
+现状：投产编排收进 `Provisioner`（**不是**新 actor —— 编排必须经 manager 的邮箱串行化，
+两个 `Message` handler 仍在 `ManagerActor` 上，只是把活委托下来）。
+`ManagerActor` 从 15 个字段收到 **9 个**。
 
-`SymbolExposure::session_notional_delta`（把重启前存货从盈亏里剔除）是 metrics 的概念，
-却住在三方共用的 `SymbolState` 上。生产代码里 `exposure()` 只有 `metrics.rs:160` 一个调用点。
-→ 计划 R5
+划分依据是实测的字段归属，不是"看起来像两件事"：
+
+| 归属 | 字段 |
+|---|---|
+| 只有编排用（搬走） | `accounts` / `capabilities` / `income_processor` / `metrics` / `exchange_actors` / `order_gateway` / `executors` |
+| 编排与别人共用 | `symbol_metas`（快照面也读）/ `position_ledger`、`outcome_pubsub`（句柄，各持一份不算副本）/ `producers`（停机链） |
+| 编排不碰 | `market_pubsub` / `account_pubsub` / `buses` / `consumers` |
+
+`symbol_metas` 与 `producers` 作为参数传入而非搬走：前者是引擎级合约目录，属于组合根，
+复制一份进编排就是两份权威（P1）；后者按 [`ChildRegistrar`] 借出 —— 那个借出面只有
+`spawn` / `remove`，编排调不到 `shutdown()`。
+
+**哪些是编译期保证、哪些只是约定**（品味 1.5，初稿把三条一律写成了"编译器保证"）：
+
+| 判据 | 强度 |
+|---|---|
+| 编排够不着三条总线与三个停机分组 | 编译期（既非字段也非参数） |
+| 编排停不掉生产者组 | 编译期（`ChildRegistrar` 无 `shutdown`） |
+| manager 改不了编排的实例列表与下单出口 | 编译期（字段私有 + `Provisioner::new`） |
+| 借出的是**哪一个**停机分组 | **仅靠调用点写对** —— 三个组同为 `ChildGroup`，编译器分不出来 |
+
+> **原文的理由是错的**。V6 初稿写"只是恰好都需要子 actor 句柄"——实测有 7 个字段
+> **只有编排用**，所以它不是"恰好共用"，而是一个真实可分的依赖簇。若真如初稿所说
+> 全是共用句柄，这一步就不该做（那会是虚假抽象：拆开后靠传一堆参数分发）。
+> 动手前把 `self.X` 逐个数了一遍才发现，行数也从"1951"变成了 2015 —— R1/R2/R3 期间它一直在涨。
+
+### ~~V7 观测口径泄漏进领域状态~~ —— **已修复（R5）**
+
+原状：`SymbolExposure::session_notional_delta`（把重启前存货从盈亏里剔除）是 metrics 的
+概念，却住在策略/对账/观测三方共用的 `SymbolState` 上；`exposure(baseline)` 的参数本身
+就是 metrics 自持的会话基线，领域层没有理由知道"会话"是什么。
+
+现状：`SymbolExposure` 与估值函数搬进 `metrics.rs`（`exposure_of(state, baseline)`），
+`messaging` 不再导出它。
+
+判据是**能不能纯移动**：它只用 `position_book().all()` 与 `bbo()` 两个既有公开访问器，
+所以搬走之后领域层不必为观测保留任何接口。若搬走还得在领域层开新口子，
+那说明边界没划对，该回上一层重想。
 
 ---
 

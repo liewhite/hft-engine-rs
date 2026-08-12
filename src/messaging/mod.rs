@@ -3,12 +3,14 @@ mod state;
 mod state_manager;
 
 pub use event::{
-    AccountData, AccountEvent, CustomEvent, IncomeEvent, MarketData, MarketEvent,
+    AccountData, AccountEvent, CustomEvent, Delivery, IncomeEvent, MarketData, MarketEvent,
 };
 mod position_book;
+mod scope;
 
 pub use position_book::PositionBook;
+pub use scope::SubscriptionScope;
 pub use state::{
-    PendingOrder, SymbolExposure, SymbolMarket, SymbolOrders, SymbolPositions, SymbolState,
+    PendingOrder, SymbolMarket, SymbolOrders, SymbolPositions, SymbolState,
 };
 pub use state_manager::{AccountView, PositionBaseline, StateManager};

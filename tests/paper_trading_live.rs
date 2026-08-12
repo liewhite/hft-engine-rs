@@ -35,9 +35,9 @@ use hft_engine_rs::exchange::binance::{
     BinanceActor, BinanceActorArgs, BinanceClient, REST_BASE_URL,
 };
 use hft_engine_rs::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{AccountData, AccountEvent, IncomeEvent, MarketData, MarketEvent, StateManager};
+use hft_engine_rs::messaging::{AccountData, AccountEvent, IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
+use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use kameo::actor::{ActorRef, Spawn, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::mailbox;
@@ -96,7 +96,7 @@ impl Strategy for DipMaker {
         0
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let IncomeEvent::Market(MarketEvent {
             data: MarketData::BBO(bbo),
             ..
@@ -105,7 +105,7 @@ impl Strategy for DipMaker {
             return Vec::new();
         };
         let symbol = COIN.to_string();
-        let Some(symbol_state) = state.symbol_state(&symbol) else {
+        let Some(symbol_state) = view.symbol(&symbol) else {
             return Vec::new();
         };
         // 成交过就收手，本测试只需要一笔

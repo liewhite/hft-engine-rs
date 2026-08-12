@@ -1,12 +1,14 @@
 mod gamma_scalp;
 mod spread_arb;
+mod view;
 
 pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
 pub use gamma_scalp::GammaScalpStrategy;
+pub use view::{StrategyView, SymbolView};
 
 use crate::domain::{Exchange, Order, OrderId, Symbol};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{CustomEvent, IncomeEvent, StateManager};
+use crate::messaging::{CustomEvent, IncomeEvent};
 use std::collections::{HashMap, HashSet};
 
 /// 策略输出的信号
@@ -57,5 +59,8 @@ pub trait Strategy: Send + Sync {
     /// Clock 全部经此到达，策略按需 match 自己关心的变体。此前 BorrowFee/ExchangeRate
     /// 走独立的 typed 回调 —— 同一事件流两套分发风格，策略在 on_event 里 match 这两类
     /// 永远收不到且编译器不报错。
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent>;
+    ///
+    /// `view` 是**本策略订阅范围内**的状态视图（见 [`StrategyView`]），按值传入且不可
+    /// 跨事件持有 —— 引擎状态容器不作为策略契约的一部分暴露。
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent>;
 }

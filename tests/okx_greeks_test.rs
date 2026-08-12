@@ -14,8 +14,8 @@ use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
 
 const TEST_QUOTE: &str = "USDT";
-use hft_engine_rs::messaging::{AccountData, IncomeEvent, StateManager};
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent};
+use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use kameo::actor::Spawn;
 use kameo::mailbox;
 use std::collections::{HashMap, HashSet};
@@ -52,11 +52,11 @@ impl Strategy for GreeksPrintStrategy {
         30_000
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         if let IncomeEvent::Account(a) = event {
             if let AccountData::Greeks(raw) = &a.data {
-                // state.greeks() 返回修正后的 delta (含现货 cashBal)
-                if let Some(g) = state.greeks(Exchange::OKX, &raw.ccy) {
+                // view.greeks() 返回修正后的 delta (含现货 cashBal)
+                if let Some(g) = view.greeks(Exchange::OKX, &raw.ccy) {
                     println!(
                         "[GREEKS] ccy={} delta={:.6} (raw={:.6}) gamma={:.6} theta={:.6} vega={:.6} ts={}",
                         g.ccy, g.delta, raw.delta, g.gamma, g.theta, g.vega, g.timestamp

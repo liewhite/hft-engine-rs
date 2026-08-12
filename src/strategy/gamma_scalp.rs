@@ -17,8 +17,8 @@
 
 use crate::domain::{Exchange, Order, OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{AccountData, IncomeEvent, MarketData, PendingOrder, StateManager};
-use crate::strategy::{OutcomeEvent, Strategy};
+use crate::messaging::{AccountData, IncomeEvent, MarketData, PendingOrder};
+use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
 
 /// 对冲数量相对目标漂移超该比例则撤单重挂 (默认值)
@@ -81,12 +81,12 @@ impl GammaScalpStrategy {
         }
     }
 
-    fn hedge(&mut self, ref_price: Price, state: &StateManager) -> Vec<OutcomeEvent> {
-        let Some(symbol_state) = state.symbol_state(&self.symbol) else {
+    fn hedge(&mut self, ref_price: Price, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+        let Some(symbol_state) = view.symbol(&self.symbol) else {
             return Vec::new();
         };
         // greeks 与 cashBal 均到达才动作 (delta 修正就绪)
-        let Some(greeks) = state.greeks(self.exchange, &self.ccy) else {
+        let Some(greeks) = view.greeks(self.exchange, &self.ccy) else {
             return Vec::new();
         };
 
@@ -199,7 +199,7 @@ impl Strategy for GammaScalpStrategy {
         5000
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         match event {
             // 逐笔成交：以最新成交价为基准评估对冲
             IncomeEvent::Market(m) => match &m.data {
@@ -207,7 +207,7 @@ impl Strategy for GammaScalpStrategy {
                     if t.exchange == self.exchange && t.symbol == self.symbol =>
                 {
                     self.last_price = Some(t.price);
-                    self.hedge(t.price, state)
+                    self.hedge(t.price, view)
                 }
                 _ => Vec::new(),
             },
@@ -215,7 +215,7 @@ impl Strategy for GammaScalpStrategy {
             IncomeEvent::Account(a) => match &a.data {
                 AccountData::Greeks(g) if g.exchange == self.exchange && g.ccy == self.ccy => {
                     match self.last_price {
-                        Some(p) => self.hedge(p, state),
+                        Some(p) => self.hedge(p, view),
                         None => Vec::new(),
                     }
                 }

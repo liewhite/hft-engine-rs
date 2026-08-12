@@ -1,13 +1,35 @@
-//! 策略投产与撤下的编排（`ManagerActor` 的一半职责，拆出成文件只为可读性 ——
-//! 编排必须经 manager 的邮箱串行化，因此仍是同一个 actor 的方法，不是新 actor）。
+//! 策略投产与撤下的编排。
 //!
 //! - **投产**（[`super::AddStrategies`]）：校验订阅可行性 → 撤遗留挂单 → 拉持仓基线
 //!   （一次快照喂 executor / 对账镜像 / 观测镜像三类消费者）→ spawn（出生即带基线）
 //!   → 注册 → 放行行情；任一步失败回滚到"什么都没发生"。
 //! - **撤下**（[`RemoveStrategies`]）：停实例 → 撤遗留挂单 → 可选 reduce-only 平仓
 //!   （经唯一下单出口 OrderGateway）；任何一环未完成都如实向调用方报错。
+//!
+//! # 为什么是 [`Provisioner`] 而不是 `impl ManagerActor`
+//!
+//! 编排必须经 manager 的邮箱串行化，所以它**不是**新 actor —— 两个 `Message` handler
+//! 仍在 `ManagerActor` 上，只是把活委托下来。拆出独立类型是为了让**依赖面成为类型声明**
+//! （`docs/architecture.md` P3，与 R2 给持仓账本换成 `PositionBook` 是同一手法）：
+//!
+//! 实测 manager 的 15 个字段里，有 7 个**只有投产编排用**（accounts / capabilities /
+//! income_processor / metrics / exchange_actors / order_gateway / executors）。
+//! 它们搬进本类型之后，编译器保证编排碰不到三条总线与停机分组，manager 也碰不到
+//! executor 列表与下单出口。
+//!
+//! # 两个必须传进来的东西
+//!
+//! - `symbol_metas`：引擎级的合约目录，快照面（`GetAllSymbolMetas`）也要读，
+//!   属于 manager 这个组合根，不该复制一份进来（P1）。
+//! - `producers`：新建的 executor 要登记进**停机链的生产者组**。传的是
+//!   [`ChildRegistrar`] 而不是 `&mut ChildGroup` —— 后者连 `shutdown()` 都能调，
+//!   而"何时停、按什么顺序停"只由 `ManagerActor` 说了算。借出面上只有 `spawn` / `remove`。
+//!
+//! 如实说明能力面的边界：三个停机分组同为 `ChildGroup`，**"传的是哪一组"仍由调用点
+//! 写对，编译器分不出来**；`ChildRegistrar` 限制的是能对它做什么，不是它是谁。
 
-use super::{ManagerActor, RegisteredExecutor, StrategySpec};
+use super::{ManagerActor, StrategySpec};
+use crate::actor_lifecycle::ChildRegistrar;
 use crate::engine::live::{
     ExecutorActor, ExecutorArgs, GetPositions, PlaceVerdict, RegisterExecutor, RegisterSymbols,
     UnregisterExecutor,
@@ -28,6 +50,40 @@ use std::time::Duration;
 /// `ExecutorActor` 的 handler 是纯策略步进 + 往 unbounded 邮箱投递，都是亚毫秒级工作，
 /// 正常远不到这个量级。留 5 秒是为了不因偶发调度抖动就走异常分支。
 const EXECUTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 一个已注册的策略实例。
+///
+/// 住在本文件、且**私有**：只有编排读写它（投产时 push、撤下时 retain）。
+struct RegisteredExecutor {
+    executor: ActorRef<ExecutorActor>,
+    account: AccountId,
+    symbols: HashSet<Symbol>,
+}
+
+/// 策略投产与撤下的编排器。
+///
+/// 由 [`ManagerActor`] 持有并在自己的 handler 里调用（因而天然被邮箱串行化）；
+/// 字段就是它的依赖声明，见模块文档。
+pub(super) struct Provisioner {
+    /// 各所的**账户私有**能力。键集 = 配了凭证的所；缺席即"该所只接公共行情"。
+    accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
+    /// 各所的订阅能力查询（知识在适配层，随 ExchangeSetup 携带；投产校验用）
+    capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
+    /// 事件分发层（注册 / 注销 executor 的订阅）
+    income_processor: ActorRef<crate::engine::live::IncomeProcessorActor>,
+    /// 观测镜像（投产时随 symbol 一起收基线）
+    metrics: ActorRef<crate::engine::live::MetricsActor>,
+    /// 对账镜像（同上；它是唯一被 REST 持续校验的那份折叠）
+    position_ledger: ActorRef<crate::engine::live::PositionLedgerActor>,
+    /// 策略信号总线（新建 executor 的产出去处）
+    outcome_pubsub: ActorRef<crate::engine::live::OutcomePubSub>,
+    /// 唯一的实盘下单出口 —— 降级平仓经此下单，与策略信号同一条路
+    order_gateway: Arc<crate::engine::live::OrderGateway>,
+    /// 各所适配层（放行 / 收回行情订阅）
+    exchange_actors: HashMap<Exchange, Box<dyn super::ExchangeActorOps>>,
+    /// 已注册的策略实例，供动态撤下使用
+    executors: Vec<RegisteredExecutor>,
+}
 
 /// 投产期订阅可行性校验（纯函数，供单测）。
 ///
@@ -72,7 +128,36 @@ fn validate_subscriptions(
 }
 
 
-impl ManagerActor {
+impl Provisioner {
+    /// 装配期构造。
+    ///
+    /// 参数多是因为编排的协作者就是这么多（每个都在字段注释里说明了用途）；
+    /// 换成字段公开 + 结构体字面量能省下这个构造函数，但那样 manager 就能随手改写
+    /// 编排的实例列表与下单出口 —— 拿边界换构造便利，不值。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
+        capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
+        income_processor: ActorRef<crate::engine::live::IncomeProcessorActor>,
+        metrics: ActorRef<crate::engine::live::MetricsActor>,
+        position_ledger: ActorRef<crate::engine::live::PositionLedgerActor>,
+        outcome_pubsub: ActorRef<crate::engine::live::OutcomePubSub>,
+        order_gateway: Arc<crate::engine::live::OrderGateway>,
+        exchange_actors: HashMap<Exchange, Box<dyn super::ExchangeActorOps>>,
+    ) -> Self {
+        Self {
+            accounts,
+            capabilities,
+            income_processor,
+            metrics,
+            position_ledger,
+            outcome_pubsub,
+            order_gateway,
+            exchange_actors,
+            executors: Vec::new(),
+        }
+    }
+
     /// 有序撤下一个 executor：发出 Stop、并**等它真的停下**。
     ///
     /// # 为什么不能用 `kill()`
@@ -90,7 +175,11 @@ impl ManagerActor {
     ///
     /// 返回 `Err(原因)` 供调用方计入"未完成"；超时不改用 `kill()`（那会打死引擎），而是如实
     /// 报出 —— 此时该实例已从 IncomeProcessor 注销，收不到新事件，危害有界。
-    async fn stop_executor(&mut self, executor: &ActorRef<ExecutorActor>) -> Result<(), String> {
+    async fn stop_executor(
+        &mut self,
+        executor: &ActorRef<ExecutorActor>,
+        producers: &mut ChildRegistrar<'_>,
+    ) -> Result<(), String> {
         // 必须是 stop_gracefully 而非 kill：前者产生 `Normal`，`on_link_died` 据此放行；
         // kill 产生 `Killed`，会被判成事故、把整个引擎带走。
         if let Err(e) = executor.stop_gracefully().await {
@@ -106,7 +195,7 @@ impl ManagerActor {
         // 留着的代价有界：它已从 IncomeProcessor 注销、收不到新事件，最坏是让停机
         // 多等一会儿，并由根部的总 deadline 如实报出来。
         if stopped.is_ok() {
-            self.producers.remove(executor);
+            producers.remove(executor);
         }
         stopped
     }
@@ -208,10 +297,12 @@ impl ManagerActor {
     }
 
     /// 批量添加策略的内部实现
-    pub(super) async fn do_add_strategies(
+    pub(super) async fn add(
         &mut self,
         strategies: Vec<StrategySpec>,
-        actor_ref: ActorRef<Self>,
+        symbol_metas: &HashMap<(Exchange, Symbol), SymbolMeta>,
+        mut producers: ChildRegistrar<'_>,
+        manager: &ActorRef<ManagerActor>,
     ) -> Result<(), ExchangeError> {
         if strategies.is_empty() {
             return Ok(());
@@ -239,7 +330,7 @@ impl ManagerActor {
         //     拒绝投产 —— 此前 subscribe 对这两种情况静默返回 Ok(())，策略上线后只能
         //     靠"一直没数据"事后发现（最难查的一类故障）。此时尚无任何副作用，Err 即
         //     "什么都没发生"。
-        validate_subscriptions(&all_subscriptions, &self.capabilities, &self.symbol_metas)
+        validate_subscriptions(&all_subscriptions, &self.capabilities, symbol_metas)
             .map_err(ExchangeError::Other)?;
 
         // 2. 按交易所分组订阅
@@ -302,15 +393,14 @@ impl ManagerActor {
                 } else {
                     Vec::new()
                 };
-            let executor_ref = self
-                .producers
+            let executor_ref = producers
                 .spawn::<ExecutorActor, _>(
-                    &actor_ref,
+                    manager,
                     "ExecutorActor",
                     ExecutorArgs {
                         strategy: spec.strategy,
                         account: spec.account,
-                        symbol_metas: Arc::new(self.symbol_metas.clone()),
+                        symbol_metas: Arc::new(symbol_metas.clone()),
                         baselines: exec_baselines,
                         outcome_pubsub: outcome_pubsub.clone(),
                     },
@@ -334,7 +424,7 @@ impl ManagerActor {
             )
             .await
         {
-            self.rollback_executors(&executor_refs).await;
+            self.rollback_executors(&executor_refs, &mut producers).await;
             return Err(e);
         }
 
@@ -521,7 +611,11 @@ impl ManagerActor {
     ///   订了同一路，贸然退订会把它们的行情一起掐掉。
     ///
     /// 这条边界必须写明：否则后来者会把"回滚不彻底"当成缺陷去补，反而补出问题。
-    async fn rollback_executors(&mut self, created: &[(ActorRef<ExecutorActor>, AccountId)]) {
+    async fn rollback_executors(
+        &mut self,
+        created: &[(ActorRef<ExecutorActor>, AccountId)],
+        producers: &mut ChildRegistrar<'_>,
+    ) {
         let ids: HashSet<ActorId> = created.iter().map(|(r, _)| r.id()).collect();
         for (executor, account) in created {
             if let Err(e) = self
@@ -534,7 +628,7 @@ impl ManagerActor {
             {
                 tracing::error!(error = %e, "回滚时注销 executor 失败");
             }
-            if let Err(reason) = self.stop_executor(executor).await {
+            if let Err(reason) = self.stop_executor(executor, producers).await {
                 tracing::error!(%account, %reason, "回滚时未能确认实例已停止");
             }
             tracing::warn!(%account, "投产失败，已撤下该策略实例");
@@ -568,6 +662,19 @@ impl Message<RemoveStrategies> for ManagerActor {
         msg: RemoveStrategies,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        self.provisioner
+            .remove(msg, ChildRegistrar::new(&mut self.producers))
+            .await
+    }
+}
+
+impl Provisioner {
+    /// 撤下一批实例并清理交易所侧残留，见 [`RemoveStrategies`]。
+    pub(super) async fn remove(
+        &mut self,
+        msg: RemoveStrategies,
+        mut producers: ChildRegistrar<'_>,
+    ) -> Result<(), ExchangeError> {
         let targets: Vec<Symbol> = msg.symbols;
         // 交易所侧的残留（挂单 / 仓位）只有实盘账户才有：模拟账户的两者都在本地柜台里，
         // 随账户一起留存（供继续记账）
@@ -653,7 +760,7 @@ impl Message<RemoveStrategies> for ManagerActor {
                 tracing::error!(error = %e, "Failed to unregister executor");
             }
             // 有序停下并**等它真的停**：后面要撤单 / 平仓，不能让它在排空邮箱时又下新单
-            if let Err(reason) = self.stop_executor(&reg.executor).await {
+            if let Err(reason) = self.stop_executor(&reg.executor, &mut producers).await {
                 tracing::error!(
                     account = %reg.account,
                     %reason,
@@ -796,9 +903,7 @@ impl Message<RemoveStrategies> for ManagerActor {
 
         Self::finish_removal(&msg.account, msg.exchange, incomplete)
     }
-}
 
-impl ManagerActor {
     /// 汇总撤下结果：只要有任何一环没完成，就**向上报错**。
     ///
     /// 调用方（`SupervisorActor::demote`）收到 `Ok` 就会把 `live` 置为 `None`、认为已干净
@@ -900,7 +1005,7 @@ mod leftover_order_tests {
 
         // 无账户：两条路径都拿到 None，即"交易所侧无残留可清理"
         assert!(
-            ManagerActor::exchange_side_cleanup(&accounts, EX).is_none(),
+            Provisioner::exchange_side_cleanup(&accounts, EX).is_none(),
             "没有账户的所必须判为无残留 —— 撤下路径据此干净收尾，而不是报错卡死"
         );
 
@@ -908,12 +1013,12 @@ mod leftover_order_tests {
         let (client, _log) = FakeClient::new(vec![]);
         accounts.insert(EX, client);
         assert!(
-            ManagerActor::exchange_side_cleanup(&accounts, EX).is_some(),
+            Provisioner::exchange_side_cleanup(&accounts, EX).is_some(),
             "有账户的所必须照常清理"
         );
         // 判据是 per-exchange 的：别的所有账户不代表本所有
         assert!(
-            ManagerActor::exchange_side_cleanup(&accounts, Exchange::Hyperliquid).is_none(),
+            Provisioner::exchange_side_cleanup(&accounts, Exchange::Hyperliquid).is_none(),
             "判据必须按所独立"
         );
     }
@@ -942,7 +1047,7 @@ mod leftover_order_tests {
     #[tokio::test]
     async fn nothing_to_cancel_sends_no_request() {
         let (client, cancelled) = FakeClient::new(vec![vec![]]);
-        ManagerActor::cancel_leftover_orders(&client, EX, &SYM.to_string())
+        Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
             .await
             .expect("空列表应直接通过");
         assert!(cancelled.lock().unwrap().is_empty());
@@ -963,7 +1068,7 @@ mod leftover_order_tests {
 
         // 复查时只剩外部单 —— 本引擎的那张已撤掉
         let (client, cancelled) = FakeClient::new(vec![first, foreign]);
-        ManagerActor::cancel_leftover_orders(&client, EX, &SYM.to_string())
+        Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
             .await
             .expect("外部单残留不该导致失败");
 
@@ -985,7 +1090,7 @@ mod leftover_order_tests {
         // 两次都返回同一张 —— 模拟撤不掉
         let (client, _cancelled) = FakeClient::new(vec![leftover.clone(), leftover]);
 
-        let err = ManagerActor::cancel_leftover_orders(&client, EX, &SYM.to_string())
+        let err = Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
             .await
             .expect_err("撤不掉必须报错");
         assert!(err.to_string().contains("ex-own"), "错误应指明是哪张单: {err}");
