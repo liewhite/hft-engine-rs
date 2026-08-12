@@ -286,11 +286,31 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 
 **不修**。列在这里是为了提醒：新增消费者时先问它会不会回灌。
 
-### V6 manager 承担四件事，1951 行 —— 违反 P3（弱）
+### ~~V6 manager 什么都干~~ —— **已修复（R5）**
 
-装配 / 投产撤下编排 / 监督树根 / 停机链根 / 总线持有 / 快照面应答。
-`provisioning.rs` 那 1039 行的投产编排是独立领域流程，与监督/停机没有内在联系，
-只是恰好都需要子 actor 句柄。不阻碍扩展，但它是全系统最难改的一处。→ 计划 R5
+原状：`ManagerActor` 15 个字段，装配 / 投产撤下编排 / 监督树根 / 停机链根 / 总线持有 /
+快照面应答全在一处，两个文件合计 2015 行。
+
+现状：投产编排收进 `Provisioner`（**不是**新 actor —— 编排必须经 manager 的邮箱串行化，
+两个 `Message` handler 仍在 `ManagerActor` 上，只是把活委托下来）。
+`ManagerActor` 从 15 个字段收到 **9 个**。
+
+划分依据是实测的字段归属，不是"看起来像两件事"：
+
+| 归属 | 字段 |
+|---|---|
+| 只有编排用（搬走） | `accounts` / `capabilities` / `income_processor` / `metrics` / `exchange_actors` / `order_gateway` / `executors` |
+| 编排与别人共用 | `symbol_metas`（快照面也读）/ `position_ledger`、`outcome_pubsub`（句柄，各持一份不算副本）/ `producers`（停机链） |
+| 编排不碰 | `market_pubsub` / `account_pubsub` / `buses` / `consumers` |
+
+`symbol_metas` 与 `producers` 作为参数传入而非搬走：前者是引擎级合约目录，属于组合根，
+复制一份进编排就是两份权威（P1）；后者传 `&mut` 是为了让编排**只能往停机链里加一项**，
+决定不了何时停、按什么顺序停。
+
+> **原文的理由是错的**。V6 初稿写"只是恰好都需要子 actor 句柄"——实测有 7 个字段
+> **只有编排用**，所以它不是"恰好共用"，而是一个真实可分的依赖簇。若真如初稿所说
+> 全是共用句柄，这一步就不该做（那会是虚假抽象：拆开后靠传一堆参数分发）。
+> 动手前把 `self.X` 逐个数了一遍才发现，行数也从"1951"变成了 2015 —— R1/R2/R3 期间它一直在涨。
 
 ### V7 观测口径泄漏进领域状态 —— 违反 P3
 
