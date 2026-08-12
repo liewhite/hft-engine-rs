@@ -21,12 +21,15 @@
 //!
 //! - `symbol_metas`：引擎级的合约目录，快照面（`GetAllSymbolMetas`）也要读，
 //!   属于 manager 这个组合根，不该复制一份进来（P1）。
-//! - `producers`：新建的 executor 要登记进**停机链的生产者组**。停机分组顺序是 manager
-//!   的职责，编排只是往里加一项 —— 传 `&mut` 而不是把整个组搬过来，正是为了让它
-//!   只能加，不能决定何时停、按什么顺序停。
+//! - `producers`：新建的 executor 要登记进**停机链的生产者组**。传的是
+//!   [`ChildRegistrar`] 而不是 `&mut ChildGroup` —— 后者连 `shutdown()` 都能调，
+//!   而"何时停、按什么顺序停"只由 `ManagerActor` 说了算。借出面上只有 `spawn` / `remove`。
+//!
+//! 如实说明能力面的边界：三个停机分组同为 `ChildGroup`，**"传的是哪一组"仍由调用点
+//! 写对，编译器分不出来**；`ChildRegistrar` 限制的是能对它做什么，不是它是谁。
 
 use super::{ManagerActor, StrategySpec};
-use crate::actor_lifecycle::ChildGroup;
+use crate::actor_lifecycle::ChildRegistrar;
 use crate::engine::live::{
     ExecutorActor, ExecutorArgs, GetPositions, PlaceVerdict, RegisterExecutor, RegisterSymbols,
     UnregisterExecutor,
@@ -50,9 +53,8 @@ const EXECUTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 一个已注册的策略实例。
 ///
-/// 住在本文件而不在 `mod.rs`：只有编排读写它（投产时 push、撤下时 retain）。
-/// `pub(super)` 仅为让 manager 能在装配时写下空列表，没有别的读者。
-pub(super) struct RegisteredExecutor {
+/// 住在本文件、且**私有**：只有编排读写它（投产时 push、撤下时 retain）。
+struct RegisteredExecutor {
     executor: ActorRef<ExecutorActor>,
     account: AccountId,
     symbols: HashSet<Symbol>,
@@ -64,23 +66,23 @@ pub(super) struct RegisteredExecutor {
 /// 字段就是它的依赖声明，见模块文档。
 pub(super) struct Provisioner {
     /// 各所的**账户私有**能力。键集 = 配了凭证的所；缺席即"该所只接公共行情"。
-    pub(super) accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
+    accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 各所的订阅能力查询（知识在适配层，随 ExchangeSetup 携带；投产校验用）
-    pub(super) capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
+    capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
     /// 事件分发层（注册 / 注销 executor 的订阅）
-    pub(super) income_processor: ActorRef<crate::engine::live::IncomeProcessorActor>,
+    income_processor: ActorRef<crate::engine::live::IncomeProcessorActor>,
     /// 观测镜像（投产时随 symbol 一起收基线）
-    pub(super) metrics: ActorRef<crate::engine::live::MetricsActor>,
+    metrics: ActorRef<crate::engine::live::MetricsActor>,
     /// 对账镜像（同上；它是唯一被 REST 持续校验的那份折叠）
-    pub(super) position_ledger: ActorRef<crate::engine::live::PositionLedgerActor>,
+    position_ledger: ActorRef<crate::engine::live::PositionLedgerActor>,
     /// 策略信号总线（新建 executor 的产出去处）
-    pub(super) outcome_pubsub: ActorRef<crate::engine::live::OutcomePubSub>,
+    outcome_pubsub: ActorRef<crate::engine::live::OutcomePubSub>,
     /// 唯一的实盘下单出口 —— 降级平仓经此下单，与策略信号同一条路
-    pub(super) order_gateway: Arc<crate::engine::live::OrderGateway>,
+    order_gateway: Arc<crate::engine::live::OrderGateway>,
     /// 各所适配层（放行 / 收回行情订阅）
-    pub(super) exchange_actors: HashMap<Exchange, Box<dyn super::ExchangeActorOps>>,
+    exchange_actors: HashMap<Exchange, Box<dyn super::ExchangeActorOps>>,
     /// 已注册的策略实例，供动态撤下使用
-    pub(super) executors: Vec<RegisteredExecutor>,
+    executors: Vec<RegisteredExecutor>,
 }
 
 /// 投产期订阅可行性校验（纯函数，供单测）。
@@ -127,6 +129,35 @@ fn validate_subscriptions(
 
 
 impl Provisioner {
+    /// 装配期构造。
+    ///
+    /// 参数多是因为编排的协作者就是这么多（每个都在字段注释里说明了用途）；
+    /// 换成字段公开 + 结构体字面量能省下这个构造函数，但那样 manager 就能随手改写
+    /// 编排的实例列表与下单出口 —— 拿边界换构造便利，不值。
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
+        capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
+        income_processor: ActorRef<crate::engine::live::IncomeProcessorActor>,
+        metrics: ActorRef<crate::engine::live::MetricsActor>,
+        position_ledger: ActorRef<crate::engine::live::PositionLedgerActor>,
+        outcome_pubsub: ActorRef<crate::engine::live::OutcomePubSub>,
+        order_gateway: Arc<crate::engine::live::OrderGateway>,
+        exchange_actors: HashMap<Exchange, Box<dyn super::ExchangeActorOps>>,
+    ) -> Self {
+        Self {
+            accounts,
+            capabilities,
+            income_processor,
+            metrics,
+            position_ledger,
+            outcome_pubsub,
+            order_gateway,
+            exchange_actors,
+            executors: Vec::new(),
+        }
+    }
+
     /// 有序撤下一个 executor：发出 Stop、并**等它真的停下**。
     ///
     /// # 为什么不能用 `kill()`
@@ -147,7 +178,7 @@ impl Provisioner {
     async fn stop_executor(
         &mut self,
         executor: &ActorRef<ExecutorActor>,
-        producers: &mut ChildGroup,
+        producers: &mut ChildRegistrar<'_>,
     ) -> Result<(), String> {
         // 必须是 stop_gracefully 而非 kill：前者产生 `Normal`，`on_link_died` 据此放行；
         // kill 产生 `Killed`，会被判成事故、把整个引擎带走。
@@ -270,7 +301,7 @@ impl Provisioner {
         &mut self,
         strategies: Vec<StrategySpec>,
         symbol_metas: &HashMap<(Exchange, Symbol), SymbolMeta>,
-        producers: &mut ChildGroup,
+        mut producers: ChildRegistrar<'_>,
         manager: &ActorRef<ManagerActor>,
     ) -> Result<(), ExchangeError> {
         if strategies.is_empty() {
@@ -393,7 +424,7 @@ impl Provisioner {
             )
             .await
         {
-            self.rollback_executors(&executor_refs, producers).await;
+            self.rollback_executors(&executor_refs, &mut producers).await;
             return Err(e);
         }
 
@@ -583,7 +614,7 @@ impl Provisioner {
     async fn rollback_executors(
         &mut self,
         created: &[(ActorRef<ExecutorActor>, AccountId)],
-        producers: &mut ChildGroup,
+        producers: &mut ChildRegistrar<'_>,
     ) {
         let ids: HashSet<ActorId> = created.iter().map(|(r, _)| r.id()).collect();
         for (executor, account) in created {
@@ -631,7 +662,9 @@ impl Message<RemoveStrategies> for ManagerActor {
         msg: RemoveStrategies,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.provisioner.remove(msg, &mut self.producers).await
+        self.provisioner
+            .remove(msg, ChildRegistrar::new(&mut self.producers))
+            .await
     }
 }
 
@@ -640,7 +673,7 @@ impl Provisioner {
     pub(super) async fn remove(
         &mut self,
         msg: RemoveStrategies,
-        producers: &mut ChildGroup,
+        mut producers: ChildRegistrar<'_>,
     ) -> Result<(), ExchangeError> {
         let targets: Vec<Symbol> = msg.symbols;
         // 交易所侧的残留（挂单 / 仓位）只有实盘账户才有：模拟账户的两者都在本地柜台里，
@@ -727,7 +760,7 @@ impl Provisioner {
                 tracing::error!(error = %e, "Failed to unregister executor");
             }
             // 有序停下并**等它真的停**：后面要撤单 / 平仓，不能让它在排空邮箱时又下新单
-            if let Err(reason) = self.stop_executor(&reg.executor, producers).await {
+            if let Err(reason) = self.stop_executor(&reg.executor, &mut producers).await {
                 tracing::error!(
                     account = %reg.account,
                     %reason,

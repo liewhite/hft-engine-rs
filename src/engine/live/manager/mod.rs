@@ -8,7 +8,7 @@
 //! - **停机**：生产者 -> 总线 -> 消费者三段依次停（见 `on_stop` 与
 //!   `crate::actor_lifecycle`），组内并发、组间有序。
 
-use crate::actor_lifecycle::{ChildGroup, ChildStop};
+use crate::actor_lifecycle::{ChildGroup, ChildRegistrar, ChildStop};
 use crate::engine::bootstrap::Supervised;
 use super::{
     to_live_outlet, to_paper_outlet, AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs,
@@ -61,8 +61,10 @@ pub struct ManagerActor {
     /// 策略投产与撤下的编排器。
     ///
     /// 它独占 manager 原有 15 个字段里只有它用的那 7 个（账户句柄、能力表、分发层、
-    /// 两个镜像、下单出口、交易所适配层、实例列表）—— 字段归属即职责声明，
-    /// 编译器保证编排碰不到三条总线与停机分组。见 `provisioning.rs` 模块文档。
+    /// 两个镜像、下单出口、交易所适配层、实例列表）—— 字段归属即职责声明。
+    ///
+    /// 三条总线与三个停机分组不在其中，也不作为参数传入，因此编排**在类型上**够不着；
+    /// 生产者组按 [`ChildRegistrar`] 借出，能力面只有 spawn / remove。见 `provisioning.rs`。
     provisioner: Provisioner,
 
     // === PubSub Actors ===
@@ -385,17 +387,16 @@ impl Actor for ManagerActor {
 
         Ok(Self {
             symbol_metas,
-            provisioner: Provisioner {
+            provisioner: Provisioner::new(
                 accounts,
                 capabilities,
-                income_processor: processor,
+                processor,
                 metrics,
-                position_ledger: position_ledger.clone(),
-                outcome_pubsub: outcome_pubsub.clone(),
+                position_ledger.clone(),
+                outcome_pubsub.clone(),
                 order_gateway,
                 exchange_actors,
-                executors: Vec::new(),
-            },
+            ),
             market_pubsub,
             account_pubsub,
             outcome_pubsub,
@@ -519,8 +520,8 @@ impl Message<AddStrategy> for ManagerActor {
             .add(
                 vec![msg.0],
                 &self.symbol_metas,
-                &mut self.producers,
-                &ctx.actor_ref().clone(),
+                ChildRegistrar::new(&mut self.producers),
+                ctx.actor_ref(),
             )
             .await
     }
@@ -541,8 +542,8 @@ impl Message<AddStrategies> for ManagerActor {
             .add(
                 msg.0,
                 &self.symbol_metas,
-                &mut self.producers,
-                &ctx.actor_ref().clone(),
+                ChildRegistrar::new(&mut self.producers),
+                ctx.actor_ref(),
             )
             .await
     }

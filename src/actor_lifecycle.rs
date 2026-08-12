@@ -87,6 +87,54 @@ pub struct ChildGroup {
     shut_down: bool,
 }
 
+/// 只能**往一个停机分组里增删成员**的借出面。
+///
+/// # 为什么需要它
+///
+/// 投产编排要把新建的 executor 登记进生产者组，此外与停机链无关。若直接给它
+/// `&mut ChildGroup`，它连 [`ChildGroup::shutdown`] 都能调 —— 也就是能把整组子 actor
+/// 提前停掉。那不是编排的职责，而"何时停、按什么顺序停"是 `ManagerActor` 唯一说了算的事。
+///
+/// 本类型把能力面收到 `spawn` / `remove` 两个方法：**停机分组的所有权与停机时机留在
+/// 组合根**，借出去的只是"加一项、撤一项"。
+///
+/// 一个如实说明：三个分组（生产者 / 总线 / 消费者）同为 `ChildGroup`，所以"借出的是
+/// 哪一组"仍由调用点写对，编译器分不出来。本类型限制的是**能对它做什么**，不是**它是谁**。
+pub struct ChildRegistrar<'a> {
+    group: &'a mut ChildGroup,
+}
+
+impl<'a> ChildRegistrar<'a> {
+    pub fn new(group: &'a mut ChildGroup) -> Self {
+        Self { group }
+    }
+
+    /// 借出面的再借出：让持有者能把它传进更深一层而不必交出所有权
+    pub fn reborrow(&mut self) -> ChildRegistrar<'_> {
+        ChildRegistrar { group: self.group }
+    }
+
+    /// 见 [`ChildGroup::spawn`]
+    pub async fn spawn<A, P>(
+        &mut self,
+        parent: &ActorRef<P>,
+        name: &'static str,
+        args: A::Args,
+    ) -> ActorRef<A>
+    where
+        A: Actor + Spawn,
+        A::Args: Send,
+        P: Actor,
+    {
+        self.group.spawn::<A, P>(parent, name, args).await
+    }
+
+    /// 见 [`ChildGroup::remove`]
+    pub fn remove<A: Actor>(&mut self, child: &ActorRef<A>) {
+        self.group.remove(child);
+    }
+}
+
 impl ChildGroup {
     /// 起一个子 actor：等价于 `spawn_link_with_mailbox`，并把它登记进本组。
     ///

@@ -304,19 +304,35 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 | 编排不碰 | `market_pubsub` / `account_pubsub` / `buses` / `consumers` |
 
 `symbol_metas` 与 `producers` 作为参数传入而非搬走：前者是引擎级合约目录，属于组合根，
-复制一份进编排就是两份权威（P1）；后者传 `&mut` 是为了让编排**只能往停机链里加一项**，
-决定不了何时停、按什么顺序停。
+复制一份进编排就是两份权威（P1）；后者按 [`ChildRegistrar`] 借出 —— 那个借出面只有
+`spawn` / `remove`，编排调不到 `shutdown()`。
+
+**哪些是编译期保证、哪些只是约定**（品味 1.5，初稿把三条一律写成了"编译器保证"）：
+
+| 判据 | 强度 |
+|---|---|
+| 编排够不着三条总线与三个停机分组 | 编译期（既非字段也非参数） |
+| 编排停不掉生产者组 | 编译期（`ChildRegistrar` 无 `shutdown`） |
+| manager 改不了编排的实例列表与下单出口 | 编译期（字段私有 + `Provisioner::new`） |
+| 借出的是**哪一个**停机分组 | **仅靠调用点写对** —— 三个组同为 `ChildGroup`，编译器分不出来 |
 
 > **原文的理由是错的**。V6 初稿写"只是恰好都需要子 actor 句柄"——实测有 7 个字段
 > **只有编排用**，所以它不是"恰好共用"，而是一个真实可分的依赖簇。若真如初稿所说
 > 全是共用句柄，这一步就不该做（那会是虚假抽象：拆开后靠传一堆参数分发）。
 > 动手前把 `self.X` 逐个数了一遍才发现，行数也从"1951"变成了 2015 —— R1/R2/R3 期间它一直在涨。
 
-### V7 观测口径泄漏进领域状态 —— 违反 P3
+### ~~V7 观测口径泄漏进领域状态~~ —— **已修复（R5）**
 
-`SymbolExposure::session_notional_delta`（把重启前存货从盈亏里剔除）是 metrics 的概念，
-却住在三方共用的 `SymbolState` 上。生产代码里 `exposure()` 只有 `metrics.rs:160` 一个调用点。
-→ 计划 R5
+原状：`SymbolExposure::session_notional_delta`（把重启前存货从盈亏里剔除）是 metrics 的
+概念，却住在策略/对账/观测三方共用的 `SymbolState` 上；`exposure(baseline)` 的参数本身
+就是 metrics 自持的会话基线，领域层没有理由知道"会话"是什么。
+
+现状：`SymbolExposure` 与估值函数搬进 `metrics.rs`（`exposure_of(state, baseline)`），
+`messaging` 不再导出它。
+
+判据是**能不能纯移动**：它只用 `position_book().all()` 与 `bbo()` 两个既有公开访问器，
+所以搬走之后领域层不必为观测保留任何接口。若搬走还得在领域层开新口子，
+那说明边界没划对，该回上一层重想。
 
 ---
 
