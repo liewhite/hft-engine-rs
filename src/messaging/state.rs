@@ -646,9 +646,6 @@ impl SymbolState {
         self.position_book.seed(&self.symbol, position, snapshot_req_ts)
     }
 
-    pub fn is_position_seeded(&self, exchange: Exchange) -> bool {
-        self.position_book.is_seeded(exchange)
-    }
 
     pub fn seeded_positions(&self) -> impl Iterator<Item = &Position> {
         self.position_book.seeded_positions()
