@@ -153,8 +153,16 @@ fn validate_subscriptions(
 /// 这两个量对策略的可行动性没有差别 —— 而这也正是改动前的行为（无记录时
 /// `position_size` 返回 `0`），本函数只是把它从"碰巧如此"变成"写明如此"。
 ///
-/// `snapshot_req_ts` 对补 0 的两行取 `0`：没有快照可言，因此不过滤任何 Fill
-/// （防双计规则见 `SymbolPositions::apply_fill`）。
+/// # 补 0 的基线取 `snapshot_req_ts = 0`，以及这里的边界
+///
+/// 没有快照可言，所以不该过滤任何 Fill（防双计规则见 `SymbolPositions::apply_fill`）。
+/// 但那条规则的判据是 `local_ts <= seeded_ts` 且 `Timestamp = u64` ——
+/// **`local_ts == 0` 的 Fill 仍会被 ts=0 的基线丢掉**。说"不过滤任何 Fill"是不准确的。
+///
+/// 今天不可达，三条各自独立：实盘与纸盘的 Fill `local_ts` 取 `now_ms()`，恒远大于 0；
+/// 回测不经投产、从不 seed；无凭证的所收不到任何 Fill。
+/// 由 `synthesised_baseline_only_swallows_a_zero_timestamp_fill` 钉住这条边界 ——
+/// 哪天有路径产生 `local_ts == 0` 的 Fill，那条测试会说明它会发生什么。
 fn executor_baselines(
     account: &AccountId,
     scope: &HashSet<(Exchange, Symbol)>,
@@ -1313,11 +1321,67 @@ mod subscription_validation_tests {
             assert_eq!(size_at(&b, NO_ACCOUNT), Some(0.0));
         }
 
-        /// 补 0 的基线取 `snapshot_req_ts = 0`：没有快照可言，不该过滤掉任何 Fill
+        /// 补 0 的基线取 `snapshot_req_ts = 0`
         #[test]
-        fn synthesised_baselines_filter_no_fills() {
+        fn synthesised_baselines_use_a_zero_snapshot_timestamp() {
             let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest());
             assert!(b.iter().all(|x| x.snapshot_req_ts == 0));
+        }
+
+        /// **钉住 ts=0 的真实边界**：它并非"不过滤任何 Fill" —— 防双计判据是
+        /// `local_ts <= seeded_ts`，所以 `local_ts == 0` 的 Fill 照样会被吞掉。
+        ///
+        /// 今天不可达（实盘/纸盘的 `local_ts` 取 `now_ms()`；回测不经投产、从不 seed；
+        /// 无凭证的所收不到 Fill），但注释里曾写成"不过滤任何 Fill"，那是不准确的声明。
+        /// 这条测试让边界成为可执行的事实：哪天真有路径产生 `local_ts == 0` 的 Fill，
+        /// 读到这里就知道会发生什么，而不是被那句话误导。
+        #[test]
+        fn synthesised_baseline_only_swallows_a_zero_timestamp_fill() {
+            use crate::messaging::{AccountData, IncomeEvent, StateManager};
+
+            let baselines = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest());
+            let fill_at = |local_ts: u64| {
+                IncomeEvent::account(
+                    AccountId::Live,
+                    local_ts,
+                    local_ts,
+                    AccountData::Fill(crate::domain::Fill {
+                        exchange: WITH_ACCOUNT,
+                        symbol: SYM.to_string(),
+                        side: crate::domain::Side::Long,
+                        price: 100.0,
+                        size: 1.0,
+                        client_order_id: None,
+                        order_id: "1".to_string(),
+                        timestamp: local_ts,
+                        fee: 0.0,
+                        reason: crate::domain::FillReason::Normal,
+                    }),
+                )
+            };
+
+            let mut swallowed = StateManager::new(&[SYM.to_string()], 0);
+            swallowed.seed_positions(&baselines);
+            swallowed.apply(&fill_at(0));
+            assert_eq!(
+                swallowed
+                    .symbol_state(&SYM.to_string())
+                    .expect("state")
+                    .position_size(WITH_ACCOUNT),
+                0.0,
+                "local_ts == 0 的 Fill 会被 ts=0 的基线判成「已含在快照里」而丢弃"
+            );
+
+            let mut kept = StateManager::new(&[SYM.to_string()], 0);
+            kept.seed_positions(&baselines);
+            kept.apply(&fill_at(1));
+            assert_eq!(
+                kept.symbol_state(&SYM.to_string())
+                    .expect("state")
+                    .position_size(WITH_ACCOUNT),
+                1.0,
+                "local_ts >= 1 照常累加 —— 实盘与纸盘取 now_ms()，恒落在这一侧"
+            );
         }
     }
 }

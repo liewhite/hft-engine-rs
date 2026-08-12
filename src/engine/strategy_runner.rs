@@ -102,7 +102,12 @@ impl StrategyRunner {
         &self.state
     }
 
-    /// 写入持仓基线（实盘投产握手；回测/模拟账户从 0 起算，不调用）。
+    /// 写入持仓基线（投产握手）。
+    ///
+    /// **实盘与模拟账户都会调用**：v0.16 起投产为作用域内每条腿都写基线，模拟账户写的是
+    /// 全 0（从零起步的真值），为的是让"持仓未查询到"这个状态对策略不可达
+    /// （见 `manager/provisioning.rs` 的 `executor_baselines`）。回测不经投产，不调用。
+    ///
     /// 语义见 [`crate::messaging::PositionBaseline`] 与 `SymbolState::seed_position`。
     pub fn seed_positions(&mut self, baselines: &[crate::messaging::PositionBaseline]) {
         self.state.seed_positions(baselines);
