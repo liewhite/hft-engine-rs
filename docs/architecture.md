@@ -232,9 +232,16 @@ fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<Outcome
 > 变量名叫 `state` 的调用点，而策略里那三处的变量名是 `state_manager`。
 > 这对 R3 的设计有实质影响：策略视图**必须**包含账户投影，不能只给 per-symbol 那三份。
 
-策略能读到其他 symbol 的状态、其他所的余额与希腊值、任意 symbol 的挂单，无机制阻止。
-连带后果：「策略是纯函数」实际是「对一个巨大可变历史投影的纯函数」；往 `StateManager`
-加字段会自动扩大所有策略的可见面，编译器不报警。→ 计划 R3
+连带后果：往 `StateManager` 加字段会自动扩大所有策略的可见面，编译器不报警；
+而账户级数据（`equity` / `account_info` / `greeks`）按交易所索引且**不按订阅范围过滤** ——
+策略可以读到它压根没订阅的交易所的净值。
+
+> **一处更正**：本节初稿还写过"策略能看到其他 symbol 的状态"，那是错的。
+> `StrategyRunner` 用策略自己 `public_streams()` 推导的 symbol 集合去建 `StateManager`，
+> 它能查到的 symbol 本来就只有自己订的。R3 的收益是接口最小化与账户数据裁剪两条，
+> 不含 symbol 隔离。
+
+→ 计划 R3
 
 ### ~~V3 `ExchangeClient` 用返回空值表达"没有能力"~~ —— **已修复（R1）**
 
