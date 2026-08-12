@@ -7,14 +7,15 @@
 //! `sub.symbols.contains(&key)`、一个查 `self.subscriptions.contains(&route)` ——
 //! 恰好等价，但那是巧合不是保证（原则 P1/P4）。
 //!
-//! 判据收进本类型之后，两条驱动调的是同一个 [`SubscriptionScope::accepts`]，
+//! 判据收进本类型之后，两条驱动调的是同一个 [`SubscriptionScope::accepts_delivery`]，
 //! 而"事件的定位精度有几档"由 [`Delivery`] 的穷举 `match` 保证漏不掉（原则 P6）。
 //!
 //! # 热路径上仍然可以用索引
 //!
 //! `IncomeProcessorActor` 为 symbol 定向的行情事件建了 `(所, symbol) -> 订阅者` 的反向
 //! 索引，那是 O(1) 扇出优化，不是第二份判据 —— 索引的键由 [`SubscriptionScope::pairs`]
-//! 灌，与 `accepts` 同源。
+//! 灌，与判据同源。这条同源关系是**结构约定**而非编译期保证，故分发层在索引命中处留了
+//! 一条 `debug_assert`：索引与范围一旦失配，测试与回测里会立刻响，而不是静默错投。
 
 use crate::domain::{Exchange, Symbol};
 use crate::messaging::{Delivery, IncomeEvent};
@@ -40,19 +41,28 @@ impl SubscriptionScope {
         Self { symbols }
     }
 
-    /// 这条事件在本范围内吗 —— **判据的唯一出处**。
+    /// 这条事件在本范围内吗。
+    ///
+    /// 一个消费者判一条事件时用它；分发层要对 N 个消费者判**同一条**事件，
+    /// 应当先自己 `delivery()` 一次再走 [`Self::accepts_delivery`] ——
+    /// `Delivery::Symbol` 持有 `Symbol`（`String`），逐个消费者重推导就是逐个一次分配。
+    pub fn accepts(&self, event: &IncomeEvent) -> bool {
+        self.accepts_delivery(&event.delivery())
+    }
+
+    /// 判据的**唯一出处**。
     ///
     /// 所级读数按所过滤，是三档里唯一不显然的一档：`Balance` / `AccountInfo` / `Greeks`
     /// 没有 symbol，此前一律广播，于是策略能读到自己压根没订的所的净值 —— 而杠杆闸门
     /// 就是拿净值算的。堵在这里（分发层）而不是堵在策略视图上：视图只挡查询，挡不住
     /// 事件 payload 本身带着净值推给策略。
-    pub fn accepts(&self, event: &IncomeEvent) -> bool {
-        match event.delivery() {
+    pub fn accepts_delivery(&self, delivery: &Delivery) -> bool {
+        match delivery {
             Delivery::Symbol(exchange, symbol) => self
                 .symbols
-                .get(&exchange)
-                .is_some_and(|symbols| symbols.contains(&symbol)),
-            Delivery::Exchange(exchange) => self.symbols.contains_key(&exchange),
+                .get(exchange)
+                .is_some_and(|symbols| symbols.contains(symbol)),
+            Delivery::Exchange(exchange) => self.symbols.contains_key(exchange),
             Delivery::Broadcast => true,
         }
     }

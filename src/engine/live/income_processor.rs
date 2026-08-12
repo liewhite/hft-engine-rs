@@ -163,12 +163,20 @@ impl Message<MarketEvent> for IncomeProcessorActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let event = IncomeEvent::Market(msg);
-        match event.delivery() {
+        let delivery = event.delivery();
+        match &delivery {
             Delivery::Symbol(exchange, symbol) => {
-                // 定向：索引 O(1)
-                if let Some(ids) = self.by_symbol.get(&(exchange, symbol)) {
+                // 定向：索引 O(1)。索引的键由 `SubscriptionScope::pairs()` 灌，与判据同源，
+                // 所以这里不再问一遍 accepts —— 但那是**结构约定**，不是编译期保证，
+                // 故留一条 debug 断言：索引一旦与范围失配（例如日后有人给 scope 加了
+                // mutator 却忘了同步索引），回测与测试里会立刻响，而不是静默错投。
+                if let Some(ids) = self.by_symbol.get(&(*exchange, symbol.clone())) {
                     for id in ids {
                         if let Some(sub) = self.executors.get(id) {
+                            debug_assert!(
+                                sub.scope.accepts_delivery(&delivery),
+                                "by_symbol 索引与订阅范围失配：事件被投给了范围外的 executor"
+                            );
                             Self::forward(sub, &event).await;
                         }
                     }
@@ -179,7 +187,7 @@ impl Message<MarketEvent> for IncomeProcessorActor {
             // 两档都由同一个判据回答，不在这里重写一遍。
             Delivery::Exchange(_) | Delivery::Broadcast => {
                 for sub in self.executors.values() {
-                    if sub.scope.accepts(&event) {
+                    if sub.scope.accepts_delivery(&delivery) {
                         Self::forward(sub, &event).await;
                     }
                 }
@@ -208,12 +216,17 @@ impl Message<AccountEvent> for IncomeProcessorActor {
             let Some(sub) = self.executors.get(id) else {
                 continue;
             };
-            if !sub.scope.accepts(&event) {
+            if !sub.scope.accepts_delivery(&delivery) {
                 // 该账户的私有事件、但不在这个 executor 的订阅范围内。
                 // - Live：分桶部署的常态（账户级全量私有流含其他桶的 symbol），静默跳过；
                 // - Paper：柜台只为本进程策略的订单产回报，被过滤即异常 —— 策略对未订阅
                 //   symbol 下了单，回报回不来，订单会停在 Created、超时清理后反复重挂。
                 //   丢弃点必须可见。
+                //
+                // **只对 Symbol 档 warn，所级档刻意不 warn**：Paper 的所级事件只有柜台按
+                // (账户, 所) 发的 AccountInfo，它被丢弃的两种来路都不值得报 —— 多策略共享
+                // 同一模拟账户时丢的是别人的所（纯噪声）；策略真在范围外的所下了单时，
+                // 那张单的 OrderUpdate 是 Symbol 档、已经在下面 warn 过了，可行动的信号没丢。
                 if account != AccountId::Live {
                     if let Delivery::Symbol(exchange, symbol) = &delivery {
                         tracing::warn!(
