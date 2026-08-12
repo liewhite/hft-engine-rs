@@ -10,7 +10,7 @@
 //! link 监管上抛 → ManagerActor `on_link_died` → 整个系统致命退出（宁可重启，绝不糊弄）。
 
 use crate::domain::{now_ms, BorrowFee, Exchange, ExchangeRate};
-use crate::engine::MarketPubSub;
+use crate::messaging::MarketPubSub;
 use crate::exchange::ibkr::IbkrClient;
 use crate::messaging::{MarketData, MarketEvent};
 use kameo::actor::{ActorRef, WeakActorRef};

@@ -6,9 +6,17 @@
 //! 保留独立 Actor 的理由：
 //! - StateManager 默认 Closed（安全侧），需要主动"喂"状态以避免策略误判
 //! - 未来加密交易所可能有维护停机等非 Liquid 状态，届时可在此扩展判定逻辑
+//!
+//! # 为什么住在适配层
+//!
+//! "这个场子什么时候开门"是**场子的属性**，不是引擎的编排逻辑 —— 加密所 7x24、
+//! IBKR 有交易时段（它自己走 `status_polling` 查交易日历）。本 actor 只由三个加密所的
+//! 适配层 spawn，此前却住在 `engine::live`，于是适配层为了 spawn 它反向依赖引擎层
+//! （`docs/architecture.md` V9）。搬到本层后那条边消失，且"新增一个 7x24 的所就复用它、
+//! 新增一个有交易时段的所就自己写"这件事，在目录上也看得出来了。
 
 use crate::domain::{now_ms, Exchange, MarketStatus};
-use crate::messaging::{MarketData, MarketEvent};
+use crate::messaging::{MarketData, MarketEvent, MarketPubSub};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -17,8 +25,6 @@ use kameo_actors::pubsub::Publish;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio_stream::wrappers::IntervalStream;
-
-use super::MarketPubSub;
 
 /// CryptoStatusActor 初始化参数
 pub struct CryptoStatusActorArgs {

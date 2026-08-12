@@ -218,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_engine_rs::exchange::utils::StepFormatter;
+    use hft_engine_rs::domain::StepFormatter;
     use std::sync::Arc;
 
     fn meta(exchange: Exchange, symbol: &str) -> SymbolMeta {

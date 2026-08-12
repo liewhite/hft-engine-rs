@@ -1120,7 +1120,7 @@ mod subscription_validation_tests {
         let meta = SymbolMeta {
             exchange: Exchange::Binance,
             symbol: "BTC".to_string(),
-            price_formatter: Arc::new(crate::exchange::utils::StepFormatter::new(0.1)),
+            price_formatter: Arc::new(crate::domain::StepFormatter::new(0.1)),
             size_step: 0.001,
             min_order_size: 0.001,
             contract_size: 1.0,

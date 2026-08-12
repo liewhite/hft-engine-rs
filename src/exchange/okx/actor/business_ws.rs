@@ -7,7 +7,7 @@
 //! - 直接解析消息并发布到对应总线
 
 use crate::domain::{CandleInterval, now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::engine::MarketPubSub;
+use crate::messaging::MarketPubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{
     CandleRawData, WsPush, candle_interval_to_okx_bar, okx_channel_to_candle_interval,

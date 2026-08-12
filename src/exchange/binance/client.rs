@@ -8,7 +8,7 @@ use crate::domain::{
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
 use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
-use crate::exchange::utils::StepFormatter;
+use crate::domain::StepFormatter;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;

@@ -12,7 +12,7 @@ use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
 use crate::exchange::hyperliquid::codec::{
     size_step, AssetCtx, AssetInfo, ClearinghouseState, MetaResponse,
 };
-use crate::exchange::utils::SignificantFiguresFormatter;
+use crate::domain::SignificantFiguresFormatter;
 use std::sync::Arc;
 use crate::exchange::hyperliquid::signing::{
     action_hash, create_signer, sign_l1_action, BulkCancelAction, BulkOrderAction, CancelResponse,

@@ -467,7 +467,7 @@ mod tests {
 
     /// 测试元数据：步长/最小量取得足够小，既有测试的数量不触发下界校验
     fn test_metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
-        use crate::exchange::utils::StepFormatter;
+        use crate::domain::StepFormatter;
         Arc::new(
             [Exchange::Binance, Exchange::OKX]
                 .into_iter()

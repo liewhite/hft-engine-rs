@@ -693,7 +693,7 @@ mod place_verdict_tests {
     use crate::domain::{
         AccountInfo, OrderId, OrderType, Position, RejectReason, Side, TimeInForce,
     };
-    use crate::exchange::utils::StepFormatter;
+    use crate::domain::StepFormatter;
     use kameo::actor::Spawn;
     use kameo::mailbox;
     use kameo_actors::pubsub::Subscribe;

@@ -21,8 +21,13 @@ use crate::domain::{Symbol, Timestamp};
 
 use super::record::SymbolRecord;
 
-/// 判据对某个 symbol 能看到的全部事实。
-pub struct SymbolView<'a> {
+/// 判据对某个 symbol 能看到的全部事实：两个账户的表现 + 时间。
+///
+/// 此前叫 `SymbolView`，与 [`crate::strategy::SymbolView`]（策略的单 symbol 状态视图）
+/// 重名 —— 两者毫无关系，却都从各自模块的顶层导出，同时 `use` 两个模块就会撞名
+/// （`docs/architecture.md` V10）。改名的是本类型：它的消费者只有 `PromotionPolicy`
+/// 的实现者，波及面比刚随 v0.13.0 发出去的策略契约小得多。
+pub struct SymbolPerformance<'a> {
     pub symbol: &'a Symbol,
     /// 模拟账户的表现（常驻运行）
     pub paper: &'a SymbolRecord,
@@ -34,7 +39,7 @@ pub struct SymbolView<'a> {
     pub now: Timestamp,
 }
 
-impl SymbolView<'_> {
+impl SymbolPerformance<'_> {
     /// 实盘是否已开启
     pub fn is_live(&self) -> bool {
         self.live.is_some()
@@ -68,7 +73,7 @@ pub trait PromotionPolicy: Send + 'static {
     ///
     /// 返回与当前状态矛盾的决定（未开实盘却 `Demote`、已开却 `Promote`）会被框架忽略并
     /// 记一条 warn —— 不静默丢弃，便于发现判据写错。
-    fn decide(&mut self, view: &SymbolView<'_>) -> Decision;
+    fn decide(&mut self, view: &SymbolPerformance<'_>) -> Decision;
 }
 
 /// 永不晋升的占位判据 —— 框架默认值。
@@ -81,7 +86,7 @@ pub trait PromotionPolicy: Send + 'static {
 pub struct NeverPromote;
 
 impl PromotionPolicy for NeverPromote {
-    fn decide(&mut self, _view: &SymbolView<'_>) -> Decision {
+    fn decide(&mut self, _view: &SymbolPerformance<'_>) -> Decision {
         Decision::Hold
     }
 }
@@ -112,7 +117,7 @@ mod tests {
         paper.apply_fill(&mk(Side::Short, 110.0, 2));
         assert!(paper.realized_pnl() > 0.0);
 
-        let view = SymbolView {
+        let view = SymbolPerformance {
             symbol: &symbol,
             paper: &paper,
             live: None,
@@ -130,7 +135,7 @@ mod tests {
             calls: u32,
         }
         impl PromotionPolicy for CountingPolicy {
-            fn decide(&mut self, _view: &SymbolView<'_>) -> Decision {
+            fn decide(&mut self, _view: &SymbolPerformance<'_>) -> Decision {
                 self.calls += 1;
                 // 第三次调用才晋升 —— 模拟"需要累积到一定观察次数"
                 if self.calls >= 3 {
@@ -144,7 +149,7 @@ mod tests {
         let symbol = "BTC".to_string();
         let paper = SymbolRecord::new(symbol.clone(), 8);
         let mut policy = CountingPolicy { calls: 0 };
-        let view = || SymbolView {
+        let view = || SymbolPerformance {
             symbol: &symbol,
             paper: &paper,
             live: None,
@@ -162,7 +167,7 @@ mod tests {
         let symbol = "BTC".to_string();
         let paper = SymbolRecord::new(symbol.clone(), 8);
         let live = SymbolRecord::new(symbol.clone(), 8);
-        let view = SymbolView {
+        let view = SymbolPerformance {
             symbol: &symbol,
             paper: &paper,
             live: Some(&live),
@@ -178,7 +183,7 @@ mod tests {
     fn live_elapsed_is_zero_when_not_live() {
         let symbol = "BTC".to_string();
         let paper = SymbolRecord::new(symbol.clone(), 8);
-        let view = SymbolView {
+        let view = SymbolPerformance {
             symbol: &symbol,
             paper: &paper,
             live: None,

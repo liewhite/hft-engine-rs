@@ -3,14 +3,15 @@ pub mod client;
 pub mod hyperliquid;
 pub mod ibkr;
 pub mod okx;
+pub mod crypto_status;
 pub mod staleness;
-pub mod utils;
 pub mod ws_loop;
 
 /// trades 线路一致性测试（联网，`#[ignore]`）
 #[cfg(test)]
 mod trades_conformance;
 
+pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
 pub use client::{
     AccountClient, ExchangeAccess, ExchangeActorOps, ExchangeClient, ExchangeOrder,
     Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe,

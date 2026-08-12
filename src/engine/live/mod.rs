@@ -4,7 +4,6 @@
 
 pub mod assembly;
 mod clock;
-mod crypto_status;
 mod manager;
 mod executor;
 mod income_processor;
@@ -15,19 +14,12 @@ mod position_ledger;
 mod supervisor;
 
 use crate::domain::AccountId;
-use crate::messaging::{AccountEvent, MarketEvent};
 use crate::strategy::OutcomeEvent;
 use kameo_actors::pubsub::PubSub;
 
-/// 公共行情总线：承载 [`MarketEvent`]（无账户归属，一份服务所有账户）。
-pub type MarketPubSub = PubSub<MarketEvent>;
-
-/// 账户私有事件总线：承载 [`AccountEvent`]（账户是必填结构字段）。
-///
-/// 实盘适配层（标 [`AccountId::Live`]）与本地柜台 `PaperCounterActor`（标 `Paper(x)`）
-/// 发布**同一个类型**到这一条总线，消费者按 `account` 字段取自己的那份 ——
-/// 账户隔离由类型与字段值保证，不靠总线拓扑，也不靠"来源即 Live"的推断。
-pub type AccountPubSub = PubSub<AccountEvent>;
+// 两条**入向**总线的别名住在 `messaging`（它们承载的事件类型就定义在那儿）。
+// 此前住在本模块，导致各所适配层为了持 `ActorRef<MarketPubSub>` 而反向依赖引擎层。
+pub use crate::messaging::{AccountPubSub, MarketPubSub};
 
 /// 带账户归属的策略信号。
 ///
@@ -90,7 +82,6 @@ pub fn to_paper_outlet(o: &AccountOutcome) -> bool {
 
 pub use assembly::{setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup};
 pub use clock::{ClockActor, ClockActorArgs};
-pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
 pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, PublishCustomEvent, RegisterSupervisedChild, SubscribeAccount, SubscribeMarket, SubscribeOutcome, StrategySpec, RemoveStrategies};
 pub use executor::{ExecutorActor, ExecutorArgs, GetPositions};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor, UnregisterExecutor};
@@ -103,7 +94,7 @@ pub use position_ledger::{
 };
 pub use supervisor::{
     Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,
-    SupervisorArgs, SymbolRecord, SymbolView,
+    SupervisorArgs, SymbolRecord, SymbolPerformance,
 };
 
 #[cfg(test)]

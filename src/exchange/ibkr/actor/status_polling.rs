@@ -5,7 +5,7 @@
 //! API 失败时 warn 并跳过本轮，等待下次轮询重试。
 
 use crate::domain::{now_ms, Exchange, MarketStatus};
-use crate::engine::MarketPubSub;
+use crate::messaging::MarketPubSub;
 use crate::exchange::ibkr::client::TradingSchedule;
 use crate::exchange::ibkr::IbkrClient;
 use crate::messaging::{MarketData, MarketEvent};

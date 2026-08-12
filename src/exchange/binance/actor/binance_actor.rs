@@ -19,7 +19,8 @@ use super::funding_fee_polling::{BinanceFundingFeePollingActor, BinanceFundingFe
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
 use crate::domain::{ExchangeError, Symbol, SymbolMeta};
-use crate::engine::{AccountPubSub, CryptoStatusActor, CryptoStatusActorArgs, MarketPubSub};
+use crate::exchange::{CryptoStatusActor, CryptoStatusActorArgs};
+use crate::messaging::{AccountPubSub, MarketPubSub};
 use crate::exchange::binance::{
     BinanceClient, BinanceCredentials, WS_MARKET_URL, WS_PUBLIC_HIGH_FREQ_URL,
 };

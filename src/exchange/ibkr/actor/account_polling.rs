@@ -4,7 +4,7 @@
 //! 持仓不在此处刷新——初始持仓由 ManagerActor 启动期统一 fetch，运行期由 Fill 维护。
 
 use crate::domain::{now_ms, Exchange};
-use crate::engine::AccountPubSub;
+use crate::messaging::AccountPubSub;
 use crate::exchange::client::AccountClient;
 use crate::exchange::ibkr::IbkrClient;
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
