@@ -3,10 +3,10 @@
 //! OKX account-greeks WebSocket 推送频率太低，改用 REST 轮询。
 //! 官方限速 10/2s，配置为每秒 3 次。
 
-use crate::domain::{now_ms, Exchange};
+use crate::domain::Exchange;
 use crate::messaging::AccountPubSub;
 use crate::exchange::okx::OkxClient;
-use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
+use crate::exchange::staleness::{stamped_on_receipt, StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::messaging::{AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -43,9 +43,10 @@ pub struct OkxGreeksPollingActor {
 impl OkxGreeksPollingActor {
     /// 拉一次希腊值并发布。`Err` = 已停摆过久，调用方应致命退出。
     async fn poll_greeks(&mut self) -> Result<(), String> {
-        let local_ts = now_ms();
+        // 戳在响应到手之后取，理由见 `stamped_on_receipt`
+        let (read, local_ts) = stamped_on_receipt(self.client.fetch_greeks()).await;
 
-        match self.client.fetch_greeks().await {
+        match read {
             Ok(greeks_list) => {
                 self.guard.record_success();
                 for greeks in greeks_list {
