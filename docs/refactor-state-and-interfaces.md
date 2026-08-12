@@ -12,8 +12,8 @@
 | 阶段 | 目标 | 对应违反 | 状态 |
 |---|---|---|---|
 | R1 | 拆 `ExchangeClient`：公共 / 账户两个 trait | V3 | **已完成** |
-| R2 | 拆 `StateManager`：四个单一职责投影 | V1 | 未开始 |
-| R3 | 策略只拿受限视图 | V2 | 未开始（依赖 R2） |
+| R2 | 拆 `StateManager`：四个单一职责投影 | V1 | **已完成** |
+| R3 | 策略只拿受限视图 | V2 | 未开始（R2 已就绪，卡在测试夹具迁移） |
 | R4 | 下单出口的分发判据收敛到一处 | V4 | **已完成** |
 | R5 | 收尾：投产编排独立、观测口径移出领域层 | V6 / V7 | 未开始 |
 
@@ -203,8 +203,58 @@ pub struct AccountView { balances, account_infos, greeks, cash_balances }
 `SymbolState::apply` 的拆法：按 variant 分派给对应投影，**保留"未知 symbol 事件 = 路由 bug"
 的 error 日志**（现在这条判断在门面上，拆完仍应在门面上，不要让三个投影各自静默忽略）。
 
-**R2b 切换消费者**：逐个消费者改为只持它需要的子结构，`StateManager` 退化为组合容器或删除。
-`SymbolState` 随之拆解——它现在是"per-symbol 的一切"，拆后每个投影自己按 symbol 索引。
+**R2b 切换消费者**：逐个消费者改为只持它需要的子结构。
+
+### R2b 完成记录
+
+**持仓账本从 39 个方法收到 8 个。** 新增 `PositionBook`（跨 symbol 的 `SymbolPositions`
+容器），`Reconciler.mirror` 的类型从 `StateManager` 改为它 —— 类型就是职责声明，
+编译器保证账本碰不到行情缓存、挂单跟踪、账户净值、希腊值。
+
+**防双计规则单一化**（这一步的正确性前提）：「seed 之后、快照请求时刻之前送达的 Fill
+要丢弃」原先写在 `SymbolState::apply_account_data` 的 Fill 分支里。账本独立之后若不动它，
+这条规则就会有两份 —— 而两份的差异表现为"对账偶尔误报漂移"，是最难查的一类。
+故提取为 `SymbolPositions::apply_fill`，与 `seeded_at` 同住一个结构，门面与账本共用。
+
+**其余两个消费者不动，理由已核实**：
+
+- `StrategyRunner` 需要全部四个投影（策略实测用 11 个方法，跨四个投影）
+- `MetricsActor` 同样需要四个：`account_infos()` 走账户投影、`exposure()` 要
+  持仓 × 价格的 join、`pending_orders()` 要挂单。它是全景观测，本就该看全。
+
+所以"持仓折叠三份宿主"的数量没变，但**性质变了**：账本那份现在是最瘦、最专一的，
+而它正是唯一被 REST 持续校验的那份。这与 architecture.md §4 V1 的记录一致。
+
+### R2a 完成记录
+
+四个投影已落地并导出：`SymbolMarket` / `SymbolPositions` / `SymbolOrders`（per symbol，
+由 `SymbolState` 门面组合）+ `AccountView`（账户级，挂在 `StateManager` 上）。
+既有调用面全部保留为委托方法，故消费者改动极小。335 用例通过，clippy 净增 0。
+
+三处实现决定：
+
+1. 两个方法（`seed` / `remove_timed_out`）的日志要 symbol，改为**传参**，而不是让三个投影
+   各存一份 symbol 副本。
+2. `SymbolPositions::all()`（全部腿，含未 seed）与 `seeded_positions()`（仅已 seed）并存，
+   语义分明：前者供降级平仓取量（"本实例账上有什么"），后者供对账与对外快照
+   （"哪些可参与比对" —— 未 seed 是未知，不是空仓）。
+3. `apply` 的路由 bug 判断（"未知 symbol 事件"）留在**门面**上，不下放给三个投影 ——
+   否则每个投影都要各判一次，判漏了会静默忽略。
+
+`market_statuses` 留在 `StateManager` 上，没有并进 `AccountView`：它是公共行情
+（不属于账户），又是 per-exchange 而非 per-symbol（进不了 `SymbolMarket`）。
+
+**测试夹具改走生产路径**：`state.rs` 与 `spread_arb` 的夹具此前直接写 `pub` 字段
+（`state.bbos.insert` / `state.positions.insert`）。字段私有化后改为盘口走 `apply(行情事件)`、
+仓位走 `seed_position`。直接写字段更省事，但那样测的就不是线上跑的那条路。
+
+### 一处影响 R3 的更正
+
+统计策略依赖面时我漏了账户级方法（当时只扫了变量名 `state` 的调用点，而策略里那三处叫
+`state_manager`）。实际是 **11 个**而非 8 个：per-symbol 八个之外，还有 `equity` /
+`account_info`（`spread_arb` 的杠杆闸门）与 `greeks`（`gamma_scalp` 的 delta）。
+
+**R3 的策略视图必须包含 `AccountView`**，不能只给 per-symbol 那三份。
 
 ### 验收
 
@@ -273,6 +323,39 @@ impl SymbolView<'_> {
 ### 风险
 
 中。改动集中在 trait 与四个实现，但 `spread_arb` 有 1648 行，需要逐个调用点核对。
+
+### 一次未完成的尝试留下的结论（附一处自己犯的错）
+
+**回滚没滚干净**：`git checkout -- .` 只回滚**已跟踪**的修改文件，新建的
+`src/strategy/view.rs` 是未跟踪文件、没被回滚，随后 `git add -A` 把它扫进了那个
+docs commit —— 于是仓库里躺了一个 109 行、没在 `mod.rs` 里声明、**不参与编译**的孤儿文件，
+而 commit message 明写着"代码已回滚，未留半成品"。
+
+这正是品味 1.5 说的"比不写更糟"的那类声明。教训写在这里：
+**声称回滚之后要 `git status` 确认，未跟踪文件不在 `checkout --` 的射程内。**
+
+
+生产代码部分改完是顺的（trait 签名、`StrategyRunner` 构造视图、`gamma_scalp`、
+`spread_arb`、三个 bin 策略），**卡点在 `spread_arb` 的测试夹具**：
+
+约 30 处调用点把 `symbol_state()`（返回 `SymbolState`）与 `view()`（返回 `StateManager`）
+当**两个独立夹具**用。改成视图之后 `SymbolView` 与 `StrategyView` 都要从**同一个**
+底层 `StateManager` 借出，两个夹具必须合并成一个，30 处调用点随之全改。
+
+下次做时先做这一步：引入一个持有底层 `StateManager` 的测试夹具类型，按需借出两种视图，
+再改生产代码。反过来做会卡在中间。
+
+### 另一处要在文档里更正的话
+
+V2 初稿的理由之一是"策略能看到其他 symbol 的状态"——**这是错的**。`StrategyRunner`
+用策略自己 `public_streams()` 推导出的 symbol 集合去建 `StateManager`，所以它能查到的
+symbol 本来就只有自己订的那些。
+
+R3 真正的收益是两条，比初稿写的窄：
+
+1. **接口最小化**：39 个方法收到 11 个，且往引擎状态里加字段不会自动扩大策略可见面
+2. **账户数据按订阅范围裁剪**：`equity` / `account_info` / `greeks` 按交易所索引，
+   此前不过滤 —— 策略可以读到它压根没订阅的交易所的净值。这是**确实存在**的越界
 
 ---
 

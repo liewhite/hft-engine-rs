@@ -201,7 +201,7 @@ impl Message<GetPositions> for ExecutorActor {
         msg.0
             .iter()
             .filter_map(|symbol| state.symbol_state(symbol))
-            .flat_map(|symbol_state| symbol_state.positions.values().cloned())
+            .flat_map(|symbol_state| symbol_state.position_book().all().cloned())
             .collect()
     }
 }

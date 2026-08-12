@@ -18,10 +18,12 @@ pub struct PositionBaseline {
     pub snapshot_req_ts: Timestamp,
 }
 
-/// 状态管理器 - 管理所有交易状态
-pub struct StateManager {
-    /// Per-symbol 状态
-    states: HashMap<Symbol, SymbolState>,
+/// **账户**投影：余额 / 净值 / 希腊值，全部 per exchange。
+///
+/// 与 per-symbol 的三个投影（见 [`SymbolState`]）并列的第四个 —— 它是账户级的，
+/// 不按 symbol 索引，所以住在 [`StateManager`] 上而不在 `SymbolState` 里。
+#[derive(Debug, Clone, Default)]
+pub struct AccountView {
     /// 全局 USDT 余额 (per exchange)
     balances: HashMap<Exchange, f64>,
     /// 账户信息: 净值 + 总持仓名义价值 (per exchange)
@@ -30,7 +32,79 @@ pub struct StateManager {
     greeks: HashMap<(Exchange, String), Greeks>,
     /// 币种现金余额 (per exchange, per ccy) — 用于修正 greeks delta
     cash_balances: HashMap<(Exchange, String), f64>,
-    /// 交易所市场状态 (per exchange)
+}
+
+impl AccountView {
+    /// 遍历所有已收到账户信息的交易所（供观测层汇总）
+    pub fn account_infos(&self) -> impl Iterator<Item = (Exchange, &AccountInfo)> {
+        self.account_infos.iter().map(|(e, i)| (*e, i))
+    }
+
+    /// 获取指定交易所的 USDT 余额
+    ///
+    /// 返回 None 表示该交易所的余额数据尚未到达
+    pub fn usdt_balance(&self, exchange: Exchange) -> Option<f64> {
+        self.balances.get(&exchange).copied()
+    }
+
+    /// 获取所有交易所的 USDT 总余额（仅包含已收到数据的交易所）
+    pub fn total_usdt_balance(&self) -> f64 {
+        self.balances.values().sum()
+    }
+
+    /// 获取指定交易所的账户信息 (equity + notional 原子性保证)
+    ///
+    /// 返回 None 表示该交易所的账户数据尚未到达
+    pub fn account_info(&self, exchange: Exchange) -> Option<&AccountInfo> {
+        self.account_infos.get(&exchange)
+    }
+
+    /// 获取指定交易所的账户净值
+    ///
+    /// 返回 None 表示该交易所的净值数据尚未到达
+    pub fn equity(&self, exchange: Exchange) -> Option<f64> {
+        self.account_infos.get(&exchange).map(|i| i.equity)
+    }
+
+    /// 获取所有交易所的总净值（仅包含已收到数据的交易所）
+    pub fn total_equity(&self) -> f64 {
+        self.account_infos.values().map(|i| i.equity).sum()
+    }
+
+    /// 获取指定交易所的账户总持仓名义价值
+    ///
+    /// 返回 None 表示该交易所的名义价值数据尚未到达
+    pub fn account_notional(&self, exchange: Exchange) -> Option<f64> {
+        self.account_infos.get(&exchange).map(|i| i.notional)
+    }
+
+    /// 获取所有交易所的总持仓名义价值（仅包含已收到数据的交易所）
+    pub fn total_account_notional(&self) -> f64 {
+        self.account_infos.values().map(|i| i.notional).sum()
+    }
+
+    /// 获取指定交易所和币种的希腊值 (delta 已包含现货余额修正)
+    ///
+    /// 仅当 greeks 推送和 cashBal 均已到达时才返回，避免未修正的 delta 引发策略误判
+    pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
+        let key = (exchange, ccy.to_string());
+        let g = self.greeks.get(&key)?;
+        let &cash_bal = self.cash_balances.get(&key)?;
+        let mut corrected = g.clone();
+        corrected.delta += cash_bal;
+        Some(corrected)
+    }
+}
+
+/// 状态管理器 - 四个投影的组合容器
+pub struct StateManager {
+    /// Per-symbol 状态（内部又分行情 / 持仓 / 挂单三个投影，见 [`SymbolState`]）
+    states: HashMap<Symbol, SymbolState>,
+    /// 账户投影
+    account: AccountView,
+    /// 交易所市场状态 (per exchange)。
+    ///
+    /// 公共行情，不属于 [`AccountView`]；又是账户级而非 per-symbol，故留在本层。
     market_statuses: HashMap<Exchange, MarketStatus>,
     /// 订单超时时间 (毫秒)
     order_timeout_ms: u64,
@@ -46,10 +120,7 @@ impl StateManager {
 
         Self {
             states,
-            balances: HashMap::new(),
-            account_infos: HashMap::new(),
-            greeks: HashMap::new(),
-            cash_balances: HashMap::new(),
+            account: AccountView::default(),
             market_statuses: HashMap::new(),
             order_timeout_ms,
         }
@@ -119,71 +190,16 @@ impl StateManager {
         self.states.iter()
     }
 
+    /// 账户投影（只读）—— 只需净值 / 余额 / 希腊值的消费者可以只拿这一份
+    pub fn account_view(&self) -> &AccountView {
+        &self.account
+    }
+
     /// 遍历全部 symbol 中**基线已写入**的持仓腿（见 [`SymbolState::seeded_positions`]）。
     ///
     /// 供持仓账本对外应答快照查询：未 seed 的腿是「未知」，不出现在结果里。
     pub fn seeded_positions(&self) -> impl Iterator<Item = &Position> {
         self.states.values().flat_map(|s| s.seeded_positions())
-    }
-
-    /// 遍历所有已收到账户信息的交易所（供观测层汇总）
-    pub fn account_infos(&self) -> impl Iterator<Item = (Exchange, &AccountInfo)> {
-        self.account_infos.iter().map(|(e, i)| (*e, i))
-    }
-
-    /// 获取指定交易所的 USDT 余额
-    ///
-    /// 返回 None 表示该交易所的余额数据尚未到达
-    pub fn usdt_balance(&self, exchange: Exchange) -> Option<f64> {
-        self.balances.get(&exchange).copied()
-    }
-
-    /// 获取所有交易所的 USDT 总余额（仅包含已收到数据的交易所）
-    pub fn total_usdt_balance(&self) -> f64 {
-        self.balances.values().sum()
-    }
-
-    /// 获取指定交易所的账户信息 (equity + notional 原子性保证)
-    ///
-    /// 返回 None 表示该交易所的账户数据尚未到达
-    pub fn account_info(&self, exchange: Exchange) -> Option<&AccountInfo> {
-        self.account_infos.get(&exchange)
-    }
-
-    /// 获取指定交易所的账户净值
-    ///
-    /// 返回 None 表示该交易所的净值数据尚未到达
-    pub fn equity(&self, exchange: Exchange) -> Option<f64> {
-        self.account_infos.get(&exchange).map(|i| i.equity)
-    }
-
-    /// 获取所有交易所的总净值（仅包含已收到数据的交易所）
-    pub fn total_equity(&self) -> f64 {
-        self.account_infos.values().map(|i| i.equity).sum()
-    }
-
-    /// 获取指定交易所的账户总持仓名义价值
-    ///
-    /// 返回 None 表示该交易所的名义价值数据尚未到达
-    pub fn account_notional(&self, exchange: Exchange) -> Option<f64> {
-        self.account_infos.get(&exchange).map(|i| i.notional)
-    }
-
-    /// 获取所有交易所的总持仓名义价值（仅包含已收到数据的交易所）
-    pub fn total_account_notional(&self) -> f64 {
-        self.account_infos.values().map(|i| i.notional).sum()
-    }
-
-    /// 获取指定交易所和币种的希腊值 (delta 已包含现货余额修正)
-    ///
-    /// 仅当 greeks 推送和 cashBal 均已到达时才返回，避免未修正的 delta 引发策略误判
-    pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
-        let key = (exchange, ccy.to_string());
-        let g = self.greeks.get(&key)?;
-        let &cash_bal = self.cash_balances.get(&key)?;
-        let mut corrected = g.clone();
-        corrected.delta += cash_bal;
-        Some(corrected)
     }
 
     /// 获取指定交易所的市场状态（默认 Closed，安全侧）
@@ -237,10 +253,10 @@ impl StateManager {
                             available = balance.available,
                             "USDT balance updated"
                         );
-                        self.balances.insert(balance.exchange, balance.available);
+                        self.account.balances.insert(balance.exchange, balance.available);
                     }
                     // 存储币种现金余额 (用于修正 greeks delta)
-                    self.cash_balances.insert(
+                    self.account.cash_balances.insert(
                         (balance.exchange, balance.asset.clone()),
                         balance.available,
                     );
@@ -257,14 +273,14 @@ impl StateManager {
                         notional = notional,
                         "AccountInfo updated"
                     );
-                    self.account_infos.insert(*exchange, AccountInfo {
+                    self.account.account_infos.insert(*exchange, AccountInfo {
                         equity: *equity,
                         notional: *notional,
                     });
                 }
                 // 账户级事件: Greeks
                 AccountData::Greeks(g) => {
-                    self.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
+                    self.account.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
                 }
                 // Symbol 私有事件 (OrderUpdate/Fill/FundingFee): 委托对应 SymbolState
                 _ => self.route_to_symbol_state(event),
@@ -285,6 +301,44 @@ impl StateManager {
             return;
         };
         state.apply(event);
+    }
+
+    // ==================== 账户投影的委托（保持既有调用面不变） ====================
+
+    pub fn account_infos(&self) -> impl Iterator<Item = (Exchange, &AccountInfo)> {
+        self.account.account_infos()
+    }
+
+    pub fn usdt_balance(&self, exchange: Exchange) -> Option<f64> {
+        self.account.usdt_balance(exchange)
+    }
+
+    pub fn total_usdt_balance(&self) -> f64 {
+        self.account.total_usdt_balance()
+    }
+
+    pub fn account_info(&self, exchange: Exchange) -> Option<&AccountInfo> {
+        self.account.account_info(exchange)
+    }
+
+    pub fn equity(&self, exchange: Exchange) -> Option<f64> {
+        self.account.equity(exchange)
+    }
+
+    pub fn total_equity(&self) -> f64 {
+        self.account.total_equity()
+    }
+
+    pub fn account_notional(&self, exchange: Exchange) -> Option<f64> {
+        self.account.account_notional(exchange)
+    }
+
+    pub fn total_account_notional(&self) -> f64 {
+        self.account.total_account_notional()
+    }
+
+    pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
+        self.account.greeks(exchange, ccy)
     }
 }
 

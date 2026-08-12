@@ -187,7 +187,23 @@ actor"。见 [external-data-access.md](./external-data-access.md) §四。
 
 按严重程度排。每条注明违反哪条原则、实证、以及在重构计划里的编号。
 
-### V1 `StateManager` / `SymbolState` 是共享大对象 —— 违反 P1、P3
+### ~~V1 `StateManager` / `SymbolState` 是共享大对象~~ —— **已修复（R2）**
+
+原状与理由见下方保留的原文。现状：拆成四个投影 ——
+`SymbolMarket` / `SymbolPositions` / `SymbolOrders`（per symbol，由 `SymbolState` 门面组合）
++ `AccountView`（账户级）。跨 symbol 的持仓容器 `PositionBook` 供只要持仓的消费者使用：
+持仓账本的可达方法从 **39 个收到 8 个**。
+
+「seed 之后、快照请求时刻之前的 Fill 要丢弃」这条防双计规则提取到
+`SymbolPositions::apply_fill`，与 `seeded_at` 同住一处 —— 账本与策略门面共用一份，
+不会各自演化出差别（那种差别的表现是"对账偶尔误报漂移"，最难查）。
+
+**持仓折叠仍是三份宿主**（账本 / executor / metrics），数量没变但性质变了：
+账本那份现在最瘦最专一，而它正是唯一被 REST 持续校验的那份。
+executor 与 metrics 的保留理由见 [external-data-access.md](./external-data-access.md) §四。
+
+<details><summary>原文（保留以便对照判断标准）</summary>
+
 
 `StateManager` 19 个公开方法 + `SymbolState` 20 个，装着六类互不相干的东西：per-symbol 行情
 （bbo / mark / index / funding）、持仓 + seed 标记、挂单 + 终态记忆 + 超时清理、余额、
@@ -199,19 +215,33 @@ metrics 用「持仓 × 价格 + 挂单 + 账户」。**一个类型有三组互
 这是"持仓折叠有三份宿主"的根因：因为持仓和价格被焊在同一结构里，`SymbolState::exposure`
 必须在结构内部 join，metrics 才没法只查持仓。→ 计划 R2
 
+</details>
+
 ### V2 `Strategy::on_event` 交出全量状态视图 —— 违反 P3
 
 ```rust
 fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent>;
 ```
 
-仓内全部四个策略实现的实际调用面并集只有 **8 个方法**（`symbol_state` / `position_size` /
-`position_sizes` / `positions` / `pending_orders` / `has_pending_orders` / `bbo` / `bbos`），
-而交出去的是 39 个。
+仓内全部策略实现的实际调用面并集是 **11 个方法**：`symbol_state` / `position_size` /
+`position_sizes` / `positions` / `pending_orders` / `has_pending_orders` / `bbo` / `bbos`
+（per-symbol），加 `equity` / `account_info` / `greeks`（账户级 —— `spread_arb` 的杠杆闸门
+与 `gamma_scalp` 的 delta 都要）。而交出去的是 39 个。
 
-策略能读到其他 symbol 的状态、其他所的余额与希腊值、任意 symbol 的挂单，无机制阻止。
-连带后果：「策略是纯函数」实际是「对一个巨大可变历史投影的纯函数」；往 `StateManager`
-加字段会自动扩大所有策略的可见面，编译器不报警。→ 计划 R3
+> **一处更正**：本节初稿写的是 8 个方法，漏了账户级那三个 —— 当时的统计只扫了
+> 变量名叫 `state` 的调用点，而策略里那三处的变量名是 `state_manager`。
+> 这对 R3 的设计有实质影响：策略视图**必须**包含账户投影，不能只给 per-symbol 那三份。
+
+连带后果：往 `StateManager` 加字段会自动扩大所有策略的可见面，编译器不报警；
+而账户级数据（`equity` / `account_info` / `greeks`）按交易所索引且**不按订阅范围过滤** ——
+策略可以读到它压根没订阅的交易所的净值。
+
+> **一处更正**：本节初稿还写过"策略能看到其他 symbol 的状态"，那是错的。
+> `StrategyRunner` 用策略自己 `public_streams()` 推导的 symbol 集合去建 `StateManager`，
+> 它能查到的 symbol 本来就只有自己订的。R3 的收益是接口最小化与账户数据裁剪两条，
+> 不含 symbol 隔离。
+
+→ 计划 R3
 
 ### ~~V3 `ExchangeClient` 用返回空值表达"没有能力"~~ —— **已修复（R1）**
 

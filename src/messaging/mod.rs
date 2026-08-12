@@ -5,5 +5,10 @@ mod state_manager;
 pub use event::{
     AccountData, AccountEvent, CustomEvent, IncomeEvent, MarketData, MarketEvent,
 };
-pub use state::{PendingOrder, SymbolExposure, SymbolState};
-pub use state_manager::{PositionBaseline, StateManager};
+mod position_book;
+
+pub use position_book::PositionBook;
+pub use state::{
+    PendingOrder, SymbolExposure, SymbolMarket, SymbolOrders, SymbolPositions, SymbolState,
+};
+pub use state_manager::{AccountView, PositionBaseline, StateManager};

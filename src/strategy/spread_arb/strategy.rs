@@ -970,19 +970,23 @@ mod tests {
         }
     }
 
-    /// 构造 SymbolState：两所各一条 BBO + 指定仓位
+    /// 构造 SymbolState：两所各一条 BBO + 指定仓位。
+    ///
+    /// 经**生产路径**：盘口走行情事件、仓位走投产 seed。直接写字段更省事，
+    /// 但那样测的就不是线上跑的那条路。
     fn symbol_state(positions: &[(Exchange, f64)]) -> SymbolState {
         let mut state = SymbolState::new(SYMBOL.to_string());
-        state.bbos.insert(SHORT_EX, bbo(SHORT_EX, 100.0, 100.2, 10.0));
-        state.bbos.insert(LONG_EX, bbo(LONG_EX, 99.8, 100.0, 10.0));
+        for b in [bbo(SHORT_EX, 100.0, 100.2, 10.0), bbo(LONG_EX, 99.8, 100.0, 10.0)] {
+            state.apply(&IncomeEvent::market(0, 0, MarketData::BBO(b)));
+        }
         for &(exchange, size) in positions {
-            state.positions.insert(
-                exchange,
-                Position {
+            state.seed_position(
+                &Position {
                     exchange,
                     symbol: SYMBOL.to_string(),
                     size,
                 },
+                0,
             );
         }
         state
@@ -1042,8 +1046,9 @@ mod tests {
     /// 显著错价：SHORT_EX 的 bid 被抬高、LONG_EX 的 ask 被压低
     fn mispriced_state() -> SymbolState {
         let mut state = symbol_state(&[]);
-        state.bbos.insert(SHORT_EX, bbo(SHORT_EX, 110.0, 110.2, 10.0));
-        state.bbos.insert(LONG_EX, bbo(LONG_EX, 89.8, 90.0, 10.0));
+        for b in [bbo(SHORT_EX, 110.0, 110.2, 10.0), bbo(LONG_EX, 89.8, 90.0, 10.0)] {
+            state.apply(&IncomeEvent::market(0, 0, MarketData::BBO(b)));
+        }
         state
     }
 
