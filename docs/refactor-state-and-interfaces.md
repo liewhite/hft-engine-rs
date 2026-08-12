@@ -13,7 +13,7 @@
 |---|---|---|---|
 | R1 | 拆 `ExchangeClient`：公共 / 账户两个 trait | V3 | **已完成** |
 | R2 | 拆 `StateManager`：四个单一职责投影 | V1 | **已完成** |
-| R3 | 策略只拿受限视图 | V2 | 未开始（R2 已就绪，卡在测试夹具迁移） |
+| R3 | 策略只拿受限视图 | V2 | **已完成** |
 | R4 | 下单出口的分发判据收敛到一处 | V4 | **已完成** |
 | R5 | 收尾：投产编排独立、观测口径移出领域层 | V6 / V7 | 未开始 |
 
@@ -312,6 +312,49 @@ impl SymbolView<'_> {
 但 `position_size` 保持返回 `f64` 有一个待核实的口子：**Live 账户 + 无凭证的所**，那条腿
 未 seed，本地持仓是"未知"而 `position_size` 会报 0。R1 之后这个组合是否还可达要核实；
 若可达，`SymbolView` 必须让未 seed 的所不可查，而不是报 0。
+
+### R3 完成记录
+
+**策略契约从 39 个方法收到 9 个**：`StrategyView`（`symbol` / `equity` / `account_info` /
+`greeks`）+ `SymbolView`（`bbo` / `position_size` / `position_sizes` /
+`has_pending_orders` / `pending_orders`）。`Strategy::on_event` 的第二个参数按值传入
+`StrategyView<'_>`（两个视图都是 `Copy` 的引用包装，无分配、无 dyn 分发）。
+
+**账户级读数按订阅交易所裁剪。** 这是本步唯一真正新增的约束 —— per-symbol 数据早已由
+`StrategyRunner::accepts` 按 `(exchange, symbol)` 过滤，视图不再重复过滤一遍（同一条
+"什么算范围内"的判据只能有一处）；而 `Balance` / `AccountInfo` / `Greeks` 没有路由键、
+`accepts` 一律放行，此前策略确实能读到未订阅所的净值。测试 `account_reads_are_cropped_to_
+subscribed_exchanges` 先断言"底层状态里确实有未订阅所的读数"再断言视图挡掉它 ——
+否则这条测试可能测了个空。
+
+**顺手删掉的死接口**：`StateManager` 上九个账户转发方法（`equity` / `account_info` /
+`greeks` / `usdt_balance` / `total_usdt_balance` / `total_equity` / `account_notional` /
+`total_account_notional` / `account_infos`）、`has_pending_orders`、`seeded_positions`。
+前九个是 R2 为"保持既有调用面不变"留的过渡层，策略改走视图后同一个事实有两个入口
+（P1）；后两个在消费者迁移后彻底无人调用。账户读数现在只剩 `account_view()` 一条路。
+
+### 那个"待核实的口子"：核实结果是不必改
+
+`SymbolView::position_size` 保持返回 `f64`。投产握手对**每个有 `AccountClient` 的所**
+都拉基线，且拉取失败直接拒绝启动（`provisioning.rs` 的 `fetch_baselines`）——
+所以实盘可下单的所必然已 seed。没有 `AccountClient` 的所确实不 seed，但引擎在那里
+从来不会也不能下单，"本地持仓 0" 是事实而非缺数据。
+
+改成 `Option<f64>` 会让全部 14 个调用点处理一个它们无法据以行动的情况
+（"这个所不可交易"应当在投产期一次性拒绝，不是每次读持仓时判一遍）。
+
+### 测试夹具：卡点的解法
+
+上次卡在 `spread_arb` 的两个独立夹具（一个 `SymbolState`、一个 `StateManager`）。
+合并成一个 `Fixture`（持底层 `StateManager`，`view()` / `symbol()` 按需借出），
+`fixture(&[..]).with_account(equity, notional)` / `.mispriced()` 链式构造。
+
+**顺带修掉一个测试本身的毛病**：旧形态下 `check_signal(&state, &manager, ..)` 的两个参数
+可以描述互相矛盾的世界（`mispriced_state()` 造的错价盘口压根不在 `manager` 里），
+而线上它们必然来自同一个 `StateManager`。合并夹具之后这种形态连编译都过不去。
+
+基线快照时刻取 `SNAPSHOT_TS = 1` 而非 0：`local_ts == snapshot_req_ts` 的 Fill 会被
+防双计规则丢弃，用 0 会让日后新增的 `local_ts = 0` 的 Fill 测试静默失效。
 
 ### 验收
 

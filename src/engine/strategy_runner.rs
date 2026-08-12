@@ -19,7 +19,7 @@
 
 use crate::domain::{Exchange, Order, OrderType, Symbol, SymbolMeta};
 use crate::messaging::{IncomeEvent, StateManager};
-use crate::strategy::{OutcomeEvent, Strategy};
+use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -60,6 +60,11 @@ pub struct StrategyRunner {
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 策略订阅的 (exchange, symbol) 集合，用于事件过滤
     subscriptions: HashSet<(Exchange, Symbol)>,
+    /// 订阅交易所集合，由 `subscriptions` 派生。
+    ///
+    /// 派生而非重新推导：它是 [`StrategyView`] 裁剪账户级读数的依据，与事件过滤
+    /// 必须同一个"范围内"判据（原则 P1）。存成字段只为免去每次事件重算一遍。
+    exchanges: HashSet<Exchange>,
     /// client_order_id 生成策略 (生产 UUID / 回测确定性计数)
     id_gen: Box<dyn ClientOrderIdGen>,
 }
@@ -86,12 +91,14 @@ impl StrategyRunner {
             .flat_map(|(ex, kinds)| kinds.iter().map(move |k| (*ex, k.symbol().clone())))
             .collect();
         let symbols: Vec<Symbol> = subscriptions.iter().map(|(_, s)| s.clone()).collect();
+        let exchanges: HashSet<Exchange> = subscriptions.iter().map(|(e, _)| *e).collect();
         let state = StateManager::new(&symbols, strategy.order_timeout_ms());
         Self {
             strategy,
             state,
             symbol_metas,
             subscriptions,
+            exchanges,
             id_gen,
         }
     }
@@ -122,7 +129,9 @@ impl StrategyRunner {
         self.state.apply(event);
         // 单一分发入口：一切事件（含 BorrowFee/ExchangeRate）都走 on_event，
         // 策略自行 match 关心的变体 —— 不存在第二套 typed 回调。
-        let raw = self.strategy.on_event(event, &self.state);
+        let raw = self
+            .strategy
+            .on_event(event, StrategyView::new(&self.state, &self.exchanges));
         raw
             .into_iter()
             .map(|signal| match signal {
@@ -190,7 +199,7 @@ mod tests {
     use crate::domain::{OrderType, Side, TimeInForce};
     use crate::exchange::utils::StepFormatter;
     use crate::exchange::SubscriptionKind;
-    use crate::messaging::{IncomeEvent, MarketData, StateManager};
+    use crate::messaging::{IncomeEvent, MarketData};
     use crate::strategy::{OutcomeEvent, Strategy};
 
     const EX: Exchange = Exchange::OKX;
@@ -231,7 +240,7 @@ mod tests {
         fn order_timeout_ms(&self) -> u64 {
             0
         }
-        fn on_event(&mut self, _e: &IncomeEvent, _s: &StateManager) -> Vec<OutcomeEvent> {
+        fn on_event(&mut self, _e: &IncomeEvent, _v: StrategyView<'_>) -> Vec<OutcomeEvent> {
             if self.placed {
                 return Vec::new();
             }

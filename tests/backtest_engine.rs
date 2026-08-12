@@ -8,9 +8,9 @@ use hft_engine_rs::domain::{
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::utils::StepFormatter;
 use hft_engine_rs::exchange::SubscriptionKind;
-use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, StateManager};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
+use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -91,7 +91,7 @@ impl Strategy for OneShotBuy {
     fn order_timeout_ms(&self) -> u64 {
         0
     }
-    fn on_event(&mut self, event: &IncomeEvent, _state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let is_market = matches!(
             event,
             IncomeEvent::Market(m) if matches!(m.data, MarketData::BBO(_) | MarketData::MarketTrade(_))
@@ -249,7 +249,7 @@ impl Strategy for EmitOnBbo {
     fn order_timeout_ms(&self) -> u64 {
         0
     }
-    fn on_event(&mut self, event: &IncomeEvent, _state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let IncomeEvent::Market(m) = event else {
             return Vec::new();
         };
@@ -325,7 +325,7 @@ impl Strategy for CustomProbe {
     fn order_timeout_ms(&self) -> u64 {
         0
     }
-    fn on_event(&mut self, event: &IncomeEvent, _state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         if let IncomeEvent::Market(m) = event {
             if let MarketData::Custom(c) = &m.data {
                 if let Some(Tag(t)) = c.get::<Tag>() {

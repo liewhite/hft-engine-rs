@@ -19,9 +19,9 @@ use hft_engine_rs::domain::{
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, StateManager};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
+use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -79,7 +79,7 @@ impl Strategy for MeanRevertMaker {
         0
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         // 自己跟成交维护开仓成本（加权平均；平完即清零）
         if let IncomeEvent::Account(a) = event {
             let AccountData::Fill(f) = &a.data else {
@@ -107,11 +107,13 @@ impl Strategy for MeanRevertMaker {
         let MarketData::MarketTrade(t) = &m.data else {
             return Vec::new();
         };
-        if state.has_pending_orders(&self.symbol) {
+        let Some(symbol_state) = view.symbol(&self.symbol) else {
+            return Vec::new();
+        };
+        if symbol_state.has_pending_orders() {
             return Vec::new();
         }
-        let symbol_state = state.symbol_state(&self.symbol);
-        let pos_size = symbol_state.map(|s| s.position_size(EX)).unwrap_or(0.0);
+        let pos_size = symbol_state.position_size(EX);
 
         if pos_size.abs() < 1e-9 {
             // 空仓：在成交价下方挂买单

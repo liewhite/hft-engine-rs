@@ -190,16 +190,14 @@ impl StateManager {
         self.states.iter()
     }
 
-    /// 账户投影（只读）—— 只需净值 / 余额 / 希腊值的消费者可以只拿这一份
+    /// 账户投影（只读）。
+    ///
+    /// 账户级读数**只有这一条路**可达 —— 此前 `StateManager` 上还挂着九个同名转发方法，
+    /// 于是同一个事实有两个入口，两边的文档与返回语义得各维护一遍（原则 P1）。
+    /// 消费者要么只拿这一份投影，要么在其上再包一层裁剪（见
+    /// [`crate::strategy::StrategyView`]）。
     pub fn account_view(&self) -> &AccountView {
         &self.account
-    }
-
-    /// 遍历全部 symbol 中**基线已写入**的持仓腿（见 [`SymbolState::seeded_positions`]）。
-    ///
-    /// 供持仓账本对外应答快照查询：未 seed 的腿是「未知」，不出现在结果里。
-    pub fn seeded_positions(&self) -> impl Iterator<Item = &Position> {
-        self.states.values().flat_map(|s| s.seeded_positions())
     }
 
     /// 获取指定交易所的市场状态（默认 Closed，安全侧）
@@ -208,14 +206,6 @@ impl StateManager {
             .get(&exchange)
             .copied()
             .unwrap_or(MarketStatus::Closed)
-    }
-
-    /// 检查指定 symbol 是否有未完成订单
-    pub fn has_pending_orders(&self, symbol: &Symbol) -> bool {
-        self.states
-            .get(symbol)
-            .map(|s| s.has_pending_orders())
-            .unwrap_or(false)
     }
 
     // ==================== 事件处理 ====================
@@ -303,43 +293,6 @@ impl StateManager {
         state.apply(event);
     }
 
-    // ==================== 账户投影的委托（保持既有调用面不变） ====================
-
-    pub fn account_infos(&self) -> impl Iterator<Item = (Exchange, &AccountInfo)> {
-        self.account.account_infos()
-    }
-
-    pub fn usdt_balance(&self, exchange: Exchange) -> Option<f64> {
-        self.account.usdt_balance(exchange)
-    }
-
-    pub fn total_usdt_balance(&self) -> f64 {
-        self.account.total_usdt_balance()
-    }
-
-    pub fn account_info(&self, exchange: Exchange) -> Option<&AccountInfo> {
-        self.account.account_info(exchange)
-    }
-
-    pub fn equity(&self, exchange: Exchange) -> Option<f64> {
-        self.account.equity(exchange)
-    }
-
-    pub fn total_equity(&self) -> f64 {
-        self.account.total_equity()
-    }
-
-    pub fn account_notional(&self, exchange: Exchange) -> Option<f64> {
-        self.account.account_notional(exchange)
-    }
-
-    pub fn total_account_notional(&self) -> f64 {
-        self.account.total_account_notional()
-    }
-
-    pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
-        self.account.greeks(exchange, ccy)
-    }
 }
 
 #[cfg(test)]

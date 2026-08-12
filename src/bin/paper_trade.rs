@@ -35,9 +35,9 @@ use hft_engine_rs::exchange::binance::BinanceCredentials;
 use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
 use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
-use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent, StateManager};
+use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy};
+use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use kameo::actor::Spawn;
 use kameo::mailbox;
 use serde::Deserialize;
@@ -92,7 +92,7 @@ impl Strategy for DipMaker {
         10_000
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let IncomeEvent::Market(MarketEvent {
             data: MarketData::BBO(bbo),
             ..
@@ -100,7 +100,7 @@ impl Strategy for DipMaker {
         else {
             return Vec::new();
         };
-        let Some(symbol_state) = state.symbol_state(&bbo.symbol) else {
+        let Some(symbol_state) = view.symbol(&bbo.symbol) else {
             return Vec::new();
         };
         // 有仓位或有挂单就不动（本演示策略不做平仓）

@@ -124,7 +124,7 @@ impl MetricsActor {
         let mut total_equity = 0.0;
         let mut total_notional = 0.0;
         let mut exchange_count = 0usize;
-        for (exchange, info) in self.state.account_infos() {
+        for (exchange, info) in self.state.account_view().account_infos() {
             let leverage = if info.equity > 0.0 {
                 info.notional / info.equity
             } else {

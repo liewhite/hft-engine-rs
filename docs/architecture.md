@@ -217,31 +217,38 @@ metrics 用「持仓 × 价格 + 挂单 + 账户」。**一个类型有三组互
 
 </details>
 
-### V2 `Strategy::on_event` 交出全量状态视图 —— 违反 P3
+### ~~V2 `Strategy::on_event` 交出全量状态视图~~ —— **已修复（R3）**
+
+原状：
 
 ```rust
 fn on_event(&mut self, event: &IncomeEvent, state: &StateManager) -> Vec<OutcomeEvent>;
 ```
 
-仓内全部策略实现的实际调用面并集是 **11 个方法**：`symbol_state` / `position_size` /
-`position_sizes` / `positions` / `pending_orders` / `has_pending_orders` / `bbo` / `bbos`
-（per-symbol），加 `equity` / `account_info` / `greeks`（账户级 —— `spread_arb` 的杠杆闸门
-与 `gamma_scalp` 的 delta 都要）。而交出去的是 39 个。
+交出 39 个方法。两个后果：往 `StateManager` 加字段/方法会自动扩大所有策略的可见面
+且编译器不报警；账户级数据（`equity` / `account_info` / `greeks`）按交易所索引且
+**不按订阅范围过滤**，策略能读到自己压根没订阅的交易所的净值。
 
-> **一处更正**：本节初稿写的是 8 个方法，漏了账户级那三个 —— 当时的统计只扫了
-> 变量名叫 `state` 的调用点，而策略里那三处的变量名是 `state_manager`。
-> 这对 R3 的设计有实质影响：策略视图**必须**包含账户投影，不能只给 per-symbol 那三份。
+现状：
 
-连带后果：往 `StateManager` 加字段会自动扩大所有策略的可见面，编译器不报警；
-而账户级数据（`equity` / `account_info` / `greeks`）按交易所索引且**不按订阅范围过滤** ——
-策略可以读到它压根没订阅的交易所的净值。
+```rust
+fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent>;
+```
 
-> **一处更正**：本节初稿还写过"策略能看到其他 symbol 的状态"，那是错的。
+[`StrategyView`] 4 个方法 + [`SymbolView`] 5 个，共 **9 个**，就是实测的调用面。
+账户级读数按订阅交易所裁剪，范围外返回 `None`（不是 0）。`StateManager` 上那九个
+账户转发方法一并删除 —— 账户读数只剩 `account_view()` 一条路。
+
+> **三次统计更正，都记在这里**。本节初稿说调用面是 8 个方法，后更正为 11 个
+> （漏了账户级三个：当时只扫了变量名叫 `state` 的调用点，而策略里那三处叫
+> `state_manager`）。R3 动手时逐个方法核实，**实际方法集是 9 个** ——
+> 之前的 8 与 11 都把"调用点数"和"方法数"混着数了。
+> 三次统计有两次错，说明这类数字必须逐个方法 grep 后再写，不能凭印象。
+>
+> 另一处更正：初稿还写过"策略能看到其他 symbol 的状态"，那是错的。
 > `StrategyRunner` 用策略自己 `public_streams()` 推导的 symbol 集合去建 `StateManager`，
 > 它能查到的 symbol 本来就只有自己订的。R3 的收益是接口最小化与账户数据裁剪两条，
 > 不含 symbol 隔离。
-
-→ 计划 R3
 
 ### ~~V3 `ExchangeClient` 用返回空值表达"没有能力"~~ —— **已修复（R1）**
 
