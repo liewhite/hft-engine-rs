@@ -574,7 +574,7 @@ pub fn okx_channel_to_candle_interval(channel: &str) -> Option<CandleInterval> {
 #[cfg(test)]
 mod trade_tests {
     use super::*;
-    use crate::exchange::utils::StepFormatter;
+    use crate::domain::StepFormatter;
     use std::sync::Arc;
 
     /// BTC-USDT-SWAP: ctVal = 0.01 BTC/张

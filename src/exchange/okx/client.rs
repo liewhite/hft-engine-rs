@@ -9,7 +9,7 @@ use crate::exchange::okx::codec::{GreeksData, PositionData};
 use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
-use crate::exchange::utils::StepFormatter;
+use crate::domain::StepFormatter;
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;

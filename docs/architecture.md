@@ -334,6 +334,47 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 所以搬走之后领域层不必为观测保留任何接口。若搬走还得在领域层开新口子，
 那说明边界没划对，该回上一层重想。
 
+### ~~V8 领域层反向依赖适配层~~ —— **已修复**
+
+`domain/models/symbol_meta.rs` 用 `crate::exchange::utils::PriceFormatter` —— 最内层依赖了
+外层。而 `price_formatter.rs` 本身**一个 `crate::` 都不用**（只用 `std::fmt::Debug`），
+它是纯粹的数值格式化，从来就不属于适配层。
+
+现状：整个文件搬进 `domain/models/`，`exchange::utils` 模块随之消失（它只有这一个成员）。
+消费者遍布 domain / engine / exchange / sim / bin / tests，改的只是 import 路径。
+
+### ~~V9 适配层反向依赖引擎层~~ —— **已修复**
+
+各所 actor 有 10+ 处 `use crate::engine::...`。实测只有三个符号：
+
+| 符号 | 为什么在错的层 | 去向 |
+|---|---|---|
+| `MarketPubSub` / `AccountPubSub` | 只是 `PubSub<MarketEvent>` 的**类型别名**，而事件类型在 `messaging` —— 别名放错层造出了整条反向边 | `messaging/bus.rs` |
+| `CryptoStatusActor` | "这个场子什么时候开门"是场子的属性；它只由三个加密所的适配层 spawn | `exchange/crypto_status.rs` |
+
+`OutcomePubSub` **有意留在 `engine::live`**：它承载的 `AccountOutcome` 包着
+`strategy::OutcomeEvent`，搬进 messaging 会造出一条新的反向边。而且那也正是它的归属——
+"哪个账户的信号"是引擎的编排概念，不是消息层的数据概念。`engine::live` 仍再导出前两个，
+让三条总线在一处可见；那是同一个类型的第二条路径，不是第二份定义。
+
+修完之后模块依赖是一张干净的 DAG（`sim` 顺带也不再依赖 `exchange`）：
+
+```
+domain ← messaging ← exchange ← strategy ← engine ← backtest
+   ↖________________↙     ↖___ sim ___↙
+observability / actor_lifecycle / option：无 crate 内依赖
+```
+
+### ~~V10 `SymbolView` 重名~~ —— **已修复**
+
+`strategy::SymbolView`（策略的单 symbol 状态视图）与 `engine::live::SymbolView`
+（晋升判据的 symbol 表现记录）是两个毫无关系的类型，却都从各自模块顶层导出 ——
+同时 `use` 两个模块就撞名。
+
+改名的是**后者**（→ `SymbolPerformance`）：它的消费者只有 `PromotionPolicy` 的实现者，
+波及面比刚随 v0.13.0 发出去的策略契约小得多。取这个名字也更准确——它装的是两个账户的
+表现记录 + 时间，本来就不是"视图"。
+
 ---
 
 ## 5. 改动前的检查清单

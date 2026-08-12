@@ -30,7 +30,7 @@ use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForc
 use hft_engine_rs::engine::{
     init_tracing, load_config, spawn_supervised, wait_for_shutdown, Decision, ManagerActor,
     ManagerActorArgs, setup_binance, setup_hyperliquid, setup_okx,
-    PromotionPolicy, SubscribeAccount, SubscribeMarket, SupervisorActor, SupervisorArgs, SymbolView,
+    PromotionPolicy, SubscribeAccount, SubscribeMarket, SupervisorActor, SupervisorArgs, SymbolPerformance,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
 use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
@@ -70,7 +70,7 @@ struct MyPolicy {
 }
 
 impl PromotionPolicy for MyPolicy {
-    fn decide(&mut self, view: &SymbolView<'_>) -> Decision {
+    fn decide(&mut self, view: &SymbolPerformance<'_>) -> Decision {
         // ===================== 在此实现你的判据 =====================
         //
         // 提醒（详见 engine::PromotionPolicy 的模块文档）：

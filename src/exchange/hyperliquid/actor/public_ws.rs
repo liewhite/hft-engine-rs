@@ -6,7 +6,7 @@
 //! - 直接解析消息并发布到对应总线
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::engine::MarketPubSub;
+use crate::messaging::MarketPubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::hyperliquid::codec::{aggregate_trades, WsActiveAssetCtx, WsBbo, WsTrade};
 use crate::exchange::hyperliquid::{to_hyperliquid, WS_URL};

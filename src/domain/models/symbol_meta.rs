@@ -1,5 +1,5 @@
 use crate::domain::models::{Exchange, Symbol};
-use crate::exchange::utils::PriceFormatter;
+use crate::domain::PriceFormatter;
 use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 use std::sync::Arc;

@@ -21,7 +21,7 @@
 mod policy;
 mod record;
 
-pub use policy::{Decision, NeverPromote, PromotionPolicy, SymbolView};
+pub use policy::{Decision, NeverPromote, PromotionPolicy, SymbolPerformance};
 pub use record::{RoundTrip, SymbolRecord};
 
 use crate::domain::{AccountId, Exchange, ExchangeError, Symbol, Timestamp};
@@ -167,7 +167,7 @@ impl SupervisorActor {
                 if state.transition_in_flight {
                     continue;
                 }
-                let view = SymbolView {
+                let view = SymbolPerformance {
                     symbol: &symbol,
                     paper: &state.paper,
                     live: state.live.as_ref(),

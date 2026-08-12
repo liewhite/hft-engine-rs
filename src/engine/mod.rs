@@ -10,7 +10,6 @@ pub use strategy_runner::{
 };
 pub use live::{
     AccountOutcome, AccountPubSub, AddStrategy, AddStrategies, ClockActor, ClockActorArgs,
-    CryptoStatusActor, CryptoStatusActorArgs,
     setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup,
     ExecutorActor, ExecutorArgs,
     GetAllSymbolMetas, IncomeProcessorActor, ManagerActor, ManagerActorArgs, MarketPubSub,
@@ -21,6 +20,6 @@ pub use live::{
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
     RegisterSymbols, RemoveStrategies, StrategySpec,
     Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,
-    SupervisorArgs, SymbolRecord, SymbolView, UnregisterExecutor,
+    SupervisorArgs, SymbolRecord, SymbolPerformance, UnregisterExecutor,
     SubscribeAccount, SubscribeMarket, SubscribeOutcome,
 };

@@ -17,7 +17,8 @@ use super::funding_fee_polling::{
 use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs};
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
 use crate::domain::{ExchangeError, Symbol, SymbolMeta};
-use crate::engine::{AccountPubSub, CryptoStatusActor, CryptoStatusActorArgs, MarketPubSub};
+use crate::exchange::{CryptoStatusActor, CryptoStatusActorArgs};
+use crate::messaging::{AccountPubSub, MarketPubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
 use crate::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
 use kameo::actor::{ActorRef, WeakActorRef};

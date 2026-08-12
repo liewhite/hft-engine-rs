@@ -186,7 +186,7 @@ impl StrategyRunner {
 mod tests {
     use super::*;
     use crate::domain::{OrderType, Side, TimeInForce};
-    use crate::exchange::utils::StepFormatter;
+    use crate::domain::StepFormatter;
     use crate::exchange::SubscriptionKind;
     use crate::messaging::{IncomeEvent, MarketData};
     use std::collections::HashSet;

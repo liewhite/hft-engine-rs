@@ -10,7 +10,7 @@
 //! （`hash` 恒为全零），但至少能由 `(time, coin)` 稳定派生，且拉取窗口可控。
 
 use crate::domain::now_ms;
-use crate::engine::AccountPubSub;
+use crate::messaging::AccountPubSub;
 use crate::exchange::hyperliquid::HyperliquidClient;
 use crate::messaging::{AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};

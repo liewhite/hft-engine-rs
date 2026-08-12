@@ -550,7 +550,7 @@ mod tests {
     use super::*;
     use crate::domain::{Fill, FillReason, Side};
     use crate::messaging::AccountData;
-    use crate::exchange::utils::StepFormatter;
+    use crate::domain::StepFormatter;
 
     const EX: Exchange = Exchange::Binance;
     const OTHER_EX: Exchange = Exchange::OKX;
@@ -959,7 +959,7 @@ mod tests {
 mod mailbox_tests {
     use super::*;
     use crate::domain::{AccountInfo, ExchangeError, OrderId, OrderUpdate};
-    use crate::exchange::utils::StepFormatter;
+    use crate::domain::StepFormatter;
     use crate::exchange::ExchangeOrder;
     use kameo::actor::Spawn;
     use std::sync::atomic::{AtomicUsize, Ordering};

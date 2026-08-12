@@ -6,7 +6,7 @@ use hft_engine_rs::domain::{
     Exchange, Order, OrderType, Price, Symbol, SymbolMeta, Side, TimeInForce, Timestamp, BBO,
 };
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
-use hft_engine_rs::exchange::utils::StepFormatter;
+use hft_engine_rs::domain::StepFormatter;
 use hft_engine_rs::exchange::SubscriptionKind;
 use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;

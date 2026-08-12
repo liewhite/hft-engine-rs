@@ -4,7 +4,7 @@
 //! 官方限速 10/2s，配置为每秒 3 次。
 
 use crate::domain::{now_ms, Exchange};
-use crate::engine::AccountPubSub;
+use crate::messaging::AccountPubSub;
 use crate::exchange::okx::OkxClient;
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::messaging::{AccountData, AccountEvent};

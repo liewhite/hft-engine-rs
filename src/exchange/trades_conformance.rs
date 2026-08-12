@@ -17,7 +17,7 @@
 //! ```
 
 use crate::domain::{Exchange, MarketTrade, Symbol, SymbolMeta};
-use crate::exchange::utils::StepFormatter;
+use crate::domain::StepFormatter;
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{MarketData, MarketEvent};
 use futures_util::{SinkExt, StreamExt};

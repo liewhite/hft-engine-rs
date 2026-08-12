@@ -3,7 +3,7 @@
 //! Binance 的 WebSocket 不推送 equity，需要通过 REST API 定时查询
 
 use crate::domain::{now_ms, Exchange};
-use crate::engine::AccountPubSub;
+use crate::messaging::AccountPubSub;
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
 use crate::messaging::{AccountData, AccountEvent};

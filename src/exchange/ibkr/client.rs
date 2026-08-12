@@ -9,7 +9,7 @@ use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::symbol::resolve_conids;
 use crate::exchange::ibkr::wire;
 use crate::exchange::ibkr::IbkrCredentials;
-use crate::exchange::utils::StepFormatter;
+use crate::domain::StepFormatter;
 use async_trait::async_trait;
 use reqwest::Client;
 use std::collections::HashMap;

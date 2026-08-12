@@ -6,7 +6,7 @@
 //! - 直接解析消息并发布到对应总线
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::engine::MarketPubSub;
+use crate::messaging::MarketPubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::okx::codec::{
     resolve_meta, BboData, FundingRateData, IndexTickerData, MarkPriceData, TradeData, WsPush,
@@ -463,7 +463,7 @@ pub(crate) fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_
 mod tests {
     use super::*;
     use crate::domain::{Exchange, MarketTrade};
-    use crate::exchange::utils::StepFormatter;
+    use crate::domain::StepFormatter;
 
     const TRADES_PUSH: &str = r#"{
         "arg":{"channel":"trades","instId":"BTC-USDT-SWAP"},

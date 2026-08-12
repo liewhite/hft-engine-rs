@@ -332,7 +332,7 @@ macro_rules! impl_exchange_actor_ops {
 mod tests {
     use super::*;
     use crate::domain::{Side, TimeInForce};
-    use crate::exchange::utils::StepFormatter;
+    use crate::domain::StepFormatter;
     use std::sync::Arc;
 
     /// OKX BTC-USDT-SWAP：每张 0.01 币、价格步长 0.1、数量步长 1 张
