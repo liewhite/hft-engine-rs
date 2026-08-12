@@ -233,7 +233,7 @@ metrics 用「持仓 × 价格 + 挂单 + 账户」。**一个类型有三组互
 fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent>;
 ```
 
-[`StrategyView`] 4 个方法 + [`SymbolView`] 5 个，共 **9 个**，就是实测的调用面。
+[`StrategyView`] 6 个方法 + [`SymbolView`] 6 个，共 **12 个**。
 `StateManager` 上那九个账户转发方法一并删除，账户读数只剩 `account_view()` 一条路。
 
 越界投递堵在**分发层**：`IncomeEvent::delivery()` 把投递范围分成
@@ -247,10 +247,17 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 > 只堵查询不堵投递等于没堵，却在文档里写成了"已修复"（正是品味 1.5 说的那种声明）。
 > 审查指出后改到分发层，视图里的裁剪整个删掉。
 
-> **三次统计更正**。本节初稿说调用面是 8 个方法，后更正为 11 个（漏了账户级三个：
-> 当时只扫了变量名叫 `state` 的调用点，而策略里那三处叫 `state_manager`）。
-> R3 动手时逐个方法核实，**实际是 9 个** —— 之前的 8 与 11 都把"调用点数"和"方法数"
-> 混着数了。三次统计两次错，说明这类数字必须逐个方法 grep 后再写，不能凭印象。
+> **统计错了四次，最后一次错在样本而不是数法**。初稿写 8 个方法，更正为 11 个
+> （漏了账户级三个：当时只扫变量名叫 `state` 的调用点，而策略里那三处叫 `state_manager`），
+> R3 动手时逐个核实为 9 个（前两次把"调用点数"和"方法数"混着数）。
+>
+> 然后升级下游时发现还差 3 个：`market_status` / `account_notional` / `position`。
+> **前三次是数错，这次是样本取错** —— "实测调用面"只扫了仓内策略，而仓外那个真实
+> 消费者（IBKR-永续跨市场套利）另有需求。尤其 `position()`：它靠 `Option` 区分
+> "这条腿没有记录"与"确定空仓"，拿不到记录就停手 —— 那正是品味 1.3 要求的做法，
+> 而只给 `position_size` 会把两者压成同一个 `0.0`。
+>
+> 教训：**"实测"的说服力取决于样本覆盖了谁**。库的调用面要连库外的消费者一起数。
 >
 > 另一处更正：初稿还写过"策略能看到其他 symbol 的状态"，那是错的。
 > `StrategyRunner` 用策略自己 `public_streams()` 推导的 symbol 集合去建 `StateManager`，

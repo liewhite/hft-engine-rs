@@ -103,10 +103,18 @@ pub trait Strategy: Send + Sync {
 
 | 类型 | 方法 |
 |---|---|
-| `StrategyView<'_>` | `symbol(&Symbol) -> Option<SymbolView>` / `equity(Exchange)` / `account_info(Exchange)` / `greeks(Exchange, ccy)` |
-| `SymbolView<'_>` | `bbo(Exchange)` / `position_size(Exchange)` / `position_sizes()` / `has_pending_orders()` / `pending_orders()` |
+| `StrategyView<'_>` | `symbol(&Symbol) -> Option<SymbolView>` / `equity(Exchange)` / `account_notional(Exchange)` / `account_info(Exchange)` / `greeks(Exchange, ccy)` / `market_status(Exchange)` |
+| `SymbolView<'_>` | `bbo(Exchange)` / `position(Exchange)` / `position_size(Exchange)` / `position_sizes()` / `has_pending_orders()` / `pending_orders()` |
 
-范围外一律 `None`，不返回默认值——净值取不到与净值为零是两回事。
+读数取不到一律 `None`，不返回默认值——净值取不到与净值为零是两回事。
+
+**两个要留意的**：
+
+- `position(ex)` 返回 `Option<&Position>`，`None` = 这条腿**没有记录**（未知）；
+  `position_size(ex)` 把未知与空仓都压成 `0.0`。跨所对冲策略拿不到某条腿的持仓时
+  应当停手而不是照常开仓，那种判断只能用 `position()`。
+- `market_status(ex)` 是唯一有默认值的读数（默认 `Closed`）。这里的默认是刻意的：
+  休市判据只有"要不要下单"一个用途，"不知道开没开"与"确定没开"应导向同一个动作。
 
 产出：
 

@@ -28,7 +28,7 @@
 //!
 //! 见品味 1.3：净值取不到与净值为零是两回事，前者伪装成后者会让杠杆闸门直接放行。
 
-use crate::domain::{AccountInfo, Exchange, Greeks, Symbol, BBO};
+use crate::domain::{AccountInfo, Exchange, Greeks, MarketStatus, Position, Symbol, BBO};
 use crate::messaging::{PendingOrder, StateManager, SymbolState};
 
 /// 策略视图：本策略订阅范围内的状态。
@@ -60,9 +60,29 @@ impl<'a> StrategyView<'a> {
         self.state.account_view().account_info(exchange)
     }
 
+    /// 某所账户总持仓名义价值。读数尚未到达返回 `None`。
+    ///
+    /// 与 [`Self::equity`] 配对算账户杠杆。`account_info()` 同时给出两者且保证原子，
+    /// 只要其中一个时用这个更直白。
+    pub fn account_notional(&self, exchange: Exchange) -> Option<f64> {
+        self.state.account_view().account_notional(exchange)
+    }
+
     /// 某所某币种的希腊值（delta 已按现货余额修正）
     pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
         self.state.account_view().greeks(exchange, ccy)
+    }
+
+    /// 某所的市场状态。**默认 `Closed`（安全侧）** —— 读数未到达与休市不作区分。
+    ///
+    /// 这里的默认值是刻意的，与品味 1.3 不冲突：休市判据只有一个用途，就是决定要不要
+    /// 下单；"不知道开没开"和"确定没开"应当导向同一个动作（不下单）。而 `equity` 那类
+    /// 读数返回 `None` 是因为拿它算杠杆时，未知与零会导向**相反**的动作。
+    ///
+    /// 未订阅的所恒为 `Closed`：`ExchangeStatus` 是 [`crate::messaging::Delivery::Exchange`]
+    /// 档，压根不会送达 —— 与本方法的默认值自然一致，不必另行裁剪。
+    pub fn market_status(&self, exchange: Exchange) -> MarketStatus {
+        self.state.market_status(exchange)
     }
 }
 
@@ -86,7 +106,17 @@ impl<'a> SymbolView<'a> {
         self.state.bbo(exchange)
     }
 
-    /// 某所持仓（带符号，正多负空）。
+    /// 某所持仓记录。**`None` = 没有这条腿的记录**，与 `size == 0`（确定空仓）不是一回事。
+    ///
+    /// 需要区分"未知"与"空仓"时用它，别用 [`Self::position_size`] —— 后者把两者压成同一个
+    /// `0.0`。典型场景：跨所对冲策略在拿不到某条腿的持仓时应当停手，而不是当它空仓照常开仓
+    /// （品味 1.3）。
+    pub fn position(&self, exchange: Exchange) -> Option<&'a Position> {
+        self.state.position(exchange)
+    }
+
+    /// 某所持仓大小（带符号，正多负空）。**无记录与空仓都返回 `0.0`** ——
+    /// 要区分两者见 [`Self::position`]。
     ///
     /// # 未 seed 的腿报 0 是否算"未知伪装成默认值"
     ///
@@ -130,5 +160,42 @@ mod tests {
         let view = StrategyView::new(&m);
         assert!(view.symbol(&SYM.to_string()).is_some());
         assert!(view.symbol(&"ETH".to_string()).is_none());
+    }
+
+    /// **未知与空仓必须可分**：`position` 返回 `None`，`position_size` 返回 `0.0`。
+    ///
+    /// 跨所对冲策略拿不到某条腿的持仓时应当停手，而不是当它空仓照常开仓。只给
+    /// `position_size` 的话这个判断做不出来 —— 这正是本方法存在的理由。
+    #[test]
+    fn an_absent_leg_is_distinguishable_from_a_flat_one() {
+        let mut m = StateManager::new(&[SYM.to_string()], 0);
+        m.seed_positions(&[crate::messaging::PositionBaseline {
+            position: Position {
+                exchange: Exchange::OKX,
+                symbol: SYM.to_string(),
+                size: 0.0,
+            },
+            snapshot_req_ts: 1,
+        }]);
+        let view = StrategyView::new(&m);
+        let sym = view.symbol(&SYM.to_string()).expect("已注册");
+
+        assert!(sym.position(Exchange::OKX).is_some(), "已 seed 的空仓腿是「确定空仓」");
+        assert_eq!(sym.position_size(Exchange::OKX), 0.0);
+
+        assert!(sym.position(Exchange::Binance).is_none(), "没记录的腿是「未知」");
+        assert_eq!(
+            sym.position_size(Exchange::Binance),
+            0.0,
+            "position_size 把未知压成 0 —— 所以要区分就得用 position()"
+        );
+    }
+
+    /// 市场状态默认 `Closed`（安全侧）：读数未到达与休市导向同一个动作，不下单
+    #[test]
+    fn market_status_defaults_to_closed() {
+        let m = StateManager::new(&[SYM.to_string()], 0);
+        let view = StrategyView::new(&m);
+        assert_eq!(view.market_status(Exchange::IBKR), MarketStatus::Closed);
     }
 }
