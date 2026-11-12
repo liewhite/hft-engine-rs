@@ -478,7 +478,7 @@ impl Manager {
         let manager = Self {
             inbox,
             provisioner: Provisioner::new(provisioning::Collaborators {
-                scope,
+                manager_stopping: scope.stop_flag(),
                 producers,
                 symbol_metas,
                 accounts,

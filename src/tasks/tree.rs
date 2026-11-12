@@ -113,6 +113,12 @@ impl Scope {
         self.0.stop.cancelled()
     }
 
+    /// 本节点停止状态的只读视图，交给只需要问「是不是在停机」的协作方（不必把整个
+    /// `Scope` —— 连同起子任务、报错、请求停止的能力 —— 交出去）
+    pub fn stop_flag(&self) -> StopFlag {
+        StopFlag(self.0.stop.clone())
+    }
+
     /// 主动收工：请求本节点停止，`run` 随后返回 `Ok` 即算正常退出（见 [`Task::run`]）。
     pub fn request_stop(&self) {
         self.0.stop.cancel();
@@ -206,6 +212,17 @@ impl ScopeInner {
         if let Some(root) = self.root.as_ref().and_then(Weak::upgrade) {
             root.stop.cancel();
         }
+    }
+}
+
+/// 见 [`Scope::stop_flag`]：只能查、不能改
+#[derive(Clone, Debug)]
+pub struct StopFlag(CancellationToken);
+
+impl StopFlag {
+    /// 所属节点是否已被请求停止
+    pub fn is_stopping(&self) -> bool {
+        self.0.is_cancelled()
     }
 }
 
@@ -938,6 +955,26 @@ mod tests {
         root.fail_handle().fail(anyhow::anyhow!("下单结果不确定"));
         root.stopping().await;
         assert!(format!("{:#}", root.shutdown().await.unwrap_err()).contains("下单结果不确定"));
+    }
+
+    /// 停止状态的只读视图跟着节点走：节点被请求停止后它随之为真
+    #[tokio::test]
+    async fn stop_flag_follows_the_node() {
+        let root = Root::new("root");
+        let (flag_tx, flag_rx) = oneshot::channel();
+        let h = root
+            .group("g")
+            .spawn_fn("n", |scope| async move {
+                flag_tx.send(scope.stop_flag()).unwrap();
+                scope.stopping().await;
+                Ok(())
+            })
+            .unwrap();
+        let flag = flag_rx.await.unwrap();
+        assert!(!flag.is_stopping());
+        h.stop().await;
+        assert!(flag.is_stopping());
+        root.shutdown().await.unwrap();
     }
 
     /// 根未经 shutdown 就被丢弃：子任务至少收到停止信号

@@ -32,7 +32,7 @@ use crate::domain::{
     SymbolMeta,
 };
 use crate::exchange::{AccountClient, ExchangeHandle, SubscriptionKind};
-use crate::tasks::{ChildHandle, Gone, Group, Scope};
+use crate::tasks::{ChildHandle, Gone, Group, StopFlag};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,7 +64,7 @@ struct Spawned {
 
 /// [`Provisioner::new`] 的参数：编排的全部协作者（每个的用途见 [`Provisioner`] 的字段注释）
 pub(super) struct Collaborators {
-    pub scope: Scope,
+    pub manager_stopping: StopFlag,
     pub producers: Group,
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     pub accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
@@ -82,8 +82,8 @@ pub(super) struct Collaborators {
 /// 由 [`super::Manager`] 持有并在处理收件箱消息时调用（因而天然被串行化）；
 /// 字段就是它的依赖声明，见模块文档。
 pub(super) struct Provisioner {
-    /// manager 自己的 Scope：只用来判断"是否在停机"（协作者失联时分清是停机途中还是事故）
-    scope: Scope,
+    /// manager 是否已被请求停止（只读）：协作者失联时分清是停机途中还是事故
+    manager_stopping: StopFlag,
     /// manager 的生产者组：新建的 executor 挂在这里
     producers: Group,
     /// 引擎级合约目录（与快照面共享同一个 Arc）
@@ -213,7 +213,7 @@ impl Provisioner {
     /// 不了编排的实例列表与下单出口。
     pub(super) fn new(c: Collaborators) -> Self {
         Self {
-            scope: c.scope,
+            manager_stopping: c.manager_stopping,
             producers: c.producers,
             symbol_metas: c.symbol_metas,
             accounts: c.accounts,
@@ -231,7 +231,7 @@ impl Provisioner {
     /// 协作者已停止收件时的处置：manager 在停机途中（整机在停）记 warn 当作已完成；
     /// 否则是协作者出错退出了（它的错误会自己冒到根），这里如实报错。
     fn collaborator_gone(&self, what: &str) -> Result<(), String> {
-        if self.scope.is_stopping() {
+        if self.manager_stopping.is_stopping() {
             tracing::warn!("{what}：对方已停止收件（引擎正在停机）");
             Ok(())
         } else {
