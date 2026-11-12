@@ -23,10 +23,7 @@ const TEST_QUANTITY: f64 = 0.001; // TODO: 填写测试数量
 fn get_credentials() -> Option<HyperliquidCredentials> {
     let wallet_address = std::env::var("HYPERLIQUID_WALLET_ADDRESS").ok()?;
     let private_key = std::env::var("HYPERLIQUID_PRIVATE_KEY").ok()?;
-    Some(HyperliquidCredentials {
-        wallet_address,
-        private_key,
-    })
+    Some(HyperliquidCredentials::with_private_key(wallet_address, private_key))
 }
 
 /// L2 订单簿响应

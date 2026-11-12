@@ -3,6 +3,7 @@ pub(crate) mod codec;
 mod client;
 pub(crate) mod signing;
 mod symbol;
+mod transport;
 
 pub use actor::{HyperliquidActor, HyperliquidActorArgs};
 pub use client::HyperliquidClient;
@@ -14,21 +15,100 @@ pub const REST_BASE_URL: &str = "https://api.hyperliquid.xyz";
 /// Hyperliquid WebSocket 地址
 pub const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
-/// Hyperliquid 凭证
-/// 使用私钥进行 EIP-712 签名
+/// Hyperliquid 凭证：查询用的主钱包地址 + 下单怎么签名。
+///
+/// 配置写法（二选一，两个都写或都不写在加载时报错）：
+/// ```json
+/// {"wallet_address": "0x...", "private_key": "..."}             // 本进程持 agent 私钥
+/// {"wallet_address": "0x...", "signer_url": "http://127.0.0.1:8080"} // 同机 enclave 签名机
+/// ```
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(try_from = "RawHyperliquidCredentials")]
 pub struct HyperliquidCredentials {
-    /// 钱包地址 (0x...)
+    /// 主钱包地址 (0x...)。持仓、挂单、成交等查询都用它，不是 agent 地址。
     pub wallet_address: String,
-    /// 私钥 (不含 0x 前缀)
-    pub private_key: String,
+    pub signing: HyperliquidSigning,
 }
 
 impl HyperliquidCredentials {
+    pub fn with_private_key(wallet_address: String, private_key: String) -> Self {
+        Self { wallet_address, signing: HyperliquidSigning::PrivateKey(private_key) }
+    }
+
+    pub fn with_signer(wallet_address: String, url: String) -> Self {
+        Self { wallet_address, signing: HyperliquidSigning::Signer { url } }
+    }
 }
+
+/// 下单签名方式。切换只改配置，下单逻辑不变（见 `transport` 模块）。
+#[derive(Clone)]
+pub enum HyperliquidSigning {
+    /// 本进程持有 agent 私钥（不含 0x 前缀亦可）
+    PrivateKey(String),
+    /// 同机 enclave-hyperliquid-signer 的 hostd 地址
+    Signer { url: String },
+}
+
+/// 手写 Debug：私钥不进日志
+impl std::fmt::Debug for HyperliquidSigning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HyperliquidSigning::PrivateKey(_) => f.write_str("PrivateKey(<redacted>)"),
+            HyperliquidSigning::Signer { url } => f.debug_struct("Signer").field("url", url).finish(),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHyperliquidCredentials {
+    wallet_address: String,
+    private_key: Option<String>,
+    signer_url: Option<String>,
+}
+
+impl TryFrom<RawHyperliquidCredentials> for HyperliquidCredentials {
+    type Error = String;
+    fn try_from(r: RawHyperliquidCredentials) -> Result<Self, String> {
+        let signing = match (r.private_key, r.signer_url) {
+            (Some(k), None) => HyperliquidSigning::PrivateKey(k),
+            (None, Some(url)) => HyperliquidSigning::Signer { url },
+            (Some(_), Some(_)) => return Err("hyperliquid 凭证 private_key 与 signer_url 只能写一个".into()),
+            (None, None) => return Err("hyperliquid 凭证缺 private_key 或 signer_url".into()),
+        };
+        Ok(Self { wallet_address: r.wallet_address, signing })
+    }
+}
+
 
 /// 本所适配层是否实现了这种公共订阅（**能力查询**，装配期由 `ExchangeSetup` 携带）。
 /// 派生自 public WS 的 kind 映射函数，见各所同名函数的约定。
 pub fn supports_subscription(kind: &crate::exchange::SubscriptionKind) -> bool {
     actor::public_ws::kind_to_stream(kind, "USDC", "").is_some()
+}
+
+#[cfg(test)]
+mod credentials_tests {
+    use super::*;
+
+    #[test]
+    fn exactly_one_signing_method() {
+        let k: HyperliquidCredentials =
+            serde_json::from_str(r#"{"wallet_address":"0xa","private_key":"ab"}"#).unwrap();
+        assert!(matches!(k.signing, HyperliquidSigning::PrivateKey(_)));
+        let s: HyperliquidCredentials =
+            serde_json::from_str(r#"{"wallet_address":"0xa","signer_url":"http://127.0.0.1:8080"}"#).unwrap();
+        assert!(matches!(s.signing, HyperliquidSigning::Signer { .. }));
+        assert!(serde_json::from_str::<HyperliquidCredentials>(
+            r#"{"wallet_address":"0xa","private_key":"ab","signer_url":"x"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<HyperliquidCredentials>(r#"{"wallet_address":"0xa"}"#).is_err());
+    }
+
+    #[test]
+    fn private_key_is_not_debug_printed() {
+        let c = HyperliquidCredentials::with_private_key("0xa".into(), "deadbeef".into());
+        assert!(!format!("{c:?}").contains("deadbeef"));
+    }
 }

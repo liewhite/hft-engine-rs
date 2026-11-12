@@ -4,7 +4,7 @@
 
 use super::symbol::{belongs_to_dex, from_hyperliquid, to_hyperliquid};
 use crate::domain::{
-    now_ms, Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, Side, Symbol,
+    Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, Side, Symbol,
     SymbolMeta, Timestamp,
 };
 use md5::{Digest, Md5};
@@ -15,12 +15,14 @@ use crate::exchange::hyperliquid::codec::{
 use crate::domain::SignificantFiguresFormatter;
 use std::sync::Arc;
 use crate::exchange::hyperliquid::signing::{
-    action_hash, create_signer, sign_l1_action, BulkCancelAction, BulkOrderAction, CancelResponse,
-    CancelWire, ExchangeRequest, LimitOrder, OrderResponse, OrderResponseData, OrderStatus,
-    OrderType as WireOrderType, OrderWire,
+    CancelResponse, OrderResponse, OrderResponseData, OrderStatus,
 };
-use crate::exchange::hyperliquid::{HyperliquidCredentials, REST_BASE_URL};
-use alloy::signers::local::PrivateKeySigner;
+use crate::exchange::hyperliquid::transport::{
+    float_to_wire, EnclaveSubmitter, HlCancelIntent, HlOrderIntent, HlSubmitter, HlTif,
+    LocalKeySubmitter,
+};
+use crate::exchange::hyperliquid::{HyperliquidCredentials, HyperliquidSigning, REST_BASE_URL};
+use crate::domain::PriceFormatter;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -33,14 +35,30 @@ const DEX_ASSET_INDEX_BASE: u32 = 110_000;
 /// 每个 DEX 之间的 asset index 间距
 const DEX_ASSET_INDEX_STEP: u32 = 10_000;
 
+/// 市价单的让价：HL 没有原生市价单，用「对手价 ± 5%」的 IOC 限价单代替（与
+/// hyperliquid-python-sdk `market_open` 默认滑点同值）。
+///
+/// 为什么不再用极端价（买 999999999 / 卖 0.00000001）：签名机按 `limitPx × sz` 限单笔
+/// 名义，极端价的买单必被拒签；而且极端价在薄盘口上等于不设保护。IOC 只吃到 5% 内的流动性，
+/// 剩余部分撤销，由调用方按成交回报继续处理。
+const MARKET_ORDER_SLIPPAGE: f64 = 0.05;
+
+/// meta 里一个币下单要用的两项
+#[derive(Debug, Clone, Copy)]
+struct AssetEntry {
+    /// 全局 asset index（含 dex 偏移）
+    asset: u32,
+    sz_decimals: i32,
+}
+
 /// Hyperliquid 交易所客户端
 pub struct HyperliquidClient {
     /// HTTP 客户端
     client: Client,
     /// 凭证（可选）
     credentials: Option<HyperliquidCredentials>,
-    /// 签名器（从 credentials 派生）
-    signer: Option<PrivateKeySigner>,
+    /// 下单/撤单的签名提交通道（从 credentials 派生；有凭证即有）
+    submitter: Option<Arc<dyn HlSubmitter>>,
     /// REST API 基础 URL
     base_url: String,
     /// 计价币种 (e.g., "USDC", "USDE")
@@ -49,8 +67,8 @@ pub struct HyperliquidClient {
     dex: String,
     /// 是否是主网
     is_mainnet: bool,
-    /// Coin -> Asset Index 映射 (懒加载)
-    coin_to_asset: RwLock<Option<HashMap<String, u32>>>,
+    /// Coin -> (Asset Index, szDecimals) 映射 (懒加载)
+    coin_to_asset: RwLock<Option<HashMap<String, AssetEntry>>>,
 }
 
 impl HyperliquidClient {
@@ -65,21 +83,29 @@ impl HyperliquidClient {
             .build()
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
 
-        // 如果有凭证，创建签名器
-        let signer = credentials
-            .as_ref()
-            .map(|c| create_signer(&c.private_key))
-            .transpose()
-            .map_err(|e| ExchangeError::Other(format!("Failed to create signer: {}", e)))?;
+        let base_url = REST_BASE_URL.to_string();
+        let is_mainnet = true; // 默认主网
+        let submitter: Option<Arc<dyn HlSubmitter>> = match credentials.as_ref().map(|c| &c.signing) {
+            None => None,
+            Some(HyperliquidSigning::PrivateKey(key)) => Some(Arc::new(LocalKeySubmitter::new(
+                client.clone(),
+                base_url.clone(),
+                key,
+                is_mainnet,
+            )?)),
+            Some(HyperliquidSigning::Signer { url }) => {
+                Some(Arc::new(EnclaveSubmitter::new(client.clone(), url.clone())))
+            }
+        };
 
         Ok(Self {
             client,
             credentials,
-            signer,
-            base_url: REST_BASE_URL.to_string(),
+            submitter,
+            base_url,
             quote,
             dex,
-            is_mainnet: true, // 默认主网
+            is_mainnet,
             coin_to_asset: RwLock::new(None),
         })
     }
@@ -201,8 +227,8 @@ impl HyperliquidClient {
         )))
     }
 
-    /// 获取 coin 对应的 asset index
-    async fn get_asset_index(&self, coin: &str) -> Result<u32, ExchangeError> {
+    /// 获取 coin 对应的 asset index 与 szDecimals
+    async fn asset_entry(&self, coin: &str) -> Result<AssetEntry, ExchangeError> {
         // 先检查缓存
         {
             let guard = self.coin_to_asset.read().unwrap();
@@ -219,7 +245,10 @@ impl HyperliquidClient {
         // 构建映射（全局 asset index = offset + 数组位置）
         let mut map = HashMap::new();
         for (idx, asset) in meta.universe.iter().enumerate() {
-            map.insert(asset.name.clone(), offset + idx as u32);
+            map.insert(
+                asset.name.clone(),
+                AssetEntry { asset: offset + idx as u32, sz_decimals: asset.sz_decimals },
+            );
         }
 
         // 获取结果
@@ -237,62 +266,45 @@ impl HyperliquidClient {
         result
     }
 
-    /// 发送 POST /exchange 请求
-    async fn post_exchange<T: for<'de> Deserialize<'de>>(
-        &self,
-        body: &ExchangeRequest,
-    ) -> Result<T, ExchangeError> {
-        let resp = self
-            .client
-            .post(format!("{}/exchange", self.base_url))
-            .header("Content-Type", "application/json")
-            .json(body)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-
-        if !status.is_success() {
-            return Err(ExchangeError::ApiError(
-                Exchange::Hyperliquid,
-                status.as_u16() as i32,
-                text,
-            ));
-        }
-
-        serde_json::from_str::<T>(&text).map_err(|e| {
-            ExchangeError::Other(format!(
-                "Failed to parse exchange response: {} (body: {})",
-                e, text
-            ))
-        })
+    /// 签名提交通道；没配凭证时本不该走到这里（AccountClient 只在有凭证时装配）
+    fn submitter(&self) -> Result<&dyn HlSubmitter, ExchangeError> {
+        self.submitter
+            .as_deref()
+            .ok_or(ExchangeError::AuthenticationFailed(Exchange::Hyperliquid))
     }
 
-    /// 将 domain Order 转换为 OrderWire
-    async fn order_to_wire(&self, order: &Order) -> Result<OrderWire, ExchangeError> {
+    /// 市价单的 IOC 限价：取当前盘口对手价，往不利方向让 [`MARKET_ORDER_SLIPPAGE`]，
+    /// 按 HL 价格精度取整。多一次 `l2Book` 查询；对延迟敏感的路径应由策略自己用 BBO
+    /// 下 IOC 限价单，不走市价单。
+    async fn market_limit_px(&self, coin: &str, is_buy: bool, sz_decimals: i32) -> Result<String, ExchangeError> {
+        let book: serde_json::Value = self
+            .post_info(serde_json::json!({"type": "l2Book", "coin": coin}))
+            .await?;
+        let side = if is_buy { 1 } else { 0 }; // levels = [bids, asks]
+        let top = book["levels"][side][0]["px"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|p| *p > 0.0)
+            .ok_or_else(|| ExchangeError::Other(format!("{coin} 盘口无对手价，市价单无法定价")))?;
+        let px = if is_buy { top * (1.0 + MARKET_ORDER_SLIPPAGE) } else { top * (1.0 - MARKET_ORDER_SLIPPAGE) };
+        let formatted = SignificantFiguresFormatter::new(sz_decimals.max(0) as u32).format(px);
+        let px: f64 = formatted.parse().map_err(|_| ExchangeError::ParseError(formatted.clone()))?;
+        float_to_wire(px)
+    }
+
+    /// 将 domain Order 转换为下单意图
+    async fn order_intent(&self, order: &Order) -> Result<HlOrderIntent, ExchangeError> {
         let coin = to_hyperliquid(&order.symbol, &self.quote, &self.dex);
-        let asset = self.get_asset_index(&coin).await?;
+        let entry = self.asset_entry(&coin).await?;
 
         let is_buy = matches!(order.side, Side::Long);
 
-        // 提取价格和构造订单类型
-        let (limit_px, order_type) = match &order.order_type {
-            OrderType::Market => {
-                // 市价单: 使用极端价格
-                let px = if is_buy { "999999999" } else { "0.00000001" };
-                (
-                    px.to_string(),
-                    WireOrderType::Limit(LimitOrder {
-                        tif: "Ioc".to_string(),
-                    }),
-                )
-            }
+        let (limit_px, tif) = match &order.order_type {
+            OrderType::Market => (self.market_limit_px(&coin, is_buy, entry.sz_decimals).await?, HlTif::Ioc),
             OrderType::Limit { price, tif } => {
-                let tif_str = match tif {
-                    crate::domain::TimeInForce::GTC => "Gtc",
-                    crate::domain::TimeInForce::IOC => "Ioc",
+                let tif = match tif {
+                    crate::domain::TimeInForce::GTC => HlTif::Gtc,
+                    crate::domain::TimeInForce::IOC => HlTif::Ioc,
                     crate::domain::TimeInForce::FOK => {
                         // FOK 要求全部成交或取消，IOC 允许部分成交，语义不同
                         // Hyperliquid 不支持 FOK，记录警告
@@ -300,26 +312,22 @@ impl HyperliquidClient {
                             symbol = %order.symbol,
                             "FOK not supported on Hyperliquid, using IOC (may result in partial fill)"
                         );
-                        "Ioc"
+                        HlTif::Ioc
                     }
-                    crate::domain::TimeInForce::PostOnly => "Alo", // Add Liquidity Only
+                    crate::domain::TimeInForce::PostOnly => HlTif::Alo,
                 };
-                (
-                    format!("{}", price),
-                    WireOrderType::Limit(LimitOrder {
-                        tif: tif_str.to_string(),
-                    }),
-                )
+                (float_to_wire(*price)?, tif)
             }
         };
 
-        Ok(OrderWire {
-            asset,
+        Ok(HlOrderIntent {
+            coin,
+            asset: entry.asset,
             is_buy,
             limit_px,
-            sz: format!("{}", order.quantity),
+            sz: float_to_wire(order.quantity)?,
             reduce_only: order.reduce_only,
-            order_type,
+            tif,
             cloid: if order.client_order_id.is_empty() {
                 None
             } else {
@@ -515,36 +523,19 @@ impl AccountClient for HyperliquidClient {
     }
 
     async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
-        let signer = self
-            .signer
-            .as_ref()
-            .ok_or_else(|| ExchangeError::Other("No credentials configured".to_string()))?;
+        let submitter = self.submitter()?;
 
         // `order_id` 是交易所侧的 oid（见 fetch_pending_orders / private_ws 的映射）
         let oid: u64 = order_id.parse().map_err(|_| {
             ExchangeError::ParseError(format!("Hyperliquid order_id 不是合法的 oid: {order_id}"))
         })?;
         let coin = to_hyperliquid(symbol, &self.quote, &self.dex);
-        let asset = self.get_asset_index(&coin).await?;
+        let asset = self.asset_entry(&coin).await?.asset;
 
-        // 与 place_order 同一条签名链路：msgpack action hash -> EIP-712
-        let action = BulkCancelAction::new(vec![CancelWire { a: asset, o: oid }]);
-        let nonce = now_ms();
-        let connection_id = action_hash(&action, nonce, None)
-            .map_err(|e| ExchangeError::Other(format!("Cancel action hash failed: {e}")))?;
-        let signature = sign_l1_action(signer, connection_id, self.is_mainnet)
-            .await
-            .map_err(|e| ExchangeError::Other(format!("Signing failed: {e}")))?;
-
-        let request = ExchangeRequest {
-            action: serde_json::to_value(&action)
-                .map_err(|e| ExchangeError::Other(format!("Serialize cancel action failed: {e}")))?,
-            nonce,
-            signature: signature.to_api_format(),
-            vault_address: None,
-        };
-
-        let response: CancelResponse = self.post_exchange(&request).await?;
+        let raw = submitter.cancel(&HlCancelIntent { coin, asset, oid }).await?;
+        let response: CancelResponse = serde_json::from_value(raw.clone()).map_err(|e| {
+            ExchangeError::ParseError(format!("Failed to parse cancel response: {e} (body: {raw})"))
+        })?;
         if response.status != "ok" {
             return Err(ExchangeError::Other(format!(
                 "Hyperliquid cancel rejected: {}",
@@ -667,41 +658,12 @@ impl AccountClient for HyperliquidClient {
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
         // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
         let order = order.inner();
-        // 确保有签名器
-        let signer = self
-            .signer
-            .as_ref()
-            .ok_or_else(|| ExchangeError::Other("No credentials configured".to_string()))?;
-
-        // 转换订单格式
-        let order_wire = self.order_to_wire(&order).await?;
-
-        // 构造批量下单 action
-        let action = BulkOrderAction::new(vec![order_wire]);
-
-        // 生成 nonce (当前毫秒时间戳)
-        let nonce = now_ms();
-
-        // 计算 action hash (用于签名)
-        let connection_id = action_hash(&action, nonce, None)
-            .map_err(|e| ExchangeError::Other(format!("Action hash failed: {}", e)))?;
-
-        // EIP-712 签名
-        let signature = sign_l1_action(signer, connection_id, self.is_mainnet)
-            .await
-            .map_err(|e| ExchangeError::Other(format!("Signing failed: {}", e)))?;
-
-        // 构造请求
-        let request = ExchangeRequest {
-            action: serde_json::to_value(&action)
-                .map_err(|e| ExchangeError::Other(format!("Serialize action failed: {}", e)))?,
-            nonce,
-            signature: signature.to_api_format(),
-            vault_address: None,
-        };
-
-        // 发送请求
-        let response: OrderResponse = self.post_exchange(&request).await?;
+        let submitter = self.submitter()?;
+        let intent = self.order_intent(order).await?;
+        let raw = submitter.place(&intent).await?;
+        let response: OrderResponse = serde_json::from_value(raw.clone()).map_err(|e| {
+            ExchangeError::ParseError(format!("Failed to parse order response: {e} (body: {raw})"))
+        })?;
 
         // 解析响应 — 错误时 response 是字符串，成功时是 OrderResponseData 对象
         if response.status != "ok" {

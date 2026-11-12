@@ -36,18 +36,15 @@ fn load_credentials() -> HyperliquidCredentials {
         .expect("读取 hype_config.json 失败，请确认文件存在");
     let config: HypeConfig =
         serde_json::from_str(&content).expect("解析 hype_config.json 失败");
-    HyperliquidCredentials {
-        wallet_address: config.wallet,
-        private_key: config.agent_key,
-    }
+    HyperliquidCredentials::with_private_key(config.wallet, config.agent_key)
 }
 
 /// 创建 XYZ DEX 客户端（无凭证，仅用于公开接口）
 fn create_public_client() -> HyperliquidClient {
-    let creds = HyperliquidCredentials {
-        wallet_address: "0x0000000000000000000000000000000000000000".to_string(),
-        private_key: "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
-    };
+    let creds = HyperliquidCredentials::with_private_key(
+        "0x0000000000000000000000000000000000000000".to_string(),
+        "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+    );
     HyperliquidClient::new(TEST_QUOTE.to_string(), TEST_DEX.to_string(), Some(creds)).expect("创建公开客户端失败")
 }
 
