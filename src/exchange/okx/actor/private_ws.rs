@@ -29,6 +29,9 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 /// 登录响应等待超时 (秒)。超时 → 启动失败受控退出，避免 on_start 永久阻塞。
 const LOGIN_TIMEOUT_SECS: u64 = 10;
 
+/// 私有流必须全部确认的频道：account（余额）、orders（订单与成交）
+const REQUIRED_CHANNELS: [&str; 2] = ["account", "orders"];
+
 /// OkxPrivateWsActor 初始化参数
 pub struct OkxPrivateWsActorArgs {
     /// 凭证
@@ -42,6 +45,8 @@ pub struct OkxPrivateWsActorArgs {
 }
 
 /// OkxPrivateWsActor - 私有 WebSocket Actor
+///
+/// `on_start` 返回前已登录、且 [`REQUIRED_CHANNELS`] 都已确认订阅生效。
 pub struct OkxPrivateWsActor {
     /// 账户私有事件总线（发布事件，标 Live）
     account_pubsub: ActorRef<AccountPubSub>,
@@ -157,8 +162,8 @@ impl Actor for OkxPrivateWsActor {
         let subscribe_msg = json!({
             "op": "subscribe",
             "args": [
-                {"channel": "account"},
-                {"channel": "orders", "instType": "SWAP"}
+                {"channel": REQUIRED_CHANNELS[0]},
+                {"channel": REQUIRED_CHANNELS[1], "instType": "SWAP"}
             ]
         })
         .to_string();
@@ -168,17 +173,9 @@ impl Actor for OkxPrivateWsActor {
             .await
             .map_err(|e| ExchangeError::WebSocketError(format!("OKX send private subscribe: {e}")))?;
 
-        // 5. 创建出站消息 channel
+        // 5. 起 ws_loop（心跳、回 Pong、断线判定都归它）
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-
-        // 6. 创建入站消息 channel (收到的数据/错误)
-        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
-
-        // attach_stream 监控入站消息
-        let incoming_stream = ReceiverStream::new(incoming_rx);
-        actor_ref.attach_stream(incoming_stream, (), ());
-
-        // 7. 启动 ws_loop
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
         tokio::spawn(ws_loop::run_ws_loop(
             read,
             write,
@@ -186,6 +183,16 @@ impl Actor for OkxPrivateWsActor {
             incoming_tx,
             ws_loop::WsKeepalive::okx(),
         ));
+
+        // 6. 等两个频道都确认才算启动完成；期间收到的帧在后续数据之前重放给本 actor
+        let frames = ws_loop::await_subscriptions(&mut incoming_rx, &REQUIRED_CHANNELS, subscription_confirmed)
+            .await
+            .map_err(|e| ExchangeError::WebSocketError(format!("OKX 私有订阅: {e}")))?;
+        actor_ref.attach_stream(
+            futures_util::stream::iter(frames.into_iter().map(Ok)).chain(ReceiverStream::new(incoming_rx)),
+            (),
+            (),
+        );
 
         tracing::info!("OkxPrivateWsActor started");
 
@@ -229,6 +236,28 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPrivateWsAct
 // 消息解析
 // ============================================================================
 
+fn server_error(value: &serde_json::Value) -> WsError {
+    let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+    WsError::ParseError(format!("OKX error: code={code}, msg={msg}"))
+}
+
+/// 启动期订阅确认判据（见 [`ws_loop::await_subscriptions`]）：订阅回执
+/// `{"event":"subscribe","arg":{"channel":"orders",…}}` 或该频道数据到达都算；
+/// `{"event":"error",…}`（如订阅被拒）启动失败
+fn subscription_confirmed(raw: &str) -> Result<Option<String>, WsError> {
+    if raw == "pong" {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+    let channel = value.pointer("/arg/channel").and_then(|c| c.as_str()).map(str::to_string);
+    match value.get("event").and_then(|v| v.as_str()) {
+        Some("error") => Err(server_error(&value)),
+        Some("subscribe") | None => Ok(channel),
+        Some(_) => Ok(None),
+    }
+}
+
 fn parse_private_message(
     raw: &str,
     local_ts: u64,
@@ -252,14 +281,7 @@ fn parse_private_message(
                 // OKX 连接计数事件，忽略
                 return Ok(Vec::new());
             }
-            "error" => {
-                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
-                return Err(WsError::ParseError(format!(
-                    "OKX error: code={}, msg={}",
-                    code, msg
-                )));
-            }
+            "error" => return Err(server_error(&value)),
             _ => {
                 tracing::warn!(event, raw, "OKX unknown event");
                 return Ok(Vec::new());
@@ -404,6 +426,19 @@ mod tests {
             .collect()
     }
 
+    /// 启动期确认判据：订阅回执与频道数据都算；连接计数等事件不算；订阅被拒启动失败
+    #[test]
+    fn subscribe_ack_or_channel_data_confirms_a_channel() {
+        let ack = r#"{"event":"subscribe","arg":{"channel":"orders","instType":"SWAP"},"connId":"a"}"#;
+        assert_eq!(subscription_confirmed(ack).unwrap().as_deref(), Some("orders"));
+        assert_eq!(subscription_confirmed(&order_push("BTC-USDT-SWAP", "0")).unwrap().as_deref(), Some("orders"));
+        let count = r#"{"event":"channel-conn-count","channel":"orders","connCount":"2","connId":"a"}"#;
+        assert_eq!(subscription_confirmed(count).unwrap(), None);
+        assert_eq!(subscription_confirmed("pong").unwrap(), None);
+        let rejected = r#"{"event":"error","code":"60018","msg":"bad channel","connId":"a"}"#;
+        assert!(subscription_confirmed(rejected).unwrap_err().to_string().contains("60018"));
+    }
+
     /// 同名不同计价币 / 币本位的成交不串进 BTC：原样以 UnmappedFill 上报（张数不折算）
     #[test]
     fn other_quote_and_inverse_fills_do_not_leak_into_btc() {
@@ -412,5 +447,28 @@ mod tests {
         assert_eq!(kinds(&order_push("BTC-USD-SWAP", "3")), ["unmapped:BTC-USD-SWAP:3"]);
         // 无成交的订单状态：不关心
         assert!(kinds(&order_push("BTC-USDC-SWAP", "0")).is_empty());
+    }
+
+    /// 联网只读：真登录 OKX 私有流，启动（on_start 返回）即 account / orders 都已确认。
+    /// 需要白名单 IP 与 OKX_API_KEY / OKX_SECRET / OKX_PASSPHRASE。
+    #[tokio::test]
+    #[ignore = "需要联网、OKX 凭证与白名单 IP"]
+    async fn live_private_subscriptions_confirm_at_startup() {
+        use kameo::actor::Spawn;
+        use kameo_actors::DeliveryStrategy;
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("缺 {k}"));
+        let credentials =
+            OkxCredentials { api_key: env("OKX_API_KEY"), secret: env("OKX_SECRET"), passphrase: env("OKX_PASSPHRASE") };
+        let pubsub = AccountPubSub::spawn(AccountPubSub::new(DeliveryStrategy::BestEffort));
+        let started = std::time::Instant::now();
+        let actor = OkxPrivateWsActor::spawn(OkxPrivateWsActorArgs {
+            credentials,
+            account_pubsub: pubsub,
+            symbol_metas: Arc::new(metas()),
+            quote: "USDT".to_string(),
+        });
+        actor.wait_for_startup_result().await.expect("订阅应在启动期确认");
+        println!("OKX 私有订阅确认耗时 {:?}", started.elapsed());
+        actor.stop_gracefully().await.unwrap();
     }
 }

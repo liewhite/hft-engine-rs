@@ -75,7 +75,9 @@ impl Actor for BinancePrivateWsActor {
             })?;
 
         // 2. 连接私有 WebSocket（迁移后用 query 参数传 listenKey；未带 events 让交易所推全部事件）
-        // 失败向上传播 → 启动期受控退出，不重试/不重连
+        // 失败向上传播 → 启动期受控退出，不重试/不重连。
+        // 订阅确认：币安私有流没有订阅请求，listenKey 在连接地址里，握手成功即订阅生效
+        // （OKX / HL 要另等回执，见 ws_loop::await_subscriptions）
         let url = format!("{}?listenKey={}", WS_PRIVATE_URL, listen_key);
         let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
             .await

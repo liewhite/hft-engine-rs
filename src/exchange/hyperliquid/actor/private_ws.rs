@@ -26,7 +26,6 @@ use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
 use kameo_actors::pubsub::Publish;
 use serde_json::json;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -42,6 +41,10 @@ pub struct HyperliquidPrivateWsActorArgs {
 }
 
 /// HyperliquidPrivateWsActor - 账户 WebSocket Actor
+///
+/// `on_start` 返回前两条订阅（见 [`REQUIRED_SUBSCRIPTIONS`]）都已确认生效（见
+/// [`ws_loop::await_subscriptions`]）—— **连接活着不等于订阅活着**：HL 的 keepalive 只证明
+/// 链路通，订阅被悄悄拒掉时 ping/pong 照常。
 pub struct HyperliquidPrivateWsActor {
     /// 账户私有事件总线（发布事件，标 Live）
     account_pubsub: ActorRef<AccountPubSub>,
@@ -50,81 +53,23 @@ pub struct HyperliquidPrivateWsActor {
     /// 否则别的 dex 上的成交会被剥掉前缀后当成同名标的的 Fill，直接污染「基线 + Fill」
     /// 维护的持仓。
     markets: Arc<HlMarkets>,
-    /// 尚未确认生效的订阅。两条订阅（见 [`REQUIRED_SUBSCRIPTIONS`]）必须全部确认，
-    /// 否则 [`SubscriptionDeadline`] 到期即自杀 —— **连接活着不等于订阅活着**：HL 的
-    /// keepalive 只证明链路通，订阅被悄悄拒掉时 ping/pong 照常。
-    ///
-    /// 确认有两个等效来源（见 [`Self::confirm_subscription`]）：服务端的
-    /// `subscriptionResponse` 回执，或该频道的数据到达。后者是更硬的证据，也让记账
-    /// 不依赖"HL 一定对每个订阅都回回执"这个未经实盘验证的假设。
-    pending_subscriptions: HashSet<&'static str>,
-    /// 发送消息到 ws_loop 的 channel
-    #[allow(dead_code)]
+    /// 发送消息到 ws_loop 的 channel（drop 即让 ws_loop 收工）
     ws_tx: Option<mpsc::Sender<String>>,
 }
 
 /// 私有流必须全部确认的订阅（缺任何一条，本地账本都会从此落后于交易所）
 const REQUIRED_SUBSCRIPTIONS: [&str; 2] = ["orderUpdates", "userFills"];
 
-/// 订阅确认的等待上限：超时未集齐即判定订阅失败并自杀（由 supervisor 决定重启与否）
-const SUBSCRIPTION_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
 impl HyperliquidPrivateWsActor {
     /// 解析并处理消息
     async fn handle_message(&mut self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        match parse_private_message(raw, &self.markets, local_ts)? {
-            PrivateMessage::SubscriptionAck(sub_type) => {
-                self.confirm_subscription(&sub_type);
-            }
-            PrivateMessage::Events { channel, events } => {
-                // 数据到达即订阅生效 —— 不依赖"HL 一定会对每个订阅都回确认回执"这个
-                // 假设。两个判据取或：收到回执、或收到该频道的数据。
-                self.confirm_subscription(channel);
-                for event in events {
-                    if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
-                        tracing::error!(error = %e, "Failed to publish to AccountPubSub");
-                    }
-                }
+        for event in parse_private_message(raw, &self.markets, local_ts)? {
+            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
+                tracing::error!(error = %e, "Failed to publish to AccountPubSub");
             }
         }
         Ok(())
-    }
-
-    /// 记下"这个订阅确实活着"。两个来源等效：服务端的确认回执，或该频道的数据到达。
-    fn confirm_subscription(&mut self, subscription: &str) {
-        if self.pending_subscriptions.remove(subscription) {
-            tracing::info!(
-                subscription,
-                remaining = self.pending_subscriptions.len(),
-                "Hyperliquid 私有订阅已确认生效"
-            );
-        }
-    }
-}
-
-/// 订阅确认的截止检查（on_start 延时自投递一次）
-pub struct SubscriptionDeadline;
-
-impl Message<SubscriptionDeadline> for HyperliquidPrivateWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        _msg: SubscriptionDeadline,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        if self.pending_subscriptions.is_empty() {
-            return;
-        }
-        // 只要有一条没确认，本 actor 提供的账本就是残缺的 —— 与其带病运行，不如
-        // 立刻死掉让上层看见（与"预热失败即致命"同一姿态）。
-        tracing::error!(
-            missing = ?self.pending_subscriptions,
-            timeout_s = SUBSCRIPTION_ACK_TIMEOUT.as_secs(),
-            "Hyperliquid 私有订阅未在超时内全部确认，私有回报不可信，退出"
-        );
-        ctx.actor_ref().kill();
     }
 }
 
@@ -137,20 +82,11 @@ impl Actor for HyperliquidPrivateWsActor {
         let (ws_stream, _) = tokio_tungstenite::connect_async(WS_URL)
             .await
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
-
         let (write, read) = ws_stream.split();
 
-        // 2. 创建出站消息 channel
+        // 2. 起 ws_loop（心跳、回 Pong、断线判定都归它）
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-
-        // 3. 创建入站消息 channel
-        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
-
-        // attach_stream 监控入站消息
-        let incoming_stream = ReceiverStream::new(incoming_rx);
-        actor_ref.attach_stream(incoming_stream, (), ());
-
-        // 4. 启动 ws_loop
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
         tokio::spawn(ws_loop::run_ws_loop(
             read,
             write,
@@ -159,55 +95,38 @@ impl Actor for HyperliquidPrivateWsActor {
             ws_loop::WsKeepalive::hyperliquid(),
         ));
 
-        // 5. 订阅账户频道
-        // orderUpdates: 订单更新
-        let subscribe_orders = json!({
-            "method": "subscribe",
-            "subscription": {
-                "type": "orderUpdates",
-                "user": args.wallet_address
-            }
-        })
-        .to_string();
+        // 3. 订阅账户频道：orderUpdates（订单更新）、userFills（成交）
+        for sub_type in REQUIRED_SUBSCRIPTIONS {
+            let msg = json!({
+                "method": "subscribe",
+                "subscription": {"type": sub_type, "user": args.wallet_address}
+            })
+            .to_string();
+            outgoing_tx
+                .send(msg)
+                .await
+                .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid send {sub_type}: {e}")))?;
+        }
 
-        outgoing_tx
-            .send(subscribe_orders)
+        // 4. 等两条订阅都确认才算启动完成；期间收到的帧在后续数据之前重放给本 actor
+        let frames = ws_loop::await_subscriptions(&mut incoming_rx, &REQUIRED_SUBSCRIPTIONS, subscription_confirmed)
             .await
-            .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid send orderUpdates: {e}")))?;
-
-        // userFills: 成交推送
-        let subscribe_fills = json!({
-            "method": "subscribe",
-            "subscription": {
-                "type": "userFills",
-                "user": args.wallet_address
-            }
-        })
-        .to_string();
-
-        outgoing_tx
-            .send(subscribe_fills)
-            .await
-            .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid send userFills: {e}")))?;
-
-        // 6. 订阅确认的截止检查：请求发出去 ≠ 订阅生效（见 pending_subscriptions）
-        let deadline_ref = actor_ref.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(SUBSCRIPTION_ACK_TIMEOUT).await;
-            // actor 已停机时投递失败是预期（本检查已无意义）
-            let _ = deadline_ref.tell(SubscriptionDeadline).send().await;
-        });
+            .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid 私有订阅: {e}")))?;
+        actor_ref.attach_stream(
+            futures_util::stream::iter(frames.into_iter().map(Ok)).chain(ReceiverStream::new(incoming_rx)),
+            (),
+            (),
+        );
 
         tracing::info!(
             wallet = %args.wallet_address,
             dexes = ?args.markets.dexes(),
-            "HyperliquidPrivateWsActor started, subscribed to orderUpdates and userFills"
+            "HyperliquidPrivateWsActor started, orderUpdates and userFills confirmed"
         );
 
         Ok(Self {
             account_pubsub: args.account_pubsub,
             markets: args.markets,
-            pending_subscriptions: REQUIRED_SUBSCRIPTIONS.into_iter().collect(),
             ws_tx: Some(outgoing_tx),
         })
     }
@@ -244,82 +163,64 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPriv
 // 消息解析
 // ============================================================================
 
-/// 私有流一条报文对本 actor 的语义。
-///
-/// 解析保持纯函数，订阅记账（需要跨报文的状态）留给 actor —— 见
-/// [`HyperliquidPrivateWsActor::pending_subscriptions`]。
-enum PrivateMessage {
-    /// 携带零到多条事件。`channel` 供订阅记账使用 —— **该频道有数据到达，就是订阅
-    /// 生效的最硬证据**（比确认回执更直接）。pong / 未知频道给空串。
-    Events {
-        channel: &'static str,
-        events: Vec<AccountEvent>,
-    },
+/// 私有流一条报文的协议层含义（不涉及品种目录）。启动期的订阅确认与运行期的事件解析
+/// 都从这里分流，HL 私有流报文格式只在这一处。
+#[derive(Debug, PartialEq)]
+enum Frame {
     /// 某个订阅的确认回执，值为订阅类型（如 `orderUpdates`）
     SubscriptionAck(String),
+    /// 订阅频道的数据。**该频道有数据到达，就是订阅生效的最硬证据**（比确认回执更直接）
+    Data { channel: &'static str, data: serde_json::Value },
+    /// pong、未知频道等与本 actor 无关的报文
+    Ignored,
 }
 
-fn parse_private_message(
-    raw: &str,
-    markets: &HlMarkets,
-    local_ts: u64,
-) -> Result<PrivateMessage, WsError> {
-    let value: serde_json::Value =
+fn classify(raw: &str) -> Result<Frame, WsError> {
+    let mut value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
-
-    if value.get("channel").is_some() {
-        let channel = value["channel"].as_str().unwrap_or("");
-
-        match channel {
-            // 服务端拒绝/报错：**必须致命**。此前它落进下面的未知分支被 debug 掉，
-            // 于是"订阅被拒（地址格式、限流）"表现为：连接健康、ping/pong
-            // 正常、而订单与成交回报再也不来 —— 系统全绿地瞎跑。
-            "error" => {
-                return Err(WsError::ParseError(format!(
-                    "Hyperliquid 私有流返回错误: {}",
-                    value.get("data").unwrap_or(&value)
-                )));
-            }
-            "subscriptionResponse" => {
-                // {"channel":"subscriptionResponse","data":{"method":"subscribe",
-                //   "subscription":{"type":"orderUpdates","user":"0x..."}}}
-                let sub_type = value
-                    .pointer("/data/subscription/type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                return Ok(PrivateMessage::SubscriptionAck(sub_type.to_string()));
-            }
-            // 应用层心跳应答（HL 文档口径：{"channel":"pong"}）
-            "pong" => {
-                return Ok(PrivateMessage::Events { channel: "", events: Vec::new() });
-            }
-            "orderUpdates" => {
-                // 订单更新
-                let data = &value["data"];
-                return parse_order_updates(data, markets, local_ts)
-                    .map(|events| PrivateMessage::Events { channel: "orderUpdates", events });
-            }
-            "userFills" => {
-                // 成交推送
-                let data = &value["data"];
-                return parse_user_fills(data, markets, local_ts)
-                    .map(|events| PrivateMessage::Events { channel: "userFills", events });
-            }
-            _ => {
-                tracing::debug!(channel, "Unknown Hyperliquid private channel");
-                return Ok(PrivateMessage::Events { channel: "", events: Vec::new() });
-            }
+    let channel = value.get("channel").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+    match channel.as_str() {
+        // 服务端拒绝/报错：**必须致命**。此前它落进未知分支被 debug 掉，于是"订阅被拒
+        // （地址格式、限流）"表现为：连接健康、ping/pong 正常、而订单与成交回报再也不来。
+        "error" => Err(WsError::ParseError(format!(
+            "Hyperliquid 私有流返回错误: {}",
+            value.get("data").unwrap_or(&value)
+        ))),
+        // {"channel":"subscriptionResponse","data":{"method":"subscribe",
+        //   "subscription":{"type":"orderUpdates","user":"0x..."}}}
+        "subscriptionResponse" => Ok(Frame::SubscriptionAck(
+            value.pointer("/data/subscription/type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        )),
+        "orderUpdates" => Ok(Frame::Data { channel: "orderUpdates", data: value["data"].take() }),
+        "userFills" => Ok(Frame::Data { channel: "userFills", data: value["data"].take() }),
+        // 应用层心跳应答（{"channel":"pong"}）
+        "pong" => Ok(Frame::Ignored),
+        "" => {
+            tracing::debug!(raw, "Unhandled Hyperliquid private message");
+            Ok(Frame::Ignored)
+        }
+        other => {
+            tracing::debug!(channel = other, "Unknown Hyperliquid private channel");
+            Ok(Frame::Ignored)
         }
     }
+}
 
-    // pong 消息
-    if value.get("method").map(|v| v.as_str()) == Some(Some("pong")) {
-        return Ok(PrivateMessage::Events { channel: "", events: Vec::new() });
+/// 启动期订阅确认判据（见 [`ws_loop::await_subscriptions`]）：回执或数据到达都算
+fn subscription_confirmed(raw: &str) -> Result<Option<String>, WsError> {
+    Ok(match classify(raw)? {
+        Frame::SubscriptionAck(sub) => Some(sub),
+        Frame::Data { channel, .. } => Some(channel.to_string()),
+        Frame::Ignored => None,
+    })
+}
+
+fn parse_private_message(raw: &str, markets: &HlMarkets, local_ts: u64) -> Result<Vec<AccountEvent>, WsError> {
+    match classify(raw)? {
+        Frame::Data { channel: "orderUpdates", data } => parse_order_updates(&data, markets, local_ts),
+        Frame::Data { channel: "userFills", data } => parse_user_fills(&data, markets, local_ts),
+        Frame::Data { .. } | Frame::SubscriptionAck(_) | Frame::Ignored => Ok(Vec::new()),
     }
-
-    // 其他未知消息
-    tracing::debug!(raw, "Unhandled Hyperliquid private message");
-    Ok(PrivateMessage::Events { channel: "", events: Vec::new() })
 }
 
 /// 解析 orderUpdates 消息。
@@ -412,10 +313,7 @@ pub(crate) fn parse_user_fills_for_test(
     raw: &str,
     local_ts: u64,
 ) -> Result<Vec<AccountEvent>, WsError> {
-    match parse_private_message(raw, markets, local_ts)? {
-        PrivateMessage::Events { events, .. } => Ok(events),
-        PrivateMessage::SubscriptionAck(_) => panic!("不是 userFills 数据"),
-    }
+    parse_private_message(raw, markets, local_ts)
 }
 
 #[cfg(test)]
@@ -505,39 +403,18 @@ mod tests {
         );
     }
 
-    /// 订阅确认回执带回订阅类型，供 actor 记账（凑齐三条才算订阅生效）
+    /// 启动期确认判据：回执与该频道数据都算确认（不依赖"HL 一定对每个订阅都回回执"）；
+    /// pong 等无关报文不算
     #[test]
-    fn subscription_response_is_reported_as_ack() {
-        let raw = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe",
+    fn ack_or_channel_data_confirms_a_subscription() {
+        let ack = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe",
             "subscription":{"type":"orderUpdates","user":"0xabc"}}}"#;
-        match parse_private_message(raw, &testkit::markets(&[""]), 1).unwrap() {
-            PrivateMessage::SubscriptionAck(t) => assert_eq!(t, "orderUpdates"),
-            _ => panic!("订阅确认必须能被识别，否则记账永远凑不齐、启动 15 秒后自杀"),
-        }
-    }
-
-    /// 数据到达同样算订阅生效：不依赖回执格式的假设（若某个频道不回回执而只推数据，
-    /// 仅靠回执记账会在 15 秒后误杀）
-    #[test]
-    fn incoming_data_also_confirms_the_subscription() {
-        let raw = r#"{"channel":"userFills","data":{"user":"0xabc","fills":[]}}"#;
-        match parse_private_message(raw, &testkit::markets(&[""]), 1).unwrap() {
-            PrivateMessage::Events { channel, .. } => assert_eq!(
-                channel, "userFills",
-                "数据报文必须带回频道名，否则无法用它推进订阅记账"
-            ),
-            _ => panic!("userFills 数据应解析为 Events"),
-        }
-    }
-
-    /// 两条必需订阅缺一不可 —— 常量与记账初值是同一出处
-    #[test]
-    fn both_private_subscriptions_are_required() {
-        let pending: HashSet<&'static str> = REQUIRED_SUBSCRIPTIONS.into_iter().collect();
-        assert_eq!(pending.len(), 2);
-        for sub in ["orderUpdates", "userFills"] {
-            assert!(pending.contains(sub), "{sub} 未纳入订阅确认记账");
-        }
+        assert_eq!(subscription_confirmed(ack).unwrap().as_deref(), Some("orderUpdates"));
+        let data = r#"{"channel":"userFills","data":{"user":"0xabc","fills":[]}}"#;
+        assert_eq!(subscription_confirmed(data).unwrap().as_deref(), Some("userFills"));
+        assert_eq!(subscription_confirmed(r#"{"channel":"pong"}"#).unwrap(), None);
+        let rejected = r#"{"channel":"error","data":"Invalid subscription"}"#;
+        assert!(subscription_confirmed(rejected).is_err(), "启动期被拒必须启动失败");
     }
 
     /// clearinghouseState 不再订阅：即使推来也不产出任何事件（统一账户下其中净值恒为 0，
@@ -545,10 +422,7 @@ mod tests {
     #[test]
     fn clearinghouse_state_push_yields_no_account_info() {
         let raw = format!(r#"{{"channel":"clearinghouseState","data":{{"user":"0xabc","dex":"","clearinghouseState":{}}}}}"#, testkit::OWN_EMPTY_STATE);
-        match parse_private_message(&raw, &testkit::markets(&[""]), 1).unwrap() {
-            PrivateMessage::Events { events, .. } => assert!(events.is_empty()),
-            _ => panic!("应解析为空事件"),
-        }
+        assert!(parse_private_message(&raw, &testkit::markets(&[""]), 1).unwrap().is_empty());
     }
 
     /// orderUpdates 同口径过滤
@@ -565,5 +439,25 @@ mod tests {
             .collect();
         assert_eq!(symbols, ["BTC", "NVDA"]);
         assert_eq!(parse_order_updates(&data, &testkit::markets(&["xyz"]), 1).unwrap().len(), 1);
+    }
+
+    /// 联网只读：真连 HL，启动（on_start 返回）即两条订阅都已确认。
+    /// `HL_WALLET=0x… cargo test --lib live_private_subscriptions_confirm_at_startup -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "需要联网；HL_WALLET 可选（缺省用零地址，订阅照样确认）"]
+    async fn live_private_subscriptions_confirm_at_startup() {
+        use kameo::actor::Spawn;
+        use kameo_actors::DeliveryStrategy;
+        let wallet = std::env::var("HL_WALLET").unwrap_or_else(|_| format!("0x{}", "0".repeat(40)));
+        let pubsub = AccountPubSub::spawn(AccountPubSub::new(DeliveryStrategy::BestEffort));
+        let started = std::time::Instant::now();
+        let actor = HyperliquidPrivateWsActor::spawn(HyperliquidPrivateWsActorArgs {
+            wallet_address: wallet,
+            account_pubsub: pubsub,
+            markets: Arc::new(testkit::markets(&[""])),
+        });
+        actor.wait_for_startup_result().await.expect("订阅应在启动期确认");
+        println!("HL 私有订阅确认耗时 {:?}", started.elapsed());
+        actor.stop_gracefully().await.unwrap();
     }
 }
