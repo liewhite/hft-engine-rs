@@ -29,6 +29,8 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 
 mod provisioning;
+#[cfg(test)]
+mod tests;
 
 pub use provisioning::RemoveStrategies;
 use provisioning::Provisioner;
