@@ -6,8 +6,9 @@
 //! - [`Group::spawn_periodic`]：定时轮询。迁移前有十来个"每隔 N 毫秒查一次 REST"的 actor，
 //!   形状完全相同：节拍 → 做一次 → 出错整支停。
 //!
-//! 节拍用 [`MissedTickBehavior::Skip`]：一次轮询慢于周期时不积压补跑（旧版 kameo 的定时流
-//! 不等处理完就投递，曾要专门丢弃邮箱里积压的过时拍）。首拍立即触发。
+//! 节拍用 [`MissedTickBehavior::Skip`]：一次轮询慢于周期时不积压补跑 —— 错过的几拍合并成
+//! 做完时立即的一拍，之后回到整周期节奏（旧版 kameo 的定时流不等处理完就投递，曾要专门
+//! 丢弃邮箱里积压的过时拍）。首拍立即触发。
 
 use std::future::Future;
 use std::time::Duration;
@@ -118,6 +119,71 @@ mod tests {
         root.stopping().await;
         let e = root.shutdown().await.unwrap_err();
         assert!(format!("{e:#}").contains("第 2 次失败"), "{e:#}");
+    }
+
+    /// 记下每一拍开始的时刻（相对起点）；第一拍耗时 `first_takes`，之后瞬间完成
+    struct Slow {
+        start: tokio::time::Instant,
+        first_takes: Duration,
+        starts: Arc<std::sync::Mutex<Vec<Duration>>>,
+        finished: Arc<AtomicUsize>,
+    }
+
+    impl Periodic for Slow {
+        async fn tick(&mut self) -> anyhow::Result<()> {
+            let n = {
+                let mut starts = self.starts.lock().unwrap();
+                starts.push(self.start.elapsed());
+                starts.len()
+            };
+            if n == 1 {
+                tokio::time::sleep(self.first_takes).await;
+            }
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn slow(first_takes: Duration) -> (Slow, Arc<std::sync::Mutex<Vec<Duration>>>, Arc<AtomicUsize>) {
+        let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let job = Slow {
+            start: tokio::time::Instant::now(),
+            first_takes,
+            starts: starts.clone(),
+            finished: finished.clone(),
+        };
+        (job, starts, finished)
+    }
+
+    /// 一拍慢于周期时不补跑：错过的几拍合并成做完时立即的一拍，之后回到整周期节奏
+    /// （不会像 Burst 那样按错过的拍数连跑）
+    #[tokio::test(start_paused = true)]
+    async fn periodic_skips_missed_ticks() {
+        let (job, starts, _) = slow(Duration::from_millis(2500));
+        let root = Root::new("t");
+        root.group("g").spawn_periodic("p", Duration::from_secs(1), job).unwrap();
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let ms: Vec<u128> = starts.lock().unwrap().iter().map(|d| d.as_millis()).collect();
+        // 0s 那拍做到 2.5s；错过的 1s、2s 两拍只在 2.5s 补一拍（Burst 会在 2.5s 连跑两拍），
+        // 下一拍回到整周期 3s
+        assert_eq!(ms, [0, 2500, 3000]);
+        root.shutdown().await.unwrap();
+    }
+
+    /// 停止不打断正在做的那一拍：做完才退出，之后不再开新的一拍
+    #[tokio::test(start_paused = true)]
+    async fn stop_waits_for_the_running_tick() {
+        let (job, starts, finished) = slow(Duration::from_secs(2));
+        let root = Root::new("t");
+        let h = root.group("g").spawn_periodic("p", Duration::from_secs(1), job).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let t0 = tokio::time::Instant::now();
+        h.stop().await;
+        assert!(t0.elapsed() >= Duration::from_millis(1500), "停止应等这一拍做完");
+        assert_eq!(finished.load(Ordering::SeqCst), 1, "正在做的一拍被打断了");
+        assert_eq!(starts.lock().unwrap().len(), 1, "停止后不应再开新的一拍");
+        root.shutdown().await.unwrap();
     }
 
     /// 地址在构造完成时交到调用方手里，消息送达
