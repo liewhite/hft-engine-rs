@@ -163,7 +163,6 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
         }),
         metas(),
         hft_engine_rs::backtest::backtest_account(),
-
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {
@@ -222,7 +221,6 @@ fn trade_print_matching_fills_resting_limit() {
         }),
         metas(),
         hft_engine_rs::backtest::backtest_account(),
-
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {
@@ -289,7 +287,6 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
         Box::new(EmitOnBbo { seen_customs: Arc::clone(&seen_by_strategy) }),
         metas(),
         hft_engine_rs::backtest::backtest_account(),
-
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let seen_by_observer: Rc<RefCell<Vec<(usize, f64)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -370,14 +367,12 @@ fn inbound_custom_events_route_by_scope() {
             Box::new(CustomProbe { symbol: SYM.to_string(), seen: Arc::clone(&seen_btc) }),
             metas(),
             hft_engine_rs::backtest::backtest_account(),
-
             Box::new(SequentialClientOrderIdGen::default()),
         ),
         StrategyRunner::with_id_gen(
             Box::new(CustomProbe { symbol: SYM2.to_string(), seen: Arc::clone(&seen_eth) }),
             metas(),
             hft_engine_rs::backtest::backtest_account(),
-
             Box::new(SequentialClientOrderIdGen::default()),
         ),
     ];

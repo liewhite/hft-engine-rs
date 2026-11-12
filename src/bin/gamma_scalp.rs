@@ -122,7 +122,6 @@ fn main() -> anyhow::Result<()> {
         Box::new(strategy),
         symbol_metas.clone(),
         hft_engine_rs::backtest::backtest_account(),
-
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {

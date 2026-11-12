@@ -132,6 +132,14 @@ impl<'a> BacktestEngine<'a> {
         config: SimConfig,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     ) -> Self {
+        // 回测的私有事件一律标 backtest_account()；runner 绑别的账户会静默收不到任何成交，结果全错
+        for r in &runners {
+            assert_eq!(
+                r.account(),
+                &super::backtest_account(),
+                "回测 runner 必须绑定 backtest_account()，否则收不到回测撮合的私有事件"
+            );
+        }
         Self {
             source,
             runners,

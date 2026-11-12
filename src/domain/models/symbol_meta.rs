@@ -20,6 +20,7 @@ pub struct SymbolMeta {
     ///
     /// 框架只如实提供；与价格有关，所以不在 [`Self::checked_exchange_qty`] 里校验 ——
     /// 用不用、怎么和自己的下限合并由策略决定。
+    /// 模拟柜台与回测撮合也不按它拒单（回测里不会出现「低于金额下限被拒」）。
     pub min_notional: f64,
     /// 合约乘数 (OKX: cval, Binance: 1.0)
     ///

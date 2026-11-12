@@ -198,7 +198,8 @@ impl FundingArbStrategy {
             return self.maintain(sv, &[], now);
         }
         if self.hedge_attempts > 0 {
-            if net.abs() * px >= self.p.min_order_notional {
+            let floor = self.leg.map_or(self.p.min_order_notional, |pair| self.min_notional(hedge_target(pair, net).0));
+            if net.abs() * px >= floor {
                 tracing::warn!(symbol = %self.symbol(), net, ?positions, "补腿后剩下补腿所下不出的零头，不再补");
             } else {
                 tracing::info!(symbol = %self.symbol(), attempts = self.hedge_attempts, "各所持仓已对冲");
@@ -305,9 +306,10 @@ impl FundingArbStrategy {
     }
 
     /// 这个币数量按参考价 `px` 在该所能不能下出去：取整后非 0、不低于最小下单量，
-    /// 且金额不低于该所最小下单金额
+    /// 且取整后的金额不低于该所最小下单金额
     fn tradable(&self, ex: Exchange, qty: f64, px: f64) -> bool {
-        self.metas[&ex].checked_exchange_qty(qty).is_ok() && qty * px >= self.min_notional(ex)
+        let meta = &self.metas[&ex];
+        meta.checked_exchange_qty(qty).is_ok() && meta.round_coin_size_down(qty) * px >= self.min_notional(ex)
     }
 
     /// 两所挂同样的量：按两所精度依次向下取整（各所步长都是 10 的幂次，取整后同为两所步长的整数倍）；

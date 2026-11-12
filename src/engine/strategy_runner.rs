@@ -116,6 +116,11 @@ impl StrategyRunner {
         self.state.seed_positions(baselines);
     }
 
+    /// 本策略绑定的账户
+    pub fn account(&self) -> &AccountId {
+        self.subscriptions.account()
+    }
+
     /// 这条事件在本策略的订阅范围内吗（判据与实盘分发层共用，见 [`SubscriptionScope`]）
     pub fn accepts(&self, event: &IncomeEvent) -> bool {
         self.subscriptions.accepts(event)
@@ -272,7 +277,6 @@ mod tests {
             }),
             metas(),
             crate::backtest::backtest_account(),
-
             Box::new(SequentialClientOrderIdGen::default()),
         );
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);
@@ -310,7 +314,6 @@ mod tests {
             }),
             metas(),
             crate::backtest::backtest_account(),
-
             Box::new(SequentialClientOrderIdGen::default()),
         );
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);

@@ -232,21 +232,14 @@ impl StateManager {
                         state.remove_timed_out_orders(now, self.order_timeout_ms);
                     }
                 }
-                // 币级行情: 委托对应 SymbolState
-                MarketData::FundingRate(_)
-                | MarketData::BBO(_)
-                | MarketData::MarketTrade(_)
-                | MarketData::MarkPrice(_)
-                | MarketData::IndexPrice(_)
-                | MarketData::Candle(_)
-                | MarketData::HistoryCandles(_) => {
-                    let Some(symbol) = m.data.symbol() else {
-                        unreachable!("币级行情在 MarketData::delivery 里必有 symbol")
-                    };
-                    if let Some(state) = self.routed_state(symbol) {
-                        state.apply_market(&m.data);
-                    }
-                }
+                // 币级行情: 委托对应 SymbolState（各变体直接取自己的 symbol）
+                MarketData::FundingRate(r) => self.route_market(&r.symbol, &m.data),
+                MarketData::BBO(b) => self.route_market(&b.symbol, &m.data),
+                MarketData::MarketTrade(t) => self.route_market(&t.symbol, &m.data),
+                MarketData::MarkPrice(mp) => self.route_market(&mp.symbol, &m.data),
+                MarketData::IndexPrice(ip) => self.route_market(&ip.symbol, &m.data),
+                MarketData::Candle(c) => self.route_market(&c.symbol, &m.data),
+                MarketData::HistoryCandles(h) => self.route_market(&h.symbol, &m.data),
             },
             IncomeEvent::Account(a) => match &a.data {
                 AccountData::Symbol(data) => {
@@ -256,6 +249,12 @@ impl StateManager {
                 }
                 AccountData::Exchange(data) => self.apply_exchange_account(data),
             },
+        }
+    }
+
+    fn route_market(&mut self, symbol: &Symbol, data: &MarketData) {
+        if let Some(state) = self.routed_state(symbol) {
+            state.apply_market(data);
         }
     }
 
