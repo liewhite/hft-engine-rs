@@ -1,7 +1,7 @@
 use crate::domain::Symbol;
 use serde::Deserialize;
 
-/// 资金费套利（币安 × Hyperliquid）配置。
+/// 资金费套利（多所：币安 / Hyperliquid / OKX）配置。
 ///
 /// 杠杆按**交易所各自**算（两所资金不互通，风险聚集在单边）：
 /// - 单币：该币在该所的持仓价值 / 该所账户净值 ≤ `max_symbol_leverage`
@@ -13,6 +13,9 @@ use serde::Deserialize;
 pub struct FundingArbConfig {
     /// 开仓门槛：两所「过去 24h 实际资金费累加 × 365」之差的绝对值，0.5 = 50%
     pub open_threshold_apr: f64,
+    /// 平仓门槛：一对相反仓位的收益年化（空头所年化 − 多头所年化）低于此值即在这两所之间平仓，
+    /// 0.1 = 10%；须小于开仓门槛
+    pub close_threshold_apr: f64,
     /// 单笔挂单金额上限（USD）；实际取 min(本值, 两所对手盘第一档的金额)
     pub order_notional: f64,
     /// 单笔挂单最小金额（USD）。HL 单笔最低 10 USD，低于此值不挂；
@@ -45,7 +48,7 @@ pub struct FundingArbConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairConfig {
-    /// 内部符号（两所同名，如 "BTC"、"TSLA"）
+    /// 内部符号（各所同名，如 "BTC"、"TSLA"）。在哪几所做由启动时各所品种目录决定（至少两所）
     pub symbol: Symbol,
     #[serde(default)]
     pub order_distance: Option<f64>,
@@ -58,6 +61,7 @@ pub struct PairConfig {
 pub struct PairParams {
     pub symbol: Symbol,
     pub open_threshold_apr: f64,
+    pub close_threshold_apr: f64,
     pub order_notional: f64,
     pub min_order_notional: f64,
     pub max_account_leverage: f64,
@@ -82,6 +86,12 @@ impl FundingArbConfig {
             }
         };
         pos("open_threshold_apr", self.open_threshold_apr)?;
+        if !(self.close_threshold_apr.is_finite() && self.close_threshold_apr < self.open_threshold_apr) {
+            return Err(format!(
+                "close_threshold_apr 必须是有限值且小于 open_threshold_apr（当前 {} / {}）",
+                self.close_threshold_apr, self.open_threshold_apr
+            ));
+        }
         pos("order_notional", self.order_notional)?;
         pos("min_order_notional", self.min_order_notional)?;
         pos("max_account_leverage", self.max_account_leverage)?;
@@ -116,6 +126,7 @@ impl FundingArbConfig {
             .map(|p| PairParams {
                 symbol: p.symbol.clone(),
                 open_threshold_apr: self.open_threshold_apr,
+                close_threshold_apr: self.close_threshold_apr,
                 order_notional: self.order_notional,
                 min_order_notional: self.min_order_notional,
                 max_account_leverage: self.max_account_leverage,
@@ -138,7 +149,7 @@ mod tests {
 
     fn cfg() -> FundingArbConfig {
         serde_json::from_value(serde_json::json!({
-            "open_threshold_apr": 0.5, "order_notional": 200.0, "min_order_notional": 11.0,
+            "open_threshold_apr": 0.5, "close_threshold_apr": 0.1, "order_notional": 200.0, "min_order_notional": 11.0,
             "max_account_leverage": 1.5, "max_symbol_leverage": 0.2, "order_distance": 0.0005,
             "requote_ratio": 1.0, "hedge_retry_ms": 2000, "fill_settle_ms": 1500, "min_requote_ms": 5000, "max_bbo_age_ms": 5000,
             "max_funding_age_ms": 7200000,
@@ -165,5 +176,8 @@ mod tests {
         let mut c = cfg();
         c.max_account_leverage = 0.0;
         assert!(c.validate().is_err());
+        let mut c = cfg();
+        c.close_threshold_apr = 0.5;
+        assert!(c.validate().is_err(), "平仓门槛不小于开仓门槛会开了就平");
     }
 }

@@ -44,61 +44,78 @@ impl SettledFundingWindow {
     }
 }
 
-/// 持仓方向：做空费率高的一所、做多费率低的一所
+/// 一对所上的一次对冲操作：在 `sell` 卖、在 `buy` 买（数量相同）。
+/// 开仓时 `sell` 是费率高的一所；平仓时 `sell` 是持多仓的一所。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    /// 币安空、HL 多（币安年化 > HL 年化）
-    ShortBinanceLongHl,
-    /// 币安多、HL 空（HL 年化 > 币安年化）
-    LongBinanceShortHl,
-}
-
-impl Direction {
-    /// 从币安持仓方向推出（HL 恰好相反）；空仓为 None
-    pub fn from_binance_position(bn_size: f64) -> Option<Self> {
-        if bn_size < 0.0 {
-            Some(Direction::ShortBinanceLongHl)
-        } else if bn_size > 0.0 {
-            Some(Direction::LongBinanceShortHl)
-        } else {
-            None
-        }
-    }
-
-    /// 按年化高低推出该持有的方向；相等时无方向
-    fn favoured(bn_apr: f64, hl_apr: f64) -> Option<Self> {
-        if bn_apr > hl_apr {
-            Some(Direction::ShortBinanceLongHl)
-        } else if hl_apr > bn_apr {
-            Some(Direction::LongBinanceShortHl)
-        } else {
-            None
-        }
-    }
+pub struct LegPair {
+    pub sell: Exchange,
+    pub buy: Exchange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FundingAction {
-    /// 按该方向开仓 / 继续加仓（受杠杆限制）
-    Open(Direction),
-    /// 平掉现有仓位
-    Close,
+    /// 在这对所之间开仓 / 继续加仓（受杠杆限制）；可能顺带削减已有的腿
+    Open(LegPair),
+    /// 在这对所之间平掉相反仓位（只减仓）
+    Close(LegPair),
     /// 不动
     Hold,
 }
 
-/// 用户规格：
-/// - 年化差 ≥ 门槛 → 按费率方向开（已有同向仓位则继续加）；
-/// - 已有仓位而过去一天年化**反转**（费率高的一所换了边）→ 平仓；
+/// 用户规格（#673）：
+/// - **平仓优先**：任意一对「一所多、一所空」的仓位，若空头所年化 − 多头所年化 < 平仓门槛
+///   （过去一天这对仓位的收益率低于门槛，含反转），在这两所之间平仓；几对同时满足取收益率最低的。
+///   只看这两所的年化，第三所数据缺失不影响。
+/// - 否则在年化最高与最低的两所之间（差 ≥ 开仓门槛）开仓：高的卖、低的买。须全部所的年化都已知，
+///   否则「差最大的两所」无从判断。
 /// - 其余持有。
-pub fn decide(bn_apr: f64, hl_apr: f64, held: Option<Direction>, open_threshold_apr: f64) -> FundingAction {
-    let favoured = Direction::favoured(bn_apr, hl_apr);
-    match held {
-        Some(h) if favoured.is_some_and(|f| f != h) => FundingAction::Close,
-        _ => match favoured {
-            Some(f) if (bn_apr - hl_apr).abs() >= open_threshold_apr => FundingAction::Open(f),
-            _ => FundingAction::Hold,
-        },
+///
+/// `aprs`：各所年化，`None` = 未知；`positions`：各所持仓（只传价值够一笔最小单的，正多负空）。
+/// 两者的顺序决定同分时的取舍，调用方保持固定顺序即可。
+///
+/// 平仓优先不会与开仓来回打架：开仓选的是全局最高 / 最低两所，新形成的多空对收益率
+/// 至少等于原有某对的收益率（原有各对都已 ≥ 平仓门槛，否则先平），不会立刻满足平仓条件。
+/// 同理，开仓要在某所削减已有的腿（在持多的最高所卖、或在持空的最低所买）时，那条腿所在的仓位对
+/// 收益已 ≤ 0，必先被平仓条件接住；用户允许开仓削减已有腿，实际只会削到不足一笔最小单的零头。
+pub fn decide(
+    aprs: &[(Exchange, Option<f64>)],
+    positions: &[(Exchange, f64)],
+    open_threshold_apr: f64,
+    close_threshold_apr: f64,
+) -> FundingAction {
+    let apr = |ex: Exchange| aprs.iter().find(|(e, _)| *e == ex).and_then(|(_, a)| *a);
+
+    let mut close: Option<(f64, LegPair)> = None;
+    for &(long_ex, _) in positions.iter().filter(|(_, p)| *p > 0.0) {
+        for &(short_ex, _) in positions.iter().filter(|(_, p)| *p < 0.0) {
+            let (Some(long_apr), Some(short_apr)) = (apr(long_ex), apr(short_ex)) else {
+                continue;
+            };
+            let earn = short_apr - long_apr;
+            if earn < close_threshold_apr && close.is_none_or(|(best, _)| earn < best) {
+                close = Some((earn, LegPair { sell: long_ex, buy: short_ex }));
+            }
+        }
+    }
+    if let Some((_, pair)) = close {
+        return FundingAction::Close(pair);
+    }
+
+    let mut known = Vec::with_capacity(aprs.len());
+    for &(ex, a) in aprs {
+        match a {
+            Some(a) => known.push((ex, a)),
+            None => return FundingAction::Hold,
+        }
+    }
+    // 同分取靠前的所（顺序固定，结果确定）
+    let high = known.iter().copied().reduce(|best, x| if x.1 > best.1 { x } else { best });
+    let low = known.iter().copied().reduce(|best, x| if x.1 < best.1 { x } else { best });
+    match (high, low) {
+        (Some((h, ha)), Some((l, la))) if h != l && ha - la >= open_threshold_apr => {
+            FundingAction::Open(LegPair { sell: h, buy: l })
+        }
+        _ => FundingAction::Hold,
     }
 }
 
@@ -107,6 +124,9 @@ mod tests {
     use super::*;
 
     const H: u64 = 3600 * 1000;
+    const BN: Exchange = Exchange::Binance;
+    const HL: Exchange = Exchange::Hyperliquid;
+    const OKX: Exchange = Exchange::OKX;
 
     fn window(ex: Exchange, start: u64, rates: &[(u64, f64)]) -> SettledFundingWindow {
         SettledFundingWindow {
@@ -124,8 +144,8 @@ mod tests {
     #[test]
     fn apr_sums_settlements_regardless_of_interval() {
         // 用户例子：HL 每小时 1 份 × 24，币安每 8 小时 3 份 × 3 —— 都是一天 24 份
-        let hl = window(Exchange::Hyperliquid, 0, &(1..=24).map(|i| (i * H, 1e-5)).collect::<Vec<_>>());
-        let bn = window(Exchange::Binance, 0, &[(8 * H, 8e-5), (16 * H, 8e-5), (24 * H, 8e-5)]);
+        let hl = window(HL, 0, &(1..=24).map(|i| (i * H, 1e-5)).collect::<Vec<_>>());
+        let bn = window(BN, 0, &[(8 * H, 8e-5), (16 * H, 8e-5), (24 * H, 8e-5)]);
         let now = 24 * H;
         assert!((hl.apr(now, H).unwrap() - 24.0 * 1e-5 * 365.0).abs() < 1e-12);
         assert!((bn.apr(now, H).unwrap() - 24.0 * 1e-5 * 365.0).abs() < 1e-12);
@@ -133,26 +153,53 @@ mod tests {
 
     #[test]
     fn apr_unknown_when_stale_empty_or_listed_less_than_a_day() {
-        let w = window(Exchange::Binance, 0, &[(8 * H, 1e-4)]);
+        let w = window(BN, 0, &[(8 * H, 1e-4)]);
         assert!(w.apr(24 * H + 2 * H, H).is_none(), "stale");
-        assert!(window(Exchange::Binance, 0, &[]).apr(24 * H, H).is_none(), "empty");
-        assert!(window(Exchange::Binance, 0, &[(12 * H, 1e-4)]).apr(24 * H, H).is_none(), "half day");
+        assert!(window(BN, 0, &[]).apr(24 * H, H).is_none(), "empty");
+        assert!(window(BN, 0, &[(12 * H, 1e-4)]).apr(24 * H, H).is_none(), "half day");
+    }
+
+    fn aprs(bn: f64, hl: f64, okx: f64) -> Vec<(Exchange, Option<f64>)> {
+        vec![(BN, Some(bn)), (HL, Some(hl)), (OKX, Some(okx))]
+    }
+
+    use FundingAction::*;
+
+    #[test]
+    fn open_between_highest_and_lowest() {
+        // 无仓：差最大的两所，高卖低买；差不够不开
+        assert_eq!(decide(&aprs(0.8, 0.1, 0.3), &[], 0.5, 0.1), Open(LegPair { sell: BN, buy: HL }));
+        assert_eq!(decide(&aprs(0.0, -0.2, 0.4), &[], 0.5, 0.1), Open(LegPair { sell: OKX, buy: HL }));
+        assert_eq!(decide(&aprs(0.4, 0.0, 0.2), &[], 0.5, 0.1), Hold);
+        // 所对随费率变化：已有 BN空/HL多，今天 OKX 最高 → 在 OKX×HL 继续开（不平 BN×HL：它仍赚 ≥ 10%）
+        let pos = [(BN, -1.0), (HL, 1.0)];
+        assert_eq!(decide(&aprs(0.5, 0.0, 0.9), &pos, 0.5, 0.1), Open(LegPair { sell: OKX, buy: HL }));
+        // BN 多 / OKX 空，今天 BN 最高：开仓会在 BN 卖（削减多腿），但这对仓收益
+        // OKX−BN = 0.0−0.9 < 10%，平仓优先先平
+        let pos = [(BN, 1.0), (OKX, -1.0)];
+        assert_eq!(decide(&aprs(0.9, 0.3, 0.0), &pos, 0.5, 0.1), Close(LegPair { sell: BN, buy: OKX }));
     }
 
     #[test]
-    fn decide_follows_user_spec() {
-        use Direction::*;
-        use FundingAction::*;
-        // 无仓：差 ≥ 门槛才开，空费率高的一所
-        assert_eq!(decide(0.8, 0.1, None, 0.5), Open(ShortBinanceLongHl));
-        assert_eq!(decide(-0.3, 0.3, None, 0.5), Open(LongBinanceShortHl));
-        assert_eq!(decide(0.4, 0.0, None, 0.5), Hold);
-        // 有仓同向：差大继续加，差小持有
-        assert_eq!(decide(0.8, 0.1, Some(ShortBinanceLongHl), 0.5), Open(ShortBinanceLongHl));
-        assert_eq!(decide(0.2, 0.1, Some(ShortBinanceLongHl), 0.5), Hold);
-        // 反转即平，不管差多小
-        assert_eq!(decide(0.1, 0.11, Some(ShortBinanceLongHl), 0.5), Close);
-        // 相等不算反转
-        assert_eq!(decide(0.1, 0.1, Some(ShortBinanceLongHl), 0.5), Hold);
+    fn close_when_pair_earns_below_threshold() {
+        // BN 空 HL 多：收益 = BN − HL；低于 10% 平（含反转），平仓优先于开仓
+        let pos = [(BN, -1.0), (HL, 1.0)];
+        assert_eq!(decide(&aprs(0.15, 0.0, 0.0), &pos, 0.5, 0.1), Hold);
+        assert_eq!(decide(&aprs(0.05, 0.0, 0.0), &pos, 0.5, 0.1), Close(LegPair { sell: HL, buy: BN }));
+        assert_eq!(decide(&aprs(-0.3, 0.0, 0.9), &pos, 0.5, 0.1), Close(LegPair { sell: HL, buy: BN }));
+        // 第三所不动；几对都满足时取收益最低的一对
+        let pos = [(BN, -2.0), (HL, 1.0), (OKX, 1.0)];
+        assert_eq!(decide(&aprs(0.0, 0.05, -0.02), &pos, 0.5, 0.1), Close(LegPair { sell: HL, buy: BN }));
+    }
+
+    #[test]
+    fn unknown_apr_blocks_open_but_not_unrelated_close() {
+        let mut a = aprs(0.8, 0.0, 0.0);
+        a[2].1 = None;
+        // OKX 未知：不知道谁差最大，不开
+        assert_eq!(decide(&a, &[], 0.5, 0.1), Hold);
+        // BN×HL 这对的平仓只看这两所
+        let pos = [(BN, 1.0), (HL, -1.0)];
+        assert_eq!(decide(&a, &pos, 0.5, 0.1), Close(LegPair { sell: BN, buy: HL }));
     }
 }

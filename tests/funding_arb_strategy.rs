@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 const BN: Exchange = Exchange::Binance;
 const HL: Exchange = Exchange::Hyperliquid;
+const OKX: Exchange = Exchange::OKX;
 const SYM: &str = "XMR";
 const H: u64 = 3600 * 1000;
 /// 事件时刻都在窗口之后（窗口 [T0-24h, T0]）
@@ -19,7 +20,7 @@ const T0: u64 = 100 * H;
 
 fn config() -> FundingArbConfig {
     serde_json::from_value(serde_json::json!({
-        "open_threshold_apr": 0.5, "order_notional": 200.0, "min_order_notional": 11.0,
+        "open_threshold_apr": 0.5, "close_threshold_apr": 0.1, "order_notional": 200.0, "min_order_notional": 11.0,
         "max_account_leverage": 1.5, "max_symbol_leverage": 0.2, "order_distance": 0.001,
         "requote_ratio": 1.0, "hedge_retry_ms": 1000, "fill_settle_ms": 500, "min_requote_ms": 0, "max_bbo_age_ms": 5000,
         "max_funding_age_ms": 7200000, "pairs": [{"symbol": SYM}]
@@ -47,30 +48,43 @@ struct Sim {
 }
 
 impl Sim {
-    /// 两所盘口 100/100.1、每档 100 个，两所净值各 10000，带初始持仓
+    /// 币安 × HL 两所，盘口 100/100.1、每档 100 个，净值各 10000，带初始持仓
     fn new(bn_pos: f64, hl_pos: f64) -> Self {
-        let mut s = Self::without_bbo(bn_pos, hl_pos);
-        s.bbo(BN);
-        s.bbo(HL);
-        s
+        Self::multi(&[(BN, bn_pos), (HL, hl_pos)])
     }
 
     fn without_bbo(bn_pos: f64, hl_pos: f64) -> Self {
+        Self::multi_without_bbo(&[(BN, bn_pos), (HL, hl_pos)])
+    }
+
+    /// 任意几所（顺序即策略里的所顺序）
+    fn multi(legs: &[(Exchange, f64)]) -> Self {
+        let mut s = Self::multi_without_bbo(legs);
+        for &(ex, _) in legs {
+            s.bbo(ex);
+        }
+        s
+    }
+
+    fn multi_without_bbo(legs: &[(Exchange, f64)]) -> Self {
         let p = config().params().remove(0);
+        let exchanges: Vec<Exchange> = legs.iter().map(|(e, _)| *e).collect();
         let mut runner = StrategyRunner::new(
-            Box::new(FundingArbStrategy::new(p)),
-            Arc::new(HashMap::from([meta(BN), meta(HL)])),
+            Box::new(FundingArbStrategy::new(p, exchanges.clone())),
+            Arc::new(exchanges.iter().map(|&e| meta(e)).collect::<HashMap<_, _>>()),
         );
-        runner.seed_positions(
-            &[(BN, bn_pos), (HL, hl_pos)]
-                .map(|(exchange, size)| PositionBaseline {
-                    position: Position { exchange, symbol: SYM.into(), size },
-                    snapshot_req_ts: 1,
-                }),
-        );
+        let baselines: Vec<PositionBaseline> = legs
+            .iter()
+            .map(|&(exchange, size)| PositionBaseline {
+                position: Position { exchange, symbol: SYM.into(), size },
+                snapshot_req_ts: 1,
+            })
+            .collect();
+        runner.seed_positions(&baselines);
         let mut s = Sim { runner, now: T0 };
-        s.equity(BN, 10_000.0, 0.0);
-        s.equity(HL, 10_000.0, 0.0);
+        for ex in exchanges {
+            s.equity(ex, 10_000.0, 0.0);
+        }
         s
     }
 
@@ -349,4 +363,90 @@ fn dust_imbalance_is_ignored() {
     // 差 0.1 × 100 = 10U < 最小单额 11U：不补
     let mut s = Sim::new(-2.0, 2.1);
     assert!(placed(&s.bbo(BN)).is_empty());
+}
+
+// ---------------------------------------------------------------- 多所（#673）
+
+#[test]
+fn three_exchanges_open_on_widest_pair_only() {
+    let mut s = Sim::multi(&[(BN, 0.0), (HL, 0.0), (OKX, 0.0)]);
+    s.funding(BN, 0.2);
+    s.funding(HL, 0.0);
+    let out = s.funding(OKX, 0.9);
+    let o = placed(&out);
+    assert_eq!(o.len(), 2, "{out:?}");
+    let sell = o.iter().find(|o| o.side == Side::Short).unwrap();
+    let buy = o.iter().find(|o| o.side == Side::Long).unwrap();
+    assert_eq!((sell.exchange, buy.exchange), (OKX, HL), "年化最高的 OKX 卖、最低的 HL 买，币安不动");
+}
+
+#[test]
+fn three_exchanges_wait_for_every_funding_before_opening() {
+    let mut s = Sim::multi(&[(BN, 0.0), (HL, 0.0), (OKX, 0.0)]);
+    s.funding(BN, 0.9);
+    assert!(placed(&s.funding(HL, 0.0)).is_empty(), "OKX 年化未知时不知道哪对差最大");
+}
+
+#[test]
+fn close_below_threshold_leaves_third_exchange_alone() {
+    // 币安空 2、HL 多 1、OKX 多 1；BN−HL 收益 5% < 10% → 平 HL×BN，OKX×BN 收益 20% 不动
+    let mut s = Sim::multi(&[(BN, -2.0), (HL, 1.0), (OKX, 1.0)]);
+    s.funding(OKX, -0.1);
+    assert!(placed(&s.funding(BN, 0.1)).is_empty(), "OKX×BN 收益 20% ≥ 门槛");
+    // 平仓只看这对两所的年化：HL 一到就平
+    let out = s.funding(HL, 0.05);
+    let o = placed(&out);
+    assert_eq!(o.len(), 2, "{out:?}");
+    assert!(o.iter().all(|x| x.reduce_only && x.exchange != OKX), "{o:?}");
+    let hl = o.iter().find(|x| x.exchange == HL).unwrap();
+    assert_eq!(hl.side, Side::Short);
+    assert!((hl.quantity - 1.0).abs() < 1e-9, "可平量 = min(HL 多 1, 币安空 2)：{}", hl.quantity);
+}
+
+#[test]
+fn pair_earning_above_close_threshold_is_held() {
+    // 币安空 HL 多，收益 15%：高于平仓门槛、低于开仓门槛 → 不动
+    let mut s = Sim::new(-2.0, 2.0);
+    s.funding(BN, 0.15);
+    assert!(placed(&s.funding(HL, 0.0)).is_empty());
+}
+
+#[test]
+fn three_exchanges_hedge_on_the_quoted_pair() {
+    let mut s = Sim::multi(&[(BN, 0.0), (HL, 0.0), (OKX, 0.0)]);
+    s.funding(BN, 0.2);
+    s.funding(HL, 0.0);
+    let o = placed(&s.funding(OKX, 0.9));
+    let okx = o.iter().find(|o| o.exchange == OKX).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&okx, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::Pending);
+    s.fill(&okx, 1.0);
+    s.confirm(&okx, OrderStatus::Cancelled);
+    s.confirm(&hl, OrderStatus::Cancelled);
+    s.advance(600);
+    let h = placed(&s.bbo(BN));
+    assert_eq!(h.len(), 1, "{h:?}");
+    assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (HL, Side::Long, 1.0), "OKX 卖成交 → 在 HL 买补，不碰币安");
+    assert!(matches!(h[0].order_type, OrderType::Market));
+}
+
+#[test]
+fn both_close_legs_filling_needs_no_hedge() {
+    // 平仓：HL 多 2 / 币安空 2，两边挂单各成交 1 → 仍对冲，不补腿
+    let mut s = Sim::new(-2.0, 2.0);
+    s.funding(BN, -0.1);
+    let o = placed(&s.funding(HL, 0.0));
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    let bn = o.iter().find(|o| o.exchange == BN).unwrap().clone();
+    assert_eq!((hl.side, bn.side), (Side::Short, Side::Long));
+    s.confirm(&hl, OrderStatus::Pending);
+    s.confirm(&bn, OrderStatus::Pending);
+    // 两边都成交 1（各平 1），持仓 BN −1 / HL 1，已对冲：不补
+    s.fill(&hl, 1.0);
+    s.fill(&bn, 1.0);
+    s.confirm(&hl, OrderStatus::Cancelled);
+    s.confirm(&bn, OrderStatus::Cancelled);
+    s.advance(600);
+    assert!(placed(&s.bbo(BN)).iter().all(|o| !matches!(o.order_type, OrderType::Market)));
 }
