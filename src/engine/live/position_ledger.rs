@@ -166,7 +166,8 @@ impl Reconciler {
 
     /// 比对某所的一份完整读数。
     ///
-    /// `Err` = 已确认漂移（连续 `max_consecutive` 次差值稳定的不一致），调用方应致命退出。
+    /// `Err` = 已确认漂移（连续 `max_consecutive` 次差值稳定的不一致），或读数里同一 symbol
+    /// 出现两条（映射混了合约，见 `index_positions`），调用方应致命退出。
     pub fn reconcile(&mut self, exchange: Exchange, positions: &[Position]) -> Result<(), String> {
         // 读数是该所的**完整**快照，因此"跟踪范围内、但读数里没有的 symbol"= 交易所侧空仓。
         // 这个推断正是选 REST 全量而非私有 WS 增量推送的理由（见模块文档）：

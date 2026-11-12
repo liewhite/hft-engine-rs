@@ -10,10 +10,10 @@ pub fn to_binance(symbol: &Symbol, quote: &str) -> String {
     format!("{}{}", symbol, quote)
 }
 
-/// [`to_binance`] 的逆：只认 `{base}{quote}`（base 为字母数字），其余返回 `None`。
+/// [`to_binance`] 的逆：只认 `{base}{quote}`，其余返回 `None`。
 pub fn from_binance(s: &str, quote: &str) -> Option<Symbol> {
     let base = s.strip_suffix(quote)?;
-    (!base.is_empty() && base.chars().all(|c| c.is_ascii_alphanumeric())).then(|| base.to_string())
+    (!base.is_empty()).then(|| base.to_string())
 }
 
 #[cfg(test)]

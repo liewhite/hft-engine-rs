@@ -544,7 +544,7 @@ impl Strategy for FundingArbStrategy {
             IncomeEvent::Account(a) => {
                 if let AccountData::UnmappedFill(f) = &a.data {
                     self.halt(format!(
-                        "{} 账户在品种目录外有成交：{} {:?} {}@{}（与本策略共用保证金却不在杠杆口径里；覆盖该所的币都会停）",
+                        "{} 账户在品种目录外有成交：{} {:?} 数量 {}（交易所原始单位）@{}（与本策略共用保证金却不在杠杆口径里；覆盖该所的币都会停）",
                         f.exchange, f.instrument, f.side, f.size, f.price
                     ));
                 }

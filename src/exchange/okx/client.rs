@@ -689,12 +689,7 @@ impl AccountClient for OkxClient {
         }
 
         let mut positions = Vec::new();
-        for d in &data.data {
-            let Some(symbol) = from_okx(&d.inst_id, &self.quote) else {
-                // 别的计价币、币本位、交割合约是别的品种，不进任何 symbol 的持仓
-                tracing::debug!(inst_id = %d.inst_id, "OKX 持仓不是本引擎接入的合约，跳过");
-                continue;
-            };
+        for (symbol, d) in mapped_positions(&data.data, &self.quote) {
 
             // 张 -> 币：[`ExchangeClient`] 的契约是返回币本位（见 crate::domain::Quantity）。
             // 字段口径（空串=0、张数、双向持仓拒绝）全在 codec 里，不在此处重抄一份。
@@ -707,6 +702,21 @@ impl AccountClient for OkxClient {
 
         Ok(positions)
     }
+}
+
+/// 持仓列表里本引擎接入的合约及其内部 symbol。别的计价币、币本位、交割合约是别的品种，
+/// 不进任何 symbol 的持仓。
+fn mapped_positions<'a>(
+    data: &'a [PositionData],
+    quote: &'a str,
+) -> impl Iterator<Item = (Symbol, &'a PositionData)> + 'a {
+    data.iter().filter_map(move |d| match from_okx(&d.inst_id, quote) {
+        Some(symbol) => Some((symbol, d)),
+        None => {
+            tracing::debug!(inst_id = %d.inst_id, "OKX 持仓不是本引擎接入的合约，跳过");
+            None
+        }
+    })
 }
 
 /// 解析 `funding-rate-history`：只留 `fundingTime >= start_ms` 的，按时间升序。
@@ -906,5 +916,24 @@ mod pending_orders_tests {
                 "{field} 解析失败应让整份快照报错（含字段名以便定位），实际: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod positions_tests {
+    use super::*;
+
+    /// USDT 永续、USDC 永续、币本位同时有 BTC 仓位：只有 BTC-USDT-SWAP 进 BTC 的持仓
+    #[test]
+    fn same_base_other_quotes_do_not_leak_into_btc() {
+        let data: Vec<PositionData> = serde_json::from_str(
+            r#"[{"instId":"BTC-USDT-SWAP","posSide":"net","pos":"3"},
+                {"instId":"BTC-USDC-SWAP","posSide":"net","pos":"-7"},
+                {"instId":"BTC-USD-SWAP","posSide":"net","pos":"11"}]"#,
+        )
+        .unwrap();
+        let got: Vec<(Symbol, &str)> =
+            mapped_positions(&data, "USDT").map(|(s, d)| (s, d.inst_id.as_str())).collect();
+        assert_eq!(got, [("BTC".to_string(), "BTC-USDT-SWAP")]);
     }
 }
