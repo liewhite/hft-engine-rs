@@ -403,18 +403,21 @@ impl Task for PaperCounter {
         loop {
             let next_due = self.delayed.front().map(|(due, _)| *due);
             tokio::select! {
-                // 已到期的延迟消息先于收件箱里的新消息应用：它在到期那一刻就"到达柜台"了
+                // 收件箱先于已到期的延迟单：到期时仍排在箱里的行情多半是延迟期内到的，先应用
+                // 延迟单会让它们打到该单上，违背模块文档「延迟期内到达的成交不会打到该单上」。
+                // 代价：柜台忙到收件箱排不空时延迟单会晚于到期入簿，这段时间的成交也打不到它 ——
+                // 偏向少成交，与撮合层"不高估成交"的取向一致。
                 biased;
-                _ = tokio::time::sleep_until(next_due.unwrap_or_else(Instant::now)), if next_due.is_some() => {
-                    let (_, msg) = self.delayed.pop_front().expect("队首刚看过");
-                    self.apply(msg);
-                }
                 msg = self.inbox.recv() => match msg {
                     Some(Msg::Market(ev)) => self.on_market(&ev),
                     Some(Msg::Outcome(tagged)) => self.on_outcome(tagged),
                     // 已被要求停止，收件箱已排空
                     None => break,
                 },
+                _ = tokio::time::sleep_until(next_due.unwrap_or_else(Instant::now)), if next_due.is_some() => {
+                    let (_, msg) = self.delayed.pop_front().expect("队首刚看过");
+                    self.apply(msg);
+                }
             }
         }
         // 还没到期的模拟单/撤单随停机丢弃：模拟账户不持久化，下次启动从零起步
@@ -810,6 +813,26 @@ mod tests {
         h.trade(98.0).await;
         h.settle(30).await;
         assert_eq!(h.fills(), vec![(99.0, 0.5)]);
+        h.finish().await;
+    }
+
+    /// 延迟期内到达、到期那一刻还排在收件箱里的成交，同样打不到该单（收件箱先于到期的延迟单）
+    #[tokio::test(start_paused = true)]
+    async fn trade_still_queued_when_delay_elapses_does_not_hit_the_order() {
+        let h = Harness::new(100).await;
+        h.bbo(100.0, 100.1).await;
+        h.place(Side::Long, 99.0, 0.5).await;
+        h.settle(99).await; // t=99：单子已排队，100 到期
+        // 柜台积压：一批越价成交进箱时柜台还没轮到运行。时钟随后一步跨过到期时刻，柜台
+        // 处理积压途中会让出执行权（tokio 协作预算），时间驱动随即把到期定时器置为就绪 ——
+        // 此时箱里仍有延迟期内到的成交，正是两条分支同时就绪的时刻
+        for _ in 0..1000 {
+            h.trade(98.0).await;
+        }
+        tokio::time::advance(Duration::from_millis(5)).await;
+        h.settle(10).await;
+        assert_eq!(h.statuses(), vec![OrderStatus::Pending]);
+        assert!(h.fills().is_empty(), "延迟期内到的成交打到了单上");
         h.finish().await;
     }
 
