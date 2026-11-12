@@ -139,10 +139,10 @@ impl Actor for ExecutorActor {
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let mut runner = StrategyRunner::new(args.strategy, args.symbol_metas);
+        let account = args.account;
+        let mut runner = StrategyRunner::new(args.strategy, args.symbol_metas, account.clone());
         // 基线先于一切流事件写入（on_start 完成前邮箱消息不会被处理）
         runner.seed_positions(&args.baselines);
-        let account = args.account;
         tracing::info!(baselines = args.baselines.len(), "ExecutorActor started");
         Ok(Self {
             runner,

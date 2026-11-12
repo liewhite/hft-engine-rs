@@ -11,7 +11,7 @@ use crate::exchange::client::WsError;
 use crate::exchange::okx::codec::{resolve_meta, AccountData as OkxAccountPush, OrderPushData, WsEvent, WsPush};
 use crate::exchange::okx::{OkxCredentials, WS_PRIVATE_URL};
 use crate::exchange::ws_loop;
-use crate::messaging::{AccountData, AccountEvent};
+use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, AccountEvent};
 use futures_util::{SinkExt, StreamExt};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -311,11 +311,11 @@ fn parse_private_message(
                         account: crate::domain::AccountId::Live,
                         exchange_ts,
                         local_ts,
-                        data: AccountData::Balance(Balance {
+                        data: AccountData::Exchange(ExchangeAccountData::Balance(Balance {
                             exchange: Exchange::OKX,
                             asset: detail.ccy.clone(),
                             available: cash_bal,
-                        }),
+                        })),
                     });
                 }
             }
@@ -338,7 +338,7 @@ fn parse_private_message(
                             account: crate::domain::AccountId::Live,
                             exchange_ts: local_ts,
                             local_ts,
-                            data: AccountData::UnmappedFill(f),
+                            data: AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)),
                         });
                     }
                     continue;
@@ -354,7 +354,7 @@ fn parse_private_message(
                         account: crate::domain::AccountId::Live,
                         exchange_ts: local_ts,
                         local_ts,
-                        data: AccountData::Fill(fill),
+                        data: AccountData::Symbol(SymbolAccountData::Fill(fill)),
                     });
                 }
 
@@ -364,7 +364,7 @@ fn parse_private_message(
                     account: crate::domain::AccountId::Live,
                     exchange_ts: local_ts,
                     local_ts,
-                    data: AccountData::OrderUpdate(order_update),
+                    data: AccountData::Symbol(SymbolAccountData::OrderUpdate(order_update)),
                 });
             }
             Ok(events)
@@ -411,9 +411,9 @@ mod tests {
             .unwrap()
             .into_iter()
             .map(|e| match e.data {
-                AccountData::Fill(f) => format!("fill:{}:{}", f.symbol, f.size),
-                AccountData::OrderUpdate(u) => format!("order:{}", u.symbol),
-                AccountData::UnmappedFill(f) => format!("unmapped:{}:{}", f.instrument, f.size),
+                AccountData::Symbol(SymbolAccountData::Fill(f)) => format!("fill:{}:{}", f.symbol, f.size),
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => format!("order:{}", u.symbol),
+                AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => format!("unmapped:{}:{}", f.instrument, f.size),
                 other => format!("{other:?}"),
             })
             .collect()

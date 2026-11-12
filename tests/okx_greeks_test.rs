@@ -14,7 +14,7 @@ use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
 
 const TEST_QUOTE: &str = "USDT";
-use hft_engine_rs::messaging::{AccountData, IncomeEvent};
+use hft_engine_rs::messaging::{ExchangeAccountData, AccountData, IncomeEvent};
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use kameo::actor::Spawn;
 use kameo::mailbox;
@@ -54,7 +54,7 @@ impl Strategy for GreeksPrintStrategy {
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         if let IncomeEvent::Account(a) = event {
-            if let AccountData::Greeks(raw) = &a.data {
+            if let AccountData::Exchange(ExchangeAccountData::Greeks(raw)) = &a.data {
                 // view.greeks() 返回修正后的 delta (含现货 cashBal)
                 if let Some(g) = view.greeks(Exchange::OKX, &raw.ccy) {
                     println!(

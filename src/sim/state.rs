@@ -2,7 +2,7 @@ use crate::domain::{
     Exchange, Fill, MarketTrade, Order, OrderId, OrderType, OrderUpdate, OrderStatus, Position,
     Price, Quantity, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
 };
-use crate::messaging::{AccountData, MarketData, MarketEvent};
+use crate::messaging::{SymbolAccountData, AccountData, MarketData, MarketEvent};
 use crate::sim::ledger::Ledger;
 use crate::sim::matcher;
 use indexmap::IndexMap;
@@ -401,7 +401,7 @@ impl SimState {
         match self.resting.shift_remove(order_id) {
             Some(o) => vec![(
                 now,
-                AccountData::OrderUpdate(OrderUpdate {
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(OrderUpdate {
                     order_id: order_id.clone(),
                     client_order_id: Some(o.client_order_id),
                     exchange: self.exchange,
@@ -410,7 +410,7 @@ impl SimState {
                     status: OrderStatus::Cancelled,
                     quantity: o.quantity,
                     // 如实带上撤单前的累计成交（部分成交后撤单），不谎报 0
-                }),
+                })),
             )],
             None => Vec::new(),
         }
@@ -445,7 +445,7 @@ impl SimState {
         {
             events.push((
                 ts,
-                AccountData::OrderUpdate(OrderUpdate {
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(OrderUpdate {
                     order_id: order_id.clone(),
                     client_order_id: Some(order.client_order_id.clone()),
                     exchange: self.exchange,
@@ -453,7 +453,7 @@ impl SimState {
                     side: order.side,
                     status: OrderStatus::Cancelled,
                     quantity: order.quantity,
-                }),
+                })),
             ));
         }
         events
@@ -520,7 +520,7 @@ impl SimState {
             // reduceOnly 无可平仓位 -> 不成交，回 Cancelled
             let events = vec![(
                 ts,
-                AccountData::OrderUpdate(OrderUpdate {
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(OrderUpdate {
                     order_id: order_id.clone(),
                     client_order_id: Some(client_order_id.to_string()),
                     exchange: self.exchange,
@@ -528,7 +528,7 @@ impl SimState {
                     side,
                     status: OrderStatus::Cancelled,
                     quantity: order_qty,
-                }),
+                })),
             )];
             return (FillResult::NoPositionToReduce, events);
         }
@@ -570,8 +570,8 @@ impl SimState {
             reason: crate::domain::FillReason::Normal, // 回测无强平/ADL
         };
         let events = vec![
-            (ts, AccountData::OrderUpdate(update)),
-            (ts, AccountData::Fill(f)),
+            (ts, AccountData::Symbol(SymbolAccountData::OrderUpdate(update))),
+            (ts, AccountData::Symbol(SymbolAccountData::Fill(f))),
         ];
         (
             FillResult::Traded {
@@ -593,7 +593,7 @@ fn status_event(
 ) -> (Timestamp, AccountData) {
     (
         ts,
-        AccountData::OrderUpdate(OrderUpdate {
+        AccountData::Symbol(SymbolAccountData::OrderUpdate(OrderUpdate {
             order_id: order_id.clone(),
             client_order_id: Some(order.client_order_id.clone()),
             exchange,
@@ -601,7 +601,7 @@ fn status_event(
             side: order.side,
             status,
             quantity: order.quantity,
-        }),
+        })),
     )
 }
 
@@ -694,7 +694,7 @@ mod tests {
     fn statuses(evs: &[(Timestamp, AccountData)]) -> Vec<OrderStatus> {
         evs.iter()
             .filter_map(|(_, d)| match d {
-                AccountData::OrderUpdate(u) => Some(u.status.clone()),
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => Some(u.status.clone()),
                 _ => None,
             })
             .collect()
@@ -702,7 +702,7 @@ mod tests {
     fn fills(evs: &[(Timestamp, AccountData)]) -> Vec<Fill> {
         evs.iter()
             .filter_map(|(_, d)| match d {
-                AccountData::Fill(f) => Some(f.clone()),
+                AccountData::Symbol(SymbolAccountData::Fill(f)) => Some(f.clone()),
                 _ => None,
             })
             .collect()
@@ -748,7 +748,7 @@ mod tests {
         s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
         let evs = s.on_market(&market_ev(bbo(49990.0, 49994.0, 2)));
         assert!(
-            evs.iter().any(|(_, d)| matches!(d, AccountData::Fill(_))),
+            evs.iter().any(|(_, d)| matches!(d, AccountData::Symbol(SymbolAccountData::Fill(_)))),
             "越价应产出成交回报"
         );
         // 回报时间戳取行情时刻（确定性）
@@ -901,7 +901,7 @@ mod tests {
         let cancelled: Vec<f64> = evs
             .iter()
             .filter_map(|(_, d)| match d {
-                AccountData::OrderUpdate(u) if u.status == OrderStatus::Cancelled => {
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) if u.status == OrderStatus::Cancelled => {
                     Some(u.quantity)
                 }
                 _ => None,

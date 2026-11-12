@@ -17,7 +17,7 @@
 //!   - 单位折算 (币 -> 张) 是**线路细节**，只发生在实盘出口，见
 //!     [`crate::exchange::ExchangeOrder`]；回测不经过那里，因此全程币本位
 
-use crate::domain::{Exchange, Order, OrderType, Symbol, SymbolMeta};
+use crate::domain::{AccountId, Exchange, Order, OrderType, Symbol, SymbolMeta};
 use crate::messaging::{IncomeEvent, StateManager, SubscriptionScope};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::collections::HashMap;
@@ -65,22 +65,25 @@ pub struct StrategyRunner {
 }
 
 impl StrategyRunner {
-    /// 生产构造：client_order_id 用交易所 UUID。
+    /// 生产构造：client_order_id 用交易所 UUID。`account` 是本策略绑定的账户（只收它的私有事件）。
     pub fn new(
         strategy: Box<dyn Strategy>,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+        account: AccountId,
     ) -> Self {
-        Self::with_id_gen(strategy, symbol_metas, Box::new(ExchangeUuidGen))
+        Self::with_id_gen(strategy, symbol_metas, account, Box::new(ExchangeUuidGen))
     }
 
     /// 注入 id 生成策略 (回测传 [`SequentialClientOrderIdGen`] 以确保确定性)。
     pub fn with_id_gen(
         strategy: Box<dyn Strategy>,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+        account: AccountId,
         id_gen: Box<dyn ClientOrderIdGen>,
     ) -> Self {
         // 从 public_streams 推导订阅范围
-        let subscriptions = SubscriptionScope::from_pairs(
+        let subscriptions = SubscriptionScope::new(
+            account,
             strategy
                 .public_streams()
                 .iter()
@@ -267,6 +270,8 @@ mod tests {
                 placed: false,
             }),
             metas(),
+            crate::backtest::backtest_account(),
+
             Box::new(SequentialClientOrderIdGen::default()),
         );
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);
@@ -303,6 +308,8 @@ mod tests {
                 placed: false,
             }),
             metas(),
+            crate::backtest::backtest_account(),
+
             Box::new(SequentialClientOrderIdGen::default()),
         );
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);
@@ -326,6 +333,7 @@ mod tests {
                 placed: false,
             }),
             metas(),
+            crate::domain::AccountId::Live,
         );
 
         let bbo = |exchange: Exchange, symbol: &str| {
@@ -348,11 +356,11 @@ mod tests {
                 crate::domain::AccountId::Live,
                 0,
                 0,
-                crate::messaging::AccountData::AccountInfo {
+                crate::messaging::AccountData::Exchange(crate::messaging::ExchangeAccountData::AccountInfo {
                     exchange,
                     equity: 1.0,
                     notional: 0.0,
-                },
+                }),
             )
         };
 

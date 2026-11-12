@@ -49,7 +49,7 @@ use super::config::PairParams;
 use super::signal::{decide, FundingAction, LegPair, SettledFundingWindow};
 use crate::domain::{Exchange, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{AccountData, IncomeEvent, MarketData, MarketEvent, PendingOrder};
+use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, IncomeEvent, MarketData, MarketEvent, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
 use std::collections::{HashMap, HashSet};
 
@@ -542,13 +542,13 @@ impl Strategy for FundingArbStrategy {
                 }
             }
             IncomeEvent::Account(a) => {
-                if let AccountData::UnmappedFill(f) = &a.data {
+                if let AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) = &a.data {
                     self.halt(format!(
                         "{} 账户在品种目录外有成交：{} {:?} 数量 {}（交易所原始单位）@{}（与本策略共用保证金却不在杠杆口径里；覆盖该所的币都会停）",
                         f.exchange, f.instrument, f.side, f.size, f.price
                     ));
                 }
-                if let AccountData::Fill(f) = &a.data {
+                if let AccountData::Symbol(SymbolAccountData::Fill(f)) = &a.data {
                     // 归属判据与框架同一份（订单号前缀）。盖不住本引擎另一个进程在同账户同币上交易；
                     // 本策略一个进程覆盖全部币，不会出现。
                     let ours = f.client_order_id.as_ref().is_some_and(|c| f.exchange.owns_cli_order_id(c));

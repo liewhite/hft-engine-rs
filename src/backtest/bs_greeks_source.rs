@@ -10,7 +10,7 @@
 
 use crate::backtest::source::MarketDataSource;
 use crate::domain::{Balance, Exchange, Greeks, Symbol, Timestamp};
-use crate::messaging::{AccountData, IncomeEvent, MarketData};
+use crate::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData};
 use crate::option::{self, OptionRight, MILLIS_PER_YEAR};
 use std::cell::RefCell;
 
@@ -185,7 +185,7 @@ impl<S: MarketDataSource> MarketDataSource for BsGreeksSource<S> {
                 crate::backtest::backtest_account(),
                 now,
                 now,
-                AccountData::Greeks(greeks),
+                AccountData::Exchange(ExchangeAccountData::Greeks(greeks)),
             );
             if balance_emitted {
                 vec![ev, greeks_ev]
@@ -195,11 +195,11 @@ impl<S: MarketDataSource> MarketDataSource for BsGreeksSource<S> {
                     crate::backtest::backtest_account(),
                     now,
                     now,
-                    AccountData::Balance(Balance {
+                    AccountData::Exchange(ExchangeAccountData::Balance(Balance {
                         exchange: self.config.exchange,
                         asset: self.config.ccy.clone(),
                         available: self.config.spot_holding,
-                    }),
+                    })),
                 );
                 vec![ev, balance_ev, greeks_ev]
             }
@@ -264,10 +264,10 @@ mod tests {
         // 首笔注入 trade + balance + greeks 三事件
         let balances = evs
             .iter()
-            .filter(|e| matches!(e, IncomeEvent::Account(a) if matches!(&a.data, AccountData::Balance(b) if b.asset == "ETH")))
+            .filter(|e| matches!(e, IncomeEvent::Account(a) if matches!(&a.data, AccountData::Exchange(ExchangeAccountData::Balance(b)) if b.asset == "ETH")))
             .count();
         assert_eq!(balances, 1, "balance 只发一次");
-        assert!(evs.iter().any(|e| matches!(e, IncomeEvent::Account(a) if matches!(a.data, AccountData::Greeks(_)))));
+        assert!(evs.iter().any(|e| matches!(e, IncomeEvent::Account(a) if matches!(a.data, AccountData::Exchange(ExchangeAccountData::Greeks(_))))));
     }
 
     #[test]
@@ -281,7 +281,7 @@ mod tests {
             .iter()
             .find_map(|e| match e {
                 IncomeEvent::Account(a) => match &a.data {
-                    AccountData::Greeks(g) => Some(g.clone()),
+                    AccountData::Exchange(ExchangeAccountData::Greeks(g)) => Some(g.clone()),
                     _ => None,
                 },
                 _ => None,

@@ -18,7 +18,7 @@ use crate::exchange::hyperliquid::codec::{WsOrderUpdate, WsUserFills};
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
 use crate::exchange::ws_loop;
-use crate::messaging::{AccountData, AccountEvent};
+use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, AccountEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -248,7 +248,7 @@ fn parse_order_updates(
             // 四所口径曾混装且无人读，见 crate::domain::OrderUpdate 的文档）
             exchange_ts: order_update.status_timestamp,
             local_ts,
-            data: AccountData::OrderUpdate(update),
+            data: AccountData::Symbol(SymbolAccountData::OrderUpdate(update)),
         });
     }
 
@@ -283,9 +283,9 @@ fn parse_user_fills(
     let mut events = Vec::new();
     for ws_fill in &user_fills.fills {
         let data = if markets.owns(&ws_fill.coin) {
-            AccountData::Fill(ws_fill.to_fill()?)
+            AccountData::Symbol(SymbolAccountData::Fill(ws_fill.to_fill()?))
         } else {
-            AccountData::UnmappedFill(ws_fill.to_unmapped_fill()?)
+            AccountData::Exchange(ExchangeAccountData::UnmappedFill(ws_fill.to_unmapped_fill()?))
         };
         events.push(AccountEvent {
             // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
@@ -355,8 +355,8 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .map(|e| match e.data {
-                    AccountData::Fill(f) => format!("fill:{}", f.symbol),
-                    AccountData::UnmappedFill(f) => format!("unmapped:{}", f.instrument),
+                    AccountData::Symbol(SymbolAccountData::Fill(f)) => format!("fill:{}", f.symbol),
+                    AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => format!("unmapped:{}", f.instrument),
                     other => panic!("unexpected {other:?}"),
                 })
                 .collect()
@@ -426,7 +426,7 @@ mod tests {
         let symbols: Vec<_> = events
             .iter()
             .map(|e| match &e.data {
-                AccountData::OrderUpdate(u) => u.symbol.clone(),
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => u.symbol.clone(),
                 other => panic!("expected order update, got {other:?}"),
             })
             .collect();

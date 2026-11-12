@@ -15,7 +15,7 @@
 use crate::backtest::source::MarketDataSource;
 use crate::domain::{Exchange, Order, OrderId, Price, Symbol, SymbolMeta, Timestamp};
 use crate::engine::StrategyRunner;
-use crate::messaging::{AccountData, IncomeEvent};
+use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, IncomeEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
 use std::cmp::{Ordering, Reverse};
@@ -386,7 +386,7 @@ impl<'a> BacktestEngine<'a> {
 
     /// 把事件投递给观察者与各策略；策略产出的信号按下单延迟入队到达撮合。
     fn deliver(&mut self, ev: IncomeEvent) {
-        if matches!(&ev, IncomeEvent::Account(a) if matches!(a.data, AccountData::Fill(_))) {
+        if matches!(&ev, IncomeEvent::Account(a) if matches!(a.data, AccountData::Symbol(SymbolAccountData::Fill(_)))) {
             self.fill_count += 1;
         }
         for i in 0..self.observers.len() {
@@ -433,11 +433,11 @@ impl<'a> BacktestEngine<'a> {
             crate::backtest::backtest_account(),
             ts,
             ts,
-            AccountData::AccountInfo {
+            AccountData::Exchange(ExchangeAccountData::AccountInfo {
                 exchange,
                 equity,
                 notional,
-            },
+            }),
         )
     }
 }

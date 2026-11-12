@@ -3,27 +3,28 @@
 //! # 为什么要有这个类型
 //!
 //! 同一个判断有两条驱动要做：实盘的 `IncomeProcessorActor`（总线 → executor）与回测的
-//! `BacktestEngine`（虚拟时间循环 → runner）。此前两边各写各的 —— 一个查
-//! `sub.symbols.contains(&key)`、一个查 `self.subscriptions.contains(&route)` ——
-//! 恰好等价，但那是巧合不是保证（原则 P1/P4）。
-//!
-//! 判据收进本类型之后，两条驱动调的是同一个 [`SubscriptionScope::accepts_delivery`]，
-//! 而"事件的定位精度有几档"由 [`Delivery`] 的穷举 `match` 保证漏不掉（原则 P6）。
+//! `BacktestEngine`（虚拟时间循环 → runner）。判据收进本类型之后，两条驱动调的是同一个
+//! [`SubscriptionScope::accepts`]：账户归属、所、symbol 三个维度都在这里判，不在分发层
+//! 另写一份账户过滤（原则 P1/P4）。"事件的定位精度有几档"由 [`Delivery`] 的穷举 `match`
+//! 保证漏不掉（原则 P6）。
 //!
 //! # 热路径上仍然可以用索引
 //!
 //! `IncomeProcessorActor` 为 symbol 定向的行情事件建了 `(所, symbol) -> 订阅者` 的反向
-//! 索引，那是 O(1) 扇出优化，不是第二份判据 —— 索引的键由 [`SubscriptionScope::pairs`]
-//! 灌，与判据同源。这条同源关系是**结构约定**而非编译期保证，故分发层在索引命中处留了
-//! 一条 `debug_assert`：索引与范围一旦失配，测试与回测里会立刻响，而不是静默错投。
+//! 索引、为账户事件建了 `账户 -> 订阅者` 的索引，那是扇出优化，不是第二份判据 ——
+//! 索引的键由 [`SubscriptionScope::pairs`] / [`SubscriptionScope::account`] 灌，与判据同源。
+//! 这条同源关系是**结构约定**而非编译期保证，故分发层在索引命中处留了
+//! `debug_assert`：索引与范围一旦失配，测试与回测里会立刻响，而不是静默错投。
 
-use crate::domain::{Exchange, Symbol};
+use crate::domain::{AccountId, Exchange, Symbol};
 use crate::messaging::{Delivery, IncomeEvent};
 use std::collections::{HashMap, HashSet};
 
-/// 一个消费者订阅的 (交易所, symbol) 范围。
-#[derive(Debug, Clone, Default)]
+/// 一个消费者的订阅范围：绑定的账户 + 订阅的 (交易所, symbol)。
+#[derive(Debug, Clone)]
 pub struct SubscriptionScope {
+    /// 绑定的账户：只收这个账户的私有事件（行情无账户归属，不受它限制）
+    account: AccountId,
     /// 所 -> 该所订阅的 symbol 集合。
     ///
     /// 按所分层而非存 `HashSet<(Exchange, Symbol)>`，有两个理由：**键集兼作订阅交易所
@@ -33,38 +34,42 @@ pub struct SubscriptionScope {
 }
 
 impl SubscriptionScope {
-    pub fn from_pairs(pairs: impl IntoIterator<Item = (Exchange, Symbol)>) -> Self {
+    pub fn new(account: AccountId, pairs: impl IntoIterator<Item = (Exchange, Symbol)>) -> Self {
         let mut symbols: HashMap<Exchange, HashSet<Symbol>> = HashMap::new();
         for (exchange, symbol) in pairs {
             symbols.entry(exchange).or_default().insert(symbol);
         }
-        Self { symbols }
+        Self { account, symbols }
     }
 
-    /// 这条事件在本范围内吗。
+    /// 这条事件在本范围内吗 —— 判据的**唯一出处**。
     ///
-    /// 一个消费者判一条事件时用它；分发层要对 N 个消费者判**同一条**事件，
-    /// 应当先自己 `delivery()` 一次再走 [`Self::accepts_delivery`] ——
-    /// `Delivery::Symbol` 持有 `Symbol`（`String`），逐个消费者重推导就是逐个一次分配。
+    /// - 账户事件先看归属：别的账户的私有事件一律不收（实盘与模拟账户不串账）。
+    /// - 所级读数按所过滤：`Balance` / `AccountInfo` / `Greeks` 没有 symbol，写成广播的话
+    ///   策略能读到自己压根没订的所的净值 —— 而杠杆闸门就是拿净值算的。
     pub fn accepts(&self, event: &IncomeEvent) -> bool {
-        self.accepts_delivery(&event.delivery())
+        match event {
+            IncomeEvent::Market(m) => self.covers(&m.data.delivery()),
+            IncomeEvent::Account(a) => {
+                a.account == self.account && self.covers(&a.data.delivery())
+            }
+        }
     }
 
-    /// 判据的**唯一出处**。
-    ///
-    /// 所级读数按所过滤，是三档里唯一不显然的一档：`Balance` / `AccountInfo` / `Greeks`
-    /// 没有 symbol，此前一律广播，于是策略能读到自己压根没订的所的净值 —— 而杠杆闸门
-    /// 就是拿净值算的。堵在这里（分发层）而不是堵在策略视图上：视图只挡查询，挡不住
-    /// 事件 payload 本身带着净值推给策略。
-    pub fn accepts_delivery(&self, delivery: &Delivery) -> bool {
+    fn covers(&self, delivery: &Delivery) -> bool {
         match delivery {
             Delivery::Symbol(exchange, symbol) => self
                 .symbols
                 .get(exchange)
-                .is_some_and(|symbols| symbols.contains(symbol)),
+                .is_some_and(|symbols| symbols.contains(*symbol)),
             Delivery::Exchange(exchange) => self.symbols.contains_key(exchange),
             Delivery::Broadcast => true,
         }
+    }
+
+    /// 绑定的账户（供分发层灌账户索引）
+    pub fn account(&self) -> &AccountId {
+        &self.account
     }
 
     /// 遍历全部 (所, symbol) 对（供分发层灌反向索引）
@@ -83,15 +88,15 @@ impl SubscriptionScope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AccountId, BBO};
-    use crate::messaging::{AccountData, MarketData};
+    use crate::domain::BBO;
+    use crate::messaging::{AccountData, ExchangeAccountData, MarketData};
 
     const EX: Exchange = Exchange::OKX;
     const OUTSIDE: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
 
     fn scope() -> SubscriptionScope {
-        SubscriptionScope::from_pairs([(EX, SYM.to_string())])
+        SubscriptionScope::new(AccountId::Live, [(EX, SYM.to_string())])
     }
 
     fn bbo(exchange: Exchange, symbol: &str) -> IncomeEvent {
@@ -110,17 +115,21 @@ mod tests {
         )
     }
 
-    fn account_info(exchange: Exchange) -> IncomeEvent {
+    fn account_info_of(account: AccountId, exchange: Exchange) -> IncomeEvent {
         IncomeEvent::account(
-            AccountId::Live,
+            account,
             0,
             0,
-            AccountData::AccountInfo {
+            AccountData::Exchange(ExchangeAccountData::AccountInfo {
                 exchange,
                 equity: 1.0,
                 notional: 0.0,
-            },
+            }),
         )
+    }
+
+    fn account_info(exchange: Exchange) -> IncomeEvent {
+        account_info_of(AccountId::Live, exchange)
     }
 
     /// 定向档：只收订了的 (所, symbol)
@@ -146,6 +155,15 @@ mod tests {
         );
     }
 
+    /// **串账防线**：别的账户的私有事件，就算所和 symbol 都对得上也不收；行情不分账户
+    #[test]
+    fn account_events_of_another_account_are_rejected() {
+        let paper = SubscriptionScope::new(AccountId::Paper("x".to_string()), [(EX, SYM.to_string())]);
+        assert!(!paper.accepts(&account_info(EX)), "模拟账户不该收实盘净值");
+        assert!(paper.accepts(&account_info_of(AccountId::Paper("x".to_string()), EX)));
+        assert!(paper.accepts(&bbo(EX, SYM)), "行情无账户归属");
+    }
+
     /// 广播档：与交易所无关的全局事件一律放行（Clock 不放行会让超时清理停摆）
     #[test]
     fn events_without_an_exchange_reach_everyone() {
@@ -155,7 +173,7 @@ mod tests {
     /// 空范围只收广播 —— 不会因为"没订任何东西"就变成什么都收
     #[test]
     fn an_empty_scope_still_only_takes_broadcasts() {
-        let empty = SubscriptionScope::default();
+        let empty = SubscriptionScope::new(AccountId::Live, []);
         assert!(empty.accepts(&IncomeEvent::market(0, 0, MarketData::Clock)));
         assert!(!empty.accepts(&bbo(EX, SYM)));
         assert!(!empty.accepts(&account_info(EX)));

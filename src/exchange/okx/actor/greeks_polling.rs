@@ -7,7 +7,7 @@ use crate::domain::Exchange;
 use crate::messaging::AccountPubSub;
 use crate::exchange::okx::OkxClient;
 use crate::exchange::staleness::{stamped_on_receipt, StalenessGuard, MAX_POLL_STALENESS_MS};
-use crate::messaging::{AccountData, AccountEvent};
+use crate::messaging::{ExchangeAccountData, AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -65,7 +65,7 @@ impl OkxGreeksPollingActor {
                             account: crate::domain::AccountId::Live,
                             exchange_ts,
                             local_ts,
-                            data: AccountData::Greeks(greeks),
+                            data: AccountData::Exchange(ExchangeAccountData::Greeks(greeks)),
                         }))
                         .send()
                         .await

@@ -39,7 +39,7 @@
 use crate::domain::{
     now_ms, AccountId, Exchange, Order, OrderId, Symbol, SymbolMeta, Timestamp, BBO,
 };
-use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
+use crate::messaging::{ExchangeAccountData, AccountData, AccountEvent, MarketData, MarketEvent};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
@@ -174,11 +174,11 @@ impl PaperCounterActor {
                 account: account.clone(),
                 exchange_ts: ts,
                 local_ts: ts,
-                data: AccountData::AccountInfo {
+                data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
                     exchange: state.exchange,
                     equity,
                     notional,
-                },
+                }),
             };
             if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Paper counter failed to publish account info");
@@ -452,6 +452,7 @@ impl Message<ApplyCancel> for PaperCounterActor {
 mod tests {
     use super::*;
     use crate::domain::{MarketTrade, OrderStatus, OrderType, Side, TimeInForce, BBO};
+    use crate::messaging::SymbolAccountData;
     use kameo::actor::Spawn;
     use kameo::mailbox;
     use kameo_actors::pubsub::Subscribe;
@@ -612,7 +613,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    AccountData::OrderUpdate(u) => Some(u.status.clone()),
+                    AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => Some(u.status.clone()),
                     _ => None,
                 })
                 .collect()
@@ -624,7 +625,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    AccountData::Fill(f) => Some((f.price, f.size)),
+                    AccountData::Symbol(SymbolAccountData::Fill(f)) => Some((f.price, f.size)),
                     _ => None,
                 })
                 .collect()
@@ -636,7 +637,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    AccountData::OrderUpdate(u) => Some(u.order_id.clone()),
+                    AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => Some(u.order_id.clone()),
                     _ => None,
                 })
                 .collect()
@@ -723,7 +724,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match &e.data {
-                AccountData::AccountInfo { exchange, .. } => Some(*exchange),
+                AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, .. }) => Some(*exchange),
                 _ => None,
             })
             .collect();
@@ -911,7 +912,7 @@ mod tests {
             .unwrap()
             .iter()
             .find_map(|e| match &e.data {
-                AccountData::Fill(f) => Some(f.fee),
+                AccountData::Symbol(SymbolAccountData::Fill(f)) => Some(f.fee),
                 _ => None,
             })
             .expect("fill");
@@ -1026,7 +1027,7 @@ mod tests {
             .unwrap();
         h.settle(30).await;
         let equity = h.events.lock().unwrap().iter().find_map(|e| match &e.data {
-            AccountData::AccountInfo { equity, .. } => Some(*equity),
+            AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) => Some(*equity),
             _ => None,
         });
         assert_eq!(equity, Some(10_000.0));

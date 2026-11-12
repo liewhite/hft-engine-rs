@@ -737,7 +737,7 @@ impl Message<StreamMessage<Instant, (), ()>> for PositionLedgerActor {
 mod tests {
     use super::*;
     use crate::domain::{Fill, FillReason, Side};
-    use crate::messaging::AccountData;
+    use crate::messaging::{AccountData, SymbolAccountData};
     use crate::domain::StepFormatter;
 
     const EX: Exchange = Exchange::Binance;
@@ -795,7 +795,7 @@ mod tests {
             account: crate::domain::AccountId::Live,
             exchange_ts: local_ts,
             local_ts,
-            data: AccountData::Fill(Fill {
+            data: AccountData::Symbol(SymbolAccountData::Fill(Fill {
                 exchange,
                 symbol: SYM.to_string(),
                 side,
@@ -806,7 +806,7 @@ mod tests {
                 timestamp: local_ts,
                 fee: 0.0,
                 reason: FillReason::Normal,
-            }),
+            })),
         }
     }
 
@@ -1250,7 +1250,7 @@ mod hl_multi_dex_tests {
         // 未接入的 flx 上同名 TSLA 的成交：不进 Fill 流（以 UnmappedFill 上报），不会串到 xyz:TSLA
         let foreign = user_fills_json(&[("flx:TSLA", "B", 5.0)]);
         let foreign = fills_from_ws(&m, &foreign, SNAPSHOT_TS + 1).unwrap();
-        assert!(foreign.iter().all(|e| matches!(e.data, crate::messaging::AccountData::UnmappedFill(_))));
+        assert!(foreign.iter().all(|e| matches!(e.data, crate::messaging::AccountData::Exchange(crate::messaging::ExchangeAccountData::UnmappedFill(_)))));
         for e in events.iter().chain(&foreign) {
             r.on_event(e);
         }

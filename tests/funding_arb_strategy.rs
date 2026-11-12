@@ -5,7 +5,7 @@ use hft_engine_rs::domain::{
     Side, StepFormatter, SymbolMeta, TimeInForce, BBO,
 };
 use hft_engine_rs::engine::StrategyRunner;
-use hft_engine_rs::messaging::{AccountData, CustomEvent, IncomeEvent, MarketData, PositionBaseline};
+use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, CustomEvent, IncomeEvent, MarketData, PositionBaseline};
 use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, OutcomeEvent, SettledFundingWindow};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,6 +74,7 @@ impl Sim {
         let mut runner = StrategyRunner::new(
             Box::new(FundingArbStrategy::new(p, exchanges.iter().map(|&e| meta(e).1).collect())),
             Arc::new(exchanges.iter().map(|&e| meta(e)).collect::<HashMap<_, _>>()),
+            AccountId::Live,
         );
         let baselines: Vec<PositionBaseline> = legs
             .iter()
@@ -112,7 +113,7 @@ impl Sim {
 
     fn equity(&mut self, ex: Exchange, equity: f64, notional: f64) -> Vec<OutcomeEvent> {
         let now = self.now;
-        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::AccountInfo { exchange: ex, equity, notional }))
+        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange: ex, equity, notional })))
     }
 
     /// 某所过去 24h 每小时一样的费率，使年化 = `apr`
@@ -142,7 +143,7 @@ impl Sim {
             quantity: o.quantity,
         };
         let now = self.now;
-        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::OrderUpdate(u)))
+        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Symbol(SymbolAccountData::OrderUpdate(u))))
     }
 
     fn fill(&mut self, o: &hft_engine_rs::domain::Order, size: f64) -> Vec<OutcomeEvent> {
@@ -159,7 +160,7 @@ impl Sim {
             reason: FillReason::Normal,
         };
         let now = self.now;
-        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Fill(f)))
+        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Symbol(SymbolAccountData::Fill(f))))
     }
 }
 
@@ -555,14 +556,14 @@ fn unmapped_fill_halts() {
         AccountId::Live,
         now,
         now,
-        AccountData::UnmappedFill(hft_engine_rs::messaging::UnmappedFill {
+        AccountData::Exchange(ExchangeAccountData::UnmappedFill(hft_engine_rs::messaging::UnmappedFill {
             exchange: HL,
             instrument: "flx:TSLA".into(),
             side: Side::Long,
             size: 1.0,
             price: 100.0,
             timestamp: now,
-        }),
+        })),
     ));
     s.funding(BN, 0.8);
     assert!(placed(&s.funding(HL, 0.1)).is_empty(), "停止交易后不得开仓");

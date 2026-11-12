@@ -8,7 +8,7 @@ use hft_engine_rs::domain::{
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::domain::StepFormatter;
 use hft_engine_rs::exchange::SubscriptionKind;
-use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData};
+use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::cell::RefCell;
@@ -123,15 +123,15 @@ impl Strategy for OneShotBuy {
 fn event_sig(ev: &IncomeEvent) -> String {
     match ev {
         IncomeEvent::Account(a) => match &a.data {
-            AccountData::OrderUpdate(u) => format!(
+            AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => format!(
                 "OU ts={} cid={:?} {:?} qty={}",
                 a.exchange_ts, u.client_order_id, u.status, u.quantity
             ),
-            AccountData::Fill(f) => format!(
+            AccountData::Symbol(SymbolAccountData::Fill(f)) => format!(
                 "FL ts={} cid={:?} oid={} {:?} px={} sz={} fee={}",
                 a.exchange_ts, f.client_order_id, f.order_id, f.side, f.price, f.size, f.fee
             ),
-            AccountData::AccountInfo { equity, .. } => {
+            AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) => {
                 format!("ACC ts={} eq={}", a.exchange_ts, equity)
             }
             other => format!("{other:?}"),
@@ -161,6 +161,8 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
             placed: false,
         }),
         metas(),
+        hft_engine_rs::backtest::backtest_account(),
+
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {
@@ -218,6 +220,8 @@ fn trade_print_matching_fills_resting_limit() {
             placed: false,
         }),
         metas(),
+        hft_engine_rs::backtest::backtest_account(),
+
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {
@@ -283,6 +287,8 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
     let runner = StrategyRunner::with_id_gen(
         Box::new(EmitOnBbo { seen_customs: Arc::clone(&seen_by_strategy) }),
         metas(),
+        hft_engine_rs::backtest::backtest_account(),
+
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let seen_by_observer: Rc<RefCell<Vec<(usize, f64)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -362,11 +368,15 @@ fn inbound_custom_events_route_by_scope() {
         StrategyRunner::with_id_gen(
             Box::new(CustomProbe { symbol: SYM.to_string(), seen: Arc::clone(&seen_btc) }),
             metas(),
+            hft_engine_rs::backtest::backtest_account(),
+
             Box::new(SequentialClientOrderIdGen::default()),
         ),
         StrategyRunner::with_id_gen(
             Box::new(CustomProbe { symbol: SYM2.to_string(), seen: Arc::clone(&seen_eth) }),
             metas(),
+            hft_engine_rs::backtest::backtest_account(),
+
             Box::new(SequentialClientOrderIdGen::default()),
         ),
     ];

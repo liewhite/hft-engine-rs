@@ -25,7 +25,7 @@ pub use policy::{Decision, NeverPromote, PromotionPolicy, SymbolPerformance};
 pub use record::{RoundTrip, SymbolRecord};
 
 use crate::domain::{AccountId, Exchange, ExchangeError, Symbol, Timestamp};
-use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
+use crate::messaging::{SymbolAccountData, AccountData, AccountEvent, MarketData, MarketEvent};
 use crate::strategy::Strategy;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -131,7 +131,7 @@ impl SupervisorActor {
     /// 把一笔成交记到对应账户的表现里（账户从事件自带的标签取 —— 一条总线一次订阅，
     /// 实盘与全部模拟账户的成交都经此，替代旧的共享总线 + Paper 总线双订阅）
     fn record_fill(&mut self, event: &AccountEvent) {
-        let AccountData::Fill(fill) = &event.data else {
+        let AccountData::Symbol(SymbolAccountData::Fill(fill)) = &event.data else {
             return;
         };
         let account = &event.account;

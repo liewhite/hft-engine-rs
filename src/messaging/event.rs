@@ -37,7 +37,7 @@ use std::sync::Arc;
 /// # 路由与账户归属
 ///
 /// - 带 `(exchange, symbol)` scope 的事件按既有订阅关系定向投递，无 scope 的广播 ——
-///   复用 [`IncomeEvent::routing`] 的推导，无第二套路由。
+///   复用 [`IncomeEvent::delivery`] 的推导，无第二套路由。
 /// - 自定义事件**没有账户归属**（如同行情，故属 [`MarketData`]）：实盘与模拟账户的
 ///   策略都会收到。需要区分时在 payload 里自带判别字段。
 ///
@@ -135,8 +135,8 @@ pub enum MarketData {
     },
     /// K线实时推送
     Candle(Candle),
-    /// 历史K线批量数据（订阅时一次性推送；发布端保证非空，见 OKX business WS）
-    HistoryCandles(Vec<Candle>),
+    /// 历史K线批量数据（订阅时一次性推送）
+    HistoryCandles(HistoryCandles),
     /// 融券券源读数 (借券费 + 可借量)；参考数据，策略在 on_event 里消费
     BorrowFee(BorrowFee),
     /// 汇率读数 (货币对)；参考数据，策略在 on_event 里消费
@@ -149,42 +149,47 @@ pub enum MarketData {
 }
 
 impl MarketData {
-    /// 事件关联的 symbol（`None` = 无 symbol 维度，广播语义）
-    pub fn symbol(&self) -> Option<&Symbol> {
+    /// 这条行情该投给谁：**每个变体自己声明定位精度**（穷举 match，新增变体编译即要求
+    /// 给出档位）。投递范围的唯一出处 —— `symbol()` / `exchange()` 都由它派生。
+    pub fn delivery(&self) -> Delivery<'_> {
         match self {
-            MarketData::FundingRate(r) => Some(&r.symbol),
-            MarketData::BBO(b) => Some(&b.symbol),
-            MarketData::MarketTrade(t) => Some(&t.symbol),
-            MarketData::MarkPrice(mp) => Some(&mp.symbol),
-            MarketData::IndexPrice(ip) => Some(&ip.symbol),
-            MarketData::Candle(c) => Some(&c.symbol),
-            MarketData::HistoryCandles(cs) => cs.first().map(|c| &c.symbol),
-            MarketData::BorrowFee(bf) => Some(&bf.symbol),
+            MarketData::FundingRate(r) => Delivery::Symbol(r.exchange, &r.symbol),
+            MarketData::BBO(b) => Delivery::Symbol(b.exchange, &b.symbol),
+            MarketData::MarketTrade(t) => Delivery::Symbol(t.exchange, &t.symbol),
+            MarketData::MarkPrice(mp) => Delivery::Symbol(mp.exchange, &mp.symbol),
+            MarketData::IndexPrice(ip) => Delivery::Symbol(ip.exchange, &ip.symbol),
+            MarketData::Candle(c) => Delivery::Symbol(c.exchange, &c.symbol),
+            MarketData::HistoryCandles(h) => Delivery::Symbol(h.exchange, &h.symbol),
+            MarketData::BorrowFee(bf) => Delivery::Symbol(bf.exchange, &bf.symbol),
+            MarketData::ExchangeRate(er) => Delivery::Exchange(er.exchange),
+            MarketData::ExchangeStatus { exchange, .. } => Delivery::Exchange(*exchange),
             // 自定义事件的 scope 由构造方决定（for_symbol 定向 / new 广播）
-            MarketData::Custom(c) => c.scope().map(|(_, s)| s),
-            MarketData::ExchangeStatus { .. }
-            | MarketData::ExchangeRate(_)
-            | MarketData::Clock => None,
+            MarketData::Custom(c) => match c.scope() {
+                Some((e, s)) => Delivery::Symbol(*e, s),
+                None => Delivery::Broadcast,
+            },
+            MarketData::Clock => Delivery::Broadcast,
         }
     }
 
-    /// 事件来源交易所
-    pub fn exchange(&self) -> Option<Exchange> {
-        match self {
-            MarketData::FundingRate(r) => Some(r.exchange),
-            MarketData::BBO(b) => Some(b.exchange),
-            MarketData::MarketTrade(t) => Some(t.exchange),
-            MarketData::MarkPrice(mp) => Some(mp.exchange),
-            MarketData::IndexPrice(ip) => Some(ip.exchange),
-            MarketData::Candle(c) => Some(c.exchange),
-            MarketData::HistoryCandles(cs) => cs.first().map(|c| c.exchange),
-            MarketData::BorrowFee(bf) => Some(bf.exchange),
-            MarketData::ExchangeRate(er) => Some(er.exchange),
-            MarketData::ExchangeStatus { exchange, .. } => Some(*exchange),
-            MarketData::Custom(c) => c.scope().map(|(e, _)| *e),
-            MarketData::Clock => None,
-        }
+    /// 事件关联的 symbol（`None` = 无 symbol 维度）
+    pub fn symbol(&self) -> Option<&Symbol> {
+        self.delivery().symbol()
     }
+
+    /// 事件来源交易所（`None` = 与交易所无关的全局事件）
+    pub fn exchange(&self) -> Option<Exchange> {
+        self.delivery().exchange()
+    }
+}
+
+/// 一批历史 K 线（订阅时一次性推送）。(所, symbol) 是结构字段而不是从首根 K 线推导 ——
+/// 否则空批没有归属、只能退化成广播。
+#[derive(Debug, Clone)]
+pub struct HistoryCandles {
+    pub exchange: Exchange,
+    pub symbol: Symbol,
+    pub candles: Vec<Candle>,
 }
 
 // ============================================================================
@@ -208,17 +213,34 @@ pub struct AccountEvent {
     pub data: AccountData,
 }
 
-/// 账户私有数据（封闭枚举）
+/// 账户私有数据。定位精度在**类型**上分两档：币级（带 (所, symbol)）与所级（只带所）。
+///
+/// 分成两个类型而不是一张平铺枚举加一个「哪些变体有 symbol」的判断：状态层按档分派时
+/// 不再有默认分支，新增一个账户事件必须先选档、再在该档的穷举 match 里写处理，漏了编译不过；
+/// 币级状态（`SymbolState`）也收不到所级事件。
 #[derive(Debug, Clone)]
 pub enum AccountData {
+    /// 币级：属于某个 (所, symbol)
+    Symbol(SymbolAccountData),
+    /// 所级：属于某个所的整个账户
+    Exchange(ExchangeAccountData),
+}
+
+/// 币级账户事件（封闭枚举）
+#[derive(Debug, Clone)]
+pub enum SymbolAccountData {
     OrderUpdate(OrderUpdate),
     /// 成交事件 (持仓的唯一增量来源，见 `SymbolState::seed_position` 的维护模型)
     Fill(Fill),
-    Balance(Balance),
     /// 资费结算事件 (账户每次收/付资费时推送)
     FundingFee(FundingFee),
-    /// 账户希腊值 (按币种)。**账户持仓的风险读数**，归属账户侧 —— 历史上它被广播给
-    /// 全部账户是分类表漏行的意外行为（且无受益者：paper 策略因收不到 cashBal 恒不动作）
+}
+
+/// 所级账户事件（封闭枚举）
+#[derive(Debug, Clone)]
+pub enum ExchangeAccountData {
+    Balance(Balance),
+    /// 账户希腊值 (按币种)。**账户持仓的风险读数**，归属账户侧
     Greeks(Greeks),
     /// 账户信息 (净值 + 总持仓名义价值)
     AccountInfo {
@@ -228,7 +250,7 @@ pub enum AccountData {
         /// 账户总持仓名义价值 (用于计算杠杆率)
         notional: f64,
     },
-    /// 本账户在**引擎品种目录之外**的成交（如 HL 未接入市场的合约、现货），所级事件。
+    /// 本账户在**引擎品种目录之外**的成交（如 HL 未接入市场的合约、现货）。
     /// 不进任何 symbol 的持仓；框架只如实上报，怎么处理（忽略 / 停止交易）由策略决定。
     UnmappedFill(UnmappedFill),
 }
@@ -246,58 +268,99 @@ pub struct UnmappedFill {
     pub timestamp: Timestamp,
 }
 
-impl AccountData {
-    /// 事件关联的 symbol（`None` = 账户级，投给该账户的全部 executor）
-    pub fn symbol(&self) -> Option<&Symbol> {
+impl SymbolAccountData {
+    pub fn exchange(&self) -> Exchange {
         match self {
-            AccountData::OrderUpdate(u) => Some(&u.symbol),
-            AccountData::Fill(f) => Some(&f.symbol),
-            AccountData::FundingFee(fee) => Some(&fee.symbol),
-            AccountData::Balance(_)
-            | AccountData::Greeks(_)
-            | AccountData::AccountInfo { .. }
-            | AccountData::UnmappedFill(_) => None,
+            SymbolAccountData::OrderUpdate(u) => u.exchange,
+            SymbolAccountData::Fill(f) => f.exchange,
+            SymbolAccountData::FundingFee(fee) => fee.exchange,
         }
     }
 
-    /// 事件来源交易所
-    pub fn exchange(&self) -> Option<Exchange> {
+    pub fn symbol(&self) -> &Symbol {
         match self {
-            AccountData::OrderUpdate(u) => Some(u.exchange),
-            AccountData::Fill(f) => Some(f.exchange),
-            AccountData::FundingFee(fee) => Some(fee.exchange),
-            AccountData::Balance(b) => Some(b.exchange),
-            AccountData::Greeks(g) => Some(g.exchange),
-            AccountData::AccountInfo { exchange, .. } => Some(*exchange),
-            AccountData::UnmappedFill(f) => Some(f.exchange),
+            SymbolAccountData::OrderUpdate(u) => &u.symbol,
+            SymbolAccountData::Fill(f) => &f.symbol,
+            SymbolAccountData::FundingFee(fee) => &fee.symbol,
         }
     }
 }
+
+impl ExchangeAccountData {
+    pub fn exchange(&self) -> Exchange {
+        match self {
+            ExchangeAccountData::Balance(b) => b.exchange,
+            ExchangeAccountData::Greeks(g) => g.exchange,
+            ExchangeAccountData::AccountInfo { exchange, .. } => *exchange,
+            ExchangeAccountData::UnmappedFill(f) => f.exchange,
+        }
+    }
+}
+
+impl AccountData {
+    /// 这条账户事件该投给谁：由类型分档直接给出。
+    pub fn delivery(&self) -> Delivery<'_> {
+        match self {
+            AccountData::Symbol(d) => Delivery::Symbol(d.exchange(), d.symbol()),
+            AccountData::Exchange(d) => Delivery::Exchange(d.exchange()),
+        }
+    }
+
+    /// 事件关联的 symbol（`None` = 所级）
+    pub fn symbol(&self) -> Option<&Symbol> {
+        self.delivery().symbol()
+    }
+
+    /// 事件来源交易所（账户事件必有）
+    pub fn exchange(&self) -> Exchange {
+        match self {
+            AccountData::Symbol(d) => d.exchange(),
+            AccountData::Exchange(d) => d.exchange(),
+        }
+    }
+}
+
 
 // ============================================================================
 // 统一视图（策略 / 状态层）
 // ============================================================================
 
-/// 一条事件的投递范围。
+/// 一条事件的投递范围（借用事件里的 symbol，不分配）。
 ///
 /// 消费者（executor / 回测 runner）声明的订阅范围是 `(交易所, symbol)` 的集合，
 /// 而事件的定位精度有三档，正好对应本枚举的三个变体：
 ///
-/// - [`Delivery::Symbol`]：行情与 symbol 级私有回报（BBO / OrderUpdate / Fill…）
-/// - [`Delivery::Exchange`]：某个所的**所级读数**，无 symbol —— 账户私有的
-///   `Balance` / `AccountInfo` / `Greeks`，以及公共的 `ExchangeStatus` / `ExchangeRate`。
+/// - [`Delivery::Symbol`]：行情与币级私有回报（BBO / OrderUpdate / Fill…）
+/// - [`Delivery::Exchange`]：某个所的**所级读数**，无 symbol —— [`ExchangeAccountData`]
+///   全部变体，以及公共的 `ExchangeStatus` / `ExchangeRate`。
 ///   只投给订了这个所的消费者：一个策略拿不到自己没订的所的净值与希腊值。
 /// - [`Delivery::Broadcast`]：与交易所无关的全局事件（`Clock`、无 scope 的自定义事件）
 ///
 /// 穷举 `match` 是刻意的（原则 P6）：新增一档投递范围时，分发层与 `accepts` 都会编译失败。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Delivery {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery<'a> {
     /// 定向到 (所, symbol)
-    Symbol(Exchange, Symbol),
+    Symbol(Exchange, &'a Symbol),
     /// 定向到所
     Exchange(Exchange),
     /// 广播
     Broadcast,
+}
+
+impl<'a> Delivery<'a> {
+    pub fn symbol(self) -> Option<&'a Symbol> {
+        match self {
+            Delivery::Symbol(_, s) => Some(s),
+            Delivery::Exchange(_) | Delivery::Broadcast => None,
+        }
+    }
+
+    pub fn exchange(self) -> Option<Exchange> {
+        match self {
+            Delivery::Symbol(e, _) | Delivery::Exchange(e) => Some(e),
+            Delivery::Broadcast => None,
+        }
+    }
 }
 
 /// 策略与状态层的统一事件视图。
@@ -336,37 +399,25 @@ impl IncomeEvent {
         })
     }
 
-    /// 获取事件关联的 Symbol
+    /// 事件关联的 symbol（`None` = 所级或全局事件）
     pub fn symbol(&self) -> Option<&Symbol> {
-        match self {
-            IncomeEvent::Market(m) => m.data.symbol(),
-            IncomeEvent::Account(a) => a.data.symbol(),
-        }
+        self.delivery().symbol()
     }
 
-    /// 获取事件来源交易所
+    /// 事件来源交易所（`None` = 全局事件）
     pub fn exchange(&self) -> Option<Exchange> {
-        match self {
-            IncomeEvent::Market(m) => m.data.exchange(),
-            IncomeEvent::Account(a) => a.data.exchange(),
-        }
+        self.delivery().exchange()
     }
 
     /// 这条事件该投给谁。
     ///
-    /// **路由知识的单一出处**：实盘分发层（IncomeProcessor → executor）与回测
-    /// （`StrategyRunner::accepts`）都由本方法推导 —— 新增事件变体时改 `symbol()`/
-    /// `exchange()` 即可，没有第二份 match，也没有任何例外变体。
-    ///
-    /// 注意账户事件的投递仍先限于**该账户**的 executor（分发层按 `account` 先过滤）。
-    pub fn delivery(&self) -> Delivery {
-        match (self.exchange(), self.symbol()) {
-            (Some(e), Some(s)) => Delivery::Symbol(e, s.clone()),
-            (Some(e), None) => Delivery::Exchange(e),
-            // 无来源交易所 = 与具体交易所无关的全局事件（Clock、无 scope 的自定义事件）。
-            // `(None, Some(_))` 今天不存在任何变体（有 symbol 必有 exchange），
-            // 真出现了当广播处理也是安全侧：宁可多投一个消费者，不可静默丢事件。
-            (None, _) => Delivery::Broadcast,
+    /// **路由知识的单一出处**：每个变体的档位由 [`MarketData::delivery`] 的穷举 match
+    /// 与 [`AccountData`] 的类型分档给出；实盘分发层与回测都经
+    /// [`crate::messaging::SubscriptionScope::accepts`] 用它。账户归属也在那里判。
+    pub fn delivery(&self) -> Delivery<'_> {
+        match self {
+            IncomeEvent::Market(m) => m.data.delivery(),
+            IncomeEvent::Account(a) => a.data.delivery(),
         }
     }
 
@@ -434,7 +485,7 @@ mod custom_event_tests {
         ));
         assert_eq!(
             ev.delivery(),
-            Delivery::Symbol(Exchange::Binance, "BTC".to_string())
+            Delivery::Symbol(Exchange::Binance, &"BTC".to_string())
         );
     }
 

@@ -18,7 +18,7 @@ use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::ExchangeClient;
-use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData};
+use hft_engine_rs::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::GammaScalpStrategy;
 use std::cell::RefCell;
@@ -121,6 +121,8 @@ fn main() -> anyhow::Result<()> {
     let runner = StrategyRunner::with_id_gen(
         Box::new(strategy),
         symbol_metas.clone(),
+        hft_engine_rs::backtest::backtest_account(),
+
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {
@@ -147,7 +149,7 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     IncomeEvent::Account(a) => {
-                        if let AccountData::AccountInfo { equity, .. } = &a.data {
+                        if let AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) = &a.data {
                             // 首笔成交之前 (price=0) 不采样
                             if s.last_price > 0.0 {
                                 let p = s.last_price;

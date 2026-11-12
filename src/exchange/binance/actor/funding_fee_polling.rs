@@ -10,7 +10,7 @@
 use crate::domain::now_ms;
 use crate::messaging::AccountPubSub;
 use crate::exchange::binance::BinanceClient;
-use crate::messaging::{AccountData, AccountEvent};
+use crate::messaging::{SymbolAccountData, AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -54,7 +54,7 @@ impl BinanceFundingFeePollingActor {
                             account: crate::domain::AccountId::Live,
                             exchange_ts,
                             local_ts,
-                            data: AccountData::FundingFee(fee),
+                            data: AccountData::Symbol(SymbolAccountData::FundingFee(fee)),
                         }))
                         .send()
                         .await

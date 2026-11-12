@@ -35,7 +35,7 @@ use hft_engine_rs::exchange::binance::{
     BinanceActor, BinanceActorArgs, BinanceClient, REST_BASE_URL,
 };
 use hft_engine_rs::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{AccountData, AccountEvent, IncomeEvent, MarketData, MarketEvent};
+use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, AccountEvent, IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use kameo::actor::{ActorRef, Spawn, WeakActorRef};
@@ -182,15 +182,15 @@ impl Message<AccountEvent> for Watcher {
     async fn handle(&mut self, ev: AccountEvent, _c: &mut Context<Self, Self::Reply>) {
         let mut log = self.0.lock().unwrap();
         match &ev.data {
-            AccountData::OrderUpdate(u) => {
+            AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
                 log.order_updates
                     .push((u.order_id.clone(), format!("{:?}", u.status)));
                 if matches!(u.status, hft_engine_rs::domain::OrderStatus::Pending) {
                     log.resting = true;
                 }
             }
-            AccountData::Fill(f) => log.fills.push((f.price, f.size)),
-            AccountData::AccountInfo { equity, .. } => log.equity = Some(*equity),
+            AccountData::Symbol(SymbolAccountData::Fill(f)) => log.fills.push((f.price, f.size)),
+            AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) => log.equity = Some(*equity),
             _ => {}
         }
     }

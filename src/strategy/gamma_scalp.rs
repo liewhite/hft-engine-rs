@@ -17,7 +17,7 @@
 
 use crate::domain::{Exchange, Order, OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{AccountData, IncomeEvent, MarketData, PendingOrder};
+use crate::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
 
@@ -213,7 +213,7 @@ impl Strategy for GammaScalpStrategy {
             },
             // greeks 变化 (delta 漂移) 也即时触发，用最新成交价为基准
             IncomeEvent::Account(a) => match &a.data {
-                AccountData::Greeks(g) if g.exchange == self.exchange && g.ccy == self.ccy => {
+                AccountData::Exchange(ExchangeAccountData::Greeks(g)) if g.exchange == self.exchange && g.ccy == self.ccy => {
                     match self.last_price {
                         Some(p) => self.hedge(p, view),
                         None => Vec::new(),

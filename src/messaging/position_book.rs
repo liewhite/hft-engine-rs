@@ -18,7 +18,7 @@
 
 use crate::domain::{Position, Symbol};
 use crate::messaging::state_manager::PositionBaseline;
-use crate::messaging::{AccountData, AccountEvent, SymbolPositions};
+use crate::messaging::{SymbolAccountData, AccountData, AccountEvent, SymbolPositions};
 use std::collections::HashMap;
 
 /// 跨 symbol 的持仓账本
@@ -72,7 +72,7 @@ impl PositionBook {
         if event.account != crate::domain::AccountId::Live {
             return;
         }
-        let AccountData::Fill(fill) = &event.data else {
+        let AccountData::Symbol(SymbolAccountData::Fill(fill)) = &event.data else {
             return;
         };
         let Some(positions) = self.symbols.get_mut(&fill.symbol) else {
@@ -113,7 +113,7 @@ mod tests {
             account,
             exchange_ts: local_ts,
             local_ts,
-            data: AccountData::Fill(Fill {
+            data: AccountData::Symbol(SymbolAccountData::Fill(Fill {
                 exchange: EX,
                 symbol: SYM.to_string(),
                 side: Side::Long,
@@ -124,7 +124,7 @@ mod tests {
                 timestamp: local_ts,
                 fee: 0.0,
                 reason: FillReason::Normal,
-            }),
+            })),
         }
     }
 
@@ -165,7 +165,7 @@ mod tests {
     fn fills_for_untracked_symbols_are_dropped() {
         let mut b = book();
         let mut ev = fill_event(AccountId::Live, 5.0, 10);
-        if let AccountData::Fill(f) = &mut ev.data {
+        if let AccountData::Symbol(SymbolAccountData::Fill(f)) = &mut ev.data {
             f.symbol = "ETH".to_string();
         }
         b.apply(&ev);

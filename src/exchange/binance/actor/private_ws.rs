@@ -13,7 +13,7 @@ use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsRespons
 use crate::exchange::binance::{BinanceCredentials, WS_PRIVATE_URL};
 use crate::exchange::client::WsError;
 use crate::exchange::ws_loop;
-use crate::messaging::{AccountData, AccountEvent};
+use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, AccountEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -224,7 +224,7 @@ fn parse_private_message(
                     account: crate::domain::AccountId::Live,
                     exchange_ts,
                     local_ts,
-                    data: AccountData::Balance(balance),
+                    data: AccountData::Exchange(ExchangeAccountData::Balance(balance)),
                 });
             }
 
@@ -244,7 +244,7 @@ fn parse_private_message(
                         account: crate::domain::AccountId::Live,
                         exchange_ts,
                         local_ts,
-                        data: AccountData::UnmappedFill(f),
+                        data: AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)),
                     });
                 }
                 return Ok(events);
@@ -258,7 +258,7 @@ fn parse_private_message(
                     account: crate::domain::AccountId::Live,
                     exchange_ts,
                     local_ts,
-                    data: AccountData::Fill(fill),
+                    data: AccountData::Symbol(SymbolAccountData::Fill(fill)),
                 });
             }
 
@@ -267,10 +267,10 @@ fn parse_private_message(
                 account: crate::domain::AccountId::Live,
                 exchange_ts,
                 local_ts,
-                data: AccountData::OrderUpdate(
+                data: AccountData::Symbol(SymbolAccountData::OrderUpdate(
                     update.to_order_update(symbol)
                         ?,
-                ),
+                )),
             });
 
             Ok(events)
@@ -338,9 +338,9 @@ mod tests {
             .unwrap()
             .into_iter()
             .map(|e| match e.data {
-                AccountData::Fill(f) => format!("fill:{}", f.symbol),
-                AccountData::OrderUpdate(u) => format!("order:{}", u.symbol),
-                AccountData::UnmappedFill(f) => format!("unmapped:{}", f.instrument),
+                AccountData::Symbol(SymbolAccountData::Fill(f)) => format!("fill:{}", f.symbol),
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => format!("order:{}", u.symbol),
+                AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => format!("unmapped:{}", f.instrument),
                 other => format!("{other:?}"),
             })
             .collect()

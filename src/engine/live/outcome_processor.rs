@@ -10,7 +10,7 @@ use crate::domain::{
 };
 use crate::exchange::{AccountClient, ExchangeOrder};
 use crate::domain::AccountId;
-use crate::messaging::{AccountData, AccountEvent};
+use crate::messaging::{SymbolAccountData, AccountData, AccountEvent};
 use crate::strategy::OutcomeEvent;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -433,7 +433,7 @@ impl OrderGateway {
                 account: AccountId::Live,
                 exchange_ts: local_ts,
                 local_ts,
-                data: AccountData::OrderUpdate(update),
+                data: AccountData::Symbol(SymbolAccountData::OrderUpdate(update)),
             }))
             .send()
             .await
@@ -462,7 +462,7 @@ impl OrderGateway {
                 account: AccountId::Live,
                 exchange_ts: local_ts, // 本地错误，没有交易所时间戳
                 local_ts,
-                data: AccountData::OrderUpdate(update),
+                data: AccountData::Symbol(SymbolAccountData::OrderUpdate(update)),
             }))
             .send()
             .await
@@ -575,7 +575,7 @@ impl Message<AccountEvent> for OutcomeProcessorActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: AccountEvent, _ctx: &mut Context<Self, Self::Reply>) {
-        let AccountData::OrderUpdate(update) = &msg.data else {
+        let AccountData::Symbol(SymbolAccountData::OrderUpdate(update)) = &msg.data else {
             return;
         };
         let Some(client_order_id) = &update.client_order_id else {
@@ -848,7 +848,7 @@ mod place_verdict_tests {
             self.events.lock().unwrap().iter().any(|e| {
                 matches!(
                     &e.data,
-                    AccountData::OrderUpdate(u)
+                    AccountData::Symbol(SymbolAccountData::OrderUpdate(u))
                         if matches!(u.status, OrderStatus::Error { .. })
                 )
             })

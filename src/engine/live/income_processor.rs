@@ -1,14 +1,10 @@
 //! IncomeProcessorActor - 事件分发 Actor
 //!
-//! 订阅 MarketBus 与 AccountBus，按订阅关系与账户归属分发到对应的 ExecutorActor：
-//! - 行情（[`MarketEvent`]）：一份服务所有账户 —— 有 symbol 的按 (exchange, symbol)
-//!   定向投给订阅者，无 symbol 的（Clock/ExchangeStatus/无 scope 的 Custom）广播；
-//! - 账户事件（[`AccountEvent`]）：只投给**该账户**的 executor —— 有 symbol 的再按
-//!   订阅过滤，账户级的（Balance/AccountInfo/Greeks）投给该账户全部 executor。
-//!
-//! 账户归属由事件自带的 `account` 字段决定（类型保证），不存在需要维护的分类表 ——
-//! 历史上这里有一张手工的 `is_account_private` 变体清单，新增私有变体漏改一行的
-//! 失效方向是"实盘私有事件广播给模拟策略"（危险侧、编译器不报）。
+//! 订阅 MarketBus 与 AccountBus，按订阅范围分发到对应的 ExecutorActor。"这条事件归不归它"
+//! 一律问 [`SubscriptionScope::accepts`]（账户归属、所、symbol 都在那里判），这里只管扇出：
+//! - 行情（[`MarketEvent`]）：一份服务所有账户 —— 有 symbol 的经 `(所, symbol)` 索引定向，
+//!   其余逐个问范围；
+//! - 账户事件（[`AccountEvent`]）：经账户索引只看该账户的 executor，再问范围。
 //!
 //! # 路由索引
 //!
@@ -29,11 +25,9 @@ use std::collections::{HashMap, HashSet};
 /// Executor 订阅信息
 struct ExecutorSubscription {
     executor: ActorRef<ExecutorActor>,
-    /// 订阅范围。"这条事件归不归它"一律问 [`SubscriptionScope::accepts`]，
-    /// 与回测驱动同一份判据 —— 下面的 `by_symbol` 反向索引只是热路径的扇出优化。
+    /// 订阅范围（含绑定账户）。"这条事件归不归它"一律问 [`SubscriptionScope::accepts`]，
+    /// 与回测驱动同一份判据 —— 下面的两个反向索引只是热路径的扇出优化。
     scope: SubscriptionScope,
-    /// 该 executor 绑定的账户
-    account: AccountId,
 }
 
 /// ProcessorActor - 事件分发
@@ -59,10 +53,10 @@ impl IncomeProcessorActor {
                     }
                 }
             }
-            if let Some(v) = self.by_account.get_mut(&sub.account) {
+            if let Some(v) = self.by_account.get_mut(sub.scope.account()) {
                 v.retain(|x| *x != id);
                 if v.is_empty() {
-                    self.by_account.remove(&sub.account);
+                    self.by_account.remove(sub.scope.account());
                 }
             }
         }
@@ -120,7 +114,8 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
         // 且 ActorId 唯一，但这不该是巧合保护，而是结构保证。
         self.remove_from_indexes(actor_id);
 
-        let scope = SubscriptionScope::from_pairs(
+        let scope = SubscriptionScope::new(
+            msg.account,
             msg.subscriptions
                 .iter()
                 .map(|(ex, kind)| (*ex, kind.symbol().clone())),
@@ -139,7 +134,7 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
                 .push(actor_id);
         }
         self.by_account
-            .entry(msg.account.clone())
+            .entry(scope.account().clone())
             .or_default()
             .push(actor_id);
         self.executors.insert(
@@ -147,7 +142,6 @@ impl Message<RegisterExecutor> for IncomeProcessorActor {
             ExecutorSubscription {
                 executor: msg.executor,
                 scope,
-                account: msg.account,
             },
         );
     }
@@ -163,18 +157,16 @@ impl Message<MarketEvent> for IncomeProcessorActor {
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let event = IncomeEvent::Market(msg);
-        let delivery = event.delivery();
-        match &delivery {
+        match event.delivery() {
             Delivery::Symbol(exchange, symbol) => {
                 // 定向：索引 O(1)。索引的键由 `SubscriptionScope::pairs()` 灌，与判据同源，
                 // 所以这里不再问一遍 accepts —— 但那是**结构约定**，不是编译期保证，
-                // 故留一条 debug 断言：索引一旦与范围失配（例如日后有人给 scope 加了
-                // mutator 却忘了同步索引），回测与测试里会立刻响，而不是静默错投。
-                if let Some(ids) = self.by_symbol.get(&(*exchange, symbol.clone())) {
+                // 故留一条 debug 断言：索引一旦与范围失配，回测与测试里会立刻响。
+                if let Some(ids) = self.by_symbol.get(&(exchange, symbol.clone())) {
                     for id in ids {
                         if let Some(sub) = self.executors.get(id) {
                             debug_assert!(
-                                sub.scope.accepts_delivery(&delivery),
+                                sub.scope.accepts(&event),
                                 "by_symbol 索引与订阅范围失配：事件被投给了范围外的 executor"
                             );
                             Self::forward(sub, &event).await;
@@ -187,7 +179,7 @@ impl Message<MarketEvent> for IncomeProcessorActor {
             // 两档都由同一个判据回答，不在这里重写一遍。
             Delivery::Exchange(_) | Delivery::Broadcast => {
                 for sub in self.executors.values() {
-                    if sub.scope.accepts_delivery(&delivery) {
+                    if sub.scope.accepts(&event) {
                         Self::forward(sub, &event).await;
                     }
                 }
@@ -196,8 +188,7 @@ impl Message<MarketEvent> for IncomeProcessorActor {
     }
 }
 
-/// 账户事件：只投给**该账户**的 executor（账户由事件自带标签决定，类型保证）。
-/// 有 symbol 的再按订阅过滤，账户级的投给该账户全部 executor。
+/// 账户事件：经账户索引只看**该账户**的 executor，再按订阅范围过滤。
 impl Message<AccountEvent> for IncomeProcessorActor {
     type Reply = ();
 
@@ -211,24 +202,23 @@ impl Message<AccountEvent> for IncomeProcessorActor {
         let Some(ids) = self.by_account.get(&account) else {
             return;
         };
-        let delivery = event.delivery();
         for id in ids {
             let Some(sub) = self.executors.get(id) else {
                 continue;
             };
-            if !sub.scope.accepts_delivery(&delivery) {
+            if !sub.scope.accepts(&event) {
                 // 该账户的私有事件、但不在这个 executor 的订阅范围内。
                 // - Live：分桶部署的常态（账户级全量私有流含其他桶的 symbol），静默跳过；
                 // - Paper：柜台只为本进程策略的订单产回报，被过滤即异常 —— 策略对未订阅
                 //   symbol 下了单，回报回不来，订单会停在 Created、超时清理后反复重挂。
                 //   丢弃点必须可见。
                 //
-                // **只对 Symbol 档 warn，所级档刻意不 warn**：Paper 的所级事件只有柜台按
+                // **只对币级事件 warn，所级刻意不 warn**：Paper 的所级事件只有柜台按
                 // (账户, 所) 发的 AccountInfo，它被丢弃的两种来路都不值得报 —— 多策略共享
                 // 同一模拟账户时丢的是别人的所（纯噪声）；策略真在范围外的所下了单时，
-                // 那张单的 OrderUpdate 是 Symbol 档、已经在下面 warn 过了，可行动的信号没丢。
+                // 那张单的 OrderUpdate 是币级、已经在下面 warn 过了，可行动的信号没丢。
                 if account != AccountId::Live {
-                    if let Delivery::Symbol(exchange, symbol) = &delivery {
+                    if let Delivery::Symbol(exchange, symbol) = event.delivery() {
                         tracing::warn!(
                             %account,
                             %exchange,
@@ -270,14 +260,14 @@ impl Message<UnregisterExecutor> for IncomeProcessorActor {
 mod routing_tests {
     use super::*;
     use crate::domain::{Exchange, Fill, FillReason, MarketTrade, Side};
-    use crate::messaging::{AccountData, MarketData};
+    use crate::messaging::{SymbolAccountData, AccountData, MarketData};
 
     fn fill_event(account: AccountId) -> AccountEvent {
         AccountEvent {
             account,
             exchange_ts: 1,
             local_ts: 1,
-            data: AccountData::Fill(Fill {
+            data: AccountData::Symbol(SymbolAccountData::Fill(Fill {
                 exchange: Exchange::Binance,
                 symbol: "BTC".to_string(),
                 side: Side::Long,
@@ -288,7 +278,7 @@ mod routing_tests {
                 timestamp: 1,
                 fee: 0.0,
                 reason: FillReason::Normal,
-            }),
+            })),
         }
     }
 
@@ -316,7 +306,7 @@ mod routing_tests {
         let ev = IncomeEvent::Account(live);
         assert_eq!(
             ev.delivery(),
-            Delivery::Symbol(Exchange::Binance, "BTC".to_string()),
+            Delivery::Symbol(Exchange::Binance, &"BTC".to_string()),
             "Fill 有 symbol，应定向路由"
         );
     }
@@ -330,7 +320,7 @@ mod routing_tests {
         let ev = IncomeEvent::Market(trade_event());
         assert_eq!(
             ev.delivery(),
-            Delivery::Symbol(Exchange::Binance, "BTC".to_string()),
+            Delivery::Symbol(Exchange::Binance, &"BTC".to_string()),
             "有 symbol 的行情按 (所, symbol) 定向"
         );
 
@@ -338,11 +328,11 @@ mod routing_tests {
             AccountId::Live,
             0,
             0,
-            crate::messaging::AccountData::AccountInfo {
+            crate::messaging::AccountData::Exchange(crate::messaging::ExchangeAccountData::AccountInfo {
                 exchange: Exchange::Binance,
                 equity: 1.0,
                 notional: 0.0,
-            },
+            }),
         );
         assert_eq!(
             account_info.delivery(),

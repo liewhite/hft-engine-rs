@@ -8,7 +8,7 @@ use crate::messaging::AccountPubSub;
 use crate::exchange::client::AccountClient;
 use crate::exchange::ibkr::IbkrClient;
 use crate::exchange::staleness::{stamped_on_receipt, StalenessGuard, MAX_POLL_STALENESS_MS};
-use crate::messaging::{AccountData, AccountEvent};
+use crate::messaging::{ExchangeAccountData, AccountData, AccountEvent};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
@@ -55,11 +55,11 @@ impl IbkrAccountPollingActor {
                         account: crate::domain::AccountId::Live,
                         exchange_ts: local_ts,
                         local_ts,
-                        data: AccountData::AccountInfo {
+                        data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
                             exchange: Exchange::IBKR,
                             equity: info.equity,
                             notional: info.notional,
-                        },
+                        }),
                     }))
                     .send()
                     .await

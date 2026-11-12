@@ -1364,7 +1364,7 @@ mod subscription_validation_tests {
         /// 读到这里就知道会发生什么，而不是被那句话误导。
         #[test]
         fn synthesised_baseline_only_swallows_a_zero_timestamp_fill() {
-            use crate::messaging::{AccountData, IncomeEvent, StateManager};
+            use crate::messaging::{SymbolAccountData, AccountData, IncomeEvent, StateManager};
 
             let baselines = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest());
             let fill_at = |local_ts: u64| {
@@ -1372,7 +1372,7 @@ mod subscription_validation_tests {
                     AccountId::Live,
                     local_ts,
                     local_ts,
-                    AccountData::Fill(crate::domain::Fill {
+                    AccountData::Symbol(SymbolAccountData::Fill(crate::domain::Fill {
                         exchange: WITH_ACCOUNT,
                         symbol: SYM.to_string(),
                         side: crate::domain::Side::Long,
@@ -1383,7 +1383,7 @@ mod subscription_validation_tests {
                         timestamp: local_ts,
                         fee: 0.0,
                         reason: crate::domain::FillReason::Normal,
-                    }),
+                    })),
                 )
             };
 

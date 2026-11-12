@@ -933,7 +933,7 @@ impl Strategy for SpreadArbStrategy {
 mod tests {
     use super::*;
     use crate::domain::{Position, BBO};
-    use crate::messaging::{AccountData, StateManager};
+    use crate::messaging::{ExchangeAccountData, AccountData, StateManager};
 
     const SYMBOL: &str = "BTC";
     const SHORT_EX: Exchange = Exchange::Binance;
@@ -1017,11 +1017,11 @@ mod tests {
                     crate::domain::AccountId::Live,
                     0,
                     0,
-                    AccountData::AccountInfo {
+                    AccountData::Exchange(ExchangeAccountData::AccountInfo {
                         exchange,
                         equity,
                         notional,
-                    },
+                    }),
                 ));
             }
             self

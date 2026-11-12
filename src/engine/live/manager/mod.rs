@@ -21,7 +21,7 @@ use super::{
 use crate::domain::{
     now_ms, AccountId, Exchange, ExchangeError, Position, Symbol, SymbolMeta,
 };
-use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
+use crate::messaging::{SymbolAccountData, AccountData, AccountEvent, MarketData, MarketEvent};
 use super::assembly::{ExchangeSetup, SpawnCtx};
 use crate::exchange::{AccountClient, ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::strategy::Strategy;
@@ -271,7 +271,7 @@ impl Actor for ManagerActor {
         // （见 OrderGateway::in_flight）。只订 OrderUpdate，不吃全量账户事件。
         account_pubsub
             .tell(SubscribeFilter(live_processor, |e: &AccountEvent| {
-                matches!(e.data, AccountData::OrderUpdate(_))
+                matches!(e.data, AccountData::Symbol(SymbolAccountData::OrderUpdate(_)))
             }))
             .send()
             .await
@@ -344,7 +344,7 @@ impl Actor for ManagerActor {
         // 镜像的增量输入只有实盘 Fill：按类型+账户过滤订阅（模拟成交绝不进实盘镜像）
         account_pubsub
             .tell(SubscribeFilter(position_ledger.clone(), |e: &AccountEvent| {
-                e.account == AccountId::Live && matches!(e.data, AccountData::Fill(_))
+                e.account == AccountId::Live && matches!(e.data, AccountData::Symbol(SymbolAccountData::Fill(_)))
             }))
             .send()
             .await

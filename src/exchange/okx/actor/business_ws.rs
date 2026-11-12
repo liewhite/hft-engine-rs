@@ -15,7 +15,7 @@ use crate::exchange::okx::codec::{
 };
 use crate::exchange::okx::{to_okx, REST_BASE_URL, WS_BUSINESS_URL};
 use crate::exchange::ws_loop;
-use crate::messaging::{MarketData, MarketEvent};
+use crate::messaging::{HistoryCandles, MarketData, MarketEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -141,8 +141,7 @@ impl OkxBusinessWsActor {
             candles.pop();
         }
 
-        // 空批不发布：下游依赖 `HistoryCandles` 非空推导 symbol 路由（首根 K 线），
-        // 空数组只会静默落入广播作 no-op —— 在源头拦住并留下可见信号
+        // 空批没有内容可给策略，不发布，留一条可见信号
         if candles.is_empty() {
             tracing::warn!(%inst_id, "历史 K 线为空（全部未 confirm 或交易所返回空），不发布");
             return Ok(());
@@ -153,7 +152,11 @@ impl OkxBusinessWsActor {
         let event = MarketEvent {
             exchange_ts: local_ts,
             local_ts,
-            data: MarketData::HistoryCandles(candles),
+            data: MarketData::HistoryCandles(HistoryCandles {
+                exchange: Exchange::OKX,
+                symbol: symbol.clone(),
+                candles,
+            }),
         };
         if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
             tracing::error!(error = %e, "Failed to publish to MarketPubSub");

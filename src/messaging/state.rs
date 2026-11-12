@@ -1,5 +1,5 @@
 use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, OrderType, Position, Side, Symbol, Timestamp, TimeInForce, BBO};
-use crate::messaging::event::{AccountData, AccountEvent, IncomeEvent, MarketData};
+use crate::messaging::event::{MarketData, SymbolAccountData};
 use std::collections::{HashMap, VecDeque};
 
 /// 记住多少个最近到达**权威终态**的订单号（见 [`SymbolState::recent_terminal`]）。
@@ -51,7 +51,7 @@ pub struct SymbolOrders {
     /// 已到达**权威终态**的 client_order_id 环形记录（容量 [`TERMINAL_MEMORY`]）。
     ///
     /// 用途只有一个：拦住"迟到的非终态回报把已结束的订单复活成**永久** pending"
-    /// （见 [`SymbolState::apply_account_data`] 的重建分支）。
+    /// （见 [`SymbolState::apply_account`] 的重建分支）。
     ///
     /// 只记权威终态 —— `Filled`/`Cancelled`/`Rejected`，即交易所说的、或撤单后复查确认
     /// 订单已不在挂单列表时合成的。**不记 `Error`**：那是本地 REST 调用的结论
@@ -442,35 +442,19 @@ impl SymbolState {
         }
     }
 
-    /// 更新状态
-    ///
-    /// 如果事件的 symbol 与 state 的 symbol 不一致，则忽略该事件
-    pub fn apply(&mut self, event: &IncomeEvent) {
-        // 校验 symbol 一致性 (Balance/Equity/Clock 无 symbol，直接忽略)
-        if let Some(event_symbol) = event.symbol() {
-            if event_symbol != &self.symbol {
-                tracing::warn!(
-                    expected = %self.symbol,
-                    actual = %event_symbol,
-                    "Event symbol mismatch, ignoring"
-                );
-                return;
-            }
-        } else {
-            // Balance/Equity/Clock 无 symbol，在 per-symbol 状态中不处理
-            return;
-        }
-
-        match event {
-            IncomeEvent::Market(m) => self.market.apply(&self.symbol, &m.data),
-            IncomeEvent::Account(a) => self.apply_account_data(a),
-        }
+    /// 行情事件的状态转移。调用方（`StateManager`）已按 symbol 路由。
+    pub fn apply_market(&mut self, data: &MarketData) {
+        debug_assert_eq!(data.symbol(), Some(&self.symbol), "行情被路由到了别的 symbol 状态");
+        self.market.apply(&self.symbol, data);
     }
 
-    /// 账户私有事件的状态转移（挂单跟踪 + 持仓累加）
-    fn apply_account_data(&mut self, event: &AccountEvent) {
-        match &event.data {
-            AccountData::OrderUpdate(update) => {
+    /// 币级账户事件的状态转移（挂单跟踪 + 持仓累加）。调用方已按 symbol 路由。
+    ///
+    /// 只收 [`SymbolAccountData`]：所级账户事件在类型上就到不了这里。
+    pub fn apply_account(&mut self, data: &SymbolAccountData, local_ts: Timestamp) {
+        debug_assert_eq!(data.symbol(), &self.symbol, "账户事件被路由到了别的 symbol 状态");
+        match data {
+            SymbolAccountData::OrderUpdate(update) => {
                 tracing::info!(
                     symbol = %self.symbol,
                     exchange = %update.exchange,
@@ -585,7 +569,7 @@ impl SymbolState {
                                         status: update.status.clone(),
                                         // 重建时刻即本地知晓时刻（超时清理只作用于 Created 态，
                                         // 而重建进来的必是 Pending/PartiallyFilled，不受影响）
-                                        created_at: event.local_ts,
+                                        created_at: local_ts,
                                     },
                                 );
                             }
@@ -603,24 +587,12 @@ impl SymbolState {
                     }
                 }
             }
-            AccountData::Fill(fill) => {
+            SymbolAccountData::Fill(fill) => {
                 // 不相交字段借用：symbol 与 position_book 是两个字段，无需为每条 Fill 克隆
-                self.position_book
-                    .apply_fill(&self.symbol, fill, event.local_ts);
+                self.position_book.apply_fill(&self.symbol, fill, local_ts);
             }
-            AccountData::FundingFee(_) => {
+            SymbolAccountData::FundingFee(_) => {
                 // 资费事件不修改本地 symbol 状态，下游策略自行去重与统计
-            }
-            // 账户级事件（Balance/Greeks/AccountInfo）无 symbol，由 StateManager 提前
-            // 拦截；到达即路由 bug：记录后忽略（不 panic）
-            AccountData::Balance(_)
-            | AccountData::Greeks(_)
-            | AccountData::AccountInfo { .. }
-            | AccountData::UnmappedFill(_) => {
-                tracing::error!(
-                    symbol = %self.symbol,
-                    "账户级事件错误地进入 SymbolState（路由 bug），忽略"
-                );
             }
         }
     }
@@ -721,8 +693,11 @@ mod tests {
 
     const EX: Exchange = Exchange::Binance;
 
-    fn ev(data: AccountData) -> IncomeEvent {
-        IncomeEvent::account(crate::domain::AccountId::Live, 1, 1, data)
+    /// 一条币级账户事件及其送达时刻
+    type Ev = (SymbolAccountData, Timestamp);
+
+    fn apply(state: &mut SymbolState, (data, local_ts): &Ev) {
+        state.apply_account(data, *local_ts);
     }
 
     fn position(size: f64) -> Position {
@@ -733,16 +708,13 @@ mod tests {
         }
     }
 
-    fn fill(side: Side, size: f64) -> IncomeEvent {
+    fn fill(side: Side, size: f64) -> Ev {
         fill_at(EX, side, size, 1)
     }
 
-    fn fill_at(exchange: Exchange, side: Side, size: f64, local_ts: u64) -> IncomeEvent {
-        IncomeEvent::account(
-            crate::domain::AccountId::Live,
-            local_ts,
-            local_ts,
-            AccountData::Fill(crate::domain::Fill {
+    fn fill_at(exchange: Exchange, side: Side, size: f64, local_ts: u64) -> Ev {
+        (
+            SymbolAccountData::Fill(crate::domain::Fill {
                 exchange,
                 symbol: SYMBOL.to_string(),
                 side,
@@ -754,6 +726,7 @@ mod tests {
                 fee: 0.0,
                 reason: crate::domain::FillReason::Normal,
             }),
+            local_ts,
         )
     }
 
@@ -765,10 +738,10 @@ mod tests {
         assert!(state.seed_position(&position(2.0), 0), "首次 seed 应成功");
         assert_eq!(state.position_size(EX), 2.0);
 
-        state.apply(&fill(Side::Long, 1.0));
+        apply(&mut state, &fill(Side::Long, 1.0));
         assert_eq!(state.position_size(EX), 3.0);
 
-        state.apply(&fill(Side::Short, 0.5));
+        apply(&mut state, &fill(Side::Short, 0.5));
         assert!((state.position_size(EX) - 2.5).abs() < 1e-12);
     }
 
@@ -780,7 +753,7 @@ mod tests {
     fn second_baseline_never_overwrites_position() {
         let mut state = SymbolState::new(SYMBOL.to_string());
         state.seed_position(&position(2.0), 0);
-        state.apply(&fill(Side::Long, 1.0));
+        apply(&mut state, &fill(Side::Long, 1.0));
         assert_eq!(state.position_size(EX), 3.0);
 
         // 第二次 seed（哪怕数值"看起来更新"）也不得覆写
@@ -792,7 +765,7 @@ mod tests {
         );
 
         // 覆写若发生，这条 Fill 会把仓位推到 4.0 之外
-        state.apply(&fill(Side::Long, 1.0));
+        apply(&mut state, &fill(Side::Long, 1.0));
         assert_eq!(state.position_size(EX), 4.0);
     }
 
@@ -805,11 +778,11 @@ mod tests {
         state.seed_position(&position(2.0), 10);
 
         // t=1 送达（fill() 的 local_ts=1 <= 10）：已含在快照里，丢弃
-        state.apply(&fill(Side::Long, 1.0));
+        apply(&mut state, &fill(Side::Long, 1.0));
         assert_eq!(state.position_size(EX), 2.0, "快照已含的 Fill 不得再累加");
 
         // t=11 送达：快照之后的新成交，累加
-        state.apply(&fill_at(EX, Side::Long, 1.0, 11));
+        apply(&mut state, &fill_at(EX, Side::Long, 1.0, 11));
         assert_eq!(state.position_size(EX), 3.0);
     }
 
@@ -822,15 +795,15 @@ mod tests {
         state.seed_position(&position(2.0), 10);
 
         // OKX 未 seed：t=1 送达的 Fill 照常从 0 累加，不受 Binance 的过滤时刻影响
-        state.apply(&fill_at(Exchange::OKX, Side::Long, 1.5, 1));
+        apply(&mut state, &fill_at(Exchange::OKX, Side::Long, 1.5, 1));
         assert_eq!(state.position_size(Exchange::OKX), 1.5, "未 seed 的所不得被误过滤");
         assert_eq!(state.position_size(EX), 2.0, "Binance 腿不受影响");
     }
 
     // ===== 外部挂单：只接管本引擎自己的单 =====
 
-    fn order_update(client_order_id: Option<String>, status: OrderStatus) -> IncomeEvent {
-        ev(AccountData::OrderUpdate(crate::domain::OrderUpdate {
+    fn order_update(client_order_id: Option<String>, status: OrderStatus) -> Ev {
+        (SymbolAccountData::OrderUpdate(crate::domain::OrderUpdate {
             order_id: "ex-1".to_string(),
             client_order_id,
             exchange: EX,
@@ -838,7 +811,7 @@ mod tests {
             side: Side::Long,
             status,
             quantity: 1.0,
-        }))
+        }), 1)
     }
 
     /// 本引擎的单在本地无记录时要重新纳入跟踪。
@@ -850,7 +823,7 @@ mod tests {
         let mut state = SymbolState::new(SYMBOL.to_string());
         let own_id = EX.new_cli_order_id();
 
-        state.apply(&order_update(Some(own_id.clone()), OrderStatus::Pending));
+        apply(&mut state, &order_update(Some(own_id.clone()), OrderStatus::Pending));
 
         let tracked: Vec<String> = state
             .pending_orders()
@@ -869,7 +842,7 @@ mod tests {
 
         // Binance 网页/App 下单的典型 client_order_id 形态
         for foreign in ["web_1a2b3c", "android_9f8e", "x-someone-else"] {
-            state.apply(&order_update(
+            apply(&mut state, &order_update(
                 Some(foreign.to_string()),
                 OrderStatus::Pending,
             ));
@@ -885,7 +858,7 @@ mod tests {
     #[test]
     fn fill_without_baseline_starts_from_zero() {
         let mut state = SymbolState::new(SYMBOL.to_string());
-        state.apply(&fill(Side::Short, 1.5));
+        apply(&mut state, &fill(Side::Short, 1.5));
         assert_eq!(state.position_size(EX), -1.5);
     }
 
@@ -901,15 +874,15 @@ mod tests {
         state.seed_position(&position(2.0), 0);
 
         // 同向加仓 2.0（成交价不影响持仓数量）
-        state.apply(&fill(Side::Long, 2.0));
+        apply(&mut state, &fill(Side::Long, 2.0));
         assert!((state.position(EX).expect("position").size - 4.0).abs() < 1e-12);
 
         // 反向平掉 1.0（价格同样不影响数量）
-        state.apply(&fill(Side::Short, 1.0));
+        apply(&mut state, &fill(Side::Short, 1.0));
         assert!((state.position(EX).expect("position").size - 3.0).abs() < 1e-12);
 
         // 反手：卖 5 -> 净空 2
-        state.apply(&fill(Side::Short, 5.0));
+        apply(&mut state, &fill(Side::Short, 5.0));
         assert!((state.position(EX).expect("position").size + 2.0).abs() < 1e-12);
     }
 
@@ -939,12 +912,12 @@ mod tests {
             },
             0,
         );
-        state.apply(&order_update(Some(own_id.clone()), OrderStatus::Pending));
-        state.apply(&order_update(Some(own_id.clone()), OrderStatus::Cancelled));
+        apply(&mut state, &order_update(Some(own_id.clone()), OrderStatus::Pending));
+        apply(&mut state, &order_update(Some(own_id.clone()), OrderStatus::Cancelled));
         assert!(!state.has_pending_orders(), "撤单确认后应无挂单");
 
         // 迟到的部分成交回报（撤单前那一刻发生的成交，WS 走另一条路径后到）
-        state.apply(&order_update(Some(own_id), OrderStatus::PartiallyFilled));
+        apply(&mut state, &order_update(Some(own_id), OrderStatus::PartiallyFilled));
         assert!(
             !state.has_pending_orders(),
             "已终态订单被迟到回报复活成永久 pending —— 该 symbol 将冻结到进程重启"
@@ -959,12 +932,12 @@ mod tests {
         let mut state = SymbolState::new(SYMBOL.to_string());
         let own_id = EX.new_cli_order_id();
 
-        state.apply(&order_update(
+        apply(&mut state, &order_update(
             Some(own_id.clone()),
             OrderStatus::Error { reason: "REST timeout".to_string() },
         ));
         // 交易所其实收到了这张单，确认姗姗来迟
-        state.apply(&order_update(Some(own_id), OrderStatus::Pending));
+        apply(&mut state, &order_update(Some(own_id), OrderStatus::Pending));
         assert!(
             state.has_pending_orders(),
             "本地 REST 失败后到达的真实确认必须重新纳入跟踪"
@@ -981,12 +954,10 @@ mod tests {
         let own_id = EX.new_cli_order_id();
 
         let mut ghost = order_update(Some(own_id), OrderStatus::Pending);
-        if let IncomeEvent::Account(a) = &mut ghost {
-            if let AccountData::OrderUpdate(u) = &mut a.data {
-                u.quantity = 0.0;
-            }
+        if let SymbolAccountData::OrderUpdate(u) = &mut ghost.0 {
+            u.quantity = 0.0;
         }
-        state.apply(&ghost);
+        apply(&mut state, &ghost);
 
         assert!(
             !state.has_pending_orders(),

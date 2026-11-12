@@ -47,7 +47,7 @@ use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::client::IbkrClient;
 use crate::exchange::ibkr::wire;
 use crate::exchange::ws_loop;
-use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent};
+use crate::messaging::{SymbolAccountData, AccountData, AccountEvent, MarketData, MarketEvent};
 use futures_util::StreamExt;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
@@ -485,7 +485,7 @@ impl IbkrPublicWsActor {
                 account: crate::domain::AccountId::Live,
                 exchange_ts: local_ts,
                 local_ts,
-                data: AccountData::OrderUpdate(update),
+                data: AccountData::Symbol(SymbolAccountData::OrderUpdate(update)),
             };
 
             if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
@@ -738,7 +738,7 @@ impl IbkrPublicWsActor {
                 account: crate::domain::AccountId::Live,
                 exchange_ts: local_ts,
                 local_ts,
-                data: AccountData::Fill(pending.fill),
+                data: AccountData::Symbol(SymbolAccountData::Fill(pending.fill)),
             }))
             .send()
             .await
@@ -753,7 +753,7 @@ impl IbkrPublicWsActor {
                     account: crate::domain::AccountId::Live,
                     exchange_ts: local_ts,
                     local_ts,
-                    data: AccountData::OrderUpdate(order_update),
+                    data: AccountData::Symbol(SymbolAccountData::OrderUpdate(order_update)),
                 }))
                 .send()
                 .await

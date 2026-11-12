@@ -16,7 +16,7 @@
 //!   （见 [`crate::observability`]，未配置时无外部依赖、行为与从前一致）
 
 use crate::domain::{AccountId, Exchange, Symbol, TradingStats};
-use crate::messaging::{AccountData, AccountEvent, IncomeEvent, MarketEvent, StateManager, SymbolState};
+use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, AccountEvent, IncomeEvent, MarketEvent, StateManager, SymbolState};
 use crate::observability::{prometheus, MetricsPushConfig, PromText};
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
@@ -142,17 +142,17 @@ impl MetricsActor {
     /// **绝不**触碰实盘视图（total / state）—— 串账防线，见 paper_stats 字段说明。
     fn apply_paper_event(&mut self, account: &AccountId, data: &AccountData) {
         match data {
-            AccountData::Fill(fill) => {
+            AccountData::Symbol(SymbolAccountData::Fill(fill)) => {
                 self.paper_stats_mut(account).apply_fill(fill);
             }
-            AccountData::OrderUpdate(update) => {
+            AccountData::Symbol(SymbolAccountData::OrderUpdate(update)) => {
                 self.paper_stats_mut(account).apply_order_update(update);
             }
-            AccountData::AccountInfo {
+            AccountData::Exchange(ExchangeAccountData::AccountInfo {
                 exchange,
                 equity,
                 notional,
-            } => {
+            }) => {
                 self.paper_accounts
                     .insert((account.clone(), *exchange), (*equity, *notional));
             }
@@ -505,7 +505,7 @@ impl Message<AccountEvent> for MetricsActor {
         }
         // 累计统计
         match &msg.data {
-            AccountData::Fill(fill) => {
+            AccountData::Symbol(SymbolAccountData::Fill(fill)) => {
                 self.total.apply_fill(fill);
                 self.per_symbol
                     .entry(fill.symbol.clone())
@@ -514,7 +514,7 @@ impl Message<AccountEvent> for MetricsActor {
                     })
                     .apply_fill(fill);
             }
-            AccountData::OrderUpdate(update) => {
+            AccountData::Symbol(SymbolAccountData::OrderUpdate(update)) => {
                 self.total.apply_order_update(update);
                 self.per_symbol
                     .entry(update.symbol.clone())
@@ -570,7 +570,7 @@ mod tests {
     }
 
     fn fill_data(exchange: Exchange, symbol: &str, side: Side, size: f64) -> AccountData {
-        AccountData::Fill(Fill {
+        AccountData::Symbol(SymbolAccountData::Fill(Fill {
             exchange,
             symbol: symbol.to_string(),
             side,
@@ -581,7 +581,7 @@ mod tests {
             timestamp: 0,
             fee: 0.0,
             reason: FillReason::Normal,
-        })
+        }))
     }
 
     /// 直接构造（绕过 actor 生命周期），用于测试纯状态累积逻辑
@@ -706,7 +706,7 @@ mod tests {
         // 本次会话又买 1 个（价 100），随后 BBO 报 110；
         // local_ts 晚于快照请求时刻，不会被 seed 的防双计过滤
         let data = fill_data(Exchange::Binance, &symbol, Side::Long, 1.0);
-        if let AccountData::Fill(f) = &data {
+        if let AccountData::Symbol(SymbolAccountData::Fill(f)) = &data {
             metrics.total.apply_fill(f);
         }
         metrics.state.apply(&IncomeEvent::account(
@@ -768,11 +768,7 @@ mod tests {
             );
         }
         for &(exchange, mid) in priced {
-            state.apply(&IncomeEvent::market(
-                0,
-                0,
-                crate::messaging::MarketData::BBO(exposure_bbo(exchange, mid)),
-            ));
+            state.apply_market(&crate::messaging::MarketData::BBO(exposure_bbo(exchange, mid)));
         }
         state
     }
