@@ -2,8 +2,8 @@
 //!
 //! 把一个事件喂给策略、维护策略独享状态、产出策略信号。不含任何
 //! 传输/并发设施 (无 actor / channel / pubsub)，因此被两种驱动复用：
-//!   - 实盘 [`crate::engine::ExecutorActor`]：actor 串行消费总线事件，调用 [`StrategyRunner::on_event`]
-//!     后把结果发布到 OutcomePubSub
+//!   - 实盘 [`crate::engine::Executor`]：按收件箱串行消费总线事件，调用 [`StrategyRunner::on_event`]
+//!     后把结果发布到出向总线
 //!   - 回测 [`crate::backtest::BacktestEngine`]：单线程虚拟时间循环里同步调用 [`StrategyRunner::accepts`] /
 //!     [`StrategyRunner::on_event`]
 //!

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 ///
 /// 这是**投产握手的载荷，不是事件** —— 它只属于特定消费者（executor 出生时随
 /// `ExecutorArgs`、镜像随 `RegisterSymbols`），不上广播总线。生产者只有一个：
-/// `ManagerActor` 投产期的一次 REST 快照，同一份快照喂给全部账本消费者
+/// manager 投产期的一次 REST 快照，同一份快照喂给全部账本消费者
 /// （executor / 对账镜像 / 观测镜像），三者口径一致。
 ///
 /// `snapshot_req_ts` 的用途见 [`SymbolState::seed_position`]：seed 之后、该时刻

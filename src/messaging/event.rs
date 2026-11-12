@@ -28,10 +28,10 @@ use std::sync::Arc;
 /// # 两个方向、两条既有总线（不新增分发机制）
 ///
 /// - **策略向外**：策略返回 [`crate::strategy::OutcomeEvent::Emit`]，事件随其他信号发布
-///   到 Outcome 总线，外部处理者经 `SubscribeOutcome` 订阅（带账户归属）。**不会回流给
+///   到 Outcome 总线，外部观察者订阅 `ManagerHandle::outcome_bus()`（带账户归属）。**不会回流给
 ///   任何策略** —— 策略间不能直接通信，回环在结构上不可能；确需转发时由外部处理者显式
 ///   经入向入口注入，转发点可见可控。
-/// - **外部向策略**：经 `ManagerActor` 的 `PublishCustomEvent` 注入 Market 总线，
+/// - **外部向策略**：经 `ManagerHandle::publish_custom_event` 注入行情总线，
 ///   按 scope 路由（见下）后进入订阅者的 `Strategy::on_event`。
 ///
 /// # 路由与账户归属
@@ -199,7 +199,7 @@ pub struct HistoryCandles {
 /// 账户私有事件：账户是**必填结构字段** —— "不知道归属的私有事件"在类型上不可表达。
 ///
 /// 生产者：实盘适配层的私有路径（private WS / 账户轮询，标 [`AccountId::Live`]）与
-/// 本地柜台 `PaperCounterActor`（标 `Paper(x)`）。二者发布**同一个类型**到同一条
+/// 本地柜台 `PaperCounter`（标 `Paper(x)`）。二者发布**同一个类型**到同一条
 /// AccountBus，消费者按 `account` 取自己的那份 —— 账户隔离由字段值而非总线拓扑保证。
 ///
 /// 注：实盘适配层当前单账户，标签在发布点直接写 `AccountId::Live`；将来支持多实盘

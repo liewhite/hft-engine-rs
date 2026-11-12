@@ -1,4 +1,4 @@
-//! Prometheus pushgateway 推送：`MetricsActor` 的周期快照可选外送。
+//! Prometheus pushgateway 推送：`Metrics` 的周期快照可选外送。
 //!
 //! 选 push 而非 pull（/metrics HTTP 端点）：不引入 HTTP server 依赖，且引擎可能跑在
 //! 无入站网络的环境。文本用 Prometheus exposition format，端点为

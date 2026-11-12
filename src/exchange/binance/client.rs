@@ -196,7 +196,7 @@ impl BinanceClient {
         &self.quote
     }
 
-    /// 获取凭证（供 ManagerActor 创建 BinanceActor 使用）
+    /// 获取凭证（供装配层创建 BinanceNode 使用）
     pub fn credentials(&self) -> Option<&BinanceCredentials> {
         self.credentials.as_ref()
     }

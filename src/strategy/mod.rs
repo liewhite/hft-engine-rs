@@ -39,10 +39,10 @@ pub enum OutcomeEvent {
     },
     /// 向外发布自定义事件（见 [`CustomEvent`] 的方向与路由文档）。
     ///
-    /// 随其他信号发布到 Outcome 总线，外部处理者经 `SubscribeOutcome` 订阅、
+    /// 随其他信号发布到 Outcome 总线，外部观察者订阅 `ManagerHandle::outcome_bus()`、
     /// 按类型 `get::<T>()` 消费；下单/撤单处理器（实盘出口与模拟柜台）对它 no-op。
-    /// **不会回流给任何策略** —— 确需喂给策略的事件走 `ManagerActor` 的
-    /// `PublishCustomEvent` 入向入口。
+    /// **不会回流给任何策略** —— 确需喂给策略的事件走
+    /// `ManagerHandle::publish_custom_event` 入向入口。
     Emit(CustomEvent),
 }
 

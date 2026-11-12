@@ -306,7 +306,7 @@ impl SymbolPositions {
         }
     }
 
-    /// 该所的持仓基线是否已写入（写入后该腿才可参与对账，见 `PositionLedgerActor`）
+    /// 该所的持仓基线是否已写入（写入后该腿才可参与对账，见 `PositionLedger`）
     pub fn is_seeded(&self, exchange: Exchange) -> bool {
         self.seeded_at.contains_key(&exchange)
     }
@@ -540,7 +540,7 @@ impl SymbolState {
                                 // 会在它旁边重复挂单。
                                 //
                                 // （启动期交易所已存在的遗留挂单**不走这条路** —— 那些由
-                                // `ManagerActor` 在启动期直接撤掉，见 `cancel_leftover_orders`。）
+                                // manager 在投产期直接撤掉，见 `cancel_leftover_orders`。）
                                 //
                                 // 权威字段直接取自 update：side/quantity/status。
                                 //

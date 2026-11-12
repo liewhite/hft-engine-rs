@@ -15,7 +15,7 @@
 //!
 //! 底层 `StateManager` 里本来就只有订阅范围内的读数 —— 事件在**分发层**按
 //! [`crate::messaging::Delivery`] 过滤（`StrategyRunner::accepts` 与
-//! `IncomeProcessorActor` 同据一份判据），范围外的东西根本进不来。
+//! `IncomeProcessor` 同据一份判据），范围外的东西根本进不来。
 //!
 //! 视图初版曾在这里按订阅交易所再裁剪一遍账户读数。那是错的，两个原因：
 //! 同一条"什么算范围内"的判据成了第三处实现（原则 P1/P4）；而且它**挡不住**——

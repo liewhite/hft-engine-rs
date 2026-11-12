@@ -53,7 +53,7 @@ pub struct BacktestResult {
 type Observer<'a> = Box<dyn FnMut(&IncomeEvent) + 'a>;
 
 /// Outcome 旁路观察者：策略每产出一条信号立即回调 (runner 下标, 信号)。
-/// 等价实盘 Outcome 总线的外部订阅者（`SubscribeOutcome`）—— 两个方向各有各的观察口，
+/// 等价实盘 Outcome 总线的外部订阅者（订阅 `ManagerHandle::outcome_bus()`）—— 两个方向各有各的观察口，
 /// 不把 outcome 包装成 income 混进 [`Observer`]（那会丢失方向与发出者归属）。
 type OutcomeObserver<'a> = Box<dyn FnMut(usize, &OutcomeEvent) + 'a>;
 
@@ -167,7 +167,7 @@ impl<'a> BacktestEngine<'a> {
     }
 
     /// 注册 Outcome 旁路观察者：策略每产出一条信号（下单/撤单/Emit）立即回调，
-    /// 带 runner 下标标识发出者。等价实盘经 `SubscribeOutcome` 订阅 Outcome 总线。
+    /// 带 runner 下标标识发出者。等价实盘订阅 `ManagerHandle::outcome_bus()`。
     pub fn with_outcome_observer(mut self, obs: impl FnMut(usize, &OutcomeEvent) + 'a) -> Self {
         self.outcome_observers.push(Box::new(obs));
         self

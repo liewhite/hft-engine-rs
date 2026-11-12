@@ -2,7 +2,7 @@
 //!
 //! # 为什么要有这个类型
 //!
-//! 同一个判断有两条驱动要做：实盘的 `IncomeProcessorActor`（总线 → executor）与回测的
+//! 同一个判断有两条驱动要做：实盘的 `IncomeProcessor`（总线 → executor）与回测的
 //! `BacktestEngine`（虚拟时间循环 → runner）。判据收进本类型之后，两条驱动调的是同一个
 //! [`SubscriptionScope::accepts`]：账户归属、所、symbol 三个维度都在这里判，不在分发层
 //! 另写一份账户过滤（原则 P1/P4）。"事件的定位精度有几档"由 [`Delivery`] 的穷举 `match`
@@ -10,7 +10,7 @@
 //!
 //! # 热路径上仍然可以用索引
 //!
-//! `IncomeProcessorActor` 为 symbol 定向的行情事件建了 `(所, symbol) -> 订阅者` 的反向
+//! `IncomeProcessor` 为 symbol 定向的行情事件建了 `(所, symbol) -> 订阅者` 的反向
 //! 索引、为账户事件建了 `账户 -> 订阅者` 的索引，那是扇出优化，不是第二份判据 ——
 //! 索引的键由 [`SubscriptionScope::pairs`] / [`SubscriptionScope::account`] 灌，与判据同源。
 //! 这条同源关系是**结构约定**而非编译期保证，故分发层在索引命中处留了

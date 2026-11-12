@@ -52,7 +52,7 @@ enum FillResult {
 ///
 /// 交易所身份在构造时钉死（[`Self::exchange`]），内部一切状态（挂单簿、持仓、行情）都只属于
 /// 这一个所 —— 跨所隔离由持有方按 (账户, 交易所) 分实例实现（模拟盘
-/// `PaperCounterActor`、回测 `BacktestEngine` 皆如此）。此前 exchange 以方法参数传入、
+/// `PaperCounter`、回测 `BacktestEngine` 皆如此）。此前 exchange 以方法参数传入、
 /// 只用来给回报贴标签，内部键全按 symbol —— 接口看似有交易所维度实则没有：跨所策略绑到
 /// 一个实例上，A 所挂单会被 B 所的成交撮合、两所持仓并进一条。收进构造参数后，
 /// "喂错所的行情"成为可检测的路由 bug（见 [`Self::on_market`]），而非静默串账。

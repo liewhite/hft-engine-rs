@@ -2,7 +2,7 @@
 //!
 //! # 为什么单独有这个类型
 //!
-//! 持仓账本（`PositionLedgerActor`）此前持有整个 [`StateManager`]，而它一辈子只用得到
+//! 持仓账本（`PositionLedger`）此前持有整个 [`StateManager`]，而它一辈子只用得到
 //! 持仓那一份：行情缓存、挂单跟踪、账户净值、希腊值它一个都不碰。这既是接口过宽
 //! （`docs/architecture.md` 原则 P3），也让"三份持仓折叠"里它那一份看起来像是重复
 //! 造出来的 —— 实际上它是**唯一被 REST 持续校验的那份**，理应是最瘦、最专一的。
@@ -99,7 +99,7 @@ impl PositionBook {
     /// 全部**基线已写入**的腿（含 `size == 0` 的空仓腿）。
     ///
     /// 未 seed 的腿不在结果里 —— 那是"未知"而非"空仓"，见
-    /// [`SymbolPositions::seeded_positions`]。对外快照（`GetLivePositions`）用的就是它。
+    /// [`SymbolPositions::seeded_positions`]。对外快照（`ManagerHandle::live_positions`）用的就是它。
     pub fn seeded_positions(&self) -> impl Iterator<Item = &Position> {
         self.symbols.values().flat_map(|p| p.seeded_positions())
     }

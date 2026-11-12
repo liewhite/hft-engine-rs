@@ -6,7 +6,7 @@
 //! 依赖引擎运行时；运行期出口全部旁路（异步、失败降级、限流），绝不拖垮交易。
 //! - 告警外送（[`alert`]）：tracing 的 WARN/ERROR 事件经 Layer 旁路推 webhook ——
 //!   零业务侵入，对账漂移/投产失败/断流退出等既有告警点自动覆盖
-//! - 指标推送（[`prometheus`]）：`MetricsActor` 的周期快照可选推 Prometheus pushgateway
+//! - 指标推送（[`prometheus`]）：`Metrics` 的周期快照可选推 Prometheus pushgateway
 //!
 //! 两者都由环境变量启用（未设置 = 关闭，行为与从前完全一致）：
 //! - `SLACK_BOT_TOKEN` + `SLACK_ALERT_CHANNEL`：告警经 Slack bot 发到指定频道；或
