@@ -174,17 +174,22 @@ pub enum OutcomeEvent {
 `MarketData` 12 个变体：`BBO` / `MarketTrade` / `MarkPrice` / `IndexPrice` / `FundingRate` /
 `Candle` / `HistoryCandles` / `BorrowFee` / `ExchangeRate` / `ExchangeStatus` / `Clock` / `Custom`
 
-`AccountData` 6 个：`OrderUpdate` / `Fill` / `Balance` / `FundingFee` / `Greeks` / `AccountInfo`
+`AccountData` 按定位精度在类型上分两档（#696）：
+- `Symbol(SymbolAccountData)`：`OrderUpdate` / `Fill` / `FundingFee`
+- `Exchange(ExchangeAccountData)`：`Balance` / `Greeks` / `AccountInfo` / `UnmappedFill`
 
-投递范围由 `IncomeEvent::delivery()` 推导，三档：
+状态层按档分派、不带默认分支；`SymbolState` 只收币级。新增账户事件先选档，漏处理编译不过。
+
+投递范围由 `IncomeEvent::delivery()` 推导（行情每个变体自己声明档位，账户事件由类型分档给出），三档：
 
 | 档 | 覆盖 | 投给谁 |
 |---|---|---|
 | `Symbol(所, symbol)` | 行情、symbol 级私有回报 | 订了这个 (所, symbol) 的 |
-| `Exchange(所)` | `Balance` / `AccountInfo` / `Greeks` / `ExchangeStatus` / `ExchangeRate` | 订了这个所的 |
+| `Exchange(所)` | `ExchangeAccountData` 全部 / `ExchangeStatus` / `ExchangeRate` | 订了这个所的 |
 | `Broadcast` | `Clock`、无 scope 的自定义事件 | 全部 |
 
-判据只有一份实现（`SubscriptionScope::accepts`），实盘分发层与回测循环共用。
+判据只有一份实现（`SubscriptionScope::accepts`），实盘分发层与回测循环共用。订阅范围带绑定账户：
+账户事件先看归属（别的账户的私有事件不收），再看上表。
 
 ---
 
@@ -247,6 +252,7 @@ use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 let runner = StrategyRunner::with_id_gen(
     Box::new(my_strategy),
     symbol_metas.clone(),
+    hft_engine_rs::backtest::backtest_account(),       // 回测账户：只收它的私有事件
     Box::new(SequentialClientOrderIdGen::default()),  // 确定性 id：同输入同输出
 );
 let mut engine = BacktestEngine::new(source.as_ref(), vec![runner], sim_config, symbol_metas);
