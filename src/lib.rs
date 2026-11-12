@@ -8,3 +8,4 @@ pub mod observability;
 pub mod option;
 pub mod sim;
 pub mod strategy;
+pub mod tasks;
