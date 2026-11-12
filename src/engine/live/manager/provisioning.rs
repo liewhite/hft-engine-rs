@@ -21,6 +21,9 @@
 //! - `producers`：新建的 executor 挂在 manager 的**生产者组**下（运行期往已声明的组里
 //!   spawn）。组只提供 spawn 能力 —— "何时停、按什么顺序停"由任务树按分组声明顺序决定，
 //!   编排改不了。撤下的实例自己退出后即从组里摘除，不需要编排记得去删。
+//!
+//!   如实说明能力面的边界：`producers` 和 `consumers` 同为 [`Group`]，**传的是哪一组仍由调用点
+//!   写对，编译器分不出来**；`Group` 限制的是能对它做什么（只能 spawn、不能 shutdown），不是它是谁。
 
 use super::StrategySpec;
 use crate::engine::live::{
@@ -228,8 +231,8 @@ impl Provisioner {
         }
     }
 
-    /// 协作者已停止收件时的处置：manager 在停机途中（整机在停）记 warn 当作已完成；
-    /// 否则是协作者出错退出了（它的错误会自己冒到根），这里如实报错。
+    /// 协作者已停止收件时的处置（一对一请求方，来路与处理见 `docs/architecture.md` 3.1
+    /// 「Gone 的来路与处理」）：manager 在停机途中记 warn 当作已完成，否则如实报错。
     fn collaborator_gone(&self, what: &str) -> Result<(), String> {
         if self.manager_stopping.is_stopping() {
             tracing::warn!("{what}：对方已停止收件（引擎正在停机）");

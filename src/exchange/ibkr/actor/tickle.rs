@@ -1,6 +1,10 @@
 //! IbkrTickle - IBKR tickle 保活
 //!
 //! 定时发送 POST /tickle 维持 session。连续失败 3 次即出错退出，整支（IbkrNode 及以上）停下。
+//!
+//! 判死时长如实说明：阈值数的是**尝试次数**，不是墙钟。节拍是 `spawn_periodic` 的 Skip（一次没做完
+//! 不补跑），所以一次请求卡到超时才失败时，下一次要等它返回才开始 —— 判死约需 3 × max(60s, 请求
+//! 超时)，比"3 分钟"慢。要更快判死得按墙钟（距上次成功多久）判，目前没做。
 
 use crate::exchange::ibkr::auth::{self, IbkrAuth};
 use crate::tasks::{ChildHandle, Group, GroupClosed, Periodic};

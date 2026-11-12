@@ -724,7 +724,9 @@ impl FillPairing {
         }
     }
 
-    /// 处理一条 str 成交推送（`now` 用于排 commission 超时）
+    /// 处理一条 str 成交推送（`now` 用于排 commission 超时）。
+    ///
+    /// 解析后生成 Fill 更新仓位，同时（有 order_ref 时）生成 Filled OrderUpdate 关闭 pending order。
     fn on_trade_message(
         &mut self,
         value: &serde_json::Value,
@@ -898,7 +900,12 @@ impl FillPairing {
         self.deadlines.front().map(|(t, _)| *t)
     }
 
-    /// Commission 超时处理 — 已到期且仍在等的，以 fee=0 发布
+    /// Commission 超时处理 — 已到期且仍在等的，以 fee=0 发布。
+    ///
+    /// 这是第二条消息不来时该 fill 的**唯一兜底发布路径**（停机时另由 [`Self::flush_all`] 补发）：
+    /// 它不被驱动就意味着这笔成交永远留在 `pending_fills` 里、永不发布 —— 本地持仓从此永久
+    /// 落后于交易所。所以它由 `run` 的 `select!` 按 [`Self::next_deadline`] 直接驱动，不经任何可能投递
+    /// 失败的消息。
     fn expire_due(&mut self, now: Instant) {
         while let Some((t, _)) = self.deadlines.front() {
             if *t > now {

@@ -145,11 +145,16 @@ CLAUDE.md 的七条是通用的，这里只写**本项目特有的、可以直�
 ### P5 IO 不在消息处理里
 
 收件箱是共享资源。组件处理一条消息时 `await` 在网络/文件上，都会让它的**全部**其他消息排在
-一次超时后面。正确形态是 `spawn` 出去、结果回投为消息。（只做一件事、不收消息的定时轮询器
-`spawn_periodic` 在 `tick` 里直接 await 是正当的。）
+一次超时后面。正确形态二选一，都留在任务树上、不用游离的 `tokio::spawn`：
 
-配套要求：一旦拉取移出 handler，"结果永不回投"就成为可达状态（任务 panic、请求真挂死），
-必须有一道**不依赖回投**的守卫。见 `PositionLedger::check_in_flight_staleness`。
+- IO 放进 `run` 自己 poll 的在途 future，与收件箱在同一个 `select!` 里推进（`PositionLedger` 的持仓拉取）；
+- 或挂成本组件分组下的子任务（`OutcomeProcessor` 的 `requests` 组，一张单一个子任务）。
+
+（只做一件事、不收消息的定时轮询器 `spawn_periodic` 在 `tick` 里直接 await 是正当的。）
+
+两种形态下 IO 任务 panic 都随任务上冒、整机停机，停机也会等它们返回，不会被吞掉。仍然可达的只有
+"请求真挂死、迟迟不返回"：结果会被拿来做判定的，必须有一道**不依赖结果到达**的守卫。
+见 `PositionLedger::check_in_flight_staleness`。
 
 ### P6 漏改必须编译失败
 
@@ -223,12 +228,15 @@ CLAUDE.md 的七条是通用的，这里只写**本项目特有的、可以直�
     （组内并发、组间有序），全部收尾完才调它自己的 `Task::stop`。分组只能在构造阶段声明。
   - 唯一的硬期限在根上：`bootstrap::shutdown` 对整棵树设 30s，停机中再收到信号直接退出；
     中间层只告警"迟迟未停"、不放弃。
+  - 只需要问"是不是在停机"的协作方拿 `Scope::stop_flag()`（只读），不拿整个 `Scope`。
 - **收件箱**（`inbox.rs`）：只能从 `Scope` 建。生死只跟着任务走（地址全丢了也不会关）；停机时
   `recv` 先关闭、再排空已进箱的消息、然后返回 `None` —— **有收件箱的组件以 `recv()` 返回 `None`
   作停止信号**，不另写 `scope.stopping()` 分支直接 break（会丢箱里的消息，收件箱销毁时报 ERROR）。
 - **总线**（`bus.rs`）：一对多扇出，在发布者自己的任务里同步投进订阅者的无界收件箱，
   `publish` 不会失败。只能经 `Inbox::subscribe(bus, fn 过滤器, Msg::变体)` 订阅，订阅凭证存在收件箱里，
   收件箱关闭即退订；关闭与退订之间到达的投递记 ERROR"事件丢失"，不静默。
+  发布与订阅是两种能力：`Bus` 能发能订，`Bus::tap()` 得到的 `BusTap` 只能订 —— 交给外部观察者的一律是
+  `BusTap`。
 
 两个公共形状（`periodic.rs`）：`Group::spawn_addressed`（起有收件箱的组件，构造完成时交回地址）、
 `Group::spawn_periodic`（定时轮询：首拍立即、`MissedTickBehavior::Skip` 不积压补跑、停止优先，`tick`
@@ -237,16 +245,50 @@ CLAUDE.md 的七条是通用的，这里只写**本项目特有的、可以直�
 **组件写法**：每个组件一个 `enum Msg` + 收件箱；对外给可克隆的 `XxxHandle(Addr<Msg>)`，带类型化方法（ask 用
 `addr.ask(|tx| Msg::Get(tx))`）；构造逻辑写在 spawn 的闭包里（在里面订阅总线、声明分组、起子任务）；
 WS / 定时器由任务自己持有、在 `run` 的 `select!` 里 poll；收尾要补发的东西（如 IBKR 等 commission
-的成交）**直接发到总线**，不经父节点转（父节点的收件箱先关）。各所 WS 连接统一用
-`exchange::ws_loop::WsConn`（读循环挂成子任务，断线/空闲超时 = 子任务 Err 上冒）。
+的成交）**直接发到总线**，不经父节点转（父节点的收件箱先关）。处理一条消息出错要整支停就 `?`
+返回 `Err`；可容忍的失败在组件内部消化（记日志继续），不要抛 `Err` 指望上层不当回事。命名：类型不带
+`Actor` 后缀，各所父节点叫 `XxxNode`，参数叫 `XxxArgs`。标准形状：
 
-**发送失败**：`addr.send` / `ask` 返回 `Gone` = 对方已停止收件，只可能在停机途中或对方已出错退出
-（出错会自己上冒）。`scope.is_stopping()` 时记 warn 忽略；否则返回 `Err`（"不该发生"的地方要大声）。
+```rust
+impl Task for Foo {
+    async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
+        let mut tick = tokio::time::interval(self.every);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                msg = self.inbox.recv() => match msg {
+                    Some(m) => self.handle(m).await?,
+                    None => return Ok(()),          // 已被要求停止，箱已排空
+                },
+                _ = tick.tick() => self.poll()?,
+            }
+        }
+    }
+}
+```
+
+各所 WS 连接统一用 `exchange::ws_loop::WsConn`：`WsConn::spawn(&scope.group("conn"), ..)` 把读循环挂成子任务
+（断线/空闲超时 = 子任务 Err 上冒）；私有 WS 构造时 `await_subscriptions` 等订阅确认；取帧用
+`conn.next(scope)`（停机时把已缓冲的回报交完再返回 `None`，没有收件箱的私有 WS 整个 `run` 就是
+`while let Some(raw) = conn.next(scope).await? {..}`），停机信号另有来源的 `select!` 分支里用 `conn.recv()`。
+
+**Gone 的来路与处理**：`addr.send` / `ask` 返回 `Gone` = 对方已停止收件。来路只有三种：
+
+1. 整机停机途中：生产者组先停，发给已关箱者的最后几条失败 —— 正常；
+2. 对方自己出错退出：它的错误已自行上冒、整机在停；
+3. 编排没先注销就停了它（违反"先注销再停"）：它本就要停，丢的消息没人需要。
+
+三种都不是发送方该另行上冒的事故（真事故由出事的一方自己报）。处理按发送方的角色分两种：
+
+- **一对一请求方**（要这条结果才能往下走，如投产编排）：自己在停机（`is_stopping()`）时记 warn
+  当作已完成；否则返回 `Err` 如实报给调用方（"不该发生"的地方要大声）。
+- **一对多分发方**（分发层的 executor 名单、持仓账本的监视名单）：记 warn 并把对方摘出名单（之后
+  不再为它重复报），自己照常运行 —— 一个收件方没了不该拖倒服务其他人的分发方。
 
 **拓扑**：
 
 ```
-Root("engine")                         ← bootstrap::run_engine 持有，唯一 30s 总期限
+Root("engine")                         ← bootstrap::run_engine 持有，唯一 30s 总期限、二次信号直接退出
 └─ group "main"
    └─ Manager
       ├─ group "producers"   各所 XxxNode（及其 WS / 轮询子任务）、Clock、策略 Executor
@@ -260,7 +302,8 @@ Root("engine")                         ← bootstrap::run_engine 持有，唯一
   `Addr<ExchangeCmd>`（`Subscribe` / `SubscribeBatch` / `Unsubscribe`）；`engine::live::assembly` 把引擎侧的
   `SpawnCtx { producers, market_bus, account_bus, symbol_metas }` 映射成各所参数。
 - 外部观察者（如 funding_arb 的资金费轮询器、adaptive_trade 的 `Supervisor`）经 `ManagerHandle::observers()`
-  挂到 consumers 组，在自己的构造闭包里 `inbox.subscribe(handle.market_bus(), ..)`。
+  挂到 consumers 组，在自己的构造闭包里 `inbox.subscribe(handle.market_bus(), ..)`。`ManagerHandle` 的三条总线
+  只给 `BusTap`（只订阅）；外部唯一的入向入口是 `publish_custom_event`。
 - 启动：manager 构造（预加载 metas、建总线、起全部子任务、等私有订阅确认）在 build 里完成，
   `Manager::spawn(..).await` 返回即启动完成；失败同时返回 `Err` 并上冒。
 - 停机：`run_engine` 收到 SIGINT/SIGTERM 或任何节点出错（`root.stopping()`）后 `root.shutdown()`；`biased` 让
@@ -379,9 +422,20 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 
 `producers → consumers`，但 Outcome 的两个消费者（本地柜台、`OrderGateway`）会倒回来往 Account
 总线发，而它们的订阅者与它们同在消费者组、同时停。停机瞬间在途的这批回报投给已关闭的收件箱，
-总线记 ERROR"事件丢失"，代价是最终一次指标快照少记一笔。已在 `manager/mod.rs` 的
-"如实声明：两段线性模型盖不住一条回灌边"论证过再切一刀分组也救不回来（柜台延迟管道里等待的单、
-`OrderGateway` 的在途 REST 无论怎么排都会丢）。
+总线记 ERROR"事件丢失"，代价是最终一次指标快照少记一笔。
+
+两个回灌源在停机时各自的实际行为（**本节是这条事实的唯一出处**，代码注释引用这里）：
+
+- **`OrderGateway` 的在途请求不会丢**：每张单的下单/撤单请求是 `OutcomeProcessor` 的 `requests`
+  子组里的一个子任务。停机时 `OutcomeProcessor` 先排空收件箱（排空期间起的单也挂进来），框架再等
+  全部在途请求返回才算它停完（REST 有自己的超时，根的 30s 总期限兜底）；请求任务 panic 作为错误上冒。
+  丢的只是请求返回后**合成的失败/撤单回报**：它们发到账户总线时，同组的订阅者（分发层、指标、
+  账本）可能已关箱，记 ERROR"事件丢失"。停机期间成交的单，交易所回报本进程收不到（交易所节点已先停），
+  下次启动由 REST 持仓基线得到。
+- **本地柜台**延迟管道里未到期的模拟单/撤单随停机丢弃（记 warn）：模拟账户不持久化。
+
+再切一刀分组（把两个回灌源单独先停）能救回的只是那几条合成回报和柜台回报 —— 而这批数据一个字节
+都不持久化（paper 账户每次启动从零起步、实盘持仓走 REST 基线重建），不值得。
 
 **不修**。列在这里是为了提醒：新增消费者时先问它会不会回灌。
 

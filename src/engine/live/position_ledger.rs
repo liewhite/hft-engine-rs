@@ -702,8 +702,8 @@ impl Ledger {
         match result {
             Ok(positions) => self.reconciler.reconcile_executor(executor, &positions),
             Err(Gone) => {
-                // executor 已停却没有先撤出名单 —— 只可能是它出错退出（错误已自行上冒、
-                // 整机在停）或整机正在停机。这里只把它摘掉，免得每个节拍重复报同一件事。
+                // executor 已停却没有先撤出名单：账本是一对多分发方，摘掉它、免得每个节拍
+                // 重复报同一件事（来路见 docs/architecture.md 3.1「Gone 的来路与处理」）
                 tracing::warn!(%executor, "executor 持仓查询失败（已停止收件），移出监视名单");
                 self.executors.remove(&executor);
                 Ok(())

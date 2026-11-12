@@ -285,13 +285,9 @@ impl IncomeProcessor {
         }
     }
 
-    /// 投递失败（`Gone`）= 该 executor 已停止收件，只有三种来路，都不是需要分发层上冒的事故：
-    /// - 整机停机：生产者组（executor 与交易所节点）先停，交易所节点收尾时发出的最后几条
-    ///   事件到这里时 executor 已关箱 —— 正常；
-    /// - executor 自己出错退出：它的错误已经自行上冒、整机在停；
-    /// - 编排没先注销就停了它（违反「先注销再停」的约定）：它本就要停，丢的事件没人需要。
-    ///
-    /// 所以记 warn 并把它摘出名单（之后不会再为它报第二次），分发器照常运行。
+    /// 投递失败（`Gone`）= 该 executor 已停止收件。分发层是一对多分发方：记 warn 并把它摘出
+    /// 名单（之后不会再为它报第二次），分发器照常运行。来路与理由见 `docs/architecture.md` 3.1
+    /// 「Gone 的来路与处理」。
     fn drop_gone(&mut self, gone: Vec<ExecutorId>) {
         for id in gone {
             tracing::warn!(executor = %id, "executor 已停止收件，事件未送达，移出分发名单（停机途中属正常）");
