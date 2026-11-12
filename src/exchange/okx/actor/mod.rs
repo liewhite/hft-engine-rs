@@ -1,11 +1,13 @@
-//! OKX Actor 模块
+//! OKX 节点模块
 //!
 //! 树状结构:
-//! OkxActor (父)
-//! ├── OkxPublicWsActor [spawn_link]
-//! ├── OkxPrivateWsActor [spawn_link]
-//! ├── OkxBusinessWsActor [spawn_link] (K线数据)
-//! └── OkxGreeksPollingActor [spawn_link] (REST 轮询希腊值)
+//! OkxNode
+//! ├── OkxPublicWs
+//! ├── OkxBusinessWs（K线数据）
+//! ├── OkxPrivateWs（需要凭证）
+//! ├── EquityPoller（通用，见 crate::exchange::equity_polling）
+//! ├── OkxGreeksPoller（REST 轮询希腊值）
+//! └── CryptoStatus
 
 mod business_ws;
 mod greeks_polling;
@@ -13,4 +15,4 @@ mod okx_actor;
 mod private_ws;
 pub(crate) mod public_ws;
 
-pub use okx_actor::{OkxActor, OkxActorArgs};
+pub use okx_actor::{OkxArgs, OkxNode};

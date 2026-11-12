@@ -1,46 +1,38 @@
-//! HyperliquidPublicWsActor - 管理 Hyperliquid WebSocket 连接
+//! HyperliquidPublicWs - 管理 Hyperliquid 公共 WebSocket 连接
 //!
 //! 职责:
-//! - 维护 WebSocket 连接
-//! - 处理 Subscribe/Unsubscribe 请求
-//! - 直接解析消息并发布到对应总线
+//! - 维护 WebSocket 连接（读循环是子任务）
+//! - 处理订阅/退订命令
+//! - 直接解析消息并发布到行情总线
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol};
-use crate::messaging::MarketPubSub;
-use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
 use crate::exchange::hyperliquid::codec::{aggregate_trades, WsActiveAssetCtx, WsBbo, WsTrade};
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
-use crate::exchange::ws_loop;
-use crate::messaging::{MarketData, MarketEvent};
+use crate::exchange::ws_loop::{self, WsConn};
+use crate::messaging::{MarketBus, MarketData, MarketEvent};
+use crate::tasks::{Addr, Group, Inbox, Scope, Task};
+use anyhow::Context as _;
 use futures_util::StreamExt;
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::ActorStopReason;
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
-use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
-/// HyperliquidPublicWsActor 初始化参数
-pub struct HyperliquidPublicWsActorArgs {
+/// 公共 WebSocket 组件
+pub(super) struct HyperliquidPublicWs {
+    inbox: Inbox<ExchangeCmd>,
+    conn: WsConn,
     /// 行情总线（发布事件）
-    pub market_pubsub: ActorRef<MarketPubSub>,
-    /// 已接入 dex 的品种目录（symbol → 带 dex 前缀的 coin）
-    pub markets: Arc<HlMarkets>,
+    market_bus: MarketBus,
+    /// 订阅记账（品种目录、已订阅的 stream / kind、trades 订阅时刻）
+    book: SubscriptionBook,
 }
 
-/// HyperliquidPublicWsActor - WebSocket Actor
-pub struct HyperliquidPublicWsActor {
-    /// 行情总线（发布事件）
-    market_pubsub: ActorRef<MarketPubSub>,
+/// 订阅记账：纯状态，不碰连接和总线（单测直接构造它）
+struct SubscriptionBook {
     /// 品种目录：订阅前查 coin，查不到的 symbol 不订阅
     markets: Arc<HlMarkets>,
-    /// 发送消息到 ws_loop 的 channel
-    ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的底层 stream (用于 WebSocket 去重)
     subscribed_streams: HashSet<String>,
     /// 已订阅的 kinds (用于事件分发和取消订阅)
@@ -55,53 +47,21 @@ pub struct HyperliquidPublicWsActor {
     trades_subscribed_at: HashMap<Symbol, u64>,
 }
 
-impl HyperliquidPublicWsActor {
-    /// 批量发送订阅消息（发送多条消息，无速率限制）
-    async fn send_subscribe_batch(&self, kinds: &[SubscriptionKind]) -> Result<(), WsError> {
-        let tx = self
-            .ws_tx
-            .as_ref()
-            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
-
-        for kind in kinds {
-            let subscription = self.subscription(kind)?;
-            let msg = json!({
-                "method": "subscribe",
-                "subscription": subscription
-            })
-            .to_string();
-
-            tx.send(msg)
-                .await
-                .map_err(|_| WsError::Network("Channel closed".to_string()))?;
+impl SubscriptionBook {
+    fn new(markets: Arc<HlMarkets>) -> Self {
+        Self {
+            markets,
+            subscribed_streams: HashSet::new(),
+            subscribed_kinds: HashSet::new(),
+            trades_subscribed_at: HashMap::new(),
         }
-
-        Ok(())
-    }
-
-    /// 发送取消订阅消息
-    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let subscription = self.subscription(kind)?;
-        let msg = json!({
-            "method": "unsubscribe",
-            "subscription": subscription
-        })
-        .to_string();
-
-        let tx = self
-            .ws_tx
-            .as_ref()
-            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
-        tx.send(msg)
-            .await
-            .map_err(|_| WsError::Network("Channel closed".to_string()))
     }
 
     /// kind 对应的订阅报文；只对已过订阅期筛选的 kind 调用（Candle 与目录外的 symbol
-    /// 在 SubscribeBatch 里就被跳过），走到这里还查不到属路由 bug
+    /// 在订阅时就被跳过），走到这里还查不到属路由 bug
     fn subscription(&self, kind: &SubscriptionKind) -> Result<serde_json::Value, WsError> {
         let channel = kind_channel(kind).ok_or_else(|| {
-            WsError::ParseError(format!("{kind:?} reached HyperliquidPublicWsActor (routing bug)"))
+            WsError::ParseError(format!("{kind:?} reached HyperliquidPublicWs (routing bug)"))
         })?;
         let coin = self.markets.coin(kind.symbol()).ok_or_else(|| {
             WsError::ParseError(format!("{} 不在 HL 品种目录里 (routing bug)", kind.symbol()))
@@ -114,23 +74,6 @@ impl HyperliquidPublicWsActor {
         Some(format!("{}:{}", kind_channel(kind)?, self.markets.coin(kind.symbol())?))
     }
 
-    /// 解析并处理消息
-    async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
-        let local_ts = now_ms();
-        let events = parse_public_message(raw, local_ts, &self.subscribed_kinds)?;
-        for event in events {
-            if self.is_trade_backfill(&event) {
-                continue;
-            }
-            if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to MarketPubSub");
-            }
-        }
-        Ok(())
-    }
-}
-
-impl HyperliquidPublicWsActor {
     /// 该事件是否为 trades 订阅前的历史回填 (仅 MarketTrade 适用)。
     ///
     /// 判据：成交时间早于本 symbol 的 trades 订阅时刻。无订阅记录时不判为回填
@@ -156,97 +99,91 @@ impl HyperliquidPublicWsActor {
     }
 }
 
-impl Actor for HyperliquidPublicWsActor {
-    type Args = HyperliquidPublicWsActorArgs;
-    type Error = ExchangeError;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
-        let (ws_stream, _) = tokio_tungstenite::connect_async(WS_URL)
-            .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
-
-        let (write, read) = ws_stream.split();
-
-        // 创建出站消息 channel (Subscribe/Unsubscribe)
-        let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-
-        // 创建入站消息 channel (收到的数据/错误)
-        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
-
-        // attach_stream 监控入站消息
-        let incoming_stream = ReceiverStream::new(incoming_rx);
-        actor_ref.attach_stream(incoming_stream, (), ());
-
-        // 启动 ws_loop
-        tokio::spawn(ws_loop::run_ws_loop(
-            read,
-            write,
-            outgoing_rx,
-            incoming_tx,
-            ws_loop::WsKeepalive::hyperliquid(),
-        ));
-
-        tracing::info!("HyperliquidPublicWsActor started");
-
-        Ok(Self {
-            market_pubsub: args.market_pubsub,
-            markets: args.markets,
-            ws_tx: Some(outgoing_tx),
-            subscribed_streams: HashSet::new(),
-            subscribed_kinds: HashSet::new(),
-            trades_subscribed_at: HashMap::new(),
-        })
+impl HyperliquidPublicWs {
+    /// 在 `group` 下起公共 WS，等连接建好，返回命令地址
+    pub(super) async fn spawn(
+        group: &Group,
+        market_bus: MarketBus,
+        markets: Arc<HlMarkets>,
+    ) -> anyhow::Result<Addr<ExchangeCmd>> {
+        let (_, addr) = group
+            .spawn_addressed("HyperliquidPublicWs", move |scope: Scope, inbox| async move {
+                // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
+                let (ws_stream, _) = tokio_tungstenite::connect_async(WS_URL)
+                    .await
+                    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
+                let (write, read) = ws_stream.split();
+                let conn = WsConn::spawn(
+                    &scope.group("conn"),
+                    "HyperliquidPublicWsLoop",
+                    read,
+                    write,
+                    ws_loop::WsKeepalive::hyperliquid(),
+                )?;
+                tracing::info!("HyperliquidPublicWs started");
+                Ok(Self { inbox, conn, market_bus, book: SubscriptionBook::new(markets) })
+            })
+            .await?;
+        Ok(addr)
     }
 
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        // Drop ws_tx 会导致 ws_loop 退出
-        self.ws_tx.take();
-        tracing::info!("HyperliquidPublicWsActor stopped");
+    /// 批量发送订阅消息（发送多条消息，无速率限制）
+    async fn send_subscribe_batch(&self, kinds: &[SubscriptionKind]) -> Result<(), WsError> {
+        for kind in kinds {
+            let subscription = self.book.subscription(kind)?;
+            let msg = json!({
+                "method": "subscribe",
+                "subscription": subscription
+            })
+            .to_string();
+            self.conn.send(msg).await?;
+        }
         Ok(())
     }
-}
 
-// ============================================================================
-// 消息处理
-// ============================================================================
-
-impl Message<Subscribe> for HyperliquidPublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Subscribe,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        // 委托给批量订阅
-        self.handle(SubscribeBatch { kinds: vec![msg.kind] }, ctx)
-            .await
+    /// 发送取消订阅消息
+    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
+        let subscription = self.book.subscription(kind)?;
+        let msg = json!({
+            "method": "unsubscribe",
+            "subscription": subscription
+        })
+        .to_string();
+        self.conn.send(msg).await
     }
-}
 
-impl Message<SubscribeBatch> for HyperliquidPublicWsActor {
-    type Reply = ();
+    /// 解析并处理消息
+    fn handle_message(&self, raw: &str) -> anyhow::Result<()> {
+        let events = parse_public_message(raw, now_ms(), &self.book.subscribed_kinds)
+            .with_context(|| format!("Hyperliquid 公共 WS 解析失败: {raw}"))?;
+        for event in events {
+            if self.book.is_trade_backfill(&event) {
+                continue;
+            }
+            self.market_bus.publish(event);
+        }
+        Ok(())
+    }
 
-    async fn handle(
-        &mut self,
-        msg: SubscribeBatch,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+    async fn handle_cmd(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
+        match cmd {
+            ExchangeCmd::Subscribe(kind) => self.subscribe_batch(vec![kind]).await,
+            ExchangeCmd::SubscribeBatch(kinds) => self.subscribe_batch(kinds).await,
+            ExchangeCmd::Unsubscribe(kind) => self.unsubscribe(kind).await,
+        }
+    }
+
+    async fn subscribe_batch(&mut self, kinds: Vec<SubscriptionKind>) -> anyhow::Result<()> {
         // 1. 过滤有效的 kinds（symbol 存在且未订阅）
         let mut new_stream_kinds = Vec::new();
         let mut new_kinds = Vec::new();
 
-        for kind in msg.kinds {
-            if self.subscribed_kinds.contains(&kind) {
+        for kind in kinds {
+            if self.book.subscribed_kinds.contains(&kind) {
                 continue;
             }
 
-            let stream = match self.stream(&kind) {
+            let stream = match self.book.stream(&kind) {
                 Some(stream) => stream,
                 None => {
                     tracing::warn!(
@@ -257,9 +194,9 @@ impl Message<SubscribeBatch> for HyperliquidPublicWsActor {
                     continue;
                 }
             };
-            if !self.subscribed_streams.contains(&stream) {
+            if !self.book.subscribed_streams.contains(&stream) {
                 new_stream_kinds.push(kind.clone());
-                self.subscribed_streams.insert(stream);
+                self.book.subscribed_streams.insert(stream);
             }
             new_kinds.push(kind);
         }
@@ -271,76 +208,63 @@ impl Message<SubscribeBatch> for HyperliquidPublicWsActor {
                 count = new_stream_kinds.len(),
                 "Batch subscribing to streams"
             );
-
-            if let Err(e) = self.send_subscribe_batch(&new_stream_kinds).await {
-                tracing::error!(error = %e, "Failed to send batch subscribe, killing actor");
-                ctx.actor_ref().kill();
-                return;
-            }
+            self.send_subscribe_batch(&new_stream_kinds)
+                .await
+                .context("Hyperliquid 批量订阅发送失败")?;
         }
 
         // 3. 记录已订阅的 kinds；trades 额外记录订阅时刻以过滤历史回填
         let subscribed_at = now_ms();
         for kind in new_kinds {
             if let SubscriptionKind::Trades { symbol } = &kind {
-                self.trades_subscribed_at
-                    .insert(symbol.clone(), subscribed_at);
+                self.book.trades_subscribed_at.insert(symbol.clone(), subscribed_at);
             }
-            self.subscribed_kinds.insert(kind);
+            self.book.subscribed_kinds.insert(kind);
         }
+        Ok(())
     }
-}
 
-impl Message<Unsubscribe> for HyperliquidPublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Unsubscribe,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        if let SubscriptionKind::Trades { symbol } = &msg.kind {
-            self.trades_subscribed_at.remove(symbol);
+    async fn unsubscribe(&mut self, kind: SubscriptionKind) -> anyhow::Result<()> {
+        if let SubscriptionKind::Trades { symbol } = &kind {
+            self.book.trades_subscribed_at.remove(symbol);
         }
-        if !self.subscribed_kinds.remove(&msg.kind) {
-            return;
+        if !self.book.subscribed_kinds.remove(&kind) {
+            return Ok(());
         }
 
         // 检查是否还有其他 kinds 使用同一个 stream
         // Candle 从不进入 subscribed_kinds（订阅期已跳过），此处若为 None 属路由 bug，记录并跳过
-        let stream = match self.stream(&msg.kind) {
-            Some(stream) => stream,
-            None => {
-                tracing::error!(kind = ?msg.kind, "Candle routed to HyperliquidPublicWsActor unsubscribe (routing bug), skipping");
-                return;
-            }
+        let Some(stream) = self.book.stream(&kind) else {
+            tracing::error!(?kind, "Candle routed to HyperliquidPublicWs unsubscribe (routing bug), skipping");
+            return Ok(());
         };
         let stream_still_needed = self
+            .book
             .subscribed_kinds
             .iter()
-            .any(|k| self.stream(k).as_ref() == Some(&stream));
+            .any(|k| self.book.stream(k).as_ref() == Some(&stream));
 
         if !stream_still_needed {
-            if let Err(e) = self.send_unsubscribe(&msg.kind).await {
-                tracing::error!(error = %e, "Failed to send unsubscribe, killing actor");
-                ctx.actor_ref().kill();
-                return;
-            }
-            self.subscribed_streams.remove(&stream);
+            self.send_unsubscribe(&kind)
+                .await
+                .context("Hyperliquid 取消订阅发送失败")?;
+            self.book.subscribed_streams.remove(&stream);
         }
+        Ok(())
     }
 }
 
-/// WebSocket 入站消息处理
-impl Message<StreamMessage<Result<String, WsError>, (), ()>> for HyperliquidPublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Result<String, WsError>, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        crate::dispatch_ws_stream_message!(self, msg, ctx, "Hyperliquid");
+impl Task for HyperliquidPublicWs {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                cmd = self.inbox.recv() => match cmd {
+                    Some(cmd) => self.handle_cmd(cmd).await?,
+                    None => return Ok(()),
+                },
+                frame = self.conn.recv() => self.handle_message(&frame?)?,
+            }
+        }
     }
 }
 
@@ -523,80 +447,67 @@ mod tests {
         }
     }
 
-    /// 只构造过滤判定所需的字段；其余字段不参与 `is_trade_backfill`
-    fn actor_with_subscription(subscribed: Option<u64>) -> HyperliquidPublicWsActor {
-        HyperliquidPublicWsActor {
-            market_pubsub: unreachable_pubsub(),
-            markets: Arc::new(crate::exchange::hyperliquid::testkit::markets(&["", "xyz"])),
-            ws_tx: None,
-            subscribed_streams: HashSet::new(),
-            subscribed_kinds: HashSet::new(),
-            trades_subscribed_at: match subscribed {
-                Some(ts) => HashMap::from([("BTC".to_string(), ts)]),
-                None => HashMap::new(),
-            },
+    /// 订阅记账（不涉及连接和总线），可选带一条 BTC 的 trades 订阅时刻
+    fn book_with_subscription(subscribed: Option<u64>) -> SubscriptionBook {
+        let mut book = SubscriptionBook::new(Arc::new(crate::exchange::hyperliquid::testkit::markets(&["", "xyz"])));
+        if let Some(ts) = subscribed {
+            book.trades_subscribed_at.insert("BTC".to_string(), ts);
         }
-    }
-
-    /// 过滤判定不触碰 pubsub，故这里只需要一个类型正确的引用
-    fn unreachable_pubsub() -> ActorRef<MarketPubSub> {
-        use kameo::actor::Spawn;
-        use kameo_actors::DeliveryStrategy;
-        MarketPubSub::spawn(MarketPubSub::new(DeliveryStrategy::BestEffort))
+        book
     }
 
     #[tokio::test]
     async fn pre_subscription_trade_is_dropped_as_backfill() {
-        let actor = actor_with_subscription(Some(SUBSCRIBED_AT));
-        assert!(actor.is_trade_backfill(&trade_event(SUBSCRIBED_AT - 1)));
+        let book = book_with_subscription(Some(SUBSCRIBED_AT));
+        assert!(book.is_trade_backfill(&trade_event(SUBSCRIBED_AT - 1)));
     }
 
     #[tokio::test]
     async fn trade_at_or_after_subscription_is_kept() {
-        let actor = actor_with_subscription(Some(SUBSCRIBED_AT));
-        assert!(!actor.is_trade_backfill(&trade_event(SUBSCRIBED_AT)));
-        assert!(!actor.is_trade_backfill(&trade_event(SUBSCRIBED_AT + 1)));
+        let book = book_with_subscription(Some(SUBSCRIBED_AT));
+        assert!(!book.is_trade_backfill(&trade_event(SUBSCRIBED_AT)));
+        assert!(!book.is_trade_backfill(&trade_event(SUBSCRIBED_AT + 1)));
     }
 
     /// 无订阅记录时不判为回填 —— 宁可放过也不误杀实时成交
     #[tokio::test]
     async fn trade_without_subscription_record_is_kept() {
-        let actor = actor_with_subscription(None);
-        assert!(!actor.is_trade_backfill(&trade_event(SUBSCRIBED_AT - 10_000)));
+        let book = book_with_subscription(None);
+        assert!(!book.is_trade_backfill(&trade_event(SUBSCRIBED_AT - 10_000)));
     }
 
     #[tokio::test]
     async fn non_trade_event_is_never_backfill() {
-        let actor = actor_with_subscription(Some(SUBSCRIBED_AT));
+        let book = book_with_subscription(Some(SUBSCRIBED_AT));
         let clock = MarketEvent {
             exchange_ts: 0,
             local_ts: 0,
             data: MarketData::Clock,
         };
-        assert!(!actor.is_trade_backfill(&clock));
+        assert!(!book.is_trade_backfill(&clock));
     }
 
     #[tokio::test]
     async fn trades_kind_maps_to_trades_subscription() {
-        let actor = actor_with_subscription(None);
+        let book = book_with_subscription(None);
         let kind = SubscriptionKind::Trades { symbol: "BTC".to_string() };
-        let sub = actor.subscription(&kind).expect("must map");
+        let sub = book.subscription(&kind).expect("must map");
         assert_eq!(sub["type"], "trades");
         assert_eq!(sub["coin"], "BTC");
     }
 
-    /// 同一个 actor 订阅主站与 xyz：coin 各带各的前缀，目录外的 symbol 不订阅
+    /// 同一条公共 WS 订阅主站与 xyz：coin 各带各的前缀，目录外的 symbol 不订阅
     #[tokio::test]
-    async fn one_actor_subscribes_across_dexes() {
-        let actor = actor_with_subscription(None);
+    async fn one_ws_subscribes_across_dexes() {
+        let book = book_with_subscription(None);
         let bbo = |s: &str| SubscriptionKind::BBO { symbol: s.to_string() };
-        assert_eq!(actor.subscription(&bbo("TSLA")).unwrap()["coin"], "xyz:TSLA");
-        assert_eq!(actor.stream(&bbo("BTC")).as_deref(), Some("bbo:BTC"));
+        assert_eq!(book.subscription(&bbo("TSLA")).unwrap()["coin"], "xyz:TSLA");
+        assert_eq!(book.stream(&bbo("BTC")).as_deref(), Some("bbo:BTC"));
         assert_eq!(
-            actor.stream(&SubscriptionKind::FundingRate { symbol: "TSLA".into() }).as_deref(),
+            book.stream(&SubscriptionKind::FundingRate { symbol: "TSLA".into() }).as_deref(),
             Some("activeAssetCtx:xyz:TSLA")
         );
-        assert!(actor.stream(&bbo("AAPL")).is_none());
-        assert!(actor.subscription(&bbo("AAPL")).is_err());
+        assert!(book.stream(&bbo("AAPL")).is_none());
+        assert!(book.subscription(&bbo("AAPL")).is_err());
     }
 }

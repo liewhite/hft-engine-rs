@@ -1,6 +1,6 @@
-//! HyperliquidFundingFeePollingActor - 定时拉取 Hyperliquid 资费历史
+//! HyperliquidFundingFeePoller - 定时拉取 Hyperliquid 资费历史
 //!
-//! 与 `BinanceFundingFeePollingActor` 对位，行为刻意保持一致：
+//! 与 `BinanceFundingFeePoller` 对位，行为刻意保持一致：
 //! - 每隔 `interval_ms` 拉一次，窗口固定为最近 24h
 //! - 不做去重，下游凭 `FundingFee::tran_id` 自行去重（重叠窗口是有意的：
 //!   宁可重复推送靠下游去重，也不要因为窗口对不齐而漏掉一次结算）
@@ -10,37 +10,39 @@
 //! （`hash` 恒为全零），但至少能由 `(time, coin)` 稳定派生，且拉取窗口可控。
 
 use crate::domain::now_ms;
-use crate::messaging::AccountPubSub;
 use crate::exchange::hyperliquid::HyperliquidClient;
-use crate::messaging::{SymbolAccountData, AccountData, AccountEvent};
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
-use kameo_actors::pubsub::Publish;
+use crate::messaging::{AccountBus, AccountData, AccountEvent, SymbolAccountData};
+use crate::tasks::{ChildHandle, Group, GroupClosed, Periodic};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
-use tokio_stream::wrappers::IntervalStream;
 
 /// 资费拉取窗口（24 小时）
 const FUNDING_FEE_LOOKBACK_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// 初始化参数
-pub struct HyperliquidFundingFeePollingActorArgs {
-    pub client: Arc<HyperliquidClient>,
-    pub account_pubsub: ActorRef<AccountPubSub>,
-    /// 轮询间隔 (毫秒)
-    pub interval_ms: u64,
-}
-
-pub struct HyperliquidFundingFeePollingActor {
+pub(super) struct HyperliquidFundingFeePoller {
     client: Arc<HyperliquidClient>,
-    account_pubsub: ActorRef<AccountPubSub>,
+    account_bus: AccountBus,
 }
 
-impl HyperliquidFundingFeePollingActor {
-    async fn poll(&self) {
+impl HyperliquidFundingFeePoller {
+    /// 在 `group` 下起轮询，每 `interval_ms` 毫秒一次（首次立即）
+    pub(super) fn spawn(
+        group: &Group,
+        client: Arc<HyperliquidClient>,
+        account_bus: AccountBus,
+        interval_ms: u64,
+    ) -> Result<ChildHandle, GroupClosed> {
+        tracing::info!(exchange = "Hyperliquid", interval_ms, "HyperliquidFundingFeePoller started");
+        group.spawn_periodic(
+            "HyperliquidFundingFeePoller",
+            Duration::from_millis(interval_ms),
+            Self { client, account_bus },
+        )
+    }
+}
+
+impl Periodic for HyperliquidFundingFeePoller {
+    async fn tick(&mut self) -> anyhow::Result<()> {
         let now = now_ms();
         let start = now.saturating_sub(FUNDING_FEE_LOOKBACK_MS);
 
@@ -49,20 +51,13 @@ impl HyperliquidFundingFeePollingActor {
                 let local_ts = now_ms();
                 for fee in fees {
                     let exchange_ts = fee.timestamp;
-                    if let Err(e) = self
-                        .account_pubsub
-                        .tell(Publish(AccountEvent {
-                            // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
-                            account: crate::domain::AccountId::Live,
-                            exchange_ts,
-                            local_ts,
-                            data: AccountData::Symbol(SymbolAccountData::FundingFee(fee)),
-                        }))
-                        .send()
-                        .await
-                    {
-                        tracing::error!(error = %e, "Failed to publish FundingFee to AccountPubSub");
-                    }
+                    self.account_bus.publish(AccountEvent {
+                        // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
+                        account: crate::domain::AccountId::Live,
+                        exchange_ts,
+                        local_ts,
+                        data: AccountData::Symbol(SymbolAccountData::FundingFee(fee)),
+                    });
                 }
             }
             // 不接 StalenessGuard（与账户净值/希腊值轮询不同）：资费是**流水累加**而非
@@ -77,61 +72,6 @@ impl HyperliquidFundingFeePollingActor {
                 );
             }
         }
-    }
-}
-
-impl Actor for HyperliquidFundingFeePollingActor {
-    type Args = HyperliquidFundingFeePollingActorArgs;
-    type Error = Infallible;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let interval = Duration::from_millis(args.interval_ms);
-        let interval_stream = IntervalStream::new(tokio::time::interval(interval));
-        actor_ref.attach_stream(interval_stream, (), ());
-
-        tracing::info!(
-            exchange = "Hyperliquid",
-            interval_ms = interval.as_millis() as u64,
-            "HyperliquidFundingFeePollingActor started"
-        );
-
-        Ok(Self {
-            client: args.client,
-            account_pubsub: args.account_pubsub,
-        })
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        tracing::info!("HyperliquidFundingFeePollingActor stopped");
         Ok(())
-    }
-}
-
-impl Message<StreamMessage<Instant, (), ()>> for HyperliquidFundingFeePollingActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Instant, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        match msg {
-            StreamMessage::Next(_) => {
-                self.poll().await;
-            }
-            StreamMessage::Started(_) => {
-                tracing::debug!("Hyperliquid FundingFee polling stream started");
-            }
-            StreamMessage::Finished(_) => {
-                tracing::error!(
-                    "Hyperliquid FundingFee polling stream unexpectedly finished, killing actor"
-                );
-                ctx.actor_ref().kill();
-            }
-        }
     }
 }

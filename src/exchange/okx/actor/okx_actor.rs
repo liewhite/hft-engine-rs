@@ -1,31 +1,31 @@
-//! OkxActor - OKX 交易所的父 Actor
+//! OkxNode - OKX 交易所节点
 //!
 //! 职责:
-//! - 管理 PublicWsActor 和 PrivateWsActor 子 actor
-//! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
-//! - WsActors 直接解析消息并发布到对应总线
+//! - 管理公共/私有/业务 WS 和各轮询子任务
+//! - 把订阅/退订命令按 kind 路由：Candle 到 Business WS，其余到公共 WS
+//! - WS 组件直接解析消息并发布到对应总线
 //!
-//! 架构:
-//! OkxActor (父)
-//! ├── OkxPublicWsActor [spawn_link]
-//! ├── OkxPrivateWsActor [spawn_link] (optional, 需要凭证)
-//! └── EquityPollingActor [spawn_link] (optional, 需要凭证；净值 / 持仓总价值)
+//! 树:
+//! OkxNode
+//! ├── OkxPublicWs
+//! ├── OkxBusinessWs（K线）
+//! ├── OkxPrivateWs（需要凭证）
+//! ├── EquityPoller（需要凭证；净值 / 持仓总价值）
+//! ├── OkxGreeksPoller（需要凭证）
+//! └── CryptoStatus
 
-use crate::actor_lifecycle::ChildGroup;
-use super::business_ws::{OkxBusinessWsActor, OkxBusinessWsActorArgs};
-use super::greeks_polling::{OkxGreeksPollingActor, OkxGreeksPollingActorArgs};
-use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
-use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
-use crate::domain::{ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::equity_polling::{EquityPollingActor, EquityPollingActorArgs};
-use crate::exchange::{CryptoStatusActor, CryptoStatusActorArgs};
-use crate::messaging::{AccountPubSub, MarketPubSub};
-use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
+use super::business_ws::OkxBusinessWs;
+use super::greeks_polling::OkxGreeksPoller;
+use super::private_ws::OkxPrivateWs;
+use super::public_ws::OkxPublicWs;
+use crate::domain::{Symbol, SymbolMeta};
+use crate::exchange::client::{ExchangeCmd, ExchangeHandle, SubscriptionKind};
+use crate::exchange::equity_polling::EquityPoller;
 use crate::exchange::okx::{OkxClient, OkxCredentials};
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::ActorStopReason;
-use kameo::message::{Context, Message};
-use kameo::Actor;
+use crate::exchange::CryptoStatus;
+use crate::messaging::{AccountBus, MarketBus};
+use crate::tasks::{Addr, Group, Inbox, Scope, Task};
+use anyhow::Context as _;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,237 +38,128 @@ const EQUITY_POLL_INTERVAL_MS: u64 = 2_000;
 /// Greeks REST 轮询间隔 (毫秒) — 每秒 1 次，官方限速 10/2s
 const GREEKS_POLLING_INTERVAL_MS: u64 = 1000;
 
-/// OkxActor 初始化参数
-pub struct OkxActorArgs {
+/// OkxNode 构造参数
+pub struct OkxArgs {
     /// 凭证（可选）
     pub credentials: Option<OkxCredentials>,
-    /// REST client (用于 Greeks 轮询)
+    /// REST client (用于净值 / Greeks 轮询)
     pub client: Option<Arc<OkxClient>>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 公共行情总线（public WS / 状态广播用）
-    pub market_pubsub: ActorRef<MarketPubSub>,
+    pub market_bus: MarketBus,
     /// 账户私有事件总线（private WS / 账户轮询用）
-    pub account_pubsub: ActorRef<AccountPubSub>,
+    pub account_bus: AccountBus,
     /// 计价币种 (e.g., "USDT")
     pub quote: String,
 }
 
-/// OkxActor - 父 Actor
-pub struct OkxActor {
-    /// Public WebSocket Actor
-    public_ws: ActorRef<OkxPublicWsActor>,
-    /// Business WebSocket Actor (K线)
-    business_ws: ActorRef<OkxBusinessWsActor>,
-    /// 全部子 actor：谁 spawn 的谁负责等（见 [`crate::actor_lifecycle`]）
-    children: ChildGroup,
+/// OKX 交易所节点
+pub struct OkxNode {
+    inbox: Inbox<ExchangeCmd>,
+    /// 公共 WebSocket（除 K 线外的全部行情）
+    public_ws: Addr<ExchangeCmd>,
+    /// Business WebSocket（K 线）
+    business_ws: Addr<ExchangeCmd>,
 }
 
-impl Actor for OkxActor {
-    type Args = OkxActorArgs;
-    type Error = ExchangeError;
+/// 按订阅 kind 选择落到哪条 WS：K 线只在 business 线上有
+fn is_business(kind: &SubscriptionKind) -> bool {
+    matches!(kind, SubscriptionKind::Candle { .. })
+}
 
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+impl OkxNode {
+    /// 在 `group` 下起 OKX 节点，等全部 WS 连好（私有的含登录与订阅确认），返回句柄。
+    /// 任一失败 → 返回 Err 并上冒（启动期受控退出，不重试）。
+    pub async fn spawn(group: &Group, args: OkxArgs) -> anyhow::Result<ExchangeHandle> {
+        let (_, addr) = group
+            .spawn_addressed("OkxNode", move |scope: Scope, inbox| async move {
+                let OkxArgs { credentials, client, symbol_metas, market_bus, account_bus, quote } = args;
+                let children = scope.group("children");
 
-        // 1. 并发 spawn 三个 WS actor（spawn 本身瞬间返回）
-        let mut children = ChildGroup::default();
-        let public_ws = children.spawn::<OkxPublicWsActor, _>(
-            &actor_ref,
-            "OkxPublicWsActor",
-            OkxPublicWsActorArgs {
-                market_pubsub: args.market_pubsub.clone(),
-                symbol_metas: args.symbol_metas.clone(),
-                quote: args.quote.clone(),
-            },
-        )
-        .await;
-        let business_ws = children.spawn::<OkxBusinessWsActor, _>(
-            &actor_ref,
-            "OkxBusinessWsActor",
-            OkxBusinessWsActorArgs {
-                market_pubsub: args.market_pubsub.clone(),
-                symbol_metas: args.symbol_metas.clone(),
-                quote: args.quote.clone(),
-            },
-        )
-        .await;
-        let private_ws_opt = if let Some(credentials) = args.credentials {
-            Some(
-                children.spawn::<OkxPrivateWsActor, _>(
-                    &actor_ref,
-                    "OkxPrivateWsActor",
-                    OkxPrivateWsActorArgs {
-                        credentials,
-                        account_pubsub: args.account_pubsub.clone(),
-                        symbol_metas: args.symbol_metas,
-                        quote: args.quote.clone(),
-                    },
-                )
-                .await,
-            )
-        } else {
-            None
-        };
-        let has_private_ws = private_ws_opt.is_some();
+                // 1. 三条 WS 并发连接；任一失败 → 向上传播（启动期受控退出，不重试）
+                let has_private_ws = credentials.is_some();
+                let private = async {
+                    match credentials {
+                        Some(credentials) => OkxPrivateWs::spawn(
+                            &children,
+                            credentials,
+                            account_bus.clone(),
+                            symbol_metas.clone(),
+                            quote.clone(),
+                        )
+                        .await
+                        .map(|_| ()),
+                        None => Ok(()),
+                    }
+                };
+                let (public_ws, business_ws, ()) = tokio::try_join!(
+                    OkxPublicWs::spawn(&children, market_bus.clone(), symbol_metas.clone(), quote.clone()),
+                    OkxBusinessWs::spawn(&children, market_bus.clone(), symbol_metas.clone(), quote.clone()),
+                    private,
+                )?;
+                tracing::info!(exchange = "OKX", has_private_ws, "WS ready");
 
-        // 2. 并发等三个 WS 全部完成；任一失败 → 向上传播（启动期受控退出，不重试）
-        let private_wait = async {
-            if let Some(p) = &private_ws_opt {
-                p.wait_for_startup_result().await
-            } else {
-                Ok(())
-            }
-        };
-        let (public_r, business_r, private_r) = tokio::join!(
-            public_ws.wait_for_startup_result(),
-            business_ws.wait_for_startup_result(),
-            private_wait,
-        );
-        public_r.map_err(|e| ExchangeError::Other(format!("OkxPublicWsActor failed to start: {e}")))?;
-        business_r
-            .map_err(|e| ExchangeError::Other(format!("OkxBusinessWsActor failed to start: {e}")))?;
-        private_r
-            .map_err(|e| ExchangeError::Other(format!("OkxPrivateWsActor failed to start: {e}")))?;
-        tracing::info!(exchange = "OKX", has_private_ws, "WS actors ready");
+                // 2. Greeks 轮询要签名，故按**凭证**门控：装配处只在有凭证时才给 client
+                // （见 assembly::setup_okx），所以这里 `Some` 即"可轮询"，不必再判一次 bool。
+                // 无凭证时不起它 —— 否则 non-auth 模式会每秒失败刷日志。
+                if let Some(client) = client {
+                    // 净值与持仓总价值走 REST 轮询：私有 WS 推送的 notionalUsd 在单币种保证金模式下是空串
+                    EquityPoller::spawn(&children, client.clone(), account_bus.clone(), EQUITY_POLL_INTERVAL_MS)?;
+                    OkxGreeksPoller::spawn(&children, client, account_bus.clone(), GREEKS_POLLING_INTERVAL_MS)?;
+                }
+                CryptoStatus::spawn(
+                    &children,
+                    crate::domain::Exchange::OKX,
+                    market_bus.clone(),
+                    STATUS_BROADCAST_INTERVAL_MS,
+                )?;
 
-        // 3. polling actor 的 on_start 仅 attach_stream，省略 wait
-        //
-        // Greeks 轮询要签名，故按**凭证**门控：装配处只在有凭证时才给 client
-        // （见 assembly::setup_okx），所以这里 `Some` 即"可轮询"，不必再判一次 bool。
-        // 无凭证时不起它 —— 否则 non-auth 模式会每秒失败刷日志。
-        if let Some(client) = args.client {
-            // 净值与持仓总价值走 REST 轮询：私有 WS 推送的 notionalUsd 在单币种保证金模式下是空串
-            children.spawn::<EquityPollingActor, _>(
-                &actor_ref,
-                "EquityPollingActor",
-                EquityPollingActorArgs {
-                    client: client.clone(),
-                    account_pubsub: args.account_pubsub.clone(),
-                    interval_ms: EQUITY_POLL_INTERVAL_MS,
-                },
-            )
-            .await;
-            children.spawn::<OkxGreeksPollingActor, _>(
-                &actor_ref,
-                "OkxGreeksPollingActor",
-                OkxGreeksPollingActorArgs {
-                    client,
-                    account_pubsub: args.account_pubsub.clone(),
-                    interval_ms: GREEKS_POLLING_INTERVAL_MS,
-                },
-            )
-            .await;
-        }
-        children.spawn::<CryptoStatusActor, _>(
-            &actor_ref,
-            "CryptoStatusActor",
-            CryptoStatusActorArgs {
-                exchange: crate::domain::Exchange::OKX,
-                market_pubsub: args.market_pubsub.clone(),
-                interval_ms: STATUS_BROADCAST_INTERVAL_MS,
-            },
-        )
-        .await;
-
-        tracing::info!(
-            exchange = "OKX",
-            has_private_ws,
-            "OkxActor started"
-        );
-
-        Ok(Self { public_ws, business_ws, children })
+                tracing::info!(exchange = "OKX", has_private_ws, "OkxNode started");
+                Ok(Self { inbox, public_ws, business_ws })
+            })
+            .await?;
+        Ok(ExchangeHandle::new(addr))
     }
 
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        // 谁 spawn 的谁负责等（见 actor_lifecycle 模块文档）
-        self.children.shutdown().await;
-        tracing::info!("OkxActor stopped");
+    fn ws_for(&self, kind: &SubscriptionKind) -> &Addr<ExchangeCmd> {
+        if is_business(kind) {
+            &self.business_ws
+        } else {
+            &self.public_ws
+        }
+    }
+
+    /// 按目标 WS 路由命令；批量订阅按目标拆分
+    fn route(&self, cmd: ExchangeCmd) -> anyhow::Result<()> {
+        match cmd {
+            ExchangeCmd::Subscribe(ref kind) | ExchangeCmd::Unsubscribe(ref kind) => {
+                self.ws_for(kind)
+                    .send(cmd)
+                    .context("转发订阅命令失败：OKX WS 已停止收件")?;
+            }
+            ExchangeCmd::SubscribeBatch(kinds) => {
+                let (business_kinds, public_kinds): (Vec<_>, Vec<_>) =
+                    kinds.into_iter().partition(is_business);
+                for (target, kinds) in [(&self.public_ws, public_kinds), (&self.business_ws, business_kinds)] {
+                    if !kinds.is_empty() {
+                        target
+                            .send(ExchangeCmd::SubscribeBatch(kinds))
+                            .context("转发批量订阅失败：OKX WS 已停止收件")?;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
 
-// ============================================================================
-// 消息处理
-// ============================================================================
-
-impl Message<Subscribe> for OkxActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Subscribe,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        match &msg.kind {
-            SubscriptionKind::Candle { .. } => {
-                if let Err(e) = self.business_ws.tell(msg).send().await {
-                    tracing::error!(error = %e, "Failed to forward message to OkxBusinessWsActor");
-                }
-            }
-            _ => {
-                if let Err(e) = self.public_ws.tell(msg).send().await {
-                    tracing::error!(error = %e, "Failed to forward message to OkxPublicWsActor");
-                }
-            }
+impl Task for OkxNode {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        // 子 WS 只在出错时提前停止收件（出错会自己上冒），转发失败就整支停
+        while let Some(cmd) = self.inbox.recv().await {
+            self.route(cmd)?;
         }
-    }
-}
-
-impl Message<SubscribeBatch> for OkxActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: SubscribeBatch,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        // 按目标 actor 拆分
-        let mut public_kinds = Vec::new();
-        let mut business_kinds = Vec::new();
-
-        for kind in msg.kinds {
-            match &kind {
-                SubscriptionKind::Candle { .. } => business_kinds.push(kind),
-                _ => public_kinds.push(kind),
-            }
-        }
-
-        if !public_kinds.is_empty() {
-            if let Err(e) = self.public_ws.tell(SubscribeBatch { kinds: public_kinds }).send().await {
-                tracing::error!(error = %e, "Failed to forward message to OkxPublicWsActor");
-            }
-        }
-        if !business_kinds.is_empty() {
-            if let Err(e) = self.business_ws.tell(SubscribeBatch { kinds: business_kinds }).send().await {
-                tracing::error!(error = %e, "Failed to forward message to OkxBusinessWsActor");
-            }
-        }
-    }
-}
-
-impl Message<Unsubscribe> for OkxActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Unsubscribe,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        match &msg.kind {
-            SubscriptionKind::Candle { .. } => {
-                if let Err(e) = self.business_ws.tell(msg).send().await {
-                    tracing::error!(error = %e, "Failed to forward message to OkxBusinessWsActor");
-                }
-            }
-            _ => {
-                if let Err(e) = self.public_ws.tell(msg).send().await {
-                    tracing::error!(error = %e, "Failed to forward message to OkxPublicWsActor");
-                }
-            }
-        }
+        Ok(())
     }
 }

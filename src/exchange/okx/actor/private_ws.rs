@@ -1,228 +1,196 @@
-//! OkxPrivateWsActor - 管理 OKX 私有 WebSocket 连接
+//! OkxPrivateWs - 管理 OKX 私有 WebSocket 连接
 //!
 //! 职责:
 //! - 建立私有 WebSocket 连接并完成登录
-//! - 自动订阅私有频道 (positions, account, orders)
-//! - 直接解析消息并发布到对应总线
+//! - 自动订阅私有频道 (account, orders)
+//! - 直接解析消息并发布到账户总线
 
 use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::messaging::AccountPubSub;
 use crate::exchange::client::WsError;
 use crate::exchange::okx::codec::{resolve_meta, AccountData as OkxAccountPush, OrderPushData, WsEvent, WsPush};
 use crate::exchange::okx::{OkxCredentials, WS_PRIVATE_URL};
-use crate::exchange::ws_loop;
-use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, AccountEvent};
+use crate::exchange::ws_loop::{self, WsConn};
+use crate::messaging::{AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData};
+use crate::tasks::{ChildHandle, Group, Scope, Task};
+use anyhow::Context as _;
 use futures_util::{SinkExt, StreamExt};
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::ActorStopReason;
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
-use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// 登录响应等待超时 (秒)。超时 → 启动失败受控退出，避免 on_start 永久阻塞。
+/// 登录响应等待超时 (秒)。超时 → 启动失败受控退出，避免构造永久阻塞。
 const LOGIN_TIMEOUT_SECS: u64 = 10;
 
 /// 私有流必须全部确认的频道：account（余额）、orders（订单与成交）
 const REQUIRED_CHANNELS: [&str; 2] = ["account", "orders"];
 
-/// OkxPrivateWsActor 初始化参数
-pub struct OkxPrivateWsActorArgs {
-    /// 凭证
-    pub credentials: OkxCredentials,
-    /// 账户私有事件总线（发布事件，标 Live）
-    pub account_pubsub: ActorRef<AccountPubSub>,
-    /// Symbol 元数据（用于仓位转换）
-    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 计价币：只有该计价币的永续映射到内部 symbol（见 `okx::symbol`）
-    pub quote: String,
-}
-
-/// OkxPrivateWsActor - 私有 WebSocket Actor
+/// 私有 WebSocket 组件（没有收件箱：只读不收命令）
 ///
-/// `on_start` 返回前已登录、且 [`REQUIRED_CHANNELS`] 都已确认订阅生效。
-pub struct OkxPrivateWsActor {
+/// 构造完成（`spawn` 返回）前已登录、且 [`REQUIRED_CHANNELS`] 都已确认订阅生效。
+pub(super) struct OkxPrivateWs {
     /// 账户私有事件总线（发布事件，标 Live）
-    account_pubsub: ActorRef<AccountPubSub>,
-    /// Symbol 元数据
+    account_bus: AccountBus,
+    /// Symbol 元数据（用于仓位转换）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币：只有该计价币的永续映射到内部 symbol（见 `okx::symbol`）
     quote: String,
-    /// 发送消息到 ws_loop 的 channel
-    ws_tx: Option<mpsc::Sender<String>>,
+    conn: WsConn,
 }
 
-impl OkxPrivateWsActor {
-    /// 解析并处理消息
-    async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
+impl OkxPrivateWs {
+    /// 在 `group` 下起私有 WS，等登录成功、私有频道全部确认
+    pub(super) async fn spawn(
+        group: &Group,
+        credentials: OkxCredentials,
+        account_bus: AccountBus,
+        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+        quote: String,
+    ) -> anyhow::Result<ChildHandle> {
+        group
+            .spawn("OkxPrivateWs", move |scope: Scope| async move {
+                // 1. 连接私有 WebSocket（失败向上传播 → 启动期受控退出）
+                let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PRIVATE_URL)
+                    .await
+                    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
+                let (mut write, mut read) = ws_stream.split();
+
+                // 2. 登录（带超时；任何失败向上传播 → 启动期受控退出，不重试）
+                login(&credentials, &mut write, &mut read).await?;
+
+                // 3. 订阅私有频道
+                //
+                // **不订阅 `positions`**：持仓的维护模型是「启动期 REST 基线 + 之后全程 Fill 累加」，
+                // 持仓推送既不是基线（基线只能来自 Manager）也不参与增量（增量走 `orders` 频道
+                // 产出的 Fill）。要校验本地持仓是否漂移，走 PositionLedger 那条独立轮询通道
+                // （见 crate::engine 的 PositionLedger），不在这里塞快照。
+                let subscribe_msg = json!({
+                    "op": "subscribe",
+                    "args": [
+                        {"channel": REQUIRED_CHANNELS[0]},
+                        {"channel": REQUIRED_CHANNELS[1], "instType": "SWAP"}
+                    ]
+                })
+                .to_string();
+                write
+                    .send(WsMessage::Text(subscribe_msg))
+                    .await
+                    .map_err(|e| ExchangeError::WebSocketError(format!("OKX send private subscribe: {e}")))?;
+
+                // 4. 起读循环（心跳、回 Pong、断线判定都归它）
+                let mut conn = WsConn::spawn(&scope.group("conn"), "OkxPrivateWsLoop", read, write, ws_loop::WsKeepalive::okx())?;
+
+                // 5. 等两个频道都确认才算启动完成；期间收到的帧之后由 recv 先交出
+                conn.await_subscriptions(Exchange::OKX, &REQUIRED_CHANNELS, subscription_confirmed).await?;
+
+                tracing::info!("OkxPrivateWs started");
+                Ok(Self { account_bus, symbol_metas, quote, conn })
+            })
+            .await
+    }
+
+    /// 解析并发布一帧
+    fn handle_message(&self, raw: &str) -> anyhow::Result<()> {
         tracing::debug!(raw, "OKX private message received");
-        let local_ts = now_ms();
-        let events = parse_private_message(raw, local_ts, &self.quote, &self.symbol_metas)?;
+        let events = parse_private_message(raw, now_ms(), &self.quote, &self.symbol_metas)
+            .with_context(|| format!("OKX 私有 WS 解析失败: {raw}"))?;
         tracing::debug!(count = events.len(), "OKX private events parsed");
         for event in events {
-            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to AccountPubSub");
-            }
+            self.account_bus.publish(event);
         }
         Ok(())
     }
 }
 
-impl Actor for OkxPrivateWsActor {
-    type Args = OkxPrivateWsActorArgs;
-    type Error = ExchangeError;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 1. 连接私有 WebSocket（失败向上传播 → 启动期受控退出）
-        let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PRIVATE_URL)
-            .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // 2. 发送 login 消息
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-        let sign = args.credentials.sign_ws_login(&timestamp);
-
-        let login_msg = json!({
-            "op": "login",
-            "args": [{
-                "apiKey": args.credentials.api_key,
-                "passphrase": args.credentials.passphrase,
-                "timestamp": timestamp,
-                "sign": sign
-            }]
-        })
-        .to_string();
-
-        write
-            .send(WsMessage::Text(login_msg))
-            .await
-            .map_err(|e| ExchangeError::WebSocketError(format!("OKX send login: {e}")))?;
-
-        // 3. 等待 login 响应（带超时；任何失败向上传播 → 启动期受控退出，不重试）
-        let login_wait = async {
-            loop {
-                match read.next().await {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
-                            if event.event == "login" {
-                                if event.code.as_deref() == Some("0") {
-                                    tracing::info!("OKX private login success");
-                                    return Ok(());
-                                } else {
-                                    return Err(ExchangeError::AuthenticationFailed(Exchange::OKX));
-                                }
-                            }
-                        }
+impl Task for OkxPrivateWs {
+    async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                _ = scope.stopping() => {
+                    // 已经收到的回报处理完再走（可能有成交）
+                    while let Some(raw) = self.conn.try_recv() {
+                        self.handle_message(&raw)?;
                     }
-                    Some(Ok(WsMessage::Ping(data))) => {
-                        write.send(WsMessage::Pong(data)).await.map_err(|e| {
-                            ExchangeError::WebSocketError(format!("OKX pong during login: {e}"))
-                        })?;
-                    }
-                    Some(Err(e)) => {
-                        return Err(ExchangeError::WebSocketError(format!(
-                            "OKX WS error during login: {e}"
-                        )));
-                    }
-                    None => {
-                        return Err(ExchangeError::ConnectionFailed(
-                            Exchange::OKX,
-                            "WS closed during login".to_string(),
-                        ));
-                    }
-                    _ => {}
+                    return Ok(());
                 }
+                frame = self.conn.recv() => self.handle_message(&frame?)?,
             }
-        };
-        tokio::time::timeout(Duration::from_secs(LOGIN_TIMEOUT_SECS), login_wait)
-            .await
-            .map_err(|_| {
-                ExchangeError::Timeout(format!(
-                    "OKX private login timed out after {LOGIN_TIMEOUT_SECS}s"
-                ))
-            })??;
-
-        // 4. 订阅私有频道
-        //
-        // **不订阅 `positions`**：持仓的维护模型是「启动期 REST 基线 + 之后全程 Fill 累加」，
-        // 持仓推送既不是基线（基线只能来自 ManagerActor）也不参与增量（增量走 `orders` 频道
-        // 产出的 Fill）。要校验本地持仓是否漂移，走 PositionLedgerActor 那条独立轮询通道
-        // （见 crate::engine::PositionLedgerActor），不在这里塞快照。
-        let subscribe_msg = json!({
-            "op": "subscribe",
-            "args": [
-                {"channel": REQUIRED_CHANNELS[0]},
-                {"channel": REQUIRED_CHANNELS[1], "instType": "SWAP"}
-            ]
-        })
-        .to_string();
-
-        write
-            .send(WsMessage::Text(subscribe_msg))
-            .await
-            .map_err(|e| ExchangeError::WebSocketError(format!("OKX send private subscribe: {e}")))?;
-
-        // 5. 起 ws_loop（心跳、回 Pong、断线判定都归它）
-        let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
-        tokio::spawn(ws_loop::run_ws_loop(
-            read,
-            write,
-            outgoing_rx,
-            incoming_tx,
-            ws_loop::WsKeepalive::okx(),
-        ));
-
-        // 6. 等两个频道都确认才算启动完成；期间收到的帧排在后续数据之前交给本 actor
-        let incoming = ws_loop::await_subscriptions(Exchange::OKX, incoming_rx, &REQUIRED_CHANNELS, subscription_confirmed).await?;
-        actor_ref.attach_stream(incoming, (), ());
-
-        tracing::info!("OkxPrivateWsActor started");
-
-        Ok(Self {
-            account_pubsub: args.account_pubsub,
-            symbol_metas: args.symbol_metas,
-            quote: args.quote,
-            ws_tx: Some(outgoing_tx),
-        })
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        self.ws_tx.take();
-        tracing::info!("OkxPrivateWsActor stopped");
-        Ok(())
+        }
     }
 }
 
-// ============================================================================
-// 消息处理
-// ============================================================================
+/// 发 login 并等登录响应（带超时）。读循环尚未起，期间服务端 Ping 由这里回 Pong。
+async fn login(
+    credentials: &OkxCredentials,
+    write: &mut (impl SinkExt<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    read: &mut (impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> Result<(), ExchangeError> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| ExchangeError::Other(format!("系统时钟早于 UNIX 纪元: {e}")))?
+        .as_secs()
+        .to_string();
+    let sign = credentials.sign_ws_login(&timestamp);
 
-/// WebSocket 入站消息处理
-impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPrivateWsActor {
-    type Reply = ();
+    let login_msg = json!({
+        "op": "login",
+        "args": [{
+            "apiKey": credentials.api_key,
+            "passphrase": credentials.passphrase,
+            "timestamp": timestamp,
+            "sign": sign
+        }]
+    })
+    .to_string();
 
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Result<String, WsError>, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        crate::dispatch_ws_stream_message!(self, msg, ctx, "OKX");
-    }
+    write
+        .send(WsMessage::Text(login_msg))
+        .await
+        .map_err(|e| ExchangeError::WebSocketError(format!("OKX send login: {e}")))?;
+
+    let login_wait = async {
+        loop {
+            match read.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
+                        if event.event == "login" {
+                            if event.code.as_deref() == Some("0") {
+                                tracing::info!("OKX private login success");
+                                return Ok(());
+                            } else {
+                                return Err(ExchangeError::AuthenticationFailed(Exchange::OKX));
+                            }
+                        }
+                    }
+                }
+                Some(Ok(WsMessage::Ping(data))) => {
+                    write.send(WsMessage::Pong(data)).await.map_err(|e| {
+                        ExchangeError::WebSocketError(format!("OKX pong during login: {e}"))
+                    })?;
+                }
+                Some(Err(e)) => {
+                    return Err(ExchangeError::WebSocketError(format!(
+                        "OKX WS error during login: {e}"
+                    )));
+                }
+                None => {
+                    return Err(ExchangeError::ConnectionFailed(
+                        Exchange::OKX,
+                        "WS closed during login".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(LOGIN_TIMEOUT_SECS), login_wait)
+        .await
+        .map_err(|_| {
+            ExchangeError::Timeout(format!(
+                "OKX private login timed out after {LOGIN_TIMEOUT_SECS}s"
+            ))
+        })?
 }
 
 // ============================================================================
@@ -235,7 +203,7 @@ fn server_error(value: &serde_json::Value) -> WsError {
     WsError::ParseError(format!("OKX error: code={code}, msg={msg}"))
 }
 
-/// 启动期订阅确认判据（见 [`ws_loop::await_subscriptions`]）：订阅回执
+/// 启动期订阅确认判据（见 [`WsConn::await_subscriptions`]）：订阅回执
 /// `{"event":"subscribe","arg":{"channel":"orders",…}}` 或该频道数据到达都算；
 /// `{"event":"error",…}`（如订阅被拒）启动失败
 fn subscription_confirmed(raw: &str) -> Result<Option<String>, WsError> {
@@ -300,7 +268,7 @@ fn parse_private_message(
                     .u_time
                     .parse::<u64>()
                     .map_err(|_| WsError::ParseError(format!("Failed to parse OKX account timestamp: {}", data.u_time)))?;
-                // 净值与持仓总价值不从这里取，由 EquityPollingActor 走 REST（见 codec::AccountData）。
+                // 净值与持仓总价值不从这里取，由 EquityPoller 走 REST（见 codec::AccountData）。
                 // 推送每个币种的现金余额 (用于修正 greeks delta)
                 for detail in &data.details {
                     let cash_bal: f64 = detail.cash_bal.parse()
@@ -369,7 +337,7 @@ fn parse_private_message(
             }
             Ok(events)
         }
-        // account-greeks 已迁移到 REST 轮询 (OkxGreeksPollingActor)
+        // account-greeks 已迁移到 REST 轮询 (OkxGreeksPoller)
         "account-greeks" => Ok(Vec::new()),
         _ => {
             tracing::warn!(channel, raw, "Unknown OKX private channel");
@@ -443,26 +411,26 @@ mod tests {
         assert!(kinds(&order_push("BTC-USDC-SWAP", "0")).is_empty());
     }
 
-    /// 联网只读：真登录 OKX 私有流，启动（on_start 返回）即 account / orders 都已确认。
+    /// 联网只读：真登录 OKX 私有流，启动（spawn 返回）即 account / orders 都已确认。
     /// 需要白名单 IP 与 OKX_API_KEY / OKX_SECRET / OKX_PASSPHRASE。
     #[tokio::test]
     #[ignore = "需要联网、OKX 凭证与白名单 IP"]
     async fn live_private_subscriptions_confirm_at_startup() {
-        use kameo::actor::Spawn;
-        use kameo_actors::DeliveryStrategy;
         let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("缺 {k}"));
         let credentials =
             OkxCredentials { api_key: env("OKX_API_KEY"), secret: env("OKX_SECRET"), passphrase: env("OKX_PASSPHRASE") };
-        let pubsub = AccountPubSub::spawn(AccountPubSub::new(DeliveryStrategy::BestEffort));
+        let root = crate::tasks::Root::new("t");
         let started = std::time::Instant::now();
-        let actor = OkxPrivateWsActor::spawn(OkxPrivateWsActorArgs {
+        OkxPrivateWs::spawn(
+            &root.group("g"),
             credentials,
-            account_pubsub: pubsub,
-            symbol_metas: Arc::new(metas()),
-            quote: "USDT".to_string(),
-        });
-        actor.wait_for_startup_result().await.expect("订阅应在启动期确认");
+            AccountBus::new("account"),
+            Arc::new(metas()),
+            "USDT".to_string(),
+        )
+        .await
+        .expect("订阅应在启动期确认");
         println!("OKX 私有订阅确认耗时 {:?}", started.elapsed());
-        actor.stop_gracefully().await.unwrap();
+        root.shutdown().await.unwrap();
     }
 }

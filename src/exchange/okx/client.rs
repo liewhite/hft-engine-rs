@@ -77,7 +77,7 @@ impl OkxClient {
         &self.quote
     }
 
-    /// 获取凭证（供 ManagerActor 创建 OkxActor 使用）
+    /// 获取凭证（供装配创建 OkxNode 使用）
     pub fn credentials(&self) -> Option<&OkxCredentials> {
         self.credentials.as_ref()
     }
@@ -334,7 +334,7 @@ struct PendingOrdersResponse {
 /// # 一条解析不了 = 整份快照不可信 = `Err`（绝不跳过该条继续）
 ///
 /// 挂单快照的消费方都在做「不在列表里 ⇒ 该单已终态」的推断：
-/// - 启动期 `ManagerActor::cancel_leftover_orders` 据此判定"遗留挂单已撤净"；
+/// - 启动期 `Manager::cancel_leftover_orders` 据此判定"遗留挂单已撤净"；
 /// - 运行期撤单失败复查（[`crate::engine::live`] 的 `cancel_recheck_verdict`）据此
 ///   合成 Cancelled、清掉本地 pending。
 ///

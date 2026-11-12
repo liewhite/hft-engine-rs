@@ -3,7 +3,7 @@ pub(crate) mod codec;
 mod client;
 mod symbol;
 
-pub use actor::{OkxActor, OkxActorArgs};
+pub use actor::{OkxArgs, OkxNode};
 pub use client::OkxClient;
 pub use symbol::{from_okx, from_okx_index, to_okx, to_okx_index};
 

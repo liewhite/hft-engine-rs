@@ -8,7 +8,7 @@ mod symbol;
 pub(crate) mod testkit;
 mod transport;
 
-pub use actor::{HyperliquidActor, HyperliquidActorArgs};
+pub use actor::{HyperliquidArgs, HyperliquidNode};
 pub use client::HyperliquidClient;
 pub use symbol::from_hyperliquid;
 
