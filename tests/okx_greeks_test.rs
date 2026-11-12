@@ -1,23 +1,20 @@
 //! OKX Account Greeks 轮询测试
 //!
-//! 通过 ManagerActor + mock 策略，测试 OKX Greeks REST 轮询的完整框架链路。
+//! 通过 Manager + mock 策略，测试 OKX Greeks REST 轮询的完整框架链路。
 //!
 //! 运行:
 //! OKX_API_KEY=xxx OKX_SECRET=xxx OKX_PASSPHRASE=xxx \
 //!   cargo test --test okx_greeks_test -- --ignored --nocapture
 
 use hft_engine_rs::domain::Exchange;
-use hft_engine_rs::engine::{
-    AddStrategies, ManagerActor, ManagerActorArgs, StrategySpec,
-};
+use hft_engine_rs::engine::{Manager, ManagerArgs, StrategySpec};
 use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
 
 const TEST_QUOTE: &str = "USDT";
 use hft_engine_rs::messaging::{ExchangeAccountData, AccountData, IncomeEvent};
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
-use kameo::actor::Spawn;
-use kameo::mailbox;
+use hft_engine_rs::tasks::Root;
 use std::collections::{HashMap, HashSet};
 
 fn get_credentials() -> Option<OkxCredentials> {
@@ -38,7 +35,7 @@ struct GreeksPrintStrategy {
 
 impl Strategy for GreeksPrintStrategy {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
-        // 订阅一个 BBO 以触发 OkxActor 创建（Greeks 由 REST 轮询获取）
+        // 订阅一个 BBO 以触发 OKX 节点创建（Greeks 由 REST 轮询获取）
         let mut kinds = HashSet::new();
         kinds.insert(SubscriptionKind::BBO {
             symbol: self.symbol.clone(),
@@ -87,26 +84,29 @@ async fn test_okx_greeks_push() {
         credentials: Some(credentials),
     })
     .expect("装配 OKX");
-    let manager = ManagerActor::spawn_with_mailbox(
-        ManagerActorArgs {
+    let root = Root::new("test");
+    let manager = Manager::spawn(
+        &root.group("main"),
+        ManagerArgs {
             exchanges: vec![okx],
             paper: Default::default(),
         },
-        mailbox::unbounded(),
-    );
+    )
+    .await
+    .expect("启动 Manager");
 
     let strategy = GreeksPrintStrategy {
         symbol: "BTC".to_string(),
     };
 
-    let result = manager
-        .ask(AddStrategies(vec![StrategySpec::live(Box::new(strategy))]))
-        .send()
-        .await;
-    result.expect("添加策略失败");
+    manager
+        .add_strategy(StrategySpec::live(Box::new(strategy)))
+        .await
+        .expect("添加策略失败");
 
     println!("策略已启动，等待 Greeks 轮询 (每333ms, Ctrl+C 退出)...\n");
 
     // 持续运行，等待推送
     tokio::signal::ctrl_c().await.unwrap();
+    root.shutdown().await.expect("正常停机");
 }

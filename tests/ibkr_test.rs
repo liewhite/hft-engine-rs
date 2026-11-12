@@ -6,52 +6,36 @@
 //! 运行: cargo test ibkr -- --ignored
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce, BBO};
-use hft_engine_rs::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials};
+use hft_engine_rs::exchange::ibkr::{IbkrArgs, IbkrClient, IbkrCredentials, IbkrNode};
 use hft_engine_rs::exchange::ibkr::auth::tickle;
-use hft_engine_rs::exchange::{AccountClient, ExchangeOrder, ExchangeClient, SubscribeBatch, SubscriptionKind};
-use hft_engine_rs::engine::{AccountPubSub, MarketPubSub};
+use hft_engine_rs::exchange::{AccountClient, ExchangeOrder, ExchangeClient, SubscriptionKind};
+use hft_engine_rs::engine::{AccountBus, MarketBus};
 use hft_engine_rs::messaging::{MarketData, MarketEvent};
-use kameo::actor::{ActorRef, Spawn};
-use kameo::error::Infallible;
-use kameo::mailbox;
-use kameo::message::{Context, Message};
-use kameo::Actor;
-use kameo_actors::pubsub::Subscribe as PubSubSubscribe;
-use kameo_actors::DeliveryStrategy;
+use hft_engine_rs::tasks::{Inbox, Root, Scope, Task};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 /// 测试数量 — 股票最小 1 股
 const TEST_QUANTITY: f64 = 1.0;
 
-// ─── BBO 收集器 Actor (用于 WebSocket 测试) ─────────────────
+// ─── BBO 收集器 (用于 WebSocket 测试) ─────────────────
 
 struct BboCollector {
+    inbox: Inbox<MarketEvent>,
     collected: Arc<Mutex<Vec<BBO>>>,
     notify: Arc<Notify>,
 }
 
-impl Actor for BboCollector {
-    type Args = (Arc<Mutex<Vec<BBO>>>, Arc<Notify>);
-    type Error = Infallible;
-
-    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        Ok(Self {
-            collected: args.0,
-            notify: args.1,
-        })
-    }
-}
-
-impl Message<MarketEvent> for BboCollector {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: MarketEvent, _ctx: &mut Context<Self, Self::Reply>) {
-        if let MarketData::BBO(bbo) = msg.data {
-            println!("收到 BBO: {} bid={} ask={}", bbo.symbol, bbo.bid_price, bbo.ask_price);
-            self.collected.lock().unwrap().push(bbo);
-            self.notify.notify_one();
+impl Task for BboCollector {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        while let Some(msg) = self.inbox.recv().await {
+            if let MarketData::BBO(bbo) = msg.data {
+                println!("收到 BBO: {} bid={} ask={}", bbo.symbol, bbo.bid_price, bbo.ask_price);
+                self.collected.lock().unwrap().push(bbo);
+                self.notify.notify_one();
+            }
         }
+        Ok(())
     }
 }
 
@@ -313,41 +297,42 @@ async fn test_ibkr_ws_bbo() {
     let conids = client.conids().clone();
     println!("连接成功，conids: {:?}", conids);
 
-    // 2. 创建 IncomePubSub
-    let market_pubsub = MarketPubSub::spawn_with_mailbox(
-        MarketPubSub::new(DeliveryStrategy::BestEffort),
-        mailbox::unbounded(),
-    );
-    let account_pubsub = AccountPubSub::spawn_with_mailbox(
-        AccountPubSub::new(DeliveryStrategy::BestEffort),
-        mailbox::unbounded(),
-    );
+    // 2. 总线与任务树（交易所节点在生产者组，收集器在消费者组）
+    let market_bus = MarketBus::new("market");
+    let account_bus = AccountBus::new("account");
+    let root = Root::new("test");
+    let producers = root.group("producers");
+    let consumers = root.group("consumers");
 
-    // 3. 创建 BBO 收集器并订阅 PubSub
+    // 3. 创建 BBO 收集器并订阅行情总线
     let collected = Arc::new(Mutex::new(Vec::<BBO>::new()));
     let notify = Arc::new(Notify::new());
-    let collector = BboCollector::spawn_with_mailbox(
-        (collected.clone(), notify.clone()),
-        mailbox::unbounded(),
-    );
-    market_pubsub
-        .tell(PubSubSubscribe(collector))
-        .send()
-        .await
-        .expect("订阅 MarketPubSub 失败");
+    {
+        let (bus, collected, notify) = (market_bus.clone(), collected.clone(), notify.clone());
+        consumers
+            .spawn("BboCollector", move |scope: Scope| async move {
+                let (_addr, mut inbox) = scope.inbox::<MarketEvent>();
+                inbox.subscribe(&bus, |_| true, |e| e);
+                Ok(BboCollector { inbox, collected, notify })
+            })
+            .await
+            .expect("启动 BBO 收集器失败");
+    }
 
-    // 4. 启动 IbkrActor (含 WebSocket 连接)
-    let ibkr_actor = IbkrActor::spawn_with_mailbox(
-        IbkrActorArgs {
+    // 4. 启动 IbkrNode (含 WebSocket 连接)
+    let ibkr = IbkrNode::spawn(
+        &producers,
+        IbkrArgs {
             snapshot: None,
             auth,
-            market_pubsub,
-            account_pubsub,
+            market_bus,
+            account_bus,
             conids,
             client,
         },
-        mailbox::unbounded(),
-    );
+    )
+    .await
+    .expect("启动 IbkrNode 失败");
 
     // 5. 订阅所有 symbol 的 BBO
     let bbo_kinds: Vec<SubscriptionKind> = symbols
@@ -355,15 +340,11 @@ async fn test_ibkr_ws_bbo() {
         .map(|s| SubscriptionKind::BBO { symbol: s.clone() })
         .collect();
     println!("订阅 BBO: {:?}", bbo_kinds);
-    ibkr_actor
-        .tell(SubscribeBatch { kinds: bbo_kinds })
-        .send()
-        .await
-        .expect("发送 SubscribeBatch 失败");
+    ibkr.subscribe_batch(bbo_kinds).expect("发送 SubscribeBatch 失败");
 
-    // 6. 验证 Actor 连接成功 (给 WS 2 秒完成连接和订阅)
+    // 6. 验证节点连接成功 (给 WS 2 秒完成连接和订阅)
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    assert!(ibkr_actor.is_alive(), "IbkrActor 应处于运行状态 (WS 连接成功)");
+    assert!(!root.is_stopping(), "IbkrNode 应处于运行状态 (WS 连接成功)");
 
     // 7. 等待收到 BBO (最多 30 秒; 非交易时段可能无数据)
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -385,8 +366,8 @@ async fn test_ibkr_ws_bbo() {
         }
     }
 
-    // 8. 验证 Actor 仍然存活 (WS 连接稳定)
-    assert!(ibkr_actor.is_alive(), "IbkrActor 在等待期间不应崩溃");
+    // 8. 验证节点仍在运行 (WS 连接稳定)
+    assert!(!root.is_stopping(), "IbkrNode 在等待期间不应出错");
 
     let bbos = collected.lock().unwrap().clone();
     println!("共收到 {} 条 BBO 数据", bbos.len());
@@ -405,7 +386,7 @@ async fn test_ibkr_ws_bbo() {
     }
 
     // 清理
-    ibkr_actor.kill();
+    root.shutdown().await.expect("正常停机");
 }
 
 /// 测试下单 → 验证成交流程

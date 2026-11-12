@@ -1,7 +1,7 @@
 //! 无凭证 (non-auth) 公共行情链路端到端验证：BBO + Trades，三个交易所。
 //!
 //! 与 `exchange::trades_conformance` 的区别：那里只验证 codec 与线路报文一致；这里跑**真实
-//! actor 链路** —— 交易所父 actor -> public WS 子 actor -> codec -> IncomePubSub -> 订阅者，
+//! 组件链路** —— 交易所节点 -> public WS 子任务 -> codec -> MarketBus -> 订阅者，
 //! 因此还能验证：
 //!   1. 三个所在 `credentials: None` 下能否只订阅行情、不碰账户（private WS 是 Option 门控）
 //!   2. `SubscriptionKind::Trades` 在真实订阅路径上生效（端点路由 / 频道名 / 事件分发）
@@ -9,8 +9,8 @@
 //!      才进 domain。若折算失效，OKX 会因缺 meta 丢弃全部事件（收不到任何数据），或者数量
 //!      被放大 contract_size 倍（BTC 为 100 倍）——两者本测试都能发现。
 //!
-//! 注意 `ManagerActor` **不支持** non-auth：它以 credentials 为门控，None 时不建 client、
-//! 不拉 metas、不 spawn 交易所 actor。故此处直接 spawn 交易所 actor。
+//! 注意 `Manager` **不支持** non-auth：它以 credentials 为门控，None 时不建 client、
+//! 不拉 metas、不起交易所节点。故此处直接在任务树上起交易所节点。
 //!
 //! 运行:
 //! ```sh
@@ -18,21 +18,13 @@
 //! ```
 
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
-use hft_engine_rs::engine::{AccountPubSub, MarketPubSub};
-use hft_engine_rs::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient, REST_BASE_URL};
-use hft_engine_rs::exchange::hyperliquid::{
-    HyperliquidActor, HyperliquidActorArgs, HyperliquidClient,
-};
-use hft_engine_rs::exchange::okx::{OkxActor, OkxActorArgs, OkxClient};
-use hft_engine_rs::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
+use hft_engine_rs::engine::{AccountBus, MarketBus};
+use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
+use hft_engine_rs::exchange::hyperliquid::{HyperliquidArgs, HyperliquidClient, HyperliquidNode};
+use hft_engine_rs::exchange::okx::{OkxArgs, OkxClient, OkxNode};
+use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
 use hft_engine_rs::messaging::{MarketData, MarketEvent};
-use kameo::actor::{ActorRef, Spawn, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::mailbox;
-use kameo::message::{Context, Message};
-use kameo::Actor;
-use kameo_actors::pubsub::Subscribe;
-use kameo_actors::DeliveryStrategy;
+use hft_engine_rs::tasks::{Inbox, Root, Scope, Task};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -59,46 +51,31 @@ struct Observed {
 
 type Shared = Arc<Mutex<HashMap<Exchange, Observed>>>;
 
-/// 订阅 IncomePubSub 并累计各所的 BBO / Trade 观测
+/// 订阅 MarketBus 并累计各所的 BBO / Trade 观测
 struct Collector {
+    inbox: Inbox<MarketEvent>,
     shared: Shared,
 }
 
-impl Actor for Collector {
-    type Args = Shared;
-    type Error = Infallible;
-
-    async fn on_start(shared: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
-        Ok(Self { shared })
-    }
-
-    async fn on_stop(
-        &mut self,
-        _r: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-}
-
-impl Message<MarketEvent> for Collector {
-    type Reply = ();
-
-    async fn handle(&mut self, ev: MarketEvent, _ctx: &mut Context<Self, Self::Reply>) {
-        let mut guard = self.shared.lock().expect("collector mutex");
-        match &ev.data {
-            MarketData::BBO(b) => {
-                let e = guard.entry(b.exchange).or_default();
-                e.bbo_count += 1;
-                e.last_bbo = Some((b.bid_price, b.bid_qty, b.ask_qty));
+impl Task for Collector {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        while let Some(ev) = self.inbox.recv().await {
+            let mut guard = self.shared.lock().expect("collector mutex");
+            match &ev.data {
+                MarketData::BBO(b) => {
+                    let e = guard.entry(b.exchange).or_default();
+                    e.bbo_count += 1;
+                    e.last_bbo = Some((b.bid_price, b.bid_qty, b.ask_qty));
+                }
+                MarketData::MarketTrade(t) => {
+                    let e = guard.entry(t.exchange).or_default();
+                    e.trade_count += 1;
+                    e.trade_qtys.push(t.qty);
+                }
+                _ => {}
             }
-            MarketData::MarketTrade(t) => {
-                let e = guard.entry(t.exchange).or_default();
-                e.trade_count += 1;
-                e.trade_qtys.push(t.qty);
-            }
-            _ => {}
         }
+        Ok(())
     }
 }
 
@@ -123,7 +100,7 @@ fn subscriptions() -> Vec<SubscriptionKind> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "需要联网连交易所（无需凭证）"]
-async fn noauth_bbo_and_trades_flow_through_actor_path() {
+async fn noauth_bbo_and_trades_flow_through_node_path() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("hft_engine_rs=warn")
         .try_init();
@@ -146,7 +123,7 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("okx meta (public REST)");
-    // HL 的 actor 直接用 client 的品种目录，这里只确认目录里有该币
+    // HL 节点直接用 client 的品种目录，这里只确认目录里有该币
     let hl_metas = hl_client
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
@@ -165,81 +142,73 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
         "OKX BTC 每张应小于 1 币，实际 {okx_contract_size}"
     );
 
-    // ---- 2. PubSub + 收集者 ----
-    let market_pubsub = MarketPubSub::spawn_with_mailbox(
-        MarketPubSub::new(DeliveryStrategy::BestEffort),
-        mailbox::unbounded(),
-    );
-    let account_pubsub = AccountPubSub::spawn_with_mailbox(
-        AccountPubSub::new(DeliveryStrategy::BestEffort),
-        mailbox::unbounded(),
-    );
+    // ---- 2. 总线 + 收集者（消费者组后停：生产者收尾时发的事件照样收得到） ----
+    let market_bus = MarketBus::new("market");
+    let account_bus = AccountBus::new("account");
+    let root = Root::new("test");
+    let producers = root.group("producers");
+    let consumers = root.group("consumers");
     let shared: Shared = Arc::new(Mutex::new(HashMap::new()));
-    let collector = Collector::spawn_with_mailbox(shared.clone(), mailbox::unbounded());
-    market_pubsub
-        .tell(Subscribe(collector.clone()))
-        .send()
-        .await
-        .expect("subscribe collector");
+    {
+        let (bus, shared) = (market_bus.clone(), shared.clone());
+        consumers
+            .spawn("Collector", move |scope: Scope| async move {
+                let (_addr, mut inbox) = scope.inbox::<MarketEvent>();
+                inbox.subscribe(&bus, |_| true, |e| e);
+                Ok(Collector { inbox, shared })
+            })
+            .await
+            .expect("collector");
+    }
 
-    // ---- 3. 三个交易所 actor，全部 credentials: None ----
-    let binance = BinanceActor::spawn_with_mailbox(
-        BinanceActorArgs {
+    // ---- 3. 三个交易所节点，全部 credentials: None ----
+    let binance = BinanceNode::spawn(
+        &producers,
+        BinanceArgs {
             credentials: None,
             symbol_metas: metas_of(binance_metas),
             rest_base_url: REST_BASE_URL.to_string(),
-            market_pubsub: market_pubsub.clone(),
-            account_pubsub: account_pubsub.clone(),
+            market_bus: market_bus.clone(),
+            account_bus: account_bus.clone(),
             quote: "USDT".to_string(),
         },
-        mailbox::unbounded(),
-    );
-    let okx = OkxActor::spawn_with_mailbox(
-        OkxActorArgs {
+    )
+    .await
+    .expect("BinanceNode 应能在无凭证下启动（private WS 由 Option 门控）");
+    let okx = OkxNode::spawn(
+        &producers,
+        OkxArgs {
             credentials: None,
             client: Some(okx_client.clone()),
             symbol_metas: metas_of(okx_metas),
-            market_pubsub: market_pubsub.clone(),
-            account_pubsub: account_pubsub.clone(),
+            market_bus: market_bus.clone(),
+            account_bus: account_bus.clone(),
             quote: "USDT".to_string(),
         },
-        mailbox::unbounded(),
-    );
-    let hl = HyperliquidActor::spawn_with_mailbox(
-        HyperliquidActorArgs {
+    )
+    .await
+    .expect("OkxNode 应能在无凭证下启动");
+    let hl = HyperliquidNode::spawn(
+        &producers,
+        HyperliquidArgs {
             client: hl_client.clone(),
-            market_pubsub: market_pubsub.clone(),
-            account_pubsub: account_pubsub.clone(),
+            market_bus: market_bus.clone(),
+            account_bus: account_bus.clone(),
         },
-        mailbox::unbounded(),
-    );
-
-    binance
-        .wait_for_startup_result()
-        .await
-        .expect("BinanceActor 应能在无凭证下启动（private WS 由 Option 门控）");
-    okx.wait_for_startup_result()
-        .await
-        .expect("OkxActor 应能在无凭证下启动");
-    hl.wait_for_startup_result()
-        .await
-        .expect("HyperliquidActor 应能在无凭证下启动");
-    println!("三个交易所 actor 均已在 non-auth 模式下启动");
+    )
+    .await
+    .expect("HyperliquidNode 应能在无凭证下启动");
+    println!("三个交易所节点均已在 non-auth 模式下启动");
 
     // ---- 4. 订阅 BBO + Trades ----
-    binance
-        .subscribe_batch(subscriptions())
-        .await
-        .expect("binance subscribe");
-    okx.subscribe_batch(subscriptions())
-        .await
-        .expect("okx subscribe");
-    hl.subscribe_batch(subscriptions())
-        .await
-        .expect("hl subscribe");
+    binance.subscribe_batch(subscriptions()).expect("binance subscribe");
+    okx.subscribe_batch(subscriptions()).expect("okx subscribe");
+    hl.subscribe_batch(subscriptions()).expect("hl subscribe");
 
     tokio::time::sleep(OBSERVE).await;
 
+    assert!(!root.is_stopping(), "观测期间有节点出错（见日志）");
+    root.shutdown().await.expect("正常停机");
     let observed = shared.lock().expect("mutex").clone();
 
     // ---- 5. 断言与报告 ----

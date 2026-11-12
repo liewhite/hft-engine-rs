@@ -3,11 +3,11 @@
 //! 验证"模拟盘只改变 outcome 事件流向"这一设计是否成立 —— 链路与实盘完全相同：
 //!
 //! ```text
-//! 真实公共 WS -> 交易所 actor -> IncomePubSub -> IncomeProcessor -> Executor(StrategyRunner)
+//! 真实公共 WS -> 交易所节点 -> MarketBus -> IncomeProcessor -> Executor(StrategyRunner)
 //!                                    ^                                      |
-//!                                    |                              OutcomePubSub
+//!                                    |                                 OutcomeBus
 //!                                    |                                      v
-//!                                    +----------- 回报/成交 ------ PaperCounterActor (本地柜台)
+//!                       AccountBus <-+----------- 回报/成交 ------ PaperCounter (本地柜台)
 //! ```
 //!
 //! 唯一被替换的是柜台：订单不发往交易所，由本地按"真实成交越过挂单价"判定成交。
@@ -15,7 +15,7 @@
 //! 策略用一个最小挂单器：拿到 BBO 后在**买价下方若干 bp** 挂 PostOnly 买单，等真实成交打穿。
 //! 挂得离盘口越近成交越快，但也越容易在观测窗口内反复成交 —— 这里只要求至少成交一次。
 //!
-//! 注意：本测试**不经过 ManagerActor**。manager 目前以凭证为交易所开关，模拟盘想完全脱离
+//! 注意：本测试**不经过 Manager**。manager 目前以凭证为交易所开关，模拟盘想完全脱离
 //! 凭证运行还需要把"启用哪个所 + 计价币"从凭证里拆出来（见 README/提交说明）。
 //!
 //! 运行:
@@ -27,24 +27,15 @@ use hft_engine_rs::domain::{
     AccountId, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
 use hft_engine_rs::engine::{
-    AccountPubSub, IncomeProcessorActor, MarketPubSub, OutcomePubSub, PaperCounterActor,
-    PaperCounterArgs, RegisterExecutor,
+    AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, OutcomeBus, PaperCounter,
+    PaperCounterArgs,
 };
-use hft_engine_rs::engine::live::{ExecutorActor, ExecutorArgs};
-use hft_engine_rs::exchange::binance::{
-    BinanceActor, BinanceActorArgs, BinanceClient, REST_BASE_URL,
-};
-use hft_engine_rs::exchange::{ExchangeActorOps, ExchangeClient, SubscriptionKind};
+use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
+use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
 use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, AccountEvent, IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
-use kameo::actor::{ActorRef, Spawn, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::mailbox;
-use kameo::message::{Context, Message};
-use kameo::Actor;
-use kameo_actors::pubsub::Subscribe;
-use kameo_actors::DeliveryStrategy;
+use hft_engine_rs::tasks::{Inbox, Root, Scope, Task};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -159,57 +150,49 @@ struct Log {
     min_trade_after_rest: Option<f64>,
 }
 
-struct Watcher(Arc<Mutex<Log>>);
-
-impl Actor for Watcher {
-    type Args = Arc<Mutex<Log>>;
-    type Error = Infallible;
-    async fn on_start(a: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
-        Ok(Self(a))
-    }
-    async fn on_stop(
-        &mut self,
-        _r: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
+/// 观测者收的两类事件：柜台回报（账户事件，带 Paper 标签）与行情（成交价区间诊断）
+enum WatcherMsg {
+    Account(AccountEvent),
+    Market(MarketEvent),
 }
 
-/// 柜台回报（账户事件，带 Paper 标签）
-impl Message<AccountEvent> for Watcher {
-    type Reply = ();
-    async fn handle(&mut self, ev: AccountEvent, _c: &mut Context<Self, Self::Reply>) {
-        let mut log = self.0.lock().unwrap();
-        match &ev.data {
-            AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
-                log.order_updates
-                    .push((u.order_id.clone(), format!("{:?}", u.status)));
-                if matches!(u.status, hft_engine_rs::domain::OrderStatus::Pending) {
-                    log.resting = true;
+struct Watcher {
+    inbox: Inbox<WatcherMsg>,
+    log: Arc<Mutex<Log>>,
+}
+
+impl Task for Watcher {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        while let Some(msg) = self.inbox.recv().await {
+            let mut log = self.log.lock().unwrap();
+            match msg {
+                WatcherMsg::Account(ev) => match &ev.data {
+                    AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
+                        log.order_updates.push((u.order_id.clone(), format!("{:?}", u.status)));
+                        if matches!(u.status, hft_engine_rs::domain::OrderStatus::Pending) {
+                            log.resting = true;
+                        }
+                    }
+                    AccountData::Symbol(SymbolAccountData::Fill(f)) => log.fills.push((f.price, f.size)),
+                    AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) => {
+                        log.equity = Some(*equity)
+                    }
+                    _ => {}
+                },
+                WatcherMsg::Market(ev) => {
+                    if let MarketData::MarketTrade(t) = &ev.data {
+                        log.trade_count += 1;
+                        log.min_trade_price = Some(log.min_trade_price.map_or(t.price, |m: f64| m.min(t.price)));
+                        log.max_trade_price = Some(log.max_trade_price.map_or(t.price, |m: f64| m.max(t.price)));
+                        if log.resting {
+                            log.min_trade_after_rest =
+                                Some(log.min_trade_after_rest.map_or(t.price, |m: f64| m.min(t.price)));
+                        }
+                    }
                 }
             }
-            AccountData::Symbol(SymbolAccountData::Fill(f)) => log.fills.push((f.price, f.size)),
-            AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) => log.equity = Some(*equity),
-            _ => {}
         }
-    }
-}
-
-/// 行情观测（成交价区间诊断）
-impl Message<MarketEvent> for Watcher {
-    type Reply = ();
-    async fn handle(&mut self, ev: MarketEvent, _c: &mut Context<Self, Self::Reply>) {
-        let mut log = self.0.lock().unwrap();
-        if let MarketData::MarketTrade(t) = &ev.data {
-            log.trade_count += 1;
-            log.min_trade_price = Some(log.min_trade_price.map_or(t.price, |m: f64| m.min(t.price)));
-            log.max_trade_price = Some(log.max_trade_price.map_or(t.price, |m: f64| m.max(t.price)));
-            if log.resting {
-                log.min_trade_after_rest =
-                    Some(log.min_trade_after_rest.map_or(t.price, |m: f64| m.min(t.price)));
-            }
-        }
+        Ok(())
     }
 }
 
@@ -234,25 +217,18 @@ async fn paper_counter_fills_from_live_trades() {
     let metas_by_key: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> =
         Arc::new(metas.into_iter().map(|m| ((EX, m.symbol.clone()), m)).collect());
 
-    // ---- 总线 ----
-    let market_pubsub = MarketPubSub::spawn_with_mailbox(
-        MarketPubSub::new(DeliveryStrategy::BestEffort),
-        mailbox::unbounded(),
-    );
-    let account_pubsub = AccountPubSub::spawn_with_mailbox(
-        AccountPubSub::new(DeliveryStrategy::BestEffort),
-        mailbox::unbounded(),
-    );
-    let outcome_pubsub = OutcomePubSub::spawn_with_mailbox(
-        OutcomePubSub::new(DeliveryStrategy::BestEffort),
-        mailbox::unbounded(),
-    );
+    // ---- 总线与任务树（同 Manager：生产者先停、消费者后停） ----
+    let market_bus = MarketBus::new("market");
+    let account_bus = AccountBus::new("account");
+    let outcome_bus = OutcomeBus::new("outcome");
+    let root = Root::new("test");
+    let producers = root.group("producers");
+    let consumers = root.group("consumers");
 
-    // ---- 本地柜台：订阅 outcome（收订单）与 income（收行情/Clock）----
-    // 模拟账户私有事件走独立总线
-    let counter = PaperCounterActor::spawn_with_mailbox(
+    // ---- 本地柜台：订阅 outcome（收订单）与行情（收成交/Clock），回报发到账户总线 ----
+    PaperCounter::spawn(
+        &consumers,
         PaperCounterArgs {
-            account_pubsub: account_pubsub.clone(),
             symbol_metas: metas_by_key.clone(),
             config: SimConfig {
                 initial_balance_usdt: 10_000.0,
@@ -262,95 +238,77 @@ async fn paper_counter_fills_from_live_trades() {
                 order_to_exchange_delay_ms: ORDER_DELAY_MS,
                 exchange_to_strategy_delay_ms: 0,
             },
+            market_bus: market_bus.clone(),
+            outcome_bus: outcome_bus.clone(),
+            account_bus: account_bus.clone(),
         },
-        mailbox::unbounded(),
-    );
-    outcome_pubsub
-        .tell(Subscribe(counter.clone()))
-        .send()
-        .await
-        .expect("counter subscribes outcome");
-    market_pubsub
-        .tell(Subscribe(counter))
-        .send()
-        .await
-        .expect("counter subscribes income");
+    )
+    .await
+    .expect("paper counter");
 
     // ---- 策略链路：IncomeProcessor -> Executor ----
-    let processor = IncomeProcessorActor::spawn_with_mailbox(
-        IncomeProcessorActor::default(),
-        mailbox::unbounded(),
-    );
-    market_pubsub
-        .tell(Subscribe(processor.clone()))
-        .send()
+    let (_, processor) = IncomeProcessor::spawn(&consumers, &market_bus, &account_bus)
         .await
-        .expect("processor subscribes income");
-    account_pubsub
-        .tell(Subscribe(processor.clone()))
-        .send()
-        .await
-        .expect("processor subscribes paper");
+        .expect("income processor");
 
     // 观测 log 提前创建：策略要把自己的挂单价写进去（回报不再捎带价格）
     let log = Arc::new(Mutex::new(Log::default()));
 
-    let executor = ExecutorActor::spawn_with_mailbox(
+    let (_, executor) = Executor::spawn(
+        &producers,
         ExecutorArgs {
             strategy: Box::new(DipMaker(Arc::clone(&log))),
             account: PAPER_ACCOUNT.clone(),
             symbol_metas: metas_by_key.clone(),
             // 模拟账户从零起步，无基线
             baselines: Vec::new(),
-            outcome_pubsub: outcome_pubsub.clone(),
+            outcome_bus: outcome_bus.clone(),
         },
-        mailbox::unbounded(),
-    );
+    )
+    .await
+    .expect("executor");
     processor
-        .tell(RegisterExecutor {
-            executor: executor.clone(),
-            subscriptions: HashSet::from([(
+        .register(
+            executor,
+            HashSet::from([(
                 EX,
                 SubscriptionKind::BBO {
                     symbol: COIN.to_string(),
                 },
             )]),
-            account: PAPER_ACCOUNT.clone(),
-        })
-        .send()
+            PAPER_ACCOUNT.clone(),
+        )
         .await
         .expect("register executor");
 
-    // ---- 观测者 ----
-    let watcher = Watcher::spawn_with_mailbox(log.clone(), mailbox::unbounded());
-    market_pubsub
-        .tell(Subscribe(watcher.clone()))
-        .send()
-        .await
-        .expect("watcher subscribes income");
-    // 柜台回报走 paper 总线
-    account_pubsub
-        .tell(Subscribe(watcher))
-        .send()
-        .await
-        .expect("watcher subscribes paper");
+    // ---- 观测者：行情 + 柜台回报（账户总线） ----
+    {
+        let (market_bus, account_bus, log) = (market_bus.clone(), account_bus.clone(), log.clone());
+        consumers
+            .spawn("Watcher", move |scope: Scope| async move {
+                let (_addr, mut inbox) = scope.inbox::<WatcherMsg>();
+                inbox.subscribe(&market_bus, |_| true, WatcherMsg::Market);
+                inbox.subscribe(&account_bus, |_| true, WatcherMsg::Account);
+                Ok(Watcher { inbox, log })
+            })
+            .await
+            .expect("watcher");
+    }
 
-    // ---- 交易所 actor：无凭证，只订公共行情 ----
-    let binance = BinanceActor::spawn_with_mailbox(
-        BinanceActorArgs {
+    // ---- 交易所节点：无凭证，只订公共行情 ----
+    let binance = BinanceNode::spawn(
+        &producers,
+        BinanceArgs {
             credentials: None,
             symbol_metas: metas_by_symbol,
             rest_base_url: REST_BASE_URL.to_string(),
-            market_pubsub: market_pubsub.clone(),
-            account_pubsub: account_pubsub.clone(),
+            market_bus: market_bus.clone(),
+            account_bus: account_bus.clone(),
             quote: "USDT".to_string(),
         },
-        mailbox::unbounded(),
-    );
-    binance
-        .wait_for_startup_result()
-        .await
-        .expect("binance actor (non-auth)");
+    )
+    .await
+    .expect("binance node (non-auth)");
     binance
         .subscribe_batch(vec![
             SubscriptionKind::BBO {
@@ -360,28 +318,14 @@ async fn paper_counter_fills_from_live_trades() {
                 symbol: COIN.to_string(),
             },
         ])
-        .await
         .expect("subscribe");
 
-    // 柜台需要 Clock 才发布净值；这里自己推几拍，不必拉起 ClockActor
-    let clock_pubsub = market_pubsub.clone();
-    let clock = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let ts = hft_engine_rs::domain::now_ms();
-            let _ = clock_pubsub
-                .tell(kameo_actors::pubsub::Publish(MarketEvent {
-                    exchange_ts: ts,
-                    local_ts: ts,
-                    data: MarketData::Clock,
-                }))
-                .send()
-                .await;
-        }
-    });
+    // 柜台需要 Clock 才发布净值
+    Clock::spawn(&producers, 1000, market_bus.clone()).expect("clock");
 
     tokio::time::sleep(OBSERVE).await;
-    clock.abort();
+    assert!(!root.is_stopping(), "观测期间有节点出错（见日志）");
+    root.shutdown().await.expect("正常停机");
 
     let log = log.lock().unwrap();
     println!("order updates: {:?}", log.order_updates);
