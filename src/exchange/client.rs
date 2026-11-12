@@ -483,6 +483,14 @@ mod tests {
         assert!(err.contains("最小下单量"), "got: {err}");
     }
 
+    /// 上游算出 NaN 时本地拒绝（NaN 比较恒假，曾穿过两道下界检查）
+    #[test]
+    fn non_finite_quantity_is_rejected() {
+        let err = ExchangeOrder::from_domain(coin_order(f64::NAN, 62_500.0), &okx_btc_meta())
+            .expect_err("NaN 数量必须被拒");
+        assert!(err.contains("有限值"), "got: {err}");
+    }
+
     /// 其余字段原样透传（方向/reduce_only/client_order_id 不属于单位换算范畴）
     #[test]
     fn non_quantity_fields_pass_through() {

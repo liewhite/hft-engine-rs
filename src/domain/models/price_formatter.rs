@@ -31,13 +31,13 @@ impl StepFormatter {
         Self { step, decimals }
     }
 
+    /// 步长的小数位数 = 步长十进制写法的小数位（0.25 → 2、0.001 → 3、5 → 0）。
+    ///
+    /// 不用 `-log10(step).floor()`：那只对 10 的幂次对，0.25 会算成 1 位，100.25 被写成 "100.3"。
+    /// f64 的 `to_string` 是最短往返写法（0.1 → "0.1"），据此数小数位是精确的。
     fn step_to_decimals(step: f64) -> usize {
-        if step >= 1.0 {
-            return 0;
-        }
-        // 使用 log10 计算小数位数
-        let decimals = -step.log10().floor() as usize;
-        decimals
+        let text = step.to_string();
+        text.split_once('.').map_or(0, |(_, frac)| frac.len())
     }
 
     fn round_to_step(value: f64, step: f64) -> f64 {
@@ -135,6 +135,11 @@ mod tests {
         let f1 = StepFormatter::new(1.0);
         assert_eq!(f1.format(4870.0), "4870");
         assert_eq!(f1.format(4869.6), "4870");
+        // 步长不是 10 的幂次：小数位按步长写法算（log10 推法曾把 0.25 算成 1 位）
+        let q = StepFormatter::new(0.25);
+        assert_eq!(q.format(100.25), "100.25");
+        assert_eq!(q.format(100.3), "100.25");
+        assert_eq!(StepFormatter::new(0.005).format(1.2345), "1.235");
     }
 
     #[test]

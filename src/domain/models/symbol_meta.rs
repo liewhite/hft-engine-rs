@@ -85,7 +85,12 @@ impl SymbolMeta {
     /// - 取整后为 0（请求量不足一个 `size_step`）：照发交易所必拒，且策略会陷入
     ///   "下单 → 被拒 → pending 清除 → 下个事件再下"的静默重试环
     /// - 低于 `min_order_size`（交易所最小下单量，交易所单位）：同样必拒
+    /// - 非有限值（NaN / 无穷）：上游算错了，拒绝而不是照发
     pub fn checked_exchange_qty(&self, coin_amount: f64) -> Result<f64, String> {
+        // NaN 与任何数比较都为假，会穿过下面两道下界检查原样发出去
+        if !coin_amount.is_finite() {
+            return Err(format!("数量不是有限值：{coin_amount}"));
+        }
         let quantity = self.round_size_down(self.coin_to_qty(coin_amount));
         if quantity <= 0.0 {
             return Err(format!(
