@@ -21,7 +21,7 @@ use super::{
 use crate::domain::{
     now_ms, AccountId, Exchange, ExchangeError, Position, Symbol, SymbolMeta,
 };
-use crate::messaging::{SymbolAccountData, AccountData, AccountEvent, MarketData, MarketEvent};
+use crate::messaging::{AccountData, AccountEvent, MarketData, MarketEvent, PositionBook, SymbolAccountData};
 use super::assembly::{ExchangeSetup, SpawnCtx};
 use crate::exchange::{AccountClient, ExchangeActorOps, ExchangeClient, SubscriptionKind};
 use crate::strategy::Strategy;
@@ -341,10 +341,10 @@ impl Actor for ManagerActor {
             },
         )
         .await;
-        // 镜像的增量输入只有实盘 Fill：按类型+账户过滤订阅（模拟成交绝不进实盘镜像）
+        // 镜像的增量输入只有实盘 Fill：订阅过滤与账本同一判据（模拟成交绝不进实盘镜像）
         account_pubsub
             .tell(SubscribeFilter(position_ledger.clone(), |e: &AccountEvent| {
-                e.account == AccountId::Live && matches!(e.data, AccountData::Symbol(SymbolAccountData::Fill(_)))
+                PositionBook::live_fill(e).is_some()
             }))
             .send()
             .await

@@ -69,16 +69,21 @@ impl PositionBook {
     /// 跟踪范围外的 symbol 静默丢弃：分桶部署下账户级私有流必然带来其他桶的成交，
     /// 那不是错误（该判断与 `Reconciler` 此前的 `is_tracked` 过滤同义，只是搬进了本类型）。
     pub fn apply(&mut self, event: &AccountEvent) {
-        if event.account != crate::domain::AccountId::Live {
-            return;
-        }
-        let AccountData::Symbol(SymbolAccountData::Fill(fill)) = &event.data else {
+        let Some(fill) = Self::live_fill(event) else {
             return;
         };
         let Some(positions) = self.symbols.get_mut(&fill.symbol) else {
             return;
         };
         positions.apply_fill(&fill.symbol, fill, event.local_ts);
+    }
+
+    /// 账本吃哪些事件（只有实盘 Fill）的**唯一判据**：[`Self::apply`] 与总线订阅过滤都用它。
+    pub fn live_fill(event: &AccountEvent) -> Option<&crate::domain::Fill> {
+        match (&event.account, &event.data) {
+            (crate::domain::AccountId::Live, AccountData::Symbol(SymbolAccountData::Fill(fill))) => Some(fill),
+            _ => None,
+        }
     }
 
     /// 某个已注册 symbol 的持仓投影
