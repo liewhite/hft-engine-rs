@@ -40,7 +40,14 @@ where
 
     let result = match std::panic::AssertUnwindSafe(body()).catch_unwind().await {
         Ok(r) => r,
-        Err(_) => Err(anyhow::anyhow!("主流程 panic（详情见上一条 panic 日志）")),
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "（非文本 panic）".to_string());
+            Err(anyhow::anyhow!("主流程 panic: {msg}"))
+        }
     };
     if let Err(e) = &result {
         let reason = format!("{e:#}");

@@ -64,5 +64,5 @@ async fn panic_in_main_is_alerted_and_flushed() {
     let got = bodies.lock().unwrap().clone();
     assert!(got[0].contains("启动自检"), "{got:?}");
     assert!(got.iter().any(|b| b.contains("模拟主流程崩溃")), "panic 内容要外送: {got:?}");
-    assert!(got.iter().any(|b| b.contains("进程因错误退出")), "退出原因要在返回前发完: {got:?}");
+    assert!(got.iter().any(|b| b.contains("进程因错误退出: 主流程 panic: 模拟主流程崩溃")), "退出原因带 panic 内容，要在返回前发完: {got:?}");
 }
