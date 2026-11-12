@@ -22,7 +22,7 @@
 //! 资金费数据：本进程起一个轮询任务，每 `funding_poll_secs` 秒为每个币拉它所在各所过去 24h
 //! 已结算的公共费率，整窗作为 `SettledFundingWindow` 自定义事件投递给对应策略。
 
-use hft_engine_rs::domain::{now_ms, Exchange, Symbol};
+use hft_engine_rs::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::live::{GetAllSymbolMetas, PublishCustomEvent};
 use hft_engine_rs::engine::{
     init_tracing, load_config, setup_binance, setup_hyperliquid, setup_okx, wait_for_shutdown, AddStrategies,
@@ -37,7 +37,7 @@ use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, SettledFundi
 use kameo::actor::{ActorRef, Spawn};
 use kameo::mailbox;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -117,35 +117,26 @@ async fn main() -> anyhow::Result<()> {
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("GetAllSymbolMetas failed: {e}"))?;
-    let listed: HashMap<Exchange, HashSet<Symbol>> = metas
+    let listed: HashMap<(Exchange, Symbol), SymbolMeta> = metas
         .into_iter()
-        .map(|(ex, ms)| (ex, ms.into_iter().map(|m| m.symbol).collect()))
+        .flat_map(|(ex, ms)| ms.into_iter().map(move |m| ((ex, m.symbol.clone()), m)))
         .collect();
+    let mut specs = Vec::new();
     let mut coverage: Vec<(Symbol, Vec<Exchange>)> = Vec::new();
     let mut lonely: Vec<String> = Vec::new();
     for p in config.strategy.params() {
-        let on: Vec<Exchange> = exchanges
-            .iter()
-            .copied()
-            .filter(|ex| listed.get(ex).is_some_and(|s| s.contains(&p.symbol)))
-            .collect();
+        let on: Vec<SymbolMeta> =
+            exchanges.iter().filter_map(|&ex| listed.get(&(ex, p.symbol.clone())).cloned()).collect();
+        let on_ex: Vec<Exchange> = on.iter().map(|m| m.exchange).collect();
+        tracing::info!(symbol = %p.symbol, exchanges = ?on_ex, "币种覆盖");
         if on.len() < 2 {
-            lonely.push(format!("{}（只在 {on:?}）", p.symbol));
+            lonely.push(format!("{}（只在 {on_ex:?}）", p.symbol));
+            continue;
         }
-        coverage.push((p.symbol.clone(), on));
+        coverage.push((p.symbol.clone(), on_ex));
+        specs.push(StrategySpec::live(Box::new(FundingArbStrategy::new(p, on)) as Box<dyn Strategy>));
     }
     anyhow::ensure!(lonely.is_empty(), "这些币上市的所不足两个，没法对冲：{}", lonely.join("、"));
-    for (symbol, on) in &coverage {
-        tracing::info!(%symbol, exchanges = ?on, "币种覆盖");
-    }
-
-    let specs = config
-        .strategy
-        .params()
-        .into_iter()
-        .zip(coverage.iter())
-        .map(|(p, (_, on))| StrategySpec::live(Box::new(FundingArbStrategy::new(p, on.clone())) as Box<dyn Strategy>))
-        .collect();
     manager
         .ask(AddStrategies(specs))
         .send()

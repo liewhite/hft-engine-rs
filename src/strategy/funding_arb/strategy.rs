@@ -5,7 +5,7 @@
 //!
 //! # 每个事件做一件事，按优先级
 //!
-//! 1. **各所持仓之和不为 0**（价值 ≥ 最小单额）：先撤掉全部挂单，等补腿那所没有任何在途单后，
+//! 1. **各所持仓之和不为 0**（价值 ≥ 最小单额，且补腿所下得出这个量）：先撤掉全部挂单，等补腿那所没有任何在途单后，
 //!    在最近一次挂单的所对上市价补齐落后腿：多了就在该对的卖出所卖，少了就在买入所买。
 //!    这正是用户规格「开仓加短腿、平仓砍长腿」：没成交的那条腿就是落后腿，补它即补齐这次操作；
 //!    补过头（撤单期间另一边也成交）时反向补回的也是落后腿。补腿失败由框架记错误日志，本策略隔
@@ -31,11 +31,17 @@
 //! 订单终态超过这个窗口，仍会多补一份：之后会反向补回（结果多一来回的手续费），或在开仓时两腿
 //! 各多出约一笔挂单金额（仍对冲，但不经杠杆检查）。每发生一次超出一笔，不会自动收回。
 //!
+//! # 零头（如实声明）
+//!
+//! 各所下单粒度不同（OKX 一手可值十几 U）。挂单量按两所粒度向下取整成两边都下得出的量；
+//! 持仓差不足补腿所的一手（或最小下单量）时视为零头，不补 —— 补了也会被交易所拒。所以每个币
+//! 可能留着不超过一手的单边敞口。
+//!
 //! 外来成交按订单号前缀判别（与框架同一判据）；HL 的前缀是格式要求，别的程序带 cloid 的单认不出。
 
 use super::config::PairParams;
 use super::signal::{decide, FundingAction, LegPair, SettledFundingWindow};
-use crate::domain::{Exchange, Order, OrderId, OrderType, Side, Symbol, TimeInForce, Timestamp, BBO};
+use crate::domain::{Exchange, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{AccountData, IncomeEvent, MarketData, MarketEvent, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
@@ -55,6 +61,8 @@ pub struct FundingArbStrategy {
     p: PairParams,
     /// 该币上市的所（固定顺序，决定同分时的取舍），至少两所
     exchanges: Vec<Exchange>,
+    /// 各所合约规格：判断一个数量在该所下不下得出（精度与最小下单量的唯一出处）
+    metas: HashMap<Exchange, SymbolMeta>,
     funding: HashMap<Exchange, SettledFundingWindow>,
     bbo_local_ts: HashMap<Exchange, Timestamp>,
     /// 最近一次挂 maker 的所对：不平衡时在这对所上补腿
@@ -79,17 +87,20 @@ pub struct FundingArbStrategy {
 }
 
 impl FundingArbStrategy {
-    /// `exchanges`：该币上市的所，至少两所、不重复（装配处按各所品种目录给出）
-    pub fn new(p: PairParams, exchanges: Vec<Exchange>) -> Self {
+    /// `metas`：该币在各所的合约规格，一所一份、至少两所，顺序即所的顺序（装配处按各所品种目录给出）
+    pub fn new(p: PairParams, metas: Vec<SymbolMeta>) -> Self {
+        let exchanges: Vec<Exchange> = metas.iter().map(|m| m.exchange).collect();
         let distinct: HashSet<_> = exchanges.iter().collect();
         assert!(
-            exchanges.len() >= 2 && distinct.len() == exchanges.len(),
-            "{}: 资金费套利至少要两个不同的所，实际 {exchanges:?}",
-            p.symbol
+            exchanges.len() >= 2 && distinct.len() == exchanges.len() && metas.iter().all(|m| m.symbol == p.symbol),
+            "{}: 资金费套利至少要两个不同的所、且规格属于本币，实际 {:?}",
+            p.symbol,
+            metas.iter().map(|m| (m.exchange, &m.symbol)).collect::<Vec<_>>()
         );
         Self {
             p,
             exchanges,
+            metas: metas.into_iter().map(|m| (m.exchange, m)).collect(),
             funding: HashMap::new(),
             bbo_local_ts: HashMap::new(),
             leg: None,
@@ -157,14 +168,21 @@ impl FundingArbStrategy {
 
         if !self.startup_checked {
             self.startup_checked = true;
-            if net.abs() * px >= self.p.min_order_notional {
+            // 只看下得出单的差：哪所都下不出的零头是本策略自己留下的（见模块文档）
+            if net.abs() * px >= self.p.min_order_notional && self.exchanges.iter().any(|&ex| self.tradable(ex, net.abs())) {
                 self.halt(format!("启动时各所持仓之和不为 0：{positions:?}（可能有不归本策略的仓位）"));
                 return Vec::new();
             }
         }
 
         if net.abs() * px >= self.p.min_order_notional {
-            return self.hedge(sv, net, &positions, now);
+            let Some(pair) = self.leg else {
+                self.halt(format!("各所持仓之和不为 0 但本策略还没挂过单，不知道在哪对所补：{positions:?}"));
+                return self.maintain(sv, &[], now);
+            };
+            if self.tradable(hedge_target(pair, net).0, net.abs()) {
+                return self.hedge(sv, pair, net, &positions, now);
+            }
         }
         if self.hedge_attempts > 0 {
             tracing::info!(symbol = %self.symbol(), attempts = self.hedge_attempts, "各所持仓已对冲");
@@ -236,7 +254,18 @@ impl FundingArbStrategy {
         }
     }
 
+    /// 这个币数量在该所能不能下出去（取整后非 0 且不低于最小下单量）
+    fn tradable(&self, ex: Exchange, qty: f64) -> bool {
+        self.metas[&ex].checked_exchange_qty(qty).is_ok()
+    }
+
+    /// 两所挂同样的量：按两所精度依次向下取整（各所步长都是 10 的幂次，取整后同为两所步长的整数倍）；
+    /// 任一所下不出则不挂。
     fn pair_quotes(&self, pair: LegPair, bbos: &HashMap<Exchange, &BBO>, qty: f64, reduce_only: bool) -> Vec<Quote> {
+        let qty = self.metas[&pair.buy].round_coin_size_down(self.metas[&pair.sell].round_coin_size_down(qty));
+        if !(self.tradable(pair.sell, qty) && self.tradable(pair.buy, qty)) {
+            return Vec::new();
+        }
         [(pair.sell, Side::Short), (pair.buy, Side::Long)]
             .into_iter()
             .map(|(ex, side)| Quote { exchange: ex, side, price: self.maker_price(bbos[&ex], side), qty, reduce_only })
@@ -375,7 +404,7 @@ impl FundingArbStrategy {
     }
 
     /// 持仓之和不为 0：撤所有 maker，补腿所无在途单且过了重试间隔时市价补齐。
-    fn hedge(&mut self, sv: SymbolView<'_>, net: f64, positions: &[(Exchange, f64)], now: Timestamp) -> Vec<OutcomeEvent> {
+    fn hedge(&mut self, sv: SymbolView<'_>, pair: LegPair, net: f64, positions: &[(Exchange, f64)], now: Timestamp) -> Vec<OutcomeEvent> {
         let mut out: Vec<OutcomeEvent> = sv
             .pending_orders()
             .filter(|p| matches!(p.order.order_type, OrderType::Limit { .. }))
@@ -385,12 +414,7 @@ impl FundingArbStrategy {
             .filter_map(|p| self.cancel(p, now))
             .collect();
 
-        let Some(pair) = self.leg else {
-            self.halt(format!("各所持仓之和不为 0 但本策略还没挂过单，不知道在哪对所补：{positions:?}"));
-            return out;
-        };
-        // 多了在卖出所卖、少了在买入所买：补的就是这次操作里没成交的落后腿
-        let (target, side) = if net > 0.0 { (pair.sell, Side::Short) } else { (pair.buy, Side::Long) };
+        let (target, side) = hedge_target(pair, net);
         if sv.pending_orders().any(|p| p.order.exchange == target) {
             return out; // 等补腿所上的挂单撤完 / 在途补腿单出结果，免得重复成交
         }
@@ -430,6 +454,15 @@ impl FundingArbStrategy {
             comment: format!("funding_arb hedge | {target} {side:?} qty={:.6} positions={positions:?} pair={pair:?}", net.abs()),
         });
         out
+    }
+}
+
+/// 多了在卖出所卖、少了在买入所买：补的就是这次操作里没成交的落后腿
+fn hedge_target(pair: LegPair, net: f64) -> (Exchange, Side) {
+    if net > 0.0 {
+        (pair.sell, Side::Short)
+    } else {
+        (pair.buy, Side::Long)
     }
 }
 

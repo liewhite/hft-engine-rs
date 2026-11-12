@@ -29,14 +29,16 @@ fn config() -> FundingArbConfig {
 }
 
 fn meta(ex: Exchange) -> ((Exchange, String), SymbolMeta) {
+    // OKX 用粗粒度（一手 1 个币 ≈ 100U），测零头处理；其余所 0.001
+    let step = if ex == OKX { 1.0 } else { 0.001 };
     (
         (ex, SYM.to_string()),
         SymbolMeta {
             exchange: ex,
             symbol: SYM.to_string(),
             price_formatter: Arc::new(StepFormatter::new(0.01)),
-            size_step: 0.001,
-            min_order_size: 0.001,
+            size_step: step,
+            min_order_size: step,
             contract_size: 1.0,
         },
     )
@@ -70,7 +72,7 @@ impl Sim {
         let p = config().params().remove(0);
         let exchanges: Vec<Exchange> = legs.iter().map(|(e, _)| *e).collect();
         let mut runner = StrategyRunner::new(
-            Box::new(FundingArbStrategy::new(p, exchanges.clone())),
+            Box::new(FundingArbStrategy::new(p, exchanges.iter().map(|&e| meta(e).1).collect())),
             Arc::new(exchanges.iter().map(|&e| meta(e)).collect::<HashMap<_, _>>()),
         );
         let baselines: Vec<PositionBaseline> = legs
@@ -428,6 +430,8 @@ fn three_exchanges_hedge_on_the_quoted_pair() {
     let h = placed(&s.bbo(BN));
     assert_eq!(h.len(), 1, "{h:?}");
     assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (HL, Side::Long, 1.0), "OKX 卖成交 → 在 HL 买补，不碰币安");
+    assert_eq!(okx.quantity, 1.0, "两腿同量：按 OKX 一手 1 个币向下取整");
+    assert_eq!(hl.quantity, 1.0);
     assert!(matches!(h[0].order_type, OrderType::Market));
 }
 
@@ -449,4 +453,30 @@ fn both_close_legs_filling_needs_no_hedge() {
     s.confirm(&bn, OrderStatus::Cancelled);
     s.advance(600);
     assert!(placed(&s.bbo(BN)).iter().all(|o| !matches!(o.order_type, OrderType::Market)));
+}
+
+#[test]
+fn imbalance_below_one_lot_of_the_hedge_exchange_is_dust() {
+    // OKX 一手 1 个币（≈100U）。HL 买单先成交 0.5（50U ≥ 最小单额，但 OKX 下不出 0.5）→ 不补、不停机；
+    // HL 补满到 1.0 后在 OKX 补卖 1
+    let mut s = Sim::multi(&[(HL, 0.0), (OKX, 0.0)]);
+    s.funding(HL, 0.0);
+    let o = placed(&s.funding(OKX, 0.9));
+    let okx = o.iter().find(|o| o.exchange == OKX).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&okx, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::PartiallyFilled);
+    s.fill(&hl, 0.5);
+    s.advance(600);
+    let out = s.bbo(HL);
+    assert!(placed(&out).iter().all(|o| !matches!(o.order_type, OrderType::Market)), "零头不补：{out:?}");
+    let c = cancels(&s.fill(&hl, 0.5));
+    assert!(c.contains(&OKX), "差够一手：撤挂单准备补腿：{c:?}");
+    s.confirm(&hl, OrderStatus::Filled);
+    s.confirm(&okx, OrderStatus::Cancelled);
+    s.advance(600);
+    let h = placed(&s.bbo(HL));
+    assert_eq!(h.len(), 1, "{h:?}");
+    assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (OKX, Side::Short, 1.0));
 }
