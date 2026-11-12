@@ -4,6 +4,7 @@ pub mod hyperliquid;
 pub mod ibkr;
 pub mod okx;
 pub mod crypto_status;
+pub(crate) mod equity_polling;
 pub mod staleness;
 pub mod ws_loop;
 

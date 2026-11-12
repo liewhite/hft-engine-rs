@@ -1,8 +1,9 @@
-//! BinanceEquityPollingActor - 定时查询 Binance 账户 equity
+//! EquityPollingActor - 定时用 REST 查账户净值与持仓总价值（`AccountClient::fetch_account_info`）
 //!
-//! Binance 的 WebSocket 不推送 equity，需要通过 REST API 定时查询
+//! 用于 WebSocket 不推送净值、或推送的净值口径不对的所：Binance 的 WS 不推 equity；
+//! Hyperliquid 统一账户的净值在 spot clearinghouse，按 dex 推送的 clearinghouseState
+//! 里恒为 0。所别只体现在 `client.exchange()` 与各 client 的 `fetch_account_info` 实现里。
 
-use crate::domain::Exchange;
 use crate::messaging::AccountPubSub;
 use crate::exchange::staleness::{stamped_on_receipt, StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
@@ -17,9 +18,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_stream::wrappers::IntervalStream;
 
-/// BinanceEquityPollingActor 初始化参数
-pub struct BinanceEquityPollingActorArgs {
-    /// Binance client (用于查询 equity)
+/// EquityPollingActor 初始化参数
+pub struct EquityPollingActorArgs {
+    /// 账户 client（用于查询 equity；所别取自 `client.exchange()`）
     pub client: Arc<dyn AccountClient>,
     /// Income PubSub (发布事件)
     pub account_pubsub: ActorRef<AccountPubSub>,
@@ -27,9 +28,9 @@ pub struct BinanceEquityPollingActorArgs {
     pub interval_ms: u64,
 }
 
-/// BinanceEquityPollingActor - 定时查询 equity
-pub struct BinanceEquityPollingActor {
-    /// Binance client
+/// EquityPollingActor - 定时查询 equity
+pub struct EquityPollingActor {
+    /// 账户 client
     client: Arc<dyn AccountClient>,
     /// Income PubSub (发布事件)
     account_pubsub: ActorRef<AccountPubSub>,
@@ -38,7 +39,7 @@ pub struct BinanceEquityPollingActor {
     guard: StalenessGuard,
 }
 
-impl BinanceEquityPollingActor {
+impl EquityPollingActor {
     /// 执行一次账户信息查询 (equity + notional)。`Err` = 已停摆过久，调用方应致命退出。
     async fn poll_account_info(&mut self) -> Result<(), String> {
         // 戳在响应到手之后取，理由见 `stamped_on_receipt`
@@ -56,7 +57,7 @@ impl BinanceEquityPollingActor {
                         exchange_ts: local_ts,
                         local_ts,
                         data: AccountData::AccountInfo {
-                            exchange: Exchange::Binance,
+                            exchange: self.client.exchange(),
                             equity: info.equity,
                             notional: info.notional,
                         },
@@ -70,7 +71,7 @@ impl BinanceEquityPollingActor {
             Err(e) => {
                 self.guard.check_failure(&e)?;
                 tracing::warn!(
-                    exchange = %Exchange::Binance,
+                    exchange = %self.client.exchange(),
                     error = %e,
                     stale_ms = self.guard.stale_ms(),
                     "Failed to fetch account info, will retry"
@@ -81,8 +82,8 @@ impl BinanceEquityPollingActor {
     }
 }
 
-impl Actor for BinanceEquityPollingActor {
-    type Args = BinanceEquityPollingActorArgs;
+impl Actor for EquityPollingActor {
+    type Args = EquityPollingActorArgs;
     type Error = Infallible;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
@@ -93,15 +94,16 @@ impl Actor for BinanceEquityPollingActor {
         actor_ref.attach_stream(interval_stream, (), ());
 
         tracing::info!(
-            exchange = "Binance",
+            exchange = %args.client.exchange(),
             interval_ms = interval.as_millis() as u64,
-            "BinanceEquityPollingActor started"
+            "EquityPollingActor started"
         );
 
+        let guard = StalenessGuard::new(format!("{} 账户净值", args.client.exchange()), MAX_POLL_STALENESS_MS);
         Ok(Self {
             client: args.client,
             account_pubsub: args.account_pubsub,
-            guard: StalenessGuard::new("Binance 账户净值", MAX_POLL_STALENESS_MS),
+            guard,
         })
     }
 
@@ -110,13 +112,13 @@ impl Actor for BinanceEquityPollingActor {
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
-        tracing::info!("BinanceEquityPollingActor stopped");
+        tracing::info!("EquityPollingActor stopped");
         Ok(())
     }
 }
 
 /// 定时器消息处理
-impl Message<StreamMessage<Instant, (), ()>> for BinanceEquityPollingActor {
+impl Message<StreamMessage<Instant, (), ()>> for EquityPollingActor {
     type Reply = ();
 
     async fn handle(
@@ -127,7 +129,7 @@ impl Message<StreamMessage<Instant, (), ()>> for BinanceEquityPollingActor {
         match msg {
             StreamMessage::Next(_) => {
                 if let Err(reason) = self.poll_account_info().await {
-                    tracing::error!(%reason, "Binance 账户净值长期取不到，退出（陈旧净值会让杠杆闸门失准）");
+                    tracing::error!(exchange = %self.client.exchange(), %reason, "账户净值长期取不到，退出（陈旧净值会让杠杆闸门失准）");
                     ctx.actor_ref().kill();
                 }
             }

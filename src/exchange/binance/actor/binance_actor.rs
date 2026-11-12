@@ -11,10 +11,10 @@
 //! ├── BinancePublicWsActor [spawn_link]
 //! ├── BinancePrivateWsActor [spawn_link] (optional, 需要凭证)
 //! │   └── BinanceListenKeyActor [spawn_link]
-//! └── BinanceEquityPollingActor [spawn_link]
+//! └── EquityPollingActor [spawn_link]
 
 use crate::actor_lifecycle::ChildGroup;
-use super::equity_polling::{BinanceEquityPollingActor, BinanceEquityPollingActorArgs};
+use crate::exchange::equity_polling::{EquityPollingActor, EquityPollingActorArgs};
 use super::funding_fee_polling::{BinanceFundingFeePollingActor, BinanceFundingFeePollingActorArgs};
 use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
 use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
@@ -195,10 +195,10 @@ impl Actor for BinanceActor {
         // 用同一个带凭证的 client（`binance_client` 与 `has_private_ws` 同源于凭证是否存在）：
         // 净值查询是账户私有能力，只有 AccountClient 提供
         if let Some(client) = binance_client.clone() {
-            children.spawn::<BinanceEquityPollingActor, _>(
+            children.spawn::<EquityPollingActor, _>(
                 &actor_ref,
-                "BinanceEquityPollingActor",
-                BinanceEquityPollingActorArgs {
+                "EquityPollingActor",
+                EquityPollingActorArgs {
                     client,
                     account_pubsub: args.account_pubsub.clone(),
                     interval_ms: 1000,

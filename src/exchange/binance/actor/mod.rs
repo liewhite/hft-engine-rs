@@ -5,11 +5,10 @@
 //! ├── BinancePublicWsActor [spawn_link]
 //! ├── BinancePrivateWsActor [spawn_link]
 //! │   └── BinanceListenKeyActor [spawn_link]
-//! ├── BinanceEquityPollingActor [spawn_link]
+//! ├── EquityPollingActor [spawn_link]（通用，见 crate::exchange::equity_polling）
 //! └── BinanceFundingFeePollingActor [spawn_link]
 
 pub(crate) mod binance_actor;
-mod equity_polling;
 mod funding_fee_polling;
 mod listen_key;
 mod private_ws;
