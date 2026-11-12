@@ -282,17 +282,6 @@ impl MetricsActor {
                 ),
                 "metrics.position"
             );
-
-            // 单腿裸敞口是本策略的已知风险点（无强制 rebalance），单独告警
-            if exposure.legs == 1 {
-                tracing::warn!(
-                    target: "metrics",
-                    %symbol,
-                    net_size = format!("{:.6}", exposure.net_size),
-                    net_notional = format!("{:.2}", exposure.net_notional),
-                    "metrics.single_leg_exposure：单腿裸敞口，等待后续信号中和"
-                );
-            }
         }
 
         // ---------- 订单 + 历史 ----------

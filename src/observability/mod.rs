@@ -19,5 +19,5 @@
 pub mod alert;
 pub mod prometheus;
 
-pub use alert::{spawn_alert_webhook_layer, AlertWebhookConfig};
+pub use alert::{spawn_alert_webhook_layer, AlertHandle, AlertWebhookConfig};
 pub use prometheus::{MetricsPushConfig, PromText};

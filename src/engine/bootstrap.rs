@@ -7,7 +7,39 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use crate::actor_lifecycle::ChildStop;
 use crate::engine::live::{ManagerActor, ManagerActorArgs, RegisterSupervisedChild};
 
-/// 初始化 tracing（fmt + EnvFilter + 可选告警外送）
+/// 退出前等告警发完的最长时间（单次发送超时 10s，留出一条告警加一条汇总的余量）
+const ALERT_FLUSH_DEADLINE: Duration = Duration::from_secs(20);
+
+/// 进程入口：各启动程序的 `main` 只写 `run_main(run).await`。
+///
+/// 1. 初始化日志与告警外送；配了告警就先试发一条，不通直接拒绝启动 —— 告警是停机类事故
+///    唯一的及时通知渠道，配了却不通等于没配，而运行者以为配了。
+/// 2. 跑 `body`。出错时把退出原因记成 ERROR（于是也会外送）。
+/// 3. 在 [`ALERT_FLUSH_DEADLINE`] 内等告警发完再返回 —— 否则进程退出会丢掉最要紧的那几条。
+pub async fn run_main<F, Fut>(body: F) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let alerts = init_tracing()?;
+    if let Some(a) = &alerts {
+        a.probe().await.map_err(|e| e.context("告警外送不通，拒绝启动（修好告警配置，或去掉告警环境变量明确关闭）"))?;
+        tracing::info!("告警外送已启用并试发成功，不受 RUST_LOG 控制台过滤影响");
+    }
+    let result = body().await;
+    if let Err(e) = &result {
+        tracing::error!(error = format!("{e:#}"), "进程因错误退出");
+    }
+    if let Some(a) = alerts {
+        if !a.flush(ALERT_FLUSH_DEADLINE).await {
+            tracing::error!("退出前告警未在 {}s 内发完，可能有告警未送达", ALERT_FLUSH_DEADLINE.as_secs());
+        }
+    }
+    result
+}
+
+/// 初始化 tracing（fmt + EnvFilter + 可选告警外送），返回告警句柄（未配置为 None）。
+/// 只由 [`run_main`] 调用：启动试发与退出前发完都在那里。
 ///
 /// 默认放行**全部 info**，只把已知吵闹的依赖降到 warn。
 ///
@@ -18,7 +50,7 @@ use crate::engine::live::{ManagerActor, ManagerActorArgs, RegisterSupervisedChil
 /// 设置 `SLACK_BOT_TOKEN`+`SLACK_ALERT_CHANNEL` 或 `ALERT_WEBHOOK_URL` 环境变量即启用告警外送：WARN/ERROR 级事件（对账漂移、
 /// 投产失败、断流退出等既有告警点）旁路外送，见
 /// [`crate::observability::alert`]。未设置 = 行为与从前完全一致。
-pub fn init_tracing() -> anyhow::Result<()> {
+fn init_tracing() -> anyhow::Result<Option<crate::observability::AlertHandle>> {
     const DEFAULT_FILTER: &str = "info,\
         hyper=warn,hyper_util=warn,reqwest=warn,h2=warn,rustls=warn,\
         tungstenite=warn,tokio_tungstenite=warn";
@@ -27,9 +59,13 @@ pub fn init_tracing() -> anyhow::Result<()> {
     } else {
         EnvFilter::new(DEFAULT_FILTER)
     };
-    let alert_config = crate::observability::AlertWebhookConfig::from_env();
-    let alert_enabled = alert_config.is_some();
-    let alert_layer = alert_config.map(crate::observability::spawn_alert_webhook_layer);
+    let (alert_layer, alert_handle) = match crate::observability::AlertWebhookConfig::from_env() {
+        Some(config) => {
+            let (layer, handle) = crate::observability::spawn_alert_webhook_layer(config)?;
+            (Some(layer), Some(handle))
+        }
+        None => (None, None),
+    };
     // EnvFilter 必须作为 fmt 层的 **per-layer filter**，不能挂成全局 layer ——
     // 全局挂载是"所有 layer 的 AND"，RUST_LOG=error 会连带把 WARN 挡在告警层外，
     // 告警外送随控制台冗余度配置静默失效。
@@ -43,10 +79,7 @@ pub fn init_tracing() -> anyhow::Result<()> {
         .with(fmt::layer().with_filter(filter))
         .with(alert_layer.map(|l| l.with_filter(tracing_subscriber::filter::LevelFilter::WARN)))
         .init();
-    if alert_enabled {
-        tracing::info!("告警外送已启用，不受 RUST_LOG 控制台过滤影响");
-    }
-    Ok(())
+    Ok(alert_handle)
 }
 
 /// 从 CLI 参数读取配置文件并反序列化

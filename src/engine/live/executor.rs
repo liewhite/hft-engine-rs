@@ -103,8 +103,8 @@ impl ExecutorActor {
     ///
     /// 所以改为让积压**可见**（与 [`crate::exchange::staleness`] 同一姿态：读数流的问题
     /// 要能被发现，而不是被静默吸收）：超过阈值即 warn（按时间节流，见
-    /// [`LAG_WARN_INTERVAL_MS`]），`ALERT_WEBHOOK_URL` 会把 WARN 外送成告警
-    /// （见 [`crate::engine::init_tracing`]）。
+    /// [`LAG_WARN_INTERVAL_MS`]），配了告警外送时 WARN 会外送
+    /// （见 [`crate::observability::alert`]）。
     ///
     /// 不 kill：偶发的 GC / 调度抖动不该打死引擎，而持续积压会持续告警。
     ///

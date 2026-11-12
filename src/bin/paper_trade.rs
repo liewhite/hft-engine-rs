@@ -27,7 +27,7 @@
 use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::engine::{
-    init_tracing, load_config, run_engine, AddStrategies, ManagerActorArgs,
+    load_config, run_engine, run_main, AddStrategies, ManagerActorArgs,
     setup_binance, setup_hyperliquid, setup_okx,
     StrategySpec,
 };
@@ -134,7 +134,10 @@ impl Strategy for DipMaker {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing()?;
+    run_main(run).await
+}
+
+async fn run() -> anyhow::Result<()> {
     let config: PaperTradeConfig = load_config("paper.json")?;
 
     // 只支持单所演示：取配置里第一个启用的所

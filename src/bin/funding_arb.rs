@@ -26,7 +26,7 @@
 use hft_engine_rs::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::live::{GetAllSymbolMetas, PublishCustomEvent};
 use hft_engine_rs::engine::{
-    init_tracing, load_config, setup_binance, setup_hyperliquid, setup_okx, run_engine, AddStrategies,
+    load_config, setup_binance, setup_hyperliquid, setup_okx, run_engine, run_main, AddStrategies,
     ExchangeSetup, ManagerActor, ManagerActorArgs, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
@@ -88,7 +88,10 @@ async fn connect(cfg: &ExchangesConfig) -> anyhow::Result<Connected> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing()?;
+    run_main(run).await
+}
+
+async fn run() -> anyhow::Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| "config.json".to_string());
     let config: Config = load_config(&path)?;
     config.strategy.validate().map_err(|e| anyhow::anyhow!("strategy 配置非法: {e}"))?;

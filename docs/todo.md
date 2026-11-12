@@ -24,7 +24,7 @@
 ### 3. 单腿裸敞口只靠 `adjust_for_exposure` 中和（已知取舍）
 两条腿是独立 IOC 单，可能只成交一条腿，形成裸方向敞口。当前**没有强制对冲/rebalance**：
 靠后续信号在 `adjust_for_exposure` 里逐步中和，**收敛时间无上界**。
-指标层已对此单独告警（`metrics.single_leg_exposure`），先靠人看。
+指标层有 `hft_single_leg` / `hft_single_leg_symbols` 指标，先靠看板人看（逐 tick 的 WARN 告警已删：两腿先后成交的策略里单腿是常态，会刷屏挤占告警名额）。
 若要收紧，可加"敞口存续超过 N 秒即强制 reduce-only 平掉"的兜底。
 
 注：风控闸门本身不会制造裸单——`enforce_single_leg_reduces_exposure` 会把"另一腿被拦、

@@ -137,7 +137,7 @@ pub enum OutcomeEvent {
 | 快照面 | `GetAllSymbolMetas` / `GetLivePositions` |
 | 入向注入 | `PublishCustomEvent(CustomEvent)` |
 | 晋升调度 | `SupervisorActor` + `SupervisorArgs`，判据实现 `PromotionPolicy::decide(&SymbolPerformance) -> Decision` |
-| 启动辅助 | `init_tracing` / `load_config` / `run_engine`（启动 → 装配 → 运行 → 唯一停机路径）/ `spawn_supervised` |
+| 启动辅助 | `run_main`（日志与告警：启动试发、退出前发完）/ `load_config` / `run_engine`（启动 → 装配 → 运行 → 唯一停机路径）/ `spawn_supervised` |
 | 纯逻辑核心 | `StrategyRunner`（回测直接驱动它）、`ClientOrderIdGen` |
 
 **流面与快照面是两条独立的路**，不要合并成一个 `Query { kind }`：
@@ -194,14 +194,17 @@ pub enum OutcomeEvent {
 
 ```rust
 use hft_engine_rs::engine::{
-    init_tracing, load_config, run_engine,
+    load_config, run_engine, run_main,
     AddStrategies, ManagerActorArgs, StrategySpec,
     setup_binance, setup_okx,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing()?;
+    run_main(run).await
+}
+
+async fn run() -> anyhow::Result<()> {
     let config: MyConfig = load_config("config.json")?;
 
     // 1. 装配参与的交易所。缺省即该所不参与 —— manager 对"有哪些所"彻底无知

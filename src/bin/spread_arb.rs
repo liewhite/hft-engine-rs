@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{
-    init_tracing, load_config, run_engine, AddStrategies, GetAllSymbolMetas,
+    load_config, run_engine, run_main, AddStrategies, GetAllSymbolMetas,
     ManagerActorArgs, setup_binance, setup_hyperliquid, setup_okx, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
@@ -113,7 +113,10 @@ fn build_symbol_universe(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing()?;
+    run_main(run).await
+}
+
+async fn run() -> anyhow::Result<()> {
     tracing::info!("Spread arbitrage system starting...");
 
     let config: Config = load_config("config.json")?;

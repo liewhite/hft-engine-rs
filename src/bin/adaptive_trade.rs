@@ -28,7 +28,7 @@
 use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::engine::{
-    init_tracing, load_config, run_engine, spawn_supervised, Decision,
+    load_config, run_engine, run_main, spawn_supervised, Decision,
     ManagerActorArgs, setup_binance, setup_hyperliquid, setup_okx,
     PromotionPolicy, SubscribeAccount, SubscribeMarket, SupervisorActor, SupervisorArgs, SymbolPerformance,
 };
@@ -205,7 +205,10 @@ async fn top_symbols_by_volume(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_tracing()?;
+    run_main(run).await
+}
+
+async fn run() -> anyhow::Result<()> {
     let config: AdaptiveConfig = load_config("adaptive.json")?;
     anyhow::ensure!(config.top_n > 0, "top_n 必须 > 0");
 

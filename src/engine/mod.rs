@@ -3,7 +3,7 @@ pub mod live;
 mod strategy_runner;
 
 pub use bootstrap::{
-    init_tracing, load_config, run_engine, spawn_supervised, Supervised,
+    load_config, run_engine, run_main, spawn_supervised, Supervised,
 };
 pub use strategy_runner::{
     ClientOrderIdGen, ExchangeUuidGen, SequentialClientOrderIdGen, StrategyRunner,
