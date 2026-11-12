@@ -4,7 +4,7 @@
 
 use crate::domain::{
     AccountInfo, CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderType, OrderUpdate,
-    Position, Symbol, SymbolMeta,
+    PlaceError, Position, Symbol, SymbolMeta,
 };
 use async_trait::async_trait;
 
@@ -205,7 +205,11 @@ pub trait AccountClient: Send + Sync + 'static {
     fn exchange(&self) -> Exchange;
 
     /// 下单。入参已是交易所单位，见 [`ExchangeOrder`]。
-    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError>;
+    ///
+    /// 失败时必须如实分成「被拒绝」与「结果不确定」两种，见 [`PlaceError`]：只有交易所
+    /// 明确拒单或请求根本没发出才算被拒绝，其余（超时、5xx、断线、回复解析不了……）都是
+    /// 结果不确定。拿不准的一律报不确定 —— 报错了的代价是停机，报成拒绝的代价是重复下单。
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError>;
 
     /// 撤单
     async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError>;
@@ -230,6 +234,16 @@ pub trait AccountClient: Send + Sync + 'static {
     /// 只含本引擎接入的合约（映射不到内部 symbol 的别的品种不列入），每个 symbol 至多一条；
     /// 消费方用 [`index_positions`] 建索引，重复即报错。数量口径为币本位，见 trait 级文档。
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError>;
+}
+
+/// 下单 HTTP 请求在拿到回复之前就失败了：连接都没建立（`is_connect`）说明请求没送到交易所，
+/// 确定没挂上；其余（超时、连接中途断开、读回复失败）请求可能已到交易所，结果不确定。
+pub(crate) fn place_send_error(exchange: Exchange, e: reqwest::Error) -> PlaceError {
+    if e.is_connect() {
+        PlaceError::unsent(format!("{exchange} connect failed: {e}"))
+    } else {
+        PlaceError::indeterminate(format!("{exchange} request failed: {e}"))
+    }
 }
 
 /// 把一所的持仓快照按 symbol 建索引。同一 symbol 出现两条说明映射把两个合约混成了一个

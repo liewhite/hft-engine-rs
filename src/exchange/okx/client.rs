@@ -2,11 +2,11 @@
 
 use super::symbol::{from_okx, to_okx};
 use crate::domain::{
-    Exchange, ExchangeError, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate, Side,
+    Exchange, ExchangeError, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate, PlaceError, Side,
     Symbol, SymbolMeta, TimeInForce,
 };
 use crate::exchange::okx::codec::{parse_account_info, GreeksData, PositionData};
-use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
 use crate::domain::StepFormatter;
@@ -535,7 +535,7 @@ impl AccountClient for OkxClient {
         )))
     }
 
-    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {
         // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
         let order = order.inner();
         let path = "/api/v5/trade/order";
@@ -576,29 +576,14 @@ impl AccountClient for OkxClient {
             },
         };
 
-        let body = serde_json::to_string(&request)?;
+        let body = serde_json::to_string(&request).map_err(PlaceError::unsent)?;
         let timestamp = Self::iso_timestamp();
         let sign = self
             .sign(&timestamp, "POST", path, &body)
-            .ok_or_else(|| ExchangeError::Other("No credentials".to_string()))?;
+            .ok_or_else(|| PlaceError::unsent("No credentials"))?;
         let headers = self
             .build_headers(&sign, &timestamp)
-            .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OrderData {
-            ord_id: String,
-            s_code: String,
-            s_msg: String,
-        }
-
-        #[derive(Deserialize)]
-        struct Response {
-            code: String,
-            msg: String,
-            data: Vec<OrderData>,
-        }
+            .ok_or_else(|| PlaceError::unsent("Failed to build headers"))?;
 
         let resp = self
             .client
@@ -607,31 +592,13 @@ impl AccountClient for OkxClient {
             .body(body)
             .send()
             .await
-            .map_err(Self::map_reqwest_error)?;
-
-        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
-
-        // 先检查 data 中的具体错误信息（更详细）
-        if let Some(order_data) = data.data.first() {
-            if order_data.s_code != "0" {
-                let msg = format!("code={}, msg={}", order_data.s_code, order_data.s_msg);
-                return Err(ExchangeError::OrderRejected(
-                    Exchange::OKX,
-                    crate::domain::RejectReason::classify(&msg),
-                ));
-            }
-            return Ok(order_data.ord_id.clone());
-        }
-
-        // 如果没有 data，检查顶层错误
-        if data.code != "0" {
-            return Err(map_okx_error(&data.code, &data.msg));
-        }
-
-        Err(ExchangeError::OrderRejected(
-            Exchange::OKX,
-            crate::domain::RejectReason::Other("No order data in response".to_string()),
-        ))
+            .map_err(|e| place_send_error(Exchange::OKX, e))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| PlaceError::indeterminate(format!("OKX 读下单回复失败 (HTTP {status}): {e}")))?;
+        parse_place_reply(status, &text)
     }
 
     /// 净值 = `account/balance` 的 `totalEq`（USD）；持仓总价值 = `account/positions`（全部
@@ -766,6 +733,57 @@ fn parse_settled_funding(
     out.retain(|f| f.settle_time >= start_ms);
     out.sort_by_key(|f| f.settle_time);
     Ok(out)
+}
+
+/// OKX 自己说「结果未知」或系统侧故障、不能断定没受理的错误码（官方错误码表）：
+/// 50001 服务暂不可用、50004 接口请求超时（"不代表请求成功或者失败，请检查请求结果"）、
+/// 50013 系统繁忙、50026 系统错误、51149 下单超时。可能出现在顶层 `code`，也可能出现在单笔 `sCode`。
+const OKX_UNKNOWN_STATUS_CODES: &[&str] = &["50001", "50004", "50013", "50026", "51149"];
+
+/// 下单回复 → 三种结论。纯函数。
+///
+/// OKX 的失败回复常带非 2xx 状态（如 50004 是 HTTP 400），所以**先看正文、不看状态码**：
+/// - 有单笔结果 `data[0]`：`sCode == "0"` 成功；`sCode` 属于「结果未知」→ 不确定；其余 → 拒绝；
+/// - 没有单笔结果：顶层 `code` 属于「结果未知」或 HTTP 5xx → 不确定；其余非 0（签名、限频、参数）→ 拒绝；
+///   顶层 0 却没有单笔结果 → 不确定；
+/// - 正文解析不了（网关 HTML、空回复）→ 不确定。
+fn parse_place_reply(status: u16, text: &str) -> Result<OrderId, PlaceError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OrderData {
+        #[serde(default)]
+        ord_id: String,
+        s_code: String,
+        #[serde(default)]
+        s_msg: String,
+    }
+    #[derive(Deserialize)]
+    struct Response {
+        code: String,
+        #[serde(default)]
+        msg: String,
+        #[serde(default)]
+        data: Vec<OrderData>,
+    }
+    let unknown = |code: &str| OKX_UNKNOWN_STATUS_CODES.contains(&code);
+    let Ok(resp) = serde_json::from_str::<Response>(text) else {
+        let body: String = text.chars().take(300).collect();
+        return Err(PlaceError::indeterminate(format!("OKX 下单回复解析不了 (HTTP {status}): {body}")));
+    };
+    if let Some(d) = resp.data.first() {
+        let detail = format!("HTTP {status}, sCode={}, sMsg={}", d.s_code, d.s_msg);
+        return match d.s_code.as_str() {
+            "0" => Ok(d.ord_id.clone()),
+            c if unknown(c) => Err(PlaceError::indeterminate(format!("OKX {detail}"))),
+            _ => Err(PlaceError::rejected(detail)),
+        };
+    }
+    let detail = format!("HTTP {status}, code={}, msg={}", resp.code, resp.msg);
+    match resp.code.as_str() {
+        "0" => Err(PlaceError::indeterminate(format!("OKX 下单回复没有单笔结果: {detail}"))),
+        c if unknown(c) || status >= 500 => Err(PlaceError::indeterminate(format!("OKX {detail}"))),
+        _ => Err(PlaceError::rejected(detail)),
+    }
 }
 
 /// 错误码映射
@@ -935,5 +953,70 @@ mod positions_tests {
         let got: Vec<(Symbol, &str)> =
             mapped_positions(&data, "USDT").map(|(s, d)| (s, d.inst_id.as_str())).collect();
         assert_eq!(got, [("BTC".to_string(), "BTC-USDT-SWAP")]);
+    }
+}
+
+#[cfg(test)]
+mod place_reply_tests {
+    use super::*;
+    use crate::domain::RejectReason;
+
+    fn rejected(r: Result<OrderId, PlaceError>) -> bool {
+        matches!(r, Err(PlaceError::Rejected(_)))
+    }
+    fn indeterminate(r: Result<OrderId, PlaceError>) -> bool {
+        matches!(r, Err(PlaceError::Indeterminate(_)))
+    }
+
+    #[test]
+    fn accepted_returns_order_id() {
+        let body = r#"{"code":"0","msg":"","data":[{"clOrdId":"x","ordId":"777","sCode":"0","sMsg":"Order placed"}]}"#;
+        assert_eq!(parse_place_reply(200, body), Ok("777".to_string()));
+    }
+
+    /// 单笔被拒：只挂 maker 会吃单、余额不足、精度 —— 交易所明确不接
+    #[test]
+    fn per_order_rejections() {
+        for s in [
+            r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"51026","sMsg":"Order failed. Post-only order would have taken liquidity"}]}"#,
+            r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"51008","sMsg":"Order failed. Insufficient USDT margin in account"}]}"#,
+            r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"51121","sMsg":"Order quantity must be a multiple of the lot size."}]}"#,
+        ] {
+            assert!(rejected(parse_place_reply(200, s)), "{s}");
+        }
+    }
+
+    #[test]
+    fn reduce_only_message_keeps_its_reason() {
+        let s = r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"51169","sMsg":"Order failed: reduce-only order"}]}"#;
+        assert_eq!(parse_place_reply(200, s), Err(PlaceError::Rejected(RejectReason::ReduceOnlyClosed)));
+    }
+
+    /// 顶层被拒（没有单笔结果）：签名错、限频
+    #[test]
+    fn top_level_rejections() {
+        for (status, s) in [
+            (401, r#"{"code":"50113","msg":"Invalid Sign","data":[]}"#),
+            (429, r#"{"code":"50011","msg":"Too Many Requests"}"#),
+        ] {
+            assert!(rejected(parse_place_reply(status, s)), "{s}");
+        }
+    }
+
+    /// OKX 自己说结果未知的码（顶层或单笔）、5xx、解析不了、成功却没单笔结果 → 不确定
+    #[test]
+    fn unknown_outcomes() {
+        for (status, s) in [
+            (400, r#"{"code":"50004","msg":"API endpoint request timeout (does not mean that the request was successful or failed, please check the request result)","data":[]}"#),
+            (503, r#"{"code":"50001","msg":"Service temporarily unavailable"}"#),
+            (200, r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"51149","sMsg":"Order timed out. Please try again."}]}"#),
+            (200, r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"50026","sMsg":"System error"}]}"#),
+            (502, r#"{"code":"50000","msg":"x"}"#),
+            (502, "<html>Bad Gateway</html>"),
+            (200, ""),
+            (200, r#"{"code":"0","msg":"","data":[]}"#),
+        ] {
+            assert!(indeterminate(parse_place_reply(status, s)), "{status} {s}");
+        }
     }
 }

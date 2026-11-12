@@ -12,7 +12,7 @@ use crate::actor_lifecycle::{ChildGroup, ChildRegistrar, ChildStop};
 use crate::engine::bootstrap::Supervised;
 use super::{
     to_live_outlet, to_paper_outlet, AccountOutcome, AccountPubSub, ClockActor, ClockActorArgs,
-    IncomeProcessorActor, MarketPubSub, MetricsActor, MetricsActorArgs, OrderGateway,
+    IncomeProcessorActor, MarketPubSub, MetricsActor, MetricsActorArgs, EngineHalt, OrderGateway,
     OutcomePubSub, OutcomeProcessorActor, PaperCounterActor, PaperCounterArgs,
     GetLivePositions, PositionLedgerActor, PositionLedgerArgs,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
@@ -251,6 +251,8 @@ impl Actor for ManagerActor {
             // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
             Arc::new(symbol_metas.clone()),
             /* dry_run */ false,
+            // 下单结果不确定时停机：杀掉本 actor（监督树的根），on_stop 依次收尾
+            EngineHalt::kill(actor_ref.downgrade()),
         ));
         let live_processor = consumers.spawn::<OutcomeProcessorActor, _>(
             &actor_ref,

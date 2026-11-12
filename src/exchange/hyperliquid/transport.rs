@@ -23,7 +23,8 @@ use super::signing::{
     action_hash, create_signer, sign_l1_action, BulkCancelAction, BulkOrderAction, CancelWire,
     ExchangeRequest, LimitOrder, OrderType as WireOrderType, OrderWire,
 };
-use crate::domain::{now_ms, Exchange, ExchangeError, RejectReason};
+use crate::domain::{now_ms, Exchange, ExchangeError, PlaceError};
+use crate::exchange::client::place_send_error;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -74,13 +75,13 @@ pub(crate) struct HlCancelIntent {
 
 /// 签名并提交到 HL 的通道。返回 HL `/exchange` 的原始回复。
 ///
-/// 错误种类**只用于日志可读**，调用方不按种类分流，也不能据此断定"确定没提交"：
-/// 例如签名机已提交但回复解析失败时报的是 `ParseError`。"单可能已到 HL"的情况由框架
-/// 现有机制收敛 —— `OrderGateway` 的在途登记，加上"下单失败只是本地结论，后到的交易所
-/// 回报会把单重新纳入跟踪"（见 `messaging/state.rs`）。与网络断开同一类处理。
+/// 拿不到回复时的失败按「确定没提交 / 结果不确定」归类（见 [`PlaceError`]）：只有通道自己
+/// 知道请求走到了哪一步（签名前失败、连接没建立、签名机拒签、已签名但提交超时……），所以
+/// 在这里定。拿到回复之后的解读（statuses 逐单判错）在 client。撤单不分这两类（撤单失败由
+/// `OrderGateway::cancel` 用挂单列表复查），按普通错误返回。
 #[async_trait]
 pub(crate) trait HlSubmitter: Send + Sync {
-    async fn place(&self, order: &HlOrderIntent) -> Result<Value, ExchangeError>;
+    async fn place(&self, order: &HlOrderIntent) -> Result<Value, PlaceError>;
     async fn cancel(&self, cancel: &HlCancelIntent) -> Result<Value, ExchangeError>;
 }
 
@@ -125,16 +126,16 @@ impl LocalKeySubmitter {
         Ok(Self { http, base_url, signer, is_mainnet })
     }
 
-    async fn sign_and_post<A: serde::Serialize>(&self, action: &A) -> Result<Value, ExchangeError> {
+    async fn sign_and_post<A: serde::Serialize>(&self, action: &A) -> Result<Value, PlaceError> {
         let nonce = now_ms();
         let connection_id = action_hash(action, nonce, None)
-            .map_err(|e| ExchangeError::Other(format!("Action hash failed: {e}")))?;
+            .map_err(|e| PlaceError::unsent(format!("Action hash failed: {e}")))?;
         let signature = sign_l1_action(&self.signer, connection_id, self.is_mainnet)
             .await
-            .map_err(|e| ExchangeError::Other(format!("Signing failed: {e}")))?;
+            .map_err(|e| PlaceError::unsent(format!("Signing failed: {e}")))?;
         let request = ExchangeRequest {
             action: serde_json::to_value(action)
-                .map_err(|e| ExchangeError::Other(format!("Serialize action failed: {e}")))?,
+                .map_err(|e| PlaceError::unsent(format!("Serialize action failed: {e}")))?,
             nonce,
             signature: signature.to_api_format(),
             vault_address: None,
@@ -145,7 +146,7 @@ impl LocalKeySubmitter {
 
 #[async_trait]
 impl HlSubmitter for LocalKeySubmitter {
-    async fn place(&self, o: &HlOrderIntent) -> Result<Value, ExchangeError> {
+    async fn place(&self, o: &HlOrderIntent) -> Result<Value, PlaceError> {
         let action = BulkOrderAction::new(vec![OrderWire {
             asset: o.asset,
             is_buy: o.is_buy,
@@ -160,28 +161,41 @@ impl HlSubmitter for LocalKeySubmitter {
 
     async fn cancel(&self, c: &HlCancelIntent) -> Result<Value, ExchangeError> {
         let action = BulkCancelAction::new(vec![CancelWire { a: c.asset, o: c.oid }]);
-        self.sign_and_post(&action).await
+        self.sign_and_post(&action).await.map_err(cancel_error)
     }
 }
 
-/// POST JSON，HTTP 非 2xx 报 `ApiError`，网络错误报 `ConnectionFailed`（结果未知）。
-async fn post_json<B: serde::Serialize>(http: &Client, url: &str, body: &B) -> Result<Value, ExchangeError> {
+/// 撤单不区分两类失败，转成普通错误（只为日志可读）
+fn cancel_error(e: PlaceError) -> ExchangeError {
+    ExchangeError::Other(format!("Hyperliquid cancel: {e}"))
+}
+
+/// POST JSON 到 HL `/exchange`，HTTP 层的失败按 [`classify_hl_http`] 归类。
+async fn post_json<B: serde::Serialize>(http: &Client, url: &str, body: &B) -> Result<Value, PlaceError> {
     let resp = http
         .post(url)
         .json(body)
         .send()
         .await
-        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
-    let status = resp.status();
+        .map_err(|e| place_send_error(Exchange::Hyperliquid, e))?;
+    let status = resp.status().as_u16();
     let text = resp
         .text()
         .await
-        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
-    if !status.is_success() {
-        return Err(ExchangeError::ApiError(Exchange::Hyperliquid, status.as_u16() as i32, text));
+        .map_err(|e| PlaceError::indeterminate(format!("HL 读回复失败 (HTTP {status}): {e}")))?;
+    classify_hl_http(status, &text)
+}
+
+/// HL `/exchange` 的 HTTP 层：2xx 且是 JSON → 交给 client 解读；4xx（422 请求体不合法、
+/// 429 限频）→ HL 没受理，拒绝；5xx 或 2xx 却不是 JSON → 不确定。纯函数。
+fn classify_hl_http(status: u16, text: &str) -> Result<Value, PlaceError> {
+    let body: String = text.chars().take(300).collect();
+    match status {
+        200..=299 => serde_json::from_str(text)
+            .map_err(|e| PlaceError::indeterminate(format!("HL /exchange 回复不是 JSON: {e} (body: {body})"))),
+        400..=499 => Err(PlaceError::rejected(format!("HL HTTP {status}: {body}"))),
+        _ => Err(PlaceError::indeterminate(format!("HL HTTP {status}: {body}"))),
     }
-    serde_json::from_str(&text)
-        .map_err(|e| ExchangeError::ParseError(format!("HL /exchange 回复不是 JSON: {e} (body: {text})")))
 }
 
 // ---------------------------------------------------------------------------
@@ -202,53 +216,52 @@ impl EnclaveSubmitter {
         Self { http, url: url.trim_end_matches('/').to_string() }
     }
 
-    async fn exchange(&self, intent: Value) -> Result<Value, ExchangeError> {
+    async fn exchange(&self, intent: Value) -> Result<Value, PlaceError> {
         let resp = self
             .http
             .post(format!("{}/exchange", self.url))
             .json(&json!({ "intent": intent }))
             .send()
             .await
-            // 连不上 hostd：请求没送到，确定没有提交；但读回复中途断开时可能已提交，
-            // 两者在 reqwest 层分不开，一律按"结果未知"报。
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, format!("signer: {e}")))?;
+            // 连不上 hostd（is_connect）= 请求没送到，确定没提交；其余可能已提交
+            .map_err(|e| place_send_error(Exchange::Hyperliquid, e))?;
         let status = resp.status().as_u16();
         let text = resp
             .text()
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, format!("signer: {e}")))?;
-        let body: Value = serde_json::from_str(&text)
-            .map_err(|e| ExchangeError::ParseError(format!("signer 回复不是 JSON: {e} (HTTP {status}, body: {text})")))?;
+            .map_err(|e| PlaceError::indeterminate(format!("signer 读回复失败 (HTTP {status}): {e}")))?;
+        let body: Value = serde_json::from_str(&text).map_err(|e| {
+            PlaceError::indeterminate(format!("signer 回复不是 JSON: {e} (HTTP {status}, body: {text})"))
+        })?;
         classify_signer_reply(status, body)
     }
 }
 
 /// 按签名机的 HTTP 状态归类（表见 integration.md 第 4 节）。纯函数，便于测试。
-fn classify_signer_reply(status: u16, body: Value) -> Result<Value, ExchangeError> {
+fn classify_signer_reply(status: u16, body: Value) -> Result<Value, PlaceError> {
     let err = body.get("error").and_then(Value::as_str).unwrap_or("").to_string();
     match status {
+        // 200 却没有 response：签名机可能已提交，结果不确定
         200 => body
             .get("response")
             .cloned()
-            .ok_or_else(|| ExchangeError::ParseError(format!("signer 200 但没有 response: {body}"))),
+            .ok_or_else(|| PlaceError::indeterminate(format!("signer 200 但没有 response: {body}"))),
         // 违反风控 / 格式错：确定没签、没提交
-        422 => Err(ExchangeError::OrderRejected(
-            Exchange::Hyperliquid,
-            RejectReason::Other(format!("signer 拒签: {err}")),
-        )),
-        // 已签名但提交 HL 失败（有 signed）：单可能已到 HL；或连不上 enclave（无 signed）。
-        // 前者结果未知，后者确定没提交 —— 按更坏的"未知"报，调用方靠回报流 / 查单收敛。
-        502 if body.get("signed").is_some() => Err(ExchangeError::ConnectionFailed(
-            Exchange::Hyperliquid,
-            format!("signer 已签名但提交 HL 失败，结果未知: {err}"),
-        )),
-        _ => Err(ExchangeError::ApiError(Exchange::Hyperliquid, status as i32, format!("signer: {err}"))),
+        422 => Err(PlaceError::rejected(format!("signer 拒签: {err}"))),
+        // 已签名但提交 HL 失败（有 signed）：单可能已到 HL，结果不确定
+        502 if body.get("signed").is_some() => Err(PlaceError::indeterminate(format!(
+            "signer 已签名但提交 HL 失败: {err}"
+        ))),
+        // 连不上 enclave（无 signed）：没签名就不可能提交
+        502 => Err(PlaceError::unsent(format!("signer 连不上 enclave: {err}"))),
+        // 其余（500 审计失败等）：说不清走到了哪一步
+        _ => Err(PlaceError::indeterminate(format!("signer HTTP {status}: {err}"))),
     }
 }
 
 #[async_trait]
 impl HlSubmitter for EnclaveSubmitter {
-    async fn place(&self, o: &HlOrderIntent) -> Result<Value, ExchangeError> {
+    async fn place(&self, o: &HlOrderIntent) -> Result<Value, PlaceError> {
         let mut order = json!({
             "coin": o.coin,
             "isBuy": o.is_buy,
@@ -266,6 +279,7 @@ impl HlSubmitter for EnclaveSubmitter {
     async fn cancel(&self, c: &HlCancelIntent) -> Result<Value, ExchangeError> {
         self.exchange(json!({"type": "cancel", "cancels": [{"coin": c.coin, "oid": c.oid}]}))
             .await
+            .map_err(cancel_error)
     }
 }
 
@@ -298,18 +312,34 @@ mod tests {
     }
 
     #[test]
-    fn signer_policy_rejection_is_order_rejected() {
+    fn signer_policy_rejection_is_rejected() {
         let e = classify_signer_reply(422, json!({"error": "coin not allowed"})).unwrap_err();
-        assert!(matches!(e, ExchangeError::OrderRejected(Exchange::Hyperliquid, _)), "{e:?}");
+        assert!(matches!(e, PlaceError::Rejected(_)), "{e:?}");
+    }
+
+    /// 已签名提交失败、200 没 response、500 → 不确定；连不上 enclave（没签名）→ 确定没提交
+    #[test]
+    fn signer_failures_split_by_whether_it_may_have_been_submitted() {
+        for (status, body) in [
+            (502, json!({"signed": {"nonce": 1}, "error": "timeout"})),
+            (500, json!({"error": "audit"})),
+            (200, json!({"signed": {}})),
+        ] {
+            let e = classify_signer_reply(status, body.clone()).unwrap_err();
+            assert!(matches!(e, PlaceError::Indeterminate(_)), "{status} {body}: {e:?}");
+        }
+        let e = classify_signer_reply(502, json!({"error": "vsock"})).unwrap_err();
+        assert!(matches!(e, PlaceError::Rejected(_)), "{e:?}");
     }
 
     #[test]
-    fn signer_submit_failure_after_signing_is_unknown_outcome() {
-        let e = classify_signer_reply(502, json!({"signed": {"nonce": 1}, "error": "timeout"})).unwrap_err();
-        assert!(matches!(e, ExchangeError::ConnectionFailed(..)), "{e:?}");
-        let e = classify_signer_reply(502, json!({"error": "vsock"})).unwrap_err();
-        assert!(matches!(e, ExchangeError::ApiError(_, 502, _)), "{e:?}");
-        let e = classify_signer_reply(500, json!({"error": "audit"})).unwrap_err();
-        assert!(matches!(e, ExchangeError::ApiError(_, 500, _)), "{e:?}");
+    fn hl_http_layer() {
+        assert_eq!(classify_hl_http(200, r#"{"status":"ok"}"#).unwrap(), json!({"status": "ok"}));
+        for (status, text) in [(200, "<html>"), (500, "oops"), (502, ""), (504, "")] {
+            assert!(matches!(classify_hl_http(status, text), Err(PlaceError::Indeterminate(_))), "{status}");
+        }
+        for (status, text) in [(422, "Failed to deserialize the JSON body"), (429, "rate limited")] {
+            assert!(matches!(classify_hl_http(status, text), Err(PlaceError::Rejected(_))), "{status}");
+        }
     }
 }

@@ -1026,7 +1026,7 @@ mod leftover_order_tests {
             self.cancelled.lock().unwrap().push(order_id.clone());
             Ok(())
         }
-        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, crate::domain::PlaceError> {
             unreachable!("撤单流程不该下单")
         }
         async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {

@@ -1094,7 +1094,7 @@ mod mailbox_tests {
                 }
             }
         }
-        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, crate::domain::PlaceError> {
             unreachable!("账本不下单")
         }
         async fn cancel_order(

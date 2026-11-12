@@ -1,10 +1,10 @@
 //! IBKR ExchangeClient 实现 (仅 REST)
 
 use crate::domain::{
-    Exchange, ExchangeError, OrderId, OrderStatus, OrderType, Side, Symbol, SymbolMeta,
+    Exchange, ExchangeError, OrderId, OrderStatus, OrderType, PlaceError, Side, Symbol, SymbolMeta,
     TimeInForce,
 };
-use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::symbol::resolve_conids;
 use crate::exchange::ibkr::wire;
@@ -559,11 +559,11 @@ impl AccountClient for IbkrClient {
         Ok(updates)
     }
 
-    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {
         // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
         let order = order.inner();
         let conid = self.conids.get(&order.symbol).ok_or_else(|| {
-            ExchangeError::SymbolNotFound(Exchange::IBKR, order.symbol.clone())
+            PlaceError::unsent(ExchangeError::SymbolNotFound(Exchange::IBKR, order.symbol.clone()))
         })?;
 
         let side = match order.side {
@@ -583,9 +583,8 @@ impl AccountClient for IbkrClient {
                     // （其余三所都有对应值：GTX / post_only / Alo）。显式拒绝，让策略
                     // 作者在选型时就知道该所不支持，而不是上线后从成交明细里发现。
                     TimeInForce::PostOnly => {
-                        return Err(ExchangeError::Other(
-                            "IBKR 不支持 post-only（Web API 无对应 tif），拒绝把它静默降级为 GTC"
-                                .to_string(),
+                        return Err(PlaceError::unsent(
+                            "IBKR 不支持 post-only（Web API 无对应 tif），拒绝把它静默降级为 GTC",
                         ))
                     }
                 };
@@ -617,14 +616,17 @@ impl AccountClient for IbkrClient {
         let body = serde_json::json!({ "orders": [order_body] });
 
         let resp = self
-            .authed_request("POST", &url)?
+            .authed_request("POST", &url)
+            .map_err(PlaceError::unsent)?
             .json(&body)
             .send()
             .await
-            .map_err(Self::map_reqwest_error)?;
+            .map_err(|e| place_send_error(Exchange::IBKR, e))?;
 
-        let resp_body: serde_json::Value =
-            resp.json().await.map_err(Self::map_reqwest_error)?;
+        let resp_body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| PlaceError::indeterminate(format!("IBKR 下单回复解析不了: {e}")))?;
 
         // 处理 reply 确认循环
         let order_id = self
@@ -907,14 +909,20 @@ impl IbkrClient {
     }
 
     /// 处理下单响应，包括 reply 确认循环 (最多 5 轮)
+    ///
+    /// 失败归类：回复里带 `error` 字段 = IBKR 明确拒单；确认请求网络失败、回复对不上、
+    /// 确认轮数用尽都说不清单子是否已生效 → 不确定。
     async fn handle_order_response(
         &self,
         initial_resp: &serde_json::Value,
-    ) -> Result<OrderId, ExchangeError> {
+    ) -> Result<OrderId, PlaceError> {
         let mut current_resp = initial_resp.clone();
         let max_replies = 5;
 
         for _ in 0..max_replies {
+            if let Some(err) = current_resp.get("error").and_then(|v| v.as_str()) {
+                return Err(PlaceError::rejected(format!("IBKR: {err}")));
+            }
             if let Some(arr) = current_resp.as_array() {
                 if let Some(first) = arr.first() {
                     // 情况 1: 直接返回 order_id
@@ -931,32 +939,25 @@ impl IbkrClient {
                         );
 
                         let resp = self
-                            .authed_request("POST", &reply_url)?
+                            .authed_request("POST", &reply_url)
+                            .map_err(PlaceError::indeterminate)?
                             .json(&serde_json::json!({"confirmed": true}))
                             .send()
                             .await
-                            .map_err(Self::map_reqwest_error)?;
+                            .map_err(PlaceError::indeterminate)?;
 
-                        current_resp =
-                            resp.json().await.map_err(Self::map_reqwest_error)?;
+                        current_resp = resp.json().await.map_err(PlaceError::indeterminate)?;
                         continue;
                     }
                 }
             }
 
-            return Err(ExchangeError::OrderRejected(
-                Exchange::IBKR,
-                crate::domain::RejectReason::classify(&format!(
-                    "Unexpected order response: {}",
-                    current_resp
-                )),
-            ));
+            return Err(PlaceError::indeterminate(format!(
+                "IBKR unexpected order response: {current_resp}"
+            )));
         }
 
-        Err(ExchangeError::OrderRejected(
-            Exchange::IBKR,
-            crate::domain::RejectReason::Other("Too many reply confirmations".to_string()),
-        ))
+        Err(PlaceError::indeterminate("IBKR too many reply confirmations"))
     }
 
     /// 查询当天 live orders (原始 JSON)

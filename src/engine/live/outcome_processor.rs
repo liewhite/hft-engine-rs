@@ -5,7 +5,7 @@
 //! 因此 `SimState` 拿到的同样是币本位订单 —— 两条路径在策略侧口径一致。
 
 use crate::domain::{
-    now_ms, Exchange, ExchangeError, Order, OrderStatus, OrderUpdate, RejectReason, Side, Symbol,
+    now_ms, Exchange, Order, OrderStatus, OrderUpdate, PlaceError, RejectReason, Side, Symbol,
     SymbolMeta,
 };
 use crate::exchange::{AccountClient, ExchangeOrder};
@@ -55,6 +55,33 @@ pub struct OrderGateway {
     ///
     /// 由多个并发的下单任务与 `Message<IncomeEvent>`（ack）两处访问，故用 Mutex。
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 下单结果不确定时的停机开关（见 [`EngineHalt`]）
+    halt: EngineHalt,
+    /// 已因结果不确定触发停机：此后不再发任何新单（停机收尾期间策略可能还在出信号）
+    halted: std::sync::atomic::AtomicBool,
+}
+
+/// 受控停机开关：杀掉监督树的根（`ManagerActor`）。根的 `on_stop` 依次停下全部子 actor，
+/// `wait_for_shutdown` 以错误返回，进程退出 —— 与持仓对账确认漂移时同一条停机路径。
+///
+/// 做成开关而不是直接持有 `ActorRef<ManagerActor>`：网关只需要「能停机」这一个能力，
+/// 测试里换一个替身 actor 就能验证它被触发了。
+#[derive(Clone)]
+pub struct EngineHalt(Arc<dyn Fn() + Send + Sync>);
+
+impl EngineHalt {
+    /// 触发时杀掉 `target`（弱引用：开关不该让根 actor 多活一刻）
+    pub fn kill<A: Actor>(target: WeakActorRef<A>) -> Self {
+        Self(Arc::new(move || {
+            if let Some(target) = target.upgrade() {
+                target.kill();
+            }
+        }))
+    }
+
+    fn fire(&self) {
+        (self.0)()
+    }
 }
 
 /// [`OrderGateway::place`] 的结构化结论，给**编排方**消费（策略侧的闭环走事件回报，
@@ -81,6 +108,7 @@ impl OrderGateway {
         account_pubsub: ActorRef<AccountPubSub>,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
         dry_run: bool,
+        halt: EngineHalt,
     ) -> Self {
         Self {
             accounts,
@@ -88,20 +116,40 @@ impl OrderGateway {
             symbol_metas,
             dry_run,
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            halt,
+            halted: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// 下一张单：出向校验（折算 + 取整 + 下界）→ 登记 in_flight → REST → 失败反馈。
+    /// 下一张单：出向校验（折算 + 取整 + 下界）→ 登记 in_flight → REST → 按三种结果处置。
+    ///
+    /// # 三种结果（见 [`PlaceError`]）
+    ///
+    /// - 成功：交易所回报流接手。
+    /// - 被拒绝（单子确定没挂上）：反馈 `OrderUpdate(Error)` 给策略，策略清掉这张挂单、照常再下。
+    /// - 错误（结果不确定，单子可能已挂上或已成交）：**不**反馈 Error —— 那会让策略以为单子
+    ///   没了，再挂一张、再补一次腿。若交易所回报流已经认领了这张单（in_flight 已被摘掉），
+    ///   策略手里就有真实状态，以回报为准、继续运行；否则框架无从得知真相，停机交人工核对
+    ///   （[`EngineHalt`]），停机期间不再发新单。
     ///
     /// # 返回值是给**编排方**的结论（策略侧的闭环走事件回报）
     ///
     /// - `Ok(verdict)`：见 [`PlaceVerdict`] 各变体 —— 特别地，`ExchangeSpoke` 不是成功，
-    ///   只是"REST 的失败结论已被交易所回报作废"。
-    /// - `Err`：这张单确定没挂上，且原因作数 —— 调用方（降级平仓）据此如实计入"未完成"。
-    ///
-    /// 一切失败路径都已通过 [`Self::send_order_error`] 反馈为 `OrderUpdate(Error)`，
-    /// 总线路径 spawn 后忽略返回值不会丢失信息。
+    ///   只是"REST 的结论已被交易所回报作废"。
+    /// - `Err`：这张单没有成功挂上（被拒绝、未发出），或结果不确定且引擎已在停机 ——
+    ///   调用方（降级平仓）都如实计入"未完成"。
     pub async fn place(&self, order: Order, comment: &str) -> Result<PlaceVerdict, String> {
+        if self.halted.load(std::sync::atomic::Ordering::SeqCst) {
+            let reason = "引擎因下单结果不确定正在停机，不再发新单".to_string();
+            tracing::warn!(
+                exchange = %order.exchange,
+                symbol = %order.symbol,
+                client_order_id = ?order.client_order_id,
+                "{}", reason
+            );
+            return Err(reason);
+        }
+
         let Some(client) = self.accounts.get(&order.exchange).cloned() else {
             let reason = format!("{} 没有账户（未配置凭证），无法下单", order.exchange);
             tracing::error!(exchange = %order.exchange, "{}", reason);
@@ -191,58 +239,79 @@ impl OrderGateway {
                 Ok(PlaceVerdict::Accepted)
             }
             Err(e) => {
-                // 按结构化 RejectReason 判断，不再字符串嗅探：
-                // reduce-only 因仓位已平被拒是无害的（平仓目标已达成），降级为 info。
-                let reduce_only_closed = matches!(
-                    &e,
-                    ExchangeError::OrderRejected(_, RejectReason::ReduceOnlyClosed)
-                );
-                if reduce_only_closed {
-                    tracing::info!(
-                        exchange = %order.exchange,
-                        symbol = %order.symbol,
-                        client_order_id = ?order.client_order_id,
-                        "Reduce-only order rejected: position already closed"
-                    );
-                } else {
-                    tracing::error!(
-                        exchange = %order.exchange,
-                        symbol = %order.symbol,
-                        client_order_id = ?order.client_order_id,
-                        error = %e,
-                        "Failed to place order"
-                    );
-                }
-                // 交易所已经对这张单说过话（成交/挂上/被拒），本地这条
-                // REST 结论就作废：再发一条 Error 是假警报，还会在账本
-                // 里留一行假的 error。remove 返回 false 即"已被摘掉"。
-                let still_in_flight = self
+                // 交易所已经对这张单说过话（成交/挂上/被拒），本地这条 REST 结论就作废：
+                // 状态以回报为准（策略侧 SymbolState 消费它闭环）。remove 返回 false 即"已被摘掉"。
+                let exchange_spoke = !self
                     .in_flight
                     .lock()
                     .expect("in_flight 锁被毒化")
                     .remove(&order.client_order_id);
-                if still_in_flight {
-                    self.send_order_error(&order, e.to_string()).await;
-                } else {
-                    tracing::info!(
+                if exchange_spoke {
+                    tracing::warn!(
                         exchange = %order.exchange,
                         symbol = %order.symbol,
                         client_order_id = ?order.client_order_id,
                         error = %e,
                         "REST 下单失败，但交易所已回报过该单 —— 以交易所回报为准，不再上报失败"
                     );
+                    return Ok(PlaceVerdict::ExchangeSpoke);
                 }
-                // 编排方视角的三种分道（不可压扁，见 PlaceVerdict）：
-                // 仓位已平 = 目标达成；交易所已表态 = 内容未知、由调用方裁断；其余 = 真失败
-                if reduce_only_closed {
-                    Ok(PlaceVerdict::ReduceOnlyAlreadyClosed)
-                } else if !still_in_flight {
-                    Ok(PlaceVerdict::ExchangeSpoke)
-                } else {
-                    Err(e.to_string())
+                match e {
+                    PlaceError::Rejected(reason) => {
+                        // reduce-only 因仓位已平被拒：平仓目标已达成，对编排方不是失败
+                        let already_closed = reason == RejectReason::ReduceOnlyClosed;
+                        let reason = self.rejected(&order, reason).await;
+                        if already_closed {
+                            Ok(PlaceVerdict::ReduceOnlyAlreadyClosed)
+                        } else {
+                            Err(reason)
+                        }
+                    }
+                    PlaceError::Indeterminate(detail) => Err(self.halt_on_indeterminate(&order, &detail)),
                 }
             }
         }
+    }
+
+    /// 被拒绝：单子确定没挂上。反馈 Error 给策略清掉挂单（reduce-only 已平也一样要清），
+    /// 返回拒单原因。reduce-only 因仓位已平被拒是无害的，只记 info。
+    async fn rejected(&self, order: &Order, reason: RejectReason) -> String {
+        if reason == RejectReason::ReduceOnlyClosed {
+            tracing::info!(
+                exchange = %order.exchange,
+                symbol = %order.symbol,
+                client_order_id = ?order.client_order_id,
+                "Reduce-only order rejected: position already closed"
+            );
+        } else {
+            tracing::error!(
+                exchange = %order.exchange,
+                symbol = %order.symbol,
+                client_order_id = ?order.client_order_id,
+                %reason,
+                "Order rejected"
+            );
+        }
+        let reason = PlaceError::Rejected(reason).to_string();
+        self.send_order_error(order, reason.clone()).await;
+        reason
+    }
+
+    /// 结果不确定且交易所回报流没认领：停机。不反馈 Error（那会让策略以为单子没了）。
+    fn halt_on_indeterminate(&self, order: &Order, detail: &str) -> String {
+        self.halted.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::error!(
+            exchange = %order.exchange,
+            symbol = %order.symbol,
+            side = %order.side,
+            order_type = ?order.order_type,
+            quantity = order.quantity,
+            client_order_id = ?order.client_order_id,
+            %detail,
+            "下单结果不确定（单子可能已挂上或已成交），停机交人工核对挂单与持仓"
+        );
+        self.halt.fire();
+        format!("下单结果不确定，引擎停机: {detail}")
     }
 
     /// 撤一张单：REST 撤单 → 成功合成 Cancelled 回报；失败用挂单列表复查裁定。
@@ -691,7 +760,7 @@ mod tests {
 mod place_verdict_tests {
     use super::*;
     use crate::domain::{
-        AccountInfo, OrderId, OrderType, Position, RejectReason, Side, TimeInForce,
+        AccountInfo, ExchangeError, OrderId, OrderType, Position, RejectReason, Side, TimeInForce,
     };
     use crate::domain::StepFormatter;
     use kameo::actor::Spawn;
@@ -708,7 +777,7 @@ mod place_verdict_tests {
     /// place_order 的可编程行为：测试注入结果；`gate` 存在时先通知已进入、再等放行
     /// （用于在 REST 在途期间模拟"WS 回报先到"）。
     struct FakeClient {
-        result: Mutex<Option<Result<OrderId, ExchangeError>>>,
+        result: Mutex<Option<Result<OrderId, PlaceError>>>,
         gate: Option<(mpsc::Sender<()>, tokio::sync::Mutex<mpsc::Receiver<()>>)>,
     }
 
@@ -717,7 +786,7 @@ mod place_verdict_tests {
         fn exchange(&self) -> Exchange {
             EX
         }
-        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, PlaceError> {
             if let Some((entered_tx, proceed_rx)) = &self.gate {
                 entered_tx.send(()).await.expect("通知已进入 place_order");
                 proceed_rx.lock().await.recv().await.expect("等待放行");
@@ -784,9 +853,20 @@ mod place_verdict_tests {
         )]))
     }
 
+    /// 停机开关的替身目标：被杀即表示网关触发了停机
+    struct HaltTarget;
+    impl Actor for HaltTarget {
+        type Args = ();
+        type Error = Infallible;
+        async fn on_start(_: (), _r: ActorRef<Self>) -> Result<Self, Self::Error> {
+            Ok(Self)
+        }
+    }
+
     struct Harness {
         gateway: Arc<OrderGateway>,
         events: Arc<Mutex<Vec<AccountEvent>>>,
+        halt_target: ActorRef<HaltTarget>,
     }
 
     impl Harness {
@@ -800,8 +880,17 @@ mod place_verdict_tests {
             pubsub.tell(Subscribe(sink)).send().await.unwrap();
             let clients: HashMap<Exchange, Arc<dyn AccountClient>> =
                 HashMap::from([(EX, Arc::new(client) as Arc<dyn AccountClient>)]);
-            let gateway = Arc::new(OrderGateway::new(clients, pubsub, metas(), false));
-            Self { gateway, events }
+            let halt_target = HaltTarget::spawn_with_mailbox((), mailbox::unbounded());
+            halt_target.wait_for_startup().await;
+            let halt = EngineHalt::kill(halt_target.downgrade());
+            let gateway = Arc::new(OrderGateway::new(clients, pubsub, metas(), false, halt));
+            Self { gateway, events, halt_target }
+        }
+
+        /// 是否触发了停机
+        async fn halted(&self) -> bool {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            !self.halt_target.is_alive()
         }
 
         /// 是否发出了 Error 终态回报（策略侧失败闭环）
@@ -835,10 +924,7 @@ mod place_verdict_tests {
     #[tokio::test]
     async fn reduce_only_closed_is_already_closed() {
         let h = Harness::new(FakeClient {
-            result: Mutex::new(Some(Err(ExchangeError::OrderRejected(
-                EX,
-                RejectReason::ReduceOnlyClosed,
-            )))),
+            result: Mutex::new(Some(Err(PlaceError::Rejected(RejectReason::ReduceOnlyClosed)))),
             gate: None,
         })
         .await;
@@ -847,17 +933,36 @@ mod place_verdict_tests {
         assert!(h.error_reported().await, "策略侧仍需 Error 回报清 pending");
     }
 
-    /// 纯 REST 失败（交易所从未回报）→ Err，且发 Error 回报
+    /// 被拒绝（交易所从未回报）→ Err，且发 Error 回报让策略清挂单；不停机
     #[tokio::test]
-    async fn pure_rest_failure_is_err_with_feedback() {
+    async fn rejection_is_err_with_feedback() {
         let h = Harness::new(FakeClient {
-            result: Mutex::new(Some(Err(ExchangeError::Other("boom".to_string())))),
+            result: Mutex::new(Some(Err(PlaceError::rejected("Margin is insufficient.")))),
             gate: None,
         })
         .await;
         let verdict = h.gateway.place(order(), "t").await;
-        assert!(verdict.is_err(), "真失败必须是 Err: {verdict:?}");
-        assert!(h.error_reported().await, "真失败必须反馈 Error 回报");
+        assert!(verdict.is_err(), "拒单必须是 Err: {verdict:?}");
+        assert!(h.error_reported().await, "拒单必须反馈 Error 回报");
+        assert!(!h.halted().await, "拒单不该停机");
+    }
+
+    /// 结果不确定且交易所没回报过 → 停机；**不**发 Error（否则策略以为单子没了、再挂一张）；
+    /// 此后的新单一律不发（FakeClient 只备了一份结果，再调就 panic）
+    #[tokio::test]
+    async fn indeterminate_halts_without_feedback_and_stops_new_orders() {
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(Some(Err(PlaceError::indeterminate("HTTP 503 Unknown error")))),
+            gate: None,
+        })
+        .await;
+        let verdict = h.gateway.place(order(), "t").await;
+        assert!(verdict.is_err(), "结果不确定不是成功: {verdict:?}");
+        assert!(h.halted().await, "结果不确定必须停机");
+        assert!(!h.error_reported().await, "结果不确定不能告诉策略单子没了");
+
+        let again = h.gateway.place(order(), "t").await;
+        assert!(again.is_err(), "停机期间不再发新单: {again:?}");
     }
 
     /// **Critical 回归防线**：REST 在途期间交易所已回报（内容未知，可能是拒单）→
@@ -868,7 +973,7 @@ mod place_verdict_tests {
         let (entered_tx, mut entered_rx) = mpsc::channel(1);
         let (proceed_tx, proceed_rx) = mpsc::channel(1);
         let h = Harness::new(FakeClient {
-            result: Mutex::new(Some(Err(ExchangeError::Other("late 503".to_string())))),
+            result: Mutex::new(Some(Err(PlaceError::indeterminate("late 503")))),
             gate: Some((entered_tx, tokio::sync::Mutex::new(proceed_rx))),
         })
         .await;
@@ -892,5 +997,6 @@ mod place_verdict_tests {
             !h.error_reported().await,
             "交易所已回报过，迟到的 REST 失败不该再发假 Error"
         );
+        assert!(!h.halted().await, "交易所回报流已认领该单，状态以回报为准，不必停机");
     }
 }

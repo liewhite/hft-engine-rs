@@ -2,12 +2,12 @@
 
 use super::symbol::{from_binance, to_binance};
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, OrderId, OrderStatus, OrderType, RejectReason,
+    Exchange, ExchangeError, FundingFee, OrderId, OrderStatus, OrderType, PlaceError, RejectReason,
     SettledFunding, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
-use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
 use crate::domain::StepFormatter;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
@@ -663,12 +663,12 @@ impl AccountClient for BinanceClient {
         Ok(updates)
     }
 
-    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {
         // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
         let order = order.inner();
         let api_key = self
             .api_key()
-            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+            .ok_or_else(|| PlaceError::unsent("No API key"))?;
 
         let symbol = to_binance(&order.symbol, &self.quote);
         let side = side_to_binance(order.side);
@@ -700,13 +700,7 @@ impl AccountClient for BinanceClient {
 
         let query = self
             .build_signed_query(&params)
-            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
-
-        #[derive(Deserialize)]
-        struct Response {
-            #[serde(rename = "orderId")]
-            order_id: i64,
-        }
+            .ok_or_else(|| PlaceError::unsent("Failed to sign request"))?;
 
         let resp = self
             .client
@@ -714,20 +708,13 @@ impl AccountClient for BinanceClient {
             .header("X-MBX-APIKEY", api_key)
             .send()
             .await
-            .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or_else(|| {
-                ExchangeError::OrderRejected(
-                    Exchange::Binance,
-                    crate::domain::RejectReason::classify(&text),
-                )
-            }));
-        }
-
-        let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
-        Ok(data.order_id.to_string())
+            .map_err(|e| place_send_error(Exchange::Binance, e))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| PlaceError::indeterminate(format!("Binance 读下单回复失败 (HTTP {status}): {e}")))?;
+        parse_place_reply(status, &text)
     }
 
     async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
@@ -739,13 +726,56 @@ impl AccountClient for BinanceClient {
     }
 }
 
+/// 币安自己说「执行状态未知」的错误码（官方文档）：
+/// -1000 UNKNOWN、-1001 DISCONNECTED（内部错误）、-1006 UNEXPECTED_RESP、-1007 TIMEOUT
+/// （"Send status unknown; execution status unknown"）。
+const BINANCE_UNKNOWN_STATUS_CODES: &[i32] = &[-1000, -1001, -1006, -1007];
+
+/// 下单回复 → 三种结论。纯函数，按币安文档的约定：
+/// - 2xx 带 `orderId`：成功；2xx 但解析不了：单已受理却拿不到编号，结果不确定；
+/// - 回复是 `{code, msg}`：`code` 属于「状态未知」那几个 → 不确定；-1008（服务过载，文档写明
+///   请求失败）→ 拒绝；其余 5xx 与 408（等后端超时）→ 不确定（文档：不代表失败，可能已执行）；其余 4xx → 拒绝
+///   （格式/精度/余额/限频/只挂 maker 会吃单 -5022 等，单没进撮合）；
+/// - 非 2xx 又解析不出 `{code, msg}`（网关 HTML、空回复）：不确定。
+fn parse_place_reply(status: u16, text: &str) -> Result<OrderId, PlaceError> {
+    #[derive(Deserialize)]
+    struct Accepted {
+        #[serde(rename = "orderId")]
+        order_id: i64,
+    }
+    #[derive(Deserialize)]
+    struct Failed {
+        code: i32,
+        msg: String,
+    }
+    let body: String = text.chars().take(300).collect();
+    if (200..300).contains(&status) {
+        return serde_json::from_str::<Accepted>(text)
+            .map(|a| a.order_id.to_string())
+            .map_err(|e| PlaceError::indeterminate(format!("Binance 下单回复解析不了 (HTTP {status}): {e}; body: {body}")));
+    }
+    let Ok(Failed { code, msg }) = serde_json::from_str::<Failed>(text) else {
+        return Err(PlaceError::indeterminate(format!("Binance 下单失败且回复解析不了 (HTTP {status}): {body}")));
+    };
+    let detail = format!("HTTP {status}, code={code}, msg={msg}");
+    if BINANCE_UNKNOWN_STATUS_CODES.contains(&code) {
+        return Err(PlaceError::indeterminate(format!("Binance {detail}")));
+    }
+    if code == -2022 {
+        // "ReduceOnly Order is rejected" —— reduce-only 单因仓位已平被拒
+        return Err(PlaceError::Rejected(RejectReason::ReduceOnlyClosed));
+    }
+    if (status >= 500 || status == 408) && code != -1008 {
+        return Err(PlaceError::indeterminate(format!("Binance {detail}")));
+    }
+    Err(PlaceError::Rejected(RejectReason::Other(detail)))
+}
+
 /// 错误码映射
 fn map_binance_error(code: i32, msg: &str) -> ExchangeError {
     match code {
         -1003 => ExchangeError::RateLimited(Exchange::Binance, Duration::from_secs(60)),
         -2010 | -2019 => ExchangeError::InsufficientBalance(Exchange::Binance, 0.0, 0.0),
-        // -2022: "ReduceOnly Order is rejected" —— reduce-only 单因仓位已平被拒
-        -2022 => ExchangeError::OrderRejected(Exchange::Binance, RejectReason::ReduceOnlyClosed),
         -4028 => ExchangeError::ApiError(
             Exchange::Binance,
             code,
@@ -828,5 +858,68 @@ mod settled_funding_tests {
     fn bad_rate_fails_the_whole_batch() {
         let body = r#"[{"fundingTime":1,"fundingRate":"x"}]"#;
         assert!(parse_settled_funding(body, &"BTC".to_string()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod place_reply_tests {
+    use super::*;
+
+    fn rejected(r: Result<OrderId, PlaceError>) -> bool {
+        matches!(r, Err(PlaceError::Rejected(_)))
+    }
+    fn indeterminate(r: Result<OrderId, PlaceError>) -> bool {
+        matches!(r, Err(PlaceError::Indeterminate(_)))
+    }
+
+    #[test]
+    fn accepted_returns_order_id() {
+        assert_eq!(parse_place_reply(200, r#"{"orderId":123,"status":"NEW"}"#), Ok("123".to_string()));
+    }
+
+    /// 受理了却拿不到编号：单可能在簿上，不能当没挂上
+    #[test]
+    fn unparseable_2xx_is_indeterminate() {
+        assert!(indeterminate(parse_place_reply(200, "<html>")));
+    }
+
+    /// 交易所明确拒单：精度、余额、只挂 maker 会吃单、限频、过载（文档写明失败）
+    #[test]
+    fn explicit_rejections() {
+        for (status, body) in [
+            (400, r#"{"code":-1111,"msg":"Precision is over the maximum defined for this asset."}"#),
+            (400, r#"{"code":-2019,"msg":"Margin is insufficient."}"#),
+            (400, r#"{"code":-5022,"msg":"Due to the order could not be executed as maker, the Post Only order will be rejected."}"#),
+            (429, r#"{"code":-1003,"msg":"Too many requests"}"#),
+            (503, r#"{"code":-1008,"msg":"Server is currently overloaded with other requests."}"#),
+        ] {
+            assert!(rejected(parse_place_reply(status, body)), "{status} {body}");
+        }
+    }
+
+    #[test]
+    fn reduce_only_closed_keeps_its_reason() {
+        assert_eq!(
+            parse_place_reply(400, r#"{"code":-2022,"msg":"ReduceOnly Order is rejected."}"#),
+            Err(PlaceError::Rejected(RejectReason::ReduceOnlyClosed))
+        );
+    }
+
+    /// 币安自己说状态未知的码、5xx、408、解析不了的失败回复 → 不确定
+    #[test]
+    fn unknown_outcomes() {
+        for (status, body) in [
+            (400, r#"{"code":-1007,"msg":"Timeout waiting for response from backend server. Send status unknown; execution status unknown."}"#),
+            (400, r#"{"code":-1006,"msg":"An unexpected response was received from the message bus."}"#),
+            (400, r#"{"code":-1000,"msg":"An unknown error occurred while processing the request."}"#),
+            (400, r#"{"code":-1001,"msg":"Internal error; unable to process your request."}"#),
+            (503, r#"{"code":-1000,"msg":"Unknown error, please check your request or try again later."}"#),
+            (502, r#"{"code":-1,"msg":"x"}"#),
+            (408, r#"{"code":-1,"msg":"timeout"}"#),
+            (502, "<html>Bad Gateway</html>"),
+            (403, ""),
+        ] {
+            assert!(indeterminate(parse_place_reply(status, body)), "{status} {body}");
+        }
     }
 }

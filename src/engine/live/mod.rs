@@ -86,7 +86,7 @@ pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, M
 pub use executor::{ExecutorActor, ExecutorArgs, GetPositions};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor, UnregisterExecutor};
 pub use metrics::{MetricsActor, MetricsActorArgs, RegisterSymbols, DEFAULT_REPORT_INTERVAL_MS};
-pub use outcome_processor::{OrderGateway, OutcomeProcessorActor, PlaceVerdict};
+pub use outcome_processor::{EngineHalt, OrderGateway, OutcomeProcessorActor, PlaceVerdict};
 pub use paper_counter::{PaperCounterActor, PaperCounterArgs};
 pub use position_ledger::{
     GetLivePositions, PositionLedgerActor, PositionLedgerArgs, Reconciler,

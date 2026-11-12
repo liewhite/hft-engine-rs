@@ -42,6 +42,42 @@ impl std::fmt::Display for RejectReason {
     }
 }
 
+/// 下单失败的结论。下单只有三种结果：成功（`Ok`）、被拒绝、错误（结果不确定）。
+///
+/// 两种失败的处置完全不同，所以各所适配层**必须**为每条失败路径明确选一种 —— 这里有意
+/// 不提供从 [`ExchangeError`] 的自动转换，`?` 写不出来，漏选会编译失败：
+/// - 被拒绝：单子确定没挂上，策略可以照常再下；
+/// - 错误：单子可能已挂上甚至已成交。若当成没挂上，策略会再挂一张、再补一次腿，敞口翻倍。
+///   框架对它的处置见 `OrderGateway::place`（交易所回报流已认领则以回报为准，否则停机）。
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PlaceError {
+    /// 确定没挂上：交易所明确说不接这张单（价格/数量不合规、余额不足、只挂 maker 的单会
+    /// 立刻成交、限频……），或请求根本没发出去（本地组装、签名失败）。
+    #[error("rejected: {0}")]
+    Rejected(RejectReason),
+    /// 结果不确定：超时、5xx、网络断开、回复解析不了、交易所自己说"状态未知"的错误码、
+    /// HL 市价单只成交一部分……
+    #[error("outcome unknown: {0}")]
+    Indeterminate(String),
+}
+
+impl PlaceError {
+    /// 交易所明确拒单（按原始消息识别 reduce-only 已平，见 [`RejectReason::classify`]）
+    pub fn rejected(msg: impl Into<String>) -> Self {
+        PlaceError::Rejected(RejectReason::classify(&msg.into()))
+    }
+
+    /// 请求没有发出去（本地组装、签名、缺凭证）—— 确定没挂上
+    pub fn unsent(e: impl std::fmt::Display) -> Self {
+        PlaceError::Rejected(RejectReason::Other(format!("not sent: {e}")))
+    }
+
+    /// 结果不确定
+    pub fn indeterminate(e: impl std::fmt::Display) -> Self {
+        PlaceError::Indeterminate(e.to_string())
+    }
+}
+
 /// 交易所错误类型
 ///
 /// `Clone` 是必需的：kameo `wait_for_startup_result()` 约束 `A::Error: Clone`，
@@ -56,9 +92,6 @@ pub enum ExchangeError {
 
     #[error("Rate limited on {0}, retry after {1:?}")]
     RateLimited(Exchange, Duration),
-
-    #[error("Order rejected on {0}: {1}")]
-    OrderRejected(Exchange, RejectReason),
 
     #[error("Insufficient balance on {0}: need {1}, have {2}")]
     InsufficientBalance(Exchange, f64, f64),
