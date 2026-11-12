@@ -100,12 +100,14 @@ impl BinanceNode {
     pub async fn spawn(group: &Group, args: BinanceArgs) -> anyhow::Result<ExchangeHandle> {
         let (_, addr) = group
             .spawn_addressed("BinanceNode", move |scope: Scope, inbox| async move {
+                // 拆开：下面的 async 块按值取走凭证，其余字段在同一个 try_join! 里被借用
+                let BinanceArgs { credentials, symbol_metas, rest_base_url, market_bus, account_bus, quote } = args;
                 // 凭证可用时构建 Arc<BinanceClient>，供 FundingFee / equity 轮询使用。
                 // 初始持仓查询在 manager 投产编排里（executor 注册后），不在此处。
                 // 构建失败向上传播 → 启动期受控退出
-                let binance_client: Option<Arc<BinanceClient>> = match args.credentials.as_ref() {
+                let binance_client: Option<Arc<BinanceClient>> = match credentials.as_ref() {
                     Some(c) => Some(Arc::new(
-                        BinanceClient::new(args.quote.clone(), Some(c.clone()))
+                        BinanceClient::new(quote.clone(), Some(c.clone()))
                             .context("Failed to create BinanceClient")?,
                     )),
                     None => None,
@@ -113,15 +115,17 @@ impl BinanceNode {
                 let children = scope.group("children");
 
                 // 1. 三条 WS 并发连接；任一失败 → 向上传播
-                let has_private_ws = args.credentials.is_some();
-                let private = async {
-                    match args.credentials {
+                let has_private_ws = credentials.is_some();
+                let (private_group, private_account_bus, private_quote) =
+                    (children.clone(), account_bus.clone(), quote.clone());
+                let private = async move {
+                    match credentials {
                         Some(credentials) => BinancePrivateWs::spawn(
-                            &children,
+                            &private_group,
                             credentials,
-                            args.rest_base_url,
-                            args.account_bus.clone(),
-                            args.quote.clone(),
+                            rest_base_url,
+                            private_account_bus,
+                            private_quote,
                         )
                         .await
                         .map(|_| ()),
@@ -133,17 +137,17 @@ impl BinanceNode {
                         &children,
                         "BinancePublicWs",
                         WsTarget::PublicHighFreq.url(),
-                        args.market_bus.clone(),
-                        args.symbol_metas.clone(),
-                        args.quote.clone(),
+                        market_bus.clone(),
+                        symbol_metas.clone(),
+                        quote.clone(),
                     ),
                     BinancePublicWs::spawn(
                         &children,
                         "BinanceMarketWs",
                         WsTarget::Market.url(),
-                        args.market_bus.clone(),
-                        args.symbol_metas.clone(),
-                        args.quote.clone(),
+                        market_bus.clone(),
+                        symbol_metas.clone(),
+                        quote.clone(),
                     ),
                     private,
                 )?;
@@ -154,13 +158,13 @@ impl BinanceNode {
                 // 用同一个带凭证的 client（`binance_client` 与 `has_private_ws` 同源于凭证是否存在）：
                 // 净值查询是账户私有能力，只有 AccountClient 提供
                 if let Some(client) = binance_client {
-                    EquityPoller::spawn(&children, client.clone(), args.account_bus.clone(), 1000)?;
-                    BinanceFundingFeePoller::spawn(&children, client, args.account_bus.clone(), 60_000)?;
+                    EquityPoller::spawn(&children, client.clone(), account_bus.clone(), 1000)?;
+                    BinanceFundingFeePoller::spawn(&children, client, account_bus.clone(), 60_000)?;
                 }
                 CryptoStatus::spawn(
                     &children,
                     crate::domain::Exchange::Binance,
-                    args.market_bus.clone(),
+                    market_bus.clone(),
                     STATUS_BROADCAST_INTERVAL_MS,
                 )?;
 
