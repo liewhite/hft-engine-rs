@@ -1,7 +1,7 @@
 use super::from_binance;
 use crate::domain::{
     Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
-    OrderUpdate, Side, now_ms, BBO,
+    OrderUpdate, Side, Symbol, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -243,14 +243,45 @@ pub struct OrderData {
 }
 
 impl OrderTradeUpdate {
-    pub fn to_order_update(&self, quote: &str) -> Result<OrderUpdate, String> {
-        let symbol = from_binance(&self.o.s, quote)
-            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.o.s))?;
-        let side = match self.o.side.as_str() {
-            "BUY" => Side::Long,
-            "SELL" => Side::Short,
-            other => return Err(format!("Unknown Binance side: {}", other)),
-        };
+    /// 这笔回报对应的内部 symbol；`None` = 本引擎未接入的合约（别的计价币、交割），
+    /// 由调用方按目录外处理（见 [`Self::to_unmapped_fill`]）。
+    pub fn symbol(&self, quote: &str) -> Option<Symbol> {
+        from_binance(&self.o.s, quote)
+    }
+
+    fn side(&self) -> Result<Side, String> {
+        match self.o.side.as_str() {
+            "BUY" => Ok(Side::Long),
+            "SELL" => Ok(Side::Short),
+            other => Err(format!("Unknown Binance side: {}", other)),
+        }
+    }
+
+    /// 本次成交量，0 = 这条回报没有成交
+    fn last_filled(&self) -> Result<f64, String> {
+        f64::from_str(&self.o.l).map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))
+    }
+
+    /// 本引擎未接入的合约上的成交：原样上报（见 `AccountData::UnmappedFill`）。无成交返回 `None`。
+    pub fn to_unmapped_fill(&self) -> Result<Option<crate::messaging::UnmappedFill>, String> {
+        let size = self.last_filled()?;
+        if size == 0.0 {
+            return Ok(None);
+        }
+        Ok(Some(crate::messaging::UnmappedFill {
+            exchange: Exchange::Binance,
+            instrument: self.o.s.clone(),
+            side: self.side()?,
+            size,
+            price: f64::from_str(&self.o.last_price)
+                .map_err(|_| format!("Failed to parse last price: {}", self.o.last_price))?,
+            timestamp: now_ms(),
+        }))
+    }
+
+    /// `symbol` 来自 [`Self::symbol`]。
+    pub fn to_order_update(&self, symbol: Symbol) -> Result<OrderUpdate, String> {
+        let side = self.side()?;
 
         let status = match self.o.status.as_str() {
             "NEW" => OrderStatus::Pending,
@@ -280,25 +311,19 @@ impl OrderTradeUpdate {
     }
 
     /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）
-    pub fn to_fill(&self, quote: &str) -> Result<Option<Fill>, String> {
-        let fill_sz = f64::from_str(&self.o.l)
-            .map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))?;
+    /// `symbol` 来自 [`Self::symbol`]。
+    pub fn to_fill(&self, symbol: Symbol) -> Result<Option<Fill>, String> {
+        let fill_sz = self.last_filled()?;
 
         // 没有成交则不生成 Fill
         if fill_sz == 0.0 {
             return Ok(None);
         }
 
-        let symbol = from_binance(&self.o.s, quote)
-            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.o.s))?;
         let last_price = f64::from_str(&self.o.last_price)
             .map_err(|_| format!("Failed to parse last price: {}", self.o.last_price))?;
 
-        let side = match self.o.side.as_str() {
-            "BUY" => Side::Long,
-            "SELL" => Side::Short,
-            other => return Err(format!("Unknown Binance side: {}", other)),
-        };
+        let side = self.side()?;
 
         // Binance: n 为正数表示收费
         // 走到这里说明确实有成交（上面已对 fill_sz == 0 提前返回），此时 Binance 必推

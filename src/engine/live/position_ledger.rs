@@ -171,8 +171,8 @@ impl Reconciler {
         // 读数是该所的**完整**快照，因此"跟踪范围内、但读数里没有的 symbol"= 交易所侧空仓。
         // 这个推断正是选 REST 全量而非私有 WS 增量推送的理由（见模块文档）：
         // 它才能抓到最危险的一类漂移 —— 本地有仓、交易所已经没了。
-        let reported: HashMap<&Symbol, f64> =
-            positions.iter().map(|p| (&p.symbol, p.size)).collect();
+        // 同一 symbol 两条 = 映射混了合约，读数不可信，按致命处理（见 index_positions）
+        let reported = crate::exchange::client::index_positions(positions.to_vec())?;
 
         // 拆开字段以取得互不重叠的借用（mirror 只读、mismatches 可变）
         let Self {
@@ -189,7 +189,7 @@ impl Reconciler {
             if !state.is_seeded(exchange) {
                 continue;
             }
-            let reported_size = reported.get(symbol).copied().unwrap_or(0.0);
+            let reported_size = reported.get(symbol).map_or(0.0, |p| p.size);
             let local_size = state.position_size(exchange);
             let tolerance = tolerance_of(symbol_metas, exchange, symbol);
             // 带符号差值：+X 与 -X 是方向相反的两种漂移，不能混为一谈

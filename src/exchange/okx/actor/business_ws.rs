@@ -132,7 +132,7 @@ impl OkxBusinessWsActor {
 
         // OKX 返回的数据按时间倒序，反转为正序
         let mut candles: Vec<_> = data.data.iter().rev()
-            .map(|raw| parse_candle_data(raw, &inst_id, interval))
+            .map(|raw| parse_candle_data(raw, &inst_id, &self.quote, interval))
             .collect::<Result<Vec<_>, _>>()
             ?;
 
@@ -171,7 +171,7 @@ impl OkxBusinessWsActor {
     /// 解析并处理 Business WS 消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_business_message(raw, local_ts)?;
+        let events = parse_business_message(raw, &self.quote, local_ts)?;
         for event in events {
             if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Failed to publish to MarketPubSub");
@@ -363,7 +363,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxBusinessWsAc
 // 消息解析
 // ============================================================================
 
-fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<MarketEvent>, WsError> {
+fn parse_business_message(raw: &str, quote: &str, local_ts: u64) -> Result<Vec<MarketEvent>, WsError> {
     // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
     if raw == "pong" {
         return Ok(Vec::new());
@@ -406,7 +406,7 @@ fn parse_business_message(raw: &str, local_ts: u64) -> Result<Vec<MarketEvent>, 
 
         let mut events = Vec::new();
         for raw_data in &push.data {
-            let candle = parse_candle_data(raw_data, inst_id, interval)
+            let candle = parse_candle_data(raw_data, inst_id, quote, interval)
                 ?;
             events.push(MarketEvent {
                 exchange_ts: candle.open_time,

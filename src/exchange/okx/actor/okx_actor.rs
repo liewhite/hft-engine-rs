@@ -101,6 +101,7 @@ impl Actor for OkxActor {
                         credentials,
                         account_pubsub: args.account_pubsub.clone(),
                         symbol_metas: args.symbol_metas,
+                        quote: args.quote.clone(),
                     },
                 )
                 .await,

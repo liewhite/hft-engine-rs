@@ -186,7 +186,7 @@ async fn okx_trades_matches_codec() {
         "OKX",
         WS_PUBLIC_URL,
         json!({"op": "subscribe", "args": [arg]}),
-        |raw| parse_public_message(raw, 0, &metas).map_err(|e| e.to_string()),
+        |raw| parse_public_message(raw, "USDT", 0, &metas).map_err(|e| e.to_string()),
     )
     .await;
 

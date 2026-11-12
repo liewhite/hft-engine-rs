@@ -234,8 +234,22 @@ fn parse_private_message(
 
             let mut events = Vec::new();
 
+            // 同账户里别的计价币、交割合约的单也会推过来：映射不到本引擎 symbol 的，订单状态
+            // 不关心，成交以 UnmappedFill 原样上报，不进任何 symbol 的持仓
+            let Some(symbol) = update.symbol(quote) else {
+                if let Some(f) = update.to_unmapped_fill().map_err(WsError::ParseError)? {
+                    events.push(AccountEvent {
+                        account: crate::domain::AccountId::Live,
+                        exchange_ts,
+                        local_ts,
+                        data: AccountData::UnmappedFill(f),
+                    });
+                }
+                return Ok(events);
+            };
+
             // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
-            if let Some(fill) = update.to_fill(quote)
+            if let Some(fill) = update.to_fill(symbol.clone())
                 ? {
                 events.push(AccountEvent {
                     // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
@@ -252,7 +266,7 @@ fn parse_private_message(
                 exchange_ts,
                 local_ts,
                 data: AccountData::OrderUpdate(
-                    update.to_order_update(quote)
+                    update.to_order_update(symbol)
                         ?,
                 ),
             });
@@ -304,4 +318,38 @@ async fn create_listen_key(rest_base_url: &str, api_key: &str) -> Result<String,
         .map_err(|e| WsError::AuthFailed(e.to_string()))?;
 
     Ok(data.listen_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn order_push(symbol: &str, last_filled: &str) -> String {
+        format!(
+            r#"{{"e":"ORDER_TRADE_UPDATE","E":1,"o":{{"s":"{symbol}","c":"x-a","S":"SELL","i":7,"X":"FILLED",
+            "q":"0.5","p":"0","z":"0.5","l":"{last_filled}","L":"60000","ap":"60000","rp":"0","n":"0.01"}}}}"#
+        )
+    }
+
+    fn kinds(raw: &str) -> Vec<String> {
+        parse_private_message(raw, "USDT", 0)
+            .unwrap()
+            .into_iter()
+            .map(|e| match e.data {
+                AccountData::Fill(f) => format!("fill:{}", f.symbol),
+                AccountData::OrderUpdate(u) => format!("order:{}", u.symbol),
+                AccountData::UnmappedFill(f) => format!("unmapped:{}", f.instrument),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// 别的计价币、交割合约的回报不再让解析报错停机，也不串进同名 symbol
+    #[test]
+    fn other_quote_and_delivery_fills_are_reported_unmapped() {
+        assert_eq!(kinds(&order_push("BTCUSDT", "0.5")), ["fill:BTC", "order:BTC"]);
+        assert_eq!(kinds(&order_push("BTCUSDC", "0.5")), ["unmapped:BTCUSDC"]);
+        assert_eq!(kinds(&order_push("BTCUSDT_251226", "0.5")), ["unmapped:BTCUSDT_251226"]);
+        assert!(kinds(&order_push("BTCUSDC", "0")).is_empty());
+    }
 }

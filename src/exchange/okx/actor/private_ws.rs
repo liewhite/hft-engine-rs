@@ -37,6 +37,8 @@ pub struct OkxPrivateWsActorArgs {
     pub account_pubsub: ActorRef<AccountPubSub>,
     /// Symbol 元数据（用于仓位转换）
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 计价币：只有该计价币的永续映射到内部 symbol（见 `okx::symbol`）
+    pub quote: String,
 }
 
 /// OkxPrivateWsActor - 私有 WebSocket Actor
@@ -45,6 +47,7 @@ pub struct OkxPrivateWsActor {
     account_pubsub: ActorRef<AccountPubSub>,
     /// Symbol 元数据
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    quote: String,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
 }
@@ -54,7 +57,7 @@ impl OkxPrivateWsActor {
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         tracing::debug!(raw, "OKX private message received");
         let local_ts = now_ms();
-        let events = parse_private_message(raw, local_ts, &self.symbol_metas)?;
+        let events = parse_private_message(raw, local_ts, &self.quote, &self.symbol_metas)?;
         tracing::debug!(count = events.len(), "OKX private events parsed");
         for event in events {
             if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
@@ -189,6 +192,7 @@ impl Actor for OkxPrivateWsActor {
         Ok(Self {
             account_pubsub: args.account_pubsub,
             symbol_metas: args.symbol_metas,
+            quote: args.quote,
             ws_tx: Some(outgoing_tx),
         })
     }
@@ -228,6 +232,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPrivateWsAct
 fn parse_private_message(
     raw: &str,
     local_ts: u64,
+    quote: &str,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
 ) -> Result<Vec<AccountEvent>, WsError> {
     // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
@@ -307,24 +312,20 @@ fn parse_private_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                // 缺 meta 无法把张数折为币本位，绝不能按张数下发（会差 contract_size 倍）。
-                //
-                // 丢弃在这里是**安全**的，因为"本引擎在交易的 symbol 缺 meta"已经不可能
-                // 走到运行期：投产期 `validate_subscriptions` 会拒绝任何没有 SymbolMeta
-                // 的订阅，元数据加载处的剔除也已改为 error 留痕。所以走到这条分支只剩一种
-                // 解释 —— **该 instId 不归本引擎管**：OKX 私有流订阅的是 `instType=SWAP`
-                // 全账户推送，同账户里人工下的单、别的进程/分桶实例的成交都会推过来。
-                // 那些成交本就不该进本实例的账本，丢弃是正确处理，不是数据丢失。
-                //
-                // 唯一的残余角落 —— "被元数据剔除的合约上恰好有手工持仓" —— 由另一条
-                // 路径响亮兜住：该 symbol 一旦进入持仓/对账流程，`contract_size_of`
-                // 查不到乘数会直接报错（见 okx/client.rs 的 contract_size_of）。
-                let Some(meta) = resolve_meta(&data.inst_id, symbol_metas) else {
-                    tracing::debug!(
-                        exchange = "OKX",
-                        inst_id = %data.inst_id,
-                        "私有回报的 instId 不在本实例的交易范围内（同账户的其他单），忽略"
-                    );
+                // 私有流订阅的是 `instType=SWAP` 全账户推送，别的计价币、币本位合约的单也会
+                // 推过来。映射不到本引擎 symbol（或无 meta、无法折算张数）的：订单状态不关心，
+                // 成交以 UnmappedFill 原样上报，不进任何 symbol 的持仓 —— 绝不能按张数下发
+                // 或当成同名的 USDT 合约。市场元数据加载的是该计价币的全部永续，故「映射得到却无
+                // meta」只剩字段异常被剔除的合约（加载处已 error 留痕）。
+                let Some(meta) = resolve_meta(&data.inst_id, quote, symbol_metas) else {
+                    if let Some(f) = data.to_unmapped_fill().map_err(WsError::ParseError)? {
+                        events.push(AccountEvent {
+                            account: crate::domain::AccountId::Live,
+                            exchange_ts: local_ts,
+                            local_ts,
+                            data: AccountData::UnmappedFill(f),
+                        });
+                    }
                     continue;
                 };
                 // 数量折算由签名强制完成（含 status 内嵌的 PartiallyFilled）
@@ -359,5 +360,57 @@ fn parse_private_message(
             tracing::warn!(channel, raw, "Unknown OKX private channel");
             Ok(Vec::new())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::StepFormatter;
+
+    /// 已接入 BTC-USDT-SWAP（每张 0.01 BTC）
+    fn metas() -> HashMap<Symbol, SymbolMeta> {
+        HashMap::from([(
+            "BTC".to_string(),
+            SymbolMeta {
+                exchange: Exchange::OKX,
+                symbol: "BTC".to_string(),
+                price_formatter: Arc::new(StepFormatter::new(0.1)),
+                size_step: 1.0,
+                min_order_size: 1.0,
+                contract_size: 0.01,
+            },
+        )])
+    }
+
+    fn order_push(inst_id: &str, fill_sz: &str) -> String {
+        format!(
+            r#"{{"arg":{{"channel":"orders","instType":"SWAP"}},"data":[{{"instId":"{inst_id}","ordId":"1",
+            "clOrdId":"x-a","side":"buy","state":"filled","sz":"{fill_sz}","fillSz":"{fill_sz}",
+            "fillPx":"60000","fillFee":"-0.1"}}]}}"#
+        )
+    }
+
+    fn kinds(raw: &str) -> Vec<String> {
+        parse_private_message(raw, 0, "USDT", &metas())
+            .unwrap()
+            .into_iter()
+            .map(|e| match e.data {
+                AccountData::Fill(f) => format!("fill:{}:{}", f.symbol, f.size),
+                AccountData::OrderUpdate(u) => format!("order:{}", u.symbol),
+                AccountData::UnmappedFill(f) => format!("unmapped:{}:{}", f.instrument, f.size),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// 同名不同计价币 / 币本位的成交不串进 BTC：原样以 UnmappedFill 上报（张数不折算）
+    #[test]
+    fn other_quote_and_inverse_fills_do_not_leak_into_btc() {
+        assert_eq!(kinds(&order_push("BTC-USDT-SWAP", "3")), ["fill:BTC:0.03", "order:BTC"]);
+        assert_eq!(kinds(&order_push("BTC-USDC-SWAP", "3")), ["unmapped:BTC-USDC-SWAP:3"]);
+        assert_eq!(kinds(&order_push("BTC-USD-SWAP", "3")), ["unmapped:BTC-USD-SWAP:3"]);
+        // 无成交的订单状态：不关心
+        assert!(kinds(&order_push("BTC-USDC-SWAP", "0")).is_empty());
     }
 }

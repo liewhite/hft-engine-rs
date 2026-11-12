@@ -227,8 +227,26 @@ pub trait AccountClient: Send + Sync + 'static {
     /// 因此返回 `Ok(vec![])` 只有一个合法含义：**该账户确实没有任何持仓**。
     /// "未配置凭证"这一情形已由类型排除 —— 那时根本不存在本对象。
     ///
-    /// 数量口径为币本位，见 trait 级文档。
+    /// 只含本引擎接入的合约（映射不到内部 symbol 的别的品种不列入），每个 symbol 至多一条；
+    /// 消费方用 [`index_positions`] 建索引，重复即报错。数量口径为币本位，见 trait 级文档。
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError>;
+}
+
+/// 把一所的持仓快照按 symbol 建索引。同一 symbol 出现两条说明映射把两个合约混成了一个
+/// （如 BTC-USDT 与 BTC-USDC），静默覆盖会记错持仓 —— 报错。
+pub fn index_positions(
+    positions: Vec<Position>,
+) -> Result<std::collections::HashMap<Symbol, Position>, String> {
+    let mut map = std::collections::HashMap::with_capacity(positions.len());
+    for p in positions {
+        if let Some(prev) = map.insert(p.symbol.clone(), p) {
+            return Err(format!(
+                "{} 持仓快照里 {} 出现两条（品种映射把不同合约混成了同一个 symbol）",
+                prev.exchange, prev.symbol
+            ));
+        }
+    }
+    Ok(map)
 }
 
 /// **已结算公共资金费率**的历史拉取（无需凭证）。资金费套利按「过去 24h 实际结算累加」比较
@@ -347,6 +365,15 @@ macro_rules! impl_exchange_actor_ops {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 快照里同一 symbol 两条（映射把两个合约混成了一个）必须报错，不能后一条覆盖前一条
+    #[test]
+    fn duplicate_symbol_in_position_snapshot_is_an_error() {
+        let p = |symbol: &str, size: f64| Position { exchange: Exchange::OKX, symbol: symbol.into(), size };
+        let ok = index_positions(vec![p("BTC", 1.0), p("ETH", -2.0)]).unwrap();
+        assert_eq!(ok["BTC"].size, 1.0);
+        assert!(index_positions(vec![p("BTC", 1.0), p("BTC", 5.0)]).is_err());
+    }
     use crate::domain::{Side, TimeInForce};
     use crate::domain::StepFormatter;
     use std::sync::Arc;

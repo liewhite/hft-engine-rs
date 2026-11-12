@@ -6,13 +6,15 @@ use std::str::FromStr;
 
 /// 由 OKX `instId` 解析出内部 symbol 并取其元数据。
 ///
-/// 返回 `None` 表示 instId 无法识别或该 symbol 未配置 —— 调用方应跳过该条并告警，
-/// **绝不能**退化为"不折算直接下发"（那会把张数当币数，见 [`crate::domain::Quantity`]）。
+/// 返回 `None` 表示 instId 不是本引擎接入的合约（别的计价币、币本位、交割）或该 symbol 未配置
+/// —— 调用方跳过或按目录外上报，**绝不能**退化为"不折算直接下发"（那会把张数当币数，
+/// 见 [`crate::domain::Quantity`]）。
 pub(crate) fn resolve_meta<'a>(
     inst_id: &str,
+    quote: &str,
     metas: &'a HashMap<Symbol, SymbolMeta>,
 ) -> Option<&'a SymbolMeta> {
-    let symbol = from_okx(inst_id)?;
+    let symbol = from_okx(inst_id, quote)?;
     metas.get(&symbol)
 }
 
@@ -63,8 +65,8 @@ pub struct FundingRateData {
 impl FundingRateData {
     /// 转换为 FundingRate
     /// timestamp: 数据时间戳（毫秒）
-    pub fn to_funding_rate(&self, timestamp: u64) -> Result<FundingRate, String> {
-        let symbol = from_okx(&self.inst_id)
+    pub fn to_funding_rate(&self, quote: &str, timestamp: u64) -> Result<FundingRate, String> {
+        let symbol = from_okx(&self.inst_id, quote)
             .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let rate = f64::from_str(&self.funding_rate)
             .map_err(|_| format!("Failed to parse funding rate: {}", self.funding_rate))?;
@@ -191,8 +193,8 @@ pub struct MarkPriceData {
 }
 
 impl MarkPriceData {
-    pub fn to_mark_price(&self) -> Result<MarkPrice, String> {
-        let symbol = from_okx(&self.inst_id)
+    pub fn to_mark_price(&self, quote: &str) -> Result<MarkPrice, String> {
+        let symbol = from_okx(&self.inst_id, quote)
             .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let price = f64::from_str(&self.mark_px)
             .map_err(|_| format!("Failed to parse mark price: {}", self.mark_px))?;
@@ -218,9 +220,9 @@ pub struct IndexTickerData {
 }
 
 impl IndexTickerData {
-    pub fn to_index_price(&self) -> Result<IndexPrice, String> {
+    pub fn to_index_price(&self, quote: &str) -> Result<IndexPrice, String> {
         // index-tickers 返回 BTC-USDT 格式，使用 from_okx_index 解析
-        let symbol = from_okx_index(&self.inst_id)
+        let symbol = from_okx_index(&self.inst_id, quote)
             .ok_or_else(|| format!("Unknown OKX index symbol: {}", self.inst_id))?;
         let price = f64::from_str(&self.idx_px)
             .map_err(|_| format!("Failed to parse index price: {}", self.idx_px))?;
@@ -385,6 +387,26 @@ impl OrderPushData {
         })
     }
 
+    /// 本引擎未接入的合约（别的计价币、币本位、交割）上的成交：原样上报（见
+    /// `AccountData::UnmappedFill`），数量是交易所原始张数 —— 没有可信的折算系数。
+    /// 无成交（`fillSz` 为 0）返回 `None`。
+    pub fn to_unmapped_fill(&self) -> Result<Option<crate::messaging::UnmappedFill>, String> {
+        let size = f64::from_str(&self.fill_sz)
+            .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?;
+        if size == 0.0 {
+            return Ok(None);
+        }
+        Ok(Some(crate::messaging::UnmappedFill {
+            exchange: Exchange::OKX,
+            instrument: self.inst_id.clone(),
+            side: parse_side(&self.side)?,
+            size,
+            price: f64::from_str(&self.fill_px)
+                .map_err(|_| format!("Failed to parse fill_px: {}", self.fill_px))?,
+            timestamp: now_ms(),
+        }))
+    }
+
     /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）。数量折算为币本位。
     pub fn to_fill(&self, meta: &SymbolMeta) -> Result<Option<Fill>, String> {
         let fill_sz = meta.qty_to_coin(
@@ -514,13 +536,14 @@ pub type CandleRawData = Vec<String>;
 pub fn parse_candle_data(
     raw: &CandleRawData,
     inst_id: &str,
+    quote: &str,
     interval: CandleInterval,
 ) -> Result<Candle, String> {
     if raw.len() < 9 {
         return Err(format!("OKX candle data incomplete: {:?}", raw));
     }
 
-    let symbol = from_okx(inst_id)
+    let symbol = from_okx(inst_id, quote)
         .ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
     let open_time: u64 = raw[0].parse()
         .map_err(|_| format!("Failed to parse candle ts: {}", raw[0]))?;

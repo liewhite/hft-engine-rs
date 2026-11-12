@@ -514,8 +514,8 @@ impl Provisioner {
                      错了之后无从纠正）: {e}"
                 ))
             })?;
-            let position_map: HashMap<Symbol, crate::domain::Position> =
-                positions.into_iter().map(|p| (p.symbol.clone(), p)).collect();
+            let position_map = crate::exchange::client::index_positions(positions)
+                .map_err(|e| ExchangeError::Other(format!("{e}，拒绝启动")))?;
             for (ex, symbol) in exchange_symbols.iter().filter(|(e, _)| *e == exchange) {
                 let pos = position_map.get(symbol).cloned().unwrap_or(crate::domain::Position {
                     exchange: *ex,

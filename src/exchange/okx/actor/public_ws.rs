@@ -95,7 +95,7 @@ impl OkxPublicWsActor {
     /// 解析并处理消息
     async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        let events = parse_public_message(raw, local_ts, &self.symbol_metas)?;
+        let events = parse_public_message(raw, &self.quote, local_ts, &self.symbol_metas)?;
         for event in events {
             if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
                 tracing::error!(error = %e, "Failed to publish to MarketPubSub");
@@ -275,6 +275,7 @@ impl Message<StreamMessage<Result<String, WsError>, (), ()>> for OkxPublicWsActo
 /// `symbol_metas` 用于把 OKX 的**张数**口径折算为币本位 (与 `parse_private_message` 同一套路)。
 pub(crate) fn parse_public_message(
     raw: &str,
+    quote: &str,
     local_ts: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
 ) -> Result<Vec<MarketEvent>, WsError> {
@@ -315,7 +316,7 @@ pub(crate) fn parse_public_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let rate = data.to_funding_rate(local_ts)
+                let rate = data.to_funding_rate(quote, local_ts)
                     ?;
                 events.push(MarketEvent {
                     exchange_ts: local_ts,
@@ -335,7 +336,7 @@ pub(crate) fn parse_public_message(
                 .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
 
             // 盘口量也是张数，需按 meta 折算；缺 meta 无法折算，丢弃并告警
-            let Some(meta) = resolve_meta(inst_id, symbol_metas) else {
+            let Some(meta) = resolve_meta(inst_id, quote, symbol_metas) else {
                 tracing::warn!(exchange = "OKX", %inst_id, "Missing SymbolMeta for bbo, dropping");
                 return Ok(Vec::new());
             };
@@ -364,7 +365,7 @@ pub(crate) fn parse_public_message(
                 .as_ref()
                 .ok_or_else(|| WsError::ParseError("Missing instId in trades".into()))?;
 
-            let Some(meta) = resolve_meta(inst_id, symbol_metas) else {
+            let Some(meta) = resolve_meta(inst_id, quote, symbol_metas) else {
                 tracing::warn!(exchange = "OKX", %inst_id, "Missing SymbolMeta for trades, dropping");
                 return Ok(Vec::new());
             };
@@ -386,7 +387,7 @@ pub(crate) fn parse_public_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let mp = data.to_mark_price()
+                let mp = data.to_mark_price(quote)
                     ?;
                 events.push(MarketEvent {
                     exchange_ts: mp.timestamp,
@@ -402,7 +403,7 @@ pub(crate) fn parse_public_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let ip = data.to_index_price()
+                let ip = data.to_index_price(quote)
                     ?;
                 events.push(MarketEvent {
                     exchange_ts: ip.timestamp,
@@ -498,7 +499,7 @@ mod tests {
 
     #[test]
     fn trade_size_is_converted_from_contracts_to_coin() {
-        let events = parse_public_message(TRADES_PUSH, 0, &metas(0.01)).expect("parse");
+        let events = parse_public_message(TRADES_PUSH, "USDT", 0, &metas(0.01)).expect("parse");
         let trades = trades_of(events);
         assert_eq!(trades.len(), 1);
         // 12 张 x 0.01 = 0.12 BTC；若漏了折算会是 12（差 100 倍）
@@ -510,7 +511,7 @@ mod tests {
     /// 缺 SymbolMeta 时必须丢弃，绝不能把张数当币数发下去
     #[test]
     fn trade_without_symbol_meta_is_dropped_not_passed_through() {
-        let events = parse_public_message(TRADES_PUSH, 0, &HashMap::new()).expect("parse");
+        let events = parse_public_message(TRADES_PUSH, "USDT", 0, &HashMap::new()).expect("parse");
         assert!(trades_of(events).is_empty());
     }
 

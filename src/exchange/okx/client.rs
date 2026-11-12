@@ -163,12 +163,12 @@ impl OkxClient {
         // 缺了就拒绝投产（分工：加载处负责可见，投产处负责判定）。
         let mut metas = Vec::new();
         for d in data.data {
-            // 只处理配置的 quote 对应的品种 (e.g., BTC-USDT-SWAP)
-            if !d.inst_id.contains(&format!("-{}-SWAP", self.quote)) {
+            // 只接入配置计价币的永续（如 BTC-USDT-SWAP），映射规则只在 okx::symbol 一处
+            let Some(symbol) = from_okx(&d.inst_id, &self.quote) else {
                 continue;
-            }
-            let parsed = from_okx(&d.inst_id).and_then(|symbol| {
-                let positive = |raw: &str| raw.parse::<f64>().ok().filter(|&v| v > 0.0);
+            };
+            let positive = |raw: &str| raw.parse::<f64>().ok().filter(|&v| v > 0.0);
+            let parsed = (|| {
                 Some(SymbolMeta {
                     exchange: Exchange::OKX,
                     symbol,
@@ -177,14 +177,14 @@ impl OkxClient {
                     min_order_size: positive(&d.min_sz)?,
                     contract_size: positive(&d.ct_val)?,
                 })
-            });
+            })();
             match parsed {
                 Some(meta) => metas.push(meta),
                 None => tracing::error!(
                     inst_id = %d.inst_id,
                     tick_sz = %d.tick_sz, lot_sz = %d.lot_sz,
                     min_sz = %d.min_sz, ct_val = %d.ct_val,
-                    "OKX 合约元数据字段异常，该 symbol 不可交易（下单会被拒、私有回报会被丢弃）"
+                    "OKX 合约元数据字段异常，该 symbol 不可交易（下单会被拒、私有成交按目录外上报）"
                 ),
             }
         }
@@ -369,6 +369,7 @@ struct PendingOrdersResponse {
 /// 列表里本身就是异常，报错优于猜一个价格。
 fn parse_pending_order(
     d: &PendingOrderData,
+    quote: &str,
     contract_size: f64,
 ) -> Result<OrderUpdate, ExchangeError> {
     let fail = |field: &str, raw: &str| {
@@ -377,7 +378,7 @@ fn parse_pending_order(
             d.ord_id
         ))
     };
-    let symbol = from_okx(&d.inst_id).ok_or_else(|| fail("instId", &d.inst_id))?;
+    let symbol = from_okx(&d.inst_id, quote).ok_or_else(|| fail("instId", &d.inst_id))?;
     let side = match d.side.as_str() {
         "buy" => Side::Long,
         "sell" => Side::Short,
@@ -519,7 +520,7 @@ impl AccountClient for OkxClient {
             let page_full = page.len() >= PENDING_ORDERS_PAGE_LIMIT;
             let last_ord_id = page.last().map(|d| d.ord_id.clone());
             for d in &page {
-                updates.push(parse_pending_order(d, contract_size)?);
+                updates.push(parse_pending_order(d, &self.quote, contract_size)?);
             }
             match last_ord_id {
                 Some(cursor) if page_full => after = Some(cursor),
@@ -689,9 +690,9 @@ impl AccountClient for OkxClient {
 
         let mut positions = Vec::new();
         for d in &data.data {
-            let Some(symbol) = from_okx(&d.inst_id) else {
-                // 账户里可能有本项目未接入的合约（如交割合约），跳过而非报错
-                tracing::debug!(inst_id = %d.inst_id, "OKX position 的 instId 无法识别，跳过");
+            let Some(symbol) = from_okx(&d.inst_id, &self.quote) else {
+                // 别的计价币、币本位、交割合约是别的品种，不进任何 symbol 的持仓
+                tracing::debug!(inst_id = %d.inst_id, "OKX 持仓不是本引擎接入的合约，跳过");
                 continue;
             };
 
@@ -861,7 +862,7 @@ mod pending_orders_tests {
     /// 张 -> 币折算贯穿数量字段（ExchangeClient 的契约是币本位）
     #[test]
     fn quantities_are_converted_to_coin_unit() {
-        let u = parse_pending_order(&raw(Some("x-abc")), 0.01).unwrap();
+        let u = parse_pending_order(&raw(Some("x-abc")), "USDT", 0.01).unwrap();
         assert_eq!(u.symbol, "BTC");
         assert_eq!(u.side, Side::Long);
         assert!((u.quantity - 0.03).abs() < 1e-12, "sz 3 张 × 0.01 = 0.03 币");
@@ -876,7 +877,7 @@ mod pending_orders_tests {
     #[test]
     fn missing_client_order_id_stays_none() {
         for missing in [None, Some("")] {
-            let u = parse_pending_order(&raw(missing), 1.0).unwrap();
+            let u = parse_pending_order(&raw(missing), "USDT", 1.0).unwrap();
             assert_eq!(
                 u.client_order_id, None,
                 "clOrdId 缺失时被编造成了 {:?} —— 撤单复查的活单保护会失效",
@@ -899,7 +900,7 @@ mod pending_orders_tests {
         for (field, corrupt) in cases {
             let mut d = raw(Some("x-abc"));
             corrupt(&mut d);
-            let err = parse_pending_order(&d, 1.0).unwrap_err();
+            let err = parse_pending_order(&d, "USDT", 1.0).unwrap_err();
             assert!(
                 err.to_string().contains(field),
                 "{field} 解析失败应让整份快照报错（含字段名以便定位），实际: {err}"
