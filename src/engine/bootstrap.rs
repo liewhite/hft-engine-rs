@@ -14,21 +14,40 @@ const ALERT_FLUSH_DEADLINE: Duration = Duration::from_secs(20);
 ///
 /// 1. 初始化日志与告警外送；配了告警就先试发一条，不通直接拒绝启动 —— 告警是停机类事故
 ///    唯一的及时通知渠道，配了却不通等于没配，而运行者以为配了。
-/// 2. 跑 `body`。出错时把退出原因记成 ERROR（于是也会外送）。
-/// 3. 在 [`ALERT_FLUSH_DEADLINE`] 内等告警发完再返回 —— 否则进程退出会丢掉最要紧的那几条。
+/// 2. 装 panic hook：任何线程、任何任务 panic 都先记一条 ERROR（于是也会外送）。
+/// 3. 跑 `body`；它出错或 panic 都转成退出原因，不占名额直接外送。
+/// 4. 在 [`ALERT_FLUSH_DEADLINE`] 内等告警发完再返回 —— 否则进程退出会丢掉最要紧的那几条。
 pub async fn run_main<F, Fut>(body: F) -> anyhow::Result<()>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
+    use futures_util::FutureExt;
+
     let alerts = init_tracing()?;
     if let Some(a) = &alerts {
-        a.probe().await.map_err(|e| e.context("告警外送不通，拒绝启动（修好告警配置，或去掉告警环境变量明确关闭）"))?;
+        if let Err(e) = a.probe().await {
+            tracing::error!(error = %e, "告警外送不通，拒绝启动");
+            return Err(e.context("告警外送不通，拒绝启动（修好告警配置，或去掉告警环境变量明确关闭）"));
+        }
         tracing::info!("告警外送已启用并试发成功，不受 RUST_LOG 控制台过滤影响");
     }
-    let result = body().await;
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(panic = %info, "panic");
+        default_hook(info);
+    }));
+
+    let result = match std::panic::AssertUnwindSafe(body()).catch_unwind().await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow::anyhow!("主流程 panic（详情见上一条 panic 日志）")),
+    };
     if let Err(e) = &result {
-        tracing::error!(error = format!("{e:#}"), "进程因错误退出");
+        let reason = format!("{e:#}");
+        match &alerts {
+            Some(a) => a.fatal(&reason),
+            None => tracing::error!(reason, "进程因错误退出"),
+        }
     }
     if let Some(a) = alerts {
         if !a.flush(ALERT_FLUSH_DEADLINE).await {
@@ -59,7 +78,7 @@ fn init_tracing() -> anyhow::Result<Option<crate::observability::AlertHandle>> {
     } else {
         EnvFilter::new(DEFAULT_FILTER)
     };
-    let (alert_layer, alert_handle) = match crate::observability::AlertWebhookConfig::from_env() {
+    let (alert_layer, alert_handle) = match crate::observability::AlertWebhookConfig::from_env()? {
         Some(config) => {
             let (layer, handle) = crate::observability::spawn_alert_webhook_layer(config)?;
             (Some(layer), Some(handle))

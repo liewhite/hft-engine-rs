@@ -48,6 +48,7 @@ kameo_actors = "0.6.1"
 
 # Logging
 tracing = "0.1"
+tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # URL parsing
@@ -98,6 +99,7 @@ name = "gamma_scalp"
 path = "src/bin/gamma_scalp.rs"
 
 [dev-dependencies]
+log = "0.4"
 # 测试用暂停时钟（tokio::test(start_paused)）——keepalive/空闲检测测试无需真实等待
 tokio = { version = "1", features = ["full", "test-util"] }
 
