@@ -2,14 +2,13 @@
 //!
 //! 选币口径：**每个交易所只订阅自己上市的 symbol**（再按 hash 分桶取本实例负责的一份）。
 //! 一个 symbol 至少在两个交易所上市才建策略，且策略只拿到真正上市该 symbol 的交易所列表——
-//! 避免向交易所订阅它没有的 symbol（会触发 WS 订阅错误 → actor 级联退出）。
+//! 避免向交易所订阅它没有的 symbol（会触发 WS 订阅错误 → 整机停机）。
 
 use std::collections::{BTreeMap, HashMap};
 
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{
-    load_config, run_engine, run_main, AddStrategies, GetAllSymbolMetas,
-    ManagerActorArgs, setup_binance, setup_hyperliquid, setup_okx, StrategySpec,
+    load_config, run_engine, run_main, ManagerArgs, setup_binance, setup_hyperliquid, setup_okx, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
 use hft_engine_rs::exchange::ExchangeAccess;
@@ -139,7 +138,7 @@ async fn run() -> anyhow::Result<()> {
         exchanges.push(setup_hyperliquid(access).await?);
     }
 
-    let args = ManagerActorArgs {
+    let args = ManagerArgs {
         exchanges,
         // 实盘策略；本 bin 不跑模拟账户，柜台配置用默认值即可
         paper: Default::default(),
@@ -147,7 +146,7 @@ async fn run() -> anyhow::Result<()> {
     // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
     run_engine(args, |manager| async move {
         // 各交易所的 symbol metas（只含配了凭证的所——这就是"参与交易所"的单一数据源）
-        let metas: HashMap<Exchange, Vec<SymbolMeta>> = manager.ask(GetAllSymbolMetas).send().await?;
+        let metas: HashMap<Exchange, Vec<SymbolMeta>> = manager.all_symbol_metas();
         for (exchange, exchange_metas) in &metas {
             tracing::info!(%exchange, listed = exchange_metas.len(), "Exchange symbols listed");
         }
@@ -195,12 +194,9 @@ async fn run() -> anyhow::Result<()> {
         let strategy_count = strategies.len();
 
         manager
-            .ask(AddStrategies(
-                strategies.into_iter().map(StrategySpec::live).collect(),
-            ))
-            .send()
+            .add_strategies(strategies.into_iter().map(StrategySpec::live).collect())
             .await
-            .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("AddStrategies failed: {e}"))?;
 
         tracing::info!(count = strategy_count, "Strategies batch added");
         Ok(())

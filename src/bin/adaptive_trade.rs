@@ -28,9 +28,9 @@
 use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::engine::{
-    load_config, run_engine, run_main, spawn_supervised, Decision,
-    ManagerActorArgs, setup_binance, setup_hyperliquid, setup_okx,
-    PromotionPolicy, SubscribeAccount, SubscribeMarket, SupervisorActor, SupervisorArgs, SymbolPerformance,
+    load_config, run_engine, run_main, Decision,
+    ManagerArgs, setup_binance, setup_hyperliquid, setup_okx,
+    PromotionPolicy, Supervisor, SupervisorArgs, SymbolPerformance,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
 use hft_engine_rs::exchange::hyperliquid::HyperliquidAccess;
@@ -249,7 +249,7 @@ async fn run() -> anyhow::Result<()> {
         exchanges.push(setup_hyperliquid(access).await?);
     }
 
-    let args = ManagerActorArgs {
+    let args = ManagerArgs {
         exchanges,
         paper: config.paper,
     };
@@ -266,34 +266,20 @@ async fn run() -> anyhow::Result<()> {
             }) as Box<dyn Strategy>
         });
 
-        // 挂进引擎的监督树：它出错要整机退出，而不是留下一个没人看着的第二个根
-        let supervisor = spawn_supervised::<SupervisorActor>(
+        // 挂进引擎的任务树（消费者组）：它出错要整机退出，而不是留下一个没人看着的第二个根。
+        // 行情总线的 Clock 节拍与账户总线的成交（实盘与全部模拟账户，由事件自带标签区分）
+        // 由它在构造时自己订阅
+        Supervisor::spawn(
             &manager,
             SupervisorArgs {
                 symbols: symbols.clone(),
                 exchange: EXCHANGE,
                 strategy_factory,
                 policy: Box::new(MyPolicy { _reserved: () }),
-                manager: manager.clone(),
             },
         )
         .await
-        .context("SupervisorActor 启动失败")?;
-
-        // 行情总线给 Clock 节拍；账户总线一次订阅覆盖实盘与全部模拟账户的成交
-        // （账户由事件自带标签区分，见 AccountEvent）
-        manager
-            .tell(SubscribeMarket::only(supervisor.clone(), |e| {
-                matches!(e.data, MarketData::Clock)
-            }))
-            .send()
-            .await
-            .context("订阅行情总线失败")?;
-        manager
-            .tell(SubscribeAccount::all(supervisor))
-            .send()
-            .await
-            .context("订阅账户总线失败")?;
+        .context("Supervisor 启动失败")?;
         Ok(())
     })
     .await

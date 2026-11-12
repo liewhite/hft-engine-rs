@@ -1,7 +1,7 @@
 //! 模拟盘入口：真实实盘行情 + 本地柜台撮合，**不需要任何凭证**。
 //!
 //! 与实盘 (`spread_arb`) 共用同一份策略与行情链路，差异只在 outcome 事件流向 ——
-//! 订单落 `PaperCounterActor` 的本地柜台，永不发往交易所。
+//! 订单落 `PaperCounter` 的本地柜台，永不发往交易所。
 //!
 //! 运行:
 //! ```sh
@@ -27,7 +27,7 @@
 use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::engine::{
-    load_config, run_engine, run_main, AddStrategies, ManagerActorArgs,
+    load_config, run_engine, run_main, ManagerArgs,
     setup_binance, setup_hyperliquid, setup_okx,
     StrategySpec,
 };
@@ -171,7 +171,7 @@ async fn run() -> anyhow::Result<()> {
         exchanges.push(setup_hyperliquid(access).await?);
     }
 
-    let args = ManagerActorArgs {
+    let args = ManagerArgs {
         exchanges,
         paper: config.paper,
     };
@@ -185,11 +185,7 @@ async fn run() -> anyhow::Result<()> {
         };
         manager
             // 绑定到按 symbol 命名的模拟账户；实盘账户不注册任何策略，故不会有真实下单
-            .ask(AddStrategies(vec![StrategySpec::paper(
-                Box::new(strategy),
-                config.symbols.join(","),
-            )]))
-            .send()
+            .add_strategy(StrategySpec::paper(Box::new(strategy), config.symbols.join(",")))
             .await
             .context("添加策略失败")?;
         Ok(())
