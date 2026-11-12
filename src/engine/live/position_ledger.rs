@@ -1003,10 +1003,11 @@ mod hl_multi_dex_tests {
         let raw = user_fills_json(&[("BTC", "B", 0.5), ("xyz:TSLA", "A", 1.0)]);
         let events = fills_from_ws(&m, &raw, SNAPSHOT_TS + 1).unwrap();
         assert_eq!(events.len(), 2, "两个 dex 的成交都要进 Fill 流");
-        // 未接入的 flx 上同名 TSLA 的成交：不进 Fill 流，整条推送报错（停机），不会串到 xyz:TSLA
+        // 未接入的 flx 上同名 TSLA 的成交：不进 Fill 流（以 UnmappedFill 上报），不会串到 xyz:TSLA
         let foreign = user_fills_json(&[("flx:TSLA", "B", 5.0)]);
-        assert!(fills_from_ws(&m, &foreign, SNAPSHOT_TS + 1).is_err());
-        for e in &events {
+        let foreign = fills_from_ws(&m, &foreign, SNAPSHOT_TS + 1).unwrap();
+        assert!(foreign.iter().all(|e| matches!(e.data, crate::messaging::AccountData::UnmappedFill(_))));
+        for e in events.iter().chain(&foreign) {
             r.on_event(e);
         }
         let snapshot = rest_snapshot(&m);

@@ -83,14 +83,13 @@ impl Actor for HyperliquidActor {
             },
         )
         .await;
-        let private_ws_opt = if let Some((wallet_address, foreign_checked_at)) = private_feed.clone() {
+        let private_ws_opt = if let Some(wallet_address) = private_feed.clone() {
             Some(
                 children.spawn::<HyperliquidPrivateWsActor, _>(
                     &actor_ref,
                     "HyperliquidPrivateWsActor",
                     HyperliquidPrivateWsActorArgs {
                         wallet_address,
-                        foreign_checked_at,
                         markets: markets.clone(),
                         account_pubsub: args.account_pubsub.clone(),
                     },

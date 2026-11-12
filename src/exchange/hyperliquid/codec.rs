@@ -525,6 +525,18 @@ pub struct WsFill {
 }
 
 impl WsFill {
+    /// 品种目录外的成交：交易所原始写法原样上报（见 `AccountData::UnmappedFill`）
+    pub fn to_unmapped_fill(&self) -> Result<crate::messaging::UnmappedFill, String> {
+        Ok(crate::messaging::UnmappedFill {
+            exchange: Exchange::Hyperliquid,
+            instrument: self.coin.clone(),
+            side: parse_side(&self.side)?,
+            size: f64::from_str(&self.sz).map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?,
+            price: f64::from_str(&self.px).map_err(|_| format!("Failed to parse fill px: {}", self.px))?,
+            timestamp: self.time,
+        })
+    }
+
     pub fn to_fill(&self) -> Result<Fill, String> {
         let symbol = from_hyperliquid(&self.coin);
         let price = f64::from_str(&self.px)

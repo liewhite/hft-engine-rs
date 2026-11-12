@@ -24,13 +24,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
-/// 市价单的让价：HL 没有原生市价单，用「对手价 ± 5%」的 IOC 限价单代替（与
-/// hyperliquid-python-sdk `market_open` 默认滑点同值）。
-///
-/// 为什么不再用极端价（买 999999999 / 卖 0.00000001）：签名机按 `limitPx × sz` 限单笔
-/// 名义，极端价的买单必被拒签；而且极端价在薄盘口上等于不设保护。IOC 只吃到 5% 内的流动性，
-/// 剩余部分撤销，由调用方按成交回报继续处理。
-const MARKET_ORDER_SLIPPAGE: f64 = 0.05;
 
 /// 账户的保证金口径（`POST /info {"type":"userAbstraction"}`，启动时查一次）。
 ///
@@ -62,9 +55,6 @@ impl HlAccountMode {
 /// 有凭证时才有的账户能力：查询地址、签名通道、保证金口径三者同生同灭，放在一起
 struct HlAccount {
     credentials: HyperliquidCredentials,
-    /// 启动检查（未接入 dex 无仓位）完成的时刻（毫秒）。私有 WS 订阅前的空档里发生的外来
-    /// 成交只出现在订阅后的历史快照里，快照中晚于此刻的外来成交同样停机。
-    foreign_checked_at: Timestamp,
     submitter: Arc<dyn HlSubmitter>,
     mode: HlAccountMode,
 }
@@ -80,6 +70,8 @@ pub struct HyperliquidClient {
     quote: String,
     /// 已接入 dex 的品种目录（启动时建好，只读）
     markets: Arc<HlMarkets>,
+    /// HL 上全部 perp dex（含未接入的），供 [`Self::fetch_positions_outside_catalog`] 查遍
+    all_dexes: Vec<String>,
 }
 
 impl HyperliquidClient {
@@ -154,10 +146,6 @@ impl HyperliquidClient {
                          改成统一账户或只接一个 dex"
                     )));
                 }
-                // 戳取在发请求之前：检查期间发生的成交也落在「晚于此刻」里，宁可多查不漏
-                let foreign_checked_at = crate::domain::now_ms();
-                check_no_positions_on_other_dexes(&client, &base_url, &credentials.wallet_address, &perp_dexs, &dexes)
-                    .await?;
                 // 只支持主网：网络只在构造签名通道时决定一次
                 let is_mainnet = true;
                 let submitter: Arc<dyn HlSubmitter> = match &credentials.signing {
@@ -171,11 +159,14 @@ impl HyperliquidClient {
                         Arc::new(EnclaveSubmitter::new(client.clone(), url.clone()))
                     }
                 };
-                Some(HlAccount { credentials, submitter, mode, foreign_checked_at })
+                Some(HlAccount { credentials, submitter, mode })
             }
         };
 
-        Ok(Self { client, account, base_url, quote, markets })
+        let all_dexes: Vec<String> = std::iter::once(String::new())
+            .chain(perp_dexs.iter().flatten().filter_map(|v| v["name"].as_str().map(str::to_string)))
+            .collect();
+        Ok(Self { client, account, base_url, quote, markets, all_dexes })
     }
 
     /// 已接入 dex 的品种目录（适配层内的 WS actor 共用同一份）
@@ -183,9 +174,29 @@ impl HyperliquidClient {
         &self.markets
     }
 
-    /// 查询地址（主钱包）与外来仓位启动检查时刻。没配凭证时为 None
-    pub(crate) fn private_feed(&self) -> Option<(String, Timestamp)> {
-        self.account.as_ref().map(|a| (a.credentials.wallet_address.clone(), a.foreign_checked_at))
+    /// 查询地址（主钱包）。没配凭证时为 None
+    pub(crate) fn private_feed(&self) -> Option<String> {
+        self.account.as_ref().map(|a| a.credentials.wallet_address.clone())
+    }
+
+    /// 钱包在**品种目录之外**的全部永续仓位（交易所原始写法，如 `flx:TSLA`、只许逐仓的
+    /// `xyz:SOXL`）：未接入的 dex 全查，已接入 dex 上不可交易的也算。只报事实 —— 这些仓位与
+    /// 本进程共用保证金（统一账户）却不在持仓与持仓总价值的口径里，意味着什么由调用方决定。
+    pub async fn fetch_positions_outside_catalog(&self) -> Result<Vec<String>, ExchangeError> {
+        let user = &self.account()?.credentials.wallet_address;
+        let states = futures_util::future::try_join_all(self.all_dexes.iter().map(|dex| async move {
+            let state: ClearinghouseState = self
+                .post_info(serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex}))
+                .await?;
+            Ok::<_, ExchangeError>((dex.clone(), state))
+        }))
+        .await?;
+        Ok(states
+            .iter()
+            .flat_map(|(dex, s)| own_positions(dex, s))
+            .map(|w| w.position.coin.clone())
+            .filter(|coin| !self.markets.owns(coin))
+            .collect())
     }
 
     /// 账户能力；没配凭证时本不该走到这里（AccountClient 只在有凭证时装配）
@@ -218,7 +229,7 @@ impl HyperliquidClient {
         .await
     }
 
-    /// 市价单的 IOC 限价：取当前盘口对手价，往不利方向让 [`MARKET_ORDER_SLIPPAGE`]，
+    /// 市价单的 IOC 限价：取当前盘口对手价，往不利方向让配置的 `market_order_slippage`，
     /// 按 HL 价格精度取整。多一次 `l2Book` 查询；对延迟敏感的路径应由策略自己用 BBO
     /// 下 IOC 限价单，不走市价单。
     async fn market_limit_px(&self, coin: &str, is_buy: bool, sz_decimals: i32) -> Result<String, ExchangeError> {
@@ -231,7 +242,8 @@ impl HyperliquidClient {
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|p| *p > 0.0)
             .ok_or_else(|| ExchangeError::Other(format!("{coin} 盘口无对手价，市价单无法定价")))?;
-        let px = if is_buy { top * (1.0 + MARKET_ORDER_SLIPPAGE) } else { top * (1.0 - MARKET_ORDER_SLIPPAGE) };
+        let slippage = self.account()?.credentials.market_order_slippage;
+        let px = if is_buy { top * (1.0 + slippage) } else { top * (1.0 - slippage) };
         // 格式化器输出已是规范小数（无尾随零、不用科学计数法），直接用
         Ok(hl_price_formatter(sz_decimals).format(px))
     }
@@ -384,50 +396,6 @@ async fn post_info_with<T: for<'de> Deserialize<'de>>(
         .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))
 }
 
-/// 启动检查：钱包在**未接入**的 dex 上不能有仓位。
-///
-/// 统一账户下所有 dex 的全仓仓位共用一份 USDC 保证金，而持仓总价值只算已接入的 dex
-/// （每 2 秒查遍全部十几个 dex 会吃掉 HL 每 IP 限频的一半以上）。所以把「别处没有仓位」
-/// 作为启动前提：有就拒绝启动。运行中新出现的外来仓位必先有一笔成交，私有 WS 收到
-/// 品种目录外的成交即报错停机（见 private_ws `parse_user_fills`）。残余窗口：外来成交到
-/// 停机之间（推送延迟，秒级以内），杠杆闸门可能按偏小的持仓总价值放行一次开仓（如实声明）。
-/// 本检查到私有 WS 订阅生效之间的空档由订阅后的历史快照补上（快照里晚于检查时刻的外来
-/// 成交同样停机）。
-/// 标准账户也查：外来仓位一律停机是用户定的规矩，与保证金是否共用无关。
-async fn check_no_positions_on_other_dexes(
-    client: &Client,
-    base_url: &str,
-    user: &str,
-    perp_dexs: &[Option<serde_json::Value>],
-    connected: &[String],
-) -> Result<(), ExchangeError> {
-    let others: Vec<String> = std::iter::once(String::new())
-        .chain(perp_dexs.iter().flatten().filter_map(|v| v["name"].as_str().map(str::to_string)))
-        .filter(|d| !connected.contains(d))
-        .collect();
-    let states = futures_util::future::try_join_all(others.iter().map(|dex| async move {
-        let state: ClearinghouseState = post_info_with(
-            client,
-            base_url,
-            serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex}),
-        )
-        .await?;
-        Ok::<_, ExchangeError>((dex, state))
-    }))
-    .await?;
-    let foreign: Vec<String> = states
-        .iter()
-        .flat_map(|(dex, s)| s.asset_positions.iter().map(move |w| format!("{dex}:{}", w.position.coin)))
-        .collect();
-    if foreign.is_empty() {
-        Ok(())
-    } else {
-        Err(ExchangeError::Other(format!(
-            "HL 钱包在未接入的 dex 上有仓位 {foreign:?}：它们与本进程共用保证金却不计入杠杆，拒绝启动"
-        )))
-    }
-}
-
 /// 一份 clearinghouseState 里属于所查 dex 的仓位（按 coin 前缀）。持仓与持仓总价值共用：
 /// 若某 dex 的响应带出别的 dex 的仓位，不会被两份快照重复计入。
 fn own_positions<'a>(
@@ -447,9 +415,9 @@ fn parse_num(field: &str, v: &str) -> Result<f64, ExchangeError> {
 /// - 每份只取**属于所查 dex** 的仓位（[`own_positions`]）；
 /// - 某 dex 响应非空、却没有一个仓位属于它 —— coin 前缀口径变了的征兆，报错而不是返回空：
 ///   本函数是持仓基线的唯一来源，静默返回空会让基线变成全零、此后由 Fill 累加永不纠正；
-/// - 不在品种目录里的仓位（如人工开的逐仓股票）报错：外来仓位一律停机（用户定）。
-///   基线时拒绝启动；运行中由对账拉取失败 → 停摆守卫到期退出。与 Fill 流同一判据
-///   （[`HlMarkets::owns`]）。
+/// - 不在品种目录里的仓位（如人工开的逐仓股票）不返回：它们映射不到内部 symbol，本引擎
+///   不交易它们（与 Fill 流同一判据 [`HlMarkets::owns`]）。要知道有没有这类仓位用
+///   [`HyperliquidClient::fetch_positions_outside_catalog`]。
 pub(crate) fn positions_from_states(
     markets: &HlMarkets,
     states: &[(String, ClearinghouseState)],
@@ -467,10 +435,8 @@ pub(crate) fn positions_from_states(
         }
         for w in mine {
             if !markets.owns(&w.position.coin) {
-                return Err(ExchangeError::Other(format!(
-                    "HL 持仓 {} 不在品种目录里（外来仓位或不可交易品种），本地账本无法覆盖",
-                    w.position.coin
-                )));
+                tracing::debug!(coin = %w.position.coin, "HL 持仓不在品种目录里，不返回");
+                continue;
             }
             positions.push(w.position.to_position().map_err(ExchangeError::ParseError)?);
         }
@@ -504,9 +470,10 @@ struct SpotBalance {
 /// 即 `total` 已含未实现盈亏，再加一次会重复计。
 /// 只算计价币：账户里的其他现货（HYPE 等）不计入，净值偏小，杠杆偏保守。
 ///
-/// **持仓总价值 = 各已接入 dex 全部仓位的 `positionValue` 绝对值之和**。未接入 dex 不查：
-/// 启动时已确认那里没有仓位，之后新出现的会先以外来成交触发停机（见
-/// [`check_no_positions_on_other_dexes`]）。
+/// **持仓总价值 = 各已接入 dex 全部仓位的 `positionValue` 绝对值之和**。未接入 dex 不查
+/// （每 2 秒查遍全部十几个 dex 会吃掉 HL 每 IP 限频的一半以上），所以口径**不含**未接入 dex
+/// 的仓位；那里有没有仓位用 [`HyperliquidClient::fetch_positions_outside_catalog`] 查，
+/// 运行中新开的会以 `UnmappedFill` 上报。
 /// 余额里没有计价币 = 该币余额为 0（`balances` 是全量列表；计价币是各 dex 保证金币种已在
 /// `connect` 校验过）。
 pub(crate) fn unified_account_info(
@@ -1220,9 +1187,10 @@ mod unified_account_tests {
         assert!(positions_from_states(&m, &wrong).is_err());
     }
 
-    /// 已接入 dex 上不在品种目录里的仓位（外来仓位）：报错（基线拒绝启动、对账停摆退出）
+    /// 已接入 dex 上不在品种目录里的仓位：不返回（映射不到内部 symbol），由
+    /// `fetch_positions_outside_catalog` 单独报告
     #[test]
-    fn uncatalogued_position_is_an_error() {
+    fn uncatalogued_position_is_not_returned() {
         let only_btc = HlMarkets::build(vec![DexUniverse {
             dex: String::new(),
             offset: 0,
@@ -1230,7 +1198,7 @@ mod unified_account_tests {
         }])
         .unwrap();
         let states = vec![("".to_string(), state(UNIFIED_MAIN))];
-        let err = positions_from_states(&only_btc, &states).unwrap_err();
-        assert!(err.to_string().contains("kPEPE"), "{err}");
+        let got = positions_from_states(&only_btc, &states).unwrap();
+        assert!(got.iter().all(|p| p.symbol == "BTC"), "{got:?}");
     }
 }

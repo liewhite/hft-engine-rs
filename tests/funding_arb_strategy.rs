@@ -545,3 +545,25 @@ fn thin_book_does_not_place_new_makers() {
     s.funding(BN, 0.8);
     assert!(placed(&s.funding(HL, 0.1)).is_empty());
 }
+
+#[test]
+fn unmapped_fill_halts() {
+    // 账户在品种目录外的成交（如 HL 别的市场、现货）：停止交易
+    let mut s = Sim::new(0.0, 0.0);
+    let now = s.now;
+    s.ev(IncomeEvent::account(
+        AccountId::Live,
+        now,
+        now,
+        AccountData::UnmappedFill(hft_engine_rs::messaging::UnmappedFill {
+            exchange: HL,
+            instrument: "flx:TSLA".into(),
+            side: Side::Long,
+            size: 1.0,
+            price: 100.0,
+            timestamp: now,
+        }),
+    ));
+    s.funding(BN, 0.8);
+    assert!(placed(&s.funding(HL, 0.1)).is_empty(), "停止交易后不得开仓");
+}

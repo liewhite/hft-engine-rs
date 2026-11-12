@@ -23,6 +23,8 @@
 //! 并报 error，等人处理后重启：
 //! - 启动时各所持仓之和不为 0；
 //! - 运行中收到不是本策略下的单的成交；
+//! - 收到账户在品种目录外的成交（框架以 `UnmappedFill` 上报，如 HL 未接入市场的合约、现货）：
+//!   那笔仓位与本策略共用保证金却不在杠杆口径里；
 //! - 不平衡出现时还没挂过任何单（不知道该在哪对所补）。
 //!
 //! # 残余窗口（如实声明）
@@ -539,6 +541,12 @@ impl Strategy for FundingArbStrategy {
                 }
             }
             IncomeEvent::Account(a) => {
+                if let AccountData::UnmappedFill(f) = &a.data {
+                    self.halt(format!(
+                        "账户在品种目录外有成交：{} {} {:?} {}@{}（与本策略共用保证金却不在杠杆口径里）",
+                        f.exchange, f.instrument, f.side, f.size, f.price
+                    ));
+                }
                 if let AccountData::Fill(f) = &a.data {
                     // 归属判据与框架同一份（订单号前缀）。盖不住本引擎另一个进程在同账户同币上交易；
                     // 本策略一个进程覆盖全部币，不会出现。

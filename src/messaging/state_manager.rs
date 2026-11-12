@@ -272,6 +272,8 @@ impl StateManager {
                 AccountData::Greeks(g) => {
                     self.account.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
                 }
+                // 品种目录外的成交：不属于任何 symbol 状态，框架只运送，策略在 on_event 里自行处理
+                AccountData::UnmappedFill(_) => {}
                 // Symbol 私有事件 (OrderUpdate/Fill/FundingFee): 委托对应 SymbolState
                 _ => self.route_to_symbol_state(event),
             },

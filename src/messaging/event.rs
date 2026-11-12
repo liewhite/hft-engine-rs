@@ -228,6 +228,22 @@ pub enum AccountData {
         /// 账户总持仓名义价值 (用于计算杠杆率)
         notional: f64,
     },
+    /// 本账户在**引擎品种目录之外**的成交（如 HL 未接入市场的合约、现货），所级事件。
+    /// 不进任何 symbol 的持仓；框架只如实上报，怎么处理（忽略 / 停止交易）由策略决定。
+    UnmappedFill(UnmappedFill),
+}
+
+/// 品种目录外的一笔成交。`instrument` 是交易所原始写法（如 `flx:TSLA`、`@107`），
+/// 不是内部 symbol —— 它本来就映射不到内部 symbol。
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnmappedFill {
+    pub exchange: Exchange,
+    pub instrument: String,
+    pub side: crate::domain::Side,
+    /// 交易所原始数量
+    pub size: f64,
+    pub price: f64,
+    pub timestamp: Timestamp,
 }
 
 impl AccountData {
@@ -237,9 +253,10 @@ impl AccountData {
             AccountData::OrderUpdate(u) => Some(&u.symbol),
             AccountData::Fill(f) => Some(&f.symbol),
             AccountData::FundingFee(fee) => Some(&fee.symbol),
-            AccountData::Balance(_) | AccountData::Greeks(_) | AccountData::AccountInfo { .. } => {
-                None
-            }
+            AccountData::Balance(_)
+            | AccountData::Greeks(_)
+            | AccountData::AccountInfo { .. }
+            | AccountData::UnmappedFill(_) => None,
         }
     }
 
@@ -252,6 +269,7 @@ impl AccountData {
             AccountData::Balance(b) => Some(b.exchange),
             AccountData::Greeks(g) => Some(g.exchange),
             AccountData::AccountInfo { exchange, .. } => Some(*exchange),
+            AccountData::UnmappedFill(f) => Some(f.exchange),
         }
     }
 }

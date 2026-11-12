@@ -613,7 +613,10 @@ impl SymbolState {
             }
             // 账户级事件（Balance/Greeks/AccountInfo）无 symbol，由 StateManager 提前
             // 拦截；到达即路由 bug：记录后忽略（不 panic）
-            AccountData::Balance(_) | AccountData::Greeks(_) | AccountData::AccountInfo { .. } => {
+            AccountData::Balance(_)
+            | AccountData::Greeks(_)
+            | AccountData::AccountInfo { .. }
+            | AccountData::UnmappedFill(_) => {
                 tracing::error!(
                     symbol = %self.symbol,
                     "账户级事件错误地进入 SymbolState（路由 bug），忽略"

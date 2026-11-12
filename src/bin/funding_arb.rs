@@ -11,7 +11,8 @@
 //!   "exchanges": {
 //!     "binance": {"quote": "USDT", "credentials": {"api_key": "…", "secret": "…"}},
 //!     "hyperliquid": {"quote": "USDC", "dexes": ["", "xyz"],
-//!                     "credentials": {"wallet_address": "0x…", "signer_url": "http://127.0.0.1:8080"}},
+//!                     "credentials": {"wallet_address": "0x…", "signer_url": "http://127.0.0.1:8080",
+//!                                     "market_order_slippage": 0.05}},
 //!     "okx": {"quote": "USDT", "credentials": {"api_key": "…", "secret": "…", "passphrase": "…"}}
 //!   },
 //!   "strategy": { "pairs": [{"symbol": "BTC"}, {"symbol": "TSLA"}], "…": "…" },
@@ -86,6 +87,19 @@ async fn connect(cfg: &ExchangesConfig) -> anyhow::Result<Connected> {
     Ok(c)
 }
 
+/// HL 统一账户下，未接入市场或不可交易品种上的仓位与本策略共用保证金，却不在杠杆口径里：
+/// 有就拒绝启动（用户定）。框架只报告有哪些，判定在这里。
+async fn refuse_positions_outside_catalog(cfg: &ExchangesConfig) -> anyhow::Result<()> {
+    let Some(a) = &cfg.hyperliquid else { return Ok(()) };
+    let client = HyperliquidClient::connect(a.quote.clone(), a.dexes.clone(), a.credentials.clone()).await?;
+    let outside = client.fetch_positions_outside_catalog().await?;
+    anyhow::ensure!(
+        outside.is_empty(),
+        "HL 钱包在品种目录外有仓位 {outside:?}：它们与本策略共用保证金却不在杠杆口径里，拒绝启动"
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing()?;
@@ -110,6 +124,13 @@ async fn main() -> anyhow::Result<()> {
         .wait_for_startup_result()
         .await
         .map_err(|e| anyhow::anyhow!("Manager startup failed: {e}"))?;
+
+    // 用户定的规矩：账户里有本策略管不到的仓位就不启动。放在引擎启动（私有推送已订阅）之后，
+    // 检查之后新出现的外来成交由策略收到 UnmappedFill 停止交易，中间没有空档
+    if let Err(e) = refuse_positions_outside_catalog(&config.exchanges).await {
+        let _ = manager.stop_gracefully().await;
+        return Err(e);
+    }
 
     // 每个币在哪几所做：该币在各所品种目录里出现的所（按配置的所顺序），不足两所拒绝启动
     let metas = manager

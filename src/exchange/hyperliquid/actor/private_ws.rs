@@ -39,8 +39,6 @@ pub struct HyperliquidPrivateWsActorArgs {
     pub account_pubsub: ActorRef<AccountPubSub>,
     /// 已接入 dex 的品种目录（入向过滤判据）
     pub markets: Arc<HlMarkets>,
-    /// 外来仓位启动检查的时刻：订阅后历史快照里晚于此刻的外来成交也停机
-    pub foreign_checked_at: u64,
 }
 
 /// HyperliquidPrivateWsActor - 账户 WebSocket Actor
@@ -52,8 +50,6 @@ pub struct HyperliquidPrivateWsActor {
     /// 否则别的 dex 上的成交会被剥掉前缀后当成同名标的的 Fill，直接污染「基线 + Fill」
     /// 维护的持仓。
     markets: Arc<HlMarkets>,
-    /// 见 [`HyperliquidPrivateWsActorArgs::foreign_checked_at`]
-    foreign_checked_at: u64,
     /// 尚未确认生效的订阅。两条订阅（见 [`REQUIRED_SUBSCRIPTIONS`]）必须全部确认，
     /// 否则 [`SubscriptionDeadline`] 到期即自杀 —— **连接活着不等于订阅活着**：HL 的
     /// keepalive 只证明链路通，订阅被悄悄拒掉时 ping/pong 照常。
@@ -77,7 +73,7 @@ impl HyperliquidPrivateWsActor {
     /// 解析并处理消息
     async fn handle_message(&mut self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        match parse_private_message(raw, &self.markets, self.foreign_checked_at, local_ts)? {
+        match parse_private_message(raw, &self.markets, local_ts)? {
             PrivateMessage::SubscriptionAck(sub_type) => {
                 self.confirm_subscription(&sub_type);
             }
@@ -211,7 +207,6 @@ impl Actor for HyperliquidPrivateWsActor {
         Ok(Self {
             account_pubsub: args.account_pubsub,
             markets: args.markets,
-            foreign_checked_at: args.foreign_checked_at,
             pending_subscriptions: REQUIRED_SUBSCRIPTIONS.into_iter().collect(),
             ws_tx: Some(outgoing_tx),
         })
@@ -267,7 +262,6 @@ enum PrivateMessage {
 fn parse_private_message(
     raw: &str,
     markets: &HlMarkets,
-    foreign_checked_at: u64,
     local_ts: u64,
 ) -> Result<PrivateMessage, WsError> {
     let value: serde_json::Value =
@@ -308,7 +302,7 @@ fn parse_private_message(
             "userFills" => {
                 // 成交推送
                 let data = &value["data"];
-                return parse_user_fills(data, markets, foreign_checked_at, local_ts)
+                return parse_user_fills(data, markets, local_ts)
                     .map(|events| PrivateMessage::Events { channel: "userFills", events });
             }
             _ => {
@@ -348,7 +342,7 @@ fn parse_order_updates(
         let order_update: WsOrderUpdate = serde_json::from_value(update.clone())
             .map_err(|e| WsError::ParseError(format!("orderUpdate parse: {}", e)))?;
         if !markets.owns(&order_update.order.coin) {
-            // 挂单本身不改变持仓；它若成交，userFills 那边会停机
+            // 挂单本身不改变持仓；它若成交，userFills 那边以 UnmappedFill 上报
             tracing::warn!(coin = %order_update.order.coin, "HL 外来订单（不在品种目录里），跳过");
             continue;
         }
@@ -369,47 +363,21 @@ fn parse_order_updates(
 
 /// 解析 userFills 消息。
 ///
-/// userFills 是账户级推送：已接入 dex 上目录内品种的成交进 Fill 流；**其余成交（未接入的
-/// dex、不可交易品种）报错**，经 WS 解析错误路径停机。不能只是跳过：
-/// - 剥掉前缀后会被当成同名品种的 Fill，污染「基线 + Fill」维护的持仓；
-/// - 跳过则留下一笔与本进程共用保证金、却不计入杠杆的外来仓位（统一账户下持仓总价值只算
-///   已接入 dex）。外来成交一律停机是用户定的规矩。
+/// userFills 是账户级推送：已接入 dex 上目录内品种的成交进 Fill 流；**其余成交**（未接入的
+/// dex、不可交易品种、现货）作为 [`AccountData::UnmappedFill`] 原样上报，不进任何 symbol 的
+/// 持仓 —— 剥掉前缀后会被当成同名品种的 Fill，污染「基线 + Fill」维护的持仓。
+/// 这类成交意味着什么（忽略 / 停止交易）由策略决定，框架只报事实。
 /// 判据与持仓基线、对账读数相同（[`HlMarkets::owns`]），两条通道口径一致。
-/// 初始快照（`isSnapshot`）不入账（历史成交已含在持仓基线里）；其中**晚于外来仓位启动检查**
-/// （`foreign_checked_at`）的外来成交同样停机 —— 那是检查之后、订阅生效之前的空档里发生的，
-/// 只有快照里看得到。更早的历史外来成交不管（现存仓位由启动检查负责）。
-///
-/// 现货成交（coin 形如 `@107`、`PURR/USDC`）也在 userFills 里，同样算外来成交：同一钱包上
-/// 手工买卖现货会让进程停机。
+/// 初始快照（`isSnapshot`）是历史成交，不入账也不上报（现存持仓由持仓查询给出）。
 fn parse_user_fills(
     data: &serde_json::Value,
     markets: &HlMarkets,
-    foreign_checked_at: u64,
     local_ts: u64,
 ) -> Result<Vec<AccountEvent>, WsError> {
     let user_fills: WsUserFills = serde_json::from_value(data.clone())
         .map_err(|e| WsError::ParseError(format!("userFills parse: {}", e)))?;
 
-    let foreign = |f: &crate::exchange::hyperliquid::codec::WsFill| {
-        WsError::ParseError(format!(
-            "HL 外来成交 {} {}@{} time={}（不在已接入 dex {:?} 的品种目录里），本地账本与杠杆口径无法覆盖，停机",
-            f.coin,
-            f.sz,
-            f.px,
-            f.time,
-            markets.dexes()
-        ))
-    };
-
-    // 快照只查空档里的外来成交，不入账
     if user_fills.is_snapshot {
-        if let Some(f) = user_fills
-            .fills
-            .iter()
-            .find(|f| f.time >= foreign_checked_at && !markets.owns(&f.coin))
-        {
-            return Err(foreign(f));
-        }
         tracing::debug!(
             user = %user_fills.user,
             fills_count = user_fills.fills.len(),
@@ -420,17 +388,17 @@ fn parse_user_fills(
 
     let mut events = Vec::new();
     for ws_fill in &user_fills.fills {
-        if !markets.owns(&ws_fill.coin) {
-            return Err(foreign(ws_fill));
-        }
-        let fill = ws_fill.to_fill()
-            ?;
+        let data = if markets.owns(&ws_fill.coin) {
+            AccountData::Fill(ws_fill.to_fill()?)
+        } else {
+            AccountData::UnmappedFill(ws_fill.to_unmapped_fill()?)
+        };
         events.push(AccountEvent {
             // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
             account: crate::domain::AccountId::Live,
-            exchange_ts: fill.timestamp,
+            exchange_ts: ws_fill.time,
             local_ts,
-            data: AccountData::Fill(fill),
+            data,
         });
     }
 
@@ -444,7 +412,7 @@ pub(crate) fn parse_user_fills_for_test(
     raw: &str,
     local_ts: u64,
 ) -> Result<Vec<AccountEvent>, WsError> {
-    match parse_private_message(raw, markets, 0, local_ts)? {
+    match parse_private_message(raw, markets, local_ts)? {
         PrivateMessage::Events { events, .. } => Ok(events),
         PrivateMessage::SubscriptionAck(_) => panic!("不是 userFills 数据"),
     }
@@ -486,42 +454,37 @@ mod tests {
     }
 
     /// **错账防线**：userFills 是账户级推送。已接入的每个 dex 的成交都进 Fill 流；
-    /// 未接入 dex 或目录外品种的成交报错停机 —— 否则 "flx:TSLA" 会被剥前缀成 "TSLA"，
-    /// 当成 xyz 同名标的的 Fill 累进持仓，或留下不计入杠杆的外来仓位。
+    /// 未接入 dex、目录外品种、现货的成交以 UnmappedFill 原样上报 —— 绝不剥前缀当成
+    /// 同名标的的 Fill（"flx:TSLA" 不能累进 xyz 的 TSLA 持仓）。
     #[test]
-    fn fills_of_connected_dexes_flow_and_foreign_fills_are_fatal() {
-        let symbols = |m: &HlMarkets, fills: Vec<serde_json::Value>| -> Result<Vec<String>, WsError> {
+    fn fills_of_connected_dexes_flow_and_others_are_reported_unmapped() {
+        let kinds = |m: &HlMarkets, fills: Vec<serde_json::Value>| -> Vec<String> {
             let data = json!({"user": "0xabc", "fills": fills});
-            Ok(parse_user_fills(&data, m, 0, 1)?
+            parse_user_fills(&data, m, 1)
+                .unwrap()
                 .into_iter()
                 .map(|e| match e.data {
-                    AccountData::Fill(f) => f.symbol,
-                    other => panic!("expected fill, got {other:?}"),
+                    AccountData::Fill(f) => format!("fill:{}", f.symbol),
+                    AccountData::UnmappedFill(f) => format!("unmapped:{}", f.instrument),
+                    other => panic!("unexpected {other:?}"),
                 })
-                .collect())
+                .collect()
         };
         let both = testkit::markets(&["", "xyz"]);
-        assert_eq!(symbols(&both, vec![fill_json("BTC"), fill_json("xyz:TSLA")]).unwrap(), ["BTC", "TSLA"]);
-        // 未接入的 flx、目录里没有的 ETH：整条推送报错
-        assert!(symbols(&both, vec![fill_json("BTC"), fill_json("flx:TSLA")]).is_err());
-        assert!(symbols(&both, vec![fill_json("ETH")]).is_err());
-        // 只接主站：xyz 的成交是外来的
-        assert!(symbols(&testkit::markets(&[""]), vec![fill_json("xyz:TSLA")]).is_err());
-        // 现货成交也是外来的
-        assert!(symbols(&both, vec![fill_json("@107")]).is_err());
-        assert!(symbols(&both, vec![fill_json("PURR/USDC")]).is_err());
-        // 只接 xyz：主站裸 coin 是外来的
-        assert!(symbols(&testkit::markets(&["xyz"]), vec![fill_json("BTC")]).is_err());
+        assert_eq!(kinds(&both, vec![fill_json("BTC"), fill_json("xyz:TSLA")]), ["fill:BTC", "fill:TSLA"]);
+        assert_eq!(kinds(&both, vec![fill_json("BTC"), fill_json("flx:TSLA")]), ["fill:BTC", "unmapped:flx:TSLA"]);
+        assert_eq!(kinds(&both, vec![fill_json("ETH")]), ["unmapped:ETH"]);
+        assert_eq!(kinds(&testkit::markets(&[""]), vec![fill_json("xyz:TSLA")]), ["unmapped:xyz:TSLA"]);
+        assert_eq!(kinds(&both, vec![fill_json("@107"), fill_json("PURR/USDC")]), ["unmapped:@107", "unmapped:PURR/USDC"]);
+        assert_eq!(kinds(&testkit::markets(&["xyz"]), vec![fill_json("BTC")]), ["unmapped:BTC"]);
     }
 
-    /// 初始快照不入账；早于启动检查的历史外来成交不管，晚于的（检查到订阅生效的空档）停机
+    /// 初始快照是历史成交：不入账、不上报
     #[test]
-    fn snapshot_fills_only_trip_on_foreign_fills_after_the_startup_check() {
+    fn snapshot_fills_are_ignored() {
         let m = testkit::markets(&[""]);
         let data = json!({"user": "0xabc", "isSnapshot": true, "fills": [fill_json("BTC"), fill_json("flx:TSLA")]});
-        // fill_json 的 time = 1
-        assert!(parse_user_fills(&data, &m, 2, 1).unwrap().is_empty(), "历史外来成交不该挡住启动");
-        assert!(parse_user_fills(&data, &m, 1, 1).is_err(), "空档里的外来成交必须停机");
+        assert!(parse_user_fills(&data, &m, 1).unwrap().is_empty());
     }
 
     /// **Critical 回归防线**：服务端的错误报文必须致命。
@@ -533,7 +496,7 @@ mod tests {
     #[test]
     fn server_error_message_is_fatal() {
         let raw = r#"{"channel":"error","data":"Invalid subscription {\"type\":\"userFills\"}"}"#;
-        let err = parse_private_message(raw, &testkit::markets(&[""]), 0, 1)
+        let err = parse_private_message(raw, &testkit::markets(&[""]), 1)
             .err()
             .expect("服务端错误报文被吞掉了 —— 订阅被拒会表现为静默断流");
         assert!(
@@ -547,7 +510,7 @@ mod tests {
     fn subscription_response_is_reported_as_ack() {
         let raw = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe",
             "subscription":{"type":"orderUpdates","user":"0xabc"}}}"#;
-        match parse_private_message(raw, &testkit::markets(&[""]), 0, 1).unwrap() {
+        match parse_private_message(raw, &testkit::markets(&[""]), 1).unwrap() {
             PrivateMessage::SubscriptionAck(t) => assert_eq!(t, "orderUpdates"),
             _ => panic!("订阅确认必须能被识别，否则记账永远凑不齐、启动 15 秒后自杀"),
         }
@@ -558,7 +521,7 @@ mod tests {
     #[test]
     fn incoming_data_also_confirms_the_subscription() {
         let raw = r#"{"channel":"userFills","data":{"user":"0xabc","fills":[]}}"#;
-        match parse_private_message(raw, &testkit::markets(&[""]), 0, 1).unwrap() {
+        match parse_private_message(raw, &testkit::markets(&[""]), 1).unwrap() {
             PrivateMessage::Events { channel, .. } => assert_eq!(
                 channel, "userFills",
                 "数据报文必须带回频道名，否则无法用它推进订阅记账"
@@ -582,7 +545,7 @@ mod tests {
     #[test]
     fn clearinghouse_state_push_yields_no_account_info() {
         let raw = format!(r#"{{"channel":"clearinghouseState","data":{{"user":"0xabc","dex":"","clearinghouseState":{}}}}}"#, testkit::OWN_EMPTY_STATE);
-        match parse_private_message(&raw, &testkit::markets(&[""]), 0, 1).unwrap() {
+        match parse_private_message(&raw, &testkit::markets(&[""]), 1).unwrap() {
             PrivateMessage::Events { events, .. } => assert!(events.is_empty()),
             _ => panic!("应解析为空事件"),
         }
