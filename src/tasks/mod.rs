@@ -10,5 +10,5 @@ pub mod inbox;
 pub mod tree;
 
 pub use bus::{Bus, Subscription};
-pub use inbox::{inbox, Addr, Gone, Inbox};
-pub use tree::{ChildHandle, FailHandle, Group, GroupClosed, Scope, Task};
+pub use inbox::{Addr, Gone, Inbox};
+pub use tree::{ChildHandle, FailHandle, Group, GroupClosed, Root, Scope, Task};

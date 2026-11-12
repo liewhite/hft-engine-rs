@@ -2,12 +2,12 @@
 //!
 //! # 三条规则
 //!
-//! - **树形**：每个组件是一个 tokio 任务，挂在父节点的某个 [`Group`] 下；根是 [`Scope::root`]。
+//! - **树形**：每个组件是一个 tokio 任务，挂在父节点的某个 [`Group`] 下；根是 [`Root`]。
 //!   谁 spawn 的谁负责停、负责等，没有全局登记表。
 //! - **出错向上冒**：组件的 `build` / `run` / `stop` 返回 `Err` 或 panic，就记到父节点上并请求
-//!   父节点停止；父节点停完后带着这个错误退出，一层层冒到根。返回 `Ok` 是正常退出，只收掉
-//!   它自己那一支，父节点照常运行。
-//! - **停机自上而下传信号、自下而上收尾**：一个节点的 `run` 返回后，框架按创建顺序逐组停掉
+//!   父节点停止，同时立刻请求根停机；父节点停完后带着这个错误退出，一层层冒到根。被要求停止
+//!   后返回 `Ok` 是正常退出，只收掉它自己那一支，父节点照常运行。
+//! - **停机自上而下传信号、自下而上收尾**：一个节点的 `run` 返回后，框架按声明顺序逐组停掉
 //!   它的子任务（组内并发、组间有序），全部收尾完才调它自己的 [`Task::stop`]。所以祖先的
 //!   资源一定活到子孙收尾完 —— 这一点由框架保证，组件不需要记得去等。
 //!
@@ -30,15 +30,17 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
-/// 子任务迟迟不停时，每隔多久告警一次（只告警，不放弃，见模块文档）。
-const SLOW_CHILD_WARN_INTERVAL: Duration = Duration::from_secs(5);
+/// 子任务迟迟不停、或 `run` 收到停止信号后迟迟不返回时，每隔多久告警一次（只告警，不放弃）
+const SLOW_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 一个组件。
 ///
 /// - [`Self::run`] 是它的主循环，**必须在 `scope.stopping()` 完成后尽快返回**（通常是
 ///   `select!` 里的一个分支，或用 [`crate::tasks::Inbox::recv`]）。框架不会中途丢弃 `run` 的
-///   future —— 正在处理的那条消息一定处理完。
-/// - [`Self::stop`] 是收尾，在它的全部子任务都收尾完之后才调用。
+///   future —— 正在处理的那条消息一定处理完；迟迟不返回会每 5 秒告警。
+///   **没被要求停止就返回 `Ok` 算出错**（流结束、循环意外跳出不会被悄悄收掉）；真要收工先调
+///   [`Scope::request_stop`]。
+/// - [`Self::stop`] 是收尾，在它的全部子任务都收尾完之后才调用；`run` 出错或 panic 也照样调。
 ///
 /// 只有一段循环、没有收尾的组件用 [`Group::spawn_fn`]，不必实现本 trait。
 pub trait Task: Send + 'static {
@@ -49,7 +51,7 @@ pub trait Task: Send + 'static {
     }
 }
 
-/// 一个节点的上下文：停止信号、子任务分组、向上报错的入口。
+/// 一个节点的上下文：停止信号、子任务分组、收件箱、向上报错的入口。
 ///
 /// 可以克隆（内部共享）：组件的构造代码和主循环都可以拿着它起子任务。
 #[derive(Clone)]
@@ -57,34 +59,41 @@ pub struct Scope(Arc<ScopeInner>);
 
 struct ScopeInner {
     name: String,
-    /// 本节点的停止请求：父节点框架轮到本组时发出，或本节点自己出错（[`Scope::fail`]）时发出
+    /// 树根：任何节点出错都立刻请求根停机（见 [`ScopeInner::fail`]）。根自己为 None
+    root: Option<Weak<ScopeInner>>,
+    /// 本节点的停止请求：父节点框架轮到本组时发出，或本节点出错 / 主动收工时发出
     stop: CancellationToken,
-    /// 按创建顺序排列的子任务分组，停机时依次停
+    /// 按声明顺序排列的子任务分组，停机时依次停
     groups: Mutex<GroupList>,
     /// 子任务冒上来的错误或 [`Scope::fail`] 记下的错误；只保留第一个（根因），其余记日志
-    failure: Mutex<Option<anyhow::Error>>,
+    failure: Mutex<FailureSlot>,
 }
 
 #[derive(Default)]
 struct GroupList {
     groups: Vec<Group>,
+    /// 构造阶段已结束：分组只能在构造阶段声明（停机顺序 = 声明顺序，运行期追加会把新组排到
+    /// 最后停，悄悄改变停机语义）
+    sealed: bool,
     /// 已开始停机：此后新建的组一律是关闭的，spawn 会失败
     closed: bool,
 }
 
-impl Scope {
-    /// 树根。根没有任务在跑它，由调用方驱动：等 [`Self::stopping`]（任何子任务出错都会触发）
-    /// 或外部停机信号，再调 [`Self::shutdown`]。
-    pub fn root(name: impl Into<String>) -> Self {
-        Self::new(name.into())
-    }
+#[derive(Default)]
+struct FailureSlot {
+    error: Option<anyhow::Error>,
+    /// 节点已交出最终结果：此后再上报的错误没人读，只能记日志
+    finished: bool,
+}
 
-    fn new(name: String) -> Self {
+impl Scope {
+    fn new(name: String, root: Option<Weak<ScopeInner>>) -> Self {
         Self(Arc::new(ScopeInner {
             name,
+            root,
             stop: CancellationToken::new(),
             groups: Mutex::new(GroupList::default()),
-            failure: Mutex::new(None),
+            failure: Mutex::new(FailureSlot::default()),
         }))
     }
 
@@ -102,38 +111,52 @@ impl Scope {
         self.0.stop.cancelled()
     }
 
-    /// 新建一个子任务分组。**停机时按创建顺序逐组停**，组内并发：有先后依赖的子任务
-    /// 放进不同的组，按依赖顺序创建。
-    pub fn group(&self, name: &'static str) -> Group {
-        let mut list = self.0.groups.lock().unwrap();
-        let group = Group::new(name, Arc::downgrade(&self.0), list.closed);
-        list.groups.push(group.clone());
-        group
+    /// 主动收工：请求本节点停止，`run` 随后返回 `Ok` 即算正常退出（见 [`Task::run`]）。
+    pub fn request_stop(&self) {
+        self.0.stop.cancel();
     }
 
-    /// 记下一个错误并请求本节点停止：本节点停完后带着这个错误退出（冒到父节点）。
+    /// 新建一个子任务分组。**停机时按声明顺序逐组停**，组内并发：有先后依赖的子任务
+    /// 放进不同的组，按依赖顺序声明。
     ///
-    /// 子任务出错时框架会调它；组件自己遇到"必须整支停下"的情况（如下单结果不确定）
-    /// 也调它，见 [`Self::fail_handle`]。
+    /// # Panics
+    /// 只能在构造阶段（[`Group::spawn`] 的 `build` 里）调用；运行期再调会 panic（随即按出错
+    /// 处理）。运行期新增的子任务往已声明的组里 spawn。
+    pub fn group(&self, name: &'static str) -> Group {
+        {
+            let mut list = self.0.groups.lock().unwrap();
+            if !list.sealed {
+                let group = Group::new(name, Arc::downgrade(&self.0), list.closed);
+                list.groups.push(group.clone());
+                return group;
+            }
+        }
+        // 在锁外 panic：持锁 panic 会毒化互斥锁，停机路径随之 panic、子树再也收不了尾
+        panic!(
+            "{}: 分组 {name} 必须在构造阶段声明（停机顺序 = 声明顺序），运行期只能往已有的组里 spawn",
+            self.0.name
+        )
+    }
+
+    /// 记下一个错误并请求本节点停止：本节点停完后带着这个错误退出（冒到父节点）；同时立刻
+    /// 请求根停机。组件自己遇到"必须停下"的情况调它，或经 [`Self::fail_handle`] 交给别处调。
     pub fn fail(&self, err: anyhow::Error) {
         self.0.fail(err);
     }
 
-    /// 一个可以交给别处、事后调用 [`Scope::fail`] 的句柄。只持弱引用：节点已退出时调用无效果。
+    /// 一个可以交给别处、事后调用 [`Scope::fail`] 的句柄。只持弱引用。
     pub fn fail_handle(&self) -> FailHandle {
         FailHandle(Arc::downgrade(&self.0))
     }
 
-    /// 停掉本节点的全部子任务（按组创建顺序，组内并发），然后交出记下的错误（若有）。
-    ///
-    /// 只给根用：非根节点由框架在 `run` 返回后自动走这一步。
-    pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.0.stop.cancel();
-        self.shutdown_groups().await;
-        match self.0.failure.lock().unwrap().take() {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+    /// 新建一个属于本节点的收件箱。收件箱只能从 `Scope` 建：能收消息、能订阅总线的一定是
+    /// 挂在树上、有人监督的组件。
+    pub fn inbox<M: Send + 'static>(&self) -> (super::Addr<M>, super::Inbox<M>) {
+        super::inbox::new(self.clone())
+    }
+
+    fn seal(&self) {
+        self.0.groups.lock().unwrap().sealed = true;
     }
 
     async fn shutdown_groups(&self) {
@@ -147,8 +170,11 @@ impl Scope {
         }
     }
 
-    fn take_failure(&self) -> Option<anyhow::Error> {
-        self.0.failure.lock().unwrap().take()
+    /// 交出记下的错误，并标记本节点已结束
+    fn finish(&self) -> Option<anyhow::Error> {
+        let mut slot = self.0.failure.lock().unwrap();
+        slot.finished = true;
+        slot.error.take()
     }
 }
 
@@ -156,8 +182,12 @@ impl ScopeInner {
     fn fail(&self, err: anyhow::Error) {
         {
             let mut slot = self.failure.lock().unwrap();
-            match &*slot {
-                None => *slot = Some(err),
+            if slot.finished {
+                tracing::error!(node = %self.name, error = %format!("{err:#}"), "节点已结束，错误无处上报");
+                return;
+            }
+            match &slot.error {
+                None => slot.error = Some(err),
                 Some(first) => tracing::error!(
                     node = %self.name,
                     first = %format!("{first:#}"),
@@ -167,6 +197,13 @@ impl ScopeInner {
             }
         }
         self.stop.cancel();
+        // 立刻请求根停机：错误本身仍逐层冒（根因随最终退出结果交出），但"整机要停"不必等
+        // 中间每一层的 run 返回 —— 某一层卡在不理会停止信号的 await 上时，根照样开始停机，
+        // 卡住的那层由"迟迟未返回/未停"告警和根的总期限暴露出来。
+        // 只取消根的信号，不越过分组顺序：停机仍由根自上而下逐组进行。
+        if let Some(root) = self.root.as_ref().and_then(Weak::upgrade) {
+            root.stop.cancel();
+        }
     }
 }
 
@@ -179,6 +216,77 @@ impl FailHandle {
         match self.0.upgrade() {
             Some(scope) => scope.fail(err),
             None => tracing::error!(error = %format!("{err:#}"), "节点已退出，错误无处上报"),
+        }
+    }
+}
+
+/// 树根。只有它能 [`Self::shutdown`]；组件拿到的 [`Scope`] 没有这个能力。
+///
+/// 调用方（`crate::engine::bootstrap`）的用法：声明分组、起子任务，等 [`Self::stopping`]
+/// （任何节点出错都会触发）或外部停机信号，再 [`Self::shutdown`]，对它设总期限。
+pub struct Root {
+    scope: Scope,
+    shut_down: bool,
+}
+
+impl Root {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            scope: Scope::new(name.into(), None),
+            shut_down: false,
+        }
+    }
+
+    /// 声明一个分组（停机按声明顺序，见 [`Scope::group`]；根上随时可以声明）
+    pub fn group(&self, name: &'static str) -> Group {
+        self.scope.group(name)
+    }
+
+    /// 有节点出错（或 [`Self::fail_handle`] 被调用）时完成
+    pub fn stopping(&self) -> WaitForCancellationFuture<'_> {
+        self.scope.stopping()
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.scope.is_stopping()
+    }
+
+    pub fn fail_handle(&self) -> FailHandle {
+        self.scope.fail_handle()
+    }
+
+    /// 按声明顺序逐组停掉全部子任务，等全部收尾完，交出最终结果（根因错误，若有）。
+    /// 返回的 future 被丢弃（如超过总期限）时，未停完的子任务继续收尾直到 runtime 关闭。
+    pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        self.shut_down = true;
+        self.scope.0.stop.cancel();
+        self.scope.shutdown_groups().await;
+        match self.scope.finish() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Root {
+    fn drop(&mut self) {
+        if self.shut_down {
+            return;
+        }
+        // 没走 shutdown 就被丢弃（调用方提前返回或 panic）：子任务的停止信号永远不会再发，
+        // 它们会一直跑。尽力而为：把信号全部发出去（不等收尾），并大声报出来。
+        let groups = std::mem::take(&mut self.scope.0.groups.lock().unwrap().groups);
+        let mut names = Vec::new();
+        for g in &groups {
+            let mut state = g.0.state.lock().unwrap();
+            state.closed = true;
+            for c in &state.children {
+                c.stop.cancel();
+                names.push(c.name.to_string());
+            }
+        }
+        if !names.is_empty() {
+            tracing::error!(?names, "任务树的根未经 shutdown 就被丢弃：已向子任务发出停止信号，但没人等它们收尾");
         }
     }
 }
@@ -201,7 +309,7 @@ struct GroupState {
 
 static NEXT_CHILD_ID: AtomicU64 = AtomicU64::new(1);
 
-/// spawn 时组已关闭（所属节点已在停机）
+/// spawn 时组已关闭（所属节点已在停机）。停机途中的正常竞态，调用方不要当事故往上抛。
 #[derive(Debug, thiserror::Error)]
 #[error("任务组 {group} 已关闭（所属节点正在停机），不能再起 {child}")]
 pub struct GroupClosed {
@@ -223,11 +331,13 @@ impl Group {
 
     /// 起一个子任务，等它构造完成。
     ///
-    /// `build` 在子任务自己的 tokio 任务里跑，拿到子任务的 [`Scope`]（可以在里面起孙任务）。
-    /// 构造失败时：调用方拿到 `Err`（带根因），**同时**错误照常冒到本组所属节点 ——
-    /// 构造失败就是失败，不由调用方选择吞掉。
+    /// `build` 在子任务自己的 tokio 任务里跑，拿到子任务的 [`Scope`]（在里面声明分组、起孙
+    /// 任务、建收件箱）。构造失败时：调用方拿到 `Err`（带根因），**同时**错误照常冒到本组
+    /// 所属节点 —— 构造失败就是失败，不由调用方选择吞掉。
     ///
     /// 子任务在返回前就已登记进本组：即便调用方不等返回值，停机时也一定会被等到。
+    ///
+    /// 本组已关闭时返回的错误可 `downcast_ref::<GroupClosed>()`（见 [`GroupClosed`]）。
     pub async fn spawn<T, B, Fut>(
         &self,
         name: impl Into<String>,
@@ -250,7 +360,7 @@ impl Group {
     }
 
     /// 起一个只有一段主循环、没有收尾的子任务。`f` 拿到子任务的 [`Scope`]，返回的 future
-    /// 就是它的 `run`：必须在 `scope.stopping()` 后尽快返回。不等待（没有构造阶段）。
+    /// 就是它的 `run`（规则同 [`Task::run`]）。不等待（没有构造阶段，分组也不能声明）。
     pub fn spawn_fn<F, Fut>(&self, name: impl Into<String>, f: F) -> Result<ChildHandle, GroupClosed>
     where
         F: FnOnce(Scope) -> Fut + Send + 'static,
@@ -275,7 +385,7 @@ impl Group {
         B: FnOnce(Scope) -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
     {
-        let scope = Scope::new(name.clone());
+        let scope = Scope::new(name.clone(), Some(self.root()));
         let handle = ChildHandle {
             id: NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed),
             name: Arc::from(name.as_str()),
@@ -295,24 +405,42 @@ impl Group {
         let group = Arc::downgrade(&self.0);
         let me = handle.clone();
         tokio::spawn(async move {
+            // 框架自身万一 panic（本不该发生），也要让等它的父节点等得到，不至于永远挂住
+            let _done = me.done.clone().drop_guard();
             let outcome = run_node(&scope, build, started).await;
-            if let Some(group) = group.upgrade() {
-                group.state.lock().unwrap().children.retain(|c| c.id != me.id);
-                match outcome {
-                    Ok(()) => tracing::debug!(task = %me.name, group = group.name, "任务正常退出"),
-                    Err(e) => {
-                        let e = e.context(format!("{} 出错退出", me.name));
-                        tracing::error!(error = %format!("{e:#}"), "任务出错退出，上报父节点");
-                        match group.owner.upgrade() {
-                            Some(owner) => owner.fail(e),
-                            None => tracing::error!(task = %me.name, "父节点已不在，错误无处上报"),
-                        }
+            let group = group.upgrade();
+            // 顺序要紧：先上报，再从组里摘除，最后标记完成。父节点停机时要么还在组里看到它、
+            // 等到它完成（此时错误已记下）；要么看不到它（错误更早就记下了）。反过来的话，
+            // 父节点可能恰好在摘除之后、上报之前读走"无错误"，一次事故被报成正常停机。
+            match outcome {
+                Ok(()) => tracing::debug!(task = %me.name, "任务正常退出"),
+                Err(e) => {
+                    let e = e.context(format!("{} 出错退出", me.name));
+                    tracing::error!(error = %format!("{e:#}"), "任务出错退出，上报父节点");
+                    match group.as_ref().and_then(|g| g.owner.upgrade()) {
+                        Some(owner) => owner.fail(e),
+                        None => tracing::error!(task = %me.name, "父节点已不在，错误无处上报"),
                     }
                 }
             }
-            me.done.cancel();
+            match &group {
+                Some(group) => group.state.lock().unwrap().children.retain(|c| c.id != me.id),
+                None => tracing::error!(task = %me.name, "所属任务组已销毁（根未经 shutdown 被丢弃？）"),
+            }
+            // _done 在此 drop：最后才标记完成
         });
         Ok(handle)
+    }
+
+    /// 本组所在树的根
+    fn root(&self) -> Weak<ScopeInner> {
+        match self.0.owner.upgrade() {
+            Some(owner) => match &owner.root {
+                Some(root) => root.clone(),
+                None => Arc::downgrade(&owner),
+            },
+            None => Weak::new(),
+        }
     }
 
     /// 停掉并等完本组全部子任务（并发），并关闭本组。只由所属节点的框架调用。
@@ -340,7 +468,9 @@ where
     B: FnOnce(Scope) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
 {
-    let mut task = match catch(build(scope.clone())).await {
+    let built = catch(build(scope.clone())).await;
+    scope.seal();
+    let mut task = match built {
         Ok(task) => {
             let _ = started.send(Ok(()));
             task
@@ -350,17 +480,43 @@ where
             // 构造途中可能已起了孙任务：照样先停它们
             scope.0.stop.cancel();
             scope.shutdown_groups().await;
-            return Err(first_error(scope.take_failure(), [Err(e)]));
+            return Err(first_error(scope.finish(), [Err(e)]));
         }
     };
-    let ran = catch(task.run(scope)).await;
-    // run 自己返回（正常退出或出错）时也要收掉子树
+    let ran = match run_watched(scope, &mut task).await {
+        // 没被要求停止就自己返回 Ok：流结束、循环跳出 —— 不能当正常退出悄悄收掉
+        Ok(()) if !scope.is_stopping() => Err(anyhow::anyhow!(
+            "run 未经停止请求就自行结束（真要收工请先调 Scope::request_stop）"
+        )),
+        other => other,
+    };
+    // run 自己返回（正常收工或出错）时也要收掉子树
     scope.0.stop.cancel();
     scope.shutdown_groups().await;
     let stopped = catch(task.stop()).await;
-    match (scope.take_failure(), ran, stopped) {
+    match (scope.finish(), ran, stopped) {
         (None, Ok(()), Ok(())) => Ok(()),
         (failure, ran, stopped) => Err(first_error(failure, [ran, stopped])),
+    }
+}
+
+/// 跑 `run`；收到停止信号后它迟迟不返回就每 5 秒告警一次（不理会停止信号的组件由此暴露）
+async fn run_watched<T: Task>(scope: &Scope, task: &mut T) -> anyhow::Result<()> {
+    let run = catch(task.run(scope));
+    tokio::pin!(run);
+    tokio::select! {
+        r = &mut run => return r,
+        _ = scope.stopping() => {}
+    }
+    let mut waited = Duration::ZERO;
+    loop {
+        match tokio::time::timeout(SLOW_WARN_INTERVAL, &mut run).await {
+            Ok(r) => return r,
+            Err(_) => {
+                waited += SLOW_WARN_INTERVAL;
+                tracing::warn!(task = %scope.name(), waited_s = waited.as_secs(), "已请求停止，run 迟迟未返回");
+            }
+        }
     }
 }
 
@@ -407,6 +563,8 @@ where
 }
 
 /// 一个子任务的句柄：可以单独停掉它（连同它的子树）并等收尾完。
+///
+/// 不要拿自己的句柄调 [`Self::stop`]（会永远等自己）；要收工用 [`Scope::request_stop`]。
 #[derive(Clone)]
 pub struct ChildHandle {
     id: u64,
@@ -421,7 +579,7 @@ impl ChildHandle {
         &self.name
     }
 
-    /// 请求它停止，等它（连同子树）收尾完。它这样退出算正常退出，父节点照常运行。
+    /// 请求它停止，等它（连同子树）收尾完。这样退出算正常退出，父节点照常运行。
     pub async fn stop(&self) {
         self.stop.cancel();
         self.wait_done("（单独停止）").await;
@@ -440,10 +598,10 @@ impl ChildHandle {
     async fn wait_done(&self, group: &'static str) {
         let mut waited = Duration::ZERO;
         loop {
-            match tokio::time::timeout(SLOW_CHILD_WARN_INTERVAL, self.done.cancelled()).await {
+            match tokio::time::timeout(SLOW_WARN_INTERVAL, self.done.cancelled()).await {
                 Ok(()) => return,
                 Err(_) => {
-                    waited += SLOW_CHILD_WARN_INTERVAL;
+                    waited += SLOW_WARN_INTERVAL;
                     tracing::warn!(task = %self.name, group, waited_s = waited.as_secs(), "子任务迟迟未停，继续等待");
                 }
             }
@@ -472,7 +630,7 @@ mod tests {
         log.lock().unwrap().clone()
     }
 
-    /// 深度为 depth 的链；每层 stop 时记一笔，叶子收尾最慢
+    /// 等停止信号；stop 时记一笔，叶子收尾最慢
     struct Node {
         name: String,
         leaf: bool,
@@ -515,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_stops_the_tree_bottom_up() {
         let log = log();
-        let root = Scope::root("root");
+        let root = Root::new("root");
         spawn_chain(root.group("main"), 2, log.clone()).await.unwrap();
 
         root.shutdown().await.expect("正常停机不该报错");
@@ -523,35 +681,31 @@ mod tests {
         assert_eq!(entries(&log), ["d0:stopped", "d1:stopped", "d2:stopped"]);
     }
 
-    /// 组间有序：先创建的组全部停完，后创建的组才收到停止信号。
+    /// 组间有序：先声明的组全部停完，后声明的组才收到停止信号。
     /// 生产者在自己收尾时发的最后一批消息，消费者必须还活着收得到。
     #[tokio::test]
-    async fn groups_stop_in_creation_order() {
+    async fn groups_stop_in_declaration_order() {
         let log = log();
-        let root = Scope::root("root");
+        let root = Root::new("root");
         let producers = root.group("producers");
         let consumers = root.group("consumers");
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
         let consumer_log = log.clone();
+        let (addr_tx, addr_rx) = oneshot::channel();
         consumers
             .spawn_fn("consumer", move |scope| async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        Some(n) = rx.recv() => consumer_log.lock().unwrap().push(format!("got {n}")),
-                        _ = scope.stopping() => break,
-                    }
-                }
-                while let Ok(n) = rx.try_recv() {
+                let (addr, mut inbox) = scope.inbox::<u32>();
+                addr_tx.send(addr).unwrap();
+                while let Some(n) = inbox.recv().await {
                     consumer_log.lock().unwrap().push(format!("got {n}"));
                 }
                 consumer_log.lock().unwrap().push("consumer stopped".into());
                 Ok(())
             })
             .unwrap();
+        let addr = addr_rx.await.unwrap();
 
-        struct Producer(tokio::sync::mpsc::UnboundedSender<u32>);
+        struct Producer(crate::tasks::Addr<u32>);
         impl Task for Producer {
             async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
                 scope.stopping().await;
@@ -566,7 +720,7 @@ mod tests {
             }
         }
         producers
-            .spawn("producer", move |_| async move { Ok(Producer(tx)) })
+            .spawn("producer", move |_| async move { Ok(Producer(addr)) })
             .await
             .unwrap();
 
@@ -578,7 +732,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn children_in_one_group_stop_concurrently() {
         let log = log();
-        let root = Scope::root("root");
+        let root = Root::new("root");
         let group = root.group("slow");
         for _ in 0..3 {
             spawn_chain(group.clone(), 0, log.clone()).await.unwrap();
@@ -593,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn child_error_propagates_to_the_root_and_stops_everything() {
         let log = log();
-        let root = Scope::root("root");
+        let root = Root::new("root");
         let main = root.group("main");
         spawn_chain(main.clone(), 1, log.clone()).await.unwrap();
         let mid_log = log.clone();
@@ -613,10 +767,50 @@ mod tests {
         assert_eq!(got, ["d0:stopped", "d1:stopped", "mid:stopped"]);
     }
 
+    /// 子任务出错与整机停机同时发生：错误不能被当成正常停机吞掉。
+    /// 子任务在收到停止信号后才出错（收尾里撤单失败这一类），根照样带着错误退出。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn error_during_shutdown_is_not_lost() {
+        for _ in 0..50 {
+            let root = Root::new("root");
+            root.group("g")
+                .spawn_fn("canceller", |scope| async move {
+                    scope.stopping().await;
+                    tokio::task::yield_now().await;
+                    anyhow::bail!("撤单失败")
+                })
+                .unwrap();
+            let err = root.shutdown().await.expect_err("收尾出错必须冒到根");
+            assert!(format!("{err:#}").contains("撤单失败"));
+        }
+    }
+
+    /// 中间层不理会停止信号：叶子出错照样立刻请求根停机（不等中间层的 run 返回）
+    #[tokio::test]
+    async fn error_reaches_the_root_even_if_a_middle_layer_is_stuck() {
+        struct Stuck;
+        impl Task for Stuck {
+            async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+                std::future::pending().await
+            }
+        }
+        let root = Root::new("root");
+        root.group("g")
+            .spawn("stuck", |scope: Scope| async move {
+                scope.group("kids").spawn_fn("leaf", |_| async { anyhow::bail!("断流") })?;
+                Ok(Stuck)
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), root.stopping())
+            .await
+            .expect("根必须在中间层卡住时也收到停机请求");
+    }
+
     /// panic 等同出错
     #[tokio::test]
     async fn panic_is_an_error() {
-        let root = Scope::root("root");
+        let root = Root::new("root");
         root.group("g")
             .spawn_fn("boom", |_| async { panic!("越界") })
             .unwrap();
@@ -625,11 +819,27 @@ mod tests {
         assert!(format!("{err:#}").contains("越界"), "{err:#}");
     }
 
-    /// 正常退出只收掉它自己那一支，父节点照常运行
+    /// 没被要求停止就自己返回 Ok（流结束、循环跳出）算出错
     #[tokio::test]
-    async fn normal_exit_does_not_stop_the_parent() {
-        let root = Scope::root("root");
-        let h = root.group("g").spawn_fn("done", |_| async { Ok(()) }).unwrap();
+    async fn returning_ok_without_a_stop_request_is_an_error() {
+        let root = Root::new("root");
+        root.group("g").spawn_fn("stream", |_| async { Ok(()) }).unwrap();
+        root.stopping().await;
+        let err = root.shutdown().await.unwrap_err();
+        assert!(format!("{err:#}").contains("未经停止请求"), "{err:#}");
+    }
+
+    /// 主动收工：只收掉它自己那一支，父节点照常运行
+    #[tokio::test]
+    async fn requested_exit_does_not_stop_the_parent() {
+        let root = Root::new("root");
+        let h = root
+            .group("g")
+            .spawn_fn("done", |scope| async move {
+                scope.request_stop();
+                Ok(())
+            })
+            .unwrap();
         h.finished().await;
         assert!(!root.is_stopping());
         root.shutdown().await.unwrap();
@@ -639,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn stopping_one_child_waits_for_its_subtree() {
         let log = log();
-        let root = Scope::root("root");
+        let root = Root::new("root");
         let h = spawn_chain(root.group("g"), 1, log.clone()).await.unwrap();
         h.stop().await;
         assert_eq!(entries(&log), ["d0:stopped", "d1:stopped"]);
@@ -651,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn build_failure_is_reported_to_caller_and_parent() {
         static GRANDCHILD_STOPPED: AtomicUsize = AtomicUsize::new(0);
-        let root = Scope::root("root");
+        let root = Root::new("root");
         let err = root
             .group("g")
             .spawn("ledger", |scope: Scope| async move {
@@ -672,23 +882,55 @@ mod tests {
         assert_eq!(GRANDCHILD_STOPPED.load(Ordering::SeqCst), 1);
     }
 
-    /// 停机开始后不能再往这个节点下起任务
+    /// 停机开始后不能再往这个节点下起任务；错误可识别为 GroupClosed
     #[tokio::test]
     async fn spawning_into_a_closed_group_fails() {
-        let root = Scope::root("root");
+        let root = Root::new("root");
         let g = root.group("g");
         root.shutdown().await.unwrap();
         assert!(g.spawn_fn("late", |_| async { Ok(()) }).is_err());
-        assert!(root.group("later").spawn_fn("late", |_| async { Ok(()) }).is_err());
+        let err = g
+            .spawn("late", |_| async { Ok(Node { name: String::new(), leaf: false, log: log() }) })
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<GroupClosed>().is_some());
+    }
+
+    /// 运行期声明分组 = 出错（停机顺序只能在构造阶段定）
+    #[tokio::test]
+    async fn declaring_a_group_at_runtime_is_an_error() {
+        let root = Root::new("root");
+        root.group("g")
+            .spawn_fn("late-group", |scope| async move {
+                let _ = scope.group("too-late");
+                Ok(())
+            })
+            .unwrap();
+        root.stopping().await;
+        assert!(format!("{:#}", root.shutdown().await.unwrap_err()).contains("构造阶段"));
     }
 
     /// fail_handle：组件自己判定必须停机（如下单结果不确定）
     #[tokio::test]
-    async fn fail_handle_stops_the_node_with_that_error() {
-        let root = Scope::root("root");
-        let halt = root.fail_handle();
-        halt.fail(anyhow::anyhow!("下单结果不确定"));
+    async fn fail_handle_stops_the_root_with_that_error() {
+        let root = Root::new("root");
+        root.fail_handle().fail(anyhow::anyhow!("下单结果不确定"));
         root.stopping().await;
         assert!(format!("{:#}", root.shutdown().await.unwrap_err()).contains("下单结果不确定"));
+    }
+
+    /// 根未经 shutdown 就被丢弃：子任务至少收到停止信号
+    #[tokio::test]
+    async fn dropping_the_root_signals_children() {
+        let root = Root::new("root");
+        let h = root
+            .group("g")
+            .spawn_fn("orphan", |s| async move {
+                s.stopping().await;
+                Ok(())
+            })
+            .unwrap();
+        drop(root);
+        tokio::time::timeout(Duration::from_secs(5), h.finished()).await.expect("子任务应收到停止信号");
     }
 }
