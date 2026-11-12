@@ -41,6 +41,8 @@ const SLOW_WARN_INTERVAL: Duration = Duration::from_secs(5);
 ///   **没被要求停止就返回 `Ok` 算出错**（流结束、循环意外跳出不会被悄悄收掉）；真要收工先调
 ///   [`Scope::request_stop`]。
 /// - [`Self::stop`] 是收尾，在它的全部子任务都收尾完之后才调用；`run` 出错或 panic 也照样调。
+///   **收尾时要补发的东西（如成交）直接发到总线，不要经父节点转**：父节点的收件箱在停子任务
+///   之前就已关闭，发给它会失败（[`crate::tasks::Gone`]）。
 ///
 /// 只有一段循环、没有收尾的组件用 [`Group::spawn_fn`]，不必实现本 trait。
 pub trait Task: Send + 'static {
@@ -405,8 +407,8 @@ impl Group {
         let group = Arc::downgrade(&self.0);
         let me = handle.clone();
         tokio::spawn(async move {
-            // 框架自身万一 panic（本不该发生），也要让等它的父节点等得到，不至于永远挂住
-            let _done = me.done.clone().drop_guard();
+            // 框架自身万一 panic（本不该发生）：上报错误再标记完成，父节点既不会挂住、也不会误当正常退出
+            let mut guard = ExitGuard { done: me.done.clone(), owner: group.clone(), completed: false };
             let outcome = run_node(&scope, build, started).await;
             let group = group.upgrade();
             // 顺序要紧：先上报，再从组里摘除，最后标记完成。父节点停机时要么还在组里看到它、
@@ -427,7 +429,7 @@ impl Group {
                 Some(group) => group.state.lock().unwrap().children.retain(|c| c.id != me.id),
                 None => tracing::error!(task = %me.name, "所属任务组已销毁（根未经 shutdown 被丢弃？）"),
             }
-            // _done 在此 drop：最后才标记完成
+            guard.completed = true; // guard 在此 drop：最后才标记完成
         });
         Ok(handle)
     }
@@ -454,6 +456,25 @@ impl Group {
             child.stop.cancel();
         }
         futures_util::future::join_all(children.iter().map(|c| c.wait_done(self.0.name))).await;
+    }
+}
+
+/// 子任务包装的退出守卫：无论怎样离开都标记完成；没走到正常结尾（框架自身 panic）时先上报错误
+struct ExitGuard {
+    done: CancellationToken,
+    owner: Weak<GroupInner>,
+    completed: bool,
+}
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            match self.owner.upgrade().and_then(|g| g.owner.upgrade()) {
+                Some(owner) => owner.fail(anyhow::anyhow!("任务框架内部 panic，子任务状态未知")),
+                None => tracing::error!("任务框架内部 panic，且父节点已不在"),
+            }
+        }
+        self.done.cancel();
     }
 }
 

@@ -79,9 +79,25 @@ impl<M: Send + 'static> Inbox<M> {
     }
 
     fn close(&mut self) {
-        self.subscriptions.clear();
-        self.keep_open = None;
+        // 先关接收端、再退订：两步之间到达的投递会失败并在总线上记「事件丢失」，不会静默
         self.rx.close();
+        self.keep_open = None;
+        self.subscriptions.clear();
+    }
+}
+
+impl<M> Drop for Inbox<M> {
+    /// 组件没把箱里的消息取完就退出（比如 `run` 在停止分支里直接 break、没再调 `recv`）：
+    /// 关闭并点数，有剩余就报 ERROR —— 丢了要说出来。
+    fn drop(&mut self) {
+        self.rx.close();
+        let mut lost = 0usize;
+        while self.rx.try_recv().is_ok() {
+            lost += 1;
+        }
+        if lost > 0 {
+            tracing::error!(node = %self.scope.name(), lost, "收件箱销毁时仍有未处理的消息，已丢失");
+        }
     }
 }
 
