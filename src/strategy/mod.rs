@@ -1,8 +1,13 @@
+mod funding_arb;
 mod gamma_scalp;
 mod spread_arb;
 mod view;
 
 pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
+pub use funding_arb::{
+    FundingArbConfig, FundingArbStrategy, PairConfig as FundingArbPairConfig, SettledFundingWindow,
+    FUNDING_WINDOW_MS,
+};
 pub use gamma_scalp::GammaScalpStrategy;
 pub use view::{StrategyView, SymbolView};
 
