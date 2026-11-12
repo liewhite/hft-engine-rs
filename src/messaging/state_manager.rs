@@ -365,7 +365,7 @@ mod tests {
         manager.seed_positions(&[baseline(99.0, 20)]);
 
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(state.position_size(EX), 2.0, "重复 seed 不得覆写存量");
+        assert_eq!(state.position_book().position_size(EX), 2.0, "重复 seed 不得覆写存量");
     }
 
     /// **防双计**：快照请求时刻之前送达的 Fill 已含在快照里，seed 之后到达必须丢弃；
@@ -382,7 +382,7 @@ mod tests {
         manager.apply(&fill_at(1.0, 15));
 
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(state.position_size(EX), 3.0, "应为 2.0(快照) + 1.0(新成交)");
+        assert_eq!(state.position_book().position_size(EX), 3.0, "应为 2.0(快照) + 1.0(新成交)");
     }
 
     /// 未 seed 的所从 0 起算（模拟账户、未配置凭证的所）：Fill 直接累加，不受过滤影响
@@ -391,7 +391,7 @@ mod tests {
         let mut manager = StateManager::new(&[SYM.to_string()], 0);
         manager.apply(&fill_at(1.5, 5));
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(state.position_size(EX), 1.5);
+        assert_eq!(state.position_book().position_size(EX), 1.5);
     }
 
     /// 未注册 symbol 的基线被跳过（不 panic、不隐式建状态）

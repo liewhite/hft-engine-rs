@@ -1395,7 +1395,7 @@ mod subscription_validation_tests {
                 swallowed
                     .symbol_state(&SYM.to_string())
                     .expect("state")
-                    .position_size(WITH_ACCOUNT),
+                    .position_book().position_size(WITH_ACCOUNT),
                 0.0,
                 "local_ts == 0 的 Fill 会被 ts=0 的基线判成「已含在快照里」而丢弃"
             );
@@ -1406,7 +1406,7 @@ mod subscription_validation_tests {
             assert_eq!(
                 kept.symbol_state(&SYM.to_string())
                     .expect("state")
-                    .position_size(WITH_ACCOUNT),
+                    .position_book().position_size(WITH_ACCOUNT),
                 1.0,
                 "local_ts >= 1 照常累加 —— 实盘与纸盘取 now_ms()，恒落在这一侧"
             );

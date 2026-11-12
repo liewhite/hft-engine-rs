@@ -224,7 +224,7 @@ impl Message<GetSeededPositions> for ExecutorActor {
         self.runner
             .state()
             .symbol_states()
-            .flat_map(|(_, symbol_state)| symbol_state.seeded_positions())
+            .flat_map(|(_, symbol_state)| symbol_state.position_book().seeded_positions())
             .cloned()
             .collect()
     }

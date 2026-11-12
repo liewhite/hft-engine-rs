@@ -16,7 +16,6 @@ use chrono::Utc;
 use hmac::{Hmac, Mac};
 use reqwest::header::HeaderMap;
 use reqwest::Client;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::sync::Arc;
@@ -24,12 +23,13 @@ use std::time::Duration;
 
 /// OKX 交易所客户端
 pub struct OkxClient {
-    /// symbol -> 合约乘数 (ctVal) 缓存，惰性拉取一次
+    /// 合约目录（含每张币数 ctVal），进程内只拉一次：引擎预加载的品种元数据与本 client
+    /// 折算张数用的每张币数都取自这一份，不存在两份各拉各的。
     ///
     /// [`ExchangeClient`] 的契约是**返回币本位数量** (见 [`crate::domain::Quantity`])，而 OKX
     /// REST 返回的是张数，故 client 必须自备折算能力，不能把折算责任推给调用方 —— 那样每个
     /// 调用点都得记着乘一次，漏一处就静默算错 contract_size 倍。
-    contract_sizes: tokio::sync::OnceCell<HashMap<Symbol, f64>>,
+    instruments: tokio::sync::OnceCell<Vec<SymbolMeta>>,
     /// HTTP 客户端
     client: Client,
     /// 凭证（可选）
@@ -49,7 +49,7 @@ impl OkxClient {
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
 
         Ok(Self {
-            contract_sizes: tokio::sync::OnceCell::new(),
+            instruments: tokio::sync::OnceCell::new(),
             client,
             credentials,
             base_url: REST_BASE_URL.to_string(),
@@ -57,23 +57,19 @@ impl OkxClient {
         })
     }
 
-    /// 取该 symbol 的合约乘数 (张 -> 币)，首次调用时拉取并缓存全部合约信息。
+    /// 合约目录：首次调用时拉取，之后取缓存
+    async fn instruments(&self) -> Result<&[SymbolMeta], ExchangeError> {
+        self.instruments.get_or_try_init(|| self.get_all_instruments()).await.map(Vec::as_slice)
+    }
+
+    /// 取该 symbol 的合约乘数 (张 -> 币)，读合约目录
     async fn contract_size_of(&self, symbol: &Symbol) -> Result<f64, ExchangeError> {
-        let sizes = self
-            .contract_sizes
-            .get_or_try_init(|| async {
-                let metas = self.get_all_instruments().await?;
-                Ok::<_, ExchangeError>(
-                    metas
-                        .into_iter()
-                        .map(|m| (m.symbol, m.contract_size))
-                        .collect::<HashMap<_, _>>(),
-                )
-            })
-            .await?;
-        sizes.get(symbol).copied().ok_or_else(|| {
-            ExchangeError::Other(format!("No OKX contract size for symbol {symbol}"))
-        })
+        self.instruments()
+            .await?
+            .iter()
+            .find(|m| &m.symbol == symbol)
+            .map(|m| m.contract_size)
+            .ok_or_else(|| ExchangeError::Other(format!("No OKX contract size for symbol {symbol}")))
     }
 
     /// 获取计价币种
@@ -397,13 +393,12 @@ impl ExchangeClient for OkxClient {
     }
 
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        self.get_all_instruments().await
+        Ok(self.instruments().await?.to_vec())
     }
 
     async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        let all = self.get_all_instruments().await?;
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
-        Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
+        Ok(self.instruments().await?.iter().filter(|m| symbol_set.contains(&m.symbol)).cloned().collect())
     }
 }
 

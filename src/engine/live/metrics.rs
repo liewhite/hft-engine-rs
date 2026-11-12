@@ -78,7 +78,7 @@ fn exposure_of(state: &SymbolState, baseline: Option<&HashMap<Exchange, f64>>) -
         }
         exposure.legs += 1;
         exposure.net_size += position.size;
-        match state.bbo(position.exchange) {
+        match state.market().bbo(position.exchange) {
             Some(bbo) => {
                 let mid = bbo.mid_price();
                 let base = baseline
@@ -177,30 +177,61 @@ impl MetricsActor {
 
     /// 输出一次完整报告（结构化日志；配置了 pushgateway 时同一份数字同时推送）
     fn report(&self) {
+        let prom = self.render();
+        // 配置了 pushgateway 就把同一份数字推出去（异步、失败只记 warn，不拖垮引擎）
+        if let Some(config) = &self.push {
+            prometheus::spawn_push(config.clone(), prom.into_body());
+        }
+        if self.total.forced_fills > 0 {
+            tracing::warn!(
+                target: "metrics",
+                forced_fills = self.total.forced_fills,
+                "metrics.forced_fills：存在强平/ADL 成交"
+            );
+        }
+
+        // 最近成交明细放 debug：默认不刷屏，排查时开 RUST_LOG=metrics=debug 即可看到
+        for fill in &self.total.recent_fills {
+            tracing::debug!(
+                target: "metrics",
+                exchange = %fill.exchange,
+                symbol = %fill.symbol,
+                side = %fill.side,
+                price = fill.price,
+                size = fill.size,
+                fee = fill.fee,
+                reason = ?fill.reason,
+                ts = fill.timestamp,
+                "metrics.recent_fill"
+            );
+        }
+    }
+
+    /// 本轮全部指标（同时写结构化日志）
+    fn render(&self) -> PromText {
         let mut prom = PromText::default();
         // ---------- 账户 ----------
         let mut total_equity = 0.0;
         let mut total_notional = 0.0;
         let mut exchange_count = 0usize;
         for (exchange, info) in self.state.account_view().account_infos() {
-            let leverage = if info.equity > 0.0 {
-                info.notional / info.equity
-            } else {
-                0.0
-            };
+            // 净值 ≤0 时杠杆算不出：不推这个点（看板断线），不能报成 0 冒充「很安全」
+            let leverage = (info.equity > 0.0).then(|| info.notional / info.equity);
             total_equity += info.equity;
             total_notional += info.notional;
             exchange_count += 1;
             let ex_label = exchange.to_string();
             prom.gauge("hft_equity", &[("exchange", &ex_label)], info.equity);
             prom.gauge("hft_account_notional", &[("exchange", &ex_label)], info.notional);
-            prom.gauge("hft_account_leverage", &[("exchange", &ex_label)], leverage);
+            if let Some(l) = leverage {
+                prom.gauge("hft_account_leverage", &[("exchange", &ex_label)], l);
+            }
             tracing::info!(
                 target: "metrics",
                 %exchange,
                 equity = format!("{:.2}", info.equity),
                 notional = format!("{:.2}", info.notional),
-                leverage = format!("{:.3}", leverage),
+                leverage = leverage.map_or_else(|| "n/a".to_string(), |l| format!("{l:.3}")),
                 "metrics.account"
             );
         }
@@ -216,7 +247,7 @@ impl MetricsActor {
 
         for (symbol, symbol_state) in self.state.symbol_states() {
             let exposure = exposure_of(symbol_state, self.baseline.get(symbol));
-            let pending = symbol_state.pending_orders().count();
+            let pending = symbol_state.order_book().iter().count();
             pending_orders += pending;
             session_position_value += exposure.session_notional_delta;
             gross_notional += exposure.gross_notional;
@@ -369,34 +400,7 @@ impl MetricsActor {
             );
         }
 
-        // 配置了 pushgateway 就把同一份数字推出去（异步、失败只记 warn，不拖垮引擎）
-        if let Some(config) = &self.push {
-            prometheus::spawn_push(config.clone(), prom.into_body());
-        }
-
-        if self.total.forced_fills > 0 {
-            tracing::warn!(
-                target: "metrics",
-                forced_fills = self.total.forced_fills,
-                "metrics.forced_fills：存在强平/ADL 成交"
-            );
-        }
-
-        // 最近成交明细放 debug：默认不刷屏，排查时开 RUST_LOG=metrics=debug 即可看到
-        for fill in &self.total.recent_fills {
-            tracing::debug!(
-                target: "metrics",
-                exchange = %fill.exchange,
-                symbol = %fill.symbol,
-                side = %fill.side,
-                price = fill.price,
-                size = fill.size,
-                fee = fill.fee,
-                reason = ?fill.reason,
-                ts = fill.timestamp,
-                "metrics.recent_fill"
-            );
-        }
+        prom
     }
 }
 
@@ -599,6 +603,24 @@ mod tests {
         }
     }
 
+    /// 净值 ≤0 时杠杆算不出：不推杠杆点（看板断线），不得报成 0 冒充「很安全」
+    #[test]
+    fn leverage_not_reported_when_equity_non_positive() {
+        let mut metrics = actor();
+        for (exchange, equity) in [(Exchange::Binance, 0.0), (Exchange::OKX, 1000.0)] {
+            metrics.state.apply(&IncomeEvent::account(
+                AccountId::Live,
+                1,
+                1,
+                AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, equity, notional: 500.0 }),
+            ));
+        }
+        let body = metrics.render().into_body();
+        let leverage: Vec<&str> = body.lines().filter(|l| l.starts_with("hft_account_leverage")).collect();
+        assert_eq!(leverage.len(), 1, "只有净值为正的所有杠杆点: {leverage:?}");
+        assert!(leverage[0].contains(&Exchange::OKX.to_string()) && leverage[0].ends_with(" 0.5"), "{leverage:?}");
+    }
+
     /// 模拟账户事件按账户分账，**绝不**混进实盘视图（total/state）
     #[tokio::test]
     async fn paper_events_never_leak_into_live_view() {
@@ -618,7 +640,7 @@ mod tests {
                 .state
                 .symbol_state(&"BTC".to_string())
                 .unwrap()
-                .position_size(Exchange::Binance),
+                .position_book().position_size(Exchange::Binance),
             0.0,
             "模拟成交不得进实盘持仓镜像"
         );

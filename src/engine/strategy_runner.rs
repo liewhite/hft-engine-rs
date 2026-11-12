@@ -319,7 +319,7 @@ mod tests {
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);
         runner.on_event(&ev);
         let state = runner.state().symbol_state(&SYM.to_string()).expect("state");
-        let pending: Vec<f64> = state.pending_orders().map(|p| p.order.quantity).collect();
+        let pending: Vec<f64> = state.order_book().iter().map(|p| p.order.quantity).collect();
         assert_eq!(pending, vec![0.125]);
     }
 

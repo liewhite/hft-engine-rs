@@ -615,31 +615,11 @@ impl SymbolState {
         &self.order_book
     }
 
-    // ==================== 委托（保持既有调用面不变） ====================
+    // ==================== 写入口 ====================
+    // 读一律经上面三个投影；写要带上本 symbol（日志与校验用），且投影只读外放，故写入口留在这里
 
     pub fn seed_position(&mut self, position: &Position, snapshot_req_ts: Timestamp) -> bool {
         self.position_book.seed(&self.symbol, position, snapshot_req_ts)
-    }
-
-
-    pub fn seeded_positions(&self) -> impl Iterator<Item = &Position> {
-        self.position_book.seeded_positions()
-    }
-
-    pub fn has_positions(&self) -> bool {
-        self.position_book.has_positions()
-    }
-
-    pub fn position(&self, exchange: Exchange) -> Option<&Position> {
-        self.position_book.position(exchange)
-    }
-
-    pub fn position_size(&self, exchange: Exchange) -> f64 {
-        self.position_book.position_size(exchange)
-    }
-
-    pub fn position_sizes(&self) -> (f64, f64) {
-        self.position_book.position_sizes()
     }
 
     pub fn add_pending_order(&mut self, order: Order, created_at: Timestamp) {
@@ -648,38 +628,6 @@ impl SymbolState {
 
     pub fn remove_timed_out_orders(&mut self, now: Timestamp, timeout_ms: u64) -> usize {
         self.order_book.remove_timed_out(&self.symbol, now, timeout_ms)
-    }
-
-    pub fn has_pending_orders(&self) -> bool {
-        self.order_book.has_pending()
-    }
-
-    pub fn has_pending_side(&self, side: Side) -> bool {
-        self.order_book.has_pending_side(side)
-    }
-
-    pub fn pending_orders(&self) -> impl Iterator<Item = &PendingOrder> {
-        self.order_book.iter()
-    }
-
-    pub fn bbo(&self, exchange: Exchange) -> Option<&BBO> {
-        self.market.bbo(exchange)
-    }
-
-    pub fn mark_price(&self, exchange: Exchange) -> Option<&MarkPrice> {
-        self.market.mark_price(exchange)
-    }
-
-    pub fn index_price(&self, exchange: Exchange) -> Option<&IndexPrice> {
-        self.market.index_price(exchange)
-    }
-
-    pub fn best_short_exchange(&self) -> Option<(Exchange, &FundingRate)> {
-        self.market.best_short_exchange()
-    }
-
-    pub fn best_long_exchange(&self) -> Option<(Exchange, &FundingRate)> {
-        self.market.best_long_exchange()
     }
 }
 
@@ -736,13 +684,13 @@ mod tests {
         let mut state = SymbolState::new(SYMBOL.to_string());
 
         assert!(state.seed_position(&position(2.0), 0), "首次 seed 应成功");
-        assert_eq!(state.position_size(EX), 2.0);
+        assert_eq!(state.position_book().position_size(EX), 2.0);
 
         apply(&mut state, &fill(Side::Long, 1.0));
-        assert_eq!(state.position_size(EX), 3.0);
+        assert_eq!(state.position_book().position_size(EX), 3.0);
 
         apply(&mut state, &fill(Side::Short, 0.5));
-        assert!((state.position_size(EX) - 2.5).abs() < 1e-12);
+        assert!((state.position_book().position_size(EX) - 2.5).abs() < 1e-12);
     }
 
     /// **Critical 回归防线**：第二次 seed 不得覆写持仓（幂等，返回 false）。
@@ -754,19 +702,19 @@ mod tests {
         let mut state = SymbolState::new(SYMBOL.to_string());
         state.seed_position(&position(2.0), 0);
         apply(&mut state, &fill(Side::Long, 1.0));
-        assert_eq!(state.position_size(EX), 3.0);
+        assert_eq!(state.position_book().position_size(EX), 3.0);
 
         // 第二次 seed（哪怕数值"看起来更新"）也不得覆写
         assert!(!state.seed_position(&position(3.0), 5), "重复 seed 应返回 false");
         assert_eq!(
-            state.position_size(EX),
+            state.position_book().position_size(EX),
             3.0,
             "第二次 seed 覆写了持仓——快照与 Fill 流叠加会重复计算成交"
         );
 
         // 覆写若发生，这条 Fill 会把仓位推到 4.0 之外
         apply(&mut state, &fill(Side::Long, 1.0));
-        assert_eq!(state.position_size(EX), 4.0);
+        assert_eq!(state.position_book().position_size(EX), 4.0);
     }
 
     /// **防双计**：seed 之后到达、但送达时刻早于快照请求时刻的 Fill 已含在快照里，丢弃；
@@ -779,11 +727,11 @@ mod tests {
 
         // t=1 送达（fill() 的 local_ts=1 <= 10）：已含在快照里，丢弃
         apply(&mut state, &fill(Side::Long, 1.0));
-        assert_eq!(state.position_size(EX), 2.0, "快照已含的 Fill 不得再累加");
+        assert_eq!(state.position_book().position_size(EX), 2.0, "快照已含的 Fill 不得再累加");
 
         // t=11 送达：快照之后的新成交，累加
         apply(&mut state, &fill_at(EX, Side::Long, 1.0, 11));
-        assert_eq!(state.position_size(EX), 3.0);
+        assert_eq!(state.position_book().position_size(EX), 3.0);
     }
 
     /// **seed 过滤按所隔离**：只 seed 了一个所时，另一个所的早时刻 Fill 不得被误过滤
@@ -796,8 +744,8 @@ mod tests {
 
         // OKX 未 seed：t=1 送达的 Fill 照常从 0 累加，不受 Binance 的过滤时刻影响
         apply(&mut state, &fill_at(Exchange::OKX, Side::Long, 1.5, 1));
-        assert_eq!(state.position_size(Exchange::OKX), 1.5, "未 seed 的所不得被误过滤");
-        assert_eq!(state.position_size(EX), 2.0, "Binance 腿不受影响");
+        assert_eq!(state.position_book().position_size(Exchange::OKX), 1.5, "未 seed 的所不得被误过滤");
+        assert_eq!(state.position_book().position_size(EX), 2.0, "Binance 腿不受影响");
     }
 
     // ===== 外部挂单：只接管本引擎自己的单 =====
@@ -826,7 +774,7 @@ mod tests {
         apply(&mut state, &order_update(Some(own_id.clone()), OrderStatus::Pending));
 
         let tracked: Vec<String> = state
-            .pending_orders()
+            .order_book().iter()
             .map(|p| p.order.client_order_id.clone())
             .collect();
         assert_eq!(tracked, vec![own_id]);
@@ -848,9 +796,9 @@ mod tests {
             ));
         }
         assert!(
-            !state.has_pending_orders(),
+            !state.order_book().has_pending(),
             "外部挂单被接管进了本地 pending：{:?}",
-            state.pending_orders().map(|p| &p.order.client_order_id).collect::<Vec<_>>()
+            state.order_book().iter().map(|p| &p.order.client_order_id).collect::<Vec<_>>()
         );
     }
 
@@ -859,7 +807,7 @@ mod tests {
     fn fill_without_baseline_starts_from_zero() {
         let mut state = SymbolState::new(SYMBOL.to_string());
         apply(&mut state, &fill(Side::Short, 1.5));
-        assert_eq!(state.position_size(EX), -1.5);
+        assert_eq!(state.position_book().position_size(EX), -1.5);
     }
 
     /// 持仓随 Fill **只累加数量**：买加、卖减、反手翻符号。
@@ -875,15 +823,15 @@ mod tests {
 
         // 同向加仓 2.0（成交价不影响持仓数量）
         apply(&mut state, &fill(Side::Long, 2.0));
-        assert!((state.position(EX).expect("position").size - 4.0).abs() < 1e-12);
+        assert!((state.position_book().position(EX).expect("position").size - 4.0).abs() < 1e-12);
 
         // 反向平掉 1.0（价格同样不影响数量）
         apply(&mut state, &fill(Side::Short, 1.0));
-        assert!((state.position(EX).expect("position").size - 3.0).abs() < 1e-12);
+        assert!((state.position_book().position(EX).expect("position").size - 3.0).abs() < 1e-12);
 
         // 反手：卖 5 -> 净空 2
         apply(&mut state, &fill(Side::Short, 5.0));
-        assert!((state.position(EX).expect("position").size + 2.0).abs() < 1e-12);
+        assert!((state.position_book().position(EX).expect("position").size + 2.0).abs() < 1e-12);
     }
 
     /// **Critical 回归防线**：已到达权威终态的订单，不得被迟到的非终态回报复活。
@@ -914,12 +862,12 @@ mod tests {
         );
         apply(&mut state, &order_update(Some(own_id.clone()), OrderStatus::Pending));
         apply(&mut state, &order_update(Some(own_id.clone()), OrderStatus::Cancelled));
-        assert!(!state.has_pending_orders(), "撤单确认后应无挂单");
+        assert!(!state.order_book().has_pending(), "撤单确认后应无挂单");
 
         // 迟到的部分成交回报（撤单前那一刻发生的成交，WS 走另一条路径后到）
         apply(&mut state, &order_update(Some(own_id), OrderStatus::PartiallyFilled));
         assert!(
-            !state.has_pending_orders(),
+            !state.order_book().has_pending(),
             "已终态订单被迟到回报复活成永久 pending —— 该 symbol 将冻结到进程重启"
         );
     }
@@ -939,7 +887,7 @@ mod tests {
         // 交易所其实收到了这张单，确认姗姗来迟
         apply(&mut state, &order_update(Some(own_id), OrderStatus::Pending));
         assert!(
-            state.has_pending_orders(),
+            state.order_book().has_pending(),
             "本地 REST 失败后到达的真实确认必须重新纳入跟踪"
         );
     }
@@ -960,7 +908,7 @@ mod tests {
         apply(&mut state, &ghost);
 
         assert!(
-            !state.has_pending_orders(),
+            !state.order_book().has_pending(),
             "qty 为 0 的更新被重建成了幽灵挂单"
         );
     }

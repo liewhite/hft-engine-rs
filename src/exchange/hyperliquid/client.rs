@@ -8,7 +8,7 @@ use crate::domain::{
 };
 use md5::{Digest, Md5};
 use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
-use crate::exchange::hyperliquid::codec::{ClearinghouseState, MetaResponse};
+use crate::exchange::hyperliquid::codec::{parse_side, ClearinghouseState, MetaResponse};
 use std::sync::Arc;
 use crate::exchange::hyperliquid::signing::{
     CancelResponse, OrderResponse, OrderResponseData, OrderStatus,
@@ -807,14 +807,8 @@ impl AccountClient for HyperliquidClient {
 
         let mut updates = Vec::new();
         for o in orders.into_iter().filter(|o| o.coin == target.coin) {
-            let side = match o.side.as_str() {
-                "B" => Side::Long,
-                "A" => Side::Short,
-                other => {
-                    tracing::warn!(side = other, coin = %o.coin, "HL openOrders 未知方向，跳过");
-                    continue;
-                }
-            };
+            // 不认识的方向当场报错：跳过会让启动撤残单漏单，漏掉的单之后成交即成外来成交
+            let side = parse_side(&o.side).map_err(ExchangeError::ParseError)?;
             let orig_sz: f64 = o
                 .orig_sz
                 .parse()

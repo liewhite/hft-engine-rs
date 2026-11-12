@@ -17,7 +17,7 @@ use std::str::FromStr;
 /// 三处推送共用这套编码，但**语义各不相同**：订单/成交推送里是"本账户这一笔的方向"，
 /// trades 里是"主动方 (taker) 的方向"。故此处只统一**编码**解析，语义由各调用方自行表达
 /// —— 合并成一个 "parse_taker_side" 会把两种含义混为一谈。
-fn parse_side(raw: &str) -> Result<Side, String> {
+pub(crate) fn parse_side(raw: &str) -> Result<Side, String> {
     match raw {
         "B" => Ok(Side::Long),
         "A" => Ok(Side::Short),

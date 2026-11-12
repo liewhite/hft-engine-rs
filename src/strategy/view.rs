@@ -108,7 +108,7 @@ impl<'a> SymbolView<'a> {
 
     /// 某所盘口。未到达返回 `None`。
     pub fn bbo(&self, exchange: Exchange) -> Option<&'a BBO> {
-        self.state.bbo(exchange)
+        self.state.market().bbo(exchange)
     }
 
     /// 某所持仓大小（带符号，正多负空）。
@@ -126,22 +126,22 @@ impl<'a> SymbolView<'a> {
     /// 作用域**外**的所返回 `0.0` —— 那是策略问了自己没订阅的东西，与读未订阅 symbol
     /// 的盘口同类，属调用方的 bug。
     pub fn position_size(&self, exchange: Exchange) -> f64 {
-        self.state.position_size(exchange)
+        self.state.position_book().position_size(exchange)
     }
 
     /// 跨所的 (多头总量, 空头总量)：正向持仓之和为正，负向持仓之和为负。
     pub fn position_sizes(&self) -> (f64, f64) {
-        self.state.position_sizes()
+        self.state.position_book().position_sizes()
     }
 
     /// 本 symbol 是否有未完成订单
     pub fn has_pending_orders(&self) -> bool {
-        self.state.has_pending_orders()
+        self.state.order_book().has_pending()
     }
 
     /// 遍历本 symbol 的未完成订单
     pub fn pending_orders(&self) -> impl Iterator<Item = &'a PendingOrder> {
-        self.state.pending_orders()
+        self.state.order_book().iter()
     }
 }
 

@@ -26,7 +26,7 @@
 use hft_engine_rs::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::live::{GetAllSymbolMetas, PublishCustomEvent};
 use hft_engine_rs::engine::{
-    load_config, setup_binance, setup_hyperliquid, setup_okx, run_engine, run_main, AddStrategies,
+    load_config, setup_binance, setup_hyperliquid, setup_okx, run_engine, run_main, spawn_supervised, AddStrategies,
     ExchangeSetup, ManagerActor, ManagerActorArgs, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
@@ -36,10 +36,15 @@ use hft_engine_rs::exchange::{ExchangeAccess, SettledFundingSource};
 use hft_engine_rs::messaging::CustomEvent;
 use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, SettledFundingWindow, Strategy, FUNDING_WINDOW_MS};
 use kameo::actor::ActorRef;
+use kameo::error::Infallible;
+use kameo::message::{Context, Message, StreamMessage};
+use kameo::Actor;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::{Instant, MissedTickBehavior};
+use tokio_stream::wrappers::IntervalStream;
 
 /// 要接的所：配了就接。加一所 = 这里加一个字段 + `connect` 里加一段
 #[derive(Debug, Clone, Deserialize)]
@@ -92,10 +97,16 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "config.json".to_string());
-    let config: Config = load_config(&path)?;
+    let config: Config = load_config("config.json")?;
     config.strategy.validate().map_err(|e| anyhow::anyhow!("strategy 配置非法: {e}"))?;
     anyhow::ensure!(config.funding_poll_secs > 0, "funding_poll_secs 必须 > 0");
+    // 每项数据一轮刷新一次：轮询一轮不短于最大可用年龄的话，数据会周期性过期，策略在「未知」里反复进出
+    anyhow::ensure!(
+        config.funding_poll_secs.saturating_mul(1000) < config.strategy.max_funding_age_ms,
+        "funding_poll_secs（{}s）必须短于 strategy.max_funding_age_ms（{}ms）",
+        config.funding_poll_secs,
+        config.strategy.max_funding_age_ms
+    );
 
     let Connected { setups, funding_sources } = connect(&config.exchanges).await?;
     let exchanges: Vec<Exchange> = funding_sources.iter().map(|s| s.exchange()).collect();
@@ -141,62 +152,112 @@ async fn run() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("AddStrategies failed: {e}"))?;
         tracing::info!(count = coverage.len(), "strategies added");
 
-        let poll_manager = manager.clone();
-        let interval = Duration::from_secs(config.funding_poll_secs);
-        tokio::spawn(async move {
-            let mut failures: HashMap<(Symbol, Exchange), u32> = HashMap::new();
-            loop {
-                poll_funding(&funding_sources, &coverage, &poll_manager, interval, &mut failures).await;
-            }
-        });
+        // 轮询器挂在引擎监督树上：它若意外崩溃，整机受控停机并带上死因 —— 裸 spawn 的任务
+        // 崩了没人知道，资金费数据随之过期，所有币悄悄变成只平不开
+        let requests: Vec<(Symbol, Arc<dyn SettledFundingSource>)> = coverage
+            .iter()
+            .flat_map(|(symbol, on)| {
+                funding_sources
+                    .iter()
+                    .filter(|s| on.contains(&s.exchange()))
+                    .map(move |s| (symbol.clone(), s.clone()))
+            })
+            .collect();
+        spawn_supervised::<FundingPoller>(
+            &manager,
+            FundingPollerArgs {
+                requests,
+                round: Duration::from_secs(config.funding_poll_secs),
+                manager: manager.clone(),
+            },
+        )
+        .await?;
         Ok(())
     })
     .await
 }
 
-/// 拉一轮各币所在各所过去 24h 已结算费率并投递，请求均匀摊在 `interval` 里（HL info 按 IP 每分钟
-/// 1200 权重，fundingHistory 一次约 20；币安 fundingRate 500 次 / 5 分钟；OKX 10 次 / 2 秒）。
-/// 偶发失败记 warn（网络会间歇掉线，下一轮就补上）；同一项连续失败 3 轮记 error ——
-/// 此时策略侧数据会过期变"未知"，该币不开仓、只平两所数据都在的仓位对。
-async fn poll_funding(
-    sources: &[Arc<dyn SettledFundingSource>],
-    coverage: &[(Symbol, Vec<Exchange>)],
-    manager: &ActorRef<ManagerActor>,
-    interval: Duration,
-    failures: &mut HashMap<(Symbol, Exchange), u32>,
-) {
-    let requests: usize = coverage.iter().map(|(_, on)| on.len()).sum();
-    let gap = interval / requests.max(1) as u32;
-    for (symbol, on) in coverage {
-        for source in sources.iter().filter(|s| on.contains(&s.exchange())) {
-            let ex = source.exchange();
-            let start = now_ms().saturating_sub(FUNDING_WINDOW_MS);
-            match source.fetch_settled_funding(symbol, start).await {
-                Ok(entries) => {
-                    failures.remove(&(symbol.clone(), ex));
-                    let w = SettledFundingWindow {
-                        exchange: ex,
-                        symbol: symbol.clone(),
-                        window_start: start,
-                        fetched_at: now_ms(),
-                        entries,
-                    };
-                    let ev = CustomEvent::for_symbol(ex, symbol.clone(), w);
-                    if let Err(e) = manager.tell(PublishCustomEvent(ev)).send().await {
-                        tracing::error!(error = %e, "投递资金费窗口失败");
-                    }
-                }
-                Err(e) => {
-                    let n = failures.entry((symbol.clone(), ex)).or_default();
-                    *n += 1;
-                    if *n >= 3 {
-                        tracing::error!(%symbol, %ex, rounds = *n, error = %e, "已结算资金费连续拉取失败，该所数据将过期");
-                    } else {
-                        tracing::warn!(%symbol, %ex, error = %e, "拉取已结算资金费失败");
-                    }
+struct FundingPollerArgs {
+    /// 每个 (币, 该币上市的所) 一项，轮流拉
+    requests: Vec<(Symbol, Arc<dyn SettledFundingSource>)>,
+    /// 拉完一整轮的时长；单项间隔 = round / 项数
+    round: Duration,
+    manager: ActorRef<ManagerActor>,
+}
+
+/// 资金费轮询器：每个间隔拉一项（一个币在一个所过去 24h 的已结算费率），整窗作为自定义事件
+/// 投递给对应策略；请求均匀摊在一轮里（HL info 按 IP 每分钟 1200 权重，fundingHistory 一次约 20；
+/// 币安 fundingRate 500 次 / 5 分钟；OKX 10 次 / 2 秒）。一条消息只拉一项，停机时最多等一个请求。
+/// 偶发失败记 warn（网络会间歇掉线，下一轮就补上）；同一项连续失败 3 轮记 error —— 此时策略侧
+/// 数据会过期变"未知"，该币不开仓、只平两所数据都在的仓位对。
+struct FundingPoller {
+    requests: Vec<(Symbol, Arc<dyn SettledFundingSource>)>,
+    next: usize,
+    failures: HashMap<(Symbol, Exchange), u32>,
+    manager: ActorRef<ManagerActor>,
+}
+
+impl Actor for FundingPoller {
+    type Args = FundingPollerArgs;
+    type Error = Infallible;
+
+    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let gap = args.round / args.requests.len().max(1) as u32;
+        let mut ticker = tokio::time::interval(gap);
+        // 某次请求慢了就顺延，不在之后连发补拍（会撞各所限频）
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        actor_ref.attach_stream(IntervalStream::new(ticker), (), ());
+        tracing::info!(requests = args.requests.len(), gap_ms = gap.as_millis() as u64, "资金费轮询器启动");
+        Ok(Self { requests: args.requests, next: 0, failures: HashMap::new(), manager: args.manager })
+    }
+}
+
+impl FundingPoller {
+    async fn poll_one(&mut self) {
+        let Some((symbol, source)) = self.requests.get(self.next).cloned() else { return };
+        self.next = (self.next + 1) % self.requests.len();
+        let ex = source.exchange();
+        let start = now_ms().saturating_sub(FUNDING_WINDOW_MS);
+        match source.fetch_settled_funding(&symbol, start).await {
+            Ok(entries) => {
+                self.failures.remove(&(symbol.clone(), ex));
+                let w = SettledFundingWindow {
+                    exchange: ex,
+                    symbol: symbol.clone(),
+                    window_start: start,
+                    fetched_at: now_ms(),
+                    entries,
+                };
+                let ev = CustomEvent::for_symbol(ex, symbol, w);
+                if let Err(e) = self.manager.tell(PublishCustomEvent(ev)).send().await {
+                    tracing::error!(error = %e, "投递资金费窗口失败");
                 }
             }
-            tokio::time::sleep(gap).await;
+            Err(e) => {
+                let n = self.failures.entry((symbol.clone(), ex)).or_default();
+                *n += 1;
+                if *n >= 3 {
+                    tracing::error!(%symbol, %ex, rounds = *n, error = %e, "已结算资金费连续拉取失败，该所数据将过期");
+                } else {
+                    tracing::warn!(%symbol, %ex, error = %e, "拉取已结算资金费失败");
+                }
+            }
+        }
+    }
+}
+
+impl Message<StreamMessage<Instant, (), ()>> for FundingPoller {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: StreamMessage<Instant, (), ()>, ctx: &mut Context<Self, Self::Reply>) {
+        match msg {
+            StreamMessage::Next(_) => self.poll_one().await,
+            StreamMessage::Started(_) => {}
+            StreamMessage::Finished(_) => {
+                // 定时流不会自己结束；真结束了就让监督树停机，不悄悄停止拉数
+                tracing::error!("资金费轮询定时流意外结束");
+                ctx.actor_ref().kill();
+            }
         }
     }
 }
