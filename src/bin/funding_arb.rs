@@ -87,15 +87,20 @@ async fn connect(cfg: &ExchangesConfig) -> anyhow::Result<Connected> {
     Ok(c)
 }
 
-/// HL 统一账户下，未接入市场或不可交易品种上的仓位与本策略共用保证金，却不在杠杆口径里：
-/// 有就拒绝启动（用户定）。框架只报告有哪些，判定在这里。
-async fn refuse_positions_outside_catalog(cfg: &ExchangesConfig) -> anyhow::Result<()> {
+/// 私有推送订阅确认的等待上限（框架 15 秒）再加余量
+const PRIVATE_FEED_SETTLE: Duration = Duration::from_secs(20);
+
+/// HL 统一账户下，未接入市场、不可交易品种、现货上的仓位与成交与本策略共用保证金，却不在
+/// 杠杆口径里：现有这类仓位、或引擎启动以来有这类成交，就拒绝启动（用户定）。
+/// 框架只报告有哪些，判定在这里。
+async fn refuse_foreign_exposure(cfg: &ExchangesConfig, since: u64) -> anyhow::Result<()> {
     let Some(a) = &cfg.hyperliquid else { return Ok(()) };
     let client = HyperliquidClient::connect(a.quote.clone(), a.dexes.clone(), a.credentials.clone()).await?;
-    let outside = client.fetch_positions_outside_catalog().await?;
+    let positions = client.fetch_positions_outside_catalog().await?;
+    let fills = client.fetch_unmapped_fills_since(since).await?;
     anyhow::ensure!(
-        outside.is_empty(),
-        "HL 钱包在品种目录外有仓位 {outside:?}：它们与本策略共用保证金却不在杠杆口径里，拒绝启动"
+        positions.is_empty() && fills.is_empty(),
+        "HL 钱包在品种目录外有仓位 {positions:?} 或启动以来有成交 {fills:?}：与本策略共用保证金却不在杠杆口径里，拒绝启动"
     );
     Ok(())
 }
@@ -112,6 +117,8 @@ async fn main() -> anyhow::Result<()> {
     let exchanges: Vec<Exchange> = funding_sources.iter().map(|s| s.exchange()).collect();
     tracing::info!(?exchanges, pairs = config.strategy.pairs.len(), "funding_arb starting");
 
+    // 外来成交补查的起点：引擎（含私有推送）启动之前
+    let started_at = now_ms();
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
             exchanges: setups,
@@ -124,13 +131,6 @@ async fn main() -> anyhow::Result<()> {
         .wait_for_startup_result()
         .await
         .map_err(|e| anyhow::anyhow!("Manager startup failed: {e}"))?;
-
-    // 用户定的规矩：账户里有本策略管不到的仓位就不启动。放在引擎启动（私有推送已订阅）之后，
-    // 检查之后新出现的外来成交由策略收到 UnmappedFill 停止交易，中间没有空档
-    if let Err(e) = refuse_positions_outside_catalog(&config.exchanges).await {
-        let _ = manager.stop_gracefully().await;
-        return Err(e);
-    }
 
     // 每个币在哪几所做：该币在各所品种目录里出现的所（按配置的所顺序），不足两所拒绝启动
     let metas = manager
@@ -164,6 +164,20 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("AddStrategies failed: {e}"))?;
     tracing::info!(count = coverage.len(), "strategies added");
+
+    // 用户定的规矩：账户里有本策略管不到的仓位或成交就不启动。策略已加入，此后推送来的
+    // 目录外成交由策略收到 UnmappedFill 停止交易；此前的由下面补查。先等私有推送订阅确认
+    // （框架 15 秒内未确认即退出），之后才没有「推送没生效、快照又不入账」的空档。
+    // 资金费轮询在检查之后才起：没有费率前策略不开不平，等待期间不会交易。
+    tokio::time::sleep(PRIVATE_FEED_SETTLE).await;
+    if let Err(e) = refuse_foreign_exposure(&config.exchanges, started_at).await {
+        tracing::error!(error = %e, "拒绝启动");
+        if let Err(stop) = manager.stop_gracefully().await {
+            tracing::warn!(error = %stop, "停止引擎失败");
+        }
+        manager.wait_for_shutdown_with_result(|_| ()).await;
+        return Err(e);
+    }
 
     let poll_manager = manager.clone();
     let interval = Duration::from_secs(config.funding_poll_secs);

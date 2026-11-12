@@ -179,6 +179,27 @@ impl HyperliquidClient {
         self.account.as_ref().map(|a| a.credentials.wallet_address.clone())
     }
 
+    /// 钱包自 `start_ms` 起在**品种目录之外**的成交（未接入 dex、不可交易品种、现货），
+    /// 与私有推送的 `UnmappedFill` 同一判据。供调用方补查「私有推送生效前」那段时间。
+    /// 单次最多 2000 条，取满即报错（不返回截断的结果）。
+    pub async fn fetch_unmapped_fills_since(
+        &self,
+        start_ms: Timestamp,
+    ) -> Result<Vec<crate::messaging::UnmappedFill>, ExchangeError> {
+        let user = &self.account()?.credentials.wallet_address;
+        let fills: Vec<crate::exchange::hyperliquid::codec::WsFill> = self
+            .post_info(serde_json::json!({"type": "userFillsByTime", "user": user, "startTime": start_ms}))
+            .await?;
+        if fills.len() >= 2000 {
+            return Err(ExchangeError::Other("HL userFillsByTime 取满 2000 条，结果可能被截断".into()));
+        }
+        fills
+            .iter()
+            .filter(|f| !self.markets.owns(&f.coin))
+            .map(|f| f.to_unmapped_fill().map_err(ExchangeError::ParseError))
+            .collect()
+    }
+
     /// 钱包在**品种目录之外**的全部永续仓位（交易所原始写法，如 `flx:TSLA`、只许逐仓的
     /// `xyz:SOXL`）：未接入的 dex 全查，已接入 dex 上不可交易的也算。只报事实 —— 这些仓位与
     /// 本进程共用保证金（统一账户）却不在持仓与持仓总价值的口径里，意味着什么由调用方决定。

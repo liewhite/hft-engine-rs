@@ -368,7 +368,8 @@ fn parse_order_updates(
 /// 持仓 —— 剥掉前缀后会被当成同名品种的 Fill，污染「基线 + Fill」维护的持仓。
 /// 这类成交意味着什么（忽略 / 停止交易）由策略决定，框架只报事实。
 /// 判据与持仓基线、对账读数相同（[`HlMarkets::owns`]），两条通道口径一致。
-/// 初始快照（`isSnapshot`）是历史成交，不入账也不上报（现存持仓由持仓查询给出）。
+/// 初始快照（`isSnapshot`）是历史成交，不入账也不上报：现存持仓由持仓查询给出，订阅生效前的
+/// 目录外成交用 `HyperliquidClient::fetch_unmapped_fills_since` 补查。
 fn parse_user_fills(
     data: &serde_json::Value,
     markets: &HlMarkets,
