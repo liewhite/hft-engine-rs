@@ -81,6 +81,11 @@ impl PositionBook {
         positions.apply_fill(&fill.symbol, fill, event.local_ts);
     }
 
+    /// 某个已注册 symbol 的持仓投影
+    pub fn get(&self, symbol: &Symbol) -> Option<&SymbolPositions> {
+        self.symbols.get(symbol)
+    }
+
     /// 遍历已注册 symbol 的持仓投影
     pub fn iter(&self) -> impl Iterator<Item = (&Symbol, &SymbolPositions)> {
         self.symbols.iter()

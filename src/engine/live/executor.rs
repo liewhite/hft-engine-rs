@@ -206,6 +206,30 @@ impl Message<GetPositions> for ExecutorActor {
     }
 }
 
+/// 查询本实例**基线已写入**的全部腿（策略下单所依据的那份持仓），供持仓账本把它纳入
+/// 对账（见 [`crate::engine::PositionLedgerActor`] 模块文档「两条比对」）。
+///
+/// 只给已 seed 的腿：未 seed 的是「未知」，拿去比必然误判。实盘实例出生即把作用域内每条腿
+/// 都 seed 了（见 `executor_baselines`），所以这就是它的全部持仓。
+pub struct GetSeededPositions;
+
+impl Message<GetSeededPositions> for ExecutorActor {
+    type Reply = Vec<crate::domain::Position>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetSeededPositions,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.runner
+            .state()
+            .symbol_states()
+            .flat_map(|(_, symbol_state)| symbol_state.seeded_positions())
+            .cloned()
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod lag_throttle_tests {
     use super::*;

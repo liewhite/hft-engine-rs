@@ -256,8 +256,8 @@ impl SymbolPositions {
     /// - 成交发生在快照**之前**（已含在快照）、Fill 在快照请求之后才送达
     ///   （`local_ts > snapshot_req_ts`）—— 会双计，窗口 = 交易所撮合到 Fill 送达的时延。
     /// - 再晋升时新 executor 用**新**快照 seed 而镜像沿用旧账本：新快照到注册完成之间的
-    ///   外部成交会造成 executor 与镜像分歧且对账不可见（见 `activate_executors` 的
-    ///   窗口清单）。
+    ///   外部成交会造成 executor 与镜像分歧（见 `activate_executors` 的窗口清单；
+    ///   实盘 executor 与镜像的分歧由持仓账本检出并停机，#694）。
     ///
     /// 都只可能来自投产瞬间的外部/手动成交，与旧的总线投递方案等宽。
     pub fn seed(

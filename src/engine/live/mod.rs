@@ -83,13 +83,14 @@ pub fn to_paper_outlet(o: &AccountOutcome) -> bool {
 pub use assembly::{setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup};
 pub use clock::{ClockActor, ClockActorArgs};
 pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, PublishCustomEvent, RegisterSupervisedChild, SubscribeAccount, SubscribeMarket, SubscribeOutcome, StrategySpec, RemoveStrategies};
-pub use executor::{ExecutorActor, ExecutorArgs, GetPositions};
+pub use executor::{ExecutorActor, ExecutorArgs, GetPositions, GetSeededPositions};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor, UnregisterExecutor};
 pub use metrics::{MetricsActor, MetricsActorArgs, RegisterSymbols, DEFAULT_REPORT_INTERVAL_MS};
 pub use outcome_processor::{EngineHalt, OrderGateway, OutcomeProcessorActor, PlaceVerdict};
 pub use paper_counter::{PaperCounterActor, PaperCounterArgs};
 pub use position_ledger::{
-    GetLivePositions, PositionLedgerActor, PositionLedgerArgs, Reconciler,
+    GetLivePositions, PositionLedgerActor, PositionLedgerArgs, Reconciler, UnwatchExecutor,
+    WatchExecutor,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
 };
 pub use supervisor::{

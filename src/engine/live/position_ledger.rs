@@ -39,13 +39,24 @@
 //! IO 上**，这既是快照面契约的硬性要求，也修掉了一个既有缺陷：此前 handler 里 `join_all`
 //! 各所 REST，最长一个 client 超时期间**本轮比对与 Fill 摄入一起停摆**。
 //!
-//! # 比对的是「事件流镜像」而非「各 executor 的内部状态」
+//! # 两条比对：账本 vs 交易所，executor vs 账本
 //!
-//! 本 actor 自建一份镜像（复用 [`StateManager`]，与策略侧同一份实现），由投产握手的基线
-//! + income 流的 `Fill` 驱动。因此它证明的是"**事件流**与交易所一致"，而不是"某个
-//! executor 的 StateManager 与交易所一致"。executor 是同一事件流的确定性消费者、且与镜像
-//! 用同一份 seed 语义与同一条防双计规则（同一个 [`SymbolPositions::apply_fill`]）——流对了它
-//! 就对了。
+//! 本 actor 自建一份镜像（[`PositionBook`]，与策略侧同一份 seed 语义与防双计规则），由投产
+//! 握手的基线 + 账户总线的实盘 `Fill` 驱动。对交易所读数比对证明的是"**事件流**与交易所
+//! 一致"。
+//!
+//! 但策略下单用的是 executor 自己那份折叠，它经另一条分发路径（IncomeProcessor 按订阅
+//! 转发）拿 Fill —— 分发出错、或再晋升时 executor 用了更新的快照 seed，它会单独错，而上面
+//! 那条比对看不见。所以每个节拍也向每个**实盘** executor 要一份它的持仓，与账本按同一判据
+//! 比对（#694）：
+//!
+//! ```text
+//!   交易所 REST ──比对──> 账本镜像 <──比对── 实盘 executor 的持仓（下单依据）
+//! ```
+//!
+//! 监视名单由编排维护：投产时 [`WatchExecutor`]，撤下/回滚时先 [`UnwatchExecutor`] 再
+//! 注销订阅 —— 顺序要紧，注销后的 executor 不再收 Fill，若还在名单里会被误判分叉。
+//! 模拟账户的 executor 不进名单（它的持仓本就与实盘无关）。
 //!
 //! # 注册与基线原子到达，无缓冲重放
 //!
@@ -57,7 +68,8 @@ use crate::domain::{Exchange, Position, Symbol, SymbolMeta};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
 use crate::messaging::{AccountEvent, PositionBaseline, PositionBook};
-use kameo::actor::{ActorRef, WeakActorRef};
+use super::executor::{ExecutorActor, GetSeededPositions};
+use kameo::actor::{ActorId, ActorRef, WeakActorRef};
 use kameo::error::{ActorStopReason, Infallible};
 use kameo::message::{Context, Message, StreamMessage};
 use kameo::Actor;
@@ -101,9 +113,35 @@ pub struct Reconciler {
     mirror: PositionBook,
     /// 容差来源：`coin_size_step()`（币本位最小可交易增量），小于它的差值不可能是真实漂移
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// per (所, symbol) 的不一致记录；一致一次即整条移除
-    mismatches: HashMap<(Exchange, Symbol), MismatchRecord>,
+    /// per (对手方, 所, symbol) 的不一致记录；一致一次即整条移除
+    mismatches: HashMap<(Counterpart, Exchange, Symbol), MismatchRecord>,
     max_consecutive: u32,
+}
+
+/// 账本的一条腿拿去和谁比。两种对手方用**同一判据**（差值连续稳定 N 次即致命），
+/// 只是各自独立计数。
+///
+/// - [`Counterpart::Exchange`]：交易所 REST 读数 —— 证明「事件流」与交易所一致；
+/// - [`Counterpart::Executor`]：某个实盘 executor 的决策用持仓 —— 证明「下单依据的那份」
+///   与事件流一致。两份都是同一条 Fill 流的确定性折叠，流对了它本该就对，但分发出错
+///   （某条 Fill 没送到某个 executor、再晋升时 executor 用了新快照）会让它单独错，
+///   而那一份才是真正决定下单量的。两条比对合起来：executor ≈ 账本 ≈ 交易所。
+///
+/// 为什么 executor 比账本、而不是直接比 REST：账本是权威，拿派生去比权威是「派生是否
+/// 失真」最直接的问法；且两者都在进程内，不必和某所某次 REST 读数的时点配对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Counterpart {
+    Exchange,
+    Executor(ActorId),
+}
+
+impl std::fmt::Display for Counterpart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exchange => write!(f, "交易所"),
+            Self::Executor(id) => write!(f, "executor {id}"),
+        }
+    }
 }
 
 /// 某条腿的连续不一致记录。
@@ -175,81 +213,134 @@ impl Reconciler {
         // 同一 symbol 两条 = 映射混了合约，读数不可信，按致命处理（见 index_positions）
         let reported = crate::exchange::client::index_positions(positions.to_vec())?;
 
-        // 拆开字段以取得互不重叠的借用（mirror 只读、mismatches 可变）
-        let Self {
-            mirror,
-            symbol_metas,
-            mismatches,
-            max_consecutive,
-        } = self;
-
-        let mut confirmed_drift = Vec::new();
-
         // 只比对**该所**基线已写入的腿（基线未到 = 本地未知，不是 0）
-        for (symbol, state) in mirror.iter() {
-            if !state.is_seeded(exchange) {
-                continue;
-            }
-            let reported_size = reported.get(symbol).map_or(0.0, |p| p.size);
-            let local_size = state.position_size(exchange);
-            let tolerance = tolerance_of(symbol_metas, exchange, symbol);
-            // 带符号差值：+X 与 -X 是方向相反的两种漂移，不能混为一谈
-            let diff = local_size - reported_size;
-            let key = (exchange, symbol.clone());
+        let legs: Vec<(Symbol, f64, f64)> = self
+            .mirror
+            .iter()
+            .filter(|(_, state)| state.is_seeded(exchange))
+            .map(|(symbol, state)| {
+                let reported_size = reported.get(symbol).map_or(0.0, |p| p.size);
+                (symbol.clone(), state.position_size(exchange), reported_size)
+            })
+            .collect();
+        let confirmed: Vec<String> = legs
+            .into_iter()
+            .filter_map(|(symbol, local, reported)| {
+                self.check_leg(Counterpart::Exchange, exchange, symbol, local, reported)
+            })
+            .collect();
+        self.verdict(Counterpart::Exchange, confirmed)
+    }
 
-            if diff.abs() <= tolerance {
-                // 一致即整条移除：记录衡量的是"当前正持续着的不一致"，不是历史累计
-                mismatches.remove(&key);
-                continue;
-            }
+    /// 比对某个实盘 executor 的决策用持仓（它的**基线已写入**的全部腿）与账本。
+    ///
+    /// 只比两边都有基线的腿：executor 作用域内、该所未配凭证的腿它记为 0（见
+    /// `executor_baselines`），账本那边是「未知」，不可比。账本有、executor 作用域外的腿
+    /// 不归它管，也不比。
+    ///
+    /// `Err` = 已确认该 executor 与账本分叉（连续 `max_consecutive` 次差值稳定），调用方应
+    /// 致命退出 —— 策略正拿着错的持仓算下单量。
+    pub fn reconcile_executor(&mut self, executor: ActorId, positions: &[Position]) -> Result<(), String> {
+        let counterpart = Counterpart::Executor(executor);
+        let legs: Vec<(Exchange, Symbol, f64, f64)> = positions
+            .iter()
+            .filter_map(|p| {
+                let state = self.mirror.get(&p.symbol)?;
+                state
+                    .is_seeded(p.exchange)
+                    .then(|| (p.exchange, p.symbol.clone(), state.position_size(p.exchange), p.size))
+            })
+            .collect();
+        let confirmed: Vec<String> = legs
+            .into_iter()
+            .filter_map(|(exchange, symbol, local, reported)| {
+                self.check_leg(counterpart, exchange, symbol, local, reported)
+            })
+            .collect();
+        self.verdict(counterpart, confirmed)
+    }
 
-            // 差值是否与上次相同 —— 区分真漂移与在途成交，见 MismatchRecord
-            let stable = mismatches
-                .get(&key)
-                .is_some_and(|prev| (diff - prev.last_diff).abs() <= tolerance);
-            let streak = if stable {
-                mismatches.get(&key).map_or(1, |prev| prev.streak + 1)
-            } else {
-                1
-            };
-            mismatches.insert(
-                key,
-                MismatchRecord {
-                    streak,
-                    last_diff: diff,
-                },
-            );
+    /// 某个 executor 不再受监视（已撤下）：清掉它的不一致记录，免得残留计数以后被误用。
+    pub fn forget_executor(&mut self, executor: ActorId) {
+        self.mismatches
+            .retain(|(counterpart, _, _), _| *counterpart != Counterpart::Executor(executor));
+    }
 
-            // 打成结构化日志，让漂移成为可观测的趋势，而不是只有停机那一刻才被看到
-            tracing::warn!(
-                target: "metrics",
-                %exchange,
-                %symbol,
-                local_size = format!("{local_size:.8}"),
-                reported_size = format!("{reported_size:.8}"),
-                diff = format!("{diff:.8}"),
-                tolerance = format!("{tolerance:.8}"),
-                stable_diff = stable,
-                streak,
-                max_consecutive = *max_consecutive,
-                "metrics.position_drift：本地持仓与交易所读数不一致"
-            );
+    /// 一条腿的比对与连续计数（两种对手方共用的**唯一**判据）。
+    ///
+    /// `local` 是账本值，`reported` 是对手方的值。返回 `Some(描述)` = 该腿已确认漂移。
+    fn check_leg(
+        &mut self,
+        counterpart: Counterpart,
+        exchange: Exchange,
+        symbol: Symbol,
+        local: f64,
+        reported: f64,
+    ) -> Option<String> {
+        let tolerance = tolerance_of(&self.symbol_metas, exchange, &symbol);
+        // 带符号差值：+X 与 -X 是方向相反的两种漂移，不能混为一谈
+        let diff = local - reported;
+        let key = (counterpart, exchange, symbol);
 
-            if streak >= *max_consecutive {
-                confirmed_drift.push(format!(
-                    "{exchange}/{symbol}: 本地 {local_size} vs 交易所 {reported_size} \
-                     (差 {diff}, 容差 {tolerance})"
-                ));
-            }
+        if diff.abs() <= tolerance {
+            // 一致即整条移除：记录衡量的是"当前正持续着的不一致"，不是历史累计
+            self.mismatches.remove(&key);
+            return None;
         }
 
-        if confirmed_drift.is_empty() {
+        // 差值是否与上次相同 —— 区分真漂移与在途成交，见 MismatchRecord
+        let prev = self.mismatches.get(&key).copied();
+        let stable = prev.is_some_and(|prev| (diff - prev.last_diff).abs() <= tolerance);
+        let streak = match prev {
+            Some(prev) if stable => prev.streak + 1,
+            _ => 1,
+        };
+        let (_, _, symbol) = &key;
+
+        // 打成结构化日志，让漂移成为可观测的趋势，而不是只有停机那一刻才被看到
+        tracing::warn!(
+            target: "metrics",
+            %counterpart,
+            %exchange,
+            %symbol,
+            local_size = format!("{local:.8}"),
+            reported_size = format!("{reported:.8}"),
+            diff = format!("{diff:.8}"),
+            tolerance = format!("{tolerance:.8}"),
+            stable_diff = stable,
+            streak,
+            max_consecutive = self.max_consecutive,
+            "metrics.position_drift：本地持仓与{counterpart}不一致"
+        );
+
+        let confirmed = (streak >= self.max_consecutive).then(|| {
+            format!(
+                "{exchange}/{symbol}: 本地 {local} vs {counterpart} {reported} \
+                 (差 {diff}, 容差 {tolerance})"
+            )
+        });
+        self.mismatches.insert(
+            key,
+            MismatchRecord {
+                streak,
+                last_diff: diff,
+            },
+        );
+        confirmed
+    }
+
+    fn verdict(&self, counterpart: Counterpart, confirmed: Vec<String>) -> Result<(), String> {
+        if confirmed.is_empty() {
             return Ok(());
         }
+        let consequence = match counterpart {
+            Counterpart::Exchange => "本地「基线 + Fill」已不可信",
+            Counterpart::Executor(_) => "策略下单依据的持仓已与账本分叉",
+        };
         Err(format!(
-            "持仓对账连续 {} 次差值稳定的不一致，本地「基线 + Fill」已不可信: {}",
+            "持仓对账（本地 vs {counterpart}）连续 {} 次差值稳定的不一致，{consequence}: {}",
             self.max_consecutive,
-            confirmed_drift.join("; ")
+            confirmed.join("; ")
         ))
     }
 }
@@ -302,6 +393,19 @@ pub struct PositionLedgerActor {
     guards: HashMap<Exchange, StalenessGuard>,
     /// 已发出、尚未回投结果的所（见 [`Self::spawn_fetches`]）
     in_flight: HashSet<Exchange>,
+    /// 受监视的实盘 executor（名单由编排维护，见模块文档「两条比对」）
+    executors: HashMap<ActorId, ActorRef<ExecutorActor>>,
+    /// 已发出持仓查询、尚未回投的 executor。
+    ///
+    /// 不配停摆守卫：executor 迟迟不答只可能是它邮箱积压，那由它自己的管线滞后告警报出
+    /// （`ExecutorActor::check_pipeline_lag`）；它停了则 ask 立即报错回投。
+    executor_in_flight: HashSet<ActorId>,
+}
+
+/// 一个 executor 的持仓查询结果回投（与 [`PositionsFetched`] 同一姿态：邮箱不等别人）。
+pub struct ExecutorPositionsFetched {
+    executor: ActorId,
+    result: Result<Vec<Position>, String>,
 }
 
 /// 一所读数拉取的结果回投。
@@ -376,6 +480,58 @@ impl PositionLedgerActor {
         }
     }
 
+    /// 向每个受监视、且没有在途查询的 executor 要一份持仓，结果回投为
+    /// [`ExecutorPositionsFetched`]。用 spawn 而不是就地 `ask`：executor 邮箱积压时，
+    /// 本 actor 不该跟着卡住（快照查询与 Fill 摄入都在这个邮箱里）。
+    fn spawn_executor_queries(&mut self, me: &ActorRef<Self>) {
+        for (id, executor) in &self.executors {
+            if !self.executor_in_flight.insert(*id) {
+                continue;
+            }
+            let (id, executor, me) = (*id, executor.clone(), me.clone());
+            tokio::spawn(async move {
+                let result = executor
+                    .ask(GetSeededPositions)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string());
+                // 投递失败只可能是本 actor 已停止（整机正在退出）
+                let _ = me
+                    .tell(ExecutorPositionsFetched { executor: id, result })
+                    .send()
+                    .await;
+            });
+        }
+    }
+
+    /// 处理一个 executor 的持仓回投。`Err` = 已确认分叉，调用方应致命退出。
+    fn ingest_executor(
+        &mut self,
+        executor: ActorId,
+        result: Result<Vec<Position>, String>,
+    ) -> Result<(), String> {
+        self.executor_in_flight.remove(&executor);
+        // 查询在途期间被撤出名单：它已不再收 Fill，这份答复不该拿来比
+        if !self.executors.contains_key(&executor) {
+            return Ok(());
+        }
+        match result {
+            Ok(positions) => self.reconciler.reconcile_executor(executor, &positions),
+            Err(e) => {
+                // executor 已停却没有先撤出名单 —— 只可能是异常终止，那条路径会经监督树
+                // 整机停机。这里只把它摘掉，免得每个节拍重复报同一件事。
+                tracing::warn!(%executor, error = %e, "executor 持仓查询失败（已停止？），移出监视名单");
+                self.unwatch(executor);
+                Ok(())
+            }
+        }
+    }
+
+    fn unwatch(&mut self, executor: ActorId) {
+        self.executors.remove(&executor);
+        self.reconciler.forget_executor(executor);
+    }
+
     /// 本地持仓已不可信，受控退出。
     ///
     /// 策略的三道风控闸门（单边杠杆 / 账户杠杆 / 仓位上限）全部基于它计算，继续跑等于
@@ -447,6 +603,8 @@ impl Actor for PositionLedgerActor {
             accounts: args.accounts,
             guards,
             in_flight: HashSet::new(),
+            executors: HashMap::new(),
+            executor_in_flight: HashSet::new(),
         })
     }
 
@@ -501,6 +659,40 @@ impl Message<GetLivePositions> for PositionLedgerActor {
     }
 }
 
+/// 把一个实盘 executor 加入监视名单（编排在它开始收事件之前发，见模块文档）。
+pub struct WatchExecutor(pub ActorRef<ExecutorActor>);
+
+impl Message<WatchExecutor> for PositionLedgerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: WatchExecutor, _ctx: &mut Context<Self, Self::Reply>) {
+        tracing::info!(executor = %msg.0.id(), "开始监视实盘 executor 的持仓");
+        self.executors.insert(msg.0.id(), msg.0);
+    }
+}
+
+/// 把一个 executor 移出监视名单（编排在注销它的订阅**之前**发，见模块文档）。不在名单里是空操作。
+pub struct UnwatchExecutor(pub ActorId);
+
+impl Message<UnwatchExecutor> for PositionLedgerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: UnwatchExecutor, _ctx: &mut Context<Self, Self::Reply>) {
+        self.unwatch(msg.0);
+    }
+}
+
+/// 一个 executor 的持仓返回：比对；确认分叉即致命退出
+impl Message<ExecutorPositionsFetched> for PositionLedgerActor {
+    type Reply = ();
+
+    async fn handle(&mut self, msg: ExecutorPositionsFetched, ctx: &mut Context<Self, Self::Reply>) {
+        if let Err(reason) = self.ingest_executor(msg.executor, msg.result) {
+            Self::fatal(ctx.actor_ref(), &reason);
+        }
+    }
+}
+
 /// 一所读数返回：比对；确认漂移或通道停摆即致命退出
 impl Message<PositionsFetched> for PositionLedgerActor {
     type Reply = ();
@@ -534,6 +726,7 @@ impl Message<StreamMessage<Instant, (), ()>> for PositionLedgerActor {
                     return;
                 }
                 self.spawn_fetches(ctx.actor_ref());
+                self.spawn_executor_queries(ctx.actor_ref());
             }
             StreamMessage::Started(_) => {
                 tracing::debug!("Position reconcile polling started");
@@ -907,6 +1100,72 @@ mod tests {
         assert!(!err.contains("OKX"), "不该牵连对得上的 OKX 腿: {err}");
     }
 
+    // ---------------- executor 持仓纳入对账（#694） ----------------
+
+    const EXECUTOR_SEQ: u64 = 7;
+    fn executor() -> ActorId {
+        ActorId::new(EXECUTOR_SEQ)
+    }
+
+    /// executor 与账本一致：任意多轮都不报
+    #[test]
+    fn executor_matching_the_ledger_is_not_drift() {
+        let mut r = reconciler_with(1, &[baseline_on(EX, 2.0)]);
+        r.on_event(&fill(Side::Long, 1.0));
+        for _ in 0..5 {
+            r.reconcile_executor(executor(), &[position(EX, 3.0)]).unwrap();
+        }
+    }
+
+    /// **本 issue 要抓的情形**：账本与交易所对得上，只有 executor（下单依据）错了。
+    /// 交易所那条比对永远看不见它，必须由 executor 这条在第 N 次稳定差值时报出。
+    #[test]
+    fn executor_diverging_from_a_correct_ledger_is_fatal_after_n_rounds() {
+        let mut r = reconciler_with(3, &[baseline_on(EX, 2.0)]);
+        for round in 1..=3 {
+            r.reconcile(EX, &[position(EX, 2.0)])
+                .expect("账本与交易所一致，交易所那条比对无从发现");
+            let result = r.reconcile_executor(executor(), &[position(EX, 5.0)]);
+            if round < 3 {
+                result.expect("未满 N 次不致命（可能只是在途）");
+            } else {
+                let err = result.expect_err("连续 N 次稳定差值必须致命");
+                assert!(err.contains("executor"), "报错要指明是哪个对手方: {err}");
+            }
+        }
+    }
+
+    /// 两种对手方各自计数：交易所那边的不一致不能替 executor 凑次数，反之亦然
+    #[test]
+    fn executor_and_exchange_streaks_are_independent() {
+        let mut r = reconciler_with(2, &[baseline_on(EX, 2.0)]);
+        r.reconcile(EX, &[position(EX, 9.0)]).unwrap();
+        r.reconcile_executor(executor(), &[position(EX, 9.0)])
+            .expect("executor 只不一致了一次，不能借交易所那边的次数达标");
+    }
+
+    /// 账本那边未 seed 的腿（该所无凭证）executor 记为 0 —— 不可比，跳过
+    #[test]
+    fn executor_legs_unseeded_in_the_ledger_are_skipped() {
+        let mut r = reconciler_with(1, &[baseline_on(EX, 2.0)]);
+        r.reconcile_executor(executor(), &[position(EX, 2.0), position(OTHER_EX, 0.0)])
+            .expect("OTHER_EX 在账本里是未知，不该参与比对");
+        // 即便账本靠 Fill 在那条腿上累加出了数，也是未知起点，不比
+        r.on_event(&fill_on(OTHER_EX, Side::Long, 1.0, SNAPSHOT_TS + 1));
+        r.reconcile_executor(executor(), &[position(EX, 2.0), position(OTHER_EX, 0.0)])
+            .expect("未 seed 的腿不比");
+    }
+
+    /// 撤出名单后记录清零：同一 id 再出现时从头数（不会带着旧次数一上来就致命）
+    #[test]
+    fn forgetting_an_executor_clears_its_streak() {
+        let mut r = reconciler_with(2, &[baseline_on(EX, 2.0)]);
+        r.reconcile_executor(executor(), &[position(EX, 5.0)]).unwrap();
+        r.forget_executor(executor());
+        r.reconcile_executor(executor(), &[position(EX, 5.0)])
+            .expect("forget 之后应从 1 重新计数");
+    }
+
     /// 对外快照只含**基线已写入**的腿，且空仓腿必须如实报出 0。
     ///
     /// 两个方向都要守：漏报空仓腿会让下游把"已平仓"看成"未知"；把未 seed 的腿当 0 报出去
@@ -1058,6 +1317,8 @@ mod mailbox_tests {
         Hang,
         /// 拉取过程中 panic（adapter 里的 unwrap 之类）
         Panic,
+        /// 不是故障：每次都如实返回这个持仓（给只关心 executor 那条比对的用例）
+        Steady(f64),
     }
 
     struct FaultyClient {
@@ -1088,6 +1349,11 @@ mod mailbox_tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.mode {
                 Faulty::Panic => panic!("模拟 adapter 内的 panic"),
+                Faulty::Steady(size) => Ok(vec![Position {
+                    exchange: EX,
+                    symbol: SYM.to_string(),
+                    size,
+                }]),
                 Faulty::Hang => {
                     let _permit = self.gate.acquire().await;
                     unreachable!("信号量永不放行")
@@ -1172,6 +1438,8 @@ mod mailbox_tests {
                 StalenessGuard::new(format!("{EX} 持仓对账"), MAX_POLL_STALENESS_MS),
             )]),
             in_flight: HashSet::from([EX]),
+            executors: HashMap::new(),
+            executor_in_flight: HashSet::new(),
         };
 
         // 刚发出、还在容忍窗口内：只是慢，不该停机
@@ -1289,5 +1557,139 @@ mod mailbox_tests {
             1,
             "在途期间的后续节拍必须跳过，否则慢 REST 会堆积并发请求"
         );
+    }
+
+    // ---------------- executor 持仓纳入对账（#694）：actor 层 ----------------
+
+    /// 只订一路 BBO、什么都不做的策略：本组用例只关心 executor 的持仓
+    struct Idle;
+
+    impl crate::strategy::Strategy for Idle {
+        fn public_streams(
+            &self,
+        ) -> HashMap<Exchange, HashSet<crate::exchange::SubscriptionKind>> {
+            HashMap::from([(
+                EX,
+                HashSet::from([crate::exchange::SubscriptionKind::BBO {
+                    symbol: SYM.to_string(),
+                }]),
+            )])
+        }
+        fn order_timeout_ms(&self) -> u64 {
+            0
+        }
+        fn on_event(
+            &mut self,
+            _event: &crate::messaging::IncomeEvent,
+            _view: crate::strategy::StrategyView<'_>,
+        ) -> Vec<crate::strategy::OutcomeEvent> {
+            Vec::new()
+        }
+    }
+
+    /// 起一个实盘 executor，出生持仓 = `size`（模拟「再晋升时 executor 用了新快照」）
+    fn executor_born_with(size: f64) -> ActorRef<ExecutorActor> {
+        let outcome_pubsub = super::super::OutcomePubSub::spawn(super::super::OutcomePubSub::new(
+            kameo_actors::DeliveryStrategy::BestEffort,
+        ));
+        ExecutorActor::spawn(super::super::ExecutorArgs {
+            strategy: Box::new(Idle),
+            account: crate::domain::AccountId::Live,
+            symbol_metas: metas(),
+            baselines: vec![PositionBaseline {
+                position: Position {
+                    exchange: EX,
+                    symbol: SYM.to_string(),
+                    size,
+                },
+                snapshot_req_ts: 1,
+            }],
+            outcome_pubsub,
+        })
+    }
+
+    /// 账本基线 2.0、交易所也报 2.0（这条比对永远通过）
+    async fn ledger_agreeing_with_exchange() -> ActorRef<PositionLedgerActor> {
+        let (client, _calls) = FaultyClient::pair(Faulty::Steady(2.0));
+        let ledger = PositionLedgerActor::spawn(PositionLedgerArgs {
+            accounts: HashMap::from([(EX, client)]),
+            symbol_metas: metas(),
+            interval_ms: NEVER_AGAIN_MS,
+            max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
+        });
+        ledger
+            .ask(super::super::RegisterSymbols {
+                symbols: vec![SYM.to_string()],
+                baselines: vec![PositionBaseline {
+                    position: Position {
+                        exchange: EX,
+                        symbol: SYM.to_string(),
+                        size: 2.0,
+                    },
+                    snapshot_req_ts: 1,
+                }],
+            })
+            .send()
+            .await
+            .expect("注册应成功");
+        ledger
+    }
+
+    /// 打若干轮节拍，每轮之后给足调度让「查询 -> 回投 -> 比对」走完
+    async fn tick(ledger: &ActorRef<PositionLedgerActor>, rounds: usize) {
+        for _ in 0..rounds {
+            if !ledger.is_alive() {
+                return;
+            }
+            let _ = ledger.tell(StreamMessage::Next(Instant::now())).send().await;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// **端到端**：交易所与账本都对，只有受监视的 executor 持仓错 —— 账本必须停机。
+    #[tokio::test]
+    async fn a_watched_executor_with_wrong_positions_halts_the_ledger() {
+        let ledger = ledger_agreeing_with_exchange().await;
+        let executor = executor_born_with(5.0);
+        ledger
+            .ask(WatchExecutor(executor.clone()))
+            .send()
+            .await
+            .expect("纳入名单应成功");
+
+        tick(&ledger, DEFAULT_MAX_CONSECUTIVE_MISMATCHES as usize + 2).await;
+        tokio::time::timeout(Duration::from_secs(2), ledger.wait_for_shutdown())
+            .await
+            .expect("executor 持仓与账本稳定分叉，账本必须致命退出");
+    }
+
+    /// 撤出名单的 executor 不再比对（撤下流程里它会先停更再停机，不能被误判）；
+    /// 持仓一致的 executor 也不该触发任何东西。
+    #[tokio::test]
+    async fn unwatched_or_agreeing_executors_never_halt_the_ledger() {
+        let ledger = ledger_agreeing_with_exchange().await;
+        let wrong = executor_born_with(5.0);
+        let right = executor_born_with(2.0);
+        ledger.ask(WatchExecutor(wrong.clone())).send().await.unwrap();
+        ledger.ask(WatchExecutor(right.clone())).send().await.unwrap();
+        ledger.ask(UnwatchExecutor(wrong.id())).send().await.unwrap();
+
+        tick(&ledger, DEFAULT_MAX_CONSECUTIVE_MISMATCHES as usize + 2).await;
+        assert!(ledger.is_alive(), "撤出名单的、或持仓一致的 executor 都不该打死账本");
+    }
+
+    /// executor 停了却没撤出名单：查询报错 -> 摘掉，不停机（停机由监督树负责）
+    #[tokio::test]
+    async fn a_stopped_executor_is_dropped_from_the_watch_list() {
+        let ledger = ledger_agreeing_with_exchange().await;
+        let executor = executor_born_with(5.0);
+        ledger.ask(WatchExecutor(executor.clone())).send().await.unwrap();
+        executor.stop_gracefully().await.unwrap();
+        executor.wait_for_shutdown().await;
+
+        tick(&ledger, DEFAULT_MAX_CONSECUTIVE_MISMATCHES as usize + 2).await;
+        assert!(ledger.is_alive(), "已停的 executor 不该被当成分叉");
     }
 }

@@ -32,7 +32,7 @@ use super::{ManagerActor, StrategySpec};
 use crate::actor_lifecycle::ChildRegistrar;
 use crate::engine::live::{
     ExecutorActor, ExecutorArgs, GetPositions, PlaceVerdict, RegisterExecutor, RegisterSymbols,
-    UnregisterExecutor,
+    UnregisterExecutor, UnwatchExecutor, WatchExecutor,
 };
 use crate::domain::{
     now_ms, AccountId, Exchange, ExchangeError, Order, OrderType, OrderUpdate, Side, Symbol,
@@ -212,6 +212,33 @@ impl Provisioner {
             order_gateway,
             exchange_actors,
             executors: Vec::new(),
+        }
+    }
+
+    /// 把一个 executor 从事件流上摘下：先移出持仓对账名单，再注销订阅。
+    ///
+    /// 顺序不能反：注销之后它不再收 Fill，持仓停更，若还在名单里会被误判为分叉、
+    /// 打死引擎（停下它最多要等 [`EXECUTOR_STOP_TIMEOUT`]，够对账攒满次数）。持仓账本与
+    /// 分发层是两个邮箱，tell 不保证谁先生效，所以名单这步用 ask，确认已移出再注销。
+    /// 两步失败都只可能是对方已停（整机正在退出），记录即可。
+    async fn detach_executor(&self, executor: &ActorRef<ExecutorActor>) {
+        if let Err(e) = self
+            .position_ledger
+            .ask(UnwatchExecutor(executor.id()))
+            .send()
+            .await
+        {
+            tracing::error!(error = %e, "把 executor 移出持仓对账名单失败");
+        }
+        if let Err(e) = self
+            .income_processor
+            .tell(UnregisterExecutor {
+                executor: executor.clone(),
+            })
+            .send()
+            .await
+        {
+            tracing::error!(error = %e, "注销 executor 的事件订阅失败");
         }
     }
 
@@ -552,11 +579,14 @@ impl Provisioner {
     /// - **(t0, t1] 的成交**：镜像与 executor **同错同漏** → 对账检出、受控停机 ——
     ///   这是正杀（事件确实丢了）。对比旧的总线方案：镜像缓冲重放后正确、executor 照漏，
     ///   对账通过 → live 实例带错误持仓**静默**续跑。fail-visible 严格优于 silent-drift。
-    /// - **(t1, t2] 的成交**：镜像吃到、executor 错过 → executor 静默漂移且对账不可见。
+    /// - **(t1, t2] 的成交**：镜像吃到、executor 错过 → executor 与镜像分歧。
     ///   窗口 = 几次进程内邮箱投递（旧方案同类窗口为"快照到注册"的数秒）。
     /// - **再晋升**：executor 用新时刻的快照 seed，镜像沿用连续旧账本 —— 新快照请求到
-    ///   注册完成之间的外部成交，同样造成 executor 静默漂移且对账不可见（镜像有、它没有），
-    ///   与旧方案等宽。没有交易所侧序号无法根除。
+    ///   注册完成之间的外部成交，同样造成 executor 与镜像分歧（镜像有、它没有）。
+    ///   没有交易所侧序号无法根除。
+    ///
+    /// 后两种分歧此前对账不可见（executor 静默带着错的持仓下单）；实盘 executor 纳入对账
+    /// 后（#694，见 [`WatchExecutor`]），差值稳定 N 次即受控停机，同样变成 fail-visible。
     ///
     /// 拆成独立方法只为一件事：让 [`Self::do_add_strategies`] 能在这里失败时统一回滚，
     /// 而不必在每个 `?` 旁边重复一遍回滚代码。
@@ -625,6 +655,19 @@ impl Provisioner {
                         "向 IncomeProcessor 注册策略实例失败（该实例将收不到任何事件）: {e}"
                     ))
                 })?;
+            // 实盘实例的持仓是下单依据，纳入对账（#694）。注册失败必须传播：否则这份
+            // 持仓错了没人知道 —— 与 7.1 同理。模拟账户的持仓与实盘无关，不进名单。
+            if *account == AccountId::Live {
+                self.position_ledger
+                    .ask(WatchExecutor(executor_ref.clone()))
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ExchangeError::Other(format!(
+                            "把实盘实例纳入持仓对账失败（它的持仓将无人校验）: {e}"
+                        ))
+                    })?;
+            }
             self.executors.push(RegisteredExecutor {
                 executor: executor_ref.clone(),
                 account: account.clone(),
@@ -667,16 +710,7 @@ impl Provisioner {
     ) {
         let ids: HashSet<ActorId> = created.iter().map(|(r, _)| r.id()).collect();
         for (executor, account) in created {
-            if let Err(e) = self
-                .income_processor
-                .tell(UnregisterExecutor {
-                    executor: executor.clone(),
-                })
-                .send()
-                .await
-            {
-                tracing::error!(error = %e, "回滚时注销 executor 失败");
-            }
+            self.detach_executor(executor).await;
             if let Err(reason) = self.stop_executor(executor, producers).await {
                 tracing::error!(%account, %reason, "回滚时未能确认实例已停止");
             }
@@ -798,16 +832,7 @@ impl Provisioner {
                     }
                 }
             }
-            if let Err(e) = self
-                .income_processor
-                .tell(UnregisterExecutor {
-                    executor: reg.executor.clone(),
-                })
-                .send()
-                .await
-            {
-                tracing::error!(error = %e, "Failed to unregister executor");
-            }
+            self.detach_executor(&reg.executor).await;
             // 有序停下并**等它真的停**：后面要撤单 / 平仓，不能让它在排空邮箱时又下新单
             if let Err(reason) = self.stop_executor(&reg.executor, &mut producers).await {
                 tracing::error!(

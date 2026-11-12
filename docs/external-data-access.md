@@ -99,6 +99,11 @@
 三份都是同一条 Fill 流、同一份 seed 语义（`SymbolState::seed_position`）、同一条防双计规则的确定性结果，
 因此除非有 bug 不会分叉。**新增第四份必须先证明它不能用 `GetLivePositions` 替代。**
 
+「除非有 bug」不靠信：executor 那份是下单依据，它与账本的分歧由账本每个节拍检查（#694）——
+账本向每个实盘 executor 要一份已 seed 的持仓（`GetSeededPositions`），与镜像按同一判据比对
+（差值稳定连续 N 次即致命）。于是 executor ≈ 账本 ≈ 交易所两条比对串起来。metrics 那份只用于报告，
+不纳入。
+
 ### 为什么持仓查询挂在账本 actor 上
 
 契约 2（宿主的所有 handler 都不得阻塞在 IO 上）淘汰了其他候选：
@@ -156,6 +161,7 @@
 |---|---|---|---|
 | `GetLivePositions` | 实盘权威真值 | 否 | 对外快照、观测 |
 | `ExecutorActor::GetPositions` | 某策略实例内部状态 | 是 | 降级平仓取量（须在 kill 该 executor 之前发起） |
+| `ExecutorActor::GetSeededPositions` | 某策略实例的已 seed 腿 | 只问实盘实例 | 持仓账本拿它与镜像比对（#694）；未 seed 的腿是「未知」，不给 |
 
 ### C. manager 的快照面
 
