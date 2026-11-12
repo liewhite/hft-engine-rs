@@ -272,26 +272,6 @@ impl OkxClient {
         Ok(data.data)
     }
 
-    /// 拉取某币自 `start_ms` 起**已结算**的公共资金费率（`GET /api/v5/public/funding-rate-history`，
-    /// 无需凭证），按结算时间升序。取 `realizedRate`（实际收付的费率）。
-    ///
-    /// 单次最多 100 条（最新的在前）；OKX 最短 1h 一结，24h 窗口最多 24 条，一页足够。
-    /// 限频 10 次 / 2 秒 / IP。
-    pub async fn fetch_settled_funding(
-        &self,
-        symbol: &Symbol,
-        start_ms: crate::domain::Timestamp,
-    ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
-        let url = format!(
-            "{}/api/v5/public/funding-rate-history?instId={}&limit=100",
-            self.base_url,
-            to_okx(symbol, &self.quote)
-        );
-        let resp = self.client.get(&url).send().await.map_err(Self::map_reqwest_error)?;
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        parse_settled_funding(&text, symbol, start_ms)
-    }
-
     /// 取一页挂单（`after` 为游标 = 上一页最后一条的 ordId，`None` 即首页）
     async fn fetch_pending_orders_page(
         &self,
@@ -827,6 +807,33 @@ fn order_type_to_okx(order_type: &OrderType) -> (&'static str, Option<String>) {
             };
             (ord_type, Some(price.to_string()))
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::exchange::SettledFundingSource for OkxClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::OKX
+    }
+
+    /// 拉取某币自 `start_ms` 起**已结算**的公共资金费率（`GET /api/v5/public/funding-rate-history`，
+    /// 无需凭证），按结算时间升序。取 `realizedRate`（实际收付的费率）。
+    ///
+    /// 单次最多 100 条（最新的在前）；OKX 最短 1h 一结，24h 窗口最多 24 条，一页足够。
+    /// 限频 10 次 / 2 秒 / IP。
+    async fn fetch_settled_funding(
+        &self,
+        symbol: &Symbol,
+        start_ms: crate::domain::Timestamp,
+    ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
+        let url = format!(
+            "{}/api/v5/public/funding-rate-history?instId={}&limit=100",
+            self.base_url,
+            to_okx(symbol, &self.quote)
+        );
+        let resp = self.client.get(&url).send().await.map_err(Self::map_reqwest_error)?;
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        parse_settled_funding(&text, symbol, start_ms)
     }
 }
 

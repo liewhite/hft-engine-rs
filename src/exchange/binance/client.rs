@@ -196,35 +196,6 @@ impl BinanceClient {
         &self.quote
     }
 
-    /// 拉取某交易对自 `start_ms` 起**已结算**的公共资金费率（`GET /fapi/v1/fundingRate`，
-    /// 无需凭证），按结算时间升序。
-    ///
-    /// 限频：该接口与 fundingInfo 共用 500 次 / 5 分钟 / IP，调用方按需拉取（结算才变，
-    /// 每小时一轮足够），别按行情频率轮询。单次最多 1000 条，24h 窗口最多 24 条（1h 周期）。
-    pub async fn fetch_settled_funding(
-        &self,
-        symbol: &Symbol,
-        start_ms: Timestamp,
-    ) -> Result<Vec<SettledFunding>, ExchangeError> {
-        let url = format!(
-            "{}/fapi/v1/fundingRate?symbol={}&startTime={}&limit=1000",
-            self.base_url,
-            to_binance(symbol, &self.quote),
-            start_ms
-        );
-        let resp = self.client.get(&url).send().await.map_err(Self::map_reqwest_error)?;
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-        parse_settled_funding(&text, symbol)
-    }
-
     /// 获取凭证（供 ManagerActor 创建 BinanceActor 使用）
     pub fn credentials(&self) -> Option<&BinanceCredentials> {
         self.credentials.as_ref()
@@ -850,6 +821,42 @@ fn parse_settled_funding(text: &str, symbol: &Symbol) -> Result<Vec<SettledFundi
             })
         })
         .collect()
+}
+
+#[async_trait::async_trait]
+impl crate::exchange::SettledFundingSource for BinanceClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::Binance
+    }
+
+    /// 拉取某交易对自 `start_ms` 起**已结算**的公共资金费率（`GET /fapi/v1/fundingRate`，
+    /// 无需凭证），按结算时间升序。
+    ///
+    /// 限频：该接口与 fundingInfo 共用 500 次 / 5 分钟 / IP，调用方按需拉取（结算才变，
+    /// 每小时一轮足够），别按行情频率轮询。单次最多 1000 条，24h 窗口最多 24 条（1h 周期）。
+    async fn fetch_settled_funding(
+        &self,
+        symbol: &Symbol,
+        start_ms: Timestamp,
+    ) -> Result<Vec<SettledFunding>, ExchangeError> {
+        let url = format!(
+            "{}/fapi/v1/fundingRate?symbol={}&startTime={}&limit=1000",
+            self.base_url,
+            to_binance(symbol, &self.quote),
+            start_ms
+        );
+        let resp = self.client.get(&url).send().await.map_err(Self::map_reqwest_error)?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
+        }
+        parse_settled_funding(&text, symbol)
+    }
 }
 
 #[cfg(test)]

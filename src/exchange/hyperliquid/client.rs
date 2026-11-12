@@ -328,22 +328,6 @@ impl HyperliquidClient {
         parse_user_funding(entries, &self.markets, &self.quote)
     }
 
-    /// 拉取某币自 `start_ms` 起**已结算**的公共资金费率（`fundingHistory`，无需凭证），
-    /// 按结算时间升序。HL 每小时结算一次，24h 窗口约 24 条；单次最多返回 500 条。
-    /// symbol 不在已接入 dex 的品种目录里时报错。
-    ///
-    /// 限频：info 接口按权重计（每 IP 1200/分钟），一次约 20，别按行情频率轮询。
-    pub async fn fetch_settled_funding(
-        &self,
-        symbol: &Symbol,
-        start_ms: Timestamp,
-    ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
-        let coin = &self.markets.asset(symbol)?.coin;
-        let entries: Vec<FundingHistoryEntry> = self
-            .post_info(serde_json::json!({"type": "fundingHistory", "coin": coin, "startTime": start_ms}))
-            .await?;
-        parse_funding_history(entries, symbol)
-    }
 }
 
 /// POST /info（构造期还没有 `Self`，故抽成自由函数）
@@ -534,6 +518,30 @@ fn parse_funding_history(
             })
         })
         .collect()
+}
+
+#[async_trait::async_trait]
+impl crate::exchange::SettledFundingSource for HyperliquidClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::Hyperliquid
+    }
+
+    /// 拉取某币自 `start_ms` 起**已结算**的公共资金费率（`fundingHistory`，无需凭证），
+    /// 按结算时间升序。HL 每小时结算一次，24h 窗口约 24 条；单次最多返回 500 条。
+    /// symbol 不在已接入 dex 的品种目录里时报错。
+    ///
+    /// 限频：info 接口按权重计（每 IP 1200/分钟），一次约 20，别按行情频率轮询。
+    async fn fetch_settled_funding(
+        &self,
+        symbol: &Symbol,
+        start_ms: Timestamp,
+    ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
+        let coin = &self.markets.asset(symbol)?.coin;
+        let entries: Vec<FundingHistoryEntry> = self
+            .post_info(serde_json::json!({"type": "fundingHistory", "coin": coin, "startTime": start_ms}))
+            .await?;
+        parse_funding_history(entries, symbol)
+    }
 }
 
 #[cfg(test)]

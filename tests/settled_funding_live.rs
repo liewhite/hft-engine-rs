@@ -5,6 +5,7 @@
 use hft_engine_rs::domain::now_ms;
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::hyperliquid::HyperliquidClient;
+use hft_engine_rs::exchange::SettledFundingSource;
 
 const DAY_MS: u64 = 24 * 3600 * 1000;
 
