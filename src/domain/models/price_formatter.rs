@@ -48,8 +48,17 @@ impl StepFormatter {
 impl PriceFormatter for StepFormatter {
     fn format(&self, price: f64) -> String {
         let rounded = Self::round_to_step(price, self.step);
-        let s = format!("{:.precision$}", rounded, precision = self.decimals);
+        trim_fraction_zeros(format!("{:.precision$}", rounded, precision = self.decimals))
+    }
+}
+
+/// 删小数部分的尾随零（及多余的小数点）。没有小数点时原样返回：纯整数末尾的 0 是数值的一部分，
+/// 删了会把 4870 变成 487（两个格式化器都曾这样错过，故收成这一处）。
+fn trim_fraction_zeros(s: String) -> String {
+    if s.contains('.') {
         s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
     }
 }
 
@@ -107,14 +116,7 @@ impl PriceFormatter for SignificantFiguresFormatter {
         let multiplier = 10_f64.powi(decimals as i32);
         let rounded = (price * multiplier).round() / multiplier;
 
-        // 格式化并移除小数部分的尾随零。只在有小数点时才删：decimals == 0 时输出是纯整数，
-        // 删末尾 0 会把 106290 变成 10629（价格缩小 10 倍）。
-        let s = format!("{:.precision$}", rounded, precision = decimals as usize);
-        if s.contains('.') {
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
-        } else {
-            s
-        }
+        trim_fraction_zeros(format!("{:.precision$}", rounded, precision = decimals as usize))
     }
 }
 
@@ -129,6 +131,10 @@ mod tests {
         assert_eq!(f.format(100.126), "100.13");
         assert_eq!(f.format(100_f64), "100");
         assert_eq!(f.format(10000000000_f64), "10000000000");
+        // 步长 ≥ 1 时整数末尾的 0 不得删（曾把 4870 格式化成 "487"）
+        let f1 = StepFormatter::new(1.0);
+        assert_eq!(f1.format(4870.0), "4870");
+        assert_eq!(f1.format(4869.6), "4870");
     }
 
     #[test]
