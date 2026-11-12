@@ -187,13 +187,13 @@ async fn post_json<B: serde::Serialize>(http: &Client, url: &str, body: &B) -> R
 }
 
 /// HL `/exchange` 的 HTTP 层：2xx 且是 JSON → 交给 client 解读；4xx（422 请求体不合法、
-/// 429 限频）→ HL 没受理，拒绝；5xx 或 2xx 却不是 JSON → 不确定。纯函数。
+/// 429 限频）→ HL 没受理，拒绝；408（超时）、5xx 或 2xx 却不是 JSON → 不确定。纯函数。
 fn classify_hl_http(status: u16, text: &str) -> Result<Value, PlaceError> {
     let body: String = text.chars().take(300).collect();
     match status {
         200..=299 => serde_json::from_str(text)
             .map_err(|e| PlaceError::indeterminate(format!("HL /exchange 回复不是 JSON: {e} (body: {body})"))),
-        400..=499 => Err(PlaceError::rejected(format!("HL HTTP {status}: {body}"))),
+        400..=499 if status != 408 => Err(PlaceError::rejected(format!("HL HTTP {status}: {body}"))),
         _ => Err(PlaceError::indeterminate(format!("HL HTTP {status}: {body}"))),
     }
 }
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn hl_http_layer() {
         assert_eq!(classify_hl_http(200, r#"{"status":"ok"}"#).unwrap(), json!({"status": "ok"}));
-        for (status, text) in [(200, "<html>"), (500, "oops"), (502, ""), (504, "")] {
+        for (status, text) in [(200, "<html>"), (408, ""), (500, "oops"), (502, ""), (504, "")] {
             assert!(matches!(classify_hl_http(status, text), Err(PlaceError::Indeterminate(_))), "{status}");
         }
         for (status, text) in [(422, "Failed to deserialize the JSON body"), (429, "rate limited")] {

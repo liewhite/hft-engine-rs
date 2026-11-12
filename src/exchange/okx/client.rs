@@ -743,7 +743,7 @@ const OKX_UNKNOWN_STATUS_CODES: &[&str] = &["50001", "50004", "50013", "50026", 
 /// 下单回复 → 三种结论。纯函数。
 ///
 /// OKX 的失败回复常带非 2xx 状态（如 50004 是 HTTP 400），所以**先看正文、不看状态码**：
-/// - 有单笔结果 `data[0]`：`sCode == "0"` 成功；`sCode` 属于「结果未知」→ 不确定；其余 → 拒绝；
+/// - 有单笔结果 `data[0]`：`sCode == "0"` 且有订单号 → 成功（没订单号 → 不确定）；`sCode` 属于「结果未知」→ 不确定；其余 → 拒绝；
 /// - 没有单笔结果：顶层 `code` 属于「结果未知」或 HTTP 5xx → 不确定；其余非 0（签名、限频、参数）→ 拒绝；
 ///   顶层 0 却没有单笔结果 → 不确定；
 /// - 正文解析不了（网关 HTML、空回复）→ 不确定。
@@ -773,7 +773,8 @@ fn parse_place_reply(status: u16, text: &str) -> Result<OrderId, PlaceError> {
     if let Some(d) = resp.data.first() {
         let detail = format!("HTTP {status}, sCode={}, sMsg={}", d.s_code, d.s_msg);
         return match d.s_code.as_str() {
-            "0" => Ok(d.ord_id.clone()),
+            "0" if !d.ord_id.is_empty() => Ok(d.ord_id.clone()),
+            "0" => Err(PlaceError::indeterminate(format!("OKX 受理了却没给订单号: {detail}"))),
             c if unknown(c) => Err(PlaceError::indeterminate(format!("OKX {detail}"))),
             _ => Err(PlaceError::rejected(detail)),
         };
@@ -1015,6 +1016,7 @@ mod place_reply_tests {
             (502, "<html>Bad Gateway</html>"),
             (200, ""),
             (200, r#"{"code":"0","msg":"","data":[]}"#),
+            (200, r#"{"code":"0","msg":"","data":[{"ordId":"","sCode":"0","sMsg":""}]}"#),
         ] {
             assert!(indeterminate(parse_place_reply(status, s)), "{status} {s}");
         }

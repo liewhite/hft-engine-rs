@@ -532,8 +532,9 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
         //   reduce-only 会在后续事件中纠正净敞口，不依赖单条请求的到达序。
         // - 优雅停机时 `on_stop` 不等待 in-flight 请求，理论上存在"引擎已停但请求仍在途"
         //   的窗口；接受此风险以换取事件流不阻塞。
-        // - spawned task 内的失败已由 gateway 反馈为 OrderUpdate(Error/Cancelled)，
-        //   不会静默丢失 —— 返回值只服务需要同步结论的编排方（降级平仓），此处忽略。
+        // - spawned task 内的结论不靠返回值传递：拒单由 gateway 反馈为 OrderUpdate(Error)、
+        //   撤单反馈为 Cancelled；下单结果不确定时 gateway 自己停机（不反馈 Error，见
+        //   `OrderGateway::place`）。返回值只服务需要同步结论的编排方（降级平仓），此处忽略。
         match tagged.event {
             // 自定义事件与交易所无关：它已随 Outcome 总线到达外部订阅者，本处理器只管下单/撤单
             OutcomeEvent::Emit(_) => {}
@@ -693,63 +694,6 @@ mod tests {
         );
     }
 
-    // ==================== 迟到的 REST 失败结论 ====================
-    //
-    // 这套判定全靠时序，所以直接对 in_flight 这个判据本身建模：
-    // 「登记 → 交易所说话 → REST 失败」与「登记 → REST 失败」两条路必须分道。
-
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-
-    /// 复刻 gateway 里的两步：交易所回报摘除、REST 失败时判是否还作数
-    fn ack(in_flight: &Mutex<HashSet<String>>, cid: &str) {
-        in_flight.lock().unwrap().remove(cid);
-    }
-    fn rest_failed_should_report(in_flight: &Mutex<HashSet<String>>, cid: &str) -> bool {
-        in_flight.lock().unwrap().remove(cid)
-    }
-
-    /// 交易所先回报、REST 后失败 → **不得**上报失败。
-    ///
-    /// 这正是 IBKR 限流时的真实时序：成交 0.7 秒到，REST 的 503 十秒后才回。
-    /// 那时单子早成交了，再发一条"下单失败"是假警报，还会往账本里写一行假 error
-    /// （实测一次事故里 754 条 error 有 751 条属于此类）。
-    #[test]
-    fn late_rest_failure_is_dropped_when_exchange_already_reported() {
-        let in_flight = Mutex::new(HashSet::new());
-        in_flight.lock().unwrap().insert("c-1".to_string());
-
-        ack(&in_flight, "c-1"); // WS 回报先到
-        assert!(
-            !rest_failed_should_report(&in_flight, "c-1"),
-            "交易所已回报过，迟到的 REST 失败不该再上报"
-        );
-    }
-
-    /// 交易所没说过话 → REST 失败照常上报（这才是真失败）
-    #[test]
-    fn rest_failure_is_reported_when_exchange_never_spoke() {
-        let in_flight = Mutex::new(HashSet::new());
-        in_flight.lock().unwrap().insert("c-2".to_string());
-
-        assert!(
-            rest_failed_should_report(&in_flight, "c-2"),
-            "交易所从未回报，REST 失败就是结论，必须上报"
-        );
-    }
-
-    /// 判据只作数一次：同一单不会因为重复回报而被上报两次
-    #[test]
-    fn a_single_order_is_judged_at_most_once() {
-        let in_flight = Mutex::new(HashSet::new());
-        in_flight.lock().unwrap().insert("c-3".to_string());
-
-        assert!(rest_failed_should_report(&in_flight, "c-3"));
-        assert!(
-            !rest_failed_should_report(&in_flight, "c-3"),
-            "已判过的单不该再次上报"
-        );
-    }
 }
 
 /// 对 [`OrderGateway::place`] 的返回值契约直测（不是复刻实现）。
@@ -887,10 +831,14 @@ mod place_verdict_tests {
             Self { gateway, events, halt_target }
         }
 
-        /// 是否触发了停机
+        /// 是否触发了停机（等替身停下，最多 2 秒）
         async fn halted(&self) -> bool {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            !self.halt_target.is_alive()
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.halt_target.wait_for_shutdown(),
+            )
+            .await
+            .is_ok()
         }
 
         /// 是否发出了 Error 终态回报（策略侧失败闭环）
