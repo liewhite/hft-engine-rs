@@ -1,23 +1,21 @@
 //! 交易所装配层（组合根）：每所一个 `setup_*`，产出 [`ExchangeSetup`] 交给
-//! `ManagerActorArgs::exchanges` —— manager 对"有哪些所"彻底无知，只做收集与循环。
+//! `ManagerArgs::exchanges` —— manager 对"有哪些所"彻底无知，只做收集与循环。
 //!
 //! 装配天然分两阶段：**建 client** 必须先于 symbol metas 预加载（预加载要用它），
-//! **spawn WS actor 集**必须后于预加载（actor 要用 metas）。每所把两阶段封进一个
+//! **起交易所节点**必须后于预加载（节点要用 metas）。每所把两阶段封进一个
 //! `setup_*` 函数：阶段 1 立即执行产出 client，阶段 2 以闭包延迟到 metas 就绪。
 //! IBKR 的构造是异步的（要打网关）、配置形状也不同（无 quote、另带 snapshot 轮询
 //! 配置）—— 差异全部封在它自己的 setup 内。
 
-use super::manager::ManagerActor;
-use super::{AccountPubSub, MarketPubSub};
-use crate::actor_lifecycle::ChildStop;
+use super::AccountBus;
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient, BinanceCredentials, REST_BASE_URL};
-use crate::exchange::hyperliquid::{HyperliquidAccess, HyperliquidActor, HyperliquidActorArgs, HyperliquidClient};
-use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials, IbkrSnapshotConfig};
-use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
-use crate::exchange::{AccountClient, ExchangeAccess, ExchangeActorOps, ExchangeClient, SubscriptionKind};
-use kameo::actor::{ActorRef, Spawn};
-use kameo::mailbox;
+use crate::exchange::binance::{BinanceArgs, BinanceClient, BinanceCredentials, BinanceNode, REST_BASE_URL};
+use crate::exchange::hyperliquid::{HyperliquidAccess, HyperliquidArgs, HyperliquidClient, HyperliquidNode};
+use crate::exchange::ibkr::{IbkrArgs, IbkrClient, IbkrCredentials, IbkrNode, IbkrSnapshotConfig};
+use crate::exchange::okx::{OkxArgs, OkxClient, OkxCredentials, OkxNode};
+use crate::exchange::{AccountClient, ExchangeAccess, ExchangeClient, ExchangeHandle, SubscriptionKind};
+use crate::messaging::MarketBus;
+use crate::tasks::Group;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,31 +23,26 @@ use std::sync::Arc;
 // 交易所装配：每所一个 setup_*，manager 只做收集与循环
 // ============================================================================
 
-/// 交易所 WS actor 装配的执行环境（metas 预加载完成后可用；由 manager 的 on_start 构造）
+/// 交易所节点装配的执行环境（metas 预加载完成后可用；由 manager 构造时建好）
 pub struct SpawnCtx {
-    pub(crate) manager: ActorRef<ManagerActor>,
-    pub(crate) market_pubsub: ActorRef<MarketPubSub>,
-    /// 账户私有事件总线（实盘适配层 + 本地柜台共用，见 [`AccountPubSub`]）
-    pub(crate) account_pubsub: ActorRef<AccountPubSub>,
+    /// manager 的生产者组：交易所节点挂在这里，停机时先于消费者停
+    pub(crate) producers: Group,
+    pub(crate) market_bus: MarketBus,
+    /// 账户私有事件总线（实盘适配层 + 本地柜台共用，见 [`AccountBus`]）
+    pub(crate) account_bus: AccountBus,
     /// 该所的 symbol -> meta
     pub(crate) symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
-/// 装配产物：类型擦除的操作接口 + 停机句柄。
-///
-/// 句柄必须在这里造：出了这个闭包，actor 就只剩 `Box<dyn ExchangeActorOps>`，
-/// 拿不到具体的 `ActorRef<A>`，也就造不出"停它并等它收尾完"的闭包了。
+/// 装配产物：交易所节点的句柄（订阅 / 退订行情用）。节点的生死归任务树管，句柄只是地址。
 pub(crate) type SpawnFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = Result<(Box<dyn ExchangeActorOps>, ChildStop), ExchangeError>>
-            + Send,
-    >,
+    Box<dyn std::future::Future<Output = Result<ExchangeHandle, ExchangeError>> + Send>,
 >;
 
 /// 单个交易所的装配产物（两阶段划分的理由见模块文档）。
 ///
 /// **加一个新交易所只需**：本文件写一个 `setup_*`、各 bin 的装配处加一行 push ——
-/// manager 对"有哪些所"彻底无知（`ManagerActorArgs` 收 `Vec<ExchangeSetup>`）。
+/// manager 对"有哪些所"彻底无知（`ManagerArgs` 收 `Vec<ExchangeSetup>`）。
 pub struct ExchangeSetup {
     pub(crate) exchange: Exchange,
     pub(crate) client: Arc<dyn ExchangeClient>,
@@ -62,9 +55,14 @@ pub struct ExchangeSetup {
     /// 能力查询：该所适配层是否实现某种公共订阅（知识在各适配层的
     /// `supports_subscription`，随 setup 携带 —— 投产校验用，无集中能力表）
     pub(crate) supports: fn(&SubscriptionKind) -> bool,
-    /// 延迟执行的 actor 装配：spawn + 等 on_start 完成，返回类型擦除的操作接口。
-    /// 各 setup 的 future 由 on_start 并发 join —— spawn 瞬间返回，等待是并发的。
+    /// 延迟执行的节点装配：在生产者组下起节点并等它构造完成，返回它的句柄。
+    /// 各 setup 的 future 由 manager 构造时并发 join。
     pub(crate) spawn_actor: Box<dyn FnOnce(SpawnCtx) -> SpawnFuture + Send>,
+}
+
+/// 节点启动失败转成装配错误（带上根因链）
+fn start_failed(name: &str, e: anyhow::Error) -> ExchangeError {
+    ExchangeError::Other(format!("{name} failed to start: {e:#}"))
 }
 
 pub fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<ExchangeSetup, ExchangeError> {
@@ -81,24 +79,19 @@ pub fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<Excha
         supports: crate::exchange::binance::supports_subscription,
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
-                let actor = BinanceActor::spawn_link_with_mailbox(
-                    &ctx.manager,
-                    BinanceActorArgs {
+                BinanceNode::spawn(
+                    &ctx.producers,
+                    BinanceArgs {
                         credentials: access.credentials,
                         symbol_metas: ctx.symbol_metas,
                         rest_base_url: REST_BASE_URL.to_string(),
-                        market_pubsub: ctx.market_pubsub,
-                        account_pubsub: ctx.account_pubsub,
+                        market_bus: ctx.market_bus,
+                        account_bus: ctx.account_bus,
                         quote: access.quote,
                     },
-                    mailbox::unbounded(),
                 )
-                .await;
-                actor.wait_for_startup_result().await.map_err(|e| {
-                    ExchangeError::Other(format!("BinanceActor failed to start: {e}"))
-                })?;
-                let stop = ChildStop::new("BinanceActor", actor.clone());
-                Ok((Box::new(actor) as Box<dyn ExchangeActorOps>, stop))
+                .await
+                .map_err(|e| start_failed("BinanceNode", e))
             })
         }),
     })
@@ -115,27 +108,21 @@ pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup
         supports: crate::exchange::okx::supports_subscription,
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
-                let actor = OkxActor::spawn_link_with_mailbox(
-                    &ctx.manager,
-                    OkxActorArgs {
+                OkxNode::spawn(
+                    &ctx.producers,
+                    OkxArgs {
                         credentials: access.credentials.clone(),
                         // 只在有凭证时给 —— Greeks 轮询是账户私有能力，
-                        // "能不能轮询"由 Option 表达，不再靠 actor 内部另判 bool
+                        // "能不能轮询"由 Option 表达，不再靠节点内部另判 bool
                         client: access.credentials.is_some().then_some(client),
                         symbol_metas: ctx.symbol_metas,
-                        market_pubsub: ctx.market_pubsub,
-                        account_pubsub: ctx.account_pubsub,
+                        market_bus: ctx.market_bus,
+                        account_bus: ctx.account_bus,
                         quote: access.quote,
                     },
-                    mailbox::unbounded(),
                 )
-                .await;
-                actor
-                    .wait_for_startup_result()
-                    .await
-                    .map_err(|e| ExchangeError::Other(format!("OkxActor failed to start: {e}")))?;
-                let stop = ChildStop::new("OkxActor", actor.clone());
-                Ok((Box::new(actor) as Box<dyn ExchangeActorOps>, stop))
+                .await
+                .map_err(|e| start_failed("OkxNode", e))
             })
         }),
     })
@@ -157,21 +144,16 @@ pub async fn setup_hyperliquid(
         supports: crate::exchange::hyperliquid::supports_subscription,
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
-                let actor = HyperliquidActor::spawn_link_with_mailbox(
-                    &ctx.manager,
-                    HyperliquidActorArgs {
+                HyperliquidNode::spawn(
+                    &ctx.producers,
+                    HyperliquidArgs {
                         client,
-                        market_pubsub: ctx.market_pubsub,
-                        account_pubsub: ctx.account_pubsub,
+                        market_bus: ctx.market_bus,
+                        account_bus: ctx.account_bus,
                     },
-                    mailbox::unbounded(),
                 )
-                .await;
-                actor.wait_for_startup_result().await.map_err(|e| {
-                    ExchangeError::Other(format!("HyperliquidActor failed to start: {e}"))
-                })?;
-                let stop = ChildStop::new("HyperliquidActor", actor.clone());
-                Ok((Box::new(actor) as Box<dyn ExchangeActorOps>, stop))
+                .await
+                .map_err(|e| start_failed("HyperliquidNode", e))
             })
         }),
     })
@@ -195,27 +177,20 @@ pub async fn setup_ibkr(
         supports: crate::exchange::ibkr::supports_subscription,
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
-                let actor = IbkrActor::spawn_link_with_mailbox(
-                    &ctx.manager,
-                    IbkrActorArgs {
+                IbkrNode::spawn(
+                    &ctx.producers,
+                    IbkrArgs {
                         auth,
-                        market_pubsub: ctx.market_pubsub,
-                        account_pubsub: ctx.account_pubsub,
+                        market_bus: ctx.market_bus,
+                        account_bus: ctx.account_bus,
                         conids,
                         client,
                         snapshot,
                     },
-                    mailbox::unbounded(),
                 )
-                .await;
-                actor
-                    .wait_for_startup_result()
-                    .await
-                    .map_err(|e| ExchangeError::Other(format!("IbkrActor failed to start: {e}")))?;
-                let stop = ChildStop::new("IbkrActor", actor.clone());
-                Ok((Box::new(actor) as Box<dyn ExchangeActorOps>, stop))
+                .await
+                .map_err(|e| start_failed("IbkrNode", e))
             })
         }),
     })
 }
-
