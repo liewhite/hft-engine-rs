@@ -28,7 +28,6 @@ use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 /// HyperliquidPrivateWsActor 初始化参数
 pub struct HyperliquidPrivateWsActorArgs {
@@ -86,7 +85,7 @@ impl Actor for HyperliquidPrivateWsActor {
 
         // 2. 起 ws_loop（心跳、回 Pong、断线判定都归它）
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-        let (incoming_tx, mut incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
         tokio::spawn(ws_loop::run_ws_loop(
             read,
             write,
@@ -108,15 +107,9 @@ impl Actor for HyperliquidPrivateWsActor {
                 .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid send {sub_type}: {e}")))?;
         }
 
-        // 4. 等两条订阅都确认才算启动完成；期间收到的帧在后续数据之前重放给本 actor
-        let frames = ws_loop::await_subscriptions(&mut incoming_rx, &REQUIRED_SUBSCRIPTIONS, subscription_confirmed)
-            .await
-            .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid 私有订阅: {e}")))?;
-        actor_ref.attach_stream(
-            futures_util::stream::iter(frames.into_iter().map(Ok)).chain(ReceiverStream::new(incoming_rx)),
-            (),
-            (),
-        );
+        // 4. 等两条订阅都确认才算启动完成；期间收到的帧排在后续数据之前交给本 actor
+        let incoming = ws_loop::await_subscriptions(Exchange::Hyperliquid, incoming_rx, &REQUIRED_SUBSCRIPTIONS, subscription_confirmed).await?;
+        actor_ref.attach_stream(incoming, (), ());
 
         tracing::info!(
             wallet = %args.wallet_address,

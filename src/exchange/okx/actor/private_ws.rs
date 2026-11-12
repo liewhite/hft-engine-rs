@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// 登录响应等待超时 (秒)。超时 → 启动失败受控退出，避免 on_start 永久阻塞。
@@ -175,7 +174,7 @@ impl Actor for OkxPrivateWsActor {
 
         // 5. 起 ws_loop（心跳、回 Pong、断线判定都归它）
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-        let (incoming_tx, mut incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
         tokio::spawn(ws_loop::run_ws_loop(
             read,
             write,
@@ -184,15 +183,9 @@ impl Actor for OkxPrivateWsActor {
             ws_loop::WsKeepalive::okx(),
         ));
 
-        // 6. 等两个频道都确认才算启动完成；期间收到的帧在后续数据之前重放给本 actor
-        let frames = ws_loop::await_subscriptions(&mut incoming_rx, &REQUIRED_CHANNELS, subscription_confirmed)
-            .await
-            .map_err(|e| ExchangeError::WebSocketError(format!("OKX 私有订阅: {e}")))?;
-        actor_ref.attach_stream(
-            futures_util::stream::iter(frames.into_iter().map(Ok)).chain(ReceiverStream::new(incoming_rx)),
-            (),
-            (),
-        );
+        // 6. 等两个频道都确认才算启动完成；期间收到的帧排在后续数据之前交给本 actor
+        let incoming = ws_loop::await_subscriptions(Exchange::OKX, incoming_rx, &REQUIRED_CHANNELS, subscription_confirmed).await?;
+        actor_ref.attach_stream(incoming, (), ());
 
         tracing::info!("OkxPrivateWsActor started");
 

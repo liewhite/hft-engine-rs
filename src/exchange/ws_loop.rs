@@ -2,6 +2,7 @@
 //!
 //! 提供统一的 WebSocket 循环逻辑，消除各 actor 中的代码重复
 
+use crate::domain::{Exchange, ExchangeError};
 use crate::exchange::client::WsError;
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
@@ -136,6 +137,12 @@ pub async fn run_ws_loop(
 /// 私有订阅确认的等待上限：超时未集齐即启动失败（受控退出，不重试）
 pub const SUBSCRIPTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// [`await_subscriptions`] 交给 actor `attach_stream` 的入站流：确认期间收到的帧在前，之后的帧接续
+pub type ConfirmedStream = futures_util::stream::Chain<
+    futures_util::stream::Iter<std::vec::IntoIter<Result<String, WsError>>>,
+    tokio_stream::wrappers::ReceiverStream<Result<String, WsError>>,
+>;
+
 /// 启动阶段等私有订阅全部确认，供私有 WS actor 在 `on_start` 里调用 —— **请求发出去不等于
 /// 订阅生效**，没确认就算启动完成的话，引擎会在私有回报还没接上时开始下单、建持仓基线。
 ///
@@ -144,13 +151,14 @@ pub const SUBSCRIPTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 /// （确认回执，或该频道的数据到达 —— 后者是更硬的证据）返回 `Some(订阅名)`，与订阅无关
 /// 返回 `None`，服务端拒绝/报错返回 `Err`（启动失败）。
 ///
-/// 返回期间收到的全部文本帧（含回执），调用方须在 `incoming_rx` 之前原样重放给 actor ——
-/// 其中可能已有成交回报，丢了会让持仓少记一笔。
+/// 按值拿走 `incoming_rx`，返回「确认期间收到的全部帧 + 后续帧」拼好的流，直接交给
+/// `attach_stream`：确认期间可能已有成交回报，这样写就不会漏掉重放。
 pub async fn await_subscriptions(
-    incoming_rx: &mut mpsc::Receiver<Result<String, WsError>>,
+    exchange: Exchange,
+    mut incoming_rx: mpsc::Receiver<Result<String, WsError>>,
     required: &[&str],
     confirms: impl Fn(&str) -> Result<Option<String>, WsError>,
-) -> Result<Vec<String>, WsError> {
+) -> Result<ConfirmedStream, ExchangeError> {
     let mut pending: std::collections::HashSet<&str> = required.iter().copied().collect();
     let mut frames = Vec::new();
     let wait = async {
@@ -162,18 +170,20 @@ pub async fn await_subscriptions(
             };
             if let Some(sub) = confirms(&text)? {
                 if pending.remove(sub.as_str()) {
-                    tracing::info!(subscription = %sub, remaining = pending.len(), "私有订阅已确认生效");
+                    tracing::info!(%exchange, subscription = %sub, remaining = pending.len(), "私有订阅已确认生效");
                 }
             }
-            frames.push(text);
+            frames.push(Ok(text));
         }
         Ok(())
     };
     let outcome = tokio::time::timeout(SUBSCRIPTION_CONFIRM_TIMEOUT, wait).await;
     match outcome {
-        Ok(r) => r.map(|()| frames),
-        Err(_) => Err(WsError::Network(format!(
-            "私有订阅 {pending:?} 未在 {}s 内确认，私有回报不可信",
+        Ok(Ok(())) => Ok(futures_util::stream::iter(frames)
+            .chain(tokio_stream::wrappers::ReceiverStream::new(incoming_rx))),
+        Ok(Err(e)) => Err(ExchangeError::WebSocketError(format!("{exchange} 私有订阅: {e}"))),
+        Err(_) => Err(ExchangeError::Timeout(format!(
+            "{exchange} 私有订阅 {pending:?} 未在 {}s 内确认，私有回报不可信",
             SUBSCRIPTION_CONFIRM_TIMEOUT.as_secs()
         ))),
     }
@@ -344,32 +354,37 @@ mod keepalive_tests {
         }
     }
 
-    /// 回执与数据都算确认；集齐才返回，期间的帧（含数据）全部原样交回供重放，一帧不丢
+    async fn frames(stream: ConfirmedStream, n: usize) -> Vec<String> {
+        stream.take(n).map(|f| f.unwrap()).collect().await
+    }
+
+    /// 回执与数据都算确认；集齐才返回，返回的流先给确认期间的全部帧（含数据），再接后续帧，一帧不丢
     #[tokio::test]
     async fn subscriptions_confirmed_by_ack_or_data_and_frames_are_kept() {
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, rx) = mpsc::channel(8);
         for f in ["ack:orders", "noise", "data:fills", "late"] {
             tx.send(Ok(f.to_string())).await.unwrap();
         }
-        let frames = await_subscriptions(&mut rx, &["orders", "fills"], by_prefix).await.unwrap();
-        assert_eq!(frames, ["ack:orders", "noise", "data:fills"]);
-        assert_eq!(rx.recv().await.unwrap().unwrap(), "late", "集齐后的帧留给 actor");
+        let stream = await_subscriptions(Exchange::OKX, rx, &["orders", "fills"], by_prefix).await.unwrap();
+        assert_eq!(frames(stream, 4).await, ["ack:orders", "noise", "data:fills", "late"]);
     }
 
     /// 服务端拒绝、连接断开、超时未集齐都是启动失败
     #[tokio::test(start_paused = true)]
     async fn rejection_disconnect_and_timeout_fail_startup() {
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, rx) = mpsc::channel(8);
         tx.send(Ok("error:bad sub".to_string())).await.unwrap();
-        let e = await_subscriptions(&mut rx, &["orders"], by_prefix).await.unwrap_err();
+        let e = await_subscriptions(Exchange::OKX, rx, &["orders"], by_prefix).await.err().unwrap();
         assert!(e.to_string().contains("bad sub"), "{e}");
 
+        let (tx, rx) = mpsc::channel(8);
         tx.send(Ok("ack:orders".to_string())).await.unwrap();
-        let e = await_subscriptions(&mut rx, &["orders", "fills"], by_prefix).await.unwrap_err();
-        assert!(e.to_string().contains("fills"), "超时要点名缺哪条: {e}");
+        let e = await_subscriptions(Exchange::OKX, rx, &["orders", "fills"], by_prefix).await.err().unwrap();
+        assert!(matches!(e, ExchangeError::Timeout(_)) && e.to_string().contains("fills"), "超时要点名缺哪条: {e}");
 
+        let (tx, rx) = mpsc::channel::<Result<String, WsError>>(8);
         drop(tx);
-        assert!(await_subscriptions(&mut rx, &["orders"], by_prefix).await.is_err());
+        assert!(await_subscriptions(Exchange::OKX, rx, &["orders"], by_prefix).await.is_err());
     }
 
     /// 配置了 ping_text 的所（OKX/HL）按周期发送应用层 ping
