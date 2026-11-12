@@ -100,7 +100,12 @@ impl Sim {
     }
 
     fn bbo(&mut self, ex: Exchange) -> Vec<OutcomeEvent> {
-        let b = BBO { exchange: ex, symbol: SYM.into(), bid_price: 100.0, bid_qty: 100.0, ask_price: 100.1, ask_qty: 100.0, timestamp: 0 };
+        self.bbo_depth(ex, 100.0)
+    }
+
+    /// 第一档量为 `qty` 的盘口
+    fn bbo_depth(&mut self, ex: Exchange, qty: f64) -> Vec<OutcomeEvent> {
+        let b = BBO { exchange: ex, symbol: SYM.into(), bid_price: 100.0, bid_qty: qty, ask_price: 100.1, ask_qty: qty, timestamp: 0 };
         let now = self.now;
         self.ev(IncomeEvent::market(now, now, MarketData::BBO(b)))
     }
@@ -513,4 +518,30 @@ fn missing_bbo_on_unused_exchange_does_not_block_hedging() {
     let o = placed(&s.funding(BN, 0.8));
     assert_eq!(o.len(), 2, "{o:?}");
     assert!(o.iter().all(|x| x.exchange != OKX));
+}
+
+#[test]
+fn thin_book_keeps_resting_makers_instead_of_churning() {
+    // 挂上之后对手盘第一档变薄到不够一笔最小单：不撤已挂的单（价格没偏），也不新挂；
+    // 盘口恢复后照常
+    let mut s = Sim::new(0.0, 0.0);
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    assert_eq!(o.len(), 2);
+    for x in &o {
+        s.confirm(x, OrderStatus::Pending);
+    }
+    // 测试配置最短挂单时间为 0：去留只看价格容差
+    let out = s.bbo_depth(BN, 0.05);
+    assert!(cancels(&out).is_empty() && placed(&out).is_empty(), "{out:?}");
+    let out = s.bbo(BN);
+    assert!(cancels(&out).is_empty() && placed(&out).is_empty(), "{out:?}");
+}
+
+#[test]
+fn thin_book_does_not_place_new_makers() {
+    let mut s = Sim::new(0.0, 0.0);
+    s.bbo_depth(BN, 0.05);
+    s.funding(BN, 0.8);
+    assert!(placed(&s.funding(HL, 0.1)).is_empty());
 }

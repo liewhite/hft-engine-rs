@@ -56,7 +56,10 @@ struct Quote {
     exchange: Exchange,
     side: Side,
     price: f64,
-    qty: f64,
+    /// `None` = 这一刻定不出量（对手盘第一档太薄、或凑不齐两所都下得出的一手）：不新挂，
+    /// 但已挂着的同向单按价格容差照常保留。盘口厚度一跳一跳地变，否则会挂了马上撤、撤了又挂
+    /// （实盘 11-12 首轮 OKX INIT 一秒撤挂数次），白耗下单额度
+    qty: Option<f64>,
     reduce_only: bool,
 }
 
@@ -211,19 +214,20 @@ impl FundingArbStrategy {
             FundingAction::Close(pair) if self.pair_fresh(pair, now) => self.close_quotes(pair, &bbos, &positions, px),
             _ => Vec::new(),
         };
-        if let (Some(pair), false) = (action_pair(action), quotes.is_empty()) {
+        let sized = quotes.iter().any(|q| q.qty.is_some());
+        if let (Some(pair), true) = (action_pair(action), sized) {
             self.leg = Some(pair);
         }
         match action {
             // 平仓信号在、盘口也新鲜，却挂不出单（量不足最小单或凑不齐两所都下得出的一手）：
             // 仓位会一直拿着，要人看。每个所对只报一次
-            FundingAction::Close(pair) if quotes.is_empty() && self.pair_fresh(pair, now) => {
+            FundingAction::Close(pair) if !sized && self.pair_fresh(pair, now) => {
                 if self.close_stuck != Some(pair) {
                     tracing::warn!(symbol = %self.symbol(), ?pair, ?positions, "该平仓但挂不出平仓单（量太小或下单粒度凑不齐），需人工处理");
                     self.close_stuck = Some(pair);
                 }
             }
-            _ if !quotes.is_empty() => self.close_stuck = None,
+            _ if sized => self.close_stuck = None,
             _ => {}
         }
         self.maintain(sv, &quotes, now)
@@ -297,12 +301,10 @@ impl FundingArbStrategy {
     }
 
     /// 两所挂同样的量：按两所精度依次向下取整（各所步长都是 10 的幂次，取整后同为两所步长的整数倍）；
-    /// 任一所下不出则不挂。
+    /// 任一所下不出则量为 `None`（不新挂，见 [`Quote::qty`]）。
     fn pair_quotes(&self, pair: LegPair, bbos: &HashMap<Exchange, &BBO>, qty: f64, reduce_only: bool) -> Vec<Quote> {
         let qty = self.metas[&pair.buy].round_coin_size_down(self.metas[&pair.sell].round_coin_size_down(qty));
-        if !(self.tradable(pair.sell, qty) && self.tradable(pair.buy, qty)) {
-            return Vec::new();
-        }
+        let qty = (self.tradable(pair.sell, qty) && self.tradable(pair.buy, qty)).then_some(qty);
         [(pair.sell, Side::Short), (pair.buy, Side::Long)]
             .into_iter()
             .map(|(ex, side)| Quote { exchange: ex, side, price: self.maker_price(bbos[&ex], side), qty, reduce_only })
@@ -319,7 +321,7 @@ impl FundingArbStrategy {
     ) -> Vec<Quote> {
         let notional = self.cap_notional(pair, bbos);
         if notional < self.p.min_order_notional {
-            return Vec::new();
+            return self.pair_quotes(pair, bbos, 0.0, false);
         }
         let qty = notional / px;
         let pos = |ex: Exchange| positions.iter().find(|(e, _)| *e == ex).map_or(0.0, |(_, p)| *p);
@@ -338,7 +340,7 @@ impl FundingArbStrategy {
         let held = pos(pair.sell).max(0.0).min((-pos(pair.buy)).max(0.0));
         let qty = (self.cap_notional(pair, bbos) / px).min(held);
         if qty * px < self.p.min_order_notional {
-            return Vec::new();
+            return self.pair_quotes(pair, bbos, 0.0, true);
         }
         self.pair_quotes(pair, bbos, qty, true)
     }
@@ -373,8 +375,8 @@ impl FundingArbStrategy {
             let want = quotes.iter().find(|q| q.exchange == ex);
             let pendings: Vec<&PendingOrder> = sv.pending_orders().filter(|p| p.order.exchange == ex).collect();
             if pendings.is_empty() {
-                if let Some(q) = want {
-                    out.push(self.place(q));
+                if let Some((q, qty)) = want.and_then(|q| q.qty.map(|n| (q, n))) {
+                    out.push(self.place(q, qty));
                 }
                 continue;
             }
@@ -401,7 +403,7 @@ impl FundingArbStrategy {
             && (young || (price - q.price).abs() / q.price <= self.p.order_distance * self.p.requote_ratio)
     }
 
-    fn place(&self, q: &Quote) -> OutcomeEvent {
+    fn place(&self, q: &Quote, qty: f64) -> OutcomeEvent {
         OutcomeEvent::PlaceOrders {
             orders: vec![Order {
                 id: String::new(),
@@ -409,13 +411,13 @@ impl FundingArbStrategy {
                 symbol: self.symbol().clone(),
                 side: q.side,
                 order_type: OrderType::Limit { price: q.price, tif: TimeInForce::PostOnly },
-                quantity: q.qty,
+                quantity: qty,
                 reduce_only: q.reduce_only,
                 client_order_id: String::new(),
             }],
             comment: format!(
                 "funding_arb maker | {} {:?} qty={:.6} px={} reduce_only={}",
-                q.exchange, q.side, q.qty, q.price, q.reduce_only
+                q.exchange, q.side, qty, q.price, q.reduce_only
             ),
         }
     }
