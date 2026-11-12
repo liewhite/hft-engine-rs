@@ -14,16 +14,16 @@
 
 use super::assembly::{ExchangeSetup, SpawnCtx};
 use super::{
-    AccountBus, IncomeProcessor, MarketBus, Metrics, MetricsArgs, OrderGateway, OutcomeBus,
+    AccountBus, AccountOutcome, IncomeProcessor, MarketBus, Metrics, MetricsArgs, OrderGateway, OutcomeBus,
     OutcomeProcessor, PaperCounter, PaperCounterArgs, PositionLedger, PositionLedgerArgs,
     PositionLedgerHandle, Clock, DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
     DEFAULT_POSITION_POLL_INTERVAL_MS, DEFAULT_REPORT_INTERVAL_MS,
 };
 use crate::domain::{now_ms, AccountId, Exchange, ExchangeError, Position, Symbol, SymbolMeta};
 use crate::exchange::{AccountClient, ExchangeClient, ExchangeHandle, SubscriptionKind};
-use crate::messaging::{CustomEvent, MarketData, MarketEvent};
+use crate::messaging::{AccountEvent, CustomEvent, MarketData, MarketEvent};
 use crate::strategy::Strategy;
-use crate::tasks::{Addr, Group, Inbox, Scope, Task};
+use crate::tasks::{Addr, BusTap, Group, Inbox, Scope, Task};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -100,9 +100,10 @@ pub struct ManagerHandle {
     addr: Addr<ManagerMsg>,
     /// manager 的消费者组：外部观察者挂在这里（见 [`Self::observers`]）
     consumers: Group,
+    /// 完整的行情总线：只供 [`Self::publish_custom_event`] 发布；对外只给只订阅视图
     market_bus: MarketBus,
-    account_bus: AccountBus,
-    outcome_bus: OutcomeBus,
+    account_bus: BusTap<AccountEvent>,
+    outcome_bus: BusTap<AccountOutcome>,
     /// 引擎级合约目录：构造时预加载一次、此后不变，与编排共享同一份
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     position_ledger: PositionLedgerHandle,
@@ -201,22 +202,29 @@ impl ManagerHandle {
     /// 要收事件的观察者在自己的构造闭包里 `inbox.subscribe(handle.market_bus(), ..)`：
     /// 收件箱只能从树上的 `Scope` 建，能订阅的一定是有人监督的组件。过滤器是 `fn` 指针，
     /// 只看事件本身，不通过的事件连 clone 都省掉、订阅者也不会被唤醒。
+    ///
+    /// 挂在这里就得按「出错即整机停机」来写：可容忍的失败（偶发的 REST 超时、某一轮取不到数）
+    /// 应由组件在构造与运行内部自己消化（记日志、返回 `Ok`），不要抛 `Err` 指望上层不当回事
+    /// —— 任何一层上冒的 `Err` 都会停掉整台引擎。
     pub fn observers(&self) -> &Group {
         &self.consumers
     }
 
-    /// 公共行情总线（含 Clock 与自定义事件）
-    pub fn market_bus(&self) -> &MarketBus {
-        &self.market_bus
+    // 三条总线对外只给只订阅视图：观察者往引擎总线里发事件（伪造行情、成交或策略信号）在
+    // 类型上不可表达。外部唯一的入向入口是 [`Self::publish_custom_event`]。
+
+    /// 公共行情总线（含 Clock 与自定义事件），只订阅
+    pub fn market_bus(&self) -> &BusTap<MarketEvent> {
+        self.market_bus.as_ref()
     }
 
-    /// 账户私有事件总线（实盘 + 全部模拟账户，按事件自带的 `account` 字段区分）
-    pub fn account_bus(&self) -> &AccountBus {
+    /// 账户私有事件总线（实盘 + 全部模拟账户，按事件自带的 `account` 字段区分），只订阅
+    pub fn account_bus(&self) -> &BusTap<AccountEvent> {
         &self.account_bus
     }
 
-    /// 出向总线：策略信号（带账户归属）
-    pub fn outcome_bus(&self) -> &OutcomeBus {
+    /// 出向总线：策略信号（带账户归属），只订阅
+    pub fn outcome_bus(&self) -> &BusTap<AccountOutcome> {
         &self.outcome_bus
     }
 }
@@ -462,8 +470,8 @@ impl Manager {
             addr,
             consumers,
             market_bus,
-            account_bus,
-            outcome_bus: outcome_bus.clone(),
+            account_bus: account_bus.tap(),
+            outcome_bus: outcome_bus.tap(),
             symbol_metas: symbol_metas.clone(),
             position_ledger: position_ledger.clone(),
         };

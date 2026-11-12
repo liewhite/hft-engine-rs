@@ -10,7 +10,7 @@ pub mod inbox;
 pub mod periodic;
 pub mod tree;
 
-pub use bus::{Bus, Subscription};
+pub use bus::{Bus, BusTap, Subscription};
 pub use inbox::{Addr, Gone, Inbox};
 pub use periodic::Periodic;
 pub use tree::{ChildHandle, FailHandle, Group, GroupClosed, Root, Scope, Task};

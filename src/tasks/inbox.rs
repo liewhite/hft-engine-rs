@@ -19,7 +19,7 @@
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Bus, Scope, Subscription};
+use super::{BusTap, Scope, Subscription};
 
 pub(super) fn new<M>(scope: Scope) -> (Addr<M>, Inbox<M>) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -61,10 +61,11 @@ impl<M: Send + 'static> Inbox<M> {
     }
 
     /// 订阅一条总线：`filter` 通过的事件经 `wrap` 包成本收件箱的消息投进来。
-    /// 订阅随收件箱关闭（停机）或销毁而退订。
+    /// 订阅随收件箱关闭（停机）或销毁而退订。`bus` 传 [`super::Bus`] 或它的只订阅视图
+    /// [`BusTap`] 都行。
     pub fn subscribe<E: Clone + Send + Sync + 'static>(
         &mut self,
-        bus: &Bus<E>,
+        bus: &impl AsRef<BusTap<E>>,
         filter: fn(&E) -> bool,
         wrap: fn(E) -> M,
     ) {
@@ -73,7 +74,7 @@ impl<M: Send + 'static> Inbox<M> {
             .clone()
             .expect("收件箱已关闭（节点在停机），不能再订阅");
         let name = self.scope.name().to_string();
-        self.subscriptions.push(bus.subscribe(name, filter, move |e| {
+        self.subscriptions.push(bus.as_ref().subscribe(name, filter, move |e| {
             tx.send(wrap(e)).map_err(|_| super::Gone)
         }));
     }
