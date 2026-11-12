@@ -55,8 +55,7 @@ pub enum PlaceError {
     /// 立刻成交、限频……），或请求根本没发出去（本地组装、签名失败）。
     #[error("rejected: {0}")]
     Rejected(RejectReason),
-    /// 结果不确定：超时、5xx、网络断开、回复解析不了、交易所自己说"状态未知"的错误码、
-    /// HL 市价单只成交一部分……
+    /// 结果不确定：超时、5xx、网络断开、回复解析不了、交易所自己说"状态未知"的错误码……
     #[error("outcome unknown: {0}")]
     Indeterminate(String),
 }

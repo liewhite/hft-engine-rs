@@ -479,13 +479,11 @@ fn standard_account_info(state: &ClearinghouseState) -> Result<AccountInfo, Exch
 ///
 /// - 顶层 `status != "ok"`（如签名/钱包不存在/nonce 不对）：整个请求没被受理 → 拒绝；
 /// - 单笔 `{"error": ..}`（只挂 maker 会吃单、保证金不足、价格/数量不合规、IOC 没有对手盘）→ 拒绝；
-/// - `resting` / `filled` → 成功。例外：市价单是「对手价 ± 让幅的 IOC」，深度不够时只成交
-///   一部分、余量撤销，HL 仍回 `filled` —— 按用户定的规则算错误（不确定）；
-///   限价 IOC 回 `filled` 只表示有成交，余量由调用方按成交回报处理，算成功；
+/// - `resting` / `filled` → 成功。`filled` 只表示有成交、不代表全部成交：市价单（对手价 ± 让幅
+///   的 IOC）深度不够时只成交一部分、余量撤销，HL 仍回 `filled`。用户定（#692）：这算成功 ——
+///   成交多少、余量已撤都会经回报流告诉策略，策略按持仓差再补；
 /// - 其余（结构对不上、没有 statuses、未知状态）→ 不确定。
-///
-/// `market_qty`：市价单的委托量；限价单传 `None`。
-fn parse_place_reply(raw: serde_json::Value, market_qty: Option<f64>) -> Result<OrderId, PlaceError> {
+fn parse_place_reply(raw: serde_json::Value) -> Result<OrderId, PlaceError> {
     let unparseable = |what: &str| PlaceError::indeterminate(format!("HL 下单回复{what}: {raw}"));
     let response: OrderResponse =
         serde_json::from_value(raw.clone()).map_err(|_| unparseable("解析不了"))?;
@@ -503,24 +501,7 @@ fn parse_place_reply(raw: serde_json::Value, market_qty: Option<f64>) -> Result<
     };
     match first {
         OrderStatus::Resting(r) => Ok(r.resting.oid.to_string()),
-        OrderStatus::Filled(f) => {
-            let Some(requested) = market_qty else {
-                return Ok(f.filled.oid.to_string());
-            };
-            let total: f64 = f
-                .filled
-                .total_sz
-                .parse()
-                .map_err(|_| unparseable("totalSz 非法"))?;
-            // 数量已按 szDecimals 取整，差一个最小步长以上才算没成交完；用相对容差吸收浮点尾巴
-            if total + requested * 1e-9 < requested {
-                return Err(PlaceError::indeterminate(format!(
-                    "HL 市价单部分成交 {total}/{requested}（oid={}），余量已撤",
-                    f.filled.oid
-                )));
-            }
-            Ok(f.filled.oid.to_string())
-        }
+        OrderStatus::Filled(f) => Ok(f.filled.oid.to_string()),
         OrderStatus::Error(e) => Err(PlaceError::rejected(format!("HL order error: {}", e.error))),
     }
 }
@@ -587,24 +568,16 @@ mod place_reply_tests {
             {"filled":{"totalSz":total,"avgPx":"100","oid":oid}}]}}})
     }
 
-    /// 市价单只成交一部分 → 不确定（用户定的规则）；全部成交（含浮点尾巴）→ 成功
+    /// 只成交一部分（市价单深度不够、限价 IOC）也是成功：余量已撤，回报流会告诉策略（#692 用户定）
     #[test]
-    fn market_order_partial_fill_is_indeterminate() {
-        let e = parse_place_reply(filled("0.4", 7), Some(1.0)).unwrap_err();
-        assert!(matches!(&e, PlaceError::Indeterminate(m) if m.contains("0.4/1")), "{e:?}");
-        assert_eq!(parse_place_reply(filled("0.3", 8), Some(0.1 + 0.2)).unwrap(), "8");
-    }
-
-    /// 限价 IOC 部分成交只是「有成交」，余量按回报处理
-    #[test]
-    fn limit_fill_is_success() {
-        assert_eq!(parse_place_reply(filled("0.4", 9), None).unwrap(), "9");
+    fn partial_fill_is_success() {
+        assert_eq!(parse_place_reply(filled("0.4", 9)).unwrap(), "9");
     }
 
     #[test]
     fn resting_is_success() {
         let raw = serde_json::json!({"status":"ok","response":{"type":"order","data":{"statuses":[{"resting":{"oid":42}}]}}});
-        assert_eq!(parse_place_reply(raw, None).unwrap(), "42");
+        assert_eq!(parse_place_reply(raw).unwrap(), "42");
     }
 
     /// 单笔 error 与顶层 err 都是 HL 明确不接
@@ -617,7 +590,7 @@ mod place_reply_tests {
                 {"error":"Insufficient margin to place order. asset=1"}]}}}),
             serde_json::json!({"status":"err","response":"User or API Wallet 0x0 does not exist."}),
         ] {
-            assert!(matches!(parse_place_reply(raw.clone(), None), Err(PlaceError::Rejected(_))), "{raw}");
+            assert!(matches!(parse_place_reply(raw.clone()), Err(PlaceError::Rejected(_))), "{raw}");
         }
     }
 
@@ -626,7 +599,7 @@ mod place_reply_tests {
         let raw = serde_json::json!({"status":"ok","response":{"type":"order","data":{"statuses":[
             {"error":"Reduce only order would increase position. asset=1"}]}}});
         assert_eq!(
-            parse_place_reply(raw, None),
+            parse_place_reply(raw),
             Err(PlaceError::Rejected(crate::domain::RejectReason::ReduceOnlyClosed))
         );
     }
@@ -641,7 +614,7 @@ mod place_reply_tests {
             serde_json::json!({"status":"ok"}),
             serde_json::json!("garbage"),
         ] {
-            assert!(matches!(parse_place_reply(raw.clone(), None), Err(PlaceError::Indeterminate(_))), "{raw}");
+            assert!(matches!(parse_place_reply(raw.clone()), Err(PlaceError::Indeterminate(_))), "{raw}");
         }
     }
 }
@@ -871,8 +844,7 @@ impl AccountClient for HyperliquidClient {
         let submitter = &self.account().map_err(PlaceError::unsent)?.submitter;
         let intent = self.order_intent(order).await.map_err(PlaceError::unsent)?;
         let raw = submitter.place(&intent).await?;
-        let market_qty = matches!(order.order_type, OrderType::Market).then_some(order.quantity);
-        parse_place_reply(raw, market_qty)
+        parse_place_reply(raw)
     }
 
     /// 净值与持仓总价值，口径随账户模式（启动时查定）：
