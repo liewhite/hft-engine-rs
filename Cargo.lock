@@ -1423,12 +1423,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "downcast-rs"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1902,8 +1896,6 @@ dependencies = [
  "hex",
  "hmac",
  "indexmap 2.12.1",
- "kameo",
- "kameo_actors",
  "log",
  "md-5",
  "native-tls",
@@ -2309,46 +2301,6 @@ dependencies = [
  "once_cell",
  "serdect",
  "sha2",
-]
-
-[[package]]
-name = "kameo"
-version = "0.21.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aea00bfc3709c5b95be7c9a93289d0c3ff42cf9a3b77d532387242992705bca7"
-dependencies = [
- "downcast-rs",
- "dyn-clone",
- "futures",
- "kameo_macros",
- "serde",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "kameo_actors"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "535f5db40b46b28085ddf4ba0391818e1b388548bf454e6d27a3b5cc805961fa"
-dependencies = [
- "futures",
- "glob",
- "kameo",
- "thiserror 2.0.17",
- "tokio",
-]
-
-[[package]]
-name = "kameo_macros"
-version = "0.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f200083477f64b12545688f8e0f562c31c1462827e163cb14dc2ed6c89eb888"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.113",
 ]
 
 [[package]]
@@ -4125,7 +4077,6 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
- "tracing",
  "windows-sys 0.61.2",
 ]
 

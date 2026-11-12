@@ -7,7 +7,6 @@ edition = "2021"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-tokio-stream = { version = "0.1", features = ["time"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 
@@ -41,10 +40,6 @@ anyhow = "1"
 
 # Async trait
 async-trait = "0.1"
-
-# Actor framework
-kameo = "0.21.1"
-kameo_actors = "0.6.1"
 
 # Logging
 tracing = "0.1"
@@ -102,6 +97,8 @@ path = "src/bin/gamma_scalp.rs"
 log = "0.4"
 # 测试用暂停时钟（tokio::test(start_paused)）——keepalive/空闲检测测试无需真实等待
 tokio = { version = "1", features = ["full", "test-util"] }
+# 测试里把 mpsc 接收端包成 Stream 喂给 WS 读循环
+tokio-stream = "0.1"
 
 [[bin]]
 name = "funding_arb"
