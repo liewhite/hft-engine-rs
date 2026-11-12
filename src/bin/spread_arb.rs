@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{
-    init_tracing, load_config, wait_for_shutdown, AddStrategies, GetAllSymbolMetas, ManagerActor,
+    init_tracing, load_config, run_engine, AddStrategies, GetAllSymbolMetas,
     ManagerActorArgs, setup_binance, setup_hyperliquid, setup_okx, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
@@ -16,8 +16,6 @@ use hft_engine_rs::exchange::ExchangeAccess;
 use hft_engine_rs::exchange::hyperliquid::HyperliquidAccess;
 use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::strategy::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
-use kameo::actor::Spawn;
-use kameo::mailbox;
 use md5::{Digest, Md5};
 use serde::Deserialize;
 
@@ -138,81 +136,73 @@ async fn main() -> anyhow::Result<()> {
         exchanges.push(setup_hyperliquid(access).await?);
     }
 
-    let manager = ManagerActor::spawn_with_mailbox(
-        ManagerActorArgs {
-            exchanges,
-            // 实盘策略；本 bin 不跑模拟账户，柜台配置用默认值即可
-            paper: Default::default(),
-        },
-        mailbox::unbounded(),
-    );
+    let args = ManagerActorArgs {
+        exchanges,
+        // 实盘策略；本 bin 不跑模拟账户，柜台配置用默认值即可
+        paper: Default::default(),
+    };
+    // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
+    run_engine(args, |manager| async move {
+        // 各交易所的 symbol metas（只含配了凭证的所——这就是"参与交易所"的单一数据源）
+        let metas: HashMap<Exchange, Vec<SymbolMeta>> = manager.ask(GetAllSymbolMetas).send().await?;
+        for (exchange, exchange_metas) in &metas {
+            tracing::info!(%exchange, listed = exchange_metas.len(), "Exchange symbols listed");
+        }
 
-    // 等待 Manager 启动完成；启动失败 → 带真实 ExchangeError 上下文受控退出（非零退出码）
-    manager
-        .wait_for_startup_result()
-        .await
-        .map_err(|e| anyhow::anyhow!("Manager startup failed: {e}"))?;
-
-    // 各交易所的 symbol metas（只含配了凭证的所——这就是"参与交易所"的单一数据源）
-    let metas: HashMap<Exchange, Vec<SymbolMeta>> = manager.ask(GetAllSymbolMetas).send().await?;
-    for (exchange, exchange_metas) in &metas {
-        tracing::info!(%exchange, listed = exchange_metas.len(), "Exchange symbols listed");
-    }
-
-    let universe = build_symbol_universe(&metas, &config.strategy.symbol_bucket);
-    tracing::info!(
-        buckets = config.strategy.symbol_bucket.buckets,
-        index = config.strategy.symbol_bucket.index,
-        in_bucket = universe.len(),
-        "Symbols selected into this bucket"
-    );
-
-    // 只保留至少在两个交易所上市的 symbol——单所 symbol 无跨所价差可套，
-    // 建了也永远不会产生信号，只是白占订阅与 executor。
-    let (tradable, single_exchange): (Vec<_>, Vec<_>) = universe
-        .into_iter()
-        .partition(|(_, exchanges)| exchanges.len() >= MIN_EXCHANGES_PER_SYMBOL);
-
-    if !single_exchange.is_empty() {
+        let universe = build_symbol_universe(&metas, &config.strategy.symbol_bucket);
         tracing::info!(
-            dropped = single_exchange.len(),
-            "Symbols dropped: listed on fewer than 2 exchanges"
+            buckets = config.strategy.symbol_bucket.buckets,
+            index = config.strategy.symbol_bucket.index,
+            in_bucket = universe.len(),
+            "Symbols selected into this bucket"
         );
-    }
 
-    if tradable.is_empty() {
-        anyhow::bail!(
-            "No tradable symbol: 本桶内没有任何 symbol 同时在 >= {} 个交易所上市",
-            MIN_EXCHANGES_PER_SYMBOL
-        );
-    }
+        // 只保留至少在两个交易所上市的 symbol——单所 symbol 无跨所价差可套，
+        // 建了也永远不会产生信号，只是白占订阅与 executor。
+        let (tradable, single_exchange): (Vec<_>, Vec<_>) = universe
+            .into_iter()
+            .partition(|(_, exchanges)| exchanges.len() >= MIN_EXCHANGES_PER_SYMBOL);
 
-    let strategies: Vec<Box<dyn hft_engine_rs::strategy::Strategy>> = tradable
-        .into_iter()
-        .map(|(symbol, exchanges)| {
-            tracing::debug!(%symbol, ?exchanges, "Creating strategy");
-            Box::new(SpreadArbStrategy::new(
-                config.strategy.spread_arb.clone(),
-                exchanges,
-                symbol,
-            )) as Box<dyn hft_engine_rs::strategy::Strategy>
-        })
-        .collect();
+        if !single_exchange.is_empty() {
+            tracing::info!(
+                dropped = single_exchange.len(),
+                "Symbols dropped: listed on fewer than 2 exchanges"
+            );
+        }
 
-    let strategy_count = strategies.len();
+        if tradable.is_empty() {
+            anyhow::bail!(
+                "No tradable symbol: 本桶内没有任何 symbol 同时在 >= {} 个交易所上市",
+                MIN_EXCHANGES_PER_SYMBOL
+            );
+        }
 
-    manager
-        .ask(AddStrategies(
-            strategies.into_iter().map(StrategySpec::live).collect(),
-        ))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
+        let strategies: Vec<Box<dyn hft_engine_rs::strategy::Strategy>> = tradable
+            .into_iter()
+            .map(|(symbol, exchanges)| {
+                tracing::debug!(%symbol, ?exchanges, "Creating strategy");
+                Box::new(SpreadArbStrategy::new(
+                    config.strategy.spread_arb.clone(),
+                    exchanges,
+                    symbol,
+                )) as Box<dyn hft_engine_rs::strategy::Strategy>
+            })
+            .collect();
 
-    tracing::info!(count = strategy_count, "Strategies batch added");
+        let strategy_count = strategies.len();
 
-    // 停机信号 → Ok；manager 意外终止 → Err，进程带着原因非零退出
-    wait_for_shutdown(manager).await
+        manager
+            .ask(AddStrategies(
+                strategies.into_iter().map(StrategySpec::live).collect(),
+            ))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Actor error: {}", e))?;
+
+        tracing::info!(count = strategy_count, "Strategies batch added");
+        Ok(())
+    })
+    .await
 }
 
 #[cfg(test)]

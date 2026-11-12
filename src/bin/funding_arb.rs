@@ -26,7 +26,7 @@
 use hft_engine_rs::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::live::{GetAllSymbolMetas, PublishCustomEvent};
 use hft_engine_rs::engine::{
-    init_tracing, load_config, setup_binance, setup_hyperliquid, setup_okx, wait_for_shutdown, AddStrategies,
+    init_tracing, load_config, setup_binance, setup_hyperliquid, setup_okx, run_engine, AddStrategies,
     ExchangeSetup, ManagerActor, ManagerActorArgs, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
@@ -35,8 +35,7 @@ use hft_engine_rs::exchange::okx::{OkxClient, OkxCredentials};
 use hft_engine_rs::exchange::{ExchangeAccess, SettledFundingSource};
 use hft_engine_rs::messaging::CustomEvent;
 use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, SettledFundingWindow, Strategy, FUNDING_WINDOW_MS};
-use kameo::actor::{ActorRef, Spawn};
-use kameo::mailbox;
+use kameo::actor::ActorRef;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,62 +98,57 @@ async fn main() -> anyhow::Result<()> {
     let exchanges: Vec<Exchange> = funding_sources.iter().map(|s| s.exchange()).collect();
     tracing::info!(?exchanges, pairs = config.strategy.pairs.len(), "funding_arb starting");
 
-    let manager = ManagerActor::spawn_with_mailbox(
-        ManagerActorArgs {
-            exchanges: setups,
-            // 只跑实盘（用户定：不做模拟盘），柜台配置用默认值
-            paper: Default::default(),
-        },
-        mailbox::unbounded(),
-    );
-    manager
-        .wait_for_startup_result()
-        .await
-        .map_err(|e| anyhow::anyhow!("Manager startup failed: {e}"))?;
-
-    // 每个币在哪几所做：该币在各所品种目录里出现的所（按配置的所顺序），不足两所拒绝启动
-    let metas = manager
-        .ask(GetAllSymbolMetas)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("GetAllSymbolMetas failed: {e}"))?;
-    let listed: HashMap<(Exchange, Symbol), SymbolMeta> = metas
-        .into_iter()
-        .flat_map(|(ex, ms)| ms.into_iter().map(move |m| ((ex, m.symbol.clone()), m)))
-        .collect();
-    let mut specs = Vec::new();
-    let mut coverage: Vec<(Symbol, Vec<Exchange>)> = Vec::new();
-    let mut lonely: Vec<String> = Vec::new();
-    for p in config.strategy.params() {
-        let on: Vec<SymbolMeta> =
-            exchanges.iter().filter_map(|&ex| listed.get(&(ex, p.symbol.clone())).cloned()).collect();
-        let on_ex: Vec<Exchange> = on.iter().map(|m| m.exchange).collect();
-        tracing::info!(symbol = %p.symbol, exchanges = ?on_ex, "币种覆盖");
-        if on.len() < 2 {
-            lonely.push(format!("{}（只在 {on_ex:?}）", p.symbol));
-            continue;
+    let args = ManagerActorArgs {
+        exchanges: setups,
+        // 只跑实盘（用户定：不做模拟盘），柜台配置用默认值
+        paper: Default::default(),
+    };
+    // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
+    run_engine(args, |manager| async move {
+        // 每个币在哪几所做：该币在各所品种目录里出现的所（按配置的所顺序），不足两所拒绝启动
+        let metas = manager
+            .ask(GetAllSymbolMetas)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("GetAllSymbolMetas failed: {e}"))?;
+        let listed: HashMap<(Exchange, Symbol), SymbolMeta> = metas
+            .into_iter()
+            .flat_map(|(ex, ms)| ms.into_iter().map(move |m| ((ex, m.symbol.clone()), m)))
+            .collect();
+        let mut specs = Vec::new();
+        let mut coverage: Vec<(Symbol, Vec<Exchange>)> = Vec::new();
+        let mut lonely: Vec<String> = Vec::new();
+        for p in config.strategy.params() {
+            let on: Vec<SymbolMeta> =
+                exchanges.iter().filter_map(|&ex| listed.get(&(ex, p.symbol.clone())).cloned()).collect();
+            let on_ex: Vec<Exchange> = on.iter().map(|m| m.exchange).collect();
+            tracing::info!(symbol = %p.symbol, exchanges = ?on_ex, "币种覆盖");
+            if on.len() < 2 {
+                lonely.push(format!("{}（只在 {on_ex:?}）", p.symbol));
+                continue;
+            }
+            coverage.push((p.symbol.clone(), on_ex));
+            specs.push(StrategySpec::live(Box::new(FundingArbStrategy::new(p, on)) as Box<dyn Strategy>));
         }
-        coverage.push((p.symbol.clone(), on_ex));
-        specs.push(StrategySpec::live(Box::new(FundingArbStrategy::new(p, on)) as Box<dyn Strategy>));
-    }
-    anyhow::ensure!(lonely.is_empty(), "这些币上市的所不足两个，没法对冲：{}", lonely.join("、"));
-    manager
-        .ask(AddStrategies(specs))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("AddStrategies failed: {e}"))?;
-    tracing::info!(count = coverage.len(), "strategies added");
+        anyhow::ensure!(lonely.is_empty(), "这些币上市的所不足两个，没法对冲：{}", lonely.join("、"));
+        manager
+            .ask(AddStrategies(specs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("AddStrategies failed: {e}"))?;
+        tracing::info!(count = coverage.len(), "strategies added");
 
-    let poll_manager = manager.clone();
-    let interval = Duration::from_secs(config.funding_poll_secs);
-    tokio::spawn(async move {
-        let mut failures: HashMap<(Symbol, Exchange), u32> = HashMap::new();
-        loop {
-            poll_funding(&funding_sources, &coverage, &poll_manager, interval, &mut failures).await;
-        }
-    });
-
-    wait_for_shutdown(manager).await
+        let poll_manager = manager.clone();
+        let interval = Duration::from_secs(config.funding_poll_secs);
+        tokio::spawn(async move {
+            let mut failures: HashMap<(Symbol, Exchange), u32> = HashMap::new();
+            loop {
+                poll_funding(&funding_sources, &coverage, &poll_manager, interval, &mut failures).await;
+            }
+        });
+        Ok(())
+    })
+    .await
 }
 
 /// 拉一轮各币所在各所过去 24h 已结算费率并投递，请求均匀摊在 `interval` 里（HL info 按 IP 每分钟

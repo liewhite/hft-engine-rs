@@ -28,7 +28,7 @@
 use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::engine::{
-    init_tracing, load_config, spawn_supervised, wait_for_shutdown, Decision, ManagerActor,
+    init_tracing, load_config, run_engine, spawn_supervised, Decision,
     ManagerActorArgs, setup_binance, setup_hyperliquid, setup_okx,
     PromotionPolicy, SubscribeAccount, SubscribeMarket, SupervisorActor, SupervisorArgs, SymbolPerformance,
 };
@@ -39,8 +39,6 @@ use hft_engine_rs::exchange::{ExchangeAccess, ExchangeClient, SubscriptionKind};
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
-use kameo::actor::Spawn;
-use kameo::mailbox;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -248,58 +246,52 @@ async fn main() -> anyhow::Result<()> {
         exchanges.push(setup_hyperliquid(access).await?);
     }
 
-    let manager = ManagerActor::spawn_with_mailbox(
-        ManagerActorArgs {
-            exchanges,
-            paper: config.paper,
-        },
-        mailbox::unbounded(),
-    );
-    manager
-        .wait_for_startup_result()
+    let args = ManagerActorArgs {
+        exchanges,
+        paper: config.paper,
+    };
+    // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
+    run_engine(args, |manager| async move {
+        // 模拟与实盘共用同一个工厂：同一逻辑、同一参数，否则模拟结论无法外推到实盘
+        let offset_bp = config.offset_bp;
+        let order_notional = config.order_notional;
+        let strategy_factory = Box::new(move |symbol: &Symbol| {
+            Box::new(DipMaker {
+                symbol: symbol.clone(),
+                offset_bp,
+                order_notional,
+            }) as Box<dyn Strategy>
+        });
+
+        // 挂进引擎的监督树：它出错要整机退出，而不是留下一个没人看着的第二个根
+        let supervisor = spawn_supervised::<SupervisorActor>(
+            &manager,
+            SupervisorArgs {
+                symbols: symbols.clone(),
+                exchange: EXCHANGE,
+                strategy_factory,
+                policy: Box::new(MyPolicy { _reserved: () }),
+                manager: manager.clone(),
+            },
+        )
         .await
-        .context("ManagerActor 启动失败")?;
+        .context("SupervisorActor 启动失败")?;
 
-    // 模拟与实盘共用同一个工厂：同一逻辑、同一参数，否则模拟结论无法外推到实盘
-    let offset_bp = config.offset_bp;
-    let order_notional = config.order_notional;
-    let strategy_factory = Box::new(move |symbol: &Symbol| {
-        Box::new(DipMaker {
-            symbol: symbol.clone(),
-            offset_bp,
-            order_notional,
-        }) as Box<dyn Strategy>
-    });
-
-    // 挂进引擎的监督树：它出错要整机退出，而不是留下一个没人看着的第二个根
-    let supervisor = spawn_supervised::<SupervisorActor>(
-        &manager,
-        SupervisorArgs {
-            symbols: symbols.clone(),
-            exchange: EXCHANGE,
-            strategy_factory,
-            policy: Box::new(MyPolicy { _reserved: () }),
-            manager: manager.clone(),
-        },
-    )
+        // 行情总线给 Clock 节拍；账户总线一次订阅覆盖实盘与全部模拟账户的成交
+        // （账户由事件自带标签区分，见 AccountEvent）
+        manager
+            .tell(SubscribeMarket::only(supervisor.clone(), |e| {
+                matches!(e.data, MarketData::Clock)
+            }))
+            .send()
+            .await
+            .context("订阅行情总线失败")?;
+        manager
+            .tell(SubscribeAccount::all(supervisor))
+            .send()
+            .await
+            .context("订阅账户总线失败")?;
+        Ok(())
+    })
     .await
-    .context("SupervisorActor 启动失败")?;
-
-    // 行情总线给 Clock 节拍；账户总线一次订阅覆盖实盘与全部模拟账户的成交
-    // （账户由事件自带标签区分，见 AccountEvent）
-    manager
-        .tell(SubscribeMarket::only(supervisor.clone(), |e| {
-            matches!(e.data, MarketData::Clock)
-        }))
-        .send()
-        .await
-        .context("订阅行情总线失败")?;
-    manager
-        .tell(SubscribeAccount::all(supervisor))
-        .send()
-        .await
-        .context("订阅账户总线失败")?;
-
-    // 停机信号 → Ok；manager 意外终止 → Err，进程带着原因非零退出
-    wait_for_shutdown(manager).await
 }

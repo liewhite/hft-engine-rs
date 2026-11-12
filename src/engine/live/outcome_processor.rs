@@ -62,7 +62,7 @@ pub struct OrderGateway {
 }
 
 /// 受控停机开关：杀掉监督树的根（`ManagerActor`）。根的 `on_stop` 依次停下全部子 actor，
-/// `wait_for_shutdown` 以错误返回，进程退出 —— 与持仓对账确认漂移时同一条停机路径。
+/// `run_engine` 以错误返回，进程退出 —— 与持仓对账确认漂移时同一条停机路径。
 ///
 /// 做成开关而不是直接持有 `ActorRef<ManagerActor>`：网关只需要「能停机」这一个能力，
 /// 测试里换一个替身 actor 就能验证它被触发了。

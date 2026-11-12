@@ -40,7 +40,7 @@ use std::time::Duration;
 /// 子女，理论上限就是 5 倍），结果根的 wait 提前返回、调用方退出、runtime drop 把仍在
 /// 收尾的子孙当场砍断 —— 与这套停机链要修的失效是同一种。
 ///
-/// 唯一的硬 deadline 放在根部（见 `crate::engine::wait_for_shutdown`）：那里对整棵树设
+/// 唯一的硬 deadline 放在根部（见 `crate::engine::run_engine` 的停机路径）：那里对整棵树设
 /// 一个总预算，超了如实报错退出，而不是让每一层各自偷偷放弃。
 const SLOW_CHILD_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -299,7 +299,7 @@ mod tests {
     }
 
     /// 只对根调一次 `stop_gracefully`，整棵树必须自下而上收尾完毕 —— 而且是在
-    /// 根的 wait 返回**之前**。这是 `wait_for_shutdown` 全部正确性的支点：
+    /// 根的 wait 返回**之前**。这是引擎停机路径（`crate::engine::run_engine`）全部正确性的支点：
     /// 差一点，调用方返回、runtime drop，正在收尾的子孙就被砍断了。
     #[tokio::test]
     async fn stopping_the_root_waits_for_the_whole_tree_bottom_up() {

@@ -27,7 +27,7 @@
 use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::engine::{
-    init_tracing, load_config, wait_for_shutdown, AddStrategies, ManagerActor, ManagerActorArgs,
+    init_tracing, load_config, run_engine, AddStrategies, ManagerActorArgs,
     setup_binance, setup_hyperliquid, setup_okx,
     StrategySpec,
 };
@@ -38,8 +38,6 @@ use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
-use kameo::actor::Spawn;
-use kameo::mailbox;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -170,34 +168,28 @@ async fn main() -> anyhow::Result<()> {
         exchanges.push(setup_hyperliquid(access).await?);
     }
 
-    let manager = ManagerActor::spawn_with_mailbox(
-        ManagerActorArgs {
-            exchanges,
-            paper: config.paper,
-        },
-        mailbox::unbounded(),
-    );
-    manager
-        .wait_for_startup_result()
-        .await
-        .context("ManagerActor 启动失败")?;
-
-    let strategy = DipMaker {
-        exchange,
-        symbols: config.symbols.clone(),
-        offset_bp: config.offset_bp,
-        order_notional: config.order_notional,
+    let args = ManagerActorArgs {
+        exchanges,
+        paper: config.paper,
     };
-    manager
-        // 绑定到按 symbol 命名的模拟账户；实盘账户不注册任何策略，故不会有真实下单
-        .ask(AddStrategies(vec![StrategySpec::paper(
-            Box::new(strategy),
-            config.symbols.join(","),
-        )]))
-        .send()
-        .await
-        .context("添加策略失败")?;
-
-    // 停机信号 → Ok；manager 意外终止 → Err，进程带着原因非零退出
-    wait_for_shutdown(manager).await
+    // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
+    run_engine(args, |manager| async move {
+        let strategy = DipMaker {
+            exchange,
+            symbols: config.symbols.clone(),
+            offset_bp: config.offset_bp,
+            order_notional: config.order_notional,
+        };
+        manager
+            // 绑定到按 symbol 命名的模拟账户；实盘账户不注册任何策略，故不会有真实下单
+            .ask(AddStrategies(vec![StrategySpec::paper(
+                Box::new(strategy),
+                config.symbols.join(","),
+            )]))
+            .send()
+            .await
+            .context("添加策略失败")?;
+        Ok(())
+    })
+    .await
 }

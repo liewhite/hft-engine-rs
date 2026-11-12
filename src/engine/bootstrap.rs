@@ -5,7 +5,7 @@ use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::actor_lifecycle::ChildStop;
-use crate::engine::live::{ManagerActor, RegisterSupervisedChild};
+use crate::engine::live::{ManagerActor, ManagerActorArgs, RegisterSupervisedChild};
 
 /// 初始化 tracing（fmt + EnvFilter + 可选告警外送）
 ///
@@ -188,36 +188,57 @@ where
     Ok(Supervised(actor))
 }
 
+/// 实盘引擎的完整一生：启动 → 装配 → 运行 → 停机。各启动程序只写装配那一段。
+///
+/// 1. 启动 ManagerActor 并等它启动完成（此时各所私有推送都已确认订阅生效，见
+///    [`crate::exchange::ws_loop::await_subscriptions`]）；启动失败直接返回 `Err`，没有要停的。
+/// 2. 跑 `setup`（查品种、加策略、挂观察者、起旁路任务……），拿到 manager 引用。
+///    `setup` 出错 → 走同一条停机路径（[`stop`]）后返回该错误：装配到一半的引擎
+///    （可能已加了部分策略、已在下单）不会被丢下不管。
+/// 3. 等停机信号或 manager 意外退出（[`run_until_shutdown`]）。
+///
+/// 返回 `Ok` 只有一种情形：**收到停机信号并已停机完毕**。
+pub async fn run_engine<F, Fut>(args: ManagerActorArgs, setup: F) -> anyhow::Result<()>
+where
+    F: FnOnce(ActorRef<ManagerActor>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let manager = ManagerActor::spawn_with_mailbox(args, mailbox::unbounded());
+    manager
+        .wait_for_startup_result()
+        .await
+        .map_err(|e| anyhow::anyhow!("ManagerActor 启动失败: {e}"))?;
+    drive(manager, setup).await
+}
+
+/// [`run_engine`] 启动之后的部分，对根 actor 类型泛化以便单测（真 ManagerActor 起不来）
+async fn drive<A, F, Fut>(root: ActorRef<A>, setup: F) -> anyhow::Result<()>
+where
+    A: Actor,
+    F: FnOnce(ActorRef<A>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    if let Err(e) = setup(root.clone()).await {
+        tracing::error!(error = %e, "引擎装配失败，停机");
+        if let Err(stop_err) = stop(&root).await {
+            tracing::error!(error = %stop_err, "装配失败后的停机未完成");
+        }
+        return Err(e.context("引擎装配失败（已停机）"));
+    }
+    run_until_shutdown(root).await
+}
+
 /// 等待停机信号，或 Manager 意外退出。
 ///
-/// 返回 `Ok` 只有一种情形：**收到停机信号并已停机完毕**。Manager 意外终止返回 `Err`，
-/// 调用方据此把退出如实报成事故 —— 从前两种归宿都是 `()`，上层只能一律报成
-/// "已优雅关闭"，而那在 manager 猝死时是条假消息。
-///
-/// # 停机只需停根
-///
-/// 对 manager 一次 `stop_gracefully`，整棵树会自下而上逐层收尾：每个 actor 的 `on_stop`
-/// 先等完自己那批子 actor（[`crate::actor_lifecycle::ChildGroup::shutdown`]），自己才停。
-/// 全程 `Normal` —— 一次正常停机不该在任何一层留下事故 reason。
-///
-/// 这一程必须自己走：kameo 的 `link` 建立的是**兄弟**关系，父 actor 停止时子 actor 只会
-/// 收到一条通知、不会被带停；而 `wait_for_shutdown` 等到的只是邮箱关闭，那发生在
-/// `on_stop` **之前**。两者叠加的后果是：调用方以为等完了，实际正在收尾的子孙被随后的
-/// runtime drop 当场砍断。
+/// Manager 意外终止返回 `Err`，调用方据此把退出如实报成事故 —— 从前两种归宿都是 `()`，
+/// 上层只能一律报成"已优雅关闭"，而那在 manager 猝死时是条假消息。
 ///
 /// # 为什么 SIGTERM 必须和 Ctrl-C 同等对待
 ///
 /// 只接 SIGINT 的话，容器编排的停机路径整条不可达：`docker stop` 与 k8s 滚动重启发的
 /// 都是 SIGTERM，进程会被直接杀掉 —— 优雅停机与随之而来的通知在**生产里永远走不到**，
 /// 只有开发机按 Ctrl-C 才触发，于是这条路径看着实现了、实际从没运行过。
-/// 整棵树的停机总预算。
-///
-/// 这是**唯一**的硬 deadline：中间层只告警、不放弃（见
-/// [`crate::actor_lifecycle`]），否则各层的超时会叠加成提前返回。超了就如实报错，
-/// 不再假装停干净了 —— 容器编排随后会用 SIGKILL 收尾。
-const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
-
-pub async fn wait_for_shutdown(manager: ActorRef<ManagerActor>) -> anyhow::Result<()> {
+async fn run_until_shutdown<A: Actor>(manager: ActorRef<A>) -> anyhow::Result<()> {
     tracing::info!("System running. Press Ctrl+C (or send SIGTERM) to stop.");
 
     let outcome = tokio::select! {
@@ -231,41 +252,63 @@ pub async fn wait_for_shutdown(manager: ActorRef<ManagerActor>) -> anyhow::Resul
         // 起点丢掉 —— 而这条错误往往是运维手里唯一的线索。
         reason = manager.wait_for_shutdown_with_result(|r| match r {
             Ok(reason) => format!("{reason:?}"),
-            Err(e) => e.to_string(),
+            Err(e) => format!("{e:?}"),
         }) => {
             Err(anyhow::anyhow!("ManagerActor 意外终止，引擎已停止交易: {reason}"))
         }
 
         signal = shutdown_signal() => {
             tracing::info!(signal, "Received shutdown signal");
-            // 只需停根：manager 的 `on_stop` 会等自己那批子 actor，而它们的 `on_stop`
-            // 又各自在等下一层 —— 递归自动成立（见 `crate::actor_lifecycle`）。
-            if let Err(e) = manager.stop_gracefully().await {
-                tracing::warn!(error = %e, "Failed to stop manager gracefully");
-            }
-            // 必须是 with_result：`wait_for_shutdown` 只等到邮箱关闭，那发生在
-            // `on_stop` 之前 —— 用它等于没等，整棵树的收尾会被随后的 runtime drop 砍断。
-            let stopped = manager.wait_for_shutdown_with_result(|_| ());
-            tokio::select! {
-                biased;
-
-                r = tokio::time::timeout(SHUTDOWN_DEADLINE, stopped) => match r {
-                    Ok(()) => Ok(()),
-                    Err(_) => Err(anyhow::anyhow!(
-                        "停机超时（{}s）：仍有 actor 未收尾完成，日志里的\"迟迟未停\"告警指出了是谁",
-                        SHUTDOWN_DEADLINE.as_secs()
-                    )),
-                },
-                // 停机卡住时，操作员再发一次信号应当立刻退出 —— 否则只能上 SIGKILL
-                second = shutdown_signal() => {
-                    Err(anyhow::anyhow!("停机中收到第二次 {second}，放弃等待收尾直接退出"))
-                }
-            }
+            stop(&manager).await
         }
     };
 
     tracing::info!("System stopped");
     outcome
+}
+
+/// 整棵树的停机总预算。
+///
+/// 这是**唯一**的硬 deadline：中间层只告警、不放弃（见
+/// [`crate::actor_lifecycle`]），否则各层的超时会叠加成提前返回。超了就如实报错，
+/// 不再假装停干净了 —— 容器编排随后会用 SIGKILL 收尾。
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// 唯一的停机路径（收到信号、装配失败都走这里）。
+///
+/// # 停机只需停根
+///
+/// 对 manager 一次 `stop_gracefully`，整棵树会自下而上逐层收尾：每个 actor 的 `on_stop`
+/// 先等完自己那批子 actor（[`crate::actor_lifecycle::ChildGroup::shutdown`]），自己才停。
+/// 全程 `Normal` —— 一次正常停机不该在任何一层留下事故 reason。
+///
+/// 这一程必须自己走：kameo 的 `link` 建立的是**兄弟**关系，父 actor 停止时子 actor 只会
+/// 收到一条通知、不会被带停；而 `wait_for_shutdown` 等到的只是邮箱关闭，那发生在
+/// `on_stop` **之前**。两者叠加的后果是：调用方以为等完了，实际正在收尾的子孙被随后的
+/// runtime drop 当场砍断。
+async fn stop<A: Actor>(manager: &ActorRef<A>) -> anyhow::Result<()> {
+    // manager 已停（如装配期间它出错级联退出）时发送失败是预期，下面的等待立即返回
+    if let Err(e) = manager.stop_gracefully().await {
+        tracing::warn!(error = %e, "Failed to stop manager gracefully");
+    }
+    // 必须是 with_result：`wait_for_shutdown` 只等到邮箱关闭，那发生在
+    // `on_stop` 之前 —— 用它等于没等，整棵树的收尾会被随后的 runtime drop 砍断。
+    let stopped = manager.wait_for_shutdown_with_result(|_| ());
+    tokio::select! {
+        biased;
+
+        r = tokio::time::timeout(SHUTDOWN_DEADLINE, stopped) => match r {
+            Ok(()) => Ok(()),
+            Err(_) => Err(anyhow::anyhow!(
+                "停机超时（{}s）：仍有 actor 未收尾完成，日志里的\"迟迟未停\"告警指出了是谁",
+                SHUTDOWN_DEADLINE.as_secs()
+            )),
+        },
+        // 停机卡住时，操作员再发一次信号应当立刻退出 —— 否则只能上 SIGKILL
+        second = shutdown_signal() => {
+            Err(anyhow::anyhow!("停机中收到 {second}，放弃等待收尾直接退出"))
+        }
+    }
 }
 
 /// 停机信号：SIGINT（Ctrl-C）与 SIGTERM（容器编排）等价，返回先到的那个的名字。
@@ -403,7 +446,7 @@ mod supervision_tests {
         assert!(!supervisor.is_alive(), "受监督 actor 出错死亡却没有级联退出");
     }
 
-    /// 停机是靠 kill 级联下去的，而且**先排空邮箱再停** —— `wait_for_shutdown` 的
+    /// 停机是靠 kill 级联下去的，而且**先排空邮箱再停** —— 停机路径（[`stop`]）的
     /// 全部正确性都压在这条上：
     ///
     /// - 若不级联，子孙会一直活到 runtime 被 drop，`on_stop` 里的收尾（写最后一份
@@ -434,6 +477,18 @@ mod supervision_tests {
             (6, 2),
             "排队的 6 条必须先处理完，两个 on_stop 都要跑到"
         );
+    }
+
+    /// 装配失败走同一条停机路径：根已停下（子孙由根的 on_stop 收尾，见 actor_lifecycle），
+    /// 再返回带根因的错误
+    #[tokio::test]
+    async fn setup_failure_stops_the_engine_before_returning() {
+        let root = Supervisor::spawn_with_mailbox((), mailbox::unbounded());
+        let err = drive(root.clone(), |_| async { anyhow::bail!("加策略失败") })
+            .await
+            .expect_err("装配失败必须返回 Err");
+        assert!(format!("{err:#}").contains("加策略失败"), "要带根因: {err:#}");
+        assert!(!root.is_alive(), "装配失败后引擎没停 —— 半套引擎被丢下继续跑");
     }
 
     /// 主动退出（stop_gracefully → Normal）→ 监督者继续运行，不需要事先登记意图

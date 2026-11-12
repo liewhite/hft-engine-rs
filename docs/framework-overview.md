@@ -137,7 +137,7 @@ pub enum OutcomeEvent {
 | 快照面 | `GetAllSymbolMetas` / `GetLivePositions` |
 | 入向注入 | `PublishCustomEvent(CustomEvent)` |
 | 晋升调度 | `SupervisorActor` + `SupervisorArgs`，判据实现 `PromotionPolicy::decide(&SymbolPerformance) -> Decision` |
-| 启动辅助 | `init_tracing` / `load_config` / `wait_for_shutdown` / `spawn_supervised` |
+| 启动辅助 | `init_tracing` / `load_config` / `run_engine`（启动 → 装配 → 运行 → 唯一停机路径）/ `spawn_supervised` |
 | 纯逻辑核心 | `StrategyRunner`（回测直接驱动它）、`ClientOrderIdGen` |
 
 **流面与快照面是两条独立的路**，不要合并成一个 `Query { kind }`：
@@ -194,12 +194,10 @@ pub enum OutcomeEvent {
 
 ```rust
 use hft_engine_rs::engine::{
-    init_tracing, load_config, wait_for_shutdown,
-    AddStrategies, ManagerActor, ManagerActorArgs, StrategySpec,
+    init_tracing, load_config, run_engine,
+    AddStrategies, ManagerActorArgs, StrategySpec,
     setup_binance, setup_okx,
 };
-use kameo::actor::Spawn;
-use kameo::mailbox;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -211,20 +209,18 @@ async fn main() -> anyhow::Result<()> {
     if let Some(a) = config.exchanges.binance { exchanges.push(setup_binance(a)?); }
     if let Some(a) = config.exchanges.okx     { exchanges.push(setup_okx(a)?); }
 
-    // 2. 起 manager：建三条总线、spawn 全部子 actor、链好监督树与停机链
-    let manager = ManagerActor::spawn_with_mailbox(
-        ManagerActorArgs { exchanges, paper: config.paper },
-        mailbox::unbounded(),
-    );
-    manager.wait_for_startup_result().await?;
-
-    // 3. 注册策略。live 走真实下单，paper(label) 落本地柜台，两者可同时跑
-    manager.ask(AddStrategies(vec![
-        StrategySpec::live(Box::new(my_strategy)),
-        StrategySpec::paper(Box::new(my_strategy_2), "BTC"),
-    ])).send().await?;
-
-    wait_for_shutdown(&manager).await
+    // 2. run_engine 起 manager（建三条总线、spawn 全部子 actor、链好监督树与停机链；
+    //    返回前各所私有推送都已确认订阅生效），再跑装配闭包，然后等停机信号。
+    //    闭包出错也先停机再返回 —— 装配到一半的引擎不会被丢下不管。
+    run_engine(ManagerActorArgs { exchanges, paper: config.paper }, |manager| async move {
+        // 3. 注册策略。live 走真实下单，paper(label) 落本地柜台，两者可同时跑
+        manager.ask(AddStrategies(vec![
+            StrategySpec::live(Box::new(my_strategy)),
+            StrategySpec::paper(Box::new(my_strategy_2), "BTC"),
+        ])).send().await?;
+        Ok(())
+    })
+    .await
 }
 ```
 
