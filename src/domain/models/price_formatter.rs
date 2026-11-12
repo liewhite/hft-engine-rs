@@ -107,9 +107,14 @@ impl PriceFormatter for SignificantFiguresFormatter {
         let multiplier = 10_f64.powi(decimals as i32);
         let rounded = (price * multiplier).round() / multiplier;
 
-        // 格式化并移除尾随零
+        // 格式化并移除小数部分的尾随零。只在有小数点时才删：decimals == 0 时输出是纯整数，
+        // 删末尾 0 会把 106290 变成 10629（价格缩小 10 倍）。
         let s = format!("{:.precision$}", rounded, precision = decimals as usize);
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
     }
 }
 
@@ -141,6 +146,13 @@ mod tests {
         // sz_decimals=2, max_decimals=4
         let f2 = SignificantFiguresFormatter::new(2);
         assert_eq!(f2.format(0.12345), "0.1235"); // 受 max_decimals=4 限制
+
+        // 取整到整数位时不得删整数末尾的 0（曾把 106290.4 格式化成 "10629"）
+        let f5 = SignificantFiguresFormatter::new(5);
+        assert_eq!(f5.format(106290.4), "106290");
+        assert_eq!(f5.format(99999.6), "100000");
+        assert_eq!(f5.format(70010.2), "70010");
+        assert_eq!(f5.format(12345.6), "12346");
         assert_eq!(f2.format(1234.5), "1234.5"); // 5 位有效数字
 
         // 整数价格总是允许

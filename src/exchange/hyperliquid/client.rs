@@ -801,6 +801,7 @@ impl AccountClient for HyperliquidClient {
             OrderStatus::Filled(f) if matches!(order.order_type, OrderType::Market) => {
                 check_market_fully_filled(&f.filled, order.quantity)
             }
+            // 其余（含 IOC 限价单）回 filled 只表示有成交，不代表全部成交：调用方按成交回报 / 持仓差处理余量
             OrderStatus::Filled(f) => Ok(f.filled.oid.to_string()),
             OrderStatus::Error(e) => Err(ExchangeError::Other(format!("Order error: {}", e.error))),
         }
