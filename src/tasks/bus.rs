@@ -29,7 +29,7 @@ pub struct Bus<E> {
 
 /// 同一条总线的只订阅视图（见模块文档）：没有 `publish`。克隆得到的是同一条总线。
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// let bus = hft_engine_rs::tasks::Bus::<u32>::new("t");
 /// bus.tap().publish(1); // 只订阅视图不能发布
 /// ```
