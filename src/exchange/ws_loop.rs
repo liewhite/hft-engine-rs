@@ -4,7 +4,7 @@
 
 use crate::domain::{Exchange, ExchangeError};
 use crate::exchange::client::WsError;
-use crate::tasks::{Group, GroupClosed};
+use crate::tasks::{Group, GroupClosed, Scope};
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -80,6 +80,12 @@ const INCOMING_BUFFER: usize = 100;
 /// 循环出错（断线、空闲超时、写失败）时子任务以 `Err` 退出、按任务树规则上冒，整支停下
 /// （fail-fast，不重连，交外部重启）；组件这边随后从 [`Self::recv`] 拿到"连接已断"的错误。
 /// 组件停机时，它的 `run` 先返回、之后框架才停这个子任务，所以收尾期间连接仍在。
+///
+/// 取帧有两种写法：
+/// - [`Self::next`]：感知停机。没有收件箱的组件（各所私有 WS）的整个 `run` 就是
+///   `while let Some(raw) = conn.next(scope).await? { .. }`，停机时已到手的回报（可能有成交）
+///   会先交完。有收件箱的组件在 `inbox.recv()` 返回 `None` 之后用它排空。
+/// - [`Self::recv`]：只等下一帧，供停机信号另有来源（收件箱）的 `select!` 分支用。
 pub struct WsConn {
     outgoing: mpsc::Sender<String>,
     incoming: mpsc::Receiver<String>,
@@ -104,7 +110,15 @@ impl WsConn {
         group.spawn_fn(name, move |scope| async move {
             tokio::select! {
                 _ = scope.stopping() => Ok(()),
-                r = run_ws_loop(read, write, outgoing_rx, incoming_tx, keepalive) => r,
+                r = run_ws_loop(read, write, outgoing_rx, incoming_tx, keepalive) => {
+                    if r.is_ok() {
+                        // 组件丢掉了收发端：它已退出（正常停机，或构造/运行出错）。它自己的结果由
+                        // 它自己上报，这里按主动收工退出 —— 否则框架把"未经停止请求就自行结束"
+                        // 记成错误，可能抢在组件的真正根因（如构造失败）之前报到父节点。
+                        scope.request_stop();
+                    }
+                    r
+                }
             }
         })?;
         Ok(Self { outgoing: outgoing_tx, incoming: incoming_rx, replay: Default::default() })
@@ -130,9 +144,22 @@ impl WsConn {
             .ok_or_else(|| WsError::ServerClosed("WS 循环已退出（原因见循环子任务的错误）".to_string()))
     }
 
-    /// 已经到手、还没处理的帧（停机时排空用：组件被要求停止后把已收到的回报处理完再退出）
-    pub fn try_recv(&mut self) -> Option<String> {
-        self.replay.pop_front().or_else(|| self.incoming.try_recv().ok())
+    /// 感知停机的取帧：`scope`（组件自己的）未被请求停止时等下一帧（同 [`Self::recv`]）；
+    /// 已被请求停止时只交已经缓冲在手、还没处理的帧，交完返回 `Ok(None)`。
+    ///
+    /// 停机时把已到手的帧交完是为了不丢回报：私有流里可能有成交，而读循环在组件 `run`
+    /// 返回后才停，缓冲里的帧没人取就随连接一起没了。停机期间循环仍在读，紧接着到的帧
+    /// 也会被交出；循环已退出时交完缓冲即 `None`（断线原因由循环子任务自己上报）。
+    pub async fn next(&mut self, scope: &Scope) -> Result<Option<String>, WsError> {
+        if !scope.is_stopping() {
+            tokio::select! {
+                // 帧优先：与停止信号同时就绪时不跳过（反正之后也要排空）
+                biased;
+                frame = self.recv() => return frame.map(Some),
+                _ = scope.stopping() => {}
+            }
+        }
+        Ok(self.replay.pop_front().or_else(|| self.incoming.try_recv().ok()))
     }
 
     /// 启动阶段等私有订阅全部确认，供私有 WS 组件在构造时调用 —— **请求发出去不等于
@@ -185,7 +212,7 @@ pub const SUBSCRIPTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 /// 读循环：转发出站帧、把入站文本帧交给组件、心跳与空闲判定。
 ///
 /// 返回 `Err` = 连接不可用（断线、服务端关闭、空闲超时、写失败）。组件丢掉了收发两端
-/// （只会发生在组件已退出之后）时返回 `Ok`。
+/// （只会发生在组件已退出之后）时返回 `Ok`（调用方据此主动收工，见 [`WsConn::spawn`]）。
 async fn run_ws_loop(
     mut read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
         + Unpin
@@ -439,5 +466,69 @@ mod keepalive_tests {
             let sent = w_rx.recv().await.expect("应周期性发出 ping");
             assert_eq!(sent, WsMessage::Text("ping".to_string()));
         }
+    }
+
+    /// 停机时 next 交出已缓冲的帧、交完返回 None —— 即使连接还开着（不会一直等新帧）
+    #[tokio::test]
+    async fn next_hands_over_buffered_frames_after_stop() {
+        let root = crate::tasks::Root::new("t");
+        let (feed_tx, feed_rx) = tokio::sync::oneshot::channel();
+        let (got_tx, got_rx) = tokio::sync::oneshot::channel();
+        root.group("g")
+            .spawn_fn("c", move |scope| async move {
+                let (mut conn, tx) = conn_fed_by(&["a"]);
+                // 运行中：同 recv
+                assert_eq!(conn.next(&scope).await?.as_deref(), Some("a"));
+                feed_tx.send(tx).unwrap();
+                scope.stopping().await;
+                let mut got = Vec::new();
+                while let Some(raw) = conn.next(&scope).await? {
+                    got.push(raw);
+                }
+                got_tx.send(got).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        let tx = feed_rx.await.unwrap();
+        tx.send("b".into()).await.unwrap();
+        tx.send("c".into()).await.unwrap();
+        // tx 一直活着：next 若在停机后还等新帧，这里会挂住
+        root.shutdown().await.unwrap();
+        assert_eq!(got_rx.await.unwrap(), ["b", "c"]);
+        drop(tx);
+    }
+
+    /// 组件构造失败（已起读循环、随即丢掉连接）：根上报的是构造错误，而不是读循环的
+    /// "未经停止请求就自行结束"
+    #[tokio::test]
+    async fn build_failure_stays_the_root_cause() {
+        struct Never;
+        impl crate::tasks::Task for Never {
+            async fn run(&mut self, _: &Scope) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let root = crate::tasks::Root::new("t");
+        let (w_tx, _w_rx) = mpsc::channel::<WsMessage>(8);
+        let r = root
+            .group("g")
+            .spawn("private_ws", move |scope| async move {
+                let conn = WsConn::spawn(
+                    &scope.group("conn"),
+                    "ws",
+                    stream::pending::<Frame>(),
+                    PollSender::new(w_tx),
+                    keepalive(None, 60, 3600),
+                )?;
+                drop(conn);
+                // 让读循环先看到收发端被丢、先退出，再报构造失败（最容易抢掉根因的时序）
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Err::<Never, _>(anyhow::anyhow!("订阅被拒"))
+            })
+            .await;
+        assert!(r.is_err());
+        let e = format!("{:#}", root.shutdown().await.unwrap_err());
+        assert!(e.contains("订阅被拒"), "{e}");
+        assert!(!e.contains("未经停止请求"), "{e}");
     }
 }

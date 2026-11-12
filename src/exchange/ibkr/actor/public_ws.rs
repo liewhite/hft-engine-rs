@@ -627,7 +627,7 @@ impl IbkrPublicWs {
 }
 
 impl Task for IbkrPublicWs {
-    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+    async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
         // smd 刷新定时器：服务端到期会静默终止订阅，必须主动重订阅 (见模块文档)。
         // 用 interval_at 跳过 tokio::time::interval 的"立即首跳"——刚订阅完不需要马上刷。
         let mut refresh =
@@ -645,7 +645,7 @@ impl Task for IbkrPublicWs {
                     Some(cmd) => self.handle_cmd(cmd).await?,
                     None => {
                         // 已经收到的帧处理完再走（可能有成交；仍在等 commission 的由 stop 补发）
-                        while let Some(raw) = self.conn.try_recv() {
+                        while let Some(raw) = self.conn.next(scope).await? {
                             self.handle_frame(&raw)?;
                         }
                         return Ok(());

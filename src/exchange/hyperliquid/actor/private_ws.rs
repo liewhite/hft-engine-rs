@@ -107,18 +107,11 @@ impl HyperliquidPrivateWs {
 
 impl Task for HyperliquidPrivateWs {
     async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
-        loop {
-            tokio::select! {
-                _ = scope.stopping() => {
-                    // 已经收到的回报处理完再走（可能有成交）
-                    while let Some(raw) = self.conn.try_recv() {
-                        self.handle_message(&raw)?;
-                    }
-                    return Ok(());
-                }
-                frame = self.conn.recv() => self.handle_message(&frame?)?,
-            }
+        // 停机时已到手的回报（可能有成交）先处理完再走，见 WsConn::next
+        while let Some(raw) = self.conn.next(scope).await? {
+            self.handle_message(&raw)?;
         }
+        Ok(())
     }
 }
 
