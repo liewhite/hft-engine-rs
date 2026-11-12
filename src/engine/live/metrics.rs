@@ -1,6 +1,6 @@
-//! MetricsActor - 交易指标观测
+//! Metrics - 交易指标观测
 //!
-//! 订阅 IncomePubSub 的**全量**事件流，自建一份聚合视图并定时输出结构化日志：
+//! 订阅行情与账户两条总线的**全量**事件流，自建一份聚合视图并定时输出结构化日志：
 //! - **账户**：各交易所 equity / 持仓名义 / 账户杠杆率
 //! - **持仓**：各 symbol 在各交易所的仓位、净敞口、名义价值
 //! - **订单**：当前挂单数、累计拒单数
@@ -16,17 +16,16 @@
 //!   （见 [`crate::observability`]，未配置时无外部依赖、行为与从前一致）
 
 use crate::domain::{AccountId, Exchange, Symbol, TradingStats};
-use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, AccountEvent, IncomeEvent, MarketEvent, StateManager, SymbolState};
+use crate::messaging::{
+    AccountBus, AccountData, AccountEvent, ExchangeAccountData, IncomeEvent, MarketBus,
+    MarketEvent, PositionBaseline, StateManager, SymbolAccountData, SymbolState,
+};
 use crate::observability::{prometheus, MetricsPushConfig, PromText};
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
+use crate::tasks::{Addr, Gone, Group, Inbox, Scope, Task};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
-use tokio::time::Instant;
-use tokio_stream::wrappers::IntervalStream;
-
+use tokio::sync::oneshot;
+use tokio::time::MissedTickBehavior;
 
 /// 默认指标报告间隔
 pub const DEFAULT_REPORT_INTERVAL_MS: u64 = 60_000;
@@ -95,23 +94,27 @@ fn exposure_of(state: &SymbolState, baseline: Option<&HashMap<Exchange, f64>>) -
     exposure
 }
 
-/// MetricsActor 初始化参数
-pub struct MetricsActorArgs {
+/// Metrics 构造参数
+pub struct MetricsArgs {
     /// 报告间隔 (毫秒)
     pub interval_ms: u64,
     /// 可选的 Prometheus pushgateway 推送（None = 只输出日志，与从前一致）
     pub push: Option<MetricsPushConfig>,
+    /// 订阅：全量行情（持仓估值 / 市场状态视图）
+    pub market_bus: MarketBus,
+    /// 订阅：全量账户事件（实盘 + 全部模拟账户一次订阅，按事件自带的账户分账）
+    pub account_bus: AccountBus,
 }
 
-/// MetricsActor - 交易指标观测
-pub struct MetricsActor {
+/// 从事件流重建的聚合视图（纯状态，不含收件与定时；单测直接构造）
+struct MetricsView {
     /// 账户 / 持仓 / 挂单视图（复用策略侧同一实现）
     state: StateManager,
-    /// 正在跟踪的 symbol（由 [`RegisterSymbols`] 注册）
+    /// 正在跟踪的 symbol（由 [`MetricsHandle::register_symbols`] 注册）
     tracked: HashSet<Symbol>,
     /// 会话起始仓位基线：symbol -> (exchange -> 仓位)
     ///
-    /// 取自投产握手 [`RegisterSymbols`] 携带的基线（每个 (symbol, 所) 只记第一条，
+    /// 取自投产握手 [`MetricsHandle::register_symbols`] 携带的基线（每个 (symbol, 所) 只记第一条，
     /// 与 `SymbolState` 的 seed 语义一致）。用于把重启前的存货从盈亏里剔除。
     baseline: HashMap<Symbol, HashMap<Exchange, f64>>,
     /// per-symbol 累计成交统计
@@ -126,7 +129,7 @@ pub struct MetricsActor {
     untracked_events: u64,
     /// 可选的 pushgateway 推送配置
     push: Option<MetricsPushConfig>,
-    /// 模拟账户累计成交统计（来自 PaperPubSub）。
+    /// 模拟账户累计成交统计（来自账户总线上带 Paper 标签的事件）。
     ///
     /// **与实盘视图分账**：模拟事件绝不喂进 `state`（StateManager 按 exchange 键控，
     /// 柜台的 AccountInfo 会覆盖实盘净值、Fill 会污染实盘持仓镜像）。此前模拟账户的
@@ -137,7 +140,93 @@ pub struct MetricsActor {
     paper_accounts: HashMap<(AccountId, Exchange), (f64, f64)>,
 }
 
-impl MetricsActor {
+impl MetricsView {
+    fn new(push: Option<MetricsPushConfig>) -> Self {
+        Self {
+            state: StateManager::new(&[], NO_ORDER_TIMEOUT),
+            tracked: HashSet::new(),
+            baseline: HashMap::new(),
+            per_symbol: HashMap::new(),
+            total: TradingStats::default(),
+            untracked_events: 0,
+            push,
+            paper_stats: HashMap::new(),
+            paper_accounts: HashMap::new(),
+        }
+    }
+
+    /// 投产注册：跟踪范围 + 会话起始仓位基线（见 [`MetricsHandle::register_symbols`]）
+    fn register(&mut self, symbols: Vec<Symbol>, baselines: Vec<PositionBaseline>) {
+        tracing::info!(count = symbols.len(), "Metrics tracking symbols");
+        self.state.register_symbols(&symbols);
+        self.tracked.extend(symbols);
+        // 会话起始仓位基线（盈亏口径）与持仓镜像各记一份；重复注册（再晋升）由
+        // record_baseline 的 or_insert 与 seed 的幂等各自兜住，首次值不被覆写
+        for b in &baselines {
+            self.record_baseline(&b.position.symbol, b.position.exchange, b.position.size);
+        }
+        self.state.seed_positions(&baselines);
+    }
+
+    /// 行情事件入口（持仓估值 / 市场状态视图）
+    fn on_market(&mut self, msg: MarketEvent) {
+        // 跟踪范围外的 symbol 事件直接计数跳过：喂给 StateManager 会被当成"路由 bug"打 error，
+        // 但对观测层这只是"不关心的 symbol"（分桶部署下必然出现），不是错误。
+        if let Some(symbol) = msg.data.symbol() {
+            if !self.tracked.contains(symbol) {
+                self.untracked_events += 1;
+                return;
+            }
+        }
+        self.state.apply(&IncomeEvent::Market(msg));
+    }
+
+    /// 账户事件入口：实盘进实盘视图（state/total），模拟账户按账户分账 —— 分道由事件
+    /// 自带的账户标签决定，不依赖"来源总线"区分
+    fn on_account(&mut self, msg: AccountEvent) {
+        // 穷举而非 `!= Live`：新增账户类型时这里编译失败（原则 P6）。用否定条件的话
+        // 新类型会被静默并进模拟账本 —— 观测口径出错且没有任何症状。
+        //
+        // 这里**不复用** `outlet_for`：那是"订单发往哪个执行出口"，与"记进哪本账"是
+        // 两件事，恰好同形不等于同一个概念，合并会是假抽象。
+        match msg.account {
+            AccountId::Paper(_) => {
+                self.apply_paper_event(&msg.account.clone(), &msg.data);
+                return;
+            }
+            AccountId::Live => {}
+        }
+        if let Some(symbol) = msg.data.symbol() {
+            if !self.tracked.contains(symbol) {
+                self.untracked_events += 1;
+                return;
+            }
+        }
+        // 累计统计
+        match &msg.data {
+            AccountData::Symbol(SymbolAccountData::Fill(fill)) => {
+                self.total.apply_fill(fill);
+                self.per_symbol
+                    .entry(fill.symbol.clone())
+                    .or_insert_with(|| {
+                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
+                    })
+                    .apply_fill(fill);
+            }
+            AccountData::Symbol(SymbolAccountData::OrderUpdate(update)) => {
+                self.total.apply_order_update(update);
+                self.per_symbol
+                    .entry(update.symbol.clone())
+                    .or_insert_with(|| {
+                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
+                    })
+                    .apply_order_update(update);
+            }
+            _ => {}
+        }
+        // 账户 / 持仓 / 挂单视图
+        self.state.apply(&IncomeEvent::Account(msg));
+    }
     /// 模拟账户事件的分账逻辑（纯状态转移，供 handler 委托与单测直调）。
     /// **绝不**触碰实盘视图（total / state）—— 串账防线，见 paper_stats 字段说明。
     fn apply_paper_event(&mut self, account: &AccountId, data: &AccountData) {
@@ -405,155 +494,99 @@ impl MetricsActor {
     }
 }
 
-impl Actor for MetricsActor {
-    type Args = MetricsActorArgs;
-    type Error = Infallible;
+/// Metrics 的收件箱消息
+enum MetricsMsg {
+    /// 行情总线（全量订阅）
+    Market(MarketEvent),
+    /// 账户总线（全量订阅）
+    Account(AccountEvent),
+    /// 见 [`MetricsHandle::register_symbols`]
+    Register {
+        symbols: Vec<Symbol>,
+        baselines: Vec<PositionBaseline>,
+        reply: oneshot::Sender<()>,
+    },
+}
 
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let interval = Duration::from_millis(args.interval_ms);
-        let interval_stream = IntervalStream::new(tokio::time::interval(interval));
-        actor_ref.attach_stream(interval_stream, (), ());
+/// Metrics 的对外句柄（可克隆；投产编排用它注册 symbol）
+#[derive(Clone, Debug)]
+pub struct MetricsHandle(Addr<MetricsMsg>);
 
-        tracing::info!(interval_ms = args.interval_ms, "MetricsActor started");
+impl MetricsHandle {
+    /// 投产注册握手：要跟踪的 symbol 集合 + 它们的持仓基线（同一份快照，与 executor /
+    /// 对账镜像口径一致）。注册与基线**原子**到达 —— 不存在"已注册、基线未到"的窗口，
+    /// 也就不需要缓冲重放机制。
+    ///
+    /// **等注册完成**才返回（确认完成后才放行事件流，否则盈亏基线可能晚于第一笔成交）。
+    /// `Err(Gone)` = Metrics 已停止收件（停机途中或已出错退出）。
+    pub async fn register_symbols(
+        &self,
+        symbols: Vec<Symbol>,
+        baselines: Vec<PositionBaseline>,
+    ) -> Result<(), Gone> {
+        self.0
+            .ask(|reply| MetricsMsg::Register { symbols, baselines, reply })
+            .await
+    }
+}
 
-        Ok(Self {
-            state: StateManager::new(&[], NO_ORDER_TIMEOUT),
-            tracked: HashSet::new(),
-            baseline: HashMap::new(),
-            per_symbol: HashMap::new(),
-            total: TradingStats::default(),
-            untracked_events: 0,
-            push: args.push,
-            paper_stats: HashMap::new(),
-            paper_accounts: HashMap::new(),
-        })
+/// 交易指标观测组件。
+///
+/// 观测组件故障**不得**拖垮交易：`run` 没有出错退出的路径（出错会经任务树让整机停机），
+/// pushgateway 推送失败只记 warn（见 [`prometheus::spawn_push`]）。
+pub struct Metrics {
+    inbox: Inbox<MetricsMsg>,
+    /// 报告间隔
+    every: Duration,
+    view: MetricsView,
+}
+
+impl Metrics {
+    /// 在 `group` 下起指标观测，等它订阅完成，返回句柄。订阅见 [`MetricsArgs`] 各字段。
+    pub async fn spawn(group: &Group, args: MetricsArgs) -> anyhow::Result<MetricsHandle> {
+        let (_, addr) = group
+            .spawn_addressed("Metrics", move |_scope: Scope, mut inbox: Inbox<MetricsMsg>| async move {
+                inbox.subscribe(&args.market_bus, |_| true, MetricsMsg::Market);
+                inbox.subscribe(&args.account_bus, |_| true, MetricsMsg::Account);
+                tracing::info!(interval_ms = args.interval_ms, "Metrics started");
+                Ok(Self {
+                    inbox,
+                    every: Duration::from_millis(args.interval_ms),
+                    view: MetricsView::new(args.push),
+                })
+            })
+            .await?;
+        Ok(MetricsHandle(addr))
+    }
+}
+
+impl Task for Metrics {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        let mut tick = tokio::time::interval(self.every);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                msg = self.inbox.recv() => match msg {
+                    Some(MetricsMsg::Market(ev)) => self.view.on_market(ev),
+                    Some(MetricsMsg::Account(ev)) => self.view.on_account(ev),
+                    Some(MetricsMsg::Register { symbols, baselines, reply }) => {
+                        self.view.register(symbols, baselines);
+                        // 提问方已不等回复（它自己放弃了）时无人可告知；注册本身已生效
+                        let _ = reply.send(());
+                    }
+                    // 已被要求停止，收件箱已排空
+                    None => return Ok(()),
+                },
+                _ = tick.tick() => self.view.report(),
+            }
+        }
     }
 
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
+    async fn stop(&mut self) -> anyhow::Result<()> {
         // 停机前留一份最终快照，便于事后复盘
-        self.report();
-        tracing::info!("MetricsActor stopped");
+        self.view.report();
+        tracing::info!("Metrics stopped");
         Ok(())
-    }
-}
-
-// === Messages ===
-
-/// 投产注册握手：要跟踪的 symbol 集合 + 它们的持仓基线（同一份快照，与 executor /
-/// 对账镜像口径一致）。注册与基线**原子**到达 —— 不存在"已注册、基线未到"的窗口，
-/// 也就不需要缓冲重放机制。
-pub struct RegisterSymbols {
-    pub symbols: Vec<Symbol>,
-    pub baselines: Vec<crate::messaging::PositionBaseline>,
-}
-
-impl Message<RegisterSymbols> for MetricsActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: RegisterSymbols, _ctx: &mut Context<Self, Self::Reply>) {
-        tracing::info!(count = msg.symbols.len(), "MetricsActor tracking symbols");
-        self.state.register_symbols(&msg.symbols);
-        self.tracked.extend(msg.symbols);
-        // 会话起始仓位基线（盈亏口径）与持仓镜像各记一份；重复注册（再晋升）由
-        // record_baseline 的 or_insert 与 seed 的幂等各自兜住，首次值不被覆写
-        for b in &msg.baselines {
-            self.record_baseline(&b.position.symbol, b.position.exchange, b.position.size);
-        }
-        self.state.seed_positions(&msg.baselines);
-    }
-}
-
-/// 行情事件入口（持仓估值 / 市场状态视图）
-impl Message<MarketEvent> for MetricsActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: MarketEvent, _ctx: &mut Context<Self, Self::Reply>) {
-        // 跟踪范围外的 symbol 事件直接计数跳过：喂给 StateManager 会被当成"路由 bug"打 error，
-        // 但对观测层这只是"不关心的 symbol"（分桶部署下必然出现），不是错误。
-        if let Some(symbol) = msg.data.symbol() {
-            if !self.tracked.contains(symbol) {
-                self.untracked_events += 1;
-                return;
-            }
-        }
-        self.state.apply(&IncomeEvent::Market(msg));
-    }
-}
-
-/// 账户事件入口：实盘进实盘视图（state/total），模拟账户按账户分账 —— 分道由事件
-/// 自带的账户标签决定，不再依赖"来源总线"区分
-impl Message<AccountEvent> for MetricsActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: AccountEvent, _ctx: &mut Context<Self, Self::Reply>) {
-        // 穷举而非 `!= Live`：新增账户类型时这里编译失败（原则 P6）。用否定条件的话
-        // 新类型会被静默并进模拟账本 —— 观测口径出错且没有任何症状。
-        //
-        // 这里**不复用** `outlet_for`：那是"订单发往哪个执行出口"，与"记进哪本账"是
-        // 两件事，恰好同形不等于同一个概念，合并会是假抽象。
-        match msg.account {
-            AccountId::Paper(_) => {
-                self.apply_paper_event(&msg.account.clone(), &msg.data);
-                return;
-            }
-            AccountId::Live => {}
-        }
-        if let Some(symbol) = msg.data.symbol() {
-            if !self.tracked.contains(symbol) {
-                self.untracked_events += 1;
-                return;
-            }
-        }
-        // 累计统计
-        match &msg.data {
-            AccountData::Symbol(SymbolAccountData::Fill(fill)) => {
-                self.total.apply_fill(fill);
-                self.per_symbol
-                    .entry(fill.symbol.clone())
-                    .or_insert_with(|| {
-                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
-                    })
-                    .apply_fill(fill);
-            }
-            AccountData::Symbol(SymbolAccountData::OrderUpdate(update)) => {
-                self.total.apply_order_update(update);
-                self.per_symbol
-                    .entry(update.symbol.clone())
-                    .or_insert_with(|| {
-                        TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
-                    })
-                    .apply_order_update(update);
-            }
-            _ => {}
-        }
-        // 账户 / 持仓 / 挂单视图
-        self.state.apply(&IncomeEvent::Account(msg));
-    }
-}
-
-/// 定时器：输出报告
-impl Message<StreamMessage<Instant, (), ()>> for MetricsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Instant, (), ()>,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        match msg {
-            StreamMessage::Next(_) => self.report(),
-            StreamMessage::Started(_) => tracing::debug!("Metrics report timer started"),
-            // 观测组件故障**不得**拖垮交易：MetricsActor 是 spawn_link 到 manager 的，
-            // 这里 kill 自己会经 on_link_died 让整个进程退出。定时器结束只记 error 继续存活，
-            // 事件视图仍在更新，停机时的 on_stop 报告也还在。
-            StreamMessage::Finished(_) => {
-                tracing::error!("Metrics report timer finished, 后续周期报告停止（不影响交易）")
-            }
-        }
     }
 }
 
@@ -589,25 +622,38 @@ mod tests {
         }))
     }
 
-    /// 直接构造（绕过 actor 生命周期），用于测试纯状态累积逻辑
-    fn actor() -> MetricsActor {
-        MetricsActor {
-            state: StateManager::new(&[], NO_ORDER_TIMEOUT),
-            tracked: HashSet::new(),
-            baseline: HashMap::new(),
-            per_symbol: HashMap::new(),
-            total: TradingStats::default(),
-            untracked_events: 0,
-            push: None,
-            paper_stats: HashMap::new(),
-            paper_accounts: HashMap::new(),
-        }
+    /// 直接构造聚合视图（不起组件），用于测试纯状态累积逻辑
+    fn view() -> MetricsView {
+        MetricsView::new(None)
+    }
+
+    /// 注册经句柄等到完成；组件停止后句柄报 Gone（调用方据此报错，而不是静默丢掉基线）
+    #[tokio::test]
+    async fn register_through_handle_then_gone_after_stop() {
+        let root = crate::tasks::Root::new("t");
+        let handle = Metrics::spawn(
+            &root.group("g"),
+            MetricsArgs {
+                interval_ms: DEFAULT_REPORT_INTERVAL_MS,
+                push: None,
+                market_bus: MarketBus::new("market"),
+                account_bus: AccountBus::new("account"),
+            },
+        )
+        .await
+        .unwrap();
+        let register = || (vec!["BTC".to_string()], vec![baseline_of("BTC", 1.0)]);
+        let (symbols, baselines) = register();
+        handle.register_symbols(symbols, baselines).await.expect("注册应完成");
+        root.shutdown().await.unwrap();
+        let (symbols, baselines) = register();
+        assert!(handle.register_symbols(symbols, baselines).await.is_err(), "停止后应报 Gone");
     }
 
     /// 净值 ≤0 时杠杆算不出：不推杠杆点（看板断线），不得报成 0 冒充「很安全」
     #[test]
     fn leverage_not_reported_when_equity_non_positive() {
-        let mut metrics = actor();
+        let mut metrics = view();
         for (exchange, equity) in [(Exchange::Binance, 0.0), (Exchange::OKX, 1000.0)] {
             metrics.state.apply(&IncomeEvent::account(
                 AccountId::Live,
@@ -625,7 +671,7 @@ mod tests {
     /// 模拟账户事件按账户分账，**绝不**混进实盘视图（total/state）
     #[tokio::test]
     async fn paper_events_never_leak_into_live_view() {
-        let mut metrics = actor();
+        let mut metrics = view();
         metrics.tracked.insert("BTC".to_string());
         metrics.state.register_symbols(&["BTC".to_string()]);
 
@@ -649,7 +695,7 @@ mod tests {
 
     #[tokio::test]
     async fn baseline_records_only_the_first_position_snapshot() {
-        let mut metrics = actor();
+        let mut metrics = view();
         metrics.tracked.insert("BTC".to_string());
         metrics.state.register_symbols(&["BTC".to_string()]);
 
@@ -666,17 +712,17 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_symbol_events_are_counted_not_applied() {
-        let mut metrics = actor();
+        let mut metrics = view();
         metrics.tracked.insert("BTC".to_string());
         metrics.state.register_symbols(&["BTC".to_string()]);
 
-        let ctx_free_data = fill_data(Exchange::Binance, "ETH", Side::Long, 1.0);
-        // 手工走一遍 handler 的判定分支（不经 actor 运行时）
-        if let Some(symbol) = ctx_free_data.symbol() {
-            if !metrics.tracked.contains(symbol) {
-                metrics.untracked_events += 1;
-            }
-        }
+        // 走组件真正用的账户事件入口
+        metrics.on_account(AccountEvent {
+            account: AccountId::Live,
+            exchange_ts: 1,
+            local_ts: 1,
+            data: fill_data(Exchange::Binance, "ETH", Side::Long, 1.0),
+        });
 
         assert_eq!(metrics.untracked_events, 1);
         assert_eq!(metrics.total.fills, 0);
@@ -684,7 +730,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_pnl_excludes_pre_existing_inventory() {
-        let mut metrics = actor();
+        let mut metrics = view();
         let symbol = "BTC".to_string();
         metrics.tracked.insert(symbol.clone());
         metrics.state.register_symbols(&[symbol.clone()]);
@@ -718,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_pnl_tracks_this_session_trades() {
-        let mut metrics = actor();
+        let mut metrics = view();
         let symbol = "BTC".to_string();
         metrics.tracked.insert(symbol.clone());
         metrics.state.register_symbols(&[symbol.clone()]);

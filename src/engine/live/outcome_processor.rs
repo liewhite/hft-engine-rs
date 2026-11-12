@@ -1,4 +1,4 @@
-//! 实盘出向：OrderGateway（唯一下单出口）+ OutcomeProcessorActor（总线订阅薄壳）。
+//! 实盘出向：OrderGateway（唯一下单出口）+ OutcomeProcessor（总线订阅薄壳）。
 //!
 //! **系统的出向单位边界**：策略与 `StrategyRunner` 产出的订单一律币本位，在此转为
 //! [`ExchangeOrder`]（折算 + 按交易所精度取整）后才发给交易所。回测不经过本模块，
@@ -10,17 +10,13 @@ use crate::domain::{
 };
 use crate::exchange::{AccountClient, ExchangeOrder};
 use crate::domain::AccountId;
-use crate::messaging::{SymbolAccountData, AccountData, AccountEvent};
+use crate::messaging::{AccountBus, AccountData, AccountEvent, SymbolAccountData};
 use crate::strategy::OutcomeEvent;
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::message::{Context, Message};
-use kameo::Actor;
-use kameo_actors::pubsub::Publish;
+use crate::tasks::{FailHandle, Group, Inbox, Scope, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{outlet_for, AccountOutcome, AccountPubSub, Outlet};
+use super::{outlet_for, to_live_outlet, AccountOutcome, OutcomeBus, Outlet};
 
 // ============================================================================
 // OrderGateway —— 唯一的实盘下单出口
@@ -29,8 +25,8 @@ use super::{outlet_for, AccountOutcome, AccountPubSub, Outlet};
 /// 实盘出向执行器：系统里**唯一**知道"怎么把订单发到交易所"的组件。
 ///
 /// 两个持有方共享同一实例（因此共享同一套 in_flight 判据、失败反馈与 dry_run 语义）：
-/// - [`OutcomeProcessorActor`]（总线路径）：策略信号 `tokio::spawn` 执行，不阻塞事件流；
-/// - `ManagerActor`（降级平仓，见 `RemoveStrategies`）：`await` 执行，同步拿到结论。
+/// - [`OutcomeProcessor`]（总线路径）：策略信号各起一个子任务执行，不阻塞事件流；
+/// - manager（降级平仓，见 `RemoveStrategies`）：`await` 执行，同步拿到结论。
 ///
 /// 此前降级平仓在 manager 里直发 `client.place_order` —— 系统存在第二个下单出口：
 /// 没有 in_flight 假警报防护、失败不合成回报、无视 dry_run。收敛为单一出口后，
@@ -40,7 +36,7 @@ pub struct OrderGateway {
     /// 下单请求会被拒绝并合成失败回报，而不是静默丢弃。
     accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 账户事件总线（用于发布下单失败/撤单确认回报，标 Live）
-    account_pubsub: ActorRef<AccountPubSub>,
+    account_bus: AccountBus,
     /// Symbol 元数据：用于把币本位订单折算为交易所下单单位并取整
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// dry-run 模式：只打日志不下单
@@ -53,35 +49,14 @@ pub struct OrderGateway {
     /// 那时订单早已成交，再发一条"下单失败"就是假警报，还会在账本里留一行假的
     /// error。所以：交易所一旦说过话（任何 OrderUpdate），本地的 REST 结论就作废。
     ///
-    /// 由多个并发的下单任务与 `Message<IncomeEvent>`（ack）两处访问，故用 Mutex。
+    /// 由多个并发的下单任务与交易所回报（[`Self::ack`]）两处访问，故用 Mutex。
     in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// 下单结果不确定时的停机开关（见 [`EngineHalt`]）
-    halt: EngineHalt,
+    /// 下单结果不确定时的停机开关：由 manager 构造时交入它自己的 `scope.fail_handle()`。
+    /// 触发 = manager 带错退出、整棵树停机，`run_engine` 以错误返回、进程退出 ——
+    /// 与持仓对账确认漂移时同一条停机路径。
+    halt: FailHandle,
     /// 已因结果不确定触发停机：此后不再发任何新单（停机收尾期间策略可能还在出信号）
     halted: std::sync::atomic::AtomicBool,
-}
-
-/// 受控停机开关：杀掉监督树的根（`ManagerActor`）。根的 `on_stop` 依次停下全部子 actor，
-/// `run_engine` 以错误返回，进程退出 —— 与持仓对账确认漂移时同一条停机路径。
-///
-/// 做成开关而不是直接持有 `ActorRef<ManagerActor>`：网关只需要「能停机」这一个能力，
-/// 测试里换一个替身 actor 就能验证它被触发了。
-#[derive(Clone)]
-pub struct EngineHalt(Arc<dyn Fn() + Send + Sync>);
-
-impl EngineHalt {
-    /// 触发时杀掉 `target`（弱引用：开关不该让根 actor 多活一刻）
-    pub fn kill<A: Actor>(target: WeakActorRef<A>) -> Self {
-        Self(Arc::new(move || {
-            if let Some(target) = target.upgrade() {
-                target.kill();
-            }
-        }))
-    }
-
-    fn fire(&self) {
-        (self.0)()
-    }
 }
 
 /// [`OrderGateway::place`] 的结构化结论，给**编排方**消费（策略侧的闭环走事件回报，
@@ -103,16 +78,17 @@ pub enum PlaceVerdict {
 }
 
 impl OrderGateway {
+    /// `halt`：下单结果不确定时要停掉的那个节点（manager）的 `scope.fail_handle()`。
     pub fn new(
         accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
-        account_pubsub: ActorRef<AccountPubSub>,
+        account_bus: AccountBus,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
         dry_run: bool,
-        halt: EngineHalt,
+        halt: FailHandle,
     ) -> Self {
         Self {
             accounts,
-            account_pubsub,
+            account_bus,
             symbol_metas,
             dry_run,
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -153,7 +129,7 @@ impl OrderGateway {
         let Some(client) = self.accounts.get(&order.exchange).cloned() else {
             let reason = format!("{} 没有账户（未配置凭证），无法下单", order.exchange);
             tracing::error!(exchange = %order.exchange, "{}", reason);
-            self.send_order_error(&order, reason.clone()).await;
+            self.send_order_error(&order, reason.clone());
             return Err(reason);
         };
 
@@ -195,7 +171,7 @@ impl OrderGateway {
                 symbol = %order.symbol,
                 "{}", reason
             );
-            self.send_order_error(&order, reason.clone()).await;
+            self.send_order_error(&order, reason.clone());
             return Err(reason);
         };
         // 数量下界（取整为 0 / 低于最小下单量）在 from_domain 里拦下：
@@ -210,7 +186,7 @@ impl OrderGateway {
                     %reason,
                     "订单未通过出向校验，未发送"
                 );
-                self.send_order_error(&order, reason.clone()).await;
+                self.send_order_error(&order, reason.clone());
                 return Err(reason);
             }
         };
@@ -260,7 +236,7 @@ impl OrderGateway {
                     PlaceError::Rejected(reason) => {
                         // reduce-only 因仓位已平被拒：平仓目标已达成，对编排方不是失败
                         let already_closed = reason == RejectReason::ReduceOnlyClosed;
-                        let reason = self.rejected(&order, reason).await;
+                        let reason = self.rejected(&order, reason);
                         if already_closed {
                             Ok(PlaceVerdict::ReduceOnlyAlreadyClosed)
                         } else {
@@ -275,7 +251,7 @@ impl OrderGateway {
 
     /// 被拒绝：单子确定没挂上。反馈 Error 给策略清掉挂单（reduce-only 已平也一样要清），
     /// 返回拒单原因。reduce-only 因仓位已平被拒是无害的，只记 info。
-    async fn rejected(&self, order: &Order, reason: RejectReason) -> String {
+    fn rejected(&self, order: &Order, reason: RejectReason) -> String {
         if reason == RejectReason::ReduceOnlyClosed {
             tracing::info!(
                 exchange = %order.exchange,
@@ -293,7 +269,7 @@ impl OrderGateway {
             );
         }
         let reason = PlaceError::Rejected(reason).to_string();
-        self.send_order_error(order, reason.clone()).await;
+        self.send_order_error(order, reason.clone());
         reason
     }
 
@@ -310,7 +286,12 @@ impl OrderGateway {
             %detail,
             "下单结果不确定（单子可能已挂上或已成交），停机交人工核对挂单与持仓"
         );
-        self.halt.fire();
+        self.halt.fail(anyhow::anyhow!(
+            "下单结果不确定（{} {} client_order_id={}），停机交人工核对挂单与持仓: {detail}",
+            order.exchange,
+            order.symbol,
+            order.client_order_id
+        ));
         format!("下单结果不确定，引擎停机: {detail}")
     }
 
@@ -343,8 +324,7 @@ impl OrderGateway {
                 // 撤单成功，合成 Cancelled 回报让 SymbolState 移除 pending。
                 // 必须携带真实的 client_order_id —— pending 以它为键，填错
                 // （此前填的是交易所 order_id）会让撤掉的单永远留在本地。
-                self.publish_cancelled(exchange, symbol, order_id, client_order_id)
-                    .await;
+                self.publish_cancelled(exchange, symbol, order_id, client_order_id);
                 Ok(())
             }
             Err(e) => {
@@ -380,8 +360,7 @@ impl OrderGateway {
                                     "撤单失败但订单已不在挂单列表（已成交或已撤），\
                                      合成 Cancelled 清理本地 pending"
                                 );
-                                self.publish_cancelled(exchange, symbol, order_id, client_order_id)
-                                    .await;
+                                self.publish_cancelled(exchange, symbol, order_id, client_order_id);
                                 Ok(())
                             }
                         }
@@ -410,7 +389,7 @@ impl OrderGateway {
     /// 合成撤单确认回报（撤单成功、或复查确认订单已不在挂单列表时）。
     ///
     /// `client_order_id` 必须是**本地订单号**：SymbolState 的 pending 以它为键移除。
-    async fn publish_cancelled(
+    fn publish_cancelled(
         &self,
         exchange: Exchange,
         symbol: Symbol,
@@ -427,23 +406,16 @@ impl OrderGateway {
             status: OrderStatus::Cancelled,
             quantity: 0.0,
         };
-        if let Err(e) = self
-            .account_pubsub
-            .tell(Publish(AccountEvent {
-                account: AccountId::Live,
-                exchange_ts: local_ts,
-                local_ts,
-                data: AccountData::Symbol(SymbolAccountData::OrderUpdate(update)),
-            }))
-            .send()
-            .await
-        {
-            tracing::error!(error = %e, "Failed to publish cancel confirmation");
-        }
+        self.account_bus.publish(AccountEvent {
+            account: AccountId::Live,
+            exchange_ts: local_ts,
+            local_ts,
+            data: AccountData::Symbol(SymbolAccountData::OrderUpdate(update)),
+        });
     }
 
     /// 发送订单错误事件（策略侧的失败闭环：Error 终态清 pending）
-    async fn send_order_error(&self, order: &Order, reason: String) {
+    fn send_order_error(&self, order: &Order, reason: String) {
         let local_ts = now_ms();
         let update = OrderUpdate {
             order_id: String::new(),
@@ -455,88 +427,101 @@ impl OrderGateway {
             // 如实带上委托量（与柜台的拒单回报口径一致），不填 0
             quantity: order.quantity,
         };
-
-        if let Err(e) = self
-            .account_pubsub
-            .tell(Publish(AccountEvent {
-                account: AccountId::Live,
-                exchange_ts: local_ts, // 本地错误，没有交易所时间戳
-                local_ts,
-                data: AccountData::Symbol(SymbolAccountData::OrderUpdate(update)),
-            }))
-            .send()
-            .await
-        {
-            tracing::error!(error = %e, "Failed to publish to AccountPubSub");
-        }
+        self.account_bus.publish(AccountEvent {
+            account: AccountId::Live,
+            exchange_ts: local_ts, // 本地错误，没有交易所时间戳
+            local_ts,
+            data: AccountData::Symbol(SymbolAccountData::OrderUpdate(update)),
+        });
     }
 }
 
 // ============================================================================
-// OutcomeProcessorActor —— 总线订阅薄壳
+// OutcomeProcessor —— 总线订阅薄壳
 // ============================================================================
 
-/// OutcomeProcessorActor - 订阅 OutcomePubSub，把实盘账户的策略信号交给 [`OrderGateway`]。
-pub struct OutcomeProcessorActor {
+/// 收件箱消息：两条总线的订阅都落到这里
+enum Msg {
+    /// 出向总线上归实盘出口的策略信号（订阅过滤：[`to_live_outlet`]）
+    Outcome(AccountOutcome),
+    /// 账户总线上的订单回报（订阅过滤：[`is_order_update`]）
+    OrderUpdate(AccountEvent),
+}
+
+/// 账户总线的订阅过滤：只要 `OrderUpdate`，不吃全量账户事件
+fn is_order_update(e: &AccountEvent) -> bool {
+    matches!(e.data, AccountData::Symbol(SymbolAccountData::OrderUpdate(_)))
+}
+
+/// 订阅出向总线，把实盘账户的策略信号交给 [`OrderGateway`]。
+pub struct OutcomeProcessor {
     gateway: Arc<OrderGateway>,
+    inbox: Inbox<Msg>,
+    /// 在途的下单/撤单请求，每张单一个子任务（见 [`Self::on_outcome`]）
+    requests: Group,
 }
 
-impl Actor for OutcomeProcessorActor {
-    type Args = Arc<OrderGateway>;
-    type Error = Infallible;
-
-    async fn on_start(gateway: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        if gateway.dry_run {
-            tracing::warn!("OutcomeProcessorActor started in DRY-RUN mode (orders will NOT be placed)");
-        } else {
-            tracing::info!("OutcomeProcessorActor started");
-        }
-        Ok(Self { gateway })
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        tracing::info!("OutcomeProcessorActor stopped");
+impl OutcomeProcessor {
+    /// 在 `group` 下起实盘出口，等它订阅完成。
+    ///
+    /// 订阅：
+    /// - `outcome_bus`，过滤 [`to_live_outlet`]：只认领实盘账户的信号（与本地柜台的
+    ///   `to_paper_outlet` 成对，判据只有 `outlet_for` 一处）；
+    /// - `account_bus`，只订 `OrderUpdate`：交易所回报用来作废迟到的 REST 失败结论
+    ///   （见 `OrderGateway::in_flight`）。
+    pub async fn spawn(
+        group: &Group,
+        gateway: Arc<OrderGateway>,
+        outcome_bus: &OutcomeBus,
+        account_bus: &AccountBus,
+    ) -> anyhow::Result<()> {
+        let (outcome_bus, account_bus) = (outcome_bus.clone(), account_bus.clone());
+        group
+            .spawn("OutcomeProcessor", move |scope: Scope| async move {
+                let (_addr, mut inbox) = scope.inbox::<Msg>();
+                inbox.subscribe(&outcome_bus, to_live_outlet, Msg::Outcome);
+                inbox.subscribe(&account_bus, is_order_update, Msg::OrderUpdate);
+                let requests = scope.group("requests");
+                if gateway.dry_run {
+                    tracing::warn!("OutcomeProcessor started in DRY-RUN mode (orders will NOT be placed)");
+                } else {
+                    tracing::info!("OutcomeProcessor started");
+                }
+                Ok(Self { gateway, inbox, requests })
+            })
+            .await?;
         Ok(())
     }
-}
 
-impl Message<AccountOutcome> for OutcomeProcessorActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        tagged: AccountOutcome,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        // 归属由订阅过滤器保证（见 ManagerActor 装配）。这里再验一次**不是**重新分发：
+    fn on_outcome(&self, tagged: AccountOutcome) -> anyhow::Result<()> {
+        // 归属由订阅过滤器保证（见 [`Self::spawn`]）。这里再验一次**不是**重新分发：
         // 判据仍是同一个 `outlet_for`，新增账户类型时它编译失败，不存在"两处各判各的"
-        // 那种静默漏改。留这道是因为投递路径本身没法在类型上收死（`SubscribeFilter` 是
-        // 运行期的），而装配写错时"响亮失败"远好过静默双执行 —— 品味 1.1 的第二级。
+        // 那种静默漏改。留这道是因为投递路径本身没法在类型上收死（订阅过滤是运行期的），
+        // 而装配写错时"响亮失败"远好过静默双执行 —— 品味 1.1 的第二级。
         if outlet_for(&tagged.account) != Outlet::Live {
             tracing::error!(
                 account = %tagged.account,
                 "非实盘账户的信号到达实盘出口 —— 订阅过滤器装配错误，丢弃"
             );
-            return;
+            return Ok(());
         }
-        // 下单/撤单一律 `tokio::spawn` 异步执行，**有意为之**：REST 往返可能上百 ms，
-        // 若在 handler 内 await 会阻塞本 actor 的邮箱，进而拖垮整条 income/outcome 事件流
-        // （行情、成交回报全部积压）。
+        // 下单/撤单一律各起一个子任务异步执行，**有意为之**：REST 往返可能上百 ms，
+        // 若在收件循环里 await，后面的信号与交易所回报（ack）全部排队等它。
         //
-        // 已知取舍（当前不处理，靠上层机制兜底）：
-        // - 同一 symbol 的多笔下单/撤单可能乱序到达交易所——策略层的 rebalance /
-        //   reduce-only 会在后续事件中纠正净敞口，不依赖单条请求的到达序。
-        // - 优雅停机时 `on_stop` 不等待 in-flight 请求，理论上存在"引擎已停但请求仍在途"
-        //   的窗口；接受此风险以换取事件流不阻塞。
-        // - spawned task 内的结论不靠返回值传递：拒单由 gateway 反馈为 OrderUpdate(Error)、
-        //   撤单反馈为 Cancelled；下单结果不确定时 gateway 自己停机（不反馈 Error，见
-        //   `OrderGateway::place`）。返回值只服务需要同步结论的编排方（降级平仓），此处忽略。
+        // 子任务挂在本组件的 `requests` 组下而不是游离的 `tokio::spawn`：
+        // - 停机时本组件先排空收件箱（排空期间起的单也挂进来），框架再等全部在途请求返回
+        //   才算停完 —— 不再有"引擎已停但请求仍在途"的窗口（REST 有自己的超时，根的总期限兜底）；
+        // - 请求任务 panic 会作为错误上冒、整机停机，不会被吞掉。
+        //
+        // 已知取舍（当前不处理，靠上层机制兜底）：同一 symbol 的多笔下单/撤单可能乱序
+        // 到达交易所 —— 策略层的 rebalance / reduce-only 会在后续事件中纠正净敞口，不依赖
+        // 单条请求的到达序。
+        //
+        // 子任务内的结论不靠返回值传递：拒单由 gateway 反馈为 OrderUpdate(Error)、撤单反馈为
+        // Cancelled；下单结果不确定时 gateway 自己停机（不反馈 Error，见 `OrderGateway::place`）。
+        // 返回值只服务需要同步结论的编排方（降级平仓），此处忽略。
         match tagged.event {
-            // 自定义事件与交易所无关：它已随 Outcome 总线到达外部订阅者，本处理器只管下单/撤单
+            // 自定义事件与交易所无关：它已随出向总线到达外部订阅者，本处理器只管下单/撤单
             OutcomeEvent::Emit(_) => {}
             OutcomeEvent::CancelOrder {
                 exchange,
@@ -545,9 +530,9 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
                 client_order_id,
             } => {
                 let gateway = self.gateway.clone();
-                tokio::spawn(async move {
+                self.submit(format!("cancel:{exchange}:{order_id}"), async move {
                     let _ = gateway.cancel(exchange, symbol, order_id, client_order_id).await;
-                });
+                })?;
             }
             OutcomeEvent::PlaceOrders { orders, comment } => {
                 // 关联订单独立并行下单：IOC 订单本身接受部分成交，
@@ -555,26 +540,40 @@ impl Message<AccountOutcome> for OutcomeProcessorActor {
                 for order in orders {
                     let gateway = self.gateway.clone();
                     let comment = comment.clone();
-                    tokio::spawn(async move {
+                    let name = format!("place:{}", order.client_order_id);
+                    self.submit(name, async move {
                         let _ = gateway.place(order, &comment).await;
-                    });
+                    })?;
                 }
             }
         }
+        Ok(())
     }
-}
 
-/// 交易所回报入口：**只用来作废本地的 REST 结论**。
-///
-/// 经 `SubscribeFilter` 只订阅 `OrderUpdate`，不吃行情洪水。收到任何一条回报就把该单
-/// 从 `in_flight` 摘掉 —— 交易所说过话之后，REST 那条迟到的失败结论不再作数。
-///
-/// 本处理器**不**据此维护订单状态：订单状态的单一出处是 `SymbolState`，这里只做
-/// "谁先说话"的判定。
-impl Message<AccountEvent> for OutcomeProcessorActor {
-    type Reply = ();
+    /// 把一次请求挂到 `requests` 组下执行。
+    fn submit(
+        &self,
+        name: String,
+        request: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        self.requests
+            .spawn_fn(name, |scope| async move {
+                request.await;
+                // 做完即收工：没被要求停止就返回 Ok 会被框架当成出错
+                scope.request_stop();
+                Ok(())
+            })
+            // 组只在本组件 run 返回后才关闭，此时不会再有信号要发；真发生了就是一张单没发出去
+            .map_err(|e| anyhow::anyhow!("下单/撤单请求无法执行（不该发生）: {e}"))?;
+        Ok(())
+    }
 
-    async fn handle(&mut self, msg: AccountEvent, _ctx: &mut Context<Self, Self::Reply>) {
+    /// 交易所回报入口：**只用来作废本地的 REST 结论**。
+    ///
+    /// 收到任何一条回报就把该单从 `in_flight` 摘掉 —— 交易所说过话之后，REST 那条迟到的
+    /// 失败结论不再作数。本处理器**不**据此维护订单状态：订单状态的单一出处是
+    /// `SymbolState`，这里只做"谁先说话"的判定。
+    fn on_order_update(&self, msg: &AccountEvent) {
         let AccountData::Symbol(SymbolAccountData::OrderUpdate(update)) = &msg.data else {
             return;
         };
@@ -582,6 +581,23 @@ impl Message<AccountEvent> for OutcomeProcessorActor {
             return;
         };
         self.gateway.ack(client_order_id);
+    }
+}
+
+impl Task for OutcomeProcessor {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        while let Some(msg) = self.inbox.recv().await {
+            match msg {
+                Msg::Outcome(tagged) => self.on_outcome(tagged)?,
+                Msg::OrderUpdate(event) => self.on_order_update(&event),
+            }
+        }
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> anyhow::Result<()> {
+        tracing::info!("OutcomeProcessor stopped");
+        Ok(())
     }
 }
 
@@ -696,21 +712,20 @@ mod tests {
 
 }
 
-/// 对 [`OrderGateway::place`] 的返回值契约直测（不是复刻实现）。
+/// 对 [`OrderGateway::place`] 的返回值契约直测（不是复刻实现），以及 [`OutcomeProcessor`]
+/// 的总线装配。
 ///
 /// 这份契约被降级平仓消费：把 `ExchangeSpoke` 折算成"成功"曾是一个 Critical ——
 /// WS 拒单先到、REST 错误后到时，平仓被谎报为完成、敞口无人看管。
 #[cfg(test)]
-mod place_verdict_tests {
+mod gateway_tests {
     use super::*;
     use crate::domain::{
         AccountInfo, ExchangeError, OrderId, OrderType, Position, RejectReason, Side, TimeInForce,
     };
     use crate::domain::StepFormatter;
-    use kameo::actor::Spawn;
-    use kameo::mailbox;
-    use kameo_actors::pubsub::Subscribe;
-    use kameo_actors::DeliveryStrategy;
+    use crate::engine::live::test_support::collect;
+    use crate::tasks::Root;
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
@@ -751,22 +766,6 @@ mod place_verdict_tests {
         }
     }
 
-    /// 收集账户总线上的回报，供断言"是否发了 Error 回报"
-    struct Sink(Arc<Mutex<Vec<AccountEvent>>>);
-    impl Actor for Sink {
-        type Args = Arc<Mutex<Vec<AccountEvent>>>;
-        type Error = Infallible;
-        async fn on_start(a: Self::Args, _r: ActorRef<Self>) -> Result<Self, Self::Error> {
-            Ok(Self(a))
-        }
-    }
-    impl Message<AccountEvent> for Sink {
-        type Reply = ();
-        async fn handle(&mut self, m: AccountEvent, _c: &mut Context<Self, Self::Reply>) {
-            self.0.lock().unwrap().push(m);
-        }
-    }
-
     fn order() -> Order {
         Order {
             id: String::new(),
@@ -798,48 +797,42 @@ mod place_verdict_tests {
         )]))
     }
 
-    /// 停机开关的替身目标：被杀即表示网关触发了停机
-    struct HaltTarget;
-    impl Actor for HaltTarget {
-        type Args = ();
-        type Error = Infallible;
-        async fn on_start(_: (), _r: ActorRef<Self>) -> Result<Self, Self::Error> {
-            Ok(Self)
-        }
-    }
-
+    /// 网关的停机开关接在测试树的根上：根进入停机即表示网关触发了停机
     struct Harness {
+        root: Root,
+        group: crate::tasks::Group,
+        account_bus: AccountBus,
         gateway: Arc<OrderGateway>,
+        /// 账户总线上的回报，供断言"是否发了 Error 回报"
         events: Arc<Mutex<Vec<AccountEvent>>>,
-        halt_target: ActorRef<HaltTarget>,
     }
 
     impl Harness {
         async fn new(client: FakeClient) -> Self {
-            let pubsub = AccountPubSub::spawn_with_mailbox(
-                AccountPubSub::new(DeliveryStrategy::Guaranteed),
-                mailbox::unbounded(),
-            );
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let sink = Sink::spawn_with_mailbox(events.clone(), mailbox::unbounded());
-            pubsub.tell(Subscribe(sink)).send().await.unwrap();
+            let root = Root::new("t");
+            let group = root.group("g");
+            let account_bus = AccountBus::new("account");
+            let events = collect(&group, &account_bus).await;
             let clients: HashMap<Exchange, Arc<dyn AccountClient>> =
                 HashMap::from([(EX, Arc::new(client) as Arc<dyn AccountClient>)]);
-            let halt_target = HaltTarget::spawn_with_mailbox((), mailbox::unbounded());
-            halt_target.wait_for_startup().await;
-            let halt = EngineHalt::kill(halt_target.downgrade());
-            let gateway = Arc::new(OrderGateway::new(clients, pubsub, metas(), false, halt));
-            Self { gateway, events, halt_target }
+            let gateway = Arc::new(OrderGateway::new(
+                clients,
+                account_bus.clone(),
+                metas(),
+                false,
+                root.fail_handle(),
+            ));
+            Self { root, group, account_bus, gateway, events }
         }
 
-        /// 是否触发了停机（等替身停下，最多 2 秒）
+        /// 是否触发了停机（停机开关是同步生效的）
         async fn halted(&self) -> bool {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                self.halt_target.wait_for_shutdown(),
-            )
-            .await
-            .is_ok()
+            self.root.is_stopping()
+        }
+
+        async fn finish(self) {
+            // 触发过停机的用例这里会拿到那个错误，不关心
+            let _ = self.root.shutdown().await;
         }
 
         /// 是否发出了 Error 终态回报（策略侧失败闭环）
@@ -867,6 +860,7 @@ mod place_verdict_tests {
         let verdict = h.gateway.place(order(), "t").await;
         assert_eq!(verdict, Ok(PlaceVerdict::Accepted));
         assert!(!h.error_reported().await, "受理成功不该发失败回报");
+        h.finish().await;
     }
 
     /// reduce-only 因仓位已平被拒 → 编排方得"目标已达成"，策略侧照常收 Error 闭环
@@ -880,6 +874,7 @@ mod place_verdict_tests {
         let verdict = h.gateway.place(order(), "t").await;
         assert_eq!(verdict, Ok(PlaceVerdict::ReduceOnlyAlreadyClosed));
         assert!(h.error_reported().await, "策略侧仍需 Error 回报清 pending");
+        h.finish().await;
     }
 
     /// 被拒绝（交易所从未回报）→ Err，且发 Error 回报让策略清挂单；不停机
@@ -894,6 +889,7 @@ mod place_verdict_tests {
         assert!(verdict.is_err(), "拒单必须是 Err: {verdict:?}");
         assert!(h.error_reported().await, "拒单必须反馈 Error 回报");
         assert!(!h.halted().await, "拒单不该停机");
+        h.finish().await;
     }
 
     /// 结果不确定且交易所没回报过 → 停机；**不**发 Error（否则策略以为单子没了、再挂一张）；
@@ -912,6 +908,7 @@ mod place_verdict_tests {
 
         let again = h.gateway.place(order(), "t").await;
         assert!(again.is_err(), "停机期间不再发新单: {again:?}");
+        h.finish().await;
     }
 
     /// **Critical 回归防线**：REST 在途期间交易所已回报（内容未知，可能是拒单）→
@@ -947,5 +944,99 @@ mod place_verdict_tests {
             "交易所已回报过，迟到的 REST 失败不该再发假 Error"
         );
         assert!(!h.halted().await, "交易所回报流已认领该单，状态以回报为准，不必停机");
+        h.finish().await;
+    }
+
+    // ===== OutcomeProcessor 的总线装配：订阅过滤、回报作废 REST 结论、停机等在途请求 =====
+
+    fn signal(account: AccountId) -> AccountOutcome {
+        AccountOutcome {
+            account,
+            event: OutcomeEvent::PlaceOrders {
+                orders: vec![order()],
+                comment: "t".to_string(),
+            },
+        }
+    }
+
+    async fn spawn_processor(h: &Harness) -> OutcomeBus {
+        let outcome_bus = OutcomeBus::new("outcome");
+        OutcomeProcessor::spawn(&h.group, h.gateway.clone(), &outcome_bus, &h.account_bus)
+            .await
+            .expect("OutcomeProcessor 起不来");
+        outcome_bus
+    }
+
+    /// 实盘信号经总线到达网关；模拟账户的信号不归实盘出口
+    /// （FakeClient 只备一份结果，误认领会让请求子任务 panic、根进入停机）
+    #[tokio::test]
+    async fn live_signal_reaches_gateway_and_paper_signal_is_ignored() {
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(Some(Err(PlaceError::rejected("Margin is insufficient.")))),
+            gate: None,
+        })
+        .await;
+        let outcome_bus = spawn_processor(&h).await;
+        outcome_bus.publish(signal(AccountId::Live));
+        assert!(h.error_reported().await, "实盘信号应经网关下单（此处被拒、反馈 Error）");
+        outcome_bus.publish(signal(AccountId::Paper("BTC".to_string())));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!h.halted().await, "模拟账户的信号被实盘出口认领了");
+        h.finish().await;
+    }
+
+    /// 账户总线上的交易所回报经本组件作废在途 REST 的结论：迟到的失败不再上报、不停机
+    #[tokio::test]
+    async fn exchange_report_on_bus_voids_late_rest_failure() {
+        let (entered_tx, mut entered_rx) = mpsc::channel(1);
+        let (proceed_tx, proceed_rx) = mpsc::channel(1);
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(Some(Err(PlaceError::indeterminate("late 503")))),
+            gate: Some((entered_tx, tokio::sync::Mutex::new(proceed_rx))),
+        })
+        .await;
+        let outcome_bus = spawn_processor(&h).await;
+        outcome_bus.publish(signal(AccountId::Live));
+        entered_rx.recv().await.expect("place_order 已进入");
+        h.account_bus.publish(AccountEvent {
+            account: AccountId::Live,
+            exchange_ts: 1,
+            local_ts: 1,
+            data: AccountData::Symbol(SymbolAccountData::OrderUpdate(OrderUpdate {
+                order_id: "ex-1".to_string(),
+                client_order_id: Some(CID.to_string()),
+                exchange: EX,
+                symbol: SYM.to_string(),
+                side: Side::Short,
+                status: OrderStatus::Pending,
+                quantity: 1.0,
+            })),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        proceed_tx.send(()).await.expect("放行 REST 返回失败");
+        assert!(!h.error_reported().await, "交易所已回报过，迟到的 REST 失败不该再发假 Error");
+        assert!(!h.halted().await, "交易所回报流已认领该单，不必停机");
+        h.finish().await;
+    }
+
+    /// 停机等在途请求返回才算停完（请求挂在本组件的子树上，不是游离任务）
+    #[tokio::test]
+    async fn shutdown_waits_for_in_flight_request() {
+        let (entered_tx, mut entered_rx) = mpsc::channel(1);
+        let (proceed_tx, proceed_rx) = mpsc::channel(1);
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(Some(Ok("ex-1".to_string()))),
+            gate: Some((entered_tx, tokio::sync::Mutex::new(proceed_rx))),
+        })
+        .await;
+        let outcome_bus = spawn_processor(&h).await;
+        outcome_bus.publish(signal(AccountId::Live));
+        entered_rx.recv().await.expect("place_order 已进入");
+        let shutdown = h.root.shutdown();
+        tokio::pin!(shutdown);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown).await;
+        assert!(early.is_err(), "在途请求还没返回，停机不该完成");
+        proceed_tx.send(()).await.expect("放行 REST");
+        shutdown.await.expect("正常停机");
     }
 }

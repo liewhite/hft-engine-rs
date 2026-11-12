@@ -12,19 +12,20 @@ mod outcome_processor;
 mod paper_counter;
 mod position_ledger;
 mod supervisor;
+#[cfg(test)]
+mod test_support;
 
 use crate::domain::AccountId;
 use crate::strategy::OutcomeEvent;
-use kameo_actors::pubsub::PubSub;
 
 // 两条**入向**总线的别名住在 `messaging`（它们承载的事件类型就定义在那儿）。
-// 此前住在本模块，导致各所适配层为了持 `ActorRef<MarketPubSub>` 而反向依赖引擎层。
-pub use crate::messaging::{AccountPubSub, MarketPubSub};
+// 此前住在本模块，导致各所适配层为了持总线而反向依赖引擎层。
+pub use crate::messaging::{AccountBus, MarketBus};
 
 /// 带账户归属的策略信号。
 ///
-/// 一条 OutcomePubSub 上同时跑实盘与多个模拟账户的订单：[`OutcomeProcessorActor`] 只处理
-/// [`AccountId::Live`]，[`PaperCounterActor`] 只处理 `Paper(_)`。这样"发往交易所"与"落本地
+/// 一条 [`OutcomeBus`] 上同时跑实盘与多个模拟账户的订单：[`OutcomeProcessor`] 只处理
+/// [`AccountId::Live`]，[`PaperCounter`] 只处理 `Paper(_)`。这样"发往交易所"与"落本地
 /// 柜台"仍是两个互不知情的实现，且天然支持几百个模拟账户，无需为每个账户开一条总线。
 #[derive(Debug, Clone)]
 pub struct AccountOutcome {
@@ -32,13 +33,13 @@ pub struct AccountOutcome {
     pub event: OutcomeEvent,
 }
 
-/// Outcome 事件的 PubSub Actor 类型
-pub type OutcomePubSub = PubSub<AccountOutcome>;
+/// 出向总线：策略信号（带账户归属）。住在这里而不在 `messaging` 的理由见 `messaging::bus`。
+pub type OutcomeBus = crate::tasks::Bus<AccountOutcome>;
 
 /// 一条策略信号该由哪个出口执行。
 ///
-/// 出口本身是两个互不知情的实现（[`OutcomeProcessorActor`] 发往交易所、
-/// [`PaperCounterActor`] 落本地柜台），但"这条归谁"是**一个**判断，只能有一处
+/// 出口本身是两个互不知情的实现（[`OutcomeProcessor`] 发往交易所、
+/// [`PaperCounter`] 落本地柜台），但"这条归谁"是**一个**判断，只能有一处
 /// （见 `docs/architecture.md` 原则 P4）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outlet {
@@ -66,9 +67,9 @@ pub const fn outlet_for(account: &AccountId) -> Outlet {
     }
 }
 
-/// 实盘出口的订阅过滤器（`ManagerActor` 装配时传给 `SubscribeFilter`）。
+/// 实盘出口的订阅过滤器（[`OutcomeProcessor::spawn`] 订阅出向总线时用它）。
 ///
-/// 提成具名函数而非就地写闭包，是为了让 [`outlet_dispatch_tests`] 断言的就是**装配处
+/// 提成具名函数而非就地写闭包，是为了让 [`outlet_dispatch_tests`] 断言的就是**订阅处
 /// 真正用的那一个** —— 测试里复写一遍等价表达式，证明不了线上跑的是什么。
 pub fn to_live_outlet(o: &AccountOutcome) -> bool {
     matches!(outlet_for(&o.account), Outlet::Live)
@@ -81,13 +82,13 @@ pub fn to_paper_outlet(o: &AccountOutcome) -> bool {
 
 
 pub use assembly::{setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup};
-pub use clock::{ClockActor, ClockActorArgs};
+pub use clock::Clock;
 pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, PublishCustomEvent, RegisterSupervisedChild, SubscribeAccount, SubscribeMarket, SubscribeOutcome, StrategySpec, RemoveStrategies};
 pub use executor::{ExecutorActor, ExecutorArgs, GetPositions, GetSeededPositions};
 pub use income_processor::{IncomeProcessorActor, RegisterExecutor, UnregisterExecutor};
-pub use metrics::{MetricsActor, MetricsActorArgs, RegisterSymbols, DEFAULT_REPORT_INTERVAL_MS};
-pub use outcome_processor::{EngineHalt, OrderGateway, OutcomeProcessorActor, PlaceVerdict};
-pub use paper_counter::{PaperCounterActor, PaperCounterArgs};
+pub use metrics::{Metrics, MetricsArgs, MetricsHandle, DEFAULT_REPORT_INTERVAL_MS};
+pub use outcome_processor::{OrderGateway, OutcomeProcessor, PlaceVerdict};
+pub use paper_counter::{PaperCounter, PaperCounterArgs};
 pub use position_ledger::{
     GetLivePositions, PositionLedgerActor, PositionLedgerArgs, Reconciler, UnwatchExecutor,
     WatchExecutor,
@@ -125,7 +126,7 @@ mod outlet_dispatch_tests {
 
     /// **不重不漏**：每条信号恰好被一个出口接受。
     ///
-    /// 用的是装配处真正传给 `SubscribeFilter` 的那两个函数。漏 = 信号无人执行（策略发了单
+    /// 用的是两个出口订阅时真正传进去的那两个过滤函数。漏 = 信号无人执行（策略发了单
     /// 却什么都没发生）；重 = 同一条单既发交易所又落柜台。两者都没有外在症状。
     #[test]
     fn every_signal_is_claimed_by_exactly_one_outlet() {

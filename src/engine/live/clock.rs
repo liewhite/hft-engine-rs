@@ -1,111 +1,80 @@
-//! ClockActor - 定时广播时钟信号
+//! Clock - 定时广播时钟信号
 //!
-//! 每秒发布 Clock 事件到 IncomePubSub
+//! 每隔 `interval_ms` 往行情总线发一条 `MarketData::Clock`（首拍立即）。策略的定时逻辑、
+//! 本地柜台的净值发布都由它驱动。
 
 use crate::domain::now_ms;
-use crate::messaging::{MarketData, MarketEvent};
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
-use kameo_actors::pubsub::Publish;
+use crate::messaging::{MarketBus, MarketData, MarketEvent};
+use crate::tasks::{ChildHandle, Group, GroupClosed, Periodic};
 use std::time::Duration;
-use tokio::time::Instant;
-use tokio_stream::wrappers::IntervalStream;
 
-use super::MarketPubSub;
-
-/// ClockActor 初始化参数
-pub struct ClockActorArgs {
-    /// 时钟间隔 (毫秒)
-    pub interval_ms: u64,
-    /// Income PubSub (用于发布 Clock 事件)
-    pub market_pubsub: ActorRef<MarketPubSub>,
+/// 时钟信号广播器
+pub struct Clock {
+    market_bus: MarketBus,
 }
 
-/// ClockActor - 时钟信号广播器
-pub struct ClockActor {
-    /// 时钟间隔
-    interval: Duration,
-    /// Income PubSub (发布 Clock 事件)
-    market_pubsub: ActorRef<MarketPubSub>,
+impl Clock {
+    /// 在 `group` 下起时钟，每 `interval_ms` 毫秒往 `market_bus` 发一条 Clock 事件。
+    pub fn spawn(
+        group: &Group,
+        interval_ms: u64,
+        market_bus: MarketBus,
+    ) -> Result<ChildHandle, GroupClosed> {
+        tracing::info!(interval_ms, "Clock started");
+        group.spawn_periodic("Clock", Duration::from_millis(interval_ms), Self { market_bus })
+    }
 }
 
-impl ClockActor {
-    /// 执行一次 tick
-    async fn tick(&mut self) {
+impl Periodic for Clock {
+    async fn tick(&mut self) -> anyhow::Result<()> {
         let local_ts = now_ms();
-
-        // 发布 Clock 事件到 IncomePubSub
-        if let Err(e) = self
-            .market_pubsub
-            .tell(Publish(MarketEvent {
-                exchange_ts: local_ts,
-                local_ts,
-                data: MarketData::Clock,
-            }))
-            .send()
-            .await
-        {
-            tracing::error!(error = %e, "Failed to publish to MarketPubSub");
-        }
-    }
-}
-
-impl Actor for ClockActor {
-    type Args = ClockActorArgs;
-    type Error = Infallible;
-
-    async fn on_start(
-        args: Self::Args,
-        actor_ref: ActorRef<Self>,
-    ) -> Result<Self, Self::Error> {
-        let actor = Self {
-            interval: Duration::from_millis(args.interval_ms),
-            market_pubsub: args.market_pubsub,
-        };
-
-        // 使用 attach_stream 管理 ticker 生命周期
-        let interval_stream = IntervalStream::new(tokio::time::interval(actor.interval));
-        actor_ref.attach_stream(interval_stream, (), ());
-
-        tracing::info!("ClockActor started");
-        Ok(actor)
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        tracing::info!("ClockActor stopped");
+        self.market_bus.publish(MarketEvent {
+            exchange_ts: local_ts,
+            local_ts,
+            data: MarketData::Clock,
+        });
         Ok(())
     }
 }
 
-// === Messages ===
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::{Inbox, Root, Scope, Task};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-/// Ticker stream 消息处理
-impl Message<StreamMessage<Instant, (), ()>> for ClockActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Instant, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        match msg {
-            StreamMessage::Next(_) => {
-                self.tick().await;
+    struct Counter(Inbox<MarketEvent>, Arc<AtomicUsize>);
+    impl Task for Counter {
+        async fn run(&mut self, _: &Scope) -> anyhow::Result<()> {
+            while let Some(ev) = self.0.recv().await {
+                assert!(matches!(ev.data, MarketData::Clock));
+                self.1.fetch_add(1, Ordering::SeqCst);
             }
-            StreamMessage::Started(_) => {
-                tracing::debug!("Clock ticker stream started");
-            }
-            StreamMessage::Finished(_) => {
-                // Ticker stream 不应该结束，如果结束了就 kill actor
-                tracing::error!("Clock ticker stream unexpectedly finished, killing actor");
-                ctx.actor_ref().kill();
-            }
+            Ok(())
         }
+    }
+
+    /// 首拍立即，之后按周期发到行情总线
+    #[tokio::test(start_paused = true)]
+    async fn publishes_clock_events_on_schedule() {
+        let root = Root::new("t");
+        let bus = MarketBus::new("market");
+        let n = Arc::new(AtomicUsize::new(0));
+        let producers = root.group("producers");
+        let consumers = root.group("consumers");
+        let (b, c) = (bus.clone(), n.clone());
+        consumers
+            .spawn("counter", move |scope| async move {
+                let (_addr, mut inbox) = scope.inbox();
+                inbox.subscribe(&b, |_| true, |e| e);
+                Ok(Counter(inbox, c))
+            })
+            .await
+            .unwrap();
+        Clock::spawn(&producers, 1000, bus).unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(n.load(Ordering::SeqCst), 3, "0s、1s、2s 各一拍");
+        root.shutdown().await.unwrap();
     }
 }
