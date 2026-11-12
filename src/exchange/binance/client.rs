@@ -791,7 +791,7 @@ fn parse_settled_funding(text: &str, symbol: &Symbol) -> Result<Vec<SettledFundi
         funding_rate: String,
     }
     let entries: Vec<Entry> = serde_json::from_str(text)
-        .map_err(|e| ExchangeError::ParseError(format!("fundingRate: {e} (body: {})", &text[..text.len().min(300)])))?;
+        .map_err(|e| ExchangeError::ParseError(format!("fundingRate: {e} (body: {})", text.chars().take(300).collect::<String>())))?;
     entries
         .into_iter()
         .map(|e| {

@@ -311,7 +311,7 @@ pub struct OrderFilled {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderFilledData {
-    // pub total_sz: String,
+    pub total_sz: String,
     // pub avg_px: String,
     pub oid: u64,
 }

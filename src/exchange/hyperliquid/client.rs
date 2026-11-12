@@ -65,8 +65,6 @@ pub struct HyperliquidClient {
     quote: String,
     /// Perp DEX 名称 ("" = 默认 perp DEX, "xyz" = 股票永续合约等)
     dex: String,
-    /// 是否是主网
-    is_mainnet: bool,
     /// Coin -> (Asset Index, szDecimals) 映射 (懒加载)
     coin_to_asset: RwLock<Option<HashMap<String, AssetEntry>>>,
 }
@@ -84,7 +82,8 @@ impl HyperliquidClient {
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
 
         let base_url = REST_BASE_URL.to_string();
-        let is_mainnet = true; // 默认主网
+        // 只支持主网：网络只在构造签名通道时决定一次，client 不另存一份
+        let is_mainnet = true;
         let submitter: Option<Arc<dyn HlSubmitter>> = match credentials.as_ref().map(|c| &c.signing) {
             None => None,
             Some(HyperliquidSigning::PrivateKey(key)) => Some(Arc::new(LocalKeySubmitter::new(
@@ -105,7 +104,6 @@ impl HyperliquidClient {
             base_url,
             quote,
             dex,
-            is_mainnet,
             coin_to_asset: RwLock::new(None),
         })
     }
@@ -287,9 +285,8 @@ impl HyperliquidClient {
             .filter(|p| *p > 0.0)
             .ok_or_else(|| ExchangeError::Other(format!("{coin} 盘口无对手价，市价单无法定价")))?;
         let px = if is_buy { top * (1.0 + MARKET_ORDER_SLIPPAGE) } else { top * (1.0 - MARKET_ORDER_SLIPPAGE) };
-        let formatted = SignificantFiguresFormatter::new(sz_decimals.max(0) as u32).format(px);
-        let px: f64 = formatted.parse().map_err(|_| ExchangeError::ParseError(formatted.clone()))?;
-        float_to_wire(px)
+        // 格式化器输出已是规范小数（无尾随零、不用科学计数法），直接用
+        Ok(hl_price_formatter(sz_decimals).format(px))
     }
 
     /// 将 domain Order 转换为下单意图
@@ -422,6 +419,31 @@ impl HyperliquidClient {
     }
 }
 
+/// 市价单（IOC）成交量不足委托量即报错。
+fn check_market_fully_filled(
+    filled: &crate::exchange::hyperliquid::signing::OrderFilledData,
+    requested: f64,
+) -> Result<OrderId, ExchangeError> {
+    let total: f64 = filled
+        .total_sz
+        .parse()
+        .map_err(|_| ExchangeError::ParseError(format!("HL totalSz 非法: {}", filled.total_sz)))?;
+    // 数量已按 szDecimals 取整，差一个最小步长以上才算没成交完；用相对容差吸收浮点尾巴
+    if total + requested * 1e-9 < requested {
+        return Err(ExchangeError::Other(format!(
+            "HL 市价单部分成交 {total}/{requested}（oid={}），余量已撤",
+            filled.oid
+        )));
+    }
+    Ok(filled.oid.to_string())
+}
+
+/// 按 HL 规则（5 位有效数字、小数位 ≤ 6 - szDecimals）格式化价格的格式化器。
+/// 限价单（经 SymbolMeta）与市价单定价共用这一份规则。
+fn hl_price_formatter(sz_decimals: i32) -> SignificantFiguresFormatter {
+    SignificantFiguresFormatter::new(sz_decimals.max(0) as u32)
+}
+
 /// `fundingHistory` 的单条记录（`premium` 不取）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -466,6 +488,17 @@ mod funding_history_tests {
         assert_eq!(got[0].symbol, "TSLA");
         assert_eq!(got[1].settle_time, 1794474000081);
         assert!((got[1].rate + 0.0000125).abs() < 1e-15);
+    }
+
+    #[test]
+    fn market_order_partial_fill_is_not_success() {
+        let f: crate::exchange::hyperliquid::signing::OrderFilledData =
+            serde_json::from_str(r#"{"totalSz":"0.4","avgPx":"100","oid":7}"#).unwrap();
+        let e = check_market_fully_filled(&f, 1.0).unwrap_err();
+        assert!(e.to_string().contains("0.4/1"), "{e}");
+        let f: crate::exchange::hyperliquid::signing::OrderFilledData =
+            serde_json::from_str(r#"{"totalSz":"0.3","avgPx":"100","oid":8}"#).unwrap();
+        assert_eq!(check_market_fully_filled(&f, 0.1 + 0.2).unwrap(), "8");
     }
 
     #[test]
@@ -762,6 +795,12 @@ impl AccountClient for HyperliquidClient {
 
         match &data.statuses[0] {
             OrderStatus::Resting(r) => Ok(r.resting.oid.to_string()),
+            // 市价单是「对手价 ±5% 的 IOC」：5% 内深度不够时只成交一部分、余量撤销，HL 仍回
+            // `filled`。调用方（如降级平仓）把成功读成"这条腿已处理完"，部分成交报成功会让
+            // 余量无人看管 —— 如实报未完成；已成交部分照常经回报流入账。
+            OrderStatus::Filled(f) if matches!(order.order_type, OrderType::Market) => {
+                check_market_fully_filled(&f.filled, order.quantity)
+            }
             OrderStatus::Filled(f) => Ok(f.filled.oid.to_string()),
             OrderStatus::Error(e) => Err(ExchangeError::Other(format!("Order error: {}", e.error))),
         }
@@ -859,12 +898,10 @@ struct OrderStatusOrder {
 /// 将 AssetInfo 转换为 SymbolMeta
 fn asset_info_to_symbol_meta(info: &AssetInfo) -> SymbolMeta {
     let symbol = from_hyperliquid(&info.name);
-    let sz_decimals = info.sz_decimals.max(0) as u32;
-
     SymbolMeta {
         exchange: Exchange::Hyperliquid,
         symbol,
-        price_formatter: Arc::new(SignificantFiguresFormatter::new(sz_decimals)),
+        price_formatter: Arc::new(hl_price_formatter(info.sz_decimals)),
         size_step: size_step(info.sz_decimals),
         min_order_size: size_step(info.sz_decimals), // 最小下单量为一个精度单位
         contract_size: 1.0, // Hyperliquid 是币本位，合约乘数为 1

@@ -74,10 +74,10 @@ pub(crate) struct HlCancelIntent {
 
 /// 签名并提交到 HL 的通道。返回 HL `/exchange` 的原始回复。
 ///
-/// 错误语义（调用方据此判断这单**是否可能已到 HL**）：
-/// - `ConnectionFailed` / `Timeout`：结果未知，可能已提交（与网络断开同一类）；
-/// - `OrderRejected`：确定没有提交（签名机按风控拒签等）；
-/// - 其余：确定没有提交。
+/// 错误种类**只用于日志可读**，调用方不按种类分流，也不能据此断定"确定没提交"：
+/// 例如签名机已提交但回复解析失败时报的是 `ParseError`。"单可能已到 HL"的情况由框架
+/// 现有机制收敛 —— `OrderGateway` 的在途登记，加上"下单失败只是本地结论，后到的交易所
+/// 回报会把单重新纳入跟踪"（见 `messaging/state.rs`）。与网络断开同一类处理。
 #[async_trait]
 pub(crate) trait HlSubmitter: Send + Sync {
     async fn place(&self, order: &HlOrderIntent) -> Result<Value, ExchangeError>;
@@ -258,7 +258,7 @@ impl HlSubmitter for EnclaveSubmitter {
             "reduceOnly": o.reduce_only,
         });
         if let Some(cloid) = &o.cloid {
-            order["cloid"] = json!(cloid.to_lowercase());
+            order["cloid"] = json!(cloid);
         }
         self.exchange(json!({"type": "order", "grouping": "na", "orders": [order]})).await
     }
