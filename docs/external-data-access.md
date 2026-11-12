@@ -4,64 +4,61 @@
 数据按性质选面，不为单个消费者开特例。
 
 ```text
-                      ┌─────────────────────────────────────┐
-   流（推）            │  SubscribeMarket / SubscribeAccount │
-   连续、增量、有序     │  SubscribeOutcome                   │
-                      └─────────────────────────────────────┘
-                      ┌─────────────────────────────────────┐
-   快照（拉）          │  GetAllSymbolMetas                  │
-   当下值、可采样       │  GetLivePositions                   │
-                      └─────────────────────────────────────┘
+                      ┌────────────────────────────────────────┐
+   流（推）            │  market_bus() / account_bus()          │
+   连续、增量、有序     │  outcome_bus()  + inbox.subscribe      │
+                      └────────────────────────────────────────┘
+                      ┌────────────────────────────────────────┐
+   快照（拉）          │  all_symbol_metas()                    │
+   当下值、可采样       │  live_positions()                      │
+                      └────────────────────────────────────────┘
 ```
 
-## 一、流面：`Subscribe*`
+两个面都经 `ManagerHandle`（`run_engine` 交给装配闭包的句柄）。
 
-三条消息覆盖引擎里全部事件类型，按 `fn` 指针过滤：
+## 一、流面：三条总线
 
-| 入口 | 覆盖 |
+三条总线覆盖引擎里全部事件类型，订阅时按 `fn` 指针过滤：
+
+| 总线 | 覆盖 |
 |---|---|
-| `SubscribeMarket<A>` | `MarketData` 全部 variant：BBO、MarketTrade、MarkPrice、IndexPrice、FundingRate、Candle、HistoryCandles、BorrowFee、ExchangeRate、ExchangeStatus、Clock、Custom |
-| `SubscribeAccount<A>` | `AccountData` 全部 variant：OrderUpdate、Fill、Balance、FundingFee、Greeks、AccountInfo |
-| `SubscribeOutcome<A>` | 策略信号（下单 / 撤单 / 自定义事件），带 `account` 标签 |
+| `market_bus()` | `MarketData` 全部 variant：BBO、MarketTrade、MarkPrice、IndexPrice、FundingRate、Candle、HistoryCandles、BorrowFee、ExchangeRate、ExchangeStatus、Clock、Custom |
+| `account_bus()` | `AccountData` 全部 variant：OrderUpdate、Fill、Balance、FundingFee、Greeks、AccountInfo |
+| `outcome_bus()` | 策略信号（下单 / 撤单 / 自定义事件），带 `account` 标签 |
 
 **契约**
 
-- 订阅方必须是 `Supervised<A>` —— 由 [`spawn_supervised`](../src/engine/live/mod.rs) 挂进引擎监督树后才拿得到凭证。
-  "订一个没人看着的 actor" 在类型上不可表达：观测组件悄悄死掉而引擎照常交易，是最危险的一类故障。
+- 订阅只能经收件箱（`Inbox::subscribe`），收件箱只能从任务树上的 `Scope` 建 —— 观察者经
+  `ManagerHandle::observers()` 挂到 manager 的消费者组，在自己的构造闭包里订阅。"订一个没人看着的组件"
+  不可表达：观测组件悄悄死掉而引擎照常交易，是最危险的一类故障（挂在树上的观察者出错即整机停机）。
 - 过滤器是 `fn` 指针而非闭包：不许捕获状态，因此筛选判据是纯粹的事件形状判断，可被独立推理。
 - **必须带 `account` 判据**：实盘与模拟账户共用 `AccountBus`，靠事件自带的 `account` 区分。不筛的话
   模拟成交会混进实盘口径。
-- 投递是 `BestEffort` + unbounded 邮箱：消费者跟不上时后果是积压（可见，见 `check_pipeline_lag`），不是丢事件。
+- 投递进订阅者的无界收件箱：消费者跟不上时后果是积压（可见，见 `Executor::check_pipeline_lag`），不是丢事件。
 
 **新增一个事件类型时，流面不需要任何改动** —— 订阅方的 filter 自动可见新 variant，manager 一行不用改。
 
-## 二、快照面：`Get*`
+## 二、快照面
 
-有些数据不是流。目前两项：
+有些数据不是流。目前两项（`ManagerHandle` 的方法）：
 
-| 消息 | 应答 | 语义 |
+| 方法 | 应答 | 语义 |
 |---|---|---|
-| `GetAllSymbolMetas` | `HashMap<Exchange, Vec<SymbolMeta>>` | 各所交易规则（精度、步长、合约乘数） |
-| `GetLivePositions` | `Vec<Position>` | 实盘持仓真值，**币本位**，per (所, symbol) |
+| `all_symbol_metas()`（同步） | `HashMap<Exchange, Vec<SymbolMeta>>` | 各所交易规则（精度、步长、合约乘数）；读句柄里那份启动时预加载、此后不变的目录 |
+| `live_positions().await` | `Result<Vec<Position>, String>` | 实盘持仓真值，**币本位**，per (所, symbol)；直接问持仓账本 |
 
 **契约**（每一项都必须满足，否则不该进这个面）
 
 1. **纯内存读**。应答路径上不许有任何 IO —— 不打 REST、不读文件、不推送。
-2. **不阻塞邮箱**。**数据宿主**（真正持有状态、被 manager 转发到的那个 actor）的**所有** handler
-   都不得 `await` 在 IO 上，否则查询会排在一次网络超时后面。这条约束反向淘汰了宿主候选：
-   见下文"为什么持仓查询挂在账本 actor 上"。
+2. **不阻塞收件箱**。**数据宿主**（真正持有状态的那个组件）处理**任何**消息时都不得 `await` 在
+   IO 上，否则查询会排在一次网络超时后面。这条约束反向淘汰了宿主候选：
+   见下文"为什么持仓查询挂在账本上"。
+3. **只经 `ManagerHandle` 暴露**，外部只持有这个句柄。内部组件的地址不外泄 —— 否则外部能给它发
+   任何消息。句柄的快照方法不经 manager 的收件箱：品种目录直接读句柄里那份，持仓直接问账本。
+4. **不许合并成一条通用查询**。`query(kind: Positions | SymbolMetas) -> QueryResult` 是"流程强行合并后
+   用 `match` 分发"的假抽象。新增一类快照 = 新增一个句柄方法，不改既有分支。
 
-   这条只约束数据宿主，不约束 manager 自己 —— manager 在投产期确实会 `await` 在 REST 上，
-   代价见本节末尾。两者的区别在于：manager 的阻塞是有界且一次性的（投产），
-   数据宿主的阻塞是周期性的（每个轮询节拍）。
-3. **由 `ManagerActor` 应答**，外部只需持有 manager 的 `ActorRef`。内部子 actor 的引用不外泄 ——
-   否则外部能给它发任何消息，监督树的边界就形同虚设。
-4. **不许合并成一条通用查询**。`Query { kind: Positions | SymbolMetas } -> QueryResult` 是"流程强行合并后
-   用 `match` 分发"的假抽象。新增一类快照 = 新增一条消息 + 一个 `impl Message`，不改既有分支。
-
-**已知代价**：manager 的邮箱在投产期忙于 REST 快照与订阅装配（秒级）。此期间的查询会排队，
-最长等一次投产时长。对采样式消费者（Prometheus 抓取）可接受；对要求毫秒应答的场景不可接受 ——
-那种需求应该走流面。
+（旧版快照由 manager 的邮箱应答，投产期会排队秒级；#704 起不经 manager，这条代价已不存在。）
 
 ## 三、持仓：唯一需要专门安排的一项
 
@@ -74,7 +71,7 @@
 | 净值 / 余额 / 交易所状态 | 订 `AccountData::AccountInfo` 等 | 被周期性轮询并**重发**，一个周期内自然拿到最新值 |
 | 当前挂单 | 折叠 `OrderUpdate` 流 | 初值是**已知常量**：引擎启动先撤全部残单，起点必为空 |
 | 累计成交 / 手续费 / 资费 | 折叠 `Fill` / `FundingFee` 流 | 口径是"本次会话起"，起点就是 0 |
-| **持仓** | **查 `GetLivePositions`** | 初值 = 交易所侧既有存量，非常量；且**刻意不周期性重发** |
+| **持仓** | **查 `live_positions()`** | 初值 = 交易所侧既有存量，非常量；且**刻意不周期性重发** |
 
 最后一条是设计决定：持仓真值由「投产期 REST 基线 + 之后全程 Fill 累加」维护，REST 只用于对账，
 **不许覆盖**权威状态。所以外部无法靠"等下一次快照"拿到起点。
@@ -92,29 +89,33 @@
 
 | 宿主 | 角色 | 为什么不能消除 |
 |---|---|---|
-| `PositionLedgerActor.reconciler.mirror` | **权威 + 对外** | 它是唯一被 REST 持续校验的那份，因此唯一有资格叫真值 |
-| `ExecutorActor` 的 `StrategyRunner.state` | 决策用 | 策略是**纯函数**，决策中途不能 `await` 去查询 |
-| `MetricsActor.state` | 报告用 | 需要 持仓 × 价格 的 join（`SymbolState::exposure`）；且 `on_stop` 的最终快照不能依赖一个**正在并发停机**的 actor（`consumers` 组内并发停机） |
+| `PositionLedger.reconciler.mirror` | **权威 + 对外** | 它是唯一被 REST 持续校验的那份，因此唯一有资格叫真值 |
+| `Executor` 的 `StrategyRunner.state` | 决策用 | 策略是**纯函数**，决策中途不能 `await` 去查询 |
+| `Metrics` 的本地状态 | 报告用 | 需要 持仓 × 价格 的 join；且收尾时的最终快照不能依赖一个**正在并发停机**的组件（`consumers` 组内并发停机） |
 
 三份都是同一条 Fill 流、同一份 seed 语义（`SymbolState::seed_position`）、同一条防双计规则的确定性结果，
-因此除非有 bug 不会分叉。**新增第四份必须先证明它不能用 `GetLivePositions` 替代。**
+因此除非有 bug 不会分叉。**新增第四份必须先证明它不能用 `live_positions()` 替代。**
 
 「除非有 bug」不靠信：executor 那份是下单依据，它与账本的分歧由账本每个节拍检查（#694）——
-账本向每个实盘 executor 要一份已 seed 的持仓（`GetSeededPositions`），与镜像按同一判据比对
+账本向每个实盘 executor 要一份已 seed 的持仓（`ExecutorHandle::seeded_positions`），与镜像按同一判据比对
 （差值稳定连续 N 次即致命）。于是 executor ≈ 账本 ≈ 交易所两条比对串起来。metrics 那份只用于报告，
 不纳入。
 
-### 为什么持仓查询挂在账本 actor 上
+### 为什么持仓查询挂在账本上
 
-契约 2（宿主的所有 handler 都不得阻塞在 IO 上）淘汰了其他候选：
+契约 2（宿主处理任何消息都不得阻塞在 IO 上）淘汰了其他候选：
 
-- `MetricsActor` —— 推送是 `spawn_push` 出去的，邮箱不碰 IO，**合格**；但它是观测组件，
+- `Metrics` —— 推送是 `spawn_push` 出去的，收件箱不碰 IO，**合格**；但它是观测组件，
   明确声明"故障不得拖垮交易"，让它当权威数据源会反转这条边界。
-- `PositionLedgerActor`（原 `PositionReconcileActor`）—— 原本**不合格**：`poll_and_reconcile` 在 handler 里
+- `PositionLedger`（原 `PositionReconcileActor`）—— 原本**不合格**：`poll_and_reconcile` 在 handler 里
   `join_all` 各所 REST，最长阻塞一个 client 超时。这次把拉取移出 handler（见下）后合格，且它本就是
   被校验的那一份 —— 外部读到的数字与风控守卫看到的数字**是同一个**。
 
 ## 五、本次改动清单
+
+> 历史记录（kameo 版当时的改动），名字保留原样：`PositionLedgerActor` → 现 `PositionLedger`，
+> `GetLivePositions` → 现 `ManagerHandle::live_positions`，`ExecutorActor::GetPositions / GetSeededPositions`
+> → 现 `ExecutorHandle::positions / seeded_positions`。
 
 ### A. 账本 actor 的邮箱不再阻塞在 REST 上（前置缺陷修复）
 
@@ -177,18 +178,13 @@
 改造后：**删掉 `position_state` 与 `baselined` 两个字段**，推送前查一次：
 
 ```rust
-// actor 的 Args 里加上 manager 的引用（bootstrap 处本来就持有）。
-// 两层错误都必须处理：外层是投递失败，内层是账本不可达 —— 两者都意味着**取不到**，
-// 绝不能当成"没有持仓"。取不到时正确的动作是这一轮不更新 gauge（保留上一次的值），
-// 而不是把它们清零。
-let positions = match self.manager.ask(GetLivePositions).send().await {
-    Ok(Ok(positions)) => positions,
-    Ok(Err(reason)) => {
+// 观察者里存一份 ManagerHandle（run_engine 交给装配闭包的那个，可克隆）。
+// Err（账本不可达或引擎在停机）意味着**取不到**，绝不能当成"没有持仓"。
+// 取不到时正确的动作是这一轮不更新 gauge（保留上一次的值），而不是把它们清零。
+let positions = match self.manager.live_positions().await {
+    Ok(positions) => positions,
+    Err(reason) => {
         tracing::error!(%reason, "持仓快照取不到，本轮不更新持仓 gauge");
-        return;
-    }
-    Err(e) => {
-        tracing::error!(error = %e, "manager 不可达，本轮不更新持仓 gauge");
         return;
     }
 };

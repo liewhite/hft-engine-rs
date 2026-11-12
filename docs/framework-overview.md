@@ -10,14 +10,14 @@
 
 ```
                     ┌──────────────── 用户代码 (bin) ────────────────┐
-                    │  装配交易所 → 起 ManagerActor → 注册策略        │
+                    │  装配交易所 → run_engine 起 Manager → 注册策略  │
                     └───────────────────┬───────────────────────────┘
                                         │
-   exchange 适配层            ManagerActor（组合根）           strategy 层
+   exchange 适配层            Manager（组合根）                strategy 层
   ┌──────────────┐          ┌────────────────────┐          ┌─────────────┐
-  │ Binance      │  行情事件 │  装配 / 监督树根    │          │ Strategy    │
-  │ OKX          ├─────────►│  停机链根           │          │  trait      │
-  │ Hyperliquid  │  账户事件 │  三条总线持有       │          └──────▲──────┘
+  │ Binance      │  行情事件 │  装配               │          │ Strategy    │
+  │ OKX          ├─────────►│  生产者/消费者两组   │          │  trait      │
+  │ Hyperliquid  │  账户事件 │  三条总线的建造者   │          └──────▲──────┘
   │ IBKR         ├─────────►│  快照面应答         │                 │
   └──────▲───────┘          │  ┌──────────────┐  │                 │
          │                  │  │ Provisioner  │  │           StrategyView
@@ -26,11 +26,11 @@
          │                  └─────────┼──────────┘                 │
          │                            │ spawn                      │
          │                    ┌───────▼────────┐                   │
-         │                    │ ExecutorActor  │───► StrategyRunner ┘
+         │                    │ Executor       │───► StrategyRunner ┘
          │                    └───────┬────────┘     (纯逻辑核心)
          │                            │ OutcomeEvent
          │              ┌─────────────┴──────────────┐
-         │              │      OutcomePubSub         │
+         │              │      OutcomeBus            │
          │              └──────┬──────────────┬──────┘
          │        Outlet::Live │              │ Outlet::Paper
          │         ┌───────────▼──┐    ┌──────▼──────────┐
@@ -40,18 +40,18 @@
                                                 │ 回灌成交回报
                             ┌───────────────────┘
                             ▼
-   三条总线 ── MarketPubSub / AccountPubSub / OutcomePubSub
+   三条总线 ── MarketBus / AccountBus / OutcomeBus
                             │
         ┌───────────────────┼────────────────────┬──────────────┐
         ▼                   ▼                    ▼              ▼
-  IncomeProcessor      MetricsActor       PositionLedger    外部观察者
-  (按 Delivery 分发)    (观测镜像)         (对账镜像,REST)    (SubscribeXxx)
+  IncomeProcessor      Metrics            PositionLedger    外部观察者
+  (按 Delivery 分发)    (观测镜像)         (对账镜像,REST)    (inbox.subscribe)
 ```
 
 **实盘与模拟并行**，不是两种"运行模式"：两个 outcome 消费者常驻，各按事件自带的
 `AccountId` 取自己那份。同一个 symbol 上完全可以模拟先跑、出信号后再拉起实盘。
 
-**回测与实盘共享 `StrategyRunner`**：实盘由 `ExecutorActor` 驱动（actor 串行消费总线），
+**回测与实盘共享 `StrategyRunner`**：实盘由 `Executor` 驱动（一个任务串行消费自己的收件箱），
 回测由 `BacktestEngine` 驱动（单线程虚拟时间循环）。策略代码一个字节都不用改。
 
 ---
@@ -63,20 +63,20 @@
 ```
 domain ← messaging ← exchange ← strategy ← engine ← backtest
    ↖________________↙     ↖___ sim ___↙
-observability / actor_lifecycle / option：无 crate 内依赖
+observability / tasks / option：无 crate 内依赖（messaging 起各层都用 tasks）
 ```
 
 | 模块 | 职责 | 不该做的事 |
 |---|---|---|
 | `domain` | 值类型与领域规则：`Exchange` / `Order` / `Fill` / `Position` / `AccountId` / `SymbolMeta` / `PriceFormatter` / `ExchangeError` | 不依赖任何其他模块 |
-| `messaging` | 事件类型、投递范围、状态投影：`IncomeEvent` / `Delivery` / `SubscriptionScope` / `StateManager` / `PositionBook` / 两条入向总线别名 | 不碰 IO、不碰 actor |
-| `exchange` | 四所适配层：WS 订阅、REST 下单、编解码、`CryptoStatusActor` | 不做业务判断 |
-| `strategy` | 业务决策，纯函数：`Strategy` trait、`StrategyView`、两个内置策略 | 不碰 IO、不碰 actor、不读墙钟 |
-| `engine` | actor 编排：总线、投产、监督、停机、观测、下单出口 | 不写业务判断 |
+| `messaging` | 事件类型、投递范围、状态投影：`IncomeEvent` / `Delivery` / `SubscriptionScope` / `StateManager` / `PositionBook` / 两条入向总线别名 | 不碰 IO、不起任务 |
+| `exchange` | 四所适配层：各所节点 `XxxNode`（WS 订阅、轮询）、REST 下单、编解码、`CryptoStatus` | 不做业务判断，不依赖 engine |
+| `strategy` | 业务决策，纯函数：`Strategy` trait、`StrategyView`、两个内置策略 | 不碰 IO、不起任务、不读墙钟 |
+| `engine` | 组件编排：总线、投产、停机、观测、下单出口 | 不写业务判断 |
 | `sim` | 撮合状态机与账本：`SimState` / `Ledger` / `Matcher` | 实盘模拟盘回测共用同一份 |
 | `backtest` | 历史数据源 + `BacktestEngine` | 不能与实盘走不同的策略实现 |
 | `observability` | Prometheus 推送、告警 webhook | 不当权威数据源 |
-| `actor_lifecycle` | 停机链：`ChildGroup` / `ChildRegistrar` / `ChildStop` | —— |
+| `tasks` | 组件运行时：任务树（`Root` / `Group` / `Scope` / `Task`，生命周期与出错上冒）、收件箱（`Inbox` / `Addr`）、总线（`Bus`）、`spawn_addressed` / `spawn_periodic` | 不含业务 |
 | `option` | Black-Scholes 定价（回测合成希腊值用） | —— |
 
 ---
@@ -130,20 +130,21 @@ pub enum OutcomeEvent {
 
 | 类别 | 接口 |
 |---|---|
-| 装配 | `setup_binance` / `setup_okx` / `setup_hyperliquid` / `setup_ibkr` → `ExchangeSetup`；`ManagerActorArgs { exchanges, paper }` |
-| 投产 | `AddStrategy(StrategySpec)` / `AddStrategies(Vec<StrategySpec>)` / `RemoveStrategies { account, symbols, exchange, flatten }` |
+| 装配 | `setup_binance` / `setup_okx` / `setup_hyperliquid` / `setup_ibkr` → `ExchangeSetup`；`ManagerArgs { exchanges, paper }` |
+| 投产（`ManagerHandle`） | `add_strategy(spec)` / `add_strategies(specs)` / `remove_strategies(RemoveStrategies { account, symbols, exchange, flatten })`，`.await -> Result<(), ManagerError>` |
 | 账户绑定 | `StrategySpec::live(s)` / `StrategySpec::paper(s, label)` |
-| 流面 | `SubscribeMarket` / `SubscribeAccount` / `SubscribeOutcome`，各带 `fn(&Event) -> bool` 过滤器 |
-| 快照面 | `GetAllSymbolMetas` / `GetLivePositions` |
-| 入向注入 | `PublishCustomEvent(CustomEvent)` |
-| 晋升调度 | `SupervisorActor` + `SupervisorArgs`，判据实现 `PromotionPolicy::decide(&SymbolPerformance) -> Decision` |
-| 启动辅助 | `run_main`（日志与告警：启动试发、退出前发完）/ `load_config` / `run_engine`（启动 → 装配 → 运行 → 唯一停机路径）/ `spawn_supervised` |
+| 流面 | `market_bus()` / `account_bus()` / `outcome_bus()`，观察者在构造时 `inbox.subscribe(bus, fn(&Event) -> bool, Msg::X)` |
+| 挂观察者 | `observers()`：manager 的消费者组，`spawn` / `spawn_addressed` / `spawn_periodic` |
+| 快照面 | `all_symbol_metas()`（同步）/ `live_positions().await` |
+| 入向注入 | `publish_custom_event(CustomEvent)`（同步，直接发行情总线） |
+| 晋升调度 | `Supervisor::spawn(&handle, SupervisorArgs)`，判据实现 `PromotionPolicy::decide(&SymbolPerformance) -> Decision` |
+| 启动辅助 | `run_main`（日志与告警：启动试发、退出前发完）/ `load_config` / `run_engine(args, \|handle\| ..)`（启动 → 装配 → 运行 → 唯一停机路径） |
 | 纯逻辑核心 | `StrategyRunner`（回测直接驱动它）、`ClientOrderIdGen` |
 
 **流面与快照面是两条独立的路**，不要合并成一个 `Query { kind }`：
 
 - **流面**：订阅事件，`fn` 过滤器在发布侧执行，覆盖每一个 `MarketData` / `AccountData` 变体
-- **快照面**：一问一答，纯内存读、不打 REST、不阻塞邮箱、由 manager 应答
+- **快照面**：纯内存读、不打 REST、不经 manager 的收件箱（品种目录直接读句柄里那份，持仓问账本）
 
 ### 3.3 `exchange` —— 加新交易所的扩展点
 
@@ -200,7 +201,7 @@ pub enum OutcomeEvent {
 ```rust
 use hft_engine_rs::engine::{
     load_config, run_engine, run_main,
-    AddStrategies, ManagerActorArgs, StrategySpec,
+    ManagerArgs, StrategySpec,
     setup_binance, setup_okx,
 };
 
@@ -217,15 +218,15 @@ async fn run() -> anyhow::Result<()> {
     if let Some(a) = config.exchanges.binance { exchanges.push(setup_binance(a)?); }
     if let Some(a) = config.exchanges.okx     { exchanges.push(setup_okx(a)?); }
 
-    // 2. run_engine 起 manager（建三条总线、spawn 全部子 actor、链好监督树与停机链；
-    //    返回前各所私有推送都已确认订阅生效），再跑装配闭包，然后等停机信号。
+    // 2. run_engine 建任务树、起 manager（建三条总线、在生产者/消费者两组下起全部子任务；
+    //    返回前各所私有推送都已确认订阅生效），再跑装配闭包，然后等停机信号或任何节点出错。
     //    闭包出错也先停机再返回 —— 装配到一半的引擎不会被丢下不管。
-    run_engine(ManagerActorArgs { exchanges, paper: config.paper }, |manager| async move {
+    run_engine(ManagerArgs { exchanges, paper: config.paper }, |manager| async move {
         // 3. 注册策略。live 走真实下单，paper(label) 落本地柜台，两者可同时跑
-        manager.ask(AddStrategies(vec![
+        manager.add_strategies(vec![
             StrategySpec::live(Box::new(my_strategy)),
             StrategySpec::paper(Box::new(my_strategy_2), "BTC"),
-        ])).send().await?;
+        ]).await?;
         Ok(())
     })
     .await
@@ -267,26 +268,45 @@ let result = engine.run();
 
 ### 4.3 外部观察者（导指标、发告警、对接下游）
 
+观察者挂在 manager 的**消费者组**（`manager.observers()`）上：与引擎内部的消费者同一批停、
+在全部生产者之后，生产者收尾时补发的最后一批事件照样收得到；它出错（`run` 返回 `Err` 或
+panic）整机受控停机。
+
 ```rust
-use hft_engine_rs::engine::{spawn_supervised, GetLivePositions, SubscribeMarket};
+use hft_engine_rs::tasks::{Inbox, Scope, Task};
 
-// 只能订阅受监督的 actor —— "订一个没人看着的 actor"在类型上写不出来
-let observer = spawn_supervised::<MyObserver>(&manager, args).await?;
+struct MyObserver { inbox: Inbox<MarketEvent> }
 
-manager.tell(SubscribeMarket::new(
-    observer,
-    |e| matches!(e.data, MarketData::BBO(_)),   // fn 指针，发布侧执行
-)).send().await?;
+impl Task for MyObserver {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        // recv 返回 None = 已被要求停止、收件箱已排空
+        while let Some(ev) = self.inbox.recv().await { /* ... */ }
+        Ok(())
+    }
+}
 
-// 快照面：一问一答
-let positions: Result<Vec<Position>, String> = manager.ask(GetLivePositions).send().await?;
+let bus = manager.market_bus().clone();
+let observer = manager
+    .observers()
+    .spawn("MyObserver", move |scope: Scope| async move {
+        // 收件箱只能从树上的 Scope 建：能订阅的一定是有人监督的组件
+        let (_addr, mut inbox) = scope.inbox::<MarketEvent>();
+        inbox.subscribe(&bus, |e| matches!(e.data, MarketData::BBO(_)), |e| e); // fn 指针，发布侧执行
+        Ok(MyObserver { inbox })
+    })
+    .await?;
+
+// 定时轮询（首拍立即、慢了不积压补跑，tick 返回 Err 整机停）
+manager.observers().spawn_periodic("MyPoller", Duration::from_secs(60), my_periodic)?;
+
+// 快照面
+let positions: Result<Vec<Position>, String> = manager.live_positions().await;
 ```
 
-退订：没有显式原语，**订阅者 actor 停机即自动摘除**。受监督的订阅者要收工，
-对自己的 `Supervised::actor_ref()` 调 `stop_gracefully()`。
+退订：没有显式原语，**订阅者停机即自动摘除**（订阅凭证存在收件箱里，收件箱关闭即退订）。
+观察者要收工，对 `spawn` 返回的 `ChildHandle` 调 `stop().await`，只收掉它自己。
 
-`GetLivePositions` 有两层错误，都要处理，且**任何一层的 `Err` 都不等于"无持仓"**：
-mailbox 层的 `Err`（manager 不可达）与业务层的 `Err`（账本不可达）。结果里缺席的腿是
+`live_positions()` 的 `Err`（账本不可达，或引擎在停机）**不等于"无持仓"**。结果里缺席的腿是
 "未知"而非"空仓"，不要为它报指标。
 
 ---
@@ -299,7 +319,7 @@ mailbox 层的 `Err`（manager 不可达）与业务层的 `Err`（账本不可�
 | 新交易所 | 实现 `ExchangeClient` + `AccountClient`，写一个 `setup_xxx` | 否，manager 零改动 |
 | 新数据源（回测）| 实现 `MarketDataSource` | 否 |
 | 新晋升 / 降级判据 | 实现 `PromotionPolicy` | 否 |
-| 新事件类型（用户域）| `CustomEvent` + `PublishCustomEvent` / `OutcomeEvent::Emit` | 否，框架只运送不理解 |
+| 新事件类型（用户域）| `CustomEvent` + `publish_custom_event` / `OutcomeEvent::Emit` | 否，框架只运送不理解 |
 | 新事件变体（框架域）| 给 `MarketData` / `AccountData` 加变体 | 是，且所有 `match` 会**编译失败**，漏改不了 |
 
 ---
@@ -311,8 +331,8 @@ mailbox 层的 `Err`（manager 不可达）与业务层的 `Err`（账本不可�
 - **`StrategyView` 不能跨事件持有**。生命周期钉死在一次 `on_event` 调用内，
   存起来会读到陈旧状态（编译器会拦）。
 - **持仓靠「一次 REST 基线 + Fill 永久累加」维护**，不是每次查 REST。
-  对账层（`PositionLedgerActor`）持续用 REST 校验，确认漂移后**致命退出**。
+  对账层（`PositionLedger`）持续用 REST 校验，确认漂移后**致命退出**。
 - **持仓在策略看到第一条事件前就已就绪**。三种来源：有凭证的所用 REST 快照（账户真实
   持仓），无凭证的所补 0（本引擎在那儿下不了单，恒为 0），模拟账户补 0（从零起步）。
-- **停机分三段**：生产者 → 总线 → 消费者。新增消费者时先问它会不会往回灌事件
-  （见 architecture.md V5，那条残余窗口是已知并接受的）。
+- **停机分两组**：生产者 → 消费者（总线是普通值，不占停机段）。新增消费者时先问它会不会
+  往回灌事件（见 architecture.md V5，那条残余窗口是已知并接受的）。

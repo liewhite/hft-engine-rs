@@ -15,7 +15,7 @@
 （配置校验只保证 `threshold > ioc_slippage`，不保证覆盖手续费——手续费不在代码里建模）。
 
 ### 2. 下单限速 / 多 WebSocket 连接（未做）
-- 全链路无下单限速：`OutcomeProcessorActor` 每笔订单直接 `tokio::spawn` 打 REST。
+- 全链路无下单限速：`OutcomeProcessor` 每笔订单直接 `tokio::spawn` 打 REST。
   当前风险闸门是 `max_position_notional`（限最终暴露）+ 每 symbol 单批在途（`has_pending_orders`），
   **不限频率**。symbol 数量大时可能触发交易所限频/封禁。
 - 公共行情单连接订阅全部 symbol：symbol 数量继续增长会撞上单连接订阅数上限。
@@ -40,17 +40,17 @@ IOC 部分/未成交。
 
 ### 4. 外部指标上报（已做，旁路形态）
 `src/observability/`：告警外送（tracing Layer 捕 WARN/ERROR 推 webhook，
-`ALERT_WEBHOOK_URL` 启用）+ 指标推送（MetricsActor 快照推 pushgateway，
+`ALERT_WEBHOOK_URL` 启用）+ 指标推送（Metrics 快照推 pushgateway，
 `PUSHGATEWAY_URL` 启用）。未配置时行为与从前完全一致，出口全部旁路（异步、失败
 降级、限流），不拖垮交易 —— 与"纯策略框架"决策（`a0183e8` 删除内置实现）不冲突。
 多实例部署需各配不同 `PUSHGATEWAY_JOB`。遗留结构优化：report() 的日志与 PromText
 双写同一份数字，宜先聚合快照 struct 再分别渲染（见 code review 记录）。
 
 另两点已知取舍：
-- `MetricsActor` 订阅全量 income 流，数百 symbol 的 BBO 会多一份 clone + mailbox 投递，
+- `Metrics` 订阅全量行情总线，数百 symbol 的 BBO 会多一份 clone + 收件箱投递，
   而它只在报告时用 mid 估值。若 CPU 吃紧，可改为报告时向 manager 取快照，或对 BBO 采样。
-- 它是 `spawn_link` 到 manager 的（与其他子 actor 一致的 fail-fast 姿态），意味着观测层
-  panic 会拖垮进程。定时器结束已改为只记 error 不自杀，但 panic 路径仍会级联。
+- 它挂在 manager 的任务树上（与其他子任务一致的 fail-fast 姿态），意味着观测层
+  panic 会拖垮进程（任务树把 panic 当出错上冒）。
 
 ## 二、框架层已知缺口
 
@@ -77,8 +77,8 @@ SymbolMeta 判据，加复审补的 `ibkr/wire.rs`）。遗留五项按需另立
   若某订单已被交易所确认（`Pending`）而终态更新丢失，该 symbol 会被 `has_pending_orders` 永久冻结。
   当前依赖"WS 断开即进程退出 + docker 重启"来兜底。
 - **持仓维护为增量 + 独立对账通道**：`Position` 基线一次性写入（manager 投产期点对点 +
-  总线各一条路径），之后全靠 `Fill` 累加；`PositionPollingActor` 周期性 REST 读数经
-  `PositionLedgerActor` 与「基线 + Fill」比对，连续差值稳定即停机。对账**只检测不修复**
+  总线各一条路径），之后全靠 `Fill` 累加；`PositionLedger` 周期性拉 REST 读数，
+  与「基线 + Fill」比对，连续差值稳定即停机。对账**只检测不修复**
   （无 re-baseline / 自动平仓），模拟账户与挂单不在对账范围内。漂移的 error 日志现在会经
   告警外送通道推 webhook（若配置了 `ALERT_WEBHOOK_URL`）。
 

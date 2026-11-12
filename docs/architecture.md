@@ -22,14 +22,14 @@
 ```
 
 已落地的例子：`AccountEvent.account` 是必填结构体字段而非 `Option`——"忘了标账户"不可表达；
-`SubscribeMarket` 只收 `Supervised<A>` 凭证——"订阅一个没人看着的 actor"不可表达；
+总线只能经收件箱订阅、收件箱只能从任务树上的 `Scope` 建——"订阅一个没人看着的组件"不可表达；
 过滤器是 `fn` 指针而非闭包——"过滤判据依赖外部可变状态"不可表达。
 
 反面判据：当你发现自己在写"注意不要……"的注释时，先问一句**能不能让它编译不过**。
 
 ### 1.2 宁可停机，不可裸奔
 
-风控依据不可信时受控退出，而不是降级继续。持仓对账确认漂移即 `kill`，因为策略的三道闸门
+风控依据不可信时受控退出，而不是降级继续。持仓对账确认漂移即报错上冒、整机停机，因为策略的三道闸门
 全都基于本地持仓计算——继续跑等于无风控裸奔。
 
 但这条有个必须配套的前提：**误停机比漏报更糟，所以判据必须能区分真故障与正常波动**。
@@ -57,7 +57,7 @@
 ### 1.5 如实声明残余窗口
 
 做不到的事写下来，不假装做到了。代码里"**如实声明**"这个词是刻意的标记，出现处必有一段
-"这个方案盖不住什么"的说明（如 `seed_position` 的双计窗口、停机三段模型盖不住的回灌边）。
+"这个方案盖不住什么"的说明（如 `seed_position` 的双计窗口、停机两段模型盖不住的回灌边）。
 
 反面：写"竞态已消除"而实际只是变窄了，比不写更糟——下一个人会基于这句话省掉防御。
 
@@ -118,11 +118,11 @@ CLAUDE.md 的七条是通用的，这里只写**本项目特有的、可以直�
 同一事实只有一个权威宿主。派生副本不是绝对禁止（纯函数、无锁、生命周期解耦都是正当理由），
 但**每一份派生都必须在代码里写明为什么不能查权威**。
 
-现行记录：持仓真值的权威在 `PositionLedgerActor`；executor 的那份因为"策略是纯函数、决策中途
-不能 await"；metrics 的那份因为"需要持仓 × 价格的 join，且 `on_stop` 快照不能依赖并发停机的
-actor"。见 [external-data-access.md](./external-data-access.md) §四。
+现行记录：持仓真值的权威在 `PositionLedger`；executor 的那份因为"策略是纯函数、决策中途
+不能 await"；metrics 的那份因为"需要持仓 × 价格的 join，且收尾快照不能依赖同组并发停机的
+组件"。见 [external-data-access.md](./external-data-access.md) §四。
 
-**新增第四份必须先证明它不能用 `GetLivePositions` 替代。**
+**新增第四份必须先证明它不能用 `ManagerHandle::live_positions` 替代。**
 
 ### P2 能力用类型表达，不用值域表达
 
@@ -142,13 +142,14 @@ actor"。见 [external-data-access.md](./external-data-access.md) §四。
 每个消费者自己 `if not mine { return }` 的形态，在新增一类消费者时不会编译失败——
 静默双执行或静默不执行。
 
-### P5 IO 不在 handler 里
+### P5 IO 不在消息处理里
 
-邮箱是共享资源。任何 handler `await` 在网络/文件上，都会让该 actor 的**全部**其他消息排在
-一次超时后面。正确形态是 `spawn` 出去、结果回投为消息。
+收件箱是共享资源。组件处理一条消息时 `await` 在网络/文件上，都会让它的**全部**其他消息排在
+一次超时后面。正确形态是 `spawn` 出去、结果回投为消息。（只做一件事、不收消息的定时轮询器
+`spawn_periodic` 在 `tick` 里直接 await 是正当的。）
 
 配套要求：一旦拉取移出 handler，"结果永不回投"就成为可达状态（任务 panic、请求真挂死），
-必须有一道**不依赖回投**的守卫。见 `PositionLedgerActor::check_in_flight_staleness`。
+必须有一道**不依赖回投**的守卫。见 `PositionLedger::check_in_flight_staleness`。
 
 ### P6 漏改必须编译失败
 
@@ -157,7 +158,7 @@ actor"。见 [external-data-access.md](./external-data-access.md) §四。
 
 ### P7 观测不得成为权威数据源
 
-`MetricsActor` 明确声明"故障不得拖垮交易"，连定时器挂掉都不 kill 自己。所以它不能当权威——
+`Metrics` 明确声明"故障不得拖垮交易"：`run` 没有出错退出的路径，推送失败只记 warn。所以它不能当权威——
 让一个"允许自己坏掉"的组件供给别人依赖的数据，是把边界反过来了。
 
 反向成立：权威组件可以被观测。持仓账本对外供查，正因为它是被 REST 持续校验的那一份，
@@ -171,28 +172,28 @@ actor"。见 [external-data-access.md](./external-data-access.md) §四。
  交易所适配层                引擎核心                          消费者
  ─────────────              ─────────────────                ───────────
 
- BinanceActor ┐                                          ┌─> ExecutorActor(策略, per 账户)
- OkxActor     ├─> MarketPubSub ──┬─> IncomeProcessor ────┤
- HlActor      │                  │   (按 symbol/账户路由) └─> (回测: BacktestEngine 直驱)
- IbkrActor    ┘                  │
+ BinanceNode  ┐                                          ┌─> Executor(策略, per 账户)
+ OkxNode      ├─> MarketBus ─────┬─> IncomeProcessor ────┤
+ HlNode       │                  │   (按 symbol/账户路由) └─> (回测: BacktestEngine 直驱)
+ IbkrNode     ┘                  │
       │                          │
-      └─────> AccountPubSub ─────┼─> PositionLedgerActor (持仓真值 + REST 对账 + 对外供查)
+      └─────> AccountBus ────────┼─> PositionLedger (持仓真值 + REST 对账 + 对外供查)
                     ▲            │
-                    │            └─> MetricsActor (观测，允许自己坏)
+                    │            └─> Metrics (观测，允许自己坏)
                     │
-                    │                        ExecutorActor 产出信号
+                    │                        Executor 产出信号
                     │                                │
                     │                                v
-                    │                          OutcomePubSub
+                    │                          OutcomeBus
                     │                                │
                     │            ┌───────────────────┴───────────────────┐
                     │            v                                       v
-                    └── OrderGateway(实盘唯一下单出口)          PaperCounterActor(虚拟柜台)
+                    └── OrderGateway(实盘唯一下单出口)          PaperCounter(虚拟柜台)
                              （合成失败/撤单回报回灌）              （撮合回报回灌）
 
- 对外（外部进程/observer）
-   流面: SubscribeMarket / SubscribeAccount / SubscribeOutcome  + fn 过滤
-   快照面: GetAllSymbolMetas / GetLivePositions                  见 external-data-access.md
+ 对外（bin 里的观察者，经 ManagerHandle）
+   流面: market_bus() / account_bus() / outcome_bus()；观察者挂 observers() 组、构造时 inbox.subscribe + fn 过滤
+   快照面: all_symbol_metas() / live_positions()              见 external-data-access.md
 ```
 
 模块职责：
@@ -200,12 +201,70 @@ actor"。见 [external-data-access.md](./external-data-access.md) §四。
 | 模块 | 职责 | 不该做的事 |
 |---|---|---|
 | `exchange/*` | 协议编解码、连接、签名；把交易所语言翻译成领域事件 | 不做业务判断，不缓存业务状态 |
-| `messaging/` | 事件类型、状态投影 | 不含 IO、不含 actor |
-| `engine/live/` | actor 编排、订阅装配、投产/撤下、监督与停机 | 不含策略逻辑 |
+| `messaging/` | 事件类型、状态投影 | 不含 IO、不起任务 |
+| `tasks/` | 组件运行时：任务树、收件箱、总线（见 3.1） | 不含业务 |
+| `engine/live/` | 组件编排、订阅装配、投产/撤下、停机分组 | 不含策略逻辑 |
 | `engine/strategy_runner.rs` | 策略步的纯逻辑（更新状态 → 转换订单） | 实盘/回测共用，不许有分支 |
-| `strategy/` | 业务决策，纯函数 | 不碰 IO、不碰 actor、不读墙钟 |
+| `strategy/` | 业务决策，纯函数 | 不碰 IO、不起任务、不读墙钟 |
 | `sim/` | 撮合状态机 | 实盘/回测共用 |
 | `observability/` | 指标出口 | 不当权威数据源 |
+
+### 3.1 运行时：任务树、收件箱、总线（`src/tasks`）
+
+实盘里的每个组件是一个 tokio 任务，挂在任务树上（#704 起取代 kameo）。三件事都是显式的，
+细节读 `src/tasks` 各文件的模块文档：
+
+- **任务树**（`tree.rs`）：组件挂在父节点的某个 `Group` 下，根是 `Root`。谁 spawn 的谁负责停、负责等。
+  - **出错向上冒**：`build` / `run` / `stop` 返回 `Err` 或 panic，记到父节点并立刻请求根停机；
+    根因一层层冒到根，`run_engine` 把它报成事故退出（不重连、不降级，交给外部编排重启）。
+    **被要求停止后返回 `Ok` 才是正常退出**（只收掉它自己那一支）；没被要求就返回 `Ok`
+    （流结束、循环意外跳出）算出错。
+  - **停机自上而下传信号、自下而上收尾**：节点的 `run` 返回后，按分组**声明顺序**逐组停子任务
+    （组内并发、组间有序），全部收尾完才调它自己的 `Task::stop`。分组只能在构造阶段声明。
+  - 唯一的硬期限在根上：`bootstrap::shutdown` 对整棵树设 30s，停机中再收到信号直接退出；
+    中间层只告警"迟迟未停"、不放弃。
+- **收件箱**（`inbox.rs`）：只能从 `Scope` 建。生死只跟着任务走（地址全丢了也不会关）；停机时
+  `recv` 先关闭、再排空已进箱的消息、然后返回 `None` —— **有收件箱的组件以 `recv()` 返回 `None`
+  作停止信号**，不另写 `scope.stopping()` 分支直接 break（会丢箱里的消息，收件箱销毁时报 ERROR）。
+- **总线**（`bus.rs`）：一对多扇出，在发布者自己的任务里同步投进订阅者的无界收件箱，
+  `publish` 不会失败。只能经 `Inbox::subscribe(bus, fn 过滤器, Msg::变体)` 订阅，订阅凭证存在收件箱里，
+  收件箱关闭即退订；关闭与退订之间到达的投递记 ERROR"事件丢失"，不静默。
+
+两个公共形状（`periodic.rs`）：`Group::spawn_addressed`（起有收件箱的组件，构造完成时交回地址）、
+`Group::spawn_periodic`（定时轮询：首拍立即、`MissedTickBehavior::Skip` 不积压补跑、停止优先，`tick`
+返回 `Err` 整支停；"记日志继续"的在 `tick` 里自己处理后返回 `Ok`）。
+
+**组件写法**：每个组件一个 `enum Msg` + 收件箱；对外给可克隆的 `XxxHandle(Addr<Msg>)`，带类型化方法（ask 用
+`addr.ask(|tx| Msg::Get(tx))`）；构造逻辑写在 spawn 的闭包里（在里面订阅总线、声明分组、起子任务）；
+WS / 定时器由任务自己持有、在 `run` 的 `select!` 里 poll；收尾要补发的东西（如 IBKR 等 commission
+的成交）**直接发到总线**，不经父节点转（父节点的收件箱先关）。各所 WS 连接统一用
+`exchange::ws_loop::WsConn`（读循环挂成子任务，断线/空闲超时 = 子任务 Err 上冒）。
+
+**发送失败**：`addr.send` / `ask` 返回 `Gone` = 对方已停止收件，只可能在停机途中或对方已出错退出
+（出错会自己上冒）。`scope.is_stopping()` 时记 warn 忽略；否则返回 `Err`（"不该发生"的地方要大声）。
+
+**拓扑**：
+
+```
+Root("engine")                         ← bootstrap::run_engine 持有，唯一 30s 总期限
+└─ group "main"
+   └─ Manager
+      ├─ group "producers"   各所 XxxNode（及其 WS / 轮询子任务）、Clock、策略 Executor
+      └─ group "consumers"   IncomeProcessor、OutcomeProcessor、PaperCounter、Metrics、PositionLedger、外部观察者
+```
+
+- 三条总线（`MarketBus` / `AccountBus` / `OutcomeBus`）是普通值，由 manager 构造时建好、克隆给各组件，
+  不属于任何停机分组。manager 停机两段：**生产者 → 消费者**（理由与残余窗口见
+  `engine/live/manager/mod.rs` 的分组注释和 V5）。
+- 交易所层不依赖引擎层：各所 `XxxNode::spawn(&Group, XxxArgs) -> ExchangeHandle`，`ExchangeHandle` 包
+  `Addr<ExchangeCmd>`（`Subscribe` / `SubscribeBatch` / `Unsubscribe`）；`engine::live::assembly` 把引擎侧的
+  `SpawnCtx { producers, market_bus, account_bus, symbol_metas }` 映射成各所参数。
+- 外部观察者（如 funding_arb 的资金费轮询器、adaptive_trade 的 `Supervisor`）经 `ManagerHandle::observers()`
+  挂到 consumers 组，在自己的构造闭包里 `inbox.subscribe(handle.market_bus(), ..)`。
+- 启动：manager 构造（预加载 metas、建总线、起全部子任务、等私有订阅确认）在 build 里完成，
+  `Manager::spawn(..).await` 返回即启动完成；失败同时返回 `Err` 并上冒。
+- 停机：`run_engine` 收到 SIGINT/SIGTERM 或任何节点出错（`root.stopping()`）后 `root.shutdown()`；`biased` 让
+  事故分支优先，避免把一次事故报成"收到信号、已优雅关闭"。
 
 ---
 
@@ -316,15 +375,22 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 两个出口保留一句基于同一判据的**到站断言**（装配写错时响亮失败，而非静默双执行）——
 投递路径在类型上收不死，这是品味 1.1 阶梯的第二级。
 
-### V5 停机三段模型盖不住回灌边 —— 已知并接受
+### V5 停机两段模型盖不住回灌边 —— 已知并接受
 
-`producers → buses → consumers`，但 Outcome 的两个消费者会倒回来往 Account 总线发。
-代价是停机瞬间丢最后一批回报（最终一次指标快照少记一笔）。已在 `manager/mod.rs:107-119`
-论证过救不回来（柜台的延迟管道是 spawn 的，`on_stop` 不排空它）。
+`producers → consumers`，但 Outcome 的两个消费者（本地柜台、`OrderGateway`）会倒回来往 Account
+总线发，而它们的订阅者与它们同在消费者组、同时停。停机瞬间在途的这批回报投给已关闭的收件箱，
+总线记 ERROR"事件丢失"，代价是最终一次指标快照少记一笔。已在 `manager/mod.rs` 的
+"如实声明：两段线性模型盖不住一条回灌边"论证过再切一刀分组也救不回来（柜台延迟管道里等待的单、
+`OrderGateway` 的在途 REST 无论怎么排都会丢）。
 
 **不修**。列在这里是为了提醒：新增消费者时先问它会不会回灌。
 
 ### ~~V6 manager 什么都干~~ —— **已修复（R5）**
+
+> 历史说明：下文是 R5 当时（kameo 版）的记录，类型名保留原样。#704 迁到 `crate::tasks` 后：
+> `ManagerActor` → 任务树上的 `Manager` 节点；三个停机分组变成 `producers` / `consumers` 两个 `tasks::Group`
+> （总线不再占一组）；`Provisioner` 拿到的是 producers 组本身 —— `Group` 对外没有 shutdown，编排仍停不掉
+> 整组，只能对自己起的 executor 调 `ChildHandle::stop`；"借出的是哪一个组"仍只靠调用点写对。
 
 原状：`ManagerActor` 15 个字段，装配 / 投产撤下编排 / 监督树根 / 停机链根 / 总线持有 /
 快照面应答全在一处，两个文件合计 2015 行。
@@ -390,6 +456,8 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 | `MarketPubSub` / `AccountPubSub` | 只是 `PubSub<MarketEvent>` 的**类型别名**，而事件类型在 `messaging` —— 别名放错层造出了整条反向边 | `messaging/bus.rs` |
 | `CryptoStatusActor` | "这个场子什么时候开门"是场子的属性；它只由三个加密所的适配层 spawn | `exchange/crypto_status.rs` |
 
+（历史名字；#704 后分别是 `MarketBus` / `AccountBus` = `tasks::Bus<..>`、`CryptoStatus`、`OutcomeBus`。）
+
 `OutcomePubSub` **有意留在 `engine::live`**：它承载的 `AccountOutcome` 包着
 `strategy::OutcomeEvent`，搬进 messaging 会造出一条新的反向边。而且那也正是它的归属——
 "哪个账户的信号"是引擎的编排概念，不是消息层的数据概念。`engine::live` 仍再导出前两个，
@@ -400,7 +468,7 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 ```
 domain ← messaging ← exchange ← strategy ← engine ← backtest
    ↖________________↙     ↖___ sim ___↙
-observability / actor_lifecycle / option：无 crate 内依赖
+observability / tasks / option：无 crate 内依赖（messaging 起各层都用 tasks）
 ```
 
 ### ~~V10 `SymbolView` 重名~~ —— **已修复**
