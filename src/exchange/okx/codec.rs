@@ -287,28 +287,32 @@ impl PositionData {
     }
 }
 
-/// Account 数据
+/// Account 推送（私有 WS `account` 频道）。只取各币现金余额：净值与持仓总价值改由
+/// REST 轮询（见 `OkxClient::fetch_account_info`）—— 推送里的 `notionalUsd` 只在
+/// 跨币种 / 组合保证金模式下有值，单币种保证金模式（acctLv=2）是空串。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountData {
     pub u_time: String,
-    /// 账户总权益 (USDT)
-    pub total_eq: String,
-    /// 账户总持仓名义价值 (USD)
-    pub notional_usd: String,
     pub details: Vec<AccountDetail>,
 }
 
-impl AccountData {
-    pub fn to_equity(&self) -> Result<f64, String> {
-        f64::from_str(&self.total_eq)
-            .map_err(|_| format!("Failed to parse OKX total equity: {}", self.total_eq))
+/// 账户净值与持仓总价值（REST `account/balance` 的 `totalEq` + `account/positions` 的
+/// 各仓 `notionalUsd` 绝对值之和）。两个数都必须解析成功：拿编造的 0 算杠杆会让闸门失效。
+///
+/// 持仓价值按仓位逐个累加，而不是读 balance 顶层的 `notionalUsd` —— 后者在单币种
+/// 保证金模式下是空串（实测 11-12，funding-arb 账户 acctLv=2）。
+pub fn parse_account_info(total_eq: &str, position_notionals: &[&str]) -> Result<crate::domain::AccountInfo, String> {
+    let equity = f64::from_str(total_eq).map_err(|_| format!("OKX totalEq 无法解析: '{total_eq}'"))?;
+    let mut notional = 0.0;
+    for raw in position_notionals {
+        // 空仓记录的数值字段是空串，如实记 0
+        if raw.is_empty() {
+            continue;
+        }
+        notional += f64::from_str(raw).map_err(|_| format!("OKX 持仓 notionalUsd 无法解析: '{raw}'"))?.abs();
     }
-
-    pub fn to_notional(&self) -> Result<f64, String> {
-        f64::from_str(&self.notional_usd)
-            .map_err(|_| format!("Failed to parse OKX notionalUsd: {}", self.notional_usd))
-    }
+    Ok(crate::domain::AccountInfo { equity, notional })
 }
 
 #[derive(Debug, Deserialize)]

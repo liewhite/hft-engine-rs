@@ -231,6 +231,21 @@ pub trait AccountClient: Send + Sync + 'static {
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError>;
 }
 
+/// **已结算公共资金费率**的历史拉取（无需凭证）。资金费套利按「过去 24h 实际结算累加」比较
+/// 各所，每接入一所就实现一次；调用方拿 `Vec<Arc<dyn SettledFundingSource>>` 统一轮询，
+/// 加一所不改调用方。
+#[async_trait]
+pub trait SettledFundingSource: Send + Sync + 'static {
+    fn exchange(&self) -> Exchange;
+
+    /// 自 `start_ms`（含）起已结算的费率，按结算时间升序。该所没有这个币时报错。
+    async fn fetch_settled_funding(
+        &self,
+        symbol: &Symbol,
+        start_ms: crate::domain::Timestamp,
+    ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError>;
+}
+
 // ============================================================================
 // 订阅/取消订阅消息
 // ============================================================================

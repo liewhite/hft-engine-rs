@@ -8,7 +8,8 @@
 //! 架构:
 //! OkxActor (父)
 //! ├── OkxPublicWsActor [spawn_link]
-//! └── OkxPrivateWsActor [spawn_link] (optional, 需要凭证)
+//! ├── OkxPrivateWsActor [spawn_link] (optional, 需要凭证)
+//! └── EquityPollingActor [spawn_link] (optional, 需要凭证；净值 / 持仓总价值)
 
 use crate::actor_lifecycle::ChildGroup;
 use super::business_ws::{OkxBusinessWsActor, OkxBusinessWsActorArgs};
@@ -16,6 +17,7 @@ use super::greeks_polling::{OkxGreeksPollingActor, OkxGreeksPollingActorArgs};
 use super::private_ws::{OkxPrivateWsActor, OkxPrivateWsActorArgs};
 use super::public_ws::{OkxPublicWsActor, OkxPublicWsActorArgs};
 use crate::domain::{ExchangeError, Symbol, SymbolMeta};
+use crate::exchange::equity_polling::{EquityPollingActor, EquityPollingActorArgs};
 use crate::exchange::{CryptoStatusActor, CryptoStatusActorArgs};
 use crate::messaging::{AccountPubSub, MarketPubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
@@ -29,6 +31,9 @@ use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
 const STATUS_BROADCAST_INTERVAL_MS: u64 = 60_000;
+
+/// 净值 REST 轮询间隔 (毫秒)。一次 = balance + positions 各一次，两者官方限速各 10/2s
+const EQUITY_POLL_INTERVAL_MS: u64 = 2_000;
 
 /// Greeks REST 轮询间隔 (毫秒) — 每秒 1 次，官方限速 10/2s
 const GREEKS_POLLING_INTERVAL_MS: u64 = 1000;
@@ -131,6 +136,17 @@ impl Actor for OkxActor {
         // （见 assembly::setup_okx），所以这里 `Some` 即"可轮询"，不必再判一次 bool。
         // 无凭证时不起它 —— 否则 non-auth 模式会每秒失败刷日志。
         if let Some(client) = args.client {
+            // 净值与持仓总价值走 REST 轮询：私有 WS 推送的 notionalUsd 在单币种保证金模式下是空串
+            children.spawn::<EquityPollingActor, _>(
+                &actor_ref,
+                "EquityPollingActor",
+                EquityPollingActorArgs {
+                    client: client.clone(),
+                    account_pubsub: args.account_pubsub.clone(),
+                    interval_ms: EQUITY_POLL_INTERVAL_MS,
+                },
+            )
+            .await;
             children.spawn::<OkxGreeksPollingActor, _>(
                 &actor_ref,
                 "OkxGreeksPollingActor",

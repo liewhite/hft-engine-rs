@@ -5,7 +5,7 @@ use crate::domain::{
     Exchange, ExchangeError, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate, Side,
     Symbol, SymbolMeta, TimeInForce,
 };
-use crate::exchange::okx::codec::{GreeksData, PositionData};
+use crate::exchange::okx::codec::{parse_account_info, GreeksData, PositionData};
 use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
@@ -236,6 +236,59 @@ impl OkxClient {
         }
 
         Ok(result)
+    }
+
+    /// 签名 GET，返回 `data` 数组；顶层 code 非 0 即错误。
+    async fn signed_get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<Vec<T>, ExchangeError> {
+        #[derive(Deserialize)]
+        struct Response<T> {
+            code: String,
+            msg: String,
+            #[serde(default = "Vec::new")]
+            data: Vec<T>,
+        }
+        let timestamp = Self::iso_timestamp();
+        let sign = self
+            .sign(&timestamp, "GET", path, "")
+            .ok_or_else(|| ExchangeError::Other("No credentials".to_string()))?;
+        let headers = self
+            .build_headers(&sign, &timestamp)
+            .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        let data: Response<T> = serde_json::from_str(&text).map_err(|e| {
+            ExchangeError::ParseError(format!("OKX {path}: {e} (body: {})", text.chars().take(300).collect::<String>()))
+        })?;
+        if data.code != "0" {
+            return Err(map_okx_error(&data.code, &data.msg));
+        }
+        Ok(data.data)
+    }
+
+    /// 拉取某币自 `start_ms` 起**已结算**的公共资金费率（`GET /api/v5/public/funding-rate-history`，
+    /// 无需凭证），按结算时间升序。取 `realizedRate`（实际收付的费率）。
+    ///
+    /// 单次最多 100 条（最新的在前）；OKX 最短 1h 一结，24h 窗口最多 24 条，一页足够。
+    /// 限频 10 次 / 2 秒 / IP。
+    pub async fn fetch_settled_funding(
+        &self,
+        symbol: &Symbol,
+        start_ms: crate::domain::Timestamp,
+    ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
+        let url = format!(
+            "{}/api/v5/public/funding-rate-history?instId={}&limit=100",
+            self.base_url,
+            to_okx(symbol, &self.quote)
+        );
+        let resp = self.client.get(&url).send().await.map_err(Self::map_reqwest_error)?;
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        parse_settled_funding(&text, symbol, start_ms)
     }
 
     /// 取一页挂单（`after` 为游标 = 上一页最后一条的 ordId，`None` 即首页）
@@ -580,16 +633,26 @@ impl AccountClient for OkxClient {
         ))
     }
 
+    /// 净值 = `account/balance` 的 `totalEq`（USD）；持仓总价值 = `account/positions`（全部
+    /// 品种类型）各仓 `notionalUsd` 绝对值之和。口径见 [`parse_account_info`]。
     async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
-        // OKX 的 equity/notional 经私有 WS 推送（AccountInfo 事件），本方法没有实现完整
-        // 语义（此前 notional 硬编码 0.0）。返回编造的数字比报错危险得多 —— 下游拿它算
-        // account_leverage = notional / equity 会静默失效。诚实报不支持，调用方要么走
-        // WS 推送，要么在这里补齐真实实现。
-        Err(ExchangeError::Other(
-            "OKX 不支持 REST fetch_account_info（equity/notional 走私有 WS 推送），\
-             拒绝返回编造的数字"
-                .to_string(),
-        ))
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct BalanceData {
+            total_eq: String,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PositionNotional {
+            notional_usd: String,
+        }
+        let balance: Vec<BalanceData> = self.signed_get("/api/v5/account/balance").await?;
+        let total_eq = balance
+            .first()
+            .ok_or_else(|| ExchangeError::ParseError("OKX account/balance 返回空 data".to_string()))?;
+        let positions: Vec<PositionNotional> = self.signed_get("/api/v5/account/positions").await?;
+        let notionals: Vec<&str> = positions.iter().map(|p| p.notional_usd.as_str()).collect();
+        parse_account_info(&total_eq.total_eq, &notionals).map_err(ExchangeError::ParseError)
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
@@ -644,6 +707,55 @@ impl AccountClient for OkxClient {
     }
 }
 
+/// 解析 `funding-rate-history`：只留 `fundingTime >= start_ms` 的，按时间升序。
+///
+/// 返回条数顶到单页上限 100 且最早一条仍晚于 `start_ms` 时报错（窗口没取全）——
+/// 不会发生在 ≥1h 结算周期上，真出现说明交易所行为变了，静默少算比报错危险。
+fn parse_settled_funding(
+    text: &str,
+    symbol: &Symbol,
+    start_ms: crate::domain::Timestamp,
+) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        funding_time: String,
+        realized_rate: String,
+    }
+    #[derive(Deserialize)]
+    struct Response {
+        code: String,
+        msg: String,
+        #[serde(default)]
+        data: Vec<Entry>,
+    }
+    let resp: Response = serde_json::from_str(text).map_err(|e| {
+        ExchangeError::ParseError(format!("funding-rate-history: {e} (body: {})", text.chars().take(300).collect::<String>()))
+    })?;
+    if resp.code != "0" {
+        return Err(map_okx_error(&resp.code, &resp.msg));
+    }
+    let mut out = Vec::with_capacity(resp.data.len());
+    for e in &resp.data {
+        let settle_time: u64 = e
+            .funding_time
+            .parse()
+            .map_err(|_| ExchangeError::ParseError(format!("fundingTime 非法: {}", e.funding_time)))?;
+        let rate: f64 = e
+            .realized_rate
+            .parse()
+            .map_err(|_| ExchangeError::ParseError(format!("realizedRate 非法: {}", e.realized_rate)))?;
+        out.push(crate::domain::SettledFunding { exchange: Exchange::OKX, symbol: symbol.clone(), rate, settle_time });
+    }
+    let earliest = out.iter().map(|f| f.settle_time).min();
+    if out.len() >= 100 && earliest.is_some_and(|t| t > start_ms) {
+        return Err(ExchangeError::Other(format!("OKX {symbol} 资金费历史一页 100 条未覆盖窗口起点")));
+    }
+    out.retain(|f| f.settle_time >= start_ms);
+    out.sort_by_key(|f| f.settle_time);
+    Ok(out)
+}
+
 /// 错误码映射
 fn map_okx_error(code: &str, msg: &str) -> ExchangeError {
     match code {
@@ -683,6 +795,49 @@ fn order_type_to_okx(order_type: &OrderType) -> (&'static str, Option<String>) {
             };
             (ord_type, Some(price.to_string()))
         }
+    }
+}
+
+#[cfg(test)]
+mod settled_funding_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_window_and_sorts_ascending() {
+        let body = r#"{"code":"0","msg":"","data":[
+            {"fundingTime":"3000","realizedRate":"0.0003","fundingRate":"0.0009"},
+            {"fundingTime":"2000","realizedRate":"-0.0002","fundingRate":"0"},
+            {"fundingTime":"1000","realizedRate":"0.0001","fundingRate":"0"}]}"#;
+        let got = parse_settled_funding(body, &"BTC".to_string(), 2000).unwrap();
+        assert_eq!(got.iter().map(|f| f.settle_time).collect::<Vec<_>>(), vec![2000, 3000]);
+        // 取实际结算的 realizedRate，不是 fundingRate
+        assert_eq!(got[1].rate, 0.0003);
+        assert!(got.iter().all(|f| f.exchange == Exchange::OKX));
+    }
+
+    #[test]
+    fn api_error_and_bad_numbers_fail() {
+        assert!(parse_settled_funding(r#"{"code":"51001","msg":"Instrument ID does not exist","data":[]}"#, &"X".into(), 0).is_err());
+        let bad = r#"{"code":"0","msg":"","data":[{"fundingTime":"1","realizedRate":""}]}"#;
+        assert!(parse_settled_funding(bad, &"X".into(), 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod account_info_tests {
+    use crate::exchange::okx::codec::parse_account_info;
+
+    #[test]
+    fn sums_absolute_position_notionals() {
+        let info = parse_account_info("1000.5", &["200", "-150.5", ""]).unwrap();
+        assert_eq!(info.equity, 1000.5);
+        assert_eq!(info.notional, 350.5);
+    }
+
+    #[test]
+    fn unparsable_values_fail_instead_of_zero() {
+        assert!(parse_account_info("", &[]).is_err());
+        assert!(parse_account_info("1", &["abc"]).is_err());
     }
 }
 

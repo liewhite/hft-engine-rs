@@ -280,18 +280,7 @@ fn parse_private_message(
                     .u_time
                     .parse::<u64>()
                     .map_err(|_| WsError::ParseError(format!("Failed to parse OKX account timestamp: {}", data.u_time)))?;
-                events.push(AccountEvent {
-                    // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
-                    account: crate::domain::AccountId::Live,
-                    exchange_ts,
-                    local_ts,
-                    data: AccountData::AccountInfo {
-                        exchange: Exchange::OKX,
-                        equity: data.to_equity()?,
-                        notional: data.to_notional()?,
-                    },
-                });
-
+                // 净值与持仓总价值不从这里取，由 EquityPollingActor 走 REST（见 codec::AccountData）。
                 // 推送每个币种的现金余额 (用于修正 greeks delta)
                 for detail in &data.details {
                     let cash_bal: f64 = detail.cash_bal.parse()
