@@ -112,7 +112,7 @@ Root("engine")                         ← bootstrap::run_engine 持有，唯一
 
 ## 进度（每完成一块在这里打勾并提交）
 - [x] tasks 核心（tree/inbox/bus）+ 两轮审查
-- [ ] 交易所层：ws_loop、各所 public/private/business WS、轮询（funding_fee/listen_key/greeks/equity/crypto_status/IBKR 全部）、各所 Actor、client.rs 的 ExchangeActorOps → ExchangeHandle、assembly.rs（OKX、HL 已完成）
+- [ ] 交易所层：ws_loop、各所 public/private/business WS、轮询（funding_fee/listen_key/greeks/equity/crypto_status/IBKR 全部）、各所 Actor、client.rs 的 ExchangeActorOps → ExchangeHandle、assembly.rs（OKX、HL 已完成）（IBKR 已完成）
 - [ ] 引擎层：bus 别名、clock、income/outcome processor、paper_counter、metrics、position_ledger、executor、supervisor、manager + provisioning、bootstrap
 - [ ] bins（funding_arb 的 FundingPoller 等）与 tests/
 - [ ] 删 kameo 依赖、actor_lifecycle.rs、docs（framework-overview / architecture）更新
