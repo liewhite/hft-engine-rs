@@ -24,10 +24,9 @@
 //! 已结算的公共费率，整窗作为 `SettledFundingWindow` 自定义事件投递给对应策略。
 
 use hft_engine_rs::domain::{now_ms, Exchange, Symbol, SymbolMeta};
-use hft_engine_rs::engine::live::{GetAllSymbolMetas, PublishCustomEvent};
 use hft_engine_rs::engine::{
-    load_config, setup_binance, setup_hyperliquid, setup_okx, run_engine, run_main, spawn_supervised, AddStrategies,
-    ExchangeSetup, ManagerActor, ManagerActorArgs, StrategySpec,
+    load_config, setup_binance, setup_hyperliquid, setup_okx, run_engine, run_main, ExchangeSetup, ManagerArgs,
+    ManagerHandle, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
 use hft_engine_rs::exchange::hyperliquid::{HyperliquidAccess, HyperliquidClient};
@@ -35,16 +34,11 @@ use hft_engine_rs::exchange::okx::{OkxClient, OkxCredentials};
 use hft_engine_rs::exchange::{ExchangeAccess, SettledFundingSource};
 use hft_engine_rs::messaging::CustomEvent;
 use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, SettledFundingWindow, Strategy, FUNDING_WINDOW_MS};
-use kameo::actor::ActorRef;
-use kameo::error::Infallible;
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use hft_engine_rs::tasks::Periodic;
 use std::time::Duration;
-use tokio::time::Instant;
-use tokio_stream::wrappers::IntervalStream;
 
 /// 要接的所：配了就接。加一所 = 这里加一个字段 + `connect` 里加一段
 #[derive(Debug, Clone, Deserialize)]
@@ -113,7 +107,7 @@ async fn run() -> anyhow::Result<()> {
     let exchanges: Vec<Exchange> = funding_sources.iter().map(|s| s.exchange()).collect();
     tracing::info!(?exchanges, pairs = config.strategy.pairs.len(), "funding_arb starting");
 
-    let args = ManagerActorArgs {
+    let args = ManagerArgs {
         exchanges: setups,
         // 只跑实盘（用户定：不做模拟盘），柜台配置用默认值
         paper: Default::default(),
@@ -121,11 +115,7 @@ async fn run() -> anyhow::Result<()> {
     // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
     run_engine(args, |manager| async move {
         // 每个币在哪几所做：该币在各所品种目录里出现的所（按配置的所顺序），不足两所拒绝启动
-        let metas = manager
-            .ask(GetAllSymbolMetas)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("GetAllSymbolMetas failed: {e}"))?;
+        let metas = manager.all_symbol_metas();
         let listed: HashMap<(Exchange, Symbol), SymbolMeta> = metas
             .into_iter()
             .flat_map(|(ex, ms)| ms.into_iter().map(move |m| ((ex, m.symbol.clone()), m)))
@@ -147,8 +137,7 @@ async fn run() -> anyhow::Result<()> {
         }
         anyhow::ensure!(lonely.is_empty(), "这些币上市的所不足两个，没法对冲：{}", lonely.join("、"));
         manager
-            .ask(AddStrategies(specs))
-            .send()
+            .add_strategies(specs)
             .await
             .map_err(|e| anyhow::anyhow!("AddStrategies failed: {e}"))?;
         tracing::info!(count = coverage.len(), "strategies added");
@@ -164,59 +153,32 @@ async fn run() -> anyhow::Result<()> {
                     .map(move |s| (symbol.clone(), s.clone()))
             })
             .collect();
-        spawn_supervised::<FundingPoller>(
-            &manager,
-            FundingPollerArgs {
-                requests,
-                round: Duration::from_secs(config.funding_poll_secs),
-                manager: manager.clone(),
-            },
-        )
-        .await?;
+        let gap = Duration::from_secs(config.funding_poll_secs) / requests.len().max(1) as u32;
+        tracing::info!(requests = requests.len(), gap_ms = gap.as_millis() as u64, "资金费轮询器启动");
+        let poller = FundingPoller { requests, next: 0, failures: HashMap::new(), manager: manager.clone() };
+        manager.observers().spawn_periodic("FundingPoller", gap, poller)?;
         Ok(())
     })
     .await
 }
 
-struct FundingPollerArgs {
-    /// 每个 (币, 该币上市的所) 一项，轮流拉
-    requests: Vec<(Symbol, Arc<dyn SettledFundingSource>)>,
-    /// 拉完一整轮的时长；单项间隔 = round / 项数
-    round: Duration,
-    manager: ActorRef<ManagerActor>,
-}
-
-/// 资金费轮询器：每个间隔拉一项（一个币在一个所过去 24h 的已结算费率），整窗作为自定义事件
-/// 投递给对应策略；请求均匀摊在一轮里（HL info 按 IP 每分钟 1200 权重，fundingHistory 一次约 20；
-/// 币安 fundingRate 500 次 / 5 分钟；OKX 10 次 / 2 秒）。一条消息只拉一项；定时流不等处理完就投递，
-/// 请求慢（断网时每项要等到超时）会让拍子在邮箱里积压，故过时的拍直接丢弃 —— 恢复后不连发补拍、
-/// 停机时也不必把积压的拍逐个跑完，最多约等两个请求（在跑的一个 + 期间进来的未过时一拍）。
+/// 资金费轮询器：每个单项间隔（= 一整轮 `funding_poll_secs` / 项数）拉一项（一个币在一个所过去
+/// 24h 的已结算费率），整窗作为自定义事件投递给对应策略；请求均匀摊在一轮里（HL info 按 IP
+/// 每分钟 1200 权重，fundingHistory 一次约 20；币安 fundingRate 500 次 / 5 分钟；OKX 10 次 / 2 秒）。
+/// 一拍只拉一项；请求慢（断网时每项要等到超时）时错过的拍不补跑，恢复后不连发。
 /// 偶发失败记 warn（网络会间歇掉线，下一轮就补上）；同一项连续失败 3 轮记 error —— 此时策略侧
 /// 数据会过期变"未知"，该币不开仓、只平两所数据都在的仓位对。
 struct FundingPoller {
+    /// 每个 (币, 该币上市的所) 一项，轮流拉
     requests: Vec<(Symbol, Arc<dyn SettledFundingSource>)>,
     next: usize,
-    /// 单项间隔
-    gap: Duration,
     failures: HashMap<(Symbol, Exchange), u32>,
-    manager: ActorRef<ManagerActor>,
+    manager: ManagerHandle,
 }
 
-impl Actor for FundingPoller {
-    type Args = FundingPollerArgs;
-    type Error = Infallible;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let gap = args.round / args.requests.len().max(1) as u32;
-        actor_ref.attach_stream(IntervalStream::new(tokio::time::interval(gap)), (), ());
-        tracing::info!(requests = args.requests.len(), gap_ms = gap.as_millis() as u64, "资金费轮询器启动");
-        Ok(Self { requests: args.requests, next: 0, gap, failures: HashMap::new(), manager: args.manager })
-    }
-}
-
-impl FundingPoller {
-    async fn poll_one(&mut self) {
-        let Some((symbol, source)) = self.requests.get(self.next).cloned() else { return };
+impl Periodic for FundingPoller {
+    async fn tick(&mut self) -> anyhow::Result<()> {
+        let Some((symbol, source)) = self.requests.get(self.next).cloned() else { return Ok(()) };
         self.next = (self.next + 1) % self.requests.len();
         let ex = source.exchange();
         let start = now_ms().saturating_sub(FUNDING_WINDOW_MS);
@@ -230,10 +192,7 @@ impl FundingPoller {
                     fetched_at: now_ms(),
                     entries,
                 };
-                let ev = CustomEvent::for_symbol(ex, symbol, w);
-                if let Err(e) = self.manager.tell(PublishCustomEvent(ev)).send().await {
-                    tracing::error!(error = %e, "投递资金费窗口失败");
-                }
+                self.manager.publish_custom_event(CustomEvent::for_symbol(ex, symbol, w));
             }
             Err(e) => {
                 let n = self.failures.entry((symbol.clone(), ex)).or_default();
@@ -245,43 +204,6 @@ impl FundingPoller {
                 }
             }
         }
-    }
-}
-
-impl Message<StreamMessage<Instant, (), ()>> for FundingPoller {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: StreamMessage<Instant, (), ()>, ctx: &mut Context<Self, Self::Reply>) {
-        match msg {
-            StreamMessage::Next(at) => {
-                if !tick_stale(at.elapsed(), self.gap) {
-                    self.poll_one().await;
-                }
-            }
-            StreamMessage::Started(_) => {}
-            StreamMessage::Finished(_) => {
-                // 定时流不会自己结束；真结束了就让监督树停机，不悄悄停止拉数
-                tracing::error!("资金费轮询定时流意外结束");
-                ctx.actor_ref().kill();
-            }
-        }
-    }
-}
-
-/// 一拍在邮箱里等了一整个间隔以上，说明前面的请求慢了、它已被后来的拍取代：丢弃不拉
-fn tick_stale(waited: Duration, gap: Duration) -> bool {
-    waited >= gap
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backlogged_ticks_are_dropped() {
-        let gap = Duration::from_secs(6);
-        assert!(!tick_stale(Duration::from_millis(5), gap), "准时的拍要拉");
-        assert!(tick_stale(gap, gap), "等满一个间隔的拍丢弃");
-        assert!(tick_stale(Duration::from_secs(60), gap), "断网积压的拍丢弃");
+        Ok(())
     }
 }
