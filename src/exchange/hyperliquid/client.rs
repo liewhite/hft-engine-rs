@@ -70,8 +70,6 @@ pub struct HyperliquidClient {
     quote: String,
     /// 已接入 dex 的品种目录（启动时建好，只读）
     markets: Arc<HlMarkets>,
-    /// HL 上全部 perp dex（含未接入的），供 [`Self::fetch_positions_outside_catalog`] 查遍
-    all_dexes: Vec<String>,
 }
 
 impl HyperliquidClient {
@@ -163,10 +161,7 @@ impl HyperliquidClient {
             }
         };
 
-        let all_dexes: Vec<String> = std::iter::once(String::new())
-            .chain(perp_dexs.iter().flatten().filter_map(|v| v["name"].as_str().map(str::to_string)))
-            .collect();
-        Ok(Self { client, account, base_url, quote, markets, all_dexes })
+        Ok(Self { client, account, base_url, quote, markets })
     }
 
     /// 已接入 dex 的品种目录（适配层内的 WS actor 共用同一份）
@@ -177,47 +172,6 @@ impl HyperliquidClient {
     /// 查询地址（主钱包）。没配凭证时为 None
     pub(crate) fn private_feed(&self) -> Option<String> {
         self.account.as_ref().map(|a| a.credentials.wallet_address.clone())
-    }
-
-    /// 钱包自 `start_ms` 起在**品种目录之外**的成交（未接入 dex、不可交易品种、现货），
-    /// 与私有推送的 `UnmappedFill` 同一判据。供调用方补查「私有推送生效前」那段时间。
-    /// 单次最多 2000 条，取满即报错（不返回截断的结果）。
-    pub async fn fetch_unmapped_fills_since(
-        &self,
-        start_ms: Timestamp,
-    ) -> Result<Vec<crate::messaging::UnmappedFill>, ExchangeError> {
-        let user = &self.account()?.credentials.wallet_address;
-        let fills: Vec<crate::exchange::hyperliquid::codec::WsFill> = self
-            .post_info(serde_json::json!({"type": "userFillsByTime", "user": user, "startTime": start_ms}))
-            .await?;
-        if fills.len() >= 2000 {
-            return Err(ExchangeError::Other("HL userFillsByTime 取满 2000 条，结果可能被截断".into()));
-        }
-        fills
-            .iter()
-            .filter(|f| !self.markets.owns(&f.coin))
-            .map(|f| f.to_unmapped_fill().map_err(ExchangeError::ParseError))
-            .collect()
-    }
-
-    /// 钱包在**品种目录之外**的全部永续仓位（交易所原始写法，如 `flx:TSLA`、只许逐仓的
-    /// `xyz:SOXL`）：未接入的 dex 全查，已接入 dex 上不可交易的也算。只报事实 —— 这些仓位与
-    /// 本进程共用保证金（统一账户）却不在持仓与持仓总价值的口径里，意味着什么由调用方决定。
-    pub async fn fetch_positions_outside_catalog(&self) -> Result<Vec<String>, ExchangeError> {
-        let user = &self.account()?.credentials.wallet_address;
-        let states = futures_util::future::try_join_all(self.all_dexes.iter().map(|dex| async move {
-            let state: ClearinghouseState = self
-                .post_info(serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex}))
-                .await?;
-            Ok::<_, ExchangeError>((dex.clone(), state))
-        }))
-        .await?;
-        Ok(states
-            .iter()
-            .flat_map(|(dex, s)| own_positions(dex, s))
-            .map(|w| w.position.coin.clone())
-            .filter(|coin| !self.markets.owns(coin))
-            .collect())
     }
 
     /// 账户能力；没配凭证时本不该走到这里（AccountClient 只在有凭证时装配）
@@ -437,8 +391,7 @@ fn parse_num(field: &str, v: &str) -> Result<f64, ExchangeError> {
 /// - 某 dex 响应非空、却没有一个仓位属于它 —— coin 前缀口径变了的征兆，报错而不是返回空：
 ///   本函数是持仓基线的唯一来源，静默返回空会让基线变成全零、此后由 Fill 累加永不纠正；
 /// - 不在品种目录里的仓位（如人工开的逐仓股票）不返回：它们映射不到内部 symbol，本引擎
-///   不交易它们（与 Fill 流同一判据 [`HlMarkets::owns`]）。要知道有没有这类仓位用
-///   [`HyperliquidClient::fetch_positions_outside_catalog`]。
+///   不交易它们（与 Fill 流同一判据 [`HlMarkets::owns`]）。
 pub(crate) fn positions_from_states(
     markets: &HlMarkets,
     states: &[(String, ClearinghouseState)],
@@ -493,8 +446,7 @@ struct SpotBalance {
 ///
 /// **持仓总价值 = 各已接入 dex 全部仓位的 `positionValue` 绝对值之和**。未接入 dex 不查
 /// （每 2 秒查遍全部十几个 dex 会吃掉 HL 每 IP 限频的一半以上），所以口径**不含**未接入 dex
-/// 的仓位；那里有没有仓位用 [`HyperliquidClient::fetch_positions_outside_catalog`] 查，
-/// 运行中新开的会以 `UnmappedFill` 上报。
+/// 的仓位（账户由策略全权托管的前提下不会有）。
 /// 余额里没有计价币 = 该币余额为 0（`balances` 是全量列表；计价币是各 dex 保证金币种已在
 /// `connect` 校验过）。
 pub(crate) fn unified_account_info(
@@ -1208,8 +1160,7 @@ mod unified_account_tests {
         assert!(positions_from_states(&m, &wrong).is_err());
     }
 
-    /// 已接入 dex 上不在品种目录里的仓位：不返回（映射不到内部 symbol），由
-    /// `fetch_positions_outside_catalog` 单独报告
+    /// 已接入 dex 上不在品种目录里的仓位：不返回（映射不到内部 symbol）
     #[test]
     fn uncatalogued_position_is_not_returned() {
         let only_btc = HlMarkets::build(vec![DexUniverse {
