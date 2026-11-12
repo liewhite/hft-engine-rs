@@ -43,7 +43,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::Instant;
 use tokio_stream::wrappers::IntervalStream;
 
 /// 要接的所：配了就接。加一所 = 这里加一个字段 + `connect` 里加一段
@@ -100,10 +100,11 @@ async fn run() -> anyhow::Result<()> {
     let config: Config = load_config("config.json")?;
     config.strategy.validate().map_err(|e| anyhow::anyhow!("strategy 配置非法: {e}"))?;
     anyhow::ensure!(config.funding_poll_secs > 0, "funding_poll_secs 必须 > 0");
-    // 每项数据一轮刷新一次：轮询一轮不短于最大可用年龄的话，数据会周期性过期，策略在「未知」里反复进出
+    // 每项数据一轮刷新一次：留出一整轮失败的余量（两轮 ≤ 最大可用年龄），否则数据会周期性过期，
+    // 策略在「未知」里反复进出
     anyhow::ensure!(
-        config.funding_poll_secs.saturating_mul(1000) < config.strategy.max_funding_age_ms,
-        "funding_poll_secs（{}s）必须短于 strategy.max_funding_age_ms（{}ms）",
+        config.funding_poll_secs.saturating_mul(2000) <= config.strategy.max_funding_age_ms,
+        "funding_poll_secs（{}s）的两倍不得超过 strategy.max_funding_age_ms（{}ms）",
         config.funding_poll_secs,
         config.strategy.max_funding_age_ms
     );
@@ -187,12 +188,16 @@ struct FundingPollerArgs {
 
 /// 资金费轮询器：每个间隔拉一项（一个币在一个所过去 24h 的已结算费率），整窗作为自定义事件
 /// 投递给对应策略；请求均匀摊在一轮里（HL info 按 IP 每分钟 1200 权重，fundingHistory 一次约 20；
-/// 币安 fundingRate 500 次 / 5 分钟；OKX 10 次 / 2 秒）。一条消息只拉一项，停机时最多等一个请求。
+/// 币安 fundingRate 500 次 / 5 分钟；OKX 10 次 / 2 秒）。一条消息只拉一项；定时流不等处理完就投递，
+/// 请求慢（断网时每项要等到超时）会让拍子在邮箱里积压，故过时的拍直接丢弃 —— 恢复后不连发补拍、
+/// 停机时也不必把积压的拍逐个跑完，最多等一个请求。
 /// 偶发失败记 warn（网络会间歇掉线，下一轮就补上）；同一项连续失败 3 轮记 error —— 此时策略侧
 /// 数据会过期变"未知"，该币不开仓、只平两所数据都在的仓位对。
 struct FundingPoller {
     requests: Vec<(Symbol, Arc<dyn SettledFundingSource>)>,
     next: usize,
+    /// 单项间隔
+    gap: Duration,
     failures: HashMap<(Symbol, Exchange), u32>,
     manager: ActorRef<ManagerActor>,
 }
@@ -203,12 +208,9 @@ impl Actor for FundingPoller {
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
         let gap = args.round / args.requests.len().max(1) as u32;
-        let mut ticker = tokio::time::interval(gap);
-        // 某次请求慢了就顺延，不在之后连发补拍（会撞各所限频）
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        actor_ref.attach_stream(IntervalStream::new(ticker), (), ());
+        actor_ref.attach_stream(IntervalStream::new(tokio::time::interval(gap)), (), ());
         tracing::info!(requests = args.requests.len(), gap_ms = gap.as_millis() as u64, "资金费轮询器启动");
-        Ok(Self { requests: args.requests, next: 0, failures: HashMap::new(), manager: args.manager })
+        Ok(Self { requests: args.requests, next: 0, gap, failures: HashMap::new(), manager: args.manager })
     }
 }
 
@@ -251,7 +253,11 @@ impl Message<StreamMessage<Instant, (), ()>> for FundingPoller {
 
     async fn handle(&mut self, msg: StreamMessage<Instant, (), ()>, ctx: &mut Context<Self, Self::Reply>) {
         match msg {
-            StreamMessage::Next(_) => self.poll_one().await,
+            StreamMessage::Next(at) => {
+                if !tick_stale(at.elapsed(), self.gap) {
+                    self.poll_one().await;
+                }
+            }
             StreamMessage::Started(_) => {}
             StreamMessage::Finished(_) => {
                 // 定时流不会自己结束；真结束了就让监督树停机，不悄悄停止拉数
@@ -259,5 +265,23 @@ impl Message<StreamMessage<Instant, (), ()>> for FundingPoller {
                 ctx.actor_ref().kill();
             }
         }
+    }
+}
+
+/// 一拍在邮箱里等了一整个间隔以上，说明前面的请求慢了、它已被后来的拍取代：丢弃不拉
+fn tick_stale(waited: Duration, gap: Duration) -> bool {
+    waited >= gap
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backlogged_ticks_are_dropped() {
+        let gap = Duration::from_secs(6);
+        assert!(!tick_stale(Duration::from_millis(5), gap), "准时的拍要拉");
+        assert!(tick_stale(gap, gap), "等满一个间隔的拍丢弃");
+        assert!(tick_stale(Duration::from_secs(60), gap), "断网积压的拍丢弃");
     }
 }

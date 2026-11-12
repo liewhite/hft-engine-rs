@@ -216,6 +216,7 @@ impl MetricsActor {
         let mut exchange_count = 0usize;
         for (exchange, info) in self.state.account_view().account_infos() {
             // 净值 ≤0 时杠杆算不出：不推这个点（看板断线），不能报成 0 冒充「很安全」
+            // （边界：所有所同时 ≤0 时整族缺席，pushgateway 会保留上次的值；三所同时归零不现实，不处理）
             let leverage = (info.equity > 0.0).then(|| info.notional / info.equity);
             total_equity += info.equity;
             total_notional += info.notional;
