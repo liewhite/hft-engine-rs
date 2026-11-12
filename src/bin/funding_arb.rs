@@ -117,8 +117,8 @@ async fn main() -> anyhow::Result<()> {
     let exchanges: Vec<Exchange> = funding_sources.iter().map(|s| s.exchange()).collect();
     tracing::info!(?exchanges, pairs = config.strategy.pairs.len(), "funding_arb starting");
 
-    // 外来成交补查的起点：引擎（含私有推送）启动之前
-    let started_at = now_ms();
+    // 外来成交补查的起点：引擎（含私有推送）启动之前，再往前留 1 分钟抵本机与 HL 的时钟差
+    let started_at = now_ms().saturating_sub(60_000);
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
             exchanges: setups,
