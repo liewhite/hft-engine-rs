@@ -5,10 +5,15 @@
 //! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
 //! - WsActors 直接解析消息并发布到对应总线
 //!
+//! 一个 actor 覆盖 client 接入的全部 perp dex（共用一个钱包、一条公共 WS、一条私有 WS），
+//! 品种归属由 client 的品种目录决定。
+//!
 //! 架构:
 //! HyperliquidActor (父)
 //! ├── HyperliquidPublicWsActor [spawn_link]
-//! └── HyperliquidPrivateWsActor [spawn_link] (optional, 需要凭证)
+//! ├── HyperliquidPrivateWsActor [spawn_link] (optional, 需要凭证)
+//! ├── EquityPollingActor [spawn_link] (optional, 需要凭证)
+//! └── HyperliquidFundingFeePollingActor [spawn_link] (optional, 需要凭证)
 
 use crate::actor_lifecycle::ChildGroup;
 use super::funding_fee_polling::{
@@ -16,16 +21,16 @@ use super::funding_fee_polling::{
 };
 use super::private_ws::{HyperliquidPrivateWsActor, HyperliquidPrivateWsActorArgs};
 use super::public_ws::{HyperliquidPublicWsActor, HyperliquidPublicWsActorArgs};
-use crate::domain::{ExchangeError, Symbol, SymbolMeta};
+use crate::domain::ExchangeError;
+use crate::exchange::equity_polling::{EquityPollingActor, EquityPollingActorArgs};
 use crate::exchange::{CryptoStatusActor, CryptoStatusActorArgs};
 use crate::messaging::{AccountPubSub, MarketPubSub};
 use crate::exchange::client::{Subscribe, SubscribeBatch, Unsubscribe};
-use crate::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
+use crate::exchange::hyperliquid::HyperliquidClient;
 use kameo::actor::{ActorRef, WeakActorRef};
 use kameo::error::ActorStopReason;
 use kameo::message::{Context, Message};
 use kameo::Actor;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
@@ -34,20 +39,19 @@ const STATUS_BROADCAST_INTERVAL_MS: u64 = 5_000;
 /// 资费结算轮询间隔 (毫秒)。与 Binance 侧一致：资费按小时结算，1 分钟一次绰绰有余。
 const FUNDING_FEE_POLL_INTERVAL_MS: u64 = 60_000;
 
+/// 账户净值轮询间隔 (毫秒)。一次 = spotClearinghouseState + 每个已接入 dex 一次
+/// clearinghouseState（各约 2 权重）；2 秒一次、两个 dex 约 180 权重/分钟，
+/// 与持仓对账、资金费拉取合计仍远低于 HL 每 IP 1200/分钟。陈旧守卫是 60 秒，间隔不影响它。
+const EQUITY_POLL_INTERVAL_MS: u64 = 2_000;
+
 /// HyperliquidActor 初始化参数
 pub struct HyperliquidActorArgs {
-    /// 凭证（可选）
-    pub credentials: Option<HyperliquidCredentials>,
-    /// Symbol 元数据
-    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+    /// 装配处建好的 client（品种目录、凭证都在里面；与 ExchangeSetup 里的是同一个）
+    pub client: Arc<HyperliquidClient>,
     /// 公共行情总线（public WS / 状态广播用）
     pub market_pubsub: ActorRef<MarketPubSub>,
     /// 账户私有事件总线（private WS / 账户轮询用）
     pub account_pubsub: ActorRef<AccountPubSub>,
-    /// 计价币种 (e.g., "USDC", "USDE")
-    pub quote: String,
-    /// Perp DEX 名称 ("" = 默认, "xyz" = 股票永续等)
-    pub dex: String,
 }
 
 /// HyperliquidActor - 父 Actor
@@ -63,18 +67,10 @@ impl Actor for HyperliquidActor {
     type Error = ExchangeError;
 
     async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-
-        // 凭证可用时构建 Arc<HyperliquidClient>，供 FundingFee polling 使用（与 BinanceActor 同构）。
-        // 构建失败向上传播 → 启动期受控退出
-        let hyperliquid_client: Option<Arc<HyperliquidClient>> = match args.credentials.as_ref() {
-            Some(c) => Some(Arc::new(
-                HyperliquidClient::new(args.quote.clone(), args.dex.clone(), Some(c.clone()))
-                    .map_err(|e| {
-                        ExchangeError::Other(format!("Failed to create HyperliquidClient: {e}"))
-                    })?,
-            )),
-            None => None,
-        };
+        let client = args.client;
+        let markets = client.markets().clone();
+        // 有凭证 = client 有账户（同一个 Option 的两面），私有 WS 与各轮询都按它门控
+        let private_feed = client.private_feed();
 
         // 1. 并发 spawn 两个 WS actor
         let mut children = ChildGroup::default();
@@ -83,20 +79,19 @@ impl Actor for HyperliquidActor {
             "HyperliquidPublicWsActor",
             HyperliquidPublicWsActorArgs {
                 market_pubsub: args.market_pubsub.clone(),
-                symbol_metas: args.symbol_metas.clone(),
-                quote: args.quote.clone(),
-                dex: args.dex.clone(),
+                markets: markets.clone(),
             },
         )
         .await;
-        let private_ws_opt = if let Some(credentials) = args.credentials {
+        let private_ws_opt = if let Some((wallet_address, foreign_checked_at)) = private_feed.clone() {
             Some(
                 children.spawn::<HyperliquidPrivateWsActor, _>(
                     &actor_ref,
                     "HyperliquidPrivateWsActor",
                     HyperliquidPrivateWsActorArgs {
-                        wallet_address: credentials.wallet_address,
-                        dex: args.dex.clone(),
+                        wallet_address,
+                        foreign_checked_at,
+                        markets: markets.clone(),
                         account_pubsub: args.account_pubsub.clone(),
                     },
                 )
@@ -123,11 +118,21 @@ impl Actor for HyperliquidActor {
             .map_err(|e| ExchangeError::Other(format!("HyperliquidPublicWsActor failed to start: {e}")))?;
         private_r
             .map_err(|e| ExchangeError::Other(format!("HyperliquidPrivateWsActor failed to start: {e}")))?;
-        tracing::info!(exchange = "Hyperliquid", has_private_ws, "WS actors ready");
+        tracing::info!(exchange = "Hyperliquid", has_private_ws, dexes = ?markets.dexes(), "WS actors ready");
 
-        // 2.5 资费结算轮询：与私有 WS 一样按凭证门控（userFunding 要带 user 地址）。
+        // 2.5 账户轮询（净值、资费结算）：与私有 WS 一样按凭证门控。
         //     polling actor 的 on_start 只 attach_stream（无 IO），无需 wait_for_startup。
-        if let Some(client) = hyperliquid_client {
+        if private_feed.is_some() {
+            children.spawn::<EquityPollingActor, _>(
+                &actor_ref,
+                "EquityPollingActor",
+                EquityPollingActorArgs {
+                    client: client.clone(),
+                    account_pubsub: args.account_pubsub.clone(),
+                    interval_ms: EQUITY_POLL_INTERVAL_MS,
+                },
+            )
+            .await;
             children.spawn::<HyperliquidFundingFeePollingActor, _>(
                 &actor_ref,
                 "HyperliquidFundingFeePollingActor",

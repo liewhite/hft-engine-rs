@@ -5,11 +5,12 @@
 //! - 处理 Subscribe/Unsubscribe 请求
 //! - 直接解析消息并发布到对应总线
 
-use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Exchange, ExchangeError, Symbol};
 use crate::messaging::MarketPubSub;
 use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
 use crate::exchange::hyperliquid::codec::{aggregate_trades, WsActiveAssetCtx, WsBbo, WsTrade};
-use crate::exchange::hyperliquid::{to_hyperliquid, WS_URL};
+use crate::exchange::hyperliquid::markets::HlMarkets;
+use crate::exchange::hyperliquid::WS_URL;
 use crate::exchange::ws_loop;
 use crate::messaging::{MarketData, MarketEvent};
 use futures_util::StreamExt;
@@ -28,24 +29,16 @@ use tokio_stream::wrappers::ReceiverStream;
 pub struct HyperliquidPublicWsActorArgs {
     /// 行情总线（发布事件）
     pub market_pubsub: ActorRef<MarketPubSub>,
-    /// Symbol 元数据
-    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 计价币种 (e.g., "USDC", "USDE")
-    pub quote: String,
-    /// Perp DEX 名称 ("" = 默认, "xyz" = 股票永续等)
-    pub dex: String,
+    /// 已接入 dex 的品种目录（symbol → 带 dex 前缀的 coin）
+    pub markets: Arc<HlMarkets>,
 }
 
 /// HyperliquidPublicWsActor - WebSocket Actor
 pub struct HyperliquidPublicWsActor {
     /// 行情总线（发布事件）
     market_pubsub: ActorRef<MarketPubSub>,
-    /// Symbol 元数据（用于过滤不存在的 symbol）
-    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 计价币种 (e.g., "USDC", "USDE")
-    quote: String,
-    /// Perp DEX 名称
-    dex: String,
+    /// 品种目录：订阅前查 coin，查不到的 symbol 不订阅
+    markets: Arc<HlMarkets>,
     /// 发送消息到 ws_loop 的 channel
     ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的底层 stream (用于 WebSocket 去重)
@@ -71,12 +64,7 @@ impl HyperliquidPublicWsActor {
             .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
 
         for kind in kinds {
-            let subscription = kind_to_subscription(kind, &self.quote, &self.dex).ok_or_else(|| {
-                WsError::ParseError(
-                    "Candle kind reached HyperliquidPublicWsActor subscribe (routing bug)"
-                        .to_string(),
-                )
-            })?;
+            let subscription = self.subscription(kind)?;
             let msg = json!({
                 "method": "subscribe",
                 "subscription": subscription
@@ -93,12 +81,7 @@ impl HyperliquidPublicWsActor {
 
     /// 发送取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
-        let subscription = kind_to_subscription(kind, &self.quote, &self.dex).ok_or_else(|| {
-            WsError::ParseError(
-                "Candle kind reached HyperliquidPublicWsActor unsubscribe (routing bug)"
-                    .to_string(),
-            )
-        })?;
+        let subscription = self.subscription(kind)?;
         let msg = json!({
             "method": "unsubscribe",
             "subscription": subscription
@@ -112,6 +95,23 @@ impl HyperliquidPublicWsActor {
         tx.send(msg)
             .await
             .map_err(|_| WsError::Network("Channel closed".to_string()))
+    }
+
+    /// kind 对应的订阅报文；只对已过订阅期筛选的 kind 调用（Candle 与目录外的 symbol
+    /// 在 SubscribeBatch 里就被跳过），走到这里还查不到属路由 bug
+    fn subscription(&self, kind: &SubscriptionKind) -> Result<serde_json::Value, WsError> {
+        let channel = kind_channel(kind).ok_or_else(|| {
+            WsError::ParseError(format!("{kind:?} reached HyperliquidPublicWsActor (routing bug)"))
+        })?;
+        let coin = self.markets.coin(kind.symbol()).ok_or_else(|| {
+            WsError::ParseError(format!("{} 不在 HL 品种目录里 (routing bug)", kind.symbol()))
+        })?;
+        Ok(json!({"type": channel, "coin": coin}))
+    }
+
+    /// 底层 stream 标识（同一 stream 可被多个 kind 共用，用于去重）
+    fn stream(&self, kind: &SubscriptionKind) -> Option<String> {
+        Some(format!("{}:{}", kind_channel(kind)?, self.markets.coin(kind.symbol())?))
     }
 
     /// 解析并处理消息
@@ -191,9 +191,7 @@ impl Actor for HyperliquidPublicWsActor {
 
         Ok(Self {
             market_pubsub: args.market_pubsub,
-            symbol_metas: args.symbol_metas,
-            quote: args.quote,
-            dex: args.dex,
+            markets: args.markets,
             ws_tx: Some(outgoing_tx),
             subscribed_streams: HashSet::new(),
             subscribed_kinds: HashSet::new(),
@@ -244,24 +242,18 @@ impl Message<SubscribeBatch> for HyperliquidPublicWsActor {
         let mut new_kinds = Vec::new();
 
         for kind in msg.kinds {
-            let symbol = kind.symbol();
-            if !self.symbol_metas.contains_key(symbol) {
-                tracing::warn!(
-                    exchange = "Hyperliquid",
-                    symbol = %symbol,
-                    "Symbol not found in symbol_metas, ignoring subscription"
-                );
-                continue;
-            }
-
             if self.subscribed_kinds.contains(&kind) {
                 continue;
             }
 
-            let stream = match kind_to_stream(&kind, &self.quote, &self.dex) {
+            let stream = match self.stream(&kind) {
                 Some(stream) => stream,
                 None => {
-                    tracing::error!(?kind, "Candle routed to HyperliquidPublicWsActor (routing bug), skipping");
+                    tracing::warn!(
+                        exchange = "Hyperliquid",
+                        ?kind,
+                        "不支持的订阅类型或 symbol 不在 HL 品种目录里，忽略"
+                    );
                     continue;
                 }
             };
@@ -316,19 +308,17 @@ impl Message<Unsubscribe> for HyperliquidPublicWsActor {
 
         // 检查是否还有其他 kinds 使用同一个 stream
         // Candle 从不进入 subscribed_kinds（订阅期已跳过），此处若为 None 属路由 bug，记录并跳过
-        let stream = match kind_to_stream(&msg.kind, &self.quote, &self.dex) {
+        let stream = match self.stream(&msg.kind) {
             Some(stream) => stream,
             None => {
                 tracing::error!(kind = ?msg.kind, "Candle routed to HyperliquidPublicWsActor unsubscribe (routing bug), skipping");
                 return;
             }
         };
-        let quote = &self.quote;
-        let dex = &self.dex;
         let stream_still_needed = self
             .subscribed_kinds
             .iter()
-            .any(|k| kind_to_stream(k, quote, dex).as_ref() == Some(&stream));
+            .any(|k| self.stream(k).as_ref() == Some(&stream));
 
         if !stream_still_needed {
             if let Err(e) = self.send_unsubscribe(&msg.kind).await {
@@ -496,60 +486,17 @@ pub(crate) fn parse_public_message(
 // 辅助函数
 // ============================================================================
 
-/// 将 SubscriptionKind 转换为底层 stream 标识符 (用于去重)
+/// kind 对应的 HL 订阅频道。`None` = 本适配层未实现（如 Candle）。
 ///
-/// 返回 `None` 表示该 kind 无法路由到 Hyperliquid（如 Candle 未实现）；
-/// 调用方应记录并跳过，而非 panic。
-///
-/// **Some/None 只准由 kind 变体决定**：quote/dex 只参与报文字符串拼装。
-/// `supports_subscription`（能力查询）依赖此前提传占位参数 —— 若将来按 quote/dex
-/// 分支决定支持与否，能力查询会静默失真。
-pub(crate) fn kind_to_stream(kind: &SubscriptionKind, quote: &str, dex: &str) -> Option<String> {
+/// 只由 kind 变体决定、与 symbol 无关 —— 能力查询 `supports_subscription` 直接用它。
+pub(crate) fn kind_channel(kind: &SubscriptionKind) -> Option<&'static str> {
     match kind {
         // FundingRate、MarkPrice、IndexPrice 都使用同一个 activeAssetCtx 订阅
-        SubscriptionKind::FundingRate { symbol }
-        | SubscriptionKind::MarkPrice { symbol }
-        | SubscriptionKind::IndexPrice { symbol } => {
-            Some(format!("activeAssetCtx:{}", to_hyperliquid(symbol, quote, dex)))
-        }
-        SubscriptionKind::BBO { symbol } => {
-            Some(format!("bbo:{}", to_hyperliquid(symbol, quote, dex)))
-        }
-        SubscriptionKind::Trades { symbol } => {
-            Some(format!("trades:{}", to_hyperliquid(symbol, quote, dex)))
-        }
-        SubscriptionKind::Candle { .. } => None,
-    }
-}
-
-/// 将 SubscriptionKind 转换为 Hyperliquid 订阅格式
-///
-/// 返回 `None` 表示该 kind 无法路由到 Hyperliquid（如 Candle 未实现）；
-/// 调用方应记录并跳过，而非 panic。
-pub(crate) fn kind_to_subscription(
-    kind: &SubscriptionKind,
-    quote: &str,
-    dex: &str,
-) -> Option<serde_json::Value> {
-    match kind {
-        // FundingRate、MarkPrice、IndexPrice 都使用 activeAssetCtx 订阅
-        SubscriptionKind::FundingRate { symbol }
-        | SubscriptionKind::MarkPrice { symbol }
-        | SubscriptionKind::IndexPrice { symbol } => Some(json!({
-            "type": "activeAssetCtx",
-            "coin": to_hyperliquid(symbol, quote, dex)
-        })),
-        SubscriptionKind::BBO { symbol } => {
-            // 使用 bbo 获取最优买卖价
-            Some(json!({
-                "type": "bbo",
-                "coin": to_hyperliquid(symbol, quote, dex)
-            }))
-        }
-        SubscriptionKind::Trades { symbol } => Some(json!({
-            "type": "trades",
-            "coin": to_hyperliquid(symbol, quote, dex)
-        })),
+        SubscriptionKind::FundingRate { .. }
+        | SubscriptionKind::MarkPrice { .. }
+        | SubscriptionKind::IndexPrice { .. } => Some("activeAssetCtx"),
+        SubscriptionKind::BBO { .. } => Some("bbo"),
+        SubscriptionKind::Trades { .. } => Some("trades"),
         SubscriptionKind::Candle { .. } => None,
     }
 }
@@ -580,9 +527,7 @@ mod tests {
     fn actor_with_subscription(subscribed: Option<u64>) -> HyperliquidPublicWsActor {
         HyperliquidPublicWsActor {
             market_pubsub: unreachable_pubsub(),
-            symbol_metas: Arc::new(HashMap::new()),
-            quote: "USDC".to_string(),
-            dex: String::new(),
+            markets: Arc::new(crate::exchange::hyperliquid::testkit::markets(&["", "xyz"])),
             ws_tx: None,
             subscribed_streams: HashSet::new(),
             subscribed_kinds: HashSet::new(),
@@ -633,9 +578,25 @@ mod tests {
 
     #[tokio::test]
     async fn trades_kind_maps_to_trades_subscription() {
+        let actor = actor_with_subscription(None);
         let kind = SubscriptionKind::Trades { symbol: "BTC".to_string() };
-        let sub = kind_to_subscription(&kind, "USDC", "").expect("must map");
+        let sub = actor.subscription(&kind).expect("must map");
         assert_eq!(sub["type"], "trades");
         assert_eq!(sub["coin"], "BTC");
+    }
+
+    /// 同一个 actor 订阅主站与 xyz：coin 各带各的前缀，目录外的 symbol 不订阅
+    #[tokio::test]
+    async fn one_actor_subscribes_across_dexes() {
+        let actor = actor_with_subscription(None);
+        let bbo = |s: &str| SubscriptionKind::BBO { symbol: s.to_string() };
+        assert_eq!(actor.subscription(&bbo("TSLA")).unwrap()["coin"], "xyz:TSLA");
+        assert_eq!(actor.stream(&bbo("BTC")).as_deref(), Some("bbo:BTC"));
+        assert_eq!(
+            actor.stream(&SubscriptionKind::FundingRate { symbol: "TSLA".into() }).as_deref(),
+            Some("activeAssetCtx:xyz:TSLA")
+        );
+        assert!(actor.stream(&bbo("AAPL")).is_none());
+        assert!(actor.subscription(&bbo("AAPL")).is_err());
     }
 }

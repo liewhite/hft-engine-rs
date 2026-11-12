@@ -236,13 +236,13 @@ async fn okx_trades_matches_codec() {
 #[tokio::test]
 #[ignore = "需要联网连交易所"]
 async fn hyperliquid_trades_matches_codec() {
-    use crate::exchange::hyperliquid::actor::public_ws::{
-        kind_to_subscription, parse_public_message,
-    };
+    use crate::exchange::hyperliquid::actor::public_ws::{kind_channel, parse_public_message};
     use crate::exchange::hyperliquid::WS_URL;
 
     let kind = trades_kind();
-    let subscription = kind_to_subscription(&kind, "USDC", "").expect("Trades 必须能映射到订阅");
+    // 主站品种的 coin 就是 symbol 本身（不带 dex 前缀）
+    let channel = kind_channel(&kind).expect("Trades 必须能映射到订阅");
+    let subscription = serde_json::json!({"type": channel, "coin": kind.symbol()});
     let subscribed: HashSet<SubscriptionKind> = HashSet::from([kind]);
 
     let (trades, raws) = observe(

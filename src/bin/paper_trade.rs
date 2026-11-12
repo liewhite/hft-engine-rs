@@ -32,7 +32,7 @@ use hft_engine_rs::engine::{
     StrategySpec,
 };
 use hft_engine_rs::exchange::binance::BinanceCredentials;
-use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
+use hft_engine_rs::exchange::hyperliquid::HyperliquidAccess;
 use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
@@ -48,7 +48,7 @@ use std::collections::{HashMap, HashSet};
 struct ExchangesConfig {
     binance: Option<ExchangeAccess<BinanceCredentials>>,
     okx: Option<ExchangeAccess<OkxCredentials>>,
-    hyperliquid: Option<ExchangeAccess<HyperliquidCredentials>>,
+    hyperliquid: Option<HyperliquidAccess>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -167,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
         exchanges.push(setup_okx(access)?);
     }
     if let Some(access) = config.exchanges.hyperliquid.clone() {
-        exchanges.push(setup_hyperliquid(access)?);
+        exchanges.push(setup_hyperliquid(access).await?);
     }
 
     let manager = ManagerActor::spawn_with_mailbox(

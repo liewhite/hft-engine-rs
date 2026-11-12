@@ -33,7 +33,7 @@ use hft_engine_rs::engine::{
     PromotionPolicy, SubscribeAccount, SubscribeMarket, SupervisorActor, SupervisorArgs, SymbolPerformance,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
-use hft_engine_rs::exchange::hyperliquid::HyperliquidCredentials;
+use hft_engine_rs::exchange::hyperliquid::HyperliquidAccess;
 use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{ExchangeAccess, ExchangeClient, SubscriptionKind};
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
@@ -94,7 +94,7 @@ impl PromotionPolicy for MyPolicy {
 struct ExchangesConfig {
     binance: Option<ExchangeAccess<BinanceCredentials>>,
     okx: Option<ExchangeAccess<OkxCredentials>>,
-    hyperliquid: Option<ExchangeAccess<HyperliquidCredentials>>,
+    hyperliquid: Option<HyperliquidAccess>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
         exchanges.push(setup_okx(access)?);
     }
     if let Some(access) = config.exchanges.hyperliquid.clone() {
-        exchanges.push(setup_hyperliquid(access)?);
+        exchanges.push(setup_hyperliquid(access).await?);
     }
 
     let manager = ManagerActor::spawn_with_mailbox(

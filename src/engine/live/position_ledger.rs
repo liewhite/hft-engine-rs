@@ -955,6 +955,84 @@ mod tests {
 }
 
 /// actor 层：邮箱在任何时刻都不阻塞在 REST 上（快照面契约的硬性要求）
+/// 硬要求（用户 11-12）：多 dex 下「启动 REST 基线 + Fill 流」与定时 REST 对账照样成立。
+/// 用 HL 适配层真实的解析路径（持仓快照合并、私有推送过滤）喂 [`Reconciler`]。
+#[cfg(test)]
+mod hl_multi_dex_tests {
+    use super::*;
+    use crate::exchange::hyperliquid::testkit::{fills_from_ws, markets, positions, state_json, user_fills_json};
+
+    const EX: Exchange = Exchange::Hyperliquid;
+    const SNAPSHOT_TS: u64 = 10;
+    const N: u32 = 3;
+
+    /// 主站 + xyz 两个 dex；基线：BTC 多 1、TSLA 空 2
+    fn setup() -> (crate::exchange::hyperliquid::markets::HlMarkets, Reconciler) {
+        let m = markets(&["", "xyz"]);
+        let metas: HashMap<(Exchange, Symbol), SymbolMeta> = m
+            .symbol_metas()
+            .into_iter()
+            .map(|meta| ((EX, meta.symbol.clone()), meta))
+            .collect();
+        let base = positions(
+            &m,
+            &[("", &state_json(&[("BTC", 1.0)])), ("xyz", &state_json(&[("xyz:TSLA", -2.0)]))],
+        );
+        assert_eq!(base.len(), 2, "基线必须含两个 dex 的仓位");
+        let baselines: Vec<_> = base
+            .into_iter()
+            .map(|position| PositionBaseline { position, snapshot_req_ts: SNAPSHOT_TS })
+            .collect();
+        let mut r = Reconciler::new(Arc::new(metas), N);
+        r.register(&["BTC".to_string(), "TSLA".to_string()], &baselines);
+        (m, r)
+    }
+
+    /// 交易所侧之后的真实持仓：BTC 1.5、TSLA -3（各 dex 一份快照）
+    fn rest_snapshot(m: &crate::exchange::hyperliquid::markets::HlMarkets) -> Vec<Position> {
+        positions(
+            m,
+            &[("", &state_json(&[("BTC", 1.5)])), ("xyz", &state_json(&[("xyz:TSLA", -3.0)]))],
+        )
+    }
+
+    #[test]
+    fn baseline_plus_fills_matches_rest_across_dexes() {
+        let (m, mut r) = setup();
+        // 一条推送里混着两个 dex 的成交：主站 BTC 买 0.5、xyz TSLA 卖 1
+        let raw = user_fills_json(&[("BTC", "B", 0.5), ("xyz:TSLA", "A", 1.0)]);
+        let events = fills_from_ws(&m, &raw, SNAPSHOT_TS + 1).unwrap();
+        assert_eq!(events.len(), 2, "两个 dex 的成交都要进 Fill 流");
+        // 未接入的 flx 上同名 TSLA 的成交：不进 Fill 流，整条推送报错（停机），不会串到 xyz:TSLA
+        let foreign = user_fills_json(&[("flx:TSLA", "B", 5.0)]);
+        assert!(fills_from_ws(&m, &foreign, SNAPSHOT_TS + 1).is_err());
+        for e in &events {
+            r.on_event(e);
+        }
+        let snapshot = rest_snapshot(&m);
+        for _ in 0..10 {
+            r.reconcile(EX, &snapshot).expect("基线 + Fill 与 REST 一致，不应报漂移");
+        }
+    }
+
+    #[test]
+    fn a_missed_fill_on_one_dex_becomes_drift_after_n_rounds() {
+        let (m, mut r) = setup();
+        // xyz 的那笔成交丢了，只收到主站的
+        let raw = user_fills_json(&[("BTC", "B", 0.5)]);
+        for e in &fills_from_ws(&m, &raw, SNAPSHOT_TS + 1).unwrap() {
+            r.on_event(e);
+        }
+        let snapshot = rest_snapshot(&m);
+        for round in 1..N {
+            r.reconcile(EX, &snapshot).unwrap_or_else(|e| panic!("第 {round} 次就判漂移: {e}"));
+        }
+        let err = r.reconcile(EX, &snapshot).expect_err("连续 N 次稳定差值应判漂移");
+        assert!(err.contains("TSLA"), "{err}");
+        assert!(!err.contains("BTC"), "主站那条腿是一致的: {err}");
+    }
+}
+
 #[cfg(test)]
 mod mailbox_tests {
     use super::*;

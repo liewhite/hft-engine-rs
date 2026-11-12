@@ -40,12 +40,14 @@ fn load_credentials() -> HyperliquidCredentials {
 }
 
 /// 创建 XYZ DEX 客户端（无凭证，仅用于公开接口）
-fn create_public_client() -> HyperliquidClient {
+async fn create_public_client() -> HyperliquidClient {
     let creds = HyperliquidCredentials::with_private_key(
         "0x0000000000000000000000000000000000000000".to_string(),
         "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
     );
-    HyperliquidClient::new(TEST_QUOTE.to_string(), TEST_DEX.to_string(), Some(creds)).expect("创建公开客户端失败")
+    HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()], Some(creds))
+        .await
+        .expect("创建公开客户端失败")
 }
 
 /// L2 订单簿响应
@@ -98,7 +100,7 @@ async fn fetch_bbo(coin: &str) -> Result<(f64, f64), Box<dyn std::error::Error>>
 #[tokio::test]
 #[ignore = "需要网络"]
 async fn test_xyz_fetch_all_symbol_metas() {
-    let client = create_public_client();
+    let client = create_public_client().await;
     let metas = client
         .fetch_all_symbol_metas()
         .await
@@ -124,8 +126,9 @@ async fn test_xyz_fetch_all_symbol_metas() {
 #[tokio::test]
 #[ignore = "需要网络"]
 async fn test_xyz_fetch_symbol_meta() {
-    let client = create_public_client();
-    let symbol: Symbol = TEST_COIN.to_string();
+    let client = create_public_client().await;
+    // 内部 symbol 不带 dex 前缀
+    let symbol: Symbol = hft_engine_rs::exchange::hyperliquid::from_hyperliquid(TEST_COIN);
 
     let metas = client
         .fetch_symbol_meta(&[symbol.clone()])
@@ -212,9 +215,12 @@ async fn test_xyz_fetch_meta_and_asset_ctxs() {
 /// 下单测试辅助函数
 async fn place_test_order(side: Side) {
     let credentials = load_credentials();
-    let client = HyperliquidClient::new(TEST_QUOTE.to_string(), TEST_DEX.to_string(), Some(credentials)).expect("创建客户端失败");
+    let client = HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()], Some(credentials))
+        .await
+        .expect("创建客户端失败");
 
-    let symbol: Symbol = TEST_COIN.to_string();
+    // 内部 symbol 不带 dex 前缀
+    let symbol: Symbol = hft_engine_rs::exchange::hyperliquid::from_hyperliquid(TEST_COIN);
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(TEST_COIN).await.expect("获取 BBO 失败");

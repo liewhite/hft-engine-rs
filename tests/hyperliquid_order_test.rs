@@ -76,7 +76,9 @@ async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Er
 async fn test_hyperliquid_limit_buy() {
     let credentials =
         get_credentials().expect("需要设置 HYPERLIQUID_WALLET_ADDRESS 和 HYPERLIQUID_PRIVATE_KEY");
-    let client = HyperliquidClient::new(TEST_QUOTE.to_string(), TEST_DEX.to_string(), Some(credentials)).expect("创建客户端失败");
+    let client = HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()], Some(credentials))
+        .await
+        .expect("创建客户端失败");
 
     let symbol: Symbol = TEST_BASE.to_string();
 
@@ -124,7 +126,9 @@ async fn test_hyperliquid_limit_buy() {
 async fn test_hyperliquid_limit_sell() {
     let credentials =
         get_credentials().expect("需要设置 HYPERLIQUID_WALLET_ADDRESS 和 HYPERLIQUID_PRIVATE_KEY");
-    let client = HyperliquidClient::new(TEST_QUOTE.to_string(), TEST_DEX.to_string(), Some(credentials)).expect("创建客户端失败");
+    let client = HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()], Some(credentials))
+        .await
+        .expect("创建客户端失败");
 
     let symbol: Symbol = TEST_BASE.to_string();
 

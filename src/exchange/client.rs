@@ -69,19 +69,20 @@ impl SubscriptionKind {
 /// 单个交易所的接入配置。
 ///
 /// **"启用哪个所 + 计价币"与"有没有凭证"是两件事**，故拆开：
-/// - `quote` / `dex` 决定接入哪个市场、内部符号如何拼成交易所符号 —— 公共行情也需要它们
+/// - `quote` 决定接入哪个市场、内部符号如何拼成交易所符号 —— 公共行情也需要它们
 /// - `credentials` 只决定能否接入**私有流与下单**；`None` = 只接公共行情
 ///
 /// 二者原本合在凭证结构里，导致"跑模拟盘也必须先配 API key"。拆开后模拟盘可完全脱离凭证，
 /// 且同一进程内可以让一部分所只读、另一部分所可交易。
+///
+/// 不认识的键报错（`deny_unknown_fields`）：旧配置写的 `"dex": "xyz"` 若被静默忽略，
+/// 进程会接到主站而不是股票市场。Hyperliquid 有自己的接入配置（带 `dexes`），见
+/// `crate::exchange::hyperliquid::HyperliquidAccess`。
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExchangeAccess<C> {
     /// 计价币种 (e.g., "USDT", "USDC")
     pub quote: String,
-    /// Perp DEX 名称：仅 Hyperliquid 有意义（"" = 默认 perp DEX，"xyz" = 股票永续），
-    /// 其余交易所留空
-    #[serde(default)]
-    pub dex: String,
     /// 私有访问凭证。None = 只接公共行情，不下单、不接私有流
     #[serde(default = "Option::default")]
     pub credentials: Option<C>,

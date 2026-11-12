@@ -33,6 +33,9 @@ fn parse_side(raw: &str) -> Result<Side, String> {
 #[derive(Debug, Deserialize)]
 pub struct MetaResponse {
     pub universe: Vec<AssetInfo>,
+    /// 该 dex 的保证金币种（spot token 编号，USDC = 0）
+    #[serde(rename = "collateralToken")]
+    pub collateral_token: u32,
 }
 
 /// 单个资产信息
@@ -560,14 +563,14 @@ impl WsFill {
 #[cfg(test)]
 mod clearinghouse_tests {
     use super::*;
-    use crate::exchange::hyperliquid::symbol::belongs_to_dex;
+    use crate::exchange::hyperliquid::markets::dex_of_coin;
 
     /// 取自 `POST /info {"type":"clearinghouseState","user":...,"dex":"xyz"}` 的**真实响应**
     /// （2026-08 实测股票永续 dex）。
     ///
     /// 钉死三个此前只能靠推断的口径：
-    /// - **请求带 `dex` 时，`coin` 仍带 dex 前缀**（`xyz:NVDA`）—— 故客户端的
-    ///   [`belongs_to_dex`] 过滤是必要且正确的；若响应改成不带前缀，本测试会立刻失败，
+    /// - **请求带 `dex` 时，`coin` 仍带 dex 前缀**（`xyz:NVDA`）—— 客户端按前缀判定仓位属于
+    ///   哪个 dex（[`dex_of_coin`]）；若响应改成不带前缀，本测试会立刻失败，
     ///   而不是让 `fetch_positions` 静默过滤成空、把持仓基线变成全零
     /// - `szi` **带符号**（空头为负）
     /// - `leverage.rawUsd` 只在逐仓时出现，`cumFunding` / `time` 是本结构未声明的额外字段
@@ -603,7 +606,7 @@ mod clearinghouse_tests {
         assert_eq!(state.asset_positions.len(), 1);
     }
 
-    /// **Critical 防线**：请求带 dex 时 coin 仍带前缀，故 `belongs_to_dex` 过滤成立。
+    /// **Critical 防线**：请求带 dex 时 coin 仍带前缀，故按前缀归属 dex 成立。
     ///
     /// 若哪天响应改成不带前缀，过滤会把持仓全部滤掉 → `fetch_positions` 返回空 → 持仓基线
     /// 变成全零、之后由 Fill 累加且永不纠正。本测试就是那道防线。
@@ -614,8 +617,7 @@ mod clearinghouse_tests {
         let coin = &state.asset_positions[0].position.coin;
 
         assert_eq!(coin, "xyz:NVDA", "响应不再带 dex 前缀，fetch_positions 的过滤会把持仓滤空");
-        assert!(belongs_to_dex(coin, "xyz"), "xyz dex 的持仓必须能通过过滤");
-        assert!(!belongs_to_dex(coin, ""), "带前缀的 coin 不属于默认 perp DEX");
+        assert_eq!(dex_of_coin(coin), "xyz", "xyz dex 的持仓必须归到 xyz");
     }
 
 

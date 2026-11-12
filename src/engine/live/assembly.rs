@@ -12,7 +12,7 @@ use super::{AccountPubSub, MarketPubSub};
 use crate::actor_lifecycle::ChildStop;
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::binance::{BinanceActor, BinanceActorArgs, BinanceClient, BinanceCredentials, REST_BASE_URL};
-use crate::exchange::hyperliquid::{HyperliquidActor, HyperliquidActorArgs, HyperliquidClient, HyperliquidCredentials};
+use crate::exchange::hyperliquid::{HyperliquidAccess, HyperliquidActor, HyperliquidActorArgs, HyperliquidClient};
 use crate::exchange::ibkr::{IbkrActor, IbkrActorArgs, IbkrClient, IbkrCredentials, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxActor, OkxActorArgs, OkxClient, OkxCredentials};
 use crate::exchange::{AccountClient, ExchangeAccess, ExchangeActorOps, ExchangeClient, SubscriptionKind};
@@ -141,16 +141,15 @@ pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup
     })
 }
 
-pub fn setup_hyperliquid(
-    access: ExchangeAccess<HyperliquidCredentials>,
+/// 构造是异步的：client 启动时要拉各 dex 的 meta 建品种目录、查账户模式（见
+/// [`HyperliquidClient::connect`]），一个 client 覆盖配置里的全部 dex。
+pub async fn setup_hyperliquid(
+    access: HyperliquidAccess,
 ) -> Result<ExchangeSetup, ExchangeError> {
-    let client = Arc::new(HyperliquidClient::new(
-        access.quote.clone(),
-        access.dex.clone(),
-        access.credentials.clone(),
-    )?);
+    let has_credentials = access.credentials.is_some();
+    let client = Arc::new(HyperliquidClient::connect(access.quote, access.dexes, access.credentials).await?);
     let account: Option<Arc<dyn AccountClient>> =
-        access.has_credentials().then(|| client.clone() as Arc<dyn AccountClient>);
+        has_credentials.then(|| client.clone() as Arc<dyn AccountClient>);
     Ok(ExchangeSetup {
         exchange: Exchange::Hyperliquid,
         client: client.clone(),
@@ -161,12 +160,9 @@ pub fn setup_hyperliquid(
                 let actor = HyperliquidActor::spawn_link_with_mailbox(
                     &ctx.manager,
                     HyperliquidActorArgs {
-                        credentials: access.credentials,
-                        symbol_metas: ctx.symbol_metas,
+                        client,
                         market_pubsub: ctx.market_pubsub,
                         account_pubsub: ctx.account_pubsub,
-                        quote: access.quote,
-                        dex: access.dex,
                     },
                     mailbox::unbounded(),
                 )

@@ -84,7 +84,6 @@ async fn test_okx_greeks_push() {
 
     let okx = hft_engine_rs::engine::setup_okx(ExchangeAccess {
         quote: TEST_QUOTE.to_string(),
-        dex: String::new(),
         credentials: Some(credentials),
     })
     .expect("装配 OKX");

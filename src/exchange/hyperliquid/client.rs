@@ -1,18 +1,14 @@
 //! Hyperliquid ExchangeClient 实现 (REST)
 
-#![allow(dead_code)]
-
-use super::symbol::{belongs_to_dex, from_hyperliquid, to_hyperliquid};
+use super::markets::{dex_of_coin, dex_offset, hl_price_formatter, DexUniverse, HlAsset, HlMarkets};
+use super::symbol::from_hyperliquid;
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, Side, Symbol,
-    SymbolMeta, Timestamp,
+    AccountInfo, Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, Position, Side,
+    Symbol, SymbolMeta, Timestamp,
 };
 use md5::{Digest, Md5};
 use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
-use crate::exchange::hyperliquid::codec::{
-    size_step, AssetCtx, AssetInfo, ClearinghouseState, MetaResponse,
-};
-use crate::domain::SignificantFiguresFormatter;
+use crate::exchange::hyperliquid::codec::{ClearinghouseState, MetaResponse};
 use std::sync::Arc;
 use crate::exchange::hyperliquid::signing::{
     CancelResponse, OrderResponse, OrderResponseData, OrderStatus,
@@ -26,14 +22,7 @@ use crate::domain::PriceFormatter;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::Duration;
-
-/// Builder-deployed DEX 的基础 asset index 偏移量 (Hyperliquid 协议规定)
-const DEX_ASSET_INDEX_BASE: u32 = 110_000;
-/// 每个 DEX 之间的 asset index 间距
-const DEX_ASSET_INDEX_STEP: u32 = 10_000;
 
 /// 市价单的让价：HL 没有原生市价单，用「对手价 ± 5%」的 IOC 限价单代替（与
 /// hyperliquid-python-sdk `market_open` 默认滑点同值）。
@@ -43,94 +32,167 @@ const DEX_ASSET_INDEX_STEP: u32 = 10_000;
 /// 剩余部分撤销，由调用方按成交回报继续处理。
 const MARKET_ORDER_SLIPPAGE: f64 = 0.05;
 
-/// meta 里一个币下单要用的两项
-#[derive(Debug, Clone, Copy)]
-struct AssetEntry {
-    /// 全局 asset index（含 dex 偏移）
-    asset: u32,
-    sz_decimals: i32,
+/// 账户的保证金口径（`POST /info {"type":"userAbstraction"}`，启动时查一次）。
+///
+/// 决定净值和持仓总价值从哪里读，见 [`AccountClient::fetch_account_info`] 的实现。
+/// 运行中用户若在网页上切换模式，本进程不会察觉，切换后读到的净值是否偏大**未核实**
+/// （残余窗口，如实声明；切模式属人工操作，按规程应先停本进程）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HlAccountMode {
+    /// 统一账户：同一抵押品（USDC）的余额与占用都在 spot clearinghouse，所有 dex 的全仓
+    /// 仓位共享这一份保证金；官方文档：各 perp dex 的 user state 没有意义（本账户实测
+    /// accountValue 为 0，另一有仓位的统一账户实测为各 dex 分摊的数，都不是账户净值）。
+    Unified,
+    /// 标准账户（`default` / `disabled`）：各 perp dex 保证金分开，净值在各自的
+    /// clearinghouseState。只支持单 dex（多 dex 时「账户净值」不是一个数，杠杆口径不同）。
+    Standard,
 }
 
-/// Hyperliquid 交易所客户端
+impl HlAccountMode {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "unifiedAccount" => Ok(Self::Unified),
+            "default" | "disabled" => Ok(Self::Standard),
+            // portfolioMargin / dexAbstraction：保证金口径未核实，不猜
+            other => Err(format!("HL 账户模式 {other} 未支持（只支持统一账户与标准账户）")),
+        }
+    }
+}
+
+/// 有凭证时才有的账户能力：查询地址、签名通道、保证金口径三者同生同灭，放在一起
+struct HlAccount {
+    credentials: HyperliquidCredentials,
+    /// 启动检查（未接入 dex 无仓位）完成的时刻（毫秒）。私有 WS 订阅前的空档里发生的外来
+    /// 成交只出现在订阅后的历史快照里，快照中晚于此刻的外来成交同样停机。
+    foreign_checked_at: Timestamp,
+    submitter: Arc<dyn HlSubmitter>,
+    mode: HlAccountMode,
+}
+
+/// Hyperliquid 交易所客户端。一个 client 可接多个 perp dex（共用一个钱包），
+/// 品种目录见 [`HlMarkets`]。
 pub struct HyperliquidClient {
-    /// HTTP 客户端
     client: Client,
-    /// 凭证（可选）
-    credentials: Option<HyperliquidCredentials>,
-    /// 下单/撤单的签名提交通道（从 credentials 派生；有凭证即有）
-    submitter: Option<Arc<dyn HlSubmitter>>,
-    /// REST API 基础 URL
+    /// 有凭证才有；没有时账户类方法报 AuthenticationFailed
+    account: Option<HlAccount>,
     base_url: String,
-    /// 计价币种 (e.g., "USDC", "USDE")
+    /// 计价币种 (e.g., "USDC")；统一账户的净值读 spot 里这个币的余额
     quote: String,
-    /// Perp DEX 名称 ("" = 默认 perp DEX, "xyz" = 股票永续合约等)
-    dex: String,
-    /// Coin -> (Asset Index, szDecimals) 映射 (懒加载)
-    coin_to_asset: RwLock<Option<HashMap<String, AssetEntry>>>,
+    /// 已接入 dex 的品种目录（启动时建好，只读）
+    markets: Arc<HlMarkets>,
 }
 
 impl HyperliquidClient {
-    /// 创建新的 Hyperliquid 客户端
-    pub fn new(
+    /// 建客户端：拉各 dex 的 meta 建品种目录；有凭证时再查一次账户模式。
+    ///
+    /// `dexes`：接入的 perp dex（"" = 主站，"xyz" = 股票），不能为空、不能重复。
+    /// 以下组合在这里就报错（启动失败，不带病运行）：同名品种出现在两个已接入 dex、
+    /// 标准账户配了多个 dex、账户模式未支持。
+    pub async fn connect(
         quote: String,
-        dex: String,
+        dexes: Vec<String>,
         credentials: Option<HyperliquidCredentials>,
     ) -> Result<Self, ExchangeError> {
+        let other = |m: String| ExchangeError::Other(m);
+        if dexes.is_empty() {
+            return Err(other("HL 至少要接一个 dex（\"\" = 主站）".into()));
+        }
+        if let Some(dup) = dexes.iter().enumerate().find(|(i, d)| dexes[..*i].contains(d)) {
+            return Err(other(format!("HL dexes 配置重复: \"{}\"", dup.1)));
+        }
+
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
-
         let base_url = REST_BASE_URL.to_string();
-        // 只支持主网：网络只在构造签名通道时决定一次，client 不另存一份
-        let is_mainnet = true;
-        let submitter: Option<Arc<dyn HlSubmitter>> = match credentials.as_ref().map(|c| &c.signing) {
+
+        // 品种目录
+        let perp_dexs: Vec<Option<serde_json::Value>> =
+            post_info_with(&client, &base_url, serde_json::json!({"type": "perpDexs"})).await?;
+        // 计价币的 spot token 编号：各 dex 的保证金币种必须就是它（统一账户净值只读这一个币）
+        let spot_meta: serde_json::Value =
+            post_info_with(&client, &base_url, serde_json::json!({"type": "spotMeta"})).await?;
+        let quote_token = spot_meta["tokens"]
+            .as_array()
+            .and_then(|ts| ts.iter().find(|t| t["name"].as_str() == Some(quote.as_str())))
+            .and_then(|t| t["index"].as_u64())
+            .ok_or_else(|| other(format!("HL spotMeta 里没有计价币 {quote}")))?;
+        let (client_ref, base_ref, perp_dexs_ref, quote_ref) = (&client, &base_url, &perp_dexs, &quote);
+        let metas = futures_util::future::try_join_all(dexes.iter().map(|dex| async move {
+            let meta: MetaResponse =
+                post_info_with(client_ref, base_ref, serde_json::json!({"type": "meta", "dex": dex})).await?;
+            // 保证金币种不是计价币的 dex（如以 USDT 为保证金的 cash）：净值口径对不上，拒绝
+            if u64::from(meta.collateral_token) != quote_token {
+                return Err(other(format!(
+                    "HL dex \"{dex}\" 的保证金币种编号 {} 不是计价币 {quote_ref}（编号 {quote_token}），不能接入",
+                    meta.collateral_token
+                )));
+            }
+            Ok::<_, ExchangeError>(DexUniverse {
+                dex: dex.clone(),
+                offset: dex_offset(perp_dexs_ref, dex).map_err(other)?,
+                universe: meta.universe,
+            })
+        }))
+        .await?;
+        let markets = Arc::new(HlMarkets::build(metas).map_err(other)?);
+
+        // 账户
+        let account = match credentials {
             None => None,
-            Some(HyperliquidSigning::PrivateKey(key)) => Some(Arc::new(LocalKeySubmitter::new(
-                client.clone(),
-                base_url.clone(),
-                key,
-                is_mainnet,
-            )?)),
-            Some(HyperliquidSigning::Signer { url }) => {
-                Some(Arc::new(EnclaveSubmitter::new(client.clone(), url.clone())))
+            Some(credentials) => {
+                let raw: String = post_info_with(&client, &base_url, serde_json::json!({
+                    "type": "userAbstraction",
+                    "user": credentials.wallet_address,
+                }))
+                .await?;
+                let mode = HlAccountMode::parse(&raw).map_err(other)?;
+                if mode == HlAccountMode::Standard && dexes.len() > 1 {
+                    return Err(other(format!(
+                        "HL 账户是标准模式（{raw}，各 dex 保证金分开），不支持一个进程接多个 dex {dexes:?}；\
+                         改成统一账户或只接一个 dex"
+                    )));
+                }
+                // 戳取在发请求之前：检查期间发生的成交也落在「晚于此刻」里，宁可多查不漏
+                let foreign_checked_at = crate::domain::now_ms();
+                check_no_positions_on_other_dexes(&client, &base_url, &credentials.wallet_address, &perp_dexs, &dexes)
+                    .await?;
+                // 只支持主网：网络只在构造签名通道时决定一次
+                let is_mainnet = true;
+                let submitter: Arc<dyn HlSubmitter> = match &credentials.signing {
+                    HyperliquidSigning::PrivateKey(key) => Arc::new(LocalKeySubmitter::new(
+                        client.clone(),
+                        base_url.clone(),
+                        key,
+                        is_mainnet,
+                    )?),
+                    HyperliquidSigning::Signer { url } => {
+                        Arc::new(EnclaveSubmitter::new(client.clone(), url.clone()))
+                    }
+                };
+                Some(HlAccount { credentials, submitter, mode, foreign_checked_at })
             }
         };
 
-        Ok(Self {
-            client,
-            credentials,
-            submitter,
-            base_url,
-            quote,
-            dex,
-            coin_to_asset: RwLock::new(None),
-        })
+        Ok(Self { client, account, base_url, quote, markets })
     }
 
-    /// 获取计价币种
-    pub fn quote(&self) -> &str {
-        &self.quote
+    /// 已接入 dex 的品种目录（适配层内的 WS actor 共用同一份）
+    pub(crate) fn markets(&self) -> &Arc<HlMarkets> {
+        &self.markets
     }
 
-    /// 获取 Perp DEX 名称
-    pub fn dex(&self) -> &str {
-        &self.dex
+    /// 查询地址（主钱包）与外来仓位启动检查时刻。没配凭证时为 None
+    pub(crate) fn private_feed(&self) -> Option<(String, Timestamp)> {
+        self.account.as_ref().map(|a| (a.credentials.wallet_address.clone(), a.foreign_checked_at))
     }
 
-    /// 获取凭证
-    pub fn credentials(&self) -> Option<&HyperliquidCredentials> {
-        self.credentials.as_ref()
-    }
-
-    /// 获取 REST API 基础 URL
-    pub fn rest_base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    /// reqwest 错误转换
-    fn map_reqwest_error(e: reqwest::Error) -> ExchangeError {
-        ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string())
+    /// 账户能力；没配凭证时本不该走到这里（AccountClient 只在有凭证时装配）
+    fn account(&self) -> Result<&HlAccount, ExchangeError> {
+        self.account
+            .as_ref()
+            .ok_or(ExchangeError::AuthenticationFailed(Exchange::Hyperliquid))
     }
 
     /// 发送 POST /info 请求
@@ -138,137 +200,22 @@ impl HyperliquidClient {
         &self,
         body: serde_json::Value,
     ) -> Result<T, ExchangeError> {
-        let resp = self
-            .client
-            .post(format!("{}/info", self.base_url))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(ExchangeError::ApiError(
-                Exchange::Hyperliquid,
-                status.as_u16() as i32,
-                text,
-            ));
-        }
-
-        resp.json::<T>().await.map_err(Self::map_reqwest_error)
+        post_info_with(&self.client, &self.base_url, body).await
     }
 
-    /// 获取所有交易对元数据
-    async fn get_meta(&self) -> Result<MetaResponse, ExchangeError> {
-        self.post_info(serde_json::json!({"type": "meta", "dex": self.dex}))
-            .await
-    }
-
-    /// 获取元数据和资产上下文
-    async fn get_meta_and_asset_ctxs(&self) -> Result<(MetaResponse, Vec<AssetCtx>), ExchangeError> {
-        // metaAndAssetCtxs 返回一个二元组: [meta, [assetCtx...]]
-        let resp: serde_json::Value = self
-            .post_info(serde_json::json!({"type": "metaAndAssetCtxs", "dex": self.dex}))
-            .await?;
-
-        // 解析 meta
-        let meta: MetaResponse = serde_json::from_value(resp[0].clone())
-            .map_err(|e| ExchangeError::Other(format!("Failed to parse meta: {}", e)))?;
-
-        // 解析 assetCtxs
-        let asset_ctxs: Vec<AssetCtx> = serde_json::from_value(resp[1].clone())
-            .map_err(|e| ExchangeError::Other(format!("Failed to parse assetCtxs: {}", e)))?;
-
-        Ok((meta, asset_ctxs))
-    }
-
-    /// 获取非默认 DEX 的 asset index 偏移量
-    ///
-    /// 默认 perp DEX: offset = 0
-    /// Builder-deployed DEXes (如 xyz): offset = DEX_ASSET_INDEX_BASE + i * DEX_ASSET_INDEX_STEP
-    ///   其中 i 为该 DEX 在 perpDexs 列表中的顺序（从 0 开始，跳过 null）
-    async fn get_dex_offset(&self) -> Result<u32, ExchangeError> {
-        if self.dex.is_empty() {
-            return Ok(0);
-        }
-
-        // 查询 perpDexs 列表
-        let dexes: Vec<Option<serde_json::Value>> = self
-            .post_info(serde_json::json!({"type": "perpDexs"}))
-            .await?;
-
-        // 找到我们的 DEX 在非 null 条目中的位置
-        let mut non_null_idx = 0u32;
-        for entry in &dexes {
-            if let Some(obj) = entry {
-                let name = obj
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .ok_or_else(|| {
-                        ExchangeError::Other(format!(
-                            "perpDexs entry missing 'name' field: {}",
-                            obj
-                        ))
-                    })?;
-                if name == self.dex {
-                    return Ok(DEX_ASSET_INDEX_BASE + non_null_idx * DEX_ASSET_INDEX_STEP);
-                }
-                non_null_idx += 1;
-            }
-        }
-
-        Err(ExchangeError::Other(format!(
-            "DEX '{}' not found in perpDexs",
-            self.dex
-        )))
-    }
-
-    /// 获取 coin 对应的 asset index 与 szDecimals
-    async fn asset_entry(&self, coin: &str) -> Result<AssetEntry, ExchangeError> {
-        // 先检查缓存
-        {
-            let guard = self.coin_to_asset.read().unwrap();
-            if let Some(ref map) = *guard {
-                if let Some(&idx) = map.get(coin) {
-                    return Ok(idx);
-                }
-            }
-        }
-
-        // 需要加载 meta 数据和 DEX offset
-        let (meta, offset) = tokio::try_join!(self.get_meta(), self.get_dex_offset())?;
-
-        // 构建映射（全局 asset index = offset + 数组位置）
-        let mut map = HashMap::new();
-        for (idx, asset) in meta.universe.iter().enumerate() {
-            map.insert(
-                asset.name.clone(),
-                AssetEntry { asset: offset + idx as u32, sz_decimals: asset.sz_decimals },
-            );
-        }
-
-        // 获取结果
-        let result = map
-            .get(coin)
-            .copied()
-            .ok_or_else(|| ExchangeError::Other(format!("Unknown coin: {}", coin)));
-
-        // 更新缓存
-        {
-            let mut guard = self.coin_to_asset.write().unwrap();
-            *guard = Some(map);
-        }
-
-        result
-    }
-
-    /// 签名提交通道；没配凭证时本不该走到这里（AccountClient 只在有凭证时装配）
-    fn submitter(&self) -> Result<&dyn HlSubmitter, ExchangeError> {
-        self.submitter
-            .as_deref()
-            .ok_or(ExchangeError::AuthenticationFailed(Exchange::Hyperliquid))
+    /// 已接入的每个 dex 各查一次 clearinghouseState，**全部成功才返回**（任一失败整体
+    /// 报错）：持仓基线和对账读数都要完整快照，少一个 dex 会被读成那个 dex 空仓。
+    async fn fetch_clearinghouse_states(
+        &self,
+        user: &str,
+    ) -> Result<Vec<(String, ClearinghouseState)>, ExchangeError> {
+        futures_util::future::try_join_all(self.markets.dexes().iter().map(|dex| async move {
+            let state: ClearinghouseState = self
+                .post_info(serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex}))
+                .await?;
+            Ok::<_, ExchangeError>((dex.clone(), state))
+        }))
+        .await
     }
 
     /// 市价单的 IOC 限价：取当前盘口对手价，往不利方向让 [`MARKET_ORDER_SLIPPAGE`]，
@@ -291,13 +238,12 @@ impl HyperliquidClient {
 
     /// 将 domain Order 转换为下单意图
     async fn order_intent(&self, order: &Order) -> Result<HlOrderIntent, ExchangeError> {
-        let coin = to_hyperliquid(&order.symbol, &self.quote, &self.dex);
-        let entry = self.asset_entry(&coin).await?;
+        let HlAsset { coin, asset, sz_decimals, .. } = self.markets.asset(&order.symbol)?.clone();
 
         let is_buy = matches!(order.side, Side::Long);
 
         let (limit_px, tif) = match &order.order_type {
-            OrderType::Market => (self.market_limit_px(&coin, is_buy, entry.sz_decimals).await?, HlTif::Ioc),
+            OrderType::Market => (self.market_limit_px(&coin, is_buy, sz_decimals).await?, HlTif::Ioc),
             OrderType::Limit { price, tif } => {
                 let tif = match tif {
                     crate::domain::TimeInForce::GTC => HlTif::Gtc,
@@ -319,7 +265,7 @@ impl HyperliquidClient {
 
         Ok(HlOrderIntent {
             coin,
-            asset: entry.asset,
+            asset,
             is_buy,
             limit_px,
             sz: float_to_wire(order.quantity)?,
@@ -382,14 +328,7 @@ impl HyperliquidClient {
         start_ms: Timestamp,
         end_ms: Timestamp,
     ) -> Result<Vec<FundingFee>, ExchangeError> {
-        let user = self
-            .credentials
-            .as_ref()
-            .map(|c| c.wallet_address.clone())
-            .ok_or_else(|| {
-                ExchangeError::Other("No Hyperliquid credentials: cannot query userFunding".into())
-            })?;
-
+        let user = &self.account()?.credentials.wallet_address;
         let entries: Vec<UserFundingEntry> = self
             .post_info(serde_json::json!({
                 "type": "userFunding",
@@ -399,11 +338,12 @@ impl HyperliquidClient {
             }))
             .await?;
 
-        parse_user_funding(entries, &self.dex, &self.quote)
+        parse_user_funding(entries, &self.markets, &self.quote)
     }
 
     /// 拉取某币自 `start_ms` 起**已结算**的公共资金费率（`fundingHistory`，无需凭证），
     /// 按结算时间升序。HL 每小时结算一次，24h 窗口约 24 条；单次最多返回 500 条。
+    /// symbol 不在已接入 dex 的品种目录里时报错。
     ///
     /// 限频：info 接口按权重计（每 IP 1200/分钟），一次约 20，别按行情频率轮询。
     pub async fn fetch_settled_funding(
@@ -411,12 +351,188 @@ impl HyperliquidClient {
         symbol: &Symbol,
         start_ms: Timestamp,
     ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
-        let coin = to_hyperliquid(symbol, &self.quote, &self.dex);
+        let coin = &self.markets.asset(symbol)?.coin;
         let entries: Vec<FundingHistoryEntry> = self
             .post_info(serde_json::json!({"type": "fundingHistory", "coin": coin, "startTime": start_ms}))
             .await?;
         parse_funding_history(entries, symbol)
     }
+}
+
+/// POST /info（构造期还没有 `Self`，故抽成自由函数）
+async fn post_info_with<T: for<'de> Deserialize<'de>>(
+    client: &Client,
+    base_url: &str,
+    body: serde_json::Value,
+) -> Result<T, ExchangeError> {
+    let resp = client
+        .post(format!("{base_url}/info"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(ExchangeError::ApiError(Exchange::Hyperliquid, status.as_u16() as i32, text));
+    }
+
+    resp.json::<T>()
+        .await
+        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))
+}
+
+/// 启动检查：钱包在**未接入**的 dex 上不能有仓位。
+///
+/// 统一账户下所有 dex 的全仓仓位共用一份 USDC 保证金，而持仓总价值只算已接入的 dex
+/// （每 2 秒查遍全部十几个 dex 会吃掉 HL 每 IP 限频的一半以上）。所以把「别处没有仓位」
+/// 作为启动前提：有就拒绝启动。运行中新出现的外来仓位必先有一笔成交，私有 WS 收到
+/// 品种目录外的成交即报错停机（见 private_ws `parse_user_fills`）。残余窗口：外来成交到
+/// 停机之间（推送延迟，秒级以内），杠杆闸门可能按偏小的持仓总价值放行一次开仓（如实声明）。
+/// 本检查到私有 WS 订阅生效之间的空档由订阅后的历史快照补上（快照里晚于检查时刻的外来
+/// 成交同样停机）。
+/// 标准账户也查：外来仓位一律停机是用户定的规矩，与保证金是否共用无关。
+async fn check_no_positions_on_other_dexes(
+    client: &Client,
+    base_url: &str,
+    user: &str,
+    perp_dexs: &[Option<serde_json::Value>],
+    connected: &[String],
+) -> Result<(), ExchangeError> {
+    let others: Vec<String> = std::iter::once(String::new())
+        .chain(perp_dexs.iter().flatten().filter_map(|v| v["name"].as_str().map(str::to_string)))
+        .filter(|d| !connected.contains(d))
+        .collect();
+    let states = futures_util::future::try_join_all(others.iter().map(|dex| async move {
+        let state: ClearinghouseState = post_info_with(
+            client,
+            base_url,
+            serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex}),
+        )
+        .await?;
+        Ok::<_, ExchangeError>((dex, state))
+    }))
+    .await?;
+    let foreign: Vec<String> = states
+        .iter()
+        .flat_map(|(dex, s)| s.asset_positions.iter().map(move |w| format!("{dex}:{}", w.position.coin)))
+        .collect();
+    if foreign.is_empty() {
+        Ok(())
+    } else {
+        Err(ExchangeError::Other(format!(
+            "HL 钱包在未接入的 dex 上有仓位 {foreign:?}：它们与本进程共用保证金却不计入杠杆，拒绝启动"
+        )))
+    }
+}
+
+/// 一份 clearinghouseState 里属于所查 dex 的仓位（按 coin 前缀）。持仓与持仓总价值共用：
+/// 若某 dex 的响应带出别的 dex 的仓位，不会被两份快照重复计入。
+fn own_positions<'a>(
+    dex: &'a str,
+    state: &'a ClearinghouseState,
+) -> impl Iterator<Item = &'a crate::exchange::hyperliquid::codec::AssetPositionWrapper> {
+    state.asset_positions.iter().filter(move |w| dex_of_coin(&w.position.coin) == dex)
+}
+
+fn parse_num(field: &str, v: &str) -> Result<f64, ExchangeError> {
+    v.parse::<f64>()
+        .map_err(|_| ExchangeError::ParseError(format!("HL {field} 非法: {v}")))
+}
+
+/// 各 dex 的 clearinghouseState → 本引擎的持仓（纯函数，持仓基线与对账读数的唯一出处）。
+///
+/// - 每份只取**属于所查 dex** 的仓位（[`own_positions`]）；
+/// - 某 dex 响应非空、却没有一个仓位属于它 —— coin 前缀口径变了的征兆，报错而不是返回空：
+///   本函数是持仓基线的唯一来源，静默返回空会让基线变成全零、此后由 Fill 累加永不纠正；
+/// - 不在品种目录里的仓位（如人工开的逐仓股票）报错：外来仓位一律停机（用户定）。
+///   基线时拒绝启动；运行中由对账拉取失败 → 停摆守卫到期退出。与 Fill 流同一判据
+///   （[`HlMarkets::owns`]）。
+pub(crate) fn positions_from_states(
+    markets: &HlMarkets,
+    states: &[(String, ClearinghouseState)],
+) -> Result<Vec<Position>, ExchangeError> {
+    let mut positions = Vec::new();
+    for (dex, state) in states {
+        let mine: Vec<_> = own_positions(dex, state).collect();
+        if mine.is_empty() && !state.asset_positions.is_empty() {
+            return Err(ExchangeError::ParseError(format!(
+                "HL clearinghouseState(dex=\"{dex}\") 返回 {} 个持仓，但没有一个属于该 dex（实得: {:?}）；\
+                 疑似 coin 前缀口径变了，持仓基线不能以空 Vec 蒙混过去",
+                state.asset_positions.len(),
+                state.asset_positions.iter().map(|w| w.position.coin.as_str()).collect::<Vec<_>>(),
+            )));
+        }
+        for w in mine {
+            if !markets.owns(&w.position.coin) {
+                return Err(ExchangeError::Other(format!(
+                    "HL 持仓 {} 不在品种目录里（外来仓位或不可交易品种），本地账本无法覆盖",
+                    w.position.coin
+                )));
+            }
+            positions.push(w.position.to_position().map_err(ExchangeError::ParseError)?);
+        }
+    }
+    Ok(positions)
+}
+
+/// `spotClearinghouseState` 里用得上的部分
+#[derive(Debug, Deserialize)]
+pub(crate) struct SpotClearinghouseState {
+    balances: Vec<SpotBalance>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpotBalance {
+    coin: String,
+    /// 余额。统一账户下**已含**全仓仓位的未实现盈亏（实测，见 [`unified_account_info`]）。
+    ///
+    /// 同级的 `hold`（被占用的部分，构成未核实）有意不取：净值不扣占用，
+    /// 「total − hold 当可用保证金」在统一账户下也不成立（抵押品跨 dex 共享）。
+    total: String,
+}
+
+/// 统一账户的净值与持仓总价值（纯函数）。
+///
+/// **净值 = spot 里计价币（USDC）的 `total`。** 官方文档只说「统一账户的余额和占用都在
+/// spot clearinghouse state」，没写 `total` 是否含未实现盈亏；2026-11-12 实测（只读查公开地址）：
+/// 两个持主站全仓大仓位的统一账户间隔 10 秒连取 7 次，`total` 随浮盈浮亏同步变动，
+/// `total − Σ unrealizedPnl` 几乎不变（其中一户约 88.67 万、浮亏约 10.7 万，7 次波动 < 0.02）；
+/// 另有 5 个统一账户的 `total` 与 `portfolio` 接口的账户价值相符（含浮亏 -4552 的一户）——
+/// 即 `total` 已含未实现盈亏，再加一次会重复计。
+/// 只算计价币：账户里的其他现货（HYPE 等）不计入，净值偏小，杠杆偏保守。
+///
+/// **持仓总价值 = 各已接入 dex 全部仓位的 `positionValue` 绝对值之和**。未接入 dex 不查：
+/// 启动时已确认那里没有仓位，之后新出现的会先以外来成交触发停机（见
+/// [`check_no_positions_on_other_dexes`]）。
+/// 余额里没有计价币 = 该币余额为 0（`balances` 是全量列表；计价币是各 dex 保证金币种已在
+/// `connect` 校验过）。
+pub(crate) fn unified_account_info(
+    spot: &SpotClearinghouseState,
+    states: &[(String, ClearinghouseState)],
+    quote: &str,
+) -> Result<AccountInfo, ExchangeError> {
+    let equity = match spot.balances.iter().find(|b| b.coin == quote) {
+        Some(b) => parse_num("spot total", &b.total)?,
+        None => 0.0,
+    };
+    let mut notional = 0.0;
+    for (dex, state) in states {
+        for w in own_positions(dex, state) {
+            notional += parse_num("positionValue", &w.position.position_value)?.abs();
+        }
+    }
+    Ok(AccountInfo { equity, notional })
+}
+
+/// 标准账户（只接一个 dex）的净值与持仓总价值：该 dex 的 marginSummary
+fn standard_account_info(state: &ClearinghouseState) -> Result<AccountInfo, ExchangeError> {
+    Ok(AccountInfo {
+        equity: parse_num("accountValue", &state.margin_summary.account_value)?,
+        notional: parse_num("totalNtlPos", &state.margin_summary.total_ntl_pos)?,
+    })
 }
 
 /// 市价单（IOC）成交量不足委托量即报错。
@@ -436,12 +552,6 @@ fn check_market_fully_filled(
         )));
     }
     Ok(filled.oid.to_string())
-}
-
-/// 按 HL 规则（5 位有效数字、小数位 ≤ 6 - szDecimals）格式化价格的格式化器。
-/// 限价单（经 SymbolMeta）与市价单定价共用这一份规则。
-fn hl_price_formatter(sz_decimals: i32) -> SignificantFiguresFormatter {
-    SignificantFiguresFormatter::new(sz_decimals.max(0) as u32)
 }
 
 /// `fundingHistory` 的单条记录（`premium` 不取）
@@ -529,7 +639,7 @@ struct UserFundingDelta {
 /// 把 `userFunding` 的原始记录折算成 [`FundingFee`]（纯函数，便于用真实响应做用例）。
 fn parse_user_funding(
     entries: Vec<UserFundingEntry>,
-    dex: &str,
+    markets: &HlMarkets,
     quote: &str,
 ) -> Result<Vec<FundingFee>, ExchangeError> {
     let mut result = Vec::with_capacity(entries.len());
@@ -538,8 +648,9 @@ fn parse_user_funding(
         if e.delta.kind != "funding" {
             continue;
         }
-        // 账户级接口不按 dex 过滤，必须自己筛，否则会把别的 perp dex 的同名标的算进来
-        if !belongs_to_dex(&e.delta.coin, dex) {
+        // 账户级接口返回所有 dex 的记录，只留品种目录里的（与 Fill 流同一判据），
+        // 否则别的 dex 的同名标的会被剥掉前缀算进来
+        if !markets.owns(&e.delta.coin) {
             continue;
         }
         let amount: f64 = e.delta.usdc.trim().parse().map_err(|_| {
@@ -585,27 +696,9 @@ impl ExchangeClient for HyperliquidClient {
         Exchange::Hyperliquid
     }
 
+    /// 已接入 dex 上未下架、支持全仓的品种（启动时建好的目录，不再联网）
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        let meta = self.get_meta().await?;
-        let has_dex = !self.dex.is_empty();
-
-        let metas: Vec<SymbolMeta> = meta
-            .universe
-            .into_iter()
-            .filter(|a| {
-                // 过滤条件:
-                // 1. 未下架
-                // 2. 默认 DEX 时排除带冒号的 asset (属于其他 DEX 如 "xyz:NVDA")
-                //    非默认 DEX 时不过滤冒号 (API 已按 DEX 筛选)
-                // 3. 支持全仓保证金 (排除 strictIsolated 和 noCross)
-                !a.is_delisted
-                    && (has_dex || !a.name.contains(':'))
-                    && a.supports_cross_margin()
-            })
-            .map(|a| asset_info_to_symbol_meta(&a))
-            .collect();
-
-        Ok(metas)
+        Ok(self.markets.symbol_metas())
     }
 
     async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
@@ -625,14 +718,13 @@ impl AccountClient for HyperliquidClient {
     }
 
     async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
-        let submitter = self.submitter()?;
+        let submitter = &self.account()?.submitter;
 
         // `order_id` 是交易所侧的 oid（见 fetch_pending_orders / private_ws 的映射）
         let oid: u64 = order_id.parse().map_err(|_| {
             ExchangeError::ParseError(format!("Hyperliquid order_id 不是合法的 oid: {order_id}"))
         })?;
-        let coin = to_hyperliquid(symbol, &self.quote, &self.dex);
-        let asset = self.asset_entry(&coin).await?.asset;
+        let HlAsset { coin, asset, .. } = self.markets.asset(symbol)?.clone();
 
         let raw = submitter.cancel(&HlCancelIntent { coin, asset, oid }).await?;
         let response: CancelResponse = serde_json::from_value(raw.clone()).map_err(|e| {
@@ -670,10 +762,8 @@ impl AccountClient for HyperliquidClient {
         &self,
         symbol: &Symbol,
     ) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
-        // 本 trait 只在配了凭证时才存在（见 AccountClient），走到这里说明装配处漏了约束
-        let Some(credentials) = self.credentials.as_ref() else {
-            return Err(ExchangeError::AuthenticationFailed(Exchange::Hyperliquid));
-        };
+        let wallet = &self.account()?.credentials.wallet_address;
+        let target = self.markets.asset(symbol)?;
 
         /// `frontendOpenOrders` 的条目。
         ///
@@ -690,34 +780,24 @@ impl AccountClient for HyperliquidClient {
             coin: String,
             /// `"A"` = ask/卖，`"B"` = bid/买
             side: String,
-            limit_px: String,
             /// 剩余未成交量
             sz: String,
             /// 原始下单量
             orig_sz: String,
             oid: u64,
-            timestamp: u64,
-            #[serde(default)]
-            reduce_only: bool,
         }
 
+        // 按该品种所在的 dex 查；coin 带前缀，精确比对即可（不会认错别的 dex 的同名品种）
         let orders: Vec<OpenOrder> = self
             .post_info(serde_json::json!({
                 "type": "frontendOpenOrders",
-                "user": credentials.wallet_address,
-                "dex": self.dex,
+                "user": wallet,
+                "dex": target.dex,
             }))
             .await?;
 
         let mut updates = Vec::new();
-        for o in orders {
-            // 与 fetch_positions 同理：账户级接口不按 dex 过滤，`coin` 带前缀
-            if !belongs_to_dex(&o.coin, &self.dex) {
-                continue;
-            }
-            if from_hyperliquid(&o.coin) != *symbol {
-                continue;
-            }
+        for o in orders.into_iter().filter(|o| o.coin == target.coin) {
             let side = match o.side.as_str() {
                 "B" => Side::Long,
                 "A" => Side::Short,
@@ -741,7 +821,7 @@ impl AccountClient for HyperliquidClient {
                 order_id: o.oid.to_string(),
                 // 挂单列表接口不带 cloid，逐单补一次。N 是**遗留挂单数**（IOC 策略下几乎
                 // 恒为 0），且只在启动期发生，代价与问题规模成正比。
-                client_order_id: self.cloid_of(&credentials.wallet_address, o.oid).await?,
+                client_order_id: self.cloid_of(wallet, o.oid).await?,
                 exchange: Exchange::Hyperliquid,
                 symbol: symbol.clone(),
                 side,
@@ -760,7 +840,7 @@ impl AccountClient for HyperliquidClient {
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError> {
         // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
         let order = order.inner();
-        let submitter = self.submitter()?;
+        let submitter = &self.account()?.submitter;
         let intent = self.order_intent(order).await?;
         let raw = submitter.place(&intent).await?;
         let response: OrderResponse = serde_json::from_value(raw.clone()).map_err(|e| {
@@ -807,67 +887,37 @@ impl AccountClient for HyperliquidClient {
         }
     }
 
-    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
-        // Hyperliquid 的 equity/notional 经私有 WS 推送（AccountInfo 事件），此前这里
-        // 返回全零占位。返回编造的数字比报错危险得多 —— 下游拿它算杠杆会静默失效。
-        // 诚实报不支持，调用方要么走 WS 推送，要么在这里补齐真实实现
-        // （clearinghouseState 里有 accountValue，可实现但当前无调用方）。
-        Err(ExchangeError::Other(
-            "Hyperliquid 不支持 REST fetch_account_info（equity/notional 走私有 WS 推送），\
-             拒绝返回编造的数字"
-                .to_string(),
-        ))
+    /// 净值与持仓总价值，口径随账户模式（启动时查定）：
+    /// - 统一账户：见 [`unified_account_info`]（spot 的 USDC + 各已接入 dex 的仓位价值）；
+    /// - 标准账户（只接一个 dex）：该 dex clearinghouseState 的 marginSummary。
+    ///
+    /// 由账户净值轮询定时调用；任一请求失败整体报错（不拿半份数据拼净值）。
+    async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
+        let account = self.account()?;
+        let user = account.credentials.wallet_address.as_str();
+        match account.mode {
+            HlAccountMode::Unified => {
+                let (spot, states) = tokio::try_join!(
+                    self.post_info::<SpotClearinghouseState>(
+                        serde_json::json!({"type": "spotClearinghouseState", "user": user})
+                    ),
+                    self.fetch_clearinghouse_states(user),
+                )?;
+                unified_account_info(&spot, &states, &self.quote)
+            }
+            HlAccountMode::Standard => {
+                // connect 已保证标准账户只接一个 dex
+                let states = self.fetch_clearinghouse_states(user).await?;
+                standard_account_info(&states[0].1)
+            }
+        }
     }
 
-    async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
-        // 本 trait 只在配了凭证时才存在（见 AccountClient），走到这里说明装配处漏了约束
-        let Some(credentials) = self.credentials.as_ref() else {
-            return Err(ExchangeError::AuthenticationFailed(Exchange::Hyperliquid));
-        };
-
-        let state: ClearinghouseState = self
-            .post_info(serde_json::json!({
-                "type": "clearinghouseState",
-                "user": credentials.wallet_address,
-                "dex": self.dex,
-            }))
-            .await?;
-
-        let mut positions = Vec::new();
-        for wrapper in &state.asset_positions {
-            // **必须按 dex 过滤**：账户级接口不区分 dex，`coin` 带前缀（如 `xyz:AAPL`）。
-            // 漏掉这一步会把股票永续的持仓算进默认 perp DEX 的账本——与 fetch_funding_fees
-            // 踩过的是同一个坑（见本文件测试里的真实响应样例）。
-            if !belongs_to_dex(&wrapper.position.coin, &self.dex) {
-                continue;
-            }
-            let position = wrapper
-                .position
-                .to_position()
-                .map_err(ExchangeError::ParseError)?;
-            positions.push(position);
-        }
-
-        // 守卫「响应非空、却被过滤得一个不剩」：这是 dex 前缀口径与预期不符的征兆
-        // （例如请求里已带 dex，响应便不再给 coin 加前缀）。
-        //
-        // 之所以要显式报出来：本方法是持仓基线的**唯一**来源，静默返回空 Vec 会让基线变成
-        // 全零、且此后由 Fill 累加、永不纠正 —— 正是本项目刚修掉的那类静默错账。宁可刺眼。
-        if positions.is_empty() && !state.asset_positions.is_empty() {
-            return Err(ExchangeError::ParseError(format!(
-                "Hyperliquid clearinghouseState 返回 {} 个持仓，但按 dex=\"{}\" 过滤后一个不剩；\
-                 疑似 coin 前缀口径与预期不符（实得: {:?}）。持仓基线不能以空 Vec 蒙混过去。",
-                state.asset_positions.len(),
-                self.dex,
-                state
-                    .asset_positions
-                    .iter()
-                    .map(|w| w.position.coin.as_str())
-                    .collect::<Vec<_>>(),
-            )));
-        }
-
-        Ok(positions)
+    /// 已接入全部 dex 的完整持仓（任一 dex 查询失败整体报错，见 [`positions_from_states`]）
+    async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
+        let user = &self.account()?.credentials.wallet_address;
+        let states = self.fetch_clearinghouse_states(user).await?;
+        positions_from_states(&self.markets, &states)
     }
 }
 
@@ -894,19 +944,6 @@ struct OrderStatusEnvelope {
 struct OrderStatusOrder {
     #[serde(default)]
     cloid: Option<String>,
-}
-
-/// 将 AssetInfo 转换为 SymbolMeta
-fn asset_info_to_symbol_meta(info: &AssetInfo) -> SymbolMeta {
-    let symbol = from_hyperliquid(&info.name);
-    SymbolMeta {
-        exchange: Exchange::Hyperliquid,
-        symbol,
-        price_formatter: Arc::new(hl_price_formatter(info.sz_decimals)),
-        size_step: size_step(info.sz_decimals),
-        min_order_size: size_step(info.sz_decimals), // 最小下单量为一个精度单位
-        contract_size: 1.0, // Hyperliquid 是币本位，合约乘数为 1
-    }
 }
 
 #[cfg(test)]
@@ -988,28 +1025,52 @@ mod tests {
        "delta":{"type":"funding","coin":"ETH","usdc":"9.999999","szi":"1.0","fundingRate":"0.00001","nSamples":24}}
     ]"#;
 
-    fn parse(dex: &str) -> Vec<FundingFee> {
-        let entries: Vec<UserFundingEntry> = serde_json::from_str(REAL_USER_FUNDING).unwrap();
-        parse_user_funding(entries, dex, "USDC").unwrap()
+    /// 只接 `dexes` 的品种目录：主站有 ETH，xyz 有 AAPL / NVDA
+    pub(crate) fn markets_of(dexes: &[&str]) -> HlMarkets {
+        let info = |name: &str| -> crate::exchange::hyperliquid::codec::AssetInfo {
+            serde_json::from_str(&format!(r#"{{"name":"{name}","szDecimals":2,"maxLeverage":10}}"#)).unwrap()
+        };
+        HlMarkets::build(
+            dexes
+                .iter()
+                .map(|d| DexUniverse {
+                    dex: d.to_string(),
+                    offset: if d.is_empty() { 0 } else { 110_000 },
+                    universe: if d.is_empty() {
+                        vec![info("ETH"), info("BTC")]
+                    } else {
+                        vec![info("xyz:AAPL"), info("xyz:NVDA"), info("xyz:TSLA")]
+                    },
+                })
+                .collect(),
+        )
+        .unwrap()
     }
 
-    /// 账户级接口会把所有 perp dex 的记录一起返回，必须只留本 dex 的
+    fn parse(dexes: &[&str]) -> Vec<FundingFee> {
+        let entries: Vec<UserFundingEntry> = serde_json::from_str(REAL_USER_FUNDING).unwrap();
+        parse_user_funding(entries, &markets_of(dexes), "USDC").unwrap()
+    }
+
+    /// 账户级接口会把所有 perp dex 的记录一起返回，只留已接入 dex 的
     #[test]
-    fn only_entries_of_the_configured_dex_are_kept() {
-        let fees = parse("xyz");
-        assert_eq!(fees.len(), 3, "默认 dex 的 ETH 那条不该进来");
+    fn only_entries_of_connected_dexes_are_kept() {
+        let fees = parse(&["xyz"]);
+        assert_eq!(fees.len(), 3, "未接入的主站 ETH 那条不该进来");
         assert!(fees.iter().all(|f| f.symbol == "AAPL" || f.symbol == "NVDA"));
 
-        // 反过来：接默认 dex 时只应拿到 ETH
-        let fees = parse("");
+        let fees = parse(&[""]);
         assert_eq!(fees.len(), 1);
         assert_eq!(fees[0].symbol, "ETH");
+
+        // 两个都接：全收
+        assert_eq!(parse(&["", "xyz"]).len(), 4);
     }
 
     /// dex 前缀在入 domain 时剥掉，策略侧看到的是 base symbol
     #[test]
     fn dex_prefix_is_stripped_from_symbol() {
-        let fees = parse("xyz");
+        let fees = parse(&["xyz"]);
         assert!(fees.iter().any(|f| f.symbol == "AAPL"));
         assert!(!fees.iter().any(|f| f.symbol.contains(':')));
     }
@@ -1017,7 +1078,7 @@ mod tests {
     /// 符号沿用 HL 的账户视角：正 = 收到，负 = 支付，不翻转
     #[test]
     fn amount_sign_follows_account_perspective() {
-        let fees = parse("xyz");
+        let fees = parse(&["xyz"]);
         let aapl_first = fees.iter().find(|f| f.timestamp == 1775606400000).unwrap();
         assert!((aapl_first.amount - 0.671826).abs() < 1e-9, "空头遇正费率应为收到");
         let aapl_second = fees.iter().find(|f| f.timestamp == 1775610000000).unwrap();
@@ -1029,7 +1090,7 @@ mod tests {
     /// 每个共享时刻都会有一个标的被当成重复记录静默丢弃。
     #[test]
     fn same_timestamp_different_coins_get_distinct_tran_ids() {
-        let fees = parse("xyz");
+        let fees = parse(&["xyz"]);
         let at_first_hour: Vec<_> = fees
             .iter()
             .filter(|f| f.timestamp == 1775606400000)
@@ -1060,7 +1121,7 @@ mod tests {
     fn non_funding_deltas_are_skipped() {
         let json = r#"[{"time":1,"delta":{"type":"deposit","coin":"xyz:AAPL","usdc":"100.0"}}]"#;
         let entries: Vec<UserFundingEntry> = serde_json::from_str(json).unwrap();
-        assert!(parse_user_funding(entries, "xyz", "USDC").unwrap().is_empty());
+        assert!(parse_user_funding(entries, &markets_of(&["xyz"]), "USDC").unwrap().is_empty());
     }
 
     /// 官方文档示例里 usdc 带前导空格，容错掉
@@ -1068,7 +1129,108 @@ mod tests {
     fn leading_whitespace_in_amount_is_tolerated() {
         let json = r#"[{"time":1,"delta":{"type":"funding","coin":"xyz:AAPL","usdc":" -3.625312"}}]"#;
         let entries: Vec<UserFundingEntry> = serde_json::from_str(json).unwrap();
-        let fees = parse_user_funding(entries, "xyz", "USDC").unwrap();
+        let fees = parse_user_funding(entries, &markets_of(&["xyz"]), "USDC").unwrap();
         assert!((fees[0].amount + 3.625312).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod unified_account_tests {
+    use super::*;
+    use crate::exchange::hyperliquid::testkit::{
+        self, markets, state, OWN_EMPTY_STATE, OWN_SPOT, UNIFIED_MAIN, UNIFIED_SPOT, UNIFIED_XYZ,
+    };
+
+    fn spot(raw: &str) -> SpotClearinghouseState {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    fn states(list: &[(&str, &str)]) -> Vec<(String, ClearinghouseState)> {
+        list.iter().map(|(d, raw)| (d.to_string(), state(raw))).collect()
+    }
+
+    /// 真实统一账户：净值 = spot USDC total（不是各 dex 的 accountValue 之和，
+    /// 也不再加未实现盈亏），持仓总价值 = 已接入各 dex 仓位价值之和
+    #[test]
+    fn unified_equity_is_spot_total_and_notional_sums_connected_dexes() {
+        let both = states(&[("", UNIFIED_MAIN), ("xyz", UNIFIED_XYZ)]);
+        let info = unified_account_info(&spot(UNIFIED_SPOT), &both, "USDC").unwrap();
+        assert!((info.equity - 73788.12197337).abs() < 1e-6, "{}", info.equity);
+        // 133560 + 114345 + 306850
+        assert!((info.notional - 554_755.0).abs() < 1e-6, "{}", info.notional);
+
+        // 只接主站：股票仓位不计入
+        let main = states(&[("", UNIFIED_MAIN)]);
+        let info = unified_account_info(&spot(UNIFIED_SPOT), &main, "USDC").unwrap();
+        assert!((info.notional - 247_905.0).abs() < 1e-6);
+    }
+
+    /// 本策略账户的真实响应：各 dex 的 accountValue 都是 0，净值必须读成 996.96 而不是 0
+    /// （读成 0 会让杠杆闸门永不放行）
+    #[test]
+    fn own_unified_account_reads_spot_balance_not_zero() {
+        let both = states(&[("", OWN_EMPTY_STATE), ("xyz", OWN_EMPTY_STATE)]);
+        let info = unified_account_info(&spot(OWN_SPOT), &both, "USDC").unwrap();
+        assert!((info.equity - 996.960256).abs() < 1e-9);
+        assert_eq!(info.notional, 0.0);
+        // 对照：旧口径（clearinghouseState 的 marginSummary）在统一账户下是 0
+        assert_eq!(standard_account_info(&both[0].1).unwrap().equity, 0.0);
+    }
+
+    #[test]
+    fn account_modes() {
+        assert_eq!(HlAccountMode::parse("unifiedAccount").unwrap(), HlAccountMode::Unified);
+        assert_eq!(HlAccountMode::parse("default").unwrap(), HlAccountMode::Standard);
+        assert_eq!(HlAccountMode::parse("disabled").unwrap(), HlAccountMode::Standard);
+        assert!(HlAccountMode::parse("portfolioMargin").is_err());
+        assert!(HlAccountMode::parse("dexAbstraction").is_err());
+    }
+
+    /// 持仓基线 = 已接入全部 dex 的仓位合并；只接一个 dex 时另一个的仓位不出现
+    #[test]
+    fn positions_merge_all_connected_dexes() {
+        let m = markets(&["", "xyz"]);
+        let got = testkit::positions(&m, &[("", UNIFIED_MAIN), ("xyz", UNIFIED_XYZ)]);
+        let mut pairs: Vec<_> = got.iter().map(|p| (p.symbol.as_str(), p.size)).collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(pairs, [("BCH", 500.0), ("NVDA", 1900.0), ("kPEPE", -30_000_000.0)]);
+
+        let m = markets(&["xyz"]);
+        let got = testkit::positions(&m, &[("xyz", UNIFIED_XYZ)]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].symbol, "NVDA");
+    }
+
+    /// 某 dex 的响应带出了别的 dex 的仓位：只算所查 dex 的，不会被两份快照重复计入
+    #[test]
+    fn a_position_is_counted_only_under_its_own_dex() {
+        let m = markets(&["", "xyz"]);
+        let mut main = state(UNIFIED_MAIN);
+        main.asset_positions.extend(state(UNIFIED_XYZ).asset_positions);
+        let both = vec![("".to_string(), main), ("xyz".to_string(), state(UNIFIED_XYZ))];
+        let got = positions_from_states(&m, &both).unwrap();
+        assert_eq!(got.iter().filter(|p| p.symbol == "NVDA").count(), 1);
+    }
+
+    /// 某 dex 的响应非空、却没有一个仓位属于它：前缀口径变了，报错而不是返回空基线
+    #[test]
+    fn foreign_only_response_is_an_error_not_an_empty_baseline() {
+        let m = markets(&["", "xyz"]);
+        let wrong = vec![("".to_string(), state(UNIFIED_XYZ))];
+        assert!(positions_from_states(&m, &wrong).is_err());
+    }
+
+    /// 已接入 dex 上不在品种目录里的仓位（外来仓位）：报错（基线拒绝启动、对账停摆退出）
+    #[test]
+    fn uncatalogued_position_is_an_error() {
+        let only_btc = HlMarkets::build(vec![DexUniverse {
+            dex: String::new(),
+            offset: 0,
+            universe: vec![serde_json::from_str(r#"{"name":"BTC","szDecimals":5,"maxLeverage":40}"#).unwrap()],
+        }])
+        .unwrap();
+        let states = vec![("".to_string(), state(UNIFIED_MAIN))];
+        let err = positions_from_states(&only_btc, &states).unwrap_err();
+        assert!(err.to_string().contains("kPEPE"), "{err}");
     }
 }

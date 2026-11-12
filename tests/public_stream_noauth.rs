@@ -131,7 +131,11 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
     // ---- 1. 无凭证 client：symbol meta 走公共 REST，不需要签名 ----
     let binance_client = Arc::new(BinanceClient::new("USDT".to_string(), None).expect("binance client"));
     let okx_client = Arc::new(OkxClient::new("USDT".to_string(), None).expect("okx client"));
-    let hl_client = Arc::new(HyperliquidClient::new("USDC".to_string(), String::new(), None).expect("hl client"));
+    let hl_client = Arc::new(
+        HyperliquidClient::connect("USDC".to_string(), vec![String::new()], None)
+            .await
+            .expect("hl client"),
+    );
 
     let symbol = COIN.to_string();
     let binance_metas = binance_client
@@ -142,10 +146,12 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("okx meta (public REST)");
+    // HL 的 actor 直接用 client 的品种目录，这里只确认目录里有该币
     let hl_metas = hl_client
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
-        .expect("hl meta (public REST)");
+        .expect("hl meta");
+    assert_eq!(hl_metas.len(), 1, "HL 品种目录里应有 {symbol}");
 
     // OKX 的 ctVal 是本次口径验证的关键输入
     let okx_contract_size = okx_metas
@@ -201,12 +207,9 @@ async fn noauth_bbo_and_trades_flow_through_actor_path() {
     );
     let hl = HyperliquidActor::spawn_with_mailbox(
         HyperliquidActorArgs {
-            credentials: None,
-            symbol_metas: metas_of(hl_metas),
+            client: hl_client.clone(),
             market_pubsub: market_pubsub.clone(),
             account_pubsub: account_pubsub.clone(),
-            quote: "USDC".to_string(),
-            dex: String::new(),
         },
         mailbox::unbounded(),
     );

@@ -1,7 +1,22 @@
 //! 币安 × Hyperliquid 资金费套利入口（#668）。
 //!
-//! 用法：`funding_arb [config.json]`。一个进程接一个 HL 市场（`exchanges.hyperliquid.dex`：
-//! "" = 加密币主站，"xyz" = 股票/商品），币和股票各跑一个进程，共用币安账户。
+//! 用法：`funding_arb [config.json]`。一个进程同时做加密币与股票：HL 侧按
+//! `exchanges.hyperliquid.dexes` 接入多个市场（"" = 加密币主站，"xyz" = 股票/商品），
+//! 每个币在哪个市场由启动时拉到的品种目录决定；HL 账户须为统一账户（多 dex 共用一份
+//! USDC 保证金），否则启动报错。
+//!
+//! 配置示例（凭证略）：
+//! ```json
+//! {
+//!   "exchanges": {
+//!     "binance": {"quote": "USDT", "credentials": {"api_key": "…", "secret": "…"}},
+//!     "hyperliquid": {"quote": "USDC", "dexes": ["", "xyz"],
+//!                     "credentials": {"wallet_address": "0x…", "signer_url": "http://127.0.0.1:8080"}}
+//!   },
+//!   "strategy": { "pairs": [{"symbol": "BTC"}, {"symbol": "TSLA"}], "…": "…" },
+//!   "funding_poll_secs": 300
+//! }
+//! ```
 //!
 //! 资金费数据：本进程起一个轮询任务，每 `funding_poll_secs` 秒为每个币拉两所过去 24h
 //! 已结算的公共费率，整窗作为 `SettledFundingWindow` 自定义事件投递给对应策略。
@@ -12,7 +27,7 @@ use hft_engine_rs::engine::{
     ManagerActor, ManagerActorArgs, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
-use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
+use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidAccess};
 use hft_engine_rs::exchange::ExchangeAccess;
 use hft_engine_rs::engine::live::PublishCustomEvent;
 use hft_engine_rs::messaging::CustomEvent;
@@ -27,7 +42,7 @@ use std::time::Duration;
 #[serde(deny_unknown_fields)]
 struct ExchangesConfig {
     binance: ExchangeAccess<BinanceCredentials>,
-    hyperliquid: ExchangeAccess<HyperliquidCredentials>,
+    hyperliquid: HyperliquidAccess,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,13 +61,17 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = load_config(&path)?;
     config.strategy.validate().map_err(|e| anyhow::anyhow!("strategy 配置非法: {e}"))?;
     anyhow::ensure!(config.funding_poll_secs > 0, "funding_poll_secs 必须 > 0");
-    tracing::info!(dex = %config.exchanges.hyperliquid.dex, pairs = config.strategy.pairs.len(), "funding_arb starting");
+    tracing::info!(
+        hl_dexes = ?config.exchanges.hyperliquid.dexes,
+        pairs = config.strategy.pairs.len(),
+        "funding_arb starting"
+    );
 
     let bn_access = config.exchanges.binance.clone();
     let hl_access = config.exchanges.hyperliquid.clone();
     let manager = ManagerActor::spawn_with_mailbox(
         ManagerActorArgs {
-            exchanges: vec![setup_binance(bn_access.clone())?, setup_hyperliquid(hl_access.clone())?],
+            exchanges: vec![setup_binance(bn_access.clone())?, setup_hyperliquid(hl_access.clone()).await?],
             // 只跑实盘（用户定：不做模拟盘），柜台配置用默认值
             paper: Default::default(),
         },
@@ -79,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 公共接口，不带凭证
     let bn = BinanceClient::new(bn_access.quote.clone(), None)?;
-    let hl = HyperliquidClient::new(hl_access.quote.clone(), hl_access.dex.clone(), None)?;
+    let hl = HyperliquidClient::connect(hl_access.quote.clone(), hl_access.dexes.clone(), None).await?;
     let poll_manager = manager.clone();
     let interval = Duration::from_secs(config.funding_poll_secs);
     tokio::spawn(async move {

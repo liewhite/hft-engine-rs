@@ -2,16 +2,20 @@
 //!
 //! 职责:
 //! - 维护 WebSocket 连接
-//! - 自动订阅账户频道 (webData3, orderUpdates)
+//! - 自动订阅账户频道 (orderUpdates, userFills)
 //! - 直接解析消息并发布到对应总线
 //!
 //! 注意: Hyperliquid 的账户订阅不需要认证，只需要用户地址
+//!
+//! 不订阅 clearinghouseState：它按单个 dex 推送，统一账户下其中的净值恒为 0（余额在 spot
+//! clearinghouse），多 dex 时也拼不出账户总值。净值与持仓总价值改由 REST 轮询
+//! （`AccountClient::fetch_account_info`，见 `crate::exchange::equity_polling`）。
 
-use crate::domain::{now_ms, Balance, Exchange, ExchangeError};
+use crate::domain::{now_ms, Exchange, ExchangeError};
 use crate::messaging::AccountPubSub;
 use crate::exchange::client::WsError;
-use crate::exchange::hyperliquid::codec::{ClearinghouseState, WsOrderUpdate, WsUserFills};
-use crate::exchange::hyperliquid::symbol::belongs_to_dex;
+use crate::exchange::hyperliquid::codec::{WsOrderUpdate, WsUserFills};
+use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
 use crate::exchange::ws_loop;
 use crate::messaging::{AccountData, AccountEvent};
@@ -23,7 +27,7 @@ use kameo::Actor;
 use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::HashSet;
-use std::str::FromStr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -33,26 +37,30 @@ pub struct HyperliquidPrivateWsActorArgs {
     pub wallet_address: String,
     /// 账户私有事件总线（发布事件，标 Live）
     pub account_pubsub: ActorRef<AccountPubSub>,
-    /// Perp DEX 名称 ("" = 默认 perp DEX)
-    pub dex: String,
+    /// 已接入 dex 的品种目录（入向过滤判据）
+    pub markets: Arc<HlMarkets>,
+    /// 外来仓位启动检查的时刻：订阅后历史快照里晚于此刻的外来成交也停机
+    pub foreign_checked_at: u64,
 }
 
 /// HyperliquidPrivateWsActor - 账户 WebSocket Actor
 pub struct HyperliquidPrivateWsActor {
     /// 账户私有事件总线（发布事件，标 Live）
     account_pubsub: ActorRef<AccountPubSub>,
-    /// 本 client 接入的 perp DEX：**账户级**推送（orderUpdates / userFills）不按 dex
-    /// 下发，必须自己过滤（与 REST 侧 `belongs_to_dex` 同口径），否则同一钱包在其他
-    /// dex 上的成交会被剥掉前缀后当成本 dex 同名标的的 Fill，直接污染「基线 + Fill」
+    /// 品种目录：**账户级**推送（orderUpdates / userFills）下发该钱包在所有 dex 上的记录，
+    /// 只收目录里的 coin（与 REST 侧持仓基线、对账读数同一判据 [`HlMarkets::owns`]），
+    /// 否则别的 dex 上的成交会被剥掉前缀后当成同名标的的 Fill，直接污染「基线 + Fill」
     /// 维护的持仓。
-    dex: String,
-    /// 尚未确认生效的订阅。三条订阅（见 [`REQUIRED_SUBSCRIPTIONS`]）必须全部确认，
+    markets: Arc<HlMarkets>,
+    /// 见 [`HyperliquidPrivateWsActorArgs::foreign_checked_at`]
+    foreign_checked_at: u64,
+    /// 尚未确认生效的订阅。两条订阅（见 [`REQUIRED_SUBSCRIPTIONS`]）必须全部确认，
     /// 否则 [`SubscriptionDeadline`] 到期即自杀 —— **连接活着不等于订阅活着**：HL 的
     /// keepalive 只证明链路通，订阅被悄悄拒掉时 ping/pong 照常。
     ///
     /// 确认有两个等效来源（见 [`Self::confirm_subscription`]）：服务端的
     /// `subscriptionResponse` 回执，或该频道的数据到达。后者是更硬的证据，也让记账
-    /// 不依赖"HL 一定对这三个订阅都回回执"这个未经实盘验证的假设。
+    /// 不依赖"HL 一定对每个订阅都回回执"这个未经实盘验证的假设。
     pending_subscriptions: HashSet<&'static str>,
     /// 发送消息到 ws_loop 的 channel
     #[allow(dead_code)]
@@ -60,7 +68,7 @@ pub struct HyperliquidPrivateWsActor {
 }
 
 /// 私有流必须全部确认的订阅（缺任何一条，本地账本都会从此落后于交易所）
-const REQUIRED_SUBSCRIPTIONS: [&str; 3] = ["clearinghouseState", "orderUpdates", "userFills"];
+const REQUIRED_SUBSCRIPTIONS: [&str; 2] = ["orderUpdates", "userFills"];
 
 /// 订阅确认的等待上限：超时未集齐即判定订阅失败并自杀（由 supervisor 决定重启与否）
 const SUBSCRIPTION_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -69,14 +77,13 @@ impl HyperliquidPrivateWsActor {
     /// 解析并处理消息
     async fn handle_message(&mut self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
-        match parse_private_message(raw, &self.dex, local_ts)? {
+        match parse_private_message(raw, &self.markets, self.foreign_checked_at, local_ts)? {
             PrivateMessage::SubscriptionAck(sub_type) => {
                 self.confirm_subscription(&sub_type);
             }
             PrivateMessage::Events { channel, events } => {
-                // 数据到达即订阅生效 —— 不依赖"HL 一定会对这三个订阅都回确认回执"这个
-                // 假设（`clearinghouseState` 不在 HL 公开文档的订阅主列表里，回执格式
-                // 未经实盘验证）。两个判据取或：收到回执、或收到该频道的数据。
+                // 数据到达即订阅生效 —— 不依赖"HL 一定会对每个订阅都回确认回执"这个
+                // 假设。两个判据取或：收到回执、或收到该频道的数据。
                 self.confirm_subscription(channel);
                 for event in events {
                     if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
@@ -157,22 +164,6 @@ impl Actor for HyperliquidPrivateWsActor {
         ));
 
         // 5. 订阅账户频道
-        // clearinghouseState: perp 账户状态 (positions, equity, margin)
-        let subscribe_clearinghouse = json!({
-            "method": "subscribe",
-            "subscription": {
-                "type": "clearinghouseState",
-                "user": args.wallet_address,
-                "dex": args.dex
-            }
-        })
-        .to_string();
-
-        outgoing_tx
-            .send(subscribe_clearinghouse)
-            .await
-            .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid send clearinghouseState: {e}")))?;
-
         // orderUpdates: 订单更新
         let subscribe_orders = json!({
             "method": "subscribe",
@@ -213,12 +204,14 @@ impl Actor for HyperliquidPrivateWsActor {
 
         tracing::info!(
             wallet = %args.wallet_address,
-            "HyperliquidPrivateWsActor started, subscribed to clearinghouseState, orderUpdates and userFills"
+            dexes = ?args.markets.dexes(),
+            "HyperliquidPrivateWsActor started, subscribed to orderUpdates and userFills"
         );
 
         Ok(Self {
             account_pubsub: args.account_pubsub,
-            dex: args.dex,
+            markets: args.markets,
+            foreign_checked_at: args.foreign_checked_at,
             pending_subscriptions: REQUIRED_SUBSCRIPTIONS.into_iter().collect(),
             ws_tx: Some(outgoing_tx),
         })
@@ -271,7 +264,12 @@ enum PrivateMessage {
     SubscriptionAck(String),
 }
 
-fn parse_private_message(raw: &str, dex: &str, local_ts: u64) -> Result<PrivateMessage, WsError> {
+fn parse_private_message(
+    raw: &str,
+    markets: &HlMarkets,
+    foreign_checked_at: u64,
+    local_ts: u64,
+) -> Result<PrivateMessage, WsError> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -280,7 +278,7 @@ fn parse_private_message(raw: &str, dex: &str, local_ts: u64) -> Result<PrivateM
 
         match channel {
             // 服务端拒绝/报错：**必须致命**。此前它落进下面的未知分支被 debug 掉，
-            // 于是"订阅被拒（地址格式、dex 参数、限流）"表现为：连接健康、ping/pong
+            // 于是"订阅被拒（地址格式、限流）"表现为：连接健康、ping/pong
             // 正常、而订单与成交回报再也不来 —— 系统全绿地瞎跑。
             "error" => {
                 return Err(WsError::ParseError(format!(
@@ -301,23 +299,16 @@ fn parse_private_message(raw: &str, dex: &str, local_ts: u64) -> Result<PrivateM
             "pong" => {
                 return Ok(PrivateMessage::Events { channel: "", events: Vec::new() });
             }
-            "clearinghouseState" => {
-                // perp 账户状态：只取 equity / notional / withdrawable，持仓不入事件流
-                let data = &value["data"];
-                return parse_clearinghouse_state(data, local_ts).map(|events| {
-                    PrivateMessage::Events { channel: "clearinghouseState", events }
-                });
-            }
             "orderUpdates" => {
                 // 订单更新
                 let data = &value["data"];
-                return parse_order_updates(data, dex, local_ts)
+                return parse_order_updates(data, markets, local_ts)
                     .map(|events| PrivateMessage::Events { channel: "orderUpdates", events });
             }
             "userFills" => {
                 // 成交推送
                 let data = &value["data"];
-                return parse_user_fills(data, dex, local_ts)
+                return parse_user_fills(data, markets, foreign_checked_at, local_ts)
                     .map(|events| PrivateMessage::Events { channel: "userFills", events });
             }
             _ => {
@@ -337,76 +328,14 @@ fn parse_private_message(raw: &str, dex: &str, local_ts: u64) -> Result<PrivateM
     Ok(PrivateMessage::Events { channel: "", events: Vec::new() })
 }
 
-/// 解析 clearinghouseState 消息 (perp 账户状态)
-///
-/// **只取账户级读数（equity / notional / withdrawable），不产出持仓事件。**
-/// 本推送里的 `assetPositions` 是持仓**快照**，而持仓的维护模型是「启动期 REST 基线 +
-/// 之后全程 Fill 累加」（见 [`crate::messaging::PositionBaseline`]）：快照既当不了基线
-/// （基线只能来自 ManagerActor），也不能参与增量（会与 Fill 重复计算）。要校验本地持仓
-/// 是否漂移，走 `PositionLedgerActor` 那条独立轮询通道。
-///
-/// 之所以不能像 OKX 那样干脆退订整个频道：equity / notional / withdrawable 都只有这里有。
-fn parse_clearinghouse_state(
-    data: &serde_json::Value,
-    local_ts: u64,
-) -> Result<Vec<AccountEvent>, WsError> {
-    let mut events = Vec::new();
-
-    // clearinghouseState 订阅返回结构: { clearinghouseState: {...}, user: "...", dex: "..." }
-    // 需要提取 clearinghouseState 字段
-    let state_value = data.get("clearinghouseState").unwrap_or(data);
-    let state: ClearinghouseState = serde_json::from_value(state_value.clone())
-        .map_err(|e| WsError::ParseError(format!("clearinghouseState parse: {}", e)))?;
-
-    tracing::debug!(
-        positions_count = state.asset_positions.len(),
-        coins = ?state.asset_positions.iter().map(|w| &w.position.coin).collect::<Vec<_>>(),
-        "Hyperliquid clearinghouseState received (持仓部分不入事件流，见函数文档)"
-    );
-
-    // 解析账户信息 (equity + notional)
-    let equity = f64::from_str(&state.margin_summary.account_value)
-        .map_err(|_| WsError::ParseError(format!("Failed to parse Hyperliquid accountValue: {}", state.margin_summary.account_value)))?;
-    let notional = f64::from_str(&state.margin_summary.total_ntl_pos)
-        .map_err(|_| WsError::ParseError(format!("Failed to parse Hyperliquid total_ntl_pos: {}", state.margin_summary.total_ntl_pos)))?;
-    events.push(AccountEvent {
-        // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
-        account: crate::domain::AccountId::Live,
-        exchange_ts: local_ts,
-        local_ts,
-        data: AccountData::AccountInfo {
-            exchange: Exchange::Hyperliquid,
-            equity,
-            notional,
-        },
-    });
-
-    // 解析可用余额
-    let withdrawable = f64::from_str(&state.withdrawable)
-        .map_err(|_| WsError::ParseError(format!("invalid withdrawable: {}", state.withdrawable)))?;
-    events.push(AccountEvent {
-        // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
-        account: crate::domain::AccountId::Live,
-        exchange_ts: local_ts,
-        local_ts,
-        data: AccountData::Balance(Balance {
-            exchange: Exchange::Hyperliquid,
-            asset: "USDC".to_string(),
-            available: withdrawable,
-        }),
-    });
-
-    Ok(events)
-}
-
 /// 解析 orderUpdates 消息。
 ///
-/// **按 dex 过滤在剥前缀之前**：orderUpdates 是账户级推送（一个钱包在所有 perp dex 上
-/// 的订单都从这里下发），与 REST 侧同口径（[`belongs_to_dex`]）。不过滤的话，xyz dex
-/// 的 "xyz:AAPL" 会被剥成 "AAPL"，与默认 dex 的同名标的混在一起。
+/// **过滤在剥前缀之前**：orderUpdates 是账户级推送（一个钱包在所有 perp dex 上
+/// 的订单都从这里下发），只收品种目录里的 coin（[`HlMarkets::owns`]）。不过滤的话，
+/// "xyz:AAPL" 会被剥成 "AAPL"，与主站的同名标的混在一起。
 fn parse_order_updates(
     data: &serde_json::Value,
-    dex: &str,
+    markets: &HlMarkets,
     local_ts: u64,
 ) -> Result<Vec<AccountEvent>, WsError> {
     let mut events = Vec::new();
@@ -418,12 +347,9 @@ fn parse_order_updates(
     for update in updates {
         let order_update: WsOrderUpdate = serde_json::from_value(update.clone())
             .map_err(|e| WsError::ParseError(format!("orderUpdate parse: {}", e)))?;
-        if !belongs_to_dex(&order_update.order.coin, dex) {
-            tracing::debug!(
-                coin = %order_update.order.coin,
-                dex,
-                "orderUpdate 属于其他 perp dex，跳过"
-            );
+        if !markets.owns(&order_update.order.coin) {
+            // 挂单本身不改变持仓；它若成交，userFills 那边会停机
+            tracing::warn!(coin = %order_update.order.coin, "HL 外来订单（不在品种目录里），跳过");
             continue;
         }
         let update = order_update.to_order_update()?;
@@ -443,19 +369,47 @@ fn parse_order_updates(
 
 /// 解析 userFills 消息。
 ///
-/// 与 [`parse_order_updates`] 同理，**必须按 dex 过滤**：userFills 是账户级推送，
-/// 其他 dex 的成交混进来会直接污染「基线 + Fill」维护的持仓 —— 这正是持仓对账通道
-/// 要抓的那类错账，不该由适配层制造。
+/// userFills 是账户级推送：已接入 dex 上目录内品种的成交进 Fill 流；**其余成交（未接入的
+/// dex、不可交易品种）报错**，经 WS 解析错误路径停机。不能只是跳过：
+/// - 剥掉前缀后会被当成同名品种的 Fill，污染「基线 + Fill」维护的持仓；
+/// - 跳过则留下一笔与本进程共用保证金、却不计入杠杆的外来仓位（统一账户下持仓总价值只算
+///   已接入 dex）。外来成交一律停机是用户定的规矩。
+/// 判据与持仓基线、对账读数相同（[`HlMarkets::owns`]），两条通道口径一致。
+/// 初始快照（`isSnapshot`）不入账（历史成交已含在持仓基线里）；其中**晚于外来仓位启动检查**
+/// （`foreign_checked_at`）的外来成交同样停机 —— 那是检查之后、订阅生效之前的空档里发生的，
+/// 只有快照里看得到。更早的历史外来成交不管（现存仓位由启动检查负责）。
+///
+/// 现货成交（coin 形如 `@107`、`PURR/USDC`）也在 userFills 里，同样算外来成交：同一钱包上
+/// 手工买卖现货会让进程停机。
 fn parse_user_fills(
     data: &serde_json::Value,
-    dex: &str,
+    markets: &HlMarkets,
+    foreign_checked_at: u64,
     local_ts: u64,
 ) -> Result<Vec<AccountEvent>, WsError> {
     let user_fills: WsUserFills = serde_json::from_value(data.clone())
         .map_err(|e| WsError::ParseError(format!("userFills parse: {}", e)))?;
 
-    // 忽略 snapshot（初始快照），只处理增量更新
+    let foreign = |f: &crate::exchange::hyperliquid::codec::WsFill| {
+        WsError::ParseError(format!(
+            "HL 外来成交 {} {}@{} time={}（不在已接入 dex {:?} 的品种目录里），本地账本与杠杆口径无法覆盖，停机",
+            f.coin,
+            f.sz,
+            f.px,
+            f.time,
+            markets.dexes()
+        ))
+    };
+
+    // 快照只查空档里的外来成交，不入账
     if user_fills.is_snapshot {
+        if let Some(f) = user_fills
+            .fills
+            .iter()
+            .find(|f| f.time >= foreign_checked_at && !markets.owns(&f.coin))
+        {
+            return Err(foreign(f));
+        }
         tracing::debug!(
             user = %user_fills.user,
             fills_count = user_fills.fills.len(),
@@ -466,9 +420,8 @@ fn parse_user_fills(
 
     let mut events = Vec::new();
     for ws_fill in &user_fills.fills {
-        if !belongs_to_dex(&ws_fill.coin, dex) {
-            tracing::debug!(coin = %ws_fill.coin, dex, "fill 属于其他 perp dex，跳过");
-            continue;
+        if !markets.owns(&ws_fill.coin) {
+            return Err(foreign(ws_fill));
         }
         let fill = ws_fill.to_fill()
             ?;
@@ -484,9 +437,23 @@ fn parse_user_fills(
     Ok(events)
 }
 
+/// 测试入口：一条 userFills 推送 → 进账本的事件（见 `hyperliquid::testkit`）
+#[cfg(test)]
+pub(crate) fn parse_user_fills_for_test(
+    markets: &HlMarkets,
+    raw: &str,
+    local_ts: u64,
+) -> Result<Vec<AccountEvent>, WsError> {
+    match parse_private_message(raw, markets, 0, local_ts)? {
+        PrivateMessage::Events { events, .. } => Ok(events),
+        PrivateMessage::SubscriptionAck(_) => panic!("不是 userFills 数据"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::hyperliquid::testkit;
     use serde_json::json;
 
     fn fill_json(coin: &str) -> serde_json::Value {
@@ -518,24 +485,43 @@ mod tests {
         })
     }
 
-    /// **错账防线**：userFills 是账户级推送，其他 perp dex 的成交必须被过滤 ——
-    /// 否则 "xyz:AAPL" 会被剥前缀成 "AAPL"，当成本 dex 同名标的的 Fill 累进持仓。
+    /// **错账防线**：userFills 是账户级推送。已接入的每个 dex 的成交都进 Fill 流；
+    /// 未接入 dex 或目录外品种的成交报错停机 —— 否则 "flx:TSLA" 会被剥前缀成 "TSLA"，
+    /// 当成 xyz 同名标的的 Fill 累进持仓，或留下不计入杠杆的外来仓位。
     #[test]
-    fn fills_from_other_dexes_are_filtered_out() {
-        let data = json!({
-            "user": "0xabc",
-            "fills": [fill_json("ETH"), fill_json("xyz:AAPL")]
-        });
-        // 默认 dex 只收裸 coin
-        let events = parse_user_fills(&data, "", 1).unwrap();
-        assert_eq!(events.len(), 1);
-        // 具名 dex 只收自己前缀的，裸 coin（默认 dex 的同名标的）也不能收
-        let events = parse_user_fills(&data, "xyz", 1).unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0].data {
-            AccountData::Fill(f) => assert_eq!(f.symbol, "AAPL"),
-            other => panic!("expected fill, got {other:?}"),
-        }
+    fn fills_of_connected_dexes_flow_and_foreign_fills_are_fatal() {
+        let symbols = |m: &HlMarkets, fills: Vec<serde_json::Value>| -> Result<Vec<String>, WsError> {
+            let data = json!({"user": "0xabc", "fills": fills});
+            Ok(parse_user_fills(&data, m, 0, 1)?
+                .into_iter()
+                .map(|e| match e.data {
+                    AccountData::Fill(f) => f.symbol,
+                    other => panic!("expected fill, got {other:?}"),
+                })
+                .collect())
+        };
+        let both = testkit::markets(&["", "xyz"]);
+        assert_eq!(symbols(&both, vec![fill_json("BTC"), fill_json("xyz:TSLA")]).unwrap(), ["BTC", "TSLA"]);
+        // 未接入的 flx、目录里没有的 ETH：整条推送报错
+        assert!(symbols(&both, vec![fill_json("BTC"), fill_json("flx:TSLA")]).is_err());
+        assert!(symbols(&both, vec![fill_json("ETH")]).is_err());
+        // 只接主站：xyz 的成交是外来的
+        assert!(symbols(&testkit::markets(&[""]), vec![fill_json("xyz:TSLA")]).is_err());
+        // 现货成交也是外来的
+        assert!(symbols(&both, vec![fill_json("@107")]).is_err());
+        assert!(symbols(&both, vec![fill_json("PURR/USDC")]).is_err());
+        // 只接 xyz：主站裸 coin 是外来的
+        assert!(symbols(&testkit::markets(&["xyz"]), vec![fill_json("BTC")]).is_err());
+    }
+
+    /// 初始快照不入账；早于启动检查的历史外来成交不管，晚于的（检查到订阅生效的空档）停机
+    #[test]
+    fn snapshot_fills_only_trip_on_foreign_fills_after_the_startup_check() {
+        let m = testkit::markets(&[""]);
+        let data = json!({"user": "0xabc", "isSnapshot": true, "fills": [fill_json("BTC"), fill_json("flx:TSLA")]});
+        // fill_json 的 time = 1
+        assert!(parse_user_fills(&data, &m, 2, 1).unwrap().is_empty(), "历史外来成交不该挡住启动");
+        assert!(parse_user_fills(&data, &m, 1, 1).is_err(), "空档里的外来成交必须停机");
     }
 
     /// **Critical 回归防线**：服务端的错误报文必须致命。
@@ -547,7 +533,7 @@ mod tests {
     #[test]
     fn server_error_message_is_fatal() {
         let raw = r#"{"channel":"error","data":"Invalid subscription {\"type\":\"userFills\"}"}"#;
-        let err = parse_private_message(raw, "", 1)
+        let err = parse_private_message(raw, &testkit::markets(&[""]), 0, 1)
             .err()
             .expect("服务端错误报文被吞掉了 —— 订阅被拒会表现为静默断流");
         assert!(
@@ -561,18 +547,18 @@ mod tests {
     fn subscription_response_is_reported_as_ack() {
         let raw = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe",
             "subscription":{"type":"orderUpdates","user":"0xabc"}}}"#;
-        match parse_private_message(raw, "", 1).unwrap() {
+        match parse_private_message(raw, &testkit::markets(&[""]), 0, 1).unwrap() {
             PrivateMessage::SubscriptionAck(t) => assert_eq!(t, "orderUpdates"),
             _ => panic!("订阅确认必须能被识别，否则记账永远凑不齐、启动 15 秒后自杀"),
         }
     }
 
-    /// 数据到达同样算订阅生效：不依赖回执格式的假设（clearinghouseState 的回执未经
-    /// 实盘验证；若它不回回执而只推数据，仅靠回执记账会在 15 秒后误杀）
+    /// 数据到达同样算订阅生效：不依赖回执格式的假设（若某个频道不回回执而只推数据，
+    /// 仅靠回执记账会在 15 秒后误杀）
     #[test]
     fn incoming_data_also_confirms_the_subscription() {
         let raw = r#"{"channel":"userFills","data":{"user":"0xabc","fills":[]}}"#;
-        match parse_private_message(raw, "", 1).unwrap() {
+        match parse_private_message(raw, &testkit::markets(&[""]), 0, 1).unwrap() {
             PrivateMessage::Events { channel, .. } => assert_eq!(
                 channel, "userFills",
                 "数据报文必须带回频道名，否则无法用它推进订阅记账"
@@ -581,27 +567,40 @@ mod tests {
         }
     }
 
-    /// 三条必需订阅缺一不可 —— 常量与记账初值是同一出处
+    /// 两条必需订阅缺一不可 —— 常量与记账初值是同一出处
     #[test]
-    fn all_three_private_subscriptions_are_required() {
+    fn both_private_subscriptions_are_required() {
         let pending: HashSet<&'static str> = REQUIRED_SUBSCRIPTIONS.into_iter().collect();
-        assert_eq!(pending.len(), 3);
-        for sub in ["clearinghouseState", "orderUpdates", "userFills"] {
+        assert_eq!(pending.len(), 2);
+        for sub in ["orderUpdates", "userFills"] {
             assert!(pending.contains(sub), "{sub} 未纳入订阅确认记账");
+        }
+    }
+
+    /// clearinghouseState 不再订阅：即使推来也不产出任何事件（统一账户下其中净值恒为 0，
+    /// 产出 AccountInfo 会和 REST 轮询的真实净值互相覆盖）
+    #[test]
+    fn clearinghouse_state_push_yields_no_account_info() {
+        let raw = format!(r#"{{"channel":"clearinghouseState","data":{{"user":"0xabc","dex":"","clearinghouseState":{}}}}}"#, testkit::OWN_EMPTY_STATE);
+        match parse_private_message(&raw, &testkit::markets(&[""]), 0, 1).unwrap() {
+            PrivateMessage::Events { events, .. } => assert!(events.is_empty()),
+            _ => panic!("应解析为空事件"),
         }
     }
 
     /// orderUpdates 同口径过滤
     #[test]
-    fn order_updates_from_other_dexes_are_filtered_out() {
-        let data = json!([order_update_json("ETH"), order_update_json("xyz:AAPL")]);
-        let events = parse_order_updates(&data, "", 1).unwrap();
-        assert_eq!(events.len(), 1);
-        let events = parse_order_updates(&data, "xyz", 1).unwrap();
-        assert_eq!(events.len(), 1);
-        match &events[0].data {
-            AccountData::OrderUpdate(u) => assert_eq!(u.symbol, "AAPL"),
-            other => panic!("expected order update, got {other:?}"),
-        }
+    fn order_updates_are_kept_for_connected_dexes_only() {
+        let data = json!([order_update_json("BTC"), order_update_json("xyz:NVDA"), order_update_json("flx:NVDA")]);
+        let events = parse_order_updates(&data, &testkit::markets(&["", "xyz"]), 1).unwrap();
+        let symbols: Vec<_> = events
+            .iter()
+            .map(|e| match &e.data {
+                AccountData::OrderUpdate(u) => u.symbol.clone(),
+                other => panic!("expected order update, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(symbols, ["BTC", "NVDA"]);
+        assert_eq!(parse_order_updates(&data, &testkit::markets(&["xyz"]), 1).unwrap().len(), 1);
     }
 }

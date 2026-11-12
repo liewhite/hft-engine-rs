@@ -1,19 +1,45 @@
 pub(crate) mod actor;
 pub(crate) mod codec;
 mod client;
+pub(crate) mod markets;
 pub(crate) mod signing;
 mod symbol;
+#[cfg(test)]
+pub(crate) mod testkit;
 mod transport;
 
 pub use actor::{HyperliquidActor, HyperliquidActorArgs};
 pub use client::HyperliquidClient;
-pub use symbol::{from_hyperliquid, to_hyperliquid};
+pub use symbol::from_hyperliquid;
 
 /// Hyperliquid REST API 地址
 pub const REST_BASE_URL: &str = "https://api.hyperliquid.xyz";
 
 /// Hyperliquid WebSocket 地址
 pub const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
+
+/// Hyperliquid 的接入配置（与其他所的 `ExchangeAccess` 同形，多一个 `dexes`）。
+///
+/// ```json
+/// {"quote": "USDC", "dexes": ["", "xyz"], "credentials": {...}}
+/// ```
+/// `dexes`：接入的 perp dex（`""` = 主站，`"xyz"` = 股票），不写 = 只接主站。
+/// 专属结构而不是给通用 `ExchangeAccess` 加字段：其他所配了 `dexes` 由
+/// `deny_unknown_fields` 当场报错，不靠各装配函数记得检查。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HyperliquidAccess {
+    pub quote: String,
+    #[serde(default = "main_dex_only")]
+    pub dexes: Vec<String>,
+    /// None = 只接公共行情
+    #[serde(default)]
+    pub credentials: Option<HyperliquidCredentials>,
+}
+
+fn main_dex_only() -> Vec<String> {
+    vec![String::new()]
+}
 
 /// Hyperliquid 凭证：查询用的主钱包地址 + 下单怎么签名。
 ///
@@ -84,7 +110,7 @@ impl TryFrom<RawHyperliquidCredentials> for HyperliquidCredentials {
 /// 本所适配层是否实现了这种公共订阅（**能力查询**，装配期由 `ExchangeSetup` 携带）。
 /// 派生自 public WS 的 kind 映射函数，见各所同名函数的约定。
 pub fn supports_subscription(kind: &crate::exchange::SubscriptionKind) -> bool {
-    actor::public_ws::kind_to_stream(kind, "USDC", "").is_some()
+    actor::public_ws::kind_channel(kind).is_some()
 }
 
 #[cfg(test)]
