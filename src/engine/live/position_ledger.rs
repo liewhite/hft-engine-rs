@@ -260,12 +260,6 @@ impl Reconciler {
         self.verdict(counterpart, confirmed)
     }
 
-    /// 某个 executor 不再受监视（已撤下）：清掉它的不一致记录，免得残留计数以后被误用。
-    pub fn forget_executor(&mut self, executor: ActorId) {
-        self.mismatches
-            .retain(|(counterpart, _, _), _| *counterpart != Counterpart::Executor(executor));
-    }
-
     /// 一条腿的比对与连续计数（两种对手方共用的**唯一**判据）。
     ///
     /// `local` 是账本值，`reported` 是对手方的值。返回 `Some(描述)` = 该腿已确认漂移。
@@ -335,7 +329,10 @@ impl Reconciler {
         }
         let consequence = match counterpart {
             Counterpart::Exchange => "本地「基线 + Fill」已不可信",
-            Counterpart::Executor(_) => "策略下单依据的持仓已与账本分叉",
+            Counterpart::Executor(_) => {
+                "策略下单依据的持仓已与账本分叉（也可能是该 executor 或分发层积压数秒、\
+                 期间恰有成交，先查管线滞后告警）"
+            }
         };
         Err(format!(
             "持仓对账（本地 vs {counterpart}）连续 {} 次差值稳定的不一致，{consequence}: {}",
@@ -397,8 +394,9 @@ pub struct PositionLedgerActor {
     executors: HashMap<ActorId, ActorRef<ExecutorActor>>,
     /// 已发出持仓查询、尚未回投的 executor。
     ///
-    /// 不配停摆守卫：executor 迟迟不答只可能是它邮箱积压，那由它自己的管线滞后告警报出
-    /// （`ExecutorActor::check_pipeline_lag`）；它停了则 ask 立即报错回投。
+    /// 不配停摆守卫：executor 迟迟不答多半是它邮箱积压，恢复后由它自己的管线滞后告警报出
+    /// （`ExecutorActor::check_pipeline_lag`）；它停了则 ask 立即报错回投。永久卡死在某个
+    /// handler 里时这条比对会静默失效 —— 不在本机制范围内，卡死的实例也下不了单。
     executor_in_flight: HashSet<ActorId>,
 }
 
@@ -521,15 +519,10 @@ impl PositionLedgerActor {
                 // executor 已停却没有先撤出名单 —— 只可能是异常终止，那条路径会经监督树
                 // 整机停机。这里只把它摘掉，免得每个节拍重复报同一件事。
                 tracing::warn!(%executor, error = %e, "executor 持仓查询失败（已停止？），移出监视名单");
-                self.unwatch(executor);
+                self.executors.remove(&executor);
                 Ok(())
             }
         }
-    }
-
-    fn unwatch(&mut self, executor: ActorId) {
-        self.executors.remove(&executor);
-        self.reconciler.forget_executor(executor);
     }
 
     /// 本地持仓已不可信，受控退出。
@@ -678,7 +671,8 @@ impl Message<UnwatchExecutor> for PositionLedgerActor {
     type Reply = ();
 
     async fn handle(&mut self, msg: UnwatchExecutor, _ctx: &mut Context<Self, Self::Reply>) {
-        self.unwatch(msg.0);
+        // 它的不一致记录不必清：ActorId 不复用，残留记录不会再被读到
+        self.executors.remove(&msg.0);
     }
 }
 
@@ -1154,16 +1148,6 @@ mod tests {
         r.on_event(&fill_on(OTHER_EX, Side::Long, 1.0, SNAPSHOT_TS + 1));
         r.reconcile_executor(executor(), &[position(EX, 2.0), position(OTHER_EX, 0.0)])
             .expect("未 seed 的腿不比");
-    }
-
-    /// 撤出名单后记录清零：同一 id 再出现时从头数（不会带着旧次数一上来就致命）
-    #[test]
-    fn forgetting_an_executor_clears_its_streak() {
-        let mut r = reconciler_with(2, &[baseline_on(EX, 2.0)]);
-        r.reconcile_executor(executor(), &[position(EX, 5.0)]).unwrap();
-        r.forget_executor(executor());
-        r.reconcile_executor(executor(), &[position(EX, 5.0)])
-            .expect("forget 之后应从 1 重新计数");
     }
 
     /// 对外快照只含**基线已写入**的腿，且空仓腿必须如实报出 0。
