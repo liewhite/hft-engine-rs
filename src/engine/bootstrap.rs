@@ -1,11 +1,9 @@
-use kameo::actor::{Actor, ActorRef, Spawn};
-use kameo::mailbox;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::actor_lifecycle::ChildStop;
-use crate::engine::live::{ManagerActor, ManagerActorArgs, RegisterSupervisedChild};
+use crate::engine::live::{Manager, ManagerArgs, ManagerHandle};
+use crate::tasks::Root;
 
 /// 退出前等告警发完的最长时间（单次发送超时 10s，留出一条告警加一条汇总的余量）
 const ALERT_FLUSH_DEADLINE: Duration = Duration::from_secs(20);
@@ -118,207 +116,89 @@ pub fn load_config<T: DeserializeOwned>(default_path: &str) -> anyhow::Result<T>
     Ok(serde_json::from_str(&content)?)
 }
 
-/// 受监督的 ActorRef —— **只能**由 [`spawn_supervised`] 产出。
-///
-/// 它是一张凭证：持有它即证明该 actor（1）`on_start` 已成功返回，（2）从出生起就
-/// link 在监督树上，出错必然级联。订阅接口只收这张凭证，于是"把一个没人看着的
-/// actor 订进总线"在**类型上就写不出来** —— 不需要在订阅时再查一遍存活，也就没有
-/// "查完到用之间又死了"的窗口。
-///
-/// 内层 `ActorRef` 私有，外部拿不到构造途径；需要给 actor 发消息时用
-/// [`Self::actor_ref`]。
-pub struct Supervised<A: Actor>(ActorRef<A>);
-
-impl<A: Actor> Supervised<A> {
-    /// 底层 ActorRef，用于发消息
-    pub fn actor_ref(&self) -> &ActorRef<A> {
-        &self.0
-    }
-
-    /// 交出内层引用。crate 内部可见：订阅处理器要把它放进 PubSub。
-    pub(crate) fn into_inner(self) -> ActorRef<A> {
-        self.0
-    }
-}
-
-// 手写而非 derive：derive(Clone) 会要求 `A: Clone`，而 actor 类型本身不必可克隆
-impl<A: Actor> Clone for Supervised<A> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<A: Actor> std::fmt::Debug for Supervised<A> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Supervised").field(&self.0.id()).finish()
-    }
-}
-
-/// 把一个外部 actor 挂进引擎的监督树。
-///
-/// 返回 [`Supervised<A>`] —— 一张"已启动成功且已受监督"的凭证，也是订阅接口唯一接受的
-/// 入参。返回的 actor **一定已经启动成功、且从出生起就受监督**：此后它因错误死亡
-/// （`on_start` 返回 Err、handler panic、被 kill）会经 `ManagerActor::on_link_died`
-/// 级联退出整机；而主动 `stop_gracefully()`（`Normal`）只算收工，引擎照常运行。
-///
-/// # 它堵住的两个洞
-///
-/// 自己 `spawn` 再 `SubscribeIncome` 的写法有两处静默失败，都不会以任何形式告知调用方：
-///
-/// - **启动期**：`spawn` 不返回启动结果。`on_start` 里的失败只让 actor 当场死掉
-///   （kameo 记为 `Panicked(PanicReason::OnStart)`），日志一行 "actor stopped"，
-///   而订阅照发、进程照跑 —— 观察者从第一秒起就是空的。这里 `wait_for_startup_with_result`
-///   把它变成调用点的同步 `Err`。
-/// - **运行期**：订阅不建立监督关系，订阅者死了只会被 PubSub 静默摘除。这里用
-///   `spawn_link_with_mailbox` —— 它**先 link 再 spawn**，actor 从未有过"活着但没人看着"
-///   的时刻，之后的死亡必然被观察到。
-///
-/// # 为什么不用更短的 `spawn_link`
-///
-/// 两者的 link 时机与监督语义完全一致，唯一区别是邮箱：`spawn_link` 固定给
-/// `mailbox::bounded(64)`，而这条路径上有界邮箱会**静默丢事件**。
-///
-/// 三条总线都是 `DeliveryStrategy::BestEffort`，投递走 `try_tell`（非阻塞，满了立刻失败），
-/// 而 `PubSub::publish` 对 `MailboxFull` 的处置是**什么都不做** —— 不重试、不报错、也不摘除
-/// 订阅者。观察者只要短暂落后 64 条（写 CSV、发 HTTP 都够），事件就没了，且不留痕迹。
-///
-/// 无界邮箱的代价是订阅者持续追不上时内存无限增长；但那种情形下有界邮箱只是把"内存涨"
-/// 换成"悄悄丢数据"，对账本而言更糟。真要设上限，该配的是显式的丢弃计数与告警。
-///
-/// 这也是引擎的既有约定：内部所有 actor 一律 `mailbox::unbounded()`，没有例外。
-///
-/// # 启动失败同样会级联，这是有意的
-///
-/// `on_start` 返回 `Err` 就是"这确实失败了"，不该由调用方选择吞掉。调用方拿到的 `Err`
-/// 在自己的任务里产生，不受 manager 生死影响，所以根因照样报得出来；同时监督树按同一
-/// 条判据把整机带下去，不存在"启动失败被当成可选项忽略、进程带着半套观测继续跑"的路径。
-///
-/// 真正可以容忍的失败，应当由子 actor 在 `on_start` 内部消化掉并正常运行（或自行
-/// `stop_gracefully` 退出），而不是把 `Err` 抛出来再指望上层不当回事。
-pub async fn spawn_supervised<A>(
-    manager: &ActorRef<ManagerActor>,
-    args: A::Args,
-) -> anyhow::Result<Supervised<A>>
-where
-    A: Actor + Spawn,
-    A::Args: Send,
-    A::Error: std::fmt::Display,
-{
-    let supervised = spawn_supervised_by(manager, args).await?;
-    // 登记进 manager 的停机链：只 link 的话出错会级联，但停机时没人等它收尾
-    manager
-        .tell(RegisterSupervisedChild(ChildStop::new(
-            std::any::type_name::<A>(),
-            supervised.actor_ref().clone(),
-        )))
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("登记停机链失败: {e}"))?;
-    Ok(supervised)
-}
-
-/// [`spawn_supervised`] 的监督者泛型版本。
-///
-/// 只对 crate 内可见：对外只暴露"挂在 manager 上"这一种，[`Supervised`] 这张凭证才
-/// **确切**代表"由引擎监督、出错会整机退出"。放开监督者类型的话，凭证就只剩"被某个
-/// 东西监督着"，而那个东西自己可能没人管 —— 证明力就漏了。
-/// 泛型版本留给单测：真 `ManagerActor` 的 `on_start` 要联网建 client、拉 symbol
-/// metas，起不来。
-pub(crate) async fn spawn_supervised_by<A, S>(
-    supervisor: &ActorRef<S>,
-    args: A::Args,
-) -> anyhow::Result<Supervised<A>>
-where
-    A: Actor + Spawn,
-    A::Args: Send,
-    A::Error: std::fmt::Display,
-    S: Actor,
-{
-    let actor = A::spawn_link_with_mailbox(supervisor, args, mailbox::unbounded()).await;
-    let name = std::any::type_name::<A>();
-
-    actor
-        .wait_for_startup_with_result(|result| {
-            result.map_err(|e| anyhow::anyhow!("{name} 启动失败: {e}"))
-        })
-        .await?;
-
-    tracing::info!(actor = name, "actor 已挂入监督树");
-    Ok(Supervised(actor))
-}
-
 /// 实盘引擎的完整一生：启动 → 装配 → 运行 → 停机。各启动程序只写装配那一段。
 ///
-/// 1. 启动 ManagerActor 并等它启动完成（此时各所私有推送都已确认订阅生效，见
-///    [`crate::exchange::ws_loop::await_subscriptions`]）；启动失败直接返回 `Err`，没有要停的。
-/// 2. 跑 `setup`（查品种、加策略、挂观察者、起旁路任务……），拿到 manager 引用。
-///    `setup` 出错 → 走同一条停机路径（[`stop`]）后返回该错误：装配到一半的引擎
+/// 任务树：根 `engine` 持有唯一的停机总期限，`main` 组下只有 [`Manager`] 一个节点
+/// （它下面是生产者、消费者两组，见 `engine::live::manager`）。
+///
+/// 1. 起 Manager 并等它构造完成（此时各所私有推送都已确认订阅生效，见
+///    `crate::exchange::ws_loop::WsConn::await_subscriptions`）；启动失败 → 收尾后返回 `Err`。
+/// 2. 跑 `setup`（查品种、加策略、挂观察者、起旁路任务……），拿到 [`ManagerHandle`]。
+///    `setup` 出错 → 走同一条停机路径（[`shutdown`]）后返回该错误：装配到一半的引擎
 ///    （可能已加了部分策略、已在下单）不会被丢下不管。
-/// 3. 等停机信号或 manager 意外退出（[`run_until_shutdown`]）。
+/// 3. 等停机信号或任何节点出错（[`run_until_shutdown`]）。
 ///
 /// 返回 `Ok` 只有一种情形：**收到停机信号并已停机完毕**。
-pub async fn run_engine<F, Fut>(args: ManagerActorArgs, setup: F) -> anyhow::Result<()>
+pub async fn run_engine<F, Fut>(args: ManagerArgs, setup: F) -> anyhow::Result<()>
 where
-    F: FnOnce(ActorRef<ManagerActor>) -> Fut,
+    F: FnOnce(ManagerHandle) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    let manager = ManagerActor::spawn_with_mailbox(args, mailbox::unbounded());
-    manager
-        .wait_for_startup_result()
-        .await
-        .map_err(|e| anyhow::anyhow!("ManagerActor 启动失败: {e}"))?;
-    drive(manager, setup).await
+    let root = Root::new("engine");
+    let main = root.group("main");
+    let manager = match Manager::spawn(&main, args).await {
+        Ok(manager) => manager,
+        Err(e) => {
+            // 构造途中可能已起了部分子任务（框架已先收掉 manager 那一支），照样走一遍停机：
+            // 根交出的就是同一个根因，这里只记停机本身有没有完成
+            if let Err(stop_err) = shutdown(root).await {
+                tracing::warn!(error = %format!("{stop_err:#}"), "Manager 启动失败后的停机结果");
+            }
+            return Err(e.context("Manager 启动失败"));
+        }
+    };
+    drive(root, manager, setup).await
 }
 
-/// [`run_engine`] 启动之后的部分，对根 actor 类型泛化以便单测（真 ManagerActor 起不来）
-async fn drive<A, F, Fut>(root: ActorRef<A>, setup: F) -> anyhow::Result<()>
+/// [`run_engine`] 启动之后的部分，对句柄类型泛化以便单测（真 Manager 要联网，起不来）
+async fn drive<H, F, Fut>(root: Root, handle: H, setup: F) -> anyhow::Result<()>
 where
-    A: Actor,
-    F: FnOnce(ActorRef<A>) -> Fut,
+    F: FnOnce(H) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    if let Err(e) = setup(root.clone()).await {
-        tracing::error!(error = %e, "引擎装配失败，停机");
-        if let Err(stop_err) = stop(&root).await {
-            tracing::error!(error = %stop_err, "装配失败后的停机未完成");
+    if let Err(e) = setup(handle).await {
+        tracing::error!(error = %format!("{e:#}"), "引擎装配失败，停机");
+        if let Err(stop_err) = shutdown(root).await {
+            tracing::error!(error = %format!("{stop_err:#}"), "装配失败后的停机未完成或伴随错误");
         }
         return Err(e.context("引擎装配失败（已停机）"));
     }
     run_until_shutdown(root).await
 }
 
-/// 等待停机信号，或 Manager 意外退出。
+/// 等待停机信号，或任何节点出错（任务树把错误冒到根，[`Root::stopping`] 随即完成）。
 ///
-/// Manager 意外终止返回 `Err`，调用方据此把退出如实报成事故 —— 从前两种归宿都是 `()`，
-/// 上层只能一律报成"已优雅关闭"，而那在 manager 猝死时是条假消息。
+/// 节点出错返回 `Err`（带根因），调用方据此把退出如实报成事故 —— 只报"已优雅关闭"
+/// 在出事时是条假消息。
 ///
 /// # 为什么 SIGTERM 必须和 Ctrl-C 同等对待
 ///
 /// 只接 SIGINT 的话，容器编排的停机路径整条不可达：`docker stop` 与 k8s 滚动重启发的
 /// 都是 SIGTERM，进程会被直接杀掉 —— 优雅停机与随之而来的通知在**生产里永远走不到**，
 /// 只有开发机按 Ctrl-C 才触发，于是这条路径看着实现了、实际从没运行过。
-async fn run_until_shutdown<A: Actor>(manager: ActorRef<A>) -> anyhow::Result<()> {
+async fn run_until_shutdown(root: Root) -> anyhow::Result<()> {
     tracing::info!("System running. Press Ctrl+C (or send SIGTERM) to stop.");
 
-    let outcome = tokio::select! {
-        // 按声明顺序判定，不随机：manager 已经死了之后信号才到时（进程正在因事故退出，
+    let signal = tokio::select! {
+        // 按声明顺序判定，不随机：节点已经出错之后信号才到时（进程正在因事故退出，
         // 编排随即发来 SIGTERM），两个分支会同时就绪。随机选有约一半概率把一次事故
         // 报成"收到停止信号，已优雅关闭" —— 那是条假消息。事故分支放在前面。
         biased;
 
-        // 带上停止原因：manager 因监督树上某个 actor 出错而级联退出时，reason 是
-        // `LinkDied { id, reason }`，死者与死因都在里面。只报"manager 死了"会把排查
-        // 起点丢掉 —— 而这条错误往往是运维手里唯一的线索。
-        reason = manager.wait_for_shutdown_with_result(|r| match r {
-            Ok(reason) => format!("{reason:?}"),
-            Err(e) => format!("{e:?}"),
-        }) => {
-            Err(anyhow::anyhow!("ManagerActor 意外终止，引擎已停止交易: {reason}"))
-        }
+        _ = root.stopping() => None,
+        signal = shutdown_signal() => Some(signal),
+    };
 
-        signal = shutdown_signal() => {
+    let outcome = match signal {
+        // 根因随停机结果交出（第一个冒上来的错误）：死者与死因都在里面，只报"引擎停了"
+        // 会把排查起点丢掉 —— 而这条错误往往是运维手里唯一的线索。
+        None => match shutdown(root).await {
+            Err(e) => Err(e.context("引擎因节点出错停止交易")),
+            Ok(()) => Err(anyhow::anyhow!("引擎被内部请求停机，但没有记下错误（不该发生）")),
+        },
+        Some(signal) => {
             tracing::info!(signal, "Received shutdown signal");
-            stop(&manager).await
+            shutdown(root).await
         }
     };
 
@@ -328,38 +208,23 @@ async fn run_until_shutdown<A: Actor>(manager: ActorRef<A>) -> anyhow::Result<()
 
 /// 整棵树的停机总预算。
 ///
-/// 这是**唯一**的硬 deadline：中间层只告警、不放弃（见
-/// [`crate::actor_lifecycle`]），否则各层的超时会叠加成提前返回。超了就如实报错，
-/// 不再假装停干净了 —— 容器编排随后会用 SIGKILL 收尾。
+/// 这是**唯一**的硬期限：中间层只告警、不放弃（见 `crate::tasks::tree` 模块文档），否则
+/// 各层的超时会叠加成提前返回。超了就如实报错，不再假装停干净了 —— 容器编排随后会用
+/// SIGKILL 收尾。
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
-/// 唯一的停机路径（收到信号、装配失败都走这里）。
+/// 唯一的停机路径（收到信号、节点出错、装配失败、启动失败都走这里）。
 ///
-/// # 停机只需停根
-///
-/// 对 manager 一次 `stop_gracefully`，整棵树会自下而上逐层收尾：每个 actor 的 `on_stop`
-/// 先等完自己那批子 actor（[`crate::actor_lifecycle::ChildGroup::shutdown`]），自己才停。
-/// 全程 `Normal` —— 一次正常停机不该在任何一层留下事故 reason。
-///
-/// 这一程必须自己走：kameo 的 `link` 建立的是**兄弟**关系，父 actor 停止时子 actor 只会
-/// 收到一条通知、不会被带停；而 `wait_for_shutdown` 等到的只是邮箱关闭，那发生在
-/// `on_stop` **之前**。两者叠加的后果是：调用方以为等完了，实际正在收尾的子孙被随后的
-/// runtime drop 当场砍断。
-async fn stop<A: Actor>(manager: &ActorRef<A>) -> anyhow::Result<()> {
-    // manager 已停（如装配期间它出错级联退出）时发送失败是预期，下面的等待立即返回
-    if let Err(e) = manager.stop_gracefully().await {
-        tracing::warn!(error = %e, "Failed to stop manager gracefully");
-    }
-    // 必须是 with_result：`wait_for_shutdown` 只等到邮箱关闭，那发生在
-    // `on_stop` 之前 —— 用它等于没等，整棵树的收尾会被随后的 runtime drop 砍断。
-    let stopped = manager.wait_for_shutdown_with_result(|_| ());
+/// 停根即可：任务树自上而下逐组发停止信号（manager 下先生产者、后消费者），自下而上收尾，
+/// 每个节点的子任务全部收尾完才轮到它自己。返回根因错误（若有）。
+async fn shutdown(root: Root) -> anyhow::Result<()> {
     tokio::select! {
         biased;
 
-        r = tokio::time::timeout(SHUTDOWN_DEADLINE, stopped) => match r {
-            Ok(()) => Ok(()),
+        r = tokio::time::timeout(SHUTDOWN_DEADLINE, root.shutdown()) => match r {
+            Ok(r) => r,
             Err(_) => Err(anyhow::anyhow!(
-                "停机超时（{}s）：仍有 actor 未收尾完成，日志里的\"迟迟未停\"告警指出了是谁",
+                "停机超时（{}s）：仍有任务未收尾完成，日志里的\"迟迟未停\"告警指出了是谁",
                 SHUTDOWN_DEADLINE.as_secs()
             )),
         },
@@ -395,173 +260,219 @@ async fn shutdown_signal() -> &'static str {
 #[cfg(test)]
 mod supervision_tests {
     use super::*;
-    use kameo::error::Infallible;
+    use crate::tasks::{Addr, Bus, ChildHandle, Group, Inbox, Scope, Task};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
 
-    /// 假监督者：只用来收 link 死亡通知，行为与 ManagerActor::on_link_died 一致
-    struct Supervisor;
+    /// 什么都不做、等停止信号的观察者
+    struct Idle;
 
-    impl Actor for Supervisor {
-        type Args = ();
-        type Error = Infallible;
-        async fn on_start(_: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
-            Ok(Self)
-        }
-        async fn on_link_died(
-            &mut self,
-            _: kameo::actor::WeakActorRef<Self>,
-            id: kameo::actor::ActorId,
-            reason: kameo::error::ActorStopReason,
-        ) -> Result<std::ops::ControlFlow<kameo::error::ActorStopReason>, Self::Error> {
-            if reason.is_normal() {
-                return Ok(std::ops::ControlFlow::Continue(()));
-            }
-            Ok(std::ops::ControlFlow::Break(
-                kameo::error::ActorStopReason::LinkDied {
-                    id,
-                    reason: Box::new(reason),
-                },
-            ))
-        }
-    }
-
-    static TICKS: AtomicUsize = AtomicUsize::new(0);
-    static STOPS: AtomicUsize = AtomicUsize::new(0);
-
-    /// 记录"处理了多少消息"与"on_stop 跑了几次"，用来验证排空与级联
-    struct Recorder;
-
-    impl Actor for Recorder {
-        type Args = ();
-        type Error = Infallible;
-        async fn on_start(_: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
-            Ok(Self)
-        }
-        async fn on_stop(
-            &mut self,
-            _: kameo::actor::WeakActorRef<Self>,
-            _: kameo::error::ActorStopReason,
-        ) -> Result<(), Self::Error> {
-            STOPS.fetch_add(1, Ordering::SeqCst);
+    impl Task for Idle {
+        async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
+            scope.stopping().await;
             Ok(())
         }
     }
 
-    struct Tick;
+    /// `fail` 为真时构造失败（模拟观察者打不开自己的资源）
+    async fn spawn_observer(group: &Group, fail: bool) -> anyhow::Result<ChildHandle> {
+        group
+            .spawn("Observer", move |_scope| async move {
+                anyhow::ensure!(!fail, "账本打不开");
+                Ok(Idle)
+            })
+            .await
+    }
 
-    impl kameo::message::Message<Tick> for Recorder {
-        type Reply = ();
-        async fn handle(&mut self, _: Tick, _: &mut kameo::message::Context<Self, Self::Reply>) {
-            TICKS.fetch_add(1, Ordering::SeqCst);
+    #[derive(Default)]
+    struct Counters {
+        ticks: AtomicUsize,
+        stops: AtomicUsize,
+    }
+
+    /// 记录"处理了多少消息"与"收尾跑了几次"，用来验证排空与级联
+    struct Recorder {
+        inbox: Inbox<()>,
+        counters: Arc<Counters>,
+    }
+
+    impl Task for Recorder {
+        async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+            while self.inbox.recv().await.is_some() {
+                self.counters.ticks.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        async fn stop(&mut self) -> anyhow::Result<()> {
+            self.counters.stops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
-    /// `fail` 为真时 on_start 返回 Err
-    struct Observer;
-
-    impl Actor for Observer {
-        type Args = bool;
-        type Error = anyhow::Error;
-        async fn on_start(fail: Self::Args, _: ActorRef<Self>) -> Result<Self, Self::Error> {
-            anyhow::ensure!(!fail, "账本打不开");
-            Ok(Self)
-        }
+    /// 起一个 Recorder；`with_child` 为真时它在构造时再起一个 Recorder 子任务。
+    /// 返回两者的地址（没有子任务时第二个为 None）。
+    async fn spawn_recorder(
+        group: &Group,
+        counters: Arc<Counters>,
+        with_child: bool,
+    ) -> (Addr<()>, Option<Addr<()>>) {
+        let (child_tx, child_rx) = tokio::sync::oneshot::channel();
+        let c = counters.clone();
+        let (_, addr) = group
+            .spawn_addressed("Recorder", move |scope: Scope, inbox| async move {
+                if with_child {
+                    let grand = scope.group("children");
+                    let (_, grand_addr) = grand
+                        .spawn_addressed("GrandRecorder", {
+                            let c = c.clone();
+                            move |_scope: Scope, inbox| async move { Ok(Recorder { inbox, counters: c }) }
+                        })
+                        .await?;
+                    let _ = child_tx.send(grand_addr);
+                }
+                Ok(Recorder { inbox, counters: c })
+            })
+            .await
+            .expect("Recorder 起不来");
+        (addr, child_rx.await.ok())
     }
 
-    /// 启动失败必须是调用点的 `Err`（带根因），**并且**级联退出监督者。
+    /// 启动失败必须是调用点的 `Err`（带根因），**并且**级联到根、整机停机。
     ///
     /// 两件事缺一不可：只报 Err 而不级联，等于把"这确实失败了"降级成调用方可以
     /// 忽略的建议；只级联而不报 Err，根因就丢了。
     #[tokio::test]
     async fn startup_failure_surfaces_as_error_and_cascades() {
-        let supervisor = Supervisor::spawn_with_mailbox((), mailbox::unbounded());
-        let err = spawn_supervised_by::<Observer, _>(&supervisor, true)
-            .await
-            .expect_err("on_start 失败必须传播");
-        let text = err.to_string();
+        let root = Root::new("engine");
+        let main = root.group("main");
+        let err = spawn_observer(&main, true).await.expect_err("构造失败必须传播");
+        let text = format!("{err:#}");
         assert!(text.contains("启动失败"), "错误要点名启动阶段: {text}");
         assert!(text.contains("账本打不开"), "错误要带上根因: {text}");
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            !supervisor.is_alive(),
+            root.is_stopping(),
             "启动失败被当成可选项放过了 —— 进程会带着半套观测继续跑"
         );
+        let root_err = root.shutdown().await.expect_err("根要交出根因");
+        assert!(format!("{root_err:#}").contains("账本打不开"));
     }
 
-    /// 起来之后出错死亡 → 监督者级联退出
+    /// 起来之后出错 → 整机停机，`run_engine` 的等待路径把它报成事故（带根因），
+    /// 而不是"收到信号、已优雅关闭"
     #[tokio::test]
     async fn error_death_after_startup_cascades() {
-        let supervisor = Supervisor::spawn_with_mailbox((), mailbox::unbounded());
-        let observer = spawn_supervised_by::<Observer, _>(&supervisor, false)
+        let root = Root::new("engine");
+        let main = root.group("main");
+        main.spawn_fn("Observer", |_scope| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            anyhow::bail!("轮询器崩了")
+        })
+        .unwrap();
+        let err = drive(root, (), |_| async { Ok(()) })
             .await
-            .expect("启动成功");
-
-        observer.actor_ref().kill();
-        observer.actor_ref().wait_for_shutdown().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert!(!supervisor.is_alive(), "受监督 actor 出错死亡却没有级联退出");
+            .expect_err("节点出错必须报成事故");
+        let text = format!("{err:#}");
+        assert!(text.contains("轮询器崩了"), "要带根因: {text}");
     }
 
-    /// 停机是靠 kill 级联下去的，而且**先排空邮箱再停** —— 停机路径（[`stop`]）的
+    /// 停机自上而下级联到孙任务，而且**先排空收件箱再停** —— 停机路径（[`shutdown`]）的
     /// 全部正确性都压在这条上：
     ///
-    /// - 若不级联，子孙会一直活到 runtime 被 drop，`on_stop` 里的收尾（写最后一份
-    ///   快照、补发挂起的成交）全部丢失；
+    /// - 若不级联，子孙会一直活到 runtime 被 drop，收尾（写最后一份快照、补发挂起的成交）
+    ///   全部丢失；
     /// - 若不排空，停机瞬间在途的事件就没了。
-    ///
-    /// `Signal::LinkDied` 与 `Signal::Message` 共用同一条 mpsc 队列，所以两者兼得；
-    /// 这个前提哪天变了，本用例会先炸。
     #[tokio::test]
-    async fn killing_the_root_cascades_and_drains_first() {
-        let root = Supervisor::spawn_with_mailbox((), mailbox::unbounded());
-        let child = Recorder::spawn_link_with_mailbox(&root, (), mailbox::unbounded()).await;
-        let grandchild = Recorder::spawn_link_with_mailbox(&child, (), mailbox::unbounded()).await;
+    async fn shutdown_cascades_and_drains_first() {
+        let root = Root::new("engine");
+        let counters = Arc::new(Counters::default());
+        let (child, grandchild) = spawn_recorder(&root.group("main"), counters.clone(), true).await;
+        let grandchild = grandchild.expect("孙任务地址");
 
-        // 先把消息排进子孙的邮箱，再 kill 根
+        // 先把消息排进子孙的收件箱，再停根
         for _ in 0..3 {
-            child.tell(Tick).send().await.expect("入队");
-            grandchild.tell(Tick).send().await.expect("入队");
+            child.send(()).expect("入队");
+            grandchild.send(()).expect("入队");
         }
-        root.kill();
-        root.wait_for_shutdown().await;
-        child.wait_for_shutdown().await;
-        grandchild.wait_for_shutdown().await;
+        shutdown(root).await.expect("正常停机");
 
-        assert!(!child.is_alive() && !grandchild.is_alive(), "整棵树都该停了");
+        assert!(child.is_gone() && grandchild.is_gone(), "整棵树都该停了");
         assert_eq!(
-            (TICKS.load(Ordering::SeqCst), STOPS.load(Ordering::SeqCst)),
+            (counters.ticks.load(Ordering::SeqCst), counters.stops.load(Ordering::SeqCst)),
             (6, 2),
-            "排队的 6 条必须先处理完，两个 on_stop 都要跑到"
+            "排队的 6 条必须先处理完，两个收尾都要跑到"
         );
     }
 
-    /// 装配失败走同一条停机路径：根已停下（子孙由根的 on_stop 收尾，见 actor_lifecycle），
-    /// 再返回带根因的错误
+    /// 装配失败走同一条停机路径：整棵树已收尾，再返回带根因的错误
     #[tokio::test]
     async fn setup_failure_stops_the_engine_before_returning() {
-        let root = Supervisor::spawn_with_mailbox((), mailbox::unbounded());
-        let err = drive(root.clone(), |_| async { anyhow::bail!("加策略失败") })
+        let root = Root::new("engine");
+        let counters = Arc::new(Counters::default());
+        let (addr, _) = spawn_recorder(&root.group("main"), counters.clone(), false).await;
+        let err = drive(root, (), |_| async { anyhow::bail!("加策略失败") })
             .await
             .expect_err("装配失败必须返回 Err");
         assert!(format!("{err:#}").contains("加策略失败"), "要带根因: {err:#}");
-        assert!(!root.is_alive(), "装配失败后引擎没停 —— 半套引擎被丢下继续跑");
+        assert!(addr.is_gone(), "装配失败后引擎没停 —— 半套引擎被丢下继续跑");
+        assert_eq!(counters.stops.load(Ordering::SeqCst), 1, "收尾要跑到");
     }
 
-    /// 主动退出（stop_gracefully → Normal）→ 监督者继续运行，不需要事先登记意图
+    /// 主动收工（自己的句柄 stop）→ 只收掉它自己，引擎继续运行，不需要事先登记意图
     #[tokio::test]
     async fn graceful_stop_does_not_cascade() {
-        let supervisor = Supervisor::spawn_with_mailbox((), mailbox::unbounded());
-        let observer = spawn_supervised_by::<Observer, _>(&supervisor, false)
+        let root = Root::new("engine");
+        let observer = spawn_observer(&root.group("main"), false).await.expect("启动成功");
+        observer.stop().await;
+        assert!(observer.is_finished());
+        assert!(!root.is_stopping(), "主动收工却把整机带走了");
+        root.shutdown().await.expect("正常停机不该有错误");
+    }
+
+    /// manager 的两组停机顺序：生产者收尾时补发的事件，后停的消费者照样收得到
+    /// （IBKR 收尾补发等 commission 的成交就靠这条）
+    #[tokio::test]
+    async fn events_published_by_producers_on_stop_reach_consumers() {
+        struct FlushOnStop(Bus<u32>);
+        impl Task for FlushOnStop {
+            async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
+                scope.stopping().await;
+                Ok(())
+            }
+            async fn stop(&mut self) -> anyhow::Result<()> {
+                self.0.publish(42);
+                Ok(())
+            }
+        }
+        struct Sink(Inbox<u32>, Arc<Mutex<Vec<u32>>>);
+        impl Task for Sink {
+            async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+                while let Some(n) = self.0.recv().await {
+                    self.1.lock().unwrap().push(n);
+                }
+                Ok(())
+            }
+        }
+
+        let bus = Bus::<u32>::new("t");
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let root = Root::new("engine");
+        let producers = root.group("producers");
+        let consumers = root.group("consumers");
+        let (b, g) = (bus.clone(), got.clone());
+        consumers
+            .spawn("Sink", move |scope| async move {
+                let (_addr, mut inbox) = scope.inbox::<u32>();
+                inbox.subscribe(&b, |_| true, |n| n);
+                Ok(Sink(inbox, g))
+            })
             .await
-            .expect("启动成功");
-
-        observer.actor_ref().stop_gracefully().await.expect("发送 Stop");
-        observer.actor_ref().wait_for_shutdown().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert!(supervisor.is_alive(), "主动收工却把监督者带走了");
+            .unwrap();
+        let b = bus.clone();
+        producers
+            .spawn("Producer", move |_scope| async move { Ok(FlushOnStop(b)) })
+            .await
+            .unwrap();
+        shutdown(root).await.expect("正常停机");
+        assert_eq!(*got.lock().unwrap(), [42], "生产者收尾补发的事件丢了");
     }
 }

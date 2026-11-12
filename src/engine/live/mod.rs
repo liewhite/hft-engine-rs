@@ -1,6 +1,4 @@
-//! Engine Actor 模块
-//!
-//! 包含引擎中各个 Actor 的实现
+//! 实盘引擎的各组件（任务树上的节点，见 `crate::tasks`）与组合根 [`Manager`]。
 
 pub mod assembly;
 mod clock;
@@ -83,19 +81,20 @@ pub fn to_paper_outlet(o: &AccountOutcome) -> bool {
 
 pub use assembly::{setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup};
 pub use clock::Clock;
-pub use manager::{AddStrategy, AddStrategies, GetAllSymbolMetas, ManagerActor, ManagerActorArgs, PublishCustomEvent, RegisterSupervisedChild, SubscribeAccount, SubscribeMarket, SubscribeOutcome, StrategySpec, RemoveStrategies};
-pub use executor::{ExecutorActor, ExecutorArgs, GetPositions, GetSeededPositions};
-pub use income_processor::{IncomeProcessorActor, RegisterExecutor, UnregisterExecutor};
+pub use manager::{
+    Manager, ManagerArgs, ManagerError, ManagerHandle, RemoveStrategies, StrategySpec,
+};
+pub use executor::{Executor, ExecutorArgs, ExecutorHandle, ExecutorId};
+pub use income_processor::{IncomeProcessor, IncomeProcessorHandle};
 pub use metrics::{Metrics, MetricsArgs, MetricsHandle, DEFAULT_REPORT_INTERVAL_MS};
 pub use outcome_processor::{OrderGateway, OutcomeProcessor, PlaceVerdict};
 pub use paper_counter::{PaperCounter, PaperCounterArgs};
 pub use position_ledger::{
-    GetLivePositions, PositionLedgerActor, PositionLedgerArgs, Reconciler, UnwatchExecutor,
-    WatchExecutor,
+    PositionLedger, PositionLedgerArgs, PositionLedgerHandle, Reconciler,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
 };
 pub use supervisor::{
-    Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,
+    Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, Supervisor,
     SupervisorArgs, SymbolRecord, SymbolPerformance,
 };
 

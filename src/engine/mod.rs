@@ -2,24 +2,19 @@ pub mod bootstrap;
 pub mod live;
 mod strategy_runner;
 
-pub use bootstrap::{
-    load_config, run_engine, run_main, spawn_supervised, Supervised,
-};
+pub use bootstrap::{load_config, run_engine, run_main};
 pub use strategy_runner::{
     ClientOrderIdGen, ExchangeUuidGen, SequentialClientOrderIdGen, StrategyRunner,
 };
 pub use live::{
-    AccountOutcome, AccountPubSub, AddStrategy, AddStrategies, ClockActor, ClockActorArgs,
+    AccountBus, AccountOutcome, Clock, Executor, ExecutorArgs, ExecutorHandle, ExecutorId,
     setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup,
-    ExecutorActor, ExecutorArgs,
-    GetAllSymbolMetas, IncomeProcessorActor, ManagerActor, ManagerActorArgs, MarketPubSub,
-    MetricsActor, MetricsActorArgs, OrderGateway, OutcomePubSub, OutcomeProcessorActor, PlaceVerdict,
-    RegisterExecutor,
-    PaperCounterActor, PaperCounterArgs,
-    GetLivePositions, PositionLedgerActor, PositionLedgerArgs, Reconciler,
+    IncomeProcessor, IncomeProcessorHandle, Manager, ManagerArgs, ManagerError, ManagerHandle,
+    MarketBus, Metrics, MetricsArgs, MetricsHandle, OrderGateway, OutcomeBus, OutcomeProcessor,
+    PlaceVerdict, PaperCounter, PaperCounterArgs,
+    PositionLedger, PositionLedgerArgs, PositionLedgerHandle, Reconciler,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
-    RegisterSymbols, RemoveStrategies, StrategySpec,
-    Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, SupervisorActor,
-    SupervisorArgs, SymbolRecord, SymbolPerformance, UnregisterExecutor,
-    SubscribeAccount, SubscribeMarket, SubscribeOutcome,
+    RemoveStrategies, StrategySpec,
+    Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, Supervisor,
+    SupervisorArgs, SymbolRecord, SymbolPerformance,
 };
