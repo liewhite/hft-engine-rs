@@ -1,58 +1,58 @@
-//! IbkrStatusPollingActor - 定时轮询 IBKR 市场状态
+//! IbkrStatusPoller - 定时轮询 IBKR 市场状态
 //!
 //! IBKR 股票交易所有明确的交易时段。
 //! 通过查询 AAPL 交易时间表判断当前市场状态 (Liquid/Extending/Closed)。
 //! API 失败时 warn 并跳过本轮，等待下次轮询重试。
 
 use crate::domain::{now_ms, Exchange, MarketStatus};
-use crate::messaging::MarketPubSub;
 use crate::exchange::ibkr::client::TradingSchedule;
 use crate::exchange::ibkr::IbkrClient;
-use crate::messaging::{MarketData, MarketEvent};
+use crate::messaging::{MarketBus, MarketData, MarketEvent};
+use crate::tasks::{ChildHandle, Group, GroupClosed, Periodic};
 use chrono::{Datelike, Timelike};
 use chrono_tz::US::Eastern;
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
-use kameo_actors::pubsub::Publish;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
-use tokio_stream::wrappers::IntervalStream;
 
-/// IbkrStatusPollingActor 初始化参数
-pub struct IbkrStatusPollingActorArgs {
-    /// IBKR client (用于查询交易时间表)
-    pub client: Arc<IbkrClient>,
-    /// Income PubSub (发布事件)
-    pub market_pubsub: ActorRef<MarketPubSub>,
-    /// 查询间隔 (毫秒)
-    pub interval_ms: u64,
-}
-
-/// IbkrStatusPollingActor - 定时轮询 IBKR 市场状态
-pub struct IbkrStatusPollingActor {
+/// 定时轮询 IBKR 市场状态
+pub(super) struct IbkrStatusPoller {
     client: Arc<IbkrClient>,
-    market_pubsub: ActorRef<MarketPubSub>,
+    market_bus: MarketBus,
     last_status: Option<MarketStatus>,
 }
 
-impl IbkrStatusPollingActor {
-    /// 执行一次状态轮询并发布事件
-    async fn poll_status(&mut self) {
+impl IbkrStatusPoller {
+    /// 在 `group` 下起轮询，每 `interval_ms` 毫秒一次（首次立即）
+    pub(super) fn spawn(
+        group: &Group,
+        client: Arc<IbkrClient>,
+        market_bus: MarketBus,
+        interval_ms: u64,
+    ) -> Result<ChildHandle, GroupClosed> {
+        tracing::info!(exchange = "IBKR", interval_ms, "IbkrStatusPoller started");
+        group.spawn_periodic(
+            "IbkrStatusPoller",
+            Duration::from_millis(interval_ms),
+            Self { client, market_bus, last_status: None },
+        )
+    }
+}
+
+impl Periodic for IbkrStatusPoller {
+    /// 执行一次状态轮询并发布事件（失败只告警，见下）
+    async fn tick(&mut self) -> anyhow::Result<()> {
         let schedules = match self.client.fetch_trading_schedule().await {
             Ok(s) => s,
             Err(e) => {
                 // 不接 StalenessGuard：取不到交易时段表时，`StateManager::market_status`
-                // 的缺省与本 actor 的判定都落在 `Closed`（不交易）—— 失败方向本身就是
+                // 的缺省与本组件的判定都落在 `Closed`（不交易）—— 失败方向本身就是
                 // 安全侧，再加一道致命守卫只会把"该歇着"变成"整机退出"。
                 tracing::warn!(
                     exchange = %Exchange::IBKR,
                     error = %e,
                     "Failed to fetch IBKR trading schedule"
                 );
-                return;
+                return Ok(());
             }
         };
         let status = determine_status_from_schedule(&schedules);
@@ -69,80 +69,15 @@ impl IbkrStatusPollingActor {
         }
 
         let local_ts = now_ms();
-        if let Err(e) = self
-            .market_pubsub
-            .tell(Publish(MarketEvent {
-                exchange_ts: local_ts,
-                local_ts,
-                data: MarketData::ExchangeStatus {
-                    exchange: Exchange::IBKR,
-                    status,
-                },
-            }))
-            .send()
-            .await
-        {
-            tracing::error!(error = %e, "Failed to publish to MarketPubSub");
-        }
-    }
-}
-
-impl Actor for IbkrStatusPollingActor {
-    type Args = IbkrStatusPollingActorArgs;
-    type Error = Infallible;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let interval = Duration::from_millis(args.interval_ms);
-
-        let interval_stream = IntervalStream::new(tokio::time::interval(interval));
-        actor_ref.attach_stream(interval_stream, (), ());
-
-        tracing::info!(
-            exchange = "IBKR",
-            interval_ms = interval.as_millis() as u64,
-            "IbkrStatusPollingActor started"
-        );
-
-        Ok(Self {
-            client: args.client,
-            market_pubsub: args.market_pubsub,
-            last_status: None,
-        })
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        tracing::info!("IbkrStatusPollingActor stopped");
+        self.market_bus.publish(MarketEvent {
+            exchange_ts: local_ts,
+            local_ts,
+            data: MarketData::ExchangeStatus {
+                exchange: Exchange::IBKR,
+                status,
+            },
+        });
         Ok(())
-    }
-}
-
-/// 定时器消息处理
-impl Message<StreamMessage<Instant, (), ()>> for IbkrStatusPollingActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Instant, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        match msg {
-            StreamMessage::Next(_) => {
-                self.poll_status().await;
-            }
-            StreamMessage::Started(_) => {
-                tracing::debug!("IBKR status polling stream started");
-            }
-            StreamMessage::Finished(_) => {
-                tracing::error!(
-                    "IBKR status polling stream unexpectedly finished, killing actor"
-                );
-                ctx.actor_ref().kill();
-            }
-        }
     }
 }
 

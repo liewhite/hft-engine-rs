@@ -130,7 +130,19 @@ impl IbkrClient {
         })
     }
 
-    /// 获取认证器 (Arc) 供 Actor 共享
+    /// 不联网的实例（单测用）：只带 conid 映射，任何 REST 调用都会失败
+    #[cfg(test)]
+    pub(crate) fn for_test(conids: HashMap<String, i64>) -> Self {
+        Self {
+            http: Client::new(),
+            auth: Arc::new(super::gateway::IbkrGateway::new("https://127.0.0.1:1/v1/api/".into())),
+            account_id: "TEST".into(),
+            symbols: conids.keys().cloned().collect(),
+            conids,
+        }
+    }
+
+    /// 获取认证器 (Arc) 供各组件共享
     pub fn auth(&self) -> Arc<dyn IbkrAuth> {
         self.auth.clone()
     }

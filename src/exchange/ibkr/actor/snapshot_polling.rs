@@ -1,28 +1,21 @@
-//! IbkrSnapshotPollingActor - 定时轮询 IBKR 借券费/可借量 + 现汇汇率
+//! IbkrSnapshotPoller - 定时轮询 IBKR 借券费/可借量 + 现汇汇率
 //!
-//! 与 account_polling / status_polling 同范式：IbkrActor 的 spawn_link 子 actor，定时拉取——
+//! 与 status_polling 同范式：IbkrNode 下的定时子任务，定时拉取——
 //! 借券费/可借量走 `/iserver/marketdata/snapshot`（按 config 字段 tag + borrow_symbol conid），
 //! 汇率走专用端点 `/iserver/exchangerate`（按 config 的 source/target 货币）——组装成
-//! `BorrowFee`/`ExchangeRate` 直接 Publish 到 market_pubsub（策略与监控经同一 income 流消费）。
+//! `BorrowFee`/`ExchangeRate` 直接发布到行情总线（策略与监控经同一 income 流消费）。
 //!
 //! **没有兜底常量、绝不用假数据**：拉取/解析失败即 ERROR；借券费或汇率距上次成功更新超过
-//! `max_staleness_ms`（含启动宽限）即判定数据源失效 → `kill()` 自己 → 经 IbkrActor 的
-//! link 监管上抛 → ManagerActor `on_link_died` → 整个系统致命退出（宁可重启，绝不糊弄）。
+//! `max_staleness_ms`（含启动宽限）即判定数据源失效 → 本组件出错退出 → 经任务树上冒，
+//! 整个系统致命退出（宁可重启，绝不糊弄）。
 
 use crate::domain::{now_ms, BorrowFee, Exchange, ExchangeRate};
-use crate::messaging::MarketPubSub;
 use crate::exchange::ibkr::IbkrClient;
-use crate::messaging::{MarketData, MarketEvent};
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::ActorStopReason;
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
-use kameo_actors::pubsub::Publish;
+use crate::messaging::{MarketBus, MarketData, MarketEvent};
+use crate::tasks::{ChildHandle, Group, Periodic};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
-use tokio_stream::wrappers::IntervalStream;
 
 fn default_max_staleness_ms() -> u64 {
     300_000
@@ -53,21 +46,14 @@ pub struct IbkrSnapshotConfig {
     pub max_staleness_ms: u64,
 }
 
-/// 初始化参数
-pub struct IbkrSnapshotPollingActorArgs {
-    pub client: Arc<IbkrClient>,
-    pub market_pubsub: ActorRef<MarketPubSub>,
-    pub cfg: IbkrSnapshotConfig,
-}
-
-/// IbkrSnapshotPollingActor
-pub struct IbkrSnapshotPollingActor {
+/// 借券费/汇率 snapshot 轮询
+pub(super) struct IbkrSnapshotPoller {
     client: Arc<IbkrClient>,
-    market_pubsub: ActorRef<MarketPubSub>,
+    market_bus: MarketBus,
     cfg: IbkrSnapshotConfig,
-    /// borrow_symbol 解析到的 conid（on_start 解析，解析不到即致命）
+    /// borrow_symbol 解析到的 conid（构造时解析，解析不到即致命）
     borrow_conid: i64,
-    /// actor 启动时刻（用于启动宽限内的过期判定）
+    /// 组件启动时刻（用于启动宽限内的过期判定）
     started_ms: u64,
     /// 借券费/汇率最近一次成功更新时刻（None = 启动后尚未成功）
     last_borrow_ok_ms: Option<u64>,
@@ -77,7 +63,57 @@ pub struct IbkrSnapshotPollingActor {
     borrow_frozen: bool,
 }
 
-impl IbkrSnapshotPollingActor {
+impl IbkrSnapshotPoller {
+    /// 校验配置并在 `group` 下起轮询（首次立即）。配置不合法 → Err（启动失败，不静默降级）。
+    pub(super) fn spawn(
+        group: &Group,
+        client: Arc<IbkrClient>,
+        market_bus: MarketBus,
+        cfg: IbkrSnapshotConfig,
+    ) -> anyhow::Result<ChildHandle> {
+        // 配置即时校验：解析不到 borrow conid、或 fx_target/fx_source 未配置 → 致命（不静默降级）
+        let borrow_conid = client.conid_of(&cfg.borrow_symbol).ok_or_else(|| {
+            anyhow::anyhow!(
+                "IBKR snapshot poller: borrow_symbol '{}' 无法解析到 conid",
+                cfg.borrow_symbol
+            )
+        })?;
+        if cfg.fx_target.trim().is_empty() || cfg.fx_source.trim().is_empty() {
+            anyhow::bail!("IBKR snapshot poller: fx_target/fx_source 未配置 (不能为空)");
+        }
+        // 轮询间隔必须显著小于过期阈值，否则一 tick 就过期 → 必然重启循环
+        if cfg.poll_interval_ms >= cfg.max_staleness_ms {
+            anyhow::bail!(
+                "IBKR snapshot poller: poll_interval_ms ({}) 必须 < max_staleness_ms ({})",
+                cfg.poll_interval_ms,
+                cfg.max_staleness_ms
+            );
+        }
+
+        let interval = Duration::from_millis(cfg.poll_interval_ms.max(1_000));
+        tracing::info!(
+            exchange = "IBKR",
+            borrow_symbol = %cfg.borrow_symbol,
+            borrow_conid,
+            fx_source = %cfg.fx_source,
+            fx_target = %cfg.fx_target,
+            interval_ms = interval.as_millis() as u64,
+            max_staleness_ms = cfg.max_staleness_ms,
+            "IbkrSnapshotPoller started"
+        );
+        let poller = Self {
+            client,
+            market_bus,
+            cfg,
+            borrow_conid,
+            started_ms: now_ms(),
+            last_borrow_ok_ms: None,
+            last_fx_ok_ms: None,
+            borrow_frozen: false,
+        };
+        Ok(group.spawn_periodic("IbkrSnapshotPoller", interval, poller)?)
+    }
+
     /// 拉借券费 + 可借量 → BorrowFee 事件；成功则更新 last_borrow_ok_ms
     async fn poll_borrow(&mut self) {
         match self
@@ -114,8 +150,7 @@ impl IbkrSnapshotPollingActor {
                             fee_annual: fe * self.cfg.fee_scale,
                             shortable_shares: sh,
                             timestamp: ts,
-                        }))
-                        .await;
+                        }));
                         self.last_borrow_ok_ms = Some(ts);
                     }
                     (Some(sh), Some(fe)) => tracing::error!(
@@ -162,8 +197,7 @@ impl IbkrSnapshotPollingActor {
                     quote: self.cfg.fx_target.clone(),
                     rate,
                     timestamp: ts,
-                }))
-                .await;
+                }));
                 self.last_fx_ok_ms = Some(ts);
             }
             Ok(rate) => tracing::error!(rate, "IBKR 汇率值无效 (应为正)，不计入成功"),
@@ -171,20 +205,13 @@ impl IbkrSnapshotPollingActor {
         }
     }
 
-    async fn publish(&self, data: MarketData) {
+    fn publish(&self, data: MarketData) {
         let ts = now_ms();
-        if let Err(e) = self
-            .market_pubsub
-            .tell(Publish(MarketEvent {
-                exchange_ts: ts,
-                local_ts: ts,
-                data,
-            }))
-            .send()
-            .await
-        {
-            tracing::error!(error = %e, "Failed to publish IBKR snapshot event to MarketPubSub");
-        }
+        self.market_bus.publish(MarketEvent {
+            exchange_ts: ts,
+            local_ts: ts,
+            data,
+        });
     }
 
     /// 过期判定：借券费或汇率距上次成功更新（未成功过则从启动时刻算）超过 max_staleness_ms
@@ -201,96 +228,19 @@ impl IbkrSnapshotPollingActor {
     }
 }
 
-impl Actor for IbkrSnapshotPollingActor {
-    type Args = IbkrSnapshotPollingActorArgs;
-    type Error = anyhow::Error;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 配置即时校验：解析不到 borrow conid、或 fx_target/fx_source 未配置 → 致命（不静默降级）
-        let borrow_conid = args.client.conid_of(&args.cfg.borrow_symbol).ok_or_else(|| {
-            anyhow::anyhow!(
-                "IBKR snapshot poller: borrow_symbol '{}' 无法解析到 conid",
-                args.cfg.borrow_symbol
-            )
-        })?;
-        if args.cfg.fx_target.trim().is_empty() || args.cfg.fx_source.trim().is_empty() {
-            anyhow::bail!("IBKR snapshot poller: fx_target/fx_source 未配置 (不能为空)");
-        }
-        // 轮询间隔必须显著小于过期阈值，否则一 tick 就过期 → 必然重启循环
-        if args.cfg.poll_interval_ms >= args.cfg.max_staleness_ms {
-            anyhow::bail!(
-                "IBKR snapshot poller: poll_interval_ms ({}) 必须 < max_staleness_ms ({})",
-                args.cfg.poll_interval_ms,
-                args.cfg.max_staleness_ms
-            );
-        }
-
-        let interval = Duration::from_millis(args.cfg.poll_interval_ms.max(1_000));
-        actor_ref.attach_stream(IntervalStream::new(tokio::time::interval(interval)), (), ());
-
-        tracing::info!(
-            exchange = "IBKR",
-            borrow_symbol = %args.cfg.borrow_symbol,
-            borrow_conid,
-            fx_source = %args.cfg.fx_source,
-            fx_target = %args.cfg.fx_target,
-            interval_ms = interval.as_millis() as u64,
-            max_staleness_ms = args.cfg.max_staleness_ms,
-            "IbkrSnapshotPollingActor started"
+impl Periodic for IbkrSnapshotPoller {
+    async fn tick(&mut self) -> anyhow::Result<()> {
+        self.poll_borrow().await;
+        self.poll_fx().await;
+        // 过期即致命：出错退出 → 经任务树上冒，整机退出
+        anyhow::ensure!(
+            !self.is_stale(now_ms()),
+            "IBKR 借券费/汇率数据源失效 (超过 max_staleness_ms={})：last_borrow_ok_ms={:?} last_fx_ok_ms={:?}",
+            self.cfg.max_staleness_ms,
+            self.last_borrow_ok_ms,
+            self.last_fx_ok_ms
         );
-
-        Ok(Self {
-            client: args.client,
-            market_pubsub: args.market_pubsub,
-            cfg: args.cfg,
-            borrow_conid,
-            started_ms: now_ms(),
-            last_borrow_ok_ms: None,
-            last_fx_ok_ms: None,
-            borrow_frozen: false,
-        })
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        tracing::info!(reason = ?reason, "IbkrSnapshotPollingActor stopped");
         Ok(())
-    }
-}
-
-impl Message<StreamMessage<Instant, (), ()>> for IbkrSnapshotPollingActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Instant, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        match msg {
-            StreamMessage::Next(_) => {
-                self.poll_borrow().await;
-                self.poll_fx().await;
-                // 过期即致命：kill 自己 → IbkrActor.on_link_died → ManagerActor 整机退出
-                let now = now_ms();
-                if self.is_stale(now) {
-                    tracing::error!(
-                        max_staleness_ms = self.cfg.max_staleness_ms,
-                        last_borrow_ok_ms = ?self.last_borrow_ok_ms,
-                        last_fx_ok_ms = ?self.last_fx_ok_ms,
-                        "IBKR 借券费/汇率数据源失效 (超过 max_staleness)，poller 致命退出"
-                    );
-                    ctx.actor_ref().kill();
-                }
-            }
-            StreamMessage::Started(_) => {}
-            StreamMessage::Finished(_) => {
-                tracing::error!("IBKR snapshot polling stream 意外结束，poller 致命退出");
-                ctx.actor_ref().kill();
-            }
-        }
     }
 }
 
@@ -324,7 +274,7 @@ fn eval_stale(
 /// IBKR 行情可用性字段 tag（协议常量，非账户/合约事实）。首字母表征数据类型：
 /// R=实时 / D=延迟 / Z=冻结(收盘最后值) / Y=冻结延迟 / N=未订阅。
 ///
-/// `pub(crate)`：ws 订阅的字段并集也要带上它（见 `IbkrPublicWsActorArgs::extra_md_fields`），
+/// `pub(crate)`：ws 订阅的字段并集也要带上它（见 `IbkrPublicWs::spawn` 的 `extra_md_fields`），
 /// 否则刷新后该 conid 的字段集里没有 6509，本 poller 就判不出冻结态。
 pub(crate) const MD_AVAILABILITY_FIELD: &str = "6509";
 

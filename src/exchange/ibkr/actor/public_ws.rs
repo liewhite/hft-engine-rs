@@ -1,16 +1,17 @@
-//! IbkrPublicWsActor - 管理 IBKR WebSocket 连接
+//! IbkrPublicWs - 管理 IBKR WebSocket 连接
 //!
 //! 职责:
-//! - 维护 WebSocket 连接
+//! - 维护 WebSocket 连接（读循环是子任务，见 [`WsConn`]）
 //! - 处理 BBO 订阅 (smd topic)：订阅前先行情预热 (pre-flight snapshot)，见 `send_subscribe`；
 //!   订阅后按 `SMD_REFRESH_INTERVAL` 周期性刷新，见 `refresh_subscriptions`
 //! - 处理订单状态推送 (sor topic)
-//! - 增量更新 bid/ask 缓存并发布 BBO 到 MarketPubSub
+//! - 处理成交推送 (str topic)：两条消息配对补 commission，见 [`FillPairing`]
+//! - 增量更新 bid/ask 缓存并发布 BBO 到行情总线
 //!
 //! **IBKR 的 smd 订阅会被服务端自动终止**（2026-04-10 起的行为变更）。终止时**没有 close 帧、
 //! 没有错误**，流就静默停掉——ws 连接、ping、tickle 全都照常健康，因此完全不可从连接层察觉
 //! (实测：韩股腿断流后报价冻结、且不自愈，同一条 ws 上另一条腿因被借券 snapshot 轮询顺带续命
-//! 而无恙)。故本 actor 必须在到期前主动重订阅；IBKR 建议先 `umd+` 再 `smd+` 干净刷新。
+//! 而无恙)。故本组件必须在到期前主动重订阅；IBKR 建议先 `umd+` 再 `smd+` 干净刷新。
 //!
 //! # BBO 只在价量真的变化时发布
 //!
@@ -26,12 +27,12 @@
 //! 等于"该报价第一次被观测到的时刻"，语义自洽。
 //!
 //! 代价是"行情静止"与"链路断流"在 BBO 流上不再可分。这是对的——链路存活本就不该由行情流
-//! 兼职承担：ws keepalive、tickle、以及本 actor 的 smd 周期刷新（失败即致命）已经独立证明它。
+//! 兼职承担：ws keepalive、tickle、以及本组件的 smd 周期刷新（失败即致命）已经独立证明它。
 //! 反过来，一个几分钟没动过的盘口本来就该被判为陈旧，策略不该在上面算偏离度。
 //!
-//! 该不变量**不覆盖进程重启后的第一条回包**：缓存是 actor 内存态，重启即清空，于是首条回包
+//! 该不变量**不覆盖进程重启后的第一条回包**：缓存是组件内存态，重启即清空，于是首条回包
 //! 哪怕带的还是上一个交易日的收盘价，也会被判为"变化"而发布一次。这里不额外设防，因为本
-//! actor 致命会经 `on_link_died` 整机退出——策略的 EMA 随之清零，需重新预热满 `ema_period`
+//! 组件致命会经任务树整机退出——策略的 EMA 随之清零，需重新预热满 `ema_period`
 //! 条才产出偏离度，闭市期间单条 BBO 撑不起任何信号。写在这里是为了说明它是**有条件的**
 //! 不变量，别让后来者以为"发出来的每一条都必定是新报价"。
 //!
@@ -41,38 +42,33 @@
 //! 的 10 分钟**为约束（见 `SMD_SERVER_TTL`），刷新周期取 8 分钟。
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO};
-use crate::messaging::{AccountPubSub, MarketPubSub};
-use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
+use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::client::IbkrClient;
 use crate::exchange::ibkr::wire;
-use crate::exchange::ws_loop;
-use crate::messaging::{SymbolAccountData, AccountData, AccountEvent, MarketData, MarketEvent};
-use futures_util::StreamExt;
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::ActorStopReason;
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
-use kameo_actors::pubsub::Publish;
+use crate::exchange::ws_loop::{self, WsConn};
+use crate::messaging::{
+    AccountBus, AccountData, AccountEvent, MarketBus, MarketData, MarketEvent, SymbolAccountData,
+};
+use crate::tasks::{Addr, Group, Inbox, Scope, Task};
+use anyhow::Context as _;
+use futures_util::{SinkExt, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time::Instant;
-use tokio_stream::wrappers::{IntervalStream, ReceiverStream};
-use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http};
+use tokio::time::{Instant, MissedTickBehavior};
+use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http, Message as WsMessage};
 
-/// IbkrPublicWsActor 初始化参数
-pub struct IbkrPublicWsActorArgs {
+/// IbkrPublicWs 构造参数
+pub(super) struct IbkrPublicWsArgs {
     /// 认证器 (共享，不可变)
     pub auth: Arc<dyn IbkrAuth>,
     /// REST client (共享)：订阅前的行情预热走它的 `preflight_market_data`
     pub client: Arc<IbkrClient>,
-    /// 行情总线（发布事件）
     /// 公共行情总线（BBO）
-    pub market_pubsub: ActorRef<MarketPubSub>,
+    pub market_bus: MarketBus,
     /// 账户私有事件总线（sor 订单更新 / str 成交 —— IBKR 用同一条 WS 混发公私两类 topic）
-    pub account_pubsub: ActorRef<AccountPubSub>,
+    pub account_bus: AccountBus,
     /// conid 映射 (symbol → conid)
     pub conids: HashMap<String, i64>,
     /// tickle 返回的 session_id (用于 WS Cookie)
@@ -81,7 +77,7 @@ pub struct IbkrPublicWsActorArgs {
     /// 可用性）。
     ///
     /// 为什么要在这里给：IBKR 对每个 conid 只维护一份活跃字段集，snapshot 与 ws 共用它。本
-    /// actor 的 `umd+`→`smd+` 刷新会把该 conid 的字段集重建成"本次 smd 请求的那套"，别人注册
+    /// 组件的 `umd+`→`smd+` 刷新会把该 conid 的字段集重建成"本次 smd 请求的那套"，别人注册
     /// 的字段会被连带抹掉（实测每逢刷新，借券 poller 就拿到只有 BBO 字段的空壳）。故字段集必须
     /// 是**并集**，并且由这一处（唯一重建它的地方）负责完整声明。
     pub extra_md_fields: Vec<String>,
@@ -128,8 +124,8 @@ impl BboCache {
 }
 
 const MAX_SEEN_EXECUTIONS: usize = 10_000;
-/// Fill commission 等待超时 (秒)
-const FILL_COMMISSION_TIMEOUT_SECS: u64 = 3;
+/// Fill commission 等待超时
+const FILL_COMMISSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// BBO 订阅的 IBKR 字段 tag：84=bid_price 86=ask_price 85=ask_size 88=bid_size。
 /// 预热 (snapshot) 与流式订阅 (smd) 共用同一份，保证"预热的字段"就是"要推的字段"。
@@ -137,7 +133,7 @@ const BBO_FIELDS: [&str; 4] = ["84", "86", "85", "88"];
 
 /// 该 conid 上要注册的完整字段集 = BBO ∪ 其他调用方声明的字段（去重、保持顺序）。
 ///
-/// IBKR 每个 conid 只有一份活跃字段集，而本 actor 是唯一重建它的地方（`umd+`→`smd+`），
+/// IBKR 每个 conid 只有一份活跃字段集，而本组件是唯一重建它的地方（`umd+`→`smd+`），
 /// 所以这里必须给全——漏掉谁的字段，谁就会在每次刷新后拿到空壳。
 fn merge_md_fields(base: &[&str], extra: &[String]) -> Vec<String> {
     let mut out: Vec<String> = base.iter().map(|s| s.to_string()).collect();
@@ -169,50 +165,157 @@ fn umd_message(conid: i64) -> String {
     format!("umd+{}+{{}}", conid)
 }
 
-/// 暂存的 Fill (等待 commission 到来)
-struct PendingFill {
-    fill: Fill,
-    order_update: Option<OrderUpdate>,
+/// 连接 IBKR WebSocket（需要 Cookie + User-Agent + 标准 WebSocket 握手 header；Gateway 模式
+/// 另需跳过证书验证的 TLS connector，由 `auth.ws_connector()` 给出）
+async fn connect(
+    auth: &dyn IbkrAuth,
+    session_id: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ExchangeError,
+> {
+    let ws_url = auth.ws_url();
+    let connector = auth
+        .ws_connector()
+        .map_err(|e| ExchangeError::Other(format!("IBKR failed to build WS connector: {e}")))?;
+    let cookie = auth.format_ws_cookie(session_id);
+    let uri: http::Uri = ws_url
+        .parse()
+        .map_err(|e| ExchangeError::Other(format!("IBKR invalid WS URL: {e}")))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| ExchangeError::Other("IBKR WS URL missing host".into()))?;
+    let ws_key = generate_key();
+    let ws_request = http::Request::builder()
+        .uri(&ws_url)
+        .header("Host", host)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", &ws_key)
+        .header("Cookie", &cookie)
+        .header("User-Agent", "ClientPortalGW/1")
+        .body(())
+        .map_err(|e| ExchangeError::Other(format!("IBKR failed to build WS request: {e}")))?;
+
+    // 安全：ws_url 含 OAuth access_token，cookie 是 session cookie，严禁进日志。
+    // 只打印 host。
+    tracing::info!(host = %host, "Connecting IBKR WebSocket");
+
+    let (ws_stream, _) = match connector {
+        Some(conn) => {
+            tokio_tungstenite::connect_async_tls_with_config(ws_request, None, false, Some(conn))
+                .await
+                .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
+        }
+        None => tokio_tungstenite::connect_async(ws_request)
+            .await
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?,
+    };
+    Ok(ws_stream)
 }
 
-/// Commission 超时消息 — 通知 actor 某个 execution_id 等待超时
-struct FillCommissionTimeout {
-    execution_id: String,
-}
-
-/// IbkrPublicWsActor
-pub struct IbkrPublicWsActor {
-    market_pubsub: ActorRef<MarketPubSub>,
-    account_pubsub: ActorRef<AccountPubSub>,
+/// IBKR 公共 WS 组件（实际混发公私两类 topic，见 [`IbkrPublicWsArgs::account_bus`]）
+pub(super) struct IbkrPublicWs {
+    inbox: Inbox<ExchangeCmd>,
+    conn: WsConn,
+    market_bus: MarketBus,
+    account_bus: AccountBus,
     /// REST client：订阅前行情预热用
     client: Arc<IbkrClient>,
     /// conid 映射 (symbol → conid)
     conids: HashMap<String, i64>,
     /// 反向映射 (conid → symbol)
-    conid_to_symbol: HashMap<i64, String>,
+    conid_to_symbol: Arc<HashMap<i64, String>>,
     /// 该 conid 要注册的完整字段集 (BBO ∪ 他方字段)，预热与 smd 共用同一份
     md_fields: Vec<String>,
-    /// 发送消息到 ws_loop 的 channel
-    ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的 kinds
     subscribed: HashSet<SubscriptionKind>,
     /// 每个 conid 的 BBO 缓存
     bbo_cache: HashMap<i64, BboCache>,
-    /// 已完成推送的 execution_id 集合（去重）
-    seen_executions: HashSet<String>,
-    /// 按插入顺序记录 execution_id，用于淘汰最旧条目
-    seen_executions_order: VecDeque<String>,
-    /// 等待 commission 的 pending fills (execution_id → PendingFill)
-    pending_fills: HashMap<String, PendingFill>,
+    /// str 成交的两条消息配对（等 commission）
+    fills: FillPairing,
 }
 
-impl IbkrPublicWsActor {
+impl IbkrPublicWs {
+    /// 在 `group` 下起 IBKR WS，等连接建好、sor/str 订阅发出，返回命令地址
+    pub(super) async fn spawn(
+        group: &Group,
+        args: IbkrPublicWsArgs,
+    ) -> anyhow::Result<Addr<ExchangeCmd>> {
+        let (_, addr) = group
+            .spawn_addressed("IbkrPublicWs", move |scope: Scope, inbox| async move {
+                // 连接失败向上传播 → 启动期受控退出，不重试/不重连
+                let (write, read) = connect(&*args.auth, &args.session_id).await?.split();
+                Self::build(&scope, inbox, args, read, write).await
+            })
+            .await?;
+        Ok(addr)
+    }
+
+    /// 在已建好的连接上完成构造：读循环挂成子任务、发 sor/str 订阅
+    async fn build(
+        scope: &Scope,
+        inbox: Inbox<ExchangeCmd>,
+        args: IbkrPublicWsArgs,
+        read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin
+            + Send
+            + 'static,
+        write: impl SinkExt<WsMessage> + Unpin + Send + 'static,
+    ) -> anyhow::Result<Self> {
+        let conn = WsConn::spawn(
+            &scope.group("conn"),
+            "IbkrPublicWsLoop",
+            read,
+            write,
+            ws_loop::WsKeepalive::ibkr(),
+        )?;
+
+        // 订阅订单状态推送 (sor topic)。发送失败只可能是读循环已退出，原因由它自己上报
+        match conn.send("sor+{}".to_string()).await {
+            Ok(()) => tracing::info!("IBKR sor (order status) subscription sent"),
+            Err(e) => tracing::error!(error = %e, "Failed to send IBKR sor subscription"),
+        }
+        // 订阅成交推送 (str topic)
+        match conn.send(r#"str+{"realtimeUpdatesOnly":true}"#.to_string()).await {
+            Ok(()) => tracing::info!("IBKR str (trades) subscription sent"),
+            Err(e) => tracing::error!(error = %e, "Failed to send IBKR str subscription"),
+        }
+
+        let md_fields = merge_md_fields(&BBO_FIELDS, &args.extra_md_fields);
+        tracing::info!(
+            exchange = "IBKR",
+            fields = ?md_fields,
+            "IBKR 行情字段集 (BBO ∪ 他方字段；IBKR 每 conid 只维护一份，故必须给全)"
+        );
+
+        // 构建反向映射
+        let conid_to_symbol: Arc<HashMap<i64, String>> =
+            Arc::new(args.conids.iter().map(|(s, c)| (*c, s.clone())).collect());
+
+        tracing::info!("IbkrPublicWs started");
+        Ok(Self {
+            inbox,
+            conn,
+            market_bus: args.market_bus,
+            account_bus: args.account_bus.clone(),
+            client: args.client,
+            conids: args.conids,
+            conid_to_symbol: conid_to_symbol.clone(),
+            md_fields,
+            subscribed: HashSet::new(),
+            bbo_cache: HashMap::new(),
+            fills: FillPairing::new(args.account_bus, conid_to_symbol),
+        })
+    }
+
     /// 发送 WebSocket 订阅消息
     ///
     /// **先预热再订阅**：IBKR 要求先对 conid 打一次 `/iserver/marketdata/snapshot`，IServer 才会
     /// 开始消费该合约的实时流；未预热就发 `smd` 只能收到订阅瞬间的一份值、之后不再有增量。
     ///
-    /// 预热失败即**致命**（Err 上抛 → 调用方 kill actor → 经 on_link_died 整机退出，与借券
+    /// 预热失败即**致命**（Err 上抛 → 本组件出错退出 → 经任务树整机退出，与借券
     /// snapshot poller 的"数据源失效即退出"同口径）：没预热的订阅是一条假活的行情线——有价、
     /// 但永远陈旧，比没有行情更危险。宁可退出重来，不留降级分支。
     async fn send_subscribe(&self, conid: i64) -> Result<(), WsError> {
@@ -221,27 +324,12 @@ impl IbkrPublicWsActor {
             .preflight_market_data(conid, &fields)
             .await
             .map_err(|e| WsError::Network(format!("行情预热失败 conid={conid}: {e}")))?;
-
-        let msg = smd_message(conid, &fields);
-        let tx = self
-            .ws_tx
-            .as_ref()
-            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
-        tx.send(msg)
-            .await
-            .map_err(|_| WsError::Network("Channel closed".to_string()))
+        self.conn.send(smd_message(conid, &fields)).await
     }
 
     /// 发送 WebSocket 取消订阅消息
     async fn send_unsubscribe(&self, conid: i64) -> Result<(), WsError> {
-        let msg = umd_message(conid);
-        let tx = self
-            .ws_tx
-            .as_ref()
-            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
-        tx.send(msg)
-            .await
-            .map_err(|_| WsError::Network("Channel closed".to_string()))
+        self.conn.send(umd_message(conid)).await
     }
 
     /// 在服务端 TTL (`SMD_SERVER_TTL`) 到期前重订阅所有已订阅的 BBO 腿。
@@ -250,8 +338,8 @@ impl IbkrPublicWsActor {
     /// smd 可能落在一个"服务端认为还在、实际已停"的状态上）。`send_subscribe` 内含预热，因此
     /// 刷新走的是与首次订阅完全相同的路径——不为刷新另开一套逻辑。
     ///
-    /// 任一腿刷新失败即返回 Err：调用方 kill actor → 整机退出。这条腿刷新不掉就等于服务端 TTL
-    /// 到期后静默变成死流，宁可退出重来。
+    /// 任一腿刷新失败即返回 Err → 本组件出错退出、整机退出。这条腿刷新不掉就等于服务端 TTL
+    /// 到期后静默变成死流（而这种死法从连接层完全看不出来），宁可退出重来，不留降级分支。
     ///
     /// **为什么重建时要带上他方字段**：IBKR 每个 conid 只维护一份活跃字段集（snapshot 与 ws
     /// 共用），`umd+` 会把它整个拆掉、`smd+` 按本次请求重建。曾经只重建 BBO 四字段，于是每逢
@@ -280,12 +368,77 @@ impl IbkrPublicWsActor {
         Ok(())
     }
 
+    async fn handle_cmd(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
+        match cmd {
+            ExchangeCmd::Subscribe(kind) => self.subscribe_batch(vec![kind]).await,
+            ExchangeCmd::SubscribeBatch(kinds) => self.subscribe_batch(kinds).await,
+            ExchangeCmd::Unsubscribe(kind) => self.unsubscribe(kind).await,
+        }
+    }
+
+    async fn subscribe_batch(&mut self, kinds: Vec<SubscriptionKind>) -> anyhow::Result<()> {
+        for kind in kinds {
+            // IBKR 只支持 BBO；其余类型跳过并告警（静默丢弃会让上游误以为已订阅）
+            let symbol = match &kind {
+                SubscriptionKind::BBO { symbol } => symbol.clone(),
+                other => {
+                    tracing::warn!(
+                        exchange = "IBKR",
+                        kind = ?other,
+                        "Unsupported subscription kind, skipping (IBKR only provides BBO)"
+                    );
+                    continue;
+                }
+            };
+
+            if self.subscribed.contains(&kind) {
+                continue;
+            }
+
+            let conid = match self.conids.get(&symbol) {
+                Some(c) => *c,
+                None => {
+                    tracing::warn!(
+                        exchange = "IBKR",
+                        symbol = %symbol,
+                        "Symbol not found in conid mapping, ignoring"
+                    );
+                    continue;
+                }
+            };
+
+            self.send_subscribe(conid)
+                .await
+                .with_context(|| format!("IBKR 订阅 {symbol} (conid={conid}) 失败"))?;
+
+            self.subscribed.insert(kind);
+            tracing::info!(exchange = "IBKR", symbol = %symbol, conid, "Subscribed to BBO");
+        }
+        Ok(())
+    }
+
+    async fn unsubscribe(&mut self, kind: SubscriptionKind) -> anyhow::Result<()> {
+        if !self.subscribed.remove(&kind) {
+            return Ok(());
+        }
+        if let SubscriptionKind::BBO { ref symbol } = kind {
+            if let Some(&conid) = self.conids.get(symbol) {
+                self.send_unsubscribe(conid)
+                    .await
+                    .with_context(|| format!("IBKR 退订 {symbol} (conid={conid}) 失败"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 处理一帧；失败即本组件出错退出（带原文）
+    fn handle_frame(&mut self, raw: &str) -> anyhow::Result<()> {
+        self.handle_message(raw)
+            .with_context(|| format!("IBKR WS 消息处理失败: {raw}"))
+    }
+
     /// 解析并处理 WebSocket 消息
-    async fn handle_message(
-        &mut self,
-        raw: &str,
-        actor_ref: &ActorRef<Self>,
-    ) -> Result<(), WsError> {
+    fn handle_message(&mut self, raw: &str) -> Result<(), WsError> {
         let local_ts = now_ms();
 
         let value: serde_json::Value =
@@ -294,10 +447,11 @@ impl IbkrPublicWsActor {
         // 路由: topic 以 "sor" 开头 → 订单状态更新; "str" 开头 → 成交推送
         if let Some(topic) = value.get("topic").and_then(|v| v.as_str()) {
             if topic.starts_with("sor") {
-                return self.handle_order_update(&value, local_ts).await;
+                self.handle_order_update(&value, local_ts);
+                return Ok(());
             }
             if topic.starts_with("str") {
-                return self.handle_trade_execution(&value, local_ts, actor_ref).await;
+                return self.fills.on_trade_message(&value, local_ts, Instant::now());
             }
         }
 
@@ -316,21 +470,17 @@ impl IbkrPublicWsActor {
             }
         };
 
-        self.handle_bbo(&value, conid, local_ts).await
+        self.handle_bbo(&value, conid, local_ts);
+        Ok(())
     }
 
     /// 处理 BBO 行情消息
-    async fn handle_bbo(
-        &mut self,
-        value: &serde_json::Value,
-        conid: i64,
-        local_ts: u64,
-    ) -> Result<(), WsError> {
+    fn handle_bbo(&mut self, value: &serde_json::Value, conid: i64, local_ts: u64) {
         let symbol = match self.conid_to_symbol.get(&conid) {
             Some(s) => s.clone(),
             None => {
                 tracing::warn!(conid, "Received data for unknown conid");
-                return Ok(());
+                return;
             }
         };
 
@@ -343,7 +493,7 @@ impl IbkrPublicWsActor {
             // debug 级：默认不输出，开了就是为了分辨"报文根本没到"与"到了但盘口没动"——
             // 这条腿静默时，这两者是完全不同的故障（前者是断流，后者是闭市/静市）。
             tracing::debug!(conid, symbol = %symbol, "IBKR BBO: 价量无变化，不发布");
-            return Ok(());
+            return;
         }
 
         // 当 bid > 0 && ask > 0 时发布 BBO
@@ -357,33 +507,22 @@ impl IbkrPublicWsActor {
                 ask_qty: cache.ask_size,
                 timestamp: local_ts,
             };
-
-            let event = MarketEvent {
+            self.market_bus.publish(MarketEvent {
                 exchange_ts: local_ts,
                 local_ts,
                 data: MarketData::BBO(bbo),
-            };
-
-            if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to MarketPubSub");
-            }
+            });
         }
-
-        Ok(())
     }
 
     /// 处理 sor 订单状态更新
     ///
     /// IBKR WS `sor` topic 推送订单更新，包含 order_ref (= 我们的 cOID)。
     /// 跳过无 order_ref 的非策略订单。
-    async fn handle_order_update(
-        &mut self,
-        value: &serde_json::Value,
-        local_ts: u64,
-    ) -> Result<(), WsError> {
+    fn handle_order_update(&self, value: &serde_json::Value, local_ts: u64) {
         let args = match value.get("args").and_then(|v| v.as_array()) {
             Some(arr) => arr,
-            None => return Ok(()),
+            None => return,
         };
 
         for item in args {
@@ -407,9 +546,7 @@ impl IbkrPublicWsActor {
                 .unwrap_or(0.0);
 
             let status = match ib_status {
-                "Submitted" if filled_qty > 0.0 => {
-                    OrderStatus::PartiallyFilled
-                }
+                "Submitted" if filled_qty > 0.0 => OrderStatus::PartiallyFilled,
                 "PendingSubmit" | "PreSubmitted" | "Submitted" => OrderStatus::Pending,
                 "Filled" => OrderStatus::Filled,
                 "Cancelled" => OrderStatus::Cancelled,
@@ -435,9 +572,7 @@ impl IbkrPublicWsActor {
 
             // 解析 symbol: 通过 conid 反查
             let conid = item.get("conid").and_then(|v| v.as_i64());
-            let symbol = conid.and_then(|c| self.conid_to_symbol.get(&c).cloned());
-
-            let symbol = match symbol {
+            let symbol = match conid.and_then(|c| self.conid_to_symbol.get(&c).cloned()) {
                 Some(s) => s,
                 None => {
                     tracing::warn!(
@@ -480,37 +615,121 @@ impl IbkrPublicWsActor {
                 quantity: 0.0,
             };
 
-            let event = AccountEvent {
+            self.account_bus.publish(AccountEvent {
                 // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
                 account: crate::domain::AccountId::Live,
                 exchange_ts: local_ts,
                 local_ts,
                 data: AccountData::Symbol(SymbolAccountData::OrderUpdate(update)),
-            };
+            });
+        }
+    }
+}
 
-            if let Err(e) = self.account_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to AccountPubSub");
+impl Task for IbkrPublicWs {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        // smd 刷新定时器：服务端到期会静默终止订阅，必须主动重订阅 (见模块文档)。
+        // 用 interval_at 跳过 tokio::time::interval 的"立即首跳"——刚订阅完不需要马上刷。
+        let mut refresh =
+            tokio::time::interval_at(Instant::now() + SMD_REFRESH_INTERVAL, SMD_REFRESH_INTERVAL);
+        refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        tracing::info!(
+            interval_secs = SMD_REFRESH_INTERVAL.as_secs(),
+            ttl_secs = SMD_SERVER_TTL.as_secs(),
+            "IBKR smd 刷新定时器已启动"
+        );
+        loop {
+            let commission_due = self.fills.next_deadline();
+            tokio::select! {
+                cmd = self.inbox.recv() => match cmd {
+                    Some(cmd) => self.handle_cmd(cmd).await?,
+                    None => {
+                        // 已经收到的帧处理完再走（可能有成交；仍在等 commission 的由 stop 补发）
+                        while let Some(raw) = self.conn.try_recv() {
+                            self.handle_frame(&raw)?;
+                        }
+                        return Ok(());
+                    }
+                },
+                frame = self.conn.recv() => self.handle_frame(&frame?)?,
+                // 刷新失败即致命：刷不上就等于这条腿到期后静默死掉，而这种死法从连接层完全
+                // 看不出来，所以不留降级分支
+                _ = refresh.tick() => self
+                    .refresh_subscriptions()
+                    .await
+                    .context("IBKR smd 订阅刷新失败")?,
+                _ = sleep_until_opt(commission_due) => self.fills.expire_due(Instant::now()),
             }
         }
-
-        Ok(())
     }
 
-    /// 处理 str 成交推送
-    ///
-    /// IBKR WS `str` topic 推送成交信息。解析后生成 Fill 事件更新仓位，
-    /// 同时生成 Filled OrderUpdate 关闭 pending order。
-    ///
-    /// IBKR 对同一笔成交推送 2 条消息（同一 execution_id）：
-    /// - 第一条：无 commission 字段
-    /// - 第二条：带 commission 字段
-    ///
-    /// 策略：第一条暂存，等第二条带 commission 后推送；超时 3 秒则以 fee=0 推送。
-    async fn handle_trade_execution(
+    /// 停机时把还在等 commission 的成交全部发出去（fee=0），直接发到账户总线
+    async fn stop(&mut self) -> anyhow::Result<()> {
+        self.fills.flush_all();
+        tracing::info!("IbkrPublicWs stopped");
+        Ok(())
+    }
+}
+
+/// 到点完成；`None` 永不完成（select 分支里"没有待办的定时"）
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
+// ============================================================================
+// str 成交配对
+// ============================================================================
+
+/// 暂存的 Fill (等待 commission 到来)
+struct PendingFill {
+    fill: Fill,
+    order_update: Option<OrderUpdate>,
+}
+
+/// str 成交推送的配对与去重。
+///
+/// IBKR 对同一笔成交推送 2 条消息（同一 execution_id）：
+/// - 第一条：无 commission 字段
+/// - 第二条：带 commission 字段
+///
+/// 策略：第一条暂存，等第二条带 commission 后发布；超时 3 秒则以 fee=0 发布；
+/// 停机时仍在等的以 fee=0 全部补发（见 [`Self::flush_all`]）。
+struct FillPairing {
+    account_bus: AccountBus,
+    /// 反向映射 (conid → symbol)
+    conid_to_symbol: Arc<HashMap<i64, String>>,
+    /// 已完成发布的 execution_id 集合（去重）
+    seen_executions: HashSet<String>,
+    /// 按插入顺序记录 execution_id，用于淘汰最旧条目
+    seen_executions_order: VecDeque<String>,
+    /// 等待 commission 的 pending fills (execution_id → PendingFill)
+    pending_fills: HashMap<String, PendingFill>,
+    /// 各 pending fill 的 commission 超时时刻。超时时长固定，按入队顺序即按到期顺序；
+    /// 第二条消息先到时条目留在队里，到期时 pending 里已没有它，空操作
+    deadlines: VecDeque<(Instant, String)>,
+}
+
+impl FillPairing {
+    fn new(account_bus: AccountBus, conid_to_symbol: Arc<HashMap<i64, String>>) -> Self {
+        Self {
+            account_bus,
+            conid_to_symbol,
+            seen_executions: HashSet::new(),
+            seen_executions_order: VecDeque::new(),
+            pending_fills: HashMap::new(),
+            deadlines: VecDeque::new(),
+        }
+    }
+
+    /// 处理一条 str 成交推送（`now` 用于排 commission 超时）
+    fn on_trade_message(
         &mut self,
         value: &serde_json::Value,
         local_ts: u64,
-        actor_ref: &ActorRef<Self>,
+        now: Instant,
     ) -> Result<(), WsError> {
         let args = match value.get("args").and_then(|v| v.as_array()) {
             Some(arr) => arr,
@@ -536,7 +755,7 @@ impl IbkrPublicWsActor {
                 )));
             }
 
-            // 已推送过的 execution_id，直接跳过
+            // 已发布过的 execution_id，直接跳过
             if self.seen_executions.contains(&execution_id) {
                 tracing::debug!(execution_id, "IBKR trade: already published, skipping");
                 continue;
@@ -587,7 +806,7 @@ impl IbkrPublicWsActor {
                         );
                     }
                 }
-                self.publish_fill(pending).await;
+                self.publish(pending);
                 self.mark_seen(execution_id);
                 continue;
             }
@@ -634,37 +853,6 @@ impl IbkrPublicWsActor {
                 )));
             }
 
-            // 如果第一条就带了 commission（罕见），直接推送
-            if let Some(fee) = commission {
-                tracing::info!(
-                    symbol = %symbol, side = ?side, price, size, order_ref, fee,
-                    "IBKR fill: commission in first message, publishing immediately"
-                );
-                let fill = Fill {
-                    exchange: Exchange::IBKR,
-                    symbol: symbol.clone(),
-                    order_id: execution_id.clone(),
-                    client_order_id: if order_ref.is_empty() { None } else { Some(order_ref.to_string()) },
-                    side,
-                    price,
-                    size,
-                    timestamp: local_ts,
-                    fee,
-                    reason: crate::domain::FillReason::Normal, // IBKR 执行流不区分强平/ADL
-                };
-                let order_update = self.build_order_update(item, order_ref, &symbol, side, size);
-                self.publish_fill(PendingFill { fill, order_update }).await;
-                self.mark_seen(execution_id);
-                continue;
-            }
-
-            // 暂存，等待 commission
-            tracing::info!(
-                symbol = %symbol, side = ?side, price, size, order_ref,
-                "IBKR fill: pending commission, waiting up to {}s",
-                FILL_COMMISSION_TIMEOUT_SECS
-            );
-
             let fill = Fill {
                 exchange: Exchange::IBKR,
                 symbol: symbol.clone(),
@@ -674,96 +862,100 @@ impl IbkrPublicWsActor {
                 price,
                 size,
                 timestamp: local_ts,
-                fee: 0.0,
+                fee: commission.unwrap_or(0.0),
                 reason: crate::domain::FillReason::Normal, // IBKR 执行流不区分强平/ADL
             };
-            let order_update = self.build_order_update(item, order_ref, &symbol, side, size);
-            self.pending_fills.insert(execution_id.clone(), PendingFill { fill, order_update });
+            let order_update = build_order_update(item, order_ref, &symbol, side, size);
 
-            // 启动超时定时器
-            let actor_ref = actor_ref.clone();
-            let eid = execution_id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(FILL_COMMISSION_TIMEOUT_SECS)).await;
-                // 这条定时消息是该 fill 的**唯一兜底发布路径**：投递不到就意味着这笔成交
-                // 永远留在 pending_fills 里、永不发布（本地持仓从此落后于交易所）。
-                // actor 已停机时投递失败是预期的（on_stop 会 flush 掉残留），其余情况必须
-                // 留下记录 —— 静默丢一笔成交是本次审计要消灭的那类问题。
-                if let Err(e) = actor_ref
-                    .tell(FillCommissionTimeout { execution_id: eid.clone() })
-                    .send()
-                    .await
-                {
-                    tracing::error!(
-                        execution_id = %eid, error = %e,
-                        "IBKR fill 的 commission 超时消息投递失败，该笔成交可能未发布"
-                    );
-                }
-            });
+            // 如果第一条就带了 commission（罕见），直接发布
+            if let Some(fee) = commission {
+                tracing::info!(
+                    symbol = %symbol, side = ?side, price, size, order_ref, fee,
+                    "IBKR fill: commission in first message, publishing immediately"
+                );
+                self.publish(PendingFill { fill, order_update });
+                self.mark_seen(execution_id);
+                continue;
+            }
+
+            // 暂存，等待 commission
+            tracing::info!(
+                symbol = %symbol, side = ?side, price, size, order_ref,
+                "IBKR fill: pending commission, waiting up to {}s",
+                FILL_COMMISSION_TIMEOUT.as_secs()
+            );
+            self.pending_fills
+                .insert(execution_id.clone(), PendingFill { fill, order_update });
+            self.deadlines
+                .push_back((now + FILL_COMMISSION_TIMEOUT, execution_id));
         }
 
         Ok(())
     }
 
-    /// 构建 Filled OrderUpdate（如有 order_ref）
-    fn build_order_update(
-        &self,
-        item: &serde_json::Value,
-        order_ref: &str,
-        symbol: &str,
-        side: Side,
-        size: f64,
-    ) -> Option<OrderUpdate> {
-        if order_ref.is_empty() {
-            return None;
-        }
-        let order_id = wire::order_id(item.get("orderId")).unwrap_or_default();
-        Some(OrderUpdate {
-            order_id,
-            client_order_id: Some(order_ref.to_string()),
-            exchange: Exchange::IBKR,
-            symbol: symbol.to_string(),
-            side,
-            status: OrderStatus::Filled,
-            quantity: size,
-        })
+    /// 最早一笔待发成交的 commission 超时时刻
+    fn next_deadline(&self) -> Option<Instant> {
+        self.deadlines.front().map(|(t, _)| *t)
     }
 
-    /// 推送 Fill + OrderUpdate 到 IncomePubSub
-    async fn publish_fill(&self, pending: PendingFill) {
-        let local_ts = pending.fill.timestamp;
-        if let Err(e) = self
-            .account_pubsub
-            .tell(Publish(AccountEvent {
-                account: crate::domain::AccountId::Live,
-                exchange_ts: local_ts,
-                local_ts,
-                data: AccountData::Symbol(SymbolAccountData::Fill(pending.fill)),
-            }))
-            .send()
-            .await
-        {
-            tracing::error!(error = %e, "Failed to publish Fill to AccountPubSub");
-        }
-
-        if let Some(order_update) = pending.order_update {
-            if let Err(e) = self
-                .account_pubsub
-                .tell(Publish(AccountEvent {
-                    account: crate::domain::AccountId::Live,
-                    exchange_ts: local_ts,
-                    local_ts,
-                    data: AccountData::Symbol(SymbolAccountData::OrderUpdate(order_update)),
-                }))
-                .send()
-                .await
-            {
-                tracing::error!(error = %e, "Failed to publish OrderUpdate to AccountPubSub");
+    /// Commission 超时处理 — 已到期且仍在等的，以 fee=0 发布
+    fn expire_due(&mut self, now: Instant) {
+        while let Some((t, _)) = self.deadlines.front() {
+            if *t > now {
+                break;
+            }
+            let (_, execution_id) = self.deadlines.pop_front().expect("front 已确认存在");
+            if let Some(pending) = self.pending_fills.remove(&execution_id) {
+                tracing::warn!(
+                    execution_id,
+                    "IBKR fill: commission timeout ({}s), publishing with fee=0",
+                    FILL_COMMISSION_TIMEOUT.as_secs()
+                );
+                self.publish(pending);
+                self.mark_seen(execution_id);
             }
         }
     }
 
-    /// 标记 execution_id 为已推送，并维护 FIFO 淘汰
+    /// 停机时把还在等 commission 的成交全部发出去（fee=0）：它们是**已经发生的成交**，
+    /// 带着它们静默退出等于让本地持仓少记一笔，而下次启动的基线会把这个缺口固化下来
+    /// （基线只写一次、永不纠正）。手续费不准可以事后核对，持仓少一笔不行。
+    fn flush_all(&mut self) {
+        self.deadlines.clear();
+        let pending: Vec<_> = self.pending_fills.drain().collect();
+        if pending.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            count = pending.len(),
+            "IbkrPublicWs 停机，把等待 commission 的成交以 fee=0 补发"
+        );
+        for (execution_id, fill) in pending {
+            self.publish(fill);
+            self.mark_seen(execution_id);
+        }
+    }
+
+    /// 发布 Fill + OrderUpdate 到账户总线
+    fn publish(&self, pending: PendingFill) {
+        let local_ts = pending.fill.timestamp;
+        self.account_bus.publish(AccountEvent {
+            account: crate::domain::AccountId::Live,
+            exchange_ts: local_ts,
+            local_ts,
+            data: AccountData::Symbol(SymbolAccountData::Fill(pending.fill)),
+        });
+        if let Some(order_update) = pending.order_update {
+            self.account_bus.publish(AccountEvent {
+                account: crate::domain::AccountId::Live,
+                exchange_ts: local_ts,
+                local_ts,
+                data: AccountData::Symbol(SymbolAccountData::OrderUpdate(order_update)),
+            });
+        }
+    }
+
+    /// 标记 execution_id 为已发布，并维护 FIFO 淘汰
     fn mark_seen(&mut self, execution_id: String) {
         self.seen_executions_order.push_back(execution_id.clone());
         self.seen_executions.insert(execution_id);
@@ -775,346 +967,37 @@ impl IbkrPublicWsActor {
     }
 }
 
-impl Actor for IbkrPublicWsActor {
-    type Args = IbkrPublicWsActorArgs;
-    type Error = ExchangeError;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 构建反向映射
-        let conid_to_symbol: HashMap<i64, String> = args
-            .conids
-            .iter()
-            .map(|(s, c)| (*c, s.clone()))
-            .collect();
-
-        // 连接 WebSocket (需要 Cookie + User-Agent + 标准 WebSocket 握手 header)
-        let ws_url = args.auth.ws_url();
-        let connector = args
-            .auth
-            .ws_connector()
-            .map_err(|e| ExchangeError::Other(format!("IBKR failed to build WS connector: {e}")))?;
-        let cookie = args.auth.format_ws_cookie(&args.session_id);
-        let uri: http::Uri = ws_url
-            .parse()
-            .map_err(|e| ExchangeError::Other(format!("IBKR invalid WS URL: {e}")))?;
-        let host = uri
-            .host()
-            .ok_or_else(|| ExchangeError::Other("IBKR WS URL missing host".into()))?;
-        let ws_key = generate_key();
-        let ws_request = http::Request::builder()
-            .uri(&ws_url)
-            .header("Host", host)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", &ws_key)
-            .header("Cookie", &cookie)
-            .header("User-Agent", "ClientPortalGW/1")
-            .body(())
-            .map_err(|e| ExchangeError::Other(format!("IBKR failed to build WS request: {e}")))?;
-
-        // 安全：ws_url 含 OAuth access_token，cookie 是 session cookie，严禁进日志。
-        // 只打印 host。
-        tracing::info!(host = %host, "Connecting IBKR WebSocket");
-
-        let (ws_stream, _) = match connector {
-            Some(conn) => tokio_tungstenite::connect_async_tls_with_config(
-                ws_request,
-                None,
-                false,
-                Some(conn),
-            )
-            .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?,
-            None => tokio_tungstenite::connect_async(ws_request)
-                .await
-                .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?,
-        };
-
-        let (write, read) = ws_stream.split();
-
-        let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
-
-        let incoming_stream = ReceiverStream::new(incoming_rx);
-        actor_ref.attach_stream(incoming_stream, (), ());
-
-        // smd 刷新定时器：服务端到期会静默终止订阅，必须主动重订阅 (见模块文档)。
-        // 用 interval_at 跳过 tokio::time::interval 的"立即首跳"——刚订阅完不需要马上刷。
-        actor_ref.attach_stream(
-            IntervalStream::new(tokio::time::interval_at(
-                tokio::time::Instant::now() + SMD_REFRESH_INTERVAL,
-                SMD_REFRESH_INTERVAL,
-            )),
-            (),
-            (),
-        );
-
-        tokio::spawn(ws_loop::run_ws_loop(
-            read,
-            write,
-            outgoing_rx,
-            incoming_tx,
-            ws_loop::WsKeepalive::ibkr(),
-        ));
-
-        // 订阅订单状态推送 (sor topic)
-        if let Err(e) = outgoing_tx.send("sor+{}".to_string()).await {
-            tracing::error!(error = %e, "Failed to send IBKR sor subscription");
-        } else {
-            tracing::info!("IBKR sor (order status) subscription sent");
-        }
-
-        // 订阅成交推送 (str topic) — 先打日志观察字段结构
-        if let Err(e) = outgoing_tx
-            .send(r#"str+{"realtimeUpdatesOnly":true}"#.to_string())
-            .await
-        {
-            tracing::error!(error = %e, "Failed to send IBKR str subscription");
-        } else {
-            tracing::info!("IBKR str (trades) subscription sent");
-        }
-
-        tracing::info!("IbkrPublicWsActor started");
-
-        let md_fields = merge_md_fields(&BBO_FIELDS, &args.extra_md_fields);
-        tracing::info!(
-            exchange = "IBKR",
-            fields = ?md_fields,
-            "IBKR 行情字段集 (BBO ∪ 他方字段；IBKR 每 conid 只维护一份，故必须给全)"
-        );
-
-        Ok(Self {
-            market_pubsub: args.market_pubsub,
-            account_pubsub: args.account_pubsub,
-            client: args.client,
-            conids: args.conids,
-            conid_to_symbol,
-            md_fields,
-            ws_tx: Some(outgoing_tx),
-            subscribed: HashSet::new(),
-            bbo_cache: HashMap::new(),
-            seen_executions: HashSet::new(),
-            seen_executions_order: VecDeque::new(),
-            pending_fills: HashMap::new(),
-        })
+/// 构建 Filled OrderUpdate（如有 order_ref）
+fn build_order_update(
+    item: &serde_json::Value,
+    order_ref: &str,
+    symbol: &str,
+    side: Side,
+    size: f64,
+) -> Option<OrderUpdate> {
+    if order_ref.is_empty() {
+        return None;
     }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        self.ws_tx.take();
-        // 停机时把还在等 commission 的成交全部发出去（fee=0）：它们是**已经发生的成交**，
-        // 带着它们静默退出等于让本地持仓少记一笔，而下次启动的基线会把这个缺口固化下来
-        // （基线只写一次、永不纠正）。手续费不准可以事后核对，持仓少一笔不行。
-        let pending: Vec<_> = self.pending_fills.drain().collect();
-        if !pending.is_empty() {
-            tracing::warn!(
-                count = pending.len(),
-                "IbkrPublicWsActor 停机，把等待 commission 的成交以 fee=0 补发"
-            );
-            for (execution_id, fill) in pending {
-                self.publish_fill(fill).await;
-                self.mark_seen(execution_id);
-            }
-        }
-        tracing::info!("IbkrPublicWsActor stopped");
-        Ok(())
-    }
-}
-
-// ============================================================================
-// 消息处理
-// ============================================================================
-
-impl Message<Subscribe> for IbkrPublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Subscribe,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.handle(SubscribeBatch { kinds: vec![msg.kind] }, ctx)
-            .await
-    }
-}
-
-impl Message<SubscribeBatch> for IbkrPublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: SubscribeBatch,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        for kind in msg.kinds {
-            // IBKR 只支持 BBO；其余类型跳过并告警（静默丢弃会让上游误以为已订阅）
-            let symbol = match &kind {
-                SubscriptionKind::BBO { symbol } => symbol.clone(),
-                other => {
-                    tracing::warn!(
-                        exchange = "IBKR",
-                        kind = ?other,
-                        "Unsupported subscription kind, skipping (IBKR only provides BBO)"
-                    );
-                    continue;
-                }
-            };
-
-            if self.subscribed.contains(&kind) {
-                continue;
-            }
-
-            let conid = match self.conids.get(&symbol) {
-                Some(c) => *c,
-                None => {
-                    tracing::warn!(
-                        exchange = "IBKR",
-                        symbol = %symbol,
-                        "Symbol not found in conid mapping, ignoring"
-                    );
-                    continue;
-                }
-            };
-
-            if let Err(e) = self.send_subscribe(conid).await {
-                tracing::error!(error = %e, "Failed to send IBKR subscribe, killing actor");
-                ctx.actor_ref().kill();
-                return;
-            }
-
-            self.subscribed.insert(kind);
-            tracing::info!(
-                exchange = "IBKR",
-                symbol = %symbol,
-                conid,
-                "Subscribed to BBO"
-            );
-        }
-    }
-}
-
-impl Message<Unsubscribe> for IbkrPublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Unsubscribe,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        if !self.subscribed.remove(&msg.kind) {
-            return;
-        }
-
-        if let SubscriptionKind::BBO { ref symbol } = msg.kind {
-            if let Some(&conid) = self.conids.get(symbol) {
-                if let Err(e) = self.send_unsubscribe(conid).await {
-                    tracing::error!(error = %e, "Failed to send IBKR unsubscribe, killing actor");
-                    ctx.actor_ref().kill();
-                }
-            }
-        }
-    }
-}
-
-/// Commission 超时处理 — 超时后以 fee=0 推送 pending fill
-impl Message<FillCommissionTimeout> for IbkrPublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: FillCommissionTimeout,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        if let Some(pending) = self.pending_fills.remove(&msg.execution_id) {
-            tracing::warn!(
-                execution_id = msg.execution_id,
-                "IBKR fill: commission timeout ({}s), publishing with fee=0",
-                FILL_COMMISSION_TIMEOUT_SECS
-            );
-            self.publish_fill(pending).await;
-            self.mark_seen(msg.execution_id);
-        }
-    }
-}
-
-/// WebSocket 入站消息处理
-impl Message<StreamMessage<Result<String, WsError>, (), ()>> for IbkrPublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Result<String, WsError>, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        match msg {
-            StreamMessage::Next(Ok(data)) => {
-                if let Err(e) = self.handle_message(&data, ctx.actor_ref()).await {
-                    tracing::error!(exchange = "IBKR", error = %e, raw = %data, "Public WS parse error, killing actor");
-                    ctx.actor_ref().kill();
-                }
-            }
-            StreamMessage::Next(Err(e)) => {
-                tracing::error!(error = %e, "IBKR Public WebSocket loop exited, killing actor");
-                ctx.actor_ref().kill();
-            }
-            StreamMessage::Started(_) => {
-                tracing::debug!("IBKR WsIncoming stream started");
-            }
-            StreamMessage::Finished(_) => {
-                tracing::error!("IBKR WebSocket stream unexpectedly finished, killing actor");
-                ctx.actor_ref().kill();
-            }
-        }
-    }
-}
-
-/// smd 刷新定时器 tick —— 在服务端 TTL 到期前重订阅所有 BBO 腿。
-///
-/// 刷新失败即致命（kill → on_link_died → 整机退出）：刷不上就等于这条腿到期后静默死掉，
-/// 而这种死法从连接层完全看不出来（这正是本次故障能潜伏的原因），所以不留降级分支。
-impl Message<StreamMessage<Instant, (), ()>> for IbkrPublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Instant, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        match msg {
-            StreamMessage::Next(_) => {
-                if let Err(e) = self.refresh_subscriptions().await {
-                    tracing::error!(error = %e, "smd 订阅刷新失败，killing actor");
-                    ctx.actor_ref().kill();
-                }
-            }
-            StreamMessage::Started(_) => {
-                tracing::info!(
-                    interval_secs = SMD_REFRESH_INTERVAL.as_secs(),
-                    ttl_secs = SMD_SERVER_TTL.as_secs(),
-                    "IBKR smd 刷新定时器已启动"
-                );
-            }
-            StreamMessage::Finished(_) => {
-                tracing::error!("IBKR smd 刷新定时器意外结束，killing actor");
-                ctx.actor_ref().kill();
-            }
-        }
-    }
+    let order_id = wire::order_id(item.get("orderId")).unwrap_or_default();
+    Some(OrderUpdate {
+        order_id,
+        client_order_id: Some(order_ref.to_string()),
+        exchange: Exchange::IBKR,
+        symbol: symbol.to_string(),
+        side,
+        status: OrderStatus::Filled,
+        quantity: size,
+    })
 }
 
 // ============================================================================
 // 辅助函数
 // ============================================================================
 
-/// 解析 IB 返回的数字 (可能含逗号 "1,234.56")
 /// 成交明细比对的容差（价量都是交易所回传的精确值，不一致即真不一致）
 const FILL_FIELD_EPSILON: f64 = 1e-9;
 
-/// [`wire::optional_number`] 的 WS 侧封装：解析失败即 `WsError`（→ kill actor）
+/// [`wire::optional_number`] 的 WS 侧封装：解析失败即 `WsError`（→ 本组件出错退出）
 fn wire_number(item: &serde_json::Value, field: &str) -> Result<Option<f64>, WsError> {
     wire::optional_number(item, field).map_err(WsError::ParseError)
 }
@@ -1236,4 +1119,223 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // str 成交配对、commission 超时与停机补发
+    // ------------------------------------------------------------------
+
+    use crate::exchange::ibkr::gateway::IbkrGateway;
+    use crate::tasks::Root;
+    use tokio::sync::mpsc;
+
+    const CONID: i64 = 265598;
+
+    /// 一个订阅账户总线、把收到的事件转给测试的消费者组件
+    struct Collector {
+        inbox: Inbox<AccountEvent>,
+        out: mpsc::UnboundedSender<AccountEvent>,
+    }
+
+    impl Task for Collector {
+        async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+            while let Some(e) = self.inbox.recv().await {
+                let _ = self.out.send(e);
+            }
+            Ok(())
+        }
+    }
+
+    /// 在 `group` 下起 Collector（订阅完成才返回）
+    async fn collect(group: &Group, bus: &AccountBus) -> mpsc::UnboundedReceiver<AccountEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let bus = bus.clone();
+        group
+            .spawn("collector", move |scope: Scope| async move {
+                let (_addr, mut inbox) = scope.inbox::<AccountEvent>();
+                inbox.subscribe(&bus, |_| true, |e| e);
+                Ok(Collector { inbox, out: tx })
+            })
+            .await
+            .unwrap();
+        rx
+    }
+
+    fn conid_map() -> Arc<HashMap<i64, String>> {
+        Arc::new(HashMap::from([(CONID, "AAPL".to_string())]))
+    }
+
+    fn trade(execution_id: &str, commission: Option<f64>) -> serde_json::Value {
+        let mut item = serde_json::json!({
+            "execution_id": execution_id, "conid": CONID, "side": "B",
+            "price": "150.5", "size": "10", "order_ref": "cid-1", "orderId": 123
+        });
+        if let Some(c) = commission {
+            item["commission"] = serde_json::json!(c);
+        }
+        serde_json::json!({ "topic": "str", "args": [item] })
+    }
+
+    /// 收一条事件（等不到就失败）
+    async fn next(rx: &mut mpsc::UnboundedReceiver<AccountEvent>) -> AccountData {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("等待总线事件超时")
+            .expect("收集器已退出")
+            .data
+    }
+
+    fn expect_fill(data: AccountData) -> Fill {
+        match data {
+            AccountData::Symbol(SymbolAccountData::Fill(f)) => f,
+            other => panic!("应为 Fill，实际 {other:?}"),
+        }
+    }
+
+    fn expect_filled_update(data: AccountData) {
+        match data {
+            AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
+                assert_eq!(u.status, OrderStatus::Filled);
+                assert_eq!(u.client_order_id.as_deref(), Some("cid-1"));
+            }
+            other => panic!("应为 OrderUpdate，实际 {other:?}"),
+        }
+    }
+
+    /// 第一条暂存、第二条带 commission 才发布；同一 execution_id 再来不重复发布
+    #[tokio::test]
+    async fn second_message_publishes_fill_with_commission() {
+        let root = Root::new("t");
+        let bus = AccountBus::new("account");
+        let mut rx = collect(&root.group("consumers"), &bus).await;
+        let mut fills = FillPairing::new(bus, conid_map());
+        let now = Instant::now();
+
+        fills.on_trade_message(&trade("E1", None), 1, now).unwrap();
+        assert_eq!(fills.pending_fills.len(), 1, "第一条不带 commission 应暂存");
+        fills.on_trade_message(&trade("E1", Some(1.25)), 2, now).unwrap();
+        let fill = expect_fill(next(&mut rx).await);
+        assert_eq!((fill.fee, fill.price, fill.size, fill.side), (1.25, 150.5, 10.0, Side::Long));
+        expect_filled_update(next(&mut rx).await);
+
+        fills.on_trade_message(&trade("E1", Some(1.25)), 3, now).unwrap();
+        fills.expire_due(now + FILL_COMMISSION_TIMEOUT);
+        root.shutdown().await.unwrap();
+        assert!(rx.recv().await.is_none(), "已发布的成交不得重复发布");
+    }
+
+    /// commission 等不到：到期以 fee=0 发布，之后迟到的第二条不再重复发布
+    #[tokio::test]
+    async fn commission_timeout_publishes_with_zero_fee() {
+        let root = Root::new("t");
+        let bus = AccountBus::new("account");
+        let mut rx = collect(&root.group("consumers"), &bus).await;
+        let mut fills = FillPairing::new(bus, conid_map());
+        let t0 = Instant::now();
+
+        fills.on_trade_message(&trade("E2", None), 1, t0).unwrap();
+        assert_eq!(fills.next_deadline(), Some(t0 + FILL_COMMISSION_TIMEOUT));
+        fills.expire_due(t0 + FILL_COMMISSION_TIMEOUT - Duration::from_millis(1));
+        assert_eq!(fills.pending_fills.len(), 1, "未到期不发布");
+        fills.expire_due(t0 + FILL_COMMISSION_TIMEOUT);
+        assert_eq!(expect_fill(next(&mut rx).await).fee, 0.0);
+        expect_filled_update(next(&mut rx).await);
+        assert_eq!(fills.next_deadline(), None);
+
+        fills.on_trade_message(&trade("E2", Some(1.0)), 2, t0).unwrap();
+        root.shutdown().await.unwrap();
+        assert!(rx.recv().await.is_none(), "迟到的第二条不得重复发布");
+    }
+
+    /// 缺 execution_id / 方向无法识别 / 两条价格不一致：一律致命（丢弃即持仓失真）
+    #[tokio::test]
+    async fn unusable_trades_are_fatal() {
+        let root = Root::new("t");
+        let mut fills = FillPairing::new(AccountBus::new("account"), conid_map());
+        let now = Instant::now();
+        let mut no_id = trade("", None);
+        no_id["args"][0].as_object_mut().unwrap().remove("execution_id");
+        assert!(fills.on_trade_message(&no_id, 1, now).is_err());
+        let mut bad_side = trade("E3", None);
+        bad_side["args"][0]["side"] = serde_json::json!("X");
+        assert!(fills.on_trade_message(&bad_side, 1, now).is_err());
+        fills.on_trade_message(&trade("E4", None), 1, now).unwrap();
+        let mut moved = trade("E4", Some(1.0));
+        moved["args"][0]["price"] = serde_json::json!("151");
+        assert!(fills.on_trade_message(&moved, 2, now).is_err());
+        root.shutdown().await.unwrap();
+    }
+
+    /// 离线可构造的 IbkrPublicWs：WS 两端换成内存通道，REST client 不联网
+    struct Harness {
+        root: Root,
+        frames: mpsc::Sender<Result<WsMessage, tokio_tungstenite::tungstenite::Error>>,
+        _sent: mpsc::Receiver<WsMessage>,
+        rx: mpsc::UnboundedReceiver<AccountEvent>,
+    }
+
+    async fn harness() -> Harness {
+        let root = Root::new("t");
+        // 生产者组先声明：停机时先停它（补发），再停消费者（收齐）
+        let producers = root.group("producers");
+        let consumers = root.group("consumers");
+        let account_bus = AccountBus::new("account");
+        let rx = collect(&consumers, &account_bus).await;
+
+        let conids = HashMap::from([("AAPL".to_string(), CONID)]);
+        let (frames, frame_rx) = mpsc::channel(16);
+        let (sent_tx, sent) = mpsc::channel(64);
+        let args = IbkrPublicWsArgs {
+            auth: Arc::new(IbkrGateway::new("https://127.0.0.1:1/v1/api/".into())),
+            client: Arc::new(IbkrClient::for_test(conids.clone())),
+            market_bus: MarketBus::new("market"),
+            account_bus,
+            conids,
+            session_id: "test".into(),
+            extra_md_fields: vec![],
+        };
+        producers
+            .spawn_addressed("IbkrPublicWs", move |scope: Scope, inbox| async move {
+                IbkrPublicWs::build(
+                    &scope,
+                    inbox,
+                    args,
+                    tokio_stream::wrappers::ReceiverStream::new(frame_rx),
+                    tokio_util::sync::PollSender::new(sent_tx),
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        Harness { root, frames, _sent: sent, rx }
+    }
+
+    async fn feed(h: &Harness, msg: serde_json::Value) {
+        h.frames.send(Ok(WsMessage::Text(msg.to_string()))).await.unwrap();
+    }
+
+    /// **停机补发送达总线**：还在等 commission 的成交，在 IbkrPublicWs 停机时以 fee=0 直接
+    /// 发到账户总线，并被（后停的）消费者收到 —— 漏掉会让本地持仓少记一笔并被下次基线固化
+    #[tokio::test]
+    async fn stop_flushes_pending_fill_to_account_bus() {
+        let mut h = harness().await;
+        feed(&h, trade("E9", None)).await;
+        // 远短于 3 秒的 commission 超时：确保下面收到的是停机补发，而不是超时发布
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(h.rx.try_recv().is_err(), "等 commission 期间不应发布");
+
+        h.root.shutdown().await.unwrap();
+        let fill = expect_fill(next(&mut h.rx).await);
+        assert_eq!((fill.order_id.as_str(), fill.fee), ("E9", 0.0));
+        expect_filled_update(next(&mut h.rx).await);
+    }
+
+    /// run 里的超时分支：3 秒等不到 commission 即以 fee=0 发布（不等停机）
+    #[tokio::test(start_paused = true)]
+    async fn run_publishes_on_commission_timeout() {
+        let mut h = harness().await;
+        feed(&h, trade("E10", None)).await;
+        let fill = expect_fill(next(&mut h.rx).await);
+        assert_eq!((fill.order_id.as_str(), fill.fee), ("E10", 0.0));
+        expect_filled_update(next(&mut h.rx).await);
+        h.root.shutdown().await.unwrap();
+    }
 }
