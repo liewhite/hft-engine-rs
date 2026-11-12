@@ -10,7 +10,7 @@ mod bus;
 mod position_book;
 mod scope;
 
-pub use bus::{AccountPubSub, MarketPubSub};
+pub use bus::{AccountBus, MarketBus};
 pub use position_book::PositionBook;
 pub use scope::SubscriptionScope;
 pub use state::{

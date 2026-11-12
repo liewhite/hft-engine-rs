@@ -1,79 +1,84 @@
-//! BinancePublicWsActor - 管理 Binance 公开 WebSocket 连接
+//! BinancePublicWs - 管理 Binance 公开 WebSocket 连接
 //!
 //! 职责:
-//! - 维护公开 WebSocket 连接
-//! - 处理 Subscribe/Unsubscribe 请求
-//! - 直接解析消息并发布到对应总线
+//! - 维护公开 WebSocket 连接（读循环是子任务）
+//! - 处理订阅/退订命令
+//! - 直接解析消息并发布到行情总线
 
 use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::messaging::MarketPubSub;
 use crate::exchange::binance::codec::{AggTrade, BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
-use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe, WsError};
-use crate::exchange::ws_loop;
-use crate::messaging::{MarketData, MarketEvent};
+use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
+use crate::exchange::ws_loop::{self, WsConn};
+use crate::messaging::{MarketBus, MarketData, MarketEvent};
+use crate::tasks::{Addr, Group, Inbox, Scope, Task};
+use anyhow::Context as _;
 use futures_util::StreamExt;
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::ActorStopReason;
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
-use kameo_actors::pubsub::Publish;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
-/// BinancePublicWsActor 初始化参数
-pub struct BinancePublicWsActorArgs {
-    /// WebSocket 基础 URL（迁移后 Binance 把公共流拆为 /public/ws 与 /market/ws，
-    /// 由父 actor 决定本 actor 实例绑定哪个 URL）
-    pub url: String,
-    /// 行情总线（发布事件）
-    pub market_pubsub: ActorRef<MarketPubSub>,
-    /// Symbol 元数据（公开 WS 目前不需要，但保持一致性）
-    pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
-    /// 计价币种 (e.g., "USDT")
-    pub quote: String,
-}
-
-/// BinancePublicWsActor - 公开 WebSocket Actor
-pub struct BinancePublicWsActor {
-    /// 行情总线（发布事件）
-    market_pubsub: ActorRef<MarketPubSub>,
+/// 公开 WebSocket 组件
+pub(crate) struct BinancePublicWs {
+    inbox: Inbox<ExchangeCmd>,
+    conn: WsConn,
+    market_bus: MarketBus,
     /// Symbol 元数据（用于过滤不存在的 symbol）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
     quote: String,
-    /// 发送消息到 ws_loop 的 channel
-    ws_tx: Option<mpsc::Sender<String>>,
     /// 已订阅的底层 stream (用于 WebSocket 去重)
     subscribed_streams: HashSet<String>,
     /// 已订阅的 kinds (用于事件分发和取消订阅)
     subscribed_kinds: HashSet<SubscriptionKind>,
 }
 
-impl BinancePublicWsActor {
+impl BinancePublicWs {
+    /// 在 `group` 下起一条公共 WS（迁移后 Binance 把公共流拆为 /public/ws 与 /market/ws，
+    /// 由父节点决定本实例绑定哪个 URL），等连接建好，返回命令地址
+    pub(crate) async fn spawn(
+        group: &Group,
+        name: &'static str,
+        url: &'static str,
+        market_bus: MarketBus,
+        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
+        quote: String,
+    ) -> anyhow::Result<Addr<ExchangeCmd>> {
+        let (_, addr) = group
+            .spawn_addressed(name, move |scope: Scope, inbox| async move {
+                // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
+                let (ws_stream, _) = tokio_tungstenite::connect_async(url)
+                    .await
+                    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
+                let (write, read) = ws_stream.split();
+                let conn = WsConn::spawn(&scope.group("conn"), format!("{name}Loop"), read, write, ws_loop::WsKeepalive::binance())?;
+                tracing::info!(url, "{name} started");
+                Ok(Self {
+                    inbox,
+                    conn,
+                    market_bus,
+                    symbol_metas,
+                    quote,
+                    subscribed_streams: HashSet::new(),
+                    subscribed_kinds: HashSet::new(),
+                })
+            })
+            .await?;
+        Ok(addr)
+    }
+
     /// 批量发送订阅消息（一条 WebSocket 消息包含多个 streams）
     async fn send_subscribe_batch(&self, streams: Vec<String>) -> Result<(), WsError> {
         if streams.is_empty() {
             return Ok(());
         }
-
         let msg = json!({
             "method": "SUBSCRIBE",
             "params": streams,
             "id": 1
         })
         .to_string();
-
-        let tx = self
-            .ws_tx
-            .as_ref()
-            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
-        tx.send(msg)
-            .await
-            .map_err(|_| WsError::Network("Channel closed".to_string()))
+        self.conn.send(msg).await
     }
 
     /// 发送取消订阅消息
@@ -89,115 +94,33 @@ impl BinancePublicWsActor {
             "id": 2
         })
         .to_string();
-
-        let tx = self
-            .ws_tx
-            .as_ref()
-            .ok_or_else(|| WsError::Network("ws_tx unavailable (actor stopped)".to_string()))?;
-        tx.send(msg)
-            .await
-            .map_err(|_| WsError::Network("Channel closed".to_string()))
+        self.conn.send(msg).await
     }
 
     /// 解析并处理消息
-    async fn handle_message(&self, raw: &str) -> Result<(), WsError> {
-        let local_ts = now_ms();
-        let events = parse_public_message(raw, &self.quote, local_ts, &self.subscribed_kinds)?;
+    fn handle_message(&self, raw: &str) -> anyhow::Result<()> {
+        let events = parse_public_message(raw, &self.quote, now_ms(), &self.subscribed_kinds)
+            .with_context(|| format!("Binance 公共 WS 解析失败: {raw}"))?;
         for event in events {
-            if let Err(e) = self.market_pubsub.tell(Publish(event)).send().await {
-                tracing::error!(error = %e, "Failed to publish to MarketPubSub");
-            }
+            self.market_bus.publish(event);
         }
         Ok(())
     }
-}
 
-impl Actor for BinancePublicWsActor {
-    type Args = BinancePublicWsActorArgs;
-    type Error = ExchangeError;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&args.url)
-            .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
-
-        let (write, read) = ws_stream.split();
-
-        // 创建出站消息 channel (Subscribe/Unsubscribe)
-        let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-
-        // 创建入站消息 channel (收到的数据/错误)
-        let (incoming_tx, incoming_rx) = mpsc::channel::<Result<String, WsError>>(100);
-
-        // attach_stream 监控入站消息
-        let incoming_stream = ReceiverStream::new(incoming_rx);
-        actor_ref.attach_stream(incoming_stream, (), ());
-
-        // 启动 ws_loop
-        tokio::spawn(ws_loop::run_ws_loop(
-            read,
-            write,
-            outgoing_rx,
-            incoming_tx,
-            ws_loop::WsKeepalive::binance(),
-        ));
-
-        tracing::info!(url = %args.url, "BinancePublicWsActor started");
-
-        Ok(Self {
-            market_pubsub: args.market_pubsub,
-            symbol_metas: args.symbol_metas,
-            quote: args.quote,
-            ws_tx: Some(outgoing_tx),
-            subscribed_streams: HashSet::new(),
-            subscribed_kinds: HashSet::new(),
-        })
+    async fn handle_cmd(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
+        match cmd {
+            ExchangeCmd::Subscribe(kind) => self.subscribe_batch(vec![kind]).await,
+            ExchangeCmd::SubscribeBatch(kinds) => self.subscribe_batch(kinds).await,
+            ExchangeCmd::Unsubscribe(kind) => self.unsubscribe(kind).await,
+        }
     }
 
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        // Drop ws_tx 会导致 ws_loop 退出
-        self.ws_tx.take();
-        tracing::info!("BinancePublicWsActor stopped");
-        Ok(())
-    }
-}
-
-// ============================================================================
-// 消息处理
-// ============================================================================
-
-impl Message<Subscribe> for BinancePublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Subscribe,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        // 委托给批量订阅
-        self.handle(SubscribeBatch { kinds: vec![msg.kind] }, ctx)
-            .await
-    }
-}
-
-impl Message<SubscribeBatch> for BinancePublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: SubscribeBatch,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+    async fn subscribe_batch(&mut self, kinds: Vec<SubscriptionKind>) -> anyhow::Result<()> {
         // 1. 过滤有效的 kinds（symbol 存在且未订阅）
         let mut new_streams = Vec::new();
         let mut new_kinds = Vec::new();
 
-        for kind in msg.kinds {
+        for kind in kinds {
             let symbol = kind.symbol();
             if !self.symbol_metas.contains_key(symbol) {
                 tracing::warn!(
@@ -240,11 +163,9 @@ impl Message<SubscribeBatch> for BinancePublicWsActor {
                 "Batch subscribing to streams"
             );
 
-            if let Err(e) = self.send_subscribe_batch(unique_streams.clone()).await {
-                tracing::error!(error = %e, "Failed to send batch subscribe, killing actor");
-                ctx.actor_ref().kill();
-                return;
-            }
+            self.send_subscribe_batch(unique_streams.clone())
+                .await
+                .context("Binance 批量订阅发送失败")?;
 
             for stream in unique_streams {
                 self.subscribed_streams.insert(stream);
@@ -255,27 +176,20 @@ impl Message<SubscribeBatch> for BinancePublicWsActor {
         for kind in new_kinds {
             self.subscribed_kinds.insert(kind);
         }
+        Ok(())
     }
-}
 
-impl Message<Unsubscribe> for BinancePublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Unsubscribe,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        if !self.subscribed_kinds.remove(&msg.kind) {
-            return;
+    async fn unsubscribe(&mut self, kind: SubscriptionKind) -> anyhow::Result<()> {
+        if !self.subscribed_kinds.remove(&kind) {
+            return Ok(());
         }
 
         // 检查是否还有其他 kinds 使用同一个 stream
-        let stream = match kind_to_stream(&msg.kind, &self.quote) {
+        let stream = match kind_to_stream(&kind, &self.quote) {
             Some(s) => s,
             None => {
-                tracing::warn!(kind = ?msg.kind, "Binance Candle 订阅未实现，忽略取消订阅");
-                return;
+                tracing::warn!(?kind, "Binance Candle 订阅未实现，忽略取消订阅");
+                return Ok(());
             }
         };
         let stream_still_needed = self
@@ -284,26 +198,26 @@ impl Message<Unsubscribe> for BinancePublicWsActor {
             .any(|k| kind_to_stream(k, &self.quote).as_deref() == Some(stream.as_str()));
 
         if !stream_still_needed {
-            if let Err(e) = self.send_unsubscribe(&msg.kind).await {
-                tracing::error!(error = %e, "Failed to send unsubscribe, killing actor");
-                ctx.actor_ref().kill();
-                return;
-            }
+            self.send_unsubscribe(&kind)
+                .await
+                .context("Binance 取消订阅发送失败")?;
             self.subscribed_streams.remove(&stream);
         }
+        Ok(())
     }
 }
 
-/// WebSocket 入站消息处理
-impl Message<StreamMessage<Result<String, WsError>, (), ()>> for BinancePublicWsActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Result<String, WsError>, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        crate::dispatch_ws_stream_message!(self, msg, ctx, "Binance");
+impl Task for BinancePublicWs {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                cmd = self.inbox.recv() => match cmd {
+                    Some(cmd) => self.handle_cmd(cmd).await?,
+                    None => return Ok(()),
+                },
+                frame = self.conn.recv() => self.handle_message(&frame?)?,
+            }
+        }
     }
 }
 

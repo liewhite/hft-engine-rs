@@ -85,6 +85,24 @@ Root("engine")                         ← bootstrap::run_engine 持有，唯一
 - 停机：bootstrap 收到信号或 `root.stopping()`（任何节点出错）后 `root.shutdown()`，套 30s 期限；
   `biased` 让事故分支优先（保留现有理由注释）。
 
+## 迁移中补的公共件（先看这些，别各自再写一遍）
+- `Group::spawn_addressed(name, |scope, inbox| async { ..; Ok(State) }) -> (ChildHandle, Addr<M>)`
+  （`src/tasks/periodic.rs`）：有收件箱的组件一律用它起，地址在构造完成时交回。
+- `Group::spawn_periodic(name, every, impl Periodic)`：定时轮询（`Periodic::tick` 做一次，Err 整支停；
+  "记日志继续"的在 tick 里自己处理后返回 Ok）。首拍立即、Skip 不积压、停止优先。
+- `exchange::ws_loop::WsConn`：`WsConn::spawn(&scope.group("conn"), name, read, write, keepalive)` 把读循环挂成
+  子任务（断线/空闲超时 = 子任务 Err 上冒）；组件 `conn.send(text).await`、`conn.recv().await`（可放 select!）、
+  私有 WS 构造时 `conn.await_subscriptions(exchange, required, confirms).await?`（确认期间的帧之后 recv 先交）。
+  没有收件箱的私有 WS 停机分支先 `while let Some(raw) = conn.try_recv()` 把已到手的回报处理完。
+- `exchange::{ExchangeCmd, ExchangeHandle}`（client.rs）：各所节点的收件箱消息类型就是 `ExchangeCmd`；
+  公共 WS 子组件也直接收 `ExchangeCmd`。旧 `Subscribe/SubscribeBatch/Unsubscribe` 结构体已删。
+- 总线别名：`messaging::{MarketBus, AccountBus}`（取代 `MarketPubSub/AccountPubSub`），出向 `engine::live::OutcomeBus`。
+- 交易所层不依赖引擎层：各所节点 `XxxNode::spawn(group: &Group, args: XxxArgs) -> anyhow::Result<ExchangeHandle>`，
+  `XxxArgs` 带 `market_bus/account_bus/symbol_metas` 等；`engine::live::assembly` 把 `SpawnCtx` 映射成它。
+- 命名：类型去掉 `Actor` 后缀（`EquityPollingActor` → `EquityPoller`、`ExecutorActor` → `Executor`、
+  `ManagerActor` → `Manager`），各所父节点叫 `XxxNode`；`XxxActorArgs` → `XxxArgs` 或直接作 `spawn` 参数。
+- 参考实现：Binance 全套（`src/exchange/binance/actor/`）、`equity_polling.rs`、`crypto_status.rs`。
+
 ## 测试
 - 引擎/actor 的行为测试照搬到新 API（停机顺序、出错级联、启动失败报错并级联、撤下单个策略、
   生产者收尾补发的事件送达消费者、组内并发）。专测 kameo 怪癖的测试（wait_for_shutdown 与 with_result、

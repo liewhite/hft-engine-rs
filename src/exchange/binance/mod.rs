@@ -3,7 +3,7 @@ pub(crate) mod codec;
 mod client;
 mod symbol;
 
-pub use actor::{BinanceActor, BinanceActorArgs};
+pub use actor::{BinanceArgs, BinanceNode};
 pub use client::BinanceClient;
 pub use symbol::{from_binance, to_binance};
 

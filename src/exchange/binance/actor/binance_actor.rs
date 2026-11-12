@@ -1,42 +1,41 @@
-//! BinanceActor - Binance 交易所的父 Actor
+//! BinanceNode - Binance 交易所节点
 //!
 //! 职责:
-//! - 管理 PublicWsActor、PrivateWsActor 和 EquityPollingActor 子 actor
-//! - 转发 Subscribe/Unsubscribe 到 PublicWsActor
-//! - WsActors 直接解析消息并发布到对应总线
-//! - 启动时查询持仓并推送到对应总线
+//! - 管理公共/私有 WS 和各轮询子任务
+//! - 把订阅/退订命令按 kind 路由到对应的公共 WS
+//! - WS 组件直接解析消息并发布到对应总线
 //!
-//! 架构:
-//! BinanceActor (父)
-//! ├── BinancePublicWsActor [spawn_link]
-//! ├── BinancePrivateWsActor [spawn_link] (optional, 需要凭证)
-//! │   └── BinanceListenKeyActor [spawn_link]
-//! └── EquityPollingActor [spawn_link]
+//! 树:
+//! BinanceNode
+//! ├── BinancePublicWs（/public/ws）
+//! ├── BinancePublicWs（/market/ws）
+//! ├── BinancePrivateWs（需要凭证）
+//! │   └── ListenKeyRefresher
+//! ├── EquityPoller（需要凭证）
+//! ├── BinanceFundingFeePoller（需要凭证）
+//! └── CryptoStatus
 
-use crate::actor_lifecycle::ChildGroup;
-use crate::exchange::equity_polling::{EquityPollingActor, EquityPollingActorArgs};
-use super::funding_fee_polling::{BinanceFundingFeePollingActor, BinanceFundingFeePollingActorArgs};
-use super::private_ws::{BinancePrivateWsActor, BinancePrivateWsActorArgs};
-use super::public_ws::{BinancePublicWsActor, BinancePublicWsActorArgs};
-use crate::domain::{ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::{CryptoStatusActor, CryptoStatusActorArgs};
-use crate::messaging::{AccountPubSub, MarketPubSub};
+use super::funding_fee_polling::BinanceFundingFeePoller;
+use super::private_ws::BinancePrivateWs;
+use super::public_ws::BinancePublicWs;
+use crate::domain::{Symbol, SymbolMeta};
 use crate::exchange::binance::{
     BinanceClient, BinanceCredentials, WS_MARKET_URL, WS_PUBLIC_HIGH_FREQ_URL,
 };
-use crate::exchange::client::{Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe};
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::ActorStopReason;
-use kameo::message::{Context, Message};
-use kameo::Actor;
+use crate::exchange::client::{ExchangeCmd, ExchangeHandle, SubscriptionKind};
+use crate::exchange::equity_polling::EquityPoller;
+use crate::exchange::CryptoStatus;
+use crate::messaging::{AccountBus, MarketBus};
+use crate::tasks::{Addr, Group, Inbox, Scope, Task};
+use anyhow::Context as _;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
 const STATUS_BROADCAST_INTERVAL_MS: u64 = 60_000;
 
-/// BinanceActor 初始化参数
-pub struct BinanceActorArgs {
+/// BinanceNode 构造参数
+pub struct BinanceArgs {
     /// 凭证（可选）
     pub credentials: Option<BinanceCredentials>,
     /// Symbol 元数据
@@ -44,21 +43,20 @@ pub struct BinanceActorArgs {
     /// REST 基础 URL（用于 ListenKey）
     pub rest_base_url: String,
     /// 公共行情总线（public WS / 状态广播用）
-    pub market_pubsub: ActorRef<MarketPubSub>,
+    pub market_bus: MarketBus,
     /// 账户私有事件总线（private WS / 账户轮询用）
-    pub account_pubsub: ActorRef<AccountPubSub>,
+    pub account_bus: AccountBus,
     /// 计价币种 (e.g., "USDT")
     pub quote: String,
 }
 
-/// BinanceActor - 父 Actor
-pub struct BinanceActor {
+/// Binance 交易所节点
+pub struct BinanceNode {
+    inbox: Inbox<ExchangeCmd>,
     /// 盘口高频 WebSocket（/public/ws：bookTicker、depth）
-    public_ws: ActorRef<BinancePublicWsActor>,
+    public_ws: Addr<ExchangeCmd>,
     /// 常规市场 WebSocket（/market/ws：markPrice、kline、ticker、aggTrade）
-    market_ws: ActorRef<BinancePublicWsActor>,
-    /// 全部子 actor：谁 spawn 的谁负责等（见 [`crate::actor_lifecycle`]）
-    children: ChildGroup,
+    market_ws: Addr<ExchangeCmd>,
 }
 
 /// 公共 WS 目标（Binance 迁移后按路由路径分流，两条连接）
@@ -96,231 +94,120 @@ pub(crate) fn pick_ws_target(kind: &SubscriptionKind) -> WsTarget {
     }
 }
 
-impl BinanceActor {
-    fn ws_for(&self, target: WsTarget) -> &ActorRef<BinancePublicWsActor> {
+impl BinanceNode {
+    /// 在 `group` 下起 Binance 节点，等全部 WS 连好（私有的含 ListenKey 就位），返回句柄。
+    /// 任一失败 → 返回 Err 并上冒（启动期受控退出，不重试），避免"假就绪"窗口。
+    pub async fn spawn(group: &Group, args: BinanceArgs) -> anyhow::Result<ExchangeHandle> {
+        let (_, addr) = group
+            .spawn_addressed("BinanceNode", move |scope: Scope, inbox| async move {
+                // 凭证可用时构建 Arc<BinanceClient>，供 FundingFee / equity 轮询使用。
+                // 初始持仓查询在 manager 投产编排里（executor 注册后），不在此处。
+                // 构建失败向上传播 → 启动期受控退出
+                let binance_client: Option<Arc<BinanceClient>> = match args.credentials.as_ref() {
+                    Some(c) => Some(Arc::new(
+                        BinanceClient::new(args.quote.clone(), Some(c.clone()))
+                            .context("Failed to create BinanceClient")?,
+                    )),
+                    None => None,
+                };
+                let children = scope.group("children");
+
+                // 1. 三条 WS 并发连接；任一失败 → 向上传播
+                let has_private_ws = args.credentials.is_some();
+                let private = async {
+                    match args.credentials {
+                        Some(credentials) => BinancePrivateWs::spawn(
+                            &children,
+                            credentials,
+                            args.rest_base_url,
+                            args.account_bus.clone(),
+                            args.quote.clone(),
+                        )
+                        .await
+                        .map(|_| ()),
+                        None => Ok(()),
+                    }
+                };
+                let (public_ws, market_ws, ()) = tokio::try_join!(
+                    BinancePublicWs::spawn(
+                        &children,
+                        "BinancePublicWs",
+                        WsTarget::PublicHighFreq.url(),
+                        args.market_bus.clone(),
+                        args.symbol_metas.clone(),
+                        args.quote.clone(),
+                    ),
+                    BinancePublicWs::spawn(
+                        &children,
+                        "BinanceMarketWs",
+                        WsTarget::Market.url(),
+                        args.market_bus.clone(),
+                        args.symbol_metas.clone(),
+                        args.quote.clone(),
+                    ),
+                    private,
+                )?;
+                tracing::info!(exchange = "Binance", has_private_ws, "WS ready");
+
+                // 2. 私有轮询与私有 WS 一样按凭证门控：无凭证时只订阅公共行情（non-auth 模式），
+                // 否则 equity 轮询会每秒失败一次、刷满日志（既是噪音，也会掩盖真实告警）。
+                // 用同一个带凭证的 client（`binance_client` 与 `has_private_ws` 同源于凭证是否存在）：
+                // 净值查询是账户私有能力，只有 AccountClient 提供
+                if let Some(client) = binance_client {
+                    EquityPoller::spawn(&children, client.clone(), args.account_bus.clone(), 1000)?;
+                    BinanceFundingFeePoller::spawn(&children, client, args.account_bus.clone(), 60_000)?;
+                }
+                CryptoStatus::spawn(
+                    &children,
+                    crate::domain::Exchange::Binance,
+                    args.market_bus.clone(),
+                    STATUS_BROADCAST_INTERVAL_MS,
+                )?;
+
+                tracing::info!(exchange = "Binance", has_private_ws, "BinanceNode started");
+                Ok(Self { inbox, public_ws, market_ws })
+            })
+            .await?;
+        Ok(ExchangeHandle::new(addr))
+    }
+
+    fn ws_for(&self, target: WsTarget) -> &Addr<ExchangeCmd> {
         match target {
             WsTarget::PublicHighFreq => &self.public_ws,
             WsTarget::Market => &self.market_ws,
         }
     }
-}
 
-impl Actor for BinanceActor {
-    type Args = BinanceActorArgs;
-    type Error = ExchangeError;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        // 凭证可用时构建 Arc<BinanceClient>，供 FundingFee polling 使用。
-        // 初始持仓查询已上移至 ManagerActor::add_strategies_batch（executor 注册后），不在此处。
-        // 构建失败向上传播 → 启动期受控退出
-        let binance_client: Option<Arc<BinanceClient>> = match args.credentials.as_ref() {
-            Some(c) => Some(Arc::new(
-                BinanceClient::new(args.quote.clone(), Some(c.clone()))
-                    .map_err(|e| ExchangeError::Other(format!("Failed to create BinanceClient: {e}")))?,
-            )),
-            None => None,
-        };
-
-        // 1. 先并发 spawn 所有 actor（spawn 本身是 instant，on_start 异步跑）
-        let mut children = ChildGroup::default();
-        let public_ws = children.spawn::<BinancePublicWsActor, _>(
-            &actor_ref,
-            "BinancePublicWsActor",
-            BinancePublicWsActorArgs {
-                url: WsTarget::PublicHighFreq.url().to_string(),
-                market_pubsub: args.market_pubsub.clone(),
-                symbol_metas: args.symbol_metas.clone(),
-                quote: args.quote.clone(),
-            },
-        )
-        .await;
-        let market_ws = children.spawn::<BinancePublicWsActor, _>(
-            &actor_ref,
-            "BinanceMarketWsActor",
-            BinancePublicWsActorArgs {
-                url: WsTarget::Market.url().to_string(),
-                market_pubsub: args.market_pubsub.clone(),
-                symbol_metas: args.symbol_metas.clone(),
-                quote: args.quote.clone(),
-            },
-        )
-        .await;
-        let private_ws_opt = if let Some(credentials) = args.credentials {
-            Some(
-                children.spawn::<BinancePrivateWsActor, _>(
-                    &actor_ref,
-                    "BinancePrivateWsActor",
-                    BinancePrivateWsActorArgs {
-                        credentials,
-                        rest_base_url: args.rest_base_url,
-                        account_pubsub: args.account_pubsub.clone(),
-                        quote: args.quote.clone(),
-                    },
-                )
-                .await,
-            )
-        } else {
-            None
-        };
-        let has_private_ws = private_ws_opt.is_some();
-
-        // 2. 并发等三个 WS actor 全部 on_start 完成；任一失败 → 向上传播（启动期受控退出，不重试），避免"假就绪"窗口
-        let private_wait = async {
-            if let Some(p) = &private_ws_opt {
-                p.wait_for_startup_result().await
-            } else {
-                Ok(())
+    /// 按目标 WS 路由命令。批量订阅按目标拆分，避免把 markPrice 流发到 /public/ws 被拒
+    fn route(&self, cmd: ExchangeCmd) -> anyhow::Result<()> {
+        match cmd {
+            ExchangeCmd::Subscribe(ref kind) | ExchangeCmd::Unsubscribe(ref kind) => {
+                let target = self.ws_for(pick_ws_target(kind));
+                target.send(cmd).context("转发订阅命令失败：公共 WS 已停止收件")?;
             }
-        };
-        let (public_r, market_r, private_r) = tokio::join!(
-            public_ws.wait_for_startup_result(),
-            market_ws.wait_for_startup_result(),
-            private_wait,
-        );
-        public_r.map_err(|e| {
-            ExchangeError::Other(format!("BinancePublicWsActor (/public/ws) failed to start: {e}"))
-        })?;
-        market_r.map_err(|e| {
-            ExchangeError::Other(format!("BinancePublicWsActor (/market/ws) failed to start: {e}"))
-        })?;
-        private_r.map_err(|e| {
-            ExchangeError::Other(format!("BinancePrivateWsActor failed to start: {e}"))
-        })?;
-        tracing::info!(exchange = "Binance", has_private_ws, "WS actors ready");
-
-        // 3. polling actor 的 on_start 只 attach_stream（无 IO），wait_for_startup 是 no-op，省略
-        //
-        // 私有轮询与私有 WS 一样按凭证门控：无凭证时只订阅公共行情（non-auth 模式），
-        // 否则 equity 轮询会每秒失败一次、刷满日志（既是噪音，也会掩盖真实告警）。
-        // 用同一个带凭证的 client（`binance_client` 与 `has_private_ws` 同源于凭证是否存在）：
-        // 净值查询是账户私有能力，只有 AccountClient 提供
-        if let Some(client) = binance_client.clone() {
-            children.spawn::<EquityPollingActor, _>(
-                &actor_ref,
-                "EquityPollingActor",
-                EquityPollingActorArgs {
-                    client,
-                    account_pubsub: args.account_pubsub.clone(),
-                    interval_ms: 1000,
-                },
-            )
-            .await;
+            ExchangeCmd::SubscribeBatch(kinds) => {
+                let (public_kinds, market_kinds): (Vec<_>, Vec<_>) = kinds
+                    .into_iter()
+                    .partition(|k| pick_ws_target(k) == WsTarget::PublicHighFreq);
+                for (target, kinds) in [(&self.public_ws, public_kinds), (&self.market_ws, market_kinds)] {
+                    if !kinds.is_empty() {
+                        target
+                            .send(ExchangeCmd::SubscribeBatch(kinds))
+                            .context("转发批量订阅失败：公共 WS 已停止收件")?;
+                    }
+                }
+            }
         }
-        if let Some(client) = binance_client {
-            children.spawn::<BinanceFundingFeePollingActor, _>(
-                &actor_ref,
-                "BinanceFundingFeePollingActor",
-                BinanceFundingFeePollingActorArgs {
-                    client,
-                    account_pubsub: args.account_pubsub.clone(),
-                    interval_ms: 60_000,
-                },
-            )
-            .await;
-        }
-        children.spawn::<CryptoStatusActor, _>(
-            &actor_ref,
-            "CryptoStatusActor",
-            CryptoStatusActorArgs {
-                exchange: crate::domain::Exchange::Binance,
-                market_pubsub: args.market_pubsub.clone(),
-                interval_ms: STATUS_BROADCAST_INTERVAL_MS,
-            },
-        )
-        .await;
-
-        tracing::info!(
-            exchange = "Binance",
-            has_private_ws,
-            "BinanceActor started"
-        );
-
-        Ok(Self { public_ws, market_ws, children })
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        // 谁 spawn 的谁负责等（见 actor_lifecycle 模块文档）
-        self.children.shutdown().await;
-        tracing::info!("BinanceActor stopped");
         Ok(())
     }
 }
 
-// ============================================================================
-// 消息处理
-// ============================================================================
-
-impl Message<Subscribe> for BinanceActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Subscribe,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let target = self.ws_for(pick_ws_target(&msg.kind));
-        if let Err(e) = target.tell(msg).send().await {
-            tracing::error!(error = %e, "Failed to forward Subscribe");
+impl Task for BinanceNode {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        // 子 WS 只在出错时提前停止收件（出错会自己上冒），转发失败就整支停
+        while let Some(cmd) = self.inbox.recv().await {
+            self.route(cmd)?;
         }
-    }
-}
-
-impl Message<SubscribeBatch> for BinanceActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: SubscribeBatch,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        // 按目标 WS 拆分批次，避免把 markPrice 流发到 /public/ws 被拒
-        let mut public_kinds = Vec::new();
-        let mut market_kinds = Vec::new();
-        for kind in msg.kinds {
-            match pick_ws_target(&kind) {
-                WsTarget::PublicHighFreq => public_kinds.push(kind),
-                WsTarget::Market => market_kinds.push(kind),
-            }
-        }
-
-        if !public_kinds.is_empty() {
-            if let Err(e) = self
-                .public_ws
-                .tell(SubscribeBatch { kinds: public_kinds })
-                .send()
-                .await
-            {
-                tracing::error!(error = %e, "Failed to forward SubscribeBatch to public_ws");
-            }
-        }
-        if !market_kinds.is_empty() {
-            if let Err(e) = self
-                .market_ws
-                .tell(SubscribeBatch { kinds: market_kinds })
-                .send()
-                .await
-            {
-                tracing::error!(error = %e, "Failed to forward SubscribeBatch to market_ws");
-            }
-        }
-    }
-}
-
-impl Message<Unsubscribe> for BinanceActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: Unsubscribe,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let target = self.ws_for(pick_ws_target(&msg.kind));
-        if let Err(e) = target.tell(msg).send().await {
-            tracing::error!(error = %e, "Failed to forward Unsubscribe");
-        }
+        Ok(())
     }
 }

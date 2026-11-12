@@ -12,16 +12,8 @@ pub mod ws_loop;
 #[cfg(test)]
 mod trades_conformance;
 
-pub use crypto_status::{CryptoStatusActor, CryptoStatusActorArgs};
+pub use crypto_status::CryptoStatus;
 pub use client::{
-    AccountClient, ExchangeAccess, ExchangeActorOps, ExchangeClient, ExchangeOrder, SettledFundingSource,
-    Subscribe, SubscribeBatch, SubscriptionKind, Unsubscribe,
+    AccountClient, ExchangeAccess, ExchangeClient, ExchangeCmd, ExchangeHandle, ExchangeOrder,
+    SettledFundingSource, SubscriptionKind,
 };
-
-// 为各交易所 Actor 实现 ExchangeActorOps
-crate::impl_exchange_actor_ops!(
-    binance::BinanceActor,
-    okx::OkxActor,
-    hyperliquid::HyperliquidActor,
-    ibkr::IbkrActor
-);

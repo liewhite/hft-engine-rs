@@ -279,25 +279,38 @@ pub trait SettledFundingSource: Send + Sync + 'static {
 }
 
 // ============================================================================
-// 订阅/取消订阅消息
+// 交易所节点的命令与句柄
 // ============================================================================
 
-/// 订阅消息
+/// 发给交易所节点的命令（各所节点的收件箱消息类型）
 #[derive(Debug, Clone)]
-pub struct Subscribe {
-    pub kind: SubscriptionKind,
+pub enum ExchangeCmd {
+    Subscribe(SubscriptionKind),
+    SubscribeBatch(Vec<SubscriptionKind>),
+    Unsubscribe(SubscriptionKind),
 }
 
-/// 批量订阅消息
+/// 一个交易所节点的句柄：引擎经它订阅/退订行情。各所装配函数（`engine::live::assembly`）
+/// 起好节点后交出它；节点的生死归任务树管，句柄只是地址。
 #[derive(Debug, Clone)]
-pub struct SubscribeBatch {
-    pub kinds: Vec<SubscriptionKind>,
-}
+pub struct ExchangeHandle(crate::tasks::Addr<ExchangeCmd>);
 
-/// 取消订阅消息
-#[derive(Debug, Clone)]
-pub struct Unsubscribe {
-    pub kind: SubscriptionKind,
+impl ExchangeHandle {
+    pub fn new(addr: crate::tasks::Addr<ExchangeCmd>) -> Self {
+        Self(addr)
+    }
+
+    pub fn subscribe(&self, kind: SubscriptionKind) -> Result<(), crate::tasks::Gone> {
+        self.0.send(ExchangeCmd::Subscribe(kind))
+    }
+
+    pub fn subscribe_batch(&self, kinds: Vec<SubscriptionKind>) -> Result<(), crate::tasks::Gone> {
+        self.0.send(ExchangeCmd::SubscribeBatch(kinds))
+    }
+
+    pub fn unsubscribe(&self, kind: SubscriptionKind) -> Result<(), crate::tasks::Gone> {
+        self.0.send(ExchangeCmd::Unsubscribe(kind))
+    }
 }
 
 /// WebSocket 错误
@@ -319,61 +332,6 @@ impl From<String> for WsError {
     fn from(s: String) -> Self {
         WsError::ParseError(s)
     }
-}
-
-// ============================================================================
-// ExchangeActorOps trait (类型擦除的 Actor 操作接口)
-// ============================================================================
-
-/// 交易所 Actor 操作接口
-///
-/// 用于类型擦除，使 ManagerActor 可以用 `HashMap<Exchange, Box<dyn ExchangeActorOps>>`
-/// 统一管理不同类型的交易所 Actor
-#[async_trait]
-pub trait ExchangeActorOps: Send + Sync {
-    /// 获取 Actor ID（用于建立 link）
-    fn actor_id(&self) -> kameo::actor::ActorId;
-    /// 订阅
-    async fn subscribe(&self, kind: SubscriptionKind) -> Result<(), String>;
-    /// 批量订阅
-    async fn subscribe_batch(&self, kinds: Vec<SubscriptionKind>) -> Result<(), String>;
-    /// 取消订阅
-    async fn unsubscribe(&self, kind: SubscriptionKind) -> Result<(), String>;
-}
-
-/// 为 ActorRef<A> 实现 ExchangeActorOps 的宏
-///
-/// 要求 A 实现 `Message<Subscribe>`, `Message<SubscribeBatch>`, `Message<Unsubscribe>`
-#[macro_export]
-macro_rules! impl_exchange_actor_ops {
-    ($($actor:ty),*) => {
-        $(
-            #[async_trait::async_trait]
-            impl $crate::exchange::ExchangeActorOps for kameo::actor::ActorRef<$actor> {
-                fn actor_id(&self) -> kameo::actor::ActorId {
-                    self.id()
-                }
-                async fn subscribe(&self, kind: $crate::exchange::SubscriptionKind) -> Result<(), String> {
-                    self.tell($crate::exchange::Subscribe { kind })
-                        .send()
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-                async fn subscribe_batch(&self, kinds: Vec<$crate::exchange::SubscriptionKind>) -> Result<(), String> {
-                    self.tell($crate::exchange::SubscribeBatch { kinds })
-                        .send()
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-                async fn unsubscribe(&self, kind: $crate::exchange::SubscriptionKind) -> Result<(), String> {
-                    self.tell($crate::exchange::Unsubscribe { kind })
-                        .send()
-                        .await
-                        .map_err(|e| e.to_string())
-                }
-            }
-        )*
-    };
 }
 
 #[cfg(test)]

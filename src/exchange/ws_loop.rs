@@ -1,9 +1,10 @@
 //! 公共 WebSocket 循环模块
 //!
-//! 提供统一的 WebSocket 循环逻辑，消除各 actor 中的代码重复
+//! 提供统一的 WebSocket 循环逻辑（[`WsConn`]），各所 WS 组件共用
 
 use crate::domain::{Exchange, ExchangeError};
 use crate::exchange::client::WsError;
+use crate::tasks::{Group, GroupClosed};
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -17,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 /// - `ping_text`：周期发送的应用层 ping（各所报文不同，由调用方给出；None = 该所由
 ///   服务端主动 ping，客户端回 pong 即可，见循环里的 Ping 分支）
 /// - `idle_timeout`：超过此时长没有收到**任何**入站帧（含 Ping/Pong 控制帧）即判定
-///   断流，按既有 fail-fast 姿态退出（kill -> 级联受控停机，交外部重启），不重连。
+///   断流，按既有 fail-fast 姿态退出（错误上冒 -> 整机受控停机，交外部重启），不重连。
 ///   必须大于该所服务端/我方的 ping 周期，否则安静的私有流会被误杀。
 #[derive(Debug, Clone)]
 pub struct WsKeepalive {
@@ -70,123 +71,133 @@ impl WsKeepalive {
     }
 }
 
-/// 统一处理 WS 入站 `StreamMessage` 的四个分支，消除各 WS actor 中逐字重复的样板。
+/// WS 入站缓冲：循环读得比组件处理快时在这里攒着，满了循环就暂停读（背压，不丢）
+const INCOMING_BUFFER: usize = 100;
+
+/// 一条 WS 连接的组件侧把手：读循环（心跳、回 Pong、空闲判定）作为子任务挂在组件自己的
+/// 分组下，组件经它收发文本帧。
 ///
-/// 各 actor 的 `Message<StreamMessage<Result<String, WsError>, (), ()>>` handler 逻辑相同，
-/// 仅交易所标签不同：数据到达 → `handle_message` 解析发布，失败/错误/流结束一律记录并
-/// `kill` actor（触发 `on_link_died` 级联受控停机，不重连——见错误处理约定）。
-///
-/// 要求 `$this` 具备 `async fn handle_message(&self, raw: &str) -> Result<(), WsError>`
-/// （`&self`/`&mut self` 均可）。IBKR public WS 的 `handle_message` 需额外的 actor_ref
-/// 参数，签名不同，故不使用本宏、保留独立实现。
-#[macro_export]
-macro_rules! dispatch_ws_stream_message {
-    ($this:expr, $msg:expr, $ctx:expr, $exchange:literal) => {{
-        match $msg {
-            kameo::message::StreamMessage::Next(Ok(data)) => {
-                if let Err(e) = $this.handle_message(&data).await {
-                    tracing::error!(exchange = $exchange, error = %e, raw = %data, "WS parse error, killing actor");
-                    $ctx.actor_ref().kill();
-                }
-            }
-            kameo::message::StreamMessage::Next(Err(e)) => {
-                tracing::error!(exchange = $exchange, error = %e, "WS loop exited, killing actor");
-                $ctx.actor_ref().kill();
-            }
-            kameo::message::StreamMessage::Started(_) => {
-                tracing::debug!(exchange = $exchange, "WS incoming stream started");
-            }
-            kameo::message::StreamMessage::Finished(_) => {
-                tracing::error!(exchange = $exchange, "WS stream unexpectedly finished, killing actor");
-                $ctx.actor_ref().kill();
-            }
-        }
-    }};
+/// 循环出错（断线、空闲超时、写失败）时子任务以 `Err` 退出、按任务树规则上冒，整支停下
+/// （fail-fast，不重连，交外部重启）；组件这边随后从 [`Self::recv`] 拿到"连接已断"的错误。
+/// 组件停机时，它的 `run` 先返回、之后框架才停这个子任务，所以收尾期间连接仍在。
+pub struct WsConn {
+    outgoing: mpsc::Sender<String>,
+    incoming: mpsc::Receiver<String>,
+    /// [`Self::await_subscriptions`] 期间收到的帧，[`Self::recv`] 先交它们
+    replay: std::collections::VecDeque<String>,
 }
 
-/// 运行 WebSocket 循环
-///
-/// # 参数
-/// - `read`: WebSocket 读取端
-/// - `write`: WebSocket 写入端
-/// - `outgoing_rx`: 出站消息接收器 (Subscribe/Unsubscribe 等)
-/// - `incoming_tx`: 入站消息发送器 (Ok=数据, Err=错误)
-/// - `keepalive`: 应用层心跳与空闲检测（见 [`WsKeepalive`]）
-///
-/// 循环退出时:
-/// - 如果出错（含空闲超时），发送 `Err(WsError)` 到 `incoming_tx`
-/// - 如果 `outgoing_rx` 关闭（actor drop 了 sender），正常退出
-pub async fn run_ws_loop(
-    mut read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
-        + Unpin
-        + Send,
-    mut write: impl SinkExt<WsMessage> + Unpin + Send,
-    mut outgoing_rx: mpsc::Receiver<String>,
-    incoming_tx: mpsc::Sender<Result<String, WsError>>,
-    keepalive: WsKeepalive,
-) {
-    let result =
-        run_ws_loop_inner(&mut read, &mut write, &mut outgoing_rx, &incoming_tx, &keepalive).await;
+impl WsConn {
+    /// 在 `group` 下起读循环子任务。组件构造时调用（分组只能在构造阶段声明）。
+    pub fn spawn(
+        group: &Group,
+        name: impl Into<String>,
+        read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin
+            + Send
+            + 'static,
+        write: impl SinkExt<WsMessage> + Unpin + Send + 'static,
+        keepalive: WsKeepalive,
+    ) -> Result<Self, GroupClosed> {
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<String>(INCOMING_BUFFER);
+        group.spawn_fn(name, move |scope| async move {
+            tokio::select! {
+                _ = scope.stopping() => Ok(()),
+                r = run_ws_loop(read, write, outgoing_rx, incoming_tx, keepalive) => r,
+            }
+        })?;
+        Ok(Self { outgoing: outgoing_tx, incoming: incoming_rx, replay: Default::default() })
+    }
 
-    // 出错时发送错误信号
-    if let Err(e) = result {
-        let _ = incoming_tx.send(Err(e)).await;
+    /// 发一帧文本（订阅/退订请求等）。循环已退出时返回 `Err`。
+    pub async fn send(&self, text: String) -> Result<(), WsError> {
+        self.outgoing
+            .send(text)
+            .await
+            .map_err(|_| WsError::Network("WS 循环已退出，发送失败".to_string()))
+    }
+
+    /// 下一帧入站文本。循环已退出（断线等，原因由循环子任务自己上报）时返回 `Err`。
+    /// 可安全地放在 `select!` 里（取消不丢帧）。
+    pub async fn recv(&mut self) -> Result<String, WsError> {
+        if let Some(text) = self.replay.pop_front() {
+            return Ok(text);
+        }
+        self.incoming
+            .recv()
+            .await
+            .ok_or_else(|| WsError::ServerClosed("WS 循环已退出（原因见循环子任务的错误）".to_string()))
+    }
+
+    /// 已经到手、还没处理的帧（停机时排空用：组件被要求停止后把已收到的回报处理完再退出）
+    pub fn try_recv(&mut self) -> Option<String> {
+        self.replay.pop_front().or_else(|| self.incoming.try_recv().ok())
+    }
+
+    /// 启动阶段等私有订阅全部确认，供私有 WS 组件在构造时调用 —— **请求发出去不等于
+    /// 订阅生效**，没确认就算启动完成的话，引擎会在私有回报还没接上时开始下单、建持仓基线。
+    ///
+    /// 心跳、回 Pong、断线判定都由读循环负责，这里只读文本帧。`confirms` 由各所给出：一帧
+    /// 确认了哪个订阅（确认回执，或该频道的数据到达 —— 后者是更硬的证据）返回
+    /// `Some(订阅名)`，与订阅无关返回 `None`，服务端拒绝/报错返回 `Err`（启动失败）。
+    ///
+    /// 确认期间收到的全部帧留着，之后 [`Self::recv`] 先交它们：确认期间可能已有成交回报，
+    /// 这样不会漏掉。
+    pub async fn await_subscriptions(
+        &mut self,
+        exchange: Exchange,
+        required: &[&str],
+        confirms: impl Fn(&str) -> Result<Option<String>, WsError>,
+    ) -> Result<(), ExchangeError> {
+        let mut pending: std::collections::HashSet<&str> = required.iter().copied().collect();
+        let incoming = &mut self.incoming;
+        let replay = &mut self.replay;
+        let wait = async {
+            while !pending.is_empty() {
+                let text = incoming
+                    .recv()
+                    .await
+                    .ok_or_else(|| WsError::ServerClosed("等订阅确认时连接已断".to_string()))?;
+                if let Some(sub) = confirms(&text)? {
+                    if pending.remove(sub.as_str()) {
+                        tracing::info!(%exchange, subscription = %sub, remaining = pending.len(), "私有订阅已确认生效");
+                    }
+                }
+                replay.push_back(text);
+            }
+            Ok::<(), WsError>(())
+        };
+        match tokio::time::timeout(SUBSCRIPTION_CONFIRM_TIMEOUT, wait).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(ExchangeError::WebSocketError(format!("{exchange} 私有订阅: {e}"))),
+            Err(_) => Err(ExchangeError::Timeout(format!(
+                "{exchange} 私有订阅 {pending:?} 未在 {}s 内确认，私有回报不可信",
+                SUBSCRIPTION_CONFIRM_TIMEOUT.as_secs()
+            ))),
+        }
     }
 }
 
 /// 私有订阅确认的等待上限：超时未集齐即启动失败（受控退出，不重试）
 pub const SUBSCRIPTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// [`await_subscriptions`] 交给 actor `attach_stream` 的入站流：确认期间收到的帧在前，之后的帧接续
-pub type ConfirmedStream = futures_util::stream::Chain<
-    futures_util::stream::Iter<std::vec::IntoIter<Result<String, WsError>>>,
-    tokio_stream::wrappers::ReceiverStream<Result<String, WsError>>,
->;
-
-/// 启动阶段等私有订阅全部确认，供私有 WS actor 在 `on_start` 里调用 —— **请求发出去不等于
-/// 订阅生效**，没确认就算启动完成的话，引擎会在私有回报还没接上时开始下单、建持仓基线。
+/// 读循环：转发出站帧、把入站文本帧交给组件、心跳与空闲判定。
 ///
-/// 在 [`run_ws_loop`] 已经跑起来之后、`attach_stream` 之前调用：心跳、回 Pong、断线判定都由
-/// 循环负责，这里只从 `incoming_rx` 读文本帧。`confirms` 由各所给出：一帧确认了哪个订阅
-/// （确认回执，或该频道的数据到达 —— 后者是更硬的证据）返回 `Some(订阅名)`，与订阅无关
-/// 返回 `None`，服务端拒绝/报错返回 `Err`（启动失败）。
-///
-/// 按值拿走 `incoming_rx`，返回「确认期间收到的全部帧 + 后续帧」拼好的流，直接交给
-/// `attach_stream`：确认期间可能已有成交回报，这样写就不会漏掉重放。
-pub async fn await_subscriptions(
-    exchange: Exchange,
-    mut incoming_rx: mpsc::Receiver<Result<String, WsError>>,
-    required: &[&str],
-    confirms: impl Fn(&str) -> Result<Option<String>, WsError>,
-) -> Result<ConfirmedStream, ExchangeError> {
-    let mut pending: std::collections::HashSet<&str> = required.iter().copied().collect();
-    let mut frames = Vec::new();
-    let wait = async {
-        while !pending.is_empty() {
-            let text = match incoming_rx.recv().await {
-                Some(Ok(text)) => text,
-                Some(Err(e)) => return Err(e),
-                None => return Err(WsError::ServerClosed("等订阅确认时连接已断".to_string())),
-            };
-            if let Some(sub) = confirms(&text)? {
-                if pending.remove(sub.as_str()) {
-                    tracing::info!(%exchange, subscription = %sub, remaining = pending.len(), "私有订阅已确认生效");
-                }
-            }
-            frames.push(Ok(text));
-        }
-        Ok(())
-    };
-    let outcome = tokio::time::timeout(SUBSCRIPTION_CONFIRM_TIMEOUT, wait).await;
-    match outcome {
-        Ok(Ok(())) => Ok(futures_util::stream::iter(frames)
-            .chain(tokio_stream::wrappers::ReceiverStream::new(incoming_rx))),
-        Ok(Err(e)) => Err(ExchangeError::WebSocketError(format!("{exchange} 私有订阅: {e}"))),
-        Err(_) => Err(ExchangeError::Timeout(format!(
-            "{exchange} 私有订阅 {pending:?} 未在 {}s 内确认，私有回报不可信",
-            SUBSCRIPTION_CONFIRM_TIMEOUT.as_secs()
-        ))),
-    }
+/// 返回 `Err` = 连接不可用（断线、服务端关闭、空闲超时、写失败）。组件丢掉了收发两端
+/// （只会发生在组件已退出之后）时返回 `Ok`。
+async fn run_ws_loop(
+    mut read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+        + Unpin
+        + Send,
+    mut write: impl SinkExt<WsMessage> + Unpin + Send,
+    mut outgoing_rx: mpsc::Receiver<String>,
+    incoming_tx: mpsc::Sender<String>,
+    keepalive: WsKeepalive,
+) -> anyhow::Result<()> {
+    run_ws_loop_inner(&mut read, &mut write, &mut outgoing_rx, &incoming_tx, &keepalive)
+        .await
+        .map_err(|e| anyhow::anyhow!("WS 连接: {e}"))
 }
 
 async fn run_ws_loop_inner(
@@ -195,7 +206,7 @@ async fn run_ws_loop_inner(
               + Send),
     write: &mut (impl SinkExt<WsMessage> + Unpin + Send),
     outgoing_rx: &mut mpsc::Receiver<String>,
-    incoming_tx: &mpsc::Sender<Result<String, WsError>>,
+    incoming_tx: &mpsc::Sender<String>,
     keepalive: &WsKeepalive,
 ) -> Result<(), WsError> {
     let mut ping_timer = tokio::time::interval(keepalive.ping_interval);
@@ -227,7 +238,7 @@ async fn run_ws_loop_inner(
                             return Err(WsError::Network("Send failed".to_string()));
                         }
                     }
-                    // Actor drop 了 sender，正常退出
+                    // 组件丢了发送端（组件已退出），无人再收
                     None => return Ok(()),
                 }
             }
@@ -238,7 +249,7 @@ async fn run_ws_loop_inner(
                 match ws_msg {
                     Some(Ok(WsMessage::Text(text))) => {
                         tracing::trace!(text = %text, "ws_loop received message");
-                        if incoming_tx.send(Ok(text)).await.is_err() {
+                        if incoming_tx.send(text).await.is_err() {
                             return Ok(());
                         }
                     }
@@ -246,7 +257,7 @@ async fn run_ws_loop_inner(
                         match String::from_utf8(data.into()) {
                             Ok(text) => {
                                 tracing::trace!(text = %text, "ws_loop received binary message");
-                                if incoming_tx.send(Ok(text)).await.is_err() {
+                                if incoming_tx.send(text).await.is_err() {
                                     return Ok(());
                                 }
                             }
@@ -297,7 +308,7 @@ mod keepalive_tests {
         }
     }
 
-    /// 空闲超时是**整机 kill 路径**：无任何入站帧时必须在 idle_timeout 后以 Err 退出。
+    /// 空闲超时是**整机停机路径**：无任何入站帧时必须在 idle_timeout 后以 Err 退出。
     /// start_paused 下时间自动推进，无需真实等待。
     #[tokio::test(start_paused = true)]
     async fn idle_timeout_exits_with_error() {
@@ -305,12 +316,11 @@ mod keepalive_tests {
         let (w_tx, _w_rx) = mpsc::channel::<WsMessage>(64);
         let write = PollSender::new(w_tx);
         let (_out_tx, out_rx) = mpsc::channel::<String>(8); // 保持 sender 存活，避免正常退出
-        let (in_tx, mut in_rx) = mpsc::channel::<Result<String, WsError>>(8);
+        let (in_tx, _in_rx) = mpsc::channel::<String>(8);
 
-        tokio::spawn(run_ws_loop(read, write, out_rx, in_tx, keepalive(None, 1, 3)));
-
-        let msg = in_rx.recv().await.expect("应收到断流错误");
-        let err = msg.expect_err("空闲超时必须是 Err");
+        let err = run_ws_loop(read, write, out_rx, in_tx, keepalive(None, 1, 3))
+            .await
+            .expect_err("空闲超时必须是 Err");
         assert!(err.to_string().contains("idle"), "got: {err}");
     }
 
@@ -322,7 +332,7 @@ mod keepalive_tests {
         let (w_tx, _w_rx) = mpsc::channel::<WsMessage>(64);
         let write = PollSender::new(w_tx);
         let (_out_tx, out_rx) = mpsc::channel::<String>(8);
-        let (in_tx, mut in_rx) = mpsc::channel::<Result<String, WsError>>(16);
+        let (in_tx, mut in_rx) = mpsc::channel::<String>(16);
 
         // 每 2 秒来一帧，idle 上限 3 秒：若计时不被重置，第 3 秒就会误杀
         tokio::spawn(async move {
@@ -334,16 +344,38 @@ mod keepalive_tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             drop(frame_tx);
         });
-        tokio::spawn(run_ws_loop(read, write, out_rx, in_tx, keepalive(None, 1, 3)));
+        let ws = tokio::spawn(run_ws_loop(read, write, out_rx, in_tx, keepalive(None, 1, 3)));
 
         // 5 帧全部送达（期间跨了 10 秒 > idle 3 秒，证明计时被入站帧重置）
         for i in 0..5 {
-            let msg = in_rx.recv().await.expect("帧应送达");
-            assert_eq!(msg.expect("数据帧"), format!("m{i}"));
+            assert_eq!(in_rx.recv().await.expect("帧应送达"), format!("m{i}"));
         }
         // 停止喂帧后，才在 idle 上限处退出
-        let err = in_rx.recv().await.expect("应收到断流错误").expect_err("Err");
+        let err = ws.await.unwrap().expect_err("Err");
         assert!(err.to_string().contains("idle"), "got: {err}");
+    }
+
+    /// 循环出错（断线）经任务树上冒：根停机、错误带着原因；组件侧 recv 随之报连接已断
+    #[tokio::test]
+    async fn loop_failure_propagates_through_the_tree() {
+        let root = crate::tasks::Root::new("t");
+        let (frame_tx, frame_rx) = mpsc::channel::<Frame>(4);
+        let (w_tx, _w_rx) = mpsc::channel::<WsMessage>(64);
+        let mut conn = WsConn::spawn(
+            &root.group("g"),
+            "ws",
+            ReceiverStream::new(frame_rx),
+            PollSender::new(w_tx),
+            keepalive(None, 60, 3600),
+        )
+        .unwrap();
+        frame_tx.send(Ok(WsMessage::Text("a".into()))).await.unwrap();
+        assert_eq!(conn.recv().await.unwrap(), "a");
+        drop(frame_tx); // 连接断开
+        assert!(conn.recv().await.is_err());
+        root.stopping().await;
+        let e = root.shutdown().await.unwrap_err();
+        assert!(format!("{e:#}").contains("connection dropped"), "{e:#}");
     }
 
     fn by_prefix(raw: &str) -> Result<Option<String>, WsError> {
@@ -354,37 +386,42 @@ mod keepalive_tests {
         }
     }
 
-    async fn frames(stream: ConfirmedStream, n: usize) -> Vec<String> {
-        stream.take(n).map(|f| f.unwrap()).collect().await
+    /// 不经读循环、直接喂入站帧的连接（只测订阅确认）
+    fn conn_fed_by(frames: &[&str]) -> (WsConn, mpsc::Sender<String>) {
+        let (in_tx, in_rx) = mpsc::channel(8);
+        for f in frames {
+            in_tx.try_send(f.to_string()).unwrap();
+        }
+        let (out_tx, _) = mpsc::channel(1);
+        (WsConn { outgoing: out_tx, incoming: in_rx, replay: Default::default() }, in_tx)
     }
 
-    /// 回执与数据都算确认；集齐才返回，返回的流先给确认期间的全部帧（含数据），再接后续帧，一帧不丢
+    /// 回执与数据都算确认；集齐才返回，之后 recv 先给确认期间的全部帧（含数据），再接后续帧，一帧不丢
     #[tokio::test]
     async fn subscriptions_confirmed_by_ack_or_data_and_frames_are_kept() {
-        let (tx, rx) = mpsc::channel(8);
-        for f in ["ack:orders", "noise", "data:fills", "late"] {
-            tx.send(Ok(f.to_string())).await.unwrap();
+        let (mut conn, _tx) = conn_fed_by(&["ack:orders", "noise", "data:fills", "late"]);
+        conn.await_subscriptions(Exchange::OKX, &["orders", "fills"], by_prefix).await.unwrap();
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.push(conn.recv().await.unwrap());
         }
-        let stream = await_subscriptions(Exchange::OKX, rx, &["orders", "fills"], by_prefix).await.unwrap();
-        assert_eq!(frames(stream, 4).await, ["ack:orders", "noise", "data:fills", "late"]);
+        assert_eq!(got, ["ack:orders", "noise", "data:fills", "late"]);
     }
 
     /// 服务端拒绝、连接断开、超时未集齐都是启动失败
     #[tokio::test(start_paused = true)]
     async fn rejection_disconnect_and_timeout_fail_startup() {
-        let (tx, rx) = mpsc::channel(8);
-        tx.send(Ok("error:bad sub".to_string())).await.unwrap();
-        let e = await_subscriptions(Exchange::OKX, rx, &["orders"], by_prefix).await.err().unwrap();
+        let (mut conn, _tx) = conn_fed_by(&["error:bad sub"]);
+        let e = conn.await_subscriptions(Exchange::OKX, &["orders"], by_prefix).await.err().unwrap();
         assert!(e.to_string().contains("bad sub"), "{e}");
 
-        let (tx, rx) = mpsc::channel(8);
-        tx.send(Ok("ack:orders".to_string())).await.unwrap();
-        let e = await_subscriptions(Exchange::OKX, rx, &["orders", "fills"], by_prefix).await.err().unwrap();
+        let (mut conn, _tx) = conn_fed_by(&["ack:orders"]);
+        let e = conn.await_subscriptions(Exchange::OKX, &["orders", "fills"], by_prefix).await.err().unwrap();
         assert!(matches!(e, ExchangeError::Timeout(_)) && e.to_string().contains("fills"), "超时要点名缺哪条: {e}");
 
-        let (tx, rx) = mpsc::channel::<Result<String, WsError>>(8);
+        let (mut conn, tx) = conn_fed_by(&[]);
         drop(tx);
-        assert!(await_subscriptions(Exchange::OKX, rx, &["orders"], by_prefix).await.is_err());
+        assert!(conn.await_subscriptions(Exchange::OKX, &["orders"], by_prefix).await.is_err());
     }
 
     /// 配置了 ping_text 的所（OKX/HL）按周期发送应用层 ping
@@ -394,7 +431,7 @@ mod keepalive_tests {
         let (w_tx, mut w_rx) = mpsc::channel::<WsMessage>(64);
         let write = PollSender::new(w_tx);
         let (_out_tx, out_rx) = mpsc::channel::<String>(8);
-        let (in_tx, _in_rx) = mpsc::channel::<Result<String, WsError>>(8);
+        let (in_tx, _in_rx) = mpsc::channel::<String>(8);
 
         tokio::spawn(run_ws_loop(read, write, out_rx, in_tx, keepalive(Some("ping"), 1, 3600)));
 
