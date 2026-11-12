@@ -170,7 +170,12 @@ impl FundingArbStrategy {
         if bbos.is_empty() {
             return Vec::new();
         }
-        let px = bbos.values().map(|b| b.mid_price()).sum::<f64>() / bbos.len() as f64;
+        // 参考价只用新鲜盘口（暂停所的旧价会把杠杆闸门算偏）；都不新鲜时退回全部盘口 ——
+        // 此时只用于零头判定和补腿，挂单另要求所对两所盘口新鲜，不会用到它
+        let fresh_mids: Vec<f64> =
+            bbos.iter().filter(|(ex, _)| self.bbo_fresh(**ex, now)).map(|(_, b)| b.mid_price()).collect();
+        let mids: Vec<f64> = if fresh_mids.is_empty() { bbos.values().map(|b| b.mid_price()).collect() } else { fresh_mids };
+        let px = mids.iter().sum::<f64>() / mids.len() as f64;
         let positions: Vec<(Exchange, f64)> = self.exchanges.iter().map(|&ex| (ex, sv.position_size(ex))).collect();
         let net: f64 = positions.iter().map(|(_, p)| p).sum();
 
@@ -273,7 +278,7 @@ impl FundingArbStrategy {
 
     /// 持仓差是不是零头（不补、不停机），全策略只此一处判据：
     /// - 价值不足一笔最小单；或
-    /// - 补不出去：有所对时看补腿所下不下得出；还没有所对（启动时）时，只要有一所下不出就算零头
+    /// - 补不出去：有所对时看补腿所下不下得出；还没有所对（启动时）时，只要有任一所下不出就算零头
     ///   —— 本策略留下的零头不超过当时补腿所的一手，而那一所事后未知，按最粗的一所放宽，
     ///   免得每次重启都因自己的零头停机。代价：启动时不足最粗一所一手的外来不平会被放过。
     fn is_dust(&self, net: f64, px: f64) -> bool {
