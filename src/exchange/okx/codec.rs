@@ -302,15 +302,18 @@ pub struct AccountData {
 ///
 /// 持仓价值按仓位逐个累加，而不是读 balance 顶层的 `notionalUsd` —— 后者在单币种
 /// 保证金模式下是空串（实测 11-12，funding-arb 账户 acctLv=2）。
-pub fn parse_account_info(total_eq: &str, position_notionals: &[&str]) -> Result<crate::domain::AccountInfo, String> {
+///
+/// `positions`：每仓 (pos, notionalUsd)。只有空仓（pos 为空串或 0）的价值空串才当 0；
+/// 有仓却没有价值就报错（杠杆闸门不能少算），下一轮重试，持续失败由停摆守卫接住。
+pub fn parse_account_info(total_eq: &str, positions: &[(&str, &str)]) -> Result<crate::domain::AccountInfo, String> {
     let equity = f64::from_str(total_eq).map_err(|_| format!("OKX totalEq 无法解析: '{total_eq}'"))?;
     let mut notional = 0.0;
-    for raw in position_notionals {
-        // 空仓记录的数值字段是空串，如实记 0
-        if raw.is_empty() {
+    for &(pos, raw) in positions {
+        let flat = pos.is_empty() || f64::from_str(pos).is_ok_and(|p| p == 0.0);
+        if raw.is_empty() && flat {
             continue;
         }
-        notional += f64::from_str(raw).map_err(|_| format!("OKX 持仓 notionalUsd 无法解析: '{raw}'"))?.abs();
+        notional += f64::from_str(raw).map_err(|_| format!("OKX 持仓 notionalUsd 无法解析: '{raw}'（pos={pos}）"))?.abs();
     }
     Ok(crate::domain::AccountInfo { equity, notional })
 }

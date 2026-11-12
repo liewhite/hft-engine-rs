@@ -14,7 +14,7 @@ pub struct FundingArbConfig {
     /// 开仓门槛：两所「过去 24h 实际资金费累加 × 365」之差的绝对值，0.5 = 50%
     pub open_threshold_apr: f64,
     /// 平仓门槛：一对相反仓位的收益年化（空头所年化 − 多头所年化）低于此值即在这两所之间平仓，
-    /// 0.1 = 10%；须小于开仓门槛
+    /// 0.1 = 10%；须 > 0 且小于开仓门槛
     pub close_threshold_apr: f64,
     /// 单笔挂单金额上限（USD）；实际取 min(本值, 两所对手盘第一档的金额)
     pub order_notional: f64,
@@ -86,9 +86,13 @@ impl FundingArbConfig {
             }
         };
         pos("open_threshold_apr", self.open_threshold_apr)?;
-        if !(self.close_threshold_apr.is_finite() && self.close_threshold_apr < self.open_threshold_apr) {
+        // > 0：仓位对收益 ≤ 0 时一定平（信号文档「开仓只会削到零头」的论证依赖它）
+        if !(self.close_threshold_apr.is_finite()
+            && self.close_threshold_apr > 0.0
+            && self.close_threshold_apr < self.open_threshold_apr)
+        {
             return Err(format!(
-                "close_threshold_apr 必须是有限值且小于 open_threshold_apr（当前 {} / {}）",
+                "close_threshold_apr 必须 > 0 且小于 open_threshold_apr（当前 {} / {}）",
                 self.close_threshold_apr, self.open_threshold_apr
             ));
         }

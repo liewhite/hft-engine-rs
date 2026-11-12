@@ -35,7 +35,10 @@
 //!
 //! 各所下单粒度不同（OKX 一手可值十几 U）。挂单量按两所粒度向下取整成两边都下得出的量；
 //! 持仓差不足补腿所的一手（或最小下单量）时视为零头，不补 —— 补了也会被交易所拒。所以每个币
-//! 可能留着不超过一手的单边敞口。
+//! 可能留着不超过一手的单边敞口。判据见 `is_dust`。
+//!
+//! 所对切换的那一步，旧所对的挂单撤销在途时新所对已挂单；新旧同方向的单都成交时，补腿量是两笔、
+//! 不经杠杆检查，最多超出一笔挂单金额。
 //!
 //! 外来成交按订单号前缀判别（与框架同一判据）；HL 的前缀是格式要求，别的程序带 cloid 的单认不出。
 
@@ -82,6 +85,8 @@ pub struct FundingArbStrategy {
     /// 本轮不平衡已发出的补腿单数；>0 时再发即是重试
     hedge_attempts: u32,
     last_action: Option<FundingAction>,
+    /// 已报过「挂不出平仓单」的所对（只报一次）
+    close_stuck: Option<LegPair>,
     /// 上一次是否有所的资金费未知（只在变成未知时打一次 warn）
     funding_unknown: bool,
 }
@@ -112,6 +117,7 @@ impl FundingArbStrategy {
             last_hedge_ts: None,
             hedge_attempts: 0,
             last_action: None,
+            close_stuck: None,
             funding_unknown: false,
         }
     }
@@ -124,6 +130,10 @@ impl FundingArbStrategy {
         self.bbo_local_ts
             .get(&ex)
             .is_some_and(|&t| now.saturating_sub(t) <= self.p.max_bbo_age_ms)
+    }
+
+    fn pair_fresh(&self, pair: LegPair, now: Timestamp) -> bool {
+        self.bbo_fresh(pair.sell, now) && self.bbo_fresh(pair.buy, now)
     }
 
     /// 跟踪本策略挂单的出现与离开
@@ -153,39 +163,35 @@ impl FundingArbStrategy {
             return self.maintain(sv, &[], now);
         }
 
-        let mut bbos: HashMap<Exchange, &BBO> = HashMap::new();
-        for &ex in &self.exchanges {
-            match sv.bbo(ex) {
-                Some(b) => {
-                    bbos.insert(ex, b);
-                }
-                None => return Vec::new(),
-            }
+        // 不要求每所都有盘口：某所品种暂停、迟迟没盘口时，其余所的补腿和停机检查照常；
+        // 挂单只在用到的两所盘口新鲜时才挂（见下方 fresh）
+        let bbos: HashMap<Exchange, &BBO> =
+            self.exchanges.iter().filter_map(|&ex| sv.bbo(ex).map(|b| (ex, b))).collect();
+        if bbos.is_empty() {
+            return Vec::new();
         }
         let px = bbos.values().map(|b| b.mid_price()).sum::<f64>() / bbos.len() as f64;
         let positions: Vec<(Exchange, f64)> = self.exchanges.iter().map(|&ex| (ex, sv.position_size(ex))).collect();
         let net: f64 = positions.iter().map(|(_, p)| p).sum();
 
-        if !self.startup_checked {
-            self.startup_checked = true;
-            // 只看下得出单的差：哪所都下不出的零头是本策略自己留下的（见模块文档）
-            if net.abs() * px >= self.p.min_order_notional && self.exchanges.iter().any(|&ex| self.tradable(ex, net.abs())) {
-                self.halt(format!("启动时各所持仓之和不为 0：{positions:?}（可能有不归本策略的仓位）"));
-                return Vec::new();
+        let startup = !self.startup_checked;
+        self.startup_checked = true;
+        if !self.is_dust(net, px) {
+            match (self.leg, startup) {
+                (Some(pair), false) => return self.hedge(sv, pair, net, &positions, now),
+                (_, true) => self.halt(format!("启动时各所持仓之和不为 0：{positions:?}（可能有不归本策略的仓位）")),
+                (None, false) => {
+                    self.halt(format!("各所持仓之和不为 0 但本策略还没挂过单，不知道在哪对所补：{positions:?}"))
+                }
             }
-        }
-
-        if net.abs() * px >= self.p.min_order_notional {
-            let Some(pair) = self.leg else {
-                self.halt(format!("各所持仓之和不为 0 但本策略还没挂过单，不知道在哪对所补：{positions:?}"));
-                return self.maintain(sv, &[], now);
-            };
-            if self.tradable(hedge_target(pair, net).0, net.abs()) {
-                return self.hedge(sv, pair, net, &positions, now);
-            }
+            return self.maintain(sv, &[], now);
         }
         if self.hedge_attempts > 0 {
-            tracing::info!(symbol = %self.symbol(), attempts = self.hedge_attempts, "各所持仓已对冲");
+            if net.abs() * px >= self.p.min_order_notional {
+                tracing::warn!(symbol = %self.symbol(), net, ?positions, "补腿后剩下补腿所下不出的零头，不再补");
+            } else {
+                tracing::info!(symbol = %self.symbol(), attempts = self.hedge_attempts, "各所持仓已对冲");
+            }
             self.hedge_attempts = 0;
         }
 
@@ -195,14 +201,25 @@ impl FundingArbStrategy {
         }
 
         let action = self.funding_action(&positions, px, now);
-        let fresh = |pair: LegPair| self.bbo_fresh(pair.sell, now) && self.bbo_fresh(pair.buy, now);
         let quotes = match action {
-            FundingAction::Open(pair) if fresh(pair) => self.open_quotes(pair, &bbos, &positions, px, view),
-            FundingAction::Close(pair) if fresh(pair) => self.close_quotes(pair, &bbos, &positions, px),
+            FundingAction::Open(pair) if self.pair_fresh(pair, now) => self.open_quotes(pair, &bbos, &positions, px, view),
+            FundingAction::Close(pair) if self.pair_fresh(pair, now) => self.close_quotes(pair, &bbos, &positions, px),
             _ => Vec::new(),
         };
         if let (Some(pair), false) = (action_pair(action), quotes.is_empty()) {
             self.leg = Some(pair);
+        }
+        match action {
+            // 平仓信号在、盘口也新鲜，却挂不出单（量不足最小单或凑不齐两所都下得出的一手）：
+            // 仓位会一直拿着，要人看。每个所对只报一次
+            FundingAction::Close(pair) if quotes.is_empty() && self.pair_fresh(pair, now) => {
+                if self.close_stuck != Some(pair) {
+                    tracing::warn!(symbol = %self.symbol(), ?pair, ?positions, "该平仓但挂不出平仓单（量太小或下单粒度凑不齐），需人工处理");
+                    self.close_stuck = Some(pair);
+                }
+            }
+            _ if !quotes.is_empty() => self.close_stuck = None,
+            _ => {}
         }
         self.maintain(sv, &quotes, now)
     }
@@ -251,6 +268,21 @@ impl FundingArbStrategy {
         match side {
             Side::Short => bbo.ask_price * (1.0 + self.p.order_distance),
             Side::Long => bbo.bid_price * (1.0 - self.p.order_distance),
+        }
+    }
+
+    /// 持仓差是不是零头（不补、不停机），全策略只此一处判据：
+    /// - 价值不足一笔最小单；或
+    /// - 补不出去：有所对时看补腿所下不下得出；还没有所对（启动时）时，只要有一所下不出就算零头
+    ///   —— 本策略留下的零头不超过当时补腿所的一手，而那一所事后未知，按最粗的一所放宽，
+    ///   免得每次重启都因自己的零头停机。代价：启动时不足最粗一所一手的外来不平会被放过。
+    fn is_dust(&self, net: f64, px: f64) -> bool {
+        if net.abs() * px < self.p.min_order_notional {
+            return true;
+        }
+        match self.leg {
+            Some(pair) => !self.tradable(hedge_target(pair, net).0, net.abs()),
+            None => !self.exchanges.iter().all(|&ex| self.tradable(ex, net.abs())),
         }
     }
 
@@ -430,8 +462,9 @@ impl FundingArbStrategy {
             return out;
         }
         let target_pos = positions.iter().find(|(e, _)| *e == target).map_or(0.0, |(_, p)| *p);
-        // 补腿所持仓与净差同号 → 反向下单是在减它的仓
-        let reduce_only = target_pos != 0.0 && target_pos.signum() == net.signum();
+        // 补腿所持仓与净差同号、且够减 → 只减仓（平仓补过头时不会反手开仓）；
+        // 不够减时不设，否则交易所会截短或整单拒绝，补不齐
+        let reduce_only = target_pos.signum() == net.signum() && target_pos.abs() >= net.abs();
         if self.hedge_attempts > 0 {
             tracing::error!(
                 symbol = %self.symbol(), %target, net, ?positions, attempts = self.hedge_attempts,

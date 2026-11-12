@@ -644,6 +644,7 @@ impl AccountClient for OkxClient {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct PositionNotional {
+            pos: String,
             notional_usd: String,
         }
         let balance: Vec<BalanceData> = self.signed_get("/api/v5/account/balance").await?;
@@ -651,7 +652,7 @@ impl AccountClient for OkxClient {
             .first()
             .ok_or_else(|| ExchangeError::ParseError("OKX account/balance 返回空 data".to_string()))?;
         let positions: Vec<PositionNotional> = self.signed_get("/api/v5/account/positions").await?;
-        let notionals: Vec<&str> = positions.iter().map(|p| p.notional_usd.as_str()).collect();
+        let notionals: Vec<(&str, &str)> = positions.iter().map(|p| (p.pos.as_str(), p.notional_usd.as_str())).collect();
         parse_account_info(&total_eq.total_eq, &notionals).map_err(ExchangeError::ParseError)
     }
 
@@ -829,7 +830,7 @@ mod account_info_tests {
 
     #[test]
     fn sums_absolute_position_notionals() {
-        let info = parse_account_info("1000.5", &["200", "-150.5", ""]).unwrap();
+        let info = parse_account_info("1000.5", &[("2", "200"), ("-1", "-150.5"), ("", ""), ("0", "")]).unwrap();
         assert_eq!(info.equity, 1000.5);
         assert_eq!(info.notional, 350.5);
     }
@@ -837,7 +838,8 @@ mod account_info_tests {
     #[test]
     fn unparsable_values_fail_instead_of_zero() {
         assert!(parse_account_info("", &[]).is_err());
-        assert!(parse_account_info("1", &["abc"]).is_err());
+        assert!(parse_account_info("1", &[("1", "abc")]).is_err());
+        assert!(parse_account_info("1", &[("3", "")]).is_err(), "有仓却没有价值不能当 0");
     }
 }
 

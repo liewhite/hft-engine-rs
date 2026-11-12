@@ -480,3 +480,37 @@ fn imbalance_below_one_lot_of_the_hedge_exchange_is_dust() {
     assert_eq!(h.len(), 1, "{h:?}");
     assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (OKX, Side::Short, 1.0));
 }
+
+#[test]
+fn hedge_larger_than_target_position_is_not_reduce_only() {
+    // 币安留着 0.05 个多仓零头（5U）。在「币安卖 / HL 买」开仓，HL 买单先成交 1.998：
+    // 要在币安市价卖 1.998，远超 0.05 的多仓 → 不能设只减仓（否则被交易所截短或拒绝）
+    let mut s = Sim::new(0.05, 0.0);
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    let bn = o.iter().find(|o| o.exchange == BN).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&bn, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::Pending);
+    s.fill(&hl, hl.quantity);
+    s.confirm(&hl, OrderStatus::Filled);
+    s.confirm(&bn, OrderStatus::Cancelled);
+    s.advance(600);
+    let h = placed(&s.bbo(BN));
+    assert_eq!(h.len(), 1, "{h:?}");
+    assert_eq!((h[0].exchange, h[0].side), (BN, Side::Short));
+    assert!(!h[0].reduce_only, "补腿量 {} 大于币安多仓 0.05", h[0].quantity);
+}
+
+#[test]
+fn missing_bbo_on_unused_exchange_does_not_block_hedging() {
+    // OKX 迟迟没盘口（如品种暂停）：币安×HL 照常开仓（OKX 年化也得已知才开 → 这里给 OKX 年化）
+    let mut s = Sim::multi_without_bbo(&[(BN, 0.0), (HL, 0.0), (OKX, 0.0)]);
+    s.bbo(BN);
+    s.bbo(HL);
+    s.funding(OKX, 0.3);
+    s.funding(HL, 0.0);
+    let o = placed(&s.funding(BN, 0.8));
+    assert_eq!(o.len(), 2, "{o:?}");
+    assert!(o.iter().all(|x| x.exchange != OKX));
+}
