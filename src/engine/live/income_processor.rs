@@ -1,7 +1,8 @@
-//! IncomeProcessorActor - 事件分发 Actor
+//! IncomeProcessor —— 入向事件分发
 //!
-//! 订阅 MarketBus 与 AccountBus，按订阅范围分发到对应的 ExecutorActor。"这条事件归不归它"
-//! 一律问 [`SubscriptionScope::accepts`]（账户归属、所、symbol 都在那里判），这里只管扇出：
+//! 订阅 MarketBus 与 AccountBus（全量），按订阅范围分发到对应的 [`Executor`](super::Executor)。
+//! "这条事件归不归它"一律问 [`SubscriptionScope::accepts`]（账户归属、所、symbol 都在那里判），
+//! 这里只管扇出：
 //! - 行情（[`MarketEvent`]）：一份服务所有账户 —— 有 symbol 的经 `(所, symbol)` 索引定向，
 //!   其余逐个问范围；
 //! - 账户事件（[`AccountEvent`]）：经账户索引只看该账户的 executor，再问范围。
@@ -11,38 +12,178 @@
 //! 分发是热路径（每条 BBO 都经过），按 (exchange, symbol) 与账户建反向索引做 O(1)
 //! 查找 —— 此前对每条事件线性扫描全部 executor，数百 symbol 的部署下每个行情 tick
 //! 都是 O(n) 扫描。
+//!
+//! # 名单由编排维护
+//!
+//! 投产时 [`IncomeProcessorHandle::register`]，撤下/回滚时**先** [`IncomeProcessorHandle::unregister`]
+//! （等它确认）**再**停 executor：两步都是 ask，返回即已生效，停掉的实例不会再被投递。
 
-use super::ExecutorActor;
+use super::executor::{ExecutorHandle, ExecutorId};
 use crate::domain::{AccountId, Exchange, Symbol};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{AccountEvent, Delivery, IncomeEvent, MarketEvent, SubscriptionScope};
-use kameo::actor::{ActorId, ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::message::{Context, Message};
-use kameo::Actor;
+use crate::messaging::{
+    AccountBus, AccountEvent, Delivery, IncomeEvent, MarketBus, MarketEvent, SubscriptionScope,
+};
+use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, Task};
 use std::collections::{HashMap, HashSet};
+use tokio::sync::oneshot;
 
 /// Executor 订阅信息
 struct ExecutorSubscription {
-    executor: ActorRef<ExecutorActor>,
+    executor: ExecutorHandle,
     /// 订阅范围（含绑定账户）。"这条事件归不归它"一律问 [`SubscriptionScope::accepts`]，
     /// 与回测驱动同一份判据 —— 下面的两个反向索引只是热路径的扇出优化。
     scope: SubscriptionScope,
 }
 
-/// ProcessorActor - 事件分发
-#[derive(Default)]
-pub struct IncomeProcessorActor {
-    /// ActorId -> Executor 订阅信息
-    executors: HashMap<ActorId, ExecutorSubscription>,
-    /// 反向索引：(exchange, symbol) -> 订阅者（热路径 O(1) 查找）
-    by_symbol: HashMap<(Exchange, Symbol), Vec<ActorId>>,
-    /// 反向索引：账户 -> 该账户的全部 executor
-    by_account: HashMap<AccountId, Vec<ActorId>>,
+/// IncomeProcessor 的收件箱消息
+pub enum IncomeProcessorMsg {
+    /// 行情总线（全量订阅）
+    Market(MarketEvent),
+    /// 账户总线（全量订阅）
+    Account(AccountEvent),
+    /// 见 [`IncomeProcessorHandle::register`]
+    Register {
+        executor: ExecutorHandle,
+        subscriptions: HashSet<(Exchange, SubscriptionKind)>,
+        account: AccountId,
+        reply: oneshot::Sender<()>,
+    },
+    /// 见 [`IncomeProcessorHandle::unregister`]
+    Unregister {
+        executor: ExecutorId,
+        reply: oneshot::Sender<()>,
+    },
 }
 
-impl IncomeProcessorActor {
-    fn remove_from_indexes(&mut self, id: ActorId) {
+/// IncomeProcessor 的地址（可克隆）
+#[derive(Clone, Debug)]
+pub struct IncomeProcessorHandle(Addr<IncomeProcessorMsg>);
+
+impl IncomeProcessorHandle {
+    /// 注册 executor 及其订阅（该 executor 绑定 `account`）。返回即已生效：此后的事件按范围投给它。
+    ///
+    /// 幂等：同一 executor 重复注册会先摘净旧索引再按新范围登记。
+    pub async fn register(
+        &self,
+        executor: ExecutorHandle,
+        subscriptions: HashSet<(Exchange, SubscriptionKind)>,
+        account: AccountId,
+    ) -> Result<(), Gone> {
+        self.0
+            .ask(|reply| IncomeProcessorMsg::Register {
+                executor,
+                subscriptions,
+                account,
+                reply,
+            })
+            .await
+    }
+
+    /// 注销 executor（动态撤下策略实例时使用）。返回即已生效：此后不会再有事件投给它，
+    /// 调用方可以放心停掉它。未注册是空操作（记 warn）。
+    pub async fn unregister(&self, executor: ExecutorId) -> Result<(), Gone> {
+        self.0
+            .ask(|reply| IncomeProcessorMsg::Unregister { executor, reply })
+            .await
+    }
+}
+
+/// 入向事件分发
+pub struct IncomeProcessor {
+    inbox: Inbox<IncomeProcessorMsg>,
+    executors: HashMap<ExecutorId, ExecutorSubscription>,
+    /// 反向索引：(exchange, symbol) -> 订阅者（热路径 O(1) 查找）
+    by_symbol: HashMap<(Exchange, Symbol), Vec<ExecutorId>>,
+    /// 反向索引：账户 -> 该账户的全部 executor
+    by_account: HashMap<AccountId, Vec<ExecutorId>>,
+}
+
+impl IncomeProcessor {
+    /// 在 `group`（consumers）下起分发器，构造时订阅两条入向总线的全量事件。
+    pub async fn spawn(
+        group: &Group,
+        market_bus: &MarketBus,
+        account_bus: &AccountBus,
+    ) -> anyhow::Result<(ChildHandle, IncomeProcessorHandle)> {
+        let (market_bus, account_bus) = (market_bus.clone(), account_bus.clone());
+        let (child, addr) = group
+            .spawn_addressed("IncomeProcessor", move |_scope: Scope, mut inbox| async move {
+                inbox.subscribe(&market_bus, |_| true, IncomeProcessorMsg::Market);
+                inbox.subscribe(&account_bus, |_| true, IncomeProcessorMsg::Account);
+                tracing::info!("IncomeProcessor started");
+                Ok(Self {
+                    inbox,
+                    executors: HashMap::new(),
+                    by_symbol: HashMap::new(),
+                    by_account: HashMap::new(),
+                })
+            })
+            .await?;
+        Ok((child, IncomeProcessorHandle(addr)))
+    }
+
+    fn handle(&mut self, msg: IncomeProcessorMsg) {
+        // 回执发送失败 = 提问方已不再等，没有人需要这份确认
+        match msg {
+            IncomeProcessorMsg::Market(event) => self.on_market(event),
+            IncomeProcessorMsg::Account(event) => self.on_account(event),
+            IncomeProcessorMsg::Register {
+                executor,
+                subscriptions,
+                account,
+                reply,
+            } => {
+                self.register(executor, subscriptions, account);
+                let _ = reply.send(());
+            }
+            IncomeProcessorMsg::Unregister { executor, reply } => {
+                if self.executors.contains_key(&executor) {
+                    self.remove_from_indexes(executor);
+                } else {
+                    tracing::warn!(%executor, "注销 executor：该 executor 未注册，忽略");
+                }
+                let _ = reply.send(());
+            }
+        }
+    }
+
+    fn register(
+        &mut self,
+        executor: ExecutorHandle,
+        subscriptions: HashSet<(Exchange, SubscriptionKind)>,
+        account: AccountId,
+    ) {
+        let id = executor.id();
+        // 幂等：同一 executor 重复注册时先摘净旧索引 —— 否则 by_symbol/by_account 里
+        // 出现重复 id，每条事件双份投递、Fill 双计仓位（危险侧、静默）。今天注册点单一
+        // 且 ExecutorId 唯一，但这不该是巧合保护，而是结构保证。
+        self.remove_from_indexes(id);
+
+        let scope = SubscriptionScope::new(
+            account,
+            subscriptions
+                .iter()
+                .map(|(ex, kind)| (*ex, kind.symbol().clone())),
+        );
+
+        tracing::info!(executor = %id, scope = ?scope, "Executor registered");
+
+        for (exchange, symbol) in scope.pairs() {
+            self.by_symbol
+                .entry((exchange, symbol.clone()))
+                .or_default()
+                .push(id);
+        }
+        self.by_account
+            .entry(scope.account().clone())
+            .or_default()
+            .push(id);
+        self.executors
+            .insert(id, ExecutorSubscription { executor, scope });
+    }
+
+    fn remove_from_indexes(&mut self, id: ExecutorId) {
         if let Some(sub) = self.executors.remove(&id) {
             for (exchange, symbol) in sub.scope.pairs() {
                 let key = (exchange, symbol.clone());
@@ -62,101 +203,10 @@ impl IncomeProcessorActor {
         }
     }
 
-    async fn forward(sub: &ExecutorSubscription, event: &IncomeEvent) {
-        if let Err(e) = sub.executor.tell(event.clone()).send().await {
-            tracing::error!(error = %e, "Failed to forward event to executor");
-        }
-    }
-}
-
-impl Actor for IncomeProcessorActor {
-    type Args = Self;
-    type Error = Infallible;
-
-    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        tracing::info!("ProcessorActor started");
-        Ok(args)
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        tracing::info!("ProcessorActor stopped");
-        Ok(())
-    }
-}
-
-// ============================================================================
-// Messages
-// ============================================================================
-
-/// 注册 Executor 及其订阅
-pub struct RegisterExecutor {
-    pub executor: ActorRef<ExecutorActor>,
-    pub subscriptions: HashSet<(Exchange, SubscriptionKind)>,
-    /// 该 executor 绑定的账户
-    pub account: AccountId,
-}
-
-impl Message<RegisterExecutor> for IncomeProcessorActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: RegisterExecutor,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let actor_id = msg.executor.id();
-        // 幂等：同一 executor 重复注册时先摘净旧索引 —— 否则 by_symbol/by_account 里
-        // 出现重复 id，每条事件双份投递、Fill 双计仓位（危险侧、静默）。今天注册点单一
-        // 且 ActorId 唯一，但这不该是巧合保护，而是结构保证。
-        self.remove_from_indexes(actor_id);
-
-        let scope = SubscriptionScope::new(
-            msg.account,
-            msg.subscriptions
-                .iter()
-                .map(|(ex, kind)| (*ex, kind.symbol().clone())),
-        );
-
-        tracing::info!(
-            executor_id = ?actor_id,
-            scope = ?scope,
-            "Executor registered"
-        );
-
-        for (exchange, symbol) in scope.pairs() {
-            self.by_symbol
-                .entry((exchange, symbol.clone()))
-                .or_default()
-                .push(actor_id);
-        }
-        self.by_account
-            .entry(scope.account().clone())
-            .or_default()
-            .push(actor_id);
-        self.executors.insert(
-            actor_id,
-            ExecutorSubscription {
-                executor: msg.executor,
-                scope,
-            },
-        );
-    }
-}
-
-/// 行情事件：一份服务所有账户。有 symbol 的定向投给订阅者，无 symbol 的广播。
-impl Message<MarketEvent> for IncomeProcessorActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: MarketEvent,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+    /// 行情事件：一份服务所有账户。有 symbol 的定向投给订阅者，无 symbol 的按范围投。
+    fn on_market(&mut self, msg: MarketEvent) {
         let event = IncomeEvent::Market(msg);
+        let mut gone = Vec::new();
         match event.delivery() {
             Delivery::Symbol(exchange, symbol) => {
                 // 定向：索引 O(1)。索引的键由 `SubscriptionScope::pairs()` 灌，与判据同源，
@@ -169,7 +219,7 @@ impl Message<MarketEvent> for IncomeProcessorActor {
                                 sub.scope.accepts(&event),
                                 "by_symbol 索引与订阅范围失配：事件被投给了范围外的 executor"
                             );
-                            Self::forward(sub, &event).await;
+                            Self::forward(sub, &event, &mut gone);
                         }
                     }
                 }
@@ -180,28 +230,22 @@ impl Message<MarketEvent> for IncomeProcessorActor {
             Delivery::Exchange(_) | Delivery::Broadcast => {
                 for sub in self.executors.values() {
                     if sub.scope.accepts(&event) {
-                        Self::forward(sub, &event).await;
+                        Self::forward(sub, &event, &mut gone);
                     }
                 }
             }
         }
+        self.drop_gone(gone);
     }
-}
 
-/// 账户事件：经账户索引只看**该账户**的 executor，再按订阅范围过滤。
-impl Message<AccountEvent> for IncomeProcessorActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: AccountEvent,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
+    /// 账户事件：经账户索引只看**该账户**的 executor，再按订阅范围过滤。
+    fn on_account(&mut self, msg: AccountEvent) {
         let account = msg.account.clone();
         let event = IncomeEvent::Account(msg);
         let Some(ids) = self.by_account.get(&account) else {
             return;
         };
+        let mut gone = Vec::new();
         for id in ids {
             let Some(sub) = self.executors.get(id) else {
                 continue;
@@ -229,30 +273,40 @@ impl Message<AccountEvent> for IncomeProcessorActor {
                 }
                 continue;
             }
-            Self::forward(sub, &event).await;
+            Self::forward(sub, &event, &mut gone);
+        }
+        self.drop_gone(gone);
+    }
+
+    /// 投给一个 executor；对方已停止收件则记进 `gone`（由 [`Self::drop_gone`] 处理）。
+    fn forward(sub: &ExecutorSubscription, event: &IncomeEvent, gone: &mut Vec<ExecutorId>) {
+        if sub.executor.deliver(event.clone()).is_err() {
+            gone.push(sub.executor.id());
+        }
+    }
+
+    /// 投递失败（`Gone`）= 该 executor 已停止收件，只有三种来路，都不是需要分发层上冒的事故：
+    /// - 整机停机：生产者组（executor 与交易所节点）先停，交易所节点收尾时发出的最后几条
+    ///   事件到这里时 executor 已关箱 —— 正常；
+    /// - executor 自己出错退出：它的错误已经自行上冒、整机在停；
+    /// - 编排没先注销就停了它（违反「先注销再停」的约定）：它本就要停，丢的事件没人需要。
+    ///
+    /// 所以记 warn 并把它摘出名单（之后不会再为它报第二次），分发器照常运行。
+    fn drop_gone(&mut self, gone: Vec<ExecutorId>) {
+        for id in gone {
+            tracing::warn!(executor = %id, "executor 已停止收件，事件未送达，移出分发名单（停机途中属正常）");
+            self.remove_from_indexes(id);
         }
     }
 }
 
-/// 注销 executor（动态撤下策略实例时使用）
-pub struct UnregisterExecutor {
-    pub executor: ActorRef<ExecutorActor>,
-}
-
-impl Message<UnregisterExecutor> for IncomeProcessorActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: UnregisterExecutor,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let id = msg.executor.id();
-        if self.executors.contains_key(&id) {
-            self.remove_from_indexes(id);
-        } else {
-            tracing::warn!(?id, "UnregisterExecutor: 该 executor 未注册，忽略");
+impl Task for IncomeProcessor {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        while let Some(msg) = self.inbox.recv().await {
+            self.handle(msg);
         }
+        tracing::info!("IncomeProcessor stopped");
+        Ok(())
     }
 }
 
@@ -342,5 +396,137 @@ mod routing_tests {
 
         let clock = IncomeEvent::market(0, 0, MarketData::Clock);
         assert_eq!(clock.delivery(), Delivery::Broadcast, "Clock 与交易所无关，广播");
+    }
+}
+
+/// 组件层：注册后按范围投递、注销后不再投递、对方停止收件不打死分发器。用 `tasks::Root` 搭树测。
+#[cfg(test)]
+mod task_tests {
+    use super::*;
+    use crate::domain::{Fill, FillReason, MarketTrade, Side};
+    use crate::engine::live::executor::ExecutorMsg;
+    use crate::messaging::{AccountData, MarketData, SymbolAccountData};
+    use crate::tasks::Root;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn btc_bbo() -> HashSet<(Exchange, SubscriptionKind)> {
+        HashSet::from([(
+            Exchange::Binance,
+            SubscriptionKind::BBO {
+                symbol: "BTC".to_string(),
+            },
+        )])
+    }
+
+    fn trade(symbol: &str) -> MarketEvent {
+        MarketEvent {
+            exchange_ts: 1,
+            local_ts: 1,
+            data: MarketData::MarketTrade(MarketTrade {
+                exchange: Exchange::Binance,
+                symbol: symbol.to_string(),
+                price: 100.0,
+                qty: 1.0,
+                is_buyer_maker: false,
+                timestamp: 1,
+            }),
+        }
+    }
+
+    fn live_fill() -> AccountEvent {
+        AccountEvent {
+            account: AccountId::Live,
+            exchange_ts: 1,
+            local_ts: 1,
+            data: AccountData::Symbol(SymbolAccountData::Fill(Fill {
+                exchange: Exchange::Binance,
+                symbol: "BTC".to_string(),
+                side: Side::Long,
+                price: 100.0,
+                size: 1.0,
+                client_order_id: None,
+                order_id: "1".to_string(),
+                timestamp: 1,
+                fee: 0.0,
+                reason: FillReason::Normal,
+            })),
+        }
+    }
+
+    /// 代替 executor 的收件端：记下收到的事件条数
+    async fn fake_executor(root: &Root) -> (ChildHandle, ExecutorHandle, Arc<Mutex<usize>>) {
+        let got = Arc::new(Mutex::new(0usize));
+        let (addr_tx, addr_rx) = oneshot::channel();
+        let sink = got.clone();
+        let child = root
+            .group("producers")
+            .spawn_fn("fake-executor", move |scope| async move {
+                let (addr, mut inbox) = scope.inbox::<ExecutorMsg>();
+                addr_tx.send(addr).unwrap();
+                while let Some(msg) = inbox.recv().await {
+                    if let ExecutorMsg::Event(_) = msg {
+                        *sink.lock().unwrap() += 1;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        (child, ExecutorHandle::for_test(addr_rx.await.unwrap()), got)
+    }
+
+    /// 让分发器处理完之前进箱的事件（同一收件箱 FIFO：一次 ask 应答 = 前面的都已处理）
+    async fn settle(p: &IncomeProcessorHandle) {
+        p.unregister(ExecutorId::for_test(u64::MAX)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test]
+    async fn routes_by_scope_and_stops_after_unregister() {
+        let root = Root::new("t");
+        let (market, account) = (MarketBus::new("market"), AccountBus::new("account"));
+        let (_c, processor) = IncomeProcessor::spawn(&root.group("consumers"), &market, &account)
+            .await
+            .unwrap();
+        let (_e, executor, got) = fake_executor(&root).await;
+        let id = executor.id();
+        processor
+            .register(executor, btc_bbo(), AccountId::Live)
+            .await
+            .unwrap();
+
+        market.publish(trade("BTC"));
+        market.publish(trade("ETH")); // 范围外
+        account.publish(live_fill());
+        settle(&processor).await;
+        assert_eq!(*got.lock().unwrap(), 2, "BTC 行情与该账户的 BTC 成交各一条，ETH 不投");
+
+        processor.unregister(id).await.unwrap();
+        market.publish(trade("BTC"));
+        settle(&processor).await;
+        assert_eq!(*got.lock().unwrap(), 2, "注销返回后不再投递");
+        root.shutdown().await.unwrap();
+    }
+
+    /// executor 已停止收件（停机途中的常态）：分发器记 warn、摘掉它，自己照常运行
+    #[tokio::test]
+    async fn a_gone_executor_never_halts_the_processor() {
+        let root = Root::new("t");
+        let (market, account) = (MarketBus::new("market"), AccountBus::new("account"));
+        let (_c, processor) = IncomeProcessor::spawn(&root.group("consumers"), &market, &account)
+            .await
+            .unwrap();
+        let (child, executor, _got) = fake_executor(&root).await;
+        processor
+            .register(executor, btc_bbo(), AccountId::Live)
+            .await
+            .unwrap();
+        child.stop().await;
+
+        market.publish(trade("BTC"));
+        market.publish(trade("BTC"));
+        settle(&processor).await;
+        assert!(!root.is_stopping(), "executor 停止收件不是分发层的事故");
+        root.shutdown().await.unwrap();
     }
 }

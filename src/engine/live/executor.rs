@@ -1,27 +1,28 @@
-//! ExecutorActor - 包装 Strategy 的 Actor
+//! Executor —— 一个策略实例
 //!
-//! 接收 IncomeEvent，委托 [`StrategyRunner`] 运行策略 (更新状态 + 转换订单)，
-//! 把产出的 OutcomeEvent 发布到 OutcomePubSub。纯策略逻辑集中在 StrategyRunner，
-//! 与回测引擎共享同一份实现。
+//! 接收 IncomeEvent（由 [`super::IncomeProcessor`] 按订阅范围转发），委托 [`StrategyRunner`]
+//! 运行策略（更新状态 + 转换订单），把产出的 OutcomeEvent 打上账户标签发布到 OutcomeBus。
+//! 纯策略逻辑集中在 StrategyRunner，与回测引擎共享同一份实现。
+//!
+//! 运行期由编排（manager）往 producers 组里 spawn；单独撤下时对 [`Executor::spawn`] 返回的
+//! [`ChildHandle`] 调 `stop().await`（会把箱里已收到的事件处理完再退出）。
 
-use crate::domain::{now_ms, AccountId, Exchange, Symbol, SymbolMeta, Timestamp};
+use crate::domain::{now_ms, AccountId, Exchange, Position, Symbol, SymbolMeta, Timestamp};
 use crate::engine::StrategyRunner;
 use crate::messaging::IncomeEvent;
 use crate::strategy::Strategy;
-use kameo::actor::{ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::message::{Context, Message};
-use kameo::Actor;
+use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, Task};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use kameo_actors::pubsub::Publish;
+use tokio::sync::oneshot;
 
-use super::{AccountOutcome, OutcomePubSub};
+use super::{AccountOutcome, OutcomeBus};
 
 /// 策略消费一条事件时，距适配层收到它的最大容忍时长（见
-/// [`ExecutorActor::check_pipeline_lag`]）。
+/// [`Executor::check_pipeline_lag`]）。
 ///
-/// 取 1 秒：正常路径上这个值是几毫秒（三跳进程内邮箱），到秒级只有一个解释 —— 本实例
+/// 取 1 秒：正常路径上这个值是几毫秒（三跳进程内收件箱），到秒级只有一个解释 —— 本实例
 /// 跟不上事件流。它同时是策略决策的陈旧度上限：spread_arb 的行情新鲜度门是秒级，
 /// 拿超过 1 秒的报价去算价差已经没有意义。
 const MAX_PIPELINE_LAG_MS: u64 = 1_000;
@@ -40,7 +41,31 @@ fn lag_warn_due(now: Timestamp, last_warn_ms: Timestamp) -> bool {
     now.saturating_sub(last_warn_ms) >= LAG_WARN_INTERVAL_MS
 }
 
-/// ExecutorActor 初始化参数
+/// 一个策略实例在进程内的身份：分发层（[`super::IncomeProcessor`]）与持仓账本
+/// （[`super::PositionLedger`]）的名单都按它记。进程内唯一、不复用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExecutorId(u64);
+
+impl ExecutorId {
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// 测试用：造一个固定的身份（只拿来当名单键，不对应真实实例）
+    #[cfg(test)]
+    pub(crate) fn for_test(n: u64) -> Self {
+        Self(n)
+    }
+}
+
+impl std::fmt::Display for ExecutorId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
+/// [`Executor::spawn`] 的参数
 pub struct ExecutorArgs {
     /// 策略实例
     pub strategy: Box<dyn Strategy>,
@@ -51,39 +76,146 @@ pub struct ExecutorArgs {
     /// 持仓基线（投产握手）：实例**出生即带基线**，在收到任何流事件之前写入 ——
     /// "Fill 早于基线、存量被丢"的竞态在结构上不可能。模拟账户从 0 起算，传空。
     pub baselines: Vec<crate::messaging::PositionBaseline>,
-    /// Outcome PubSub 引用 (用于发布信号)
-    pub outcome_pubsub: ActorRef<OutcomePubSub>,
+    /// 策略信号的去处
+    pub outcome_bus: OutcomeBus,
 }
 
-/// ExecutorActor - 执行策略的 Actor
-pub struct ExecutorActor {
+/// Executor 的收件箱消息
+pub enum ExecutorMsg {
+    /// 一条入向事件（行情或账户，含 Clock），由分发层转发
+    Event(IncomeEvent),
+    /// 见 [`ExecutorHandle::positions`]
+    GetPositions(Vec<Symbol>, oneshot::Sender<Vec<Position>>),
+    /// 见 [`ExecutorHandle::seeded_positions`]
+    GetSeededPositions(oneshot::Sender<Vec<Position>>),
+}
+
+/// 一个策略实例的地址（可克隆）。身份 [`ExecutorId`] 随句柄走。
+#[derive(Clone, Debug)]
+pub struct ExecutorHandle {
+    id: ExecutorId,
+    addr: Addr<ExecutorMsg>,
+}
+
+impl ExecutorHandle {
+    /// 测试用：把一个裸收件箱包装成 executor 地址（分发层测试用它代替真实实例）
+    #[cfg(test)]
+    pub(crate) fn for_test(addr: Addr<ExecutorMsg>) -> Self {
+        Self { id: ExecutorId::next(), addr }
+    }
+
+    pub fn id(&self) -> ExecutorId {
+        self.id
+    }
+
+    /// 投一条入向事件（不等处理）。`Gone` = 实例已停止收件。
+    pub fn deliver(&self, event: IncomeEvent) -> Result<(), Gone> {
+        self.addr.send(ExecutorMsg::Event(event))
+    }
+
+    /// 查询本实例维护的持仓（指定 symbol，返回其在各所的仓位）。
+    ///
+    /// 用于降级平仓取量，见 [`crate::engine::RemoveStrategies`]。读的是「基线 + Fill」维护的
+    /// **权威**持仓，**不打 REST**：
+    /// - REST 在本项目里只作对账用途（见 [`super::PositionLedger`]），持仓维护模型不允许它参与；
+    /// - 本地值比 REST 快照更**新** —— 后者可能落后于最新到达的 Fill。
+    ///
+    /// 调用方必须在停掉该 executor **之前**发起查询：停掉之后它就不再消费事件、状态停更
+    /// （停掉之后再问会得到 `Gone`）。
+    pub async fn positions(&self, symbols: Vec<Symbol>) -> Result<Vec<Position>, Gone> {
+        self.addr.ask(|tx| ExecutorMsg::GetPositions(symbols, tx)).await
+    }
+
+    /// 查询本实例**基线已写入**的全部腿（策略下单所依据的那份持仓），供持仓账本把它纳入
+    /// 对账（见 [`super::PositionLedger`] 模块文档「两条比对」）。
+    ///
+    /// 只给已 seed 的腿：未 seed 的是「未知」，拿去比必然误判。实盘实例出生即把作用域内每条腿
+    /// 都 seed 了（见 `executor_baselines`），所以这就是它的全部持仓。
+    pub async fn seeded_positions(&self) -> Result<Vec<Position>, Gone> {
+        self.addr.ask(ExecutorMsg::GetSeededPositions).await
+    }
+}
+
+/// 一个策略实例
+pub struct Executor {
+    inbox: Inbox<ExecutorMsg>,
     /// 策略执行纯逻辑核心 (状态管理 + 订单转换)
     runner: StrategyRunner,
     /// 本实例绑定的账户
     account: AccountId,
-    /// Outcome PubSub 引用 (用于发布信号)
-    outcome_pubsub: ActorRef<OutcomePubSub>,
+    /// 策略信号的去处
+    outcome_bus: OutcomeBus,
     /// 累计消费到的超限滞后事件数（进告警看趋势，见 [`Self::check_pipeline_lag`]）
     lagging_events: u64,
     /// 上次滞后告警的时刻；0 = 从未告警（见 [`lag_warn_due`]）
     last_lag_warn_ms: Timestamp,
 }
 
-impl ExecutorActor {
+impl Executor {
+    /// 在 `group` 下起一个策略实例，等它构造完成（基线已写入），返回它的句柄（单独撤下用）
+    /// 和地址。此刻它还没注册到分发层，收不到任何事件。
+    pub async fn spawn(
+        group: &Group,
+        args: ExecutorArgs,
+    ) -> anyhow::Result<(ChildHandle, ExecutorHandle)> {
+        let id = ExecutorId::next();
+        let name = format!("Executor{id}[{}]", args.account);
+        let (child, addr) = group
+            .spawn_addressed(name, move |_scope: Scope, inbox| async move {
+                let account = args.account;
+                let mut runner =
+                    StrategyRunner::new(args.strategy, args.symbol_metas, account.clone());
+                // 基线先于一切流事件写入（构造完成前收件箱里的消息不会被处理）
+                runner.seed_positions(&args.baselines);
+                tracing::info!(executor = %id, %account, baselines = args.baselines.len(), "Executor started");
+                Ok(Self {
+                    inbox,
+                    runner,
+                    account,
+                    outcome_bus: args.outcome_bus,
+                    lagging_events: 0,
+                    last_lag_warn_ms: 0,
+                })
+            })
+            .await?;
+        Ok((child, ExecutorHandle { id, addr }))
+    }
+
+    fn handle(&mut self, msg: ExecutorMsg) {
+        // 回执发送失败 = 提问方已不再等（超时放弃或自身已退出），没有人需要这份答复
+        match msg {
+            ExecutorMsg::Event(event) => self.handle_event(event),
+            ExecutorMsg::GetPositions(symbols, reply) => {
+                let state = self.runner.state();
+                let positions = symbols
+                    .iter()
+                    .filter_map(|symbol| state.symbol_state(symbol))
+                    .flat_map(|symbol_state| symbol_state.position_book().all().cloned())
+                    .collect();
+                let _ = reply.send(positions);
+            }
+            ExecutorMsg::GetSeededPositions(reply) => {
+                let positions = self
+                    .runner
+                    .state()
+                    .symbol_states()
+                    .flat_map(|(_, symbol_state)| symbol_state.position_book().seeded_positions())
+                    .cloned()
+                    .collect();
+                let _ = reply.send(positions);
+            }
+        }
+    }
+
     /// 处理 IncomeEvent，委托 runner 运行策略并发布返回的信号
-    async fn handle_event(&mut self, event: IncomeEvent) {
+    fn handle_event(&mut self, event: IncomeEvent) {
         self.check_pipeline_lag(&event);
         for signal in self.runner.on_event(&event) {
-            let tagged = AccountOutcome {
+            // 发布不会失败；订阅者（出口）停止收件时由总线记 ERROR「事件丢失」
+            self.outcome_bus.publish(AccountOutcome {
                 account: self.account.clone(),
                 event: signal,
-            };
-            // 投递失败 = 这条策略信号（下单/撤单/自定义事件）没有任何人收到。总线挂掉
-            // 本就会经 on_link_died 整机退出，这里不重试也不吞 —— 但必须留下记录，
-            // 否则"策略明明发了单却什么都没发生"无从查起。
-            if let Err(e) = self.outcome_pubsub.tell(Publish(tagged)).send().await {
-                tracing::error!(error = %e, account = %self.account, "策略信号发布失败，该信号已丢失");
-            }
+            });
         }
     }
 
@@ -91,7 +223,7 @@ impl ExecutorActor {
     ///
     /// # 为什么需要它，以及为什么不是 conflation
     ///
-    /// 三条总线都是 unbounded 邮箱 + `BestEffort`。消费者跟不上时，后果不是丢事件而是
+    /// 三条总线都投进订阅者的无界收件箱。消费者跟不上时，后果不是丢事件而是
     /// **积压**：策略排着队消费几秒前的报价做决策，而这件事目前**完全不可见** —— 没有
     /// 日志、没有指标，只有内存悄悄涨。
     ///
@@ -110,7 +242,7 @@ impl ExecutorActor {
     ///
     /// # 只在实盘路径
     ///
-    /// 本 actor 只用于实盘/模拟盘（回测直接驱动 `StrategyRunner`），故 `local_ts` 必是
+    /// 本组件只用于实盘/模拟盘（回测直接驱动 `StrategyRunner`），故 `local_ts` 必是
     /// 墙钟；回测里它是虚拟时间，拿来减 `now_ms()` 会得到无意义的巨值 —— 这也是判据
     /// 放在这里、而不是放进两条驱动共享的 `StrategyRunner` 的原因。
     fn check_pipeline_lag(&mut self, event: &IncomeEvent) {
@@ -134,99 +266,14 @@ impl ExecutorActor {
     }
 }
 
-impl Actor for ExecutorActor {
-    type Args = ExecutorArgs;
-    type Error = Infallible;
-
-    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let account = args.account;
-        let mut runner = StrategyRunner::new(args.strategy, args.symbol_metas, account.clone());
-        // 基线先于一切流事件写入（on_start 完成前邮箱消息不会被处理）
-        runner.seed_positions(&args.baselines);
-        tracing::info!(baselines = args.baselines.len(), "ExecutorActor started");
-        Ok(Self {
-            runner,
-            account,
-            outcome_pubsub: args.outcome_pubsub,
-            lagging_events: 0,
-            last_lag_warn_ms: 0,
-        })
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        tracing::info!("ExecutorActor stopped");
+impl Task for Executor {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        // 停止时收件箱先关、再把已收到的事件处理完才返回 None：撤下前已转来的事件不会丢
+        while let Some(msg) = self.inbox.recv().await {
+            self.handle(msg);
+        }
+        tracing::info!(account = %self.account, "Executor stopped");
         Ok(())
-    }
-}
-
-// === Messages ===
-
-/// IncomeEvent 消息 - 从 ProcessorActor 接收 (包含所有事件类型，含 Clock)
-impl Message<IncomeEvent> for ExecutorActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: IncomeEvent,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.handle_event(msg).await;
-    }
-}
-
-/// 查询本实例维护的持仓（指定 symbol，返回其在各所的仓位）。
-///
-/// 用于降级平仓取量，见 [`crate::engine::RemoveStrategies`]。读的是「基线 + Fill」维护的
-/// **权威**持仓，**不打 REST**：
-/// - REST 在本项目里只作对账用途（见 [`crate::engine::PositionLedgerActor`]），
-///   持仓维护模型不允许它参与；
-/// - 本地值比 REST 快照更**新** —— 后者可能落后于最新到达的 Fill。
-///
-/// 调用方必须在 `kill` 该 executor **之前**发起查询：kill 之后它就不再消费事件、状态停更。
-pub struct GetPositions(pub Vec<Symbol>);
-
-impl Message<GetPositions> for ExecutorActor {
-    type Reply = Vec<crate::domain::Position>;
-
-    async fn handle(
-        &mut self,
-        msg: GetPositions,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        let state = self.runner.state();
-        msg.0
-            .iter()
-            .filter_map(|symbol| state.symbol_state(symbol))
-            .flat_map(|symbol_state| symbol_state.position_book().all().cloned())
-            .collect()
-    }
-}
-
-/// 查询本实例**基线已写入**的全部腿（策略下单所依据的那份持仓），供持仓账本把它纳入
-/// 对账（见 [`crate::engine::PositionLedgerActor`] 模块文档「两条比对」）。
-///
-/// 只给已 seed 的腿：未 seed 的是「未知」，拿去比必然误判。实盘实例出生即把作用域内每条腿
-/// 都 seed 了（见 `executor_baselines`），所以这就是它的全部持仓。
-pub struct GetSeededPositions;
-
-impl Message<GetSeededPositions> for ExecutorActor {
-    type Reply = Vec<crate::domain::Position>;
-
-    async fn handle(
-        &mut self,
-        _msg: GetSeededPositions,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.runner
-            .state()
-            .symbol_states()
-            .flat_map(|(_, symbol_state)| symbol_state.position_book().seeded_positions())
-            .cloned()
-            .collect()
     }
 }
 

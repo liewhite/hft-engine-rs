@@ -1,17 +1,17 @@
-//! PositionLedgerActor —— 实盘持仓账本：维护真值、用 REST 校验、对外供查。
+//! PositionLedger —— 实盘持仓账本：维护真值、用 REST 校验、对外供查。
 //!
 //! # 三件事是同一件事
 //!
-//! 本 actor 持有的镜像是**进程内唯一被持续校验的持仓折叠**，因此也是唯一有资格对外称作
+//! 本组件持有的镜像是**进程内唯一被持续校验的持仓折叠**，因此也是唯一有资格对外称作
 //! 「真值」的那一份（另两份本地派生及其保留理由见 `docs/external-data-access.md`）。
 //! 校验与供查不是两个职责：账本没有守卫就是负债，守卫没有账本无物可守，而外部读到的数字
 //! 与风控守卫看到的数字**必须是同一个**，否则看板绿着、引擎却在停机边缘。
 //!
-//! 对外入口是 [`GetLivePositions`]，经 `ManagerActor` 转发（快照面契约见同一份文档）。
+//! 对外入口是 [`PositionLedgerHandle::live_positions`]，经 Manager 转发（快照面契约见同一份文档）。
 //!
 //! 持仓的权威值由「投产期 REST 基线 + 之后全程 Fill 累加」维护
 //! （见 [`crate::messaging::PositionBaseline`]）。这条通道会错：Fill 可能丢、可能被重复
-//! 计算、codec 可能算错单位或符号、也可能出现不伴随 Fill 的交易所侧变动。本 actor 用**独立
+//! 计算、codec 可能算错单位或符号、也可能出现不伴随 Fill 的交易所侧变动。本组件用**独立
 //! 的第二条通道** —— 周期性 REST 读数 —— 校验第一条：
 //!
 //! ```text
@@ -20,28 +20,34 @@
 //!   通道 B（校验）  自行轮询 REST 读数 ──> 比对 ──> 连续 N 次差值稳定的不一致即致命退出
 //! ```
 //!
-//! # 读数自产自销：轮询就在本 actor 里
+//! # 读数自产自销：轮询就在本组件里
 //!
-//! 读数（某所的**完整**持仓快照）只有一个消费者 —— 本 actor。它不是事件，不上总线：
-//! 本 actor 持有各所的 `AccountClient`，按节拍并发拉取、就地比对。完整快照的意义在于
+//! 读数（某所的**完整**持仓快照）只有一个消费者 —— 本组件。它不是事件，不上总线：
+//! 本组件持有各所的 `AccountClient`，按节拍并发拉取、就地比对。完整快照的意义在于
 //! "交易所没报告这个 symbol ⇒ 它空仓"这个推断 —— 对账最要抓的一类漂移正是**本地有仓、
 //! 交易所已经没了**（漏了平仓成交/强平回报），只有全量快照能发现它。
 //!
-//! # 职责边界：为什么不放进 MetricsActor
+//! # 职责边界：为什么不放进观测组件（Metrics）
 //!
-//! `MetricsActor` 明确声明"观测组件故障不得拖垮交易"，连定时器挂掉都不 kill 自己。而对账
+//! 观测组件明确声明"观测组件故障不得拖垮交易"，连定时器挂掉都不让自己停。而对账
 //! 连续失败要**致命退出**，那是风控语义而非观测语义。混在一起会破坏它已经写明的边界。
 //! 同理，持仓查询也不挂在它上面：让观测组件当权威数据源会反转这条边界。
 //!
-//! # 拉取不在 handler 里做
+//! # 拉取不阻塞收件箱
 //!
-//! 节拍到达时 `spawn` 各所拉取，结果回投为 [`PositionsFetched`]。**邮箱在任何时刻都不阻塞在
-//! IO 上**，这既是快照面契约的硬性要求，也修掉了一个既有缺陷：此前 handler 里 `join_all`
-//! 各所 REST，最长一个 client 超时期间**本轮比对与 Fill 摄入一起停摆**。
+//! 节拍到达时为各所发起拉取，放进 `run` 自己持有的一组在途 future，与收件箱在同一个
+//! `select!` 里并发推进；结果到达后就地比对。**收件箱在任何时刻都不阻塞在 IO 上**，这既是
+//! 快照面契约的硬性要求，也修掉了一个既有缺陷：此前处理节拍时 `join_all` 各所 REST，最长
+//! 一个 client 超时期间**本轮比对与 Fill 摄入一起停摆**。比对仍串行发生在本任务内部，镜像
+//! 不需要任何锁。
+//!
+//! 在途 future 由 `run` 自己 poll，结果不经消息回投：**不存在"结果永不回投"的路径**；拉取
+//! panic 随 `run` 一起上冒（整支停、错误冒到根）。剩下唯一的"迟迟不返回"是请求本身挂死，
+//! 由在途停摆判据兜住（见 `Ledger::check_in_flight_staleness`）。
 //!
 //! # 两条比对：账本 vs 交易所，executor vs 账本
 //!
-//! 本 actor 自建一份镜像（[`PositionBook`]，与策略侧同一份 seed 语义与防双计规则），由投产
+//! 本组件自建一份镜像（[`PositionBook`]，与策略侧同一份 seed 语义与防双计规则），由投产
 //! 握手的基线 + 账户总线的实盘 `Fill` 驱动。对交易所读数比对证明的是"**事件流**与交易所
 //! 一致"。
 //!
@@ -54,30 +60,29 @@
 //!   交易所 REST ──比对──> 账本镜像 <──比对── 实盘 executor 的持仓（下单依据）
 //! ```
 //!
-//! 监视名单由编排维护：投产时 [`WatchExecutor`]，撤下/回滚时先 [`UnwatchExecutor`] 再
-//! 注销订阅 —— 顺序要紧，注销后的 executor 不再收 Fill，若还在名单里会被误判分叉。
-//! 模拟账户的 executor 不进名单（它的持仓本就与实盘无关）。
+//! 监视名单由编排维护：投产时 [`PositionLedgerHandle::watch`]，撤下/回滚时先
+//! [`PositionLedgerHandle::unwatch`] 再注销订阅 —— 顺序要紧，注销后的 executor 不再收 Fill，
+//! 若还在名单里会被误判分叉。模拟账户的 executor 不进名单（它的持仓本就与实盘无关）。
 //!
 //! # 注册与基线原子到达，无缓冲重放
 //!
-//! [`RegisterSymbols`] 一次携带 symbol 集合与它们的基线（与 executor 同一份快照）。
-//! "已注册、基线未到"的窗口不存在，历史上为它建的 Fill 缓冲 + 按快照时刻过滤重放的
-//! 机制随之删除；快照与 Fill 流的竞态由 seed 内置的时刻过滤统一兜住。
+//! [`PositionLedgerHandle::register_symbols`] 一次携带 symbol 集合与它们的基线（与 executor
+//! 同一份快照）。"已注册、基线未到"的窗口不存在，历史上为它建的 Fill 缓冲 + 按快照时刻过滤
+//! 重放的机制随之删除；快照与 Fill 流的竞态由 seed 内置的时刻过滤统一兜住。
 
+use super::executor::{ExecutorHandle, ExecutorId};
 use crate::domain::{Exchange, Position, Symbol, SymbolMeta};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
-use crate::messaging::{AccountEvent, PositionBaseline, PositionBook};
-use super::executor::{ExecutorActor, GetSeededPositions};
-use kameo::actor::{ActorId, ActorRef, WeakActorRef};
-use kameo::error::{ActorStopReason, Infallible};
-use kameo::message::{Context, Message, StreamMessage};
-use kameo::Actor;
+use crate::messaging::{AccountBus, AccountEvent, PositionBaseline, PositionBook};
+use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, Task};
+use futures_util::future::BoxFuture;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::Instant;
-use tokio_stream::wrappers::IntervalStream;
+use tokio::sync::oneshot;
+use tokio::time::MissedTickBehavior;
 
 /// 持仓对账的轮询间隔。
 ///
@@ -96,9 +101,9 @@ pub const DEFAULT_MAX_CONSECUTIVE_MISMATCHES: u32 = 3;
 // 纯逻辑核心
 // ============================================================================
 
-/// 对账纯逻辑：注册基线、跟 Fill、比对读数。不含任何 actor / 时钟 / IO，可同步单测。
+/// 对账纯逻辑：注册基线、跟 Fill、比对读数。不含任何任务 / 时钟 / IO，可同步单测。
 ///
-/// 与 [`crate::engine::StrategyRunner`] 同样的分层：纯核心 + 薄 actor 包装。
+/// 与 [`crate::engine::StrategyRunner`] 同样的分层：纯核心 + 薄组件包装。
 pub struct Reconciler {
     /// 持仓账本：投产握手 seed 基线 + income 流的 `Fill` 驱动。
     ///
@@ -132,7 +137,7 @@ pub struct Reconciler {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Counterpart {
     Exchange,
-    Executor(ActorId),
+    Executor(ExecutorId),
 }
 
 impl std::fmt::Display for Counterpart {
@@ -240,7 +245,7 @@ impl Reconciler {
     ///
     /// `Err` = 已确认该 executor 与账本分叉（连续 `max_consecutive` 次差值稳定），调用方应
     /// 致命退出 —— 策略正拿着错的持仓算下单量。
-    pub fn reconcile_executor(&mut self, executor: ActorId, positions: &[Position]) -> Result<(), String> {
+    pub fn reconcile_executor(&mut self, executor: ExecutorId, positions: &[Position]) -> Result<(), String> {
         let counterpart = Counterpart::Executor(executor);
         let legs: Vec<(Exchange, Symbol, f64, f64)> = positions
             .iter()
@@ -365,71 +370,278 @@ fn tolerance_of(
 }
 
 // ============================================================================
-// Actor 包装（含读数轮询）
+// 组件包装（含读数轮询）
 // ============================================================================
 
-/// PositionLedgerActor 初始化参数
+/// [`PositionLedger::spawn`] 的参数
 pub struct PositionLedgerArgs {
     /// 各所的账户私有能力（读数的来源）。键集 = 配了凭证的所 —— "没有账户的所不轮询"
     /// 由类型表达，本层不再过滤。
     pub accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 用于取 `coin_size_step()`（币本位最小可交易增量）作为对账容差
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+    /// 镜像的增量输入（只订实盘 Fill）
+    pub account_bus: AccountBus,
     /// 轮询间隔（毫秒）
     pub interval_ms: u64,
     /// 连续多少次不一致判定为真实漂移
     pub max_consecutive_mismatches: u32,
 }
 
-/// 持仓账本 actor（账本与比对逻辑在 [`Reconciler`]，本层负责轮询、停摆守卫与对外应答）
-pub struct PositionLedgerActor {
+/// PositionLedger 的收件箱消息
+pub enum PositionLedgerMsg {
+    /// 账户总线上的实盘 Fill（订阅时已按 [`PositionBook::live_fill`] 过滤）
+    Account(AccountEvent),
+    /// 见 [`PositionLedgerHandle::register_symbols`]
+    RegisterSymbols {
+        symbols: Vec<Symbol>,
+        baselines: Vec<PositionBaseline>,
+        reply: oneshot::Sender<()>,
+    },
+    /// 见 [`PositionLedgerHandle::live_positions`]
+    GetLivePositions(oneshot::Sender<Vec<Position>>),
+    /// 见 [`PositionLedgerHandle::watch`]
+    Watch(ExecutorHandle, oneshot::Sender<()>),
+    /// 见 [`PositionLedgerHandle::unwatch`]
+    Unwatch(ExecutorId, oneshot::Sender<()>),
+}
+
+/// PositionLedger 的地址（可克隆）。方法都是 ask：返回即已生效。
+#[derive(Clone, Debug)]
+pub struct PositionLedgerHandle(Addr<PositionLedgerMsg>);
+
+impl PositionLedgerHandle {
+    /// 投产注册握手：symbol 集合 + 持仓基线原子到达（与观测组件收到的是同一份）。
+    pub async fn register_symbols(
+        &self,
+        symbols: Vec<Symbol>,
+        baselines: Vec<PositionBaseline>,
+    ) -> Result<(), Gone> {
+        self.0
+            .ask(|reply| PositionLedgerMsg::RegisterSymbols {
+                symbols,
+                baselines,
+                reply,
+            })
+            .await
+    }
+
+    /// 对外快照查询：实盘持仓真值。经 Manager 转发，契约见 `docs/external-data-access.md`。
+    ///
+    /// 应答为**基线已写入**的全部腿（含 `size == 0` 的空仓腿）。未 seed 的腿不在结果里 ——
+    /// 那是"未知"而非"空仓"，调用方应当**不上报**这类腿，而不是当 0 处理。
+    pub async fn live_positions(&self) -> Result<Vec<Position>, Gone> {
+        self.0.ask(PositionLedgerMsg::GetLivePositions).await
+    }
+
+    /// 把一个实盘 executor 加入监视名单（编排在它开始收事件之前调，见模块文档）。
+    pub async fn watch(&self, executor: ExecutorHandle) -> Result<(), Gone> {
+        self.0
+            .ask(|reply| PositionLedgerMsg::Watch(executor, reply))
+            .await
+    }
+
+    /// 把一个 executor 移出监视名单（编排在注销它的订阅**之前**调，见模块文档）。
+    /// 不在名单里是空操作。
+    pub async fn unwatch(&self, executor: ExecutorId) -> Result<(), Gone> {
+        self.0
+            .ask(|reply| PositionLedgerMsg::Unwatch(executor, reply))
+            .await
+    }
+}
+
+/// 持仓账本组件（账本与比对逻辑在 [`Reconciler`]，轮询与名单在 [`Ledger`]，本层只管收件与节拍）
+pub struct PositionLedger {
+    inbox: Inbox<PositionLedgerMsg>,
+    interval: Duration,
+    ledger: Ledger,
+}
+
+/// 一次拉取（或 executor 查询）的结果，在 `run` 里就地处理
+enum Fetched {
+    Exchange {
+        exchange: Exchange,
+        result: Result<Vec<Position>, String>,
+    },
+    Executor {
+        executor: ExecutorId,
+        result: Result<Vec<Position>, Gone>,
+    },
+}
+
+/// 账本的全部状态与逻辑（不含收件箱，可脱离任务树单测）
+struct Ledger {
     reconciler: Reconciler,
     accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 停摆守卫（每所一个）：对账通道停摆等于风控失效，超过容忍窗口即致命。
     /// 判据用"距上次成功的时长"而非"连续失败次数"，改轮询间隔不会连带改变容忍窗口。
     guards: HashMap<Exchange, StalenessGuard>,
-    /// 已发出、尚未回投结果的所（见 [`Self::spawn_fetches`]）
+    /// 已发出、尚未返回结果的所（见 [`Self::start_fetches`]）
     in_flight: HashSet<Exchange>,
     /// 受监视的实盘 executor（名单由编排维护，见模块文档「两条比对」）
-    executors: HashMap<ActorId, ActorRef<ExecutorActor>>,
-    /// 已发出持仓查询、尚未回投的 executor。
+    executors: HashMap<ExecutorId, ExecutorHandle>,
+    /// 已发出持仓查询、尚未返回的 executor。
     ///
-    /// 不配停摆守卫：executor 迟迟不答多半是它邮箱积压，恢复后由它自己的管线滞后告警报出
-    /// （`ExecutorActor::check_pipeline_lag`）；它停了则 ask 立即报错回投。永久卡死在某个
-    /// handler 里时这条比对会静默失效 —— 不在本机制范围内，卡死的实例也下不了单。
-    executor_in_flight: HashSet<ActorId>,
+    /// 不配停摆守卫：executor 迟迟不答多半是它收件箱积压，恢复后由它自己的管线滞后告警报出
+    /// （`Executor::check_pipeline_lag`）；它停了则查询立即返回 `Gone`。永久卡死在某次处理里时
+    /// 这条比对会静默失效 —— 不在本机制范围内，卡死的实例也下不了单。
+    executor_in_flight: HashSet<ExecutorId>,
+    /// 在途的拉取与查询，由 `run` 与收件箱一起 poll
+    pending: FuturesUnordered<BoxFuture<'static, Fetched>>,
 }
 
-/// 一个 executor 的持仓查询结果回投（与 [`PositionsFetched`] 同一姿态：邮箱不等别人）。
-pub struct ExecutorPositionsFetched {
-    executor: ActorId,
-    result: Result<Vec<Position>, String>,
+impl PositionLedger {
+    /// 在 `group`（consumers）下起账本，构造时订阅账户总线上的实盘 Fill，返回句柄与地址。
+    pub async fn spawn(
+        group: &Group,
+        args: PositionLedgerArgs,
+    ) -> anyhow::Result<(ChildHandle, PositionLedgerHandle)> {
+        let (child, addr) = group
+            .spawn_addressed("PositionLedger", move |_scope: Scope, mut inbox| async move {
+                // 镜像的增量输入只有实盘 Fill：订阅过滤与账本同一判据（模拟成交绝不进实盘镜像）
+                inbox.subscribe(
+                    &args.account_bus,
+                    |e| PositionBook::live_fill(e).is_some(),
+                    PositionLedgerMsg::Account,
+                );
+
+                // 窗口从构造时刻起算，避免首次拉取前就被判成停摆
+                let guards = args
+                    .accounts
+                    .keys()
+                    .map(|exchange| {
+                        (
+                            *exchange,
+                            StalenessGuard::new(format!("{exchange} 持仓对账"), MAX_POLL_STALENESS_MS),
+                        )
+                    })
+                    .collect();
+
+                tracing::info!(
+                    exchanges = args.accounts.len(),
+                    interval_ms = args.interval_ms,
+                    max_consecutive_mismatches = args.max_consecutive_mismatches,
+                    "PositionLedger started"
+                );
+                Ok(Self {
+                    inbox,
+                    interval: Duration::from_millis(args.interval_ms),
+                    ledger: Ledger {
+                        reconciler: Reconciler::new(args.symbol_metas, args.max_consecutive_mismatches),
+                        accounts: args.accounts,
+                        guards,
+                        in_flight: HashSet::new(),
+                        executors: HashMap::new(),
+                        executor_in_flight: HashSet::new(),
+                        pending: FuturesUnordered::new(),
+                    },
+                })
+            })
+            .await?;
+        Ok((child, PositionLedgerHandle(addr)))
+    }
 }
 
-/// 一所读数拉取的结果回投。
+impl Task for PositionLedger {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        // 首拍立即；一次处理慢于周期时不积压补跑
+        let mut tick = tokio::time::interval(self.interval);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                msg = self.inbox.recv() => match msg {
+                    Some(msg) => self.ledger.handle(msg),
+                    // 已被要求停止、箱已排空；在途的拉取随之丢弃（只读，丢了无害）
+                    None => break,
+                },
+                _ = tick.tick() => self.ledger.on_tick().map_err(fatal)?,
+                Some(done) = self.ledger.pending.next(), if !self.ledger.pending.is_empty() => {
+                    self.ledger.on_fetched(done).map_err(fatal)?;
+                }
+            }
+        }
+        tracing::info!("PositionLedger stopped");
+        Ok(())
+    }
+}
+
+/// 本地持仓已不可信，受控退出（`run` 返回这个错误，整机停机）。
 ///
-/// 拉取在 actor **之外**进行（见模块文档「拉取不在 handler 里做」），本消息把结果送回邮箱，
-/// 使比对仍然串行发生在 actor 内部 —— 镜像不需要任何锁。
-pub struct PositionsFetched {
-    exchange: Exchange,
-    result: Result<Vec<Position>, String>,
+/// 策略的三道风控闸门（单边杠杆 / 账户杠杆 / 仓位上限）全部基于它计算，继续跑等于
+/// 无风控裸奔。退出后交人工核对，容器编排负责拉起。
+fn fatal(reason: String) -> anyhow::Error {
+    anyhow::anyhow!(
+        "持仓对账确认漂移或通道停摆，退出（本地持仓不可信，风控闸门已失效，需人工核对后重启）: {reason}"
+    )
 }
 
-impl PositionLedgerActor {
+impl Ledger {
+    fn handle(&mut self, msg: PositionLedgerMsg) {
+        // 回执发送失败 = 提问方已不再等，没有人需要这份答复
+        match msg {
+            // 账本只吃实盘 Fill（订阅时已预过滤，on_event 内按账户再过滤）
+            PositionLedgerMsg::Account(event) => self.reconciler.on_event(&event),
+            PositionLedgerMsg::RegisterSymbols {
+                symbols,
+                baselines,
+                reply,
+            } => {
+                tracing::info!(count = symbols.len(), "PositionLedger tracking symbols");
+                self.reconciler.register(&symbols, &baselines);
+                let _ = reply.send(());
+            }
+            PositionLedgerMsg::GetLivePositions(reply) => {
+                let _ = reply.send(self.reconciler.positions());
+            }
+            PositionLedgerMsg::Watch(executor, reply) => {
+                tracing::info!(executor = %executor.id(), "开始监视实盘 executor 的持仓");
+                self.executors.insert(executor.id(), executor);
+                let _ = reply.send(());
+            }
+            PositionLedgerMsg::Unwatch(executor, reply) => {
+                // 它的不一致记录不必清：ExecutorId 不复用，残留记录不会再被读到
+                self.executors.remove(&executor);
+                let _ = reply.send(());
+            }
+        }
+    }
+
+    /// 轮询节拍：发起各所拉取与 executor 查询（结果稍后在 `run` 里到达）。`Err` = 应致命退出。
+    fn on_tick(&mut self) -> Result<(), String> {
+        // 没有任何配了凭证的所时无事可做（引擎只接公共行情）
+        if self.accounts.is_empty() {
+            return Ok(());
+        }
+        // 先判在途停摆：请求挂死时，守卫的两个触点都够不到，只有这里能发现
+        self.check_in_flight_staleness()?;
+        self.start_fetches();
+        self.start_executor_queries();
+        Ok(())
+    }
+
+    /// 一次拉取或查询的结果：比对；`Err` = 确认漂移、分叉或通道停摆，应致命退出。
+    fn on_fetched(&mut self, done: Fetched) -> Result<(), String> {
+        match done {
+            Fetched::Exchange { exchange, result } => {
+                self.in_flight.remove(&exchange);
+                self.ingest(exchange, result)
+            }
+            Fetched::Executor { executor, result } => self.ingest_executor(executor, result),
+        }
+    }
+
     /// 在途未回的所是否已停摆过久。`Err` = 应致命退出。
     ///
     /// # 为什么这条判据必须存在
     ///
-    /// [`StalenessGuard`] 的两个触点（`record_success` / `check_failure`）都在**结果回投**的
-    /// 路径上。而"永不回投"是可达的：拉取任务 panic（被 `tokio::spawn` 吞掉）、或 client 的
-    /// 超时失效导致请求真挂死。那时 `in_flight` 永久占位，此后每个节拍都只是跳过 ——
-    /// **该所对账静默永久失效，而引擎继续无校验地交易**。
+    /// [`StalenessGuard`] 的两个触点（`record_success` / `check_failure`）都在**结果到达**的
+    /// 路径上。而"迟迟不返回"是可达的：client 的超时失效导致请求真挂死。那时 `in_flight`
+    /// 永久占位，此后每个节拍都只是跳过 —— **该所对账静默永久失效，而引擎继续无校验地交易**。
     ///
     /// 所以"在途未回"必须与"拉取失败"同等对待：都是没拿到读数，都要过守卫。判据仍是
     /// "距上次成功的时长"，与在途了几轮无关。
     ///
-    /// （回投侧另有一道兜底：panic 会被转成 `Err` 回投，见 [`Self::spawn_fetches`]。两道
-    /// 各管一段 —— 那道让 panic 立即可诊断，这道兜住"连回投本身都没发生"。）
+    /// （拉取 panic 不在此列：拉取在本任务里被 poll，panic 随 `run` 上冒。）
     fn check_in_flight_staleness(&self) -> Result<(), String> {
         for exchange in &self.in_flight {
             let guard = self.guards.get(exchange).expect("guard 与 client 同建");
@@ -443,70 +655,44 @@ impl PositionLedgerActor {
         Ok(())
     }
 
-    /// 为每个**当前没有在途请求**的所发起一次拉取，结果稍后回投为 [`PositionsFetched`]。
+    /// 为每个**当前没有在途请求**的所发起一次拉取，结果稍后在 `run` 里到达。
     ///
     /// 跳过在途的所（而非并发再发一次）：REST 慢于轮询间隔时，堆积并发请求既压垮限流额度，
     /// 又让"最新读数"的时点无从判断。跳过是否已到停摆程度由
-    /// [`Self::check_in_flight_staleness`] 判定，节拍 handler 先过那道再进本函数。
-    fn spawn_fetches(&mut self, me: &ActorRef<Self>) {
-        let due: Vec<(Exchange, Arc<dyn AccountClient>)> = self
-            .accounts
-            .iter()
-            .filter(|(exchange, _)| !self.in_flight.contains(exchange))
-            .map(|(exchange, client)| (*exchange, client.clone()))
-            .collect();
-
-        for (exchange, client) in due {
-            self.in_flight.insert(exchange);
-            let me = me.clone();
-            tokio::spawn(async move {
-                // 再套一层 spawn 只为一件事：把拉取的 panic 变成一条 `Err` 回投。
-                // 直接在本任务里 await，panic 会连投递一起带走 —— 那正是"结果永不回投"，
-                // 而 adapter 里的 unwrap 本该是**立即可诊断**的故障，不该退化成 60 秒后的
-                // "通道停摆"。取消同理（JoinError 两种成因都在这里被翻译成人话）。
-                let fetch = tokio::spawn(async move { client.fetch_positions().await });
-                let result = match fetch.await {
-                    Ok(Ok(positions)) => Ok(positions),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(join_err) => {
-                        Err(format!("持仓拉取任务异常终止（panic 或被取消）: {join_err}"))
-                    }
-                };
-                // 投递失败只可能是 actor 已停止（整机正在退出），此时无人需要这份读数
-                let _ = me.tell(PositionsFetched { exchange, result }).send().await;
-            });
+    /// [`Self::check_in_flight_staleness`] 判定，节拍先过那道再进本函数。
+    fn start_fetches(&mut self) {
+        for (exchange, client) in &self.accounts {
+            if !self.in_flight.insert(*exchange) {
+                continue;
+            }
+            let (exchange, client) = (*exchange, client.clone());
+            self.pending.push(Box::pin(async move {
+                let result = client.fetch_positions().await.map_err(|e| e.to_string());
+                Fetched::Exchange { exchange, result }
+            }));
         }
     }
 
-    /// 向每个受监视、且没有在途查询的 executor 要一份持仓，结果回投为
-    /// [`ExecutorPositionsFetched`]。用 spawn 而不是就地 `ask`：executor 邮箱积压时，
-    /// 本 actor 不该跟着卡住（快照查询与 Fill 摄入都在这个邮箱里）。
-    fn spawn_executor_queries(&mut self, me: &ActorRef<Self>) {
+    /// 向每个受监视、且没有在途查询的 executor 要一份持仓。与拉取一样放进在途集合：
+    /// executor 收件箱积压时，本组件不该跟着卡住（快照查询与 Fill 摄入都在本组件的收件箱里）。
+    fn start_executor_queries(&mut self) {
         for (id, executor) in &self.executors {
             if !self.executor_in_flight.insert(*id) {
                 continue;
             }
-            let (id, executor, me) = (*id, executor.clone(), me.clone());
-            tokio::spawn(async move {
-                let result = executor
-                    .ask(GetSeededPositions)
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string());
-                // 投递失败只可能是本 actor 已停止（整机正在退出）
-                let _ = me
-                    .tell(ExecutorPositionsFetched { executor: id, result })
-                    .send()
-                    .await;
-            });
+            let (id, executor) = (*id, executor.clone());
+            self.pending.push(Box::pin(async move {
+                let result = executor.seeded_positions().await;
+                Fetched::Executor { executor: id, result }
+            }));
         }
     }
 
-    /// 处理一个 executor 的持仓回投。`Err` = 已确认分叉，调用方应致命退出。
+    /// 处理一个 executor 的持仓答复。`Err` = 已确认分叉，调用方应致命退出。
     fn ingest_executor(
         &mut self,
-        executor: ActorId,
-        result: Result<Vec<Position>, String>,
+        executor: ExecutorId,
+        result: Result<Vec<Position>, Gone>,
     ) -> Result<(), String> {
         self.executor_in_flight.remove(&executor);
         // 查询在途期间被撤出名单：它已不再收 Fill，这份答复不该拿来比
@@ -515,26 +701,14 @@ impl PositionLedgerActor {
         }
         match result {
             Ok(positions) => self.reconciler.reconcile_executor(executor, &positions),
-            Err(e) => {
-                // executor 已停却没有先撤出名单 —— 只可能是异常终止，那条路径会经监督树
-                // 整机停机。这里只把它摘掉，免得每个节拍重复报同一件事。
-                tracing::warn!(%executor, error = %e, "executor 持仓查询失败（已停止？），移出监视名单");
+            Err(Gone) => {
+                // executor 已停却没有先撤出名单 —— 只可能是它出错退出（错误已自行上冒、
+                // 整机在停）或整机正在停机。这里只把它摘掉，免得每个节拍重复报同一件事。
+                tracing::warn!(%executor, "executor 持仓查询失败（已停止收件），移出监视名单");
                 self.executors.remove(&executor);
                 Ok(())
             }
         }
-    }
-
-    /// 本地持仓已不可信，受控退出。
-    ///
-    /// 策略的三道风控闸门（单边杠杆 / 账户杠杆 / 仓位上限）全部基于它计算，继续跑等于
-    /// 无风控裸奔。退出后交人工核对，容器编排负责拉起。
-    fn fatal(actor_ref: &ActorRef<Self>, reason: &str) {
-        tracing::error!(
-            %reason,
-            "持仓对账确认漂移或通道停摆，退出（本地持仓不可信，风控闸门已失效，需人工核对后重启）"
-        );
-        actor_ref.kill();
     }
 
     /// 处理一所的读数：更新守卫、比对。`Err` = 确认漂移或通道停摆过久，调用方应致命退出。
@@ -560,174 +734,6 @@ impl PositionLedgerActor {
                     "Failed to fetch positions for reconciliation, will retry"
                 );
                 Ok(())
-            }
-        }
-    }
-}
-
-impl Actor for PositionLedgerActor {
-    type Args = PositionLedgerArgs;
-    type Error = Infallible;
-
-    async fn on_start(args: Self::Args, actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let interval = Duration::from_millis(args.interval_ms);
-        actor_ref.attach_stream(IntervalStream::new(tokio::time::interval(interval)), (), ());
-
-        // 窗口从构造时刻起算，避免首次拉取前就被判成停摆
-        let guards = args
-            .accounts
-            .keys()
-            .map(|exchange| {
-                (
-                    *exchange,
-                    StalenessGuard::new(format!("{exchange} 持仓对账"), MAX_POLL_STALENESS_MS),
-                )
-            })
-            .collect();
-
-        tracing::info!(
-            exchanges = args.accounts.len(),
-            interval_ms = args.interval_ms,
-            max_consecutive_mismatches = args.max_consecutive_mismatches,
-            "PositionLedgerActor started"
-        );
-        Ok(Self {
-            reconciler: Reconciler::new(args.symbol_metas, args.max_consecutive_mismatches),
-            accounts: args.accounts,
-            guards,
-            in_flight: HashSet::new(),
-            executors: HashMap::new(),
-            executor_in_flight: HashSet::new(),
-        })
-    }
-
-    async fn on_stop(
-        &mut self,
-        _actor_ref: WeakActorRef<Self>,
-        _reason: ActorStopReason,
-    ) -> Result<(), Self::Error> {
-        tracing::info!("PositionLedgerActor stopped");
-        Ok(())
-    }
-}
-
-/// 投产注册握手：symbol 集合 + 持仓基线原子到达（与 [`super::RegisterSymbols`] 同形）。
-impl Message<super::RegisterSymbols> for PositionLedgerActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: super::RegisterSymbols,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        tracing::info!(count = msg.symbols.len(), "PositionLedgerActor tracking symbols");
-        self.reconciler.register(&msg.symbols, &msg.baselines);
-    }
-}
-
-/// 账户事件入口：账本只吃实盘 Fill（经 SubscribeFilter 预过滤 + on_event 内按账户再过滤）
-impl Message<AccountEvent> for PositionLedgerActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: AccountEvent, _ctx: &mut Context<Self, Self::Reply>) {
-        self.reconciler.on_event(&msg);
-    }
-}
-
-/// 对外快照查询：实盘持仓真值。经 `ManagerActor` 转发，契约见 `docs/external-data-access.md`。
-///
-/// 应答为**基线已写入**的全部腿（含 `size == 0` 的空仓腿）。未 seed 的腿不在结果里 ——
-/// 那是"未知"而非"空仓"，调用方应当**不上报**这类腿，而不是当 0 处理。
-pub struct GetLivePositions;
-
-impl Message<GetLivePositions> for PositionLedgerActor {
-    type Reply = Vec<Position>;
-
-    async fn handle(
-        &mut self,
-        _msg: GetLivePositions,
-        _ctx: &mut Context<Self, Self::Reply>,
-    ) -> Self::Reply {
-        self.reconciler.positions()
-    }
-}
-
-/// 把一个实盘 executor 加入监视名单（编排在它开始收事件之前发，见模块文档）。
-pub struct WatchExecutor(pub ActorRef<ExecutorActor>);
-
-impl Message<WatchExecutor> for PositionLedgerActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: WatchExecutor, _ctx: &mut Context<Self, Self::Reply>) {
-        tracing::info!(executor = %msg.0.id(), "开始监视实盘 executor 的持仓");
-        self.executors.insert(msg.0.id(), msg.0);
-    }
-}
-
-/// 把一个 executor 移出监视名单（编排在注销它的订阅**之前**发，见模块文档）。不在名单里是空操作。
-pub struct UnwatchExecutor(pub ActorId);
-
-impl Message<UnwatchExecutor> for PositionLedgerActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: UnwatchExecutor, _ctx: &mut Context<Self, Self::Reply>) {
-        // 它的不一致记录不必清：ActorId 不复用，残留记录不会再被读到
-        self.executors.remove(&msg.0);
-    }
-}
-
-/// 一个 executor 的持仓返回：比对；确认分叉即致命退出
-impl Message<ExecutorPositionsFetched> for PositionLedgerActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: ExecutorPositionsFetched, ctx: &mut Context<Self, Self::Reply>) {
-        if let Err(reason) = self.ingest_executor(msg.executor, msg.result) {
-            Self::fatal(ctx.actor_ref(), &reason);
-        }
-    }
-}
-
-/// 一所读数返回：比对；确认漂移或通道停摆即致命退出
-impl Message<PositionsFetched> for PositionLedgerActor {
-    type Reply = ();
-
-    async fn handle(&mut self, msg: PositionsFetched, ctx: &mut Context<Self, Self::Reply>) {
-        self.in_flight.remove(&msg.exchange);
-        if let Err(reason) = self.ingest(msg.exchange, msg.result) {
-            Self::fatal(ctx.actor_ref(), &reason);
-        }
-    }
-}
-
-/// 轮询节拍：发起各所拉取（结果异步回投，本 handler 不碰 IO）
-impl Message<StreamMessage<Instant, (), ()>> for PositionLedgerActor {
-    type Reply = ();
-
-    async fn handle(
-        &mut self,
-        msg: StreamMessage<Instant, (), ()>,
-        ctx: &mut Context<Self, Self::Reply>,
-    ) {
-        match msg {
-            StreamMessage::Next(_) => {
-                // 没有任何配了凭证的所时无事可做（引擎只接公共行情）
-                if self.accounts.is_empty() {
-                    return;
-                }
-                // 先判在途停摆：结果永不回投时，守卫够不到，只有这里能发现
-                if let Err(reason) = self.check_in_flight_staleness() {
-                    Self::fatal(ctx.actor_ref(), &reason);
-                    return;
-                }
-                self.spawn_fetches(ctx.actor_ref());
-                self.spawn_executor_queries(ctx.actor_ref());
-            }
-            StreamMessage::Started(_) => {
-                tracing::debug!("Position reconcile polling started");
-            }
-            StreamMessage::Finished(_) => {
-                tracing::error!("Position reconcile polling stream unexpectedly finished, killing actor");
-                ctx.actor_ref().kill();
             }
         }
     }
@@ -961,7 +967,7 @@ mod tests {
 
     /// 反向：本地空仓、交易所却有仓（漏了一笔开仓 Fill）。
     ///
-    /// 基线本身是 0（`ManagerActor` 对交易所未返回的 symbol 会显式给 size=0 的基线），
+    /// 基线本身是 0（Manager 对交易所未返回的 symbol 会显式给 size=0 的基线），
     /// 此后交易所冒出仓位就说明漏了成交。
     #[test]
     fn unknown_exchange_position_is_drift() {
@@ -1098,9 +1104,8 @@ mod tests {
 
     // ---------------- executor 持仓纳入对账（#694） ----------------
 
-    const EXECUTOR_SEQ: u64 = 7;
-    fn executor() -> ActorId {
-        ActorId::new(EXECUTOR_SEQ)
+    fn executor() -> ExecutorId {
+        ExecutorId::for_test(u64::MAX - 7)
     }
 
     /// executor 与账本一致：任意多轮都不报
@@ -1200,7 +1205,6 @@ mod tests {
     }
 }
 
-/// actor 层：邮箱在任何时刻都不阻塞在 REST 上（快照面契约的硬性要求）
 /// 硬要求（用户 11-12）：多 dex 下「启动 REST 基线 + Fill 流」与定时 REST 对账照样成立。
 /// 用 HL 适配层真实的解析路径（持仓快照合并、私有推送过滤）喂 [`Reconciler`]。
 #[cfg(test)]
@@ -1280,23 +1284,29 @@ mod hl_multi_dex_tests {
     }
 }
 
+/// 组件层：收件箱在任何时刻都不阻塞在 REST 上（快照面契约的硬性要求）、在途判据、
+/// executor 持仓纳入对账（#694）。用 `tasks::Root` 搭树测。
 #[cfg(test)]
-mod mailbox_tests {
+mod task_tests {
     use super::*;
     use crate::domain::{AccountInfo, ExchangeError, OrderId, OrderUpdate};
     use crate::domain::StepFormatter;
+    use crate::engine::live::executor::{Executor, ExecutorArgs};
+    use crate::engine::live::OutcomeBus;
     use crate::exchange::ExchangeOrder;
-    use kameo::actor::Spawn;
+    use crate::tasks::Root;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
     const EX: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
-    /// 大到测试期间不会自行触发第二次节拍（首次节拍由 `interval` 立即产生，无法关掉）
+    /// 大到测试期间不会自行触发第二次节拍（首拍在 run 开始时立即触发）
     const NEVER_AGAIN_MS: u64 = 3_600_000;
+    /// 需要多轮节拍的用例用的短周期
+    const FAST_MS: u64 = 10;
 
-    /// `fetch_positions` 的故障形态。两种共用一个 client，避免把 7 个
-    /// `unreachable!` 的方法抄两遍。
+    /// `fetch_positions` 的故障形态。共用一个 client，避免把 7 个
+    /// `unreachable!` 的方法抄几遍。
     enum Faulty {
         /// 永不返回。不用 `sleep` 制造卡死：普通运行时里 sleep 会真的等，而 paused 运行时
         /// 空闲时会自动推进时钟把 sleep 走完 —— 两种都测不到"卡死"。信号量不涉及时钟。
@@ -1382,42 +1392,62 @@ mod mailbox_tests {
         )]))
     }
 
-    /// 起一个账本 actor 并完成投产注册（基线 2.0）
-    async fn ledger_with_hung_rest() -> (ActorRef<PositionLedgerActor>, Arc<AtomicUsize>) {
-        let (client, calls) = FaultyClient::pair(Faulty::Hang);
-        let ledger = PositionLedgerActor::spawn(PositionLedgerArgs {
-            accounts: HashMap::from([(EX, client)]),
-            symbol_metas: metas(),
-            interval_ms: NEVER_AGAIN_MS,
-            max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
-        });
+    fn baseline(size: f64) -> PositionBaseline {
+        PositionBaseline {
+            position: Position {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                size,
+            },
+            snapshot_req_ts: 1,
+        }
+    }
+
+    /// 在 `root` 的 consumers 组里起一个账本并完成投产注册（基线 2.0）
+    async fn ledger(
+        root: &Root,
+        client: Arc<dyn AccountClient>,
+        interval_ms: u64,
+    ) -> PositionLedgerHandle {
+        let (_child, ledger) = PositionLedger::spawn(
+            &root.group("consumers"),
+            PositionLedgerArgs {
+                accounts: HashMap::from([(EX, client)]),
+                symbol_metas: metas(),
+                account_bus: AccountBus::new("account"),
+                interval_ms,
+                max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
+            },
+        )
+        .await
+        .expect("账本应能起来");
         ledger
-            .ask(super::super::RegisterSymbols {
-                symbols: vec![SYM.to_string()],
-                baselines: vec![PositionBaseline {
-                    position: Position {
-                        exchange: EX,
-                        symbol: SYM.to_string(),
-                        size: 2.0,
-                    },
-                    snapshot_req_ts: 1,
-                }],
-            })
-            .send()
+            .register_symbols(vec![SYM.to_string()], vec![baseline(2.0)])
             .await
             .expect("注册应成功");
-        (ledger, calls)
+        ledger
+    }
+
+    /// 有界等待：条件成立即返回，否则 2 秒后失败
+    async fn eventually(what: &str, cond: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !cond() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("等不到：{what}"));
     }
 
     /// **回归防线（Critical）**：在途请求永不返回时，停摆守卫必须仍能判定致命。
     ///
-    /// 守卫的两个触点都在"结果回投"的路径上。若节拍只是跳过在途的所而不过守卫，
-    /// 拉取任务 panic 或真挂死会让该所对账**静默永久失效**，引擎继续无校验交易 ——
+    /// 守卫的两个触点都在"结果到达"的路径上。若节拍只是跳过在途的所而不过守卫，
+    /// 请求真挂死会让该所对账**静默永久失效**，引擎继续无校验交易 ——
     /// 这比漏报单次漂移严重得多，因为它没有任何外在症状。
     #[test]
     fn an_in_flight_fetch_that_never_returns_still_trips_the_staleness_guard() {
         let (client, _calls) = FaultyClient::pair(Faulty::Hang);
-        let mut ledger = PositionLedgerActor {
+        let mut ledger = Ledger {
             reconciler: Reconciler::new(metas(), DEFAULT_MAX_CONSECUTIVE_MISMATCHES),
             accounts: HashMap::from([(EX, client)]),
             guards: HashMap::from([(
@@ -1427,6 +1457,7 @@ mod mailbox_tests {
             in_flight: HashSet::from([EX]),
             executors: HashMap::new(),
             executor_in_flight: HashSet::new(),
+            pending: FuturesUnordered::new(),
         };
 
         // 刚发出、还在容忍窗口内：只是慢，不该停机
@@ -1446,107 +1477,64 @@ mod mailbox_tests {
         assert!(err.contains("已停摆"), "got: {err}");
     }
 
-    /// **回归防线**：拉取任务 panic 必须被翻译成一条 `Err` 回投，而不是让结果凭空消失。
+    /// **回归防线**：拉取 panic 不能让结果凭空消失 —— 它必须上冒、让整机停下。
     ///
-    /// 若 panic 连投递一起带走，`in_flight` 永久占位、后续节拍全部跳过。这里用
-    /// "第二轮节拍还能不能发起拉取"来观测 —— 能，就说明第一轮的 panic 已被回投消化。
+    /// 旧结构里拉取在别处 spawn、结果经消息回投，panic 会连回投一起带走，`in_flight` 永久
+    /// 占位、该所对账静默失效（当时靠把 panic 翻译成一条 `Err` 回投兜住）。新结构里拉取在
+    /// 本任务里被 poll，panic 必然随 `run` 上冒：这里钉住这一点。
     #[tokio::test]
-    async fn a_panicking_fetch_is_reported_back_instead_of_vanishing() {
-        let (client, calls) = FaultyClient::pair(Faulty::Panic);
-        let ledger = PositionLedgerActor::spawn(PositionLedgerArgs {
-            accounts: HashMap::from([(EX, client)]),
-            symbol_metas: metas(),
-            interval_ms: NEVER_AGAIN_MS,
-            max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
-        });
-
-        // 两轮节拍之间留出调度机会，让第一轮的 panic 走完"回投 -> 清 in_flight"
-        for _ in 0..2 {
-            ledger
-                .tell(StreamMessage::Next(Instant::now()))
-                .send()
-                .await
-                .expect("节拍投递应成功");
-            for _ in 0..200 {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        // 不断言确切次数：`interval` 的首次立即节拍也算一轮，总数取决于节拍来源。
-        // 要证明的只是"panic 之后还能再发起" —— 若 panic 吞掉了回投，in_flight 永久占位，
-        // 计数会永远停在 1。
-        assert!(
-            calls.load(Ordering::SeqCst) >= 2,
-            "panic 若吞掉了回投，in_flight 会永久占位，此后任何节拍都发不出拉取（实际 {} 次）",
-            calls.load(Ordering::SeqCst)
-        );
+    async fn a_panicking_fetch_halts_the_ledger() {
+        let root = Root::new("t");
+        let (client, _calls) = FaultyClient::pair(Faulty::Panic);
+        let _ledger = ledger(&root, client, NEVER_AGAIN_MS).await;
+        tokio::time::timeout(Duration::from_secs(2), root.stopping())
+            .await
+            .expect("拉取 panic 必须上冒到根");
+        let err = root.shutdown().await.expect_err("应带着错误退出");
+        assert!(format!("{err:#}").contains("模拟 adapter 内的 panic"), "{err:#}");
     }
 
     /// **回归防线**：REST 拉取卡死时，快照查询仍须应答。
     ///
-    /// 拉取一旦回到 handler 里 `await`（本次改动之前的形态），这个 `ask` 会永远排在
-    /// 那次网络超时后面，测试超时失败。
+    /// 拉取一旦回到收件箱处理里 `await`（改动之前的形态），这个查询会永远排在那次网络
+    /// 超时后面，测试超时失败。
     #[tokio::test]
     async fn a_hung_rest_fetch_never_blocks_the_snapshot_query() {
-        let (ledger, _calls) = ledger_with_hung_rest().await;
+        let root = Root::new("t");
+        let (client, calls) = FaultyClient::pair(Faulty::Hang);
+        let ledger = ledger(&root, client, NEVER_AGAIN_MS).await;
+        // 首拍已发起一轮拉取（卡死在信号量上）
+        eventually("首拍发起拉取", || calls.load(Ordering::SeqCst) >= 1).await;
 
-        // 发起一轮拉取（会卡死在信号量上）
-        ledger
-            .tell(StreamMessage::Next(Instant::now()))
-            .send()
+        let positions = tokio::time::timeout(Duration::from_secs(2), ledger.live_positions())
             .await
-            .expect("节拍投递应成功");
-
-        let positions = tokio::time::timeout(
-            Duration::from_secs(2),
-            ledger.ask(GetLivePositions).send(),
-        )
-        .await
-        .expect("拉取卡死时快照查询必须仍能应答")
-        .expect("应答应成功");
+            .expect("拉取卡死时快照查询必须仍能应答")
+            .expect("应答应成功");
 
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].size, 2.0, "应答的是账本真值（基线 2.0）");
+        root.shutdown().await.expect("正常停机");
     }
 
     /// 同一所在途期间不重复发起：慢 REST 不该堆积并发请求。
-    ///
-    /// 计数与节拍来源无关 —— `interval` 的首次立即节拍与手工投递的节拍谁先到都一样，
-    /// 第一个进入在途，其余全部跳过，故断言是确定的。
     #[tokio::test]
     async fn an_in_flight_exchange_is_not_fetched_again() {
-        let (ledger, calls) = ledger_with_hung_rest().await;
-
-        for _ in 0..3 {
-            ledger
-                .tell(StreamMessage::Next(Instant::now()))
-                .send()
-                .await
-                .expect("节拍投递应成功");
-        }
-        // 用一次 ask 确保前面的 tell 都已被处理（同一邮箱 FIFO）——
-        // 在途判据在 handler 里同步生效，故此刻"发起了几次拉取"已成定局
-        ledger.ask(GetLivePositions).send().await.expect("应答应成功");
-        // spawn 出去的拉取任务需要被调度到才会计数；有界等待，不依赖具体调度时序
-        for _ in 0..100 {
-            if calls.load(Ordering::SeqCst) >= 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        // 再给足调度机会：若在途判据失效，多余的拉取会在此期间冒出来
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
+        let root = Root::new("t");
+        let (client, calls) = FaultyClient::pair(Faulty::Hang);
+        let _ledger = ledger(&root, client, FAST_MS).await;
+        eventually("首拍发起拉取", || calls.load(Ordering::SeqCst) >= 1).await;
+        // 再过十来个节拍：若在途判据失效，多余的拉取会在此期间冒出来
+        tokio::time::sleep(Duration::from_millis(FAST_MS * 10)).await;
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
             "在途期间的后续节拍必须跳过，否则慢 REST 会堆积并发请求"
         );
+        root.shutdown().await.expect("正常停机");
     }
 
-    // ---------------- executor 持仓纳入对账（#694）：actor 层 ----------------
+    // ---------------- executor 持仓纳入对账（#694） ----------------
 
     /// 只订一路 BBO、什么都不做的策略：本组用例只关心 executor 的持仓
     struct Idle;
@@ -1574,109 +1562,80 @@ mod mailbox_tests {
         }
     }
 
-    /// 起一个实盘 executor，出生持仓 = `size`（模拟「再晋升时 executor 用了新快照」）
-    fn executor_born_with(size: f64) -> ActorRef<ExecutorActor> {
-        let outcome_pubsub = super::super::OutcomePubSub::spawn(super::super::OutcomePubSub::new(
-            kameo_actors::DeliveryStrategy::BestEffort,
-        ));
-        ExecutorActor::spawn(super::super::ExecutorArgs {
-            strategy: Box::new(Idle),
-            account: crate::domain::AccountId::Live,
-            symbol_metas: metas(),
-            baselines: vec![PositionBaseline {
-                position: Position {
-                    exchange: EX,
-                    symbol: SYM.to_string(),
-                    size,
-                },
-                snapshot_req_ts: 1,
-            }],
-            outcome_pubsub,
-        })
+    /// 在 `root` 的 producers 组里起一个实盘 executor，出生持仓 = `size`
+    /// （模拟「再晋升时 executor 用了新快照」）
+    async fn executor_born_with(root: &Root, size: f64) -> (ChildHandle, ExecutorHandle) {
+        Executor::spawn(
+            &root.group("producers"),
+            ExecutorArgs {
+                strategy: Box::new(Idle),
+                account: crate::domain::AccountId::Live,
+                symbol_metas: metas(),
+                baselines: vec![baseline(size)],
+                outcome_bus: OutcomeBus::new("outcome"),
+            },
+        )
+        .await
+        .expect("executor 应能起来")
     }
 
-    /// 账本基线 2.0、交易所也报 2.0（这条比对永远通过）
-    async fn ledger_agreeing_with_exchange() -> ActorRef<PositionLedgerActor> {
+    /// 账本基线 2.0、交易所也报 2.0（这条比对永远通过），节拍很快
+    async fn ledger_agreeing_with_exchange(root: &Root) -> PositionLedgerHandle {
         let (client, _calls) = FaultyClient::pair(Faulty::Steady(2.0));
-        let ledger = PositionLedgerActor::spawn(PositionLedgerArgs {
-            accounts: HashMap::from([(EX, client)]),
-            symbol_metas: metas(),
-            interval_ms: NEVER_AGAIN_MS,
-            max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
-        });
-        ledger
-            .ask(super::super::RegisterSymbols {
-                symbols: vec![SYM.to_string()],
-                baselines: vec![PositionBaseline {
-                    position: Position {
-                        exchange: EX,
-                        symbol: SYM.to_string(),
-                        size: 2.0,
-                    },
-                    snapshot_req_ts: 1,
-                }],
-            })
-            .send()
-            .await
-            .expect("注册应成功");
-        ledger
+        ledger(root, client, FAST_MS).await
     }
 
-    /// 打若干轮节拍，每轮之后给足调度让「查询 -> 回投 -> 比对」走完
-    async fn tick(ledger: &ActorRef<PositionLedgerActor>, rounds: usize) {
-        for _ in 0..rounds {
-            if !ledger.is_alive() {
-                return;
-            }
-            let _ = ledger.tell(StreamMessage::Next(Instant::now())).send().await;
-            for _ in 0..200 {
-                tokio::task::yield_now().await;
-            }
-        }
+    /// 足够跑完 N+2 轮「查询 -> 答复 -> 比对」的时长
+    fn enough_rounds() -> Duration {
+        Duration::from_millis(FAST_MS * (DEFAULT_MAX_CONSECUTIVE_MISMATCHES as u64 + 2) * 3)
     }
 
     /// **端到端**：交易所与账本都对，只有受监视的 executor 持仓错 —— 账本必须停机。
     #[tokio::test]
     async fn a_watched_executor_with_wrong_positions_halts_the_ledger() {
-        let ledger = ledger_agreeing_with_exchange().await;
-        let executor = executor_born_with(5.0);
-        ledger
-            .ask(WatchExecutor(executor.clone()))
-            .send()
-            .await
-            .expect("纳入名单应成功");
+        let root = Root::new("t");
+        let (_child, executor) = executor_born_with(&root, 5.0).await;
+        let ledger = ledger_agreeing_with_exchange(&root).await;
+        ledger.watch(executor).await.expect("纳入名单应成功");
 
-        tick(&ledger, DEFAULT_MAX_CONSECUTIVE_MISMATCHES as usize + 2).await;
-        tokio::time::timeout(Duration::from_secs(2), ledger.wait_for_shutdown())
+        tokio::time::timeout(Duration::from_secs(2), root.stopping())
             .await
             .expect("executor 持仓与账本稳定分叉，账本必须致命退出");
+        let err = root.shutdown().await.expect_err("应带着错误退出");
+        assert!(format!("{err:#}").contains("executor"), "报错要指明对手方: {err:#}");
     }
 
     /// 撤出名单的 executor 不再比对（撤下流程里它会先停更再停机，不能被误判）；
     /// 持仓一致的 executor 也不该触发任何东西。
     #[tokio::test]
     async fn unwatched_or_agreeing_executors_never_halt_the_ledger() {
-        let ledger = ledger_agreeing_with_exchange().await;
-        let wrong = executor_born_with(5.0);
-        let right = executor_born_with(2.0);
-        ledger.ask(WatchExecutor(wrong.clone())).send().await.unwrap();
-        ledger.ask(WatchExecutor(right.clone())).send().await.unwrap();
-        ledger.ask(UnwatchExecutor(wrong.id())).send().await.unwrap();
+        let root = Root::new("t");
+        let (_c1, wrong) = executor_born_with(&root, 5.0).await;
+        let (_c2, right) = executor_born_with(&root, 2.0).await;
+        let ledger = ledger_agreeing_with_exchange(&root).await;
+        let wrong_id = wrong.id();
+        ledger.watch(wrong).await.unwrap();
+        ledger.watch(right).await.unwrap();
+        ledger.unwatch(wrong_id).await.unwrap();
 
-        tick(&ledger, DEFAULT_MAX_CONSECUTIVE_MISMATCHES as usize + 2).await;
-        assert!(ledger.is_alive(), "撤出名单的、或持仓一致的 executor 都不该打死账本");
+        tokio::time::sleep(enough_rounds()).await;
+        assert!(!root.is_stopping(), "撤出名单的、或持仓一致的 executor 都不该打死账本");
+        root.shutdown().await.expect("正常停机");
     }
 
-    /// executor 停了却没撤出名单：查询报错 -> 摘掉，不停机（停机由监督树负责）
+    /// executor 停了却没撤出名单：查询得到 Gone -> 摘掉，不停机（它若是出错停的，
+    /// 错误由它自己上冒）
     #[tokio::test]
     async fn a_stopped_executor_is_dropped_from_the_watch_list() {
-        let ledger = ledger_agreeing_with_exchange().await;
-        let executor = executor_born_with(5.0);
-        ledger.ask(WatchExecutor(executor.clone())).send().await.unwrap();
-        executor.stop_gracefully().await.unwrap();
-        executor.wait_for_shutdown().await;
+        let root = Root::new("t");
+        let (child, executor) = executor_born_with(&root, 5.0).await;
+        let ledger = ledger_agreeing_with_exchange(&root).await;
+        // 先停再纳入：确定地模拟「停了却还在名单里」，不依赖停机与节拍的先后
+        child.stop().await;
+        ledger.watch(executor).await.unwrap();
 
-        tick(&ledger, DEFAULT_MAX_CONSECUTIVE_MISMATCHES as usize + 2).await;
-        assert!(ledger.is_alive(), "已停的 executor 不该被当成分叉");
+        tokio::time::sleep(enough_rounds()).await;
+        assert!(!root.is_stopping(), "已停的 executor 不该被当成分叉");
+        root.shutdown().await.expect("正常停机");
     }
 }
