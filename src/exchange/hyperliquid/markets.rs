@@ -29,6 +29,8 @@ use std::sync::Arc;
 
 /// HIP-3 dex 的资产编号：`100000 + dex 在 perpDexs 列表中的下标 × 10000 + 品种在该 dex
 /// meta 里的下标`。主站（下标 0，列表里是 `null`）不加偏移。
+/// HL 单笔最小下单金额（USD，所有品种同一条规则：低于它交易所回 "Order must have minimum value of $10"）
+const MIN_ORDER_NOTIONAL: f64 = 10.0;
 const BUILDER_DEX_ASSET_BASE: u32 = 100_000;
 const BUILDER_DEX_ASSET_STEP: u32 = 10_000;
 
@@ -137,6 +139,7 @@ impl HlMarkets {
                 price_formatter: Arc::new(hl_price_formatter(a.sz_decimals)),
                 size_step: size_step(a.sz_decimals),
                 min_order_size: size_step(a.sz_decimals), // 最小下单量为一个精度单位
+                min_notional: MIN_ORDER_NOTIONAL,
                 contract_size: 1.0,                       // 币本位，合约乘数为 1
             })
             .collect()

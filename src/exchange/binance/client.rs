@@ -29,6 +29,107 @@ pub struct BinanceClient {
     quote: String,
 }
 
+/// 解析 `fapi/v1/exchangeInfo`：只收配置计价币的永续，缺任一必需过滤器的品种剔除并记 error。
+fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, String> {
+    #[derive(Deserialize)]
+    struct ExchangeInfo {
+        symbols: Vec<SymbolInfo>,
+    }
+
+    #[derive(Deserialize,Debug)]
+    #[serde(rename_all = "camelCase")]
+    struct SymbolInfo {
+        symbol: String,
+        filters: Vec<Filter>,
+    }
+
+    #[derive(Deserialize,Debug)]
+    #[serde(tag = "filterType")]
+    enum Filter {
+        #[serde(rename = "PRICE_FILTER")]
+        PriceFilter {
+            #[serde(rename = "tickSize")]
+            tick_size: String,
+        },
+        #[serde(rename = "LOT_SIZE")]
+        LotSize {
+            #[serde(rename = "stepSize")]
+            step_size: String,
+            #[serde(rename = "minQty")]
+            min_qty: String,
+        },
+        #[serde(rename = "MIN_NOTIONAL")]
+        MinNotional { notional: String },
+        #[serde(other)]
+        Other,
+    }
+
+    let info: ExchangeInfo = serde_json::from_str(text).map_err(|e| {
+        format!(
+            "Failed to parse exchangeInfo: {}, response preview: {}",
+            e,
+            &text[..text.len().min(500)]
+        )
+    })?;
+
+    // 剔除必须留痕（与 OKX 同口径，见那边的说明）：被剔掉的 symbol 会一路静默失效，
+    // 而三种症状（下单被拒 / 订阅被忽略 / 回报无法折算）看不出共同的根因。
+    // 这里只记录不报错，真正的拦截在投产期 `validate_subscriptions`。
+    let mut metas = Vec::new();
+    for s in info.symbols {
+        let Some(symbol) = from_binance(&s.symbol, quote) else {
+            continue; // 非当前 quote 的交易对，不属于本引擎的宇宙
+        };
+        let mut price_step: Option<f64> = None;
+        let mut size_step: Option<f64> = None;
+        let mut min_order_size: Option<f64> = None;
+        let mut min_notional: Option<f64> = None;
+
+        for filter in s.filters {
+            match filter {
+                Filter::PriceFilter { tick_size } => {
+                    price_step = tick_size.parse().ok();
+                }
+                Filter::LotSize { step_size, min_qty } => {
+                    size_step = step_size.parse().ok();
+                    min_order_size = min_qty.parse().ok();
+                }
+                Filter::MinNotional { notional } => {
+                    min_notional = notional.parse().ok();
+                }
+                Filter::Other => {}
+            }
+        }
+
+        let positive = |v: Option<f64>| v.filter(|&v| v > 0.0);
+        match (
+            positive(price_step),
+            positive(size_step),
+            positive(min_order_size),
+            positive(min_notional),
+        ) {
+            (Some(price_step), Some(size_step), Some(min_order_size), Some(min_notional)) => {
+                metas.push(SymbolMeta {
+                    exchange: Exchange::Binance,
+                    symbol,
+                    price_formatter: Arc::new(StepFormatter::new(price_step)),
+                    size_step,
+                    min_order_size,
+                    min_notional,
+                    contract_size: 1.0,
+                });
+            }
+            _ => tracing::error!(
+                binance_symbol = %s.symbol, %symbol,
+                ?price_step, ?size_step, ?min_order_size, ?min_notional,
+                "Binance 合约过滤器缺少有效的价格/数量步长或最小下单金额，该 symbol 不可交易"
+            ),
+        }
+    }
+
+    Ok(metas)
+}
+
 impl BinanceClient {
     /// 创建新的 Binance 客户端
     pub fn new(quote: String, credentials: Option<BinanceCredentials>) -> Result<Self, ExchangeError> {
@@ -191,37 +292,6 @@ impl BinanceClient {
 
     /// 获取所有交易对信息
     async fn get_all_exchange_info(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        #[derive(Deserialize)]
-        struct ExchangeInfo {
-            symbols: Vec<SymbolInfo>,
-        }
-
-        #[derive(Deserialize,Debug)]
-        #[serde(rename_all = "camelCase")]
-        struct SymbolInfo {
-            symbol: String,
-            filters: Vec<Filter>,
-        }
-
-        #[derive(Deserialize,Debug)]
-        #[serde(tag = "filterType")]
-        enum Filter {
-            #[serde(rename = "PRICE_FILTER")]
-            PriceFilter {
-                #[serde(rename = "tickSize")]
-                tick_size: String,
-            },
-            #[serde(rename = "LOT_SIZE")]
-            LotSize {
-                #[serde(rename = "stepSize")]
-                step_size: String,
-                #[serde(rename = "minQty")]
-                min_qty: String,
-            },
-            #[serde(other)]
-            Other,
-        }
-
         let resp = self
             .client
             .get(format!("{}/fapi/v1/exchangeInfo", self.base_url))
@@ -240,64 +310,7 @@ impl BinanceClient {
             )));
         }
 
-        let info: ExchangeInfo = serde_json::from_str(&text).map_err(|e| {
-            ExchangeError::Other(format!(
-                "Failed to parse exchangeInfo: {}, response preview: {}",
-                e,
-                &text[..text.len().min(500)]
-            ))
-        })?;
-
-        // 剔除必须留痕（与 OKX 同口径，见那边的说明）：被剔掉的 symbol 会一路静默失效，
-        // 而三种症状（下单被拒 / 订阅被忽略 / 回报无法折算）看不出共同的根因。
-        // 这里只记录不报错，真正的拦截在投产期 `validate_subscriptions`。
-        let mut metas = Vec::new();
-        for s in info.symbols {
-            let Some(symbol) = from_binance(&s.symbol, &self.quote) else {
-                continue; // 非当前 quote 的交易对，不属于本引擎的宇宙
-            };
-            let mut price_step: Option<f64> = None;
-            let mut size_step: Option<f64> = None;
-            let mut min_order_size: Option<f64> = None;
-
-            for filter in s.filters {
-                match filter {
-                    Filter::PriceFilter { tick_size } => {
-                        price_step = tick_size.parse().ok();
-                    }
-                    Filter::LotSize { step_size, min_qty } => {
-                        size_step = step_size.parse().ok();
-                        min_order_size = min_qty.parse().ok();
-                    }
-                    Filter::Other => {}
-                }
-            }
-
-            let positive = |v: Option<f64>| v.filter(|&v| v > 0.0);
-            match (
-                positive(price_step),
-                positive(size_step),
-                positive(min_order_size),
-            ) {
-                (Some(price_step), Some(size_step), Some(min_order_size)) => {
-                    metas.push(SymbolMeta {
-                        exchange: Exchange::Binance,
-                        symbol,
-                        price_formatter: Arc::new(StepFormatter::new(price_step)),
-                        size_step,
-                        min_order_size,
-                        contract_size: 1.0,
-                    });
-                }
-                _ => tracing::error!(
-                    binance_symbol = %s.symbol, %symbol,
-                    ?price_step, ?size_step, ?min_order_size,
-                    "Binance 合约过滤器缺少有效的价格/数量步长，该 symbol 不可交易"
-                ),
-            }
-        }
-
-        Ok(metas)
+        parse_exchange_info(&text, &self.quote).map_err(ExchangeError::Other)
     }
 
     /// 查询所有持仓（内部实现；ExchangeClient::fetch_positions 委托到这里）
@@ -858,6 +871,30 @@ mod settled_funding_tests {
     fn bad_rate_fails_the_whole_batch() {
         let body = r#"[{"fundingTime":1,"fundingRate":"x"}]"#;
         assert!(parse_settled_funding(body, &"BTC".to_string()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exchange_info_tests {
+    use super::*;
+
+    /// 最小下单金额取自 MIN_NOTIONAL 过滤器（字段形状照 11-12 实测 fapi/v1/exchangeInfo）；
+    /// 缺这个过滤器的品种剔除，不给出一份「没有金额下限」的假规格
+    #[test]
+    fn min_notional_comes_from_the_filter_and_is_required() {
+        let body = r#"{"symbols":[
+            {"symbol":"BTCUSDT","filters":[
+                {"filterType":"PRICE_FILTER","tickSize":"0.10","minPrice":"1","maxPrice":"1000000"},
+                {"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001","maxQty":"1000"},
+                {"filterType":"MIN_NOTIONAL","notional":"50"}]},
+            {"symbol":"XMRUSDT","filters":[
+                {"filterType":"PRICE_FILTER","tickSize":"0.01"},
+                {"filterType":"LOT_SIZE","stepSize":"0.001","minQty":"0.001"}]}
+        ]}"#;
+        let metas = parse_exchange_info(body, "USDT").unwrap();
+        assert_eq!(metas.len(), 1, "缺 MIN_NOTIONAL 的 XMR 应被剔除");
+        assert_eq!(metas[0].symbol, "BTC");
+        assert_eq!(metas[0].min_notional, 50.0);
     }
 }
 

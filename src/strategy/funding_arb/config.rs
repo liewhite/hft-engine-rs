@@ -18,8 +18,8 @@ pub struct FundingArbConfig {
     pub close_threshold_apr: f64,
     /// 单笔挂单金额上限（USD）；实际取 min(本值, 两所对手盘第一档的金额)
     pub order_notional: f64,
-    /// 单笔挂单最小金额（USD）。HL 单笔最低 10 USD，低于此值不挂；
-    /// 两腿持仓差的价值低于此值也不补腿（补不出去，补了也会被拒）
+    /// 单笔最小金额（USD）的配置下限。每所实际用它与该所交易所下限（币安 MIN_NOTIONAL、
+    /// HL 10 USD）中较大的一个：低于它不挂单；持仓差的价值低于补腿所的下限也不补腿（补了会被拒）
     pub min_order_notional: f64,
     /// 账户级杠杆上限（每所各自）
     pub max_account_leverage: f64,

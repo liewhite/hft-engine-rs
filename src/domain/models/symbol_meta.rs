@@ -13,8 +13,14 @@ pub struct SymbolMeta {
     pub price_formatter: Arc<dyn PriceFormatter>,
     /// 数量精度 (最小数量变动单位)
     pub size_step: f64,
-    /// 最小下单数量
+    /// 最小下单数量（交易所下单单位）
     pub min_order_size: f64,
+    /// 交易所要求的最小下单金额（计价币，如 USDT）：币安 `MIN_NOTIONAL`、HL 10 USD；
+    /// 只按数量限制的所（OKX 按一手、IBKR）为 0。
+    ///
+    /// 框架只如实提供；与价格有关，所以不在 [`Self::checked_exchange_qty`] 里校验 ——
+    /// 用不用、怎么和自己的下限合并由策略决定。
+    pub min_notional: f64,
     /// 合约乘数 (OKX: cval, Binance: 1.0)
     ///
     /// 表示每张合约对应的币本位数量

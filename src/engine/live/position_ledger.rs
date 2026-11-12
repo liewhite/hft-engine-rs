@@ -760,6 +760,7 @@ mod tests {
                             price_formatter: Arc::new(StepFormatter::new(0.1)),
                             size_step: SIZE_STEP,
                             min_order_size: SIZE_STEP,
+                            min_notional: 0.0,
                             contract_size: 1.0,
                         },
                     )
@@ -849,6 +850,7 @@ mod tests {
                 price_formatter: Arc::new(StepFormatter::new(0.1)),
                 size_step: 1.0,
                 min_order_size: 1.0,
+                min_notional: 0.0,
                 contract_size: 0.01,
             },
         )]));
@@ -1374,6 +1376,7 @@ mod mailbox_tests {
                 price_formatter: Arc::new(StepFormatter::new(0.1)),
                 size_step: 0.001,
                 min_order_size: 0.001,
+                min_notional: 0.0,
                 contract_size: 1.0,
             },
         )]))

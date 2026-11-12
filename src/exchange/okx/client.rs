@@ -175,6 +175,7 @@ impl OkxClient {
                     price_formatter: Arc::new(StepFormatter::new(positive(&d.tick_sz)?)),
                     size_step: positive(&d.lot_sz)?,
                     min_order_size: positive(&d.min_sz)?,
+                    min_notional: 0.0,
                     contract_size: positive(&d.ct_val)?,
                 })
             })();

@@ -393,6 +393,7 @@ mod tests {
                 price_formatter: Arc::new(StepFormatter::new(0.1)),
                 size_step: 1.0,
                 min_order_size: 1.0,
+                min_notional: 0.0,
                 contract_size: 0.01,
             },
         )])

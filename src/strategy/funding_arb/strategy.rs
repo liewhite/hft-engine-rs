@@ -37,8 +37,8 @@
 //! # 零头（如实声明）
 //!
 //! 各所下单粒度不同（OKX 一手可值十几 U）。挂单量按两所粒度向下取整成两边都下得出的量；
-//! 持仓差不足补腿所的一手（或最小下单量）时视为零头，不补 —— 补了也会被交易所拒。所以每个币
-//! 可能留着不超过一手的单边敞口。判据见 `is_dust`。
+//! 持仓差不足补腿所的一手、最小下单量或最小下单金额（配置下限与交易所下限取大）时视为零头，
+//! 不补 —— 补了也会被交易所拒。所以每个币可能留着不超过一笔最小单的单边敞口。判据见 `is_dust`。
 //!
 //! 所对切换的那一步，旧所对的挂单撤销在途时新所对已挂单；新旧同方向的单都成交时，补腿量是两笔、
 //! 不经杠杆检查，最多超出一笔挂单金额。
@@ -246,7 +246,7 @@ impl FundingArbStrategy {
         let held: Vec<(Exchange, f64)> = positions
             .iter()
             .copied()
-            .filter(|(_, p)| p.abs() * px >= self.p.min_order_notional)
+            .filter(|(ex, p)| p.abs() * px >= self.min_notional(*ex))
             .collect();
 
         let unknown: Vec<Exchange> = aprs.iter().filter(|(_, a)| a.is_none()).map(|(e, _)| *e).collect();
@@ -283,31 +283,45 @@ impl FundingArbStrategy {
         }
     }
 
-    /// 持仓差是不是零头（不补、不停机），全策略只此一处判据：
-    /// - 价值不足一笔最小单；或
-    /// - 补不出去：有所对时看补腿所下不下得出；还没有所对（启动时）时，只要有任一所下不出就算零头
-    ///   —— 本策略留下的零头不超过当时补腿所的一手，而那一所事后未知，按最粗的一所放宽，
-    ///   免得每次重启都因自己的零头停机。代价：启动时不足最粗一所一手的外来不平会被放过。
+    /// 持仓差是不是零头（不补、不停机），全策略只此一处判据：补不出去就是零头（见 [`Self::tradable`]）。
+    /// 有所对时看补腿所下不下得出；还没有所对（启动时）时，只要有任一所下不出就算零头
+    /// —— 本策略留下的零头不超过当时补腿所的一笔最小单，而那一所事后未知，按最粗的一所放宽，
+    /// 免得每次重启都因自己的零头停机。代价：启动时不足最粗一所最小单的外来不平会被放过。
     fn is_dust(&self, net: f64, px: f64) -> bool {
-        if net.abs() * px < self.p.min_order_notional {
-            return true;
-        }
         match self.leg {
-            Some(pair) => !self.tradable(hedge_target(pair, net).0, net.abs()),
-            None => !self.exchanges.iter().all(|&ex| self.tradable(ex, net.abs())),
+            Some(pair) => !self.tradable(hedge_target(pair, net).0, net.abs(), px),
+            None => !self.exchanges.iter().all(|&ex| self.tradable(ex, net.abs(), px)),
         }
     }
 
-    /// 这个币数量在该所能不能下出去（取整后非 0 且不低于最小下单量）
-    fn tradable(&self, ex: Exchange, qty: f64) -> bool {
-        self.metas[&ex].checked_exchange_qty(qty).is_ok()
+    /// 该所实际用的最小下单金额：配置下限与交易所下限取大（用户 11-12 定）
+    fn min_notional(&self, ex: Exchange) -> f64 {
+        self.p.min_order_notional.max(self.metas[&ex].min_notional)
+    }
+
+    /// 一对所都下得出的最小金额
+    fn pair_min_notional(&self, pair: LegPair) -> f64 {
+        self.min_notional(pair.sell).max(self.min_notional(pair.buy))
+    }
+
+    /// 这个币数量按参考价 `px` 在该所能不能下出去：取整后非 0、不低于最小下单量，
+    /// 且金额不低于该所最小下单金额
+    fn tradable(&self, ex: Exchange, qty: f64, px: f64) -> bool {
+        self.metas[&ex].checked_exchange_qty(qty).is_ok() && qty * px >= self.min_notional(ex)
     }
 
     /// 两所挂同样的量：按两所精度依次向下取整（各所步长都是 10 的幂次，取整后同为两所步长的整数倍）；
     /// 任一所下不出则量为 `None`（不新挂，见 [`Quote::qty`]）。
-    fn pair_quotes(&self, pair: LegPair, bbos: &HashMap<Exchange, &BBO>, qty: f64, reduce_only: bool) -> Vec<Quote> {
+    fn pair_quotes(
+        &self,
+        pair: LegPair,
+        bbos: &HashMap<Exchange, &BBO>,
+        qty: f64,
+        px: f64,
+        reduce_only: bool,
+    ) -> Vec<Quote> {
         let qty = self.metas[&pair.buy].round_coin_size_down(self.metas[&pair.sell].round_coin_size_down(qty));
-        let qty = (self.tradable(pair.sell, qty) && self.tradable(pair.buy, qty)).then_some(qty);
+        let qty = (self.tradable(pair.sell, qty, px) && self.tradable(pair.buy, qty, px)).then_some(qty);
         [(pair.sell, Side::Short), (pair.buy, Side::Long)]
             .into_iter()
             .map(|(ex, side)| Quote { exchange: ex, side, price: self.maker_price(bbos[&ex], side), qty, reduce_only })
@@ -323,8 +337,8 @@ impl FundingArbStrategy {
         view: StrategyView<'_>,
     ) -> Vec<Quote> {
         let notional = self.cap_notional(pair, bbos);
-        if notional < self.p.min_order_notional {
-            return self.pair_quotes(pair, bbos, 0.0, false);
+        if notional < self.pair_min_notional(pair) {
+            return self.pair_quotes(pair, bbos, 0.0, px, false);
         }
         let qty = notional / px;
         let pos = |ex: Exchange| positions.iter().find(|(e, _)| *e == ex).map_or(0.0, |(_, p)| *p);
@@ -334,7 +348,7 @@ impl FundingArbStrategy {
             }
         }
         // 不设只减仓：开仓可能顺带削减该所已有的腿（用户允许），并可能越过 0 变成反向仓
-        self.pair_quotes(pair, bbos, qty, false)
+        self.pair_quotes(pair, bbos, qty, px, false)
     }
 
     fn close_quotes(&self, pair: LegPair, bbos: &HashMap<Exchange, &BBO>, positions: &[(Exchange, f64)], px: f64) -> Vec<Quote> {
@@ -342,10 +356,10 @@ impl FundingArbStrategy {
         // 卖出所持多、买入所持空（decide 保证），可平的量 = 两者绝对值较小的一个
         let held = pos(pair.sell).max(0.0).min((-pos(pair.buy)).max(0.0));
         let qty = (self.cap_notional(pair, bbos) / px).min(held);
-        if qty * px < self.p.min_order_notional {
-            return self.pair_quotes(pair, bbos, 0.0, true);
+        if qty * px < self.pair_min_notional(pair) {
+            return self.pair_quotes(pair, bbos, 0.0, px, true);
         }
-        self.pair_quotes(pair, bbos, qty, true)
+        self.pair_quotes(pair, bbos, qty, px, true)
     }
 
     /// 在该所把持仓从 `pos` 改到 `pos + delta` 后，单币与账户杠杆是否仍在上限内。

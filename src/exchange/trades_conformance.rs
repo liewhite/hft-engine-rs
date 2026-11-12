@@ -313,6 +313,7 @@ fn okx_btc_metas() -> HashMap<Symbol, SymbolMeta> {
             price_formatter: Arc::new(StepFormatter::new(0.1)),
             size_step: 0.01,
             min_order_size: 0.01,
+            min_notional: 0.0,
             contract_size: OKX_BTC_CONTRACT_SIZE,
         },
     )])

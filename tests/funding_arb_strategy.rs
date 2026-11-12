@@ -28,7 +28,8 @@ fn config() -> FundingArbConfig {
     .unwrap()
 }
 
-fn meta(ex: Exchange) -> ((Exchange, String), SymbolMeta) {
+/// `min_notional`：交易所最小下单金额（默认场景都是 0，只有配置下限 11U 生效）
+fn meta(ex: Exchange, min_notional: f64) -> ((Exchange, String), SymbolMeta) {
     // OKX 用粗粒度（一手 1 个币 ≈ 100U），测零头处理；其余所 0.001
     let step = if ex == OKX { 1.0 } else { 0.001 };
     (
@@ -39,6 +40,7 @@ fn meta(ex: Exchange) -> ((Exchange, String), SymbolMeta) {
             price_formatter: Arc::new(StepFormatter::new(0.01)),
             size_step: step,
             min_order_size: step,
+            min_notional,
             contract_size: 1.0,
         },
     )
@@ -69,11 +71,17 @@ impl Sim {
     }
 
     fn multi_without_bbo(legs: &[(Exchange, f64)]) -> Self {
+        Self::with_exchange_min(legs, &[])
+    }
+
+    /// 指定某些所的交易所最小下单金额（其余为 0），不推盘口
+    fn with_exchange_min(legs: &[(Exchange, f64)], mins: &[(Exchange, f64)]) -> Self {
         let p = config().params().remove(0);
         let exchanges: Vec<Exchange> = legs.iter().map(|(e, _)| *e).collect();
+        let min_of = |ex: Exchange| mins.iter().find(|(e, _)| *e == ex).map_or(0.0, |(_, m)| *m);
         let mut runner = StrategyRunner::new(
-            Box::new(FundingArbStrategy::new(p, exchanges.iter().map(|&e| meta(e).1).collect())),
-            Arc::new(exchanges.iter().map(|&e| meta(e)).collect::<HashMap<_, _>>()),
+            Box::new(FundingArbStrategy::new(p, exchanges.iter().map(|&e| meta(e, min_of(e)).1).collect())),
+            Arc::new(exchanges.iter().map(|&e| meta(e, min_of(e))).collect::<HashMap<_, _>>()),
             AccountId::Live,
         );
         let baselines: Vec<PositionBaseline> = legs
@@ -567,4 +575,42 @@ fn unmapped_fill_halts() {
     ));
     s.funding(BN, 0.8);
     assert!(placed(&s.funding(HL, 0.1)).is_empty(), "停止交易后不得开仓");
+}
+
+// ---------------------------------------------------------------- 交易所最小下单金额（#696）
+
+#[test]
+fn exchange_min_notional_above_config_blocks_thin_quotes() {
+    // 币安该币最小下单金额 50U（高于配置 11U）。对手盘第一档只有 0.3 个（30U）：
+    // 配置下限够，但币安会拒 → 不挂
+    let mut s = Sim::with_exchange_min(&[(BN, 0.0), (HL, 0.0)], &[(BN, 50.0)]);
+    s.bbo_depth(BN, 0.3);
+    s.bbo(HL);
+    s.funding(BN, 0.8);
+    assert!(placed(&s.funding(HL, 0.1)).is_empty());
+    // 盘口厚了照常挂
+    let o = placed(&s.bbo(BN));
+    assert_eq!(o.len(), 2, "{o:?}");
+}
+
+#[test]
+fn imbalance_below_the_hedge_exchanges_min_notional_is_dust() {
+    // 币安最小 50U。开仓后 HL 买单先成交 0.3（30U ≥ 配置 11U，但补腿要在币安卖 30U，会被拒）→ 不补
+    let mut s = Sim::with_exchange_min(&[(BN, 0.0), (HL, 0.0)], &[(BN, 50.0)]);
+    s.bbo(BN);
+    s.bbo(HL);
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    let bn = o.iter().find(|o| o.exchange == BN).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&bn, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::PartiallyFilled);
+    s.fill(&hl, 0.3);
+    s.advance(600);
+    let out = s.bbo(HL);
+    assert!(placed(&out).iter().all(|o| !matches!(o.order_type, OrderType::Market)), "低于币安下限不补：{out:?}");
+    // 再成交 0.3（共 60U）够币安下限 → 撤挂单准备补腿
+    let c = cancels(&s.fill(&hl, 0.3));
+    assert!(c.contains(&BN), "{c:?}");
 }
