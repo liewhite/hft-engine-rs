@@ -404,6 +404,75 @@ impl HyperliquidClient {
 
         parse_user_funding(entries, &self.dex, &self.quote)
     }
+
+    /// 拉取某币自 `start_ms` 起**已结算**的公共资金费率（`fundingHistory`，无需凭证），
+    /// 按结算时间升序。HL 每小时结算一次，24h 窗口约 24 条；单次最多返回 500 条。
+    ///
+    /// 限频：info 接口按权重计（每 IP 1200/分钟），一次约 20，别按行情频率轮询。
+    pub async fn fetch_settled_funding(
+        &self,
+        symbol: &Symbol,
+        start_ms: Timestamp,
+    ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
+        let coin = to_hyperliquid(symbol, &self.quote, &self.dex);
+        let entries: Vec<FundingHistoryEntry> = self
+            .post_info(serde_json::json!({"type": "fundingHistory", "coin": coin, "startTime": start_ms}))
+            .await?;
+        parse_funding_history(entries, symbol)
+    }
+}
+
+/// `fundingHistory` 的单条记录（`premium` 不取）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FundingHistoryEntry {
+    funding_rate: String,
+    time: u64,
+}
+
+/// 费率解析失败整批报错：少一条结算会让 24h 累计静默偏小。
+fn parse_funding_history(
+    entries: Vec<FundingHistoryEntry>,
+    symbol: &Symbol,
+) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
+    entries
+        .into_iter()
+        .map(|e| {
+            let rate = e
+                .funding_rate
+                .parse::<f64>()
+                .map_err(|_| ExchangeError::ParseError(format!("HL fundingRate 非法: {}", e.funding_rate)))?;
+            Ok(crate::domain::SettledFunding {
+                exchange: Exchange::Hyperliquid,
+                symbol: symbol.clone(),
+                rate,
+                settle_time: e.time,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod funding_history_tests {
+    use super::*;
+
+    #[test]
+    fn parses_public_funding_history() {
+        let body = r#"[{"coin":"xyz:TSLA","fundingRate":"0.0000052306","premium":"-0.0003","time":1794470400013},
+                       {"coin":"xyz:TSLA","fundingRate":"-0.0000125","premium":"0.0","time":1794474000081}]"#;
+        let entries: Vec<FundingHistoryEntry> = serde_json::from_str(body).unwrap();
+        let got = parse_funding_history(entries, &"TSLA".to_string()).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].symbol, "TSLA");
+        assert_eq!(got[1].settle_time, 1794474000081);
+        assert!((got[1].rate + 0.0000125).abs() < 1e-15);
+    }
+
+    #[test]
+    fn bad_rate_fails_the_whole_batch() {
+        let entries = vec![FundingHistoryEntry { funding_rate: "nan?".into(), time: 1 }];
+        assert!(parse_funding_history(entries, &"BTC".to_string()).is_err());
+    }
 }
 
 /// `userFunding` 的单条记录。

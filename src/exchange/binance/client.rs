@@ -2,8 +2,8 @@
 
 use super::symbol::{from_binance, to_binance};
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, OrderId, OrderStatus, OrderType, RejectReason, Side,
-    Symbol, SymbolMeta, TimeInForce, Timestamp,
+    Exchange, ExchangeError, FundingFee, OrderId, OrderStatus, OrderType, RejectReason,
+    SettledFunding, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
@@ -93,6 +93,35 @@ impl BinanceClient {
     /// 获取计价币种
     pub fn quote(&self) -> &str {
         &self.quote
+    }
+
+    /// 拉取某交易对自 `start_ms` 起**已结算**的公共资金费率（`GET /fapi/v1/fundingRate`，
+    /// 无需凭证），按结算时间升序。
+    ///
+    /// 限频：该接口与 fundingInfo 共用 500 次 / 5 分钟 / IP，调用方按需拉取（结算才变，
+    /// 每小时一轮足够），别按行情频率轮询。单次最多 1000 条，24h 窗口最多 24 条（1h 周期）。
+    pub async fn fetch_settled_funding(
+        &self,
+        symbol: &Symbol,
+        start_ms: Timestamp,
+    ) -> Result<Vec<SettledFunding>, ExchangeError> {
+        let url = format!(
+            "{}/fapi/v1/fundingRate?symbol={}&startTime={}&limit=1000",
+            self.base_url,
+            to_binance(symbol, &self.quote),
+            start_ms
+        );
+        let resp = self.client.get(&url).send().await.map_err(Self::map_reqwest_error)?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
+        }
+        parse_settled_funding(&text, symbol)
     }
 
     /// 获取凭证（供 ManagerActor 创建 BinanceActor 使用）
@@ -749,5 +778,55 @@ fn order_type_to_binance(
             };
             ("LIMIT", Some(price.to_string()), Some(tif_str))
         }
+    }
+}
+
+/// 解析 `/fapi/v1/fundingRate` 的回复。`symbol` 是请求时的内部符号（回复里的是交易所写法，
+/// 不再反解一遍）。费率解析失败整批报错：少一条结算会让 24h 累计静默偏小。
+fn parse_settled_funding(text: &str, symbol: &Symbol) -> Result<Vec<SettledFunding>, ExchangeError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        funding_time: u64,
+        funding_rate: String,
+    }
+    let entries: Vec<Entry> = serde_json::from_str(text)
+        .map_err(|e| ExchangeError::ParseError(format!("fundingRate: {e} (body: {})", &text[..text.len().min(300)])))?;
+    entries
+        .into_iter()
+        .map(|e| {
+            let rate = e
+                .funding_rate
+                .parse::<f64>()
+                .map_err(|_| ExchangeError::ParseError(format!("fundingRate 非法: {}", e.funding_rate)))?;
+            Ok(SettledFunding {
+                exchange: Exchange::Binance,
+                symbol: symbol.clone(),
+                rate,
+                settle_time: e.funding_time,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod settled_funding_tests {
+    use super::*;
+
+    #[test]
+    fn parses_public_funding_history() {
+        let body = r#"[{"symbol":"BTCUSDT","fundingTime":1794412800000,"fundingRate":"0.00006639","markPrice":"73953.1","rateType":"Regular"},
+                       {"symbol":"BTCUSDT","fundingTime":1794441600000,"fundingRate":"-0.00003453","markPrice":"73979.9"}]"#;
+        let got = parse_settled_funding(body, &"BTC".to_string()).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].settle_time, 1794412800000);
+        assert!((got[1].rate + 0.00003453).abs() < 1e-15);
+        assert_eq!(got[1].exchange, Exchange::Binance);
+    }
+
+    #[test]
+    fn bad_rate_fails_the_whole_batch() {
+        let body = r#"[{"fundingTime":1,"fundingRate":"x"}]"#;
+        assert!(parse_settled_funding(body, &"BTC".to_string()).is_err());
     }
 }
