@@ -6,10 +6,10 @@
 //! 资金费数据：本进程起一个轮询任务，每 `funding_poll_secs` 秒为每个币拉两所过去 24h
 //! 已结算的公共费率，整窗作为 `SettledFundingWindow` 自定义事件投递给对应策略。
 
-use hft_engine_rs::domain::{now_ms, Exchange, Symbol, SymbolMeta};
+use hft_engine_rs::domain::{now_ms, Exchange, Symbol};
 use hft_engine_rs::engine::{
     init_tracing, load_config, setup_binance, setup_hyperliquid, wait_for_shutdown, AddStrategies,
-    GetAllSymbolMetas, ManagerActor, ManagerActorArgs, StrategySpec,
+    ManagerActor, ManagerActorArgs, StrategySpec,
 };
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
 use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
@@ -63,18 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Manager startup failed: {e}"))?;
 
-    // 配置里的币必须两所都有（HL 侧只含全仓品种）；缺了是配置错，拒绝启动
-    let metas: HashMap<Exchange, Vec<SymbolMeta>> = manager.ask(GetAllSymbolMetas).send().await?;
-    let listed = |ex: Exchange, s: &Symbol| metas.get(&ex).is_some_and(|v| v.iter().any(|m| &m.symbol == s));
-    let missing: Vec<String> = config
-        .strategy
-        .pairs
-        .iter()
-        .filter(|p| !listed(Exchange::Binance, &p.symbol) || !listed(Exchange::Hyperliquid, &p.symbol))
-        .map(|p| p.symbol.clone())
-        .collect();
-    anyhow::ensure!(missing.is_empty(), "这些币不在两所（HL 只含全仓品种）同时上市: {missing:?}");
-
+    // 配置里的币两所是否都上市，由框架投产时校验（缺 SymbolMeta 即拒绝启动）
     let params = config.strategy.params();
     let symbols: Vec<Symbol> = params.iter().map(|p| p.symbol.clone()).collect();
     let specs = params
@@ -94,18 +83,28 @@ async fn main() -> anyhow::Result<()> {
     let poll_manager = manager.clone();
     let interval = Duration::from_secs(config.funding_poll_secs);
     tokio::spawn(async move {
+        let mut failures: HashMap<(Symbol, Exchange), u32> = HashMap::new();
         loop {
-            poll_funding(&bn, &hl, &symbols, &poll_manager).await;
-            tokio::time::sleep(interval).await;
+            poll_funding(&bn, &hl, &symbols, &poll_manager, interval, &mut failures).await;
         }
     });
 
     wait_for_shutdown(manager).await
 }
 
-/// 拉一轮两所过去 24h 已结算费率并投递。单个失败只记 warn：策略侧按数据年龄判"未知"，
-/// 持续失败会表现为该币不开不平（日志里能看到原因）。
-async fn poll_funding(bn: &BinanceClient, hl: &HyperliquidClient, symbols: &[Symbol], manager: &ActorRef<ManagerActor>) {
+/// 拉一轮两所过去 24h 已结算费率并投递，请求均匀摊在 `interval` 里（HL info 按 IP 每分钟
+/// 1200 权重，fundingHistory 一次约 20；币安 fundingRate 500 次 / 5 分钟）。
+/// 偶发失败记 warn（网络会间歇掉线，下一轮就补上）；同一项连续失败 3 轮记 error ——
+/// 此时策略侧数据会过期变"未知"，该币不开也不平。
+async fn poll_funding(
+    bn: &BinanceClient,
+    hl: &HyperliquidClient,
+    symbols: &[Symbol],
+    manager: &ActorRef<ManagerActor>,
+    interval: Duration,
+    failures: &mut HashMap<(Symbol, Exchange), u32>,
+) {
+    let gap = interval / (2 * symbols.len().max(1) as u32);
     for symbol in symbols {
         for ex in [Exchange::Binance, Exchange::Hyperliquid] {
             let start = now_ms().saturating_sub(FUNDING_WINDOW_MS);
@@ -115,6 +114,7 @@ async fn poll_funding(bn: &BinanceClient, hl: &HyperliquidClient, symbols: &[Sym
             };
             match got {
                 Ok(entries) => {
+                    failures.remove(&(symbol.clone(), ex));
                     let w = SettledFundingWindow {
                         exchange: ex,
                         symbol: symbol.clone(),
@@ -127,10 +127,17 @@ async fn poll_funding(bn: &BinanceClient, hl: &HyperliquidClient, symbols: &[Sym
                         tracing::error!(error = %e, "投递资金费窗口失败");
                     }
                 }
-                Err(e) => tracing::warn!(%symbol, %ex, error = %e, "拉取已结算资金费失败"),
+                Err(e) => {
+                    let n = failures.entry((symbol.clone(), ex)).or_default();
+                    *n += 1;
+                    if *n >= 3 {
+                        tracing::error!(%symbol, %ex, rounds = *n, error = %e, "已结算资金费连续拉取失败，该币数据将过期、不开不平");
+                    } else {
+                        tracing::warn!(%symbol, %ex, error = %e, "拉取已结算资金费失败");
+                    }
+                }
             }
-            // 币安 fundingRate 500 次 / 5 分钟 / IP，放慢一点
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(gap).await;
         }
     }
 }

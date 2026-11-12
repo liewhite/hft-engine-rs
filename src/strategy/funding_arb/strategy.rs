@@ -11,18 +11,34 @@
 //!    挂单价偏离目标超过容差就撤了重挂。开仓前查两所各自的单币 / 账户杠杆，超限不挂。
 //!
 //! 一边成交即进入 1，另一边挂单被撤、市价补齐，回到 2 —— 这就是"一边成交撤另一腿、市价补腿"。
+//!
+//! # 停机（halt）
+//!
+//! 本策略把账户里该币的全部持仓当成自己的（框架持仓 = REST 基线 + 全部成交）。下面两种情况
+//! 说明账户里有不归本策略的仓位或交易，自动"对冲"会下错单，故停止交易（撤自己的挂单、不开不补）
+//! 并报 error，等人处理后重启：
+//! - 启动时两腿已不平；
+//! - 运行中收到不是本策略下的单的成交。
+//!
+//! # 残余窗口（如实声明）
+//!
+//! 补腿前要求两所最近一张本策略的单离开挂单列表已过 `fill_settle_ms`。若某所的成交回报晚于
+//! 订单终态超过这个窗口，仍会多补一份；多补出来的差额在下一轮会按落后腿规则补回，代价是一次
+//! 多余的吃单与短时敞口，不会累积。
 
 use super::config::PairParams;
 use super::signal::{decide, Direction, FundingAction, SettledFundingWindow};
 use crate::domain::{Exchange, Order, OrderId, OrderType, Side, Symbol, TimeInForce, Timestamp, BBO};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{IncomeEvent, MarketData, MarketEvent, PendingOrder};
+use crate::messaging::{AccountData, IncomeEvent, MarketData, MarketEvent, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const BN: Exchange = Exchange::Binance;
 const HL: Exchange = Exchange::Hyperliquid;
 const EXCHANGES: [Exchange; 2] = [BN, HL];
+/// 记住多少个本策略订单号用于判别外来成交（成交回报最多晚到几秒，几百个足够）
+const OWN_ID_MEMORY: usize = 1000;
 
 /// 最近一次挂 maker 的意图，用来判定补腿时哪条是落后腿
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,8 +62,20 @@ pub struct FundingArbStrategy {
     funding: HashMap<Exchange, SettledFundingWindow>,
     bbo_local_ts: HashMap<Exchange, Timestamp>,
     mode: Option<Mode>,
-    /// 已发出撤单、尚未收到终态的订单号（防重复撤单）
-    cancelling: HashSet<OrderId>,
+    /// 已发出撤单、尚未离开挂单列表的订单号 → 发出撤单的时刻。超过 `hedge_retry_ms` 仍在
+    /// 就重撤：撤单 REST 失败时框架只返回错误、不发事件，由策略重试。
+    cancelling: HashMap<OrderId, Timestamp>,
+    /// 上一步看到的本策略挂单（client_order_id → 所），用来发现"离开挂单列表"
+    prev_pending: HashMap<String, Exchange>,
+    /// 各所最近一张本策略的单离开挂单列表的时刻（补腿结算窗口的起点）
+    last_departure: HashMap<Exchange, Timestamp>,
+    /// 最近见过的本策略订单号（判别外来成交）；只留最近的 OWN_ID_MEMORY 个
+    own_ids: VecDeque<String>,
+    own_id_set: HashSet<String>,
+    /// 首次拿到两所盘口时做过启动检查没有
+    startup_checked: bool,
+    /// 停止交易的原因
+    halted: Option<String>,
     last_hedge_ts: Option<Timestamp>,
     /// 本轮不平衡已发出的补腿单数；>0 时再发即是重试
     hedge_attempts: u32,
@@ -61,7 +89,13 @@ impl FundingArbStrategy {
             funding: HashMap::new(),
             bbo_local_ts: HashMap::new(),
             mode: None,
-            cancelling: HashSet::new(),
+            cancelling: HashMap::new(),
+            prev_pending: HashMap::new(),
+            last_departure: HashMap::new(),
+            own_ids: VecDeque::new(),
+            own_id_set: HashSet::new(),
+            startup_checked: false,
+            halted: None,
             last_hedge_ts: None,
             hedge_attempts: 0,
             last_action: None,
@@ -78,9 +112,42 @@ impl FundingArbStrategy {
             .is_some_and(|&t| now.saturating_sub(t) <= self.p.max_bbo_age_ms)
     }
 
-    fn step(&mut self, sv: SymbolView<'_>, view: StrategyView<'_>, now: Timestamp) -> Vec<OutcomeEvent> {
+    /// 跟踪本策略挂单的出现与离开
+    fn track_pending(&mut self, sv: SymbolView<'_>, now: Timestamp) {
+        let current: HashMap<String, Exchange> =
+            sv.pending_orders().map(|p| (p.order.client_order_id.clone(), p.order.exchange)).collect();
+        for (cid, ex) in &self.prev_pending {
+            if !current.contains_key(cid) {
+                self.last_departure.insert(*ex, now);
+            }
+        }
+        for cid in current.keys() {
+            if self.own_id_set.insert(cid.clone()) {
+                self.own_ids.push_back(cid.clone());
+                if self.own_ids.len() > OWN_ID_MEMORY {
+                    if let Some(old) = self.own_ids.pop_front() {
+                        self.own_id_set.remove(&old);
+                    }
+                }
+            }
+        }
+        self.prev_pending = current;
         let live: HashSet<OrderId> = sv.pending_orders().map(|p| p.order.id.clone()).collect();
-        self.cancelling.retain(|id| live.contains(id));
+        self.cancelling.retain(|id, _| live.contains(id));
+    }
+
+    fn halt(&mut self, reason: String) {
+        if self.halted.is_none() {
+            tracing::error!(symbol = %self.symbol(), %reason, "停止交易：撤掉本策略挂单，不再开仓或补腿，需人工处理后重启");
+            self.halted = Some(reason);
+        }
+    }
+
+    fn step(&mut self, sv: SymbolView<'_>, view: StrategyView<'_>, now: Timestamp) -> Vec<OutcomeEvent> {
+        self.track_pending(sv, now);
+        if self.halted.is_some() {
+            return self.maintain(sv, &[], now);
+        }
 
         let (Some(bn_bbo), Some(hl_bbo)) = (sv.bbo(BN), sv.bbo(HL)) else {
             return Vec::new();
@@ -89,6 +156,14 @@ impl FundingArbStrategy {
         let bn = sv.position_size(BN);
         let hl = sv.position_size(HL);
         let net = bn + hl;
+
+        if !self.startup_checked {
+            self.startup_checked = true;
+            if net.abs() * px >= self.p.min_order_notional {
+                self.halt(format!("启动时两腿不平：币安 {bn}，HL {hl}（可能有不归本策略的仓位）"));
+                return Vec::new();
+            }
+        }
 
         if net.abs() * px >= self.p.min_order_notional {
             return self.hedge(sv, net, bn, hl, now);
@@ -113,7 +188,7 @@ impl FundingArbStrategy {
         if !quotes.is_empty() {
             self.mode = Some(if matches!(action, FundingAction::Close) { Mode::Close } else { Mode::Open });
         }
-        self.maintain(sv, &quotes)
+        self.maintain(sv, &quotes, now)
     }
 
     /// 两所年化 → 动作；任一所数据未知时持有
@@ -132,7 +207,12 @@ impl FundingArbStrategy {
                 }
                 a
             }
-            _ => FundingAction::Hold,
+            (b, h) => {
+                if self.last_action != Some(FundingAction::Hold) {
+                    tracing::warn!(symbol = %self.symbol(), bn_known = b.is_some(), hl_known = h.is_some(), "资金费数据未知或过期，不开不平");
+                }
+                FundingAction::Hold
+            }
         };
         self.last_action = Some(action);
         action
@@ -232,7 +312,7 @@ impl FundingArbStrategy {
     }
 
     /// 让两所的挂单与 `quotes` 一致：不符的撤，缺的挂。
-    fn maintain(&mut self, sv: SymbolView<'_>, quotes: &[Quote]) -> Vec<OutcomeEvent> {
+    fn maintain(&mut self, sv: SymbolView<'_>, quotes: &[Quote], now: Timestamp) -> Vec<OutcomeEvent> {
         let mut out = Vec::new();
         for ex in EXCHANGES {
             let want = quotes.iter().find(|q| q.exchange == ex);
@@ -245,23 +325,25 @@ impl FundingArbStrategy {
             }
             let mut kept = false;
             for p in pendings {
-                if !kept && want.is_some_and(|q| self.matches(p, q)) {
+                if !kept && want.is_some_and(|q| self.matches(p, q, now)) {
                     kept = true;
                 } else {
-                    out.extend(self.cancel(p));
+                    out.extend(self.cancel(p, now));
                 }
             }
         }
         out
     }
 
-    fn matches(&self, p: &PendingOrder, q: &Quote) -> bool {
+    /// 挂着的单是否可以留着：方向与 reduce_only 一致，且价格在容差内或挂得还不够久
+    fn matches(&self, p: &PendingOrder, q: &Quote, now: Timestamp) -> bool {
         let OrderType::Limit { price, .. } = p.order.order_type else {
             return false;
         };
+        let young = now.saturating_sub(p.created_at) < self.p.min_requote_ms;
         p.order.side == q.side
             && p.order.reduce_only == q.reduce_only
-            && (price - q.price).abs() / q.price <= self.p.order_distance * self.p.requote_ratio
+            && (young || (price - q.price).abs() / q.price <= self.p.order_distance * self.p.requote_ratio)
     }
 
     fn place(&self, q: &Quote) -> OutcomeEvent {
@@ -284,10 +366,17 @@ impl FundingArbStrategy {
     }
 
     /// 撤已确认的挂单（Created 还没有交易所订单号，撤不了，等确认）
-    fn cancel(&mut self, p: &PendingOrder) -> Option<OutcomeEvent> {
-        if !p.status.is_confirmed() || !self.cancelling.insert(p.order.id.clone()) {
+    fn cancel(&mut self, p: &PendingOrder, now: Timestamp) -> Option<OutcomeEvent> {
+        if !p.status.is_confirmed() {
             return None;
         }
+        if let Some(&sent) = self.cancelling.get(&p.order.id) {
+            if now.saturating_sub(sent) < self.p.hedge_retry_ms {
+                return None;
+            }
+            tracing::warn!(symbol = %self.symbol(), exchange = %p.order.exchange, order_id = %p.order.id, "撤单未生效，重撤");
+        }
+        self.cancelling.insert(p.order.id.clone(), now);
         Some(OutcomeEvent::CancelOrder {
             exchange: p.order.exchange,
             symbol: self.symbol().clone(),
@@ -304,7 +393,7 @@ impl FundingArbStrategy {
             .cloned()
             .collect::<Vec<_>>()
             .iter()
-            .filter_map(|p| self.cancel(p))
+            .filter_map(|p| self.cancel(p, now))
             .collect();
 
         // 开仓加短腿（|持仓| 小的所），平仓 / 未知砍长腿（|持仓| 大的所）
@@ -316,6 +405,13 @@ impl FundingArbStrategy {
             return out; // 等落后腿上的挂单撤完 / 在途补腿单出结果，免得重复成交
         }
         if self.last_hedge_ts.is_some_and(|t| now.saturating_sub(t) < self.p.hedge_retry_ms) {
+            return out;
+        }
+        // 成交回报结算窗口：刚有单离开挂单列表时，它的成交可能还没到（见模块文档）
+        if EXCHANGES
+            .iter()
+            .any(|ex| self.last_departure.get(ex).is_some_and(|&t| now.saturating_sub(t) < self.p.fill_settle_ms))
+        {
             return out;
         }
         let side = if net > 0.0 { Side::Short } else { Side::Long };
@@ -365,20 +461,28 @@ impl Strategy for FundingArbStrategy {
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let now = event.local_ts();
-        if let IncomeEvent::Market(MarketEvent { data, .. }) = event {
-            match data {
-                MarketData::BBO(bbo) if &bbo.symbol == self.symbol() => {
-                    self.bbo_local_ts.insert(bbo.exchange, now);
+        // 分发层只投本币的事件，这里不再判 symbol（P4）
+        match event {
+            IncomeEvent::Market(MarketEvent { data: MarketData::BBO(bbo), .. }) => {
+                self.bbo_local_ts.insert(bbo.exchange, now);
+            }
+            IncomeEvent::Market(MarketEvent { data: MarketData::Custom(c), .. }) => {
+                if let Some(w) = c.get::<SettledFundingWindow>() {
+                    self.funding.insert(w.exchange, w.clone());
                 }
-                MarketData::Custom(c) => {
-                    if let Some(w) = c.get::<SettledFundingWindow>() {
-                        if &w.symbol == self.symbol() {
-                            self.funding.insert(w.exchange, w.clone());
-                        }
+            }
+            IncomeEvent::Account(a) => {
+                if let AccountData::Fill(f) = &a.data {
+                    let ours = f.client_order_id.as_ref().is_some_and(|c| self.own_id_set.contains(c));
+                    if !ours {
+                        self.halt(format!(
+                            "收到非本策略订单的成交：{} {:?} {} cid={:?}",
+                            f.exchange, f.side, f.size, f.client_order_id
+                        ));
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
         let Some(sv) = view.symbol(self.symbol()) else {
             return Vec::new();

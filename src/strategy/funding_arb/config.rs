@@ -27,8 +27,13 @@ pub struct FundingArbConfig {
     /// 挂单价偏离目标价超过 `order_distance × requote_ratio` 才撤单重挂。
     /// 太小会频繁撤挂：HL 按地址累计成交额限制下单次数，撤挂过多会被限流。
     pub requote_ratio: f64,
-    /// 补腿下单（市价）失败后，至少隔多久再试（毫秒）
+    /// 补腿下单（市价）失败后，至少隔多久再试；撤单未生效时也按此间隔重撤（毫秒）
     pub hedge_retry_ms: u64,
+    /// 成交回报结算窗口（毫秒）：任一所有本策略的单离开挂单列表后，等这么久再按持仓差补腿。
+    /// 订单终态与成交回报是交易所两条无序推送，终态先到时持仓还没加上，立刻补会多补一份。
+    pub fill_settle_ms: u64,
+    /// 挂单至少挂这么久才因价格偏离撤换（毫秒）。HL 下单次数按成交额回补，频繁撤挂会耗尽额度
+    pub min_requote_ms: u64,
     /// 盘口最大可用年龄（毫秒，按本地接收时刻）；任一所超龄不开新单
     pub max_bbo_age_ms: u64,
     /// 资金费数据最大可用年龄（毫秒）；超龄视为未知，不开不平
@@ -60,6 +65,8 @@ pub struct PairParams {
     pub order_distance: f64,
     pub requote_ratio: f64,
     pub hedge_retry_ms: u64,
+    pub fill_settle_ms: u64,
+    pub min_requote_ms: u64,
     pub max_bbo_age_ms: u64,
     pub max_funding_age_ms: u64,
 }
@@ -82,8 +89,8 @@ impl FundingArbConfig {
         if self.min_order_notional > self.order_notional {
             return Err("min_order_notional 不能大于 order_notional".into());
         }
-        if self.max_bbo_age_ms == 0 || self.max_funding_age_ms == 0 {
-            return Err("max_bbo_age_ms / max_funding_age_ms 必须 > 0".into());
+        if self.max_bbo_age_ms == 0 || self.max_funding_age_ms == 0 || self.hedge_retry_ms == 0 || self.fill_settle_ms == 0 {
+            return Err("max_bbo_age_ms / max_funding_age_ms / hedge_retry_ms / fill_settle_ms 必须 > 0".into());
         }
         if self.pairs.is_empty() {
             return Err("pairs 不能为空".into());
@@ -116,6 +123,8 @@ impl FundingArbConfig {
                 order_distance: p.order_distance.unwrap_or(self.order_distance),
                 requote_ratio: self.requote_ratio,
                 hedge_retry_ms: self.hedge_retry_ms,
+                fill_settle_ms: self.fill_settle_ms,
+                min_requote_ms: self.min_requote_ms,
                 max_bbo_age_ms: self.max_bbo_age_ms,
                 max_funding_age_ms: self.max_funding_age_ms,
             })
@@ -131,7 +140,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "open_threshold_apr": 0.5, "order_notional": 200.0, "min_order_notional": 11.0,
             "max_account_leverage": 1.5, "max_symbol_leverage": 0.2, "order_distance": 0.0005,
-            "requote_ratio": 1.0, "hedge_retry_ms": 2000, "max_bbo_age_ms": 5000,
+            "requote_ratio": 1.0, "hedge_retry_ms": 2000, "fill_settle_ms": 1500, "min_requote_ms": 5000, "max_bbo_age_ms": 5000,
             "max_funding_age_ms": 7200000,
             "pairs": [{"symbol": "BTC"}, {"symbol": "XMR", "order_distance": 0.001, "max_symbol_leverage": 0.1}]
         }))

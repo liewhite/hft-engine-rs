@@ -21,7 +21,7 @@ fn config() -> FundingArbConfig {
     serde_json::from_value(serde_json::json!({
         "open_threshold_apr": 0.5, "order_notional": 200.0, "min_order_notional": 11.0,
         "max_account_leverage": 1.5, "max_symbol_leverage": 0.2, "order_distance": 0.001,
-        "requote_ratio": 1.0, "hedge_retry_ms": 1000, "max_bbo_age_ms": 5000,
+        "requote_ratio": 1.0, "hedge_retry_ms": 1000, "fill_settle_ms": 500, "min_requote_ms": 0, "max_bbo_age_ms": 5000,
         "max_funding_age_ms": 7200000, "pairs": [{"symbol": SYM}]
     }))
     .unwrap()
@@ -72,6 +72,10 @@ impl Sim {
         s.equity(BN, 10_000.0, 0.0);
         s.equity(HL, 10_000.0, 0.0);
         s
+    }
+
+    fn advance(&mut self, ms: u64) {
+        self.now += ms;
     }
 
     fn ev(&mut self, e: IncomeEvent) -> Vec<OutcomeEvent> {
@@ -217,8 +221,12 @@ fn one_leg_fill_cancels_other_then_hedges_the_lagging_leg() {
     assert_eq!(c, vec![BN, HL], "{out:?}");
     assert!(placed(&out).is_empty(), "HL 挂单还在，不能补：{out:?}");
 
-    // HL 挂单撤掉 → 在 HL 市价买 1.0（开仓加短腿）
+    // HL 挂单撤掉：它的成交回报可能还在路上，结算窗口内不补
     let out = s.confirm(&hl, OrderStatus::Cancelled);
+    assert!(placed(&out).is_empty(), "结算窗口内不能补：{out:?}");
+    // 过了窗口 → 在 HL 市价买 1.0（开仓加短腿）
+    s.advance(600);
+    let out = s.bbo(HL);
     let h = placed(&out);
     assert_eq!(h.len(), 1, "{out:?}");
     assert_eq!((h[0].exchange, h[0].side, h[0].quantity, h[0].reduce_only), (HL, Side::Long, 1.0, false));
@@ -244,13 +252,72 @@ fn reversal_closes_with_reduce_only_makers() {
 }
 
 #[test]
-fn unknown_mode_imbalance_cuts_the_longer_leg() {
-    // 刚启动，两腿差 1：不知道在开还是在平 → 砍长腿（HL 多 3 → HL 卖 1，只减仓）
+fn startup_imbalance_halts_instead_of_trading() {
+    // 启动时两腿差 1（可能有不归本策略的仓位）：不补、不开
     let mut s = Sim::without_bbo(-2.0, 3.0);
     s.bbo(BN);
-    let h = placed(&s.bbo(HL));
-    assert_eq!(h.len(), 1);
-    assert_eq!((h[0].exchange, h[0].side, h[0].quantity, h[0].reduce_only), (HL, Side::Short, 1.0, true));
+    assert!(placed(&s.bbo(HL)).is_empty());
+    s.funding(BN, 0.1);
+    assert!(placed(&s.funding(HL, 0.9)).is_empty());
+}
+
+#[test]
+fn hl_terminal_before_fill_does_not_double_hedge() {
+    // HL maker 的「已成交」终态先到、成交回报晚到：窗口内不按旧持仓补
+    let mut s = Sim::new(0.0, 0.0);
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    let bn = o.iter().find(|o| o.exchange == BN).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&bn, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::Pending);
+    s.fill(&bn, 1.998);
+    s.confirm(&bn, OrderStatus::Filled);
+    s.confirm(&hl, OrderStatus::Filled); // HL 也成交了，回报还没到
+    let out = s.bbo(HL);
+    assert!(placed(&out).is_empty(), "{out:?}");
+    s.advance(100);
+    let out = s.fill(&hl, 1.998); // 回报到达，两腿已平
+    assert!(placed(&out).iter().all(|o| !matches!(o.order_type, OrderType::Market)), "{out:?}");
+    s.advance(600);
+    assert!(placed(&s.bbo(HL)).iter().all(|o| !matches!(o.order_type, OrderType::Market)));
+}
+
+#[test]
+fn foreign_fill_halts() {
+    let mut s = Sim::new(0.0, 0.0);
+    let foreign = hft_engine_rs::domain::Order {
+        id: String::new(),
+        exchange: HL,
+        symbol: SYM.into(),
+        side: Side::Long,
+        order_type: OrderType::Market,
+        quantity: 1.0,
+        reduce_only: false,
+        client_order_id: "0xmanual".into(),
+    };
+    s.fill(&foreign, 1.0);
+    s.advance(10_000);
+    assert!(placed(&s.bbo(HL)).is_empty(), "外来成交后不得自动对冲");
+    s.funding(BN, 0.8);
+    assert!(placed(&s.funding(HL, 0.1)).is_empty());
+}
+
+#[test]
+fn failed_cancel_is_retried() {
+    let mut s = Sim::new(0.0, 0.0);
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    for x in &o {
+        s.confirm(x, OrderStatus::Pending);
+    }
+    // 资金费反转到持有以下 → 不挂，撤两张
+    let out = s.funding(BN, 0.1);
+    assert_eq!(cancels(&out).len(), 2, "{out:?}");
+    // 撤单失败（没有任何事件），间隔内不重撤，过了间隔重撤
+    assert!(cancels(&s.bbo(BN)).is_empty());
+    s.advance(1_100);
+    assert_eq!(cancels(&s.bbo(BN)).len(), 2);
 }
 
 #[test]
