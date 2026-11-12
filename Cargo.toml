@@ -104,3 +104,8 @@ tokio = { version = "1", features = ["full", "test-util"] }
 [[bin]]
 name = "funding_arb"
 path = "src/bin/funding_arb.rs"
+
+# Linux 部署包静态链接 OpenSSL（vendored）：本地交叉编译不需要目标机的 openssl 头文件，
+# 产物也不依赖目标机的 libssl 版本。只作用于 Linux 目标，本机 macOS 构建不受影响。
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
