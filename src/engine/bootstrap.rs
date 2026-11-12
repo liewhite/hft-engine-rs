@@ -15,8 +15,8 @@ use crate::engine::live::{ManagerActor, RegisterSupervisedChild};
 /// 丢弃，包括"订单只落本地柜台""该 symbol 开始真实下单"这类**操作员必须看到**的提示。
 /// 按 target 白名单很容易漏掉新增的 bin，所以改为黑名单式降噪。
 ///
-/// 设置 `ALERT_WEBHOOK_URL` 环境变量即启用告警外送：WARN/ERROR 级事件（对账漂移、
-/// 投产失败、断流退出等既有告警点）旁路推送到该 webhook，见
+/// 设置 `SLACK_BOT_TOKEN`+`SLACK_ALERT_CHANNEL` 或 `ALERT_WEBHOOK_URL` 环境变量即启用告警外送：WARN/ERROR 级事件（对账漂移、
+/// 投产失败、断流退出等既有告警点）旁路外送，见
 /// [`crate::observability::alert`]。未设置 = 行为与从前完全一致。
 pub fn init_tracing() -> anyhow::Result<()> {
     const DEFAULT_FILTER: &str = "info,\
@@ -44,7 +44,7 @@ pub fn init_tracing() -> anyhow::Result<()> {
         .with(alert_layer.map(|l| l.with_filter(tracing_subscriber::filter::LevelFilter::WARN)))
         .init();
     if alert_enabled {
-        tracing::info!("告警外送已启用（ALERT_WEBHOOK_URL），不受 RUST_LOG 控制台过滤影响");
+        tracing::info!("告警外送已启用，不受 RUST_LOG 控制台过滤影响");
     }
     Ok(())
 }

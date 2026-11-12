@@ -32,20 +32,75 @@ const WINDOW: Duration = Duration::from_secs(60);
 /// 每窗口最多外送的告警条数（超出丢弃，计入 suppressed）
 const MAX_ALERTS_PER_WINDOW: u32 = 20;
 
-/// 告警外送配置
-#[derive(Debug, Clone)]
-pub struct AlertWebhookConfig {
-    /// webhook 端点（POST `{"text": "..."}`）
-    pub url: String,
+/// 告警外送目的地
+#[derive(Clone)]
+pub enum AlertWebhookConfig {
+    /// 通用 webhook（Slack incoming webhook 等）：POST `{"text": "..."}`
+    Webhook { url: String },
+    /// Slack bot：`chat.postMessage`，带 bot token、发到指定频道（bot 须已在该频道）
+    SlackBot { token: String, channel: String },
 }
 
+/// 手写 Debug：token 不进日志
+impl std::fmt::Debug for AlertWebhookConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Webhook { url } => f.debug_struct("Webhook").field("url", url).finish(),
+            Self::SlackBot { channel, .. } => f.debug_struct("SlackBot").field("channel", channel).finish(),
+        }
+    }
+}
+
+const SLACK_POST_MESSAGE: &str = "https://slack.com/api/chat.postMessage";
+
 impl AlertWebhookConfig {
-    /// 从环境变量装配：`ALERT_WEBHOOK_URL` 未设置即关闭（None）
+    /// 从环境变量装配，全部未设置即关闭（None）：
+    /// - `SLACK_BOT_TOKEN` + `SLACK_ALERT_CHANNEL` → Slack bot（只设其一视为配置错，panic 拒绝启动）
+    /// - 否则 `ALERT_WEBHOOK_URL` → 通用 webhook
     pub fn from_env() -> Option<Self> {
-        std::env::var("ALERT_WEBHOOK_URL")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .map(|url| Self { url })
+        let var = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+        Self::from_vars(var("SLACK_BOT_TOKEN"), var("SLACK_ALERT_CHANNEL"), var("ALERT_WEBHOOK_URL"))
+    }
+
+    fn from_vars(token: Option<String>, channel: Option<String>, url: Option<String>) -> Option<Self> {
+        match (token, channel) {
+            (Some(token), Some(channel)) => Some(Self::SlackBot { token, channel }),
+            (None, None) => url.map(|url| Self::Webhook { url }),
+            // 告警配一半等于没配，而运行者以为配了 —— 启动期就失败
+            _ => panic!("SLACK_BOT_TOKEN 与 SLACK_ALERT_CHANNEL 必须同时设置"),
+        }
+    }
+
+    /// 发一条告警
+    async fn send(&self, client: &reqwest::Client, text: &str) -> Result<(), String> {
+        match self {
+            Self::Webhook { url } => client
+                .post(url)
+                .json(&serde_json::json!({ "text": text }))
+                .send()
+                .await
+                .and_then(|r| r.error_for_status())
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Self::SlackBot { token, channel } => {
+                let resp: serde_json::Value = client
+                    .post(SLACK_POST_MESSAGE)
+                    .bearer_auth(token)
+                    .json(&serde_json::json!({ "channel": channel, "text": text }))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .json()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // Slack 出错也回 HTTP 200，要看 ok 字段（如 not_in_channel / invalid_auth）
+                if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                    Ok(())
+                } else {
+                    Err(format!("slack: {}", resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown")))
+                }
+            }
+        }
     }
 }
 
@@ -65,7 +120,7 @@ pub fn spawn_alert_webhook_layer(config: AlertWebhookConfig) -> AlertWebhookLaye
             handle.spawn(sender_task(config, rx));
         }
         Err(_) => {
-            eprintln!("ALERT_WEBHOOK_URL 已设置，但当前不在 tokio runtime 内，告警外送被禁用");
+            eprintln!("告警外送已配置，但当前不在 tokio runtime 内，告警外送被禁用");
         }
     }
     AlertWebhookLayer { tx }
@@ -152,8 +207,7 @@ async fn sender_task(config: AlertWebhookConfig, mut rx: mpsc::UnboundedReceiver
             let _ = write!(text, "（此前 {suppressed} 条告警因限流被抑制）");
             suppressed = 0;
         }
-        let body = serde_json::json!({ "text": text });
-        if let Err(e) = client.post(&config.url).json(&body).send().await {
+        if let Err(e) = config.send(&client, &text).await {
             // target 已被 Layer 排除，不会回环；持续失败的量受限流约束
             tracing::warn!(target: SELF_TARGET, error = %e, "告警外送失败，该条丢弃");
         }
@@ -164,6 +218,22 @@ async fn sender_task(config: AlertWebhookConfig, mut rx: mpsc::UnboundedReceiver
 mod tests {
     use super::*;
     use tracing_subscriber::prelude::*;
+
+    #[test]
+    fn config_from_vars() {
+        let s = |x: &str| Some(x.to_string());
+        assert!(matches!(AlertWebhookConfig::from_vars(s("t"), s("#c"), None), Some(AlertWebhookConfig::SlackBot { .. })));
+        assert!(matches!(AlertWebhookConfig::from_vars(None, None, s("http://x")), Some(AlertWebhookConfig::Webhook { .. })));
+        assert!(AlertWebhookConfig::from_vars(None, None, None).is_none());
+        let c = AlertWebhookConfig::from_vars(s("xoxb-secret"), s("#c"), None).unwrap();
+        assert!(!format!("{c:?}").contains("xoxb-secret"));
+    }
+
+    #[test]
+    #[should_panic]
+    fn half_slack_config_refuses_to_start() {
+        AlertWebhookConfig::from_vars(Some("t".into()), None, None);
+    }
 
     fn drain(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
         let mut got = Vec::new();

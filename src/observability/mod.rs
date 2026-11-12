@@ -9,7 +9,8 @@
 //! - 指标推送（[`prometheus`]）：`MetricsActor` 的周期快照可选推 Prometheus pushgateway
 //!
 //! 两者都由环境变量启用（未设置 = 关闭，行为与从前完全一致）：
-//! - `ALERT_WEBHOOK_URL`：告警 webhook 端点（POST `{"text": "..."}`，兼容 Slack
+//! - `SLACK_BOT_TOKEN` + `SLACK_ALERT_CHANNEL`：告警经 Slack bot 发到指定频道；或
+//!   `ALERT_WEBHOOK_URL`：告警 webhook 端点（POST `{"text": "..."}`，兼容 Slack
 //!   incoming webhook / 飞书自定义机器人的 text 模式）
 //! - `PUSHGATEWAY_URL` / `PUSHGATEWAY_JOB`（默认 `hft_engine`）：指标推送端点。
 //!   **多实例（分桶）部署必须各配不同的 `PUSHGATEWAY_JOB`** —— pushgateway 按 job
