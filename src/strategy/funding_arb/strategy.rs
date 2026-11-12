@@ -23,8 +23,11 @@
 //! # 残余窗口（如实声明）
 //!
 //! 补腿前要求两所最近一张本策略的单离开挂单列表已过 `fill_settle_ms`。若某所的成交回报晚于
-//! 订单终态超过这个窗口，仍会多补一份；多补出来的差额在下一轮会按落后腿规则补回，代价是一次
-//! 多余的吃单与短时敞口，不会累积。
+//! 订单终态超过这个窗口，仍会多补一份：开仓模式下下一轮会去另一所再加一份（不经杠杆检查），
+//! 结果两腿各多出约一笔挂单金额，仍是对冲的，但仓位超出计划一笔；平仓模式下会多砍一份再补回。
+//! 每发生一次超出一笔，不会自动收回。
+//!
+//! 外来成交按订单号前缀判别（与框架同一判据）；HL 的前缀是格式要求，别的程序带 cloid 的单认不出。
 
 use super::config::PairParams;
 use super::signal::{decide, Direction, FundingAction, SettledFundingWindow};
@@ -32,13 +35,12 @@ use crate::domain::{Exchange, Order, OrderId, OrderType, Side, Symbol, TimeInFor
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{AccountData, IncomeEvent, MarketData, MarketEvent, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 const BN: Exchange = Exchange::Binance;
 const HL: Exchange = Exchange::Hyperliquid;
 const EXCHANGES: [Exchange; 2] = [BN, HL];
-/// 记住多少个本策略订单号用于判别外来成交（成交回报最多晚到几秒，几百个足够）
-const OWN_ID_MEMORY: usize = 1000;
+
 
 /// 最近一次挂 maker 的意图，用来判定补腿时哪条是落后腿
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +71,6 @@ pub struct FundingArbStrategy {
     prev_pending: HashMap<String, Exchange>,
     /// 各所最近一张本策略的单离开挂单列表的时刻（补腿结算窗口的起点）
     last_departure: HashMap<Exchange, Timestamp>,
-    /// 最近见过的本策略订单号（判别外来成交）；只留最近的 OWN_ID_MEMORY 个
-    own_ids: VecDeque<String>,
-    own_id_set: HashSet<String>,
     /// 首次拿到两所盘口时做过启动检查没有
     startup_checked: bool,
     /// 停止交易的原因
@@ -80,6 +79,8 @@ pub struct FundingArbStrategy {
     /// 本轮不平衡已发出的补腿单数；>0 时再发即是重试
     hedge_attempts: u32,
     last_action: Option<FundingAction>,
+    /// 上一次资金费是否未知（只在变成未知时打一次 warn）
+    funding_unknown: bool,
 }
 
 impl FundingArbStrategy {
@@ -92,13 +93,12 @@ impl FundingArbStrategy {
             cancelling: HashMap::new(),
             prev_pending: HashMap::new(),
             last_departure: HashMap::new(),
-            own_ids: VecDeque::new(),
-            own_id_set: HashSet::new(),
             startup_checked: false,
             halted: None,
             last_hedge_ts: None,
             hedge_attempts: 0,
             last_action: None,
+            funding_unknown: false,
         }
     }
 
@@ -119,16 +119,6 @@ impl FundingArbStrategy {
         for (cid, ex) in &self.prev_pending {
             if !current.contains_key(cid) {
                 self.last_departure.insert(*ex, now);
-            }
-        }
-        for cid in current.keys() {
-            if self.own_id_set.insert(cid.clone()) {
-                self.own_ids.push_back(cid.clone());
-                if self.own_ids.len() > OWN_ID_MEMORY {
-                    if let Some(old) = self.own_ids.pop_front() {
-                        self.own_id_set.remove(&old);
-                    }
-                }
             }
         }
         self.prev_pending = current;
@@ -201,6 +191,7 @@ impl FundingArbStrategy {
         };
         let action = match (apr(BN), apr(HL)) {
             (Some(b), Some(h)) => {
+                self.funding_unknown = false;
                 let a = decide(b, h, held, self.p.open_threshold_apr);
                 if self.last_action != Some(a) {
                     tracing::info!(symbol = %self.symbol(), bn_apr = b, hl_apr = h, ?held, action = ?a, "资金费信号变化");
@@ -208,7 +199,8 @@ impl FundingArbStrategy {
                 a
             }
             (b, h) => {
-                if self.last_action != Some(FundingAction::Hold) {
+                if !self.funding_unknown {
+                    self.funding_unknown = true;
                     tracing::warn!(symbol = %self.symbol(), bn_known = b.is_some(), hl_known = h.is_some(), "资金费数据未知或过期，不开不平");
                 }
                 FundingAction::Hold
@@ -473,7 +465,9 @@ impl Strategy for FundingArbStrategy {
             }
             IncomeEvent::Account(a) => {
                 if let AccountData::Fill(f) = &a.data {
-                    let ours = f.client_order_id.as_ref().is_some_and(|c| self.own_id_set.contains(c));
+                    // 归属判据与框架同一份（订单号前缀）。盖不住本引擎另一个进程在同账户同币上交易；
+                    // 本策略一个进程覆盖全部币，不会出现。
+                    let ours = f.client_order_id.as_ref().is_some_and(|c| f.exchange.owns_cli_order_id(c));
                     if !ours {
                         self.halt(format!(
                             "收到非本策略订单的成交：{} {:?} {} cid={:?}",

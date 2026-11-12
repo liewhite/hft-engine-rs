@@ -284,6 +284,30 @@ fn hl_terminal_before_fill_does_not_double_hedge() {
 }
 
 #[test]
+fn own_hedge_fill_arriving_right_after_placement_is_not_foreign() {
+    // 补腿市价单发出后，下一个事件就是它的成交（中间没有别的事件）：不得停机
+    let mut s = Sim::without_bbo(0.0, 0.0);
+    s.bbo(BN);
+    s.bbo(HL);
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    let bn = o.iter().find(|o| o.exchange == BN).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&bn, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::Pending);
+    s.fill(&bn, 1.998);
+    s.confirm(&bn, OrderStatus::Filled);
+    s.confirm(&hl, OrderStatus::Cancelled);
+    s.advance(600);
+    let h = placed(&s.bbo(HL));
+    let hedge = h.iter().find(|o| matches!(o.order_type, OrderType::Market)).unwrap().clone();
+    let a = s.fill(&hedge, 1.998); // 紧接着就是成交
+    assert!(placed(&a).is_empty());
+    let out = s.confirm(&hedge, OrderStatus::Filled);
+    assert_eq!(placed(&out).len(), 2, "两腿平后继续挂开仓单，说明没停机：{out:?}");
+}
+
+#[test]
 fn foreign_fill_halts() {
     let mut s = Sim::new(0.0, 0.0);
     let foreign = hft_engine_rs::domain::Order {
@@ -294,7 +318,7 @@ fn foreign_fill_halts() {
         order_type: OrderType::Market,
         quantity: 1.0,
         reduce_only: false,
-        client_order_id: "0xmanual".into(),
+        client_order_id: "manual-ui-order".into(),
     };
     s.fill(&foreign, 1.0);
     s.advance(10_000);
