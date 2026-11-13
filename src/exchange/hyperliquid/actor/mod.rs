@@ -5,10 +5,9 @@
 //! ├── HyperliquidPublicWs
 //! ├── HyperliquidPrivateWs（需要凭证）
 //! ├── EquityPoller（通用，见 crate::exchange::equity_polling）
-//! ├── HyperliquidFundingFeePoller
+//! ├── FundingFeePoller（通用，见 crate::exchange::funding_fee_polling）
 //! └── CryptoStatus
 
-mod funding_fee_polling;
 mod hyperliquid_actor;
 pub(super) mod private_ws;
 pub(crate) mod public_ws;

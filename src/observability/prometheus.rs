@@ -28,6 +28,25 @@ impl MetricsPushConfig {
     }
 }
 
+/// 一个带标签的瞬时读数。策略经 [`crate::strategy::Strategy::gauges`] 交出自己的读数时用它，
+/// 框架负责送进指标出口（与 [`PromText`] 的一行一一对应）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gauge {
+    pub name: String,
+    pub labels: Vec<(String, String)>,
+    pub value: f64,
+}
+
+impl Gauge {
+    pub fn new(name: impl Into<String>, labels: &[(&str, &str)], value: f64) -> Self {
+        Self {
+            name: name.into(),
+            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            value,
+        }
+    }
+}
+
 /// Prometheus 文本构建器（只支持 gauge —— 快照式指标全部是 gauge；
 /// 累计量如 fills 也以 gauge 形式推送，因为进程重启后从零重计，counter 语义不成立）
 #[derive(Default)]
@@ -52,6 +71,17 @@ impl PromText {
         let _ = writeln!(self.0, " {value}");
     }
 
+    /// 追加一个 [`Gauge`]，另加 `extra` 标签（如实例所属账户）
+    pub fn push(&mut self, g: &Gauge, extra: &[(&str, &str)]) {
+        let labels: Vec<(&str, &str)> = g
+            .labels
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .chain(extra.iter().copied())
+            .collect();
+        self.gauge(&g.name, &labels, g.value);
+    }
+
     pub fn into_body(self) -> String {
         self.0
     }
@@ -61,7 +91,10 @@ impl PromText {
     }
 }
 
-/// 异步推送一份快照（spawn，不阻塞调用方；失败只记 warn —— 观测出口绝不拖垮引擎）
+/// 异步推送一份快照（spawn，不阻塞调用方；失败只记 warn —— 观测出口绝不拖垮引擎）。
+///
+/// 用 PUT 整组替换：这一份就是本 job 的全部指标。POST 只替换同名指标，某个标签组合
+/// 不再出现时（币平仓了、挂单没了）旧值会一直留在 pushgateway，看板与告警读到的是假的现状。
 pub fn spawn_push(config: MetricsPushConfig, body: String) {
     use std::sync::OnceLock;
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -69,11 +102,13 @@ pub fn spawn_push(config: MetricsPushConfig, body: String) {
         let client = CLIENT.get_or_init(|| {
             reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                // 不带 UA 的请求会被部分 CDN 拒
+                .user_agent(concat!("hft-engine-rs/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("默认 reqwest client 构建不该失败")
         });
         let endpoint = format!("{}/metrics/job/{}", config.url.trim_end_matches('/'), config.job);
-        match client.post(&endpoint).body(body).send().await {
+        match client.put(&endpoint).body(body).send().await {
             Ok(resp) if !resp.status().is_success() => {
                 tracing::warn!(status = %resp.status(), %endpoint, "pushgateway 拒绝了本次推送");
             }

@@ -13,10 +13,10 @@
 //! ├── HyperliquidPublicWs
 //! ├── HyperliquidPrivateWs（需要凭证）
 //! ├── EquityPoller（需要凭证）
-//! ├── HyperliquidFundingFeePoller（需要凭证）
+//! ├── FundingFeePoller（通用，需要凭证）
 //! └── CryptoStatus
 
-use super::funding_fee_polling::HyperliquidFundingFeePoller;
+use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
 use super::private_ws::HyperliquidPrivateWs;
 use super::public_ws::HyperliquidPublicWs;
 use crate::exchange::client::{ExchangeCmd, ExchangeHandle};
@@ -30,9 +30,6 @@ use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
 const STATUS_BROADCAST_INTERVAL_MS: u64 = 5_000;
-
-/// 资费结算轮询间隔 (毫秒)。与 Binance 侧一致：资费按小时结算，1 分钟一次绰绰有余。
-const FUNDING_FEE_POLL_INTERVAL_MS: u64 = 60_000;
 
 /// 账户净值轮询间隔 (毫秒)。一次 = spotClearinghouseState + 每个已接入 dex 一次
 /// clearinghouseState（各约 2 权重）；2 秒一次、两个 dex 约 180 权重/分钟，
@@ -92,7 +89,7 @@ impl HyperliquidNode {
                 // 2. 账户轮询（净值、资费结算）：与私有 WS 一样按凭证门控
                 if has_private_ws {
                     EquityPoller::spawn(&children, client.clone(), args.account_bus.clone(), EQUITY_POLL_INTERVAL_MS)?;
-                    HyperliquidFundingFeePoller::spawn(
+                    FundingFeePoller::spawn(
                         &children,
                         client,
                         args.account_bus.clone(),

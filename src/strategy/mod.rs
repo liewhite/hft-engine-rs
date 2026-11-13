@@ -11,7 +11,8 @@ pub use funding_arb::{
 pub use gamma_scalp::GammaScalpStrategy;
 pub use view::{StrategyView, SymbolView};
 
-use crate::domain::{Exchange, Order, OrderId, Symbol};
+use crate::domain::{Exchange, Order, OrderId, Symbol, Timestamp};
+use crate::observability::Gauge;
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{CustomEvent, IncomeEvent};
 use std::collections::{HashMap, HashSet};
@@ -68,4 +69,13 @@ pub trait Strategy: Send + Sync {
     /// `view` 是**本策略订阅范围内**的状态视图（见 [`StrategyView`]），按值传入且不可
     /// 跨事件持有 —— 引擎状态容器不作为策略契约的一部分暴露。
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent>;
+
+    /// 策略自己的观测读数（如信号输入、当前判断、是否停止交易），只读快照。
+    ///
+    /// 实盘里框架每个 Clock 拍取一次，交给指标出口（`Metrics`，配了 pushgateway 就推出去，
+    /// 读数自动加上实例账户标签）；实例撤下后它的读数随之消失。`now` 是这一拍的本地时刻。
+    /// 指标名请带策略前缀，避免与框架的 `hft_*` 及别的策略撞名。默认没有读数。
+    fn gauges(&self, _now: Timestamp) -> Vec<Gauge> {
+        Vec::new()
+    }
 }

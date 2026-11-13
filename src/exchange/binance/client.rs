@@ -967,3 +967,18 @@ mod place_reply_tests {
         }
     }
 }
+
+#[async_trait::async_trait]
+impl crate::exchange::FundingFeeSource for BinanceClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::Binance
+    }
+
+    async fn fetch_funding_fees(
+        &self,
+        start_ms: Timestamp,
+        end_ms: Timestamp,
+    ) -> Result<Vec<crate::domain::FundingFee>, ExchangeError> {
+        BinanceClient::fetch_funding_fees(self, start_ms, end_ms).await
+    }
+}

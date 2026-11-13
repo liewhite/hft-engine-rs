@@ -462,6 +462,7 @@ impl Provisioner {
                     symbol_metas: self.symbol_metas.clone(),
                     baselines: exec_baselines,
                     outcome_bus: self.outcome_bus.clone(),
+                    metrics: self.metrics.clone(),
                 },
             )
             .await;

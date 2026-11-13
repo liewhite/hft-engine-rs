@@ -3,7 +3,7 @@
 use super::symbol::{from_okx, to_okx};
 use crate::domain::{
     Exchange, ExchangeError, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate, PlaceError, Side,
-    Symbol, SymbolMeta, TimeInForce,
+    FundingFee, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 use crate::exchange::okx::codec::{parse_account_info, GreeksData, PositionData};
 use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
@@ -233,6 +233,51 @@ impl OkxClient {
         }
 
         Ok(result)
+    }
+
+    /// 查询 `[start, end]` 内的资金费结算明细（GET /api/v5/account/bills，type=8，近 7 天内）。
+    ///
+    /// 金额取 `balChg`（账户余额的带符号变化：正 = 收到，负 = 付出），结算 ID 取 `billId`。
+    /// 只返回本适配器计价币的永续（与品种目录同一映射），其余合约的资费不归本引擎。
+    pub async fn fetch_funding_fees(&self, start: Timestamp, end: Timestamp) -> Result<Vec<FundingFee>, ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Bill {
+            bill_id: String,
+            inst_id: String,
+            ccy: String,
+            bal_chg: String,
+            ts: String,
+        }
+        const PAGE: usize = 100;
+        let mut fees = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let mut path = format!("/api/v5/account/bills?instType=SWAP&type=8&begin={start}&end={end}&limit={PAGE}");
+            if let Some(cursor) = &after {
+                path.push_str(&format!("&after={cursor}"));
+            }
+            let page: Vec<Bill> = self.signed_get(&path).await?;
+            let full = page.len() >= PAGE;
+            after = page.last().map(|b| b.bill_id.clone());
+            for b in page {
+                let parse = |what: &str, raw: &str| {
+                    ExchangeError::ParseError(format!("OKX 资费账单 {} 的 {what} 非法: {raw:?}", b.bill_id))
+                };
+                let Some(symbol) = from_okx(&b.inst_id, &self.quote) else { continue };
+                fees.push(FundingFee {
+                    exchange: Exchange::OKX,
+                    symbol,
+                    asset: b.ccy.clone(),
+                    amount: b.bal_chg.parse().map_err(|_| parse("balChg", &b.bal_chg))?,
+                    timestamp: b.ts.parse().map_err(|_| parse("ts", &b.ts))?,
+                    tran_id: b.bill_id.parse().map_err(|_| parse("billId", &b.bill_id))?,
+                });
+            }
+            if !full {
+                return Ok(fees);
+            }
+        }
     }
 
     /// 签名 GET，返回 `data` 数组；顶层 code 非 0 即错误。
@@ -1023,5 +1068,20 @@ mod place_reply_tests {
         ] {
             assert!(indeterminate(parse_place_reply(status, s)), "{status} {s}");
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::exchange::FundingFeeSource for OkxClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::OKX
+    }
+
+    async fn fetch_funding_fees(
+        &self,
+        start_ms: Timestamp,
+        end_ms: Timestamp,
+    ) -> Result<Vec<crate::domain::FundingFee>, ExchangeError> {
+        OkxClient::fetch_funding_fees(self, start_ms, end_ms).await
     }
 }

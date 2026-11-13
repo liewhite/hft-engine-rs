@@ -1573,6 +1573,7 @@ mod task_tests {
                 symbol_metas: metas(),
                 baselines: vec![baseline(size)],
                 outcome_bus: OutcomeBus::new("outcome"),
+                metrics: super::super::Metrics::spawn_for_test(&root.group("consumers")).await,
             },
         )
         .await

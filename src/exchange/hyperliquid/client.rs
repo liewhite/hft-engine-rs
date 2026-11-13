@@ -1196,3 +1196,18 @@ mod unified_account_tests {
         assert!(got.iter().all(|p| p.symbol == "BTC"), "{got:?}");
     }
 }
+
+#[async_trait::async_trait]
+impl crate::exchange::FundingFeeSource for HyperliquidClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::Hyperliquid
+    }
+
+    async fn fetch_funding_fees(
+        &self,
+        start_ms: Timestamp,
+        end_ms: Timestamp,
+    ) -> Result<Vec<crate::domain::FundingFee>, ExchangeError> {
+        HyperliquidClient::fetch_funding_fees(self, start_ms, end_ms).await
+    }
+}

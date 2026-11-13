@@ -27,8 +27,8 @@ use hft_engine_rs::domain::{
     AccountId, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
 use hft_engine_rs::engine::{
-    AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, OutcomeBus, PaperCounter,
-    PaperCounterArgs,
+    AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, Metrics, MetricsArgs, OutcomeBus,
+    PaperCounter, PaperCounterArgs,
 };
 use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
@@ -254,6 +254,18 @@ async fn paper_counter_fills_from_live_trades() {
     // 观测 log 提前创建：策略要把自己的挂单价写进去（回报不再捎带价格）
     let log = Arc::new(Mutex::new(Log::default()));
 
+    let metrics = Metrics::spawn(
+        &consumers,
+        MetricsArgs {
+            interval_ms: 60_000,
+            push: None,
+            market_bus: market_bus.clone(),
+            account_bus: account_bus.clone(),
+        },
+    )
+    .await
+    .expect("metrics");
+
     let (_, executor) = Executor::spawn(
         &producers,
         ExecutorArgs {
@@ -263,6 +275,7 @@ async fn paper_counter_fills_from_live_trades() {
             // 模拟账户从零起步，无基线
             baselines: Vec::new(),
             outcome_bus: outcome_bus.clone(),
+            metrics,
         },
     )
     .await
