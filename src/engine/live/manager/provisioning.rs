@@ -1,8 +1,12 @@
 //! 策略投产的编排。
 //!
 //! - **投产**（[`super::ManagerHandle::add_strategies`]）：校验订阅可行性 →
-//!   拉持仓基线（一次快照喂 executor / 对账镜像 / 观测镜像三类消费者）→ spawn（出生即带
-//!   基线）→ 注册 → 放行行情；任一步失败回滚到"什么都没发生"。
+//!   拉持仓基线（一次快照喂 executor / 对账镜像 / 观测镜像三类消费者）→ 注册镜像 →
+//!   spawn（出生即带基线）→ 注册 → 放行行情。
+//!
+//! **前提：一个进程只在启动时投产一次，投产失败整机停机。** 三个入口（各 bin）都是这样用的；
+//! 所以投产失败不回滚（半起的实例随整机停机一起收掉），第二次投产直接报错并停机
+//! （[`Provisioner::add`] 消耗自身，manager 投产后不再持有它）。
 //!
 //! 运行期撤下实例（按表现开关实盘的 Supervisor 与它的降级平仓）已在 #761 删除：只服务一个从未
 //! 启用的单所入口，且把"撤下即市价平仓"这一策略决定写死在框架里。以后要运行中下架，按多所
@@ -31,33 +35,17 @@ use crate::domain::{AccountId, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::live::account_binding::{snapshot, PlannedAccount};
 use crate::engine::live::assembly::StartAccountStream;
 use crate::engine::live::{
-    Executor, ExecutorArgs, ExecutorHandle, ExecutorId, IncomeProcessorHandle, MetricsHandle,
-    OutcomeBus, PositionLedgerHandle,
+    Executor, ExecutorArgs, IncomeProcessorHandle, MetricsHandle, OutcomeBus, PositionLedgerHandle,
 };
 use crate::engine::{subscription_scope, NewClientOrderId};
 use crate::exchange::{AccountClient, AccountStream, ExchangeHandle, SubscriptionKind};
 use crate::messaging::{AccountBus, SubscriptionScope};
-use crate::tasks::{ChildHandle, Gone, Group, StopFlag};
+use crate::tasks::Group;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
-
-/// 等待一个 executor 有序停下的上限。
-///
-/// `Executor` 的处理是纯策略步进 + 往总线发布，都是亚毫秒级工作，正常远不到这个量级。
-/// 留 5 秒是为了不因偶发调度抖动就走异常分支。
-const EXECUTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 本次投产刚起好的一个实例（尚未注册）
-struct Spawned {
-    child: ChildHandle,
-    handle: ExecutorHandle,
-    account: AccountId,
-}
 
 /// [`Provisioner::new`] 的参数：编排的全部协作者（每个的用途见 [`Provisioner`] 的字段注释）
 pub(super) struct Collaborators {
-    pub manager_stopping: StopFlag,
     pub producers: Group,
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     pub accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
@@ -77,8 +65,6 @@ pub(super) struct Collaborators {
 /// 由 [`super::Manager`] 持有并在处理收件箱消息时调用（因而天然被串行化）；
 /// 字段就是它的依赖声明，见模块文档。
 pub(super) struct Provisioner {
-    /// manager 是否已被请求停止（只读）：协作者失联时分清是停机途中还是事故
-    manager_stopping: StopFlag,
     /// manager 的生产者组：新建的 executor 挂在这里
     producers: Group,
     /// 引擎级合约目录（与快照面共享同一个 Arc）
@@ -109,11 +95,9 @@ pub(super) struct Provisioner {
 /// 账户类数据流（[`AccountStream`]）的登记与启动：装配处登记各所能起哪几种（只在配了凭证时
 /// 登记，见 `ExchangeSetup::account_streams`），投产时按策略声明起，同一所同一种只起一份。
 ///
-/// 起好的流挂在 manager 的生产者组下（与交易所节点同组：它们往账户总线发事件）。投产回滚时
-/// 不停已起的流 —— 与已发出的行情订阅同理，多一份读数无害，别的实例可能也在用。
+/// 起好的流挂在 manager 的生产者组下（与交易所节点同组：它们往账户总线发事件）。
 pub(crate) struct AccountStreams {
     starters: HashMap<(Exchange, AccountStream), StartAccountStream>,
-    started: HashSet<(Exchange, AccountStream)>,
     account_bus: AccountBus,
 }
 
@@ -124,7 +108,6 @@ impl AccountStreams {
     ) -> Self {
         Self {
             starters,
-            started: HashSet::new(),
             account_bus,
         }
     }
@@ -146,22 +129,19 @@ impl AccountStreams {
         ))
     }
 
-    /// 起还没起的那些（已校验过）
+    /// 起要的那些（已校验过；只投产一次，故每种只起一份）
     fn start(
-        &mut self,
+        self,
         group: &Group,
         wanted: &HashSet<(Exchange, AccountStream)>,
     ) -> Result<(), ExchangeError> {
+        let mut starters = self.starters;
         for key in wanted {
-            if self.started.contains(key) {
-                continue;
-            }
-            let start = self.starters.get(key).expect("投产时已校验");
+            let start = starters.remove(key).expect("投产时已校验");
             start(group, self.account_bus.clone()).map_err(|e| {
                 ExchangeError::new(format!("起 {} 的 {:?} 失败: {e}", key.0, key.1))
             })?;
             tracing::info!(exchange = %key.0, stream = ?key.1, "账户数据流已按策略需要启动");
-            self.started.insert(*key);
         }
         Ok(())
     }
@@ -214,7 +194,6 @@ impl Provisioner {
     /// 不了编排的实例列表与下单出口。
     pub(super) fn new(c: Collaborators) -> Self {
         Self {
-            manager_stopping: c.manager_stopping,
             producers: c.producers,
             symbol_metas: c.symbol_metas,
             accounts: c.accounts,
@@ -230,57 +209,9 @@ impl Provisioner {
         }
     }
 
-    /// 协作者已停止收件时的处置（一对一请求方，来路与处理见 `docs/architecture.md` 3.1
-    /// 「Gone 的来路与处理」）：manager 在停机途中记 warn 当作已完成，否则如实报错。
-    fn collaborator_gone(&self, what: &str) -> Result<(), String> {
-        if self.manager_stopping.is_stopping() {
-            tracing::warn!("{what}：对方已停止收件（引擎正在停机）");
-            Ok(())
-        } else {
-            Err(format!("{what}：对方已停止收件（它已出错退出）"))
-        }
-    }
-
-    /// 把一个 executor 从事件流上摘下：先移出持仓对账名单，再注销订阅。
-    ///
-    /// 顺序不能反：注销之后它不再收 Fill，持仓停更，若还在名单里会被误判为分叉、
-    /// 打死引擎（停下它最多要等 [`EXECUTOR_STOP_TIMEOUT`]，够对账攒满次数）。持仓账本与
-    /// 分发层是两个收件箱，两步都是 ask：确认已移出名单再注销，确认已注销再往下走。
-    async fn detach_executor(&self, executor: ExecutorId) -> Result<(), String> {
-        if let Err(Gone) = self.position_ledger.unwatch(executor).await {
-            self.collaborator_gone(&format!("把 executor {executor} 移出持仓对账名单"))?;
-        }
-        if let Err(Gone) = self.income_processor.unregister(executor).await {
-            self.collaborator_gone(&format!("注销 executor {executor} 的事件订阅"))?;
-        }
-        Ok(())
-    }
-
-    /// 有序停下一个 executor（投产回滚用）：请求它停止、并**等它真的停下**。
-    ///
-    /// 被要求停止后正常退出只收掉它自己这一支，**不会打死引擎**；
-    /// 它自己出错退出才会冒到根、整机停机 —— 两种情形由任务树区分，不靠调用方选对 API。
-    ///
-    /// # 为什么必须等
-    ///
-    /// 停止请求发出后，实例会先把收件箱里已有的事件处理完才停，期间**仍可能产出订单**。
-    /// 不等就报回"投产失败、没有实例在跑"，会出现调用方以为已干净、它却把新单发出去的竞态。
-    ///
-    /// 返回 `Err(原因)` 供调用方记录；超时不强杀，而是如实报出 —— 此时该实例已从
-    /// IncomeProcessor 注销，收不到新事件，危害有界。它仍挂在生产者组里（实例退出时才从组里
-    /// 摘除），进程停机时照样会被等到收尾，最坏是让停机多等一会儿，并由根部的总期限如实报出。
-    async fn stop_executor(child: &ChildHandle) -> Result<(), String> {
-        tokio::time::timeout(EXECUTOR_STOP_TIMEOUT, child.stop())
-            .await
-            .map_err(|_| format!("等待实例停止超时（{}s）", EXECUTOR_STOP_TIMEOUT.as_secs()))
-    }
-
-    /// 批量添加策略的内部实现
-    pub(super) async fn add(&mut self, strategies: Vec<StrategySpec>) -> Result<(), ExchangeError> {
-        if strategies.is_empty() {
-            return Ok(());
-        }
-
+    /// 投产（只此一次，见模块文档）。任一步失败返回 `Err`，已起的部分不回滚：调用方
+    /// （manager）随即整机停机。
+    pub(super) async fn add(self, strategies: Vec<StrategySpec>) -> Result<(), ExchangeError> {
         // 1. 收集所有策略的订阅；各实例的订阅范围（腿）在这里算一次，同一份交给它的 runner 和分发层
         let mut all_subscriptions: HashSet<(Exchange, SubscriptionKind)> = HashSet::new();
         let mut scopes: Vec<SubscriptionScope> = Vec::new();
@@ -294,9 +225,7 @@ impl Provisioner {
         }
 
         // 1.5 投产期校验订阅可行性：交易所未配置、或适配层不支持该 kind，都在此刻
-        //     拒绝投产 —— 此前 subscribe 对这两种情况静默返回 Ok(())，策略上线后只能
-        //     靠"一直没数据"事后发现（最难查的一类故障）。此时尚无任何副作用，Err 即
-        //     "什么都没发生"。
+        //     拒绝投产 —— 否则策略上线后只能靠"一直没数据"事后发现（最难查的一类故障）。
         validate_subscriptions(&all_subscriptions, &self.capabilities, &self.symbol_metas)
             .map_err(ExchangeError::new)?;
         let account_streams: HashSet<(Exchange, AccountStream)> = strategies
@@ -344,16 +273,41 @@ impl Provisioner {
 
         // 4. 拉取持仓基线：**一次快照喂全部账本消费者**（executor / 对账镜像 / 观测镜像
         //    —— 三者同一份快照、同一 seed 语义、同一条防双计规则，口径天然一致）。遗留挂单已在引擎启动时
-        //    撤净（见 `super::clearing`），快照之后不会再有它们的成交。此步只读 REST、无副作用，失败即"什么都没发生"。
+        //    撤净（见 `super::clearing`），快照之后不会再有它们的成交。
         let (bindings, baselines) = snapshot(plans, &exchange_symbols, &self.accounts).await?;
 
-        // 5. 批量创建 Executor：实盘实例**出生即带基线**（在收到任何流事件之前写入，
-        //    "Fill 早于基线、存量被丢"的竞态在结构上不可能）；模拟账户从零起步，不需要
-        //    也不应该看到真实持仓。此刻它们还没被注册，收不到任何事件。
-        let mut spawned: Vec<Spawned> = Vec::new();
-        for ((spec, binding), scope) in strategies.into_iter().zip(bindings).zip(&scopes) {
+        // 5. 注册观测层与对账层：symbol 范围 + 持仓基线一次送达（注册与 seed 原子完成，
+        //    "已注册、基线未到"的窗口不存在）。注册不上，该 symbol 的 Fill 会被镜像丢弃、
+        //    对账通道静默失效，所以失败必须报出；必须确认注册完成后才放行事件流。
+        let symbols: Vec<Symbol> = exchange_symbols
+            .iter()
+            .map(|(_, symbol)| symbol.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        self.metrics
+            .register_symbols(symbols.clone(), baselines.clone())
+            .await
+            .map_err(|e| ExchangeError::new(format!("向 Metrics 注册 symbol 失败: {e}")))?;
+        self.position_ledger
+            .register_symbols(symbols, baselines)
+            .await
+            .map_err(|e| ExchangeError::new(format!("向 PositionLedger 注册 symbol 失败: {e}")))?;
+
+        // 6. 起策略要的账户数据流（每种一份）
+        self.account_streams
+            .start(&self.producers, &account_streams)?;
+
+        // 7. 起实例并注册：实盘实例**出生即带基线**（在收到任何流事件之前写入，"Fill 早于
+        //    基线、存量被丢"的竞态在结构上不可能）；模拟账户从零起步。注册到分发层后它才开始
+        //    收事件；实盘实例的持仓是下单依据，纳入对账（#694）。
+        //    残余窗口：快照之后、注册之前该 symbol 若有不在跟踪表里的成交（强平/ADL 等），
+        //    镜像与 executor 会漏掉或分歧，由对账检出、受控停机（fail-visible）。没有交易所侧
+        //    序号无法根除。
+        let count = bindings.len();
+        for ((spec, binding), scope) in strategies.into_iter().zip(bindings).zip(scopes) {
             let account = binding.account();
-            let created = Executor::spawn(
+            let (_, handle) = Executor::spawn(
                 &self.producers,
                 ExecutorArgs {
                     strategy: spec.strategy,
@@ -365,147 +319,23 @@ impl Provisioner {
                     metrics: self.metrics.clone(),
                 },
             )
-            .await;
-            match created {
-                Ok((child, handle)) => spawned.push(Spawned {
-                    child,
-                    handle,
-                    account,
-                }),
-                Err(e) => {
-                    // 起实例失败（构造出错会自己冒到根、整机停机，或生产者组已在停机）：
-                    // 已起好的同批实例尚未注册、收不到事件，停掉它们再报错
-                    self.rollback_executors(&spawned).await;
-                    return Err(ExchangeError::new(format!("起策略实例失败: {e:#}")));
-                }
-            }
-        }
-
-        // 6. 注册并投产。**从这里开始产生副作用**，故任一步失败都要回滚已注册的实例 ——
-        //    调用方把 Err 理解成"什么都没发生"。若此时留着一个绑定 AccountId::Live 的实例在跑，
-        //    它会收私有事件、会真下单，却没人知道它存在 —— 无人看管的实盘实例。
-        if let Err(e) = self
-            .activate_executors(
-                &spawned,
-                &scopes,
-                &exchange_symbols,
-                baselines,
-                exchange_subscriptions,
-                &account_streams,
-            )
             .await
-        {
-            self.rollback_executors(&spawned).await;
-            return Err(e);
-        }
-
-        tracing::info!(
-            count = spawned.len(),
-            "Strategies batch added, Executors created"
-        );
-
-        Ok(())
-    }
-
-    /// 把已创建的 executor 注册进事件流并投产：注册镜像（原子带基线）→ 注册订阅 →
-    /// 放行行情。
-    ///
-    /// # 时序不变量：基线先于任何流事件抵达每个消费者 —— 且是**结构保证**
-    ///
-    /// - **executor**：出生即带基线（`ExecutorArgs`，见 [`Self::add`] 第 5 步），
-    ///   注册前收不到任何事件；
-    /// - **镜像**（对账/观测）：`register_symbols` 一次携带 symbol 与基线，注册与 seed
-    ///   原子完成 —— "已注册、基线未到"的窗口不存在，无需缓冲重放。
-    ///
-    /// # 如实声明的残余窗口（记 t0=快照请求、t1=镜像注册完成、t2=executor 注册完成）
-    ///
-    /// 都只可能由投产瞬间该 symbol 的**不在跟踪表里的成交**（强平/ADL 等）触发（前提：此刻没有本引擎实例在交易
-    /// 该 symbol；若动态给已有实盘实例在交易的 symbol 再加实例，老实例在窗口内的成交同样
-    /// 落进这些窗口，新实例持仓错、由 #694 的比对检出停机）：
-    ///
-    /// - **(t0, t1] 的成交**：镜像与 executor **同错同漏** → 对账检出、受控停机 ——
-    ///   这是正杀（事件确实丢了）。对比旧的总线方案：镜像缓冲重放后正确、executor 照漏，
-    ///   对账通过 → live 实例带错误持仓**静默**续跑。fail-visible 严格优于 silent-drift。
-    /// - **(t1, t2] 的成交**：镜像吃到、executor 错过 → executor 与镜像分歧。
-    ///   窗口 = 几次进程内收件箱投递（旧方案同类窗口为"快照到注册"的数秒）。
-    /// - **同一批 symbol 再次投产**：executor 用新时刻的快照 seed，镜像沿用连续旧账本 —— 新快照请求到
-    ///   注册完成之间的外部成交，同样造成 executor 与镜像分歧（镜像有、它没有）。
-    ///   没有交易所侧序号无法根除。
-    ///
-    /// 后两种分歧此前对账不可见（executor 静默带着错的持仓下单）；实盘 executor 纳入对账
-    /// 后（#694，见 [`PositionLedgerHandle::watch`]），差值稳定 N 次即受控停机，同样变成
-    /// fail-visible。
-    ///
-    /// 拆成独立方法只为一件事：让 [`Self::add`] 能在这里失败时统一回滚，
-    /// 而不必在每个 `?` 旁边重复一遍回滚代码。
-    async fn activate_executors(
-        &mut self,
-        spawned: &[Spawned],
-        scopes: &[SubscriptionScope],
-        exchange_symbols: &HashSet<(Exchange, Symbol)>,
-        baselines: Vec<crate::messaging::PositionBaseline>,
-        exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>>,
-        account_streams: &HashSet<(Exchange, AccountStream)>,
-    ) -> Result<(), ExchangeError> {
-        // 6.1 注册观测层与对账层：symbol 范围 + 持仓基线一次送达。
-        //     注册失败必须向上传播：对账层注册不上，该 symbol 的 Fill 会被镜像丢弃
-        //     （is_tracked 为假），这条腿的对账通道**静默失效** —— 恰是本函数通篇要防的
-        //     "错了没人知道"。观测层同理（盈亏基线丢失，会话口径失真）。两者都是 ask：
-        //     必须确认注册完成后才放行事件流。
-        {
-            let symbols: Vec<Symbol> = exchange_symbols
-                .iter()
-                .map(|(_, symbol)| symbol.clone())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            self.metrics
-                .register_symbols(symbols.clone(), baselines.clone())
-                .await
-                .map_err(|e| {
-                    ExchangeError::new(format!(
-                        "向 Metrics 注册 symbol 失败（盈亏基线将丢失）: {e}"
-                    ))
-                })?;
-            self.position_ledger
-                .register_symbols(symbols, baselines)
-                .await
-                .map_err(|e| {
-                    ExchangeError::new(format!(
-                        "向 PositionLedger 注册 symbol 失败（对账通道静默失效，\
-                         且这批 symbol 不会出现在对外持仓快照里）: {e}"
-                    ))
-                })?;
-        }
-
-        // 6.2 向 IncomeProcessor 注册各 Executor 的订阅（自此它们开始收流事件）
-        for (s, scope) in spawned.iter().zip(scopes) {
-            // 注册失败必须**向上传播**，不能只打日志：注册不上的实例收不到任何事件
-            // （行情、成交全无），本函数却返回 Ok —— 留下一个"活着却永远收不到事件"的僵尸
-            // 实例。与"返回 Ok 即已完整投产"的契约相悖。
+            .map_err(|e| ExchangeError::new(format!("起策略实例失败: {e:#}")))?;
             self.income_processor
-                .register(s.handle.clone(), scope.clone())
+                .register(handle.clone(), scope)
                 .await
                 .map_err(|e| {
-                    ExchangeError::new(format!(
-                        "向 IncomeProcessor 注册策略实例失败（该实例将收不到任何事件）: {e}"
-                    ))
+                    ExchangeError::new(format!("向 IncomeProcessor 注册策略实例失败: {e}"))
                 })?;
-            // 实盘实例的持仓是下单依据，纳入对账（#694）。注册失败必须传播：否则这份
-            // 持仓错了没人知道 —— 与 6.1 同理。模拟账户的持仓与实盘无关，不进名单。
-            if s.account == AccountId::Live {
+            if account == AccountId::Live {
                 self.position_ledger
-                    .watch(s.handle.clone())
+                    .watch(handle)
                     .await
-                    .map_err(|e| {
-                        ExchangeError::new(format!(
-                            "把实盘实例纳入持仓对账失败（它的持仓将无人校验）: {e}"
-                        ))
-                    })?;
+                    .map_err(|e| ExchangeError::new(format!("把实盘实例纳入持仓对账失败: {e}")))?;
             }
         }
 
-        // 6.3 批量向各交易所节点发送订阅请求（市场数据从此处开始流动）
+        // 8. 向各交易所节点发送行情订阅（市场数据从此处开始流动）
         for (exchange, kinds) in exchange_subscriptions {
             if let Some(node) = self.exchanges.get(&exchange) {
                 node.subscribe_batch(kinds).map_err(|e| {
@@ -513,37 +343,9 @@ impl Provisioner {
                 })?;
             }
         }
-        // 6.4 起策略要的账户数据流（同所同种只起一份）
-        self.account_streams
-            .start(&self.producers, account_streams)?;
 
+        tracing::info!(count, "策略已投产");
         Ok(())
-    }
-
-    /// 撤下本次刚创建的 executor，使"投产返回 `Err`"等价于"没有实例在跑"。
-    ///
-    /// # 回滚的语义边界：只保证不留下无人看管的实例，**不是**恢复原状
-    ///
-    /// 下列副作用**有意不回滚**，各有理由：
-    ///
-    /// - **已发出的 `register_symbols`**：对账层比对的是**事件流镜像**，与 executor 无关。
-    ///   即便策略没加上，持仓漂移仍然被监控 —— 撤掉反而是削弱安全网。观测层同理，多跟踪
-    ///   几个 symbol 只是多几行日志。
-    /// - **已推入的持仓基线**：同上，进的是对账层镜像；而被停掉的 executor 的状态随它消失。
-    /// - **已发出的行情订阅**：多订几路行情无害（没有订阅者就是丢弃）；而且别的策略实例可能
-    ///   订了同一路，贸然退订会把它们的行情一起掐掉。
-    ///
-    /// 这条边界必须写明：否则后来者会把"回滚不彻底"当成缺陷去补，反而补出问题。
-    async fn rollback_executors(&mut self, created: &[Spawned]) {
-        for s in created {
-            if let Err(reason) = self.detach_executor(s.handle.id()).await {
-                tracing::error!(account = %s.account, %reason, "回滚时未能把实例从事件流上摘下");
-            }
-            if let Err(reason) = Self::stop_executor(&s.child).await {
-                tracing::error!(account = %s.account, %reason, "回滚时未能确认实例已停止");
-            }
-            tracing::warn!(account = %s.account, "投产失败，已撤下该策略实例");
-        }
     }
 }
 

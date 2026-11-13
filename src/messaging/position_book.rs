@@ -32,7 +32,7 @@ pub struct PositionBook {
 }
 
 impl PositionBook {
-    /// 追加注册要跟踪的 symbol（已存在的保持原状态不动）
+    /// 追加注册要跟踪的 symbol
     pub fn register_symbols(&mut self, symbols: &[Symbol]) {
         for symbol in symbols {
             self.symbols.entry(symbol.clone()).or_default();
@@ -42,7 +42,7 @@ impl PositionBook {
     /// 写入一批持仓基线（投产握手，见 [`PositionBaseline`]）。
     ///
     /// symbol 未注册的基线跳过并记 error（基线属于策略订阅范围内的 symbol，范围外到达
-    /// 说明调用方拼装错了）；已 seed 的 (所, symbol) 静默跳过（同一 symbol 再次投产时的正常形态）。
+    /// 说明调用方拼装错了）。只投产一次，每个 (所, symbol) 只 seed 一次。
     pub fn seed(&mut self, baselines: &[PositionBaseline]) {
         for baseline in baselines {
             let symbol = &baseline.position.symbol;

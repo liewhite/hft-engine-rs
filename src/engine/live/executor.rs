@@ -4,8 +4,7 @@
 //! 运行策略（更新状态 + 转换订单），把产出的 OutcomeEvent 打上账户标签发布到 OutcomeBus。
 //! 纯策略逻辑集中在 StrategyRunner，与回测引擎共享同一份实现。
 //!
-//! 运行期由编排（manager）往 producers 组里 spawn；单独撤下时对 [`Executor::spawn`] 返回的
-//! [`ChildHandle`] 调 `stop().await`（会把箱里已收到的事件处理完再退出）。
+//! 由投产编排（manager）往 producers 组里 spawn，不单独撤下，随整机停机收尾。
 
 use crate::domain::{now_ms, AccountId, Exchange, Position, Symbol, SymbolMeta, Timestamp};
 use crate::engine::{AdapterClientOrderIds, NewClientOrderId, StrategyRunner};
@@ -149,7 +148,7 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// 在 `group` 下起一个策略实例，等它构造完成（基线已写入），返回它的句柄（单独撤下用）
+    /// 在 `group` 下起一个策略实例，等它构造完成（基线已写入），返回它的任务句柄
     /// 和地址。此刻它还没注册到分发层，收不到任何事件。
     pub async fn spawn(
         group: &Group,

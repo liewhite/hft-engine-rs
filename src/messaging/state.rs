@@ -389,63 +389,26 @@ impl SymbolPositions {
     /// - `snapshot_req_ts` 是 REST 快照的**请求**时刻。在此之前送达（`local_ts <=`）的
     ///   Fill 必已含在快照里，seed 之后到达时被 [`Self::apply`] 的 Fill 分支丢弃 ——
     ///   这条过滤规则对所有基线消费者（executor、对账镜像、观测镜像）同一份。
-    /// - 同一所第二次 seed **静默跳过**并返回 `false`：镜像在每次投产注册时都会收到
-    ///   该批 symbol 的基线（同一 symbol 再次投产会重复），首次写入后的重复是流程的正常形态。
-    ///   （历史上"重复基线 = 违约"针对的是总线上适配层乱发；基线退出事件流后，
-    ///   seed 只能来自投产握手，违约面已不存在。）
+    /// - 只投产一次，每所只 seed 一次，且在任何 Fill 进来之前（executor 出生即带基线；镜像
+    ///   注册与基线原子到达，未注册 symbol 的 Fill 不进镜像）。
     ///
     /// # 如实声明的残余窗口（没有交易所侧序号无法根除）
     ///
     /// - 成交发生在快照**之前**（已含在快照）、Fill 在快照请求之后才送达
     ///   （`local_ts > snapshot_req_ts`）—— 会双计，窗口 = 交易所撮合到 Fill 送达的时延。
-    /// - 同一 symbol 再次投产时新 executor 用**新**快照 seed 而镜像沿用旧账本：新快照到注册完成之间的
-    ///   外部成交会造成 executor 与镜像分歧（见 `activate_executors` 的窗口清单；
-    ///   实盘 executor 与镜像的分歧由持仓账本检出并停机，#694）。
+    /// - 快照之后、注册完成之前的外部成交：executor 与镜像可能分歧，由持仓账本检出并停机（#694）。
     ///
     /// 都只可能来自投产瞬间不在跟踪表里的成交（强平/ADL 等），与旧的总线投递方案等宽。
-    pub fn seed(
-        &mut self,
-        symbol: &Symbol,
-        position: &Position,
-        snapshot_req_ts: Timestamp,
-    ) -> bool {
-        match self.seeded_at.get(&position.exchange) {
-            Some(_) => {
-                tracing::debug!(
-                    %symbol,
-                    exchange = %position.exchange,
-                    incoming_size = %position.size,
-                    "持仓基线已存在，跳过重复 seed（同一 symbol 再次投产时的正常形态）"
-                );
-                false
-            }
-            None => {
-                // 覆写"未 seed 但已被 Fill 累加出的仓位"是合法的（快照权威；可达场景：
-                // 前一批策略只订了别的所、本所的外部 Fill 已按 symbol 进入镜像累加），
-                // 但覆写非零值必须可见 —— 静默覆写会掩盖"累加值与快照不一致"的线索。
-                if let Some(existing) = self.positions.get(&position.exchange) {
-                    if !existing.is_empty() {
-                        tracing::warn!(
-                            %symbol,
-                            exchange = %position.exchange,
-                            accumulated_size = %existing.size,
-                            snapshot_size = %position.size,
-                            "seed 覆写了此前由 Fill 累加出的非零仓位（快照权威）"
-                        );
-                    }
-                }
-                tracing::info!(
-                    %symbol,
-                    exchange = %position.exchange,
-                    size = %position.size,
-                    snapshot_req_ts,
-                    "Position baseline seeded"
-                );
-                self.seeded_at.insert(position.exchange, snapshot_req_ts);
-                self.positions.insert(position.exchange, position.clone());
-                true
-            }
-        }
+    pub fn seed(&mut self, symbol: &Symbol, position: &Position, snapshot_req_ts: Timestamp) {
+        tracing::info!(
+            %symbol,
+            exchange = %position.exchange,
+            size = %position.size,
+            snapshot_req_ts,
+            "Position baseline seeded"
+        );
+        self.seeded_at.insert(position.exchange, snapshot_req_ts);
+        self.positions.insert(position.exchange, position.clone());
     }
 
     /// 该所的持仓基线是否已写入（写入后该腿才可参与对账，见 `PositionLedger`）
@@ -714,7 +677,7 @@ impl SymbolState {
     // ==================== 写入口 ====================
     // 读一律经上面三个投影；写要带上本 symbol（日志与校验用），且投影只读外放，故写入口留在这里
 
-    pub fn seed_position(&mut self, position: &Position, snapshot_req_ts: Timestamp) -> bool {
+    pub fn seed_position(&mut self, position: &Position, snapshot_req_ts: Timestamp) {
         self.position_book
             .seed(&self.symbol, position, snapshot_req_ts)
     }
@@ -793,10 +756,7 @@ mod tests {
     fn baseline_initializes_then_fills_accumulate() {
         let mut state = SymbolState::new(SYMBOL.to_string());
 
-        assert!(
-            state.seed_position(&position(dec!(2.0)), 0),
-            "首次 seed 应成功"
-        );
+        state.seed_position(&position(dec!(2.0)), 0);
         assert_eq!(state.position_book().position_size(EX), dec!(2.0));
 
         apply(&mut state, &fill(Side::Long, dec!(1.0)));
@@ -804,33 +764,6 @@ mod tests {
 
         apply(&mut state, &fill(Side::Short, dec!(0.5)));
         assert_eq!(state.position_book().position_size(EX), dec!(2.5));
-    }
-
-    /// **Critical 回归防线**：第二次 seed 不得覆写持仓（幂等，返回 false）。
-    ///
-    /// 快照覆写 + 晚到的 Fill 会重复计算同一笔成交。同一 symbol 再次投产时镜像会收到重复基线，
-    /// 全靠这条幂等判据兜住存量。
-    #[test]
-    fn second_baseline_never_overwrites_position() {
-        let mut state = SymbolState::new(SYMBOL.to_string());
-        state.seed_position(&position(dec!(2.0)), 0);
-        apply(&mut state, &fill(Side::Long, dec!(1.0)));
-        assert_eq!(state.position_book().position_size(EX), dec!(3.0));
-
-        // 第二次 seed（哪怕数值"看起来更新"）也不得覆写
-        assert!(
-            !state.seed_position(&position(dec!(3.0)), 5),
-            "重复 seed 应返回 false"
-        );
-        assert_eq!(
-            state.position_book().position_size(EX),
-            dec!(3.0),
-            "第二次 seed 覆写了持仓——快照与 Fill 流叠加会重复计算成交"
-        );
-
-        // 覆写若发生，这条 Fill 会把仓位推到 4.0 之外
-        apply(&mut state, &fill(Side::Long, dec!(1.0)));
-        assert_eq!(state.position_book().position_size(EX), dec!(4.0));
     }
 
     /// **防双计**：seed 之后到达、但送达时刻早于快照请求时刻的 Fill 已含在快照里，丢弃；

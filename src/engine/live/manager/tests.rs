@@ -229,9 +229,10 @@ fn greeks_on(exchange: Exchange) -> Box<dyn Strategy> {
     )])))
 }
 
-/// 账户数据流按策略声明才起，同所同种只起一份；没登记的所拒绝投产（#757）
-#[tokio::test]
-async fn account_streams_start_on_demand_once() {
+/// 起一个只有 Binance 与 OKX 的 manager；OKX 登记了 Greeks 流，起一次计一次数
+async fn manager_with_okx_greeks(
+    root: &Root,
+) -> (ManagerHandle, Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let started = Arc::new(AtomicUsize::new(0));
@@ -244,35 +245,72 @@ async fn account_streams_start_on_demand_once() {
             Ok(())
         }),
     );
-    let root = Root::new("engine");
     let handle = Manager::spawn(
         &root.group("main"),
         ManagerArgs {
-            exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None), okx],
+            exchanges: vec![fake_setup(Exchange::Binance, log, None), okx],
             paper: None,
         },
     )
     .await
     .expect("Manager 起不来");
     assert_eq!(started.load(Ordering::SeqCst), 0, "没有策略要，就不该起");
+    (handle, started)
+}
 
-    let err = handle
-        .add_strategy(StrategySpec::live(greeks_on(Exchange::Binance)))
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("Binance 不提供 Greeks"), "{err}");
-    assert_eq!(started.load(Ordering::SeqCst), 0);
+/// 投产失败：调用方拿到原因，同一错误冒到根、整机停机
+async fn assert_provisioning_halts(root: Root, err: ManagerError, cause: &str) {
+    assert!(err.to_string().contains(cause), "{err}");
+    root.stopping().await;
+    let root_err = format!("{:#}", root.shutdown().await.unwrap_err());
+    assert!(root_err.contains(cause), "{root_err}");
+}
 
+/// 账户数据流按策略声明才起（#757）；同一投产里两个实例要同一种流只起一份
+#[tokio::test]
+async fn account_streams_start_on_demand_once() {
+    use std::sync::atomic::Ordering;
+    let root = Root::new("engine");
+    let (handle, started) = manager_with_okx_greeks(&root).await;
     handle
-        .add_strategy(StrategySpec::live(greeks_on(Exchange::OKX)))
-        .await
-        .unwrap();
-    handle
-        .add_strategy(StrategySpec::live(greeks_on(Exchange::OKX)))
+        .add_strategies(vec![
+            StrategySpec::live(greeks_on(Exchange::OKX)),
+            StrategySpec::live(greeks_on(Exchange::OKX)),
+        ])
         .await
         .unwrap();
     assert_eq!(started.load(Ordering::SeqCst), 1, "同所同种只起一份");
     root.shutdown().await.expect("正常停机");
+}
+
+/// 要的账户数据流该所没登记：拒绝投产、整机停机
+#[tokio::test]
+async fn unavailable_account_stream_halts_provisioning() {
+    use std::sync::atomic::Ordering;
+    let root = Root::new("engine");
+    let (handle, started) = manager_with_okx_greeks(&root).await;
+    let err = handle
+        .add_strategy(StrategySpec::live(greeks_on(Exchange::Binance)))
+        .await
+        .unwrap_err();
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+    assert_provisioning_halts(root, err, "Binance 不提供 Greeks").await;
+}
+
+/// 只投产一次：第二次投产报错、整机停机
+#[tokio::test]
+async fn second_provisioning_halts() {
+    let root = Root::new("engine");
+    let (handle, _) = manager_with_okx_greeks(&root).await;
+    handle
+        .add_strategy(StrategySpec::live(greeks_on(Exchange::OKX)))
+        .await
+        .unwrap();
+    let err = handle
+        .add_strategy(StrategySpec::live(greeks_on(Exchange::OKX)))
+        .await
+        .unwrap_err();
+    assert_provisioning_halts(root, err, "重复投产").await;
 }
 
 /// 只订行情、别的什么都不做的策略
@@ -314,8 +352,7 @@ async fn live_strategy_is_rejected_on_exchange_without_credentials() {
         .add_strategy(StrategySpec::live(Box::new(WatchesBbo(Exchange::Binance))))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("Binance 没配凭证"), "{err}");
-    root.shutdown().await.expect("正常停机");
+    assert_provisioning_halts(root, err, "Binance 没配凭证").await;
 }
 
 /// 没配模拟柜台时，绑定模拟账户的策略拒绝投产（它的单没人撮合）
@@ -339,6 +376,5 @@ async fn paper_strategy_is_rejected_without_paper_counter() {
         ))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("没配模拟柜台"), "{err}");
-    root.shutdown().await.expect("正常停机");
+    assert_provisioning_halts(root, err, "没配模拟柜台").await;
 }

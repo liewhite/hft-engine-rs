@@ -112,7 +112,7 @@ struct MetricsView {
     tracked: HashSet<Symbol>,
     /// 会话起始仓位基线：symbol -> (exchange -> 仓位)
     ///
-    /// 取自投产握手 [`MetricsHandle::register_symbols`] 携带的基线（每个 (symbol, 所) 只记第一条）。
+    /// 取自投产握手 [`MetricsHandle::register_symbols`] 携带的基线（只投产一次，只写一次）。
     /// 用于把重启前的存货从盈亏里剔除。
     baseline: HashMap<Symbol, HashMap<Exchange, Quantity>>,
     /// per-symbol 累计成交统计
@@ -171,9 +171,11 @@ impl MetricsView {
     fn register(&mut self, symbols: Vec<Symbol>, baselines: Vec<PositionBaseline>) {
         tracing::info!(count = symbols.len(), "Metrics tracking symbols");
         self.tracked.extend(symbols);
-        // 重复注册（同一 symbol 再次投产）时首次值不被覆写
         for b in &baselines {
-            self.record_baseline(&b.position.symbol, b.position.exchange, b.position.size);
+            self.baseline
+                .entry(b.position.symbol.clone())
+                .or_default()
+                .insert(b.position.exchange, b.position.size);
         }
     }
 
@@ -314,14 +316,6 @@ impl MetricsView {
     }
 
     /// 记录会话起始仓位基线（每个 (symbol, exchange) 只记一次）
-    fn record_baseline(&mut self, symbol: &Symbol, exchange: Exchange, size: Quantity) {
-        self.baseline
-            .entry(symbol.clone())
-            .or_default()
-            .entry(exchange)
-            .or_insert(size);
-    }
-
     /// 输出一次完整报告（结构化日志），返回同一份数字的推送文本
     fn report(&mut self) -> PromText {
         self.prune_funding_fees(now_ms());
@@ -1273,18 +1267,6 @@ mod tests {
         assert_eq!(metrics.paper_stats[&account].fills, 1);
         assert_eq!(metrics.total.fills, 0, "模拟成交不得计入实盘累计");
         assert!(metrics.positions.is_empty(), "模拟读数不得进实盘持仓");
-    }
-
-    #[test]
-    fn baseline_records_only_the_first_position_snapshot() {
-        let mut metrics = view();
-        metrics.register(vec!["BTC".to_string()], vec![baseline_of("BTC", dec!(2.0))]);
-        metrics.register(vec!["BTC".to_string()], vec![baseline_of("BTC", dec!(9.0))]);
-        assert_eq!(
-            metrics.baseline["BTC"][&Exchange::Binance],
-            dec!(2.0),
-            "基线只取第一次快照"
-        );
     }
 
     #[test]

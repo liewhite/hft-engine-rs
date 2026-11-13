@@ -57,7 +57,7 @@
 //! 一致"。
 //!
 //! 但策略下单用的是 executor 自己那份折叠，它经另一条分发路径（IncomeProcessor 按订阅
-//! 转发）拿 Fill —— 分发出错、或同一 symbol 再次投产时 executor 用了更新的快照 seed，它会单独错，而上面
+//! 转发）拿 Fill —— 分发出错时它会单独错，而上面
 //! 那条比对看不见。所以每个节拍也向每个**实盘** executor 要一份它的持仓，与账本按同一判据
 //! 比对（#694）：
 //!
@@ -65,9 +65,8 @@
 //!   交易所 REST ──比对──> 账本镜像 <──比对── 实盘 executor 的持仓（下单依据）
 //! ```
 //!
-//! 监视名单由编排维护：投产时 [`PositionLedgerHandle::watch`]，撤下/回滚时先
-//! [`PositionLedgerHandle::unwatch`] 再注销订阅 —— 顺序要紧，注销后的 executor 不再收 Fill，
-//! 若还在名单里会被误判分叉。模拟账户的 executor 不进名单（它的持仓本就与实盘无关）。
+//! 监视名单由编排在投产时登记（[`PositionLedgerHandle::watch`]），实例不单独撤下；停机途中
+//! 已停的实例查询得到 `Gone` 即摘出名单。模拟账户的 executor 不进名单（它的持仓本就与实盘无关）。
 //!
 //! # 注册与基线原子到达，无缓冲重放
 //!
@@ -189,8 +188,8 @@ impl Reconciler {
 
     /// 注册要对账的 symbol 并**原子**写入它们的持仓基线（投产握手）。
     ///
-    /// 与 executor / 观测镜像同一份快照、同一 seed 语义（幂等，重复注册是同一 symbol 再次投产的
-    /// 正常形态）；快照与 Fill 流的竞态由 seed 内置的时刻过滤兜住。
+    /// 与 executor / 观测镜像同一份快照、同一 seed 语义（只投产一次，只注册一次）；快照与
+    /// Fill 流的竞态由 seed 内置的时刻过滤兜住。
     pub fn register(&mut self, symbols: &[Symbol], baselines: &[PositionBaseline]) {
         self.mirror.register_symbols(symbols);
         self.mirror.seed(baselines);
@@ -402,8 +401,6 @@ pub enum PositionLedgerMsg {
     },
     /// 见 [`PositionLedgerHandle::watch`]
     Watch(ExecutorHandle, oneshot::Sender<()>),
-    /// 见 [`PositionLedgerHandle::unwatch`]
-    Unwatch(ExecutorId, oneshot::Sender<()>),
 }
 
 /// PositionLedger 的地址（可克隆）。方法都是 ask：返回即已生效。
@@ -430,14 +427,6 @@ impl PositionLedgerHandle {
     pub async fn watch(&self, executor: ExecutorHandle) -> Result<(), Gone> {
         self.0
             .ask(|reply| PositionLedgerMsg::Watch(executor, reply))
-            .await
-    }
-
-    /// 把一个 executor 移出监视名单（编排在注销它的订阅**之前**调，见模块文档）。
-    /// 不在名单里是空操作。
-    pub async fn unwatch(&self, executor: ExecutorId) -> Result<(), Gone> {
-        self.0
-            .ask(|reply| PositionLedgerMsg::Unwatch(executor, reply))
             .await
     }
 }
@@ -626,11 +615,6 @@ impl Ledger {
             PositionLedgerMsg::Watch(executor, reply) => {
                 tracing::info!(executor = %executor.id(), "开始监视实盘 executor 的持仓");
                 self.executors.insert(executor.id(), executor);
-                let _ = reply.send(());
-            }
-            PositionLedgerMsg::Unwatch(executor, reply) => {
-                // 它的不一致记录不必清：ExecutorId 不复用，残留记录不会再被读到
-                self.executors.remove(&executor);
                 let _ = reply.send(());
             }
         }
@@ -1067,23 +1051,6 @@ mod tests {
             .reconcile(EX, &[position(EX, dec!(7.0))])
             .expect_err("若被丢弃的 Fill 混入了镜像，本地会是 7.0 而这里不会报漂移");
         assert!(err.contains("本地 2"), "got: {err}");
-    }
-
-    /// 重复注册（同一 symbol 再次投产）不得覆写镜像存量：镜像一直在跟 Fill
-    #[test]
-    fn re_registration_never_overwrites_the_mirror() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0))]);
-        r.on_event(&fill(Side::Long, dec!(1.0))); // 镜像 3.0
-                                                  // 再次投产：新快照读到 3.0，但镜像已 seed 过 —— 静默跳过，不覆写
-        r.register(
-            &[SYM.to_string()],
-            &[PositionBaseline {
-                position: position(EX, dec!(3.0)),
-                snapshot_req_ts: 100,
-            }],
-        );
-        r.reconcile(EX, &[position(EX, dec!(3.0))])
-            .expect("镜像应保持 3.0（基线 2.0 + Fill 1.0），与交易所一致");
     }
 
     /// 跟踪范围外的 symbol 不参与对账（分桶部署下账户级读数含其他桶的 symbol）
@@ -1782,7 +1749,7 @@ mod task_tests {
     }
 
     /// 在 `root` 的 producers 组里起一个实盘 executor，出生持仓 = `size`
-    /// （模拟「同一 symbol 再次投产时 executor 用了新快照」）
+    /// （模拟它的持仓与账本分叉）
     async fn executor_born_with(root: &Root, size: Decimal) -> (ChildHandle, ExecutorHandle) {
         Executor::spawn(
             &root.group("producers"),
@@ -1834,28 +1801,20 @@ mod task_tests {
         );
     }
 
-    /// 撤出名单的 executor 不再比对（撤下流程里它会先停更再停机，不能被误判）；
-    /// 持仓一致的 executor 也不该触发任何东西。
+    /// 持仓一致的 executor 不该触发任何东西。
     #[tokio::test]
-    async fn unwatched_or_agreeing_executors_never_halt_the_ledger() {
+    async fn an_agreeing_executor_never_halts_the_ledger() {
         let root = Root::new("t");
-        let (_c1, wrong) = executor_born_with(&root, dec!(5.0)).await;
-        let (_c2, right) = executor_born_with(&root, dec!(2.0)).await;
+        let (_c, right) = executor_born_with(&root, dec!(2.0)).await;
         let ledger = ledger_agreeing_with_exchange(&root).await;
-        let wrong_id = wrong.id();
-        ledger.watch(wrong).await.unwrap();
         ledger.watch(right).await.unwrap();
-        ledger.unwatch(wrong_id).await.unwrap();
 
         tokio::time::sleep(enough_rounds()).await;
-        assert!(
-            !root.is_stopping(),
-            "撤出名单的、或持仓一致的 executor 都不该打死账本"
-        );
+        assert!(!root.is_stopping(), "持仓一致的 executor 不该打死账本");
         root.shutdown().await.expect("正常停机");
     }
 
-    /// executor 停了却没撤出名单：查询得到 Gone -> 摘掉，不停机（它若是出错停的，
+    /// executor 已停（停机途中生产者先停）：查询得到 Gone -> 摘掉，不停机（它若是出错停的，
     /// 错误由它自己上冒）
     #[tokio::test]
     async fn a_stopped_executor_is_dropped_from_the_watch_list() {

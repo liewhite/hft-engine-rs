@@ -15,8 +15,8 @@
 //!
 //! # 名单由编排维护
 //!
-//! 投产时 [`IncomeProcessorHandle::register`]，撤下/回滚时**先** [`IncomeProcessorHandle::unregister`]
-//! （等它确认）**再**停 executor：两步都是 ask，返回即已生效，停掉的实例不会再被投递。
+//! 投产时 [`IncomeProcessorHandle::register`]（ask，返回即已生效）。实例不单独撤下；停机途中
+//! 已停止收件的实例在投递失败时摘出名单（见 [`IncomeProcessor::drop_gone`]）。
 
 use super::executor::{ExecutorHandle, ExecutorId};
 use crate::domain::{AccountId, Exchange, Symbol};
@@ -47,11 +47,6 @@ pub enum IncomeProcessorMsg {
         scope: SubscriptionScope,
         reply: oneshot::Sender<()>,
     },
-    /// 见 [`IncomeProcessorHandle::unregister`]
-    Unregister {
-        executor: ExecutorId,
-        reply: oneshot::Sender<()>,
-    },
 }
 
 /// IncomeProcessor 的地址（可克隆）
@@ -60,9 +55,7 @@ pub struct IncomeProcessorHandle(Addr<IncomeProcessorMsg>);
 
 impl IncomeProcessorHandle {
     /// 注册 executor 及其订阅范围（与它的 runner 是同一份，投产时算一次）。返回即已生效：
-    /// 此后的事件按范围投给它。
-    ///
-    /// 幂等：同一 executor 重复注册会先摘净旧索引再按新范围登记。
+    /// 此后的事件按范围投给它。每个 executor 只注册一次（投产只有一次，`ExecutorId` 唯一）。
     pub async fn register(
         &self,
         executor: ExecutorHandle,
@@ -74,14 +67,6 @@ impl IncomeProcessorHandle {
                 scope,
                 reply,
             })
-            .await
-    }
-
-    /// 注销 executor（动态撤下策略实例时使用）。返回即已生效：此后不会再有事件投给它，
-    /// 调用方可以放心停掉它。未注册是空操作（记 warn）。
-    pub async fn unregister(&self, executor: ExecutorId) -> Result<(), Gone> {
-        self.0
-            .ask(|reply| IncomeProcessorMsg::Unregister { executor, reply })
             .await
     }
 }
@@ -136,24 +121,11 @@ impl IncomeProcessor {
                 self.register(executor, scope);
                 let _ = reply.send(());
             }
-            IncomeProcessorMsg::Unregister { executor, reply } => {
-                if self.executors.contains_key(&executor) {
-                    self.remove_from_indexes(executor);
-                } else {
-                    tracing::warn!(%executor, "注销 executor：该 executor 未注册，忽略");
-                }
-                let _ = reply.send(());
-            }
         }
     }
 
     fn register(&mut self, executor: ExecutorHandle, scope: SubscriptionScope) {
         let id = executor.id();
-        // 幂等：同一 executor 重复注册时先摘净旧索引 —— 否则 by_symbol/by_account 里
-        // 出现重复 id，每条事件双份投递、Fill 双计仓位（危险侧、静默）。今天注册点单一
-        // 且 ExecutorId 唯一，但这不该是巧合保护，而是结构保证。
-        self.remove_from_indexes(id);
-
         tracing::info!(executor = %id, scope = ?scope, "Executor registered");
 
         for (exchange, symbol) in scope.pairs() {
@@ -372,7 +344,7 @@ mod routing_tests {
     }
 }
 
-/// 组件层：注册后按范围投递、注销后不再投递、对方停止收件不打死分发器。用 `tasks::Root` 搭树测。
+/// 组件层：注册后按范围投递、对方停止收件不打死分发器。用 `tasks::Root` 搭树测。
 #[cfg(test)]
 mod task_tests {
     use super::*;
@@ -445,37 +417,34 @@ mod task_tests {
         (child, ExecutorHandle::for_test(addr_rx.await.unwrap()), got)
     }
 
-    /// 让分发器处理完之前进箱的事件（同一收件箱 FIFO：一次 ask 应答 = 前面的都已处理）
-    async fn settle(p: &IncomeProcessorHandle) {
-        p.unregister(ExecutorId::for_test(u64::MAX)).await.unwrap();
+    /// 让分发器处理完之前进箱的事件（同一收件箱 FIFO：一次 ask 应答 = 前面的都已处理；
+    /// 拿注册一个什么都不订的实例当这次 ask）
+    async fn settle(root: &Root, p: &IncomeProcessorHandle) {
+        let (_, barrier, _) = fake_executor(root).await;
+        let nothing = SubscriptionScope::new(AccountId::Live, std::iter::empty());
+        p.register(barrier, nothing).await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     #[tokio::test]
-    async fn routes_by_scope_and_stops_after_unregister() {
+    async fn routes_by_scope() {
         let root = Root::new("t");
         let (market, account) = (MarketBus::new("market"), AccountBus::new("account"));
         let (_c, processor) = IncomeProcessor::spawn(&root.group("consumers"), &market, &account)
             .await
             .unwrap();
         let (_e, executor, got) = fake_executor(&root).await;
-        let id = executor.id();
         processor.register(executor, btc_scope()).await.unwrap();
 
         market.publish(trade("BTC"));
         market.publish(trade("ETH")); // 范围外
         account.publish(live_fill());
-        settle(&processor).await;
+        settle(&root, &processor).await;
         assert_eq!(
             *got.lock().unwrap(),
             2,
             "BTC 行情与该账户的 BTC 成交各一条，ETH 不投"
         );
-
-        processor.unregister(id).await.unwrap();
-        market.publish(trade("BTC"));
-        settle(&processor).await;
-        assert_eq!(*got.lock().unwrap(), 2, "注销返回后不再投递");
         root.shutdown().await.unwrap();
     }
 
@@ -493,7 +462,7 @@ mod task_tests {
 
         market.publish(trade("BTC"));
         market.publish(trade("BTC"));
-        settle(&processor).await;
+        settle(&root, &processor).await;
         assert!(!root.is_stopping(), "executor 停止收件不是分发层的事故");
         root.shutdown().await.unwrap();
     }

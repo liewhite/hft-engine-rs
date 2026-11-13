@@ -3,8 +3,8 @@
 //! 职责边界（每块各居其位，manager 只做粘合）：
 //! - **装配**：收下 bin 侧的 [`ExchangeSetup`]（见 [`super::assembly`]），预加载 metas、
 //!   建三条总线、起全部核心子任务 —— 对"有哪些交易所"彻底无知；
-//! - **投产编排**：见 [`provisioning`] 子模块（经本节点的收件箱串行化）；
-//! - **监督**：由任务树承担 —— 子任务被要求停止后正常退出只收掉它自己那一支（投产回滚、
+//! - **投产编排**：见 [`provisioning`] 子模块（启动时一次；失败即本节点出错、整机停机）；
+//! - **监督**：由任务树承担 —— 子任务被要求停止后正常退出只收掉它自己那一支（
 //!   外部观察者收工），出错或 panic 一律冒到根、整机受控停机，交由外部编排
 //!   重启（本项目不重连、不降级运行；唯一例外是公共行情 WS 原地重连，见
 //!   `crate::exchange::ws_loop::ReconnectingWs`）；
@@ -138,8 +138,10 @@ impl ManagerHandle {
         self.add_strategies(vec![spec]).await
     }
 
-    /// 批量投产：校验订阅 → 撤遗留挂单 → 拉持仓基线 → 起实例 → 注册 → 放行行情。
-    /// 返回 `Ok` 即已完整投产；`Err` 即"没有实例在跑"（见 `provisioning` 模块文档）。
+    /// 批量投产：校验订阅 → 拉持仓基线 → 起实例 → 注册 → 放行行情。
+    ///
+    /// **一个进程只投产一次**，在启动时。投产失败、或第二次调用，都返回 `Err` 并整机停机
+    /// （半起的实例不回滚，随整机收掉；见 `provisioning` 模块文档）。
     pub async fn add_strategies(&self, specs: Vec<StrategySpec>) -> Result<(), ManagerError> {
         self.call(|reply| ManagerMsg::AddStrategies(specs, reply))
             .await
@@ -241,8 +243,9 @@ impl ManagerHandle {
 /// 不在这里存副本。
 pub struct Manager {
     inbox: Inbox<ManagerMsg>,
-    /// 策略投产的编排器（字段归属即职责声明，见 `provisioning.rs`）
-    provisioner: Provisioner,
+    /// 策略投产的编排器（字段归属即职责声明，见 `provisioning.rs`）。只投产一次：投产时取走，
+    /// 之后为 `None`
+    provisioner: Option<Provisioner>,
 }
 
 impl Manager {
@@ -523,8 +526,7 @@ impl Manager {
         };
         let manager = Self {
             inbox,
-            provisioner: Provisioner::new(provisioning::Collaborators {
-                manager_stopping: scope.stop_flag(),
+            provisioner: Some(Provisioner::new(provisioning::Collaborators {
                 producers,
                 symbol_metas,
                 accounts,
@@ -540,36 +542,33 @@ impl Manager {
                 position_ledger,
                 outcome_bus,
                 exchanges,
-            }),
+            })),
         };
         Ok((manager, handle))
     }
 }
 
 impl Task for Manager {
-    /// 逐条处理编排请求（收件箱即串行化：同一时刻只有一个投产在进行）。
-    /// 被要求停止后交完箱里已有的请求再返回；子任务由框架按分组顺序收尾。
+    /// 处理投产请求（只此一次）。投产失败或重复投产：把原因交回调用方，同时本节点出错退出
+    /// —— 冒到根、整机停机。被要求停止后交完箱里已有的请求再返回；子任务由框架按分组顺序收尾。
     async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
         while let Some(msg) = self.inbox.recv().await {
             match msg {
                 ManagerMsg::AddStrategies(specs, reply) => {
-                    let result = self.provisioner.add(specs).await;
-                    reply_to(reply, result, "投产");
+                    let result = match self.provisioner.take() {
+                        Some(provisioner) => provisioner.add(specs).await,
+                        None => Err(ExchangeError::new("重复投产：一个进程只在启动时投产一次")),
+                    };
+                    let failure = result.as_ref().err().map(|e| format!("投产失败: {e}"));
+                    // 调用方已不在等待时结果无人读，失败照样经本节点冒到根
+                    let _ = reply.send(result);
+                    if let Some(failure) = failure {
+                        anyhow::bail!(failure);
+                    }
                 }
             }
         }
         tracing::info!("Manager inbox drained, stopping child tasks");
         Ok(())
-    }
-}
-
-/// 交回编排结果。调用方已不在（丢弃了等待）时结果无人读：失败的那份记 ERROR，不静默丢。
-fn reply_to(
-    reply: oneshot::Sender<Result<(), ExchangeError>>,
-    result: Result<(), ExchangeError>,
-    what: &str,
-) {
-    if let Err(Err(e)) = reply.send(result) {
-        tracing::error!(error = %e, "{what}失败，但调用方已不在等待结果");
     }
 }

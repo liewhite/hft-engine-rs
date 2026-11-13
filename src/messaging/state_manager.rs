@@ -117,23 +117,10 @@ impl StateManager {
         }
     }
 
-    /// 追加注册需要跟踪的 symbol（已存在的保持原状态不动）
-    ///
-    /// 用于"symbol 集合在构造之后才确定"的消费者（如指标 actor：它订阅全量事件流，
-    /// 但要跟踪哪些 symbol 由上层策略集合决定）。
-    pub fn register_symbols(&mut self, symbols: &[Symbol]) {
-        for symbol in symbols {
-            self.states
-                .entry(symbol.clone())
-                .or_insert_with(|| SymbolState::new(symbol.clone()));
-        }
-    }
-
     /// 写入一批持仓基线（投产握手，见 [`PositionBaseline`]）。
     ///
     /// symbol 未注册的基线直接跳过并记 error（基线属于策略订阅范围内的 symbol，
-    /// 范围外到达说明调用方拼装错了）；已 seed 的 (所, symbol) 静默跳过
-    /// （同一 symbol 再次投产时的正常形态，见 [`SymbolState::seed_position`]）。
+    /// 范围外到达说明调用方拼装错了）。只投产一次，每个 (所, symbol) 只 seed 一次。
     pub fn seed_positions(&mut self, baselines: &[PositionBaseline]) {
         for baseline in baselines {
             let symbol = &baseline.position.symbol;
@@ -363,21 +350,6 @@ mod tests {
                 reason: FillReason::Normal,
             })),
         )
-    }
-
-    /// 基线只写一次：第二次 seed 静默跳过（同一 symbol 再次投产时的正常形态），存量不被覆写
-    #[test]
-    fn seed_is_idempotent_and_never_overwrites() {
-        let mut manager = StateManager::new(&[SYM.to_string()]);
-        manager.seed_positions(&[baseline(dec!(2.0), 10)]);
-        manager.seed_positions(&[baseline(dec!(99.0), 20)]);
-
-        let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(
-            state.position_book().position_size(EX),
-            dec!(2.0),
-            "重复 seed 不得覆写存量"
-        );
     }
 
     /// **防双计**：快照请求时刻之前送达的 Fill 已含在快照里，seed 之后到达必须丢弃；
