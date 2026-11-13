@@ -30,8 +30,12 @@ pub struct FundingArbConfig {
     /// 挂单价偏离目标价超过 `order_distance × requote_ratio` 才撤单重挂。
     /// 太小会频繁撤挂、白耗下单撤单次数（交易所按次数限制下单撤单）。
     pub requote_ratio: f64,
-    /// 补腿下单（市价）失败后，至少隔多久再试；撤单失败后也按此间隔重撤；某所拒单退避的起始间隔（毫秒）
+    /// 补腿下单（市价）被拒后，至少隔多久再试（毫秒）
     pub hedge_retry_ms: u64,
+    /// 撤单失败（单还开着）后，至少隔多久再撤（毫秒）
+    pub cancel_retry_ms: u64,
+    /// 某所下单被拒后暂停挂新 maker 的起始时长（毫秒），连续被拒翻倍
+    pub reject_backoff_ms: u64,
     /// 挂单至少挂这么久才因价格偏离撤换（毫秒）：省下单撤单次数（交易所按次数限制下单撤单）
     pub min_requote_ms: u64,
     /// 盘口最大可用年龄（毫秒，按本地接收时刻）；任一所超龄不开新单
@@ -66,6 +70,8 @@ pub struct PairParams {
     pub order_distance: f64,
     pub requote_ratio: f64,
     pub hedge_retry_ms: u64,
+    pub cancel_retry_ms: u64,
+    pub reject_backoff_ms: u64,
     pub min_requote_ms: u64,
     pub max_bbo_age_ms: u64,
     pub max_funding_age_ms: u64,
@@ -100,8 +106,16 @@ impl FundingArbConfig {
         if self.min_order_notional > self.order_notional {
             return Err("min_order_notional 不能大于 order_notional".into());
         }
-        if self.max_bbo_age_ms == 0 || self.max_funding_age_ms == 0 || self.hedge_retry_ms == 0 {
-            return Err("max_bbo_age_ms / max_funding_age_ms / hedge_retry_ms 必须 > 0".into());
+        for (name, v) in [
+            ("max_bbo_age_ms", self.max_bbo_age_ms),
+            ("max_funding_age_ms", self.max_funding_age_ms),
+            ("hedge_retry_ms", self.hedge_retry_ms),
+            ("cancel_retry_ms", self.cancel_retry_ms),
+            ("reject_backoff_ms", self.reject_backoff_ms),
+        ] {
+            if v == 0 {
+                return Err(format!("{name} 必须 > 0"));
+            }
         }
         if self.pairs.is_empty() {
             return Err("pairs 不能为空".into());
@@ -120,6 +134,8 @@ impl FundingArbConfig {
                 order_distance: pair.order_distance.unwrap_or(self.order_distance),
                 requote_ratio: self.requote_ratio,
                 hedge_retry_ms: self.hedge_retry_ms,
+                cancel_retry_ms: self.cancel_retry_ms,
+                reject_backoff_ms: self.reject_backoff_ms,
                 min_requote_ms: self.min_requote_ms,
                 max_bbo_age_ms: self.max_bbo_age_ms,
                 max_funding_age_ms: self.max_funding_age_ms,
@@ -155,7 +171,8 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "open_threshold_apr": 0.5, "close_threshold_apr": 0.1, "order_notional": 200.0, "min_order_notional": 11.0,
             "max_account_leverage": 1.5, "max_symbol_leverage": 0.2, "order_distance": 0.0005,
-            "requote_ratio": 1.0, "hedge_retry_ms": 2000, "min_requote_ms": 5000, "max_bbo_age_ms": 5000,
+            "requote_ratio": 1.0, "hedge_retry_ms": 2000, "cancel_retry_ms": 2000,
+            "reject_backoff_ms": 2000, "min_requote_ms": 5000, "max_bbo_age_ms": 5000,
             "max_funding_age_ms": 7200000,
             "pairs": [{"symbol": "BTC"}, {"symbol": "XMR", "order_distance": 0.001, "max_symbol_leverage": 0.1}]
         }))

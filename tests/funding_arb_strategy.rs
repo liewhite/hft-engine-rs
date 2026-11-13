@@ -28,7 +28,7 @@ fn config() -> FundingArbConfig {
     serde_json::from_value(serde_json::json!({
         "open_threshold_apr": 0.5, "close_threshold_apr": 0.1, "order_notional": 200.0, "min_order_notional": 11.0,
         "max_account_leverage": 1.5, "max_symbol_leverage": 0.2, "order_distance": 0.001,
-        "requote_ratio": 1.0, "hedge_retry_ms": 1000, "min_requote_ms": 0, "max_bbo_age_ms": 5000,
+        "requote_ratio": 1.0, "hedge_retry_ms": 1000, "cancel_retry_ms": 1000, "reject_backoff_ms": 1000, "min_requote_ms": 0, "max_bbo_age_ms": 5000,
         "max_funding_age_ms": 7200000, "pairs": [{"symbol": SYM}]
     }))
     .unwrap()
@@ -946,7 +946,7 @@ fn imbalance_below_the_hedge_exchanges_min_notional_is_dust() {
     assert!(c.contains(&BN), "{c:?}");
 }
 
-/// 拒单退避：某所的 maker 被拒后不在下一个盘口事件立刻重挂，等 hedge_retry_ms；连续被拒等待翻倍；
+/// 拒单退避：某所的 maker 被拒后不在下一个盘口事件立刻重挂，等 reject_backoff_ms；连续被拒等待翻倍；
 /// 有一张被接下（挂上）后清零。另一所不受影响。
 #[test]
 fn rejected_maker_backs_off_per_exchange() {

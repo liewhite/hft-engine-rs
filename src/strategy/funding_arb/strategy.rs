@@ -101,7 +101,7 @@ pub struct FundingArbStrategy {
     reject_backoff: HashMap<Exchange, RejectBackoff>,
 }
 
-/// 某所连续被拒单时的退避：第一次拒后等 `hedge_retry_ms` 再挂新的 maker，之后每连续拒一次等待
+/// 某所连续被拒单时的退避：第一次拒后等 `reject_backoff_ms` 再挂新的 maker，之后每连续拒一次等待
 /// 翻倍，封顶 [`MAX_REJECT_BACKOFF_MS`]；该所有一张单被交易所接下（挂上或成交）就清零。
 ///
 /// 不退避时，被拒的单离开挂单列表后下一个盘口事件就重挂：持续性拒单（保证金不足、
@@ -536,7 +536,7 @@ impl FundingArbStrategy {
                 if previous.is_some_and(|b| b.client_order_id == client_order_id) {
                     return; // 这张单的拒单已从另一条路计入
                 }
-                let delay_ms = previous.map_or(self.p.hedge_retry_ms, |b| {
+                let delay_ms = previous.map_or(self.p.reject_backoff_ms, |b| {
                     (b.delay_ms * 2).min(MAX_REJECT_BACKOFF_MS)
                 });
                 tracing::warn!(symbol = %self.symbol(), %ex, %client_order_id, %reason, delay_ms, "下单被拒，该所暂停挂新单");
@@ -622,7 +622,7 @@ impl FundingArbStrategy {
     }
 
     /// 撤一张开着的单。下单请求还没结论的，框架丢弃这次撤单、受理的结论到了本策略重新判断时再撤；
-    /// 撤单在途时不重发，撤单失败（多半是单刚成交、终态马上就到）后隔 `hedge_retry_ms` 再撤。
+    /// 撤单在途时不重发，撤单失败（多半是单刚成交、终态马上就到）后隔 `cancel_retry_ms` 再撤。
     fn cancel(&self, p: &PendingOrder, now: Timestamp) -> Option<Signal> {
         // 哪些单不该发撤单（下单中、已结束、撤单在途）由框架挡；策略只定撤单失败后隔多久重撤
         if let OrderStage::Cancelling {
@@ -630,7 +630,7 @@ impl FundingArbStrategy {
             ..
         } = p.stage()
         {
-            if now.saturating_sub(*at) < self.p.hedge_retry_ms {
+            if now.saturating_sub(*at) < self.p.cancel_retry_ms {
                 return None;
             }
             tracing::warn!(symbol = %self.symbol(), exchange = %p.order.exchange, client_order_id = %p.order.client_order_id, %reason, "撤单失败且单还开着，重撤");
