@@ -434,6 +434,17 @@ impl Provisioner {
                 )));
             }
         }
+        // 实盘策略订阅的每个所都要配了凭证：没凭证的所下单在出口被拒，补腿补不上就留单边敞口（#767）
+        for (spec, subscriptions) in strategies.iter().zip(&strategy_subscriptions) {
+            if spec.account != AccountId::Live {
+                continue;
+            }
+            if let Some((exchange, _)) = subscriptions.iter().find(|(ex, _)| !self.accounts.contains_key(ex)) {
+                return Err(ExchangeError::Other(format!(
+                    "实盘策略要在 {exchange} 交易，但 {exchange} 没配凭证（下单会被拒、补腿补不上），拒绝投产"
+                )));
+            }
+        }
 
         // 2. 按交易所分组订阅
         let mut exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>> = HashMap::new();

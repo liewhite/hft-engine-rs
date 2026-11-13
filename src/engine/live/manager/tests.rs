@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 type Log = Arc<Mutex<Vec<String>>>;
 
-/// 只供 metas 预加载：一个合约都没有
+/// 只供 metas 预加载：只有一个 BTC 合约
 struct FakeClient(Exchange);
 
 #[async_trait]
@@ -20,7 +20,15 @@ impl ExchangeClient for FakeClient {
         self.0
     }
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        Ok(Vec::new())
+        Ok(vec![SymbolMeta {
+            exchange: self.0,
+            symbol: "BTC".to_string(),
+            price_formatter: Arc::new(crate::domain::StepFormatter::new(0.1)),
+            size_step: 0.001,
+            min_order_size: 0.001,
+            min_notional: 0.0,
+            contract_size: 1.0,
+        }])
     }
     async fn fetch_symbol_meta(&self, _: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
         Ok(Vec::new())
@@ -222,6 +230,41 @@ async fn account_streams_start_on_demand_once() {
     handle.add_strategy(StrategySpec::live(greeks_on(Exchange::OKX))).await.unwrap();
     handle.add_strategy(StrategySpec::live(greeks_on(Exchange::OKX))).await.unwrap();
     assert_eq!(started.load(Ordering::SeqCst), 1, "同所同种只起一份");
+    root.shutdown().await.expect("正常停机");
+}
+
+/// 只订行情、别的什么都不做的策略
+struct WatchesBbo(Exchange);
+
+impl Strategy for WatchesBbo {
+    fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
+        HashMap::from([(self.0, HashSet::from([SubscriptionKind::BBO { symbol: "BTC".to_string() }]))])
+    }
+    fn on_event(
+        &mut self,
+        _: &crate::messaging::IncomeEvent,
+        _: crate::strategy::StrategyView<'_>,
+    ) -> Vec<crate::strategy::OutcomeEvent> {
+        Vec::new()
+    }
+}
+
+/// 实盘策略要交易的所没配凭证：拒绝投产（下单会被拒、补腿补不上；#767）
+#[tokio::test]
+async fn live_strategy_is_rejected_on_exchange_without_credentials() {
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let root = Root::new("engine");
+    let handle = Manager::spawn(
+        &root.group("main"),
+        ManagerArgs { exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)], paper: None },
+    )
+    .await
+    .expect("Manager 起不来");
+    let err = handle
+        .add_strategy(StrategySpec::live(Box::new(WatchesBbo(Exchange::Binance))))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Binance 没配凭证"), "{err}");
     root.shutdown().await.expect("正常停机");
 }
 
