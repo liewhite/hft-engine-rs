@@ -88,28 +88,37 @@ pub struct HyperliquidCredentials {
     pub signing: HyperliquidSigning,
     /// 市价单的保护价让幅：HL 没有原生市价单，框架用「对手价 ×(1 ± 本值)」的 IOC 限价单代替，
     /// 只吃这个范围内的流动性。允许多大滑点是使用方的选择，必填、框架不给默认值；须在 (0, 1)。
-    pub market_order_slippage: f64,
+    /// 加载时校验并转成精确十进制（下单路径直接用，不再转换、不再判非法）。
+    pub(crate) market_order_slippage: rust_decimal::Decimal,
 }
 
 impl HyperliquidCredentials {
+    /// 本进程持有 agent 私钥（与从配置加载同一套校验）
     pub fn with_private_key(
         wallet_address: String,
         private_key: String,
         market_order_slippage: f64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        Self::try_from(RawHyperliquidCredentials {
             wallet_address,
-            signing: HyperliquidSigning::PrivateKey(private_key),
+            private_key: Some(private_key),
+            signer_url: None,
             market_order_slippage,
-        }
+        })
     }
 
-    pub fn with_signer(wallet_address: String, url: String, market_order_slippage: f64) -> Self {
-        Self {
+    /// 用同机签名服务（与从配置加载同一套校验）
+    pub fn with_signer(
+        wallet_address: String,
+        url: String,
+        market_order_slippage: f64,
+    ) -> Result<Self, String> {
+        Self::try_from(RawHyperliquidCredentials {
             wallet_address,
-            signing: HyperliquidSigning::Signer { url },
+            private_key: None,
+            signer_url: Some(url),
             market_order_slippage,
-        }
+        })
     }
 }
 
@@ -154,16 +163,18 @@ impl TryFrom<RawHyperliquidCredentials> for HyperliquidCredentials {
             }
             (None, None) => return Err("hyperliquid 凭证缺 private_key 或 signer_url".into()),
         };
-        if !(r.market_order_slippage > 0.0 && r.market_order_slippage < 1.0) {
-            return Err(format!(
-                "hyperliquid 凭证 market_order_slippage 须在 (0, 1)，当前 {}",
-                r.market_order_slippage
-            ));
-        }
+        let market_order_slippage = crate::domain::from_f64(r.market_order_slippage)
+            .filter(|s| *s > rust_decimal::Decimal::ZERO && *s < rust_decimal::Decimal::ONE)
+            .ok_or_else(|| {
+                format!(
+                    "hyperliquid 凭证 market_order_slippage 须在 (0, 1)，当前 {}",
+                    r.market_order_slippage
+                )
+            })?;
         Ok(Self {
             wallet_address: r.wallet_address,
             signing,
-            market_order_slippage: r.market_order_slippage,
+            market_order_slippage,
         })
     }
 }
@@ -199,7 +210,10 @@ mod credentials_tests {
 
     #[test]
     fn private_key_is_not_debug_printed() {
-        let c = HyperliquidCredentials::with_private_key("0xa".into(), "deadbeef".into(), 0.05);
+        let c: HyperliquidCredentials = serde_json::from_str(
+            r#"{"wallet_address":"0xa","private_key":"deadbeef","market_order_slippage":0.05}"#,
+        )
+        .unwrap();
         assert!(!format!("{c:?}").contains("deadbeef"));
     }
 }

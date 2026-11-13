@@ -248,8 +248,6 @@ impl HyperliquidAccount {
             .filter(|p| *p > Decimal::ZERO)
             .ok_or_else(|| ExchangeError::new(format!("{coin} 盘口无对手价，市价单无法定价")))?;
         let slippage = self.credentials.market_order_slippage;
-        let slippage = crate::domain::from_f64(slippage)
-            .ok_or_else(|| ExchangeError::new(format!("HL 市价滑点配置非法: {slippage}")))?;
         let px = if is_buy {
             top * (Decimal::ONE + slippage)
         } else {

@@ -13,7 +13,8 @@ use hft_engine_rs::exchange::AccountClient;
 async fn unified_account_equity_and_positions_across_dexes() {
     let wallet = std::env::var("HL_WALLET").expect("HL_WALLET");
     // 占位签名机：本测试只读，不会提交任何签名请求
-    let creds = HyperliquidCredentials::with_signer(wallet, "http://127.0.0.1:1".to_string(), 0.05);
+    let creds = HyperliquidCredentials::with_signer(wallet, "http://127.0.0.1:1".to_string(), 0.05)
+        .unwrap();
     let client = std::sync::Arc::new(
         HyperliquidClient::connect("USDC".to_string(), vec![String::new(), "xyz".to_string()])
             .await

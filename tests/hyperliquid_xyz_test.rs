@@ -41,6 +41,7 @@ fn load_credentials() -> HyperliquidCredentials {
         .expect("读取 hype_config.json 失败，请确认文件存在");
     let config: HypeConfig = serde_json::from_str(&content).expect("解析 hype_config.json 失败");
     HyperliquidCredentials::with_private_key(config.wallet, config.agent_key, 0.05)
+        .expect("凭证非法")
 }
 
 /// 创建 XYZ DEX 客户端（无凭证，仅用于公开接口）
