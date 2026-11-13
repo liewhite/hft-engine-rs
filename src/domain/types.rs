@@ -12,7 +12,8 @@ pub const USDT: &str = "USDT";
 /// - WS 路径：codec 的构造方法在**签名上**要求 [`crate::domain::SymbolMeta`]
 ///   (如 `BboData::to_bbo`)，编译器保证不会漏折算
 /// - REST 路径：由 [`crate::exchange::ExchangeClient`] 各实现内部折算后返回
-/// - 反向 (币 -> 张) 只发生在下单出口，见 `StrategyRunner::convert_order`
+/// - 反向 (币 -> 张) 只发生在下单出口 [`crate::exchange::ExchangeOrder::from_domain`]，张数只存在于
+///   `ExchangeOrder` 内部，由各所 client 组装请求时读取
 ///
 /// 违反此不变量的后果不是报错而是**静默算错**：OKX BTC 每张 0.01 币，漏折算即差 100 倍。
 ///
