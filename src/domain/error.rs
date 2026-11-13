@@ -48,7 +48,7 @@ impl PlaceError {
         PlaceError::Rejected(RejectReason::Other(msg.into()))
     }
 
-    /// 请求没有发出去（本地组装、签名、缺凭证）—— 确定没挂上
+    /// 请求没有发出去（本地组装、签名、本地限频额度不够）—— 确定没挂上
     pub fn unsent(e: impl std::fmt::Display) -> Self {
         PlaceError::Rejected(RejectReason::Other(format!("not sent: {e}")))
     }
@@ -93,11 +93,5 @@ impl ExchangeError {
 impl From<String> for ExchangeError {
     fn from(msg: String) -> Self {
         Self(msg)
-    }
-}
-
-impl From<serde_json::Error> for ExchangeError {
-    fn from(e: serde_json::Error) -> Self {
-        Self(format!("JSON: {e}"))
     }
 }

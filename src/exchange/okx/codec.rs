@@ -43,11 +43,7 @@ pub struct WsPush<T> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WsArg {
-    #[allow(dead_code)]
-    pub channel: String,
     pub inst_id: Option<String>,
-    #[allow(dead_code)]
-    pub inst_type: Option<String>,
 }
 
 /// Funding Rate 数据
@@ -55,12 +51,7 @@ pub struct WsArg {
 #[serde(rename_all = "camelCase")]
 pub struct FundingRateData {
     pub inst_id: String,
-    #[allow(dead_code)]
-    pub inst_type: String,
     pub funding_rate: String,
-    #[allow(dead_code)]
-    pub next_funding_rate: Option<String>,
-    #[allow(dead_code)]
     pub funding_time: String,
     // pub next_funding_time: String,
 }
@@ -96,8 +87,6 @@ pub struct BboData {
     pub asks: Vec<Vec<String>>,
     pub bids: Vec<Vec<String>>,
     pub ts: String,
-    #[allow(dead_code)]
-    pub seq_id: Option<i64>,
 }
 
 impl BboData {
@@ -155,8 +144,6 @@ impl BboData {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TradeData {
-    #[allow(dead_code)]
-    pub trade_id: String,
     pub px: String,
     pub sz: String,
     pub side: String,
@@ -193,8 +180,6 @@ impl TradeData {
 #[serde(rename_all = "camelCase")]
 pub struct MarkPriceData {
     pub inst_id: String,
-    #[allow(dead_code)]
-    pub inst_type: String,
     pub mark_px: String,
     pub ts: String,
 }
@@ -302,7 +287,7 @@ impl PositionData {
 }
 
 /// Account 推送（私有 WS `account` 频道）。只取各币现金余额：净值与持仓总价值改由
-/// REST 轮询（见 `OkxClient::fetch_account_info`）—— 推送里的 `notionalUsd` 只在
+/// REST 轮询（见 `OkxAccount::fetch_account_info`）—— 推送里的 `notionalUsd` 只在
 /// 跨币种 / 组合保证金模式下有值，单币种保证金模式（acctLv=2）是空串。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -342,14 +327,6 @@ pub fn parse_account_info(
 #[serde(rename_all = "camelCase")]
 pub struct AccountDetail {
     pub ccy: String,
-    #[allow(dead_code)]
-    pub eq: String,
-    #[allow(dead_code)]
-    pub avail_eq: String,
-    #[allow(dead_code)]
-    pub avail_bal: String,
-    #[allow(dead_code)]
-    pub frozen_bal: String,
     /// 币种现金余额 (现货持有量)
     pub cash_bal: String,
 }
@@ -545,7 +522,6 @@ impl GreeksData {
 
 /// WebSocket 事件响应
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct WsEvent {
     pub event: String,
     pub code: Option<String>,

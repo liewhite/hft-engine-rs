@@ -212,15 +212,16 @@ pub struct OrderData {
     /// 本次成交价格 (Last filled price)
     #[serde(rename = "L")]
     pub last_price: String,
-    /// 成交时间（交易所时间，毫秒）
-    #[serde(rename = "T")]
-    pub trade_time: u64,
+    /// 成交时间（交易所时间，毫秒）。只在有成交时用，缺省不让整条推送解析失败；有成交却缺它
+    /// 在 [`OrderTradeUpdate::to_fill`] 里报错
+    #[serde(rename = "T", default)]
+    pub trade_time: Option<u64>,
     /// 本次成交手续费 (Commission amount)。
     ///
     /// **可能缺失**：Binance 文档对 `n`/`N` 明确写着 "will not push if no commission"
     /// —— NEW / CANCELED 这类无成交事件不带该字段。此前声明为必填 `String`，于是一条
-    /// **完全合法**的回报会让整个 `OrderTradeUpdate` 反序列化失败 → `ExchangeError::new`
-    /// → kill actor → 级联整机停机。schema 必须如实描述交易所会发什么。
+    /// **完全合法**的回报会让整个 `OrderTradeUpdate` 反序列化失败 → 私有流解析出错
+    /// → 整机停机。schema 必须如实描述交易所会发什么。
     ///
     /// 有成交时它必然存在，所以 [`OrderTradeUpdate::to_fill`] 里缺失即报错（那才是真违约）。
     #[serde(default)]
@@ -334,7 +335,10 @@ impl OrderTradeUpdate {
             size: fill_sz,
             client_order_id: (!self.o.c.is_empty()).then(|| self.o.c.clone()),
             order_id: self.o.i.to_string(),
-            timestamp: self.o.trade_time,
+            timestamp: self
+                .o
+                .trade_time
+                .ok_or_else(|| format!("Binance 成交回报缺成交时间 T（订单 {}）", self.o.i))?,
             fee,
             // Binance 强平/ADL 也经 ORDER_TRADE_UPDATE 以 fill 到达并如常更新持仓；
             // 本 codec 暂未解析订单类型区分来源，统一标 Normal。

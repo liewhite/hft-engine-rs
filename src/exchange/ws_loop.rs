@@ -126,12 +126,10 @@ impl WsConn {
         if let Some(text) = self.replay.pop_front() {
             return Ok(text);
         }
-        self.incoming.recv().await.ok_or_else(|| {
-            ExchangeError::new(format!(
-                "服务端关闭连接: {}",
-                "WS 循环已退出（原因见循环子任务的错误）"
-            ))
-        })
+        self.incoming
+            .recv()
+            .await
+            .ok_or_else(|| ExchangeError::new("WS 循环已退出（原因见循环子任务的错误）"))
     }
 
     /// 感知停机的取帧：`scope`（组件自己的）未被请求停止时等下一帧（同 [`Self::recv`]）；
@@ -175,9 +173,10 @@ impl WsConn {
         let replay = &mut self.replay;
         let wait = async {
             while !pending.is_empty() {
-                let text = incoming.recv().await.ok_or_else(|| {
-                    ExchangeError::new(format!("服务端关闭连接: {}", "等订阅确认时连接已断"))
-                })?;
+                let text = incoming
+                    .recv()
+                    .await
+                    .ok_or_else(|| ExchangeError::new("等订阅确认时连接已断"))?;
                 if let Some(sub) = confirms(&text)? {
                     if pending.remove(sub.as_str()) {
                         tracing::info!(%exchange, subscription = %sub, remaining = pending.len(), "私有订阅已确认生效");
@@ -447,13 +446,13 @@ async fn run_ws_loop_inner(
                         let reason = frame
                             .map(|f| format!("code={}, reason={}", f.code, f.reason))
                             .unwrap_or_else(|| "no reason".to_string());
-                        return Err(ExchangeError::new(format!("服务端关闭连接: {}", reason)));
+                        return Err(ExchangeError::new(format!("服务端关闭连接: {reason}")));
                     }
                     Some(Err(e)) => {
-                        return Err(ExchangeError::new(e.to_string()));
+                        return Err(ExchangeError::new(format!("读帧失败: {e}")));
                     }
                     None => {
-                        return Err(ExchangeError::new(format!("服务端关闭连接: {}", "connection dropped")));
+                        return Err(ExchangeError::new("connection dropped（连接已断）"));
                     }
                     // 其它帧类型 (Pong/Frame 等) 忽略
                     _ => {}

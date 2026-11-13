@@ -3,7 +3,7 @@
 //!
 //! 「有没有凭证」由类型表达：账户类请求只在 [`OkxAccount`] 上，它的凭证不是 `Option`。
 //! 签名请求只有 [`OkxAccount::signed`] 一处，回复信封 `{code, msg, data}` 的解析只有
-//! [`OkxAccount::envelope`] 一处（#813）。
+//! [`envelope`] 一处（#813）。
 
 use super::symbol::{from_okx, to_okx};
 use crate::domain::{
@@ -408,7 +408,8 @@ impl OkxAccount {
         }
 
         let admitted = LIMITER.action(&[CANCEL.cost_in(&inst_id, 1)])?;
-        let body = serde_json::to_string(&CancelRequest { inst_id, order })?;
+        let body = serde_json::to_string(&CancelRequest { inst_id, order })
+            .expect("撤单请求体只含字符串字段，序列化不会失败");
         let path = "/api/v5/trade/cancel-order";
         let resp: Envelope<CancelData> =
             envelope(path, self.signed(Method::POST, path, body), admitted).await?;

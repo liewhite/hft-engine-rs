@@ -171,16 +171,17 @@ async fn login(
             match read.next().await {
                 Some(Ok(WsMessage::Text(text))) => {
                     if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
-                        if event.event == "login" {
-                            if event.code.as_deref() == Some("0") {
+                        // 登录失败 OKX 回 event=error（也可能是 login 带非 0 code）：带上交易所原话
+                        if event.event == "login" || event.event == "error" {
+                            if event.event == "login" && event.code.as_deref() == Some("0") {
                                 tracing::info!("OKX private login success");
                                 return Ok(());
-                            } else {
-                                return Err(ExchangeError::new(format!(
-                                    "{} 鉴权失败",
-                                    Exchange::OKX
-                                )));
                             }
+                            return Err(ExchangeError::api(
+                                Exchange::OKX,
+                                event.code.as_deref().unwrap_or("?"),
+                                format!("私有 WS 登录失败: {}", event.msg.as_deref().unwrap_or("")),
+                            ));
                         }
                     }
                 }

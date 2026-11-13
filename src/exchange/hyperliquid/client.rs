@@ -448,19 +448,18 @@ async fn post_info_with<T: for<'de> Deserialize<'de>>(
     .await
     .map_err(|e| ExchangeError::transport(Exchange::Hyperliquid, e.to_string()))?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(ExchangeError::api(
-            Exchange::Hyperliquid,
-            status.as_u16() as i32,
-            text,
-        ));
-    }
-
-    resp.json::<T>()
+    let status = resp.status();
+    let text = resp
+        .text()
         .await
-        .map_err(|e| ExchangeError::transport(Exchange::Hyperliquid, e.to_string()))
+        .map_err(|e| ExchangeError::transport(Exchange::Hyperliquid, e))?;
+    let preview = || text.chars().take(300).collect::<String>();
+    if !status.is_success() {
+        return Err(ExchangeError::api(Exchange::Hyperliquid, status, preview()));
+    }
+    // 解析不了是回复格式不对，不是连接问题
+    serde_json::from_str(&text)
+        .map_err(|e| ExchangeError::new(format!("HL /info 回复解析失败: {e}; body: {}", preview())))
 }
 
 /// 一份 clearinghouseState 里属于所查 dex 的仓位（按 coin 前缀）。持仓与持仓总价值共用：

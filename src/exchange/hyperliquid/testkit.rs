@@ -52,7 +52,7 @@ pub(crate) fn state(raw: &str) -> ClearinghouseState {
     serde_json::from_str(raw).unwrap()
 }
 
-/// 与 `HyperliquidClient::fetch_positions` 同一份逻辑
+/// 与 `HyperliquidAccount::fetch_positions` 同一份逻辑
 pub(crate) fn positions(markets: &HlMarkets, states: &[(&str, &str)]) -> Vec<Position> {
     let states: Vec<_> = states
         .iter()
