@@ -198,7 +198,7 @@ impl SymbolPositions {
     ///
     /// 持仓维护的全部内容就是**累加带符号数量**：策略决策只看数量（还能加多少、要平多少、
     /// 净敞口是否为零）。均价/盈亏不在域模型里 —— 记账需求由模拟柜台的账本
-    /// （`sim::BookPosition`）与 supervisor 的现金流账本各自完成，
+    /// （`sim::BookPosition`）完成，
     /// 见 [`crate::domain::Position`] 的文档。
     pub fn apply_fill(&mut self, symbol: &Symbol, fill: &crate::domain::Fill, local_ts: Timestamp) {
         if let Some(&seeded_ts) = self.seeded_at.get(&fill.exchange) {
@@ -231,7 +231,7 @@ impl SymbolPositions {
         );
     }
 
-    /// **全部**腿，含未 seed 的（供降级平仓取量：那时要的是"本实例账上有什么"，
+    /// **全部**腿，含未 seed 的（供观测镜像发布持仓：要的是"账上有什么"，
     /// 而不是"哪些可参与对账"。对外快照请用 [`Self::seeded_positions`]）。
     pub fn all(&self) -> impl Iterator<Item = &Position> {
         self.positions.values()
@@ -247,7 +247,7 @@ impl SymbolPositions {
     ///   Fill 必已含在快照里，seed 之后到达时被 [`Self::apply`] 的 Fill 分支丢弃 ——
     ///   这条过滤规则对所有基线消费者（executor、对账镜像、观测镜像）同一份。
     /// - 同一所第二次 seed **静默跳过**并返回 `false`：镜像在每次投产注册时都会收到
-    ///   该批 symbol 的基线（降级后再晋升会重复），首次写入后的重复是流程的正常形态。
+    ///   该批 symbol 的基线（同一 symbol 再次投产会重复），首次写入后的重复是流程的正常形态。
     ///   （历史上"重复基线 = 违约"针对的是总线上适配层乱发；基线退出事件流后，
     ///   seed 只能来自投产握手，违约面已不存在。）
     ///
@@ -255,7 +255,7 @@ impl SymbolPositions {
     ///
     /// - 成交发生在快照**之前**（已含在快照）、Fill 在快照请求之后才送达
     ///   （`local_ts > snapshot_req_ts`）—— 会双计，窗口 = 交易所撮合到 Fill 送达的时延。
-    /// - 再晋升时新 executor 用**新**快照 seed 而镜像沿用旧账本：新快照到注册完成之间的
+    /// - 同一 symbol 再次投产时新 executor 用**新**快照 seed 而镜像沿用旧账本：新快照到注册完成之间的
     ///   外部成交会造成 executor 与镜像分歧（见 `activate_executors` 的窗口清单；
     ///   实盘 executor 与镜像的分歧由持仓账本检出并停机，#694）。
     ///
@@ -272,7 +272,7 @@ impl SymbolPositions {
                     %symbol,
                     exchange = %position.exchange,
                     incoming_size = position.size,
-                    "持仓基线已存在，跳过重复 seed（再晋升时的正常形态）"
+                    "持仓基线已存在，跳过重复 seed（同一 symbol 再次投产时的正常形态）"
                 );
                 false
             }
@@ -695,7 +695,7 @@ mod tests {
 
     /// **Critical 回归防线**：第二次 seed 不得覆写持仓（幂等，返回 false）。
     ///
-    /// 快照覆写 + 晚到的 Fill 会重复计算同一笔成交。再晋升时镜像会收到重复基线，
+    /// 快照覆写 + 晚到的 Fill 会重复计算同一笔成交。同一 symbol 再次投产时镜像会收到重复基线，
     /// 全靠这条幂等判据兜住存量。
     #[test]
     fn second_baseline_never_overwrites_position() {
@@ -813,8 +813,7 @@ mod tests {
     /// 持仓随 Fill **只累加数量**：买加、卖减、反手翻符号。
     ///
     /// 均价不在这里维护（也不在域模型里，见 `crate::domain::Position` 的文档）——
-    /// 需要成本的策略自己从成交流记（口径由它自己定），记账则在 sim 账本与 supervisor
-    /// 的现金流账本里各自完成。
+    /// 需要成本的策略自己从成交流记（口径由它自己定），记账则在 sim 账本里完成。
     #[test]
     fn position_accumulates_signed_size_across_fills() {
         let mut state = SymbolState::new(SYMBOL.to_string());

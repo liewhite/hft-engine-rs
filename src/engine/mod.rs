@@ -14,7 +14,5 @@ pub use live::{
     PlaceVerdict, PaperCounter, PaperCounterArgs,
     PositionLedger, PositionLedgerArgs, PositionLedgerHandle, Reconciler,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
-    RemoveStrategies, StrategySpec,
-    Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, Supervisor,
-    SupervisorArgs, SymbolRecord, SymbolPerformance,
+    StrategySpec,
 };

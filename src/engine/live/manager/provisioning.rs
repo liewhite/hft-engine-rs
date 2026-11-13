@@ -1,18 +1,19 @@
-//! 策略投产与撤下的编排。
+//! 策略投产的编排。
 //!
 //! - **投产**（[`super::ManagerHandle::add_strategies`]）：校验订阅可行性 → 撤遗留挂单 →
 //!   拉持仓基线（一次快照喂 executor / 对账镜像 / 观测镜像三类消费者）→ spawn（出生即带
 //!   基线）→ 注册 → 放行行情；任一步失败回滚到"什么都没发生"。
-//! - **撤下**（[`RemoveStrategies`]）：停实例 → 撤遗留挂单 → 可选 reduce-only 平仓
-//!   （经唯一下单出口 OrderGateway）；任何一环未完成都如实向调用方报错。
+//!
+//! 运行期撤下实例（按表现开关实盘的 Supervisor 与它的降级平仓）已在 #761 删除：只服务一个从未
+//! 启用的单所入口，且把"撤下即市价平仓"这一策略决定写死在框架里。以后要运行中下架，按多所
+//! 形态只做「停实例 + 撤挂单」，平不平交给策略。
 //!
 //! # 为什么是 [`Provisioner`] 而不是 `impl Manager`
 //!
-//! 编排必须经 manager 的收件箱串行化，所以它**不是**新组件 —— 两种请求仍由 `Manager`
+//! 编排必须经 manager 的收件箱串行化，所以它**不是**新组件 —— 请求仍由 `Manager`
 //! 收，只是把活委托下来。拆出独立类型是为了让**依赖面成为类型声明**
 //! （`docs/architecture.md` P3，与 R2 给持仓账本换成 `PositionBook` 是同一手法）：
-//! 账户句柄、能力表、分发层、两个镜像、下单出口、交易所节点、实例列表**只有编排用**，
-//! 它们全在本类型里，manager 碰不到 executor 列表与下单出口。
+//! 账户句柄、能力表、分发层、两个镜像、交易所节点**只有编排用**，它们全在本类型里。
 //!
 //! # 两件共享的东西
 //!
@@ -20,7 +21,7 @@
 //!   两边持的是同一个 `Arc`，不是副本（P1）。
 //! - `producers`：新建的 executor 挂在 manager 的**生产者组**下（运行期往已声明的组里
 //!   spawn）。组只提供 spawn 能力 —— "何时停、按什么顺序停"由任务树按分组声明顺序决定，
-//!   编排改不了。撤下的实例自己退出后即从组里摘除，不需要编排记得去删。
+//!   编排改不了。实例退出后即从组里摘除，不需要编排记得去删。
 //!
 //!   如实说明能力面的边界：`producers` 和 `consumers` 同为 [`Group`]，**传的是哪一组仍由调用点
 //!   写对，编译器分不出来**；`Group` 限制的是能对它做什么（只能 spawn、不能 shutdown），不是它是谁。
@@ -28,11 +29,10 @@
 use super::StrategySpec;
 use crate::engine::live::{
     ExecutorArgs, Executor, ExecutorHandle, ExecutorId, IncomeProcessorHandle, MetricsHandle,
-    OrderGateway, OutcomeBus, PlaceVerdict, PositionLedgerHandle,
+    OutcomeBus, PositionLedgerHandle,
 };
 use crate::domain::{
-    now_ms, AccountId, Exchange, ExchangeError, Order, OrderType, OrderUpdate, Side, Symbol,
-    SymbolMeta,
+    now_ms, AccountId, Exchange, ExchangeError, OrderUpdate, Symbol, SymbolMeta,
 };
 use crate::exchange::{AccountClient, ExchangeHandle, SubscriptionKind};
 use crate::tasks::{ChildHandle, Gone, Group, StopFlag};
@@ -45,18 +45,6 @@ use std::time::Duration;
 /// `Executor` 的处理是纯策略步进 + 往总线发布，都是亚毫秒级工作，正常远不到这个量级。
 /// 留 5 秒是为了不因偶发调度抖动就走异常分支。
 const EXECUTOR_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 一个已注册的策略实例。
-///
-/// 住在本文件、且**私有**：只有编排读写它（投产时 push、撤下时 retain）。
-struct RegisteredExecutor {
-    /// 在生产者组里的那一支（撤下时停它）
-    child: ChildHandle,
-    /// 它的地址（查持仓、注册到分发层与对账名单）
-    handle: ExecutorHandle,
-    account: AccountId,
-    symbols: HashSet<Symbol>,
-}
 
 /// 本次投产刚起好的一个实例（尚未注册）
 struct Spawned {
@@ -76,11 +64,10 @@ pub(super) struct Collaborators {
     pub metrics: MetricsHandle,
     pub position_ledger: PositionLedgerHandle,
     pub outcome_bus: OutcomeBus,
-    pub order_gateway: Arc<OrderGateway>,
     pub exchanges: HashMap<Exchange, ExchangeHandle>,
 }
 
-/// 策略投产与撤下的编排器。
+/// 策略投产的编排器。
 ///
 /// 由 [`super::Manager`] 持有并在处理收件箱消息时调用（因而天然被串行化）；
 /// 字段就是它的依赖声明，见模块文档。
@@ -103,12 +90,8 @@ pub(super) struct Provisioner {
     position_ledger: PositionLedgerHandle,
     /// 策略信号总线（新建 executor 的产出去处）
     outcome_bus: OutcomeBus,
-    /// 唯一的实盘下单出口 —— 降级平仓经此下单，与策略信号同一条路
-    order_gateway: Arc<OrderGateway>,
     /// 各所交易所节点（放行 / 收回行情订阅）
     exchanges: HashMap<Exchange, ExchangeHandle>,
-    /// 已注册的策略实例，供动态撤下使用
-    executors: Vec<RegisteredExecutor>,
 }
 
 /// 投产期订阅可行性校验（纯函数，供单测）。
@@ -225,9 +208,7 @@ impl Provisioner {
             metrics: c.metrics,
             position_ledger: c.position_ledger,
             outcome_bus: c.outcome_bus,
-            order_gateway: c.order_gateway,
             exchanges: c.exchanges,
-            executors: Vec::new(),
         }
     }
 
@@ -257,44 +238,23 @@ impl Provisioner {
         Ok(())
     }
 
-    /// 有序撤下一个 executor：请求它停止、并**等它真的停下**。
+    /// 有序停下一个 executor（投产回滚用）：请求它停止、并**等它真的停下**。
     ///
-    /// 被要求停止后正常退出只收掉它自己这一支，**不会打死引擎**（降级正是这么做的）；
+    /// 被要求停止后正常退出只收掉它自己这一支，**不会打死引擎**；
     /// 它自己出错退出才会冒到根、整机停机 —— 两种情形由任务树区分，不靠调用方选对 API。
     ///
     /// # 为什么必须等
     ///
     /// 停止请求发出后，实例会先把收件箱里已有的事件处理完才停，期间**仍可能产出订单**。
-    /// 不等就往下走（撤单 / 平仓），会出现"我们撤完单，它才把新单发出去"的竞态 —— 那张新单
-    /// 又成了无人看管的遗留挂单。
+    /// 不等就报回"投产失败、没有实例在跑"，会出现调用方以为已干净、它却把新单发出去的竞态。
     ///
-    /// 返回 `Err(原因)` 供调用方计入"未完成"；超时不强杀，而是如实报出 —— 此时该实例已从
+    /// 返回 `Err(原因)` 供调用方记录；超时不强杀，而是如实报出 —— 此时该实例已从
     /// IncomeProcessor 注销，收不到新事件，危害有界。它仍挂在生产者组里（实例退出时才从组里
     /// 摘除），进程停机时照样会被等到收尾，最坏是让停机多等一会儿，并由根部的总期限如实报出。
     async fn stop_executor(child: &ChildHandle) -> Result<(), String> {
         tokio::time::timeout(EXECUTOR_STOP_TIMEOUT, child.stop())
             .await
             .map_err(|_| format!("等待实例停止超时（{}s）", EXECUTOR_STOP_TIMEOUT.as_secs()))
-    }
-
-    /// 该所交易所侧**可能有本引擎的残留**（挂单 / 持仓）时，返回清理所需的账户句柄。
-    ///
-    /// 判据只有一条：**有没有账户**。没有 [`AccountClient`] 就下不了单
-    /// （`OrderGateway` 拿不到句柄）、也收不到私有流，因此交易所侧不可能有本引擎的
-    /// 任何东西 —— 既无挂单，也无成交、故持仓恒为未 seed 的空。
-    ///
-    /// # 投产与撤下必须共用这一个判据
-    ///
-    /// 曾经两处各判各的：投产的撤残单遇到无账户所**跳过**，撤下的清理遇到同样情形
-    /// **返回 `Err`**。同一事实两套结论，后果是无凭证配置（`adaptive_trade` 明文支持
-    /// 「只跑模拟」）下一旦降级：executor 已停并移出登记，而 supervisor 收到 `Err`
-    /// 会保持 `live = Some(..)` —— 记账与事实背离，该 symbol 此后晋升被拒、降级重试
-    /// 永远撞同一个 `Err`，**永久卡死**。
-    fn exchange_side_cleanup(
-        accounts: &HashMap<Exchange, Arc<dyn AccountClient>>,
-        exchange: Exchange,
-    ) -> Option<&Arc<dyn AccountClient>> {
-        accounts.get(&exchange)
     }
 
     /// 列出**本引擎**在该 (所, symbol) 上的挂单。
@@ -431,8 +391,8 @@ impl Provisioner {
         //    提前的好处是它的失败**根本不需要回滚** —— 此时还没有任何实例被建出来，
         //    直接返回 Err 就等于"什么都没发生"。
         for (exchange, symbol) in &exchange_symbols {
-            // 无账户 = 交易所侧不可能有残留，跳过（判据见 exchange_side_cleanup）
-            let Some(account) = Self::exchange_side_cleanup(&self.accounts, *exchange) else {
+            // 无账户 = 下不了单、也收不到私有流，交易所侧不可能有本引擎的挂单，跳过
+            let Some(account) = self.accounts.get(exchange) else {
                 continue;
             };
             Self::cancel_leftover_orders(account, *exchange, symbol).await?;
@@ -477,10 +437,8 @@ impl Provisioner {
         }
 
         // 7. 注册并投产。**从这里开始产生副作用**，故任一步失败都要回滚已注册的实例 ——
-        //    两个调用方（bin 的 main、Supervisor::promote）都把 Err 理解成"什么都没
-        //    发生"：main 会退出进程（残留无所谓），而 Supervisor 会保持 live=None、以为没
-        //    晋升成功。若此时留着一个绑定 AccountId::Live 的实例在跑，它会收私有事件、会真
-        //    下单，而 Supervisor 永远不会去 demote 它 —— 无人看管的实盘实例。
+        //    调用方把 Err 理解成"什么都没发生"。若此时留着一个绑定 AccountId::Live 的实例在跑，
+        //    它会收私有事件、会真下单，却没人知道它存在 —— 无人看管的实盘实例。
         if let Err(e) = self
             .activate_executors(
                 &spawned,
@@ -571,7 +529,7 @@ impl Provisioner {
     ///   对账通过 → live 实例带错误持仓**静默**续跑。fail-visible 严格优于 silent-drift。
     /// - **(t1, t2] 的成交**：镜像吃到、executor 错过 → executor 与镜像分歧。
     ///   窗口 = 几次进程内收件箱投递（旧方案同类窗口为"快照到注册"的数秒）。
-    /// - **再晋升**：executor 用新时刻的快照 seed，镜像沿用连续旧账本 —— 新快照请求到
+    /// - **同一批 symbol 再次投产**：executor 用新时刻的快照 seed，镜像沿用连续旧账本 —— 新快照请求到
     ///   注册完成之间的外部成交，同样造成 executor 与镜像分歧（镜像有、它没有）。
     ///   没有交易所侧序号无法根除。
     ///
@@ -623,9 +581,8 @@ impl Provisioner {
         // 7.2 向 IncomeProcessor 注册各 Executor 的订阅（自此它们开始收流事件）
         for (s, subscriptions) in spawned.iter().zip(strategy_subscriptions.iter()) {
             // 注册失败必须**向上传播**，不能只打日志：注册不上的实例收不到任何事件
-            // （行情、成交全无），却仍会被 push 进 self.executors 并让本函数返回 Ok ——
-            // Supervisor 据此认定晋升成功、置 live=Some，此后既不会重试也不会 demote，
-            // 留下一个"活着却永远收不到事件"的僵尸实例。与"返回 Ok 即已完整投产"的契约相悖。
+            // （行情、成交全无），本函数却返回 Ok —— 留下一个"活着却永远收不到事件"的僵尸
+            // 实例。与"返回 Ok 即已完整投产"的契约相悖。
             self.income_processor
                 .register(s.handle.clone(), subscriptions.clone(), s.account.clone())
                 .await
@@ -646,12 +603,6 @@ impl Provisioner {
                         ))
                     })?;
             }
-            self.executors.push(RegisteredExecutor {
-                child: s.child.clone(),
-                handle: s.handle.clone(),
-                account: s.account.clone(),
-                symbols: subscriptions.iter().map(|(_, k)| k.symbol().clone()).collect(),
-            });
         }
 
         // 7.3 批量向各交易所节点发送订阅请求（市场数据从此处开始流动）
@@ -682,7 +633,6 @@ impl Provisioner {
     ///
     /// 这条边界必须写明：否则后来者会把"回滚不彻底"当成缺陷去补，反而补出问题。
     async fn rollback_executors(&mut self, created: &[Spawned]) {
-        let ids: HashSet<ExecutorId> = created.iter().map(|s| s.handle.id()).collect();
         for s in created {
             if let Err(reason) = self.detach_executor(s.handle.id()).await {
                 tracing::error!(account = %s.account, %reason, "回滚时未能把实例从事件流上摘下");
@@ -692,272 +642,13 @@ impl Provisioner {
             }
             tracing::warn!(account = %s.account, "投产失败，已撤下该策略实例");
         }
-        // self.executors 里可能已被 7.2 推入，一并摘掉（未推入的 retain 是 no-op）
-        self.executors.retain(|reg| !ids.contains(&reg.handle.id()));
     }
 }
-
-/// 撤下某账户在指定 symbol 上的策略实例，可选立即平仓。
-///
-/// 用于降级：`live 持续亏损 -> 关闭 live`。两步都必要 ——
-/// 只撤实例不平仓会留下无人看管的敞口；只平仓不撤实例会被策略立刻重新开仓。
-pub struct RemoveStrategies {
-    /// 目标账户（降级即 [`AccountId::Live`]）
-    pub account: AccountId,
-    /// 目标 symbol
-    pub symbols: Vec<Symbol>,
-    /// 平仓下到哪个交易所
-    pub exchange: Exchange,
-    /// 是否立即市价平掉存量仓位
-    pub flatten: bool,
-}
-
-impl Provisioner {
-    /// 撤下一批实例并清理交易所侧残留，见 [`RemoveStrategies`]。
-    pub(super) async fn remove(&mut self, msg: RemoveStrategies) -> Result<(), ExchangeError> {
-        let targets: Vec<Symbol> = msg.symbols;
-        // 交易所侧的残留（挂单 / 仓位）只有实盘账户才有：模拟账户的两者都在本地柜台里，
-        // 随账户一起留存（供继续记账）
-        let is_live = msg.account == AccountId::Live;
-        let need_flatten = msg.flatten && is_live;
-
-        // 1. 先撤实例，再平仓。顺序不能反：先平仓的话，策略在收到平仓回报后可能立刻重开。
-        //
-        //    平仓量取自 executor 的**本地持仓**，且必须在停掉它之前问 —— 停掉之后它不再
-        //    消费事件、状态就停更了。不走 REST：持仓由「基线 + Fill」维护，REST 在本项目里
-        //    只作对账（见 PositionLedger）；且本地值比 REST 快照更新（后者可能落后于
-        //    最新到达的 Fill）。真出现本地与交易所不一致时，对账层会先致命退出，走不到这里。
-        let mut removed = 0usize;
-        let mut kept = Vec::new();
-        // 按 (所, symbol) 去重：同一 symbol 若有多个实例，它们看到的是同一份交易所持仓，
-        // 累加会把平仓量翻倍（reduce-only 虽能兜住，但下单量本身就该是对的）
-        let mut to_flatten: HashMap<(Exchange, Symbol), f64> = HashMap::new();
-        // 未能完成的部分：**必须向调用方传播**。Supervisor 收到 Ok 就会把 live 置为
-        // None、认为已干净降级，而实盘可能仍有未平的仓位且此后无人看管 —— 那正是
-        // supervisor 自己写下的"谎报已关闭比撤下失败更危险"。
-        let mut incomplete: Vec<String> = Vec::new();
-        for reg in std::mem::take(&mut self.executors) {
-            let hit = reg.account == msg.account
-                && targets.iter().any(|s| reg.symbols.contains(s));
-            if !hit {
-                kept.push(reg);
-                continue;
-            }
-            // **拒绝部分覆盖**：实例覆盖的 symbol 必须完全落在 targets 内。
-            //
-            // 撤下一个实例就是停掉它管的**所有** symbol，而本次只会为 targets 撤单、平仓。
-            // 若实例还管着 targets 之外的 symbol，它们的挂单不撤、仓位不平，却再无实例维护
-            // —— 恰好制造出本次改动通篇要消灭的"无人看管的仓位"。而且对账层也发现不了：
-            // 基线已建、Fill 不再到达，只要交易所侧不动就永远不告警。
-            //
-            // 扩大范围去撤/平那些 symbol 同样不对：调用方没要求动它们，静默清仓更意外。
-            // 故拒绝并如实报错，让调用方把该实例的 symbol 一次性降完。
-            let uncovered: Vec<&Symbol> =
-                reg.symbols.iter().filter(|s| !targets.contains(s)).collect();
-            if !uncovered.is_empty() {
-                tracing::error!(
-                    account = %reg.account,
-                    ?targets,
-                    ?uncovered,
-                    "拒绝部分降级：该实例还管着 targets 之外的 symbol，撤下它会让那些 symbol \
-                     无人看管；请一次性降完该实例的全部 symbol"
-                );
-                incomplete.push(format!(
-                    "实例覆盖 {uncovered:?} 不在本次 targets 内，拒绝部分降级"
-                ));
-                kept.push(reg);
-                continue;
-            }
-            if need_flatten {
-                match reg.handle.positions(targets.clone()).await {
-                    Ok(positions) => {
-                        for pos in positions {
-                            to_flatten.insert((pos.exchange, pos.symbol), pos.size);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "取 executor 本地持仓失败，该实例的仓位无法平掉"
-                        );
-                        incomplete.push(format!("取本地持仓失败: {e}"));
-                    }
-                }
-            }
-            if let Err(reason) = self.detach_executor(reg.handle.id()).await {
-                tracing::error!(account = %reg.account, %reason, "未能把实例从事件流上摘下");
-                incomplete.push(reason);
-            }
-            // 有序停下并**等它真的停**：后面要撤单 / 平仓，不能让它在排空收件箱时又下新单
-            if let Err(reason) = Self::stop_executor(&reg.child).await {
-                tracing::error!(
-                    account = %reg.account,
-                    %reason,
-                    "未能确认实例已停止 —— 它可能仍在产出订单"
-                );
-                incomplete.push(format!("实例未确认停止: {reason}"));
-            }
-            removed += 1;
-        }
-        self.executors = kept;
-        tracing::info!(
-            account = %msg.account,
-            symbols = ?targets,
-            removed,
-            "Removed strategy instances"
-        );
-
-        // 模拟账户到此为止：它的挂单与仓位都在本地柜台里，随账户一起留存（供继续记账），
-        // 交易所侧没有任何残留需要清理。
-        //
-        // **但仍要走 incomplete 检查**：撤下阶段本身可能已经失败（拒绝部分降级、实例未确认
-        // 停止），在这里直接 `Ok(())` 会把"实例还在跑"谎报成"已干净撤下" —— 正是本分支通篇
-        // 要消灭的那类谎报。
-        if !is_live {
-            return Self::finish_removal(&msg.account, msg.exchange, incomplete);
-        }
-        // 没有账户的所：交易所侧不可能有本引擎的任何残留 —— 下不了单（`OrderGateway` 拿不到
-        // `AccountClient`），也收不到私有流，故既无挂单也无成交、持仓恒为未 seed 的空。
-        // 与投产路径的撤残单同一口径（见本文件"没有账户的所不可能有本引擎的挂单"）。
-        //
-        // **不能返回 `Err`**：此刻 executor 已经停下并移出 `self.executors`，而 supervisor
-        // 收到 `Err` 会保持 `live = Some(..)`（"实盘可能仍在运行"）。记账与事实就此背离 ——
-        // 此后晋升被 `live.is_some()` 拒绝、降级重试永远撞同一个 `Err`，该 symbol 永久卡死。
-        // 无凭证运行是 `adaptive_trade` 明文支持的配置（只跑模拟时的期望状态），可达。
-        //
-        // 仍走 `finish_removal`：撤下阶段本身可能已经失败（拒绝部分降级、实例未确认停止），
-        // 那些必须如实上报，理由同上面的模拟账户分支。
-        let Some(client) = Self::exchange_side_cleanup(&self.accounts, msg.exchange).cloned()
-        else {
-            tracing::info!(
-                account = %msg.account,
-                exchange = %msg.exchange,
-                "该所未配置凭证，交易所侧无残留可清理，撤下就此收尾"
-            );
-            return Self::finish_removal(&msg.account, msg.exchange, incomplete);
-        };
-
-        // 2. 撤掉遗留挂单。**位置是关键**：
-        //
-        //    - 必须在停掉实例**之后**：实例还活着时撤单，它会收到 Cancelled 回报，
-        //      gamma_scalp 那类"看到 pending 为空就补挂"的策略会立刻重新挂上来
-        //      （与上面"先撤实例再平仓"是同一个理由）；
-        //    - 必须在平仓**之前**：否则 reduce-only 平仓单下去之后，那张遗留的开仓单还可能
-        //      成交，又开出一个新仓位。
-        //
-        //    与 `flatten` 标志无关，只要是实盘账户就撤：不平仓可能是"想留着仓位人工处理"，
-        //    但留一张**会自己再开仓**的挂单没有任何合理理由 —— 那正是降级要消除的东西。
-        for symbol in &targets {
-            if let Err(e) = Self::cancel_leftover_orders(&client, msg.exchange, symbol).await {
-                tracing::error!(
-                    exchange = %msg.exchange,
-                    %symbol,
-                    error = %e,
-                    "[DEMOTE] 遗留挂单未撤净 —— 它可能成交并重新开出无人看管的仓位"
-                );
-                incomplete.push(format!("{symbol}: 遗留挂单未撤净 ({e})"));
-            }
-        }
-
-        // 3. 平仓。`to_flatten` 只在 `need_flatten` 为真时才被填充，故此处不再判一次；
-        //    用断言把这条不变量钉住 —— 将来若有人为别的目的（如日志）无条件填充它，
-        //    平仓就会在没被要求时触发。
-        debug_assert!(
-            need_flatten || to_flatten.is_empty(),
-            "未要求平仓却收集了待平仓位"
-        );
-        for ((exchange, symbol), size) in to_flatten {
-            let pos = crate::domain::Position {
-                exchange,
-                symbol,
-                size,
-                // 平仓只需要方向与数量；均价/浮盈在此无意义，不伪造
-            };
-            // 只平下到本次指定交易所的那些腿；空仓判据用 domain 的口径，不另写一份比较
-            if exchange != msg.exchange || pos.is_empty() {
-                continue;
-            }
-            // 反向 reduce-only 市价单：撮合层强制不反向开仓，量算多了也只会平到 0
-            let side = if pos.size > 0.0 { Side::Short } else { Side::Long };
-            let order = Order {
-                id: String::new(),
-                exchange: msg.exchange,
-                symbol: pos.symbol.clone(),
-                side,
-                order_type: OrderType::Market,
-                quantity: pos.size.abs(),
-                reduce_only: true,
-                client_order_id: msg.exchange.new_cli_order_id(),
-            };
-            tracing::warn!(
-                exchange = %msg.exchange,
-                symbol = %pos.symbol,
-                position = pos.size,
-                %side,
-                "[DEMOTE] Flattening live position with reduce-only market order"
-            );
-            // 经**唯一下单出口**下发（缺 meta、残量不足最小可交易量等失败都从这里
-            // 如实返回），按结构化结论裁断 —— 见 [`PlaceVerdict`]。
-            let symbol = pos.symbol.clone();
-            match self.order_gateway.place(order, "demote_flatten").await {
-                Ok(PlaceVerdict::Accepted
-                | PlaceVerdict::DryRun
-                | PlaceVerdict::ReduceOnlyAlreadyClosed) => {}
-                // 交易所对平仓单表过态但**内容未知**（可能成交、也可能拒单）。executor
-                // 已撤、回报无人消费，此处无从判定 —— 如实计入未完成（假告警可接受，
-                // 假成功不可接受：谎报已关闭会让 supervisor 置 live=None，敞口无人看管）。
-                // 若实际已成交，supervisor 下个节拍重试 demote 时实例已不在、无仓可平，
-                // 第二轮自然收敛为 Ok。
-                Ok(PlaceVerdict::ExchangeSpoke) => {
-                    tracing::error!(
-                        %symbol,
-                        position = pos.size,
-                        "平仓单已被交易所回报但结论未知（可能已成交也可能被拒），计入未完成待复核"
-                    );
-                    incomplete.push(format!(
-                        "{symbol}: 平仓单结论未知（交易所已回报，REST 失败），需复核"
-                    ));
-                }
-                Err(reason) => {
-                    tracing::error!(
-                        %symbol,
-                        position = pos.size,
-                        %reason,
-                        "平仓下单失败 —— 实盘仍有敞口"
-                    );
-                    incomplete.push(format!("{symbol}: 平仓下单失败 ({reason})"));
-                }
-            }
-        }
-
-        Self::finish_removal(&msg.account, msg.exchange, incomplete)
-    }
-
-    /// 汇总撤下结果：只要有任何一环没完成，就**向上报错**。
-    ///
-    /// 调用方（`Supervisor::demote`）收到 `Ok` 就会把 `live` 置为 `None`、认为已干净
-    /// 降级；若此时实例还在跑、或仓位没平、或遗留挂单没撤掉，那部分敞口就此无人看管 ——
-    /// 正是 supervisor 自己写下的"谎报已关闭比撤下失败更危险"。
-    fn finish_removal(
-        account: &AccountId,
-        exchange: Exchange,
-        incomplete: Vec<String>,
-    ) -> Result<(), ExchangeError> {
-        if incomplete.is_empty() {
-            return Ok(());
-        }
-        Err(ExchangeError::Other(format!(
-            "撤下未完成（账户 {account}，交易所 {exchange}），需人工核对: {}",
-            incomplete.join("; ")
-        )))
-    }
-}
-
 
 #[cfg(test)]
 mod leftover_order_tests {
     use super::*;
-    use crate::domain::{AccountInfo, OrderId, OrderStatus, Position};
+    use crate::domain::{AccountInfo, OrderId, OrderStatus, Position, Side};
     use crate::exchange::ExchangeOrder;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -1017,41 +708,6 @@ mod leftover_order_tests {
         }
     }
 
-    /// **回归防线（Critical）**：投产与撤下对"无账户所"必须得出同一个结论。
-    ///
-    /// 曾经两处各判各的 —— 投产跳过、撤下返回 `Err`。无凭证配置下一旦降级，executor 已停
-    /// 并移出登记，而 supervisor 收到 `Err` 会保持 `live = Some(..)`：记账与事实背离，
-    /// 该 symbol 此后晋升被拒、降级重试永远撞同一个 `Err`，永久卡死。
-    ///
-    /// 判据收敛到 [`Provisioner::exchange_side_cleanup`] 之后，两条路径不可能再分叉 ——
-    /// 本测试钉住判据本身。
-    ///
-    /// **未覆盖**：`Provisioner::remove` 的完整路径。`Manager` 构造时要联网建
-    /// client、拉 symbol metas，单测里起不来。
-    #[test]
-    fn provisioning_and_removal_agree_on_an_exchange_without_account() {
-        let mut accounts: HashMap<Exchange, Arc<dyn AccountClient>> = HashMap::new();
-
-        // 无账户：两条路径都拿到 None，即"交易所侧无残留可清理"
-        assert!(
-            Provisioner::exchange_side_cleanup(&accounts, EX).is_none(),
-            "没有账户的所必须判为无残留 —— 撤下路径据此干净收尾，而不是报错卡死"
-        );
-
-        // 有账户：两条路径都拿到句柄，照常清理
-        let (client, _log) = FakeClient::new(vec![]);
-        accounts.insert(EX, client);
-        assert!(
-            Provisioner::exchange_side_cleanup(&accounts, EX).is_some(),
-            "有账户的所必须照常清理"
-        );
-        // 判据是 per-exchange 的：别的所有账户不代表本所有
-        assert!(
-            Provisioner::exchange_side_cleanup(&accounts, Exchange::Hyperliquid).is_none(),
-            "判据必须按所独立"
-        );
-    }
-
     fn order(client_order_id: &str, order_id: &str) -> OrderUpdate {
         OrderUpdate {
             order_id: order_id.to_string(),
@@ -1108,10 +764,9 @@ mod leftover_order_tests {
         );
     }
 
-    /// 复查仍有本引擎的挂单 -> 拒绝启动/降级。
+    /// 复查仍有本引擎的挂单 -> 拒绝启动。
     ///
-    /// 留着无人看管的挂单开跑，策略会在它旁边重复挂单；对降级而言它还可能成交、
-    /// 重新开出一个没人管的仓位。
+    /// 留着无人看管的挂单开跑，策略会在它旁边重复挂单，它还可能成交、开出一个没人管的仓位。
     #[tokio::test]
     async fn still_present_after_cancel_is_an_error() {
         let own = EX.new_cli_order_id();

@@ -24,13 +24,8 @@ use super::{outlet_for, to_live_outlet, AccountOutcome, OutcomeBus, Outlet};
 
 /// 实盘出向执行器：系统里**唯一**知道"怎么把订单发到交易所"的组件。
 ///
-/// 两个持有方共享同一实例（因此共享同一套 in_flight 判据、失败反馈与 dry_run 语义）：
-/// - [`OutcomeProcessor`]（总线路径）：策略信号各起一个子任务执行，不阻塞事件流；
-/// - manager（降级平仓，见 `RemoveStrategies`）：`await` 执行，同步拿到结论。
-///
-/// 此前降级平仓在 manager 里直发 `client.place_order` —— 系统存在第二个下单出口：
-/// 没有 in_flight 假警报防护、失败不合成回报、无视 dry_run。收敛为单一出口后，
-/// 这些语义对一切下单一致。
+/// 由 [`OutcomeProcessor`] 独占：策略信号各起一个子任务执行，不阻塞事件流。系统里不存在第二个下单
+/// 出口，in_flight 假警报防护、失败合成回报、dry_run 语义对一切下单一致。
 pub struct OrderGateway {
     /// 各所的账户私有能力。键集 = 配了凭证的所 —— 不在表里就是"该所只接公共行情"，
     /// 下单请求会被拒绝并合成失败回报，而不是静默丢弃。
@@ -61,8 +56,8 @@ pub struct OrderGateway {
     machine_stopping: StopFlag,
 }
 
-/// [`OrderGateway::place`] 的结构化结论，给**编排方**消费（策略侧的闭环走事件回报，
-/// 两者语义不同，不能压扁成一个 bool —— 尤其 [`Self::ExchangeSpoke`]）。
+/// [`OrderGateway::place`] 的结构化结论。策略侧的闭环走事件回报，不读它；它把一次下单落在
+/// 哪种结果如实说出来（不压扁成一个 bool —— 尤其 [`Self::ExchangeSpoke`]），单测据此钉住三种结果的语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceVerdict {
     /// REST 确认已受理
@@ -72,10 +67,9 @@ pub enum PlaceVerdict {
     /// reduce-only 单因仓位已平被拒 —— 平仓语义下目标已达成
     ReduceOnlyAlreadyClosed,
     /// REST 失败，但交易所已经通过回报流对该单表过态，**内容未知** —— 可能是成交、
-    /// 挂上，也可能是拒单。策略路径以回报为准（`SymbolState` 会消费它闭环）；编排路径
-    /// （降级平仓：executor 已撤、回报无人消费）**不得**据此认定目标达成，须如实上报
-    /// 或复核事实 —— 把它折算成"成功"曾是一个 Critical：WS 拒单先到、REST 错误后到时，
-    /// 平仓被谎报为完成，敞口无人看管。
+    /// 挂上，也可能是拒单。策略路径以回报为准（`SymbolState` 会消费它闭环）；若将来有
+    /// 同步等结论、又没人消费回报的调用方，**不得**据此认定目标达成 —— WS 拒单先到、
+    /// REST 错误后到时，那会把没挂上的单当成功。
     ExchangeSpoke,
 }
 
@@ -116,12 +110,11 @@ impl OrderGateway {
     /// 整机一旦开始停机（不论什么原因），新单一律不发、直接返回 `Err`，也不反馈 Error 回报
     /// （策略正在停，没人再按它重挂）。
     ///
-    /// # 返回值是给**编排方**的结论（策略侧的闭环走事件回报）
+    /// # 返回值（策略侧的闭环走事件回报，不依赖它）
     ///
     /// - `Ok(verdict)`：见 [`PlaceVerdict`] 各变体 —— 特别地，`ExchangeSpoke` 不是成功，
     ///   只是"REST 的结论已被交易所回报作废"。
-    /// - `Err`：这张单没有成功挂上（被拒绝、未发出、引擎已在停机），或结果不确定、引擎因此停机 ——
-    ///   调用方（降级平仓）都如实计入"未完成"。
+    /// - `Err`：这张单没有成功挂上（被拒绝、未发出、引擎已在停机），或结果不确定、引擎因此停机。
     pub async fn place(&self, order: Order, comment: &str) -> Result<PlaceVerdict, String> {
         if self.machine_stopping.is_stopping() {
             let reason = "引擎正在停机，不再发新单".to_string();
@@ -526,7 +519,7 @@ impl OutcomeProcessor {
         //
         // 子任务内的结论不靠返回值传递：拒单由 gateway 反馈为 OrderUpdate(Error)、撤单反馈为
         // Cancelled；下单结果不确定时 gateway 自己停机（不反馈 Error，见 `OrderGateway::place`）。
-        // 返回值只服务需要同步结论的编排方（降级平仓），此处忽略。
+        // 返回值在此忽略。
         match tagged.event {
             // 自定义事件与交易所无关：它已随出向总线到达外部订阅者，本处理器只管下单/撤单
             OutcomeEvent::Emit(_) => {}
@@ -722,8 +715,8 @@ mod tests {
 /// 对 [`OrderGateway::place`] 的返回值契约直测（不是复刻实现），以及 [`OutcomeProcessor`]
 /// 的总线装配。
 ///
-/// 这份契约被降级平仓消费：把 `ExchangeSpoke` 折算成"成功"曾是一个 Critical ——
-/// WS 拒单先到、REST 错误后到时，平仓被谎报为完成、敞口无人看管。
+/// 把 `ExchangeSpoke` 折算成"成功"曾是一个 Critical —— WS 拒单先到、REST 错误后到时，
+/// 没挂上的单被当成成功。
 #[cfg(test)]
 mod gateway_tests {
     use super::*;
@@ -944,7 +937,6 @@ mod gateway_tests {
 
     /// **Critical 回归防线**：REST 在途期间交易所已回报（内容未知，可能是拒单）→
     /// 结论必须是 `ExchangeSpoke` 而不是"成功"，且不再发假的 Error 回报。
-    /// 降级平仓据此把该腿计入"未完成"，绝不谎报已关闭。
     #[tokio::test]
     async fn ws_report_during_rest_flight_is_exchange_spoke_not_success() {
         let (entered_tx, mut entered_rx) = mpsc::channel(1);

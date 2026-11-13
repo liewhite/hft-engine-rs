@@ -142,7 +142,7 @@ impl StateManager {
     ///
     /// symbol 未注册的基线直接跳过并记 error（基线属于策略订阅范围内的 symbol，
     /// 范围外到达说明调用方拼装错了）；已 seed 的 (所, symbol) 静默跳过
-    /// （再晋升时的正常形态，见 [`SymbolState::seed_position`]）。
+    /// （同一 symbol 再次投产时的正常形态，见 [`SymbolState::seed_position`]）。
     pub fn seed_positions(&mut self, baselines: &[PositionBaseline]) {
         for baseline in baselines {
             let symbol = &baseline.position.symbol;
@@ -357,7 +357,7 @@ mod tests {
         )
     }
 
-    /// 基线只写一次：第二次 seed 静默跳过（再晋升时的正常形态），存量不被覆写
+    /// 基线只写一次：第二次 seed 静默跳过（同一 symbol 再次投产时的正常形态），存量不被覆写
     #[test]
     fn seed_is_idempotent_and_never_overwrites() {
         let mut manager = StateManager::new(&[SYM.to_string()], 0);

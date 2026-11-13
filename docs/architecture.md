@@ -305,7 +305,7 @@ Root("engine")                         ← bootstrap::run_engine 持有，唯一
 - 交易所层不依赖引擎层：各所 `XxxNode::spawn(&Group, XxxArgs) -> ExchangeHandle`，`ExchangeHandle` 包
   `Addr<ExchangeCmd>`（`Subscribe` / `SubscribeBatch` / `Unsubscribe`）；`engine::live::assembly` 把引擎侧的
   `SpawnCtx { producers, market_bus, account_bus, symbol_metas }` 映射成各所参数。
-- 外部观察者（如 funding_arb 的资金费轮询器、adaptive_trade 的 `Supervisor`）经 `ManagerHandle::observers()`
+- 外部观察者（如 funding_arb 的资金费轮询器）经 `ManagerHandle::observers()`
   挂到 consumers 组，在自己的构造闭包里 `inbox.subscribe(handle.market_bus(), ..)`。`ManagerHandle` 的三条总线
   只给 `BusTap`（只订阅）；外部唯一的入向入口是 `publish_custom_event`。
 - 启动：manager 构造（预加载 metas、建总线、起全部子任务、等私有订阅确认）在 build 里完成，
@@ -539,7 +539,7 @@ observability / tasks / option：无 crate 内依赖（messaging 起各层都用
 
 改名的是**后者**（→ `SymbolPerformance`）：它的消费者只有 `PromotionPolicy` 的实现者，
 波及面比刚随 v0.13.0 发出去的策略契约小得多。取这个名字也更准确——它装的是两个账户的
-表现记录 + 时间，本来就不是"视图"。
+表现记录 + 时间，本来就不是"视图"。（#761 起 Supervisor 与 `SymbolPerformance` 已整体删除。）
 
 ---
 

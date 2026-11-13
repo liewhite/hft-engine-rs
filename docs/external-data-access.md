@@ -161,7 +161,6 @@
 | | 视角 | 含模拟账户 | 用途 |
 |---|---|---|---|
 | `GetLivePositions` | 实盘权威真值 | 否 | 对外快照、观测 |
-| `ExecutorActor::GetPositions` | 某策略实例内部状态 | 是 | 降级平仓取量（须在 kill 该 executor 之前发起） |
 | `ExecutorActor::GetSeededPositions` | 某策略实例的已 seed 腿 | 只问实盘实例 | 持仓账本拿它与镜像比对（#694）；未 seed 的腿是「未知」，不给 |
 
 ### C. manager 的快照面

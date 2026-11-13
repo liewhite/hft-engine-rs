@@ -3,14 +3,14 @@
 //! 职责边界（每块各居其位，manager 只做粘合）：
 //! - **装配**：收下 bin 侧的 [`ExchangeSetup`]（见 [`super::assembly`]），预加载 metas、
 //!   建三条总线、起全部核心子任务 —— 对"有哪些交易所"彻底无知；
-//! - **投产/撤下编排**：见 [`provisioning`] 子模块（经本节点的收件箱串行化）；
-//! - **监督**：由任务树承担 —— 子任务被要求停止后正常退出只收掉它自己那一支（撤下策略、
-//!   投产回滚、外部观察者收工），出错或 panic 一律冒到根、整机受控停机，交由外部编排
+//! - **投产编排**：见 [`provisioning`] 子模块（经本节点的收件箱串行化）；
+//! - **监督**：由任务树承担 —— 子任务被要求停止后正常退出只收掉它自己那一支（投产回滚、
+//!   外部观察者收工），出错或 panic 一律冒到根、整机受控停机，交由外部编排
 //!   重启（本项目不重连、不降级运行；唯一例外是公共行情 WS 原地重连，见
 //!   `crate::exchange::ws_loop::ReconnectingWs`）；
 //! - **停机**：生产者 → 消费者两组依次停（框架按分组的声明顺序），组内并发、组间有序。
 //!
-//! 对外只经 [`ManagerHandle`]：类型化的投产/撤下方法、只读快照、往消费者组挂观察者的入口
+//! 对外只经 [`ManagerHandle`]：类型化的投产方法、只读快照、往消费者组挂观察者的入口
 //! 和三条总线。
 
 use super::assembly::{ExchangeSetup, SpawnCtx};
@@ -33,7 +33,6 @@ mod provisioning;
 #[cfg(test)]
 mod tests;
 
-pub use provisioning::RemoveStrategies;
 use provisioning::Provisioner;
 
 /// 时钟节拍（毫秒）：Clock 事件驱动策略的定时逻辑与本地柜台的净值发布
@@ -78,11 +77,10 @@ impl StrategySpec {
     }
 }
 
-/// Manager 的收件箱消息：只有必须串行化的编排（投产、撤下）。只读快照与自定义事件注入
+/// Manager 的收件箱消息：只有必须串行化的编排（投产）。只读快照与自定义事件注入
 /// 不经收件箱，见 [`ManagerHandle`] 各方法。
 enum ManagerMsg {
     AddStrategies(Vec<StrategySpec>, oneshot::Sender<Result<(), ExchangeError>>),
-    RemoveStrategies(RemoveStrategies, oneshot::Sender<Result<(), ExchangeError>>),
 }
 
 /// 经 [`ManagerHandle`] 发起的编排请求的失败
@@ -133,12 +131,6 @@ impl ManagerHandle {
     /// 返回 `Ok` 即已完整投产；`Err` 即"没有实例在跑"（见 `provisioning` 模块文档）。
     pub async fn add_strategies(&self, specs: Vec<StrategySpec>) -> Result<(), ManagerError> {
         self.call(|reply| ManagerMsg::AddStrategies(specs, reply)).await
-    }
-
-    /// 撤下某账户在指定 symbol 上的策略实例，可选立即平仓。任何一环未完成都返回 `Err`
-    /// （见 [`RemoveStrategies`]）。
-    pub async fn remove_strategies(&self, msg: RemoveStrategies) -> Result<(), ManagerError> {
-        self.call(|reply| ManagerMsg::RemoveStrategies(msg, reply)).await
     }
 
     /// 外部向策略注入自定义事件（[`CustomEvent`] 的**入向**入口）。
@@ -236,7 +228,7 @@ impl ManagerHandle {
 /// 不在这里存副本。
 pub struct Manager {
     inbox: Inbox<ManagerMsg>,
-    /// 策略投产与撤下的编排器（字段归属即职责声明，见 `provisioning.rs`）
+    /// 策略投产的编排器（字段归属即职责声明，见 `provisioning.rs`）
     provisioner: Provisioner,
 }
 
@@ -369,9 +361,8 @@ impl Manager {
         //    分发判据只有 `outlet_for` 一处（两个订阅过滤器 to_live_outlet / to_paper_outlet
         //    都调它），新增账户类型时它编译失败。
         //
-        //    OrderGateway 是**唯一**的实盘下单出口：总线路径（OutcomeProcessor）与
-        //    降级平仓（RemoveStrategies）共享同一实例 —— in_flight 判据、失败反馈、
-        //    dry_run 语义对一切下单一致，系统不存在第二个下单出口。
+        //    OrderGateway 是**唯一**的实盘下单出口，只交给出向处理器（OutcomeProcessor）：
+        //    in_flight 判据、失败反馈、dry_run 语义对一切下单一致，系统不存在第二个下单出口。
         let order_gateway = Arc::new(OrderGateway::new(
             accounts.clone(),
             account_bus.clone(),
@@ -386,7 +377,7 @@ impl Manager {
         ));
         //    出向处理器还订交易所回报（只订 OrderUpdate），用来作废迟到的 REST 失败结论
         //    （见 OrderGateway::in_flight）
-        OutcomeProcessor::spawn(&consumers, order_gateway.clone(), &outcome_bus, &account_bus)
+        OutcomeProcessor::spawn(&consumers, order_gateway, &outcome_bus, &account_bus)
             .await?;
 
         //    本地柜台：订阅信号总线（认领 Paper 账户的订单）与行情总线（撮合 + Clock 发净值），
@@ -488,7 +479,6 @@ impl Manager {
                 metrics,
                 position_ledger,
                 outcome_bus,
-                order_gateway,
                 exchanges,
             }),
         };
@@ -497,7 +487,7 @@ impl Manager {
 }
 
 impl Task for Manager {
-    /// 逐条处理编排请求（收件箱即串行化：同一时刻只有一个投产或撤下在进行）。
+    /// 逐条处理编排请求（收件箱即串行化：同一时刻只有一个投产在进行）。
     /// 被要求停止后交完箱里已有的请求再返回；子任务由框架按分组顺序收尾。
     async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
         while let Some(msg) = self.inbox.recv().await {
@@ -505,10 +495,6 @@ impl Task for Manager {
                 ManagerMsg::AddStrategies(specs, reply) => {
                     let result = self.provisioner.add(specs).await;
                     reply_to(reply, result, "投产");
-                }
-                ManagerMsg::RemoveStrategies(msg, reply) => {
-                    let result = self.provisioner.remove(msg).await;
-                    reply_to(reply, result, "撤下");
                 }
             }
         }

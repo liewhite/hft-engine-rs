@@ -9,7 +9,6 @@ mod metrics;
 mod outcome_processor;
 mod paper_counter;
 mod position_ledger;
-mod supervisor;
 #[cfg(test)]
 mod test_support;
 
@@ -82,7 +81,7 @@ pub fn to_paper_outlet(o: &AccountOutcome) -> bool {
 pub use assembly::{setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup};
 pub use clock::Clock;
 pub use manager::{
-    Manager, ManagerArgs, ManagerError, ManagerHandle, RemoveStrategies, StrategySpec,
+    Manager, ManagerArgs, ManagerError, ManagerHandle, StrategySpec,
 };
 pub use executor::{Executor, ExecutorArgs, ExecutorHandle, ExecutorId};
 pub use income_processor::{IncomeProcessor, IncomeProcessorHandle};
@@ -92,10 +91,6 @@ pub use paper_counter::{PaperCounter, PaperCounterArgs};
 pub use position_ledger::{
     PositionLedger, PositionLedgerArgs, PositionLedgerHandle, Reconciler,
     DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
-};
-pub use supervisor::{
-    Decision, NeverPromote, PromotionPolicy, RoundTrip, StrategyFactory, Supervisor,
-    SupervisorArgs, SymbolRecord, SymbolPerformance,
 };
 
 #[cfg(test)]

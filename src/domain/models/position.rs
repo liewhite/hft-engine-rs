@@ -19,8 +19,7 @@ use crate::domain::types::Quantity;
 ///   均价按成交流加权，与交易所报什么无关）；
 /// - 实盘账户净值走 [`crate::messaging::ExchangeEventData::AccountInfo`]（交易所算好的，
 ///   一个数、无需逐 symbol 对齐）；
-/// - 策略往返盈亏由 supervisor 按**现金流**记账（买付现、卖收现，见
-///   `crate::engine::SymbolRecord`），不需要均价。
+/// - 策略需要成本时自己从成交流记，口径由它自己定。
 ///
 /// `size` 为正表示多头，为负表示空头。
 #[derive(Debug, Clone, PartialEq)]
@@ -67,7 +66,7 @@ impl Position {
     ///
     /// 这就是持仓随成交演进的**全部内容**（见结构文档：均价与盈亏不在域模型里）。
     /// 买加、卖减，与"开仓/平仓/反手"无关——那些区分只有记账才需要，而记账在
-    /// [`crate::sim::BookPosition`] 与 supervisor 的现金流账本里各自完成。
+    /// [`crate::sim::BookPosition`] 里完成。
     pub fn add_fill(&mut self, side: Side, qty: Quantity) {
         self.size += signed_qty(side, qty);
     }

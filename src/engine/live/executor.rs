@@ -84,8 +84,6 @@ pub struct ExecutorArgs {
 pub enum ExecutorMsg {
     /// 一条入向事件（行情或账户，含 Clock），由分发层转发
     Event(IncomeEvent),
-    /// 见 [`ExecutorHandle::positions`]
-    GetPositions(Vec<Symbol>, oneshot::Sender<Vec<Position>>),
     /// 见 [`ExecutorHandle::seeded_positions`]
     GetSeededPositions(oneshot::Sender<Vec<Position>>),
 }
@@ -111,19 +109,6 @@ impl ExecutorHandle {
     /// 投一条入向事件（不等处理）。`Gone` = 实例已停止收件。
     pub fn deliver(&self, event: IncomeEvent) -> Result<(), Gone> {
         self.addr.send(ExecutorMsg::Event(event))
-    }
-
-    /// 查询本实例维护的持仓（指定 symbol，返回其在各所的仓位）。
-    ///
-    /// 用于降级平仓取量，见 [`crate::engine::RemoveStrategies`]。读的是「基线 + Fill」维护的
-    /// **权威**持仓，**不打 REST**：
-    /// - REST 在本项目里只作对账用途（见 [`super::PositionLedger`]），持仓维护模型不允许它参与；
-    /// - 本地值比 REST 快照更**新** —— 后者可能落后于最新到达的 Fill。
-    ///
-    /// 调用方必须在停掉该 executor **之前**发起查询：停掉之后它就不再消费事件、状态停更
-    /// （停掉之后再问会得到 `Gone`）。
-    pub async fn positions(&self, symbols: Vec<Symbol>) -> Result<Vec<Position>, Gone> {
-        self.addr.ask(|tx| ExecutorMsg::GetPositions(symbols, tx)).await
     }
 
     /// 查询本实例**基线已写入**的全部腿（策略下单所依据的那份持仓），供持仓账本把它纳入
@@ -185,15 +170,6 @@ impl Executor {
         // 回执发送失败 = 提问方已不再等（超时放弃或自身已退出），没有人需要这份答复
         match msg {
             ExecutorMsg::Event(event) => self.handle_event(event),
-            ExecutorMsg::GetPositions(symbols, reply) => {
-                let state = self.runner.state();
-                let positions = symbols
-                    .iter()
-                    .filter_map(|symbol| state.symbol_state(symbol))
-                    .flat_map(|symbol_state| symbol_state.position_book().all().cloned())
-                    .collect();
-                let _ = reply.send(positions);
-            }
             ExecutorMsg::GetSeededPositions(reply) => {
                 let positions = self
                     .runner

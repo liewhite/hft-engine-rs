@@ -131,13 +131,12 @@ pub enum OutcomeEvent {
 | 类别 | 接口 |
 |---|---|
 | 装配 | `setup_binance` / `setup_okx` / `setup_hyperliquid` / `setup_ibkr` → `ExchangeSetup`；`ManagerArgs { exchanges, paper }` |
-| 投产（`ManagerHandle`） | `add_strategy(spec)` / `add_strategies(specs)` / `remove_strategies(RemoveStrategies { account, symbols, exchange, flatten })`，`.await -> Result<(), ManagerError>` |
+| 投产（`ManagerHandle`） | `add_strategy(spec)` / `add_strategies(specs)`，`.await -> Result<(), ManagerError>` |
 | 账户绑定 | `StrategySpec::live(s)` / `StrategySpec::paper(s, label)` |
 | 流面 | `market_bus()` / `account_bus()` / `outcome_bus()`，观察者在构造时 `inbox.subscribe(bus, fn(&Event) -> bool, Msg::X)` |
 | 挂观察者 | `observers()`：manager 的消费者组，`spawn` / `spawn_addressed` / `spawn_periodic` |
 | 快照面 | `all_symbol_metas()`（同步）/ `live_positions().await` |
 | 入向注入 | `publish_custom_event(CustomEvent)`（同步，直接发行情总线） |
-| 晋升调度 | `Supervisor::spawn(&handle, SupervisorArgs)`，判据实现 `PromotionPolicy::decide(&SymbolPerformance) -> Decision` |
 | 启动辅助 | `run_main`（日志与告警：启动试发、退出前发完）/ `load_config` / `run_engine(args, \|handle\| ..)`（启动 → 装配 → 运行 → 唯一停机路径） |
 | 纯逻辑核心 | `StrategyRunner`（回测直接驱动它）、`ClientOrderIdGen` |
 
@@ -318,7 +317,6 @@ let positions: Result<Vec<Position>, String> = manager.live_positions().await;
 | 新策略 | 实现 `Strategy` | 否 |
 | 新交易所 | 实现 `ExchangeClient` + `AccountClient`，写一个 `setup_xxx` | 否，manager 零改动 |
 | 新数据源（回测）| 实现 `MarketDataSource` | 否 |
-| 新晋升 / 降级判据 | 实现 `PromotionPolicy` | 否 |
 | 新事件类型（用户域）| `CustomEvent` + `publish_custom_event` / `OutcomeEvent::Emit` | 否，框架只运送不理解 |
 | 新事件变体（框架域）| 给 `MarketData` / `AccountData` 加变体 | 是，且所有 `match` 会**编译失败**，漏改不了 |
 

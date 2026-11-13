@@ -160,7 +160,7 @@ impl MetricsView {
         tracing::info!(count = symbols.len(), "Metrics tracking symbols");
         self.state.register_symbols(&symbols);
         self.tracked.extend(symbols);
-        // 会话起始仓位基线（盈亏口径）与持仓镜像各记一份；重复注册（再晋升）由
+        // 会话起始仓位基线（盈亏口径）与持仓镜像各记一份；重复注册（同一 symbol 再次投产）由
         // record_baseline 的 or_insert 与 seed 的幂等各自兜住，首次值不被覆写
         for b in &baselines {
             self.record_baseline(&b.position.symbol, b.position.exchange, b.position.size);

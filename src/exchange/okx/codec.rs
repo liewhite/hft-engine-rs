@@ -427,7 +427,7 @@ impl OrderPushData {
         // 必须用 fillFee（本次成交的手续费），不能用 fee —— 后者是该订单**累计**的
         // 手续费/返佣。用累计值当单笔会让分批成交的订单手续费被反复累加：一张分 3 次
         // 成交、每次 0.1 的单被记成 0.1+0.2+0.3=0.6，实际只有 0.3（N 笔均等成交高估
-        // (N+1)/2 倍）。它进 TradingStats 的净利，进而影响 supervisor 的晋升/降级决策。
+        // (N+1)/2 倍）。它进 TradingStats 的净利与盈亏指标。
         // 顺带这也让两所口径一致：Binance 的 `n` 本就是单笔手续费。
         //
         // 走到这里说明确实有成交（上面已对 fill_sz == 0 提前返回），此时 fillFee 必然
@@ -729,7 +729,7 @@ mod trade_tests {
     ///
     /// OKX 的 `fee` 是该订单**累计**手续费/返佣，`fillFee` 才是"last filled fee"。
     /// 用累计值当单笔，分批成交的订单手续费会被反复累加（3 次均等成交高估 2 倍），
-    /// 错的数字进 TradingStats 净利，再进 supervisor 的晋升/降级决策。
+    /// 错的数字进 TradingStats 净利与盈亏指标。
     #[test]
     fn fill_fee_is_used_instead_of_cumulative_fee() {
         // 第三次推送：本次成交手续费 -0.1，而订单累计已达 -0.3

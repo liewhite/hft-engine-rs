@@ -52,7 +52,7 @@
 //! 一致"。
 //!
 //! 但策略下单用的是 executor 自己那份折叠，它经另一条分发路径（IncomeProcessor 按订阅
-//! 转发）拿 Fill —— 分发出错、或再晋升时 executor 用了更新的快照 seed，它会单独错，而上面
+//! 转发）拿 Fill —— 分发出错、或同一 symbol 再次投产时 executor 用了更新的快照 seed，它会单独错，而上面
 //! 那条比对看不见。所以每个节拍也向每个**实盘** executor 要一份它的持仓，与账本按同一判据
 //! 比对（#694）：
 //!
@@ -129,7 +129,7 @@ pub struct Reconciler {
 /// - [`Counterpart::Exchange`]：交易所 REST 读数 —— 证明「事件流」与交易所一致；
 /// - [`Counterpart::Executor`]：某个实盘 executor 的决策用持仓 —— 证明「下单依据的那份」
 ///   与事件流一致。两份都是同一条 Fill 流的确定性折叠，流对了它本该就对，但分发出错
-///   （某条 Fill 没送到某个 executor、再晋升时 executor 用了新快照）会让它单独错，
+///   （某条 Fill 没送到某个 executor、同一 symbol 再次投产时 executor 用了新快照）会让它单独错，
 ///   而那一份才是真正决定下单量的。两条比对合起来：executor ≈ 账本 ≈ 交易所。
 ///
 /// 为什么 executor 比账本、而不是直接比 REST：账本是权威，拿派生去比权威是「派生是否
@@ -186,7 +186,7 @@ impl Reconciler {
 
     /// 注册要对账的 symbol 并**原子**写入它们的持仓基线（投产握手）。
     ///
-    /// 与 executor / 观测镜像同一份快照、同一 seed 语义（幂等，重复注册是再晋升的
+    /// 与 executor / 观测镜像同一份快照、同一 seed 语义（幂等，重复注册是同一 symbol 再次投产的
     /// 正常形态）；快照与 Fill 流的竞态由 seed 内置的时刻过滤兜住。
     pub fn register(&mut self, symbols: &[Symbol], baselines: &[PositionBaseline]) {
         self.mirror.register_symbols(symbols);
@@ -1039,12 +1039,12 @@ mod tests {
         assert!(err.contains("本地 2"), "got: {err}");
     }
 
-    /// 重复注册（再晋升）不得覆写镜像存量：镜像在实例撤下期间也一直在跟 Fill
+    /// 重复注册（同一 symbol 再次投产）不得覆写镜像存量：镜像一直在跟 Fill
     #[test]
     fn re_registration_never_overwrites_the_mirror() {
         let mut r = reconciler_with(1, &[baseline_on(EX, 2.0)]);
         r.on_event(&fill(Side::Long, 1.0)); // 镜像 3.0
-        // 再晋升：新快照读到 3.0，但镜像已 seed 过 —— 静默跳过，不覆写
+        // 再次投产：新快照读到 3.0，但镜像已 seed 过 —— 静默跳过，不覆写
         r.register(
             &[SYM.to_string()],
             &[PositionBaseline {
@@ -1563,7 +1563,7 @@ mod task_tests {
     }
 
     /// 在 `root` 的 producers 组里起一个实盘 executor，出生持仓 = `size`
-    /// （模拟「再晋升时 executor 用了新快照」）
+    /// （模拟「同一 symbol 再次投产时 executor 用了新快照」）
     async fn executor_born_with(root: &Root, size: f64) -> (ChildHandle, ExecutorHandle) {
         Executor::spawn(
             &root.group("producers"),
