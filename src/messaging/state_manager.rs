@@ -166,22 +166,15 @@ impl StateManager {
 
     // ==================== 下单接口 ====================
 
-    /// 添加 pending order (由 StrategyRunner 调用，client_order_id 已生成)
+    /// 登记一张刚发出的单（由 StrategyRunner 调用：已过下单范围闸门、已赋号取整）
     ///
     /// `created_at` 由调用方注入 (实盘传接收时刻、回测传虚拟事件时刻)，避免内部读墙钟破坏
     /// 回测确定性。
-    ///
-    /// symbol 未注册（策略对未订阅 symbol 下单）时记录 error 并跳过跟踪，不 panic。
     pub fn add_pending_order(&mut self, order: Order, created_at: Timestamp) {
-        let symbol = order.symbol.clone();
-        let Some(state) = self.states.get_mut(&symbol) else {
-            tracing::error!(
-                symbol = %symbol,
-                "add_pending_order: symbol 未在 StateManager 注册，无法跟踪该订单"
-            );
-            return;
-        };
-        state.add_pending_order(order, created_at);
+        self.states
+            .get_mut(&order.symbol)
+            .expect("下单范围闸门只放行订阅范围内的币，而它们在构造时都已注册")
+            .add_pending_order(order, created_at);
     }
 
     /// 策略要撤这张单：记下「撤单已发」，`Ok` 表示该发（见 [`crate::messaging::SymbolOrders::mark_cancel_sent`]）

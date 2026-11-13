@@ -54,12 +54,16 @@ impl SubscriptionScope {
         }
     }
 
+    /// 本范围订阅了这个 (所, symbol) 吗（下单范围闸门也用它，见 `StrategyRunner`）
+    pub fn contains(&self, exchange: Exchange, symbol: &Symbol) -> bool {
+        self.symbols
+            .get(&exchange)
+            .is_some_and(|symbols| symbols.contains(symbol))
+    }
+
     fn covers(&self, delivery: &Delivery) -> bool {
         match delivery {
-            Delivery::Symbol(exchange, symbol) => self
-                .symbols
-                .get(exchange)
-                .is_some_and(|symbols| symbols.contains(*symbol)),
+            Delivery::Symbol(exchange, symbol) => self.contains(*exchange, symbol),
             Delivery::Exchange(exchange) => self.symbols.contains_key(exchange),
             Delivery::Broadcast => true,
         }

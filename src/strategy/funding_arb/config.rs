@@ -72,8 +72,9 @@ pub struct PairParams {
 }
 
 impl FundingArbConfig {
-    /// 启动期一次校验，失败拒绝启动（0 值风控等于没有风控）。
-    pub fn validate(&self) -> Result<(), String> {
+    /// 校验并合并出各币生效参数（全局默认 + pair 覆盖）：一步做完，拿到参数就是校验过的。
+    /// 失败拒绝启动（0 值风控等于没有风控）。
+    pub fn params(&self) -> Result<Vec<PairParams>, String> {
         let pos = |name: &str, v: f64| {
             if v.is_finite() && v > 0.0 {
                 Ok(())
@@ -106,7 +107,23 @@ impl FundingArbConfig {
             return Err("pairs 不能为空".into());
         }
         let mut seen = std::collections::HashSet::new();
-        for p in self.params() {
+        let mut out = Vec::with_capacity(self.pairs.len());
+        for pair in &self.pairs {
+            let p = PairParams {
+                symbol: pair.symbol.clone(),
+                open_threshold_apr: self.open_threshold_apr,
+                close_threshold_apr: self.close_threshold_apr,
+                order_notional: self.order_notional,
+                min_order_notional: self.min_order_notional,
+                max_account_leverage: self.max_account_leverage,
+                max_symbol_leverage: pair.max_symbol_leverage.unwrap_or(self.max_symbol_leverage),
+                order_distance: pair.order_distance.unwrap_or(self.order_distance),
+                requote_ratio: self.requote_ratio,
+                hedge_retry_ms: self.hedge_retry_ms,
+                min_requote_ms: self.min_requote_ms,
+                max_bbo_age_ms: self.max_bbo_age_ms,
+                max_funding_age_ms: self.max_funding_age_ms,
+            };
             if !seen.insert(p.symbol.clone()) {
                 return Err(format!("pairs 里 {} 重复", p.symbol));
             }
@@ -124,30 +141,9 @@ impl FundingArbConfig {
             if p.max_symbol_leverage > p.max_account_leverage {
                 return Err(format!("{} 单币杠杆上限大于账户杠杆上限", p.symbol));
             }
+            out.push(p);
         }
-        Ok(())
-    }
-
-    /// 各币生效参数
-    pub fn params(&self) -> Vec<PairParams> {
-        self.pairs
-            .iter()
-            .map(|p| PairParams {
-                symbol: p.symbol.clone(),
-                open_threshold_apr: self.open_threshold_apr,
-                close_threshold_apr: self.close_threshold_apr,
-                order_notional: self.order_notional,
-                min_order_notional: self.min_order_notional,
-                max_account_leverage: self.max_account_leverage,
-                max_symbol_leverage: p.max_symbol_leverage.unwrap_or(self.max_symbol_leverage),
-                order_distance: p.order_distance.unwrap_or(self.order_distance),
-                requote_ratio: self.requote_ratio,
-                hedge_retry_ms: self.hedge_retry_ms,
-                min_requote_ms: self.min_requote_ms,
-                max_bbo_age_ms: self.max_bbo_age_ms,
-                max_funding_age_ms: self.max_funding_age_ms,
-            })
-            .collect()
+        Ok(out)
     }
 }
 
@@ -168,9 +164,7 @@ mod tests {
 
     #[test]
     fn pair_overrides_win_over_defaults() {
-        let c = cfg();
-        c.validate().unwrap();
-        let p = c.params();
+        let p = cfg().params().unwrap();
         assert_eq!(p[0].order_distance, 0.0005);
         assert_eq!(p[1].order_distance, 0.001);
         assert_eq!(p[1].max_symbol_leverage, 0.1);
@@ -184,12 +178,12 @@ mod tests {
             order_distance: None,
             max_symbol_leverage: None,
         });
-        assert!(c.validate().is_err());
+        assert!(c.params().is_err());
         let mut c = cfg();
         c.max_account_leverage = 0.0;
-        assert!(c.validate().is_err());
+        assert!(c.params().is_err());
         let mut c = cfg();
         c.close_threshold_apr = 0.5;
-        assert!(c.validate().is_err(), "平仓门槛不小于开仓门槛会开了就平");
+        assert!(c.params().is_err(), "平仓门槛不小于开仓门槛会开了就平");
     }
 }

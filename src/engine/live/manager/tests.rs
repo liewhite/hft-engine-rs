@@ -217,7 +217,7 @@ impl Strategy for NeedsStreams {
         &mut self,
         _: &crate::messaging::IncomeEvent,
         _: crate::strategy::StrategyView<'_>,
-    ) -> Vec<crate::strategy::OutcomeEvent> {
+    ) -> Vec<crate::strategy::Signal> {
         Vec::new()
     }
 }
@@ -291,7 +291,7 @@ impl Strategy for WatchesBbo {
         &mut self,
         _: &crate::messaging::IncomeEvent,
         _: crate::strategy::StrategyView<'_>,
-    ) -> Vec<crate::strategy::OutcomeEvent> {
+    ) -> Vec<crate::strategy::Signal> {
         Vec::new()
     }
 }

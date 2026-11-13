@@ -42,7 +42,7 @@ pub use index_price::IndexPrice;
 pub use mark_price::MarkPrice;
 pub use market_status::MarketStatus;
 pub use market_trade::MarketTrade;
-pub use order::Order;
+pub use order::{Order, OrderIntent};
 pub use order_status::OrderStatus;
 pub use order_type::OrderType;
 pub use order_update::OrderUpdate;

@@ -7,8 +7,9 @@
 //!   - 回测 [`crate::backtest::BacktestEngine`]：单线程虚拟时间循环里同步调用 [`StrategyRunner::accepts`] /
 //!     [`StrategyRunner::on_event`]
 //!
-//! 职责：过滤订阅范围、更新 StateManager、分配 client_order_id、登记 pending、按交易所精度
-//! 取整价格与数量。
+//! 职责：过滤订阅范围、更新 StateManager、把策略的下单意图变成订单（**下单范围的唯一闸门**：
+//! (所, 币) 必须在策略的订阅范围内、有合约规格、该所已装配，否则停机；再分配 client_order_id、
+//! 按交易所精度取整价格与数量）、登记订单跟踪表（登记的就是发出的那张单）。
 //!
 //! **只取整，不换单位**：产出的订单一律**币本位** (见 [`crate::domain::Quantity`])，但价格与
 //! 数量已按交易所精度取整。两件事必须分在两处：
@@ -17,7 +18,7 @@
 //!   - 单位折算 (币 -> 张) 是**线路细节**，只发生在实盘出口，见
 //!     [`crate::exchange::ExchangeOrder`]；回测不经过那里，因此全程币本位
 
-use crate::domain::{AccountId, Exchange, Order, OrderType, Symbol, SymbolMeta};
+use crate::domain::{AccountId, Exchange, Order, OrderIntent, OrderType, Symbol, SymbolMeta};
 use crate::messaging::{IncomeEvent, StateManager, SubscriptionScope};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::collections::HashMap;
@@ -130,13 +131,14 @@ impl StrategyRunner {
         self.subscriptions.accepts(event)
     }
 
-    /// 更新状态并运行策略，返回信号 (下单已分配 id、登记 pending、按交易所精度取整；
-    /// 撤单只放行下单已受理、还开着、没有撤单在途的单，并记下「撤单已发」)。
+    /// 更新状态并运行策略，返回信号（下单意图已过范围闸门、分配订单号、按交易所精度取整并登记
+    /// 跟踪表；撤单只放行下单已受理、还开着、没有撤单在途的单，并记下「撤单已发」）。
     ///
     /// 产出订单是**币本位**且已取整；单位折算是出口的职责，见模块文档。
     ///
     /// `Err` = 订单跟踪表已说不清挂单与持仓（有单等交易所太久，见 [`crate::messaging::ORDER_STUCK_MS`]），
-    /// 或策略对没有装配的交易所下单，驱动方应停机。
+    /// 或策略对范围外的 (所, 币) 下单（见 [`Self::admit`]），驱动方应停机。同一批里闸门前已登记的单
+    /// 随停机作废：停机后不发任何新单（用户定 #710）。
     pub fn on_event(&mut self, event: &IncomeEvent) -> Result<Vec<OutcomeEvent>, String> {
         self.state.apply(event)?;
         let now = event.local_ts();
@@ -149,23 +151,15 @@ impl StrategyRunner {
         for signal in raw {
             match signal {
                 OutcomeEvent::PlaceOrders { orders, comment } => {
-                    let mut converted = Vec::with_capacity(orders.len());
-                    for mut order in orders {
-                        order.client_order_id =
-                            self.id_gen.next_id(order.exchange).ok_or_else(|| {
-                                format!(
-                                    "策略对没有装配的交易所 {} 下单（{}）",
-                                    order.exchange, order.symbol
-                                )
-                            })?;
-                        // 登记未取整的原始订单，与取整前的行为保持一致（策略比对自己
-                        // 的挂单量时看到的仍是它请求的数量）
+                    let mut admitted = Vec::with_capacity(orders.len());
+                    for intent in orders {
+                        let order = self.admit(intent)?;
                         // created_at 取当前事件时刻 (回测=虚拟时间, 确定性), 不读墙钟
                         self.state.add_pending_order(order.clone(), now);
-                        converted.push(self.round_to_exchange_precision(order));
+                        admitted.push(order);
                     }
                     out.push(OutcomeEvent::PlaceOrders {
-                        orders: converted,
+                        orders: admitted,
                         comment,
                     });
                 }
@@ -184,43 +178,57 @@ impl StrategyRunner {
                     }
                 },
                 // 自定义事件原样放行：无订单语义，不登记 pending、不过精度取整
-                emit @ OutcomeEvent::Emit(_) => out.push(emit),
+                OutcomeEvent::Emit(custom) => out.push(OutcomeEvent::Emit(custom)),
             }
         }
         Ok(out)
     }
 
-    /// 按交易所精度取整价格与数量，**保持币本位**。
+    /// 下单范围闸门 + 赋号 + 取整：把一张下单意图变成要发出的订单。
     ///
-    /// 缺少 SymbolMeta 说明策略交易了未预加载的 symbol，仅告警并按原值发出（与改造前一致；
-    /// 真正致命的单位问题由出口的 [`crate::exchange::ExchangeOrder`] 兜住 —— 那里缺 meta 会
-    /// 直接拒单）。
-    fn round_to_exchange_precision(&self, order: Order) -> Order {
-        let key = (order.exchange, order.symbol.clone());
-        let meta = match self.symbol_metas.get(&key) {
-            Some(m) => m,
-            None => {
-                tracing::warn!(
-                    exchange = %order.exchange,
-                    symbol = %order.symbol,
-                    "SymbolMeta not found, order precision not rounded"
-                );
-                return order;
-            }
-        };
-        let quantity = meta.round_coin_size_down(order.quantity);
-        let order_type = match &order.order_type {
-            OrderType::Market => OrderType::Market,
-            OrderType::Limit { price, tif } => OrderType::Limit {
-                price: meta.round_price(*price),
-                tif: *tif,
-            },
-        };
-        Order {
+    /// 三种 `Err`（都是策略写错或装配错，发出去就是不在跟踪表、不在对账名单里的真单，驱动方停机）：
+    /// (所, 币) 不在策略的订阅范围内、没有合约规格（取不了整）、该所没有装配（无从赋号）。
+    ///
+    /// 取整只取整、不换单位，**保持币本位**：数量向下取到步长（不超出策略意图），价格取最近的合法 tick。
+    /// 取整后为 0 或低于最小下单量的单照发，由出口（实盘 `ExchangeOrder` / 模拟柜台）拒掉并回报策略。
+    fn admit(&mut self, intent: OrderIntent) -> Result<Order, String> {
+        let OrderIntent {
+            exchange,
+            symbol,
+            side,
             order_type,
             quantity,
-            ..order
+            reduce_only,
+        } = intent;
+        if !self.subscriptions.contains(exchange, &symbol) {
+            return Err(format!(
+                "策略对订阅范围外的 {exchange}/{symbol} 下单（范围由 public_streams 声明）"
+            ));
         }
+        let meta = self
+            .symbol_metas
+            .get(&(exchange, symbol.clone()))
+            .ok_or_else(|| format!("{exchange}/{symbol} 没有合约规格，无法按交易所精度取整"))?;
+        let client_order_id = self
+            .id_gen
+            .next_id(exchange)
+            .ok_or_else(|| format!("策略对没有装配的交易所 {exchange} 下单（{symbol}）"))?;
+        let order_type = match order_type {
+            OrderType::Market => OrderType::Market,
+            OrderType::Limit { price, tif } => OrderType::Limit {
+                price: meta.round_price(price),
+                tif,
+            },
+        };
+        Ok(Order {
+            client_order_id,
+            exchange,
+            quantity: meta.round_coin_size_down(quantity),
+            symbol,
+            side,
+            order_type,
+            reduce_only,
+        })
     }
 }
 
@@ -231,7 +239,7 @@ mod tests {
     use crate::domain::{OrderType, Side, TimeInForce};
     use crate::exchange::SubscriptionKind;
     use crate::messaging::{IncomeEvent, MarketData};
-    use crate::strategy::{OutcomeEvent, Strategy};
+    use crate::strategy::{OutcomeEvent, Signal, Strategy};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::collections::HashSet;
@@ -256,11 +264,28 @@ mod tests {
         )]))
     }
 
-    /// 一次性下一张指定数量/价格的挂单
+    /// 一次性下一张指定 (所, 币)、数量、价格的挂单
     struct OneShot {
+        exchange: Exchange,
+        symbol: &'static str,
         quantity: Decimal,
         price: Decimal,
         placed: bool,
+    }
+
+    impl OneShot {
+        fn new(quantity: Decimal, price: Decimal) -> Self {
+            Self::at(EX, SYM, quantity, price)
+        }
+        fn at(exchange: Exchange, symbol: &'static str, quantity: Decimal, price: Decimal) -> Self {
+            Self {
+                exchange,
+                symbol,
+                quantity,
+                price,
+                placed: false,
+            }
+        }
     }
 
     impl Strategy for OneShot {
@@ -272,16 +297,15 @@ mod tests {
                 }]),
             )])
         }
-        fn on_event(&mut self, _e: &IncomeEvent, _v: StrategyView<'_>) -> Vec<OutcomeEvent> {
+        fn on_event(&mut self, _e: &IncomeEvent, _v: StrategyView<'_>) -> Vec<Signal> {
             if self.placed {
                 return Vec::new();
             }
             self.placed = true;
             vec![OutcomeEvent::PlaceOrders {
-                orders: vec![Order {
-                    id: String::new(),
-                    exchange: EX,
-                    symbol: SYM.to_string(),
+                orders: vec![OrderIntent {
+                    exchange: self.exchange,
+                    symbol: self.symbol.to_string(),
                     side: Side::Long,
                     order_type: OrderType::Limit {
                         price: self.price,
@@ -289,27 +313,28 @@ mod tests {
                     },
                     quantity: self.quantity,
                     reduce_only: false,
-                    client_order_id: String::new(),
                 }],
                 comment: "t".to_string(),
             }]
         }
     }
 
-    fn run_once(quantity: Decimal, price: Decimal) -> Order {
-        let mut runner = StrategyRunner::new(
-            Box::new(OneShot {
-                quantity,
-                price,
-                placed: false,
-            }),
+    fn runner(strategy: OneShot) -> StrategyRunner {
+        StrategyRunner::new(
+            Box::new(strategy),
             metas(),
             crate::backtest::backtest_account(),
             Box::new(SequentialClientOrderIdGen::default()),
-        );
-        let ev = IncomeEvent::market(1, 1, MarketData::Clock);
-        match runner
-            .on_event(&ev)
+        )
+    }
+
+    fn clock() -> IncomeEvent {
+        IncomeEvent::market(1, 1, MarketData::Clock)
+    }
+
+    fn run_once(quantity: Decimal, price: Decimal) -> Order {
+        match runner(OneShot::new(quantity, price))
+            .on_event(&clock())
             .expect("无报错")
             .into_iter()
             .next()
@@ -320,7 +345,7 @@ mod tests {
         }
     }
 
-    /// 产出订单必须仍是**币本位**（单位折算是出口的事），但已按交易所精度取整。
+    /// 产出订单必须仍是**币本位**（单位折算是出口的事），但已按交易所精度取整、已赋号。
     /// 这条同时守住回测：`SimState` 拿到的就是这个订单。
     #[test]
     fn emitted_order_is_coin_denominated_and_rounded() {
@@ -335,33 +360,51 @@ mod tests {
             OrderType::Limit { price, .. } => assert_eq!(price, dec!(62500.2)),
             OrderType::Market => panic!("expected limit"),
         }
+        assert_eq!(order.client_order_id, "bt0");
     }
 
-    /// pending 登记的是策略请求的原始数量（未取整），与改造前行为一致
+    /// 跟踪表登记的就是发出的那张单（取整后的量）：拿成交与单量比较时（#796）口径与交易所一致
     #[test]
-    fn pending_order_keeps_strategy_requested_quantity() {
-        let mut runner = StrategyRunner::new(
-            Box::new(OneShot {
-                quantity: dec!(0.125),
-                price: dec!(62_500.0),
-                placed: false,
-            }),
-            metas(),
-            crate::backtest::backtest_account(),
-            Box::new(SequentialClientOrderIdGen::default()),
-        );
-        let ev = IncomeEvent::market(1, 1, MarketData::Clock);
-        runner.on_event(&ev).unwrap();
+    fn tracked_order_is_the_rounded_order_sent() {
+        let mut runner = runner(OneShot::new(dec!(0.125), dec!(62_500.0)));
+        runner.on_event(&clock()).unwrap();
         let state = runner
             .state()
             .symbol_state(&SYM.to_string())
             .expect("state");
-        let pending: Vec<Decimal> = state
+        let pending: Vec<(Decimal, &str)> = state
             .order_book()
             .iter()
-            .map(|p| p.order.quantity)
+            .map(|p| (p.order.quantity, p.order.client_order_id.as_str()))
             .collect();
-        assert_eq!(pending, vec![dec!(0.125)]);
+        assert_eq!(pending, vec![(dec!(0.12), "bt0")]);
+    }
+
+    /// 下单范围闸门：订阅范围外的 (所, 币) 不发、不登记，报错让驱动方停机
+    #[test]
+    fn orders_outside_the_subscription_scope_stop_the_engine() {
+        for (exchange, symbol) in [(EX, "ETH"), (Exchange::Binance, SYM)] {
+            let mut runner = runner(OneShot::at(exchange, symbol, dec!(1), dec!(1)));
+            let err = runner.on_event(&clock()).expect_err("范围外下单应报错");
+            assert!(err.contains("订阅范围外"), "{err}");
+            assert!(runner
+                .state()
+                .symbol_state(&SYM.to_string())
+                .is_some_and(|s| !s.order_book().has_pending()));
+        }
+    }
+
+    /// 范围内但没有合约规格（取不了整）同样停机，不按原值照发
+    #[test]
+    fn orders_without_symbol_meta_stop_the_engine() {
+        let mut runner = StrategyRunner::new(
+            Box::new(OneShot::new(dec!(1), dec!(1))),
+            Arc::new(HashMap::new()),
+            crate::backtest::backtest_account(),
+            Box::new(SequentialClientOrderIdGen::default()),
+        );
+        let err = runner.on_event(&clock()).expect_err("缺规格应报错");
+        assert!(err.contains("没有合约规格"), "{err}");
     }
 
     /// **范围是从 `public_streams()` 推导出来的**。
@@ -372,11 +415,7 @@ mod tests {
     #[test]
     fn the_scope_is_derived_from_the_strategys_declared_streams() {
         let runner = StrategyRunner::new(
-            Box::new(OneShot {
-                quantity: dec!(1.0),
-                price: dec!(1.0),
-                placed: false,
-            }),
+            Box::new(OneShot::new(dec!(1.0), dec!(1.0))),
             metas(),
             crate::domain::AccountId::Live,
             Box::new(SequentialClientOrderIdGen::default()),

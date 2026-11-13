@@ -277,7 +277,6 @@ async fn place_test_order(side: Side) {
 
     let cli_id = hft_engine_rs::exchange::hyperliquid::CLIENT_ORDER_IDS.generate();
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::Hyperliquid,
         symbol,
         side,

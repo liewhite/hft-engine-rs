@@ -4,7 +4,8 @@
 use hft_engine_rs::backtest::{BacktestEngine, BacktestResult, MarketDataSource};
 use hft_engine_rs::domain::PriceStep;
 use hft_engine_rs::domain::{
-    dec, Exchange, Order, OrderType, Price, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
+    dec, Exchange, OrderIntent, OrderType, Price, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
+    BBO,
 };
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::SubscriptionKind;
@@ -12,7 +13,7 @@ use hft_engine_rs::messaging::{
     AccountData, ExchangeAccountData, IncomeEvent, MarketData, SymbolAccountData,
 };
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
+use hft_engine_rs::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -93,7 +94,7 @@ impl Strategy for OneShotBuy {
         m.insert(EX, kinds);
         m
     }
-    fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<Signal> {
         let is_market = matches!(
             event,
             IncomeEvent::Market(m) if matches!(m.data, MarketData::BBO(_) | MarketData::MarketTrade(_))
@@ -101,8 +102,7 @@ impl Strategy for OneShotBuy {
         if is_market && !self.placed {
             self.placed = true;
             return vec![OutcomeEvent::PlaceOrders {
-                orders: vec![Order {
-                    id: String::new(),
+                orders: vec![OrderIntent {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     side: Side::Long,
@@ -112,7 +112,6 @@ impl Strategy for OneShotBuy {
                     },
                     quantity: dec!(1.0),
                     reduce_only: false,
-                    client_order_id: String::new(),
                 }],
                 comment: "buy".to_string(),
             }];
@@ -258,7 +257,7 @@ impl Strategy for EmitOnBbo {
         m.insert(EX, kinds);
         m
     }
-    fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<Signal> {
         let IncomeEvent::Market(m) = event else {
             return Vec::new();
         };
@@ -342,7 +341,7 @@ impl Strategy for CustomProbe {
         m.insert(EX, kinds);
         m
     }
-    fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<Signal> {
         if let IncomeEvent::Market(m) = event {
             if let MarketData::Custom(c) = &m.data {
                 if let Some(Tag(t)) = c.get::<Tag>() {

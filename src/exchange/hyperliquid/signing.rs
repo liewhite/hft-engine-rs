@@ -161,9 +161,9 @@ pub struct OrderWire {
     /// Order type
     #[serde(rename = "t")]
     pub order_type: OrderType,
-    /// Client order ID (optional)
-    #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
-    pub cloid: Option<String>,
+    /// Client order ID（本引擎的单都带）
+    #[serde(rename = "c")]
+    pub cloid: String,
 }
 
 /// 订单类型

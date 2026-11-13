@@ -1,6 +1,6 @@
 use crate::domain::{
-    Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, Position, Quantity, Symbol,
-    Timestamp, BBO,
+    Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderId, OrderStatus, Position, Quantity,
+    Symbol, Timestamp, BBO,
 };
 use crate::messaging::event::{MarketData, OrderRequestResult, RequestOutcome, SymbolAccountData};
 use std::collections::HashMap;
@@ -22,8 +22,11 @@ pub const ORDER_STUCK_MS: u64 = 60_000;
 /// 生命周期是一个状态机（[`OrderStage`]），只能由下面的转换方法推进；字段不对外可写。
 #[derive(Debug, Clone)]
 pub struct PendingOrder {
+    /// 发出的那张单（已取整，数量与交易所看到的一致）
     pub order: Order,
     pub created_at: Timestamp,
+    /// 交易所订单号：下单受理或第一条订单回报到了才有（只用于排查日志）
+    exchange_order_id: Option<OrderId>,
     /// 按客户端订单号收到的成交之和（币）
     filled: Quantity,
     /// 交易所回报里的累计成交（币，取见过的最大值）
@@ -66,6 +69,7 @@ impl PendingOrder {
         Self {
             order,
             created_at,
+            exchange_order_id: None,
             filled: Quantity::ZERO,
             reported_filled: Quantity::ZERO,
             stage: OrderStage::Placing,
@@ -111,8 +115,7 @@ impl PendingOrder {
     /// 要撤这张单：`Ok` = 该发撤单，已记为撤单在途；`Err` 带不发的原因。
     ///
     /// 收到的成交已加满单量的也不发：交易所那边已经成交完，终态回报还在路上（成交常先于终态到，策略
-    /// 被这笔成交唤醒、要撤挂单时它看着还开着，#796 OKX 51400）。单量是策略请求的量（未按交易所精度取整），
-    /// 取整后变小的单成交加不满它，那时退回原样：多发一次撤单、交易所报撤单失败，无害。
+    /// 被这笔成交唤醒、要撤挂单时它看着还开着，#796 OKX 51400）。单量是取整后发出的量，与成交同一口径。
     fn request_cancel(&mut self, now: Timestamp) -> Result<(), &'static str> {
         self.stage = match &self.stage {
             OrderStage::Placing => return Err("下单请求还没结论"),
@@ -557,9 +560,8 @@ impl SymbolOrders {
             return;
         };
         p.reported_filled = p.reported_filled.max(update.filled_quantity);
-        if p.order.id.is_empty() {
-            p.order.id = update.order_id.clone();
-        }
+        p.exchange_order_id
+            .get_or_insert_with(|| update.order_id.clone());
         p.on_report(&update.status, local_ts);
         self.settle(symbol, client_id);
     }
@@ -582,9 +584,7 @@ impl SymbolOrders {
         };
         match &r.outcome {
             RequestOutcome::Placed { order_id } => {
-                if p.order.id.is_empty() {
-                    p.order.id = order_id.clone();
-                }
+                p.exchange_order_id.get_or_insert_with(|| order_id.clone());
                 p.on_placed();
             }
             RequestOutcome::PlaceRejected { reason } => {
@@ -624,9 +624,9 @@ impl SymbolOrders {
                 let waited = now.saturating_sub(since);
                 if waited > ORDER_STUCK_MS {
                     return Err(format!(
-                        "{symbol} {} 订单 {client_id}（交易所号 {}）{what}已 {waited}ms：{:?}，收到成交 {}，交易所说累计 {}。\
+                        "{symbol} {} 订单 {client_id}（交易所号 {:?}）{what}已 {waited}ms：{:?}，收到成交 {}，交易所说累计 {}。\
                          跟踪表说不清这张单和持仓，停机交人工核对挂单与持仓",
-                        p.order.exchange, p.order.id, p.stage, p.filled, p.reported_filled
+                        p.order.exchange, p.exchange_order_id, p.stage, p.filled, p.reported_filled
                     ));
                 }
             }
@@ -892,7 +892,6 @@ mod tests {
 
     fn tracked_order(qty: Decimal) -> Order {
         Order {
-            id: String::new(),
             exchange: EX,
             symbol: SYMBOL.to_string(),
             side: Side::Long,
@@ -1040,7 +1039,10 @@ mod tests {
             ),
         );
         let p = the_order(&state).unwrap();
-        assert_eq!((p.stage(), p.order.id.as_str()), (&OrderStage::Live, "77"));
+        assert_eq!(
+            (p.stage(), p.exchange_order_id.as_deref()),
+            (&OrderStage::Live, Some("77"))
+        );
 
         state.mark_cancel_sent(CID, 2).unwrap();
         assert_eq!(

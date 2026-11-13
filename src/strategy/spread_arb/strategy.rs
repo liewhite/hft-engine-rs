@@ -1,10 +1,10 @@
 use crate::domain::{
-    dec, from_f64, to_f64, Decimal, Exchange, Order, OrderType, Price, Quantity, Side, Symbol,
-    TimeInForce, Timestamp,
+    dec, from_f64, to_f64, Decimal, Exchange, OrderIntent, OrderType, Price, Quantity, Side,
+    Symbol, TimeInForce, Timestamp,
 };
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{IncomeEvent, MarketData, MarketEvent};
-use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
+use crate::strategy::{OutcomeEvent, Signal, Strategy, StrategyView, SymbolView};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -746,7 +746,7 @@ impl SpreadArbStrategy {
     }
 
     /// 根据处理后的信号生成订单列表
-    fn make_orders(&self, signal: &TradingSignal) -> Vec<Order> {
+    fn make_orders(&self, signal: &TradingSignal) -> Vec<OrderIntent> {
         // 计算带滑点的价格（模拟市价单）
         // short_price 是 bid，做空用 bid - slippage
         // long_price 是 ask，做多用 ask + slippage
@@ -765,8 +765,7 @@ impl SpreadArbStrategy {
         let mut orders = Vec::new();
 
         if signal.short_size > Decimal::ZERO {
-            orders.push(Order {
-                id: String::new(),
+            orders.push(OrderIntent {
                 exchange: signal.short_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Short,
@@ -776,13 +775,11 @@ impl SpreadArbStrategy {
                 },
                 quantity: signal.short_size,
                 reduce_only: false,
-                client_order_id: String::new(),
             });
         }
 
         if signal.long_size > Decimal::ZERO {
-            orders.push(Order {
-                id: String::new(),
+            orders.push(OrderIntent {
                 exchange: signal.long_exchange,
                 symbol: self.symbol.clone(),
                 side: Side::Long,
@@ -792,7 +789,6 @@ impl SpreadArbStrategy {
                 },
                 quantity: signal.long_size,
                 reduce_only: false,
-                client_order_id: String::new(),
             });
         }
 
@@ -905,7 +901,7 @@ impl Strategy for SpreadArbStrategy {
         streams
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal> {
         // 获取本策略关注的 symbol 状态
         let Some(symbol_state) = view.symbol(&self.symbol) else {
             return vec![];

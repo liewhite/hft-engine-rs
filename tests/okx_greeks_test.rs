@@ -13,7 +13,7 @@ use hft_engine_rs::exchange::{AccountStream, ExchangeAccess, SubscriptionKind};
 
 const TEST_QUOTE: &str = "USDT";
 use hft_engine_rs::messaging::{AccountData, ExchangeAccountData, IncomeEvent};
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
+use hft_engine_rs::strategy::{Strategy, StrategyView};
 use hft_engine_rs::tasks::Root;
 use std::collections::{HashMap, HashSet};
 
@@ -49,7 +49,11 @@ impl Strategy for GreeksPrintStrategy {
         HashMap::from([(Exchange::OKX, HashSet::from([AccountStream::Greeks]))])
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn on_event(
+        &mut self,
+        event: &IncomeEvent,
+        view: StrategyView<'_>,
+    ) -> Vec<hft_engine_rs::strategy::Signal> {
         if let IncomeEvent::Account(a) = event {
             if let AccountData::Exchange(ExchangeAccountData::Greeks(raw)) = &a.data {
                 // view.greeks() 返回修正后的 delta (含现货 cashBal)

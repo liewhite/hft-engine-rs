@@ -609,7 +609,6 @@ mod gateway_tests {
 
     fn order() -> Order {
         Order {
-            id: String::new(),
             exchange: EX,
             symbol: SYM.to_string(),
             side: Side::Short,

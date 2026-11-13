@@ -211,7 +211,6 @@ async fn test_ibkr_limit_buy() {
     println!("下单价格: {} (格式化后: {})", mid_price, price);
 
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::IBKR,
         symbol,
         side: Side::Long,
@@ -260,7 +259,6 @@ async fn test_ibkr_limit_sell() {
     println!("下单价格: {} (格式化后: {})", mid_price, price);
 
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::IBKR,
         symbol,
         side: Side::Short,
@@ -441,7 +439,6 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .unwrap();
 
     let buy_order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::IBKR,
         symbol: symbol.clone(),
         side: Side::Long,
@@ -507,7 +504,6 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .unwrap();
 
     let sell_order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::IBKR,
         symbol: symbol.clone(),
         side: Side::Short,

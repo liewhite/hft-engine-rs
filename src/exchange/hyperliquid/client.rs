@@ -305,11 +305,7 @@ impl HyperliquidClient {
             sz: decimal_to_wire(order.quantity)?,
             reduce_only: order.reduce_only,
             tif,
-            cloid: if order.client_order_id.is_empty() {
-                None
-            } else {
-                Some(order.client_order_id.clone())
-            },
+            cloid: order.client_order_id.clone(),
         })
     }
 

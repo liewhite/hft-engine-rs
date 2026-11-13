@@ -11,19 +11,23 @@ pub use gamma_scalp::GammaScalpStrategy;
 pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
 pub use view::{StrategyView, SymbolView};
 
-use crate::domain::{Exchange, Order, Symbol, Timestamp};
+use crate::domain::{Exchange, Order, OrderIntent, Symbol, Timestamp};
 use crate::exchange::{AccountStream, SubscriptionKind};
 use crate::messaging::{CustomEvent, IncomeEvent};
 use crate::observability::Gauge;
 use std::collections::{HashMap, HashSet};
 
-/// 策略输出的信号
+/// 策略产出的信号：下单只给意图（[`OrderIntent`]，没有订单号、未取整）
+pub type Signal = OutcomeEvent<OrderIntent>;
+
+/// 信号。两段生命用同一个枚举、只有单的类型不同：策略产出 [`Signal`]（下单意图），
+/// 框架（`StrategyRunner`）查范围、赋号、取整后发到出向总线的是 `OutcomeEvent<Order>`。
 #[derive(Debug, Clone)]
-pub enum OutcomeEvent {
+pub enum OutcomeEvent<O = Order> {
     /// 下单信号（一次决策可包含多个关联订单）
     PlaceOrders {
         /// 关联订单列表
-        orders: Vec<Order>,
+        orders: Vec<O>,
         /// 信号意图描述，如 "spread_open | spread=0.30% | qty=10"
         comment: String,
     },
@@ -71,7 +75,10 @@ pub trait Strategy: Send + Sync {
     ///
     /// `view` 是**本策略订阅范围内**的状态视图（见 [`StrategyView`]），按值传入且不可
     /// 跨事件持有 —— 引擎状态容器不作为策略契约的一部分暴露。
-    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent>;
+    ///
+    /// 下单意图只能落在本策略订阅的 (所, 币) 上（[`Self::public_streams`] 声明的范围）：范围外的
+    /// 单框架不发，整机停机（策略写错了，发出去就是不在跟踪表、不在对账名单里的真单）。
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal>;
 
     /// 策略自己的观测读数（如信号输入、当前判断、是否停止交易），只读快照。
     ///

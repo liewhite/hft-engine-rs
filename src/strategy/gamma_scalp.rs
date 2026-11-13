@@ -16,12 +16,12 @@
 //! (买卖间距同为 `base_offset_ratio`)，是 gamma scalp 的最小核心形态。
 
 use crate::domain::{
-    dec, from_f64, to_f64, Decimal, Exchange, Order, OrderType, Price, Quantity, Side, Symbol,
-    TimeInForce,
+    dec, from_f64, to_f64, Decimal, Exchange, OrderIntent, OrderType, Price, Quantity, Side,
+    Symbol, TimeInForce,
 };
 use crate::exchange::{AccountStream, SubscriptionKind};
 use crate::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData, PendingOrder};
-use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
+use crate::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
 
 /// 对冲数量相对目标漂移超该比例则撤单重挂 (默认值)
@@ -93,7 +93,7 @@ impl GammaScalpStrategy {
         }
     }
 
-    fn hedge(&mut self, ref_price: Price, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn hedge(&mut self, ref_price: Price, view: StrategyView<'_>) -> Vec<Signal> {
         let Some(symbol_state) = view.symbol(&self.symbol) else {
             return Vec::new();
         };
@@ -121,7 +121,7 @@ impl GammaScalpStrategy {
         qty: Quantity,
         price: Price,
         net_delta: f64,
-    ) -> Vec<OutcomeEvent> {
+    ) -> Vec<Signal> {
         match pending {
             Some(p) => match p.order.order_type {
                 OrderType::Limit { .. } => {
@@ -142,8 +142,7 @@ impl GammaScalpStrategy {
                     Vec::new()
                 } else {
                     vec![OutcomeEvent::PlaceOrders {
-                        orders: vec![Order {
-                            id: String::new(),
+                        orders: vec![OrderIntent {
                             exchange: self.exchange,
                             symbol: self.symbol.clone(),
                             side,
@@ -153,7 +152,6 @@ impl GammaScalpStrategy {
                             },
                             quantity: qty,
                             reduce_only: false,
-                            client_order_id: String::new(),
                         }],
                         comment: format!(
                             "gamma_hedge | {side:?} netDelta={net_delta:.4} qty={qty:.4} px={price:.4}"
@@ -166,7 +164,7 @@ impl GammaScalpStrategy {
 
     /// 撤掉对冲单。下单还没受理、已结束、撤单还在途的单由框架丢弃（见 `OutcomeEvent::CancelOrder`），这里不用记；
     /// 被丢弃的撤单在下一次重算（逐笔成交或 greeks 事件）时再发
-    fn cancel(&self, pending: &PendingOrder) -> OutcomeEvent {
+    fn cancel(&self, pending: &PendingOrder) -> Signal {
         tracing::debug!(
             symbol = %self.symbol,
             client_order_id = %pending.order.client_order_id,
@@ -199,7 +197,7 @@ impl Strategy for GammaScalpStrategy {
         HashMap::from([(self.exchange, HashSet::from([AccountStream::Greeks]))])
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal> {
         match event {
             // 逐笔成交：以最新成交价为基准评估对冲
             IncomeEvent::Market(m) => match &m.data {

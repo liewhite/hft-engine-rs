@@ -14,7 +14,7 @@ use anyhow::Context;
 use chrono::NaiveDate;
 use hft_engine_rs::backtest::{BacktestEngine, BinanceDataKind, BinanceHistory};
 use hft_engine_rs::domain::{
-    dec, Decimal, Exchange, Order, OrderType, Price, Quantity, Side, Symbol, SymbolMeta,
+    dec, Decimal, Exchange, OrderIntent, OrderType, Price, Quantity, Side, Symbol, SymbolMeta,
     TimeInForce,
 };
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
@@ -22,7 +22,7 @@ use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
 use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, SymbolAccountData};
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
+use hft_engine_rs::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -54,10 +54,9 @@ impl MeanRevertMaker {
         qty: Quantity,
         reduce_only: bool,
         comment: &str,
-    ) -> OutcomeEvent {
+    ) -> Signal {
         OutcomeEvent::PlaceOrders {
-            orders: vec![Order {
-                id: String::new(),
+            orders: vec![OrderIntent {
                 exchange: EX,
                 symbol: self.symbol.clone(),
                 side,
@@ -67,7 +66,6 @@ impl MeanRevertMaker {
                 },
                 quantity: qty,
                 reduce_only,
-                client_order_id: String::new(),
             }],
             comment: comment.to_string(),
         }
@@ -86,7 +84,7 @@ impl Strategy for MeanRevertMaker {
         m
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal> {
         // 自己跟成交维护开仓成本（加权平均；平完即清零）
         if let IncomeEvent::Account(a) = event {
             let AccountData::Symbol(SymbolAccountData::Fill(f)) = &a.data else {

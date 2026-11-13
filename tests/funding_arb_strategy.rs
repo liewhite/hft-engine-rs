@@ -96,7 +96,7 @@ impl Sim {
     }
 
     fn bare_with_min(legs: &[(Exchange, Decimal)], mins: &[(Exchange, f64)]) -> Self {
-        let p = config().params().remove(0);
+        let p = config().params().unwrap().remove(0);
         let exchanges: Vec<Exchange> = legs.iter().map(|(e, _)| *e).collect();
         let min_of = |ex: Exchange| mins.iter().find(|(e, _)| *e == ex).map_or(0.0, |(_, m)| *m);
         let mut runner = StrategyRunner::new(
@@ -994,6 +994,22 @@ fn rejected_maker_backs_off_per_exchange() {
     s.confirm(&third[0], OrderStatus::Rejected { reason: "x".into() });
     s.advance(1000);
     assert_eq!(placed(&s.bbo(BN)).len(), 1, "被接下后退避应清零");
+}
+
+/// 同一张单的拒单经下单请求的结论与订单回报各到一次，只算一次：等待不翻倍
+#[test]
+fn one_rejected_order_counts_once_across_both_channels() {
+    let mut s = Sim::new(dec!(0.0), dec!(0.0));
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    let bn = o.iter().find(|o| o.exchange == BN).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&hl, OrderStatus::Pending);
+
+    s.confirm(&bn, OrderStatus::Rejected { reason: "x".into() });
+    s.reject(&bn);
+    s.advance(1000);
+    assert_eq!(placed(&s.bbo(BN)).len(), 1, "一张单被拒一次，应只等 1000ms");
 }
 
 /// 看板读数：各所年化、年化差、当前信号（开仓在哪对所）、未停机

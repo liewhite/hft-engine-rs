@@ -572,8 +572,7 @@ impl AccountClient for OkxClient {
             px: Option<String>,
             #[serde(skip_serializing_if = "std::ops::Not::not")]
             reduce_only: bool,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            cl_ord_id: Option<String>,
+            cl_ord_id: String,
         }
 
         let admitted = LIMITER.action(&[PLACE.cost_in(&inst_id, 1), PLACE_ACCOUNT.cost(1)])?;
@@ -585,11 +584,7 @@ impl AccountClient for OkxClient {
             sz,
             px: price,
             reduce_only,
-            cl_ord_id: if order.client_order_id.is_empty() {
-                None
-            } else {
-                Some(order.client_order_id.clone())
-            },
+            cl_ord_id: order.client_order_id.clone(),
         };
 
         let body = serde_json::to_string(&request).map_err(PlaceError::unsent)?;

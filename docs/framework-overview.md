@@ -96,7 +96,7 @@ pub trait Strategy: Send + Sync {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>>;
 
     /// 唯一的事件入口。行情、私有回报、账户读数、券源汇率、Clock 全部经此到达。
-    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent>;
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal>;
 }
 ```
 
@@ -120,12 +120,17 @@ pub trait Strategy: Send + Sync {
 产出：
 
 ```rust
-pub enum OutcomeEvent {
-    PlaceOrders { orders: Vec<Order>, comment: String },
-    CancelOrder { exchange, symbol, order_id, client_order_id },
+pub type Signal = OutcomeEvent<OrderIntent>;   // 策略产出
+pub enum OutcomeEvent<O = Order> {             // StrategyRunner 处理后发往出口的是 OutcomeEvent<Order>
+    PlaceOrders { orders: Vec<O>, comment: String },
+    CancelOrder { exchange, symbol, client_order_id },
     Emit(CustomEvent),   // 发给外部订阅者，下单出口对它 no-op
 }
 ```
+
+策略只给下单意图 `OrderIntent`（所、币、方向、类型、数量、只减仓），没有订单号、不必取整。
+`StrategyRunner` 是**下单范围的唯一闸门**：(所, 币) 不在本策略订阅范围内、没有合约规格或该所没装配，
+整机停机；否则分配客户端订单号、按交易所精度取整成 `Order`，登记进订单跟踪表的就是这张发出的单。
 
 ### 3.2 `engine` —— 装配与运行时
 

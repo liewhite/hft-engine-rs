@@ -26,7 +26,7 @@
 
 use anyhow::Context;
 use hft_engine_rs::domain::{
-    from_f64, to_f64, Decimal, Exchange, Order, OrderType, Side, Symbol, TimeInForce,
+    from_f64, to_f64, Decimal, Exchange, OrderIntent, OrderType, Side, Symbol, TimeInForce,
 };
 use hft_engine_rs::engine::{
     load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, StrategySpec,
@@ -34,7 +34,7 @@ use hft_engine_rs::engine::{
 use hft_engine_rs::exchange::SubscriptionKind;
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
+use hft_engine_rs::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -75,7 +75,7 @@ impl Strategy for DipMaker {
         HashMap::from([(self.exchange, kinds)])
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal> {
         let IncomeEvent::Market(MarketEvent {
             data: MarketData::BBO(bbo),
             ..
@@ -103,8 +103,7 @@ impl Strategy for DipMaker {
             return Vec::new();
         };
         vec![OutcomeEvent::PlaceOrders {
-            orders: vec![Order {
-                id: String::new(),
+            orders: vec![OrderIntent {
                 exchange: self.exchange,
                 symbol: bbo.symbol.clone(),
                 side: Side::Long,
@@ -114,7 +113,6 @@ impl Strategy for DipMaker {
                 },
                 quantity,
                 reduce_only: false,
-                client_order_id: String::new(),
             }],
             comment: format!(
                 "paper_dip_buy | bid={} | offset={}bp | notional={}",

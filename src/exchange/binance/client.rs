@@ -713,9 +713,7 @@ impl AccountClient for BinanceClient {
             params.push(("timeInForce", t));
         }
 
-        if !order.client_order_id.is_empty() {
-            params.push(("newClientOrderId", &order.client_order_id));
-        }
+        params.push(("newClientOrderId", &order.client_order_id));
 
         // 下单不占 IP 权重，占账户下单数；签名放在取额度之后
         let admitted = LIMITER.action(&[ORDERS_10S.cost(1), ORDERS_1M.cost(1)])?;

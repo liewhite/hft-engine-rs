@@ -111,7 +111,6 @@ async fn test_hyperliquid_limit_buy() {
     let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple());
     // 构造限价买单
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::Hyperliquid,
         symbol,
         side: Side::Long,
@@ -168,7 +167,6 @@ async fn test_hyperliquid_limit_sell() {
     let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple());
     // 构造限价卖单
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::Hyperliquid,
         symbol,
         side: Side::Short,

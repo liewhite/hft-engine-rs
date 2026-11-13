@@ -84,7 +84,6 @@ async fn test_binance_limit_buy() {
 
     // 构造限价买单
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::Binance,
         symbol,
         side: Side::Long,
@@ -131,7 +130,6 @@ async fn test_binance_limit_sell() {
 
     // 构造限价卖单
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::Binance,
         symbol,
         side: Side::Short,

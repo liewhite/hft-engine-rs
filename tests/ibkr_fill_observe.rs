@@ -150,7 +150,6 @@ async fn ibkr_fill_observe() {
         .unwrap();
     let client_oid = hft_engine_rs::exchange::ibkr::CLIENT_ORDER_IDS.generate();
     let order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::IBKR,
         symbol: symbol.clone(),
         side: Side::Long,
@@ -230,7 +229,6 @@ async fn ibkr_fill_observe() {
         .parse()
         .unwrap();
     let sell_order = Order {
-        id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::IBKR,
         symbol: symbol.clone(),
         side: Side::Short,

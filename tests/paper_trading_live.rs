@@ -26,7 +26,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{
-    AccountId, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
+    AccountId, Exchange, OrderIntent, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
 use hft_engine_rs::engine::{
     AccountBinding, AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, Metrics,
@@ -39,7 +39,7 @@ use hft_engine_rs::messaging::{
     SymbolAccountData,
 };
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
+use hft_engine_rs::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
 use hft_engine_rs::tasks::{Inbox, Root, Scope, Task};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -93,7 +93,7 @@ impl Strategy for DipMaker {
         )])
     }
 
-    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal> {
         let IncomeEvent::Market(MarketEvent {
             data: MarketData::BBO(bbo),
             ..
@@ -116,8 +116,7 @@ impl Strategy for DipMaker {
         let price = bbo.bid_price * (Decimal::ONE - OFFSET_BP / dec!(10000));
         self.0.lock().unwrap().limit_price = Some(price);
         vec![OutcomeEvent::PlaceOrders {
-            orders: vec![Order {
-                id: String::new(),
+            orders: vec![OrderIntent {
                 exchange: EX,
                 symbol: COIN.to_string(),
                 side: Side::Long,
@@ -127,7 +126,6 @@ impl Strategy for DipMaker {
                 },
                 quantity: ORDER_QTY,
                 reduce_only: false,
-                client_order_id: String::new(),
             }],
             comment: format!(
                 "paper_dip_buy | bid={} | offset={OFFSET_BP}bp",

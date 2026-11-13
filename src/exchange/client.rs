@@ -418,7 +418,6 @@ mod tests {
 
     fn coin_order(quantity: Decimal, price: Decimal) -> Order {
         Order {
-            id: String::new(),
             exchange: Exchange::OKX,
             symbol: "BTC".to_string(),
             side: Side::Long,

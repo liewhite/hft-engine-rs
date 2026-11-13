@@ -63,8 +63,8 @@ pub(crate) struct HlOrderIntent {
     pub sz: String,
     pub reduce_only: bool,
     pub tif: HlTif,
-    /// `0x` + 32 位小写十六进制
-    pub cloid: Option<String>,
+    /// 客户端订单号：`0x` + 32 位小写十六进制
+    pub cloid: String,
 }
 
 /// 一笔撤单意图（按客户端订单号 cloid：`0x` + 32 位小写十六进制）
@@ -333,17 +333,15 @@ fn classify_signer_reply(status: u16, body: Value) -> Result<Value, PlaceError> 
 #[async_trait]
 impl HlSubmitter for EnclaveSubmitter {
     async fn place(&self, o: &HlOrderIntent, admitted: Admitted) -> Result<Value, PlaceError> {
-        let mut order = json!({
+        let order = json!({
             "coin": o.coin,
             "isBuy": o.is_buy,
             "sz": o.sz,
             "limitPx": o.limit_px,
             "orderType": {"limit": {"tif": o.tif.as_str()}},
             "reduceOnly": o.reduce_only,
+            "cloid": o.cloid,
         });
-        if let Some(cloid) = &o.cloid {
-            order["cloid"] = json!(cloid);
-        }
         self.exchange(
             json!({"type": "order", "grouping": "na", "orders": [order]}),
             admitted,

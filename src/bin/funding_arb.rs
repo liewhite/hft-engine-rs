@@ -54,9 +54,9 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let config: Config = load_config("config.json")?;
-    config
+    let params = config
         .strategy
-        .validate()
+        .params()
         .map_err(|e| anyhow::anyhow!("strategy 配置非法: {e}"))?;
     anyhow::ensure!(config.funding_poll_secs > 0, "funding_poll_secs 必须 > 0");
     // 每项数据一轮刷新一次：留出一整轮失败的余量（两轮 ≤ 最大可用年龄），否则数据会周期性过期，
@@ -101,7 +101,7 @@ async fn run() -> anyhow::Result<()> {
         let mut specs = Vec::new();
         let mut coverage: Vec<(Symbol, Vec<Exchange>)> = Vec::new();
         let mut lonely: Vec<String> = Vec::new();
-        for p in config.strategy.params() {
+        for p in params {
             let on: Vec<SymbolMeta> = exchanges
                 .iter()
                 .filter_map(|&ex| manager.symbol_meta(ex, &p.symbol))

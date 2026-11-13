@@ -1804,7 +1804,7 @@ mod task_tests {
             &mut self,
             _event: &crate::messaging::IncomeEvent,
             _view: crate::strategy::StrategyView<'_>,
-        ) -> Vec<crate::strategy::OutcomeEvent> {
+        ) -> Vec<crate::strategy::Signal> {
             Vec::new()
         }
     }

@@ -713,7 +713,6 @@ mod tests {
     }
     fn limit(side: Side, price: Price, tif: TimeInForce, cid: &str) -> Order {
         Order {
-            id: String::new(),
             exchange: EX,
             symbol: sym(),
             side,
@@ -725,7 +724,6 @@ mod tests {
     }
     fn limit_ro(side: Side, price: Price, tif: TimeInForce, cid: &str, qty: Quantity) -> Order {
         Order {
-            id: String::new(),
             exchange: EX,
             symbol: sym(),
             side,

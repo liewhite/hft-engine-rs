@@ -591,7 +591,6 @@ mod tests {
 
         async fn place_tif(&self, side: Side, price: Decimal, qty: Decimal, tif: TimeInForce) {
             let order = Order {
-                id: String::new(),
                 exchange: EX,
                 symbol: SYM.to_string(),
                 side,
@@ -684,7 +683,6 @@ mod tests {
         let h = Harness::new(0).await;
         // 在 OKX 上下一单，惰性开出 (账户, OKX) 柜台
         let order = Order {
-            id: String::new(),
             exchange: Exchange::OKX,
             symbol: SYM.to_string(),
             side: Side::Long,
@@ -1032,7 +1030,6 @@ mod tests {
             account: AccountId::Live,
             event: OutcomeEvent::PlaceOrders {
                 orders: vec![Order {
-                    id: String::new(),
                     exchange: EX,
                     symbol: SYM.to_string(),
                     side: Side::Long,
