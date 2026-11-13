@@ -105,6 +105,11 @@ impl StrategyRunner {
         &self.state
     }
 
+    /// 策略自己的观测读数（见 [`Strategy::gauges`]）
+    pub fn strategy_gauges(&self, now: crate::domain::Timestamp) -> Vec<crate::observability::Gauge> {
+        self.strategy.gauges(now)
+    }
+
     /// 写入持仓基线（投产握手）。
     ///
     /// **实盘与模拟账户都会调用**：v0.16 起投产为作用域内每条腿都写基线，模拟账户写的是

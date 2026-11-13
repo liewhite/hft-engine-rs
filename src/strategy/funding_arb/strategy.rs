@@ -46,6 +46,7 @@ use super::signal::{decide, FundingAction, LegPair, SettledFundingWindow};
 use crate::domain::{Exchange, Order, OrderId, OrderStatus, OrderType, OrderUpdate, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{AccountData, IncomeEvent, MarketData, MarketEvent, PendingOrder, SymbolAccountData};
+use crate::observability::Gauge;
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
 use std::collections::{HashMap, HashSet};
 
@@ -587,6 +588,47 @@ impl Strategy for FundingArbStrategy {
     /// 只作用于迟迟未获交易所确认（Created）的单；挂着的 maker 由本策略按价格偏离自行撤换
     fn order_timeout_ms(&self) -> u64 {
         60_000
+    }
+
+    /// 看板与告警用：各所年化与数据年龄、年化差、最近一次判断的信号（停止交易或补腿期间不再判断，
+    /// 停在最后一次）、门槛、是否停止交易
+    fn gauges(&self, now: Timestamp) -> Vec<Gauge> {
+        let sym = self.symbol().as_str();
+        let mut out = Vec::new();
+        let mut known = Vec::new();
+        for &ex in &self.exchanges {
+            let ex_label = ex.to_string();
+            let labels = [("symbol", sym), ("exchange", ex_label.as_str())];
+            let Some(w) = self.funding.get(&ex) else { continue };
+            out.push(Gauge::new("funding_arb_funding_age_seconds", &labels, now.saturating_sub(w.fetched_at) as f64 / 1000.0));
+            if let Some(apr) = w.apr(now, self.p.max_funding_age_ms) {
+                out.push(Gauge::new("funding_arb_apr", &labels, apr));
+                known.push(apr);
+            }
+        }
+        if known.len() == self.exchanges.len() {
+            let max = known.iter().copied().fold(f64::MIN, f64::max);
+            let min = known.iter().copied().fold(f64::MAX, f64::min);
+            out.push(Gauge::new("funding_arb_apr_spread", &[("symbol", sym)], max - min));
+        }
+        if let Some(action) = self.last_action {
+            let (name, pair) = match action {
+                FundingAction::Open(p) => ("open", Some(p)),
+                FundingAction::Close(p) => ("close", Some(p)),
+                FundingAction::Hold => ("hold", None),
+            };
+            let sell = pair.map(|p| p.sell.to_string()).unwrap_or_default();
+            let buy = pair.map(|p| p.buy.to_string()).unwrap_or_default();
+            out.push(Gauge::new(
+                "funding_arb_signal",
+                &[("symbol", sym), ("action", name), ("sell", sell.as_str()), ("buy", buy.as_str())],
+                1.0,
+            ));
+        }
+        out.push(Gauge::new("funding_arb_open_threshold_apr", &[("symbol", sym)], self.p.open_threshold_apr));
+        out.push(Gauge::new("funding_arb_close_threshold_apr", &[("symbol", sym)], self.p.close_threshold_apr));
+        out.push(Gauge::new("funding_arb_halted", &[("symbol", sym)], if self.halted.is_some() { 1.0 } else { 0.0 }));
+        out
     }
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {

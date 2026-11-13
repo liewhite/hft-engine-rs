@@ -604,3 +604,24 @@ fn rejected_maker_backs_off_per_exchange() {
     s.advance(1000);
     assert_eq!(placed(&s.bbo(BN)).len(), 1, "被接下后退避应清零");
 }
+
+/// 看板读数：各所年化、年化差、当前信号（开仓在哪对所）、未停机
+#[test]
+fn gauges_report_aprs_spread_and_signal() {
+    let mut s = Sim::new(0.0, 0.0);
+    s.funding(BN, 0.8);
+    s.funding(HL, 0.1);
+    let g = s.runner.strategy_gauges(s.now);
+    let value = |name: &str, labels: &[(&str, &str)]| {
+        g.iter()
+            .find(|x| x.name == name && labels.iter().all(|(k, v)| x.labels.iter().any(|(a, b)| a == k && b == v)))
+            .map(|x| x.value)
+    };
+    let bn = BN.to_string();
+    let hl = HL.to_string();
+    assert!((value("funding_arb_apr", &[("exchange", &bn)]).unwrap() - 0.8).abs() < 1e-9, "{g:?}");
+    assert!((value("funding_arb_apr", &[("exchange", &hl)]).unwrap() - 0.1).abs() < 1e-9, "{g:?}");
+    assert!((value("funding_arb_apr_spread", &[("symbol", SYM)]).unwrap() - 0.7).abs() < 1e-9, "{g:?}");
+    assert_eq!(value("funding_arb_signal", &[("action", "open"), ("sell", &bn), ("buy", &hl)]), Some(1.0), "{g:?}");
+    assert_eq!(value("funding_arb_halted", &[("symbol", SYM)]), Some(0.0));
+}

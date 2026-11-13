@@ -23,7 +23,7 @@ use crate::exchange::binance::{
 };
 use crate::exchange::client::{ExchangeCmd, ExchangeHandle, SubscriptionKind};
 use crate::exchange::equity_polling::EquityPoller;
-use crate::exchange::funding_fee_polling::FundingFeePoller;
+use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
@@ -159,7 +159,7 @@ impl BinanceNode {
                 // 净值查询是账户私有能力，只有 AccountClient 提供
                 if let Some(client) = binance_client {
                     EquityPoller::spawn(&children, client.clone(), account_bus.clone(), 1000)?;
-                    FundingFeePoller::spawn(&children, client, account_bus.clone(), 60_000)?;
+                    FundingFeePoller::spawn(&children, client, account_bus.clone(), FUNDING_FEE_POLL_INTERVAL_MS)?;
                 }
                 CryptoStatus::spawn(
                     &children,

@@ -12,6 +12,7 @@
 //! ├── OkxPrivateWs（需要凭证）
 //! ├── EquityPoller（需要凭证；净值 / 持仓总价值）
 //! ├── OkxGreeksPoller（需要凭证）
+//! ├── FundingFeePoller（需要凭证）
 //! └── CryptoStatus
 
 use super::business_ws::OkxBusinessWs;
@@ -21,6 +22,7 @@ use super::public_ws::OkxPublicWs;
 use crate::domain::{Symbol, SymbolMeta};
 use crate::exchange::client::{ExchangeCmd, ExchangeHandle, SubscriptionKind};
 use crate::exchange::equity_polling::EquityPoller;
+use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
 use crate::exchange::okx::{OkxClient, OkxCredentials};
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
@@ -106,7 +108,8 @@ impl OkxNode {
                 if let Some(client) = client {
                     // 净值与持仓总价值走 REST 轮询：私有 WS 推送的 notionalUsd 在单币种保证金模式下是空串
                     EquityPoller::spawn(&children, client.clone(), account_bus.clone(), EQUITY_POLL_INTERVAL_MS)?;
-                    OkxGreeksPoller::spawn(&children, client, account_bus.clone(), GREEKS_POLLING_INTERVAL_MS)?;
+                    OkxGreeksPoller::spawn(&children, client.clone(), account_bus.clone(), GREEKS_POLLING_INTERVAL_MS)?;
+                    FundingFeePoller::spawn(&children, client, account_bus.clone(), FUNDING_FEE_POLL_INTERVAL_MS)?;
                 }
                 CryptoStatus::spawn(
                     &children,

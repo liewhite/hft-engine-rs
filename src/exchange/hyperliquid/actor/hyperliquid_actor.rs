@@ -20,7 +20,7 @@ use super::private_ws::HyperliquidPrivateWs;
 use super::public_ws::HyperliquidPublicWs;
 use crate::exchange::client::{ExchangeCmd, ExchangeHandle};
 use crate::exchange::equity_polling::EquityPoller;
-use crate::exchange::funding_fee_polling::FundingFeePoller;
+use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
 use crate::exchange::hyperliquid::HyperliquidClient;
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
@@ -30,9 +30,6 @@ use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
 const STATUS_BROADCAST_INTERVAL_MS: u64 = 5_000;
-
-/// 资费结算轮询间隔 (毫秒)。与 Binance 侧一致：资费按小时结算，1 分钟一次绰绰有余。
-const FUNDING_FEE_POLL_INTERVAL_MS: u64 = 60_000;
 
 /// 账户净值轮询间隔 (毫秒)。一次 = spotClearinghouseState + 每个已接入 dex 一次
 /// clearinghouseState（各约 2 权重）；2 秒一次、两个 dex 约 180 权重/分钟，

@@ -9,7 +9,7 @@
 
 use crate::domain::{now_ms, AccountId, Exchange, Position, Symbol, SymbolMeta, Timestamp};
 use crate::engine::StrategyRunner;
-use crate::messaging::IncomeEvent;
+use crate::messaging::{IncomeEvent, MarketData, MarketEvent};
 use crate::strategy::Strategy;
 use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, Task};
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
-use super::{AccountOutcome, OutcomeBus};
+use super::{AccountOutcome, MetricsHandle, OutcomeBus};
 
 /// 策略消费一条事件时，距适配层收到它的最大容忍时长（见
 /// [`Executor::check_pipeline_lag`]）。
@@ -78,6 +78,8 @@ pub struct ExecutorArgs {
     pub baselines: Vec<crate::messaging::PositionBaseline>,
     /// 策略信号的去处
     pub outcome_bus: OutcomeBus,
+    /// 策略观测读数的去处（每个 Clock 拍交一次，见 [`crate::strategy::Strategy::gauges`]）
+    pub metrics: MetricsHandle,
 }
 
 /// Executor 的收件箱消息
@@ -130,6 +132,9 @@ pub struct Executor {
     account: AccountId,
     /// 策略信号的去处
     outcome_bus: OutcomeBus,
+    /// 本实例身份（观测读数按它归属）
+    id: ExecutorId,
+    metrics: MetricsHandle,
     /// 累计消费到的超限滞后事件数（进告警看趋势，见 [`Self::check_pipeline_lag`]）
     lagging_events: u64,
     /// 上次滞后告警的时刻；0 = 从未告警（见 [`lag_warn_due`]）
@@ -158,6 +163,8 @@ impl Executor {
                     runner,
                     account,
                     outcome_bus: args.outcome_bus,
+                    id,
+                    metrics: args.metrics,
                     lagging_events: 0,
                     last_lag_warn_ms: 0,
                 })
@@ -192,6 +199,11 @@ impl Executor {
                 account: self.account.clone(),
                 event: signal,
             });
+        }
+        if let IncomeEvent::Market(MarketEvent { data: MarketData::Clock, local_ts, .. }) = &event {
+            // Metrics 先于本实例停下时交不出去，读数随停机作废，无需处理
+            let gauges = self.runner.strategy_gauges(*local_ts);
+            let _ = self.metrics.strategy_gauges(self.id, self.account.clone(), gauges);
         }
     }
 
@@ -248,6 +260,8 @@ impl Task for Executor {
         while let Some(msg) = self.inbox.recv().await {
             self.handle(msg);
         }
+        // 撤下的实例不再有读数：交一份空的，让它的旧读数从指标里消失
+        let _ = self.metrics.strategy_gauges(self.id, self.account.clone(), Vec::new());
         tracing::info!(account = %self.account, "Executor stopped");
         Ok(())
     }

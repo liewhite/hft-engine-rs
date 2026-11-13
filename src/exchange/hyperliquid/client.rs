@@ -713,16 +713,30 @@ impl crate::exchange::FundingFeeSource for HyperliquidClient {
         start_ms: Timestamp,
         end_ms: Timestamp,
     ) -> Result<Vec<FundingFee>, ExchangeError> {
+        // 带时间段的查询一次最多回 500 条：满页就从最后一条的时刻接着取。同一毫秒可能有
+        // 几个币（HL 同时结算全部币），所以下一页从该时刻（含）起，重叠的几条由下游按结算 ID 去重
+        const PAGE: usize = 500;
         let user = &self.account()?.credentials.wallet_address;
-        let entries: Vec<UserFundingEntry> = self
-            .post_info(serde_json::json!({
-                "type": "userFunding",
-                "user": user,
-                "startTime": start_ms,
-                "endTime": end_ms,
-            }))
-            .await?;
-
+        let mut entries: Vec<UserFundingEntry> = Vec::new();
+        let mut from = start_ms;
+        loop {
+            let page: Vec<UserFundingEntry> = self
+                .post_info(serde_json::json!({
+                    "type": "userFunding",
+                    "user": user,
+                    "startTime": from,
+                    "endTime": end_ms,
+                }))
+                .await?;
+            let full = page.len() >= PAGE;
+            let last = page.iter().map(|e| e.time).max();
+            entries.extend(page);
+            match last {
+                // 整页同一毫秒（不现实）时也要往前走，不原地打转
+                Some(t) if full => from = t.max(from + 1),
+                _ => break,
+            }
+        }
         parse_user_funding(entries, &self.markets, &self.quote)
     }
 }

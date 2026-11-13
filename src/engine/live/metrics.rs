@@ -15,12 +15,13 @@
 //! - 默认只输出日志；配置 `PUSHGATEWAY_URL` 后同一份数字推送 pushgateway
 //!   （见 [`crate::observability`]，未配置时无外部依赖、行为与从前一致）
 
-use crate::domain::{AccountId, Exchange, Symbol, TradingStats};
+use super::ExecutorId;
+use crate::domain::{now_ms, AccountId, Exchange, Symbol, Timestamp, TradingStats};
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, IncomeEvent, MarketBus,
     MarketEvent, PositionBaseline, StateManager, SymbolAccountData, SymbolState,
 };
-use crate::observability::{MetricsPushConfig, PromText, Pusher};
+use crate::observability::{Gauge, MetricsPushConfig, PromText, Pusher};
 use crate::tasks::{Addr, Gone, Group, Inbox, Scope, Task};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -32,6 +33,9 @@ pub const DEFAULT_REPORT_INTERVAL_MS: u64 = 60_000;
 
 /// 观测层不做订单超时清理（挂单的生命周期由策略侧负责，这里只如实反映）
 const NO_ORDER_TIMEOUT: u64 = 0;
+
+/// 资金费收入的统计窗口：过去 24h（交易所的资费轮询器每次也是重发最近 24h，靠结算 ID 去重）
+const FUNDING_FEE_WINDOW_MS: u64 = 24 * 3600 * 1000;
 
 /// per-symbol 统计不保留逐笔明细，明细只在全局那一份上保留
 const NO_PER_SYMBOL_FILL_DETAIL: usize = 0;
@@ -136,6 +140,12 @@ struct MetricsView {
     /// 各模拟账户柜台的最新净值：(账户, 所) -> (equity, notional)。
     /// 已知取舍：账户撤下后条目残留（= 最后一次快照，持续上报），生命周期内不清理
     paper_accounts: HashMap<(AccountId, Exchange), (f64, f64)>,
+    /// 各策略实例最新一份自报读数（见 [`crate::strategy::Strategy::gauges`]），按实例归属；
+    /// 实例撤下时交来空的一份，条目即删除
+    strategy_gauges: HashMap<ExecutorId, (AccountId, Vec<Gauge>)>,
+    /// 实盘账户收到 / 付出的资金费：(所, 结算 ID) -> (币, 金额, 结算时刻)。
+    /// 交易所轮询器每次重发最近 24h，同一笔按结算 ID 只记一次；超出窗口的在报告时清掉
+    funding_fees: HashMap<(Exchange, u64), (Symbol, f64, Timestamp)>,
 }
 
 impl MetricsView {
@@ -149,6 +159,8 @@ impl MetricsView {
             untracked_events: 0,
             paper_stats: HashMap::new(),
             paper_accounts: HashMap::new(),
+            strategy_gauges: HashMap::new(),
+            funding_fees: HashMap::new(),
         }
     }
 
@@ -210,6 +222,10 @@ impl MetricsView {
                     })
                     .apply_fill(fill);
             }
+            AccountData::Symbol(SymbolAccountData::FundingFee(fee)) => {
+                self.funding_fees
+                    .insert((fee.exchange, fee.tran_id), (fee.symbol.clone(), fee.amount, fee.timestamp));
+            }
             AccountData::Symbol(SymbolAccountData::OrderUpdate(update)) => {
                 self.total.apply_order_update(update);
                 self.per_symbol
@@ -252,6 +268,21 @@ impl MetricsView {
             .or_insert_with(|| TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL))
     }
 
+    /// 清掉结算时刻已出 24h 窗口的资金费
+    fn prune_funding_fees(&mut self, now: Timestamp) {
+        self.funding_fees
+            .retain(|_, (_, _, ts)| now.saturating_sub(*ts) <= FUNDING_FEE_WINDOW_MS);
+    }
+
+    /// 收一个策略实例最新的自报读数；空 = 实例已撤下，删掉它的条目
+    fn set_strategy_gauges(&mut self, executor: ExecutorId, account: AccountId, gauges: Vec<Gauge>) {
+        if gauges.is_empty() {
+            self.strategy_gauges.remove(&executor);
+        } else {
+            self.strategy_gauges.insert(executor, (account, gauges));
+        }
+    }
+
     /// 记录会话起始仓位基线（每个 (symbol, exchange) 只记一次）
     fn record_baseline(&mut self, symbol: &Symbol, exchange: Exchange, size: f64) {
         self.baseline
@@ -262,7 +293,8 @@ impl MetricsView {
     }
 
     /// 输出一次完整报告（结构化日志），返回同一份数字的推送文本
-    fn report(&self) -> PromText {
+    fn report(&mut self) -> PromText {
+        self.prune_funding_fees(now_ms());
         let prom = self.render();
         if self.total.forced_fills > 0 {
             tracing::warn!(
@@ -299,7 +331,6 @@ impl MetricsView {
         let mut exchange_count = 0usize;
         for (exchange, info) in self.state.account_view().account_infos() {
             // 净值 ≤0 时杠杆算不出：不推这个点（看板断线），不能报成 0 冒充「很安全」
-            // （边界：所有所同时 ≤0 时整族缺席，pushgateway 会保留上次的值；三所同时归零不现实，不处理）
             let leverage = (info.equity > 0.0).then(|| info.notional / info.equity);
             total_equity += info.equity;
             total_notional += info.notional;
@@ -367,6 +398,18 @@ impl MetricsView {
                 exposure.net_notional,
             );
             prom.gauge("hft_pending_orders", &[("symbol", sym_label)], pending as f64);
+            // 各所分腿：对冲是否到位要按所看（净仓为 0 也可能是两所之间搬错了腿）
+            for position in symbol_state.position_book().all() {
+                if position.is_empty() {
+                    continue;
+                }
+                let ex_label = position.exchange.to_string();
+                let labels = [("symbol", sym_label), ("exchange", ex_label.as_str())];
+                prom.gauge("hft_position_size", &labels, position.size);
+                if let Some(bbo) = symbol_state.market().bbo(position.exchange) {
+                    prom.gauge("hft_position_notional", &labels, position.size * bbo.mid_price());
+                }
+            }
             prom.gauge(
                 "hft_symbol_fills",
                 &[("symbol", sym_label)],
@@ -440,6 +483,41 @@ impl MetricsView {
             "metrics.summary"
         );
 
+        // ---------- 资金费（实盘，过去 24h，按结算 ID 去重） ----------
+        let mut funding: HashMap<(&Symbol, Exchange), f64> = HashMap::new();
+        for ((exchange, _), (symbol, amount, _)) in &self.funding_fees {
+            *funding.entry((symbol, *exchange)).or_default() += amount;
+        }
+        let mut funding_total = 0.0;
+        for ((symbol, exchange), amount) in &funding {
+            funding_total += amount;
+            let ex_label = exchange.to_string();
+            prom.gauge(
+                "hft_funding_fee_24h",
+                &[("symbol", symbol.as_str()), ("exchange", ex_label.as_str())],
+                *amount,
+            );
+        }
+        prom.gauge("hft_funding_fee_24h_total", &[], funding_total);
+        tracing::info!(target: "metrics", funding_fee_24h = format!("{:.4}", funding_total), "metrics.funding");
+
+        // ---------- 策略自报读数 ----------
+        // 逐行把关（见 Gauge::validate），名字加标签重复的也丢：pushgateway 整份收或整份拒
+        let mut seen: HashSet<String> = HashSet::new();
+        for (account, gauges) in self.strategy_gauges.values() {
+            let account_label = account.to_string();
+            for g in gauges {
+                let verdict = g.validate().and_then(|()| {
+                    let key = format!("{}{:?}{account_label}", g.name, g.labels);
+                    seen.insert(key).then_some(()).ok_or_else(|| format!("{} 重复: {:?}", g.name, g.labels))
+                });
+                match verdict {
+                    Ok(()) => prom.push(g, &[("account", account_label.as_str())]),
+                    Err(e) => tracing::warn!(target: "metrics", error = %e, "策略读数不合格，本轮不推"),
+                }
+            }
+        }
+
         // ---------- 模拟账户 ----------
         for (account, stats) in &self.paper_stats {
             let account_label = account.to_string();
@@ -496,6 +574,12 @@ enum MetricsMsg {
     Market(MarketEvent),
     /// 账户总线（全量订阅）
     Account(AccountEvent),
+    /// 见 [`MetricsHandle::strategy_gauges`]
+    StrategyGauges {
+        executor: ExecutorId,
+        account: AccountId,
+        gauges: Vec<Gauge>,
+    },
     /// 见 [`MetricsHandle::register_symbols`]
     Register {
         symbols: Vec<Symbol>,
@@ -509,6 +593,17 @@ enum MetricsMsg {
 pub struct MetricsHandle(Addr<MetricsMsg>);
 
 impl MetricsHandle {
+    /// 一个策略实例交来它最新的自报读数（不等处理；整份替换上一份，空 = 实例已撤下）。
+    /// `Err(Gone)` = Metrics 已停止收件。
+    pub fn strategy_gauges(
+        &self,
+        executor: ExecutorId,
+        account: AccountId,
+        gauges: Vec<Gauge>,
+    ) -> Result<(), Gone> {
+        self.0.send(MetricsMsg::StrategyGauges { executor, account, gauges })
+    }
+
     /// 投产注册握手：要跟踪的 symbol 集合 + 它们的持仓基线（同一份快照，与 executor /
     /// 对账镜像口径一致）。注册与基线**原子**到达 —— 不存在"已注册、基线未到"的窗口，
     /// 也就不需要缓冲重放机制。
@@ -563,7 +658,7 @@ impl Metrics {
     }
 
     /// 输出一次报告；配了推送就把同一份数字交给推送器
-    fn report(&self) {
+    fn report(&mut self) {
         let prom = self.view.report();
         if let Some(pusher) = &self.pusher {
             // 只可能是推送器自己出错退出（已由任务树上报）
@@ -571,6 +666,22 @@ impl Metrics {
                 tracing::warn!("指标推送器已退出，本次快照未推送");
             }
         }
+    }
+
+    /// 测试用：在 `group` 下起一个只写日志、不订任何真实总线的 Metrics
+    #[cfg(test)]
+    pub(crate) async fn spawn_for_test(group: &Group) -> MetricsHandle {
+        Self::spawn(
+            group,
+            MetricsArgs {
+                interval_ms: DEFAULT_REPORT_INTERVAL_MS,
+                push: None,
+                market_bus: MarketBus::new("market"),
+                account_bus: AccountBus::new("account"),
+            },
+        )
+        .await
+        .expect("Metrics 应能起来")
     }
 }
 
@@ -583,6 +694,9 @@ impl Task for Metrics {
                 msg = self.inbox.recv() => match msg {
                     Some(MetricsMsg::Market(ev)) => self.view.on_market(ev),
                     Some(MetricsMsg::Account(ev)) => self.view.on_account(ev),
+                    Some(MetricsMsg::StrategyGauges { executor, account, gauges }) => {
+                        self.view.set_strategy_gauges(executor, account, gauges)
+                    }
                     Some(MetricsMsg::Register { symbols, baselines, reply }) => {
                         self.view.register(symbols, baselines);
                         // 提问方已不等回复（它自己放弃了）时无人可告知；注册本身已生效
@@ -742,6 +856,82 @@ mod tests {
         let got = got.lock().unwrap();
         assert_eq!(got.len(), 2, "停机返回时最终快照应已推完: {got:?}");
         assert!(got[1].contains("hft_equity{exchange=\"OKX\"} 4321"), "最终快照要含停机前收到的净值: {}", got[1]);
+    }
+
+    fn live(data: AccountData) -> AccountEvent {
+        AccountEvent { account: AccountId::Live, exchange_ts: 1, local_ts: 1, data }
+    }
+
+    fn funding_fee(exchange: Exchange, tran_id: u64, amount: f64, timestamp: Timestamp) -> AccountEvent {
+        live(AccountData::Symbol(SymbolAccountData::FundingFee(crate::domain::FundingFee {
+            exchange,
+            symbol: "BTC".to_string(),
+            asset: "USDT".to_string(),
+            amount,
+            timestamp,
+            tran_id,
+        })))
+    }
+
+    fn line_value(body: &str, prefix: &str) -> Option<f64> {
+        body.lines().find(|l| l.starts_with(prefix)).map(|l| l.rsplit(' ').next().unwrap().parse().unwrap())
+    }
+
+    /// 轮询器每分钟重发最近 24h：同一结算 ID 只算一次；出窗的被清掉
+    #[test]
+    fn funding_fees_dedup_by_settlement_and_roll_off_after_24h() {
+        let mut metrics = view();
+        metrics.register(vec!["BTC".to_string()], Vec::new());
+        let now = 100 * FUNDING_FEE_WINDOW_MS;
+        for _ in 0..2 {
+            metrics.on_account(funding_fee(Exchange::Binance, 1, 2.0, now - 1000));
+            metrics.on_account(funding_fee(Exchange::Binance, 2, -0.5, now - FUNDING_FEE_WINDOW_MS - 1));
+            metrics.on_account(funding_fee(Exchange::OKX, 1, 3.0, now - 1000));
+        }
+        metrics.prune_funding_fees(now);
+        let body = metrics.render().into_body();
+        assert_eq!(line_value(&body, "hft_funding_fee_24h{symbol=\"BTC\",exchange=\"Binance\"}"), Some(2.0), "{body}");
+        assert_eq!(line_value(&body, "hft_funding_fee_24h{symbol=\"BTC\",exchange=\"OKX\"}"), Some(3.0), "{body}");
+        assert_eq!(line_value(&body, "hft_funding_fee_24h_total "), Some(5.0), "{body}");
+    }
+
+    /// 策略读数带上实例账户标签推出；实例撤下（交来空的一份）后不再出现
+    #[test]
+    fn strategy_gauges_follow_their_executor() {
+        let mut metrics = view();
+        let id = ExecutorId::for_test(7);
+        metrics.set_strategy_gauges(id, AccountId::Live, vec![Gauge::new("x_apr", &[("symbol", "BTC")], 0.5)]);
+        let body = metrics.render().into_body();
+        assert!(body.contains("x_apr{symbol=\"BTC\",account=\"live\"} 0.5"), "{body}");
+        metrics.set_strategy_gauges(id, AccountId::Live, Vec::new());
+        assert!(!metrics.render().into_body().contains("x_apr"));
+    }
+
+    /// 不合格的策略读数（占框架前缀、名字非法、重复）丢掉，其余照推
+    #[test]
+    fn bad_strategy_gauges_are_dropped_not_pushed() {
+        let mut metrics = view();
+        let g = |name: &str, sym: &str| Gauge::new(name, &[("symbol", sym)], 1.0);
+        metrics.set_strategy_gauges(
+            ExecutorId::for_test(1),
+            AccountId::Live,
+            vec![g("hft_equity", "A"), g("bad-name", "A"), g("ok_x", "A"), g("ok_x", "A"), g("ok_x", "B")],
+        );
+        let body = metrics.render().into_body();
+        assert_eq!(body.lines().filter(|l| l.starts_with("ok_x")).count(), 2, "{body}");
+        assert!(!body.contains("bad-name") && !body.contains("hft_equity{symbol"), "{body}");
+    }
+
+    /// 各所分腿持仓按所推出（净仓为 0 时也看得到两条腿）
+    #[test]
+    fn per_exchange_legs_are_reported() {
+        let mut metrics = view();
+        metrics.register(vec!["BTC".to_string()], Vec::new());
+        metrics.on_account(live(fill_data(Exchange::Binance, "BTC", Side::Long, 1.0)));
+        metrics.on_account(live(fill_data(Exchange::OKX, "BTC", Side::Short, 1.0)));
+        let body = metrics.render().into_body();
+        assert_eq!(line_value(&body, "hft_position_size{symbol=\"BTC\",exchange=\"Binance\"}"), Some(1.0), "{body}");
+        assert_eq!(line_value(&body, "hft_position_size{symbol=\"BTC\",exchange=\"OKX\"}"), Some(-1.0), "{body}");
     }
 
     /// 净值 ≤0 时杠杆算不出：不推杠杆点（看板断线），不得报成 0 冒充「很安全」
