@@ -88,7 +88,7 @@ async fn fetch_bbo(coin: &str) -> Result<(Decimal, Decimal), Box<dyn std::error:
         .json()
         .await?;
 
-    let bids = resp.levels.get(0).ok_or("No bids")?;
+    let bids = resp.levels.first().ok_or("No bids")?;
     let asks = resp.levels.get(1).ok_or("No asks")?;
 
     let best_bid = bids.first().ok_or("No bid level")?;
@@ -139,7 +139,7 @@ async fn test_xyz_fetch_symbol_meta() {
     let symbol: Symbol = hft_engine_rs::exchange::hyperliquid::from_hyperliquid(TEST_COIN);
 
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
 
@@ -253,7 +253,7 @@ async fn place_test_order(side: Side) {
 
     // 获取 SymbolMeta 用于格式化价格
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
@@ -293,7 +293,7 @@ async fn place_test_order(side: Side) {
     println!("提交订单: {:?}", order);
 
     let order_id = client
-        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");
     println!(

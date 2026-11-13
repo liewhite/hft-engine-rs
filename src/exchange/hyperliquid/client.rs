@@ -248,7 +248,7 @@ impl HyperliquidClient {
         let side = if is_buy { 1 } else { 0 }; // levels = [bids, asks]
         let top = book["levels"][side][0]["px"]
             .as_str()
-            .and_then(|s| crate::domain::parse_decimal(&s).ok())
+            .and_then(|s| crate::domain::parse_decimal(s).ok())
             .filter(|p| *p > Decimal::ZERO)
             .ok_or_else(|| ExchangeError::Other(format!("{coin} 盘口无对手价，市价单无法定价")))?;
         let slippage = self.account()?.credentials.market_order_slippage;

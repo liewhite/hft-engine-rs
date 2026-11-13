@@ -205,7 +205,7 @@ async fn okx_trades_matches_codec() {
                 .filter_map(|t| {
                     t["sz"]
                         .as_str()
-                        .and_then(|s| crate::domain::parse_decimal(&s).ok())
+                        .and_then(|s| crate::domain::parse_decimal(s).ok())
                 })
                 .collect::<Vec<_>>()
         })

@@ -117,7 +117,7 @@ async fn test_ibkr_symbol_metas() {
 
     // fetch_symbol_meta (单个)
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     assert_eq!(metas.len(), 1, "应返回 1 个 SymbolMeta");
@@ -201,7 +201,7 @@ async fn test_ibkr_limit_buy() {
 
     // 获取 SymbolMeta 格式化价格
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
@@ -227,7 +227,7 @@ async fn test_ibkr_limit_buy() {
     println!("提交买单: {:?}", order);
 
     let order_id = client
-        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");
     println!("买单成功，订单ID: {}", order_id);
@@ -250,7 +250,7 @@ async fn test_ibkr_limit_sell() {
 
     // 获取 SymbolMeta 格式化价格
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
@@ -276,7 +276,7 @@ async fn test_ibkr_limit_sell() {
     println!("提交卖单: {:?}", order);
 
     let order_id = client
-        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");
     println!("卖单成功，订单ID: {}", order_id);
@@ -431,7 +431,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
     // 3. 按 ask + 滑点 买入 (IOC，确保成交)
     let slippage = 0.05; // $0.05 滑点
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到 SymbolMeta");
@@ -459,7 +459,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
         TEST_QUANTITY, symbol, buy_price
     );
     let buy_order_id = client
-        .place_order(ExchangeOrder::from_domain(buy_order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(buy_order, meta).expect("订单未通过出向校验"))
         .await
         .expect("买单失败");
     println!("[下单返回] order_id={}", buy_order_id);
@@ -525,7 +525,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
         TEST_QUANTITY, symbol, sell_price
     );
     let sell_order_id = client
-        .place_order(ExchangeOrder::from_domain(sell_order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(sell_order, meta).expect("订单未通过出向校验"))
         .await
         .expect("卖单失败");
     println!("[成交] 卖单 order_id={}", sell_order_id);

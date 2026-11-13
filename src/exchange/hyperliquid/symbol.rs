@@ -10,7 +10,7 @@ use crate::domain::Symbol;
 ///
 /// 去掉 "{dex}:" 前缀 (e.g., "xyz:AAPL" → "AAPL")
 pub fn from_hyperliquid(coin: &str) -> Symbol {
-    coin.split(':').last().unwrap_or(coin).to_string()
+    coin.split(':').next_back().unwrap_or(coin).to_string()
 }
 
 #[cfg(test)]

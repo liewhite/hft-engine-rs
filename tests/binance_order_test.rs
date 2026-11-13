@@ -72,7 +72,7 @@ async fn test_binance_limit_buy() {
 
     // 获取 SymbolMeta 用于格式化价格
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
@@ -119,7 +119,7 @@ async fn test_binance_limit_sell() {
 
     // 获取 SymbolMeta 用于格式化价格
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
@@ -147,7 +147,7 @@ async fn test_binance_limit_sell() {
     println!("提交卖单: {:?}", order);
 
     let order_id = client
-        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");
     println!("卖单成功，订单ID: {}", order_id);

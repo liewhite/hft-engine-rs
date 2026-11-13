@@ -410,8 +410,7 @@ mod tests {
     fn server_error_message_is_fatal() {
         let raw = r#"{"channel":"error","data":"Invalid subscription {\"type\":\"userFills\"}"}"#;
         let err = parse_private_message(raw, &testkit::markets(&[""]), 1)
-            .err()
-            .expect("服务端错误报文被吞掉了 —— 订阅被拒会表现为静默断流");
+            .expect_err("服务端错误报文被吞掉了 —— 订阅被拒会表现为静默断流");
         assert!(
             err.to_string().contains("Invalid subscription"),
             "错误详情应保留以便定位: {err}"

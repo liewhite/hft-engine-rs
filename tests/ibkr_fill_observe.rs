@@ -138,7 +138,7 @@ async fn ibkr_fill_observe() {
     println!("\n{} bid={} ask={}", symbol, bid, ask);
 
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到 SymbolMeta");
@@ -165,7 +165,7 @@ async fn ibkr_fill_observe() {
 
     println!("\n下单买入: {} @ {} cOID={}", symbol, buy_price, client_oid);
     let order_id = client
-        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");
     println!("下单成功 order_id={}", order_id);
@@ -182,7 +182,7 @@ async fn ibkr_fill_observe() {
                 // 提取文本（Text 或 Binary→UTF-8）
                 let text = match &msg {
                     Some(Ok(WsMessage::Text(t))) => Some(t.clone()),
-                    Some(Ok(WsMessage::Binary(b))) => String::from_utf8(b.clone().into()).ok(),
+                    Some(Ok(WsMessage::Binary(b))) => String::from_utf8(b.clone()).ok(),
                     Some(Ok(WsMessage::Ping(data))) => {
                         let _ = write.send(WsMessage::Pong(data.clone())).await.ok();
                         None
@@ -244,7 +244,7 @@ async fn ibkr_fill_observe() {
     };
     println!("\n平仓卖出 {} @ {}", symbol, sell_price);
     let _ = client
-        .place_order(ExchangeOrder::from_domain(sell_order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(sell_order, meta).expect("订单未通过出向校验"))
         .await
         .expect("卖单失败");
     println!("平仓完成");

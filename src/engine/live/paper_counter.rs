@@ -995,22 +995,8 @@ mod tests {
             }),
         });
         h.settle(50).await;
-
-        let republished: Vec<&'static str> = h
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|e| match &e.data {
-                // AccountData 枚举里根本没有行情变体 —— 回显在类型上不可表达，
-                // 这里保留探针只为文档意图（永远匹配不到）
-                _ => None::<&'static str>,
-            })
-            .collect();
-        assert!(
-            republished.is_empty(),
-            "柜台把行情回显发回了总线（会与自身订阅形成无限循环）: {republished:?}"
-        );
+        // 柜台只往总线发 AccountEvent，而 AccountData 没有行情变体 —— 「回显行情」在类型上
+        // 写不出来，不用再逐条探针；这里守住的是：喂入行情后柜台不卡死、能正常收尾。
         h.finish().await;
     }
 

@@ -640,7 +640,7 @@ mod leftover_order_tests {
     }
 
     impl FakeClient {
-        fn new(rounds: Vec<Vec<OrderUpdate>>) -> (Arc<dyn AccountClient>, CancelLog) {
+        fn with_rounds(rounds: Vec<Vec<OrderUpdate>>) -> (Arc<dyn AccountClient>, CancelLog) {
             let cancelled: CancelLog = Arc::new(Mutex::new(Vec::new()));
             let client = Arc::new(Self {
                 pending: Mutex::new(rounds.into()),
@@ -702,7 +702,7 @@ mod leftover_order_tests {
     /// 没有挂单时，一个撤单请求都不该发
     #[tokio::test]
     async fn nothing_to_cancel_sends_no_request() {
-        let (client, cancelled) = FakeClient::new(vec![vec![]]);
+        let (client, cancelled) = FakeClient::with_rounds(vec![vec![]]);
         Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
             .await
             .expect("空列表应直接通过");
@@ -713,7 +713,7 @@ mod leftover_order_tests {
     #[tokio::test]
     async fn all_leftover_orders_are_cancelled() {
         let (client, cancelled) =
-            FakeClient::new(vec![vec![order("a", "ex-a"), order("b", "ex-b")], vec![]]);
+            FakeClient::with_rounds(vec![vec![order("a", "ex-a"), order("b", "ex-b")], vec![]]);
         Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
             .await
             .expect("撤净应通过");
@@ -730,7 +730,8 @@ mod leftover_order_tests {
             client_order_id: None,
             ..order("", "ex-manual")
         };
-        let (client, _cancelled) = FakeClient::new(vec![vec![manual.clone()], vec![manual]]);
+        let (client, _cancelled) =
+            FakeClient::with_rounds(vec![vec![manual.clone()], vec![manual]]);
         let err = Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
             .await
             .expect_err("应拒绝启动");
@@ -745,7 +746,7 @@ mod leftover_order_tests {
         let own = "own-1".to_string();
         let leftover = vec![order(&own, "ex-own")];
         // 两次都返回同一张 —— 模拟撤不掉
-        let (client, _cancelled) = FakeClient::new(vec![leftover.clone(), leftover]);
+        let (client, _cancelled) = FakeClient::with_rounds(vec![leftover.clone(), leftover]);
 
         let err = Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
             .await

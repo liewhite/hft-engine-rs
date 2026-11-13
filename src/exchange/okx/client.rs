@@ -170,7 +170,7 @@ impl OkxClient {
                 continue;
             };
             let positive = |raw: &str| {
-                crate::domain::parse_decimal(&raw)
+                crate::domain::parse_decimal(raw)
                     .ok()
                     .filter(|v| *v > Decimal::ZERO)
             };
@@ -241,7 +241,7 @@ impl OkxClient {
 
         let mut result = Vec::new();
         for item in &data.data {
-            let greeks = item.to_greeks().map_err(|e| ExchangeError::Other(e))?;
+            let greeks = item.to_greeks().map_err(ExchangeError::Other)?;
             result.push(greeks);
         }
 
@@ -1002,7 +1002,8 @@ mod pending_orders_tests {
     /// 跳过一条 = 对"启动期撤净遗留单"与"撤单复查"谎报该单不存在（见函数文档）。
     #[test]
     fn any_unparsable_field_fails_the_whole_snapshot() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut PendingOrderData)>)> = vec![
+        type Corrupt = Box<dyn Fn(&mut PendingOrderData)>;
+        let cases: Vec<(&str, Corrupt)> = vec![
             (
                 "instId",
                 Box::new(|d: &mut PendingOrderData| d.inst_id = "???".to_string()),

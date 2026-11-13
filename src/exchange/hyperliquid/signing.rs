@@ -171,7 +171,6 @@ pub struct OrderWire {
 #[serde(rename_all = "camelCase")]
 pub enum OrderType {
     Limit(LimitOrder),
-    // Trigger(TriggerOrder),
 }
 
 /// 限价单参数
@@ -179,15 +178,6 @@ pub enum OrderType {
 pub struct LimitOrder {
     pub tif: String,
 }
-
-/// 触发单参数
-// #[derive(Debug, Clone, Serialize)]
-// #[serde(rename_all = "camelCase")]
-// pub struct TriggerOrder {
-//     pub is_market: bool,
-//     pub trigger_px: String,
-//     pub tpsl: String,
-// }
 
 /// 批量下单 Action
 #[derive(Debug, Clone, Serialize)]
@@ -312,8 +302,6 @@ pub struct OrderFilled {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderFilledData {
-    pub total_sz: String,
-    // pub avg_px: String,
     pub oid: u64,
 }
 

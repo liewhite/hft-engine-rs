@@ -1332,7 +1332,9 @@ mod tests {
         let mut metrics = view();
         let symbol = "BTC".to_string();
         metrics.tracked.insert(symbol.clone());
-        metrics.state.register_symbols(&[symbol.clone()]);
+        metrics
+            .state
+            .register_symbols(std::slice::from_ref(&symbol));
 
         // 启动时已有 2 个多头（重启场景）：投产握手 seed 基线
         metrics.record_baseline(&symbol, Exchange::Binance, dec!(2.0));
@@ -1377,7 +1379,9 @@ mod tests {
         let mut metrics = view();
         let symbol = "BTC".to_string();
         metrics.tracked.insert(symbol.clone());
-        metrics.state.register_symbols(&[symbol.clone()]);
+        metrics
+            .state
+            .register_symbols(std::slice::from_ref(&symbol));
 
         metrics.record_baseline(&symbol, Exchange::Binance, dec!(2.0));
         metrics

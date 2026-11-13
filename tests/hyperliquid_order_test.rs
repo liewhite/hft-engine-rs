@@ -64,7 +64,7 @@ async fn fetch_bbo(symbol: &Symbol) -> Result<(Decimal, Decimal), Box<dyn std::e
         .await?;
 
     // levels[0] = bids, levels[1] = asks
-    let bids = resp.levels.get(0).ok_or("No bids")?;
+    let bids = resp.levels.first().ok_or("No bids")?;
     let asks = resp.levels.get(1).ok_or("No asks")?;
 
     let best_bid = bids.first().ok_or("No bid level")?;
@@ -98,7 +98,7 @@ async fn test_hyperliquid_limit_buy() {
 
     // 获取 SymbolMeta 用于格式化价格
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
@@ -108,7 +108,7 @@ async fn test_hyperliquid_limit_buy() {
     let price: Decimal = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", ask, price);
 
-    let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple().to_string());
+    let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple());
     // 构造限价买单
     let order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -127,7 +127,7 @@ async fn test_hyperliquid_limit_buy() {
     println!("提交买单: {:?}", order);
 
     let order_id = client
-        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");
     println!("买单成功，订单ID: {}", order_id);
@@ -155,7 +155,7 @@ async fn test_hyperliquid_limit_sell() {
 
     // 获取 SymbolMeta 用于格式化价格
     let metas = client
-        .fetch_symbol_meta(&[symbol.clone()])
+        .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
@@ -165,7 +165,7 @@ async fn test_hyperliquid_limit_sell() {
     let price: Decimal = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", bid, price);
 
-    let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple().to_string());
+    let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple());
     // 构造限价卖单
     let order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -184,7 +184,7 @@ async fn test_hyperliquid_limit_sell() {
     println!("提交卖单: {:?}", order);
 
     let order_id = client
-        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");
     println!("卖单成功，订单ID: {}", order_id);

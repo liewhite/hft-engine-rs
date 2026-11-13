@@ -465,7 +465,7 @@ async fn run_ws_loop_inner(
                         }
                     }
                     Some(Ok(WsMessage::Binary(data))) => {
-                        match String::from_utf8(data.into()) {
+                        match String::from_utf8(data) {
                             Ok(text) => {
                                 tracing::trace!(text = %text, "ws_loop received binary message");
                                 if incoming_tx.send(text).await.is_err() {

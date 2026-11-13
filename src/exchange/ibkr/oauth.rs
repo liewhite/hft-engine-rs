@@ -77,17 +77,14 @@ impl IbkrOAuth {
         // DH 密钥交换
         let http = crate::net::http(super::HTTP_TIMEOUT).build()?;
 
-        let live_session_token = dh_exchange(
-            &http,
-            &base_url,
+        let creds = DhCredentials {
             consumer_key,
             access_token,
-            &prepend_bytes,
-            &prepend_hex,
-            &signature_key,
-            &dh_prime_num,
-        )
-        .await?;
+            prepend_bytes: &prepend_bytes,
+            prepend_hex: &prepend_hex,
+            signature_key: &signature_key,
+        };
+        let live_session_token = dh_exchange(&http, &base_url, &creds, &dh_prime_num).await?;
 
         tracing::info!("IBKR OAuth: live_session_token obtained and verified");
 
@@ -162,16 +159,28 @@ impl IbkrAuth for IbkrOAuth {
 // DH 密钥交换 (构造阶段一次性完成)
 // ============================================================================
 
+/// DH 交换要用的身份凭据（构造阶段从配置和私钥解出，只在这一次交换里用）
+struct DhCredentials<'a> {
+    consumer_key: &'a str,
+    access_token: &'a str,
+    prepend_bytes: &'a [u8],
+    prepend_hex: &'a str,
+    signature_key: &'a RsaPrivateKey,
+}
+
 async fn dh_exchange(
     http: &Client,
     base_url: &str,
-    consumer_key: &str,
-    access_token: &str,
-    prepend_bytes: &[u8],
-    prepend_hex: &str,
-    signature_key: &RsaPrivateKey,
+    creds: &DhCredentials<'_>,
     dh_prime: &BigUint,
 ) -> anyhow::Result<String> {
+    let DhCredentials {
+        consumer_key,
+        access_token,
+        prepend_bytes,
+        prepend_hex,
+        signature_key,
+    } = *creds;
     let dh_generator: u32 = 2;
 
     // 1. 生成 256-bit DH random

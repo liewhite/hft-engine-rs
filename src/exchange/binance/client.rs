@@ -49,7 +49,7 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
     #[serde(tag = "filterType")]
     enum Filter {
         #[serde(rename = "PRICE_FILTER")]
-        PriceFilter {
+        Price {
             #[serde(rename = "tickSize")]
             tick_size: String,
         },
@@ -89,7 +89,7 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
 
         for filter in s.filters {
             match filter {
-                Filter::PriceFilter { tick_size } => {
+                Filter::Price { tick_size } => {
                     price_step = crate::domain::parse_decimal(&tick_size).ok();
                 }
                 Filter::LotSize { step_size, min_qty } => {
