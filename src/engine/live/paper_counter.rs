@@ -205,7 +205,7 @@ impl PaperCounter {
         self.states.get_mut(&key).expect("just inserted")
     }
 
-    /// 逐 (账户, 交易所) 发布净值 AccountInfo（等价实盘的 equity 轮询）。
+    /// 逐 (账户, 交易所) 发布净值 AccountInfo（等价实盘的 equity 轮询）与各币持仓价值（等价实盘账本的读数）。
     /// 交易所字段取各柜台自己的所 —— 此前写死 Binance，OKX/HL 模拟盘的策略查自己所的
     /// equity 恒为 None、永不下单。
     fn publish_account_info(&self, ts: Timestamp) {
@@ -221,6 +221,16 @@ impl PaperCounter {
                     equity,
                     notional,
                 }),
+            });
+            // 与实盘账本同一读数：各币持仓价值（策略的账户杠杆闸门用它，#759）
+            let values = state.ledger.position_values(|s: &Symbol| state.mark_of(s));
+            self.account_bus.publish(AccountEvent {
+                account: account.clone(),
+                exchange_ts: ts,
+                local_ts: ts,
+                data: AccountData::Exchange(ExchangeAccountData::PositionValues(
+                    crate::messaging::PositionValues { exchange: state.exchange, values },
+                )),
             });
         }
     }

@@ -335,8 +335,9 @@ impl<'a> BacktestEngine<'a> {
                 self.symbol_metas.clone(),
             ),
         );
-        let info = self.account_info_event(exchange, self.now);
-        self.schedule(self.now, Action::Deliver(info));
+        for ev in self.account_events(exchange, self.now) {
+            self.schedule(self.now, Action::Deliver(ev));
+        }
     }
 
     /// 把撮合回报按 ex->strat 延迟入队投递给策略（统一归属回测账户）。
@@ -381,8 +382,9 @@ impl<'a> BacktestEngine<'a> {
                 // 周期刷新各所净值, 等价实盘 accountRefresh（BTreeMap 保证投递序确定）
                 let exchanges: Vec<Exchange> = self.states.keys().copied().collect();
                 for exchange in exchanges {
-                    let account = self.account_info_event(exchange, self.now);
-                    self.deliver(account);
+                    for ev in self.account_events(exchange, self.now) {
+                        self.deliver(ev);
+                    }
                 }
                 // 仅在仍有行情待注入时续期, 源耗尽则停摆让队列自然排空 -> 保证终止
                 if self.more_data {
@@ -433,19 +435,19 @@ impl<'a> BacktestEngine<'a> {
         }
     }
 
-    fn account_info_event(&self, exchange: Exchange, ts: Timestamp) -> IncomeEvent {
+    /// 所级账户读数：净值（AccountInfo）+ 各币持仓价值（与实盘账本同一读数，#759）
+    fn account_events(&self, exchange: Exchange, ts: Timestamp) -> [IncomeEvent; 2] {
         let state = self.states.get(&exchange).expect("柜台已创建");
-        let equity = state.ledger.equity(|s: &Symbol| state.mark_of(s));
-        let notional = state.ledger.notional(|s: &Symbol| state.mark_of(s));
-        IncomeEvent::account(
-            crate::backtest::backtest_account(),
-            ts,
-            ts,
-            AccountData::Exchange(ExchangeAccountData::AccountInfo {
-                exchange,
-                equity,
-                notional,
-            }),
-        )
+        let mark_of = |s: &Symbol| state.mark_of(s);
+        let info = ExchangeAccountData::AccountInfo {
+            exchange,
+            equity: state.ledger.equity(mark_of),
+            notional: state.ledger.notional(mark_of),
+        };
+        let values = ExchangeAccountData::PositionValues(crate::messaging::PositionValues {
+            exchange,
+            values: state.ledger.position_values(mark_of),
+        });
+        [info, values].map(|d| IncomeEvent::account(crate::backtest::backtest_account(), ts, ts, AccountData::Exchange(d)))
     }
 }

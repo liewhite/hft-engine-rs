@@ -642,7 +642,13 @@ impl Ledger {
                 }
             }
             PositionLedgerMsg::Market(MarketEvent { data: MarketData::BBO(bbo), .. }) => {
-                self.mids.insert((bbo.exchange, bbo.symbol.clone()), bbo.mid_price());
+                let mid = bbo.mid_price();
+                match self.mids.get_mut(&(bbo.exchange, bbo.symbol.clone())) {
+                    Some(m) => *m = mid,
+                    None => {
+                        self.mids.insert((bbo.exchange, bbo.symbol.clone()), mid);
+                    }
+                }
             }
             PositionLedgerMsg::Market(_) => {}
             PositionLedgerMsg::RegisterSymbols {
@@ -709,7 +715,7 @@ impl Ledger {
                 });
             }
             Err(symbol) => {
-                tracing::debug!(%exchange, %symbol, "该币有仓但还没有盘口，暂不发持仓价值");
+                tracing::warn!(%exchange, %symbol, "该币有仓但还没有盘口，暂不发该所持仓价值（策略沿用上一份读数，启动时为未知、不开仓）");
             }
         }
     }
