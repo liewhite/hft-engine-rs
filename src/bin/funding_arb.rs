@@ -25,11 +25,14 @@
 
 use hft_engine_rs::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{
-    load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, ManagerHandle, StrategySpec,
+    load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, ManagerHandle,
+    StrategySpec,
 };
 use hft_engine_rs::exchange::SettledFundingSource;
 use hft_engine_rs::messaging::CustomEvent;
-use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, SettledFundingWindow, Strategy, FUNDING_WINDOW_MS};
+use hft_engine_rs::strategy::{
+    FundingArbConfig, FundingArbStrategy, SettledFundingWindow, Strategy, FUNDING_WINDOW_MS,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,7 +54,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let config: Config = load_config("config.json")?;
-    config.strategy.validate().map_err(|e| anyhow::anyhow!("strategy 配置非法: {e}"))?;
+    config
+        .strategy
+        .validate()
+        .map_err(|e| anyhow::anyhow!("strategy 配置非法: {e}"))?;
     anyhow::ensure!(config.funding_poll_secs > 0, "funding_poll_secs 必须 > 0");
     // 每项数据一轮刷新一次：留出一整轮失败的余量（两轮 ≤ 最大可用年龄），否则数据会周期性过期，
     // 策略在「未知」里反复进出
@@ -63,8 +69,16 @@ async fn run() -> anyhow::Result<()> {
     );
 
     let setups = setup_all(&config.exchanges).await?;
-    anyhow::ensure!(setups.len() >= 2, "exchanges 至少要配两所，当前 {}", setups.len());
-    tracing::info!(exchanges = setups.len(), pairs = config.strategy.pairs.len(), "funding_arb starting");
+    anyhow::ensure!(
+        setups.len() >= 2,
+        "exchanges 至少要配两所，当前 {}",
+        setups.len()
+    );
+    tracing::info!(
+        exchanges = setups.len(),
+        pairs = config.strategy.pairs.len(),
+        "funding_arb starting"
+    );
 
     let args = ManagerArgs {
         exchanges: setups,
@@ -78,13 +92,20 @@ async fn run() -> anyhow::Result<()> {
         // 各所的公共资金费来源：用引擎装配时建好的 client，不另建
         let funding_sources: Vec<Arc<dyn SettledFundingSource>> = exchanges
             .iter()
-            .map(|&ex| manager.settled_funding(ex).ok_or_else(|| anyhow::anyhow!("{ex} 不提供已结算资金费")))
+            .map(|&ex| {
+                manager
+                    .settled_funding(ex)
+                    .ok_or_else(|| anyhow::anyhow!("{ex} 不提供已结算资金费"))
+            })
             .collect::<anyhow::Result<_>>()?;
         let mut specs = Vec::new();
         let mut coverage: Vec<(Symbol, Vec<Exchange>)> = Vec::new();
         let mut lonely: Vec<String> = Vec::new();
         for p in config.strategy.params() {
-            let on: Vec<SymbolMeta> = exchanges.iter().filter_map(|&ex| manager.symbol_meta(ex, &p.symbol)).collect();
+            let on: Vec<SymbolMeta> = exchanges
+                .iter()
+                .filter_map(|&ex| manager.symbol_meta(ex, &p.symbol))
+                .collect();
             let on_ex: Vec<Exchange> = on.iter().map(|m| m.exchange).collect();
             tracing::info!(symbol = %p.symbol, exchanges = ?on_ex, "币种覆盖");
             if on.len() < 2 {
@@ -92,9 +113,15 @@ async fn run() -> anyhow::Result<()> {
                 continue;
             }
             coverage.push((p.symbol.clone(), on_ex));
-            specs.push(StrategySpec::live(Box::new(FundingArbStrategy::new(p, on)) as Box<dyn Strategy>));
+            specs.push(StrategySpec::live(
+                Box::new(FundingArbStrategy::new(p, on)) as Box<dyn Strategy>
+            ));
         }
-        anyhow::ensure!(lonely.is_empty(), "这些币上市的所不足两个，没法对冲：{}", lonely.join("、"));
+        anyhow::ensure!(
+            lonely.is_empty(),
+            "这些币上市的所不足两个，没法对冲：{}",
+            lonely.join("、")
+        );
         manager
             .add_strategies(specs)
             .await
@@ -113,8 +140,17 @@ async fn run() -> anyhow::Result<()> {
             })
             .collect();
         let gap = Duration::from_secs(config.funding_poll_secs) / requests.len().max(1) as u32;
-        tracing::info!(requests = requests.len(), gap_ms = gap.as_millis() as u64, "资金费轮询器启动");
-        let mut poller = FundingPoller { requests, next: 0, failures: HashMap::new(), manager: manager.clone() };
+        tracing::info!(
+            requests = requests.len(),
+            gap_ms = gap.as_millis() as u64,
+            "资金费轮询器启动"
+        );
+        let mut poller = FundingPoller {
+            requests,
+            next: 0,
+            failures: HashMap::new(),
+            manager: manager.clone(),
+        };
         manager.observers().spawn_fn("FundingPoller", move |scope| async move {
             // 第一轮（含重启后）每 WARMUP_GAP 拉一项尽快拉齐，之后每 gap 拉一项：否则重启后要等一整轮
             // （默认几分钟）才拿齐各币各所的数据，这段时间策略只平不开。第一轮不背靠背连发：各所查询
@@ -161,7 +197,9 @@ struct FundingPoller {
 impl FundingPoller {
     /// 拉下一项并投递
     async fn fetch_next(&mut self) {
-        let Some((symbol, source)) = self.requests.get(self.next).cloned() else { return };
+        let Some((symbol, source)) = self.requests.get(self.next).cloned() else {
+            return;
+        };
         self.next = (self.next + 1) % self.requests.len();
         let ex = source.exchange();
         let start = now_ms().saturating_sub(FUNDING_WINDOW_MS);
@@ -175,7 +213,8 @@ impl FundingPoller {
                     fetched_at: now_ms(),
                     entries,
                 };
-                self.manager.publish_custom_event(CustomEvent::for_symbol(ex, symbol, w));
+                self.manager
+                    .publish_custom_event(CustomEvent::for_symbol(ex, symbol, w));
             }
             Err(e) => {
                 let n = self.failures.entry((symbol.clone(), ex)).or_default();

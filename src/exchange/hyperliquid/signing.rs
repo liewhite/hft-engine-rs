@@ -91,7 +91,11 @@ pub async fn sign_l1_action(
     connection_id: B256,
     is_mainnet: bool,
 ) -> Result<L1Signature, String> {
-    let source = if is_mainnet { SOURCE_MAINNET } else { SOURCE_TESTNET };
+    let source = if is_mainnet {
+        SOURCE_MAINNET
+    } else {
+        SOURCE_TESTNET
+    };
 
     // 构造 phantom agent
     let agent = Agent {
@@ -128,8 +132,7 @@ pub fn create_signer(private_key: &str) -> Result<PrivateKeySigner, String> {
     let key = private_key.trim_start_matches("0x");
     let bytes = hex::decode(key).map_err(|e| format!("Invalid private key hex: {}", e))?;
 
-    PrivateKeySigner::from_slice(&bytes)
-        .map_err(|e| format!("Invalid private key: {}", e))
+    PrivateKeySigner::from_slice(&bytes).map_err(|e| format!("Invalid private key: {}", e))
 }
 
 // ============================================================================
@@ -345,8 +348,14 @@ mod tests {
     #[test]
     fn cancel_by_cloid_hash_matches_reference_vector() {
         let action = CancelByCloidAction::new(vec![
-            CancelByCloidWire { asset: 2, cloid: "0x00000000000000000000000000000001".into() },
-            CancelByCloidWire { asset: 0, cloid: "0xdeadbeefdeadbeefdeadbeefdeadbeef".into() },
+            CancelByCloidWire {
+                asset: 2,
+                cloid: "0x00000000000000000000000000000001".into(),
+            },
+            CancelByCloidWire {
+                asset: 0,
+                cloid: "0xdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+            },
         ]);
         let hash = action_hash(&action, 1762444800123, None).unwrap();
         assert_eq!(

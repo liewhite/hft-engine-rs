@@ -9,7 +9,9 @@
 //! 策略要在哪些所交易是它运行时声明的（`public_streams`），所以「这个所有没有账户」仍是运行时
 //! 判断，不是编译期保证；但只有绑定这一处，之后的环节拿到的都是已经齐全的类型。
 
-use crate::domain::{now_ms, AccountId, Exchange, ExchangeError, Position, Quantity, Symbol, Timestamp};
+use crate::domain::{
+    now_ms, AccountId, Exchange, ExchangeError, Position, Quantity, Symbol, Timestamp,
+};
 use crate::exchange::AccountClient;
 use crate::messaging::PositionBaseline;
 use std::collections::{HashMap, HashSet};
@@ -59,7 +61,11 @@ impl AccountBinding {
             Self::Paper { legs, .. } => legs
                 .into_iter()
                 .map(|(exchange, symbol)| PositionBaseline {
-                    position: Position { exchange, symbol, size: Quantity::ZERO },
+                    position: Position {
+                        exchange,
+                        symbol,
+                        size: Quantity::ZERO,
+                    },
                     snapshot_req_ts: 0,
                 })
                 .collect(),
@@ -152,14 +158,19 @@ pub(crate) async fn snapshot(
             symbol: symbol.clone(),
             size: Quantity::ZERO,
         });
-        Some(PositionBaseline { position, snapshot_req_ts: *snapshot_req_ts })
+        Some(PositionBaseline {
+            position,
+            snapshot_req_ts: *snapshot_req_ts,
+        })
     };
     let bindings = plans
         .into_iter()
         .map(|plan| match plan {
             // 上面已为每个实盘腿的所拉了快照
             PlannedAccount::Live(LiveLegs(legs)) => AccountBinding::Live(LiveBaselines(
-                legs.iter().map(|(leg, _)| baseline(leg).expect("实盘腿的所已拉快照")).collect(),
+                legs.iter()
+                    .map(|(leg, _)| baseline(leg).expect("实盘腿的所已拉快照"))
+                    .collect(),
             )),
             PlannedAccount::Paper { label, legs } => AccountBinding::Paper { label, legs },
         })
@@ -190,20 +201,30 @@ mod tests {
         fn exchange(&self) -> Exchange {
             WITH_ACCOUNT
         }
-        async fn fetch_pending_orders(&self, _: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
+        async fn fetch_pending_orders(
+            &self,
+            _: &Symbol,
+        ) -> Result<Vec<OrderUpdate>, ExchangeError> {
             unreachable!("拉快照不查挂单")
         }
         async fn cancel_order(&self, _: &Symbol, _: &str) -> Result<(), ExchangeError> {
             unreachable!("拉快照不撤单")
         }
-        async fn place_order(&self, _: ExchangeOrder) -> Result<OrderId, crate::domain::PlaceError> {
+        async fn place_order(
+            &self,
+            _: ExchangeOrder,
+        ) -> Result<OrderId, crate::domain::PlaceError> {
             unreachable!("拉快照不下单")
         }
         async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
             unreachable!("拉快照不查账户")
         }
         async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
-            Ok(vec![Position { exchange: WITH_ACCOUNT, symbol: SYM.to_string(), size: dec!(7.0) }])
+            Ok(vec![Position {
+                exchange: WITH_ACCOUNT,
+                symbol: SYM.to_string(),
+                size: dec!(7.0),
+            }])
         }
     }
 
@@ -216,7 +237,10 @@ mod tests {
     }
 
     fn size_at(baselines: &[PositionBaseline], leg: &Leg) -> Option<Quantity> {
-        baselines.iter().find(|b| (b.position.exchange, &b.position.symbol) == (leg.0, &leg.1)).map(|b| b.position.size)
+        baselines
+            .iter()
+            .find(|b| (b.position.exchange, &b.position.symbol) == (leg.0, &leg.1))
+            .map(|b| b.position.size)
     }
 
     /// 实盘实例：作用域内每条腿都来自快照，交易所没列出的腿是 0
@@ -229,14 +253,19 @@ mod tests {
         assert_eq!(b.len(), 2);
         assert_eq!(size_at(&b, &leg(WITH_ACCOUNT, SYM)), Some(dec!(7.0)));
         assert_eq!(size_at(&b, &leg(WITH_ACCOUNT, "ETH")), Some(dec!(0)));
-        assert!(b.iter().all(|x| x.snapshot_req_ts > 0), "实盘基线带快照请求时刻");
+        assert!(
+            b.iter().all(|x| x.snapshot_req_ts > 0),
+            "实盘基线带快照请求时刻"
+        );
     }
 
     /// 实盘实例要交易的所没配凭证：拒绝投产（下单会被拒、补腿补不上）
     #[test]
     fn live_scope_on_an_exchange_without_account_is_rejected() {
         let scope = HashSet::from([leg(WITH_ACCOUNT, SYM), leg(NO_ACCOUNT, SYM)]);
-        let Err(err) = PlannedAccount::bind(AccountId::Live, scope, &accounts()) else { panic!("应拒绝") };
+        let Err(err) = PlannedAccount::bind(AccountId::Live, scope, &accounts()) else {
+            panic!("应拒绝")
+        };
         assert!(err.to_string().contains("OKX 没配凭证"), "{err}");
     }
 
@@ -244,15 +273,26 @@ mod tests {
     #[tokio::test]
     async fn watched_legs_skip_exchanges_without_account() {
         let watched = HashSet::from([leg(WITH_ACCOUNT, SYM), leg(NO_ACCOUNT, SYM)]);
-        let paper = PlannedAccount::bind(AccountId::Paper("x".to_string()), watched.clone(), &accounts()).unwrap();
+        let paper = PlannedAccount::bind(
+            AccountId::Paper("x".to_string()),
+            watched.clone(),
+            &accounts(),
+        )
+        .unwrap();
         let (bindings, b) = snapshot(vec![paper], &watched, &accounts()).await.unwrap();
-        assert!(matches!(&bindings[..], [AccountBinding::Paper { .. }]), "模拟账户不拿真实快照");
+        assert!(
+            matches!(&bindings[..], [AccountBinding::Paper { .. }]),
+            "模拟账户不拿真实快照"
+        );
         assert_eq!(b.len(), 1);
         assert_eq!(size_at(&b, &leg(WITH_ACCOUNT, SYM)), Some(dec!(7.0)));
     }
 
     fn paper(legs: &[Leg]) -> AccountBinding {
-        AccountBinding::Paper { label: "x".to_string(), legs: legs.iter().cloned().collect() }
+        AccountBinding::Paper {
+            label: "x".to_string(),
+            legs: legs.iter().cloned().collect(),
+        }
     }
 
     /// 模拟账户：作用域内每条腿从 0 起步（不看真实持仓），基线时刻取 0
@@ -260,7 +300,9 @@ mod tests {
     fn paper_starts_flat_on_every_leg() {
         let b = paper(&[leg(WITH_ACCOUNT, SYM), leg(NO_ACCOUNT, SYM)]).into_baselines();
         assert_eq!(b.len(), 2);
-        assert!(b.iter().all(|x| x.position.size == Quantity::ZERO && x.snapshot_req_ts == 0));
+        assert!(b
+            .iter()
+            .all(|x| x.position.size == Quantity::ZERO && x.snapshot_req_ts == 0));
     }
 
     /// **钉住 ts=0 的真实边界**：防双计判据是 `local_ts <= seeded_ts`，所以 `local_ts == 0` 的 Fill
@@ -294,9 +336,17 @@ mod tests {
             let mut state = StateManager::new(&[SYM.to_string()]);
             state.seed_positions(&baselines);
             state.apply(&fill_at(local_ts)).unwrap();
-            state.symbol_state(&SYM.to_string()).expect("state").position_book().position_size(WITH_ACCOUNT)
+            state
+                .symbol_state(&SYM.to_string())
+                .expect("state")
+                .position_book()
+                .position_size(WITH_ACCOUNT)
         };
-        assert_eq!(size_after(0), dec!(0.0), "local_ts == 0 的 Fill 被判成「已含在快照里」而丢弃");
+        assert_eq!(
+            size_after(0),
+            dec!(0.0),
+            "local_ts == 0 的 Fill 被判成「已含在快照里」而丢弃"
+        );
         assert_eq!(size_after(1), dec!(1.0), "local_ts >= 1 照常累加");
     }
 }

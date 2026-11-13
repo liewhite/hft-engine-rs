@@ -1,6 +1,6 @@
-use crate::domain::{Exchange, Greeks, MarketStatus, Order, Position, Symbol, Timestamp, USDT};
 use crate::domain::AccountInfo;
-use crate::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData, SymbolState};
+use crate::domain::{Exchange, Greeks, MarketStatus, Order, Position, Symbol, Timestamp, USDT};
+use crate::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData, SymbolState};
 use std::collections::HashMap;
 
 /// 一份持仓基线：某 (所, symbol) 的起始持仓 + 其 REST 快照的**请求**时刻。
@@ -185,7 +185,12 @@ impl StateManager {
     }
 
     /// 策略要撤这张单：记下「撤单已发」，`Ok` 表示该发（见 [`crate::messaging::SymbolOrders::mark_cancel_sent`]）
-    pub fn mark_cancel_sent(&mut self, symbol: &Symbol, client_order_id: &str, now: Timestamp) -> Result<(), &'static str> {
+    pub fn mark_cancel_sent(
+        &mut self,
+        symbol: &Symbol,
+        client_order_id: &str,
+        now: Timestamp,
+    ) -> Result<(), &'static str> {
         match self.states.get_mut(symbol) {
             Some(state) => state.mark_cancel_sent(client_order_id, now),
             None => Err("symbol 未注册"),
@@ -283,13 +288,14 @@ impl StateManager {
                         available = balance.available,
                         "USDT balance updated"
                     );
-                    self.account.balances.insert(balance.exchange, balance.available);
+                    self.account
+                        .balances
+                        .insert(balance.exchange, balance.available);
                 }
                 // 存储币种现金余额 (用于修正 greeks delta)
-                self.account.cash_balances.insert(
-                    (balance.exchange, balance.asset.clone()),
-                    balance.available,
-                );
+                self.account
+                    .cash_balances
+                    .insert((balance.exchange, balance.asset.clone()), balance.available);
             }
             // equity + notional 原子写入
             ExchangeAccountData::AccountInfo {
@@ -303,18 +309,25 @@ impl StateManager {
                     notional = notional,
                     "AccountInfo updated"
                 );
-                self.account.account_infos.insert(*exchange, AccountInfo {
-                    equity: *equity,
-                    notional: *notional,
-                });
+                self.account.account_infos.insert(
+                    *exchange,
+                    AccountInfo {
+                        equity: *equity,
+                        notional: *notional,
+                    },
+                );
             }
             ExchangeAccountData::Greeks(g) => {
-                self.account.greeks.insert((g.exchange, g.ccy.clone()), g.clone());
+                self.account
+                    .greeks
+                    .insert((g.exchange, g.ccy.clone()), g.clone());
             }
             // 品种目录外的成交：不属于任何 symbol 状态，框架只运送，策略在 on_event 里自行处理
             ExchangeAccountData::UnmappedFill(_) => {}
             ExchangeAccountData::PositionValues(v) => {
-                self.account.position_values.insert(v.exchange, v.values.clone());
+                self.account
+                    .position_values
+                    .insert(v.exchange, v.values.clone());
             }
         }
     }
@@ -333,11 +346,11 @@ impl StateManager {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Fill, FillReason, Side};
     use crate::messaging::SymbolAccountData;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     const EX: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
@@ -385,7 +398,11 @@ mod tests {
         manager.seed_positions(&[baseline(dec!(99.0), 20)]);
 
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(state.position_book().position_size(EX), dec!(2.0), "重复 seed 不得覆写存量");
+        assert_eq!(
+            state.position_book().position_size(EX),
+            dec!(2.0),
+            "重复 seed 不得覆写存量"
+        );
     }
 
     /// **防双计**：快照请求时刻之前送达的 Fill 已含在快照里，seed 之后到达必须丢弃；
@@ -402,7 +419,11 @@ mod tests {
         manager.apply(&fill_at(dec!(1.0), 15)).unwrap();
 
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(state.position_book().position_size(EX), dec!(3.0), "应为 2.0(快照) + 1.0(新成交)");
+        assert_eq!(
+            state.position_book().position_size(EX),
+            dec!(3.0),
+            "应为 2.0(快照) + 1.0(新成交)"
+        );
     }
 
     /// 未 seed 的所从 0 起算（模拟账户、未配置凭证的所）：Fill 直接累加，不受过滤影响

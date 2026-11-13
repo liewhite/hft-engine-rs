@@ -3,9 +3,9 @@
 mod account_binding;
 pub mod assembly;
 mod clock;
-mod manager;
 mod executor;
 mod income_processor;
+mod manager;
 mod metrics;
 mod outcome_processor;
 mod paper_counter;
@@ -78,15 +78,15 @@ pub fn to_paper_outlet(o: &AccountOutcome) -> bool {
     matches!(outlet_for(&o.account), Outlet::Paper)
 }
 
-
-pub use assembly::{setup_all, setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup, ExchangesConfig};
 pub use account_binding::{AccountBinding, LiveBaselines};
-pub use clock::Clock;
-pub use manager::{
-    Manager, ManagerArgs, ManagerError, ManagerHandle, StrategySpec,
+pub use assembly::{
+    setup_all, setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup,
+    ExchangesConfig,
 };
+pub use clock::Clock;
 pub use executor::{Executor, ExecutorArgs, ExecutorHandle, ExecutorId};
 pub use income_processor::{IncomeProcessor, IncomeProcessorHandle};
+pub use manager::{Manager, ManagerArgs, ManagerError, ManagerHandle, StrategySpec};
 pub use metrics::{Metrics, MetricsArgs, MetricsHandle, DEFAULT_REPORT_INTERVAL_MS};
 pub use outcome_processor::{OrderGateway, OrderRequestCounts, OutcomeProcessor, RequestKind};
 pub use paper_counter::{PaperCounter, PaperCounterArgs};

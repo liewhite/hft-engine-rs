@@ -107,7 +107,8 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
         .try_init();
 
     // ---- 1. 无凭证 client：symbol meta 走公共 REST，不需要签名 ----
-    let binance_client = Arc::new(BinanceClient::new("USDT".to_string(), None).expect("binance client"));
+    let binance_client =
+        Arc::new(BinanceClient::new("USDT".to_string(), None).expect("binance client"));
     let okx_client = Arc::new(OkxClient::new("USDT".to_string(), None).expect("okx client"));
     let hl_client = Arc::new(
         HyperliquidClient::connect("USDC".to_string(), vec![String::new()], None)
@@ -203,7 +204,9 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
     println!("三个交易所节点均已在 non-auth 模式下启动");
 
     // ---- 4. 订阅 BBO + Trades ----
-    binance.subscribe_batch(subscriptions()).expect("binance subscribe");
+    binance
+        .subscribe_batch(subscriptions())
+        .expect("binance subscribe");
     okx.subscribe_batch(subscriptions()).expect("okx subscribe");
     hl.subscribe_batch(subscriptions()).expect("hl subscribe");
 

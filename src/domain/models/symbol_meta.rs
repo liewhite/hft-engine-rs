@@ -103,13 +103,17 @@ impl SymbolMeta {
     ///
     /// 规格无效（步长或乘数为 0）时返回 0，下游校验会拒。精确运算，取整幂等。
     pub fn round_coin_size_down(&self, coin_amount: Quantity) -> Quantity {
-        self.units_trunc(coin_amount).map_or(Decimal::ZERO, |units| units * self.contract_size)
+        self.units_trunc(coin_amount)
+            .map_or(Decimal::ZERO, |units| units * self.contract_size)
     }
 
     /// 币本位 → 交易所下单单位并按 `size_step` 向 0 取整。**数量取整规则的唯一实现。**
     /// `None`：规格的步长 / 乘数为 0。
     fn units_trunc(&self, coin_amount: Quantity) -> Option<Decimal> {
-        let steps = coin_amount.checked_div(self.contract_size)?.checked_div(self.size_step)?.trunc();
+        let steps = coin_amount
+            .checked_div(self.contract_size)?
+            .checked_div(self.size_step)?
+            .trunc();
         Some(steps * self.size_step)
     }
 }
@@ -149,8 +153,16 @@ mod tests {
             let m = meta(cs, step);
             for k in 1..20_000u32 {
                 let coin = Decimal::from(k) * step * cs;
-                assert_eq!(m.round_coin_size_down(coin), coin, "cs={cs} step={step} k={k}");
-                assert_eq!(m.checked_exchange_qty(coin).unwrap(), Decimal::from(k) * step, "cs={cs} step={step} k={k}");
+                assert_eq!(
+                    m.round_coin_size_down(coin),
+                    coin,
+                    "cs={cs} step={step} k={k}"
+                );
+                assert_eq!(
+                    m.checked_exchange_qty(coin).unwrap(),
+                    Decimal::from(k) * step,
+                    "cs={cs} step={step} k={k}"
+                );
             }
         }
     }
@@ -163,7 +175,11 @@ mod tests {
         assert!(m.checked_exchange_qty(dec!(-0.29)).is_err(), "负数");
         let m = meta(dec!(1), dec!(0.01));
         assert_eq!(m.round_coin_size_down(dec!(0.0599)), dec!(0.05));
-        assert_eq!(m.round_coin_size_down(dec!(-0.0599)), dec!(-0.05), "向 0 取整");
+        assert_eq!(
+            m.round_coin_size_down(dec!(-0.0599)),
+            dec!(-0.05),
+            "向 0 取整"
+        );
     }
 
     /// 几所持仓相加相减的差恰好在整步上，取整不丢步（f64 时 0.7 - 0.64 = 0.0599999…，曾少补一步，#764）
@@ -171,7 +187,10 @@ mod tests {
     fn position_differences_stay_on_step() {
         let m = meta(dec!(1), dec!(0.01));
         assert_eq!(m.round_coin_size_down(dec!(0.7) - dec!(0.64)), dec!(0.06));
-        assert_eq!(m.checked_exchange_qty(dec!(0.7) - dec!(0.64)).unwrap(), dec!(0.06));
+        assert_eq!(
+            m.checked_exchange_qty(dec!(0.7) - dec!(0.64)).unwrap(),
+            dec!(0.06)
+        );
     }
 
     #[test]

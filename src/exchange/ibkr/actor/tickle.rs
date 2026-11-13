@@ -35,7 +35,11 @@ impl IbkrTickle {
         group.spawn_periodic(
             "IbkrTickle",
             Duration::from_secs(TICKLE_INTERVAL_SECS),
-            Self { auth, http, consecutive_failures: 0 },
+            Self {
+                auth,
+                http,
+                consecutive_failures: 0,
+            },
         )
     }
 }

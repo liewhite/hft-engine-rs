@@ -108,17 +108,20 @@ impl IncomeProcessor {
     ) -> anyhow::Result<(ChildHandle, IncomeProcessorHandle)> {
         let (market_bus, account_bus) = (market_bus.clone(), account_bus.clone());
         let (child, addr) = group
-            .spawn_addressed("IncomeProcessor", move |_scope: Scope, mut inbox| async move {
-                inbox.subscribe(&market_bus, |_| true, IncomeProcessorMsg::Market);
-                inbox.subscribe(&account_bus, |_| true, IncomeProcessorMsg::Account);
-                tracing::info!("IncomeProcessor started");
-                Ok(Self {
-                    inbox,
-                    executors: HashMap::new(),
-                    by_symbol: HashMap::new(),
-                    by_account: HashMap::new(),
-                })
-            })
+            .spawn_addressed(
+                "IncomeProcessor",
+                move |_scope: Scope, mut inbox| async move {
+                    inbox.subscribe(&market_bus, |_| true, IncomeProcessorMsg::Market);
+                    inbox.subscribe(&account_bus, |_| true, IncomeProcessorMsg::Account);
+                    tracing::info!("IncomeProcessor started");
+                    Ok(Self {
+                        inbox,
+                        executors: HashMap::new(),
+                        by_symbol: HashMap::new(),
+                        by_account: HashMap::new(),
+                    })
+                },
+            )
             .await?;
         Ok((child, IncomeProcessorHandle(addr)))
     }
@@ -308,10 +311,10 @@ impl Task for IncomeProcessor {
 
 #[cfg(test)]
 mod routing_tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Exchange, Fill, FillReason, MarketTrade, Side};
-    use crate::messaging::{SymbolAccountData, AccountData, MarketData};
+    use crate::messaging::{AccountData, MarketData, SymbolAccountData};
+    use rust_decimal_macros::dec;
 
     fn fill_event(account: AccountId) -> AccountEvent {
         AccountEvent {
@@ -379,11 +382,13 @@ mod routing_tests {
             AccountId::Live,
             0,
             0,
-            crate::messaging::AccountData::Exchange(crate::messaging::ExchangeAccountData::AccountInfo {
-                exchange: Exchange::Binance,
-                equity: 1.0,
-                notional: 0.0,
-            }),
+            crate::messaging::AccountData::Exchange(
+                crate::messaging::ExchangeAccountData::AccountInfo {
+                    exchange: Exchange::Binance,
+                    equity: 1.0,
+                    notional: 0.0,
+                },
+            ),
         );
         assert_eq!(
             account_info.delivery(),
@@ -392,19 +397,23 @@ mod routing_tests {
         );
 
         let clock = IncomeEvent::market(0, 0, MarketData::Clock);
-        assert_eq!(clock.delivery(), Delivery::Broadcast, "Clock 与交易所无关，广播");
+        assert_eq!(
+            clock.delivery(),
+            Delivery::Broadcast,
+            "Clock 与交易所无关，广播"
+        );
     }
 }
 
 /// 组件层：注册后按范围投递、注销后不再投递、对方停止收件不打死分发器。用 `tasks::Root` 搭树测。
 #[cfg(test)]
 mod task_tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Fill, FillReason, MarketTrade, Side};
     use crate::engine::live::executor::ExecutorMsg;
     use crate::messaging::{AccountData, MarketData, SymbolAccountData};
     use crate::tasks::Root;
+    use rust_decimal_macros::dec;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -497,7 +506,11 @@ mod task_tests {
         market.publish(trade("ETH")); // 范围外
         account.publish(live_fill());
         settle(&processor).await;
-        assert_eq!(*got.lock().unwrap(), 2, "BTC 行情与该账户的 BTC 成交各一条，ETH 不投");
+        assert_eq!(
+            *got.lock().unwrap(),
+            2,
+            "BTC 行情与该账户的 BTC 成交各一条，ETH 不投"
+        );
 
         processor.unregister(id).await.unwrap();
         market.publish(trade("BTC"));

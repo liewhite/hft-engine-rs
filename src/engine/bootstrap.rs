@@ -28,7 +28,9 @@ where
     if let Some(a) = &alerts {
         if let Err(e) = a.probe().await {
             tracing::error!(error = %e, "告警外送不通，拒绝启动");
-            return Err(e.context("告警外送不通，拒绝启动（修好告警配置，或去掉告警环境变量明确关闭）"));
+            return Err(
+                e.context("告警外送不通，拒绝启动（修好告警配置，或去掉告警环境变量明确关闭）")
+            );
         }
         tracing::info!("告警外送已启用并试发成功，不受 RUST_LOG 控制台过滤影响");
     }
@@ -58,7 +60,10 @@ where
     }
     if let Some(a) = alerts {
         if !a.flush(ALERT_FLUSH_DEADLINE).await {
-            tracing::error!("退出前告警未在 {}s 内发完，可能有告警未送达", ALERT_FLUSH_DEADLINE.as_secs());
+            tracing::error!(
+                "退出前告警未在 {}s 内发完，可能有告警未送达",
+                ALERT_FLUSH_DEADLINE.as_secs()
+            );
         }
     }
     result
@@ -196,7 +201,9 @@ async fn run_until_shutdown(root: Root) -> anyhow::Result<()> {
         // 会把排查起点丢掉 —— 而这条错误往往是运维手里唯一的线索。
         None => match shutdown(root).await {
             Err(e) => Err(e.context("引擎因节点出错停止交易")),
-            Ok(()) => Err(anyhow::anyhow!("引擎被内部请求停机，但没有记下错误（不该发生）")),
+            Ok(()) => Err(anyhow::anyhow!(
+                "引擎被内部请求停机，但没有记下错误（不该发生）"
+            )),
         },
         Some(signal) => {
             tracing::info!(signal, "Received shutdown signal");
@@ -327,7 +334,9 @@ mod supervision_tests {
                     let (_, grand_addr) = grand
                         .spawn_addressed("GrandRecorder", {
                             let c = c.clone();
-                            move |_scope: Scope, inbox| async move { Ok(Recorder { inbox, counters: c }) }
+                            move |_scope: Scope, inbox| async move {
+                                Ok(Recorder { inbox, counters: c })
+                            }
                         })
                         .await?;
                     let _ = child_tx.send(grand_addr);
@@ -347,7 +356,9 @@ mod supervision_tests {
     async fn startup_failure_surfaces_as_error_and_cascades() {
         let root = Root::new("engine");
         let main = root.group("main");
-        let err = spawn_observer(&main, true).await.expect_err("构造失败必须传播");
+        let err = spawn_observer(&main, true)
+            .await
+            .expect_err("构造失败必须传播");
         let text = format!("{err:#}");
         assert!(text.contains("启动失败"), "错误要点名启动阶段: {text}");
         assert!(text.contains("账本打不开"), "错误要带上根因: {text}");
@@ -399,7 +410,10 @@ mod supervision_tests {
 
         assert!(child.is_gone() && grandchild.is_gone(), "整棵树都该停了");
         assert_eq!(
-            (counters.ticks.load(Ordering::SeqCst), counters.stops.load(Ordering::SeqCst)),
+            (
+                counters.ticks.load(Ordering::SeqCst),
+                counters.stops.load(Ordering::SeqCst)
+            ),
             (6, 2),
             "排队的 6 条必须先处理完，两个收尾都要跑到"
         );
@@ -414,7 +428,10 @@ mod supervision_tests {
         let err = drive(root, (), |_| async { anyhow::bail!("加策略失败") })
             .await
             .expect_err("装配失败必须返回 Err");
-        assert!(format!("{err:#}").contains("加策略失败"), "要带根因: {err:#}");
+        assert!(
+            format!("{err:#}").contains("加策略失败"),
+            "要带根因: {err:#}"
+        );
         assert!(addr.is_gone(), "装配失败后引擎没停 —— 半套引擎被丢下继续跑");
         assert_eq!(counters.stops.load(Ordering::SeqCst), 1, "收尾要跑到");
     }
@@ -423,7 +440,9 @@ mod supervision_tests {
     #[tokio::test]
     async fn graceful_stop_does_not_cascade() {
         let root = Root::new("engine");
-        let observer = spawn_observer(&root.group("main"), false).await.expect("启动成功");
+        let observer = spawn_observer(&root.group("main"), false)
+            .await
+            .expect("启动成功");
         observer.stop().await;
         assert!(observer.is_finished());
         assert!(!root.is_stopping(), "主动收工却把整机带走了");

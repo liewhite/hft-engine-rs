@@ -33,7 +33,11 @@ impl IbkrStatusPoller {
         group.spawn_periodic(
             "IbkrStatusPoller",
             Duration::from_millis(interval_ms),
-            Self { client, market_bus, last_status: None },
+            Self {
+                client,
+                market_bus,
+                last_status: None,
+            },
         )
     }
 }
@@ -133,10 +137,7 @@ fn determine_status_from_schedule(schedules: &[TradingSchedule]) -> MarketStatus
 }
 
 /// 按 description 查找 venue
-fn find_venue<'a>(
-    schedules: &'a [TradingSchedule],
-    desc: &str,
-) -> Option<&'a TradingSchedule> {
+fn find_venue<'a>(schedules: &'a [TradingSchedule], desc: &str) -> Option<&'a TradingSchedule> {
     schedules
         .iter()
         .find(|s| s.description.as_deref() == Some(desc))
@@ -225,4 +226,3 @@ fn parse_hhmm(s: &str) -> Option<u32> {
     })?;
     Some(hh * 60 + mm)
 }
-

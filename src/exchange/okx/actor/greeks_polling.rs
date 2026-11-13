@@ -77,7 +77,9 @@ impl Periodic for OkxGreeksPoller {
             }
             Err(e) => {
                 self.guard.check_failure(&e).map_err(|reason| {
-                    anyhow::anyhow!("OKX 希腊值长期取不到（陈旧读数会让 delta 敞口判断失准）: {reason}")
+                    anyhow::anyhow!(
+                        "OKX 希腊值长期取不到（陈旧读数会让 delta 敞口判断失准）: {reason}"
+                    )
                 })?;
                 tracing::warn!(
                     exchange = %Exchange::OKX,

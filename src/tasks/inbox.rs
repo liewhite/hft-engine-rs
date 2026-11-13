@@ -74,9 +74,10 @@ impl<M: Send + 'static> Inbox<M> {
             .clone()
             .expect("收件箱已关闭（节点在停机），不能再订阅");
         let name = self.scope.name().to_string();
-        self.subscriptions.push(bus.as_ref().subscribe(name, filter, move |e| {
-            tx.send(wrap(e)).map_err(|_| super::Gone)
-        }));
+        self.subscriptions
+            .push(bus.as_ref().subscribe(name, filter, move |e| {
+                tx.send(wrap(e)).map_err(|_| super::Gone)
+            }));
     }
 
     fn close(&mut self) {

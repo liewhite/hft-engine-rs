@@ -18,5 +18,5 @@ mod okx_actor;
 mod private_ws;
 pub(crate) mod public_ws;
 
-pub use okx_actor::{OkxArgs, OkxNode};
 pub(crate) use greeks_polling::{OkxGreeksPoller, GREEKS_POLLING_INTERVAL_MS};
+pub use okx_actor::{OkxArgs, OkxNode};

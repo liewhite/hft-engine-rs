@@ -1,4 +1,7 @@
-use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, Position, Quantity, Symbol, Timestamp, BBO};
+use crate::domain::{
+    Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, Position, Quantity, Symbol,
+    Timestamp, BBO,
+};
 use crate::messaging::event::{MarketData, OrderRequestResult, RequestOutcome, SymbolAccountData};
 use std::collections::HashMap;
 
@@ -41,7 +44,10 @@ pub enum OrderStage {
     /// 交易所在撮合，没撤过
     Live,
     /// 撤过、交易所还没推终态。卡单从第一次撤起计时，中间撤单失败、重撤都不重新计时（#767）
-    Cancelling { first_sent_at: Timestamp, attempt: CancelAttempt },
+    Cancelling {
+        first_sent_at: Timestamp,
+        attempt: CancelAttempt,
+    },
     /// 交易所说结束了（成交完 / 撤销 / 拒单），在等成交到齐
     Done { status: OrderStatus, at: Timestamp },
 }
@@ -57,7 +63,13 @@ pub enum CancelAttempt {
 
 impl PendingOrder {
     fn new(order: Order, created_at: Timestamp) -> Self {
-        Self { order, created_at, filled: Quantity::ZERO, reported_filled: Quantity::ZERO, stage: OrderStage::Placing }
+        Self {
+            order,
+            created_at,
+            filled: Quantity::ZERO,
+            reported_filled: Quantity::ZERO,
+            stage: OrderStage::Placing,
+        }
     }
 
     pub fn stage(&self) -> &OrderStage {
@@ -78,7 +90,12 @@ impl PendingOrder {
     fn on_report(&mut self, status: &OrderStatus, at: Timestamp) {
         match self.stage {
             OrderStage::Done { .. } => {}
-            _ if status.is_terminal() => self.stage = OrderStage::Done { status: status.clone(), at },
+            _ if status.is_terminal() => {
+                self.stage = OrderStage::Done {
+                    status: status.clone(),
+                    at,
+                }
+            }
             OrderStage::Placing => self.stage = OrderStage::Live,
             OrderStage::Live | OrderStage::Cancelling { .. } => {}
         }
@@ -101,11 +118,21 @@ impl PendingOrder {
             OrderStage::Placing => return Err("下单请求还没结论"),
             OrderStage::Done { .. } => return Err("已到终态"),
             _ if self.filled >= self.order.quantity => return Err("成交已加满单量，终态在路上"),
-            OrderStage::Cancelling { attempt: CancelAttempt::InFlight, .. } => return Err("上一次撤单还在等结论"),
-            OrderStage::Live => OrderStage::Cancelling { first_sent_at: now, attempt: CancelAttempt::InFlight },
-            OrderStage::Cancelling { first_sent_at, attempt: CancelAttempt::Failed { .. } } => {
-                OrderStage::Cancelling { first_sent_at: *first_sent_at, attempt: CancelAttempt::InFlight }
-            }
+            OrderStage::Cancelling {
+                attempt: CancelAttempt::InFlight,
+                ..
+            } => return Err("上一次撤单还在等结论"),
+            OrderStage::Live => OrderStage::Cancelling {
+                first_sent_at: now,
+                attempt: CancelAttempt::InFlight,
+            },
+            OrderStage::Cancelling {
+                first_sent_at,
+                attempt: CancelAttempt::Failed { .. },
+            } => OrderStage::Cancelling {
+                first_sent_at: *first_sent_at,
+                attempt: CancelAttempt::InFlight,
+            },
         };
         Ok(())
     }
@@ -120,7 +147,10 @@ impl PendingOrder {
     /// 已结束（多半是刚成交完）就不用再撤，不记
     fn on_cancel_failed(&mut self, at: Timestamp, reason: &str) {
         if let OrderStage::Cancelling { attempt, .. } = &mut self.stage {
-            *attempt = CancelAttempt::Failed { at, reason: reason.to_string() };
+            *attempt = CancelAttempt::Failed {
+                at,
+                reason: reason.to_string(),
+            };
         }
     }
 
@@ -130,12 +160,13 @@ impl PendingOrder {
         match &self.stage {
             OrderStage::Placing => Some((self.created_at, "下单请求没有结论")),
             OrderStage::Live => None,
-            OrderStage::Cancelling { first_sent_at, .. } => Some((*first_sent_at, "撤单发出后交易所没推终态")),
+            OrderStage::Cancelling { first_sent_at, .. } => {
+                Some((*first_sent_at, "撤单发出后交易所没推终态"))
+            }
             OrderStage::Done { at, .. } => Some((*at, "终态已到、成交没到齐")),
         }
     }
 }
-
 
 /// 单个交易对的**行情**投影：各所的盘口 / 标记价 / 指数价 / 资金费率。
 ///
@@ -204,11 +235,7 @@ impl SymbolMarket {
             .min()?;
 
         // 使用最新的 timestamp 作为当前时间
-        let current_time = self
-            .funding_rates
-            .values()
-            .map(|r| r.timestamp)
-            .max()?;
+        let current_time = self.funding_rates.values().map(|r| r.timestamp).max()?;
 
         Some((min_settle_time, current_time))
     }
@@ -222,8 +249,10 @@ impl SymbolMarket {
         self.funding_rates
             .iter()
             .max_by(|a, b| {
-                let a_daily = a.1.daily_rate_with_base_time(base_settle_time, current_time);
-                let b_daily = b.1.daily_rate_with_base_time(base_settle_time, current_time);
+                let a_daily =
+                    a.1.daily_rate_with_base_time(base_settle_time, current_time);
+                let b_daily =
+                    b.1.daily_rate_with_base_time(base_settle_time, current_time);
                 a_daily.total_cmp(&b_daily)
             })
             .map(|(e, r)| (*e, r))
@@ -238,8 +267,10 @@ impl SymbolMarket {
         self.funding_rates
             .iter()
             .min_by(|a, b| {
-                let a_daily = a.1.daily_rate_with_base_time(base_settle_time, current_time);
-                let b_daily = b.1.daily_rate_with_base_time(base_settle_time, current_time);
+                let a_daily =
+                    a.1.daily_rate_with_base_time(base_settle_time, current_time);
+                let b_daily =
+                    b.1.daily_rate_with_base_time(base_settle_time, current_time);
                 a_daily.total_cmp(&b_daily)
             })
             .map(|(e, r)| (*e, r))
@@ -413,8 +444,7 @@ impl SymbolPositions {
                     snapshot_req_ts,
                     "Position baseline seeded"
                 );
-                self.seeded_at
-                    .insert(position.exchange, snapshot_req_ts);
+                self.seeded_at.insert(position.exchange, snapshot_req_ts);
                 self.positions.insert(position.exchange, position.clone());
                 true
             }
@@ -457,7 +487,9 @@ impl SymbolPositions {
     /// 场景下成立，但它没有限定用途，读起来像是断言两者在任何场景下都等价 —— 而模拟策略
     /// 首笔成交前、以及无凭证的所，恰恰是需要分辨的。
     pub fn position_size(&self, exchange: Exchange) -> Quantity {
-        self.positions.get(&exchange).map_or(Quantity::ZERO, |p| p.size)
+        self.positions
+            .get(&exchange)
+            .map_or(Quantity::ZERO, |p| p.size)
     }
 
     /// 获取多空仓位大小
@@ -484,7 +516,10 @@ impl SymbolPositions {
 impl SymbolOrders {
     /// 登记策略刚发出的一张单（client_order_id 已分配）
     pub fn add(&mut self, order: Order, created_at: Timestamp) {
-        self.orders.insert(order.client_order_id.clone(), PendingOrder::new(order, created_at));
+        self.orders.insert(
+            order.client_order_id.clone(),
+            PendingOrder::new(order, created_at),
+        );
     }
 
     /// 策略要撤这张单：记下「撤单在途」，返回 `Ok` 表示该发。
@@ -492,7 +527,11 @@ impl SymbolOrders {
     /// 不该发的（`Err` 带原因）：不在表里、已到终态或收到的成交已加满单量（撤不掉，发了白耗一次交易所操作）、
     /// 下单请求还没结论、上一次撤单还在等结论（见 [`OrderStage`]）。下单没结论时不撤：受理的结论（或交易所回报）一到
     /// 策略就会被调用、可以再撤，只晚一个往返。
-    pub fn mark_cancel_sent(&mut self, client_order_id: &str, now: Timestamp) -> Result<(), &'static str> {
+    pub fn mark_cancel_sent(
+        &mut self,
+        client_order_id: &str,
+        now: Timestamp,
+    ) -> Result<(), &'static str> {
         match self.orders.get_mut(client_order_id) {
             Some(p) => p.request_cancel(now),
             None => Err("不在跟踪表里"),
@@ -500,7 +539,12 @@ impl SymbolOrders {
     }
 
     /// 交易所的订单回报
-    fn apply_update(&mut self, symbol: &Symbol, update: &crate::domain::OrderUpdate, local_ts: Timestamp) {
+    fn apply_update(
+        &mut self,
+        symbol: &Symbol,
+        update: &crate::domain::OrderUpdate,
+        local_ts: Timestamp,
+    ) {
         let Some(client_id) = &update.client_order_id else {
             return; // 没有订单号：跟踪表对不上它
         };
@@ -558,7 +602,11 @@ impl SymbolOrders {
 
     /// 终态且成交到齐就移出
     fn settle(&mut self, symbol: &Symbol, client_id: &str) {
-        if self.orders.get(client_id).is_some_and(|p| !p.is_open() && p.fills_settled()) {
+        if self
+            .orders
+            .get(client_id)
+            .is_some_and(|p| !p.is_open() && p.fills_settled())
+        {
             let p = self.orders.remove(client_id).expect("刚查过");
             if p.filled > p.reported_filled {
                 // 持仓对账随后会发现漂移并停机；这里先记下是哪张单多收了成交，便于排查（#764 审查）
@@ -609,7 +657,11 @@ impl SymbolState {
 
     /// 行情事件的状态转移。调用方（`StateManager`）已按 symbol 路由。
     pub fn apply_market(&mut self, data: &MarketData) {
-        debug_assert_eq!(data.symbol(), Some(&self.symbol), "行情被路由到了别的 symbol 状态");
+        debug_assert_eq!(
+            data.symbol(),
+            Some(&self.symbol),
+            "行情被路由到了别的 symbol 状态"
+        );
         self.market.apply(&self.symbol, data);
     }
 
@@ -617,7 +669,11 @@ impl SymbolState {
     ///
     /// 只收 [`SymbolAccountData`]：所级账户事件在类型上就到不了这里。
     pub fn apply_account(&mut self, data: &SymbolAccountData, local_ts: Timestamp) {
-        debug_assert_eq!(data.symbol(), &self.symbol, "账户事件被路由到了别的 symbol 状态");
+        debug_assert_eq!(
+            data.symbol(),
+            &self.symbol,
+            "账户事件被路由到了别的 symbol 状态"
+        );
         match data {
             SymbolAccountData::OrderUpdate(update) => {
                 tracing::info!(
@@ -645,7 +701,6 @@ impl SymbolState {
         }
     }
 
-
     // ==================== 投影访问 ====================
 
     /// 行情投影（只读）
@@ -667,7 +722,8 @@ impl SymbolState {
     // 读一律经上面三个投影；写要带上本 symbol（日志与校验用），且投影只读外放，故写入口留在这里
 
     pub fn seed_position(&mut self, position: &Position, snapshot_req_ts: Timestamp) -> bool {
-        self.position_book.seed(&self.symbol, position, snapshot_req_ts)
+        self.position_book
+            .seed(&self.symbol, position, snapshot_req_ts)
     }
 
     pub fn add_pending_order(&mut self, order: Order, created_at: Timestamp) {
@@ -675,7 +731,11 @@ impl SymbolState {
     }
 
     /// 策略要撤这张单，见 [`SymbolOrders::mark_cancel_sent`]
-    pub fn mark_cancel_sent(&mut self, client_order_id: &str, now: Timestamp) -> Result<(), &'static str> {
+    pub fn mark_cancel_sent(
+        &mut self,
+        client_order_id: &str,
+        now: Timestamp,
+    ) -> Result<(), &'static str> {
         self.order_book.mark_cancel_sent(client_order_id, now)
     }
 
@@ -687,10 +747,10 @@ impl SymbolState {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::Side;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     const SYMBOL: &str = "BTC";
 
@@ -740,7 +800,10 @@ mod tests {
     fn baseline_initializes_then_fills_accumulate() {
         let mut state = SymbolState::new(SYMBOL.to_string());
 
-        assert!(state.seed_position(&position(dec!(2.0)), 0), "首次 seed 应成功");
+        assert!(
+            state.seed_position(&position(dec!(2.0)), 0),
+            "首次 seed 应成功"
+        );
         assert_eq!(state.position_book().position_size(EX), dec!(2.0));
 
         apply(&mut state, &fill(Side::Long, dec!(1.0)));
@@ -762,7 +825,10 @@ mod tests {
         assert_eq!(state.position_book().position_size(EX), dec!(3.0));
 
         // 第二次 seed（哪怕数值"看起来更新"）也不得覆写
-        assert!(!state.seed_position(&position(dec!(3.0)), 5), "重复 seed 应返回 false");
+        assert!(
+            !state.seed_position(&position(dec!(3.0)), 5),
+            "重复 seed 应返回 false"
+        );
         assert_eq!(
             state.position_book().position_size(EX),
             dec!(3.0),
@@ -784,7 +850,11 @@ mod tests {
 
         // t=1 送达（fill() 的 local_ts=1 <= 10）：已含在快照里，丢弃
         apply(&mut state, &fill(Side::Long, dec!(1.0)));
-        assert_eq!(state.position_book().position_size(EX), dec!(2.0), "快照已含的 Fill 不得再累加");
+        assert_eq!(
+            state.position_book().position_size(EX),
+            dec!(2.0),
+            "快照已含的 Fill 不得再累加"
+        );
 
         // t=11 送达：快照之后的新成交，累加
         apply(&mut state, &fill_at(EX, Side::Long, dec!(1.0), 11));
@@ -800,9 +870,20 @@ mod tests {
         state.seed_position(&position(dec!(2.0)), 10);
 
         // OKX 未 seed：t=1 送达的 Fill 照常从 0 累加，不受 Binance 的过滤时刻影响
-        apply(&mut state, &fill_at(Exchange::OKX, Side::Long, dec!(1.5), 1));
-        assert_eq!(state.position_book().position_size(Exchange::OKX), dec!(1.5), "未 seed 的所不得被误过滤");
-        assert_eq!(state.position_book().position_size(EX), dec!(2.0), "Binance 腿不受影响");
+        apply(
+            &mut state,
+            &fill_at(Exchange::OKX, Side::Long, dec!(1.5), 1),
+        );
+        assert_eq!(
+            state.position_book().position_size(Exchange::OKX),
+            dec!(1.5),
+            "未 seed 的所不得被误过滤"
+        );
+        assert_eq!(
+            state.position_book().position_size(EX),
+            dec!(2.0),
+            "Binance 腿不受影响"
+        );
     }
 
     // ===== 订单跟踪：结算完才移出、与到达顺序无关、不重建 =====
@@ -815,7 +896,10 @@ mod tests {
             exchange: EX,
             symbol: SYMBOL.to_string(),
             side: Side::Long,
-            order_type: crate::domain::OrderType::Limit { price: dec!(100.0), tif: crate::domain::TimeInForce::GTC },
+            order_type: crate::domain::OrderType::Limit {
+                price: dec!(100.0),
+                tif: crate::domain::TimeInForce::GTC,
+            },
             quantity: qty,
             reduce_only: false,
             client_order_id: CID.to_string(),
@@ -866,7 +950,10 @@ mod tests {
     }
 
     fn the_order(state: &SymbolState) -> Option<&PendingOrder> {
-        state.order_book().iter().find(|p| p.order.client_order_id == CID)
+        state
+            .order_book()
+            .iter()
+            .find(|p| p.order.client_order_id == CID)
     }
 
     /// **#758 的漏洞**：HL 的终态回报先于成交到达时，单必须留在表里（不再开着），直到成交加满。
@@ -890,12 +977,18 @@ mod tests {
     fn fills_first_or_no_fills_settle_on_terminal() {
         let mut state = with_order();
         apply(&mut state, &own_fill(dec!(1.0), 1));
-        assert!(the_order(&state).is_some_and(|p| p.is_open()), "没终态前还开着");
+        assert!(
+            the_order(&state).is_some_and(|p| p.is_open()),
+            "没终态前还开着"
+        );
         apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 2));
         assert!(!state.order_book().has_pending());
 
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Cancelled, dec!(0.0), 1));
+        apply(
+            &mut state,
+            &update(CID, OrderStatus::Cancelled, dec!(0.0), 1),
+        );
         assert!(!state.order_book().has_pending());
     }
 
@@ -903,8 +996,14 @@ mod tests {
     #[test]
     fn partial_fill_then_cancel_waits_for_the_reported_amount() {
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::PartiallyFilled, dec!(0.3), 1));
-        apply(&mut state, &update(CID, OrderStatus::Cancelled, dec!(0.0), 2)); // 有的所撤单回报不带累计，取见过的最大
+        apply(
+            &mut state,
+            &update(CID, OrderStatus::PartiallyFilled, dec!(0.3), 1),
+        );
+        apply(
+            &mut state,
+            &update(CID, OrderStatus::Cancelled, dec!(0.0), 2),
+        ); // 有的所撤单回报不带累计，取见过的最大
         assert!(the_order(&state).is_some(), "0.3 的成交还没到");
         apply(&mut state, &own_fill(dec!(0.3), 3));
         assert!(!state.order_book().has_pending());
@@ -915,7 +1014,15 @@ mod tests {
     fn placed_after_terminal_does_not_reopen() {
         let mut state = with_order();
         apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1));
-        apply(&mut state, &request(RequestOutcome::Placed { order_id: "ex-1".into() }, 2));
+        apply(
+            &mut state,
+            &request(
+                RequestOutcome::Placed {
+                    order_id: "ex-1".into(),
+                },
+                2,
+            ),
+        );
         assert!(the_order(&state).is_some_and(|p| !p.is_open()));
     }
 
@@ -923,23 +1030,57 @@ mod tests {
     #[test]
     fn request_results_drive_the_record() {
         let mut state = with_order();
-        apply(&mut state, &request(RequestOutcome::Placed { order_id: "77".into() }, 1));
+        apply(
+            &mut state,
+            &request(
+                RequestOutcome::Placed {
+                    order_id: "77".into(),
+                },
+                1,
+            ),
+        );
         let p = the_order(&state).unwrap();
         assert_eq!((p.stage(), p.order.id.as_str()), (&OrderStage::Live, "77"));
 
         state.mark_cancel_sent(CID, 2).unwrap();
-        assert_eq!(state.mark_cancel_sent(CID, 3), Err("上一次撤单还在等结论"), "撤单在途不重发");
-        apply(&mut state, &request(RequestOutcome::CancelFailed { reason: "busy".into() }, 4));
+        assert_eq!(
+            state.mark_cancel_sent(CID, 3),
+            Err("上一次撤单还在等结论"),
+            "撤单在途不重发"
+        );
+        apply(
+            &mut state,
+            &request(
+                RequestOutcome::CancelFailed {
+                    reason: "busy".into(),
+                },
+                4,
+            ),
+        );
         let p = the_order(&state).unwrap();
         assert!(p.is_open());
         assert_eq!(
             p.stage(),
-            &OrderStage::Cancelling { first_sent_at: 2, attempt: CancelAttempt::Failed { at: 4, reason: "busy".into() } }
+            &OrderStage::Cancelling {
+                first_sent_at: 2,
+                attempt: CancelAttempt::Failed {
+                    at: 4,
+                    reason: "busy".into()
+                }
+            }
         );
         assert!(state.mark_cancel_sent(CID, 5).is_ok(), "失败后可以再撤");
 
         let mut state = with_order();
-        apply(&mut state, &request(RequestOutcome::PlaceRejected { reason: "margin".into() }, 1));
+        apply(
+            &mut state,
+            &request(
+                RequestOutcome::PlaceRejected {
+                    reason: "margin".into(),
+                },
+                1,
+            ),
+        );
         assert!(!state.order_book().has_pending());
     }
 
@@ -948,7 +1089,15 @@ mod tests {
     fn rejection_after_exchange_update_keeps_the_order() {
         let mut state = with_order();
         apply(&mut state, &update(CID, OrderStatus::Pending, dec!(0.0), 1));
-        apply(&mut state, &request(RequestOutcome::PlaceRejected { reason: "margin".into() }, 2));
+        apply(
+            &mut state,
+            &request(
+                RequestOutcome::PlaceRejected {
+                    reason: "margin".into(),
+                },
+                2,
+            ),
+        );
         assert!(the_order(&state).is_some_and(|p| p.is_open()));
     }
 
@@ -956,8 +1105,16 @@ mod tests {
     #[test]
     fn no_cancel_for_finished_or_unknown_orders() {
         let mut state = with_order();
-        assert_eq!(state.mark_cancel_sent(CID, 1), Err("下单请求还没结论"), "撤单会先于下单到交易所");
-        assert_eq!(the_order(&state).unwrap().stage(), &OrderStage::Placing, "没记成已撤，受理后还能撤");
+        assert_eq!(
+            state.mark_cancel_sent(CID, 1),
+            Err("下单请求还没结论"),
+            "撤单会先于下单到交易所"
+        );
+        assert_eq!(
+            the_order(&state).unwrap().stage(),
+            &OrderStage::Placing,
+            "没记成已撤，受理后还能撤"
+        );
 
         apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1));
         assert_eq!(state.mark_cancel_sent(CID, 2), Err("已到终态"));
@@ -968,16 +1125,42 @@ mod tests {
     #[test]
     fn no_cancel_once_fills_add_up_to_the_order() {
         let mut state = with_order();
-        apply(&mut state, &request(RequestOutcome::Placed { order_id: "1".into() }, 1));
+        apply(
+            &mut state,
+            &request(
+                RequestOutcome::Placed {
+                    order_id: "1".into(),
+                },
+                1,
+            ),
+        );
         apply(&mut state, &own_fill(dec!(0.4), 2));
         assert!(state.mark_cancel_sent(CID, 3).is_ok(), "部分成交照常撤");
 
         let mut state = with_order();
-        apply(&mut state, &request(RequestOutcome::Placed { order_id: "1".into() }, 1));
+        apply(
+            &mut state,
+            &request(
+                RequestOutcome::Placed {
+                    order_id: "1".into(),
+                },
+                1,
+            ),
+        );
         apply(&mut state, &own_fill(dec!(1.0), 2));
-        assert!(the_order(&state).is_some_and(|p| p.is_open()), "终态没到，还开着");
-        assert_eq!(state.mark_cancel_sent(CID, 3), Err("成交已加满单量，终态在路上"));
-        assert_eq!(the_order(&state).unwrap().stage(), &OrderStage::Live, "没记成撤单在途");
+        assert!(
+            the_order(&state).is_some_and(|p| p.is_open()),
+            "终态没到，还开着"
+        );
+        assert_eq!(
+            state.mark_cancel_sent(CID, 3),
+            Err("成交已加满单量，终态在路上")
+        );
+        assert_eq!(
+            the_order(&state).unwrap().stage(),
+            &OrderStage::Live,
+            "没记成撤单在途"
+        );
     }
 
     /// 状态机的每条转换：从每个状态出发，喂每种输入，看落到哪个状态、撤单该不该发。
@@ -986,18 +1169,50 @@ mod tests {
     fn every_stage_transition() {
         use CancelAttempt::{Failed, InFlight};
         use OrderStage::{Cancelling, Done, Live, Placing};
-        let failed = || Failed { at: 7, reason: "x".into() };
+        let failed = || Failed {
+            at: 7,
+            reason: "x".into(),
+        };
         let at = |stage: OrderStage| {
             let mut p = PendingOrder::new(tracked_order(dec!(1.0)), 0);
             p.stage = stage;
             p
         };
-        let done = || Done { status: OrderStatus::Filled, at: 1 };
+        let done = || Done {
+            status: OrderStatus::Filled,
+            at: 1,
+        };
         // 每个状态的代表
-        let all = || vec![Placing, Live, Cancelling { first_sent_at: 3, attempt: InFlight }, Cancelling { first_sent_at: 3, attempt: failed() }, done()];
+        let all = || {
+            vec![
+                Placing,
+                Live,
+                Cancelling {
+                    first_sent_at: 3,
+                    attempt: InFlight,
+                },
+                Cancelling {
+                    first_sent_at: 3,
+                    attempt: failed(),
+                },
+                done(),
+            ]
+        };
 
         // 交易所推非终态：下单中 → 挂着，其余不动
-        for (from, to) in all().into_iter().zip([Live, Live, Cancelling { first_sent_at: 3, attempt: InFlight }, Cancelling { first_sent_at: 3, attempt: failed() }, done()]) {
+        for (from, to) in all().into_iter().zip([
+            Live,
+            Live,
+            Cancelling {
+                first_sent_at: 3,
+                attempt: InFlight,
+            },
+            Cancelling {
+                first_sent_at: 3,
+                attempt: failed(),
+            },
+            done(),
+        ]) {
             let mut p = at(from.clone());
             p.on_report(&OrderStatus::PartiallyFilled, 9);
             assert_eq!(p.stage, to, "非终态回报 from {from:?}");
@@ -1006,32 +1221,75 @@ mod tests {
         for from in all() {
             let mut p = at(from.clone());
             p.on_report(&OrderStatus::Cancelled, 9);
-            let want = if from == done() { done() } else { Done { status: OrderStatus::Cancelled, at: 9 } };
+            let want = if from == done() {
+                done()
+            } else {
+                Done {
+                    status: OrderStatus::Cancelled,
+                    at: 9,
+                }
+            };
             assert_eq!(p.stage, want, "终态回报 from {from:?}");
         }
         // 下单受理：只推下单中
         for from in all() {
             let mut p = at(from.clone());
             p.on_placed();
-            assert_eq!(p.stage, if from == Placing { Live } else { from.clone() }, "受理 from {from:?}");
+            assert_eq!(
+                p.stage,
+                if from == Placing { Live } else { from.clone() },
+                "受理 from {from:?}"
+            );
         }
         // 撤单失败：只改撤单中的这次尝试，第一次撤的时刻不变
         for from in all() {
             let mut p = at(from.clone());
             p.on_cancel_failed(7, "x");
-            let want = if matches!(from, Cancelling { .. }) { Cancelling { first_sent_at: 3, attempt: failed() } } else { from.clone() };
+            let want = if matches!(from, Cancelling { .. }) {
+                Cancelling {
+                    first_sent_at: 3,
+                    attempt: failed(),
+                }
+            } else {
+                from.clone()
+            };
             assert_eq!(p.stage, want, "撤单失败 from {from:?}");
         }
         // 下单被拒：只有下单中的移出，交易所已说过话的以交易所为准
         for from in all() {
-            assert_eq!(at(from.clone()).on_place_rejected(), from == Placing, "拒单 from {from:?}");
+            assert_eq!(
+                at(from.clone()).on_place_rejected(),
+                from == Placing,
+                "拒单 from {from:?}"
+            );
         }
         // 要撤：只有挂着、上次撤单失败的能发；重撤保留第一次撤的时刻
         let cases: Vec<(OrderStage, Result<OrderStage, &str>)> = vec![
             (Placing, Err("下单请求还没结论")),
-            (Live, Ok(Cancelling { first_sent_at: 50, attempt: InFlight })),
-            (Cancelling { first_sent_at: 3, attempt: InFlight }, Err("上一次撤单还在等结论")),
-            (Cancelling { first_sent_at: 3, attempt: failed() }, Ok(Cancelling { first_sent_at: 3, attempt: InFlight })),
+            (
+                Live,
+                Ok(Cancelling {
+                    first_sent_at: 50,
+                    attempt: InFlight,
+                }),
+            ),
+            (
+                Cancelling {
+                    first_sent_at: 3,
+                    attempt: InFlight,
+                },
+                Err("上一次撤单还在等结论"),
+            ),
+            (
+                Cancelling {
+                    first_sent_at: 3,
+                    attempt: failed(),
+                },
+                Ok(Cancelling {
+                    first_sent_at: 3,
+                    attempt: InFlight,
+                }),
+            ),
             (done(), Err("已到终态")),
         ];
         for (from, want) in cases {
@@ -1055,7 +1313,10 @@ mod tests {
         let mut state = SymbolState::new(SYMBOL.to_string());
         for cid in ["own-1", "own-2"] {
             apply(&mut state, &update(cid, OrderStatus::Pending, dec!(0.0), 1));
-            apply(&mut state, &update(cid, OrderStatus::PartiallyFilled, dec!(0.5), 2));
+            apply(
+                &mut state,
+                &update(cid, OrderStatus::PartiallyFilled, dec!(0.5), 2),
+            );
         }
         assert!(!state.order_book().has_pending());
     }
@@ -1079,16 +1340,28 @@ mod tests {
         assert!(state.check_stuck_orders(100 + ORDER_STUCK_MS).is_ok());
         assert!(state.check_stuck_orders(100 + late).is_err());
         // 撤单一直失败、反复重撤：仍从第一次撤起算（此前撤单失败后不算在等，该币会一直卡在只撤不挂）
-        apply(&mut state, &request(RequestOutcome::CancelFailed { reason: "x".into() }, 200));
+        apply(
+            &mut state,
+            &request(RequestOutcome::CancelFailed { reason: "x".into() }, 200),
+        );
         assert!(state.check_stuck_orders(100 + late).is_err());
         state.mark_cancel_sent(CID, 50_000).unwrap();
-        apply(&mut state, &request(RequestOutcome::CancelFailed { reason: "x".into() }, 50_100));
+        apply(
+            &mut state,
+            &request(RequestOutcome::CancelFailed { reason: "x".into() }, 50_100),
+        );
         assert!(state.check_stuck_orders(100 + ORDER_STUCK_MS).is_ok());
-        assert!(state.check_stuck_orders(100 + late).is_err(), "重撤不重新计时");
+        assert!(
+            state.check_stuck_orders(100 + late).is_err(),
+            "重撤不重新计时"
+        );
 
         // 终态到了、成交没到齐
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1_000));
+        apply(
+            &mut state,
+            &update(CID, OrderStatus::Filled, dec!(1.0), 1_000),
+        );
         assert!(state.check_stuck_orders(1_000 + ORDER_STUCK_MS).is_ok());
         assert!(state.check_stuck_orders(1_000 + late).is_err());
     }
@@ -1113,15 +1386,23 @@ mod tests {
 
         // 同向加仓 2.0（成交价不影响持仓数量）
         apply(&mut state, &fill(Side::Long, dec!(2.0)));
-        assert_eq!(state.position_book().position(EX).expect("position").size, dec!(4.0));
+        assert_eq!(
+            state.position_book().position(EX).expect("position").size,
+            dec!(4.0)
+        );
 
         // 反向平掉 1.0（价格同样不影响数量）
         apply(&mut state, &fill(Side::Short, dec!(1.0)));
-        assert_eq!(state.position_book().position(EX).expect("position").size, dec!(3.0));
+        assert_eq!(
+            state.position_book().position(EX).expect("position").size,
+            dec!(3.0)
+        );
 
         // 反手：卖 5 -> 净空 2
         apply(&mut state, &fill(Side::Short, dec!(5.0)));
-        assert_eq!(state.position_book().position(EX).expect("position").size, dec!(-2.0));
+        assert_eq!(
+            state.position_book().position(EX).expect("position").size,
+            dec!(-2.0)
+        );
     }
-
 }

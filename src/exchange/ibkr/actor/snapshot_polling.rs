@@ -116,21 +116,19 @@ impl IbkrSnapshotPoller {
 
     /// 拉借券费 + 可借量 → BorrowFee 事件；成功则更新 last_borrow_ok_ms
     async fn poll_borrow(&mut self) {
-        match within_budget(self
-            .client
-            .fetch_snapshot_raw(
-                self.borrow_conid,
-                &[
-                    self.cfg.shortable_field.as_str(),
-                    self.cfg.fee_field.as_str(),
-                    MD_AVAILABILITY_FIELD,
-                ],
-                // 必需字段只声明费率：活市与冻结态都返回它；可借量在冻结态本就不返回，由下面的
-                // borrow_frozen 豁免处理。**不能把 6509 算进必需**——IBKR 总会返回它，那样重试
-                // 判据恒真、空壳会被当成拿到 (曾因此每轮报"字段缺失")。
-                &[self.cfg.fee_field.as_str()],
-            ))
-            .await
+        match within_budget(self.client.fetch_snapshot_raw(
+            self.borrow_conid,
+            &[
+                self.cfg.shortable_field.as_str(),
+                self.cfg.fee_field.as_str(),
+                MD_AVAILABILITY_FIELD,
+            ],
+            // 必需字段只声明费率：活市与冻结态都返回它；可借量在冻结态本就不返回，由下面的
+            // borrow_frozen 豁免处理。**不能把 6509 算进必需**——IBKR 总会返回它，那样重试
+            // 判据恒真、空壳会被当成拿到 (曾因此每轮报"字段缺失")。
+            &[self.cfg.fee_field.as_str()],
+        ))
+        .await
         {
             Ok(obj) => {
                 // 先记录冻结态：美股休市时可借量(7636)不返回，属预期缺口而非数据源失效。
@@ -183,8 +181,11 @@ impl IbkrSnapshotPoller {
     /// 用专用汇率端点而非 snapshot last：受限货币休市/冻结时 last 为空、bid/ask 不返回，
     /// 只有 `/iserver/exchangerate` 盘外仍给参考汇率——否则 7×24 常驻每逢休市即被 is_stale 误杀。
     async fn poll_fx(&mut self) {
-        match within_budget(self.client.fetch_exchange_rate(&self.cfg.fx_target, &self.cfg.fx_source))
-            .await
+        match within_budget(
+            self.client
+                .fetch_exchange_rate(&self.cfg.fx_target, &self.cfg.fx_source),
+        )
+        .await
         {
             // 有效性校验：汇率须为正(与下游 er.rate>0 采纳条件一致)。拿到但无效不算成功。
             Ok(rate) if rate.is_finite() && rate > 0.0 => {
@@ -253,12 +254,14 @@ const POLL_STEP_BUDGET: Duration = Duration::from_secs(10);
 async fn within_budget<T>(
     fut: impl std::future::Future<Output = Result<T, ExchangeError>>,
 ) -> Result<T, ExchangeError> {
-    tokio::time::timeout(POLL_STEP_BUDGET, fut).await.unwrap_or_else(|_| {
-        Err(ExchangeError::Other(format!(
-            "IBKR 拉取超过 {}s 时限",
-            POLL_STEP_BUDGET.as_secs()
-        )))
-    })
+    tokio::time::timeout(POLL_STEP_BUDGET, fut)
+        .await
+        .unwrap_or_else(|_| {
+            Err(ExchangeError::Other(format!(
+                "IBKR 拉取超过 {}s 时限",
+                POLL_STEP_BUDGET.as_secs()
+            )))
+        })
 }
 
 /// 过期判定（纯函数，便于单测）：fx 任一超期即致命；借券腿仅在**非冻结**时计入过期。
@@ -386,7 +389,14 @@ mod tests {
         // Critical 回归：冻结期后借券端点单独故障（Err 分支已置 borrow_frozen=false），
         // fx 仍健康，活市借券真实断源必须致命——否则借券 kill 线被静默绕过。
         let now = T0 + MAX + 1;
-        assert!(eval_stale(now, Some(T0), Some(now), T0, /* borrow_frozen */ false, MAX));
+        assert!(eval_stale(
+            now,
+            Some(T0),
+            Some(now),
+            T0,
+            /* borrow_frozen */ false,
+            MAX
+        ));
     }
 
     #[test]

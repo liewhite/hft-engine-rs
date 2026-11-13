@@ -93,7 +93,13 @@ pub fn decide(
             };
             let earn = short_apr - long_apr;
             if earn < close_threshold_apr && close.is_none_or(|(best, _)| earn < best) {
-                close = Some((earn, LegPair { sell: long_ex, buy: short_ex }));
+                close = Some((
+                    earn,
+                    LegPair {
+                        sell: long_ex,
+                        buy: short_ex,
+                    },
+                ));
             }
         }
     }
@@ -109,8 +115,14 @@ pub fn decide(
         }
     }
     // 同分取靠前的所（顺序固定，结果确定）
-    let high = known.iter().copied().reduce(|best, x| if x.1 > best.1 { x } else { best });
-    let low = known.iter().copied().reduce(|best, x| if x.1 < best.1 { x } else { best });
+    let high = known
+        .iter()
+        .copied()
+        .reduce(|best, x| if x.1 > best.1 { x } else { best });
+    let low = known
+        .iter()
+        .copied()
+        .reduce(|best, x| if x.1 < best.1 { x } else { best });
     match (high, low) {
         (Some((h, ha)), Some((l, la))) if h != l && ha - la >= open_threshold_apr => {
             FundingAction::Open(LegPair { sell: h, buy: l })
@@ -137,7 +149,12 @@ mod tests {
             fetched_at: start + 24 * H,
             entries: rates
                 .iter()
-                .map(|&(t, rate)| SettledFunding { exchange: ex, symbol: "BTC".into(), rate, settle_time: t })
+                .map(|&(t, rate)| SettledFunding {
+                    exchange: ex,
+                    symbol: "BTC".into(),
+                    rate,
+                    settle_time: t,
+                })
                 .collect(),
         }
     }
@@ -157,7 +174,10 @@ mod tests {
         let w = window(BN, 0, &[(8 * H, 1e-4)]);
         assert!(w.apr(24 * H + 2 * H, H).is_none(), "stale");
         assert!(window(BN, 0, &[]).apr(24 * H, H).is_none(), "empty");
-        assert!(window(BN, 0, &[(12 * H, 1e-4)]).apr(24 * H, H).is_none(), "half day");
+        assert!(
+            window(BN, 0, &[(12 * H, 1e-4)]).apr(24 * H, H).is_none(),
+            "half day"
+        );
     }
 
     fn aprs(bn: f64, hl: f64, okx: f64) -> Vec<(Exchange, Option<f64>)> {
@@ -169,16 +189,28 @@ mod tests {
     #[test]
     fn open_between_highest_and_lowest() {
         // 无仓：差最大的两所，高卖低买；差不够不开
-        assert_eq!(decide(&aprs(0.8, 0.1, 0.3), &[], 0.5, 0.1), Open(LegPair { sell: BN, buy: HL }));
-        assert_eq!(decide(&aprs(0.0, -0.2, 0.4), &[], 0.5, 0.1), Open(LegPair { sell: OKX, buy: HL }));
+        assert_eq!(
+            decide(&aprs(0.8, 0.1, 0.3), &[], 0.5, 0.1),
+            Open(LegPair { sell: BN, buy: HL })
+        );
+        assert_eq!(
+            decide(&aprs(0.0, -0.2, 0.4), &[], 0.5, 0.1),
+            Open(LegPair { sell: OKX, buy: HL })
+        );
         assert_eq!(decide(&aprs(0.4, 0.0, 0.2), &[], 0.5, 0.1), Hold);
         // 所对随费率变化：已有 BN空/HL多，今天 OKX 最高 → 在 OKX×HL 继续开（不平 BN×HL：它仍赚 ≥ 10%）
         let pos = [(BN, dec!(-1.0)), (HL, dec!(1.0))];
-        assert_eq!(decide(&aprs(0.5, 0.0, 0.9), &pos, 0.5, 0.1), Open(LegPair { sell: OKX, buy: HL }));
+        assert_eq!(
+            decide(&aprs(0.5, 0.0, 0.9), &pos, 0.5, 0.1),
+            Open(LegPair { sell: OKX, buy: HL })
+        );
         // BN 多 / OKX 空，今天 BN 最高：开仓会在 BN 卖（削减多腿），但这对仓收益
         // OKX−BN = 0.0−0.9 < 10%，平仓优先先平
         let pos = [(BN, dec!(1.0)), (OKX, dec!(-1.0))];
-        assert_eq!(decide(&aprs(0.9, 0.3, 0.0), &pos, 0.5, 0.1), Close(LegPair { sell: BN, buy: OKX }));
+        assert_eq!(
+            decide(&aprs(0.9, 0.3, 0.0), &pos, 0.5, 0.1),
+            Close(LegPair { sell: BN, buy: OKX })
+        );
     }
 
     #[test]
@@ -186,11 +218,20 @@ mod tests {
         // BN 空 HL 多：收益 = BN − HL；低于 10% 平（含反转），平仓优先于开仓
         let pos = [(BN, dec!(-1.0)), (HL, dec!(1.0))];
         assert_eq!(decide(&aprs(0.15, 0.0, 0.0), &pos, 0.5, 0.1), Hold);
-        assert_eq!(decide(&aprs(0.05, 0.0, 0.0), &pos, 0.5, 0.1), Close(LegPair { sell: HL, buy: BN }));
-        assert_eq!(decide(&aprs(-0.3, 0.0, 0.9), &pos, 0.5, 0.1), Close(LegPair { sell: HL, buy: BN }));
+        assert_eq!(
+            decide(&aprs(0.05, 0.0, 0.0), &pos, 0.5, 0.1),
+            Close(LegPair { sell: HL, buy: BN })
+        );
+        assert_eq!(
+            decide(&aprs(-0.3, 0.0, 0.9), &pos, 0.5, 0.1),
+            Close(LegPair { sell: HL, buy: BN })
+        );
         // 第三所不动；几对都满足时取收益最低的一对
         let pos = [(BN, dec!(-2.0)), (HL, dec!(1.0)), (OKX, dec!(1.0))];
-        assert_eq!(decide(&aprs(0.0, 0.05, -0.02), &pos, 0.5, 0.1), Close(LegPair { sell: HL, buy: BN }));
+        assert_eq!(
+            decide(&aprs(0.0, 0.05, -0.02), &pos, 0.5, 0.1),
+            Close(LegPair { sell: HL, buy: BN })
+        );
     }
 
     #[test]
@@ -201,6 +242,9 @@ mod tests {
         assert_eq!(decide(&a, &[], 0.5, 0.1), Hold);
         // BN×HL 这对的平仓只看这两所
         let pos = [(BN, dec!(1.0)), (HL, dec!(-1.0))];
-        assert_eq!(decide(&a, &pos, 0.5, 0.1), Close(LegPair { sell: BN, buy: HL }));
+        assert_eq!(
+            decide(&a, &pos, 0.5, 0.1),
+            Close(LegPair { sell: BN, buy: HL })
+        );
     }
 }

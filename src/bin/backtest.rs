@@ -20,7 +20,7 @@ use hft_engine_rs::domain::{
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{SymbolAccountData, AccountData, IncomeEvent, MarketData};
+use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, SymbolAccountData};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
@@ -47,7 +47,14 @@ struct MeanRevertMaker {
 }
 
 impl MeanRevertMaker {
-    fn place(&self, side: Side, price: Price, qty: Quantity, reduce_only: bool, comment: &str) -> OutcomeEvent {
+    fn place(
+        &self,
+        side: Side,
+        price: Price,
+        qty: Quantity,
+        reduce_only: bool,
+        comment: &str,
+    ) -> OutcomeEvent {
         OutcomeEvent::PlaceOrders {
             orders: vec![Order {
                 id: String::new(),
@@ -71,12 +78,13 @@ impl Strategy for MeanRevertMaker {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
         let mut kinds = HashSet::new();
         // 仅用于把 (EX, symbol) 注册进订阅范围；trade 事件按 (exchange,symbol) 路由即可送达
-        kinds.insert(SubscriptionKind::BBO { symbol: self.symbol.clone() });
+        kinds.insert(SubscriptionKind::BBO {
+            symbol: self.symbol.clone(),
+        });
         let mut m = HashMap::new();
         m.insert(EX, kinds);
         m
     }
-
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         // 自己跟成交维护开仓成本（加权平均；平完即清零）
@@ -147,13 +155,17 @@ fn main() -> anyhow::Result<()> {
     // 内部基础符号 (如 "BTC")，计价币单独给数据源还原币安文件名
     let symbol: Symbol = args.first().cloned().unwrap_or_else(|| "BTC".to_string());
     let quote = "USDT";
-    let start_str = args.get(1).cloned().unwrap_or_else(|| "2024-01-01".to_string());
+    let start_str = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "2024-01-01".to_string());
     let end_str = args.get(2).cloned().unwrap_or_else(|| start_str.clone());
     let start = NaiveDate::parse_from_str(&start_str, "%Y-%m-%d").context("parse START date")?;
     let end = NaiveDate::parse_from_str(&end_str, "%Y-%m-%d").context("parse END date")?;
 
     // 真实 Binance (无凭证) 拉取 symbol 元数据 (精度)，与实盘一致 —— 仅此一处需要 async
-    let client = BinanceClient::new("USDT".to_string(), None).map_err(|e| anyhow::anyhow!("binance client: {e}"))?;
+    let client = BinanceClient::new("USDT".to_string(), None)
+        .map_err(|e| anyhow::anyhow!("binance client: {e}"))?;
     let metas_vec = tokio::runtime::Runtime::new()?
         .block_on(client.fetch_all_symbol_metas())
         .map_err(|e| anyhow::anyhow!("fetch symbol metas: {e}"))?;

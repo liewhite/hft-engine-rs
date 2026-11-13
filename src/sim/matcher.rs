@@ -43,9 +43,9 @@ pub fn touch_price(side: Side, bbo: &BBO) -> Price {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::Exchange;
+    use rust_decimal_macros::dec;
 
     fn bbo(bid: Price, ask: Price) -> BBO {
         BBO {

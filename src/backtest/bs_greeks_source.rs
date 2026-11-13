@@ -10,7 +10,7 @@
 
 use crate::backtest::source::MarketDataSource;
 use crate::domain::{to_f64, Balance, Exchange, Greeks, Symbol, Timestamp};
-use crate::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData};
+use crate::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData};
 use crate::option::{self, OptionRight, MILLIS_PER_YEAR};
 use std::cell::RefCell;
 
@@ -92,16 +92,44 @@ impl<S: MarketDataSource> BsGreeksSource<S> {
     /// 期权结构 (跨式/宽跨) 在 (s, now) 的理论价值 (call@call_strike + put@put_strike)
     fn straddle_value(&self, st: &StraddleState, s: f64, now: Timestamp) -> f64 {
         let t_y = self.t_years(now);
-        let call = option::greeks(OptionRight::Call, s, st.call_strike, t_y, self.config.implied_vol, self.config.risk_free_rate);
-        let put = option::greeks(OptionRight::Put, s, st.put_strike, t_y, self.config.implied_vol, self.config.risk_free_rate);
+        let call = option::greeks(
+            OptionRight::Call,
+            s,
+            st.call_strike,
+            t_y,
+            self.config.implied_vol,
+            self.config.risk_free_rate,
+        );
+        let put = option::greeks(
+            OptionRight::Put,
+            s,
+            st.put_strike,
+            t_y,
+            self.config.implied_vol,
+            self.config.risk_free_rate,
+        );
         self.config.straddles * (call.price + put.price)
     }
 
     /// 期权结构聚合为账户级 Greeks (theta 每日、vega 对 1%)
     fn greeks_at(&self, st: &StraddleState, s: f64, now: Timestamp) -> Greeks {
         let t_y = self.t_years(now);
-        let call = option::greeks(OptionRight::Call, s, st.call_strike, t_y, self.config.implied_vol, self.config.risk_free_rate);
-        let put = option::greeks(OptionRight::Put, s, st.put_strike, t_y, self.config.implied_vol, self.config.risk_free_rate);
+        let call = option::greeks(
+            OptionRight::Call,
+            s,
+            st.call_strike,
+            t_y,
+            self.config.implied_vol,
+            self.config.risk_free_rate,
+        );
+        let put = option::greeks(
+            OptionRight::Put,
+            s,
+            st.put_strike,
+            t_y,
+            self.config.implied_vol,
+            self.config.risk_free_rate,
+        );
         let n = self.config.straddles;
         Greeks {
             exchange: self.config.exchange,
@@ -255,7 +283,10 @@ mod tests {
 
     #[test]
     fn locks_strike_and_entry_zero() {
-        let src = FixedSrc(vec![trade_ev(dec!(2000.0), 1000), trade_ev(dec!(2100.0), 2000)]);
+        let src = FixedSrc(vec![
+            trade_ev(dec!(2000.0), 1000),
+            trade_ev(dec!(2100.0), 2000),
+        ]);
         let bs = BsGreeksSource::new(src, cfg(1000));
         let evs: Vec<_> = bs.events().collect();
         // 首笔行权价锁定

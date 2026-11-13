@@ -1,7 +1,10 @@
 use super::{from_okx, from_okx_index};
-use crate::domain::{Candle, CandleInterval, Decimal, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice, MarketTrade, OrderStatus, OrderUpdate, Position, Side, Symbol, SymbolMeta, now_ms, BBO};
-use std::collections::HashMap;
+use crate::domain::{
+    now_ms, Candle, CandleInterval, Decimal, Exchange, Fill, FundingRate, Greeks, IndexPrice,
+    MarkPrice, MarketTrade, OrderStatus, OrderUpdate, Position, Side, Symbol, SymbolMeta, BBO,
+};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 /// 由 OKX `instId` 解析出内部 symbol 并取其元数据。
@@ -71,7 +74,9 @@ impl FundingRateData {
         let rate = f64::from_str(&self.funding_rate)
             .map_err(|_| format!("Failed to parse funding rate: {}", self.funding_rate))?;
         // funding_time: 下次收取时间
-        let next_settle_ms: u64 = self.funding_time.parse()
+        let next_settle_ms: u64 = self
+            .funding_time
+            .parse()
             .map_err(|_| format!("Failed to parse funding time: {}", self.funding_time))?;
 
         Ok(FundingRate {
@@ -123,7 +128,9 @@ impl BboData {
         let bid_qty = crate::domain::parse_decimal(&bid[1])
             .map_err(|_| format!("Failed to parse bid qty: {}", bid[1]))?;
 
-        let timestamp = self.ts.parse::<u64>()
+        let timestamp = self
+            .ts
+            .parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
         Ok(Some(BBO {
@@ -198,7 +205,9 @@ impl MarkPriceData {
             .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
         let price = crate::domain::parse_decimal(&self.mark_px)
             .map_err(|_| format!("Failed to parse mark price: {}", self.mark_px))?;
-        let timestamp = self.ts.parse::<u64>()
+        let timestamp = self
+            .ts
+            .parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
         Ok(MarkPrice {
@@ -226,7 +235,9 @@ impl IndexTickerData {
             .ok_or_else(|| format!("Unknown OKX index symbol: {}", self.inst_id))?;
         let price = crate::domain::parse_decimal(&self.idx_px)
             .map_err(|_| format!("Failed to parse index price: {}", self.idx_px))?;
-        let timestamp = self.ts.parse::<u64>()
+        let timestamp = self
+            .ts
+            .parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
         Ok(IndexPrice {
@@ -278,7 +289,8 @@ impl PositionData {
         let contracts = if self.pos.is_empty() {
             Decimal::ZERO
         } else {
-            crate::domain::parse_decimal(&self.pos).map_err(|_| format!("Failed to parse pos: {}", self.pos))?
+            crate::domain::parse_decimal(&self.pos)
+                .map_err(|_| format!("Failed to parse pos: {}", self.pos))?
         };
         Ok(Position {
             exchange: Exchange::OKX,
@@ -307,15 +319,21 @@ pub struct AccountData {
 ///
 /// `positions`：每仓 (pos, notionalUsd)。只有空仓（pos 为空串或 0）的价值空串才当 0；
 /// 有仓却没有价值就报错（杠杆闸门不能少算），下一轮重试，持续失败由停摆守卫接住。
-pub fn parse_account_info(total_eq: &str, positions: &[(&str, &str)]) -> Result<crate::domain::AccountInfo, String> {
-    let equity = f64::from_str(total_eq).map_err(|_| format!("OKX totalEq 无法解析: '{total_eq}'"))?;
+pub fn parse_account_info(
+    total_eq: &str,
+    positions: &[(&str, &str)],
+) -> Result<crate::domain::AccountInfo, String> {
+    let equity =
+        f64::from_str(total_eq).map_err(|_| format!("OKX totalEq 无法解析: '{total_eq}'"))?;
     let mut notional = 0.0;
     for &(pos, raw) in positions {
         let flat = pos.is_empty() || f64::from_str(pos).is_ok_and(|p| p == 0.0);
         if raw.is_empty() && flat {
             continue;
         }
-        notional += f64::from_str(raw).map_err(|_| format!("OKX 持仓 notionalUsd 无法解析: '{raw}'（pos={pos}）"))?.abs();
+        notional += f64::from_str(raw)
+            .map_err(|_| format!("OKX 持仓 notionalUsd 无法解析: '{raw}'（pos={pos}）"))?
+            .abs();
     }
     Ok(crate::domain::AccountInfo { equity, notional })
 }
@@ -372,7 +390,8 @@ impl OrderPushData {
     pub fn to_order_update(&self, meta: &SymbolMeta) -> Result<OrderUpdate, String> {
         // 线路上三个数量字段都是张数，此处一次性折算为币本位
         let sz = meta.qty_to_coin(
-            crate::domain::parse_decimal(&self.sz).map_err(|_| format!("Failed to parse sz: {}", self.sz))?,
+            crate::domain::parse_decimal(&self.sz)
+                .map_err(|_| format!("Failed to parse sz: {}", self.sz))?,
         );
 
         let acc_fill_sz = meta.qty_to_coin(
@@ -441,12 +460,13 @@ impl OrderPushData {
         //
         // 走到这里说明确实有成交（上面已对 fill_sz == 0 提前返回），此时 fillFee 必然
         // 存在；缺失是交易所违约，如实报错而不是回退到 fee（那等于换个方式记错数）。
-        let fill_fee = self.fill_fee.as_deref().ok_or_else(|| {
-            format!("OKX 成交回报缺 fillFee 字段（订单 {}）", self.ord_id)
-        })?;
+        let fill_fee = self
+            .fill_fee
+            .as_deref()
+            .ok_or_else(|| format!("OKX 成交回报缺 fillFee 字段（订单 {}）", self.ord_id))?;
         // OKX: 手续费为负数表示收费，取反统一为正数=收费
-        let fee = f64::from_str(fill_fee)
-            .map_err(|_| format!("Failed to parse fillFee: {fill_fee}"))?;
+        let fee =
+            f64::from_str(fill_fee).map_err(|_| format!("Failed to parse fillFee: {fill_fee}"))?;
 
         let reason = match self.category.as_deref() {
             Some("adl") => crate::domain::FillReason::Adl,
@@ -508,7 +528,9 @@ impl GreeksData {
             .map_err(|_| format!("Failed to parse thetaBS: {}", self.theta_bs))?;
         let vega = f64::from_str(&self.vega_bs)
             .map_err(|_| format!("Failed to parse vegaBS: {}", self.vega_bs))?;
-        let timestamp = self.ts.parse::<u64>()
+        let timestamp = self
+            .ts
+            .parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
 
         Ok(Greeks {
@@ -551,9 +573,10 @@ pub fn parse_candle_data(
         return Err(format!("OKX candle data incomplete: {:?}", raw));
     }
 
-    let symbol = from_okx(inst_id, quote)
-        .ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
-    let open_time: u64 = raw[0].parse()
+    let symbol =
+        from_okx(inst_id, quote).ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
+    let open_time: u64 = raw[0]
+        .parse()
         .map_err(|_| format!("Failed to parse candle ts: {}", raw[0]))?;
     let open = crate::domain::parse_decimal(&raw[1])
         .map_err(|_| format!("Failed to parse candle open: {}", raw[1]))?;
@@ -563,8 +586,8 @@ pub fn parse_candle_data(
         .map_err(|_| format!("Failed to parse candle low: {}", raw[3]))?;
     let close = crate::domain::parse_decimal(&raw[4])
         .map_err(|_| format!("Failed to parse candle close: {}", raw[4]))?;
-    let volume = f64::from_str(&raw[5])
-        .map_err(|_| format!("Failed to parse candle vol: {}", raw[5]))?;
+    let volume =
+        f64::from_str(&raw[5]).map_err(|_| format!("Failed to parse candle vol: {}", raw[5]))?;
     let confirm = &raw[8] == "1";
 
     Ok(Candle {
@@ -611,9 +634,9 @@ pub fn okx_channel_to_candle_interval(channel: &str) -> Option<CandleInterval> {
 
 #[cfg(test)]
 mod trade_tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::PriceStep;
+    use rust_decimal_macros::dec;
     use std::sync::Arc;
 
     /// BTC-USDT-SWAP: ctVal = 0.01 BTC/张
@@ -708,7 +731,6 @@ mod trade_tests {
         assert_eq!(p.size, dec!(0.0));
     }
 
-
     /// **Critical 防线**：双向持仓模式必须报错，不能按净持仓口径解析。
     /// 该模式下 `pos` 恒为正数、方向靠 posSide 表达，静默解析会让空头被当成多头，
     /// 策略随后朝反方向加仓。
@@ -762,7 +784,9 @@ mod trade_tests {
             "state":"partially_filled","px":"42000","sz":"3","fillSz":"1","fillPx":"42000",
             "accFillSz":"3","avgPx":"42000","fee":"-0.3","feeCcy":"USDT"}"#;
         let d: OrderPushData = serde_json::from_str(raw).unwrap();
-        assert!(d.to_fill(&btc_meta()).is_err(), "缺 fillFee 应报错而非回退到 fee");
+        assert!(
+            d.to_fill(&btc_meta()).is_err(),
+            "缺 fillFee 应报错而非回退到 fee"
+        );
     }
-
 }

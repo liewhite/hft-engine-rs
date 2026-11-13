@@ -18,7 +18,7 @@ use hft_engine_rs::domain::{to_f64, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::ExchangeClient;
-use hft_engine_rs::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData};
+use hft_engine_rs::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::GammaScalpStrategy;
 use std::cell::RefCell;
@@ -66,13 +66,20 @@ fn main() -> anyhow::Result<()> {
     let clock_interval_ms = 3_600_000; // 1h 刷新净值 -> PnL 曲线按小时采样
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let start_str = args.first().cloned().unwrap_or_else(|| "2026-05-01".to_string());
-    let end_str = args.get(1).cloned().unwrap_or_else(|| "2026-05-31".to_string());
+    let start_str = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "2026-05-01".to_string());
+    let end_str = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "2026-05-31".to_string());
     let start = NaiveDate::parse_from_str(&start_str, "%Y-%m-%d").context("parse START")?;
     let end = NaiveDate::parse_from_str(&end_str, "%Y-%m-%d").context("parse END")?;
 
     // 真实 Binance (无凭证) 拉取 symbol 元数据 (精度)
-    let client = BinanceClient::new("USDT".to_string(), None).map_err(|e| anyhow::anyhow!("binance client: {e}"))?;
+    let client = BinanceClient::new("USDT".to_string(), None)
+        .map_err(|e| anyhow::anyhow!("binance client: {e}"))?;
     let metas_vec = tokio::runtime::Runtime::new()?
         .block_on(client.fetch_all_symbol_metas())
         .map_err(|e| anyhow::anyhow!("fetch symbol metas: {e}"))?;
@@ -117,7 +124,13 @@ fn main() -> anyhow::Result<()> {
     };
     let source = BsGreeksSource::new(trade_source, greeks_config);
 
-    let strategy = GammaScalpStrategy::new(EX, symbol.clone(), ccy.clone(), delta_band, base_offset_ratio);
+    let strategy = GammaScalpStrategy::new(
+        EX,
+        symbol.clone(),
+        ccy.clone(),
+        delta_band,
+        base_offset_ratio,
+    );
     let runner = StrategyRunner::new(
         Box::new(strategy),
         symbol_metas.clone(),
@@ -149,7 +162,11 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     IncomeEvent::Account(a) => {
-                        if let AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) = &a.data {
+                        if let AccountData::Exchange(ExchangeAccountData::AccountInfo {
+                            equity,
+                            ..
+                        }) = &a.data
+                        {
                             // 首笔成交之前 (price=0) 不采样
                             if s.last_price > 0.0 {
                                 let p = s.last_price;
@@ -183,7 +200,10 @@ fn main() -> anyhow::Result<()> {
         "期权            : 起点ATM {strike:.2} | IV={implied_vol} straddles={straddles} \
          band={delta_band} ETH (持有到期)"
     );
-    println!("对冲间距       : {:.2}% (PostOnly 对冲单, 对称)", base_offset_ratio * 100.0);
+    println!(
+        "对冲间距       : {:.2}% (PostOnly 对冲单, 对称)",
+        base_offset_ratio * 100.0
+    );
     println!("maker fee      : {:.3}%", maker_fee_rate * 100.0);
     println!(
         "start/end px    : {strike:.2} -> {last_price:.2}  ({:+.2}%)",
@@ -196,11 +216,13 @@ fn main() -> anyhow::Result<()> {
     println!("  永续对冲腿   : {hedge_pnl:+.2}   (含未实现 + 手续费)");
     println!("  完整 gamma   : {total_pnl:+.2}   (期权腿 + 对冲腿)");
     println!("---------------------------------------------------------");
-    println!("对冲腿 realized : {:.2} USDT (已扣手续费) | 末仓 {:?}", result.realized_pnl, result.positions);
+    println!(
+        "对冲腿 realized : {:.2} USDT (已扣手续费) | 末仓 {:?}",
+        result.realized_pnl, result.positions
+    );
 
     // ==================== 写 PnL 时序 JSON (供画图) ====================
-    let out_path = std::env::var("GAMMA_PNL_OUT")
-        .unwrap_or_else(|_| "gamma_pnl.json".to_string());
+    let out_path = std::env::var("GAMMA_PNL_OUT").unwrap_or_else(|_| "gamma_pnl.json".to_string());
     let mut json = String::from("[");
     for (i, &(ts, equity, price)) in s.samples.iter().enumerate() {
         let hedge = equity - result.initial_balance;

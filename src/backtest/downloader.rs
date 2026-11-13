@@ -21,7 +21,10 @@ impl BinanceHistoryDownloader {
         Self::with_base_url(cache, BASE_URL.to_string())
     }
 
-    pub fn with_base_url(cache: Box<dyn DataCache>, base_url: String) -> Result<Self, ExchangeError> {
+    pub fn with_base_url(
+        cache: Box<dyn DataCache>,
+        base_url: String,
+    ) -> Result<Self, ExchangeError> {
         let client = crate::net::http(Duration::from_secs(60))
             .build_blocking()
             .map_err(|e| ExchangeError::Other(format!("build http client: {e}")))?;

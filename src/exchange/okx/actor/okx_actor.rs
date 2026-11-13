@@ -23,8 +23,8 @@ use crate::domain::{Symbol, SymbolMeta};
 use crate::exchange::client::{ExchangeCmd, ExchangeHandle, SubscriptionKind};
 use crate::exchange::equity_polling::EquityPoller;
 use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
-use crate::exchange::okx::{OkxClient, OkxCredentials};
 use crate::exchange::lazy_conn::LazyConn;
+use crate::exchange::okx::{OkxClient, OkxCredentials};
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
 use crate::tasks::{Group, Inbox, Scope, Task};
@@ -73,25 +73,43 @@ impl OkxNode {
     pub async fn spawn(group: &Group, args: OkxArgs) -> anyhow::Result<ExchangeHandle> {
         let (_, addr) = group
             .spawn_addressed("OkxNode", move |scope: Scope, inbox| async move {
-                let OkxArgs { credentials, client, symbol_metas, market_bus, account_bus, quote } = args;
+                let OkxArgs {
+                    credentials,
+                    client,
+                    symbol_metas,
+                    market_bus,
+                    account_bus,
+                    quote,
+                } = args;
                 let children = scope.group("children");
 
                 // 1. 私有 WS 启动时就连（含登录与订阅确认，要在投产前生效）；失败 → 向上传播。
                 //    两条公共 WS 等第一条订阅路由过来才连（见 LazyConn）
                 let has_private_ws = credentials.is_some();
                 if let Some(credentials) = credentials {
-                    OkxPrivateWs::spawn(&children, credentials, account_bus.clone(), symbol_metas.clone(), quote.clone())
-                        .await?;
+                    OkxPrivateWs::spawn(
+                        &children,
+                        credentials,
+                        account_bus.clone(),
+                        symbol_metas.clone(),
+                        quote.clone(),
+                    )
+                    .await?;
                 }
                 let public_ws = {
-                    let (group, market_bus, metas, quote) =
-                        (children.clone(), market_bus.clone(), symbol_metas.clone(), quote.clone());
+                    let (group, market_bus, metas, quote) = (
+                        children.clone(),
+                        market_bus.clone(),
+                        symbol_metas.clone(),
+                        quote.clone(),
+                    );
                     LazyConn::new("OkxPublicWs", move || async move {
                         OkxPublicWs::spawn(&group, market_bus, metas, quote).await
                     })
                 };
                 let business_ws = {
-                    let (group, market_bus, quote) = (children.clone(), market_bus.clone(), quote.clone());
+                    let (group, market_bus, quote) =
+                        (children.clone(), market_bus.clone(), quote.clone());
                     LazyConn::new("OkxBusinessWs", move || async move {
                         OkxBusinessWs::spawn(&group, market_bus, quote).await
                     })
@@ -100,8 +118,18 @@ impl OkxNode {
                 // 2. 账户轮询按凭证门控：装配处只在有凭证时才给 client（见 assembly::setup_okx）
                 if let Some(client) = client {
                     // 净值与持仓总价值走 REST 轮询：私有 WS 推送的 notionalUsd 在单币种保证金模式下是空串
-                    EquityPoller::spawn(&children, client.clone(), account_bus.clone(), EQUITY_POLL_INTERVAL_MS)?;
-                    FundingFeePoller::spawn(&children, client, account_bus.clone(), FUNDING_FEE_POLL_INTERVAL_MS)?;
+                    EquityPoller::spawn(
+                        &children,
+                        client.clone(),
+                        account_bus.clone(),
+                        EQUITY_POLL_INTERVAL_MS,
+                    )?;
+                    FundingFeePoller::spawn(
+                        &children,
+                        client,
+                        account_bus.clone(),
+                        FUNDING_FEE_POLL_INTERVAL_MS,
+                    )?;
                 }
                 CryptoStatus::spawn(
                     &children,
@@ -111,7 +139,11 @@ impl OkxNode {
                 )?;
 
                 tracing::info!(exchange = "OKX", has_private_ws, "OkxNode started");
-                Ok(Self { inbox, public_ws, business_ws })
+                Ok(Self {
+                    inbox,
+                    public_ws,
+                    business_ws,
+                })
             })
             .await?;
         Ok(ExchangeHandle::new(addr))
@@ -135,10 +167,14 @@ impl OkxNode {
                 let (business_kinds, public_kinds): (Vec<_>, Vec<_>) =
                     kinds.into_iter().partition(is_business);
                 if !public_kinds.is_empty() {
-                    self.public_ws.send(ExchangeCmd::SubscribeBatch(public_kinds)).await?;
+                    self.public_ws
+                        .send(ExchangeCmd::SubscribeBatch(public_kinds))
+                        .await?;
                 }
                 if !business_kinds.is_empty() {
-                    self.business_ws.send(ExchangeCmd::SubscribeBatch(business_kinds)).await?;
+                    self.business_ws
+                        .send(ExchangeCmd::SubscribeBatch(business_kinds))
+                        .await?;
                 }
                 Ok(())
             }

@@ -269,8 +269,8 @@ impl SpreadArbStrategy {
         let short_bbo = state.bbo(short_exchange)?;
 
         // 使用盘口较小一侧的一部分作为基础开仓数量
-        let base_size = (long_bbo.ask_qty * ORDERBOOK_TAKE_RATIO)
-            .min(short_bbo.bid_qty * ORDERBOOK_TAKE_RATIO);
+        let base_size =
+            (long_bbo.ask_qty * ORDERBOOK_TAKE_RATIO).min(short_bbo.bid_qty * ORDERBOOK_TAKE_RATIO);
 
         Some(TradingSignal {
             long_exchange,
@@ -485,8 +485,7 @@ impl SpreadArbStrategy {
         let short_new_notional = to_f64(new_short_pos.abs() * signal.short_price);
         let long_new_notional = to_f64(new_long_pos.abs() * signal.long_price);
 
-        let short_blocked =
-            is_increasing(short_pos, new_short_pos) && short_new_notional > limit;
+        let short_blocked = is_increasing(short_pos, new_short_pos) && short_new_notional > limit;
         let long_blocked = is_increasing(long_pos, new_long_pos) && long_new_notional > limit;
 
         if short_blocked {
@@ -685,7 +684,11 @@ impl SpreadArbStrategy {
     ///
     /// 判据只能是"是否收敛 symbol 的净敞口"，不能是"是否减少该交易所自身仓位"：
     /// 中和敞口的那条腿通常是在另一个所**新开**仓位（自身仓位变大），但净敞口在缩小。
-    fn enforce_single_leg_reduces_exposure(&self, signal: &mut TradingSignal, state: SymbolView<'_>) {
+    fn enforce_single_leg_reduces_exposure(
+        &self,
+        signal: &mut TradingSignal,
+        state: SymbolView<'_>,
+    ) {
         let short_active = signal.short_size > Decimal::ZERO;
         let long_active = signal.long_size > Decimal::ZERO;
 
@@ -838,7 +841,12 @@ fn qty_for_notional(notional: f64, price: Price) -> Option<Quantity> {
 
 /// 单腿 notional 限制：低于 `min_notional` 归零，高于 `max_notional` 截到上限。
 /// 价格非正（validate 已把数量清零）或上下限折不成数量时归零（保守：不下单）。
-fn clamp_leg_notional(size: Quantity, price: Price, min_notional: f64, max_notional: f64) -> Quantity {
+fn clamp_leg_notional(
+    size: Quantity,
+    price: Price,
+    min_notional: f64,
+    max_notional: f64,
+) -> Quantity {
     let (Some(min_qty), Some(max_qty)) = (
         qty_for_notional(min_notional, price),
         qty_for_notional(max_notional, price),
@@ -896,7 +904,6 @@ impl Strategy for SpreadArbStrategy {
 
         streams
     }
-
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         // 获取本策略关注的 symbol 状态
@@ -957,7 +964,7 @@ impl Strategy for SpreadArbStrategy {
 mod tests {
     use super::*;
     use crate::domain::{Position, BBO};
-    use crate::messaging::{ExchangeAccountData, AccountData, StateManager};
+    use crate::messaging::{AccountData, ExchangeAccountData, StateManager};
 
     const SYMBOL: &str = "BTC";
     const SHORT_EX: Exchange = Exchange::Binance;
@@ -1013,8 +1020,13 @@ mod tests {
     /// 但那样测的就不是线上跑的那条路。
     fn fixture(positions: &[(Exchange, Quantity)]) -> Fixture {
         let mut manager = StateManager::new(&[SYMBOL.to_string()]);
-        for b in [bbo(SHORT_EX, dec!(100.0), dec!(100.2), dec!(10.0)), bbo(LONG_EX, dec!(99.8), dec!(100.0), dec!(10.0))] {
-            manager.apply(&IncomeEvent::market(0, 0, MarketData::BBO(b))).unwrap();
+        for b in [
+            bbo(SHORT_EX, dec!(100.0), dec!(100.2), dec!(10.0)),
+            bbo(LONG_EX, dec!(99.8), dec!(100.0), dec!(10.0)),
+        ] {
+            manager
+                .apply(&IncomeEvent::market(0, 0, MarketData::BBO(b)))
+                .unwrap();
         }
         manager.seed_positions(
             &positions
@@ -1036,24 +1048,31 @@ mod tests {
         /// 喂入两所的 AccountInfo（equity + notional）
         fn with_account(mut self, equity: f64, notional: f64) -> Self {
             for exchange in [SHORT_EX, LONG_EX] {
-                self.manager.apply(&IncomeEvent::account(
-                    crate::domain::AccountId::Live,
-                    0,
-                    0,
-                    AccountData::Exchange(ExchangeAccountData::AccountInfo {
-                        exchange,
-                        equity,
-                        notional,
-                    }),
-                )).unwrap();
+                self.manager
+                    .apply(&IncomeEvent::account(
+                        crate::domain::AccountId::Live,
+                        0,
+                        0,
+                        AccountData::Exchange(ExchangeAccountData::AccountInfo {
+                            exchange,
+                            equity,
+                            notional,
+                        }),
+                    ))
+                    .unwrap();
             }
             self
         }
 
         /// 显著错价：SHORT_EX 的 bid 被抬高、LONG_EX 的 ask 被压低
         fn mispriced(mut self) -> Self {
-            for b in [bbo(SHORT_EX, dec!(110.0), dec!(110.2), dec!(10.0)), bbo(LONG_EX, dec!(89.8), dec!(90.0), dec!(10.0))] {
-                self.manager.apply(&IncomeEvent::market(0, 0, MarketData::BBO(b))).unwrap();
+            for b in [
+                bbo(SHORT_EX, dec!(110.0), dec!(110.2), dec!(10.0)),
+                bbo(LONG_EX, dec!(89.8), dec!(90.0), dec!(10.0)),
+            ] {
+                self.manager
+                    .apply(&IncomeEvent::market(0, 0, MarketData::BBO(b)))
+                    .unwrap();
             }
             self
         }
@@ -1068,7 +1087,9 @@ mod tests {
 
         /// 本夹具只有一个 symbol，直接借出它的视图
         fn symbol(&self) -> SymbolView<'_> {
-            self.view().symbol(&SYMBOL.to_string()).expect("夹具已注册该 symbol")
+            self.view()
+                .symbol(&SYMBOL.to_string())
+                .expect("夹具已注册该 symbol")
         }
     }
 
@@ -1096,8 +1117,11 @@ mod tests {
                 } else {
                     (dec!(99.8), dec!(100.0))
                 };
-                let event =
-                    IncomeEvent::market(local_ts, local_ts, MarketData::BBO(bbo(exchange, bid, ask, dec!(10.0))));
+                let event = IncomeEvent::market(
+                    local_ts,
+                    local_ts,
+                    MarketData::BBO(bbo(exchange, bid, ask, dec!(10.0))),
+                );
                 f.apply(&event);
                 strategy.on_event(&event, f.view());
             }
@@ -1155,7 +1179,8 @@ mod tests {
         let strategy = strategy(config());
         // 两所都持有多头 → short 腿是减仓方向（factor = -1）
         // 仓位 100 × 100 = 10000 名义 / equity 1000 = 杠杆 10，远超上限 0.5
-        let f = fixture(&[(SHORT_EX, dec!(100.0)), (LONG_EX, dec!(100.0))]).with_account(1000.0, 0.0);
+        let f =
+            fixture(&[(SHORT_EX, dec!(100.0)), (LONG_EX, dec!(100.0))]).with_account(1000.0, 0.0);
 
         let threshold =
             strategy.calculate_effective_threshold(SHORT_EX, LONG_EX, f.symbol(), f.view());
@@ -1364,7 +1389,11 @@ mod tests {
     fn no_signal_before_emas_are_warm() {
         let mut strategy = strategy(config());
         let mut f = fixture(&[]).with_account(1000.0, 0.0);
-        let event = IncomeEvent::market(0, 0, MarketData::BBO(bbo(SHORT_EX, dec!(100.0), dec!(100.2), dec!(10.0))));
+        let event = IncomeEvent::market(
+            0,
+            0,
+            MarketData::BBO(bbo(SHORT_EX, dec!(100.0), dec!(100.2), dec!(10.0))),
+        );
         f.apply(&event);
 
         // 只喂一条，远未满 ema_period
@@ -1435,7 +1464,9 @@ mod tests {
         strategy.bbo_local_ts.insert(LONG_EX, 0);
 
         assert!(
-            strategy.check_signal(f.symbol(), f.view(), cfg.max_bbo_age_ms).is_some(),
+            strategy
+                .check_signal(f.symbol(), f.view(), cfg.max_bbo_age_ms)
+                .is_some(),
             "窗口内应出信号"
         );
         assert!(
@@ -1475,7 +1506,11 @@ mod tests {
 
         strategy.check_account_leverage(&mut sig, f.symbol(), f.view());
 
-        assert_eq!(sig.long_size, dec!(0.0), "账户杠杆超限时不得在空仓 symbol 上开新仓");
+        assert_eq!(
+            sig.long_size,
+            dec!(0.0),
+            "账户杠杆超限时不得在空仓 symbol 上开新仓"
+        );
         assert_eq!(sig.short_size, dec!(0.0));
     }
 
@@ -1483,7 +1518,8 @@ mod tests {
     fn account_leverage_allows_reducing_when_over_limit() {
         let strategy = strategy(config());
         // 账户杠杆超限，但两条腿都是减仓方向：short 腿在多头上卖、long 腿在空头上买
-        let f = fixture(&[(SHORT_EX, dec!(5.0)), (LONG_EX, dec!(-5.0))]).with_account(1000.0, 5000.0);
+        let f =
+            fixture(&[(SHORT_EX, dec!(5.0)), (LONG_EX, dec!(-5.0))]).with_account(1000.0, 5000.0);
         let mut sig = signal(dec!(1.0), dec!(1.0));
 
         strategy.check_account_leverage(&mut sig, f.symbol(), f.view());
@@ -1521,10 +1557,7 @@ mod tests {
         f.apply(&event);
         let outcome = strategy.on_event(&event, f.view());
 
-        assert!(
-            outcome.is_empty(),
-            "中断恢复的第一跳不得被当成错价下单"
-        );
+        assert!(outcome.is_empty(), "中断恢复的第一跳不得被当成错价下单");
         // EMA 已重置 → 该所退出候选，直到重新预热
         let f = fixture(&[]);
         assert!(strategy.bid_deviation(SHORT_EX, f.symbol()).is_none());
@@ -1540,7 +1573,11 @@ mod tests {
         warm_up(&mut strategy, &mut f, 0);
 
         // 间隔恰好等于上限，属正常范围，不应重置
-        let event = IncomeEvent::market(cfg.max_bbo_age_ms, cfg.max_bbo_age_ms, MarketData::BBO(bbo(SHORT_EX, dec!(100.0), dec!(100.2), dec!(10.0))));
+        let event = IncomeEvent::market(
+            cfg.max_bbo_age_ms,
+            cfg.max_bbo_age_ms,
+            MarketData::BBO(bbo(SHORT_EX, dec!(100.0), dec!(100.2), dec!(10.0))),
+        );
         f.apply(&event);
         strategy.on_event(&event, f.view());
 
@@ -1625,7 +1662,8 @@ mod tests {
         let cfg = config();
         let strategy = strategy(cfg.clone());
         // 杠杆远超上限 + 减仓方向 → 公式给出 0，应被 ioc_slippage 托底
-        let f = fixture(&[(SHORT_EX, dec!(100.0)), (LONG_EX, dec!(100.0))]).with_account(1000.0, 0.0);
+        let f =
+            fixture(&[(SHORT_EX, dec!(100.0)), (LONG_EX, dec!(100.0))]).with_account(1000.0, 0.0);
 
         let threshold =
             strategy.calculate_effective_threshold(SHORT_EX, LONG_EX, f.symbol(), f.view());

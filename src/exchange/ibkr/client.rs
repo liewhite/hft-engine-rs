@@ -1,16 +1,16 @@
 //! IBKR ExchangeClient 实现 (仅 REST)
 
+use crate::domain::{dec, Decimal, PriceStep};
 use crate::domain::{
     Exchange, ExchangeError, OrderId, OrderStatus, OrderType, PlaceError, Side, Symbol, SymbolMeta,
     TimeInForce,
 };
 use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
 use crate::exchange::ibkr::auth::{action_request, query_request, IbkrAuth};
-use crate::exchange::rate_limit::Admitted;
 use crate::exchange::ibkr::symbol::resolve_conids;
 use crate::exchange::ibkr::wire;
 use crate::exchange::ibkr::IbkrCredentials;
-use crate::domain::{dec, Decimal, PriceStep};
+use crate::exchange::rate_limit::Admitted;
 use async_trait::async_trait;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 /// 下单确认消息抑制 ID 列表
 const SUPPRESS_MESSAGE_IDS: &[&str] = &[
-    "o163","o399", "o299", "o354", "o382", "o383", "o407", "o434", "o451", "o452", "o462", "o478",
+    "o163", "o399", "o299", "o354", "o382", "o383", "o407", "o434", "o451", "o452", "o462", "o478",
     "o10153",
 ];
 
@@ -51,9 +51,12 @@ impl IbkrClient {
         let (req, admitted) = query_request(&*auth, &http, "POST", &init_url)
             .await
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
-        let resp = crate::net::send(req.json(&serde_json::json!({"publish": true, "compete": true})), admitted)
-            .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+        let resp = crate::net::send(
+            req.json(&serde_json::json!({"publish": true, "compete": true})),
+            admitted,
+        )
+        .await
+        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
 
         tracing::info!(status = %resp.status(), "IBKR brokerage session init");
 
@@ -87,9 +90,12 @@ impl IbkrClient {
         let (req, admitted) = query_request(&*auth, &http, "POST", &switch_url)
             .await
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
-        let resp = crate::net::send(req.json(&serde_json::json!({"acctId": account_id})), admitted)
-            .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+        let resp = crate::net::send(
+            req.json(&serde_json::json!({"acctId": account_id})),
+            admitted,
+        )
+        .await
+        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
 
         if !resp.status().is_success() {
             return Err(ExchangeError::ConnectionFailed(
@@ -103,8 +109,11 @@ impl IbkrClient {
         let (req, admitted) = query_request(&*auth, &http, "POST", &suppress_url)
             .await
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
-        match crate::net::send(req.json(&serde_json::json!({"messageIds": SUPPRESS_MESSAGE_IDS})), admitted)
-            .await
+        match crate::net::send(
+            req.json(&serde_json::json!({"messageIds": SUPPRESS_MESSAGE_IDS})),
+            admitted,
+        )
+        .await
         {
             Ok(r) if !r.status().is_success() => {
                 tracing::warn!(status = %r.status(), "IBKR suppress questions failed");
@@ -136,8 +145,12 @@ impl IbkrClient {
     #[cfg(test)]
     pub(crate) fn for_test(conids: HashMap<String, i64>) -> Self {
         Self {
-            http: crate::net::http(std::time::Duration::from_secs(1)).build().expect("建不联网的测试 client"),
-            auth: Arc::new(super::gateway::IbkrGateway::new("https://127.0.0.1:1/v1/api/".into())),
+            http: crate::net::http(std::time::Duration::from_secs(1))
+                .build()
+                .expect("建不联网的测试 client"),
+            auth: Arc::new(super::gateway::IbkrGateway::new(
+                "https://127.0.0.1:1/v1/api/".into(),
+            )),
             account_id: "TEST".into(),
             symbols: conids.keys().cloned().collect(),
             conids,
@@ -170,10 +183,7 @@ impl IbkrClient {
 
         // 使用 portfolio2 接口: 近实时数据，无缓存
         // (portfolio v1 的 /positions/{page} 有缓存延迟，invalidate 也不可靠)
-        let url = format!(
-            "{}portfolio2/{}/positions",
-            base_url, self.account_id
-        );
+        let url = format!("{}portfolio2/{}/positions", base_url, self.account_id);
 
         let (req, admitted) = self.request("GET", &url).await?;
         let resp = crate::net::send(req, admitted)
@@ -204,9 +214,10 @@ impl IbkrClient {
         let mut positions = Vec::new();
         for item in arr {
             // portfolio2 返回 conid 为字符串，portfolio v1 为数字，兼容两种格式
-            let conid = item
-                .get("conid")
-                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+            let conid = item.get("conid").and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            });
             // conid 认不出 = 这条持仓归属不明。**不能跳过**：跳过等于把它当成"该
             // symbol 空仓"，而这份读数既是基线（写一次、永不纠正）又是对账读数
             // （两条通道共用本函数）—— 字段名/类型一变，基线 0、读数也 0，对账判
@@ -276,9 +287,18 @@ impl IbkrClient {
 
         let mut schedules = Vec::new();
         for item in &items {
-            let id = item.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let trade_venue_id = item.get("tradeVenueId").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let description = item.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let trade_venue_id = item
+                .get("tradeVenueId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let description = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             let entry_schedules = match item.get("schedules").and_then(|v| v.as_array()) {
                 Some(arr) => {
@@ -291,9 +311,18 @@ impl IbkrClient {
                                 .map(|sarr| {
                                     sarr.iter()
                                         .map(|s| TradingSession {
-                                            opening_time: s.get("openingTime").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                            closing_time: s.get("closingTime").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                                            prop: s.get("prop").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                            opening_time: s
+                                                .get("openingTime")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string()),
+                                            closing_time: s
+                                                .get("closingTime")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string()),
+                                            prop: s
+                                                .get("prop")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string()),
                                         })
                                         .collect()
                                 })
@@ -301,7 +330,10 @@ impl IbkrClient {
 
                             ScheduleEntry {
                                 // 统一去掉连字符，兼容 "2000-01-03" 和 "20000103" 两种格式
-                                trading_schedule_date: entry.get("tradingScheduleDate").and_then(|v| v.as_str()).map(|s| s.replace('-', "")),
+                                trading_schedule_date: entry
+                                    .get("tradingScheduleDate")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.replace('-', "")),
                                 sessions,
                             }
                         })
@@ -367,10 +399,16 @@ impl ExchangeClient for IbkrClient {
         Ok(metas)
     }
 
-    async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+    async fn fetch_symbol_meta(
+        &self,
+        symbols: &[Symbol],
+    ) -> Result<Vec<SymbolMeta>, ExchangeError> {
         let all = self.fetch_all_symbol_metas().await?;
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
-        Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
+        Ok(all
+            .into_iter()
+            .filter(|m| symbol_set.contains(&m.symbol))
+            .collect())
     }
 }
 
@@ -380,7 +418,11 @@ impl AccountClient for IbkrClient {
         Exchange::IBKR
     }
 
-    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError> {
+    async fn cancel_order(
+        &self,
+        symbol: &Symbol,
+        client_order_id: &str,
+    ) -> Result<(), ExchangeError> {
         // IBKR 只能按 orderId 撤单：先从挂单列表里按 cOID（响应里叫 order_ref）找到它
         let order_id = self
             .fetch_pending_orders(symbol)
@@ -389,7 +431,9 @@ impl AccountClient for IbkrClient {
             .find(|o| o.client_order_id.as_deref() == Some(client_order_id))
             .map(|o| o.order_id)
             .ok_or_else(|| {
-                ExchangeError::Other(format!("IBKR 挂单列表里没有 cOID={client_order_id} 的单（已终态或未受理）"))
+                ExchangeError::Other(format!(
+                    "IBKR 挂单列表里没有 cOID={client_order_id} 的单（已终态或未受理）"
+                ))
             })?;
         let url = format!(
             "{}iserver/account/{}/order/{}",
@@ -583,7 +627,10 @@ impl AccountClient for IbkrClient {
         // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
         let order = order.inner();
         let conid = self.conids.get(&order.symbol).ok_or_else(|| {
-            PlaceError::unsent(ExchangeError::SymbolNotFound(Exchange::IBKR, order.symbol.clone()))
+            PlaceError::unsent(ExchangeError::SymbolNotFound(
+                Exchange::IBKR,
+                order.symbol.clone(),
+            ))
         })?;
 
         let side = match order.side {
@@ -594,20 +641,19 @@ impl AccountClient for IbkrClient {
         let (order_type, price, tif) = match &order.order_type {
             OrderType::Market => ("MKT", None, "DAY"),
             OrderType::Limit { price, tif } => {
-                let tif_str = match tif {
-                    TimeInForce::GTC => "GTC",
-                    TimeInForce::IOC => "IOC",
-                    TimeInForce::FOK => "FOK",
-                    // IBKR Web API 没有 post-only 语义。此前静默映射成 GTC —— 那会把
-                    // "绝不吃单"的 maker 单变成可能立即成交的吃单，成交行为被悄悄改变
-                    // （其余三所都有对应值：GTX / post_only / Alo）。显式拒绝，让策略
-                    // 作者在选型时就知道该所不支持，而不是上线后从成交明细里发现。
-                    TimeInForce::PostOnly => {
-                        return Err(PlaceError::unsent(
+                let tif_str =
+                    match tif {
+                        TimeInForce::GTC => "GTC",
+                        TimeInForce::IOC => "IOC",
+                        TimeInForce::FOK => "FOK",
+                        // IBKR Web API 没有 post-only 语义。此前静默映射成 GTC —— 那会把
+                        // "绝不吃单"的 maker 单变成可能立即成交的吃单，成交行为被悄悄改变
+                        // （其余三所都有对应值：GTX / post_only / Alo）。显式拒绝，让策略
+                        // 作者在选型时就知道该所不支持，而不是上线后从成交明细里发现。
+                        TimeInForce::PostOnly => return Err(PlaceError::unsent(
                             "IBKR 不支持 post-only（Web API 无对应 tif），拒绝把它静默降级为 GTC",
-                        ))
-                    }
-                };
+                        )),
+                    };
                 ("LMT", Some(*price), tif_str)
             }
         };
@@ -635,7 +681,8 @@ impl AccountClient for IbkrClient {
 
         let body = serde_json::json!({ "orders": [order_body] });
 
-        let (req, admitted) = action_request(&*self.auth, &self.http, "POST", &url, PlaceError::unsent)?;
+        let (req, admitted) =
+            action_request(&*self.auth, &self.http, "POST", &url, PlaceError::unsent)?;
         let resp = crate::net::send(req.json(&body), admitted)
             .await
             .map_err(|e| place_send_error(Exchange::IBKR, e))?;
@@ -646,9 +693,7 @@ impl AccountClient for IbkrClient {
             .map_err(|e| PlaceError::indeterminate(format!("IBKR 下单回复解析不了: {e}")))?;
 
         // 处理 reply 确认循环
-        let order_id = self
-            .handle_order_response(&resp_body)
-            .await?;
+        let order_id = self.handle_order_response(&resp_body).await?;
 
         Ok(order_id)
     }
@@ -659,24 +704,19 @@ impl AccountClient for IbkrClient {
         // 先 receive brokerage accounts (预热缓存)
         let recv_url = format!("{}portfolio/accounts", base_url);
         let (req, admitted) = self.request("GET", &recv_url).await?;
-        if let Err(e) = crate::net::send(req, admitted).await
-        {
+        if let Err(e) = crate::net::send(req, admitted).await {
             tracing::warn!(error = %e, "IBKR portfolio/accounts prefetch failed");
         }
 
         // 获取 account summary
-        let summary_url = format!(
-            "{}portfolio/{}/summary",
-            base_url, self.account_id
-        );
+        let summary_url = format!("{}portfolio/{}/summary", base_url, self.account_id);
 
         let (req, admitted) = self.request("GET", &summary_url).await?;
         let resp = crate::net::send(req, admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
-        let summary: serde_json::Value =
-            resp.json().await.map_err(Self::map_reqwest_error)?;
+        let summary: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
 
         // 两个字段都**必须**取到，取不到即报错，绝不兜 0：
         //
@@ -743,9 +783,10 @@ impl IbkrClient {
     /// IBKR 股票无公开 BBO REST API，通过 `/iserver/marketdata/snapshot` 获取。
     /// 首次请求可能触发订阅，需要多次请求才能拿到数据。
     pub async fn fetch_snapshot_bbo(&self, symbol: &str) -> Result<(f64, f64), ExchangeError> {
-        let conid = self.conids.get(symbol).ok_or_else(|| {
-            ExchangeError::SymbolNotFound(Exchange::IBKR, symbol.to_string())
-        })?;
+        let conid = self
+            .conids
+            .get(symbol)
+            .ok_or_else(|| ExchangeError::SymbolNotFound(Exchange::IBKR, symbol.to_string()))?;
 
         let url = snapshot_url(
             self.auth.base_url(),
@@ -769,10 +810,7 @@ impl IbkrClient {
             })?;
 
             let first = arr.first().ok_or_else(|| {
-                ExchangeError::ConnectionFailed(
-                    Exchange::IBKR,
-                    "snapshot 响应数组为空".to_string(),
-                )
+                ExchangeError::ConnectionFailed(Exchange::IBKR, "snapshot 响应数组为空".to_string())
             })?;
 
             let bid = parse_snapshot_field(first, SNAPSHOT_FIELD_BID);
@@ -828,17 +866,19 @@ impl IbkrClient {
                 .map_err(Self::map_reqwest_error)?;
             let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
 
-            let first = body
-                .as_array()
-                .and_then(|arr| arr.first())
-                .cloned();
+            let first = body.as_array().and_then(|arr| arr.first()).cloned();
 
             if let Some(obj) = first {
                 if snapshot_ready(&obj, required) {
                     return Ok(obj);
                 }
             }
-            tracing::debug!(attempt, conid, ?required, "IBKR snapshot 必需字段未就绪，重试");
+            tracing::debug!(
+                attempt,
+                conid,
+                ?required,
+                "IBKR snapshot 必需字段未就绪，重试"
+            );
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
 
@@ -943,19 +983,20 @@ impl IbkrClient {
 
                     // 情况 2: 需要 reply 确认
                     if let Some(reply_id) = first.get("id").and_then(|v| v.as_str()) {
-                        let reply_url = format!(
-                            "{}iserver/reply/{}",
-                            self.auth.base_url(),
-                            reply_id
-                        );
+                        let reply_url =
+                            format!("{}iserver/reply/{}", self.auth.base_url(), reply_id);
 
                         // 确认是已提交订单的后续步骤，不能因没额度半途放弃：按查询排队
-                        let (req, admitted) = query_request(&*self.auth, &self.http, "POST", &reply_url)
-                            .await
-                            .map_err(PlaceError::indeterminate)?;
-                        let resp = crate::net::send(req.json(&serde_json::json!({"confirmed": true})), admitted)
-                            .await
-                            .map_err(PlaceError::indeterminate)?;
+                        let (req, admitted) =
+                            query_request(&*self.auth, &self.http, "POST", &reply_url)
+                                .await
+                                .map_err(PlaceError::indeterminate)?;
+                        let resp = crate::net::send(
+                            req.json(&serde_json::json!({"confirmed": true})),
+                            admitted,
+                        )
+                        .await
+                        .map_err(PlaceError::indeterminate)?;
 
                         current_resp = resp.json().await.map_err(PlaceError::indeterminate)?;
                         continue;
@@ -968,7 +1009,9 @@ impl IbkrClient {
             )));
         }
 
-        Err(PlaceError::indeterminate("IBKR too many reply confirmations"))
+        Err(PlaceError::indeterminate(
+            "IBKR too many reply confirmations",
+        ))
     }
 
     /// 查询当天 live orders (原始 JSON)

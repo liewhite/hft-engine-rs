@@ -28,7 +28,9 @@ use anyhow::Context;
 use hft_engine_rs::domain::{
     from_f64, to_f64, Decimal, Exchange, Order, OrderType, Side, Symbol, TimeInForce,
 };
-use hft_engine_rs::engine::{load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, StrategySpec};
+use hft_engine_rs::engine::{
+    load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, StrategySpec,
+};
 use hft_engine_rs::exchange::SubscriptionKind;
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
@@ -72,7 +74,6 @@ impl Strategy for DipMaker {
             .collect();
         HashMap::from([(self.exchange, kinds)])
     }
-
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let IncomeEvent::Market(MarketEvent {
@@ -168,7 +169,10 @@ async fn run() -> anyhow::Result<()> {
         };
         manager
             // 绑定到按 symbol 命名的模拟账户；实盘账户不注册任何策略，故不会有真实下单
-            .add_strategy(StrategySpec::paper(Box::new(strategy), config.symbols.join(",")))
+            .add_strategy(StrategySpec::paper(
+                Box::new(strategy),
+                config.symbols.join(","),
+            ))
             .await
             .context("添加策略失败")?;
         Ok(())

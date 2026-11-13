@@ -8,10 +8,10 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce, BBO};
-use hft_engine_rs::exchange::ibkr::{IbkrArgs, IbkrClient, IbkrCredentials, IbkrNode};
-use hft_engine_rs::exchange::ibkr::auth::tickle;
-use hft_engine_rs::exchange::{AccountClient, ExchangeOrder, ExchangeClient, SubscriptionKind};
 use hft_engine_rs::engine::{AccountBus, MarketBus};
+use hft_engine_rs::exchange::ibkr::auth::tickle;
+use hft_engine_rs::exchange::ibkr::{IbkrArgs, IbkrClient, IbkrCredentials, IbkrNode};
+use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder, SubscriptionKind};
 use hft_engine_rs::messaging::{MarketData, MarketEvent};
 use hft_engine_rs::tasks::{Inbox, Root, Scope, Task};
 use std::sync::{Arc, Mutex};
@@ -32,7 +32,10 @@ impl Task for BboCollector {
     async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
         while let Some(msg) = self.inbox.recv().await {
             if let MarketData::BBO(bbo) = msg.data {
-                println!("收到 BBO: {} bid={} ask={}", bbo.symbol, bbo.bid_price, bbo.ask_price);
+                println!(
+                    "收到 BBO: {} bid={} ask={}",
+                    bbo.symbol, bbo.bid_price, bbo.ask_price
+                );
                 self.collected.lock().unwrap().push(bbo);
                 self.notify.notify_one();
             }
@@ -44,14 +47,21 @@ impl Task for BboCollector {
 /// 从 tests/ibkr_config.json 读取凭证
 fn load_credentials() -> IbkrCredentials {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ibkr_config.json");
-    let content = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("读取 {} 失败: {}。请参照 ibkr_config.json.example 创建", path, e));
-    serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("解析 ibkr_config.json 失败: {}", e))
+    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "读取 {} 失败: {}。请参照 ibkr_config.json.example 创建",
+            path, e
+        )
+    });
+    serde_json::from_str(&content).unwrap_or_else(|e| panic!("解析 ibkr_config.json 失败: {}", e))
 }
 
 fn first_symbol(credentials: &IbkrCredentials) -> Symbol {
-    credentials.symbols().first().expect("配置中至少需要一个 symbol").clone()
+    credentials
+        .symbols()
+        .first()
+        .expect("配置中至少需要一个 symbol")
+        .clone()
 }
 
 // ─── 测试用例 ───────────────────────────────────────────────
@@ -62,9 +72,7 @@ async fn test_ibkr_connect() {
     let credentials = load_credentials();
     let symbols = credentials.symbols().to_vec();
 
-    let client = IbkrClient::new(&credentials)
-        .await
-        .expect("IBKR 连接失败");
+    let client = IbkrClient::new(&credentials).await.expect("IBKR 连接失败");
 
     let conids = client.conids();
     println!("连接成功，conids: {:?}", conids);
@@ -80,12 +88,13 @@ async fn test_ibkr_connect() {
 async fn test_ibkr_fetch_account_info() {
     let credentials = load_credentials();
 
-    let client = IbkrClient::new(&credentials)
-        .await
-        .expect("IBKR 连接失败");
+    let client = IbkrClient::new(&credentials).await.expect("IBKR 连接失败");
 
     let info = client.fetch_account_info().await.expect("获取账户信息失败");
-    println!("账户信息: equity={}, notional={}", info.equity, info.notional);
+    println!(
+        "账户信息: equity={}, notional={}",
+        info.equity, info.notional
+    );
 
     assert!(info.equity > 0.0, "equity 应大于 0");
 }
@@ -96,12 +105,13 @@ async fn test_ibkr_symbol_metas() {
     let credentials = load_credentials();
     let symbol = first_symbol(&credentials);
 
-    let client = IbkrClient::new(&credentials)
-        .await
-        .expect("IBKR 连接失败");
+    let client = IbkrClient::new(&credentials).await.expect("IBKR 连接失败");
 
     // fetch_all_symbol_metas
-    let all_metas = client.fetch_all_symbol_metas().await.expect("获取全部 SymbolMeta 失败");
+    let all_metas = client
+        .fetch_all_symbol_metas()
+        .await
+        .expect("获取全部 SymbolMeta 失败");
     println!("全部 SymbolMeta ({} 个): {:?}", all_metas.len(), all_metas);
     assert!(!all_metas.is_empty(), "应至少有一个 SymbolMeta");
 
@@ -126,10 +136,7 @@ async fn test_ibkr_symbol_metas() {
 async fn test_ibkr_tickle() {
     let credentials = load_credentials();
 
-    let auth = credentials
-        .create_auth()
-        .await
-        .expect("创建认证器失败");
+    let auth = credentials.create_auth().await.expect("创建认证器失败");
 
     let http = auth.build_http_client().expect("创建 HTTP 客户端失败");
 
@@ -148,9 +155,7 @@ async fn test_ibkr_tickle() {
 async fn test_ibkr_fetch_positions() {
     let credentials = load_credentials();
 
-    let client = IbkrClient::new(&credentials)
-        .await
-        .expect("IBKR 连接失败");
+    let client = IbkrClient::new(&credentials).await.expect("IBKR 连接失败");
 
     let positions = client.fetch_positions().await.expect("获取持仓失败");
     println!("持仓数量: {}", positions.len());
@@ -168,9 +173,7 @@ async fn test_ibkr_snapshot_mid_price() {
     let credentials = load_credentials();
     let symbol = first_symbol(&credentials);
 
-    let client = IbkrClient::new(&credentials)
-        .await
-        .expect("IBKR 连接失败");
+    let client = IbkrClient::new(&credentials).await.expect("IBKR 连接失败");
 
     let mid_price = client
         .fetch_snapshot_mid_price(&symbol)
@@ -187,9 +190,7 @@ async fn test_ibkr_limit_buy() {
     let credentials = load_credentials();
     let symbol = first_symbol(&credentials);
 
-    let client = IbkrClient::new(&credentials)
-        .await
-        .expect("IBKR 连接失败");
+    let client = IbkrClient::new(&credentials).await.expect("IBKR 连接失败");
 
     // 获取 snapshot 中间价
     let mid_price = client
@@ -225,7 +226,10 @@ async fn test_ibkr_limit_buy() {
 
     println!("提交买单: {:?}", order);
 
-    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
+    let order_id = client
+        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .await
+        .expect("下单失败");
     println!("买单成功，订单ID: {}", order_id);
 }
 
@@ -235,9 +239,7 @@ async fn test_ibkr_limit_sell() {
     let credentials = load_credentials();
     let symbol = first_symbol(&credentials);
 
-    let client = IbkrClient::new(&credentials)
-        .await
-        .expect("IBKR 连接失败");
+    let client = IbkrClient::new(&credentials).await.expect("IBKR 连接失败");
 
     // 获取 snapshot 中间价
     let mid_price = client
@@ -273,7 +275,10 @@ async fn test_ibkr_limit_sell() {
 
     println!("提交卖单: {:?}", order);
 
-    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
+    let order_id = client
+        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .await
+        .expect("下单失败");
     println!("卖单成功，订单ID: {}", order_id);
 }
 
@@ -289,11 +294,7 @@ async fn test_ibkr_ws_bbo() {
     let symbols = credentials.symbols().to_vec();
 
     // 1. 创建 IbkrClient 获取 auth + conids
-    let client = Arc::new(
-        IbkrClient::new(&credentials)
-            .await
-            .expect("IBKR 连接失败"),
-    );
+    let client = Arc::new(IbkrClient::new(&credentials).await.expect("IBKR 连接失败"));
 
     let auth = client.auth();
     let conids = client.conids().clone();
@@ -315,7 +316,11 @@ async fn test_ibkr_ws_bbo() {
             .spawn("BboCollector", move |scope: Scope| async move {
                 let (_addr, mut inbox) = scope.inbox::<MarketEvent>();
                 inbox.subscribe(&bus, |_| true, |e| e);
-                Ok(BboCollector { inbox, collected, notify })
+                Ok(BboCollector {
+                    inbox,
+                    collected,
+                    notify,
+                })
             })
             .await
             .expect("启动 BBO 收集器失败");
@@ -342,7 +347,8 @@ async fn test_ibkr_ws_bbo() {
         .map(|s| SubscriptionKind::BBO { symbol: s.clone() })
         .collect();
     println!("订阅 BBO: {:?}", bbo_kinds);
-    ibkr.subscribe_batch(bbo_kinds).expect("发送 SubscribeBatch 失败");
+    ibkr.subscribe_batch(bbo_kinds)
+        .expect("发送 SubscribeBatch 失败");
 
     // 6. 验证节点连接成功 (给 WS 2 秒完成连接和订阅)
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -404,9 +410,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
     let credentials = load_credentials();
     let symbol = first_symbol(&credentials);
 
-    let client = IbkrClient::new(&credentials)
-        .await
-        .expect("IBKR 连接失败");
+    let client = IbkrClient::new(&credentials).await.expect("IBKR 连接失败");
 
     // 1. 读取初始仓位
     let positions_before = client.fetch_positions().await.expect("获取仓位失败");
@@ -431,7 +435,10 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到 SymbolMeta");
-    let buy_price: Decimal = meta.format_price(hft_engine_rs::domain::from_f64(ask + slippage).unwrap()).parse().unwrap();
+    let buy_price: Decimal = meta
+        .format_price(hft_engine_rs::domain::from_f64(ask + slippage).unwrap())
+        .parse()
+        .unwrap();
 
     let buy_order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -447,8 +454,14 @@ async fn test_ibkr_place_order_and_verify_fill() {
         client_order_id: hft_engine_rs::exchange::ibkr::CLIENT_ORDER_IDS.generate(),
     };
 
-    println!("[下单] 买入 {} 股 {} @ {}", TEST_QUANTITY, symbol, buy_price);
-    let buy_order_id = client.place_order(ExchangeOrder::from_domain(buy_order, &meta).expect("订单未通过出向校验")).await.expect("买单失败");
+    println!(
+        "[下单] 买入 {} 股 {} @ {}",
+        TEST_QUANTITY, symbol, buy_price
+    );
+    let buy_order_id = client
+        .place_order(ExchangeOrder::from_domain(buy_order, &meta).expect("订单未通过出向校验"))
+        .await
+        .expect("买单失败");
     println!("[下单返回] order_id={}", buy_order_id);
 
     // 4. 查询订单状态确认成交 (首次调用激活订阅，第二次取数据)
@@ -469,7 +482,12 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .find(|p| p.symbol == symbol)
         .map(|p| p.size)
         .unwrap_or(dec!(0.0));
-    println!("[买入后] {} 仓位: {} (预期: {})", symbol, pos_after_buy, pos_before + TEST_QUANTITY);
+    println!(
+        "[买入后] {} 仓位: {} (预期: {})",
+        symbol,
+        pos_after_buy,
+        pos_before + TEST_QUANTITY
+    );
     assert!(
         (pos_after_buy - (pos_before + TEST_QUANTITY)).abs() < dec!(0.01),
         "买入后仓位应增加 {} 股: before={} after={}",
@@ -483,7 +501,10 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .fetch_snapshot_bbo(&symbol)
         .await
         .expect("获取 BBO 失败");
-    let sell_price: Decimal = meta.format_price(hft_engine_rs::domain::from_f64(bid2 - slippage).unwrap()).parse().unwrap();
+    let sell_price: Decimal = meta
+        .format_price(hft_engine_rs::domain::from_f64(bid2 - slippage).unwrap())
+        .parse()
+        .unwrap();
 
     let sell_order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -499,8 +520,14 @@ async fn test_ibkr_place_order_and_verify_fill() {
         client_order_id: hft_engine_rs::exchange::ibkr::CLIENT_ORDER_IDS.generate(),
     };
 
-    println!("[下单] 卖出 {} 股 {} @ {}", TEST_QUANTITY, symbol, sell_price);
-    let sell_order_id = client.place_order(ExchangeOrder::from_domain(sell_order, &meta).expect("订单未通过出向校验")).await.expect("卖单失败");
+    println!(
+        "[下单] 卖出 {} 股 {} @ {}",
+        TEST_QUANTITY, symbol, sell_price
+    );
+    let sell_order_id = client
+        .place_order(ExchangeOrder::from_domain(sell_order, &meta).expect("订单未通过出向校验"))
+        .await
+        .expect("卖单失败");
     println!("[成交] 卖单 order_id={}", sell_order_id);
 
     // 7. 查询订单状态 + 等待仓位更新
@@ -518,7 +545,10 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .find(|p| p.symbol == symbol)
         .map(|p| p.size)
         .unwrap_or(dec!(0.0));
-    println!("[最终] {} 仓位: {} (预期: {})", symbol, pos_final, pos_before);
+    println!(
+        "[最终] {} 仓位: {} (预期: {})",
+        symbol, pos_final, pos_before
+    );
     assert!(
         (pos_final - pos_before).abs() < dec!(0.01),
         "仓位应恢复到初始值: before={} final={}",

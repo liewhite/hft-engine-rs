@@ -12,7 +12,7 @@ use hft_engine_rs::exchange::okx::OkxCredentials;
 use hft_engine_rs::exchange::{AccountStream, ExchangeAccess, SubscriptionKind};
 
 const TEST_QUOTE: &str = "USDT";
-use hft_engine_rs::messaging::{ExchangeAccountData, AccountData, IncomeEvent};
+use hft_engine_rs::messaging::{AccountData, ExchangeAccountData, IncomeEvent};
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use hft_engine_rs::tasks::Root;
 use std::collections::{HashMap, HashSet};

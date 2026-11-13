@@ -112,9 +112,15 @@ impl FundingArbConfig {
             }
             pos(&format!("{}.order_distance", p.symbol), p.order_distance)?;
             if p.order_distance >= 1.0 {
-                return Err(format!("{}.order_distance 必须 < 1（挂单价 = 盘口价 × (1 ± 它)），当前 {}", p.symbol, p.order_distance));
+                return Err(format!(
+                    "{}.order_distance 必须 < 1（挂单价 = 盘口价 × (1 ± 它)），当前 {}",
+                    p.symbol, p.order_distance
+                ));
             }
-            pos(&format!("{}.max_symbol_leverage", p.symbol), p.max_symbol_leverage)?;
+            pos(
+                &format!("{}.max_symbol_leverage", p.symbol),
+                p.max_symbol_leverage,
+            )?;
             if p.max_symbol_leverage > p.max_account_leverage {
                 return Err(format!("{} 单币杠杆上限大于账户杠杆上限", p.symbol));
             }
@@ -173,7 +179,11 @@ mod tests {
     #[test]
     fn rejects_duplicates_and_zero_limits() {
         let mut c = cfg();
-        c.pairs.push(PairConfig { symbol: "BTC".into(), order_distance: None, max_symbol_leverage: None });
+        c.pairs.push(PairConfig {
+            symbol: "BTC".into(),
+            order_distance: None,
+            max_symbol_leverage: None,
+        });
         assert!(c.validate().is_err());
         let mut c = cfg();
         c.max_account_leverage = 0.0;

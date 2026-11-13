@@ -25,16 +25,24 @@ async fn spawn_stub() -> (String, Arc<Mutex<Vec<String>>>) {
                     }
                     buf.extend_from_slice(&chunk[..n]);
                     let text = String::from_utf8_lossy(&buf).into_owned();
-                    let Some((head, body)) = text.split_once("\r\n\r\n") else { continue };
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        continue;
+                    };
                     let len: usize = head
                         .lines()
-                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
                         .unwrap_or(0);
                     if body.len() < len {
                         continue;
                     }
                     b.lock().unwrap().push(body.to_string());
-                    let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                        .await;
                     buf.clear();
                 }
             });
@@ -63,6 +71,13 @@ async fn panic_in_main_is_alerted_and_flushed() {
     assert!(result.is_err(), "panic 要转成错误返回");
     let got = bodies.lock().unwrap().clone();
     assert!(got[0].contains("启动自检"), "{got:?}");
-    assert!(got.iter().any(|b| b.contains("模拟主流程崩溃")), "panic 内容要外送: {got:?}");
-    assert!(got.iter().any(|b| b.contains("进程因错误退出: 主流程 panic: 模拟主流程崩溃")), "退出原因带 panic 内容，要在返回前发完: {got:?}");
+    assert!(
+        got.iter().any(|b| b.contains("模拟主流程崩溃")),
+        "panic 内容要外送: {got:?}"
+    );
+    assert!(
+        got.iter()
+            .any(|b| b.contains("进程因错误退出: 主流程 panic: 模拟主流程崩溃")),
+        "退出原因带 panic 内容，要在返回前发完: {got:?}"
+    );
 }

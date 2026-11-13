@@ -20,7 +20,7 @@ use crate::domain::{
     TimeInForce,
 };
 use crate::exchange::{AccountStream, SubscriptionKind};
-use crate::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData, PendingOrder};
+use crate::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
 
@@ -77,9 +77,17 @@ impl GammaScalpStrategy {
     fn desired_hedge(&self, ref_price: Price, net_delta: f64) -> Option<(Side, Quantity, Price)> {
         let offset = from_f64(self.base_offset_ratio)?;
         if net_delta > self.delta_band {
-            Some((Side::Short, from_f64(net_delta)?, ref_price * (Decimal::ONE + offset)))
+            Some((
+                Side::Short,
+                from_f64(net_delta)?,
+                ref_price * (Decimal::ONE + offset),
+            ))
         } else if net_delta < -self.delta_band {
-            Some((Side::Long, from_f64(-net_delta)?, ref_price * (Decimal::ONE - offset)))
+            Some((
+                Side::Long,
+                from_f64(-net_delta)?,
+                ref_price * (Decimal::ONE - offset),
+            ))
         } else {
             None
         }
@@ -99,10 +107,7 @@ impl GammaScalpStrategy {
 
         match self.desired_hedge(ref_price, net_delta) {
             // 带内：撤掉残留的在途对冲单
-            None => pending
-                .map(|p| self.cancel(&p))
-                .into_iter()
-                .collect(),
+            None => pending.map(|p| self.cancel(&p)).into_iter().collect(),
             // 越带：维护单张对冲单
             Some((side, qty, price)) => self.maintain(pending, side, qty, price, net_delta),
         }
@@ -208,7 +213,9 @@ impl Strategy for GammaScalpStrategy {
             },
             // greeks 变化 (delta 漂移) 也即时触发，用最新成交价为基准
             IncomeEvent::Account(a) => match &a.data {
-                AccountData::Exchange(ExchangeAccountData::Greeks(g)) if g.exchange == self.exchange && g.ccy == self.ccy => {
+                AccountData::Exchange(ExchangeAccountData::Greeks(g))
+                    if g.exchange == self.exchange && g.ccy == self.ccy =>
+                {
                     match self.last_price {
                         Some(p) => self.hedge(p, view),
                         None => Vec::new(),
@@ -226,7 +233,13 @@ mod tests {
 
     fn strat() -> GammaScalpStrategy {
         // band=0.1, offset=0.2%
-        GammaScalpStrategy::new(Exchange::Binance, "ETH".to_string(), "ETH".to_string(), 0.1, 0.002)
+        GammaScalpStrategy::new(
+            Exchange::Binance,
+            "ETH".to_string(),
+            "ETH".to_string(),
+            0.1,
+            0.002,
+        )
     }
 
     #[test]

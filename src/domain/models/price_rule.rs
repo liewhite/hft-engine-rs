@@ -31,7 +31,8 @@ impl PriceStep {
 
 impl PriceRule for PriceStep {
     fn round(&self, price: Price) -> Price {
-        (price / self.step).round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero) * self.step
+        (price / self.step).round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
+            * self.step
     }
 }
 
@@ -59,7 +60,10 @@ mod tests {
         assert_eq!(s(&q, dec!(100.25)), "100.25");
         assert_eq!(s(&q, dec!(100.3)), "100.25");
         assert_eq!(s(&PriceStep::new(dec!(0.005)), dec!(1.2345)), "1.235");
-        assert_eq!(s(&PriceStep::new(dec!(0.00001)), dec!(0.0000123456)), "0.00001");
+        assert_eq!(
+            s(&PriceStep::new(dec!(0.00001)), dec!(0.0000123456)),
+            "0.00001"
+        );
     }
 
     #[test]

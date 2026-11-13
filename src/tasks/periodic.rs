@@ -114,7 +114,11 @@ mod tests {
     async fn periodic_error_propagates() {
         let root = Root::new("t");
         root.group("g")
-            .spawn_periodic("p", Duration::from_secs(1), Counter(Arc::new(AtomicUsize::new(0)), 2))
+            .spawn_periodic(
+                "p",
+                Duration::from_secs(1),
+                Counter(Arc::new(AtomicUsize::new(0)), 2),
+            )
             .unwrap();
         root.stopping().await;
         let e = root.shutdown().await.unwrap_err();
@@ -144,7 +148,9 @@ mod tests {
         }
     }
 
-    fn slow(first_takes: Duration) -> (Slow, Arc<std::sync::Mutex<Vec<Duration>>>, Arc<AtomicUsize>) {
+    fn slow(
+        first_takes: Duration,
+    ) -> (Slow, Arc<std::sync::Mutex<Vec<Duration>>>, Arc<AtomicUsize>) {
         let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let finished = Arc::new(AtomicUsize::new(0));
         let job = Slow {
@@ -162,9 +168,16 @@ mod tests {
     async fn periodic_skips_missed_ticks() {
         let (job, starts, _) = slow(Duration::from_millis(2500));
         let root = Root::new("t");
-        root.group("g").spawn_periodic("p", Duration::from_secs(1), job).unwrap();
+        root.group("g")
+            .spawn_periodic("p", Duration::from_secs(1), job)
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(3500)).await;
-        let ms: Vec<u128> = starts.lock().unwrap().iter().map(|d| d.as_millis()).collect();
+        let ms: Vec<u128> = starts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_millis())
+            .collect();
         // 0s 那拍做到 2.5s；错过的 1s、2s 两拍只在 2.5s 补一拍（Burst 会在 2.5s 连跑两拍），
         // 下一拍回到整周期 3s
         assert_eq!(ms, [0, 2500, 3000]);
@@ -176,11 +189,17 @@ mod tests {
     async fn stop_waits_for_the_running_tick() {
         let (job, starts, finished) = slow(Duration::from_secs(2));
         let root = Root::new("t");
-        let h = root.group("g").spawn_periodic("p", Duration::from_secs(1), job).unwrap();
+        let h = root
+            .group("g")
+            .spawn_periodic("p", Duration::from_secs(1), job)
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         let t0 = tokio::time::Instant::now();
         h.stop().await;
-        assert!(t0.elapsed() >= Duration::from_millis(1500), "停止应等这一拍做完");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(1500),
+            "停止应等这一拍做完"
+        );
         assert_eq!(finished.load(Ordering::SeqCst), 1, "正在做的一拍被打断了");
         assert_eq!(starts.lock().unwrap().len(), 1, "停止后不应再开新的一拍");
         root.shutdown().await.unwrap();
@@ -220,7 +239,9 @@ mod tests {
         let root = Root::new("t");
         let r = root
             .group("g")
-            .spawn_addressed::<u32, Never, _, _>("bad", |_s, _i| async move { anyhow::bail!("连不上") })
+            .spawn_addressed::<u32, Never, _, _>("bad", |_s, _i| async move {
+                anyhow::bail!("连不上")
+            })
             .await;
         assert!(format!("{:#}", r.unwrap_err()).contains("连不上"));
         assert!(root.shutdown().await.is_err());

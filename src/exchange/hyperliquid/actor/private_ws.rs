@@ -17,7 +17,9 @@ use crate::exchange::hyperliquid::codec::{WsOrderUpdate, WsUserFills};
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
 use crate::exchange::ws_loop::{self, WsConn};
-use crate::messaging::{AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData};
+use crate::messaging::{
+    AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData,
+};
 use crate::tasks::{ChildHandle, Group, Scope, Task};
 use anyhow::Context as _;
 use futures_util::StreamExt;
@@ -56,7 +58,9 @@ impl HyperliquidPrivateWs {
                 // 1. 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
                 let ws_stream = crate::exchange::ws_loop::connect(WS_URL)
                     .await
-                    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
+                    .map_err(|e| {
+                        ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string())
+                    })?;
                 let (write, read) = ws_stream.split();
 
                 // 2. 起读循环（心跳、回 Pong、断线判定都归它）
@@ -75,21 +79,29 @@ impl HyperliquidPrivateWs {
                         "subscription": {"type": sub_type, "user": wallet_address}
                     })
                     .to_string();
-                    conn.send(msg)
-                        .await
-                        .map_err(|e| ExchangeError::WebSocketError(format!("Hyperliquid send {sub_type}: {e}")))?;
+                    conn.send(msg).await.map_err(|e| {
+                        ExchangeError::WebSocketError(format!("Hyperliquid send {sub_type}: {e}"))
+                    })?;
                 }
 
                 // 4. 等两条订阅都确认才算启动完成；期间收到的帧之后由 recv 先交出
-                conn.await_subscriptions(Exchange::Hyperliquid, &REQUIRED_SUBSCRIPTIONS, subscription_confirmed)
-                    .await?;
+                conn.await_subscriptions(
+                    Exchange::Hyperliquid,
+                    &REQUIRED_SUBSCRIPTIONS,
+                    subscription_confirmed,
+                )
+                .await?;
 
                 tracing::info!(
                     wallet = %wallet_address,
                     dexes = ?markets.dexes(),
                     "HyperliquidPrivateWs started, orderUpdates and userFills confirmed"
                 );
-                Ok(Self { account_bus, markets, conn })
+                Ok(Self {
+                    account_bus,
+                    markets,
+                    conn,
+                })
             })
             .await
     }
@@ -126,7 +138,10 @@ enum Frame {
     /// 某个订阅的确认回执，值为订阅类型（如 `orderUpdates`）
     SubscriptionAck(String),
     /// 订阅频道的数据。**该频道有数据到达，就是订阅生效的最硬证据**（比确认回执更直接）
-    Data { channel: &'static str, data: serde_json::Value },
+    Data {
+        channel: &'static str,
+        data: serde_json::Value,
+    },
     /// pong、未知频道等与本组件无关的报文
     Ignored,
 }
@@ -134,7 +149,11 @@ enum Frame {
 fn classify(raw: &str) -> Result<Frame, WsError> {
     let mut value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
-    let channel = value.get("channel").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+    let channel = value
+        .get("channel")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
     match channel.as_str() {
         // 服务端拒绝/报错：**必须致命**。此前它落进未知分支被 debug 掉，于是"订阅被拒
         // （地址格式、限流）"表现为：连接健康、ping/pong 正常、而订单与成交回报再也不来。
@@ -145,10 +164,20 @@ fn classify(raw: &str) -> Result<Frame, WsError> {
         // {"channel":"subscriptionResponse","data":{"method":"subscribe",
         //   "subscription":{"type":"orderUpdates","user":"0x..."}}}
         "subscriptionResponse" => Ok(Frame::SubscriptionAck(
-            value.pointer("/data/subscription/type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            value
+                .pointer("/data/subscription/type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
         )),
-        "orderUpdates" => Ok(Frame::Data { channel: "orderUpdates", data: value["data"].take() }),
-        "userFills" => Ok(Frame::Data { channel: "userFills", data: value["data"].take() }),
+        "orderUpdates" => Ok(Frame::Data {
+            channel: "orderUpdates",
+            data: value["data"].take(),
+        }),
+        "userFills" => Ok(Frame::Data {
+            channel: "userFills",
+            data: value["data"].take(),
+        }),
         // 应用层心跳应答（{"channel":"pong"}）
         "pong" => Ok(Frame::Ignored),
         "" => {
@@ -171,10 +200,20 @@ fn subscription_confirmed(raw: &str) -> Result<Option<String>, WsError> {
     })
 }
 
-fn parse_private_message(raw: &str, markets: &HlMarkets, local_ts: u64) -> Result<Vec<AccountEvent>, WsError> {
+fn parse_private_message(
+    raw: &str,
+    markets: &HlMarkets,
+    local_ts: u64,
+) -> Result<Vec<AccountEvent>, WsError> {
     match classify(raw)? {
-        Frame::Data { channel: "orderUpdates", data } => parse_order_updates(&data, markets, local_ts),
-        Frame::Data { channel: "userFills", data } => parse_user_fills(&data, markets, local_ts),
+        Frame::Data {
+            channel: "orderUpdates",
+            data,
+        } => parse_order_updates(&data, markets, local_ts),
+        Frame::Data {
+            channel: "userFills",
+            data,
+        } => parse_user_fills(&data, markets, local_ts),
         Frame::Data { .. } | Frame::SubscriptionAck(_) | Frame::Ignored => Ok(Vec::new()),
     }
 }
@@ -192,7 +231,8 @@ fn parse_order_updates(
     let mut events = Vec::new();
 
     // orderUpdates 必须是一个数组
-    let updates = data.as_array()
+    let updates = data
+        .as_array()
         .ok_or_else(|| WsError::ParseError(format!("orderUpdates is not an array: {}", data)))?;
 
     for update in updates {
@@ -248,7 +288,9 @@ fn parse_user_fills(
         let data = if markets.owns(&ws_fill.coin) {
             AccountData::Symbol(SymbolAccountData::Fill(ws_fill.to_fill()?))
         } else {
-            AccountData::Exchange(ExchangeAccountData::UnmappedFill(ws_fill.to_unmapped_fill()?))
+            AccountData::Exchange(ExchangeAccountData::UnmappedFill(
+                ws_fill.to_unmapped_fill()?,
+            ))
         };
         events.push(AccountEvent {
             // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
@@ -319,18 +361,35 @@ mod tests {
                 .into_iter()
                 .map(|e| match e.data {
                     AccountData::Symbol(SymbolAccountData::Fill(f)) => format!("fill:{}", f.symbol),
-                    AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => format!("unmapped:{}", f.instrument),
+                    AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => {
+                        format!("unmapped:{}", f.instrument)
+                    }
                     other => panic!("unexpected {other:?}"),
                 })
                 .collect()
         };
         let both = testkit::markets(&["", "xyz"]);
-        assert_eq!(kinds(&both, vec![fill_json("BTC"), fill_json("xyz:TSLA")]), ["fill:BTC", "fill:TSLA"]);
-        assert_eq!(kinds(&both, vec![fill_json("BTC"), fill_json("flx:TSLA")]), ["fill:BTC", "unmapped:flx:TSLA"]);
+        assert_eq!(
+            kinds(&both, vec![fill_json("BTC"), fill_json("xyz:TSLA")]),
+            ["fill:BTC", "fill:TSLA"]
+        );
+        assert_eq!(
+            kinds(&both, vec![fill_json("BTC"), fill_json("flx:TSLA")]),
+            ["fill:BTC", "unmapped:flx:TSLA"]
+        );
         assert_eq!(kinds(&both, vec![fill_json("ETH")]), ["unmapped:ETH"]);
-        assert_eq!(kinds(&testkit::markets(&[""]), vec![fill_json("xyz:TSLA")]), ["unmapped:xyz:TSLA"]);
-        assert_eq!(kinds(&both, vec![fill_json("@107"), fill_json("PURR/USDC")]), ["unmapped:@107", "unmapped:PURR/USDC"]);
-        assert_eq!(kinds(&testkit::markets(&["xyz"]), vec![fill_json("BTC")]), ["unmapped:BTC"]);
+        assert_eq!(
+            kinds(&testkit::markets(&[""]), vec![fill_json("xyz:TSLA")]),
+            ["unmapped:xyz:TSLA"]
+        );
+        assert_eq!(
+            kinds(&both, vec![fill_json("@107"), fill_json("PURR/USDC")]),
+            ["unmapped:@107", "unmapped:PURR/USDC"]
+        );
+        assert_eq!(
+            kinds(&testkit::markets(&["xyz"]), vec![fill_json("BTC")]),
+            ["unmapped:BTC"]
+        );
     }
 
     /// 初始快照是历史成交：不入账、不上报
@@ -365,26 +424,47 @@ mod tests {
     fn ack_or_channel_data_confirms_a_subscription() {
         let ack = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe",
             "subscription":{"type":"orderUpdates","user":"0xabc"}}}"#;
-        assert_eq!(subscription_confirmed(ack).unwrap().as_deref(), Some("orderUpdates"));
+        assert_eq!(
+            subscription_confirmed(ack).unwrap().as_deref(),
+            Some("orderUpdates")
+        );
         let data = r#"{"channel":"userFills","data":{"user":"0xabc","fills":[]}}"#;
-        assert_eq!(subscription_confirmed(data).unwrap().as_deref(), Some("userFills"));
-        assert_eq!(subscription_confirmed(r#"{"channel":"pong"}"#).unwrap(), None);
+        assert_eq!(
+            subscription_confirmed(data).unwrap().as_deref(),
+            Some("userFills")
+        );
+        assert_eq!(
+            subscription_confirmed(r#"{"channel":"pong"}"#).unwrap(),
+            None
+        );
         let rejected = r#"{"channel":"error","data":"Invalid subscription"}"#;
-        assert!(subscription_confirmed(rejected).is_err(), "启动期被拒必须启动失败");
+        assert!(
+            subscription_confirmed(rejected).is_err(),
+            "启动期被拒必须启动失败"
+        );
     }
 
     /// clearinghouseState 不再订阅：即使推来也不产出任何事件（统一账户下其中净值恒为 0，
     /// 产出 AccountInfo 会和 REST 轮询的真实净值互相覆盖）
     #[test]
     fn clearinghouse_state_push_yields_no_account_info() {
-        let raw = format!(r#"{{"channel":"clearinghouseState","data":{{"user":"0xabc","dex":"","clearinghouseState":{}}}}}"#, testkit::OWN_EMPTY_STATE);
-        assert!(parse_private_message(&raw, &testkit::markets(&[""]), 1).unwrap().is_empty());
+        let raw = format!(
+            r#"{{"channel":"clearinghouseState","data":{{"user":"0xabc","dex":"","clearinghouseState":{}}}}}"#,
+            testkit::OWN_EMPTY_STATE
+        );
+        assert!(parse_private_message(&raw, &testkit::markets(&[""]), 1)
+            .unwrap()
+            .is_empty());
     }
 
     /// orderUpdates 同口径过滤
     #[test]
     fn order_updates_are_kept_for_connected_dexes_only() {
-        let data = json!([order_update_json("BTC"), order_update_json("xyz:NVDA"), order_update_json("flx:NVDA")]);
+        let data = json!([
+            order_update_json("BTC"),
+            order_update_json("xyz:NVDA"),
+            order_update_json("flx:NVDA")
+        ]);
         let events = parse_order_updates(&data, &testkit::markets(&["", "xyz"]), 1).unwrap();
         let symbols: Vec<_> = events
             .iter()
@@ -394,7 +474,12 @@ mod tests {
             })
             .collect();
         assert_eq!(symbols, ["BTC", "NVDA"]);
-        assert_eq!(parse_order_updates(&data, &testkit::markets(&["xyz"]), 1).unwrap().len(), 1);
+        assert_eq!(
+            parse_order_updates(&data, &testkit::markets(&["xyz"]), 1)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// 联网只读：真连 HL，启动（spawn 返回）即两条订阅都已确认。

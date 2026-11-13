@@ -35,8 +35,7 @@ struct HypeConfig {
 fn load_credentials() -> HyperliquidCredentials {
     let content = std::fs::read_to_string("hype_config.json")
         .expect("读取 hype_config.json 失败，请确认文件存在");
-    let config: HypeConfig =
-        serde_json::from_str(&content).expect("解析 hype_config.json 失败");
+    let config: HypeConfig = serde_json::from_str(&content).expect("解析 hype_config.json 失败");
     HyperliquidCredentials::with_private_key(config.wallet, config.agent_key, 0.05)
 }
 
@@ -47,9 +46,13 @@ async fn create_public_client() -> HyperliquidClient {
         "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
         0.05,
     );
-    HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()], Some(creds))
-        .await
-        .expect("创建公开客户端失败")
+    HyperliquidClient::connect(
+        TEST_QUOTE.to_string(),
+        vec![TEST_DEX.to_string()],
+        Some(creds),
+    )
+    .await
+    .expect("创建公开客户端失败")
 }
 
 /// L2 订单簿响应
@@ -70,7 +73,9 @@ struct Level {
 /// 获取 BBO (REST API)
 #[allow(clippy::disallowed_methods)] // 联网手测的行情辅助查询，偶发一次，不经实盘限频闸门
 async fn fetch_bbo(coin: &str) -> Result<(Decimal, Decimal), Box<dyn std::error::Error>> {
-    let client = hft_engine_rs::net::http(std::time::Duration::from_secs(10)).build().expect("http client");
+    let client = hft_engine_rs::net::http(std::time::Duration::from_secs(10))
+        .build()
+        .expect("http client");
     let resp: L2Book = client
         .post("https://api.hyperliquid.xyz/info")
         .header("Content-Type", "application/json")
@@ -159,7 +164,13 @@ async fn test_xyz_fetch_symbol_meta() {
 async fn test_xyz_fetch_bbo() {
     let (bid, ask) = fetch_bbo(TEST_COIN).await.expect("获取 BBO 失败");
 
-    println!("{} BBO: bid={}, ask={}, spread={:.4}", TEST_COIN, bid, ask, ask - bid);
+    println!(
+        "{} BBO: bid={}, ask={}, spread={:.4}",
+        TEST_COIN,
+        bid,
+        ask,
+        ask - bid
+    );
     assert!(bid > dec!(0.0), "bid 应该大于 0");
     assert!(ask > dec!(0.0), "ask 应该大于 0");
     assert!(ask >= bid, "ask 应该 >= bid");
@@ -170,7 +181,9 @@ async fn test_xyz_fetch_bbo() {
 #[ignore = "需要网络"]
 #[allow(clippy::disallowed_methods)] // 联网手测的行情辅助查询，偶发一次，不经实盘限频闸门
 async fn test_xyz_fetch_meta_and_asset_ctxs() {
-    let http = hft_engine_rs::net::http(std::time::Duration::from_secs(10)).build().expect("http client");
+    let http = hft_engine_rs::net::http(std::time::Duration::from_secs(10))
+        .build()
+        .expect("http client");
     let resp: serde_json::Value = http
         .post("https://api.hyperliquid.xyz/info")
         .header("Content-Type", "application/json")
@@ -189,7 +202,11 @@ async fn test_xyz_fetch_meta_and_asset_ctxs() {
     let universe = meta["universe"].as_array().expect("universe 应该是数组");
     let ctxs_arr = ctxs.as_array().expect("assetCtxs 应该是数组");
 
-    println!("XYZ DEX assets: {}, contexts: {}", universe.len(), ctxs_arr.len());
+    println!(
+        "XYZ DEX assets: {}, contexts: {}",
+        universe.len(),
+        ctxs_arr.len()
+    );
     assert_eq!(
         universe.len(),
         ctxs_arr.len(),
@@ -219,9 +236,13 @@ async fn test_xyz_fetch_meta_and_asset_ctxs() {
 /// 下单测试辅助函数
 async fn place_test_order(side: Side) {
     let credentials = load_credentials();
-    let client = HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()], Some(credentials))
-        .await
-        .expect("创建客户端失败");
+    let client = HyperliquidClient::connect(
+        TEST_QUOTE.to_string(),
+        vec![TEST_DEX.to_string()],
+        Some(credentials),
+    )
+    .await
+    .expect("创建客户端失败");
 
     // 内部 symbol 不带 dex 前缀
     let symbol: Symbol = hft_engine_rs::exchange::hyperliquid::from_hyperliquid(TEST_COIN);
@@ -271,7 +292,10 @@ async fn place_test_order(side: Side) {
 
     println!("提交订单: {:?}", order);
 
-    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
+    let order_id = client
+        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .await
+        .expect("下单失败");
     println!(
         "下单成功，方向={:?}，订单ID: {}, 客户端ID: {}",
         side, order_id, cli_id

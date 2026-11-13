@@ -22,10 +22,7 @@ const TEST_QUANTITY: Decimal = dec!(0.002); // TODO: 填写测试数量
 fn get_credentials() -> Option<BinanceCredentials> {
     let api_key = std::env::var("BINANCE_API_KEY").ok()?;
     let secret = std::env::var("BINANCE_SECRET").ok()?;
-    Some(BinanceCredentials {
-        api_key,
-        secret,
-    })
+    Some(BinanceCredentials { api_key, secret })
 }
 
 /// BBO 数据
@@ -64,7 +61,8 @@ async fn fetch_bbo(symbol: &Symbol) -> Result<(Decimal, Decimal), Box<dyn std::e
 #[ignore = "需要真实凭证和网络"]
 async fn test_binance_limit_buy() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
-    let client = BinanceClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
+    let client =
+        BinanceClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
 
     let symbol: Symbol = TEST_BASE.to_string();
 
@@ -110,7 +108,8 @@ async fn test_binance_limit_buy() {
 #[ignore = "需要真实凭证和网络"]
 async fn test_binance_limit_sell() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
-    let client = BinanceClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
+    let client =
+        BinanceClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
 
     let symbol: Symbol = TEST_BASE.to_string();
 
@@ -147,6 +146,9 @@ async fn test_binance_limit_sell() {
 
     println!("提交卖单: {:?}", order);
 
-    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
+    let order_id = client
+        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .await
+        .expect("下单失败");
     println!("卖单成功，订单ID: {}", order_id);
 }

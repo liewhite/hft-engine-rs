@@ -15,7 +15,10 @@ use crate::messaging::{IncomeEvent, MarketData};
 use std::io::{BufRead, BufReader, Cursor};
 
 /// 解析 bookTicker zip 字节为 BBO 事件。
-pub fn parse_book_ticker(symbol: &Symbol, zip_bytes: &[u8]) -> Result<Vec<IncomeEvent>, ExchangeError> {
+pub fn parse_book_ticker(
+    symbol: &Symbol,
+    zip_bytes: &[u8],
+) -> Result<Vec<IncomeEvent>, ExchangeError> {
     map_rows(zip_bytes, |f| book_ticker_row(symbol, f))
 }
 
@@ -129,7 +132,8 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
-            zip.start_file("data.csv", SimpleFileOptions::default()).unwrap();
+            zip.start_file("data.csv", SimpleFileOptions::default())
+                .unwrap();
             zip.write_all(csv.as_bytes()).unwrap();
             zip.finish().unwrap();
         }

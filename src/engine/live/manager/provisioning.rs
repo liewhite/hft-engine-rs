@@ -27,18 +27,16 @@
 //!   写对，编译器分不出来**；`Group` 限制的是能对它做什么（只能 spawn、不能 shutdown），不是它是谁。
 
 use super::StrategySpec;
-use crate::engine::live::{
-    ExecutorArgs, Executor, ExecutorHandle, ExecutorId, IncomeProcessorHandle, MetricsHandle,
-    OutcomeBus, PositionLedgerHandle,
-};
-use crate::domain::{
-    AccountId, Exchange, ExchangeError, Symbol, SymbolMeta,
-};
+use crate::domain::{AccountId, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::live::account_binding::{snapshot, PlannedAccount};
 use crate::engine::live::assembly::StartAccountStream;
+use crate::engine::live::{
+    Executor, ExecutorArgs, ExecutorHandle, ExecutorId, IncomeProcessorHandle, MetricsHandle,
+    OutcomeBus, PositionLedgerHandle,
+};
+use crate::engine::NewClientOrderId;
 use crate::exchange::{AccountClient, AccountStream, ExchangeHandle, SubscriptionKind};
 use crate::messaging::AccountBus;
-use crate::engine::NewClientOrderId;
 use crate::tasks::{ChildHandle, Gone, Group, StopFlag};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -120,8 +118,15 @@ pub(crate) struct AccountStreams {
 }
 
 impl AccountStreams {
-    pub(crate) fn new(starters: HashMap<(Exchange, AccountStream), StartAccountStream>, account_bus: AccountBus) -> Self {
-        Self { starters, started: HashSet::new(), account_bus }
+    pub(crate) fn new(
+        starters: HashMap<(Exchange, AccountStream), StartAccountStream>,
+        account_bus: AccountBus,
+    ) -> Self {
+        Self {
+            starters,
+            started: HashSet::new(),
+            account_bus,
+        }
     }
 
     /// 投产期校验：每个要的流都得有所登记过（一次列全）
@@ -135,18 +140,26 @@ impl AccountStreams {
             return Ok(());
         }
         missing.sort();
-        Err(format!("策略要的账户数据流不可行，拒绝投产: {}", missing.join("; ")))
+        Err(format!(
+            "策略要的账户数据流不可行，拒绝投产: {}",
+            missing.join("; ")
+        ))
     }
 
     /// 起还没起的那些（已校验过）
-    fn start(&mut self, group: &Group, wanted: &HashSet<(Exchange, AccountStream)>) -> Result<(), ExchangeError> {
+    fn start(
+        &mut self,
+        group: &Group,
+        wanted: &HashSet<(Exchange, AccountStream)>,
+    ) -> Result<(), ExchangeError> {
         for key in wanted {
             if self.started.contains(key) {
                 continue;
             }
             let start = self.starters.get(key).expect("投产时已校验");
-            start(group, self.account_bus.clone())
-                .map_err(|e| ExchangeError::Other(format!("起 {} 的 {:?} 失败: {e}", key.0, key.1)))?;
+            start(group, self.account_bus.clone()).map_err(|e| {
+                ExchangeError::Other(format!("起 {} 的 {:?} 失败: {e}", key.0, key.1))
+            })?;
             tracing::info!(exchange = %key.0, stream = ?key.1, "账户数据流已按策略需要启动");
             self.started.insert(*key);
         }
@@ -195,7 +208,6 @@ fn validate_subscriptions(
     problems.sort(); // 确定的报错顺序
     Err(format!("策略订阅不可行，拒绝投产: {}", problems.join("; ")))
 }
-
 
 impl Provisioner {
     /// 装配期构造。协作者打包成 [`Collaborators`] 传入：字段不公开，manager 拿不到也改写
@@ -336,9 +348,14 @@ impl Provisioner {
             .flat_map(|spec| spec.strategy.account_streams())
             .flat_map(|(ex, streams)| streams.into_iter().map(move |s| (ex, s)))
             .collect();
-        self.account_streams.validate(&account_streams).map_err(ExchangeError::Other)?;
+        self.account_streams
+            .validate(&account_streams)
+            .map_err(ExchangeError::Other)?;
         if !self.paper_counter {
-            if let Some(spec) = strategies.iter().find(|s| matches!(s.account, AccountId::Paper(_))) {
+            if let Some(spec) = strategies
+                .iter()
+                .find(|s| matches!(s.account, AccountId::Paper(_)))
+            {
                 return Err(ExchangeError::Other(format!(
                     "策略绑定了模拟账户 {}，但没配模拟柜台（ManagerArgs::paper），它的单没人撮合，拒绝投产",
                     spec.account
@@ -350,7 +367,10 @@ impl Provisioner {
             .iter()
             .zip(&strategy_subscriptions)
             .map(|(spec, subs)| {
-                let legs = subs.iter().map(|(ex, kind)| (*ex, kind.symbol().clone())).collect();
+                let legs = subs
+                    .iter()
+                    .map(|(ex, kind)| (*ex, kind.symbol().clone()))
+                    .collect();
                 PlannedAccount::bind(spec.account.clone(), legs, &self.accounts)
             })
             .collect::<Result<_, _>>()?;
@@ -415,7 +435,11 @@ impl Provisioner {
             )
             .await;
             match created {
-                Ok((child, handle)) => spawned.push(Spawned { child, handle, account }),
+                Ok((child, handle)) => spawned.push(Spawned {
+                    child,
+                    handle,
+                    account,
+                }),
                 Err(e) => {
                     // 起实例失败（构造出错会自己冒到根、整机停机，或生产者组已在停机）：
                     // 已起好的同批实例尚未注册、收不到事件，停掉它们再报错
@@ -443,7 +467,10 @@ impl Provisioner {
             return Err(e);
         }
 
-        tracing::info!(count = spawned.len(), "Strategies batch added, Executors created");
+        tracing::info!(
+            count = spawned.len(),
+            "Strategies batch added, Executors created"
+        );
 
         Ok(())
     }
@@ -555,7 +582,8 @@ impl Provisioner {
             }
         }
         // 7.4 起策略要的账户数据流（同所同种只起一份）
-        self.account_streams.start(&self.producers, account_streams)?;
+        self.account_streams
+            .start(&self.producers, account_streams)?;
 
         Ok(())
     }
@@ -590,10 +618,10 @@ impl Provisioner {
 
 #[cfg(test)]
 mod leftover_order_tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{AccountInfo, OrderId, OrderStatus, OrderUpdate, Position, Side};
     use crate::exchange::ExchangeOrder;
+    use rust_decimal_macros::dec;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -638,10 +666,16 @@ mod leftover_order_tests {
             _symbol: &Symbol,
             client_order_id: &str,
         ) -> Result<(), ExchangeError> {
-            self.cancelled.lock().unwrap().push(client_order_id.to_string());
+            self.cancelled
+                .lock()
+                .unwrap()
+                .push(client_order_id.to_string());
             Ok(())
         }
-        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, crate::domain::PlaceError> {
+        async fn place_order(
+            &self,
+            _order: ExchangeOrder,
+        ) -> Result<OrderId, crate::domain::PlaceError> {
             unreachable!("撤单流程不该下单")
         }
         async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
@@ -678,15 +712,24 @@ mod leftover_order_tests {
     /// 遗留挂单全部撤掉，复查撤净即通过
     #[tokio::test]
     async fn all_leftover_orders_are_cancelled() {
-        let (client, cancelled) = FakeClient::new(vec![vec![order("a", "ex-a"), order("b", "ex-b")], vec![]]);
-        Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string()).await.expect("撤净应通过");
-        assert_eq!(*cancelled.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+        let (client, cancelled) =
+            FakeClient::new(vec![vec![order("a", "ex-a"), order("b", "ex-b")], vec![]]);
+        Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
+            .await
+            .expect("撤净应通过");
+        assert_eq!(
+            *cancelled.lock().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     /// 没有订单号的挂单（账户上有人手动下单，前提被破坏）：撤不了，拒绝启动
     #[tokio::test]
     async fn order_without_client_order_id_refuses_startup() {
-        let manual = OrderUpdate { client_order_id: None, ..order("", "ex-manual") };
+        let manual = OrderUpdate {
+            client_order_id: None,
+            ..order("", "ex-manual")
+        };
         let (client, _cancelled) = FakeClient::new(vec![vec![manual.clone()], vec![manual]]);
         let err = Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
             .await
@@ -707,18 +750,25 @@ mod leftover_order_tests {
         let err = Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
             .await
             .expect_err("撤不掉必须报错");
-        assert!(err.to_string().contains("ex-own"), "错误应指明是哪张单: {err}");
+        assert!(
+            err.to_string().contains("ex-own"),
+            "错误应指明是哪张单: {err}"
+        );
     }
 }
 
-
 #[cfg(test)]
 mod subscription_validation_tests {
-    use rust_decimal_macros::dec;
     use super::*;
+    use rust_decimal_macros::dec;
 
     fn bbo(ex: Exchange) -> (Exchange, SubscriptionKind) {
-        (ex, SubscriptionKind::BBO { symbol: "BTC".to_string() })
+        (
+            ex,
+            SubscriptionKind::BBO {
+                symbol: "BTC".to_string(),
+            },
+        )
     }
     fn candle(ex: Exchange) -> (Exchange, SubscriptionKind) {
         (
@@ -763,16 +813,28 @@ mod subscription_validation_tests {
         let capabilities = binance_only();
         let metas = metas_with_btc();
         // OKX 未配置
-        let err = validate_subscriptions(&[bbo(Exchange::OKX)].into_iter().collect(), &capabilities, &metas)
-            .expect_err("未配置的所必须拒绝");
+        let err = validate_subscriptions(
+            &[bbo(Exchange::OKX)].into_iter().collect(),
+            &capabilities,
+            &metas,
+        )
+        .expect_err("未配置的所必须拒绝");
         assert!(err.contains("未配置"), "got: {err}");
         // Binance 不支持 Candle
-        let err = validate_subscriptions(&[candle(Exchange::Binance)].into_iter().collect(), &capabilities, &metas)
-            .expect_err("不支持的 kind 必须拒绝");
+        let err = validate_subscriptions(
+            &[candle(Exchange::Binance)].into_iter().collect(),
+            &capabilities,
+            &metas,
+        )
+        .expect_err("不支持的 kind 必须拒绝");
         assert!(err.contains("不支持"), "got: {err}");
         // 合法订阅放行
-        validate_subscriptions(&[bbo(Exchange::Binance)].into_iter().collect(), &capabilities, &metas)
-            .expect("已配置且支持的订阅应放行");
+        validate_subscriptions(
+            &[bbo(Exchange::Binance)].into_iter().collect(),
+            &capabilities,
+            &metas,
+        )
+        .expect("已配置且支持的订阅应放行");
     }
 
     /// **Critical 回归防线**：订阅了没有 SymbolMeta 的 symbol 必须拒绝投产。
@@ -784,7 +846,9 @@ mod subscription_validation_tests {
     fn subscription_without_symbol_meta_is_rejected() {
         let eth = (
             Exchange::Binance,
-            SubscriptionKind::BBO { symbol: "ETH".to_string() },
+            SubscriptionKind::BBO {
+                symbol: "ETH".to_string(),
+            },
         );
         let err = validate_subscriptions(
             &[eth].into_iter().collect(),
@@ -809,12 +873,14 @@ mod subscription_validation_tests {
             "OKX 的 Candle 由 business WS 承接，能力查询必须为真"
         );
         assert!(crate::exchange::ibkr::supports_subscription(
-            &SubscriptionKind::BBO { symbol: "AAPL".to_string() }
+            &SubscriptionKind::BBO {
+                symbol: "AAPL".to_string()
+            }
         ));
         assert!(
-            !crate::exchange::ibkr::supports_subscription(
-                &SubscriptionKind::Trades { symbol: "AAPL".to_string() }
-            ),
+            !crate::exchange::ibkr::supports_subscription(&SubscriptionKind::Trades {
+                symbol: "AAPL".to_string()
+            }),
             "IBKR 只实现了 BBO"
         );
     }

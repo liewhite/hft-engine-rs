@@ -1,6 +1,6 @@
 pub(crate) mod actor;
-pub(crate) mod codec;
 mod client;
+pub(crate) mod codec;
 pub(crate) mod markets;
 pub(crate) mod signing;
 mod symbol;
@@ -30,10 +30,16 @@ pub const REST_BASE_URL: &str = "https://api.hyperliquid.xyz";
 
 /// 本进程访问 HL 的唯一限频闸门（经签名机提交的动作也从本机 IP 发出，同样计入）
 pub(crate) static LIMITER: std::sync::LazyLock<crate::exchange::rate_limit::RateLimiter> =
-    std::sync::LazyLock::new(|| crate::exchange::rate_limit::RateLimiter::new(crate::domain::Exchange::Hyperliquid));
+    std::sync::LazyLock::new(|| {
+        crate::exchange::rate_limit::RateLimiter::new(crate::domain::Exchange::Hyperliquid)
+    });
 /// 按 IP 的 REST 权重：1200 / 分钟
 pub(crate) static IP_WEIGHT: crate::exchange::rate_limit::Quota =
-    crate::exchange::rate_limit::Quota::new("IP 权重/分钟", 1200, std::time::Duration::from_secs(60));
+    crate::exchange::rate_limit::Quota::new(
+        "IP 权重/分钟",
+        1200,
+        std::time::Duration::from_secs(60),
+    );
 
 /// Hyperliquid WebSocket 地址
 pub const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
@@ -80,12 +86,24 @@ pub struct HyperliquidCredentials {
 }
 
 impl HyperliquidCredentials {
-    pub fn with_private_key(wallet_address: String, private_key: String, market_order_slippage: f64) -> Self {
-        Self { wallet_address, signing: HyperliquidSigning::PrivateKey(private_key), market_order_slippage }
+    pub fn with_private_key(
+        wallet_address: String,
+        private_key: String,
+        market_order_slippage: f64,
+    ) -> Self {
+        Self {
+            wallet_address,
+            signing: HyperliquidSigning::PrivateKey(private_key),
+            market_order_slippage,
+        }
     }
 
     pub fn with_signer(wallet_address: String, url: String, market_order_slippage: f64) -> Self {
-        Self { wallet_address, signing: HyperliquidSigning::Signer { url }, market_order_slippage }
+        Self {
+            wallet_address,
+            signing: HyperliquidSigning::Signer { url },
+            market_order_slippage,
+        }
     }
 }
 
@@ -103,7 +121,9 @@ impl std::fmt::Debug for HyperliquidSigning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HyperliquidSigning::PrivateKey(_) => f.write_str("PrivateKey(<redacted>)"),
-            HyperliquidSigning::Signer { url } => f.debug_struct("Signer").field("url", url).finish(),
+            HyperliquidSigning::Signer { url } => {
+                f.debug_struct("Signer").field("url", url).finish()
+            }
         }
     }
 }
@@ -123,16 +143,24 @@ impl TryFrom<RawHyperliquidCredentials> for HyperliquidCredentials {
         let signing = match (r.private_key, r.signer_url) {
             (Some(k), None) => HyperliquidSigning::PrivateKey(k),
             (None, Some(url)) => HyperliquidSigning::Signer { url },
-            (Some(_), Some(_)) => return Err("hyperliquid 凭证 private_key 与 signer_url 只能写一个".into()),
+            (Some(_), Some(_)) => {
+                return Err("hyperliquid 凭证 private_key 与 signer_url 只能写一个".into())
+            }
             (None, None) => return Err("hyperliquid 凭证缺 private_key 或 signer_url".into()),
         };
         if !(r.market_order_slippage > 0.0 && r.market_order_slippage < 1.0) {
-            return Err(format!("hyperliquid 凭证 market_order_slippage 须在 (0, 1)，当前 {}", r.market_order_slippage));
+            return Err(format!(
+                "hyperliquid 凭证 market_order_slippage 须在 (0, 1)，当前 {}",
+                r.market_order_slippage
+            ));
         }
-        Ok(Self { wallet_address: r.wallet_address, signing, market_order_slippage: r.market_order_slippage })
+        Ok(Self {
+            wallet_address: r.wallet_address,
+            signing,
+            market_order_slippage: r.market_order_slippage,
+        })
     }
 }
-
 
 /// 本所适配层是否实现了这种公共订阅（**能力查询**，装配期由 `ExchangeSetup` 携带）。
 /// 派生自 public WS 的 kind 映射函数，见各所同名函数的约定。
@@ -146,8 +174,10 @@ mod credentials_tests {
 
     #[test]
     fn exactly_one_signing_method() {
-        let k: HyperliquidCredentials =
-            serde_json::from_str(r#"{"wallet_address":"0xa","private_key":"ab","market_order_slippage":0.05}"#).unwrap();
+        let k: HyperliquidCredentials = serde_json::from_str(
+            r#"{"wallet_address":"0xa","private_key":"ab","market_order_slippage":0.05}"#,
+        )
+        .unwrap();
         assert!(matches!(k.signing, HyperliquidSigning::PrivateKey(_)));
         let s: HyperliquidCredentials =
             serde_json::from_str(r#"{"wallet_address":"0xa","signer_url":"http://127.0.0.1:8080","market_order_slippage":0.05}"#).unwrap();
@@ -156,7 +186,9 @@ mod credentials_tests {
             r#"{"wallet_address":"0xa","private_key":"ab","signer_url":"x"}"#
         )
         .is_err());
-        assert!(serde_json::from_str::<HyperliquidCredentials>(r#"{"wallet_address":"0xa"}"#).is_err());
+        assert!(
+            serde_json::from_str::<HyperliquidCredentials>(r#"{"wallet_address":"0xa"}"#).is_err()
+        );
     }
 
     #[test]

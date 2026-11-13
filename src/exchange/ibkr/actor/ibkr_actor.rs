@@ -128,7 +128,12 @@ impl IbkrNode {
 
                 // 5. 借券费/汇率 snapshot 轮询（可选）：它一旦致命退出（数据源失效）经任务树上冒、整机重启
                 if let Some(cfg) = args.snapshot {
-                    IbkrSnapshotPoller::spawn(&children, args.client, args.market_bus.clone(), cfg)?;
+                    IbkrSnapshotPoller::spawn(
+                        &children,
+                        args.client,
+                        args.market_bus.clone(),
+                        cfg,
+                    )?;
                 }
 
                 tracing::info!(exchange = "IBKR", "IbkrNode started");

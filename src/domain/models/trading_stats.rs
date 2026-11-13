@@ -103,10 +103,10 @@ impl TradingStats {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::Exchange;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     fn fill(side: Side, price: Decimal, size: Decimal, fee: f64, reason: FillReason) -> Fill {
         Fill {
@@ -126,8 +126,20 @@ mod tests {
     #[test]
     fn round_trip_pnl_equals_spread_minus_fees() {
         let mut stats = TradingStats::default();
-        stats.apply_fill(&fill(Side::Long, dec!(100.0), dec!(1.0), 0.1, FillReason::Normal));
-        stats.apply_fill(&fill(Side::Short, dec!(101.0), dec!(1.0), 0.1, FillReason::Normal));
+        stats.apply_fill(&fill(
+            Side::Long,
+            dec!(100.0),
+            dec!(1.0),
+            0.1,
+            FillReason::Normal,
+        ));
+        stats.apply_fill(&fill(
+            Side::Short,
+            dec!(101.0),
+            dec!(1.0),
+            0.1,
+            FillReason::Normal,
+        ));
 
         // 买 100 卖 101，双边各 0.1 手续费 → 净 0.8；平仓后持仓市值为 0
         assert!((stats.total_pnl(0.0) - 0.8).abs() < 1e-9);
@@ -139,7 +151,13 @@ mod tests {
     #[test]
     fn open_position_pnl_uses_inventory_value() {
         let mut stats = TradingStats::default();
-        stats.apply_fill(&fill(Side::Long, dec!(100.0), dec!(2.0), 0.0, FillReason::Normal));
+        stats.apply_fill(&fill(
+            Side::Long,
+            dec!(100.0),
+            dec!(2.0),
+            0.0,
+            FillReason::Normal,
+        ));
 
         // 持有 2 个、现价 105 → 市值 210，现金流 -200 → 浮盈 10
         assert!((stats.total_pnl(210.0) - 10.0).abs() < 1e-9);
@@ -148,8 +166,20 @@ mod tests {
     #[test]
     fn counts_forced_fills_separately() {
         let mut stats = TradingStats::default();
-        stats.apply_fill(&fill(Side::Short, dec!(100.0), dec!(1.0), 0.0, FillReason::Liquidation));
-        stats.apply_fill(&fill(Side::Short, dec!(100.0), dec!(1.0), 0.0, FillReason::Normal));
+        stats.apply_fill(&fill(
+            Side::Short,
+            dec!(100.0),
+            dec!(1.0),
+            0.0,
+            FillReason::Liquidation,
+        ));
+        stats.apply_fill(&fill(
+            Side::Short,
+            dec!(100.0),
+            dec!(1.0),
+            0.0,
+            FillReason::Normal,
+        ));
         assert_eq!(stats.forced_fills, 1);
         assert_eq!(stats.fills, 2);
     }
@@ -158,7 +188,13 @@ mod tests {
     fn recent_fills_are_bounded() {
         let mut stats = TradingStats::default();
         for _ in 0..(RECENT_FILL_CAPACITY + 10) {
-            stats.apply_fill(&fill(Side::Long, dec!(1.0), dec!(1.0), 0.0, FillReason::Normal));
+            stats.apply_fill(&fill(
+                Side::Long,
+                dec!(1.0),
+                dec!(1.0),
+                0.0,
+                FillReason::Normal,
+            ));
         }
         assert_eq!(stats.recent_fills.len(), RECENT_FILL_CAPACITY);
         assert_eq!(stats.fills as usize, RECENT_FILL_CAPACITY + 10);
@@ -167,7 +203,13 @@ mod tests {
     #[test]
     fn zero_capacity_keeps_counters_but_no_details() {
         let mut stats = TradingStats::with_recent_capacity(0);
-        stats.apply_fill(&fill(Side::Long, dec!(100.0), dec!(1.0), 0.1, FillReason::Normal));
+        stats.apply_fill(&fill(
+            Side::Long,
+            dec!(100.0),
+            dec!(1.0),
+            0.1,
+            FillReason::Normal,
+        ));
 
         assert_eq!(stats.fills, 1);
         assert!(stats.recent_fills.is_empty());

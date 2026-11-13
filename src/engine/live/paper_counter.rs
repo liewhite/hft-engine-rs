@@ -230,7 +230,10 @@ impl PaperCounter {
                 exchange_ts: ts,
                 local_ts: ts,
                 data: AccountData::Exchange(ExchangeAccountData::PositionValues(
-                    crate::messaging::PositionValues { exchange: state.exchange, values },
+                    crate::messaging::PositionValues {
+                        exchange: state.exchange,
+                        values,
+                    },
                 )),
             });
         }
@@ -357,7 +360,11 @@ impl PaperCounter {
                     );
                 }
             }
-            OutcomeEvent::CancelOrder { exchange, symbol, client_order_id } => {
+            OutcomeEvent::CancelOrder {
+                exchange,
+                symbol,
+                client_order_id,
+            } => {
                 tracing::info!(
                     %account, %exchange, %symbol, %client_order_id, delay_ms = delay,
                     "[PAPER] Cancel accepted by local counter"
@@ -388,9 +395,11 @@ impl PaperCounter {
             }
             Delayed::Cancel(c) => {
                 // 不在簿（已成交 / 已撤）时柜台回报撤单失败，与实盘同形
-                let reports = self
-                    .state_mut(&c.account, c.exchange)
-                    .on_cancel_arrived(now, &c.symbol, &c.client_order_id);
+                let reports = self.state_mut(&c.account, c.exchange).on_cancel_arrived(
+                    now,
+                    &c.symbol,
+                    &c.client_order_id,
+                );
                 self.publish_reports(&c.account, reports);
             }
         }
@@ -437,13 +446,13 @@ impl Task for PaperCounter {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{MarketTrade, OrderStatus, OrderType, Side, TimeInForce, BBO};
-    use crate::messaging::SymbolAccountData;
     use crate::engine::live::test_support::collect;
+    use crate::messaging::SymbolAccountData;
     use crate::tasks::Root;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use std::sync::Mutex;
 
     const EX: Exchange = Exchange::Binance;
@@ -520,7 +529,12 @@ mod tests {
             )
             .await
             .expect("PaperCounter 起不来");
-            Self { root, market_bus, outcome_bus, events }
+            Self {
+                root,
+                market_bus,
+                outcome_bus,
+                events,
+            }
         }
 
         fn market(&self, ev: MarketEvent) {
@@ -571,7 +585,8 @@ mod tests {
         }
 
         async fn place(&self, side: Side, price: Decimal, qty: Decimal) {
-            self.place_tif(side, price, qty, TimeInForce::PostOnly).await;
+            self.place_tif(side, price, qty, TimeInForce::PostOnly)
+                .await;
         }
 
         async fn place_tif(&self, side: Side, price: Decimal, qty: Decimal, tif: TimeInForce) {
@@ -605,7 +620,9 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter_map(|e| match &e.data {
-                    AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => Some(u.status.clone()),
+                    AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
+                        Some(u.status.clone())
+                    }
                     _ => None,
                 })
                 .collect()
@@ -649,7 +666,10 @@ mod tests {
         };
         h.market(okx_trade);
         h.settle(50).await;
-        assert!(h.fills().is_empty(), "OKX 的成交撮合了 Binance 的挂单 —— 跨所串账");
+        assert!(
+            h.fills().is_empty(),
+            "OKX 的成交撮合了 Binance 的挂单 —— 跨所串账"
+        );
         // Binance 自己的成交才撮合
         h.trade(dec!(98.0)).await;
         h.settle(50).await;
@@ -697,7 +717,9 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match &e.data {
-                AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, .. }) => Some(*exchange),
+                AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, .. }) => {
+                    Some(*exchange)
+                }
                 _ => None,
             })
             .collect();
@@ -768,15 +790,17 @@ mod tests {
         h.settle(30).await;
         assert_eq!(h.fills(), vec![(dec!(99.0), dec!(1.0))]);
         assert!(
-            h.statuses()
-                .contains(&OrderStatus::PartiallyFilled),
+            h.statuses().contains(&OrderStatus::PartiallyFilled),
             "部分成交必须以 PartiallyFilled 回报: {:?}",
             h.statuses()
         );
         // 后续 print 继续消耗剩余量
         h.trade(dec!(98.0)).await;
         h.settle(30).await;
-        assert_eq!(h.fills(), vec![(dec!(99.0), dec!(1.0)), (dec!(99.0), dec!(1.0))]);
+        assert_eq!(
+            h.fills(),
+            vec![(dec!(99.0), dec!(1.0)), (dec!(99.0), dec!(1.0))]
+        );
         h.finish().await;
     }
 
@@ -812,9 +836,9 @@ mod tests {
         h.bbo(dec!(100.0), dec!(100.1)).await;
         h.place(Side::Long, dec!(99.0), dec!(0.5)).await;
         h.settle(99).await; // t=99：单子已排队，100 到期
-        // 柜台积压：一批越价成交进箱时柜台还没轮到运行。时钟随后一步跨过到期时刻，柜台
-        // 处理积压途中会让出执行权（tokio 协作预算），时间驱动随即把到期定时器置为就绪 ——
-        // 此时箱里仍有延迟期内到的成交，正是两条分支同时就绪的时刻
+                            // 柜台积压：一批越价成交进箱时柜台还没轮到运行。时钟随后一步跨过到期时刻，柜台
+                            // 处理积压途中会让出执行权（tokio 协作预算），时间驱动随即把到期定时器置为就绪 ——
+                            // 此时箱里仍有延迟期内到的成交，正是两条分支同时就绪的时刻
         for _ in 0..1000 {
             h.trade(dec!(98.0)).await;
         }
@@ -831,7 +855,8 @@ mod tests {
         let h = Harness::new(0).await;
         h.bbo(dec!(100.0), dec!(100.1)).await;
         // 买价 101 高于卖价 100.1，到达即可成交
-        h.place_tif(Side::Long, dec!(101.0), dec!(0.5), TimeInForce::GTC).await;
+        h.place_tif(Side::Long, dec!(101.0), dec!(0.5), TimeInForce::GTC)
+            .await;
         h.settle(50).await;
         // 成交价取对手价 100.1（taker），不是挂单价 101
         assert_eq!(h.fills(), vec![(dec!(100.1), dec!(0.5))]);
@@ -846,7 +871,8 @@ mod tests {
         let h = Harness::new(200).await;
         h.bbo(dec!(100.0), dec!(100.1)).await;
         // 提交时 100.05 低于卖价 100.1，不可成交
-        h.place_tif(Side::Long, dec!(100.05), dec!(0.5), TimeInForce::GTC).await;
+        h.place_tif(Side::Long, dec!(100.05), dec!(0.5), TimeInForce::GTC)
+            .await;
 
         // 延迟期内盘口下移，卖价跌到 100.0 <= 100.05 -> 到达时变为可成交
         h.settle(60).await;
@@ -867,7 +893,8 @@ mod tests {
     async fn order_rests_if_quote_moves_away_during_delay() {
         let h = Harness::new(200).await;
         h.bbo(dec!(100.0), dec!(100.1)).await;
-        h.place_tif(Side::Long, dec!(100.2), dec!(0.5), TimeInForce::GTC).await; // 提交时越过卖价
+        h.place_tif(Side::Long, dec!(100.2), dec!(0.5), TimeInForce::GTC)
+            .await; // 提交时越过卖价
 
         h.settle(60).await;
         h.bbo(dec!(100.5), dec!(100.6)).await; // 盘口涨走，dec!(100.2) 不再可成交
@@ -888,7 +915,8 @@ mod tests {
         })
         .await;
         h.bbo(dec!(100.0), dec!(100.1)).await;
-        h.place_tif(Side::Long, dec!(101.0), dec!(2.0), TimeInForce::GTC).await;
+        h.place_tif(Side::Long, dec!(101.0), dec!(2.0), TimeInForce::GTC)
+            .await;
         h.settle(50).await;
 
         let fee = h
@@ -1022,7 +1050,10 @@ mod tests {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     side: Side::Long,
-                    order_type: OrderType::Limit { price: dec!(99.0), tif: TimeInForce::GTC },
+                    order_type: OrderType::Limit {
+                        price: dec!(99.0),
+                        tif: TimeInForce::GTC,
+                    },
                     quantity: dec!(0.5),
                     reduce_only: false,
                     client_order_id: "c-live".to_string(),
@@ -1031,7 +1062,11 @@ mod tests {
             },
         });
         h.settle(50).await;
-        assert!(h.statuses().is_empty(), "实盘信号落进了本地柜台: {:?}", h.statuses());
+        assert!(
+            h.statuses().is_empty(),
+            "实盘信号落进了本地柜台: {:?}",
+            h.statuses()
+        );
         h.finish().await;
     }
 }

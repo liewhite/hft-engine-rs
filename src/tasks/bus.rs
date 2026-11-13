@@ -40,7 +40,9 @@ pub struct BusTap<E> {
 
 impl<E> Clone for Bus<E> {
     fn clone(&self) -> Self {
-        Self { tap: self.tap.clone() }
+        Self {
+            tap: self.tap.clone(),
+        }
     }
 }
 
@@ -97,7 +99,10 @@ impl<E: Clone + Send + Sync + 'static> Bus<E> {
             }
         }
         if !gone.is_empty() {
-            tap.subscribers.write().unwrap().retain(|s| !gone.contains(&s.id));
+            tap.subscribers
+                .write()
+                .unwrap()
+                .retain(|s| !gone.contains(&s.id));
         }
     }
 

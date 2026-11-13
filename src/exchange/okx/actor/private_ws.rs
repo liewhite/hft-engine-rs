@@ -7,10 +7,14 @@
 
 use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::exchange::client::WsError;
-use crate::exchange::okx::codec::{resolve_meta, AccountData as OkxAccountPush, OrderPushData, WsEvent, WsPush};
+use crate::exchange::okx::codec::{
+    resolve_meta, AccountData as OkxAccountPush, OrderPushData, WsEvent, WsPush,
+};
 use crate::exchange::okx::{OkxCredentials, WS_PRIVATE_URL};
 use crate::exchange::ws_loop::{self, WsConn};
-use crate::messaging::{AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData};
+use crate::messaging::{
+    AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData,
+};
 use crate::tasks::{ChildHandle, Group, Scope, Task};
 use anyhow::Context as _;
 use futures_util::{SinkExt, StreamExt};
@@ -78,16 +82,31 @@ impl OkxPrivateWs {
                 write
                     .send(WsMessage::Text(subscribe_msg))
                     .await
-                    .map_err(|e| ExchangeError::WebSocketError(format!("OKX send private subscribe: {e}")))?;
+                    .map_err(|e| {
+                        ExchangeError::WebSocketError(format!("OKX send private subscribe: {e}"))
+                    })?;
 
                 // 4. 起读循环（心跳、回 Pong、断线判定都归它）
-                let mut conn = WsConn::spawn(&scope.group("conn"), "OkxPrivateWsLoop", read, write, ws_loop::WsKeepalive::okx())?;
+                let mut conn = WsConn::spawn(
+                    &scope.group("conn"),
+                    "OkxPrivateWsLoop",
+                    read,
+                    write,
+                    ws_loop::WsKeepalive::okx(),
+                )?;
 
                 // 5. 等两个频道都确认才算启动完成；期间收到的帧之后由 recv 先交出
-                conn.await_subscriptions(Exchange::OKX, &REQUIRED_CHANNELS, subscription_confirmed).await?;
+                conn.await_subscriptions(Exchange::OKX, &REQUIRED_CHANNELS, subscription_confirmed)
+                    .await?;
 
                 tracing::info!("OkxPrivateWs started");
-                Ok(Self { account_bus, symbol_metas, quote, conn, last_trades: LastTrades::default() })
+                Ok(Self {
+                    account_bus,
+                    symbol_metas,
+                    quote,
+                    conn,
+                    last_trades: LastTrades::default(),
+                })
             })
             .await
     }
@@ -95,8 +114,14 @@ impl OkxPrivateWs {
     /// 解析并发布一帧
     fn handle_message(&mut self, raw: &str) -> anyhow::Result<()> {
         tracing::debug!(raw, "OKX private message received");
-        let events = parse_private_message(raw, now_ms(), &self.quote, &self.symbol_metas, &mut self.last_trades)
-            .with_context(|| format!("OKX 私有 WS 解析失败: {raw}"))?;
+        let events = parse_private_message(
+            raw,
+            now_ms(),
+            &self.quote,
+            &self.symbol_metas,
+            &mut self.last_trades,
+        )
+        .with_context(|| format!("OKX 私有 WS 解析失败: {raw}"))?;
         tracing::debug!(count = events.len(), "OKX private events parsed");
         for event in events {
             self.account_bus.publish(event);
@@ -193,8 +218,14 @@ async fn login(
 // ============================================================================
 
 fn server_error(value: &serde_json::Value) -> WsError {
-    let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let code = value
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let msg = value
+        .get("msg")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     WsError::ParseError(format!("OKX error: code={code}, msg={msg}"))
 }
 
@@ -205,8 +236,12 @@ fn subscription_confirmed(raw: &str) -> Result<Option<String>, WsError> {
     if raw == "pong" {
         return Ok(None);
     }
-    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
-    let channel = value.pointer("/arg/channel").and_then(|c| c.as_str()).map(str::to_string);
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+    let channel = value
+        .pointer("/arg/channel")
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
     match value.get("event").and_then(|v| v.as_str()) {
         Some("error") => Err(server_error(&value)),
         Some("subscribe") | None => Ok(channel),
@@ -231,7 +266,9 @@ impl LastTrades {
     fn is_new_fill(&mut self, data: &OrderPushData) -> bool {
         // 解析不了的 fillSz 留给 to_fill 报错，这里当有成交
         let has_fill = crate::domain::parse_decimal(&data.fill_sz).map_or(true, |sz| !sz.is_zero());
-        let repeated = has_fill && !data.trade_id.is_empty() && self.0.get(&data.ord_id) == Some(&data.trade_id);
+        let repeated = has_fill
+            && !data.trade_id.is_empty()
+            && self.0.get(&data.ord_id) == Some(&data.trade_id);
         if repeated {
             tracing::warn!(
                 ord_id = %data.ord_id, trade_id = %data.trade_id, state = %data.state, fill_sz = %data.fill_sz,
@@ -293,16 +330,21 @@ fn parse_private_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let exchange_ts = data
-                    .u_time
-                    .parse::<u64>()
-                    .map_err(|_| WsError::ParseError(format!("Failed to parse OKX account timestamp: {}", data.u_time)))?;
+                let exchange_ts = data.u_time.parse::<u64>().map_err(|_| {
+                    WsError::ParseError(format!(
+                        "Failed to parse OKX account timestamp: {}",
+                        data.u_time
+                    ))
+                })?;
                 // 净值与持仓总价值不从这里取，由 EquityPoller 走 REST（见 codec::AccountData）。
                 // 推送每个币种的现金余额 (用于修正 greeks delta)
                 for detail in &data.details {
-                    let cash_bal: f64 = detail.cash_bal.parse()
-                        .map_err(|_| WsError::ParseError(format!(
-                            "Failed to parse cash_bal '{}' for ccy {}", detail.cash_bal, detail.ccy)))?;
+                    let cash_bal: f64 = detail.cash_bal.parse().map_err(|_| {
+                        WsError::ParseError(format!(
+                            "Failed to parse cash_bal '{}' for ccy {}",
+                            detail.cash_bal, detail.ccy
+                        ))
+                    })?;
                     events.push(AccountEvent {
                         // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
                         account: crate::domain::AccountId::Live,
@@ -331,7 +373,11 @@ fn parse_private_message(
                 // meta」只剩字段异常被剔除的合约（加载处已 error 留痕）。
                 let new_fill = last_trades.is_new_fill(data);
                 let Some(meta) = resolve_meta(&data.inst_id, quote, symbol_metas) else {
-                    if let Some(f) = data.to_unmapped_fill().map_err(WsError::ParseError)?.filter(|_| new_fill) {
+                    if let Some(f) = data
+                        .to_unmapped_fill()
+                        .map_err(WsError::ParseError)?
+                        .filter(|_| new_fill)
+                    {
                         events.push(AccountEvent {
                             account: crate::domain::AccountId::Live,
                             exchange_ts: local_ts,
@@ -377,9 +423,9 @@ fn parse_private_message(
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::PriceStep;
+    use rust_decimal_macros::dec;
 
     /// 已接入 BTC-USDT-SWAP（每张 0.01 BTC）
     fn metas() -> HashMap<Symbol, SymbolMeta> {
@@ -418,9 +464,15 @@ mod tests {
             .unwrap()
             .into_iter()
             .map(|e| match e.data {
-                AccountData::Symbol(SymbolAccountData::Fill(f)) => format!("fill:{}:{}", f.symbol, f.size),
-                AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => format!("order:{}", u.symbol),
-                AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => format!("unmapped:{}:{}", f.instrument, f.size),
+                AccountData::Symbol(SymbolAccountData::Fill(f)) => {
+                    format!("fill:{}:{}", f.symbol, f.size)
+                }
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
+                    format!("order:{}", u.symbol)
+                }
+                AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => {
+                    format!("unmapped:{}:{}", f.instrument, f.size)
+                }
                 other => format!("{other:?}"),
             })
             .collect()
@@ -429,22 +481,44 @@ mod tests {
     /// 启动期确认判据：订阅回执与频道数据都算；连接计数等事件不算；订阅被拒启动失败
     #[test]
     fn subscribe_ack_or_channel_data_confirms_a_channel() {
-        let ack = r#"{"event":"subscribe","arg":{"channel":"orders","instType":"SWAP"},"connId":"a"}"#;
-        assert_eq!(subscription_confirmed(ack).unwrap().as_deref(), Some("orders"));
-        assert_eq!(subscription_confirmed(&order_push("BTC-USDT-SWAP", "0")).unwrap().as_deref(), Some("orders"));
-        let count = r#"{"event":"channel-conn-count","channel":"orders","connCount":"2","connId":"a"}"#;
+        let ack =
+            r#"{"event":"subscribe","arg":{"channel":"orders","instType":"SWAP"},"connId":"a"}"#;
+        assert_eq!(
+            subscription_confirmed(ack).unwrap().as_deref(),
+            Some("orders")
+        );
+        assert_eq!(
+            subscription_confirmed(&order_push("BTC-USDT-SWAP", "0"))
+                .unwrap()
+                .as_deref(),
+            Some("orders")
+        );
+        let count =
+            r#"{"event":"channel-conn-count","channel":"orders","connCount":"2","connId":"a"}"#;
         assert_eq!(subscription_confirmed(count).unwrap(), None);
         assert_eq!(subscription_confirmed("pong").unwrap(), None);
         let rejected = r#"{"event":"error","code":"60018","msg":"bad channel","connId":"a"}"#;
-        assert!(subscription_confirmed(rejected).unwrap_err().to_string().contains("60018"));
+        assert!(subscription_confirmed(rejected)
+            .unwrap_err()
+            .to_string()
+            .contains("60018"));
     }
 
     /// 同名不同计价币 / 币本位的成交不串进 BTC：原样以 UnmappedFill 上报（张数不折算）
     #[test]
     fn other_quote_and_inverse_fills_do_not_leak_into_btc() {
-        assert_eq!(kinds(&order_push("BTC-USDT-SWAP", "3")), ["fill:BTC:0.03", "order:BTC"]);
-        assert_eq!(kinds(&order_push("BTC-USDC-SWAP", "3")), ["unmapped:BTC-USDC-SWAP:3"]);
-        assert_eq!(kinds(&order_push("BTC-USD-SWAP", "3")), ["unmapped:BTC-USD-SWAP:3"]);
+        assert_eq!(
+            kinds(&order_push("BTC-USDT-SWAP", "3")),
+            ["fill:BTC:0.03", "order:BTC"]
+        );
+        assert_eq!(
+            kinds(&order_push("BTC-USDC-SWAP", "3")),
+            ["unmapped:BTC-USDC-SWAP:3"]
+        );
+        assert_eq!(
+            kinds(&order_push("BTC-USD-SWAP", "3")),
+            ["unmapped:BTC-USD-SWAP:3"]
+        );
         // 无成交的订单状态：不关心
         assert!(kinds(&order_push("BTC-USDC-SWAP", "0")).is_empty());
     }
@@ -454,15 +528,30 @@ mod tests {
     fn repeated_trade_id_is_counted_once() {
         let mut seen = LastTrades::default();
         let sym = "BTC-USDT-SWAP";
-        assert_eq!(kinds_with(&push(sym, "live", "0", ""), &mut seen), ["order:BTC"]);
-        assert_eq!(kinds_with(&push(sym, "partially_filled", "2", "10"), &mut seen), ["fill:BTC:0.02", "order:BTC"]);
-        assert_eq!(kinds_with(&push(sym, "partially_filled", "1", "11"), &mut seen), ["fill:BTC:0.01", "order:BTC"]);
+        assert_eq!(
+            kinds_with(&push(sym, "live", "0", ""), &mut seen),
+            ["order:BTC"]
+        );
+        assert_eq!(
+            kinds_with(&push(sym, "partially_filled", "2", "10"), &mut seen),
+            ["fill:BTC:0.02", "order:BTC"]
+        );
+        assert_eq!(
+            kinds_with(&push(sym, "partially_filled", "1", "11"), &mut seen),
+            ["fill:BTC:0.01", "order:BTC"]
+        );
         // 部分成交后被撤，推送仍带上一笔的成交字段
-        assert_eq!(kinds_with(&push(sym, "canceled", "1", "11"), &mut seen), ["order:BTC"]);
+        assert_eq!(
+            kinds_with(&push(sym, "canceled", "1", "11"), &mut seen),
+            ["order:BTC"]
+        );
         assert!(seen.0.is_empty(), "结束的单不留记录");
         // 品种目录外的合约同样去重
         let other = "BTC-USDC-SWAP";
-        assert_eq!(kinds_with(&push(other, "partially_filled", "3", "20"), &mut seen), ["unmapped:BTC-USDC-SWAP:3"]);
+        assert_eq!(
+            kinds_with(&push(other, "partially_filled", "3", "20"), &mut seen),
+            ["unmapped:BTC-USDC-SWAP:3"]
+        );
         assert!(kinds_with(&push(other, "canceled", "3", "20"), &mut seen).is_empty());
     }
 
@@ -470,8 +559,13 @@ mod tests {
     #[test]
     fn unknown_order_state_is_a_parse_error() {
         let raw = push("BTC-USDT-SWAP", "something_new", "0", "");
-        assert!(parse_private_message(&raw, 0, "USDT", &metas(), &mut LastTrades::default()).is_err());
-        assert_eq!(kinds(&push("BTC-USDT-SWAP", "mmp_canceled", "0", "")), ["order:BTC"]);
+        assert!(
+            parse_private_message(&raw, 0, "USDT", &metas(), &mut LastTrades::default()).is_err()
+        );
+        assert_eq!(
+            kinds(&push("BTC-USDT-SWAP", "mmp_canceled", "0", "")),
+            ["order:BTC"]
+        );
     }
 
     /// 联网只读：真登录 OKX 私有流，启动（spawn 返回）即 account / orders 都已确认。
@@ -480,8 +574,11 @@ mod tests {
     #[ignore = "需要联网、OKX 凭证与白名单 IP"]
     async fn live_private_subscriptions_confirm_at_startup() {
         let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("缺 {k}"));
-        let credentials =
-            OkxCredentials { api_key: env("OKX_API_KEY"), secret: env("OKX_SECRET"), passphrase: env("OKX_PASSPHRASE") };
+        let credentials = OkxCredentials {
+            api_key: env("OKX_API_KEY"),
+            secret: env("OKX_SECRET"),
+            passphrase: env("OKX_PASSPHRASE"),
+        };
         let root = crate::tasks::Root::new("t");
         let started = std::time::Instant::now();
         OkxPrivateWs::spawn(

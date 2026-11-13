@@ -19,7 +19,10 @@ pub(crate) const OWN_SPOT: &str = r#"{"balances":[{"coin":"USDC","token":0,"tota
 pub(crate) const OWN_EMPTY_STATE: &str = r#"{"marginSummary":{"accountValue":"0.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMarginSummary":{"accountValue":"0.0","totalNtlPos":"0.0","totalRawUsd":"0.0","totalMarginUsed":"0.0"},"crossMaintenanceMarginUsed":"0.0","withdrawable":"0.0","assetPositions":[],"time":1794470179552}"#;
 
 fn info(name: &str) -> AssetInfo {
-    serde_json::from_str(&format!(r#"{{"name":"{name}","szDecimals":2,"maxLeverage":10}}"#)).unwrap()
+    serde_json::from_str(&format!(
+        r#"{{"name":"{name}","szDecimals":2,"maxLeverage":10}}"#
+    ))
+    .unwrap()
 }
 
 /// 品种目录：主站 BTC / kPEPE / BCH，xyz 有 NVDA / TSLA；只建 `dexes` 里列出的
@@ -51,7 +54,10 @@ pub(crate) fn state(raw: &str) -> ClearinghouseState {
 
 /// 与 `HyperliquidClient::fetch_positions` 同一份逻辑
 pub(crate) fn positions(markets: &HlMarkets, states: &[(&str, &str)]) -> Vec<Position> {
-    let states: Vec<_> = states.iter().map(|(d, raw)| (d.to_string(), state(raw))).collect();
+    let states: Vec<_> = states
+        .iter()
+        .map(|(d, raw)| (d.to_string(), state(raw)))
+        .collect();
     positions_from_states(markets, &states).unwrap()
 }
 
@@ -66,7 +72,10 @@ pub(crate) fn state_json(positions: &[(&str, f64)]) -> String {
             )
         })
         .collect();
-    OWN_EMPTY_STATE.replace(r#""assetPositions":[]"#, &format!(r#""assetPositions":[{}]"#, ps.join(",")))
+    OWN_EMPTY_STATE.replace(
+        r#""assetPositions":[]"#,
+        &format!(r#""assetPositions":[{}]"#, ps.join(",")),
+    )
 }
 
 /// 一条 userFills 推送（格式同真实推送），成交为 `(coin, side "B"/"A", sz)`
@@ -81,7 +90,10 @@ pub(crate) fn user_fills_json(fills: &[(&str, &str, f64)]) -> String {
             )
         })
         .collect();
-    format!(r#"{{"channel":"userFills","data":{{"user":"0xabc","fills":[{}]}}}}"#, fs.join(","))
+    format!(
+        r#"{{"channel":"userFills","data":{{"user":"0xabc","fills":[{}]}}}}"#,
+        fs.join(",")
+    )
 }
 
 /// 与私有 WS 同一份解析：一条推送 → 进账本的事件（本地接收时刻记为 `local_ts`）

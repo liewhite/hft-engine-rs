@@ -101,7 +101,10 @@ impl ExecutorHandle {
     /// 测试用：把一个裸收件箱包装成 executor 地址（分发层测试用它代替真实实例）
     #[cfg(test)]
     pub(crate) fn for_test(addr: Addr<ExecutorMsg>) -> Self {
-        Self { id: ExecutorId::next(), addr }
+        Self {
+            id: ExecutorId::next(),
+            addr,
+        }
     }
 
     pub fn id(&self) -> ExecutorId {
@@ -203,7 +206,10 @@ impl Executor {
     /// `Err` = 订单跟踪表说不清挂单与持仓（见 [`StrategyRunner::on_event`]），本实例带错退出、整机停机。
     fn handle_event(&mut self, event: IncomeEvent) -> anyhow::Result<()> {
         self.check_pipeline_lag(&event);
-        let signals = self.runner.on_event(&event).map_err(|e| anyhow::anyhow!(e))?;
+        let signals = self
+            .runner
+            .on_event(&event)
+            .map_err(|e| anyhow::anyhow!(e))?;
         for signal in signals {
             // 发布不会失败；订阅者（出口）停止收件时由总线记 ERROR「事件丢失」
             self.outcome_bus.publish(AccountOutcome {
@@ -211,11 +217,20 @@ impl Executor {
                 event: signal,
             });
         }
-        if let IncomeEvent::Market(MarketEvent { data: MarketData::Clock, local_ts, .. }) = &event {
+        if let IncomeEvent::Market(MarketEvent {
+            data: MarketData::Clock,
+            local_ts,
+            ..
+        }) = &event
+        {
             // Metrics 先于本实例停下时交不出去，读数随停机作废，无需处理
             let gauges = self.runner.strategy_gauges(*local_ts);
-            let _ = self.metrics.strategy_gauges(self.id, self.account.clone(), gauges);
-            let _ = self.metrics.event_lag(self.account.clone(), std::mem::take(&mut self.max_lag_ms));
+            let _ = self
+                .metrics
+                .strategy_gauges(self.id, self.account.clone(), gauges);
+            let _ = self
+                .metrics
+                .event_lag(self.account.clone(), std::mem::take(&mut self.max_lag_ms));
         }
         Ok(())
     }
@@ -275,7 +290,9 @@ impl Task for Executor {
             self.handle(msg)?;
         }
         // 撤下的实例不再有读数：交一份空的，让它的旧读数从指标里消失
-        let _ = self.metrics.strategy_gauges(self.id, self.account.clone(), Vec::new());
+        let _ = self
+            .metrics
+            .strategy_gauges(self.id, self.account.clone(), Vec::new());
         tracing::info!(account = %self.account, "Executor stopped");
         Ok(())
     }

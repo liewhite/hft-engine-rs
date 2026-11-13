@@ -36,11 +36,17 @@ mod tests {
     #[test]
     fn wire_formats() {
         let hl = hyperliquid::CLIENT_ORDER_IDS.generate();
-        assert!(hl.starts_with("0x") && hl.len() == 34, "HL cloid 必须是 0x + 32 hex: {hl}");
+        assert!(
+            hl.starts_with("0x") && hl.len() == 34,
+            "HL cloid 必须是 0x + 32 hex: {hl}"
+        );
         let bn = binance::CLIENT_ORDER_IDS.generate();
         assert!(bn.starts_with("0x") && bn.len() == 34, "{bn}");
         let okx = okx::CLIENT_ORDER_IDS.generate();
-        assert!(okx.starts_with('x') && okx.len() == 32, "OKX 不能以数字开头、至多 32 位: {okx}");
+        assert!(
+            okx.starts_with('x') && okx.len() == 32,
+            "OKX 不能以数字开头、至多 32 位: {okx}"
+        );
         let ib = ibkr::CLIENT_ORDER_IDS.generate();
         assert!(ib.starts_with("ib") && ib.len() == 32, "{ib}");
     }

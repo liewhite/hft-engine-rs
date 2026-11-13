@@ -6,7 +6,8 @@
 
 use super::from_hyperliquid;
 use crate::domain::{
-    now_ms, Decimal, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, Quantity, Side, BBO,
+    now_ms, Decimal, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, Quantity,
+    Side, BBO,
 };
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -474,7 +475,10 @@ impl WsOrderUpdate {
 /// 自成交、强平……撤单）、`scheduledCancel`，`rejected` 与 `xxxRejected`（价格精度、金额下限、
 /// post-only 会吃单……拒单）。按文档的命名约定认后缀；别的（含本引擎不用的触发单 `triggered`）
 /// 不猜（理由同 Binance 的 `to_order_update`），按解析失败处理。
-fn map_hyperliquid_order_status(status: &str, filled: Quantity) -> Result<crate::domain::OrderStatus, String> {
+fn map_hyperliquid_order_status(
+    status: &str,
+    filled: Quantity,
+) -> Result<crate::domain::OrderStatus, String> {
     use crate::domain::OrderStatus;
     Ok(match status {
         "open" if filled > Decimal::ZERO => OrderStatus::PartiallyFilled,
@@ -482,7 +486,9 @@ fn map_hyperliquid_order_status(status: &str, filled: Quantity) -> Result<crate:
         "filled" => OrderStatus::Filled,
         "canceled" | "scheduledCancel" => OrderStatus::Cancelled,
         s if s.ends_with("Canceled") => OrderStatus::Cancelled,
-        s if s == "rejected" || s.ends_with("Rejected") => OrderStatus::Rejected { reason: s.to_string() },
+        s if s == "rejected" || s.ends_with("Rejected") => OrderStatus::Rejected {
+            reason: s.to_string(),
+        },
         other => return Err(format!("Hyperliquid 订单状态未知: {other}")),
     })
 }
@@ -527,8 +533,10 @@ impl WsFill {
             exchange: Exchange::Hyperliquid,
             instrument: self.coin.clone(),
             side: parse_side(&self.side)?,
-            size: crate::domain::parse_decimal(&self.sz).map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?,
-            price: crate::domain::parse_decimal(&self.px).map_err(|_| format!("Failed to parse fill px: {}", self.px))?,
+            size: crate::domain::parse_decimal(&self.sz)
+                .map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?,
+            price: crate::domain::parse_decimal(&self.px)
+                .map_err(|_| format!("Failed to parse fill px: {}", self.px))?,
             timestamp: self.time,
         })
     }
@@ -570,9 +578,9 @@ impl WsFill {
 
 #[cfg(test)]
 mod clearinghouse_tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::exchange::hyperliquid::markets::dex_of_coin;
+    use rust_decimal_macros::dec;
 
     /// 取自 `POST /info {"type":"clearinghouseState","user":...,"dex":"xyz"}` 的**真实响应**
     /// （2026-08 实测股票永续 dex）。
@@ -607,13 +615,34 @@ mod clearinghouse_tests {
     #[test]
     fn order_status_family() {
         use crate::domain::OrderStatus;
-        assert_eq!(map_hyperliquid_order_status("open", dec!(0.0)).unwrap(), OrderStatus::Pending);
-        assert_eq!(map_hyperliquid_order_status("open", dec!(1.0)).unwrap(), OrderStatus::PartiallyFilled);
-        for s in ["canceled", "marginCanceled", "selfTradeCanceled", "scheduledCancel"] {
-            assert_eq!(map_hyperliquid_order_status(s, dec!(0.0)).unwrap(), OrderStatus::Cancelled, "{s}");
+        assert_eq!(
+            map_hyperliquid_order_status("open", dec!(0.0)).unwrap(),
+            OrderStatus::Pending
+        );
+        assert_eq!(
+            map_hyperliquid_order_status("open", dec!(1.0)).unwrap(),
+            OrderStatus::PartiallyFilled
+        );
+        for s in [
+            "canceled",
+            "marginCanceled",
+            "selfTradeCanceled",
+            "scheduledCancel",
+        ] {
+            assert_eq!(
+                map_hyperliquid_order_status(s, dec!(0.0)).unwrap(),
+                OrderStatus::Cancelled,
+                "{s}"
+            );
         }
         for s in ["rejected", "badAloPxRejected", "perpMarginRejected"] {
-            assert!(matches!(map_hyperliquid_order_status(s, dec!(0.0)).unwrap(), OrderStatus::Rejected { .. }), "{s}");
+            assert!(
+                matches!(
+                    map_hyperliquid_order_status(s, dec!(0.0)).unwrap(),
+                    OrderStatus::Rejected { .. }
+                ),
+                "{s}"
+            );
         }
         for s in ["triggered", "somethingNew", ""] {
             assert!(map_hyperliquid_order_status(s, dec!(0.0)).is_err(), "{s}");
@@ -638,20 +667,20 @@ mod clearinghouse_tests {
     /// 变成全零、之后由 Fill 累加且永不纠正。本测试就是那道防线。
     #[test]
     fn coin_keeps_dex_prefix_so_filtering_works() {
-        let state: ClearinghouseState =
-            serde_json::from_str(REAL_CLEARINGHOUSE_STATE).unwrap();
+        let state: ClearinghouseState = serde_json::from_str(REAL_CLEARINGHOUSE_STATE).unwrap();
         let coin = &state.asset_positions[0].position.coin;
 
-        assert_eq!(coin, "xyz:NVDA", "响应不再带 dex 前缀，fetch_positions 的过滤会把持仓滤空");
+        assert_eq!(
+            coin, "xyz:NVDA",
+            "响应不再带 dex 前缀，fetch_positions 的过滤会把持仓滤空"
+        );
         assert_eq!(dex_of_coin(coin), "xyz", "xyz dex 的持仓必须归到 xyz");
     }
-
 
     /// 空头的 `szi` 带负号，折算后必须保留方向
     #[test]
     fn short_position_keeps_negative_sign() {
-        let state: ClearinghouseState =
-            serde_json::from_str(REAL_CLEARINGHOUSE_STATE).unwrap();
+        let state: ClearinghouseState = serde_json::from_str(REAL_CLEARINGHOUSE_STATE).unwrap();
         let position = state.asset_positions[0].position.to_position().unwrap();
 
         assert_eq!(position.exchange, Exchange::Hyperliquid);
@@ -663,8 +692,8 @@ mod clearinghouse_tests {
 
 #[cfg(test)]
 mod trade_tests {
-    use rust_decimal_macros::dec;
     use super::*;
+    use rust_decimal_macros::dec;
 
     fn trade(side: &str, px: &str, sz: &str, time: u64, hash: &str, users: [&str; 2]) -> WsTrade {
         WsTrade {
@@ -684,7 +713,14 @@ mod trade_tests {
     #[test]
     fn single_trade_parses_price_qty_and_taker_side() {
         // side=A 是主动卖 -> 买方为挂单方
-        let t = trade("A", "42219.9", "0.125", 1630048897897, "0xabc", ["0xbuyer", TAKER]);
+        let t = trade(
+            "A",
+            "42219.9",
+            "0.125",
+            1630048897897,
+            "0xabc",
+            ["0xbuyer", TAKER],
+        );
         let out = aggregate_trades(&[t]).expect("aggregate");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].exchange, Exchange::Hyperliquid);
@@ -786,8 +822,8 @@ mod trade_tests {
 
 #[cfg(test)]
 mod bbo_tests {
-    use rust_decimal_macros::dec;
     use super::*;
+    use rust_decimal_macros::dec;
 
     /// **单边盘口是合法状态**：bid/ask 为 null 返回 Ok(None) 跳过，绝不能按坏报文
     /// 返回 Err —— 那会经 fail-fast 链路 kill actor、级联整机停机
@@ -807,5 +843,4 @@ mod bbo_tests {
         assert_eq!(bbo.bid_price, dec!(99.0));
         assert_eq!(bbo.ask_price, dec!(100.0));
     }
-
 }

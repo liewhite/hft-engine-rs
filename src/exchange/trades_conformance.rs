@@ -16,12 +16,12 @@
 //! cargo test --lib trades_conformance -- --ignored --nocapture
 //! ```
 
-use crate::domain::{Exchange, MarketTrade, Symbol, SymbolMeta};
 use crate::domain::{Decimal, PriceStep};
-use rust_decimal_macros::dec;
+use crate::domain::{Exchange, MarketTrade, Symbol, SymbolMeta};
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{MarketData, MarketEvent};
 use futures_util::{SinkExt, StreamExt};
+use rust_decimal_macros::dec;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -202,7 +202,11 @@ async fn okx_trades_matches_codec() {
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|t| t["sz"].as_str().and_then(|s| crate::domain::parse_decimal(&s).ok()))
+                .filter_map(|t| {
+                    t["sz"]
+                        .as_str()
+                        .and_then(|s| crate::domain::parse_decimal(&s).ok())
+                })
                 .collect::<Vec<_>>()
         })
         .sum();

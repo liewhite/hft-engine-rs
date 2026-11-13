@@ -15,15 +15,17 @@
 
 use super::assembly::{ExchangeSetup, SpawnCtx};
 use super::{
-    AccountBus, AccountOutcome, IncomeProcessor, MarketBus, Metrics, MetricsArgs, OrderGateway, OutcomeBus,
-    OutcomeProcessor, PaperCounter, PaperCounterArgs, PositionLedger, PositionLedgerArgs,
-    PositionLedgerHandle, Clock, DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
+    AccountBus, AccountOutcome, Clock, IncomeProcessor, MarketBus, Metrics, MetricsArgs,
+    OrderGateway, OutcomeBus, OutcomeProcessor, PaperCounter, PaperCounterArgs, PositionLedger,
+    PositionLedgerArgs, PositionLedgerHandle, DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
     DEFAULT_POSITION_POLL_INTERVAL_MS, DEFAULT_REPORT_INTERVAL_MS,
 };
 use crate::domain::{now_ms, AccountId, Exchange, ExchangeError, Position, Symbol, SymbolMeta};
-use crate::exchange::{AccountClient, ExchangeClient, ExchangeHandle, SettledFundingSource, SubscriptionKind};
-use crate::messaging::{AccountEvent, CustomEvent, MarketData, MarketEvent};
 use crate::engine::NewClientOrderId;
+use crate::exchange::{
+    AccountClient, ExchangeClient, ExchangeHandle, SettledFundingSource, SubscriptionKind,
+};
+use crate::messaging::{AccountEvent, CustomEvent, MarketData, MarketEvent};
 use crate::strategy::Strategy;
 use crate::tasks::{Addr, BusTap, Group, Inbox, Scope, Task};
 use std::collections::{HashMap, HashSet};
@@ -82,7 +84,10 @@ impl StrategySpec {
 /// Manager 的收件箱消息：只有必须串行化的编排（投产）。只读快照与自定义事件注入
 /// 不经收件箱，见 [`ManagerHandle`] 各方法。
 enum ManagerMsg {
-    AddStrategies(Vec<StrategySpec>, oneshot::Sender<Result<(), ExchangeError>>),
+    AddStrategies(
+        Vec<StrategySpec>,
+        oneshot::Sender<Result<(), ExchangeError>>,
+    ),
 }
 
 /// 经 [`ManagerHandle`] 发起的编排请求的失败
@@ -136,7 +141,8 @@ impl ManagerHandle {
     /// 批量投产：校验订阅 → 撤遗留挂单 → 拉持仓基线 → 起实例 → 注册 → 放行行情。
     /// 返回 `Ok` 即已完整投产；`Err` 即"没有实例在跑"（见 `provisioning` 模块文档）。
     pub async fn add_strategies(&self, specs: Vec<StrategySpec>) -> Result<(), ManagerError> {
-        self.call(|reply| ManagerMsg::AddStrategies(specs, reply)).await
+        self.call(|reply| ManagerMsg::AddStrategies(specs, reply))
+            .await
     }
 
     /// 外部向策略注入自定义事件（[`CustomEvent`] 的**入向**入口）。
@@ -328,8 +334,10 @@ impl Manager {
         }
 
         //    模拟盘也需要 client：symbol metas 走公共 REST，与是否有凭证无关
-        let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> =
-            setups.iter().map(|s| (s.exchange, s.client.clone())).collect();
+        let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = setups
+            .iter()
+            .map(|s| (s.exchange, s.client.clone()))
+            .collect();
         //    账户私有能力：装配处只在配了凭证时才装进 `setup.account`，故此表的键集
         //    就是"有账户的所"—— 不另存 authed 标记（见 ExchangeSetup::account）
         let accounts: HashMap<Exchange, Arc<dyn AccountClient>> = setups
@@ -340,8 +348,12 @@ impl Manager {
         let capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool> =
             setups.iter().map(|s| (s.exchange, s.supports)).collect();
         // 各所订单号生成函数（适配层提供），交给投产编排、再交给每个策略实例
-        let client_order_ids: Arc<HashMap<Exchange, NewClientOrderId>> =
-            Arc::new(setups.iter().map(|s| (s.exchange, s.new_client_order_id)).collect());
+        let client_order_ids: Arc<HashMap<Exchange, NewClientOrderId>> = Arc::new(
+            setups
+                .iter()
+                .map(|s| (s.exchange, s.new_client_order_id))
+                .collect(),
+        );
         let exchange_order: Vec<Exchange> = setups.iter().map(|s| s.exchange).collect();
         let settled_funding: HashMap<Exchange, Arc<dyn SettledFundingSource>> = setups
             .iter()
@@ -353,7 +365,9 @@ impl Manager {
             .iter_mut()
             .flat_map(|s| {
                 let exchange = s.exchange;
-                std::mem::take(&mut s.account_streams).into_iter().map(move |(k, v)| ((exchange, k), v))
+                std::mem::take(&mut s.account_streams)
+                    .into_iter()
+                    .map(move |(k, v)| ((exchange, k), v))
             })
             .collect();
 
@@ -415,8 +429,13 @@ impl Manager {
         ));
         //    出向处理器还订交易所回报（只订 OrderUpdate），用来作废迟到的 REST 失败结论
         //    （见 OrderGateway::in_flight）
-        OutcomeProcessor::spawn(&consumers, order_gateway.clone(), &outcome_bus, &account_bus)
-            .await?;
+        OutcomeProcessor::spawn(
+            &consumers,
+            order_gateway.clone(),
+            &outcome_bus,
+            &account_bus,
+        )
+        .await?;
 
         //    本地柜台（配了才起）：订阅信号总线（认领 Paper 账户的订单）与行情总线（撮合 +
         //    Clock 发净值），回报以 Paper 标签发布到账户总线 —— 与实盘适配层同一条总线、同一个类型
@@ -488,7 +507,11 @@ impl Manager {
                     symbol_metas: Self::get_symbol_metas_for(&symbol_metas, setup.exchange),
                 };
                 let exchange = setup.exchange;
-                async move { (setup.spawn_actor)(ctx).await.map(|handle| (exchange, handle)) }
+                async move {
+                    (setup.spawn_actor)(ctx)
+                        .await
+                        .map(|handle| (exchange, handle))
+                }
             })
             .collect();
         let mut exchanges: HashMap<Exchange, ExchangeHandle> = HashMap::new();
@@ -520,7 +543,10 @@ impl Manager {
                 accounts,
                 capabilities,
                 client_order_ids,
-                account_streams: provisioning::AccountStreams::new(account_stream_starters, account_bus.clone()),
+                account_streams: provisioning::AccountStreams::new(
+                    account_stream_starters,
+                    account_bus.clone(),
+                ),
                 paper_counter,
                 income_processor,
                 metrics,

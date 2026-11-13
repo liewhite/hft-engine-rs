@@ -45,7 +45,10 @@ pub enum SubscriptionKind {
     /// 指数价格
     IndexPrice { symbol: Symbol },
     /// K线
-    Candle { symbol: Symbol, interval: CandleInterval },
+    Candle {
+        symbol: Symbol,
+        interval: CandleInterval,
+    },
 }
 
 impl SubscriptionKind {
@@ -197,7 +200,8 @@ pub trait ExchangeClient: Send + Sync + 'static {
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError>;
 
     /// 获取指定交易对元数据
-    async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError>;
+    async fn fetch_symbol_meta(&self, symbols: &[Symbol])
+        -> Result<Vec<SymbolMeta>, ExchangeError>;
 }
 
 /// **账户私有**接口：只有配了凭证的所才有这个对象。
@@ -224,10 +228,17 @@ pub trait AccountClient: Send + Sync + 'static {
 
     /// 按**客户端订单号**撤单（本引擎下单时分配的 `client_order_id`）：下单请求还没结论、
     /// 还不知道交易所订单号的单也能撤。返回 `Ok` 只表示交易所受理了撤单，终态以订单回报为准。
-    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError>;
+    async fn cancel_order(
+        &self,
+        symbol: &Symbol,
+        client_order_id: &str,
+    ) -> Result<(), ExchangeError>;
 
     /// 查询当前挂单（live + partially_filled）
-    async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError>;
+    async fn fetch_pending_orders(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Vec<OrderUpdate>, ExchangeError>;
 
     /// 获取账户信息 (净值 + 总持仓名义价值)
     async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError>;
@@ -372,20 +383,24 @@ impl From<String> for WsError {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use super::*;
 
     /// 快照里同一 symbol 两条（映射把两个合约混成了一个）必须报错，不能后一条覆盖前一条
     #[test]
     fn duplicate_symbol_in_position_snapshot_is_an_error() {
-        let p = |symbol: &str, size: Decimal| Position { exchange: Exchange::OKX, symbol: symbol.into(), size };
+        let p = |symbol: &str, size: Decimal| Position {
+            exchange: Exchange::OKX,
+            symbol: symbol.into(),
+            size,
+        };
         let ok = index_positions(vec![p("BTC", dec!(1.0)), p("ETH", dec!(-2.0))]).unwrap();
         assert_eq!(ok["BTC"].size, dec!(1.0));
         assert!(index_positions(vec![p("BTC", dec!(1.0)), p("BTC", dec!(5.0))]).is_err());
     }
-    use crate::domain::{Side, TimeInForce};
     use crate::domain::PriceStep;
+    use crate::domain::{Side, TimeInForce};
     use std::sync::Arc;
 
     /// OKX BTC-USDT-SWAP：每张 0.01 币、价格步长 0.1、数量步长 1 张
@@ -428,13 +443,17 @@ mod tests {
     #[test]
     fn quantity_rounds_down_to_size_step() {
         // 0.125 币 = 12.5 张 -> 向下取整 12 张（宁可少下，不超出策略意图）
-        let wire = ExchangeOrder::from_domain(coin_order(dec!(0.125), dec!(62_500.0)), &okx_btc_meta()).expect("合法订单");
+        let wire =
+            ExchangeOrder::from_domain(coin_order(dec!(0.125), dec!(62_500.0)), &okx_btc_meta())
+                .expect("合法订单");
         assert_eq!(wire.inner().quantity, dec!(12.0));
     }
 
     #[test]
     fn price_is_rounded_to_exchange_tick() {
-        let wire = ExchangeOrder::from_domain(coin_order(dec!(0.12), dec!(62_500.17)), &okx_btc_meta()).expect("合法订单");
+        let wire =
+            ExchangeOrder::from_domain(coin_order(dec!(0.12), dec!(62_500.17)), &okx_btc_meta())
+                .expect("合法订单");
         match wire.inner().order_type {
             // 价格取**最近** tick（62500.17 -> 62500.2），与数量的向下取整不同
             OrderType::Limit { price, .. } => assert_eq!(price, dec!(62500.2)),
@@ -454,7 +473,8 @@ mod tests {
             min_notional: 0.0,
             contract_size: dec!(1.0),
         };
-        let wire = ExchangeOrder::from_domain(coin_order(dec!(0.1234), dec!(62_500.0)), &meta).expect("合法订单");
+        let wire = ExchangeOrder::from_domain(coin_order(dec!(0.1234), dec!(62_500.0)), &meta)
+            .expect("合法订单");
         assert_eq!(wire.inner().quantity, dec!(0.123));
     }
 
@@ -463,8 +483,9 @@ mod tests {
     #[test]
     fn quantity_rounding_to_zero_is_rejected() {
         // 0.004 币 = 0.4 张 -> 向下取整 0 张
-        let err = ExchangeOrder::from_domain(coin_order(dec!(0.004), dec!(62_500.0)), &okx_btc_meta())
-            .expect_err("取整为 0 的订单必须被拒");
+        let err =
+            ExchangeOrder::from_domain(coin_order(dec!(0.004), dec!(62_500.0)), &okx_btc_meta())
+                .expect_err("取整为 0 的订单必须被拒");
         assert!(err.contains("取整后为 0"), "got: {err}");
     }
 
@@ -473,7 +494,7 @@ mod tests {
     fn quantity_below_min_order_size_is_rejected() {
         let mut meta = okx_btc_meta();
         meta.min_order_size = dec!(5.0); // 最小 5 张
-        // 0.03 币 = 3 张 < 5 张
+                                         // 0.03 币 = 3 张 < 5 张
         let err = ExchangeOrder::from_domain(coin_order(dec!(0.03), dec!(62_500.0)), &meta)
             .expect_err("低于最小下单量的订单必须被拒");
         assert!(err.contains("最小下单量"), "got: {err}");
@@ -482,8 +503,9 @@ mod tests {
     /// 上游算出负数量时本地拒绝（方向在 Side 里，负数是上游算错）
     #[test]
     fn negative_quantity_is_rejected() {
-        let err = ExchangeOrder::from_domain(coin_order(dec!(-0.12), dec!(62_500.0)), &okx_btc_meta())
-            .expect_err("负数量必须被拒");
+        let err =
+            ExchangeOrder::from_domain(coin_order(dec!(-0.12), dec!(62_500.0)), &okx_btc_meta())
+                .expect_err("负数量必须被拒");
         assert!(err.contains("为负"), "got: {err}");
     }
 

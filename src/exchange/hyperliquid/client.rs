@@ -3,13 +3,12 @@
 use super::markets::{dex_of_coin, dex_offset, hl_price_rule, DexUniverse, HlAsset, HlMarkets};
 use super::symbol::from_hyperliquid;
 use crate::domain::{
-    AccountInfo, Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, PlaceError, Position, Side,
-    Symbol, SymbolMeta, Timestamp,
+    AccountInfo, Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, PlaceError,
+    Position, Side, Symbol, SymbolMeta, Timestamp,
 };
-use md5::{Digest, Md5};
+use crate::domain::{Decimal, PriceRule};
 use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
 use crate::exchange::hyperliquid::codec::{parse_side, ClearinghouseState, MetaResponse};
-use std::sync::Arc;
 use crate::exchange::hyperliquid::signing::{
     CancelResponse, OrderResponse, OrderResponseData, OrderStatus,
 };
@@ -17,13 +16,15 @@ use crate::exchange::hyperliquid::transport::{
     decimal_to_wire, EnclaveSubmitter, HlCancelIntent, HlOrderIntent, HlSubmitter, HlTif,
     LocalKeySubmitter,
 };
-use crate::exchange::hyperliquid::{HyperliquidCredentials, HyperliquidSigning, IP_WEIGHT, LIMITER, REST_BASE_URL};
+use crate::exchange::hyperliquid::{
+    HyperliquidCredentials, HyperliquidSigning, IP_WEIGHT, LIMITER, REST_BASE_URL,
+};
 use crate::exchange::rate_limit::Admitted;
-use crate::domain::{Decimal, PriceRule};
 use async_trait::async_trait;
+use md5::{Digest, Md5};
 use reqwest::Client;
 use serde::Deserialize;
-
+use std::sync::Arc;
 
 /// 账户的保证金口径（`POST /info {"type":"userAbstraction"}`，启动时查一次）。
 ///
@@ -47,7 +48,9 @@ impl HlAccountMode {
             "unifiedAccount" => Ok(Self::Unified),
             "default" | "disabled" => Ok(Self::Standard),
             // portfolioMargin / dexAbstraction：保证金口径未核实，不猜
-            other => Err(format!("HL 账户模式 {other} 未支持（只支持统一账户与标准账户）")),
+            other => Err(format!(
+                "HL 账户模式 {other} 未支持（只支持统一账户与标准账户）"
+            )),
         }
     }
 }
@@ -87,7 +90,11 @@ impl HyperliquidClient {
         if dexes.is_empty() {
             return Err(other("HL 至少要接一个 dex（\"\" = 主站）".into()));
         }
-        if let Some(dup) = dexes.iter().enumerate().find(|(i, d)| dexes[..*i].contains(d)) {
+        if let Some(dup) = dexes
+            .iter()
+            .enumerate()
+            .find(|(i, d)| dexes[..*i].contains(d))
+        {
             return Err(other(format!("HL dexes 配置重复: \"{}\"", dup.1)));
         }
 
@@ -102,10 +109,14 @@ impl HyperliquidClient {
             info(&client, &base_url, serde_json::json!({"type": "spotMeta"})).await?;
         let quote_token = spot_meta["tokens"]
             .as_array()
-            .and_then(|ts| ts.iter().find(|t| t["name"].as_str() == Some(quote.as_str())))
+            .and_then(|ts| {
+                ts.iter()
+                    .find(|t| t["name"].as_str() == Some(quote.as_str()))
+            })
             .and_then(|t| t["index"].as_u64())
             .ok_or_else(|| other(format!("HL spotMeta 里没有计价币 {quote}")))?;
-        let (client_ref, base_ref, perp_dexs_ref, quote_ref) = (&client, &base_url, &perp_dexs, &quote);
+        let (client_ref, base_ref, perp_dexs_ref, quote_ref) =
+            (&client, &base_url, &perp_dexs, &quote);
         let metas = futures_util::future::try_join_all(dexes.iter().map(|dex| async move {
             let meta: MetaResponse =
                 info(client_ref, base_ref, serde_json::json!({"type": "meta", "dex": dex})).await?;
@@ -129,10 +140,14 @@ impl HyperliquidClient {
         let account = match credentials {
             None => None,
             Some(credentials) => {
-                let raw: String = info(&client, &base_url, serde_json::json!({
-                    "type": "userAbstraction",
-                    "user": credentials.wallet_address,
-                }))
+                let raw: String = info(
+                    &client,
+                    &base_url,
+                    serde_json::json!({
+                        "type": "userAbstraction",
+                        "user": credentials.wallet_address,
+                    }),
+                )
                 .await?;
                 let mode = HlAccountMode::parse(&raw).map_err(other)?;
                 if mode == HlAccountMode::Standard && dexes.len() > 1 {
@@ -154,11 +169,21 @@ impl HyperliquidClient {
                         Arc::new(EnclaveSubmitter::new(client.clone(), url.clone()))
                     }
                 };
-                Some(HlAccount { credentials, submitter, mode })
+                Some(HlAccount {
+                    credentials,
+                    submitter,
+                    mode,
+                })
             }
         };
 
-        Ok(Self { client, account, base_url, quote, markets })
+        Ok(Self {
+            client,
+            account,
+            base_url,
+            quote,
+            markets,
+        })
     }
 
     /// 已接入 dex 的品种目录（适配层内的 WS actor 共用同一份）
@@ -168,7 +193,9 @@ impl HyperliquidClient {
 
     /// 查询地址（主钱包）。没配凭证时为 None
     pub(crate) fn private_feed(&self) -> Option<String> {
-        self.account.as_ref().map(|a| a.credentials.wallet_address.clone())
+        self.account
+            .as_ref()
+            .map(|a| a.credentials.wallet_address.clone())
     }
 
     /// 账户能力；没配凭证时本不该走到这里（AccountClient 只在有凭证时装配）
@@ -194,7 +221,9 @@ impl HyperliquidClient {
     ) -> Result<Vec<(String, ClearinghouseState)>, ExchangeError> {
         futures_util::future::try_join_all(self.markets.dexes().iter().map(|dex| async move {
             let state: ClearinghouseState = self
-                .post_info(serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex}))
+                .post_info(
+                    serde_json::json!({"type": "clearinghouseState", "user": user, "dex": dex}),
+                )
                 .await?;
             Ok::<_, ExchangeError>((dex.clone(), state))
         }))
@@ -206,10 +235,16 @@ impl HyperliquidClient {
     /// 下 IOC 限价单，不走市价单。
     ///
     /// 这次查询是下单的一部分，按交易动作取额度（没有就拒单，不排队等）。
-    async fn market_limit_px(&self, coin: &str, is_buy: bool, sz_decimals: u32) -> Result<String, ExchangeError> {
+    async fn market_limit_px(
+        &self,
+        coin: &str,
+        is_buy: bool,
+        sz_decimals: u32,
+    ) -> Result<String, ExchangeError> {
         let body = serde_json::json!({"type": "l2Book", "coin": coin});
         let admitted = LIMITER.action(&[IP_WEIGHT.cost(info_weight(&body))])?;
-        let book: serde_json::Value = post_info_with(&self.client, &self.base_url, body, admitted).await?;
+        let book: serde_json::Value =
+            post_info_with(&self.client, &self.base_url, body, admitted).await?;
         let side = if is_buy { 1 } else { 0 }; // levels = [bids, asks]
         let top = book["levels"][side][0]["px"]
             .as_str()
@@ -219,18 +254,30 @@ impl HyperliquidClient {
         let slippage = self.account()?.credentials.market_order_slippage;
         let slippage = crate::domain::from_f64(slippage)
             .ok_or_else(|| ExchangeError::Other(format!("HL 市价滑点配置非法: {slippage}")))?;
-        let px = if is_buy { top * (Decimal::ONE + slippage) } else { top * (Decimal::ONE - slippage) };
+        let px = if is_buy {
+            top * (Decimal::ONE + slippage)
+        } else {
+            top * (Decimal::ONE - slippage)
+        };
         decimal_to_wire(hl_price_rule(sz_decimals).round(px))
     }
 
     /// 将 domain Order 转换为下单意图
     async fn order_intent(&self, order: &Order) -> Result<HlOrderIntent, ExchangeError> {
-        let HlAsset { coin, asset, sz_decimals, .. } = self.markets.asset(&order.symbol)?.clone();
+        let HlAsset {
+            coin,
+            asset,
+            sz_decimals,
+            ..
+        } = self.markets.asset(&order.symbol)?.clone();
 
         let is_buy = matches!(order.side, Side::Long);
 
         let (limit_px, tif) = match &order.order_type {
-            OrderType::Market => (self.market_limit_px(&coin, is_buy, sz_decimals).await?, HlTif::Ioc),
+            OrderType::Market => (
+                self.market_limit_px(&coin, is_buy, sz_decimals).await?,
+                HlTif::Ioc,
+            ),
             OrderType::Limit { price, tif } => {
                 let tif = match tif {
                     crate::domain::TimeInForce::GTC => HlTif::Gtc,
@@ -293,13 +340,17 @@ impl HyperliquidClient {
 
         Ok(resp.order.and_then(|envelope| envelope.order.cloid))
     }
-
 }
 
 /// `/info` 请求的 IP 权重（官方文档 Rate limits）：这几种 2，`userRole` 60，其余 20。
 fn info_weight(body: &serde_json::Value) -> u32 {
     match body["type"].as_str().unwrap_or_default() {
-        "l2Book" | "allMids" | "clearinghouseState" | "orderStatus" | "spotClearinghouseState" | "exchangeStatus" => 2,
+        "l2Book"
+        | "allMids"
+        | "clearinghouseState"
+        | "orderStatus"
+        | "spotClearinghouseState"
+        | "exchangeStatus" => 2,
         "userRole" => 60,
         _ => 20,
     }
@@ -336,7 +387,8 @@ async fn info<T: for<'de> Deserialize<'de>>(
         let items = raw.as_array().map_or(0, Vec::len) as u32;
         LIMITER.record(&[IP_WEIGHT.cost(items / 20)]);
     }
-    serde_json::from_value(raw).map_err(|e| ExchangeError::ParseError(format!("HL /info 回复解析失败: {e}")))
+    serde_json::from_value(raw)
+        .map_err(|e| ExchangeError::ParseError(format!("HL /info 回复解析失败: {e}")))
 }
 
 /// POST /info（已取到额度）
@@ -347,7 +399,10 @@ async fn post_info_with<T: for<'de> Deserialize<'de>>(
     admitted: Admitted,
 ) -> Result<T, ExchangeError> {
     let resp = crate::net::send(
-        client.post(format!("{base_url}/info")).header("Content-Type", "application/json").json(&body),
+        client
+            .post(format!("{base_url}/info"))
+            .header("Content-Type", "application/json")
+            .json(&body),
         admitted,
     )
     .await
@@ -356,7 +411,11 @@ async fn post_info_with<T: for<'de> Deserialize<'de>>(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(ExchangeError::ApiError(Exchange::Hyperliquid, status.as_u16() as i32, text));
+        return Err(ExchangeError::ApiError(
+            Exchange::Hyperliquid,
+            status.as_u16() as i32,
+            text,
+        ));
     }
 
     resp.json::<T>()
@@ -370,7 +429,10 @@ fn own_positions<'a>(
     dex: &'a str,
     state: &'a ClearinghouseState,
 ) -> impl Iterator<Item = &'a crate::exchange::hyperliquid::codec::AssetPositionWrapper> {
-    state.asset_positions.iter().filter(move |w| dex_of_coin(&w.position.coin) == dex)
+    state
+        .asset_positions
+        .iter()
+        .filter(move |w| dex_of_coin(&w.position.coin) == dex)
 }
 
 fn parse_num(field: &str, v: &str) -> Result<f64, ExchangeError> {
@@ -405,7 +467,11 @@ pub(crate) fn positions_from_states(
                 tracing::debug!(coin = %w.position.coin, "HL 持仓不在品种目录里，不返回");
                 continue;
             }
-            positions.push(w.position.to_position().map_err(ExchangeError::ParseError)?);
+            positions.push(
+                w.position
+                    .to_position()
+                    .map_err(ExchangeError::ParseError)?,
+            );
         }
     }
     Ok(positions)
@@ -482,7 +548,10 @@ fn parse_place_reply(raw: serde_json::Value) -> Result<OrderId, PlaceError> {
         serde_json::from_value(raw.clone()).map_err(|_| unparseable("解析不了"))?;
     if response.status != "ok" {
         let msg = response.response.map(|v| v.to_string()).unwrap_or_default();
-        return Err(PlaceError::rejected(format!("HL status={}: {msg}", response.status)));
+        return Err(PlaceError::rejected(format!(
+            "HL status={}: {msg}",
+            response.status
+        )));
     }
     let data = response
         .response
@@ -515,10 +584,9 @@ fn parse_funding_history(
     entries
         .into_iter()
         .map(|e| {
-            let rate = e
-                .funding_rate
-                .parse::<f64>()
-                .map_err(|_| ExchangeError::ParseError(format!("HL fundingRate 非法: {}", e.funding_rate)))?;
+            let rate = e.funding_rate.parse::<f64>().map_err(|_| {
+                ExchangeError::ParseError(format!("HL fundingRate 非法: {}", e.funding_rate))
+            })?;
             Ok(crate::domain::SettledFunding {
                 exchange: Exchange::Hyperliquid,
                 symbol: symbol.clone(),
@@ -547,7 +615,9 @@ impl crate::exchange::SettledFundingSource for HyperliquidClient {
     ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
         let coin = &self.markets.asset(symbol)?.coin;
         let entries: Vec<FundingHistoryEntry> = self
-            .post_info(serde_json::json!({"type": "fundingHistory", "coin": coin, "startTime": start_ms}))
+            .post_info(
+                serde_json::json!({"type": "fundingHistory", "coin": coin, "startTime": start_ms}),
+            )
             .await?;
         parse_funding_history(entries, symbol)
     }
@@ -571,7 +641,10 @@ mod funding_history_tests {
 
     #[test]
     fn bad_rate_fails_the_whole_batch() {
-        let entries = vec![FundingHistoryEntry { funding_rate: "nan?".into(), time: 1 }];
+        let entries = vec![FundingHistoryEntry {
+            funding_rate: "nan?".into(),
+            time: 1,
+        }];
         assert!(parse_funding_history(entries, &"BTC".to_string()).is_err());
     }
 }
@@ -607,7 +680,10 @@ mod place_reply_tests {
                 {"error":"Insufficient margin to place order. asset=1"}]}}}),
             serde_json::json!({"status":"err","response":"User or API Wallet 0x0 does not exist."}),
         ] {
-            assert!(matches!(parse_place_reply(raw.clone()), Err(PlaceError::Rejected(_))), "{raw}");
+            assert!(
+                matches!(parse_place_reply(raw.clone()), Err(PlaceError::Rejected(_))),
+                "{raw}"
+            );
         }
     }
 
@@ -617,7 +693,9 @@ mod place_reply_tests {
             {"error":"Reduce only order would increase position. asset=1"}]}}});
         assert_eq!(
             parse_place_reply(raw),
-            Err(PlaceError::Rejected(crate::domain::RejectReason::ReduceOnlyClosed))
+            Err(PlaceError::Rejected(
+                crate::domain::RejectReason::ReduceOnlyClosed
+            ))
         );
     }
 
@@ -631,7 +709,13 @@ mod place_reply_tests {
             serde_json::json!({"status":"ok"}),
             serde_json::json!("garbage"),
         ] {
-            assert!(matches!(parse_place_reply(raw.clone()), Err(PlaceError::Indeterminate(_))), "{raw}");
+            assert!(
+                matches!(
+                    parse_place_reply(raw.clone()),
+                    Err(PlaceError::Indeterminate(_))
+                ),
+                "{raw}"
+            );
         }
     }
 }
@@ -719,7 +803,10 @@ impl ExchangeClient for HyperliquidClient {
         Ok(self.markets.symbol_metas())
     }
 
-    async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+    async fn fetch_symbol_meta(
+        &self,
+        symbols: &[Symbol],
+    ) -> Result<Vec<SymbolMeta>, ExchangeError> {
         let all = self.fetch_all_symbol_metas().await?;
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
         Ok(all
@@ -793,15 +880,23 @@ impl AccountClient for HyperliquidClient {
         Exchange::Hyperliquid
     }
 
-    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError> {
+    async fn cancel_order(
+        &self,
+        symbol: &Symbol,
+        client_order_id: &str,
+    ) -> Result<(), ExchangeError> {
         let submitter = &self.account()?.submitter;
         let HlAsset { coin, asset, .. } = self.markets.asset(symbol)?.clone();
         let cloid = client_order_id.to_string();
 
         let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
-        let raw = submitter.cancel(&HlCancelIntent { coin, asset, cloid }, admitted).await?;
+        let raw = submitter
+            .cancel(&HlCancelIntent { coin, asset, cloid }, admitted)
+            .await?;
         let response: CancelResponse = serde_json::from_value(raw.clone()).map_err(|e| {
-            ExchangeError::ParseError(format!("Failed to parse cancel response: {e} (body: {raw})"))
+            ExchangeError::ParseError(format!(
+                "Failed to parse cancel response: {e} (body: {raw})"
+            ))
         })?;
         if response.status != "ok" {
             return Err(ExchangeError::Other(format!(
@@ -877,10 +972,9 @@ impl AccountClient for HyperliquidClient {
                 .orig_sz
                 .parse()
                 .map_err(|_| ExchangeError::ParseError(format!("HL origSz 非法: {}", o.orig_sz)))?;
-            let remaining: Decimal = o
-                .sz
-                .parse()
-                .map_err(|_| ExchangeError::ParseError(format!("HL sz 非法: {}", o.sz)))?;
+            let remaining: Decimal =
+                o.sz.parse()
+                    .map_err(|_| ExchangeError::ParseError(format!("HL sz 非法: {}", o.sz)))?;
             let filled = (orig_sz - remaining).max(Decimal::ZERO);
 
             // Hyperliquid 是币本位（contract_size = 1），无需折算
@@ -1013,15 +1107,18 @@ mod order_status_tests {
 
     #[test]
     fn unknown_oid_yields_no_cloid_instead_of_parse_error() {
-        let resp: OrderStatusResponse = serde_json::from_str(REAL_UNKNOWN_OID)
-            .expect("unknownOid 不该导致解析失败");
+        let resp: OrderStatusResponse =
+            serde_json::from_str(REAL_UNKNOWN_OID).expect("unknownOid 不该导致解析失败");
         assert!(resp.order.is_none());
     }
 
     /// 人工经 UI 下单是 `cloid: null`：解析成 `None`，不报错
     #[test]
     fn null_cloid_is_none() {
-        let raw = REAL_ORDER_STATUS.replace(r#""cloid":"0x3f4b6d0f9d2f452b8eed2858b58959eb""#, r#""cloid":null"#);
+        let raw = REAL_ORDER_STATUS.replace(
+            r#""cloid":"0x3f4b6d0f9d2f452b8eed2858b58959eb""#,
+            r#""cloid":null"#,
+        );
         let resp: OrderStatusResponse = serde_json::from_str(&raw).expect("解析");
         assert!(resp.order.and_then(|e| e.order.cloid).is_none());
     }
@@ -1051,7 +1148,10 @@ mod tests {
     /// 只接 `dexes` 的品种目录：主站有 ETH，xyz 有 AAPL / NVDA
     pub(crate) fn markets_of(dexes: &[&str]) -> HlMarkets {
         let info = |name: &str| -> crate::exchange::hyperliquid::codec::AssetInfo {
-            serde_json::from_str(&format!(r#"{{"name":"{name}","szDecimals":2,"maxLeverage":10}}"#)).unwrap()
+            serde_json::from_str(&format!(
+                r#"{{"name":"{name}","szDecimals":2,"maxLeverage":10}}"#
+            ))
+            .unwrap()
         };
         HlMarkets::build(
             dexes
@@ -1080,7 +1180,9 @@ mod tests {
     fn only_entries_of_connected_dexes_are_kept() {
         let fees = parse(&["xyz"]);
         assert_eq!(fees.len(), 3, "未接入的主站 ETH 那条不该进来");
-        assert!(fees.iter().all(|f| f.symbol == "AAPL" || f.symbol == "NVDA"));
+        assert!(fees
+            .iter()
+            .all(|f| f.symbol == "AAPL" || f.symbol == "NVDA"));
 
         let fees = parse(&[""]);
         assert_eq!(fees.len(), 1);
@@ -1103,7 +1205,10 @@ mod tests {
     fn amount_sign_follows_account_perspective() {
         let fees = parse(&["xyz"]);
         let aapl_first = fees.iter().find(|f| f.timestamp == 1775606400000).unwrap();
-        assert!((aapl_first.amount - 0.671826).abs() < 1e-9, "空头遇正费率应为收到");
+        assert!(
+            (aapl_first.amount - 0.671826).abs() < 1e-9,
+            "空头遇正费率应为收到"
+        );
         let aapl_second = fees.iter().find(|f| f.timestamp == 1775610000000).unwrap();
         assert!(aapl_second.amount < 0.0, "空头遇负费率应为支付");
     }
@@ -1144,13 +1249,16 @@ mod tests {
     fn non_funding_deltas_are_skipped() {
         let json = r#"[{"time":1,"delta":{"type":"deposit","coin":"xyz:AAPL","usdc":"100.0"}}]"#;
         let entries: Vec<UserFundingEntry> = serde_json::from_str(json).unwrap();
-        assert!(parse_user_funding(entries, &markets_of(&["xyz"]), "USDC").unwrap().is_empty());
+        assert!(parse_user_funding(entries, &markets_of(&["xyz"]), "USDC")
+            .unwrap()
+            .is_empty());
     }
 
     /// 官方文档示例里 usdc 带前导空格，容错掉
     #[test]
     fn leading_whitespace_in_amount_is_tolerated() {
-        let json = r#"[{"time":1,"delta":{"type":"funding","coin":"xyz:AAPL","usdc":" -3.625312"}}]"#;
+        let json =
+            r#"[{"time":1,"delta":{"type":"funding","coin":"xyz:AAPL","usdc":" -3.625312"}}]"#;
         let entries: Vec<UserFundingEntry> = serde_json::from_str(json).unwrap();
         let fees = parse_user_funding(entries, &markets_of(&["xyz"]), "USDC").unwrap();
         assert!((fees[0].amount + 3.625312).abs() < 1e-9);
@@ -1159,18 +1267,20 @@ mod tests {
 
 #[cfg(test)]
 mod unified_account_tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::exchange::hyperliquid::testkit::{
         self, markets, state, OWN_EMPTY_STATE, OWN_SPOT, UNIFIED_MAIN, UNIFIED_SPOT, UNIFIED_XYZ,
     };
+    use rust_decimal_macros::dec;
 
     fn spot(raw: &str) -> SpotClearinghouseState {
         serde_json::from_str(raw).unwrap()
     }
 
     fn states(list: &[(&str, &str)]) -> Vec<(String, ClearinghouseState)> {
-        list.iter().map(|(d, raw)| (d.to_string(), state(raw))).collect()
+        list.iter()
+            .map(|(d, raw)| (d.to_string(), state(raw)))
+            .collect()
     }
 
     /// 真实统一账户：净值 = spot USDC total（不是各 dex 的 accountValue 之和，
@@ -1179,9 +1289,17 @@ mod unified_account_tests {
     fn unified_equity_is_spot_total_and_notional_sums_connected_dexes() {
         let both = states(&[("", UNIFIED_MAIN), ("xyz", UNIFIED_XYZ)]);
         let info = unified_account_info(&spot(UNIFIED_SPOT), &both, "USDC").unwrap();
-        assert!((info.equity - 73788.12197337).abs() < 1e-6, "{}", info.equity);
+        assert!(
+            (info.equity - 73788.12197337).abs() < 1e-6,
+            "{}",
+            info.equity
+        );
         // 133560 + 114345 + 306850
-        assert!((info.notional - 554_755.0).abs() < 1e-6, "{}", info.notional);
+        assert!(
+            (info.notional - 554_755.0).abs() < 1e-6,
+            "{}",
+            info.notional
+        );
 
         // 只接主站：股票仓位不计入
         let main = states(&[("", UNIFIED_MAIN)]);
@@ -1203,9 +1321,18 @@ mod unified_account_tests {
 
     #[test]
     fn account_modes() {
-        assert_eq!(HlAccountMode::parse("unifiedAccount").unwrap(), HlAccountMode::Unified);
-        assert_eq!(HlAccountMode::parse("default").unwrap(), HlAccountMode::Standard);
-        assert_eq!(HlAccountMode::parse("disabled").unwrap(), HlAccountMode::Standard);
+        assert_eq!(
+            HlAccountMode::parse("unifiedAccount").unwrap(),
+            HlAccountMode::Unified
+        );
+        assert_eq!(
+            HlAccountMode::parse("default").unwrap(),
+            HlAccountMode::Standard
+        );
+        assert_eq!(
+            HlAccountMode::parse("disabled").unwrap(),
+            HlAccountMode::Standard
+        );
         assert!(HlAccountMode::parse("portfolioMargin").is_err());
         assert!(HlAccountMode::parse("dexAbstraction").is_err());
     }
@@ -1217,7 +1344,14 @@ mod unified_account_tests {
         let got = testkit::positions(&m, &[("", UNIFIED_MAIN), ("xyz", UNIFIED_XYZ)]);
         let mut pairs: Vec<_> = got.iter().map(|p| (p.symbol.as_str(), p.size)).collect();
         pairs.sort_by(|a, b| a.0.cmp(b.0));
-        assert_eq!(pairs, [("BCH", dec!(500)), ("NVDA", dec!(1900)), ("kPEPE", dec!(-30000000))]);
+        assert_eq!(
+            pairs,
+            [
+                ("BCH", dec!(500)),
+                ("NVDA", dec!(1900)),
+                ("kPEPE", dec!(-30000000))
+            ]
+        );
 
         let m = markets(&["xyz"]);
         let got = testkit::positions(&m, &[("xyz", UNIFIED_XYZ)]);
@@ -1230,8 +1364,12 @@ mod unified_account_tests {
     fn a_position_is_counted_only_under_its_own_dex() {
         let m = markets(&["", "xyz"]);
         let mut main = state(UNIFIED_MAIN);
-        main.asset_positions.extend(state(UNIFIED_XYZ).asset_positions);
-        let both = vec![("".to_string(), main), ("xyz".to_string(), state(UNIFIED_XYZ))];
+        main.asset_positions
+            .extend(state(UNIFIED_XYZ).asset_positions);
+        let both = vec![
+            ("".to_string(), main),
+            ("xyz".to_string(), state(UNIFIED_XYZ)),
+        ];
         let got = positions_from_states(&m, &both).unwrap();
         assert_eq!(got.iter().filter(|p| p.symbol == "NVDA").count(), 1);
     }
@@ -1250,7 +1388,10 @@ mod unified_account_tests {
         let only_btc = HlMarkets::build(vec![DexUniverse {
             dex: String::new(),
             offset: 0,
-            universe: vec![serde_json::from_str(r#"{"name":"BTC","szDecimals":5,"maxLeverage":40}"#).unwrap()],
+            universe: vec![serde_json::from_str(
+                r#"{"name":"BTC","szDecimals":5,"maxLeverage":40}"#,
+            )
+            .unwrap()],
         }])
         .unwrap();
         let states = vec![("".to_string(), state(UNIFIED_MAIN))];

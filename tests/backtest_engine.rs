@@ -2,13 +2,15 @@
 //! 用内存假数据源驱动，验证 下单->挂单->越价成交 全链路 + 确定性 + trade-print 撮合。
 
 use hft_engine_rs::backtest::{BacktestEngine, BacktestResult, MarketDataSource};
+use hft_engine_rs::domain::PriceStep;
 use hft_engine_rs::domain::{
-    dec, Exchange, Order, OrderType, Price, Symbol, SymbolMeta, Side, TimeInForce, Timestamp, BBO,
+    dec, Exchange, Order, OrderType, Price, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
 };
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
-use hft_engine_rs::domain::PriceStep;
 use hft_engine_rs::exchange::SubscriptionKind;
-use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, IncomeEvent, MarketData};
+use hft_engine_rs::messaging::{
+    AccountData, ExchangeAccountData, IncomeEvent, MarketData, SymbolAccountData,
+};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::cell::RefCell;
@@ -85,7 +87,9 @@ impl Strategy for OneShotBuy {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
         let mut m = HashMap::new();
         let mut kinds = HashSet::new();
-        kinds.insert(SubscriptionKind::BBO { symbol: SYM.to_string() });
+        kinds.insert(SubscriptionKind::BBO {
+            symbol: SYM.to_string(),
+        });
         m.insert(EX, kinds);
         m
     }
@@ -136,7 +140,10 @@ fn event_sig(ev: &IncomeEvent) -> String {
         },
         IncomeEvent::Market(m) => match &m.data {
             MarketData::BBO(b) => {
-                format!("BBO ts={} bid={} ask={}", m.exchange_ts, b.bid_price, b.ask_price)
+                format!(
+                    "BBO ts={} bid={} ask={}",
+                    m.exchange_ts, b.bid_price, b.ask_price
+                )
             }
             other => format!("{other:?}"),
         },
@@ -148,7 +155,7 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
     let source = FixedSource {
         evs: vec![
             bbo_ev(dec!(100.0), dec!(100.1), 1000), // 挂买单 @100 (PostOnly, 不可成交 -> resting)
-            bbo_ev(dec!(99.8), dec!(99.9), 2000),   // ask 99.9 <= 100 -> 越价, resting 买单成交 @100
+            bbo_ev(dec!(99.8), dec!(99.9), 2000), // ask 99.9 <= 100 -> 越价, resting 买单成交 @100
             bbo_ev(dec!(99.7), dec!(99.8), 3000),
         ],
     };
@@ -197,7 +204,10 @@ fn deterministic_same_input_same_result() {
     // 逐笔事件序列 (含 client_order_id) 也必须完全一致 —— 真正验证确定性, 无盲区
     assert_eq!(trace1, trace2);
     // 确认 client_order_id 是确定性计数而非随机 UUID
-    assert!(trace1.iter().any(|s| s.contains("cid=Some(\"bt0\")")), "trace: {trace1:?}");
+    assert!(
+        trace1.iter().any(|s| s.contains("cid=Some(\"bt0\")")),
+        "trace: {trace1:?}"
+    );
 }
 
 #[test]
@@ -242,7 +252,9 @@ impl Strategy for EmitOnBbo {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
         let mut m = HashMap::new();
         let mut kinds = HashSet::new();
-        kinds.insert(SubscriptionKind::BBO { symbol: SYM.to_string() });
+        kinds.insert(SubscriptionKind::BBO {
+            symbol: SYM.to_string(),
+        });
         m.insert(EX, kinds);
         m
     }
@@ -252,11 +264,14 @@ impl Strategy for EmitOnBbo {
         };
         match &m.data {
             MarketData::Custom(_) => {
-                self.seen_customs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.seen_customs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Vec::new()
             }
             MarketData::BBO(b) => vec![OutcomeEvent::Emit(
-                hft_engine_rs::messaging::CustomEvent::new(PingSignal { mid: (b.bid_price + b.ask_price) / dec!(2) }),
+                hft_engine_rs::messaging::CustomEvent::new(PingSignal {
+                    mid: (b.bid_price + b.ask_price) / dec!(2),
+                }),
             )],
             _ => Vec::new(),
         }
@@ -274,11 +289,16 @@ struct PingSignal {
 #[test]
 fn emitted_custom_events_reach_observers_but_never_strategies() {
     let source = FixedSource {
-        evs: vec![bbo_ev(dec!(100.0), dec!(100.1), 1000), bbo_ev(dec!(100.2), dec!(100.3), 2000)],
+        evs: vec![
+            bbo_ev(dec!(100.0), dec!(100.1), 1000),
+            bbo_ev(dec!(100.2), dec!(100.3), 2000),
+        ],
     };
     let seen_by_strategy = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let runner = StrategyRunner::new(
-        Box::new(EmitOnBbo { seen_customs: Arc::clone(&seen_by_strategy) }),
+        Box::new(EmitOnBbo {
+            seen_customs: Arc::clone(&seen_by_strategy),
+        }),
         metas(),
         hft_engine_rs::backtest::backtest_account(),
         Box::new(SequentialClientOrderIdGen::default()),
@@ -316,7 +336,9 @@ impl Strategy for CustomProbe {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
         let mut m = HashMap::new();
         let mut kinds = HashSet::new();
-        kinds.insert(SubscriptionKind::BBO { symbol: self.symbol.clone() });
+        kinds.insert(SubscriptionKind::BBO {
+            symbol: self.symbol.clone(),
+        });
         m.insert(EX, kinds);
         m
     }
@@ -346,8 +368,14 @@ fn inbound_custom_events_route_by_scope() {
     const SYM2: &str = "ETHUSDT";
     let source = FixedSource {
         evs: vec![
-            custom_ev(CustomEvent::for_symbol(EX, SYM.to_string(), Tag("btc")), 1000),
-            custom_ev(CustomEvent::for_symbol(EX, SYM2.to_string(), Tag("eth")), 2000),
+            custom_ev(
+                CustomEvent::for_symbol(EX, SYM.to_string(), Tag("btc")),
+                1000,
+            ),
+            custom_ev(
+                CustomEvent::for_symbol(EX, SYM2.to_string(), Tag("eth")),
+                2000,
+            ),
             custom_ev(CustomEvent::new(Tag("all")), 3000),
         ],
     };
@@ -355,19 +383,27 @@ fn inbound_custom_events_route_by_scope() {
     let seen_eth = Arc::new(std::sync::Mutex::new(Vec::new()));
     let runners = vec![
         StrategyRunner::new(
-            Box::new(CustomProbe { symbol: SYM.to_string(), seen: Arc::clone(&seen_btc) }),
+            Box::new(CustomProbe {
+                symbol: SYM.to_string(),
+                seen: Arc::clone(&seen_btc),
+            }),
             metas(),
             hft_engine_rs::backtest::backtest_account(),
             Box::new(SequentialClientOrderIdGen::default()),
         ),
         StrategyRunner::new(
-            Box::new(CustomProbe { symbol: SYM2.to_string(), seen: Arc::clone(&seen_eth) }),
+            Box::new(CustomProbe {
+                symbol: SYM2.to_string(),
+                seen: Arc::clone(&seen_eth),
+            }),
             metas(),
             hft_engine_rs::backtest::backtest_account(),
             Box::new(SequentialClientOrderIdGen::default()),
         ),
     ];
-    BacktestEngine::new(&source, runners, SimConfig::default(), metas()).run().expect("回测不该中止");
+    BacktestEngine::new(&source, runners, SimConfig::default(), metas())
+        .run()
+        .expect("回测不该中止");
     assert_eq!(
         *seen_btc.lock().unwrap(),
         vec!["btc", "all"],

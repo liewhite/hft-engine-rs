@@ -99,18 +99,32 @@ impl BinanceNode {
     pub async fn spawn(group: &Group, args: BinanceArgs) -> anyhow::Result<ExchangeHandle> {
         let (_, addr) = group
             .spawn_addressed("BinanceNode", move |scope: Scope, inbox| async move {
-                let BinanceArgs { client, credentials, rest_base_url, market_bus, account_bus, quote } = args;
+                let BinanceArgs {
+                    client,
+                    credentials,
+                    rest_base_url,
+                    market_bus,
+                    account_bus,
+                    quote,
+                } = args;
                 let children = scope.group("children");
 
                 // 1. 私有 WS 启动时就连（要在投产前确认订阅生效）；失败 → 向上传播。
                 //    两条公共 WS 等第一条订阅路由过来才连（见 LazyConn）
                 let has_private_ws = credentials.is_some();
                 if let Some(credentials) = credentials {
-                    BinancePrivateWs::spawn(&children, credentials, rest_base_url, account_bus.clone(), quote.clone())
-                        .await?;
+                    BinancePrivateWs::spawn(
+                        &children,
+                        credentials,
+                        rest_base_url,
+                        account_bus.clone(),
+                        quote.clone(),
+                    )
+                    .await?;
                 }
                 let lazy_public = |name: &'static str, target: WsTarget| {
-                    let (group, market_bus, quote) = (children.clone(), market_bus.clone(), quote.clone());
+                    let (group, market_bus, quote) =
+                        (children.clone(), market_bus.clone(), quote.clone());
                     LazyConn::new(name, move || async move {
                         BinancePublicWs::spawn(&group, name, target.url(), market_bus, quote).await
                     })
@@ -121,7 +135,12 @@ impl BinanceNode {
                 //    （见 assembly 的 setup_binance），无凭证时只接公共行情
                 if let Some(client) = client {
                     EquityPoller::spawn(&children, client.clone(), account_bus.clone(), 1000)?;
-                    FundingFeePoller::spawn(&children, client, account_bus.clone(), FUNDING_FEE_POLL_INTERVAL_MS)?;
+                    FundingFeePoller::spawn(
+                        &children,
+                        client,
+                        account_bus.clone(),
+                        FUNDING_FEE_POLL_INTERVAL_MS,
+                    )?;
                 }
                 CryptoStatus::spawn(
                     &children,
@@ -131,7 +150,11 @@ impl BinanceNode {
                 )?;
 
                 tracing::info!(exchange = "Binance", has_private_ws, "BinanceNode started");
-                Ok(Self { inbox, public_ws, market_ws })
+                Ok(Self {
+                    inbox,
+                    public_ws,
+                    market_ws,
+                })
             })
             .await?;
         Ok(ExchangeHandle::new(addr))
@@ -155,9 +178,14 @@ impl BinanceNode {
                 let (public_kinds, market_kinds): (Vec<_>, Vec<_>) = kinds
                     .into_iter()
                     .partition(|k| pick_ws_target(k) == WsTarget::PublicHighFreq);
-                for (target, kinds) in [(WsTarget::PublicHighFreq, public_kinds), (WsTarget::Market, market_kinds)] {
+                for (target, kinds) in [
+                    (WsTarget::PublicHighFreq, public_kinds),
+                    (WsTarget::Market, market_kinds),
+                ] {
                     if !kinds.is_empty() {
-                        self.ws_for(target).send(ExchangeCmd::SubscribeBatch(kinds)).await?;
+                        self.ws_for(target)
+                            .send(ExchangeCmd::SubscribeBatch(kinds))
+                            .await?;
                     }
                 }
                 Ok(())

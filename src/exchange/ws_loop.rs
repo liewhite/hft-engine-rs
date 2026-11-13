@@ -147,7 +147,11 @@ impl WsConn {
                 },
             }
         })?;
-        Ok(Self { outgoing: outgoing_tx, incoming: incoming_rx, replay: Default::default() })
+        Ok(Self {
+            outgoing: outgoing_tx,
+            incoming: incoming_rx,
+            replay: Default::default(),
+        })
     }
 
     /// 发一帧文本（订阅/退订请求等）。循环已退出时返回 `Err`。
@@ -164,10 +168,9 @@ impl WsConn {
         if let Some(text) = self.replay.pop_front() {
             return Ok(text);
         }
-        self.incoming
-            .recv()
-            .await
-            .ok_or_else(|| WsError::ServerClosed("WS 循环已退出（原因见循环子任务的错误）".to_string()))
+        self.incoming.recv().await.ok_or_else(|| {
+            WsError::ServerClosed("WS 循环已退出（原因见循环子任务的错误）".to_string())
+        })
     }
 
     /// 感知停机的取帧：`scope`（组件自己的）未被请求停止时等下一帧（同 [`Self::recv`]）；
@@ -185,7 +188,10 @@ impl WsConn {
                 _ = scope.stopping() => {}
             }
         }
-        Ok(self.replay.pop_front().or_else(|| self.incoming.try_recv().ok()))
+        Ok(self
+            .replay
+            .pop_front()
+            .or_else(|| self.incoming.try_recv().ok()))
     }
 
     /// 启动阶段等私有订阅全部确认，供私有 WS 组件在构造时调用 —— **请求发出去不等于
@@ -223,7 +229,9 @@ impl WsConn {
         };
         match tokio::time::timeout(SUBSCRIPTION_CONFIRM_TIMEOUT, wait).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(ExchangeError::WebSocketError(format!("{exchange} 私有订阅: {e}"))),
+            Ok(Err(e)) => Err(ExchangeError::WebSocketError(format!(
+                "{exchange} 私有订阅: {e}"
+            ))),
             Err(_) => Err(ExchangeError::Timeout(format!(
                 "{exchange} 私有订阅 {pending:?} 未在 {}s 内确认，私有回报不可信",
                 SUBSCRIPTION_CONFIRM_TIMEOUT.as_secs()
@@ -249,7 +257,9 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 建 WS 连接，限时 [`CONNECT_TIMEOUT`]（见 [`crate::net::ws_connect`]）。公共流重连和三所私有流启动共用。
 pub(crate) async fn connect(url: &str) -> Result<crate::net::WsStream, WsError> {
-    crate::net::ws_connect(url, None, CONNECT_TIMEOUT).await.map_err(WsError::ConnectionFailed)
+    crate::net::ws_connect(url, None, CONNECT_TIMEOUT)
+        .await
+        .map_err(WsError::ConnectionFailed)
 }
 /// 重连失败后的等待：从 1 秒起翻倍，封顶 30 秒，一直重试到连上或停机
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -293,14 +303,32 @@ impl ReconnectingWs {
         let conn = Self::open(&group, &name, &url, &keepalive)
             .await
             .map_err(|e| anyhow::anyhow!("{name} 连接 {url} 失败: {e}"))?;
-        Ok(Self { group, name, url, keepalive, conn })
+        Ok(Self {
+            group,
+            name,
+            url,
+            keepalive,
+            conn,
+        })
     }
 
-    async fn open(group: &Group, name: &str, url: &str, keepalive: &WsKeepalive) -> Result<WsConn, WsError> {
+    async fn open(
+        group: &Group,
+        name: &str,
+        url: &str,
+        keepalive: &WsKeepalive,
+    ) -> Result<WsConn, WsError> {
         let ws = connect(url).await?;
         let (write, read) = ws.split();
-        WsConn::spawn_loop(group, format!("{name}Loop"), read, write, keepalive.clone(), OnLoss::Report)
-            .map_err(|e| WsError::ConnectionFailed(e.to_string()))
+        WsConn::spawn_loop(
+            group,
+            format!("{name}Loop"),
+            read,
+            write,
+            keepalive.clone(),
+            OnLoss::Report,
+        )
+        .map_err(|e| WsError::ConnectionFailed(e.to_string()))
     }
 
     /// 发一帧文本（订阅/退订）。连接已断时丢掉：重连时组件会重发全部订阅。
@@ -346,7 +374,9 @@ impl ReconnectingWs {
                     );
                     return true;
                 }
-                Err(e) => tracing::warn!(conn = %self.name, attempt, error = %e, retry_in = ?backoff, "WS 重连失败"),
+                Err(e) => {
+                    tracing::warn!(conn = %self.name, attempt, error = %e, retry_in = ?backoff, "WS 重连失败")
+                }
             }
             tokio::select! {
                 _ = scope.stopping() => return false,
@@ -370,9 +400,15 @@ async fn run_ws_loop(
     incoming_tx: mpsc::Sender<String>,
     keepalive: WsKeepalive,
 ) -> anyhow::Result<()> {
-    run_ws_loop_inner(&mut read, &mut write, &mut outgoing_rx, &incoming_tx, &keepalive)
-        .await
-        .map_err(|e| anyhow::anyhow!("WS 连接: {e}"))
+    run_ws_loop_inner(
+        &mut read,
+        &mut write,
+        &mut outgoing_rx,
+        &incoming_tx,
+        &keepalive,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("WS 连接: {e}"))
 }
 
 async fn run_ws_loop_inner(
@@ -519,7 +555,13 @@ mod keepalive_tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             drop(frame_tx);
         });
-        let ws = tokio::spawn(run_ws_loop(read, write, out_rx, in_tx, keepalive(None, 1, 3)));
+        let ws = tokio::spawn(run_ws_loop(
+            read,
+            write,
+            out_rx,
+            in_tx,
+            keepalive(None, 1, 3),
+        ));
 
         // 5 帧全部送达（期间跨了 10 秒 > idle 3 秒，证明计时被入站帧重置）
         for i in 0..5 {
@@ -544,7 +586,10 @@ mod keepalive_tests {
             keepalive(None, 60, 3600),
         )
         .unwrap();
-        frame_tx.send(Ok(WsMessage::Text("a".into()))).await.unwrap();
+        frame_tx
+            .send(Ok(WsMessage::Text("a".into())))
+            .await
+            .unwrap();
         assert_eq!(conn.recv().await.unwrap(), "a");
         drop(frame_tx); // 连接断开
         assert!(conn.recv().await.is_err());
@@ -568,14 +613,23 @@ mod keepalive_tests {
             in_tx.try_send(f.to_string()).unwrap();
         }
         let (out_tx, _) = mpsc::channel(1);
-        (WsConn { outgoing: out_tx, incoming: in_rx, replay: Default::default() }, in_tx)
+        (
+            WsConn {
+                outgoing: out_tx,
+                incoming: in_rx,
+                replay: Default::default(),
+            },
+            in_tx,
+        )
     }
 
     /// 回执与数据都算确认；集齐才返回，之后 recv 先给确认期间的全部帧（含数据），再接后续帧，一帧不丢
     #[tokio::test]
     async fn subscriptions_confirmed_by_ack_or_data_and_frames_are_kept() {
         let (mut conn, _tx) = conn_fed_by(&["ack:orders", "noise", "data:fills", "late"]);
-        conn.await_subscriptions(Exchange::OKX, &["orders", "fills"], by_prefix).await.unwrap();
+        conn.await_subscriptions(Exchange::OKX, &["orders", "fills"], by_prefix)
+            .await
+            .unwrap();
         let mut got = Vec::new();
         for _ in 0..4 {
             got.push(conn.recv().await.unwrap());
@@ -587,16 +641,30 @@ mod keepalive_tests {
     #[tokio::test(start_paused = true)]
     async fn rejection_disconnect_and_timeout_fail_startup() {
         let (mut conn, _tx) = conn_fed_by(&["error:bad sub"]);
-        let e = conn.await_subscriptions(Exchange::OKX, &["orders"], by_prefix).await.err().unwrap();
+        let e = conn
+            .await_subscriptions(Exchange::OKX, &["orders"], by_prefix)
+            .await
+            .err()
+            .unwrap();
         assert!(e.to_string().contains("bad sub"), "{e}");
 
         let (mut conn, _tx) = conn_fed_by(&["ack:orders"]);
-        let e = conn.await_subscriptions(Exchange::OKX, &["orders", "fills"], by_prefix).await.err().unwrap();
-        assert!(matches!(e, ExchangeError::Timeout(_)) && e.to_string().contains("fills"), "超时要点名缺哪条: {e}");
+        let e = conn
+            .await_subscriptions(Exchange::OKX, &["orders", "fills"], by_prefix)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(e, ExchangeError::Timeout(_)) && e.to_string().contains("fills"),
+            "超时要点名缺哪条: {e}"
+        );
 
         let (mut conn, tx) = conn_fed_by(&[]);
         drop(tx);
-        assert!(conn.await_subscriptions(Exchange::OKX, &["orders"], by_prefix).await.is_err());
+        assert!(conn
+            .await_subscriptions(Exchange::OKX, &["orders"], by_prefix)
+            .await
+            .is_err());
     }
 
     /// 配置了 ping_text 的所（OKX/HL）按周期发送应用层 ping
@@ -608,7 +676,13 @@ mod keepalive_tests {
         let (_out_tx, out_rx) = mpsc::channel::<String>(8);
         let (in_tx, _in_rx) = mpsc::channel::<String>(8);
 
-        tokio::spawn(run_ws_loop(read, write, out_rx, in_tx, keepalive(Some("ping"), 1, 3600)));
+        tokio::spawn(run_ws_loop(
+            read,
+            write,
+            out_rx,
+            in_tx,
+            keepalive(Some("ping"), 1, 3600),
+        ));
 
         for _ in 0..3 {
             let sent = w_rx.recv().await.expect("应周期性发出 ping");
@@ -650,7 +724,10 @@ mod keepalive_tests {
     /// （收到的文本帧的接收端，往客户端发帧的发送端）交出来；发送端被丢掉就关闭该连接
     async fn local_ws_server(
         max_conns: usize,
-    ) -> (String, mpsc::Receiver<(mpsc::Receiver<String>, mpsc::Sender<String>)>) {
+    ) -> (
+        String,
+        mpsc::Receiver<(mpsc::Receiver<String>, mpsc::Sender<String>)>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let (conns_tx, conns_rx) = mpsc::channel(4);
@@ -706,11 +783,19 @@ mod keepalive_tests {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         root.group("c")
             .spawn_fn("c", move |scope| async move {
-                let mut ws = ReconnectingWs::connect(conn_group, "pub", url, keepalive(None, 60, 3600)).await?;
+                let mut ws =
+                    ReconnectingWs::connect(conn_group, "pub", url, keepalive(None, 60, 3600))
+                        .await?;
                 ws.send("sub-a".into()).await;
                 assert_eq!(ws.recv().await, None, "服务端关连接后 recv 应报断线");
-                assert!(!scope.is_stopping() && !scope.machine_stop_flag().is_stopping(), "断线不应触发停机");
-                assert!(ws.reconnect(&scope, vec!["sub-a".into(), "sub-b".into()]).await);
+                assert!(
+                    !scope.is_stopping() && !scope.machine_stop_flag().is_stopping(),
+                    "断线不应触发停机"
+                );
+                assert!(
+                    ws.reconnect(&scope, vec!["sub-a".into(), "sub-b".into()])
+                        .await
+                );
                 result_tx.send(ws.recv().await).unwrap();
                 scope.stopping().await;
                 Ok(())
@@ -732,10 +817,15 @@ mod keepalive_tests {
         let (lost_tx, lost_rx) = tokio::sync::oneshot::channel();
         root.group("c")
             .spawn_fn("c", move |scope| async move {
-                let mut ws = ReconnectingWs::connect(conn_group, "pub", url, keepalive(None, 60, 3600)).await?;
+                let mut ws =
+                    ReconnectingWs::connect(conn_group, "pub", url, keepalive(None, 60, 3600))
+                        .await?;
                 assert_eq!(ws.recv().await, None);
                 lost_tx.send(()).unwrap();
-                assert!(!ws.reconnect(&scope, vec!["sub".into()]).await, "停机时 reconnect 应让路");
+                assert!(
+                    !ws.reconnect(&scope, vec!["sub".into()]).await,
+                    "停机时 reconnect 应让路"
+                );
                 Ok(())
             })
             .unwrap();

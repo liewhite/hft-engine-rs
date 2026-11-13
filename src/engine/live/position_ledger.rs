@@ -78,13 +78,13 @@
 //! 重放的机制随之删除；快照与 Fill 流的竞态由 seed 内置的时刻过滤统一兜住。
 
 use super::executor::{ExecutorHandle, ExecutorId};
+use crate::domain::{now_ms, AccountId};
 use crate::domain::{to_f64, Exchange, Position, Price, Quantity, Symbol};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
-use crate::domain::{now_ms, AccountId};
 use crate::messaging::{
-    AccountBus, AccountData, AccountEvent, ExchangeAccountData, MarketBus, MarketData, MarketEvent, PositionBaseline,
-    PositionBook, PositionValues,
+    AccountBus, AccountData, AccountEvent, ExchangeAccountData, MarketBus, MarketData, MarketEvent,
+    PositionBaseline, PositionBook, PositionValues,
 };
 use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, StopFlag, Task};
 use futures_util::future::BoxFuture;
@@ -273,15 +273,24 @@ impl Reconciler {
     ///
     /// `Err` = 已确认该 executor 与账本分叉（连续 `max_consecutive` 次差值稳定），调用方应
     /// 致命退出 —— 策略正拿着错的持仓算下单量。
-    pub fn reconcile_executor(&mut self, executor: ExecutorId, positions: &[Position]) -> Result<(), String> {
+    pub fn reconcile_executor(
+        &mut self,
+        executor: ExecutorId,
+        positions: &[Position],
+    ) -> Result<(), String> {
         let counterpart = Counterpart::Executor(executor);
         let legs: Vec<(Exchange, Symbol, Quantity, Quantity)> = positions
             .iter()
             .filter_map(|p| {
                 let state = self.mirror.get(&p.symbol)?;
-                state
-                    .is_seeded(p.exchange)
-                    .then(|| (p.exchange, p.symbol.clone(), state.position_size(p.exchange), p.size))
+                state.is_seeded(p.exchange).then(|| {
+                    (
+                        p.exchange,
+                        p.symbol.clone(),
+                        state.position_size(p.exchange),
+                        p.size,
+                    )
+                })
             })
             .collect();
         let confirmed: Vec<String> = legs
@@ -511,54 +520,60 @@ impl PositionLedger {
         args: PositionLedgerArgs,
     ) -> anyhow::Result<(ChildHandle, PositionLedgerHandle)> {
         let (child, addr) = group
-            .spawn_addressed("PositionLedger", move |scope: Scope, mut inbox| async move {
-                // 镜像的增量输入只有实盘 Fill：订阅过滤与账本同一判据（模拟成交绝不进实盘镜像）
-                inbox.subscribe(
-                    &args.account_bus,
-                    |e| PositionBook::live_fill(e).is_some(),
-                    PositionLedgerMsg::Account,
-                );
-                inbox.subscribe(
-                    &args.market_bus,
-                    |e| matches!(e.data, MarketData::BBO(_)),
-                    PositionLedgerMsg::Market,
-                );
+            .spawn_addressed(
+                "PositionLedger",
+                move |scope: Scope, mut inbox| async move {
+                    // 镜像的增量输入只有实盘 Fill：订阅过滤与账本同一判据（模拟成交绝不进实盘镜像）
+                    inbox.subscribe(
+                        &args.account_bus,
+                        |e| PositionBook::live_fill(e).is_some(),
+                        PositionLedgerMsg::Account,
+                    );
+                    inbox.subscribe(
+                        &args.market_bus,
+                        |e| matches!(e.data, MarketData::BBO(_)),
+                        PositionLedgerMsg::Market,
+                    );
 
-                // 窗口从构造时刻起算，避免首次拉取前就被判成停摆
-                let guards = args
-                    .accounts
-                    .keys()
-                    .map(|exchange| {
-                        (
-                            *exchange,
-                            StalenessGuard::new(format!("{exchange} 持仓对账"), MAX_POLL_STALENESS_MS),
-                        )
+                    // 窗口从构造时刻起算，避免首次拉取前就被判成停摆
+                    let guards = args
+                        .accounts
+                        .keys()
+                        .map(|exchange| {
+                            (
+                                *exchange,
+                                StalenessGuard::new(
+                                    format!("{exchange} 持仓对账"),
+                                    MAX_POLL_STALENESS_MS,
+                                ),
+                            )
+                        })
+                        .collect();
+
+                    tracing::info!(
+                        exchanges = args.accounts.len(),
+                        interval_ms = args.interval_ms,
+                        max_consecutive_mismatches = args.max_consecutive_mismatches,
+                        "PositionLedger started"
+                    );
+                    Ok(Self {
+                        inbox,
+                        interval: Duration::from_millis(args.interval_ms),
+                        ledger: Ledger {
+                            reconciler: Reconciler::new(args.max_consecutive_mismatches),
+                            accounts: args.accounts,
+                            guards,
+                            in_flight: HashSet::new(),
+                            executors: HashMap::new(),
+                            executor_in_flight: HashSet::new(),
+                            pending: FuturesUnordered::new(),
+                            account_bus: args.account_bus,
+                            mids: HashMap::new(),
+                            machine_stop: scope.machine_stop_flag(),
+                        },
                     })
-                    .collect();
-
-                tracing::info!(
-                    exchanges = args.accounts.len(),
-                    interval_ms = args.interval_ms,
-                    max_consecutive_mismatches = args.max_consecutive_mismatches,
-                    "PositionLedger started"
-                );
-                Ok(Self {
-                    inbox,
-                    interval: Duration::from_millis(args.interval_ms),
-                    ledger: Ledger {
-                        reconciler: Reconciler::new(args.max_consecutive_mismatches),
-                        accounts: args.accounts,
-                        guards,
-                        in_flight: HashSet::new(),
-                        executors: HashMap::new(),
-                        executor_in_flight: HashSet::new(),
-                        pending: FuturesUnordered::new(),
-                        account_bus: args.account_bus,
-                        mids: HashMap::new(),
-                        machine_stop: scope.machine_stop_flag(),
-                    },
-                })
-            })
+                },
+            )
             .await?;
         Ok((child, PositionLedgerHandle(addr)))
     }
@@ -609,7 +624,10 @@ impl Ledger {
                     self.publish_values(d.exchange());
                 }
             }
-            PositionLedgerMsg::Market(MarketEvent { data: MarketData::BBO(bbo), .. }) => {
+            PositionLedgerMsg::Market(MarketEvent {
+                data: MarketData::BBO(bbo),
+                ..
+            }) => {
                 let mid = bbo.mid_price();
                 match self.mids.get_mut(&(bbo.exchange, bbo.symbol.clone())) {
                     Some(m) => *m = mid,
@@ -676,10 +694,9 @@ impl Ledger {
                     account: AccountId::Live,
                     exchange_ts: ts,
                     local_ts: ts,
-                    data: AccountData::Exchange(ExchangeAccountData::PositionValues(PositionValues {
-                        exchange,
-                        values,
-                    })),
+                    data: AccountData::Exchange(ExchangeAccountData::PositionValues(
+                        PositionValues { exchange, values },
+                    )),
                 });
             }
             Err(symbol) => {
@@ -752,7 +769,10 @@ impl Ledger {
             let (id, executor) = (*id, executor.clone());
             self.pending.push(Box::pin(async move {
                 let result = executor.seeded_positions().await;
-                Fetched::Executor { executor: id, result }
+                Fetched::Executor {
+                    executor: id,
+                    result,
+                }
             }));
         }
     }
@@ -781,7 +801,11 @@ impl Ledger {
     }
 
     /// 处理一所的读数：更新守卫、比对。`Err` = 确认漂移或通道停摆过久，调用方应致命退出。
-    fn ingest(&mut self, exchange: Exchange, result: Result<Vec<Position>, String>) -> Result<(), String> {
+    fn ingest(
+        &mut self,
+        exchange: Exchange,
+        result: Result<Vec<Position>, String>,
+    ) -> Result<(), String> {
         let guard = self
             .guards
             .get_mut(&exchange)
@@ -810,11 +834,11 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Fill, FillReason, Side};
     use crate::messaging::{AccountData, SymbolAccountData};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     const EX: Exchange = Exchange::Binance;
     const OTHER_EX: Exchange = Exchange::OKX;
@@ -882,7 +906,8 @@ mod tests {
     #[test]
     fn any_nonzero_diff_is_drift() {
         let mut r = reconciler_with(1, &[baseline_on(EX, dec!(1.0))]);
-        r.reconcile(EX, &[position(EX, dec!(1.001))]).expect_err("差 0.001 也是漂移");
+        r.reconcile(EX, &[position(EX, dec!(1.001))])
+            .expect_err("差 0.001 也是漂移");
     }
 
     /// 成交累加精确归零：0.1 + 0.2 - 0.3 与交易所的 0 一致（f64 下差 5.5e-17，曾靠容差兜住）
@@ -916,7 +941,15 @@ mod tests {
         let mut r = reconciler_with(3, &[baseline_on(EX, dec!(1.0))]);
 
         // 本地始终 1.0，交易所读数每次不同 -> 差值每次不同 -> 永远停在 streak=1
-        for reported in [dec!(3.0), dec!(7.0), dec!(2.5), dec!(9.0), dec!(4.25), dec!(6.5), dec!(8.75)] {
+        for reported in [
+            dec!(3.0),
+            dec!(7.0),
+            dec!(2.5),
+            dec!(9.0),
+            dec!(4.25),
+            dec!(6.5),
+            dec!(8.75),
+        ] {
             r.reconcile(EX, &[position(EX, reported)])
                 .expect("差值在变说明是在途成交，不该判为漂移");
         }
@@ -1067,7 +1100,7 @@ mod tests {
     fn re_registration_never_overwrites_the_mirror() {
         let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0))]);
         r.on_event(&fill(Side::Long, dec!(1.0))); // 镜像 3.0
-        // 再次投产：新快照读到 3.0，但镜像已 seed 过 —— 静默跳过，不覆写
+                                                  // 再次投产：新快照读到 3.0，但镜像已 seed 过 —— 静默跳过，不覆写
         r.register(
             &[SYM.to_string()],
             &[PositionBaseline {
@@ -1096,7 +1129,10 @@ mod tests {
     /// 计数按 (所, symbol) 分开：一个所的漂移不该借另一个所的次数达标
     #[test]
     fn streaks_are_per_exchange() {
-        let mut r = reconciler_with(2, &[baseline_on(EX, dec!(1.0)), baseline_on(OTHER_EX, dec!(0.0))]);
+        let mut r = reconciler_with(
+            2,
+            &[baseline_on(EX, dec!(1.0)), baseline_on(OTHER_EX, dec!(0.0))],
+        );
 
         // Binance 不一致一次
         r.reconcile(EX, &[position(EX, dec!(9.0))]).unwrap();
@@ -1112,7 +1148,13 @@ mod tests {
     /// 同一 symbol 跨所独立：Binance 漂了，OKX 那条腿的读数不受影响
     #[test]
     fn per_exchange_legs_are_compared_independently() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(1.0)), baseline_on(OTHER_EX, dec!(-1.0))]);
+        let mut r = reconciler_with(
+            1,
+            &[
+                baseline_on(EX, dec!(1.0)),
+                baseline_on(OTHER_EX, dec!(-1.0)),
+            ],
+        );
 
         // OKX 腿一致
         r.reconcile(OTHER_EX, &[position(OTHER_EX, dec!(-1.0))])
@@ -1137,7 +1179,8 @@ mod tests {
         let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0))]);
         r.on_event(&fill(Side::Long, dec!(1.0)));
         for _ in 0..5 {
-            r.reconcile_executor(executor(), &[position(EX, dec!(3.0))]).unwrap();
+            r.reconcile_executor(executor(), &[position(EX, dec!(3.0))])
+                .unwrap();
         }
     }
 
@@ -1172,12 +1215,18 @@ mod tests {
     #[test]
     fn executor_legs_unseeded_in_the_ledger_are_skipped() {
         let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0))]);
-        r.reconcile_executor(executor(), &[position(EX, dec!(2.0)), position(OTHER_EX, dec!(0.0))])
-            .expect("OTHER_EX 在账本里是未知，不该参与比对");
+        r.reconcile_executor(
+            executor(),
+            &[position(EX, dec!(2.0)), position(OTHER_EX, dec!(0.0))],
+        )
+        .expect("OTHER_EX 在账本里是未知，不该参与比对");
         // 即便账本靠 Fill 在那条腿上累加出了数，也是未知起点，不比
         r.on_event(&fill_on(OTHER_EX, Side::Long, dec!(1.0), SNAPSHOT_TS + 1));
-        r.reconcile_executor(executor(), &[position(EX, dec!(2.0)), position(OTHER_EX, dec!(0.0))])
-            .expect("未 seed 的腿不比");
+        r.reconcile_executor(
+            executor(),
+            &[position(EX, dec!(2.0)), position(OTHER_EX, dec!(0.0))],
+        )
+        .expect("未 seed 的腿不比");
     }
 
     /// 对外快照只含**基线已写入**的腿，且空仓腿必须如实报出 0。
@@ -1186,7 +1235,10 @@ mod tests {
     /// 则相反 —— 下游会据此算出假的对冲完整性。
     #[test]
     fn snapshot_contains_seeded_legs_only_including_flat_ones() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0)), baseline_on(OTHER_EX, dec!(0.0))]);
+        let mut r = reconciler_with(
+            1,
+            &[baseline_on(EX, dec!(2.0)), baseline_on(OTHER_EX, dec!(0.0))],
+        );
         r.on_event(&fill(Side::Long, dec!(1.0))); // EX 腿 -> 3.0
 
         let snapshot = r.positions();
@@ -1218,10 +1270,20 @@ mod tests {
     #[test]
     fn position_values_are_abs_size_times_mid_and_flat_legs_need_no_price() {
         let mut r = Reconciler::new(1);
-        r.register(&[SYM.to_string(), "ETH".to_string()], &[baseline_on(EX, dec!(-2.0)), baseline_on(OTHER_EX, dec!(0.0))]);
+        r.register(
+            &[SYM.to_string(), "ETH".to_string()],
+            &[
+                baseline_on(EX, dec!(-2.0)),
+                baseline_on(OTHER_EX, dec!(0.0)),
+            ],
+        );
         r.on_event(&fill_on(EX, Side::Short, dec!(1.0), SNAPSHOT_TS + 1)); // EX: -3
         let mid = |s: &Symbol| (s == SYM).then_some(dec!(100));
-        assert_eq!(r.position_values(EX, mid), Ok(HashMap::from([(SYM.to_string(), 300.0)])), "ETH 未 seed，不报");
+        assert_eq!(
+            r.position_values(EX, mid),
+            Ok(HashMap::from([(SYM.to_string(), 300.0)])),
+            "ETH 未 seed，不报"
+        );
         assert_eq!(
             r.position_values(OTHER_EX, |_: &Symbol| None),
             Ok(HashMap::from([(SYM.to_string(), 0.0)])),
@@ -1233,7 +1295,10 @@ mod tests {
     #[test]
     fn a_held_symbol_without_a_price_makes_the_values_unknown() {
         let r = reconciler_with(1, &[baseline_on(EX, dec!(1.0))]);
-        assert_eq!(r.position_values(EX, |_: &Symbol| None), Err(SYM.to_string()));
+        assert_eq!(
+            r.position_values(EX, |_: &Symbol| None),
+            Err(SYM.to_string())
+        );
     }
 
     /// 镜像只吃基线与成交：对账读数本身绝不能写进镜像（否则漂移会被自我抹平）
@@ -1255,7 +1320,9 @@ mod tests {
 #[cfg(test)]
 mod hl_multi_dex_tests {
     use super::*;
-    use crate::exchange::hyperliquid::testkit::{fills_from_ws, markets, positions, state_json, user_fills_json};
+    use crate::exchange::hyperliquid::testkit::{
+        fills_from_ws, markets, positions, state_json, user_fills_json,
+    };
 
     const EX: Exchange = Exchange::Hyperliquid;
     const SNAPSHOT_TS: u64 = 10;
@@ -1266,12 +1333,18 @@ mod hl_multi_dex_tests {
         let m = markets(&["", "xyz"]);
         let base = positions(
             &m,
-            &[("", &state_json(&[("BTC", 1.0)])), ("xyz", &state_json(&[("xyz:TSLA", -2.0)]))],
+            &[
+                ("", &state_json(&[("BTC", 1.0)])),
+                ("xyz", &state_json(&[("xyz:TSLA", -2.0)])),
+            ],
         );
         assert_eq!(base.len(), 2, "基线必须含两个 dex 的仓位");
         let baselines: Vec<_> = base
             .into_iter()
-            .map(|position| PositionBaseline { position, snapshot_req_ts: SNAPSHOT_TS })
+            .map(|position| PositionBaseline {
+                position,
+                snapshot_req_ts: SNAPSHOT_TS,
+            })
             .collect();
         let mut r = Reconciler::new(N);
         r.register(&["BTC".to_string(), "TSLA".to_string()], &baselines);
@@ -1282,7 +1355,10 @@ mod hl_multi_dex_tests {
     fn rest_snapshot(m: &crate::exchange::hyperliquid::markets::HlMarkets) -> Vec<Position> {
         positions(
             m,
-            &[("", &state_json(&[("BTC", 1.5)])), ("xyz", &state_json(&[("xyz:TSLA", -3.0)]))],
+            &[
+                ("", &state_json(&[("BTC", 1.5)])),
+                ("xyz", &state_json(&[("xyz:TSLA", -3.0)])),
+            ],
         )
     }
 
@@ -1296,13 +1372,19 @@ mod hl_multi_dex_tests {
         // 未接入的 flx 上同名 TSLA 的成交：不进 Fill 流（以 UnmappedFill 上报），不会串到 xyz:TSLA
         let foreign = user_fills_json(&[("flx:TSLA", "B", 5.0)]);
         let foreign = fills_from_ws(&m, &foreign, SNAPSHOT_TS + 1).unwrap();
-        assert!(foreign.iter().all(|e| matches!(e.data, crate::messaging::AccountData::Exchange(crate::messaging::ExchangeAccountData::UnmappedFill(_)))));
+        assert!(foreign.iter().all(|e| matches!(
+            e.data,
+            crate::messaging::AccountData::Exchange(
+                crate::messaging::ExchangeAccountData::UnmappedFill(_)
+            )
+        )));
         for e in events.iter().chain(&foreign) {
             r.on_event(e);
         }
         let snapshot = rest_snapshot(&m);
         for _ in 0..10 {
-            r.reconcile(EX, &snapshot).expect("基线 + Fill 与 REST 一致，不应报漂移");
+            r.reconcile(EX, &snapshot)
+                .expect("基线 + Fill 与 REST 一致，不应报漂移");
         }
     }
 
@@ -1316,9 +1398,12 @@ mod hl_multi_dex_tests {
         }
         let snapshot = rest_snapshot(&m);
         for round in 1..N {
-            r.reconcile(EX, &snapshot).unwrap_or_else(|e| panic!("第 {round} 次就判漂移: {e}"));
+            r.reconcile(EX, &snapshot)
+                .unwrap_or_else(|e| panic!("第 {round} 次就判漂移: {e}"));
         }
-        let err = r.reconcile(EX, &snapshot).expect_err("连续 N 次稳定差值应判漂移");
+        let err = r
+            .reconcile(EX, &snapshot)
+            .expect_err("连续 N 次稳定差值应判漂移");
         assert!(err.contains("TSLA"), "{err}");
         assert!(!err.contains("BTC"), "主站那条腿是一致的: {err}");
     }
@@ -1328,13 +1413,15 @@ mod hl_multi_dex_tests {
 /// executor 持仓纳入对账（#694）。用 `tasks::Root` 搭树测。
 #[cfg(test)]
 mod task_tests {
-    use rust_decimal_macros::dec;
     use super::*;
-    use crate::domain::{AccountInfo, Decimal, ExchangeError, OrderId, OrderUpdate, PriceStep, SymbolMeta};
+    use crate::domain::{
+        AccountInfo, Decimal, ExchangeError, OrderId, OrderUpdate, PriceStep, SymbolMeta,
+    };
     use crate::engine::live::executor::{Executor, ExecutorArgs};
     use crate::engine::live::OutcomeBus;
     use crate::exchange::ExchangeOrder;
     use crate::tasks::Root;
+    use rust_decimal_macros::dec;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
@@ -1396,7 +1483,10 @@ mod task_tests {
                 }
             }
         }
-        async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, crate::domain::PlaceError> {
+        async fn place_order(
+            &self,
+            _order: ExchangeOrder,
+        ) -> Result<OrderId, crate::domain::PlaceError> {
             unreachable!("账本不下单")
         }
         async fn cancel_order(
@@ -1449,7 +1539,14 @@ mod task_tests {
         client: Arc<dyn AccountClient>,
         interval_ms: u64,
     ) -> PositionLedgerHandle {
-        ledger_on(root, client, interval_ms, AccountBus::new("account"), MarketBus::new("market")).await
+        ledger_on(
+            root,
+            client,
+            interval_ms,
+            AccountBus::new("account"),
+            MarketBus::new("market"),
+        )
+        .await
     }
 
     /// 同 [`ledger`]，总线由调用方给（要往里发事件或收账本发出的读数时用）
@@ -1545,7 +1642,10 @@ mod task_tests {
             .await
             .expect("拉取 panic 必须上冒到根");
         let err = root.shutdown().await.expect_err("应带着错误退出");
-        assert!(format!("{err:#}").contains("模拟 adapter 内的 panic"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("模拟 adapter 内的 panic"),
+            "{err:#}"
+        );
     }
 
     /// **回归防线**：REST 拉取卡死时，快照查询仍须应答。
@@ -1596,19 +1696,37 @@ mod task_tests {
         let probe_seen = seen.clone();
         let probe_bus = account_bus.clone();
         root.group("consumers")
-            .spawn_addressed("ValuesProbe", move |_scope, mut inbox: Inbox<AccountEvent>| async move {
-                inbox.subscribe(
-                    &probe_bus,
-                    |e| matches!(e.data, AccountData::Exchange(ExchangeAccountData::PositionValues(_))),
-                    |e| e,
-                );
-                Ok(ValuesProbe { inbox, seen: probe_seen })
-            })
+            .spawn_addressed(
+                "ValuesProbe",
+                move |_scope, mut inbox: Inbox<AccountEvent>| async move {
+                    inbox.subscribe(
+                        &probe_bus,
+                        |e| {
+                            matches!(
+                                e.data,
+                                AccountData::Exchange(ExchangeAccountData::PositionValues(_))
+                            )
+                        },
+                        |e| e,
+                    );
+                    Ok(ValuesProbe {
+                        inbox,
+                        seen: probe_seen,
+                    })
+                },
+            )
             .await
             .expect("探针应能起来");
         let (client, _calls) = FaultyClient::pair(Faulty::Steady(dec!(2.0)));
         // 节拍很慢：首拍（立即）之后的读数只可能来自成交
-        let _ledger = ledger_on(&root, client, NEVER_AGAIN_MS, account_bus.clone(), market_bus.clone()).await;
+        let _ledger = ledger_on(
+            &root,
+            client,
+            NEVER_AGAIN_MS,
+            account_bus.clone(),
+            market_bus.clone(),
+        )
+        .await;
         // 盘口与成交按序进账本收件箱
         market_bus.publish(MarketEvent {
             exchange_ts: 0,
@@ -1628,18 +1746,20 @@ mod task_tests {
             account: crate::domain::AccountId::Live,
             exchange_ts: 2,
             local_ts: 2,
-            data: AccountData::Symbol(crate::messaging::SymbolAccountData::Fill(crate::domain::Fill {
-                exchange: EX,
-                symbol: SYM.to_string(),
-                side: crate::domain::Side::Long,
-                price: dec!(100.0),
-                size: dec!(1.0),
-                client_order_id: None,
-                order_id: "1".to_string(),
-                timestamp: 2,
-                fee: 0.0,
-                reason: crate::domain::FillReason::Normal,
-            })),
+            data: AccountData::Symbol(crate::messaging::SymbolAccountData::Fill(
+                crate::domain::Fill {
+                    exchange: EX,
+                    symbol: SYM.to_string(),
+                    side: crate::domain::Side::Long,
+                    price: dec!(100.0),
+                    size: dec!(1.0),
+                    client_order_id: None,
+                    order_id: "1".to_string(),
+                    timestamp: 2,
+                    fee: 0.0,
+                    reason: crate::domain::FillReason::Normal,
+                },
+            )),
         });
         eventually("成交后立刻发出读数", || {
             last().is_some_and(|v| v.exchange == EX && v.values.get(SYM) == Some(&300.0))
@@ -1672,9 +1792,7 @@ mod task_tests {
     struct Idle;
 
     impl crate::strategy::Strategy for Idle {
-        fn public_streams(
-            &self,
-        ) -> HashMap<Exchange, HashSet<crate::exchange::SubscriptionKind>> {
+        fn public_streams(&self) -> HashMap<Exchange, HashSet<crate::exchange::SubscriptionKind>> {
             HashMap::from([(
                 EX,
                 HashSet::from([crate::exchange::SubscriptionKind::BBO {
@@ -1698,9 +1816,9 @@ mod task_tests {
             &root.group("producers"),
             ExecutorArgs {
                 strategy: Box::new(Idle),
-                binding: crate::engine::live::AccountBinding::Live(crate::engine::live::LiveBaselines::for_test(vec![
-                    baseline(size),
-                ])),
+                binding: crate::engine::live::AccountBinding::Live(
+                    crate::engine::live::LiveBaselines::for_test(vec![baseline(size)]),
+                ),
                 symbol_metas: metas(),
                 client_order_ids: Default::default(),
                 outcome_bus: OutcomeBus::new("outcome"),
@@ -1734,7 +1852,10 @@ mod task_tests {
             .await
             .expect("executor 持仓与账本稳定分叉，账本必须致命退出");
         let err = root.shutdown().await.expect_err("应带着错误退出");
-        assert!(format!("{err:#}").contains("executor"), "报错要指明对手方: {err:#}");
+        assert!(
+            format!("{err:#}").contains("executor"),
+            "报错要指明对手方: {err:#}"
+        );
     }
 
     /// 撤出名单的 executor 不再比对（撤下流程里它会先停更再停机，不能被误判）；
@@ -1751,7 +1872,10 @@ mod task_tests {
         ledger.unwatch(wrong_id).await.unwrap();
 
         tokio::time::sleep(enough_rounds()).await;
-        assert!(!root.is_stopping(), "撤出名单的、或持仓一致的 executor 都不该打死账本");
+        assert!(
+            !root.is_stopping(),
+            "撤出名单的、或持仓一致的 executor 都不该打死账本"
+        );
         root.shutdown().await.expect("正常停机");
     }
 

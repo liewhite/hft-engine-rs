@@ -102,7 +102,10 @@ impl StrategyRunner {
     }
 
     /// 策略自己的观测读数（见 [`Strategy::gauges`]）
-    pub fn strategy_gauges(&self, now: crate::domain::Timestamp) -> Vec<crate::observability::Gauge> {
+    pub fn strategy_gauges(
+        &self,
+        now: crate::domain::Timestamp,
+    ) -> Vec<crate::observability::Gauge> {
         self.strategy.gauges(now)
     }
 
@@ -139,31 +142,47 @@ impl StrategyRunner {
         let now = event.local_ts();
         // 单一分发入口：一切事件（含 BorrowFee/ExchangeRate）都走 on_event，
         // 策略自行 match 关心的变体 —— 不存在第二套 typed 回调。
-        let raw = self.strategy.on_event(event, StrategyView::new(&self.state));
+        let raw = self
+            .strategy
+            .on_event(event, StrategyView::new(&self.state));
         let mut out = Vec::with_capacity(raw.len());
         for signal in raw {
             match signal {
                 OutcomeEvent::PlaceOrders { orders, comment } => {
                     let mut converted = Vec::with_capacity(orders.len());
                     for mut order in orders {
-                        order.client_order_id = self
-                            .id_gen
-                            .next_id(order.exchange)
-                            .ok_or_else(|| format!("策略对没有装配的交易所 {} 下单（{}）", order.exchange, order.symbol))?;
+                        order.client_order_id =
+                            self.id_gen.next_id(order.exchange).ok_or_else(|| {
+                                format!(
+                                    "策略对没有装配的交易所 {} 下单（{}）",
+                                    order.exchange, order.symbol
+                                )
+                            })?;
                         // 登记未取整的原始订单，与取整前的行为保持一致（策略比对自己
                         // 的挂单量时看到的仍是它请求的数量）
                         // created_at 取当前事件时刻 (回测=虚拟时间, 确定性), 不读墙钟
                         self.state.add_pending_order(order.clone(), now);
                         converted.push(self.round_to_exchange_precision(order));
                     }
-                    out.push(OutcomeEvent::PlaceOrders { orders: converted, comment });
+                    out.push(OutcomeEvent::PlaceOrders {
+                        orders: converted,
+                        comment,
+                    });
                 }
-                OutcomeEvent::CancelOrder { exchange, symbol, client_order_id } => {
-                    match self.state.mark_cancel_sent(&symbol, &client_order_id, now) {
-                        Ok(()) => out.push(OutcomeEvent::CancelOrder { exchange, symbol, client_order_id }),
-                        Err(why) => tracing::debug!(%exchange, %symbol, %client_order_id, why, "撤单不发出"),
+                OutcomeEvent::CancelOrder {
+                    exchange,
+                    symbol,
+                    client_order_id,
+                } => match self.state.mark_cancel_sent(&symbol, &client_order_id, now) {
+                    Ok(()) => out.push(OutcomeEvent::CancelOrder {
+                        exchange,
+                        symbol,
+                        client_order_id,
+                    }),
+                    Err(why) => {
+                        tracing::debug!(%exchange, %symbol, %client_order_id, why, "撤单不发出")
                     }
-                }
+                },
                 // 自定义事件原样放行：无订单语义，不登记 pending、不过精度取整
                 emit @ OutcomeEvent::Emit(_) => out.push(emit),
             }
@@ -207,15 +226,15 @@ impl StrategyRunner {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use super::*;
-    use crate::domain::{OrderType, Side, TimeInForce};
     use crate::domain::PriceStep;
+    use crate::domain::{OrderType, Side, TimeInForce};
     use crate::exchange::SubscriptionKind;
     use crate::messaging::{IncomeEvent, MarketData};
-    use std::collections::HashSet;
     use crate::strategy::{OutcomeEvent, Strategy};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    use std::collections::HashSet;
 
     const EX: Exchange = Exchange::OKX;
     const SYM: &str = "BTC";
@@ -289,7 +308,13 @@ mod tests {
             Box::new(SequentialClientOrderIdGen::default()),
         );
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);
-        match runner.on_event(&ev).expect("无报错").into_iter().next().expect("signal") {
+        match runner
+            .on_event(&ev)
+            .expect("无报错")
+            .into_iter()
+            .next()
+            .expect("signal")
+        {
             OutcomeEvent::PlaceOrders { orders, .. } => orders.into_iter().next().unwrap(),
             other => panic!("unexpected {other:?}"),
         }
@@ -327,8 +352,15 @@ mod tests {
         );
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);
         runner.on_event(&ev).unwrap();
-        let state = runner.state().symbol_state(&SYM.to_string()).expect("state");
-        let pending: Vec<Decimal> = state.order_book().iter().map(|p| p.order.quantity).collect();
+        let state = runner
+            .state()
+            .symbol_state(&SYM.to_string())
+            .expect("state");
+        let pending: Vec<Decimal> = state
+            .order_book()
+            .iter()
+            .map(|p| p.order.quantity)
+            .collect();
         assert_eq!(pending, vec![dec!(0.125)]);
     }
 
@@ -370,11 +402,13 @@ mod tests {
                 crate::domain::AccountId::Live,
                 0,
                 0,
-                crate::messaging::AccountData::Exchange(crate::messaging::ExchangeAccountData::AccountInfo {
-                    exchange,
-                    equity: 1.0,
-                    notional: 0.0,
-                }),
+                crate::messaging::AccountData::Exchange(
+                    crate::messaging::ExchangeAccountData::AccountInfo {
+                        exchange,
+                        equity: 1.0,
+                        notional: 0.0,
+                    },
+                ),
             )
         };
 

@@ -123,7 +123,10 @@ impl Ledger {
     }
 
     /// 各 symbol 持仓价值 = |持仓| × 估值价（与实盘账本的 `PositionValues` 同一含义，#759）
-    pub fn position_values(&self, mark_of: impl Fn(&Symbol) -> f64) -> std::collections::HashMap<Symbol, f64> {
+    pub fn position_values(
+        &self,
+        mark_of: impl Fn(&Symbol) -> f64,
+    ) -> std::collections::HashMap<Symbol, f64> {
         self.positions
             .iter()
             .map(|(symbol, p)| (symbol.clone(), to_f64(p.size.abs()) * mark_of(symbol)))
@@ -169,7 +172,10 @@ mod tests {
         l.positions.get(&sym()).map_or(Quantity::ZERO, |p| p.size)
     }
     fn entry_of(l: &Ledger) -> f64 {
-        l.positions.get(&sym()).map(|p| p.entry_price).unwrap_or(0.0)
+        l.positions
+            .get(&sym())
+            .map(|p| p.entry_price)
+            .unwrap_or(0.0)
     }
 
     #[test]

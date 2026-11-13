@@ -150,8 +150,14 @@ mod tests {
         let err = guard
             .check_failure("connection refused")
             .expect_err("停摆超过上限仍被当成可重试 —— 消费方会一直用旧读数决策");
-        assert!(err.contains("Binance 账户净值"), "错误应指明是哪个数据源: {err}");
-        assert!(err.contains("connection refused"), "应保留最后一次失败原因: {err}");
+        assert!(
+            err.contains("Binance 账户净值"),
+            "错误应指明是哪个数据源: {err}"
+        );
+        assert!(
+            err.contains("connection refused"),
+            "应保留最后一次失败原因: {err}"
+        );
     }
 
     /// 一次成功即重置窗口：间歇性失败不会累积成假的"长期停摆"

@@ -141,7 +141,7 @@ impl HlMarkets {
                 size_step: size_step(a.sz_decimals),
                 min_order_size: size_step(a.sz_decimals), // 最小下单量为一个精度单位
                 min_notional: MIN_ORDER_NOTIONAL,
-                contract_size: Decimal::ONE,              // 币本位，合约乘数为 1
+                contract_size: Decimal::ONE, // 币本位，合约乘数为 1
             })
             .collect()
     }
@@ -153,13 +153,21 @@ pub(crate) fn dex_of_coin(coin: &str) -> &str {
 }
 
 /// 由 `perpDexs` 响应求某 dex 的资产编号偏移。列表第 0 项是主站（`null`）。
-pub(crate) fn dex_offset(perp_dexs: &[Option<serde_json::Value>], dex: &str) -> Result<u32, String> {
+pub(crate) fn dex_offset(
+    perp_dexs: &[Option<serde_json::Value>],
+    dex: &str,
+) -> Result<u32, String> {
     if dex.is_empty() {
         return Ok(0);
     }
     let idx = perp_dexs
         .iter()
-        .position(|e| e.as_ref().and_then(|v| v.get("name")).and_then(|n| n.as_str()) == Some(dex))
+        .position(|e| {
+            e.as_ref()
+                .and_then(|v| v.get("name"))
+                .and_then(|n| n.as_str())
+                == Some(dex)
+        })
         .ok_or_else(|| format!("HL perpDexs 里没有 dex \"{dex}\""))?;
     Ok(BUILDER_DEX_ASSET_BASE + idx as u32 * BUILDER_DEX_ASSET_STEP)
 }
@@ -194,7 +202,10 @@ impl PriceRule for HlSigFigs {
         let lead_exp = digits - 1 - p.scale() as i64;
         let sig_fig_decimals = (4 - lead_exp).max(0) as u32;
         let max_decimals = 6_u32.saturating_sub(self.sz_decimals);
-        price.round_dp_with_strategy(sig_fig_decimals.min(max_decimals), RoundingStrategy::MidpointAwayFromZero)
+        price.round_dp_with_strategy(
+            sig_fig_decimals.min(max_decimals),
+            RoundingStrategy::MidpointAwayFromZero,
+        )
     }
 }
 
@@ -212,7 +223,10 @@ mod tests {
 
     /// 实测 perpDexs 的开头（2026-11）：主站是 null，xyz 下标 1、flx 下标 2
     fn perp_dexs() -> Vec<Option<serde_json::Value>> {
-        serde_json::from_str(r#"[null,{"name":"xyz","fullName":"XYZ"},{"name":"flx","fullName":"Felix"}]"#).unwrap()
+        serde_json::from_str(
+            r#"[null,{"name":"xyz","fullName":"XYZ"},{"name":"flx","fullName":"Felix"}]"#,
+        )
+        .unwrap()
     }
 
     fn two_dex_markets() -> HlMarkets {
@@ -230,7 +244,11 @@ mod tests {
                     info("xyz:XYZ100", 4, ""),
                     info("xyz:TSLA", 3, ""),
                     // 实测：已下架且只许逐仓，与主站 STX 同名
-                    info("xyz:STX", 2, r#","isDelisted":true,"onlyIsolated":true,"marginMode":"noCross""#),
+                    info(
+                        "xyz:STX",
+                        2,
+                        r#","isDelisted":true,"onlyIsolated":true,"marginMode":"noCross""#,
+                    ),
                     info("xyz:AAPL", 3, r#","marginMode":"noCross""#),
                 ],
             },
@@ -249,7 +267,10 @@ mod tests {
         let m = two_dex_markets();
         assert_eq!(m.asset(&"ETH".into()).unwrap().asset, 1);
         let tsla = m.asset(&"TSLA".into()).unwrap();
-        assert_eq!((tsla.asset, tsla.coin.as_str(), tsla.dex.as_str()), (110_001, "xyz:TSLA", "xyz"));
+        assert_eq!(
+            (tsla.asset, tsla.coin.as_str(), tsla.dex.as_str()),
+            (110_001, "xyz:TSLA", "xyz")
+        );
     }
 
     #[test]
@@ -283,8 +304,16 @@ mod tests {
     #[test]
     fn same_symbol_on_two_connected_dexes_is_rejected() {
         let err = HlMarkets::build(vec![
-            DexUniverse { dex: String::new(), offset: 0, universe: vec![info("GOLD", 2, "")] },
-            DexUniverse { dex: "xyz".into(), offset: 110_000, universe: vec![info("xyz:GOLD", 2, "")] },
+            DexUniverse {
+                dex: String::new(),
+                offset: 0,
+                universe: vec![info("GOLD", 2, "")],
+            },
+            DexUniverse {
+                dex: "xyz".into(),
+                offset: 110_000,
+                universe: vec![info("xyz:GOLD", 2, "")],
+            },
         ])
         .unwrap_err();
         assert!(err.contains("GOLD") && err.contains("xyz:GOLD"), "{err}");

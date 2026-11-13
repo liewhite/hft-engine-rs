@@ -23,7 +23,10 @@ mod tests {
     #[test]
     fn only_configured_quote_perpetual_maps() {
         assert_eq!(from_binance("BTCUSDT", "USDT").as_deref(), Some("BTC"));
-        assert_eq!(from_binance("1000PEPEUSDT", "USDT").as_deref(), Some("1000PEPE"));
+        assert_eq!(
+            from_binance("1000PEPEUSDT", "USDT").as_deref(),
+            Some("1000PEPE")
+        );
         for other in ["BTCUSDC", "BTCUSDT_251226", "USDT", "BTCUSD_PERP"] {
             assert_eq!(from_binance(other, "USDT"), None, "{other}");
         }

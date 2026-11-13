@@ -20,8 +20,8 @@
 //! 宿主机给的编号它不信）。编号由 client 从 meta 解析一次、缓存，两个字段各取所需。
 
 use super::signing::{
-    action_hash, create_signer, sign_l1_action, BulkOrderAction, CancelByCloidAction, CancelByCloidWire,
-    ExchangeRequest, LimitOrder, OrderType as WireOrderType, OrderWire,
+    action_hash, create_signer, sign_l1_action, BulkOrderAction, CancelByCloidAction,
+    CancelByCloidWire, ExchangeRequest, LimitOrder, OrderType as WireOrderType, OrderWire,
 };
 use crate::domain::{now_ms, Decimal, Exchange, ExchangeError, PlaceError};
 use crate::exchange::client::place_send_error;
@@ -86,7 +86,11 @@ pub(crate) struct HlCancelIntent {
 #[async_trait]
 pub(crate) trait HlSubmitter: Send + Sync {
     async fn place(&self, order: &HlOrderIntent, admitted: Admitted) -> Result<Value, PlaceError>;
-    async fn cancel(&self, cancel: &HlCancelIntent, admitted: Admitted) -> Result<Value, ExchangeError>;
+    async fn cancel(
+        &self,
+        cancel: &HlCancelIntent,
+        admitted: Admitted,
+    ) -> Result<Value, ExchangeError>;
 }
 
 /// 价格 / 数量 → HL 规范小数字符串，与 hyperliquid-python-sdk 的 `float_to_wire` 同口径：
@@ -99,9 +103,15 @@ pub(crate) fn decimal_to_wire(x: Decimal) -> Result<String, ExchangeError> {
         return Err(ExchangeError::Other(format!("HL 价格/数量非法: {x}")));
     }
     if x.scale() > 8 {
-        return Err(ExchangeError::Other(format!("HL 价格/数量超过 8 位小数: {x}")));
+        return Err(ExchangeError::Other(format!(
+            "HL 价格/数量超过 8 位小数: {x}"
+        )));
     }
-    Ok(if x.is_zero() { "0".to_string() } else { x.to_string() })
+    Ok(if x.is_zero() {
+        "0".to_string()
+    } else {
+        x.to_string()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -125,10 +135,19 @@ impl LocalKeySubmitter {
     ) -> Result<Self, ExchangeError> {
         let signer = create_signer(private_key)
             .map_err(|e| ExchangeError::Other(format!("Failed to create signer: {e}")))?;
-        Ok(Self { http, base_url, signer, is_mainnet })
+        Ok(Self {
+            http,
+            base_url,
+            signer,
+            is_mainnet,
+        })
     }
 
-    async fn sign_and_post<A: serde::Serialize>(&self, action: &A, admitted: Admitted) -> Result<Value, PlaceError> {
+    async fn sign_and_post<A: serde::Serialize>(
+        &self,
+        action: &A,
+        admitted: Admitted,
+    ) -> Result<Value, PlaceError> {
         let nonce = next_nonce(now_ms());
         let connection_id = action_hash(action, nonce, None)
             .map_err(|e| PlaceError::unsent(format!("Action hash failed: {e}")))?;
@@ -142,7 +161,13 @@ impl LocalKeySubmitter {
             signature: signature.to_api_format(),
             vault_address: None,
         };
-        post_json(&self.http, &format!("{}/exchange", self.base_url), &request, admitted).await
+        post_json(
+            &self.http,
+            &format!("{}/exchange", self.base_url),
+            &request,
+            admitted,
+        )
+        .await
     }
 }
 
@@ -155,15 +180,22 @@ impl HlSubmitter for LocalKeySubmitter {
             limit_px: o.limit_px.clone(),
             sz: o.sz.clone(),
             reduce_only: o.reduce_only,
-            order_type: WireOrderType::Limit(LimitOrder { tif: o.tif.as_str().to_string() }),
+            order_type: WireOrderType::Limit(LimitOrder {
+                tif: o.tif.as_str().to_string(),
+            }),
             cloid: o.cloid.clone(),
         }]);
         self.sign_and_post(&action, admitted).await
     }
 
     async fn cancel(&self, c: &HlCancelIntent, admitted: Admitted) -> Result<Value, ExchangeError> {
-        let action = CancelByCloidAction::new(vec![CancelByCloidWire { asset: c.asset, cloid: c.cloid.clone() }]);
-        self.sign_and_post(&action, admitted).await.map_err(cancel_error)
+        let action = CancelByCloidAction::new(vec![CancelByCloidWire {
+            asset: c.asset,
+            cloid: c.cloid.clone(),
+        }]);
+        self.sign_and_post(&action, admitted)
+            .await
+            .map_err(cancel_error)
     }
 }
 
@@ -193,7 +225,12 @@ fn cancel_error(e: PlaceError) -> ExchangeError {
 }
 
 /// POST JSON 到 HL `/exchange`，HTTP 层的失败按 [`classify_hl_http`] 归类。
-async fn post_json<B: serde::Serialize>(http: &Client, url: &str, body: &B, admitted: Admitted) -> Result<Value, PlaceError> {
+async fn post_json<B: serde::Serialize>(
+    http: &Client,
+    url: &str,
+    body: &B,
+    admitted: Admitted,
+) -> Result<Value, PlaceError> {
     let resp = crate::net::send(http.post(url).json(body), admitted)
         .await
         .map_err(|e| place_send_error(Exchange::Hyperliquid, e))?;
@@ -210,10 +247,15 @@ async fn post_json<B: serde::Serialize>(http: &Client, url: &str, body: &B, admi
 fn classify_hl_http(status: u16, text: &str) -> Result<Value, PlaceError> {
     let body: String = text.chars().take(300).collect();
     match status {
-        200..=299 => serde_json::from_str(text)
-            .map_err(|e| PlaceError::indeterminate(format!("HL /exchange 回复不是 JSON: {e} (body: {body})"))),
-        400..=499 if status != 408 => Err(PlaceError::rejected(format!("HL HTTP {status}: {body}"))),
-        _ => Err(PlaceError::indeterminate(format!("HL HTTP {status}: {body}"))),
+        200..=299 => serde_json::from_str(text).map_err(|e| {
+            PlaceError::indeterminate(format!("HL /exchange 回复不是 JSON: {e} (body: {body})"))
+        }),
+        400..=499 if status != 408 => {
+            Err(PlaceError::rejected(format!("HL HTTP {status}: {body}")))
+        }
+        _ => Err(PlaceError::indeterminate(format!(
+            "HL HTTP {status}: {body}"
+        ))),
     }
 }
 
@@ -232,21 +274,30 @@ pub(crate) struct EnclaveSubmitter {
 
 impl EnclaveSubmitter {
     pub(crate) fn new(http: Client, url: String) -> Self {
-        Self { http, url: url.trim_end_matches('/').to_string() }
+        Self {
+            http,
+            url: url.trim_end_matches('/').to_string(),
+        }
     }
 
     async fn exchange(&self, intent: Value, admitted: Admitted) -> Result<Value, PlaceError> {
-        let resp = crate::net::send(self.http.post(format!("{}/exchange", self.url)).json(&json!({ "intent": intent })), admitted)
-            .await
-            // 连不上 hostd（is_connect）= 请求没送到，确定没提交；其余可能已提交
-            .map_err(|e| place_send_error(Exchange::Hyperliquid, e))?;
+        let resp = crate::net::send(
+            self.http
+                .post(format!("{}/exchange", self.url))
+                .json(&json!({ "intent": intent })),
+            admitted,
+        )
+        .await
+        // 连不上 hostd（is_connect）= 请求没送到，确定没提交；其余可能已提交
+        .map_err(|e| place_send_error(Exchange::Hyperliquid, e))?;
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| PlaceError::indeterminate(format!("signer 读回复失败 (HTTP {status}): {e}")))?;
+        let text = resp.text().await.map_err(|e| {
+            PlaceError::indeterminate(format!("signer 读回复失败 (HTTP {status}): {e}"))
+        })?;
         let body: Value = serde_json::from_str(&text).map_err(|e| {
-            PlaceError::indeterminate(format!("signer 回复不是 JSON: {e} (HTTP {status}, body: {text})"))
+            PlaceError::indeterminate(format!(
+                "signer 回复不是 JSON: {e} (HTTP {status}, body: {text})"
+            ))
         })?;
         classify_signer_reply(status, body)
     }
@@ -254,13 +305,16 @@ impl EnclaveSubmitter {
 
 /// 按签名机的 HTTP 状态归类（表见 integration.md 第 4 节）。纯函数，便于测试。
 fn classify_signer_reply(status: u16, body: Value) -> Result<Value, PlaceError> {
-    let err = body.get("error").and_then(Value::as_str).unwrap_or("").to_string();
+    let err = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     match status {
         // 200 却没有 response：签名机可能已提交，结果不确定
-        200 => body
-            .get("response")
-            .cloned()
-            .ok_or_else(|| PlaceError::indeterminate(format!("signer 200 但没有 response: {body}"))),
+        200 => body.get("response").cloned().ok_or_else(|| {
+            PlaceError::indeterminate(format!("signer 200 但没有 response: {body}"))
+        }),
         // 违反风控 / 格式错：确定没签、没提交
         422 => Err(PlaceError::rejected(format!("signer 拒签: {err}"))),
         // 已签名但提交 HL 失败（有 signed）：单可能已到 HL，结果不确定
@@ -270,7 +324,9 @@ fn classify_signer_reply(status: u16, body: Value) -> Result<Value, PlaceError> 
         // 连不上 enclave（无 signed）：没签名就不可能提交
         502 => Err(PlaceError::unsent(format!("signer 连不上 enclave: {err}"))),
         // 其余（500 审计失败等）：说不清走到了哪一步
-        _ => Err(PlaceError::indeterminate(format!("signer HTTP {status}: {err}"))),
+        _ => Err(PlaceError::indeterminate(format!(
+            "signer HTTP {status}: {err}"
+        ))),
     }
 }
 
@@ -288,13 +344,20 @@ impl HlSubmitter for EnclaveSubmitter {
         if let Some(cloid) = &o.cloid {
             order["cloid"] = json!(cloid);
         }
-        self.exchange(json!({"type": "order", "grouping": "na", "orders": [order]}), admitted).await
+        self.exchange(
+            json!({"type": "order", "grouping": "na", "orders": [order]}),
+            admitted,
+        )
+        .await
     }
 
     async fn cancel(&self, c: &HlCancelIntent, admitted: Admitted) -> Result<Value, ExchangeError> {
-        self.exchange(json!({"type": "cancelByCloid", "cancels": [{"coin": c.coin, "cloid": c.cloid}]}), admitted)
-            .await
-            .map_err(cancel_error)
+        self.exchange(
+            json!({"type": "cancelByCloid", "cancels": [{"coin": c.coin, "cloid": c.cloid}]}),
+            admitted,
+        )
+        .await
+        .map_err(cancel_error)
     }
 }
 
@@ -324,7 +387,8 @@ mod tests {
     #[test]
     fn signer_200_yields_raw_hl_reply() {
         let hl = json!({"status": "ok", "response": {"type": "order"}});
-        let got = classify_signer_reply(200, json!({"signed": {}, "response": hl.clone()})).unwrap();
+        let got =
+            classify_signer_reply(200, json!({"signed": {}, "response": hl.clone()})).unwrap();
         assert_eq!(got, hl);
     }
 
@@ -343,7 +407,10 @@ mod tests {
             (200, json!({"signed": {}})),
         ] {
             let e = classify_signer_reply(status, body.clone()).unwrap_err();
-            assert!(matches!(e, PlaceError::Indeterminate(_)), "{status} {body}: {e:?}");
+            assert!(
+                matches!(e, PlaceError::Indeterminate(_)),
+                "{status} {body}: {e:?}"
+            );
         }
         let e = classify_signer_reply(502, json!({"error": "vsock"})).unwrap_err();
         assert!(matches!(e, PlaceError::Rejected(_)), "{e:?}");
@@ -354,9 +421,14 @@ mod tests {
     fn nonces_never_repeat_within_a_millisecond() {
         let now = now_ms() + 10_000_000; // 远高于别的测试可能用过的值
         let handles: Vec<_> = (0..8)
-            .map(|_| std::thread::spawn(move || (0..1000).map(|_| next_nonce(now)).collect::<Vec<_>>()))
+            .map(|_| {
+                std::thread::spawn(move || (0..1000).map(|_| next_nonce(now)).collect::<Vec<_>>())
+            })
             .collect();
-        let mut all: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let mut all: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
         all.sort_unstable();
         let n = all.len();
         all.dedup();
@@ -368,12 +440,33 @@ mod tests {
 
     #[test]
     fn hl_http_layer() {
-        assert_eq!(classify_hl_http(200, r#"{"status":"ok"}"#).unwrap(), json!({"status": "ok"}));
-        for (status, text) in [(200, "<html>"), (408, ""), (500, "oops"), (502, ""), (504, "")] {
-            assert!(matches!(classify_hl_http(status, text), Err(PlaceError::Indeterminate(_))), "{status}");
+        assert_eq!(
+            classify_hl_http(200, r#"{"status":"ok"}"#).unwrap(),
+            json!({"status": "ok"})
+        );
+        for (status, text) in [
+            (200, "<html>"),
+            (408, ""),
+            (500, "oops"),
+            (502, ""),
+            (504, ""),
+        ] {
+            assert!(
+                matches!(
+                    classify_hl_http(status, text),
+                    Err(PlaceError::Indeterminate(_))
+                ),
+                "{status}"
+            );
         }
-        for (status, text) in [(422, "Failed to deserialize the JSON body"), (429, "rate limited")] {
-            assert!(matches!(classify_hl_http(status, text), Err(PlaceError::Rejected(_))), "{status}");
+        for (status, text) in [
+            (422, "Failed to deserialize the JSON body"),
+            (429, "rate limited"),
+        ] {
+            assert!(
+                matches!(classify_hl_http(status, text), Err(PlaceError::Rejected(_))),
+                "{status}"
+            );
         }
     }
 }

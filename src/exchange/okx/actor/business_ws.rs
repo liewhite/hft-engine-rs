@@ -6,11 +6,11 @@
 //! - 收到订阅时先通过 REST 获取 100 根历史 K线并发布，再 WS 订阅实时推送
 //! - 直接解析消息并发布到行情总线
 
-use crate::domain::{CandleInterval, now_ms, Exchange, ExchangeError, Symbol};
+use crate::domain::{now_ms, CandleInterval, Exchange, ExchangeError, Symbol};
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
 use crate::exchange::okx::codec::{
-    CandleRawData, WsPush, candle_interval_to_okx_bar, okx_channel_to_candle_interval,
-    parse_candle_data,
+    candle_interval_to_okx_bar, okx_channel_to_candle_interval, parse_candle_data, CandleRawData,
+    WsPush,
 };
 use crate::exchange::okx::{to_okx, REST_BASE_URL, WS_BUSINESS_URL};
 use crate::exchange::ws_loop::{self, WsConn};
@@ -51,7 +51,13 @@ impl OkxBusinessWs {
                     .await
                     .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
                 let (write, read) = ws_stream.split();
-                let conn = WsConn::spawn(&scope.group("conn"), "OkxBusinessWsLoop", read, write, ws_loop::WsKeepalive::okx())?;
+                let conn = WsConn::spawn(
+                    &scope.group("conn"),
+                    "OkxBusinessWsLoop",
+                    read,
+                    write,
+                    ws_loop::WsKeepalive::okx(),
+                )?;
 
                 let http_client = crate::exchange::client::exchange_http_client(Exchange::OKX)?;
 
@@ -85,7 +91,9 @@ impl OkxBusinessWs {
     /// 发送 WS 取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
         let arg = kind_to_business_arg(kind, &self.quote).ok_or_else(|| {
-            WsError::ParseError("Non-Candle kind reached OkxBusinessWs unsubscribe (routing bug)".to_string())
+            WsError::ParseError(
+                "Non-Candle kind reached OkxBusinessWs unsubscribe (routing bug)".to_string(),
+            )
         })?;
         let msg = json!({
             "op": "unsubscribe",
@@ -119,23 +127,29 @@ impl OkxBusinessWs {
             .query(&[crate::exchange::okx::CANDLES.cost(1)])
             .await
             .map_err(|e| WsError::Network(e.to_string()))?;
-        let resp = crate::net::send(self.http_client.get(&url), admitted).await
+        let resp = crate::net::send(self.http_client.get(&url), admitted)
+            .await
             .map_err(|e| WsError::Network(format!("History candles request failed: {}", e)))?;
 
-        let data: Response = resp.json().await
+        let data: Response = resp
+            .json()
+            .await
             .map_err(|e| WsError::ParseError(format!("History candles parse failed: {}", e)))?;
 
         if data.code != "0" {
             return Err(WsError::ParseError(format!(
-                "OKX history candles API error: code={}, msg={}", data.code, data.msg
+                "OKX history candles API error: code={}, msg={}",
+                data.code, data.msg
             )));
         }
 
         // OKX 返回的数据按时间倒序，反转为正序
-        let mut candles: Vec<_> = data.data.iter().rev()
+        let mut candles: Vec<_> = data
+            .data
+            .iter()
+            .rev()
             .map(|raw| parse_candle_data(raw, &inst_id, &self.quote, interval))
-            .collect::<Result<Vec<_>, _>>()
-            ?;
+            .collect::<Result<Vec<_>, _>>()?;
 
         // 最新一条若未 confirm 则删除（WS 实时推送会补上）
         if candles.last().is_some_and(|c| !c.confirm) {
@@ -197,8 +211,9 @@ impl OkxBusinessWs {
             if self.subscribed.contains(&kind) {
                 continue;
             }
-            let arg = kind_to_business_arg(&kind, &self.quote)
-                .ok_or_else(|| anyhow::anyhow!("非 K 线订阅被路由到 OkxBusinessWs（路由 bug）: {kind:?}"))?;
+            let arg = kind_to_business_arg(&kind, &self.quote).ok_or_else(|| {
+                anyhow::anyhow!("非 K 线订阅被路由到 OkxBusinessWs（路由 bug）: {kind:?}")
+            })?;
             new_args.push(arg);
             new_kinds.push(kind);
         }
@@ -260,7 +275,11 @@ impl Task for OkxBusinessWs {
 // 消息解析
 // ============================================================================
 
-fn parse_business_message(raw: &str, quote: &str, local_ts: u64) -> Result<Vec<MarketEvent>, WsError> {
+fn parse_business_message(
+    raw: &str,
+    quote: &str,
+    local_ts: u64,
+) -> Result<Vec<MarketEvent>, WsError> {
     // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
     if raw == "pong" {
         return Ok(Vec::new());
@@ -273,8 +292,14 @@ fn parse_business_message(raw: &str, quote: &str, local_ts: u64) -> Result<Vec<M
         match event {
             "subscribe" | "unsubscribe" => return Ok(Vec::new()),
             "error" => {
-                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let code = value
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let msg = value
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 return Err(WsError::ParseError(format!(
                     "OKX business error: code={}, msg={}",
                     code, msg
@@ -303,8 +328,7 @@ fn parse_business_message(raw: &str, quote: &str, local_ts: u64) -> Result<Vec<M
 
         let mut events = Vec::new();
         for raw_data in &push.data {
-            let candle = parse_candle_data(raw_data, inst_id, quote, interval)
-                ?;
+            let candle = parse_candle_data(raw_data, inst_id, quote, interval)?;
             events.push(MarketEvent {
                 exchange_ts: candle.open_time,
                 local_ts,

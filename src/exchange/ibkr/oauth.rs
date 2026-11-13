@@ -55,8 +55,9 @@ impl IbkrOAuth {
 
         let encryption_key: RsaPrivateKey = rsa::pkcs8::DecodePrivateKey::from_pkcs8_pem(&enc_pem)
             .map_err(|e| anyhow::anyhow!("Failed to parse encryption key: {}", e))?;
-        let signature_key: RsaPrivateKey = rsa::pkcs8::DecodePrivateKey::from_pkcs8_pem(&sig_pem)
-            .map_err(|e| anyhow::anyhow!("Failed to parse signature key: {}", e))?;
+        let signature_key: RsaPrivateKey =
+            rsa::pkcs8::DecodePrivateKey::from_pkcs8_pem(&sig_pem)
+                .map_err(|e| anyhow::anyhow!("Failed to parse signature key: {}", e))?;
 
         // RSA-PKCS1v15 解密 access_token_secret
         let access_token_secret_bytes = general_purpose::STANDARD
@@ -133,8 +134,7 @@ impl IbkrAuth for IbkrOAuth {
 
         // HMAC-SHA256 签名
         let lst_bytes = general_purpose::STANDARD.decode(&self.live_session_token)?;
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&lst_bytes).expect("HMAC accepts any size");
+        let mut mac = Hmac::<Sha256>::new_from_slice(&lst_bytes).expect("HMAC accepts any size");
         mac.update(base_string.as_bytes());
         let signature = url_encode(&general_purpose::STANDARD.encode(mac.finalize().into_bytes()));
 
@@ -203,8 +203,7 @@ async fn dh_exchange(
         ("diffie_hellman_challenge", dh_challenge_hex),
     ];
 
-    let base_string =
-        generate_base_string("POST", &url, &headers, None, Some(prepend_hex));
+    let base_string = generate_base_string("POST", &url, &headers, None, Some(prepend_hex));
 
     // RSA-SHA256 签名
     let signature = rsa_sha256_sign(signature_key, &base_string)?;
@@ -221,7 +220,7 @@ async fn dh_exchange(
         admitted,
     )
     .await
-        .map_err(|e| anyhow::anyhow!("LST request failed: {}", e))?;
+    .map_err(|e| anyhow::anyhow!("LST request failed: {}", e))?;
 
     let status = resp.status();
     let resp_text = resp
@@ -246,9 +245,7 @@ async fn dh_exchange(
         .ok_or_else(|| anyhow::anyhow!("Missing diffie_hellman_response in LST response"))?;
     let lst_signature = body["live_session_token_signature"]
         .as_str()
-        .ok_or_else(|| {
-            anyhow::anyhow!("Missing live_session_token_signature in LST response")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("Missing live_session_token_signature in LST response"))?;
 
     let dh_response = BigUint::parse_bytes(dh_response_hex.as_bytes(), 16)
         .ok_or_else(|| anyhow::anyhow!("Failed to parse dh_response"))?;
@@ -263,9 +260,8 @@ async fn dh_exchange(
     let lst = general_purpose::STANDARD.encode(hmac_sha1.finalize().into_bytes());
 
     // 7. 验证 live_session_token_signature
-    let mut verify_hmac =
-        Hmac::<Sha1>::new_from_slice(&general_purpose::STANDARD.decode(&lst)?)
-            .expect("HMAC accepts any size");
+    let mut verify_hmac = Hmac::<Sha1>::new_from_slice(&general_purpose::STANDARD.decode(&lst)?)
+        .expect("HMAC accepts any size");
     verify_hmac.update(consumer_key.as_bytes());
     let computed_sig = hex::encode(verify_hmac.finalize().into_bytes());
 

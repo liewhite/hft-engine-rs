@@ -76,7 +76,11 @@ impl CustomEvent {
     }
 
     /// 带 `(exchange, symbol)` scope 的自定义事件：只投递给订阅了该 symbol 的 executor
-    pub fn for_symbol<T: Any + Send + Sync>(exchange: Exchange, symbol: Symbol, payload: T) -> Self {
+    pub fn for_symbol<T: Any + Send + Sync>(
+        exchange: Exchange,
+        symbol: Symbol,
+        payload: T,
+    ) -> Self {
         Self {
             scope: Some((exchange, symbol)),
             name: std::any::type_name::<T>(),
@@ -369,7 +373,6 @@ impl AccountData {
     }
 }
 
-
 // ============================================================================
 // 统一视图（策略 / 状态层）
 // ============================================================================
@@ -519,8 +522,15 @@ mod custom_event_tests {
     fn downcast_roundtrip_and_type_mismatch() {
         let ev = CustomEvent::new(AlphaSignal { score: 0.7 });
         assert_eq!(ev.get::<AlphaSignal>(), Some(&AlphaSignal { score: 0.7 }));
-        assert!(ev.get::<OtherType>().is_none(), "类型不符必须得 None，而不是错误的值");
-        assert!(ev.name.contains("AlphaSignal"), "name 供日志定位: {}", ev.name);
+        assert!(
+            ev.get::<OtherType>().is_none(),
+            "类型不符必须得 None，而不是错误的值"
+        );
+        assert!(
+            ev.name.contains("AlphaSignal"),
+            "name 供日志定位: {}",
+            ev.name
+        );
     }
 
     /// 带 scope 的自定义事件走既有的 (exchange, symbol) 定向路由 —— 复用订阅关系，

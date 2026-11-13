@@ -87,7 +87,8 @@ impl BinanceHistorySource {
         for symbol in &self.symbols {
             let binance_symbol = to_binance(symbol, &self.quote);
             for kind in &self.kinds {
-                let key = BinanceHistoryDownloader::daily_key(kind.key(), &binance_symbol, &date_str);
+                let key =
+                    BinanceHistoryDownloader::daily_key(kind.key(), &binance_symbol, &date_str);
                 let bytes = self
                     .downloader
                     .fetch(&key)

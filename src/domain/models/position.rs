@@ -55,7 +55,6 @@ impl Position {
             exchange,
             symbol,
             size: Quantity::ZERO,
-
         }
     }
 

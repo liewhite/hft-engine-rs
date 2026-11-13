@@ -60,10 +60,15 @@ impl SubscriptionBook {
     /// 在订阅时就被跳过），走到这里还查不到属路由 bug
     fn subscription(&self, kind: &SubscriptionKind) -> Result<serde_json::Value, WsError> {
         let channel = kind_channel(kind).ok_or_else(|| {
-            WsError::ParseError(format!("{kind:?} reached HyperliquidPublicWs (routing bug)"))
+            WsError::ParseError(format!(
+                "{kind:?} reached HyperliquidPublicWs (routing bug)"
+            ))
         })?;
         let coin = self.markets.coin(kind.symbol()).ok_or_else(|| {
-            WsError::ParseError(format!("{} 不在 HL 品种目录里 (routing bug)", kind.symbol()))
+            WsError::ParseError(format!(
+                "{} 不在 HL 品种目录里 (routing bug)",
+                kind.symbol()
+            ))
         })?;
         Ok(json!({"type": channel, "coin": coin}))
     }
@@ -84,7 +89,11 @@ impl SubscriptionBook {
 
     /// 底层 stream 标识（同一 stream 可被多个 kind 共用，用于去重）
     fn stream(&self, kind: &SubscriptionKind) -> Option<String> {
-        Some(format!("{}:{}", kind_channel(kind)?, self.markets.coin(kind.symbol())?))
+        Some(format!(
+            "{}:{}",
+            kind_channel(kind)?,
+            self.markets.coin(kind.symbol())?
+        ))
     }
 
     /// 该事件是否为 trades 订阅前的历史回填 (仅 MarketTrade 适用)。
@@ -120,14 +129,26 @@ impl HyperliquidPublicWs {
         markets: Arc<HlMarkets>,
     ) -> anyhow::Result<Addr<ExchangeCmd>> {
         let (_, addr) = group
-            .spawn_addressed("HyperliquidPublicWs", move |scope: Scope, inbox| async move {
-                // 启动时连不上即启动失败（受控退出）；运行中断线由 run 原地重连（#762）
-                let conn =
-                    ReconnectingWs::connect(scope.group("conn"), "HyperliquidPublicWs", WS_URL, WsKeepalive::hyperliquid())
-                        .await?;
-                tracing::info!("HyperliquidPublicWs started");
-                Ok(Self { inbox, conn, market_bus, book: SubscriptionBook::new(markets) })
-            })
+            .spawn_addressed(
+                "HyperliquidPublicWs",
+                move |scope: Scope, inbox| async move {
+                    // 启动时连不上即启动失败（受控退出）；运行中断线由 run 原地重连（#762）
+                    let conn = ReconnectingWs::connect(
+                        scope.group("conn"),
+                        "HyperliquidPublicWs",
+                        WS_URL,
+                        WsKeepalive::hyperliquid(),
+                    )
+                    .await?;
+                    tracing::info!("HyperliquidPublicWs started");
+                    Ok(Self {
+                        inbox,
+                        conn,
+                        market_bus,
+                        book: SubscriptionBook::new(markets),
+                    })
+                },
+            )
             .await?;
         Ok(addr)
     }
@@ -154,7 +175,10 @@ impl HyperliquidPublicWs {
 
     /// 断线重连：重发全部订阅；trades 订阅时刻一并刷新（重订阅后 HL 又会先推一批历史回填）
     async fn reconnect(&mut self, scope: &Scope) -> anyhow::Result<bool> {
-        let subscriptions = self.book.all_subscriptions().context("Hyperliquid 重连时生成订阅报文")?;
+        let subscriptions = self
+            .book
+            .all_subscriptions()
+            .context("Hyperliquid 重连时生成订阅报文")?;
         if !self.conn.reconnect(scope, subscriptions).await {
             return Ok(false);
         }
@@ -224,7 +248,9 @@ impl HyperliquidPublicWs {
         let subscribed_at = now_ms();
         for kind in new_kinds {
             if let SubscriptionKind::Trades { symbol } = &kind {
-                self.book.trades_subscribed_at.insert(symbol.clone(), subscribed_at);
+                self.book
+                    .trades_subscribed_at
+                    .insert(symbol.clone(), subscribed_at);
             }
             self.book.subscribed_kinds.insert(kind);
         }
@@ -242,7 +268,10 @@ impl HyperliquidPublicWs {
         // 检查是否还有其他 kinds 使用同一个 stream
         // Candle 从不进入 subscribed_kinds（订阅期已跳过），此处若为 None 属路由 bug，记录并跳过
         let Some(stream) = self.book.stream(&kind) else {
-            tracing::error!(?kind, "Candle routed to HyperliquidPublicWs unsubscribe (routing bug), skipping");
+            tracing::error!(
+                ?kind,
+                "Candle routed to HyperliquidPublicWs unsubscribe (routing bug), skipping"
+            );
             return Ok(());
         };
         let stream_still_needed = self
@@ -329,38 +358,29 @@ pub(crate) fn parse_public_message(
                 let mut events = Vec::new();
 
                 // 根据订阅的 kinds 生成对应的事件
-                if subscribed_kinds
-                    .contains(&SubscriptionKind::FundingRate { symbol: symbol.clone() })
-                {
+                if subscribed_kinds.contains(&SubscriptionKind::FundingRate {
+                    symbol: symbol.clone(),
+                }) {
                     events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: MarketData::FundingRate(
-                            ctx.to_funding_rate(local_ts)
-                                ?,
-                        ),
+                        data: MarketData::FundingRate(ctx.to_funding_rate(local_ts)?),
                     });
                 }
-                if subscribed_kinds
-                    .contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() })
-                {
+                if subscribed_kinds.contains(&SubscriptionKind::MarkPrice {
+                    symbol: symbol.clone(),
+                }) {
                     events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: MarketData::MarkPrice(
-                            ctx.to_mark_price(local_ts)
-                                ?,
-                        ),
+                        data: MarketData::MarkPrice(ctx.to_mark_price(local_ts)?),
                     });
                 }
                 if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
                     events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: MarketData::IndexPrice(
-                            ctx.to_index_price(local_ts)
-                                ?,
-                        ),
+                        data: MarketData::IndexPrice(ctx.to_index_price(local_ts)?),
                     });
                 }
 
@@ -441,9 +461,9 @@ pub(crate) fn kind_channel(kind: &SubscriptionKind) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Exchange, MarketTrade};
+    use rust_decimal_macros::dec;
 
     const SUBSCRIBED_AT: u64 = 1_785_747_800_000;
 
@@ -464,7 +484,10 @@ mod tests {
 
     /// 订阅记账（不涉及连接和总线），可选带一条 BTC 的 trades 订阅时刻
     fn book_with_subscription(subscribed: Option<u64>) -> SubscriptionBook {
-        let mut book = SubscriptionBook::new(Arc::new(crate::exchange::hyperliquid::testkit::markets(&["", "xyz"])));
+        let mut book =
+            SubscriptionBook::new(Arc::new(crate::exchange::hyperliquid::testkit::markets(&[
+                "", "xyz",
+            ])));
         if let Some(ts) = subscribed {
             book.trades_subscribed_at.insert("BTC".to_string(), ts);
         }
@@ -505,7 +528,9 @@ mod tests {
     #[tokio::test]
     async fn trades_kind_maps_to_trades_subscription() {
         let book = book_with_subscription(None);
-        let kind = SubscriptionKind::Trades { symbol: "BTC".to_string() };
+        let kind = SubscriptionKind::Trades {
+            symbol: "BTC".to_string(),
+        };
         let sub = book.subscription(&kind).expect("must map");
         assert_eq!(sub["type"], "trades");
         assert_eq!(sub["coin"], "BTC");
@@ -515,11 +540,16 @@ mod tests {
     #[tokio::test]
     async fn one_ws_subscribes_across_dexes() {
         let book = book_with_subscription(None);
-        let bbo = |s: &str| SubscriptionKind::BBO { symbol: s.to_string() };
+        let bbo = |s: &str| SubscriptionKind::BBO {
+            symbol: s.to_string(),
+        };
         assert_eq!(book.subscription(&bbo("TSLA")).unwrap()["coin"], "xyz:TSLA");
         assert_eq!(book.stream(&bbo("BTC")).as_deref(), Some("bbo:BTC"));
         assert_eq!(
-            book.stream(&SubscriptionKind::FundingRate { symbol: "TSLA".into() }).as_deref(),
+            book.stream(&SubscriptionKind::FundingRate {
+                symbol: "TSLA".into()
+            })
+            .as_deref(),
             Some("activeAssetCtx:xyz:TSLA")
         );
         assert!(book.stream(&bbo("AAPL")).is_none());
@@ -531,10 +561,18 @@ mod tests {
     async fn resubscription_sends_one_message_per_stream() {
         let mut book = book_with_subscription(None);
         for kind in [
-            SubscriptionKind::BBO { symbol: "BTC".into() },
-            SubscriptionKind::FundingRate { symbol: "BTC".into() },
-            SubscriptionKind::MarkPrice { symbol: "BTC".into() },
-            SubscriptionKind::BBO { symbol: "TSLA".into() },
+            SubscriptionKind::BBO {
+                symbol: "BTC".into(),
+            },
+            SubscriptionKind::FundingRate {
+                symbol: "BTC".into(),
+            },
+            SubscriptionKind::MarkPrice {
+                symbol: "BTC".into(),
+            },
+            SubscriptionKind::BBO {
+                symbol: "TSLA".into(),
+            },
         ] {
             book.subscribed_kinds.insert(kind);
         }
@@ -545,13 +583,21 @@ mod tests {
             .map(|m| {
                 let v: serde_json::Value = serde_json::from_str(m).unwrap();
                 assert_eq!(v["method"], "subscribe");
-                (v["subscription"]["type"].as_str().unwrap().into(), v["subscription"]["coin"].as_str().unwrap().into())
+                (
+                    v["subscription"]["type"].as_str().unwrap().into(),
+                    v["subscription"]["coin"].as_str().unwrap().into(),
+                )
             })
             .collect();
         coins.sort();
         assert_eq!(
             coins,
-            [("activeAssetCtx", "BTC"), ("bbo", "BTC"), ("bbo", "xyz:TSLA")].map(|(a, b)| (a.to_string(), b.to_string()))
+            [
+                ("activeAssetCtx", "BTC"),
+                ("bbo", "BTC"),
+                ("bbo", "xyz:TSLA")
+            ]
+            .map(|(a, b)| (a.to_string(), b.to_string()))
         );
     }
 }

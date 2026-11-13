@@ -3,11 +3,11 @@
 
 use super::*;
 use crate::domain::SymbolMeta;
-use rust_decimal_macros::dec;
 use crate::exchange::{ExchangeCmd, ExchangeHandle};
 use crate::messaging::{AccountData, ExchangeAccountData};
 use crate::tasks::Root;
 use async_trait::async_trait;
+use rust_decimal_macros::dec;
 use std::sync::Mutex;
 
 type Log = Arc<Mutex<Vec<String>>>;
@@ -50,7 +50,10 @@ impl Task for FakeNode {
         Ok(())
     }
     async fn stop(&mut self) -> anyhow::Result<()> {
-        self.log.lock().unwrap().push(format!("{} 节点收尾", self.exchange));
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("{} 节点收尾", self.exchange));
         self.account_bus.publish(final_report(self.exchange));
         Ok(())
     }
@@ -87,7 +90,12 @@ fn fake_setup(exchange: Exchange, log: Log, fail: Option<&'static str>) -> Excha
                 let (_, addr) = ctx
                     .producers
                     .spawn_addressed(format!("{exchange}Node"), move |_scope, inbox| async move {
-                        Ok(FakeNode { inbox, exchange, account_bus: ctx.account_bus, log })
+                        Ok(FakeNode {
+                            inbox,
+                            exchange,
+                            account_bus: ctx.account_bus,
+                            log,
+                        })
                     })
                     .await
                     .map_err(|e| ExchangeError::Other(format!("{e:#}")))?;
@@ -106,8 +114,13 @@ struct Observer {
 impl Task for Observer {
     async fn run(&mut self, _: &Scope) -> anyhow::Result<()> {
         while let Some(ev) = self.inbox.recv().await {
-            if let AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, .. }) = ev.data {
-                self.log.lock().unwrap().push(format!("观察者收到 {exchange} 回报"));
+            if let AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, .. }) =
+                ev.data
+            {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("观察者收到 {exchange} 回报"));
             }
         }
         self.log.lock().unwrap().push("观察者收尾".into());
@@ -116,7 +129,10 @@ impl Task for Observer {
 }
 
 fn is_account_info(ev: &AccountEvent) -> bool {
-    matches!(ev.data, AccountData::Exchange(ExchangeAccountData::AccountInfo { .. }))
+    matches!(
+        ev.data,
+        AccountData::Exchange(ExchangeAccountData::AccountInfo { .. })
+    )
 }
 
 /// 生产者组先停、消费者组后停：交易所节点收尾时补发的回报，挂在消费者组的观察者收得到
@@ -140,7 +156,10 @@ async fn producers_stop_before_consumers_and_their_last_reports_arrive() {
         .spawn("observer", move |scope| async move {
             let (_, mut inbox) = scope.inbox::<AccountEvent>();
             inbox.subscribe(&account_bus, is_account_info, |e| e);
-            Ok(Observer { inbox, log: observer_log })
+            Ok(Observer {
+                inbox,
+                log: observer_log,
+            })
         })
         .await
         .unwrap();
@@ -169,13 +188,19 @@ async fn exchange_startup_failure_cascades_to_the_root() {
         },
     )
     .await;
-    let Err(err) = result else { panic!("一所起不来，Manager 必须构造失败") };
+    let Err(err) = result else {
+        panic!("一所起不来，Manager 必须构造失败")
+    };
     assert!(format!("{err:#}").contains("OKX 私有订阅被拒"), "{err:#}");
 
     root.stopping().await;
     let root_err = format!("{:#}", root.shutdown().await.unwrap_err());
     assert!(root_err.contains("OKX 私有订阅被拒"), "{root_err}");
-    assert_eq!(*log.lock().unwrap(), ["Binance 节点收尾"], "已起来的节点必须被停下收尾");
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["Binance 节点收尾"],
+        "已起来的节点必须被停下收尾"
+    );
 }
 
 /// 只声明要哪些账户数据流、别的什么都不做的策略
@@ -198,7 +223,10 @@ impl Strategy for NeedsStreams {
 }
 
 fn greeks_on(exchange: Exchange) -> Box<dyn Strategy> {
-    Box::new(NeedsStreams(HashMap::from([(exchange, HashSet::from([crate::exchange::AccountStream::Greeks]))])))
+    Box::new(NeedsStreams(HashMap::from([(
+        exchange,
+        HashSet::from([crate::exchange::AccountStream::Greeks]),
+    )])))
 }
 
 /// 账户数据流按策略声明才起，同所同种只起一份；没登记的所拒绝投产（#757）
@@ -219,18 +247,30 @@ async fn account_streams_start_on_demand_once() {
     let root = Root::new("engine");
     let handle = Manager::spawn(
         &root.group("main"),
-        ManagerArgs { exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None), okx], paper: None },
+        ManagerArgs {
+            exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None), okx],
+            paper: None,
+        },
     )
     .await
     .expect("Manager 起不来");
     assert_eq!(started.load(Ordering::SeqCst), 0, "没有策略要，就不该起");
 
-    let err = handle.add_strategy(StrategySpec::live(greeks_on(Exchange::Binance))).await.unwrap_err();
+    let err = handle
+        .add_strategy(StrategySpec::live(greeks_on(Exchange::Binance)))
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("Binance 不提供 Greeks"), "{err}");
     assert_eq!(started.load(Ordering::SeqCst), 0);
 
-    handle.add_strategy(StrategySpec::live(greeks_on(Exchange::OKX))).await.unwrap();
-    handle.add_strategy(StrategySpec::live(greeks_on(Exchange::OKX))).await.unwrap();
+    handle
+        .add_strategy(StrategySpec::live(greeks_on(Exchange::OKX)))
+        .await
+        .unwrap();
+    handle
+        .add_strategy(StrategySpec::live(greeks_on(Exchange::OKX)))
+        .await
+        .unwrap();
     assert_eq!(started.load(Ordering::SeqCst), 1, "同所同种只起一份");
     root.shutdown().await.expect("正常停机");
 }
@@ -240,7 +280,12 @@ struct WatchesBbo(Exchange);
 
 impl Strategy for WatchesBbo {
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
-        HashMap::from([(self.0, HashSet::from([SubscriptionKind::BBO { symbol: "BTC".to_string() }]))])
+        HashMap::from([(
+            self.0,
+            HashSet::from([SubscriptionKind::BBO {
+                symbol: "BTC".to_string(),
+            }]),
+        )])
     }
     fn on_event(
         &mut self,
@@ -258,7 +303,10 @@ async fn live_strategy_is_rejected_on_exchange_without_credentials() {
     let root = Root::new("engine");
     let handle = Manager::spawn(
         &root.group("main"),
-        ManagerArgs { exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)], paper: None },
+        ManagerArgs {
+            exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)],
+            paper: None,
+        },
     )
     .await
     .expect("Manager 起不来");
@@ -277,12 +325,18 @@ async fn paper_strategy_is_rejected_without_paper_counter() {
     let root = Root::new("engine");
     let handle = Manager::spawn(
         &root.group("main"),
-        ManagerArgs { exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)], paper: None },
+        ManagerArgs {
+            exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)],
+            paper: None,
+        },
     )
     .await
     .expect("Manager 起不来");
     let err = handle
-        .add_strategy(StrategySpec::paper(Box::new(NeedsStreams(HashMap::new())), "p"))
+        .add_strategy(StrategySpec::paper(
+            Box::new(NeedsStreams(HashMap::new())),
+            "p",
+        ))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("没配模拟柜台"), "{err}");

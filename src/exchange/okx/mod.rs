@@ -1,6 +1,6 @@
 pub(crate) mod actor;
-pub(crate) mod codec;
 mod client;
+pub(crate) mod codec;
 mod symbol;
 
 pub use actor::{OkxArgs, OkxNode};

@@ -15,7 +15,7 @@
 use crate::backtest::source::MarketDataSource;
 use crate::domain::{Exchange, Order, OrderId, Symbol, SymbolMeta, Timestamp};
 use crate::engine::StrategyRunner;
-use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, IncomeEvent};
+use crate::messaging::{AccountData, ExchangeAccountData, IncomeEvent, SymbolAccountData};
 use crate::sim::{SimConfig, SimState};
 use crate::strategy::OutcomeEvent;
 use std::cmp::{Ordering, Reverse};
@@ -273,8 +273,7 @@ impl<'a> BacktestEngine<'a> {
             .map(|state| state.ledger.equity(|s| state.mark_of(s)))
             .sum();
         // 每个所各入金一份，总初始资金随实际出现的所数走（无行情时保持单份，见上方早退分支）
-        let initial_balance =
-            self.config.initial_balance_usdt * (self.states.len().max(1) as f64);
+        let initial_balance = self.config.initial_balance_usdt * (self.states.len().max(1) as f64);
         let total_cash: f64 = self.states.values().map(|s| s.ledger.cash).sum();
         let result = BacktestResult {
             initial_balance,
@@ -408,7 +407,8 @@ impl<'a> BacktestEngine<'a> {
 
     /// 把事件投递给观察者与各策略；策略产出的信号按下单延迟入队到达撮合。
     fn deliver(&mut self, ev: IncomeEvent) {
-        if matches!(&ev, IncomeEvent::Account(a) if matches!(a.data, AccountData::Symbol(SymbolAccountData::Fill(_)))) {
+        if matches!(&ev, IncomeEvent::Account(a) if matches!(a.data, AccountData::Symbol(SymbolAccountData::Fill(_))))
+        {
             self.fill_count += 1;
         }
         for i in 0..self.observers.len() {
@@ -440,7 +440,11 @@ impl<'a> BacktestEngine<'a> {
                             self.schedule(self.now + order_delay, Action::OrderArrive(o, id));
                         }
                     }
-                    OutcomeEvent::CancelOrder { exchange, symbol, client_order_id } => {
+                    OutcomeEvent::CancelOrder {
+                        exchange,
+                        symbol,
+                        client_order_id,
+                    } => {
                         self.schedule(
                             self.now + order_delay,
                             Action::CancelArrive(exchange, symbol, client_order_id),
@@ -467,6 +471,13 @@ impl<'a> BacktestEngine<'a> {
             exchange,
             values: state.ledger.position_values(mark_of),
         });
-        [info, values].map(|d| IncomeEvent::account(crate::backtest::backtest_account(), ts, ts, AccountData::Exchange(d)))
+        [info, values].map(|d| {
+            IncomeEvent::account(
+                crate::backtest::backtest_account(),
+                ts,
+                ts,
+                AccountData::Exchange(d),
+            )
+        })
     }
 }

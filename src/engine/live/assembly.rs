@@ -13,16 +13,20 @@
 
 use super::AccountBus;
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
-use crate::exchange::binance::{BinanceArgs, BinanceClient, BinanceCredentials, BinanceNode, REST_BASE_URL};
-use crate::exchange::hyperliquid::{HyperliquidAccess, HyperliquidArgs, HyperliquidClient, HyperliquidNode};
+use crate::engine::NewClientOrderId;
+use crate::exchange::binance::{
+    BinanceArgs, BinanceClient, BinanceCredentials, BinanceNode, REST_BASE_URL,
+};
+use crate::exchange::hyperliquid::{
+    HyperliquidAccess, HyperliquidArgs, HyperliquidClient, HyperliquidNode,
+};
 use crate::exchange::ibkr::{IbkrArgs, IbkrClient, IbkrCredentials, IbkrNode, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxArgs, OkxClient, OkxCredentials, OkxNode};
 use crate::exchange::okx::{OkxGreeksPoller, GREEKS_POLLING_INTERVAL_MS};
 use crate::exchange::{
-    AccountClient, AccountStream, ExchangeAccess, ExchangeClient, ExchangeHandle, SettledFundingSource,
-    SubscriptionKind,
+    AccountClient, AccountStream, ExchangeAccess, ExchangeClient, ExchangeHandle,
+    SettledFundingSource, SubscriptionKind,
 };
-use crate::engine::NewClientOrderId;
 use crate::messaging::MarketBus;
 use crate::tasks::{Group, GroupClosed};
 use std::collections::HashMap;
@@ -79,14 +83,17 @@ pub struct ExchangeSetup {
 }
 
 /// 起一种账户类数据流（见 [`AccountStream`]）：在给定分组下起它，读数发到账户总线
-pub(crate) type StartAccountStream = Box<dyn Fn(&Group, AccountBus) -> Result<(), GroupClosed> + Send + Sync>;
+pub(crate) type StartAccountStream =
+    Box<dyn Fn(&Group, AccountBus) -> Result<(), GroupClosed> + Send + Sync>;
 
 /// 节点启动失败转成装配错误（带上根因链）
 fn start_failed(name: &str, e: anyhow::Error) -> ExchangeError {
     ExchangeError::Other(format!("{name} failed to start: {e:#}"))
 }
 
-pub fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<ExchangeSetup, ExchangeError> {
+pub fn setup_binance(
+    access: ExchangeAccess<BinanceCredentials>,
+) -> Result<ExchangeSetup, ExchangeError> {
     let client = Arc::new(BinanceClient::new(
         access.quote.clone(),
         access.credentials.clone(),
@@ -121,14 +128,18 @@ pub fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<Excha
 }
 
 pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup, ExchangeError> {
-    let client = Arc::new(OkxClient::new(access.quote.clone(), access.credentials.clone())?);
+    let client = Arc::new(OkxClient::new(
+        access.quote.clone(),
+        access.credentials.clone(),
+    )?);
     let authed = access.has_credentials().then(|| client.clone());
     let mut account_streams: HashMap<AccountStream, StartAccountStream> = HashMap::new();
     if let Some(c) = authed.clone() {
         account_streams.insert(
             AccountStream::Greeks,
             Box::new(move |group: &Group, account_bus: AccountBus| {
-                OkxGreeksPoller::spawn(group, c.clone(), account_bus, GREEKS_POLLING_INTERVAL_MS).map(|_| ())
+                OkxGreeksPoller::spawn(group, c.clone(), account_bus, GREEKS_POLLING_INTERVAL_MS)
+                    .map(|_| ())
             }),
         );
     }
@@ -163,11 +174,10 @@ pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup
 
 /// 构造是异步的：client 启动时要拉各 dex 的 meta 建品种目录、查账户模式（见
 /// [`HyperliquidClient::connect`]），一个 client 覆盖配置里的全部 dex。
-pub async fn setup_hyperliquid(
-    access: HyperliquidAccess,
-) -> Result<ExchangeSetup, ExchangeError> {
+pub async fn setup_hyperliquid(access: HyperliquidAccess) -> Result<ExchangeSetup, ExchangeError> {
     let has_credentials = access.credentials.is_some();
-    let client = Arc::new(HyperliquidClient::connect(access.quote, access.dexes, access.credentials).await?);
+    let client =
+        Arc::new(HyperliquidClient::connect(access.quote, access.dexes, access.credentials).await?);
     let account: Option<Arc<dyn AccountClient>> =
         has_credentials.then(|| client.clone() as Arc<dyn AccountClient>);
     Ok(ExchangeSetup {

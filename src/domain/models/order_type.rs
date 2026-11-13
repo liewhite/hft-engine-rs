@@ -1,5 +1,5 @@
-use crate::domain::types::Price;
 use crate::domain::models::TimeInForce;
+use crate::domain::types::Price;
 use serde::{Deserialize, Serialize};
 
 /// 订单类型

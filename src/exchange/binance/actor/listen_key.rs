@@ -61,7 +61,7 @@ impl ListenKeyRefresher {
             admitted,
         )
         .await
-            .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+        .map_err(|e| WsError::AuthFailed(e.to_string()))?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -82,7 +82,9 @@ impl Periodic for ListenKeyRefresher {
         match self.refresh_listen_key().await {
             Ok(()) => self.guard.record_success(),
             Err(e) => {
-                self.guard.check_failure(&e).map_err(|reason| anyhow::anyhow!("{reason}（私有流即将失效）"))?;
+                self.guard
+                    .check_failure(&e)
+                    .map_err(|reason| anyhow::anyhow!("{reason}（私有流即将失效）"))?;
                 tracing::warn!(error = %e, failing_ms = self.guard.stale_ms(), "Binance ListenKey 续期失败，下拍重试");
             }
         }

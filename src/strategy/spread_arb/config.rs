@@ -66,7 +66,9 @@ impl SpreadArbConfig {
             return Err("max_position_notional 必须 > 0".to_string());
         }
         if self.max_position_notional < self.max_notional {
-            return Err("max_position_notional 不应小于 max_notional（否则首笔即被拦截）".to_string());
+            return Err(
+                "max_position_notional 不应小于 max_notional（否则首笔即被拦截）".to_string(),
+            );
         }
         if !(self.max_symbol_leverage.is_finite() && self.max_symbol_leverage > 0.0) {
             return Err("max_symbol_leverage 必须 > 0".to_string());

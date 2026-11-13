@@ -38,7 +38,10 @@ impl CryptoStatus {
         group.spawn_periodic(
             format!("{exchange}CryptoStatus"),
             Duration::from_millis(interval_ms),
-            Self { exchange, market_bus },
+            Self {
+                exchange,
+                market_bus,
+            },
         )
     }
 }

@@ -72,7 +72,10 @@ impl std::fmt::Debug for AlertWebhookConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Webhook { url } => f.debug_struct("Webhook").field("url", url).finish(),
-            Self::SlackBot { channel, .. } => f.debug_struct("SlackBot").field("channel", channel).finish(),
+            Self::SlackBot { channel, .. } => f
+                .debug_struct("SlackBot")
+                .field("channel", channel)
+                .finish(),
         }
     }
 }
@@ -85,10 +88,18 @@ impl AlertWebhookConfig {
     /// - 否则 `ALERT_WEBHOOK_URL` → 通用 webhook
     pub fn from_env() -> anyhow::Result<Option<Self>> {
         let var = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
-        Self::from_vars(var("SLACK_BOT_TOKEN"), var("SLACK_ALERT_CHANNEL"), var("ALERT_WEBHOOK_URL"))
+        Self::from_vars(
+            var("SLACK_BOT_TOKEN"),
+            var("SLACK_ALERT_CHANNEL"),
+            var("ALERT_WEBHOOK_URL"),
+        )
     }
 
-    fn from_vars(token: Option<String>, channel: Option<String>, url: Option<String>) -> anyhow::Result<Option<Self>> {
+    fn from_vars(
+        token: Option<String>,
+        channel: Option<String>,
+        url: Option<String>,
+    ) -> anyhow::Result<Option<Self>> {
         match (token, channel) {
             (Some(token), Some(channel)) => Ok(Some(Self::SlackBot { token, channel })),
             (None, None) => Ok(url.map(|url| Self::Webhook { url })),
@@ -111,13 +122,15 @@ struct HttpSink {
 impl AlertSink for HttpSink {
     async fn send(&self, text: &str) -> Result<(), String> {
         match &self.config {
-            AlertWebhookConfig::Webhook { url } => {
-                crate::net::send_unmetered(self.client.post(url).json(&serde_json::json!({ "text": text })))
-                    .await
-                    .and_then(|r| r.error_for_status())
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            }
+            AlertWebhookConfig::Webhook { url } => crate::net::send_unmetered(
+                self.client
+                    .post(url)
+                    .json(&serde_json::json!({ "text": text })),
+            )
+            .await
+            .and_then(|r| r.error_for_status())
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
             AlertWebhookConfig::SlackBot { token, channel } => {
                 let resp: serde_json::Value = crate::net::send_unmetered(
                     self.client
@@ -126,15 +139,20 @@ impl AlertSink for HttpSink {
                         .json(&serde_json::json!({ "channel": channel, "text": text })),
                 )
                 .await
-                    .map_err(|e| e.to_string())?
-                    .json()
-                    .await
-                    .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .json()
+                .await
+                .map_err(|e| e.to_string())?;
                 // Slack 出错也回 HTTP 200，要看 ok 字段（如 not_in_channel / channel_not_found）
                 if resp.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                     Ok(())
                 } else {
-                    Err(format!("slack: {}", resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown")))
+                    Err(format!(
+                        "slack: {}",
+                        resp.get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                    ))
                 }
             }
         }
@@ -167,7 +185,9 @@ enum Msg {
 ///     .with(alert_layer.with_filter(LevelFilter::WARN)).init()`
 /// —— EnvFilter 不能全局挂（会连带灭掉告警外送），告警层不能裸挂（无过滤器的 layer
 /// 会把全局 max level hint 退化到 TRACE，依赖库的 trace 事件全部被构造派发）。
-pub fn spawn_alert_webhook_layer(config: AlertWebhookConfig) -> anyhow::Result<(AlertWebhookLayer, AlertHandle)> {
+pub fn spawn_alert_webhook_layer(
+    config: AlertWebhookConfig,
+) -> anyhow::Result<(AlertWebhookLayer, AlertHandle)> {
     let client = crate::net::http(Duration::from_secs(10))
         .build()
         .map_err(|e| anyhow::anyhow!("告警发送器构建 HTTP client 失败: {e}"))?;
@@ -201,7 +221,10 @@ impl AlertHandle {
     /// 记本地 ERROR 并不占名额直接外送 —— 退出原因不能被窗口名额吞进汇总、截成半句
     pub fn fatal(&self, reason: &str) {
         tracing::error!(target: SELF_TARGET, reason, "进程因错误退出");
-        let _ = self.tx.send(Msg::Fatal(format!("[{}][ERROR] 进程因错误退出: {reason}", instance_label())));
+        let _ = self.tx.send(Msg::Fatal(format!(
+            "[{}][ERROR] 进程因错误退出: {reason}",
+            instance_label()
+        )));
     }
 
     /// 在 `deadline` 内把已入队的告警和未报的汇总发完；超时返回 false
@@ -231,12 +254,26 @@ impl<S: Subscriber> Layer<S> for AlertWebhookLayer {
         if meta.target() == SELF_TARGET {
             return;
         }
-        let mut text = format!("[{}][{}] {}: ", instance_label(), meta.level(), meta.target());
+        let mut text = format!(
+            "[{}][{}] {}: ",
+            instance_label(),
+            meta.level(),
+            meta.target()
+        );
         let mut visitor = TextVisitor(&mut text);
         event.record(&mut visitor);
         // 接收端关闭（发送任务退出）时丢弃 —— 告警通道绝不反向影响引擎
-        let key = format!("{}:{}:{}", meta.target(), meta.file().unwrap_or("?"), meta.line().unwrap_or(0));
-        let _ = self.tx.send(Msg::Alert(Alert { level: *meta.level(), key, text }));
+        let key = format!(
+            "{}:{}:{}",
+            meta.target(),
+            meta.file().unwrap_or("?"),
+            meta.line().unwrap_or(0)
+        );
+        let _ = self.tx.send(Msg::Alert(Alert {
+            level: *meta.level(),
+            key,
+            text,
+        }));
     }
 }
 
@@ -286,7 +323,12 @@ struct Throttle {
 
 impl Throttle {
     fn new(now: Instant) -> Self {
-        Self { window_start: now, sent: HashMap::new(), seen: Default::default(), held: Vec::new() }
+        Self {
+            window_start: now,
+            sent: HashMap::new(),
+            seen: Default::default(),
+            held: Vec::new(),
+        }
     }
 
     /// 决定这条告警是否立即外送：返回 Some(文本) 就发，None 表示已计入汇总
@@ -301,7 +343,11 @@ impl Throttle {
             Some((_, h)) => h.count += 1,
             None => self.held.push((
                 alert.key,
-                Held { level: alert.level, sample: alert.text.chars().take(SAMPLE_CHARS).collect(), count: 1 },
+                Held {
+                    level: alert.level,
+                    sample: alert.text.chars().take(SAMPLE_CHARS).collect(),
+                    count: 1,
+                },
             )),
         }
         None
@@ -320,7 +366,10 @@ impl Throttle {
         // ERROR 排前面
         let mut held = held;
         held.sort_by_key(|(_, h)| h.level != Level::ERROR);
-        let mut text = format!("[{}] 告警汇总：以下告警最近一段时间重复或超出名额，未逐条外送", instance_label());
+        let mut text = format!(
+            "[{}] 告警汇总：以下告警最近一段时间重复或超出名额，未逐条外送",
+            instance_label()
+        );
         for (_, h) in held {
             let _ = write!(text, "\n×{} {}", h.count, h.sample);
         }
@@ -343,7 +392,10 @@ async fn deliver(sink: &impl AlertSink, health: &mut Health, text: &str) {
         Ok(()) => {
             if let Some(lost) = health.down.take() {
                 tracing::info!(target: SELF_TARGET, lost, "告警外送已恢复");
-                let notice = format!("[{}] 告警外送曾中断，期间丢失 {lost} 条，详见本机日志", instance_label());
+                let notice = format!(
+                    "[{}] 告警外送曾中断，期间丢失 {lost} 条，详见本机日志",
+                    instance_label()
+                );
                 if let Err(e) = sink.send(&notice).await {
                     tracing::error!(target: SELF_TARGET, error = %e, "告警外送不可用");
                     health.down = Some(lost);
@@ -404,12 +456,21 @@ mod tests {
     fn config_from_vars() {
         let s = |x: &str| Some(x.to_string());
         let ok = |t, c, u| AlertWebhookConfig::from_vars(t, c, u).unwrap();
-        assert!(matches!(ok(s("t"), s("#c"), None), Some(AlertWebhookConfig::SlackBot { .. })));
-        assert!(matches!(ok(None, None, s("http://x")), Some(AlertWebhookConfig::Webhook { .. })));
+        assert!(matches!(
+            ok(s("t"), s("#c"), None),
+            Some(AlertWebhookConfig::SlackBot { .. })
+        ));
+        assert!(matches!(
+            ok(None, None, s("http://x")),
+            Some(AlertWebhookConfig::Webhook { .. })
+        ));
         assert!(ok(None, None, None).is_none());
         let c = ok(s("xoxb-secret"), s("#c"), None).unwrap();
         assert!(!format!("{c:?}").contains("xoxb-secret"));
-        assert!(AlertWebhookConfig::from_vars(s("t"), None, None).is_err(), "Slack 配一半拒绝启动");
+        assert!(
+            AlertWebhookConfig::from_vars(s("t"), None, None).is_err(),
+            "Slack 配一半拒绝启动"
+        );
     }
 
     fn drain(rx: &mut mpsc::UnboundedReceiver<Msg>) -> Vec<Alert> {
@@ -434,7 +495,11 @@ mod tests {
         });
         let got = drain(&mut rx);
         assert_eq!(got.len(), 2, "只外送 WARN/ERROR 且排除自身");
-        assert!(got[0].text.contains("腿不齐") && got[0].text.contains("symbol=\"BTC\""), "{}", got[0].text);
+        assert!(
+            got[0].text.contains("腿不齐") && got[0].text.contains("symbol=\"BTC\""),
+            "{}",
+            got[0].text
+        );
         assert!(got[1].text.contains("漂移确认"));
         assert_ne!(got[0].key, got[1].key, "不同调用点键不同");
     }
@@ -463,7 +528,11 @@ mod tests {
         let got = drain(&mut rx);
         assert_eq!(got.len(), 2);
         assert_ne!(got[0].key, got[1].key, "不同位置的依赖库日志不能共用一个键");
-        assert!(got[0].text.contains("tungstenite::protocol") && !got[0].text.contains("log.file"), "{}", got[0].text);
+        assert!(
+            got[0].text.contains("tungstenite::protocol") && !got[0].text.contains("log.file"),
+            "{}",
+            got[0].text
+        );
     }
 
     /// **Critical 回归防线**：控制台的 EnvFilter 收紧（如 RUST_LOG=error）绝不能连带
@@ -484,11 +553,19 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(target: "t", "控制台被 error 级过滤，但告警必须外送");
         });
-        assert_eq!(drain(&mut rx).len(), 1, "RUST_LOG=error 把 WARN 告警外送也灭掉了");
+        assert_eq!(
+            drain(&mut rx).len(),
+            1,
+            "RUST_LOG=error 把 WARN 告警外送也灭掉了"
+        );
     }
 
     fn alert(level: Level, key: &str, text: &str) -> Alert {
-        Alert { level, key: key.to_string(), text: text.to_string() }
+        Alert {
+            level,
+            key: key.to_string(),
+            text: text.to_string(),
+        }
     }
 
     /// 同一调用点窗口内只发第一条，其余进汇总；WARN 用完名额不影响 ERROR
@@ -500,15 +577,24 @@ mod tests {
         assert!(th.admit(alert(Level::WARN, "w0", "重复")).is_none());
         // 用完 WARN 名额
         let keys: Vec<String> = (1..=20).map(|i| format!("w{i}")).collect();
-        let sent_warn = keys.iter().filter(|k| th.admit(alert(Level::WARN, k, "别的 WARN")).is_some()).count();
+        let sent_warn = keys
+            .iter()
+            .filter(|k| th.admit(alert(Level::WARN, k, "别的 WARN")).is_some())
+            .count();
         assert_eq!(sent_warn as u32, budget(Level::WARN) - 1);
-        assert!(th.admit(alert(Level::ERROR, "e", "漂移确认")).is_some(), "ERROR 不被 WARN 挤掉");
+        assert!(
+            th.admit(alert(Level::ERROR, "e", "漂移确认")).is_some(),
+            "ERROR 不被 WARN 挤掉"
+        );
 
         assert!(th.roll(t0 + WINDOW / 2, false).is_none(), "窗口未到不汇总");
         let summary = th.roll(t0 + WINDOW, false).expect("有被合并的就汇总");
         assert!(summary.contains("×1 重复"), "{summary}");
         assert!(th.roll(t0 + WINDOW * 3, false).is_none(), "汇总后清零");
-        assert!(th.admit(alert(Level::WARN, "w0", "新窗口首条")).is_some(), "新窗口重新放行");
+        assert!(
+            th.admit(alert(Level::WARN, "w0", "新窗口首条")).is_some(),
+            "新窗口重新放行"
+        );
     }
 
     #[derive(Clone, Default)]
@@ -536,7 +622,10 @@ mod tests {
         struct W(Arc<Mutex<Vec<String>>>);
         impl std::io::Write for W {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().push(String::from_utf8_lossy(b).into_owned());
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(b).into_owned());
                 Ok(b.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -545,7 +634,10 @@ mod tests {
         }
         let logs = Arc::new(Mutex::new(Vec::new()));
         let w = W(logs.clone());
-        let sub = tracing_subscriber::fmt().with_ansi(false).with_writer(move || w.clone()).finish();
+        let sub = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || w.clone())
+            .finish();
         (sub, logs)
     }
 
@@ -566,7 +658,12 @@ mod tests {
             send(Level::ERROR, k, "失败中");
         }
         assert!(handle.flush(Duration::from_secs(1)).await);
-        let down_logs = logs.lock().unwrap().iter().filter(|l| l.contains("告警外送不可用")).count();
+        let down_logs = logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("告警外送不可用"))
+            .count();
         assert_eq!(down_logs, 1, "连续失败只记一次");
 
         *sink.ok.lock().unwrap() = true;
@@ -577,7 +674,11 @@ mod tests {
         assert!(sent[0].contains("恢复后第一条"));
         assert!(sent[1].contains("丢失 3 条"), "a b c 都丢了: {sent:?}");
         assert!(sent[2].contains("×1 重复的"), "flush 把汇总发出: {sent:?}");
-        assert!(logs.lock().unwrap().iter().any(|l| l.contains("告警外送已恢复")));
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("告警外送已恢复")));
 
         // 退出原因不占名额：ERROR 名额用完后照样直发
         for i in 0..budget(Level::ERROR) {
@@ -585,6 +686,11 @@ mod tests {
         }
         handle.fatal("对账漂移");
         assert!(handle.flush(Duration::from_secs(1)).await);
-        assert!(sink.sent.lock().unwrap().iter().any(|t| t.contains("进程因错误退出: 对账漂移")));
+        assert!(sink
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.contains("进程因错误退出: 对账漂移")));
     }
 }

@@ -45,7 +45,11 @@ impl FundingRate {
     /// # 参数
     /// - `base_settle_time`: 统一的结算时间基准（通常取所有交易所中最近的）
     /// - `current_time`: 当前时间
-    pub fn daily_rate_with_base_time(&self, base_settle_time: Timestamp, current_time: Timestamp) -> Rate {
+    pub fn daily_rate_with_base_time(
+        &self,
+        base_settle_time: Timestamp,
+        current_time: Timestamp,
+    ) -> Rate {
         if current_time >= base_settle_time {
             return 0.0;
         }

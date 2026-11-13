@@ -15,7 +15,7 @@ pub use bus::{AccountBus, MarketBus};
 pub use position_book::PositionBook;
 pub use scope::SubscriptionScope;
 pub use state::{
-    CancelAttempt, OrderStage, PendingOrder, SymbolMarket, SymbolOrders, SymbolPositions, SymbolState,
-    ORDER_STUCK_MS,
+    CancelAttempt, OrderStage, PendingOrder, SymbolMarket, SymbolOrders, SymbolPositions,
+    SymbolState, ORDER_STUCK_MS,
 };
 pub use state_manager::{AccountView, PositionBaseline, StateManager};

@@ -10,23 +10,22 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, TimeInForce};
-use hft_engine_rs::exchange::ibkr::{IbkrClient, IbkrCredentials};
-use hft_engine_rs::exchange::ibkr::auth::{tickle, IbkrAuth};
-use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder};
 use futures_util::{SinkExt, StreamExt};
+use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, TimeInForce};
+use hft_engine_rs::exchange::ibkr::auth::{tickle, IbkrAuth};
+use hft_engine_rs::exchange::ibkr::{IbkrClient, IbkrCredentials};
+use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder};
 use tokio_tungstenite::tungstenite::{handshake::client::generate_key, http, Message as WsMessage};
 
 /// 从项目根目录 config.json 的 ibkr 字段读取凭证
 fn load_credentials() -> IbkrCredentials {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.json");
-    let content = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("读取 {} 失败: {}", path, e));
-    let config: serde_json::Value = serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("解析 config.json 失败: {}", e));
+    let content =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("读取 {} 失败: {}", path, e));
+    let config: serde_json::Value =
+        serde_json::from_str(&content).unwrap_or_else(|e| panic!("解析 config.json 失败: {}", e));
     let ibkr = config.get("ibkr").expect("config.json 中缺少 ibkr 字段");
-    serde_json::from_value(ibkr.clone())
-        .unwrap_or_else(|e| panic!("解析 ibkr 凭证失败: {}", e))
+    serde_json::from_value(ibkr.clone()).unwrap_or_else(|e| panic!("解析 ibkr 凭证失败: {}", e))
 }
 
 /// 连接 IBKR WebSocket，返回 (write, read)
@@ -55,9 +54,10 @@ async fn connect_ws(
         .body(())
         .expect("Failed to build WS request");
 
-    let ws_stream = hft_engine_rs::net::ws_connect(ws_request, connector, std::time::Duration::from_secs(10))
-        .await
-        .expect("WS connect failed");
+    let ws_stream =
+        hft_engine_rs::net::ws_connect(ws_request, connector, std::time::Duration::from_secs(10))
+            .await
+            .expect("WS connect failed");
 
     ws_stream.split()
 }
@@ -72,7 +72,11 @@ async fn ibkr_fill_observe() {
         .ok();
 
     let credentials = load_credentials();
-    let symbol = credentials.symbols().first().expect("至少配置一个 symbol").clone();
+    let symbol = credentials
+        .symbols()
+        .first()
+        .expect("至少配置一个 symbol")
+        .clone();
 
     // 1. 创建 client（获取 auth + conids）
     let client = IbkrClient::new(&credentials).await.expect("IBKR 连接失败");
@@ -127,7 +131,10 @@ async fn ibkr_fill_observe() {
     println!("初始阶段收到 {} 条消息\n", init_count);
 
     // 6. 获取 BBO 并下单
-    let (bid, ask) = client.fetch_snapshot_bbo(&symbol).await.expect("获取 BBO 失败");
+    let (bid, ask) = client
+        .fetch_snapshot_bbo(&symbol)
+        .await
+        .expect("获取 BBO 失败");
     println!("\n{} bid={} ask={}", symbol, bid, ask);
 
     let metas = client
@@ -137,7 +144,10 @@ async fn ibkr_fill_observe() {
     let meta = metas.first().expect("未找到 SymbolMeta");
 
     // IOC 买入 1 股，价格吃 ask + 滑点确保成交
-    let buy_price: Decimal = meta.format_price(hft_engine_rs::domain::from_f64(ask + 0.05).unwrap()).parse().unwrap();
+    let buy_price: Decimal = meta
+        .format_price(hft_engine_rs::domain::from_f64(ask + 0.05).unwrap())
+        .parse()
+        .unwrap();
     let client_oid = hft_engine_rs::exchange::ibkr::CLIENT_ORDER_IDS.generate();
     let order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -154,7 +164,10 @@ async fn ibkr_fill_observe() {
     };
 
     println!("\n下单买入: {} @ {} cOID={}", symbol, buy_price, client_oid);
-    let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
+    let order_id = client
+        .place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验"))
+        .await
+        .expect("下单失败");
     println!("下单成功 order_id={}", order_id);
 
     // 7. 监听所有 WS 消息 30 秒，打印 sor/str 相关的原始 JSON
@@ -208,8 +221,14 @@ async fn ibkr_fill_observe() {
     println!("\n共收到 {} 条消息", msg_count);
 
     // 8. 平仓卖出
-    let (bid2, _) = client.fetch_snapshot_bbo(&symbol).await.expect("获取 BBO 失败");
-    let sell_price: Decimal = meta.format_price(hft_engine_rs::domain::from_f64(bid2 - 0.05).unwrap()).parse().unwrap();
+    let (bid2, _) = client
+        .fetch_snapshot_bbo(&symbol)
+        .await
+        .expect("获取 BBO 失败");
+    let sell_price: Decimal = meta
+        .format_price(hft_engine_rs::domain::from_f64(bid2 - 0.05).unwrap())
+        .parse()
+        .unwrap();
     let sell_order = Order {
         id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::IBKR,
@@ -224,6 +243,9 @@ async fn ibkr_fill_observe() {
         client_order_id: hft_engine_rs::exchange::ibkr::CLIENT_ORDER_IDS.generate(),
     };
     println!("\n平仓卖出 {} @ {}", symbol, sell_price);
-    let _ = client.place_order(ExchangeOrder::from_domain(sell_order, &meta).expect("订单未通过出向校验")).await.expect("卖单失败");
+    let _ = client
+        .place_order(ExchangeOrder::from_domain(sell_order, &meta).expect("订单未通过出向校验"))
+        .await
+        .expect("卖单失败");
     println!("平仓完成");
 }

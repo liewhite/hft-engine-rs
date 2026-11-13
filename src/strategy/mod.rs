@@ -3,18 +3,18 @@ mod gamma_scalp;
 mod spread_arb;
 mod view;
 
-pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
 pub use funding_arb::{
     FundingArbConfig, FundingArbStrategy, PairConfig as FundingArbPairConfig, SettledFundingWindow,
     FUNDING_WINDOW_MS,
 };
 pub use gamma_scalp::GammaScalpStrategy;
+pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
 pub use view::{StrategyView, SymbolView};
 
 use crate::domain::{Exchange, Order, Symbol, Timestamp};
-use crate::observability::Gauge;
 use crate::exchange::{AccountStream, SubscriptionKind};
 use crate::messaging::{CustomEvent, IncomeEvent};
+use crate::observability::Gauge;
 use std::collections::{HashMap, HashSet};
 
 /// 策略输出的信号

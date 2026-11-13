@@ -29,12 +29,15 @@ use hft_engine_rs::domain::{
     AccountId, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
 use hft_engine_rs::engine::{
-    AccountBinding, AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, Metrics, MetricsArgs, OutcomeBus,
-    NewClientOrderId, PaperCounter, PaperCounterArgs,
+    AccountBinding, AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, Metrics,
+    MetricsArgs, NewClientOrderId, OutcomeBus, PaperCounter, PaperCounterArgs,
 };
 use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
-use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, AccountEvent, IncomeEvent, MarketData, MarketEvent};
+use hft_engine_rs::messaging::{
+    AccountData, AccountEvent, ExchangeAccountData, IncomeEvent, MarketData, MarketEvent,
+    SymbolAccountData,
+};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use hft_engine_rs::tasks::{Inbox, Root, Scope, Task};
@@ -90,7 +93,6 @@ impl Strategy for DipMaker {
         )])
     }
 
-
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let IncomeEvent::Market(MarketEvent {
             data: MarketData::BBO(bbo),
@@ -127,7 +129,10 @@ impl Strategy for DipMaker {
                 reduce_only: false,
                 client_order_id: String::new(),
             }],
-            comment: format!("paper_dip_buy | bid={} | offset={OFFSET_BP}bp", bbo.bid_price),
+            comment: format!(
+                "paper_dip_buy | bid={} | offset={OFFSET_BP}bp",
+                bbo.bid_price
+            ),
         }]
     }
 }
@@ -172,12 +177,15 @@ impl Task for Watcher {
             match msg {
                 WatcherMsg::Account(ev) => match &ev.data {
                     AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
-                        log.order_updates.push((u.order_id.clone(), format!("{:?}", u.status)));
+                        log.order_updates
+                            .push((u.order_id.clone(), format!("{:?}", u.status)));
                         if matches!(u.status, hft_engine_rs::domain::OrderStatus::Pending) {
                             log.resting = true;
                         }
                     }
-                    AccountData::Symbol(SymbolAccountData::Fill(f)) => log.fills.push((f.price, f.size)),
+                    AccountData::Symbol(SymbolAccountData::Fill(f)) => {
+                        log.fills.push((f.price, f.size))
+                    }
                     AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) => {
                         log.equity = Some(*equity)
                     }
@@ -186,11 +194,19 @@ impl Task for Watcher {
                 WatcherMsg::Market(ev) => {
                     if let MarketData::MarketTrade(t) = &ev.data {
                         log.trade_count += 1;
-                        log.min_trade_price = Some(log.min_trade_price.map_or(t.price, |m: Decimal| m.min(t.price)));
-                        log.max_trade_price = Some(log.max_trade_price.map_or(t.price, |m: Decimal| m.max(t.price)));
+                        log.min_trade_price = Some(
+                            log.min_trade_price
+                                .map_or(t.price, |m: Decimal| m.min(t.price)),
+                        );
+                        log.max_trade_price = Some(
+                            log.max_trade_price
+                                .map_or(t.price, |m: Decimal| m.max(t.price)),
+                        );
                         if log.resting {
-                            log.min_trade_after_rest =
-                                Some(log.min_trade_after_rest.map_or(t.price, |m: Decimal| m.min(t.price)));
+                            log.min_trade_after_rest = Some(
+                                log.min_trade_after_rest
+                                    .map_or(t.price, |m: Decimal| m.min(t.price)),
+                            );
                         }
                     }
                 }
@@ -216,8 +232,12 @@ async fn paper_counter_fills_from_live_trades() {
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("public symbol meta");
-    let metas_by_key: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> =
-        Arc::new(metas.into_iter().map(|m| ((EX, m.symbol.clone()), m)).collect());
+    let metas_by_key: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> = Arc::new(
+        metas
+            .into_iter()
+            .map(|m| ((EX, m.symbol.clone()), m))
+            .collect(),
+    );
 
     // ---- 总线与任务树（同 Manager：生产者先停、消费者后停） ----
     let market_bus = MarketBus::new("market");
@@ -273,9 +293,15 @@ async fn paper_counter_fills_from_live_trades() {
         &producers,
         ExecutorArgs {
             strategy: Box::new(DipMaker(Arc::clone(&log))),
-            binding: AccountBinding::Paper { label: PAPER_LABEL.to_string(), legs: HashSet::new() },
+            binding: AccountBinding::Paper {
+                label: PAPER_LABEL.to_string(),
+                legs: HashSet::new(),
+            },
             symbol_metas: metas_by_key.clone(),
-            client_order_ids: Arc::new(HashMap::from([(EX, bn_client_order_id as NewClientOrderId)])),
+            client_order_ids: Arc::new(HashMap::from([(
+                EX,
+                bn_client_order_id as NewClientOrderId,
+            )])),
             outcome_bus: outcome_bus.clone(),
             metrics,
         },
@@ -361,7 +387,9 @@ async fn paper_counter_fills_from_live_trades() {
         "柜台未回报任何订单状态 —— outcome 未流到本地柜台"
     );
     assert!(
-        log.order_updates.iter().all(|(id, _)| id.starts_with("paper-")),
+        log.order_updates
+            .iter()
+            .all(|(id, _)| id.starts_with("paper-")),
         "订单号应由本地柜台发放（paper-*），实际 {:?}",
         log.order_updates
     );

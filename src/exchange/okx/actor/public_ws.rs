@@ -44,7 +44,13 @@ impl OkxPublicWs {
         let (_, addr) = group
             .spawn_addressed("OkxPublicWs", move |scope: Scope, inbox| async move {
                 // 启动时连不上即启动失败（受控退出）；运行中断线由 run 原地重连（#762）
-                let conn = ReconnectingWs::connect(scope.group("conn"), "OkxPublicWs", WS_PUBLIC_URL, WsKeepalive::okx()).await?;
+                let conn = ReconnectingWs::connect(
+                    scope.group("conn"),
+                    "OkxPublicWs",
+                    WS_PUBLIC_URL,
+                    WsKeepalive::okx(),
+                )
+                .await?;
                 tracing::info!("OkxPublicWs started");
                 Ok(Self {
                     inbox,
@@ -77,7 +83,10 @@ impl OkxPublicWs {
             .filter_map(|k| {
                 let arg = kind_to_arg(k, &self.quote);
                 if arg.is_none() {
-                    tracing::error!(?k, "OKX 重连重发订阅：该 kind 生成不出订阅参数，重连后不再有它的行情");
+                    tracing::error!(
+                        ?k,
+                        "OKX 重连重发订阅：该 kind 生成不出订阅参数，重连后不再有它的行情"
+                    );
                 }
                 arg
             })
@@ -91,7 +100,9 @@ impl OkxPublicWs {
     /// 发送取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
         let arg = kind_to_arg(kind, &self.quote).ok_or_else(|| {
-            WsError::ParseError("Candle kind reached OkxPublicWs unsubscribe (routing bug)".to_string())
+            WsError::ParseError(
+                "Candle kind reached OkxPublicWs unsubscribe (routing bug)".to_string(),
+            )
         })?;
         let msg = json!({
             "op": "unsubscribe",
@@ -131,8 +142,9 @@ impl OkxPublicWs {
             if self.subscribed.contains(&kind) {
                 continue;
             }
-            let arg = kind_to_arg(&kind, &self.quote)
-                .ok_or_else(|| anyhow::anyhow!("K 线订阅被路由到 OkxPublicWs（路由 bug）: {kind:?}"))?;
+            let arg = kind_to_arg(&kind, &self.quote).ok_or_else(|| {
+                anyhow::anyhow!("K 线订阅被路由到 OkxPublicWs（路由 bug）: {kind:?}")
+            })?;
             new_args.push(arg);
             new_kinds.push(kind);
         }
@@ -209,8 +221,14 @@ pub(crate) fn parse_public_message(
         match event {
             "subscribe" | "unsubscribe" => return Ok(Vec::new()),
             "error" => {
-                let code = value.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let msg = value.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let code = value
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let msg = value
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 return Err(WsError::ParseError(format!(
                     "OKX error: code={}, msg={}",
                     code, msg
@@ -234,8 +252,7 @@ pub(crate) fn parse_public_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let rate = data.to_funding_rate(quote, local_ts)
-                    ?;
+                let rate = data.to_funding_rate(quote, local_ts)?;
                 events.push(MarketEvent {
                     exchange_ts: local_ts,
                     local_ts,
@@ -305,8 +322,7 @@ pub(crate) fn parse_public_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let mp = data.to_mark_price(quote)
-                    ?;
+                let mp = data.to_mark_price(quote)?;
                 events.push(MarketEvent {
                     exchange_ts: mp.timestamp,
                     local_ts,
@@ -321,8 +337,7 @@ pub(crate) fn parse_public_message(
 
             let mut events = Vec::new();
             for data in &push.data {
-                let ip = data.to_index_price(quote)
-                    ?;
+                let ip = data.to_index_price(quote)?;
                 events.push(MarketEvent {
                     exchange_ts: ip.timestamp,
                     local_ts,
@@ -380,10 +395,10 @@ pub(crate) fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use super::*;
-    use crate::domain::{Exchange, MarketTrade};
     use crate::domain::PriceStep;
+    use crate::domain::{Exchange, MarketTrade};
+    use rust_decimal_macros::dec;
 
     const TRADES_PUSH: &str = r#"{
         "arg":{"channel":"trades","instId":"BTC-USDT-SWAP"},
@@ -419,7 +434,8 @@ mod tests {
 
     #[test]
     fn trade_size_is_converted_from_contracts_to_coin() {
-        let events = parse_public_message(TRADES_PUSH, "USDT", 0, &metas(dec!(0.01))).expect("parse");
+        let events =
+            parse_public_message(TRADES_PUSH, "USDT", 0, &metas(dec!(0.01))).expect("parse");
         let trades = trades_of(events);
         assert_eq!(trades.len(), 1);
         // 12 张 x 0.01 = 0.12 BTC；若漏了折算会是 12（差 100 倍）
@@ -437,7 +453,9 @@ mod tests {
 
     #[test]
     fn trades_kind_maps_to_trades_channel() {
-        let kind = SubscriptionKind::Trades { symbol: "BTC".to_string() };
+        let kind = SubscriptionKind::Trades {
+            symbol: "BTC".to_string(),
+        };
         let arg = kind_to_arg(&kind, "USDT").expect("must map");
         assert_eq!(arg["channel"], "trades");
         assert_eq!(arg["instId"], "BTC-USDT-SWAP");

@@ -40,7 +40,10 @@ impl FundingFeePoller {
         group.spawn_periodic(
             format!("{exchange}FundingFeePoller"),
             Duration::from_millis(interval_ms),
-            Self { source, account_bus },
+            Self {
+                source,
+                account_bus,
+            },
         )
     }
 }

@@ -1,19 +1,19 @@
 //! OKX ExchangeClient 实现 (仅 REST)
 
 use super::symbol::{from_okx, to_okx};
+use crate::domain::{Decimal, PriceStep};
 use crate::domain::{
-    Exchange, ExchangeError, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate, PlaceError, Side,
-    FundingFee, Symbol, SymbolMeta, TimeInForce, Timestamp,
+    Exchange, ExchangeError, FundingFee, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate,
+    PlaceError, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
-use crate::exchange::okx::codec::{parse_account_info, GreeksData, PositionData};
 use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
+use crate::exchange::okx::codec::{parse_account_info, GreeksData, PositionData};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::{
-    BALANCE, BILLS, CANCEL, FUNDING_HISTORY, GREEKS, INSTRUMENTS, LIMITER, ORDERS_PENDING, PLACE, PLACE_ACCOUNT, POSITIONS,
-    REST_BASE_URL,
+    BALANCE, BILLS, CANCEL, FUNDING_HISTORY, GREEKS, INSTRUMENTS, LIMITER, ORDERS_PENDING, PLACE,
+    PLACE_ACCOUNT, POSITIONS, REST_BASE_URL,
 };
 use crate::exchange::rate_limit::Quota;
-use crate::domain::{Decimal, PriceStep};
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
@@ -60,7 +60,10 @@ impl OkxClient {
 
     /// 合约目录：首次调用时拉取，之后取缓存
     async fn instruments(&self) -> Result<&[SymbolMeta], ExchangeError> {
-        self.instruments.get_or_try_init(|| self.get_all_instruments()).await.map(Vec::as_slice)
+        self.instruments
+            .get_or_try_init(|| self.get_all_instruments())
+            .await
+            .map(Vec::as_slice)
     }
 
     /// 取该 symbol 的合约乘数 (张 -> 币)，读合约目录
@@ -70,7 +73,9 @@ impl OkxClient {
             .iter()
             .find(|m| &m.symbol == symbol)
             .map(|m| m.contract_size)
-            .ok_or_else(|| ExchangeError::Other(format!("No OKX contract size for symbol {symbol}")))
+            .ok_or_else(|| {
+                ExchangeError::Other(format!("No OKX contract size for symbol {symbol}"))
+            })
     }
 
     /// 获取计价币种
@@ -97,8 +102,7 @@ impl OkxClient {
     fn sign(&self, timestamp: &str, method: &str, path: &str, body: &str) -> Option<String> {
         let credentials = self.credentials.as_ref()?;
         let message = format!("{}{}{}{}", timestamp, method, path, body);
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(credentials.secret.as_bytes()).ok()?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(credentials.secret.as_bytes()).ok()?;
         mac.update(message.as_bytes());
         let result = mac.finalize();
         Some(general_purpose::STANDARD.encode(result.into_bytes()))
@@ -137,7 +141,10 @@ impl OkxClient {
 
         let admitted = LIMITER.query(&[INSTRUMENTS.cost(1)]).await?;
         let resp = crate::net::send(
-            self.client.get(format!("{}/api/v5/public/instruments?instType=SWAP", self.base_url)),
+            self.client.get(format!(
+                "{}/api/v5/public/instruments?instType=SWAP",
+                self.base_url
+            )),
             admitted,
         )
         .await
@@ -162,7 +169,11 @@ impl OkxClient {
             let Some(symbol) = from_okx(&d.inst_id, &self.quote) else {
                 continue;
             };
-            let positive = |raw: &str| crate::domain::parse_decimal(&raw).ok().filter(|v| *v > Decimal::ZERO);
+            let positive = |raw: &str| {
+                crate::domain::parse_decimal(&raw)
+                    .ok()
+                    .filter(|v| *v > Decimal::ZERO)
+            };
             let parsed = (|| {
                 Some(SymbolMeta {
                     exchange: Exchange::OKX,
@@ -207,15 +218,22 @@ impl OkxClient {
             data: Vec<GreeksData>,
         }
 
-        let resp = crate::net::send(self.client.get(format!("{}{}", self.base_url, path)).headers(headers), admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
+        let resp = crate::net::send(
+            self.client
+                .get(format!("{}{}", self.base_url, path))
+                .headers(headers),
+            admitted,
+        )
+        .await
+        .map_err(Self::map_reqwest_error)?;
 
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        let data: Response = serde_json::from_str(&text)
-            .map_err(|e| ExchangeError::Other(format!(
-                "Failed to parse greeks response: {}, body: {}", e, text
-            )))?;
+        let data: Response = serde_json::from_str(&text).map_err(|e| {
+            ExchangeError::Other(format!(
+                "Failed to parse greeks response: {}, body: {}",
+                e, text
+            ))
+        })?;
 
         if data.code != "0" {
             return Err(map_okx_error(&data.code, &data.msg));
@@ -223,8 +241,7 @@ impl OkxClient {
 
         let mut result = Vec::new();
         for item in &data.data {
-            let greeks = item.to_greeks()
-                .map_err(|e| ExchangeError::Other(e))?;
+            let greeks = item.to_greeks().map_err(|e| ExchangeError::Other(e))?;
             result.push(greeks);
         }
 
@@ -232,7 +249,11 @@ impl OkxClient {
     }
 
     /// 签名 GET（先按 `quota` 取额度），返回 `data` 数组；顶层 code 非 0 即错误。
-    async fn signed_get<T: for<'de> Deserialize<'de>>(&self, quota: &'static Quota, path: &str) -> Result<Vec<T>, ExchangeError> {
+    async fn signed_get<T: for<'de> Deserialize<'de>>(
+        &self,
+        quota: &'static Quota,
+        path: &str,
+    ) -> Result<Vec<T>, ExchangeError> {
         #[derive(Deserialize)]
         struct Response<T> {
             code: String,
@@ -248,12 +269,20 @@ impl OkxClient {
         let headers = self
             .build_headers(&sign, &timestamp)
             .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
-        let resp = crate::net::send(self.client.get(format!("{}{}", self.base_url, path)).headers(headers), admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
+        let resp = crate::net::send(
+            self.client
+                .get(format!("{}{}", self.base_url, path))
+                .headers(headers),
+            admitted,
+        )
+        .await
+        .map_err(Self::map_reqwest_error)?;
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         let data: Response<T> = serde_json::from_str(&text).map_err(|e| {
-            ExchangeError::ParseError(format!("OKX {path}: {e} (body: {})", text.chars().take(300).collect::<String>()))
+            ExchangeError::ParseError(format!(
+                "OKX {path}: {e} (body: {})",
+                text.chars().take(300).collect::<String>()
+            ))
         })?;
         if data.code != "0" {
             return Err(map_okx_error(&data.code, &data.msg));
@@ -282,9 +311,14 @@ impl OkxClient {
             .build_headers(&sign, &timestamp)
             .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
 
-        let resp = crate::net::send(self.client.get(format!("{}{}", self.base_url, path)).headers(headers), admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
+        let resp = crate::net::send(
+            self.client
+                .get(format!("{}{}", self.base_url, path))
+                .headers(headers),
+            admitted,
+        )
+        .await
+        .map_err(Self::map_reqwest_error)?;
         let data: PendingOrdersResponse = resp.json().await.map_err(Self::map_reqwest_error)?;
         if data.code != "0" {
             return Err(map_okx_error(&data.code, &data.msg));
@@ -383,9 +417,18 @@ impl ExchangeClient for OkxClient {
         Ok(self.instruments().await?.to_vec())
     }
 
-    async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+    async fn fetch_symbol_meta(
+        &self,
+        symbols: &[Symbol],
+    ) -> Result<Vec<SymbolMeta>, ExchangeError> {
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
-        Ok(self.instruments().await?.iter().filter(|m| symbol_set.contains(&m.symbol)).cloned().collect())
+        Ok(self
+            .instruments()
+            .await?
+            .iter()
+            .filter(|m| symbol_set.contains(&m.symbol))
+            .cloned()
+            .collect())
     }
 }
 
@@ -395,7 +438,11 @@ impl AccountClient for OkxClient {
         Exchange::OKX
     }
 
-    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError> {
+    async fn cancel_order(
+        &self,
+        symbol: &Symbol,
+        client_order_id: &str,
+    ) -> Result<(), ExchangeError> {
         let path = "/api/v5/trade/cancel-order";
         let inst_id = to_okx(symbol, &self.quote);
 
@@ -435,9 +482,15 @@ impl AccountClient for OkxClient {
             data: Vec<CancelData>,
         }
 
-        let resp = crate::net::send(self.client.post(format!("{}{}", self.base_url, path)).headers(headers).body(body), admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
+        let resp = crate::net::send(
+            self.client
+                .post(format!("{}{}", self.base_url, path))
+                .headers(headers)
+                .body(body),
+            admitted,
+        )
+        .await
+        .map_err(Self::map_reqwest_error)?;
 
         let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
 
@@ -464,7 +517,10 @@ impl AccountClient for OkxClient {
     /// 完整性是这个接口的全部价值所在（见 [`parse_pending_order`] 与
     /// [`PENDING_ORDERS_MAX_PAGES`]）：分页取不全、或有一条解析不了，都返回 `Err`，
     /// 绝不返回一份"少了几张"的列表。
-    async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
+    async fn fetch_pending_orders(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Vec<OrderUpdate>, ExchangeError> {
         let inst_id = to_okx(symbol, &self.quote);
         // 张 -> 币：REST 全程用张数，此处一次取到乘数，所有数量字段统一折算
         let contract_size = self.contract_size_of(symbol).await?;
@@ -545,14 +601,19 @@ impl AccountClient for OkxClient {
             .build_headers(&sign, &timestamp)
             .ok_or_else(|| PlaceError::unsent("Failed to build headers"))?;
 
-        let resp = crate::net::send(self.client.post(format!("{}{}", self.base_url, path)).headers(headers).body(body), admitted)
-            .await
-            .map_err(|e| place_send_error(Exchange::OKX, e))?;
+        let resp = crate::net::send(
+            self.client
+                .post(format!("{}{}", self.base_url, path))
+                .headers(headers)
+                .body(body),
+            admitted,
+        )
+        .await
+        .map_err(|e| place_send_error(Exchange::OKX, e))?;
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| PlaceError::indeterminate(format!("OKX 读下单回复失败 (HTTP {status}): {e}")))?;
+        let text = resp.text().await.map_err(|e| {
+            PlaceError::indeterminate(format!("OKX 读下单回复失败 (HTTP {status}): {e}"))
+        })?;
         parse_place_reply(status, &text)
     }
 
@@ -570,12 +631,18 @@ impl AccountClient for OkxClient {
             pos: String,
             notional_usd: String,
         }
-        let balance: Vec<BalanceData> = self.signed_get(&BALANCE, "/api/v5/account/balance").await?;
-        let total_eq = balance
-            .first()
-            .ok_or_else(|| ExchangeError::ParseError("OKX account/balance 返回空 data".to_string()))?;
-        let positions: Vec<PositionNotional> = self.signed_get(&POSITIONS, "/api/v5/account/positions").await?;
-        let notionals: Vec<(&str, &str)> = positions.iter().map(|p| (p.pos.as_str(), p.notional_usd.as_str())).collect();
+        let balance: Vec<BalanceData> =
+            self.signed_get(&BALANCE, "/api/v5/account/balance").await?;
+        let total_eq = balance.first().ok_or_else(|| {
+            ExchangeError::ParseError("OKX account/balance 返回空 data".to_string())
+        })?;
+        let positions: Vec<PositionNotional> = self
+            .signed_get(&POSITIONS, "/api/v5/account/positions")
+            .await?;
+        let notionals: Vec<(&str, &str)> = positions
+            .iter()
+            .map(|p| (p.pos.as_str(), p.notional_usd.as_str()))
+            .collect();
         parse_account_info(&total_eq.total_eq, &notionals).map_err(ExchangeError::ParseError)
     }
 
@@ -597,9 +664,14 @@ impl AccountClient for OkxClient {
             data: Vec<PositionData>,
         }
 
-        let resp = crate::net::send(self.client.get(format!("{}{}", self.base_url, path)).headers(headers), admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
+        let resp = crate::net::send(
+            self.client
+                .get(format!("{}{}", self.base_url, path))
+                .headers(headers),
+            admitted,
+        )
+        .await
+        .map_err(Self::map_reqwest_error)?;
 
         let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
 
@@ -609,7 +681,6 @@ impl AccountClient for OkxClient {
 
         let mut positions = Vec::new();
         for (symbol, d) in mapped_positions(&data.data, &self.quote) {
-
             // 张 -> 币：[`ExchangeClient`] 的契约是返回币本位（见 crate::domain::Quantity）。
             // 字段口径（空串=0、张数、双向持仓拒绝）全在 codec 里，不在此处重抄一份。
             let contract_size = self.contract_size_of(&symbol).await?;
@@ -629,13 +700,14 @@ fn mapped_positions<'a>(
     data: &'a [PositionData],
     quote: &'a str,
 ) -> impl Iterator<Item = (Symbol, &'a PositionData)> + 'a {
-    data.iter().filter_map(move |d| match from_okx(&d.inst_id, quote) {
-        Some(symbol) => Some((symbol, d)),
-        None => {
-            tracing::debug!(inst_id = %d.inst_id, "OKX 持仓不是本引擎接入的合约，跳过");
-            None
-        }
-    })
+    data.iter()
+        .filter_map(move |d| match from_okx(&d.inst_id, quote) {
+            Some(symbol) => Some((symbol, d)),
+            None => {
+                tracing::debug!(inst_id = %d.inst_id, "OKX 持仓不是本引擎接入的合约，跳过");
+                None
+            }
+        })
 }
 
 /// 解析 `funding-rate-history`：只留 `fundingTime >= start_ms` 的，按时间升序。
@@ -661,26 +733,34 @@ fn parse_settled_funding(
         data: Vec<Entry>,
     }
     let resp: Response = serde_json::from_str(text).map_err(|e| {
-        ExchangeError::ParseError(format!("funding-rate-history: {e} (body: {})", text.chars().take(300).collect::<String>()))
+        ExchangeError::ParseError(format!(
+            "funding-rate-history: {e} (body: {})",
+            text.chars().take(300).collect::<String>()
+        ))
     })?;
     if resp.code != "0" {
         return Err(map_okx_error(&resp.code, &resp.msg));
     }
     let mut out = Vec::with_capacity(resp.data.len());
     for e in &resp.data {
-        let settle_time: u64 = e
-            .funding_time
-            .parse()
-            .map_err(|_| ExchangeError::ParseError(format!("fundingTime 非法: {}", e.funding_time)))?;
-        let rate: f64 = e
-            .realized_rate
-            .parse()
-            .map_err(|_| ExchangeError::ParseError(format!("realizedRate 非法: {}", e.realized_rate)))?;
-        out.push(crate::domain::SettledFunding { exchange: Exchange::OKX, symbol: symbol.clone(), rate, settle_time });
+        let settle_time: u64 = e.funding_time.parse().map_err(|_| {
+            ExchangeError::ParseError(format!("fundingTime 非法: {}", e.funding_time))
+        })?;
+        let rate: f64 = e.realized_rate.parse().map_err(|_| {
+            ExchangeError::ParseError(format!("realizedRate 非法: {}", e.realized_rate))
+        })?;
+        out.push(crate::domain::SettledFunding {
+            exchange: Exchange::OKX,
+            symbol: symbol.clone(),
+            rate,
+            settle_time,
+        });
     }
     let earliest = out.iter().map(|f| f.settle_time).min();
     if out.len() >= 100 && earliest.is_some_and(|t| t > start_ms) {
-        return Err(ExchangeError::Other(format!("OKX {symbol} 资金费历史一页 100 条未覆盖窗口起点")));
+        return Err(ExchangeError::Other(format!(
+            "OKX {symbol} 资金费历史一页 100 条未覆盖窗口起点"
+        )));
     }
     out.retain(|f| f.settle_time >= start_ms);
     out.sort_by_key(|f| f.settle_time);
@@ -720,20 +800,26 @@ fn parse_place_reply(status: u16, text: &str) -> Result<OrderId, PlaceError> {
     let unknown = |code: &str| OKX_UNKNOWN_STATUS_CODES.contains(&code);
     let Ok(resp) = serde_json::from_str::<Response>(text) else {
         let body: String = text.chars().take(300).collect();
-        return Err(PlaceError::indeterminate(format!("OKX 下单回复解析不了 (HTTP {status}): {body}")));
+        return Err(PlaceError::indeterminate(format!(
+            "OKX 下单回复解析不了 (HTTP {status}): {body}"
+        )));
     };
     if let Some(d) = resp.data.first() {
         let detail = format!("HTTP {status}, sCode={}, sMsg={}", d.s_code, d.s_msg);
         return match d.s_code.as_str() {
             "0" if !d.ord_id.is_empty() => Ok(d.ord_id.clone()),
-            "0" => Err(PlaceError::indeterminate(format!("OKX 受理了却没给订单号: {detail}"))),
+            "0" => Err(PlaceError::indeterminate(format!(
+                "OKX 受理了却没给订单号: {detail}"
+            ))),
             c if unknown(c) => Err(PlaceError::indeterminate(format!("OKX {detail}"))),
             _ => Err(PlaceError::rejected(detail)),
         };
     }
     let detail = format!("HTTP {status}, code={}, msg={}", resp.code, resp.msg);
     match resp.code.as_str() {
-        "0" => Err(PlaceError::indeterminate(format!("OKX 下单回复没有单笔结果: {detail}"))),
+        "0" => Err(PlaceError::indeterminate(format!(
+            "OKX 下单回复没有单笔结果: {detail}"
+        ))),
         c if unknown(c) || status >= 500 => Err(PlaceError::indeterminate(format!("OKX {detail}"))),
         _ => Err(PlaceError::rejected(detail)),
     }
@@ -797,9 +883,16 @@ impl crate::exchange::SettledFundingSource for OkxClient {
         start_ms: crate::domain::Timestamp,
     ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
         let inst_id = to_okx(symbol, &self.quote);
-        let url = format!("{}/api/v5/public/funding-rate-history?instId={inst_id}&limit=100", self.base_url);
-        let admitted = LIMITER.query(&[FUNDING_HISTORY.cost_in(&inst_id, 1)]).await?;
-        let resp = crate::net::send(self.client.get(&url), admitted).await.map_err(Self::map_reqwest_error)?;
+        let url = format!(
+            "{}/api/v5/public/funding-rate-history?instId={inst_id}&limit=100",
+            self.base_url
+        );
+        let admitted = LIMITER
+            .query(&[FUNDING_HISTORY.cost_in(&inst_id, 1)])
+            .await?;
+        let resp = crate::net::send(self.client.get(&url), admitted)
+            .await
+            .map_err(Self::map_reqwest_error)?;
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         parse_settled_funding(&text, symbol, start_ms)
     }
@@ -816,7 +909,10 @@ mod settled_funding_tests {
             {"fundingTime":"2000","realizedRate":"-0.0002","fundingRate":"0"},
             {"fundingTime":"1000","realizedRate":"0.0001","fundingRate":"0"}]}"#;
         let got = parse_settled_funding(body, &"BTC".to_string(), 2000).unwrap();
-        assert_eq!(got.iter().map(|f| f.settle_time).collect::<Vec<_>>(), vec![2000, 3000]);
+        assert_eq!(
+            got.iter().map(|f| f.settle_time).collect::<Vec<_>>(),
+            vec![2000, 3000]
+        );
         // 取实际结算的 realizedRate，不是 fundingRate
         assert_eq!(got[1].rate, 0.0003);
         assert!(got.iter().all(|f| f.exchange == Exchange::OKX));
@@ -824,7 +920,12 @@ mod settled_funding_tests {
 
     #[test]
     fn api_error_and_bad_numbers_fail() {
-        assert!(parse_settled_funding(r#"{"code":"51001","msg":"Instrument ID does not exist","data":[]}"#, &"X".into(), 0).is_err());
+        assert!(parse_settled_funding(
+            r#"{"code":"51001","msg":"Instrument ID does not exist","data":[]}"#,
+            &"X".into(),
+            0
+        )
+        .is_err());
         let bad = r#"{"code":"0","msg":"","data":[{"fundingTime":"1","realizedRate":""}]}"#;
         assert!(parse_settled_funding(bad, &"X".into(), 0).is_err());
     }
@@ -836,7 +937,11 @@ mod account_info_tests {
 
     #[test]
     fn sums_absolute_position_notionals() {
-        let info = parse_account_info("1000.5", &[("2", "200"), ("-1", "-150.5"), ("", ""), ("0", "")]).unwrap();
+        let info = parse_account_info(
+            "1000.5",
+            &[("2", "200"), ("-1", "-150.5"), ("", ""), ("0", "")],
+        )
+        .unwrap();
         assert_eq!(info.equity, 1000.5);
         assert_eq!(info.notional, 350.5);
     }
@@ -845,14 +950,17 @@ mod account_info_tests {
     fn unparsable_values_fail_instead_of_zero() {
         assert!(parse_account_info("", &[]).is_err());
         assert!(parse_account_info("1", &[("1", "abc")]).is_err());
-        assert!(parse_account_info("1", &[("3", "")]).is_err(), "有仓却没有价值不能当 0");
+        assert!(
+            parse_account_info("1", &[("3", "")]).is_err(),
+            "有仓却没有价值不能当 0"
+        );
     }
 }
 
 #[cfg(test)]
 mod pending_orders_tests {
-    use rust_decimal_macros::dec;
     use super::*;
+    use rust_decimal_macros::dec;
 
     fn raw(cl_ord_id: Option<&str>) -> PendingOrderData {
         PendingOrderData {
@@ -895,10 +1003,22 @@ mod pending_orders_tests {
     #[test]
     fn any_unparsable_field_fails_the_whole_snapshot() {
         let cases: Vec<(&str, Box<dyn Fn(&mut PendingOrderData)>)> = vec![
-            ("instId", Box::new(|d: &mut PendingOrderData| d.inst_id = "???".to_string())),
-            ("side", Box::new(|d: &mut PendingOrderData| d.side = "sideways".to_string())),
-            ("state", Box::new(|d: &mut PendingOrderData| d.state = "canceled".to_string())),
-            ("sz", Box::new(|d: &mut PendingOrderData| d.sz = "n/a".to_string())),
+            (
+                "instId",
+                Box::new(|d: &mut PendingOrderData| d.inst_id = "???".to_string()),
+            ),
+            (
+                "side",
+                Box::new(|d: &mut PendingOrderData| d.side = "sideways".to_string()),
+            ),
+            (
+                "state",
+                Box::new(|d: &mut PendingOrderData| d.state = "canceled".to_string()),
+            ),
+            (
+                "sz",
+                Box::new(|d: &mut PendingOrderData| d.sz = "n/a".to_string()),
+            ),
         ];
         for (field, corrupt) in cases {
             let mut d = raw(Some("x-abc"));
@@ -925,8 +1045,9 @@ mod positions_tests {
                 {"instId":"BTC-USD-SWAP","posSide":"net","pos":"11"}]"#,
         )
         .unwrap();
-        let got: Vec<(Symbol, &str)> =
-            mapped_positions(&data, "USDT").map(|(s, d)| (s, d.inst_id.as_str())).collect();
+        let got: Vec<(Symbol, &str)> = mapped_positions(&data, "USDT")
+            .map(|(s, d)| (s, d.inst_id.as_str()))
+            .collect();
         assert_eq!(got, [("BTC".to_string(), "BTC-USDT-SWAP")]);
     }
 }
@@ -964,7 +1085,10 @@ mod place_reply_tests {
     #[test]
     fn reduce_only_message_keeps_its_reason() {
         let s = r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"51169","sMsg":"Order failed: reduce-only order"}]}"#;
-        assert_eq!(parse_place_reply(200, s), Err(PlaceError::Rejected(RejectReason::ReduceOnlyClosed)));
+        assert_eq!(
+            parse_place_reply(200, s),
+            Err(PlaceError::Rejected(RejectReason::ReduceOnlyClosed))
+        );
     }
 
     /// 顶层被拒（没有单笔结果）：签名错、限频
@@ -982,15 +1106,30 @@ mod place_reply_tests {
     #[test]
     fn unknown_outcomes() {
         for (status, s) in [
-            (400, r#"{"code":"50004","msg":"API endpoint request timeout (does not mean that the request was successful or failed, please check the request result)","data":[]}"#),
-            (503, r#"{"code":"50001","msg":"Service temporarily unavailable"}"#),
-            (200, r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"51149","sMsg":"Order timed out. Please try again."}]}"#),
-            (200, r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"50026","sMsg":"System error"}]}"#),
+            (
+                400,
+                r#"{"code":"50004","msg":"API endpoint request timeout (does not mean that the request was successful or failed, please check the request result)","data":[]}"#,
+            ),
+            (
+                503,
+                r#"{"code":"50001","msg":"Service temporarily unavailable"}"#,
+            ),
+            (
+                200,
+                r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"51149","sMsg":"Order timed out. Please try again."}]}"#,
+            ),
+            (
+                200,
+                r#"{"code":"1","msg":"","data":[{"ordId":"","sCode":"50026","sMsg":"System error"}]}"#,
+            ),
             (502, r#"{"code":"50000","msg":"x"}"#),
             (502, "<html>Bad Gateway</html>"),
             (200, ""),
             (200, r#"{"code":"0","msg":"","data":[]}"#),
-            (200, r#"{"code":"0","msg":"","data":[{"ordId":"","sCode":"0","sMsg":""}]}"#),
+            (
+                200,
+                r#"{"code":"0","msg":"","data":[{"ordId":"","sCode":"0","sMsg":""}]}"#,
+            ),
         ] {
             assert!(indeterminate(parse_place_reply(status, s)), "{status} {s}");
         }
@@ -1007,7 +1146,11 @@ impl crate::exchange::FundingFeeSource for OkxClient {
     ///
     /// 金额取 `balChg`（账户余额的带符号变化：正 = 收到，负 = 付出），结算 ID 取 `billId`。
     /// 只返回本适配器计价币的永续（与品种目录同一映射），其余合约的资费不归本引擎。
-    async fn fetch_funding_fees(&self, start: Timestamp, end: Timestamp) -> Result<Vec<FundingFee>, ExchangeError> {
+    async fn fetch_funding_fees(
+        &self,
+        start: Timestamp,
+        end: Timestamp,
+    ) -> Result<Vec<FundingFee>, ExchangeError> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Bill {
@@ -1021,7 +1164,9 @@ impl crate::exchange::FundingFeeSource for OkxClient {
         let mut fees = Vec::new();
         let mut after: Option<String> = None;
         loop {
-            let mut path = format!("/api/v5/account/bills?instType=SWAP&type=8&begin={start}&end={end}&limit={PAGE}");
+            let mut path = format!(
+                "/api/v5/account/bills?instType=SWAP&type=8&begin={start}&end={end}&limit={PAGE}"
+            );
             if let Some(cursor) = &after {
                 path.push_str(&format!("&after={cursor}"));
             }
@@ -1030,9 +1175,14 @@ impl crate::exchange::FundingFeeSource for OkxClient {
             after = page.last().map(|b| b.bill_id.clone());
             for b in page {
                 let parse = |what: &str, raw: &str| {
-                    ExchangeError::ParseError(format!("OKX 资费账单 {} 的 {what} 非法: {raw:?}", b.bill_id))
+                    ExchangeError::ParseError(format!(
+                        "OKX 资费账单 {} 的 {what} 非法: {raw:?}",
+                        b.bill_id
+                    ))
                 };
-                let Some(symbol) = from_okx(&b.inst_id, &self.quote) else { continue };
+                let Some(symbol) = from_okx(&b.inst_id, &self.quote) else {
+                    continue;
+                };
                 fees.push(FundingFee {
                     exchange: Exchange::OKX,
                     symbol,

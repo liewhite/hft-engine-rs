@@ -26,12 +26,15 @@ impl MetricsPushConfig {
         let url = std::env::var("PUSHGATEWAY_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())?;
-        let job = std::env::var("PUSHGATEWAY_JOB").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "hft_engine".to_string())
-        });
+        let job = std::env::var("PUSHGATEWAY_JOB")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| "hft_engine".to_string())
+            });
         Some(Self { url, job })
     }
 }
@@ -52,7 +55,9 @@ impl Gauge {
     pub fn validate(&self) -> Result<(), String> {
         let ident = |s: &str, colon: bool| {
             let mut chars = s.chars();
-            chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || (colon && c == ':'))
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || (colon && c == ':'))
                 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || (colon && c == ':'))
         };
         if !ident(&self.name, true) {
@@ -61,7 +66,11 @@ impl Gauge {
         if self.name.starts_with("hft_") {
             return Err(format!("{} 占用了框架的 hft_ 前缀", self.name));
         }
-        if let Some((k, _)) = self.labels.iter().find(|(k, _)| !ident(k, false) || k.starts_with("__")) {
+        if let Some((k, _)) = self
+            .labels
+            .iter()
+            .find(|(k, _)| !ident(k, false) || k.starts_with("__"))
+        {
             return Err(format!("{} 的标签名非法: {k:?}", self.name));
         }
         Ok(())
@@ -70,7 +79,10 @@ impl Gauge {
     pub fn new(name: impl Into<String>, labels: &[(&str, &str)], value: f64) -> Self {
         Self {
             name: name.into(),
-            labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             value,
         }
     }
@@ -92,7 +104,10 @@ impl PromText {
                     let _ = write!(self.0, ",");
                 }
                 // label 值转义：反斜杠、双引号、换行
-                let escaped = v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+                let escaped = v
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
                 let _ = write!(self.0, "{k}=\"{escaped}\"");
             }
             let _ = write!(self.0, "}}");
@@ -147,13 +162,24 @@ impl Pusher {
     /// 在 `group` 下起推送器，返回投递快照的地址。
     pub async fn spawn(group: &Group, config: MetricsPushConfig) -> anyhow::Result<Addr<String>> {
         let (_, addr) = group
-            .spawn_addressed("MetricsPusher", move |_scope: Scope, inbox: Inbox<String>| async move {
-                let client = crate::net::http(PUSH_TIMEOUT)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("指标推送器构建 HTTP client 失败: {e}"))?;
-                let endpoint = format!("{}/metrics/job/{}", config.url.trim_end_matches('/'), config.job);
-                Ok(Self { inbox, client, endpoint })
-            })
+            .spawn_addressed(
+                "MetricsPusher",
+                move |_scope: Scope, inbox: Inbox<String>| async move {
+                    let client = crate::net::http(PUSH_TIMEOUT)
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("指标推送器构建 HTTP client 失败: {e}"))?;
+                    let endpoint = format!(
+                        "{}/metrics/job/{}",
+                        config.url.trim_end_matches('/'),
+                        config.job
+                    );
+                    Ok(Self {
+                        inbox,
+                        client,
+                        endpoint,
+                    })
+                },
+            )
             .await?;
         Ok(addr)
     }

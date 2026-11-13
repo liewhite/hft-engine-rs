@@ -18,7 +18,7 @@
 
 use crate::domain::{Position, Symbol};
 use crate::messaging::state_manager::PositionBaseline;
-use crate::messaging::{SymbolAccountData, AccountData, AccountEvent, SymbolPositions};
+use crate::messaging::{AccountData, AccountEvent, SymbolAccountData, SymbolPositions};
 use std::collections::HashMap;
 
 /// 跨 symbol 的持仓账本
@@ -81,7 +81,10 @@ impl PositionBook {
     /// 账本吃哪些事件（只有实盘 Fill）的**唯一判据**：[`Self::apply`] 与总线订阅过滤都用它。
     pub fn live_fill(event: &AccountEvent) -> Option<&crate::domain::Fill> {
         match (&event.account, &event.data) {
-            (crate::domain::AccountId::Live, AccountData::Symbol(SymbolAccountData::Fill(fill))) => Some(fill),
+            (
+                crate::domain::AccountId::Live,
+                AccountData::Symbol(SymbolAccountData::Fill(fill)),
+            ) => Some(fill),
             _ => None,
         }
     }
@@ -107,10 +110,10 @@ impl PositionBook {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{AccountId, Exchange, Fill, FillReason, Position, Side};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     const EX: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
@@ -160,7 +163,11 @@ mod tests {
     #[test]
     fn paper_fills_never_touch_the_live_book() {
         let mut b = book();
-        b.apply(&fill_event(AccountId::Paper(SYM.to_string()), dec!(5.0), 10));
+        b.apply(&fill_event(
+            AccountId::Paper(SYM.to_string()),
+            dec!(5.0),
+            10,
+        ));
         assert_eq!(size_of(&b), dec!(2.0), "模拟成交不得改变实盘账本");
 
         b.apply(&fill_event(AccountId::Live, dec!(5.0), 10));

@@ -21,7 +21,11 @@ impl Clock {
         market_bus: MarketBus,
     ) -> Result<ChildHandle, GroupClosed> {
         tracing::info!(interval_ms, "Clock started");
-        group.spawn_periodic("Clock", Duration::from_millis(interval_ms), Self { market_bus })
+        group.spawn_periodic(
+            "Clock",
+            Duration::from_millis(interval_ms),
+            Self { market_bus },
+        )
     }
 }
 

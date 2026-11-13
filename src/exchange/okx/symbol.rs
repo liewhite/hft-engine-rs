@@ -40,7 +40,14 @@ mod tests {
     #[test]
     fn only_configured_quote_perpetual_maps() {
         assert_eq!(from_okx("BTC-USDT-SWAP", "USDT").as_deref(), Some("BTC"));
-        for other in ["BTC-USDC-SWAP", "BTC-USD-SWAP", "BTC-USDT-251226", "BTC-USDT", "-USDT-SWAP", "A-B-USDT-SWAP"] {
+        for other in [
+            "BTC-USDC-SWAP",
+            "BTC-USD-SWAP",
+            "BTC-USDT-251226",
+            "BTC-USDT",
+            "-USDT-SWAP",
+            "A-B-USDT-SWAP",
+        ] {
             assert_eq!(from_okx(other, "USDT"), None, "{other}");
         }
         assert_eq!(from_okx("BTC-USDC-SWAP", "USDC").as_deref(), Some("BTC"));

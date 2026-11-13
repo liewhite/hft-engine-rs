@@ -1,14 +1,16 @@
 //! Binance ExchangeClient 实现 (仅 REST)
 
 use super::symbol::{from_binance, to_binance};
+use crate::domain::{Decimal, PriceStep};
 use crate::domain::{
     Exchange, ExchangeError, FundingFee, OrderId, OrderStatus, OrderType, PlaceError, RejectReason,
     SettledFunding, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
-use crate::exchange::binance::{FUNDING_RATE, IP_WEIGHT, LIMITER, ORDERS_10S, ORDERS_1M, REST_BASE_URL};
+use crate::exchange::binance::{
+    FUNDING_RATE, IP_WEIGHT, LIMITER, ORDERS_10S, ORDERS_1M, REST_BASE_URL,
+};
 use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
-use crate::domain::{Decimal, PriceStep};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
@@ -36,14 +38,14 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
         symbols: Vec<SymbolInfo>,
     }
 
-    #[derive(Deserialize,Debug)]
+    #[derive(Deserialize, Debug)]
     #[serde(rename_all = "camelCase")]
     struct SymbolInfo {
         symbol: String,
         filters: Vec<Filter>,
     }
 
-    #[derive(Deserialize,Debug)]
+    #[derive(Deserialize, Debug)]
     #[serde(tag = "filterType")]
     enum Filter {
         #[serde(rename = "PRICE_FILTER")]
@@ -132,7 +134,10 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
 
 impl BinanceClient {
     /// 创建新的 Binance 客户端
-    pub fn new(quote: String, credentials: Option<BinanceCredentials>) -> Result<Self, ExchangeError> {
+    pub fn new(
+        quote: String,
+        credentials: Option<BinanceCredentials>,
+    ) -> Result<Self, ExchangeError> {
         let client = crate::exchange::client::exchange_http_client(Exchange::Binance)?;
 
         Ok(Self {
@@ -173,9 +178,8 @@ impl BinanceClient {
                 &text[..text.len().min(500)]
             )));
         }
-        let tickers: Vec<Ticker24h> = serde_json::from_str(&text).map_err(|e| {
-            ExchangeError::Other(format!("Failed to parse ticker/24hr: {e}"))
-        })?;
+        let tickers: Vec<Ticker24h> = serde_json::from_str(&text)
+            .map_err(|e| ExchangeError::Other(format!("Failed to parse ticker/24hr: {e}")))?;
 
         Ok(tickers
             .into_iter()
@@ -233,10 +237,8 @@ impl BinanceClient {
             .unwrap()
             .as_millis();
 
-        let mut query_parts: Vec<String> = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect();
+        let mut query_parts: Vec<String> =
+            params.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         query_parts.push(format!("timestamp={}", timestamp));
 
         let query_string = query_parts.join("&");
@@ -260,9 +262,13 @@ impl BinanceClient {
     /// 获取所有交易对信息
     async fn get_all_exchange_info(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         let admitted = LIMITER.query(&[IP_WEIGHT.cost(1)]).await?;
-        let resp = crate::net::send(self.client.get(format!("{}/fapi/v1/exchangeInfo", self.base_url)), admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
+        let resp = crate::net::send(
+            self.client
+                .get(format!("{}/fapi/v1/exchangeInfo", self.base_url)),
+            admitted,
+        )
+        .await
+        .map_err(Self::map_reqwest_error)?;
 
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
@@ -307,7 +313,7 @@ impl BinanceClient {
             admitted,
         )
         .await
-            .map_err(Self::map_reqwest_error)?;
+        .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -338,9 +344,12 @@ impl BinanceClient {
                 Some(s) => s,
                 None => continue, // 非当前 quote 的交易对，跳过
             };
-            let size: Decimal = crate::domain::parse_decimal(&p.position_amt)
-                .map_err(|_| ExchangeError::Other(format!(
-                    "Failed to parse position_amt '{}' for {}", p.position_amt, p.symbol)))?;
+            let size: Decimal = crate::domain::parse_decimal(&p.position_amt).map_err(|_| {
+                ExchangeError::Other(format!(
+                    "Failed to parse position_amt '{}' for {}",
+                    p.position_amt, p.symbol
+                ))
+            })?;
             // 跳过空仓位
             if size.is_zero() {
                 continue;
@@ -386,7 +395,7 @@ impl BinanceClient {
             admitted,
         )
         .await
-            .map_err(Self::map_reqwest_error)?;
+        .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -430,10 +439,16 @@ impl ExchangeClient for BinanceClient {
         self.get_all_exchange_info().await
     }
 
-    async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
+    async fn fetch_symbol_meta(
+        &self,
+        symbols: &[Symbol],
+    ) -> Result<Vec<SymbolMeta>, ExchangeError> {
         let all = self.get_all_exchange_info().await?;
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
-        Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
+        Ok(all
+            .into_iter()
+            .filter(|m| symbol_set.contains(&m.symbol))
+            .collect())
     }
 }
 
@@ -490,7 +505,7 @@ impl crate::exchange::FundingFeeSource for BinanceClient {
             admitted,
         )
         .await
-            .map_err(Self::map_reqwest_error)?;
+        .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -536,7 +551,11 @@ impl AccountClient for BinanceClient {
         Exchange::Binance
     }
 
-    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError> {
+    async fn cancel_order(
+        &self,
+        symbol: &Symbol,
+        client_order_id: &str,
+    ) -> Result<(), ExchangeError> {
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
@@ -554,7 +573,7 @@ impl AccountClient for BinanceClient {
             admitted,
         )
         .await
-            .map_err(Self::map_reqwest_error)?;
+        .map_err(Self::map_reqwest_error)?;
 
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
@@ -568,7 +587,10 @@ impl AccountClient for BinanceClient {
         Ok(())
     }
 
-    async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
+    async fn fetch_pending_orders(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
@@ -598,7 +620,7 @@ impl AccountClient for BinanceClient {
             admitted,
         )
         .await
-            .map_err(Self::map_reqwest_error)?;
+        .map_err(Self::map_reqwest_error)?;
 
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
@@ -708,12 +730,11 @@ impl AccountClient for BinanceClient {
             admitted,
         )
         .await
-            .map_err(|e| place_send_error(Exchange::Binance, e))?;
+        .map_err(|e| place_send_error(Exchange::Binance, e))?;
         let status = resp.status().as_u16();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| PlaceError::indeterminate(format!("Binance 读下单回复失败 (HTTP {status}): {e}")))?;
+        let text = resp.text().await.map_err(|e| {
+            PlaceError::indeterminate(format!("Binance 读下单回复失败 (HTTP {status}): {e}"))
+        })?;
         parse_place_reply(status, &text)
     }
 
@@ -752,10 +773,16 @@ fn parse_place_reply(status: u16, text: &str) -> Result<OrderId, PlaceError> {
     if (200..300).contains(&status) {
         return serde_json::from_str::<Accepted>(text)
             .map(|a| a.order_id.to_string())
-            .map_err(|e| PlaceError::indeterminate(format!("Binance 下单回复解析不了 (HTTP {status}): {e}; body: {body}")));
+            .map_err(|e| {
+                PlaceError::indeterminate(format!(
+                    "Binance 下单回复解析不了 (HTTP {status}): {e}; body: {body}"
+                ))
+            });
     }
     let Ok(Failed { code, msg }) = serde_json::from_str::<Failed>(text) else {
-        return Err(PlaceError::indeterminate(format!("Binance 下单失败且回复解析不了 (HTTP {status}): {body}")));
+        return Err(PlaceError::indeterminate(format!(
+            "Binance 下单失败且回复解析不了 (HTTP {status}): {body}"
+        )));
     };
     let detail = format!("HTTP {status}, code={code}, msg={msg}");
     if BINANCE_UNKNOWN_STATUS_CODES.contains(&code) {
@@ -813,22 +840,28 @@ fn order_type_to_binance(
 
 /// 解析 `/fapi/v1/fundingRate` 的回复。`symbol` 是请求时的内部符号（回复里的是交易所写法，
 /// 不再反解一遍）。费率解析失败整批报错：少一条结算会让 24h 累计静默偏小。
-fn parse_settled_funding(text: &str, symbol: &Symbol) -> Result<Vec<SettledFunding>, ExchangeError> {
+fn parse_settled_funding(
+    text: &str,
+    symbol: &Symbol,
+) -> Result<Vec<SettledFunding>, ExchangeError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Entry {
         funding_time: u64,
         funding_rate: String,
     }
-    let entries: Vec<Entry> = serde_json::from_str(text)
-        .map_err(|e| ExchangeError::ParseError(format!("fundingRate: {e} (body: {})", text.chars().take(300).collect::<String>())))?;
+    let entries: Vec<Entry> = serde_json::from_str(text).map_err(|e| {
+        ExchangeError::ParseError(format!(
+            "fundingRate: {e} (body: {})",
+            text.chars().take(300).collect::<String>()
+        ))
+    })?;
     entries
         .into_iter()
         .map(|e| {
-            let rate = e
-                .funding_rate
-                .parse::<f64>()
-                .map_err(|_| ExchangeError::ParseError(format!("fundingRate 非法: {}", e.funding_rate)))?;
+            let rate = e.funding_rate.parse::<f64>().map_err(|_| {
+                ExchangeError::ParseError(format!("fundingRate 非法: {}", e.funding_rate))
+            })?;
             Ok(SettledFunding {
                 exchange: Exchange::Binance,
                 symbol: symbol.clone(),
@@ -860,8 +893,12 @@ impl crate::exchange::SettledFundingSource for BinanceClient {
             to_binance(symbol, &self.quote),
             start_ms
         );
-        let admitted = LIMITER.query(&[FUNDING_RATE.cost(1), IP_WEIGHT.cost(1)]).await?;
-        let resp = crate::net::send(self.client.get(&url), admitted).await.map_err(Self::map_reqwest_error)?;
+        let admitted = LIMITER
+            .query(&[FUNDING_RATE.cost(1), IP_WEIGHT.cost(1)])
+            .await?;
+        let resp = crate::net::send(self.client.get(&url), admitted)
+            .await
+            .map_err(Self::map_reqwest_error)?;
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         if !status.is_success() {
@@ -934,7 +971,10 @@ mod place_reply_tests {
 
     #[test]
     fn accepted_returns_order_id() {
-        assert_eq!(parse_place_reply(200, r#"{"orderId":123,"status":"NEW"}"#), Ok("123".to_string()));
+        assert_eq!(
+            parse_place_reply(200, r#"{"orderId":123,"status":"NEW"}"#),
+            Ok("123".to_string())
+        );
     }
 
     /// 受理了却拿不到编号：单可能在簿上，不能当没挂上
@@ -947,11 +987,20 @@ mod place_reply_tests {
     #[test]
     fn explicit_rejections() {
         for (status, body) in [
-            (400, r#"{"code":-1111,"msg":"Precision is over the maximum defined for this asset."}"#),
+            (
+                400,
+                r#"{"code":-1111,"msg":"Precision is over the maximum defined for this asset."}"#,
+            ),
             (400, r#"{"code":-2019,"msg":"Margin is insufficient."}"#),
-            (400, r#"{"code":-5022,"msg":"Due to the order could not be executed as maker, the Post Only order will be rejected."}"#),
+            (
+                400,
+                r#"{"code":-5022,"msg":"Due to the order could not be executed as maker, the Post Only order will be rejected."}"#,
+            ),
             (429, r#"{"code":-1003,"msg":"Too many requests"}"#),
-            (503, r#"{"code":-1008,"msg":"Server is currently overloaded with other requests."}"#),
+            (
+                503,
+                r#"{"code":-1008,"msg":"Server is currently overloaded with other requests."}"#,
+            ),
         ] {
             assert!(rejected(parse_place_reply(status, body)), "{status} {body}");
         }
@@ -960,7 +1009,10 @@ mod place_reply_tests {
     #[test]
     fn reduce_only_closed_keeps_its_reason() {
         assert_eq!(
-            parse_place_reply(400, r#"{"code":-2022,"msg":"ReduceOnly Order is rejected."}"#),
+            parse_place_reply(
+                400,
+                r#"{"code":-2022,"msg":"ReduceOnly Order is rejected."}"#
+            ),
             Err(PlaceError::Rejected(RejectReason::ReduceOnlyClosed))
         );
     }
@@ -969,17 +1021,35 @@ mod place_reply_tests {
     #[test]
     fn unknown_outcomes() {
         for (status, body) in [
-            (400, r#"{"code":-1007,"msg":"Timeout waiting for response from backend server. Send status unknown; execution status unknown."}"#),
-            (400, r#"{"code":-1006,"msg":"An unexpected response was received from the message bus."}"#),
-            (400, r#"{"code":-1000,"msg":"An unknown error occurred while processing the request."}"#),
-            (400, r#"{"code":-1001,"msg":"Internal error; unable to process your request."}"#),
-            (503, r#"{"code":-1000,"msg":"Unknown error, please check your request or try again later."}"#),
+            (
+                400,
+                r#"{"code":-1007,"msg":"Timeout waiting for response from backend server. Send status unknown; execution status unknown."}"#,
+            ),
+            (
+                400,
+                r#"{"code":-1006,"msg":"An unexpected response was received from the message bus."}"#,
+            ),
+            (
+                400,
+                r#"{"code":-1000,"msg":"An unknown error occurred while processing the request."}"#,
+            ),
+            (
+                400,
+                r#"{"code":-1001,"msg":"Internal error; unable to process your request."}"#,
+            ),
+            (
+                503,
+                r#"{"code":-1000,"msg":"Unknown error, please check your request or try again later."}"#,
+            ),
             (502, r#"{"code":-1,"msg":"x"}"#),
             (408, r#"{"code":-1,"msg":"timeout"}"#),
             (502, "<html>Bad Gateway</html>"),
             (403, ""),
         ] {
-            assert!(indeterminate(parse_place_reply(status, body)), "{status} {body}");
+            assert!(
+                indeterminate(parse_place_reply(status, body)),
+                "{status} {body}"
+            );
         }
     }
 }

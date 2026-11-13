@@ -50,9 +50,7 @@ impl SubscriptionScope {
     pub fn accepts(&self, event: &IncomeEvent) -> bool {
         match event {
             IncomeEvent::Market(m) => self.covers(&m.data.delivery()),
-            IncomeEvent::Account(a) => {
-                a.account == self.account && self.covers(&a.data.delivery())
-            }
+            IncomeEvent::Account(a) => a.account == self.account && self.covers(&a.data.delivery()),
         }
     }
 
@@ -87,10 +85,10 @@ impl SubscriptionScope {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::BBO;
     use crate::messaging::{AccountData, ExchangeAccountData, MarketData};
+    use rust_decimal_macros::dec;
 
     const EX: Exchange = Exchange::OKX;
     const OUTSIDE: Exchange = Exchange::Binance;
@@ -159,7 +157,8 @@ mod tests {
     /// **串账防线**：别的账户的私有事件，就算所和 symbol 都对得上也不收；行情不分账户
     #[test]
     fn account_events_of_another_account_are_rejected() {
-        let paper = SubscriptionScope::new(AccountId::Paper("x".to_string()), [(EX, SYM.to_string())]);
+        let paper =
+            SubscriptionScope::new(AccountId::Paper("x".to_string()), [(EX, SYM.to_string())]);
         assert!(!paper.accepts(&account_info(EX)), "模拟账户不该收实盘净值");
         assert!(paper.accepts(&account_info_of(AccountId::Paper("x".to_string()), EX)));
         assert!(paper.accepts(&bbo(EX, SYM)), "行情无账户归属");

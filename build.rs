@@ -10,7 +10,9 @@ const BUILD_INPUTS: [&str; 4] = ["src", "Cargo.toml", "Cargo.lock", "build.rs"];
 
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn main() {
@@ -28,9 +30,10 @@ fn main() {
     // HEAD（切分支）、index（add/commit）、当前分支的 ref 文件（commit）；worktree 下 HEAD/index
     // 在 git-dir，分支 ref 在 common-dir。ref 被打包进 packed-refs 时文件不存在，cargo 会每次重跑，
     // 只是多一次 git 调用，结果仍对
-    if let (Some(dir), Some(common)) =
-        (git(&["rev-parse", "--absolute-git-dir"]), git(&["rev-parse", "--git-common-dir"]))
-    {
+    if let (Some(dir), Some(common)) = (
+        git(&["rev-parse", "--absolute-git-dir"]),
+        git(&["rev-parse", "--git-common-dir"]),
+    ) {
         println!("cargo:rerun-if-changed={dir}/HEAD");
         println!("cargo:rerun-if-changed={dir}/index");
         if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {

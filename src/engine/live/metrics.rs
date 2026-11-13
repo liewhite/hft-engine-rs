@@ -16,8 +16,9 @@
 //!   （见 [`crate::observability`]，未配置时无外部依赖、行为与从前一致）
 
 use super::{ExecutorId, OrderRequestCounts};
-use std::sync::Arc;
-use crate::domain::{now_ms, to_f64, AccountId, Exchange, Quantity, Symbol, Timestamp, TradingStats};
+use crate::domain::{
+    now_ms, to_f64, AccountId, Exchange, Quantity, Symbol, Timestamp, TradingStats,
+};
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, IncomeEvent, MarketBus,
     MarketEvent, PositionBaseline, RequestOutcome, StateManager, SymbolAccountData, SymbolState,
@@ -25,6 +26,7 @@ use crate::messaging::{
 use crate::observability::{Gauge, MetricsPushConfig, PromText, Pusher};
 use crate::tasks::{Addr, Gone, Group, Inbox, Scope, Task};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
@@ -71,7 +73,10 @@ pub struct SymbolExposure {
 ///
 /// `baseline` 为各所的会话起始仓位（缺失视为 0）。缺 BBO 的腿不参与估值但计入
 /// `unpriced_legs` —— 宁可显式暴露"估值不完整"，也不用兜底价格伪造一个看似完整的数字。
-fn exposure_of(state: &SymbolState, baseline: Option<&HashMap<Exchange, Quantity>>) -> SymbolExposure {
+fn exposure_of(
+    state: &SymbolState,
+    baseline: Option<&HashMap<Exchange, Quantity>>,
+) -> SymbolExposure {
     let mut exposure = SymbolExposure::default();
     for position in state.position_book().all() {
         if position.is_empty() {
@@ -239,8 +244,10 @@ impl MetricsView {
                     .apply_fill(fill);
             }
             AccountData::Symbol(SymbolAccountData::FundingFee(fee)) => {
-                self.funding_fees
-                    .insert((fee.exchange, fee.tran_id), (fee.symbol.clone(), fee.amount, fee.timestamp));
+                self.funding_fees.insert(
+                    (fee.exchange, fee.tran_id),
+                    (fee.symbol.clone(), fee.amount, fee.timestamp),
+                );
             }
             AccountData::Symbol(SymbolAccountData::OrderUpdate(update)) => {
                 self.total.apply_order_update(update);
@@ -258,7 +265,9 @@ impl MetricsView {
                     self.total.apply_place_rejected();
                     self.per_symbol
                         .entry(r.symbol.clone())
-                        .or_insert_with(|| TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL))
+                        .or_insert_with(|| {
+                            TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
+                        })
                         .apply_place_rejected();
                 }
                 return;
@@ -324,7 +333,12 @@ impl MetricsView {
     }
 
     /// 收一个策略实例最新的自报读数；空 = 实例已撤下，删掉它的条目
-    fn set_strategy_gauges(&mut self, executor: ExecutorId, account: AccountId, gauges: Vec<Gauge>) {
+    fn set_strategy_gauges(
+        &mut self,
+        executor: ExecutorId,
+        account: AccountId,
+        gauges: Vec<Gauge>,
+    ) {
         if gauges.is_empty() {
             self.strategy_gauges.remove(&executor);
         } else {
@@ -388,7 +402,11 @@ impl MetricsView {
             exchange_count += 1;
             let ex_label = exchange.to_string();
             prom.gauge("hft_equity", &[("exchange", &ex_label)], info.equity);
-            prom.gauge("hft_account_notional", &[("exchange", &ex_label)], info.notional);
+            prom.gauge(
+                "hft_account_notional",
+                &[("exchange", &ex_label)],
+                info.notional,
+            );
             if let Some(l) = leverage {
                 prom.gauge("hft_account_leverage", &[("exchange", &ex_label)], l);
             }
@@ -437,7 +455,11 @@ impl MetricsView {
             let session_pnl = stats
                 .map(|s| s.total_pnl(exposure.session_notional_delta))
                 .unwrap_or(0.0);
-            prom.gauge("hft_position_net_size", &[("symbol", sym_label)], to_f64(exposure.net_size));
+            prom.gauge(
+                "hft_position_net_size",
+                &[("symbol", sym_label)],
+                to_f64(exposure.net_size),
+            );
             prom.gauge(
                 "hft_position_gross_notional",
                 &[("symbol", sym_label)],
@@ -448,7 +470,11 @@ impl MetricsView {
                 &[("symbol", sym_label)],
                 exposure.net_notional,
             );
-            prom.gauge("hft_pending_orders", &[("symbol", sym_label)], pending as f64);
+            prom.gauge(
+                "hft_pending_orders",
+                &[("symbol", sym_label)],
+                pending as f64,
+            );
             // 各所分腿：对冲是否到位要按所看（净仓为 0 也可能是两所之间搬错了腿）
             for position in symbol_state.position_book().all() {
                 if position.is_empty() {
@@ -458,7 +484,11 @@ impl MetricsView {
                 let labels = [("symbol", sym_label), ("exchange", ex_label.as_str())];
                 prom.gauge("hft_position_size", &labels, to_f64(position.size));
                 if let Some(bbo) = symbol_state.market().bbo(position.exchange) {
-                    prom.gauge("hft_position_notional", &labels, to_f64(position.size * bbo.mid_price()));
+                    prom.gauge(
+                        "hft_position_notional",
+                        &labels,
+                        to_f64(position.size * bbo.mid_price()),
+                    );
                 }
             }
             prom.gauge(
@@ -466,7 +496,11 @@ impl MetricsView {
                 &[("symbol", sym_label)],
                 stats.map(|s| s.fills as f64).unwrap_or(0.0),
             );
-            prom.gauge("hft_symbol_session_pnl", &[("symbol", sym_label)], session_pnl);
+            prom.gauge(
+                "hft_symbol_session_pnl",
+                &[("symbol", sym_label)],
+                session_pnl,
+            );
             prom.gauge(
                 "hft_single_leg",
                 &[("symbol", sym_label)],
@@ -499,18 +533,34 @@ impl MetricsView {
         prom.gauge("hft_total_account_notional", &[], total_notional);
         prom.gauge("hft_position_gross_notional_total", &[], gross_notional);
         prom.gauge("hft_position_net_notional_abs_total", &[], abs_net_notional);
-        prom.gauge("hft_symbols_with_position", &[], symbols_with_position as f64);
+        prom.gauge(
+            "hft_symbols_with_position",
+            &[],
+            symbols_with_position as f64,
+        );
         prom.gauge("hft_single_leg_symbols", &[], single_leg_symbols as f64);
         prom.gauge("hft_unpriced_legs", &[], unpriced_legs as f64);
         prom.gauge("hft_pending_orders_total", &[], pending_orders as f64);
-        prom.gauge("hft_rejected_orders_total", &[], self.total.rejected_orders as f64);
+        prom.gauge(
+            "hft_rejected_orders_total",
+            &[],
+            self.total.rejected_orders as f64,
+        );
         prom.gauge("hft_fills_total", &[], self.total.fills as f64);
-        prom.gauge("hft_forced_fills_total", &[], self.total.forced_fills as f64);
+        prom.gauge(
+            "hft_forced_fills_total",
+            &[],
+            self.total.forced_fills as f64,
+        );
         prom.gauge("hft_volume_total", &[], self.total.volume);
         prom.gauge("hft_fee_total", &[], self.total.fee);
         prom.gauge("hft_session_pnl", &[], total_session_pnl);
         // 恒为 1，标签带提交号：看板据此显示在跑的版本，换版前后能对上（#742）
-        prom.gauge("hft_build_info", &[("commit", crate::build_info::GIT_COMMIT)], 1.0);
+        prom.gauge(
+            "hft_build_info",
+            &[("commit", crate::build_info::GIT_COMMIT)],
+            1.0,
+        );
         tracing::info!(
             target: "metrics",
             exchanges = exchange_count,
@@ -565,7 +615,11 @@ impl MetricsView {
         let mut lags: Vec<_> = self.event_lag_max_ms.iter().collect();
         lags.sort_by_key(|(a, _)| a.to_string());
         for (account, ms) in lags {
-            prom.gauge("hft_event_lag_max_ms", &[("account", &account.to_string())], *ms as f64);
+            prom.gauge(
+                "hft_event_lag_max_ms",
+                &[("account", &account.to_string())],
+                *ms as f64,
+            );
         }
 
         // ---------- 策略自报读数 ----------
@@ -576,11 +630,15 @@ impl MetricsView {
             for g in gauges {
                 let verdict = g.validate().and_then(|()| {
                     let key = format!("{}{:?}{account_label}", g.name, g.labels);
-                    seen.insert(key).then_some(()).ok_or_else(|| format!("{} 重复: {:?}", g.name, g.labels))
+                    seen.insert(key)
+                        .then_some(())
+                        .ok_or_else(|| format!("{} 重复: {:?}", g.name, g.labels))
                 });
                 match verdict {
                     Ok(()) => prom.push(g, &[("account", account_label.as_str())]),
-                    Err(e) => tracing::warn!(target: "metrics", error = %e, "策略读数不合格，本轮不推"),
+                    Err(e) => {
+                        tracing::warn!(target: "metrics", error = %e, "策略读数不合格，本轮不推")
+                    }
                 }
             }
         }
@@ -588,8 +646,16 @@ impl MetricsView {
         // ---------- 模拟账户 ----------
         for (account, stats) in &self.paper_stats {
             let account_label = account.to_string();
-            prom.gauge("hft_paper_fills", &[("account", &account_label)], stats.fills as f64);
-            prom.gauge("hft_paper_volume", &[("account", &account_label)], stats.volume);
+            prom.gauge(
+                "hft_paper_fills",
+                &[("account", &account_label)],
+                stats.fills as f64,
+            );
+            prom.gauge(
+                "hft_paper_volume",
+                &[("account", &account_label)],
+                stats.volume,
+            );
             prom.gauge("hft_paper_fee", &[("account", &account_label)], stats.fee);
             prom.gauge("hft_paper_cash", &[("account", &account_label)], stats.cash);
             prom.gauge(
@@ -670,13 +736,20 @@ impl MetricsHandle {
         account: AccountId,
         gauges: Vec<Gauge>,
     ) -> Result<(), Gone> {
-        self.0.send(MetricsMsg::StrategyGauges { executor, account, gauges })
+        self.0.send(MetricsMsg::StrategyGauges {
+            executor,
+            account,
+            gauges,
+        })
     }
 
     /// 策略实例报告一拍（一个 Clock 周期）内消费事件的最大滞后（事件被适配层收到到被策略
     /// 处理之间的毫秒数）。指标按账户取上报周期内的最大值推出
     pub fn event_lag(&self, account: AccountId, max_lag_ms: u64) -> Result<(), Gone> {
-        self.0.send(MetricsMsg::EventLag { account, max_lag_ms })
+        self.0.send(MetricsMsg::EventLag {
+            account,
+            max_lag_ms,
+        })
     }
 
     /// 投产注册握手：要跟踪的 symbol 集合 + 它们的持仓基线（同一份快照，与 executor /
@@ -691,7 +764,11 @@ impl MetricsHandle {
         baselines: Vec<PositionBaseline>,
     ) -> Result<(), Gone> {
         self.0
-            .ask(|reply| MetricsMsg::Register { symbols, baselines, reply })
+            .ask(|reply| MetricsMsg::Register {
+                symbols,
+                baselines,
+                reply,
+            })
             .await
     }
 }
@@ -713,21 +790,24 @@ impl Metrics {
     /// 在 `group` 下起指标观测，等它订阅完成，返回句柄。订阅见 [`MetricsArgs`] 各字段。
     pub async fn spawn(group: &Group, args: MetricsArgs) -> anyhow::Result<MetricsHandle> {
         let (_, addr) = group
-            .spawn_addressed("Metrics", move |scope: Scope, mut inbox: Inbox<MetricsMsg>| async move {
-                let pusher = match args.push {
-                    Some(config) => Some(Pusher::spawn(&scope.group("push"), config).await?),
-                    None => None,
-                };
-                inbox.subscribe(&args.market_bus, |_| true, MetricsMsg::Market);
-                inbox.subscribe(&args.account_bus, |_| true, MetricsMsg::Account);
-                tracing::info!(interval_ms = args.interval_ms, "Metrics started");
-                Ok(Self {
-                    inbox,
-                    every: Duration::from_millis(args.interval_ms),
-                    view: MetricsView::new(args.order_requests),
-                    pusher,
-                })
-            })
+            .spawn_addressed(
+                "Metrics",
+                move |scope: Scope, mut inbox: Inbox<MetricsMsg>| async move {
+                    let pusher = match args.push {
+                        Some(config) => Some(Pusher::spawn(&scope.group("push"), config).await?),
+                        None => None,
+                    };
+                    inbox.subscribe(&args.market_bus, |_| true, MetricsMsg::Market);
+                    inbox.subscribe(&args.account_bus, |_| true, MetricsMsg::Account);
+                    tracing::info!(interval_ms = args.interval_ms, "Metrics started");
+                    Ok(Self {
+                        inbox,
+                        every: Duration::from_millis(args.interval_ms),
+                        view: MetricsView::new(args.order_requests),
+                        pusher,
+                    })
+                },
+            )
             .await?;
         Ok(MetricsHandle(addr))
     }
@@ -794,10 +874,10 @@ impl Task for Metrics {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal::Decimal;
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Fill, FillReason, Position, Side};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     /// 投产握手的基线载荷（snapshot_req_ts=0；需要累加的 Fill 应带 local_ts > 0）
     fn baseline_of(symbol: &str, size: Decimal) -> crate::messaging::PositionBaseline {
@@ -849,14 +929,22 @@ mod tests {
         .unwrap();
         let register = || (vec!["BTC".to_string()], vec![baseline_of("BTC", dec!(1.0))]);
         let (symbols, baselines) = register();
-        handle.register_symbols(symbols, baselines).await.expect("注册应完成");
+        handle
+            .register_symbols(symbols, baselines)
+            .await
+            .expect("注册应完成");
         root.shutdown().await.unwrap();
         let (symbols, baselines) = register();
-        assert!(handle.register_symbols(symbols, baselines).await.is_err(), "停止后应报 Gone");
+        assert!(
+            handle.register_symbols(symbols, baselines).await.is_err(),
+            "停止后应报 Gone"
+        );
     }
 
     /// 假 pushgateway：每个请求先拖 `delay` 再回 200，回完才记下请求体
-    async fn slow_gateway(delay: Duration) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    async fn slow_gateway(
+        delay: Duration,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -878,7 +966,11 @@ mod tests {
                         if let Some(end) = text.find("\r\n\r\n") {
                             let len: usize = text[..end]
                                 .lines()
-                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse().unwrap())
+                                })
                                 .unwrap_or(0);
                             if buf.len() >= end + 4 + len {
                                 break text[end + 4..].to_string();
@@ -886,7 +978,11 @@ mod tests {
                         }
                     };
                     tokio::time::sleep(delay).await;
-                    sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    sock.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
                     record.lock().unwrap().push(body);
                 });
             }
@@ -904,7 +1000,10 @@ mod tests {
             &root.group("g"),
             MetricsArgs {
                 interval_ms: DEFAULT_REPORT_INTERVAL_MS,
-                push: Some(MetricsPushConfig { url, job: "t".to_string() }),
+                push: Some(MetricsPushConfig {
+                    url,
+                    job: "t".to_string(),
+                }),
                 market_bus: MarketBus::new("market"),
                 account_bus: account_bus.clone(),
                 order_requests: Default::default(),
@@ -936,26 +1035,44 @@ mod tests {
 
         let got = got.lock().unwrap();
         assert_eq!(got.len(), 2, "停机返回时最终快照应已推完: {got:?}");
-        assert!(got[1].contains("hft_equity{exchange=\"OKX\"} 4321"), "最终快照要含停机前收到的净值: {}", got[1]);
+        assert!(
+            got[1].contains("hft_equity{exchange=\"OKX\"} 4321"),
+            "最终快照要含停机前收到的净值: {}",
+            got[1]
+        );
     }
 
     fn live(data: AccountData) -> AccountEvent {
-        AccountEvent { account: AccountId::Live, exchange_ts: 1, local_ts: 1, data }
+        AccountEvent {
+            account: AccountId::Live,
+            exchange_ts: 1,
+            local_ts: 1,
+            data,
+        }
     }
 
-    fn funding_fee(exchange: Exchange, tran_id: u64, amount: f64, timestamp: Timestamp) -> AccountEvent {
-        live(AccountData::Symbol(SymbolAccountData::FundingFee(crate::domain::FundingFee {
-            exchange,
-            symbol: "BTC".to_string(),
-            asset: "USDT".to_string(),
-            amount,
-            timestamp,
-            tran_id,
-        })))
+    fn funding_fee(
+        exchange: Exchange,
+        tran_id: u64,
+        amount: f64,
+        timestamp: Timestamp,
+    ) -> AccountEvent {
+        live(AccountData::Symbol(SymbolAccountData::FundingFee(
+            crate::domain::FundingFee {
+                exchange,
+                symbol: "BTC".to_string(),
+                asset: "USDT".to_string(),
+                amount,
+                timestamp,
+                tran_id,
+            },
+        )))
     }
 
     fn line_value(body: &str, prefix: &str) -> Option<f64> {
-        body.lines().find(|l| l.starts_with(prefix)).map(|l| l.rsplit(' ').next().unwrap().parse().unwrap())
+        body.lines()
+            .find(|l| l.starts_with(prefix))
+            .map(|l| l.rsplit(' ').next().unwrap().parse().unwrap())
     }
 
     /// 轮询器每分钟重发最近 24h：同一结算 ID 只算一次；出窗的被清掉
@@ -966,14 +1083,37 @@ mod tests {
         let now = 100 * FUNDING_FEE_WINDOW_MS;
         for _ in 0..2 {
             metrics.on_account(funding_fee(Exchange::Binance, 1, 2.0, now - 1000));
-            metrics.on_account(funding_fee(Exchange::Binance, 2, -0.5, now - FUNDING_FEE_WINDOW_MS - 1));
+            metrics.on_account(funding_fee(
+                Exchange::Binance,
+                2,
+                -0.5,
+                now - FUNDING_FEE_WINDOW_MS - 1,
+            ));
             metrics.on_account(funding_fee(Exchange::OKX, 1, 3.0, now - 1000));
         }
         metrics.prune_funding_fees(now);
         let body = metrics.render().into_body();
-        assert_eq!(line_value(&body, "hft_funding_fee_24h{symbol=\"BTC\",exchange=\"Binance\"}"), Some(2.0), "{body}");
-        assert_eq!(line_value(&body, "hft_funding_fee_24h{symbol=\"BTC\",exchange=\"OKX\"}"), Some(3.0), "{body}");
-        assert_eq!(line_value(&body, "hft_funding_fee_24h_total "), Some(5.0), "{body}");
+        assert_eq!(
+            line_value(
+                &body,
+                "hft_funding_fee_24h{symbol=\"BTC\",exchange=\"Binance\"}"
+            ),
+            Some(2.0),
+            "{body}"
+        );
+        assert_eq!(
+            line_value(
+                &body,
+                "hft_funding_fee_24h{symbol=\"BTC\",exchange=\"OKX\"}"
+            ),
+            Some(3.0),
+            "{body}"
+        );
+        assert_eq!(
+            line_value(&body, "hft_funding_fee_24h_total "),
+            Some(5.0),
+            "{body}"
+        );
     }
 
     /// 策略读数带上实例账户标签推出；实例撤下（交来空的一份）后不再出现
@@ -981,9 +1121,16 @@ mod tests {
     fn strategy_gauges_follow_their_executor() {
         let mut metrics = view();
         let id = ExecutorId::for_test(7);
-        metrics.set_strategy_gauges(id, AccountId::Live, vec![Gauge::new("x_apr", &[("symbol", "BTC")], 0.5)]);
+        metrics.set_strategy_gauges(
+            id,
+            AccountId::Live,
+            vec![Gauge::new("x_apr", &[("symbol", "BTC")], 0.5)],
+        );
         let body = metrics.render().into_body();
-        assert!(body.contains("x_apr{symbol=\"BTC\",account=\"live\"} 0.5"), "{body}");
+        assert!(
+            body.contains("x_apr{symbol=\"BTC\",account=\"live\"} 0.5"),
+            "{body}"
+        );
         metrics.set_strategy_gauges(id, AccountId::Live, Vec::new());
         assert!(!metrics.render().into_body().contains("x_apr"));
     }
@@ -996,11 +1143,24 @@ mod tests {
         metrics.set_strategy_gauges(
             ExecutorId::for_test(1),
             AccountId::Live,
-            vec![g("hft_equity", "A"), g("bad-name", "A"), g("ok_x", "A"), g("ok_x", "A"), g("ok_x", "B")],
+            vec![
+                g("hft_equity", "A"),
+                g("bad-name", "A"),
+                g("ok_x", "A"),
+                g("ok_x", "A"),
+                g("ok_x", "B"),
+            ],
         );
         let body = metrics.render().into_body();
-        assert_eq!(body.lines().filter(|l| l.starts_with("ok_x")).count(), 2, "{body}");
-        assert!(!body.contains("bad-name") && !body.contains("hft_equity{symbol"), "{body}");
+        assert_eq!(
+            body.lines().filter(|l| l.starts_with("ok_x")).count(),
+            2,
+            "{body}"
+        );
+        assert!(
+            !body.contains("bad-name") && !body.contains("hft_equity{symbol"),
+            "{body}"
+        );
     }
 
     /// 下单 / 撤单请求计数按所按种类推出；事件滞后按账户取周期内最大值，报完清零（#757）
@@ -1014,11 +1174,32 @@ mod tests {
         metrics.record_event_lag(AccountId::Live, 900);
         metrics.record_event_lag(AccountId::Live, 10);
         let body = metrics.report().into_body();
-        assert_eq!(line_value(&body, "hft_order_requests{exchange=\"Hyperliquid\",kind=\"place\"}"), Some(3.0), "{body}");
-        assert_eq!(line_value(&body, "hft_order_requests{exchange=\"Hyperliquid\",kind=\"cancel\"}"), Some(2.0), "{body}");
-        assert_eq!(line_value(&body, "hft_event_lag_max_ms{account=\"live\"}"), Some(900.0), "{body}");
+        assert_eq!(
+            line_value(
+                &body,
+                "hft_order_requests{exchange=\"Hyperliquid\",kind=\"place\"}"
+            ),
+            Some(3.0),
+            "{body}"
+        );
+        assert_eq!(
+            line_value(
+                &body,
+                "hft_order_requests{exchange=\"Hyperliquid\",kind=\"cancel\"}"
+            ),
+            Some(2.0),
+            "{body}"
+        );
+        assert_eq!(
+            line_value(&body, "hft_event_lag_max_ms{account=\"live\"}"),
+            Some(900.0),
+            "{body}"
+        );
         let next = metrics.report().into_body();
-        assert!(!next.contains("hft_event_lag_max_ms"), "报过的周期应清零: {next}");
+        assert!(
+            !next.contains("hft_event_lag_max_ms"),
+            "报过的周期应清零: {next}"
+        );
     }
 
     /// 各所分腿持仓按所推出（净仓为 0 时也看得到两条腿）
@@ -1026,11 +1207,32 @@ mod tests {
     fn per_exchange_legs_are_reported() {
         let mut metrics = view();
         metrics.register(vec!["BTC".to_string()], Vec::new());
-        metrics.on_account(live(fill_data(Exchange::Binance, "BTC", Side::Long, dec!(1.0))));
-        metrics.on_account(live(fill_data(Exchange::OKX, "BTC", Side::Short, dec!(1.0))));
+        metrics.on_account(live(fill_data(
+            Exchange::Binance,
+            "BTC",
+            Side::Long,
+            dec!(1.0),
+        )));
+        metrics.on_account(live(fill_data(
+            Exchange::OKX,
+            "BTC",
+            Side::Short,
+            dec!(1.0),
+        )));
         let body = metrics.render().into_body();
-        assert_eq!(line_value(&body, "hft_position_size{symbol=\"BTC\",exchange=\"Binance\"}"), Some(1.0), "{body}");
-        assert_eq!(line_value(&body, "hft_position_size{symbol=\"BTC\",exchange=\"OKX\"}"), Some(-1.0), "{body}");
+        assert_eq!(
+            line_value(
+                &body,
+                "hft_position_size{symbol=\"BTC\",exchange=\"Binance\"}"
+            ),
+            Some(1.0),
+            "{body}"
+        );
+        assert_eq!(
+            line_value(&body, "hft_position_size{symbol=\"BTC\",exchange=\"OKX\"}"),
+            Some(-1.0),
+            "{body}"
+        );
     }
 
     /// 净值 ≤0 时杠杆算不出：不推杠杆点（看板断线），不得报成 0 冒充「很安全」
@@ -1038,17 +1240,30 @@ mod tests {
     fn leverage_not_reported_when_equity_non_positive() {
         let mut metrics = view();
         for (exchange, equity) in [(Exchange::Binance, 0.0), (Exchange::OKX, 1000.0)] {
-            metrics.state.apply(&IncomeEvent::account(
-                AccountId::Live,
-                1,
-                1,
-                AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, equity, notional: 500.0 }),
-            )).unwrap();
+            metrics
+                .state
+                .apply(&IncomeEvent::account(
+                    AccountId::Live,
+                    1,
+                    1,
+                    AccountData::Exchange(ExchangeAccountData::AccountInfo {
+                        exchange,
+                        equity,
+                        notional: 500.0,
+                    }),
+                ))
+                .unwrap();
         }
         let body = metrics.render().into_body();
-        let leverage: Vec<&str> = body.lines().filter(|l| l.starts_with("hft_account_leverage")).collect();
+        let leverage: Vec<&str> = body
+            .lines()
+            .filter(|l| l.starts_with("hft_account_leverage"))
+            .collect();
         assert_eq!(leverage.len(), 1, "只有净值为正的所有杠杆点: {leverage:?}");
-        assert!(leverage[0].contains(&Exchange::OKX.to_string()) && leverage[0].ends_with(" 0.5"), "{leverage:?}");
+        assert!(
+            leverage[0].contains(&Exchange::OKX.to_string()) && leverage[0].ends_with(" 0.5"),
+            "{leverage:?}"
+        );
     }
 
     /// 模拟账户事件按账户分账，**绝不**混进实盘视图（total/state）
@@ -1070,7 +1285,8 @@ mod tests {
                 .state
                 .symbol_state(&"BTC".to_string())
                 .unwrap()
-                .position_book().position_size(Exchange::Binance),
+                .position_book()
+                .position_size(Exchange::Binance),
             dec!(0.0),
             "模拟成交不得进实盘持仓镜像"
         );
@@ -1120,21 +1336,26 @@ mod tests {
 
         // 启动时已有 2 个多头（重启场景）：投产握手 seed 基线
         metrics.record_baseline(&symbol, Exchange::Binance, dec!(2.0));
-        metrics.state.seed_positions(&[baseline_of(&symbol, dec!(2.0))]);
+        metrics
+            .state
+            .seed_positions(&[baseline_of(&symbol, dec!(2.0))]);
         // 喂 BBO 让持仓可估值
-        metrics.state.apply(&IncomeEvent::market(
-            0,
-            0,
-            crate::messaging::MarketData::BBO(crate::domain::BBO {
-                exchange: Exchange::Binance,
-                symbol: symbol.clone(),
-                bid_price: dec!(100.0),
-                bid_qty: dec!(1.0),
-                ask_price: dec!(100.0),
-                ask_qty: dec!(1.0),
-                timestamp: 0,
-            }),
-        )).unwrap();
+        metrics
+            .state
+            .apply(&IncomeEvent::market(
+                0,
+                0,
+                crate::messaging::MarketData::BBO(crate::domain::BBO {
+                    exchange: Exchange::Binance,
+                    symbol: symbol.clone(),
+                    bid_price: dec!(100.0),
+                    bid_qty: dec!(1.0),
+                    ask_price: dec!(100.0),
+                    ask_qty: dec!(1.0),
+                    timestamp: 0,
+                }),
+            ))
+            .unwrap();
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
         let exposure = exposure_of(state, metrics.baseline.get(&symbol));
@@ -1142,7 +1363,13 @@ mod tests {
         // 全额市值 200，但本次会话未成交 → session PnL 为 0，而非凭空 +200
         assert!((exposure.net_notional - 200.0).abs() < 1e-9);
         assert!(exposure.session_notional_delta.abs() < 1e-9);
-        assert!(metrics.total.total_pnl(exposure.session_notional_delta).abs() < 1e-9);
+        assert!(
+            metrics
+                .total
+                .total_pnl(exposure.session_notional_delta)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[tokio::test]
@@ -1153,7 +1380,9 @@ mod tests {
         metrics.state.register_symbols(&[symbol.clone()]);
 
         metrics.record_baseline(&symbol, Exchange::Binance, dec!(2.0));
-        metrics.state.seed_positions(&[baseline_of(&symbol, dec!(2.0))]);
+        metrics
+            .state
+            .seed_positions(&[baseline_of(&symbol, dec!(2.0))]);
 
         // 本次会话又买 1 个（价 100），随后 BBO 报 110；
         // local_ts 晚于快照请求时刻，不会被 seed 的防双计过滤
@@ -1161,25 +1390,31 @@ mod tests {
         if let AccountData::Symbol(SymbolAccountData::Fill(f)) = &data {
             metrics.total.apply_fill(f);
         }
-        metrics.state.apply(&IncomeEvent::account(
-            crate::domain::AccountId::Live,
-            1,
-            1,
-            data,
-        )).unwrap();
-        metrics.state.apply(&IncomeEvent::market(
-            0,
-            0,
-            crate::messaging::MarketData::BBO(crate::domain::BBO {
-                exchange: Exchange::Binance,
-                symbol: symbol.clone(),
-                bid_price: dec!(110.0),
-                bid_qty: dec!(1.0),
-                ask_price: dec!(110.0),
-                ask_qty: dec!(1.0),
-                timestamp: 0,
-            }),
-        )).unwrap();
+        metrics
+            .state
+            .apply(&IncomeEvent::account(
+                crate::domain::AccountId::Live,
+                1,
+                1,
+                data,
+            ))
+            .unwrap();
+        metrics
+            .state
+            .apply(&IncomeEvent::market(
+                0,
+                0,
+                crate::messaging::MarketData::BBO(crate::domain::BBO {
+                    exchange: Exchange::Binance,
+                    symbol: symbol.clone(),
+                    bid_price: dec!(110.0),
+                    bid_qty: dec!(1.0),
+                    ask_price: dec!(110.0),
+                    ask_qty: dec!(1.0),
+                    timestamp: 0,
+                }),
+            ))
+            .unwrap();
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
         let exposure = exposure_of(state, metrics.baseline.get(&symbol));
@@ -1207,7 +1442,10 @@ mod tests {
 
     /// 经**生产路径**构造夹具：仓位走投产 seed、盘口走行情事件。
     /// 直接写字段更省事，但那样测的就不是线上跑的那条路。
-    fn state_with(positions: &[(Exchange, Decimal)], priced: &[(Exchange, Decimal)]) -> SymbolState {
+    fn state_with(
+        positions: &[(Exchange, Decimal)],
+        priced: &[(Exchange, Decimal)],
+    ) -> SymbolState {
         let mut state = SymbolState::new(EXPOSURE_SYMBOL.to_string());
         for &(exchange, size) in positions {
             state.seed_position(
@@ -1220,7 +1458,9 @@ mod tests {
             );
         }
         for &(exchange, mid) in priced {
-            state.apply_market(&crate::messaging::MarketData::BBO(exposure_bbo(exchange, mid)));
+            state.apply_market(&crate::messaging::MarketData::BBO(exposure_bbo(
+                exchange, mid,
+            )));
         }
         state
     }
@@ -1229,7 +1469,10 @@ mod tests {
     fn hedged_position_has_near_zero_net_notional() {
         let state = state_with(
             &[(Exchange::Binance, dec!(1.0)), (Exchange::OKX, dec!(-1.0))],
-            &[(Exchange::Binance, dec!(100.0)), (Exchange::OKX, dec!(100.0))],
+            &[
+                (Exchange::Binance, dec!(100.0)),
+                (Exchange::OKX, dec!(100.0)),
+            ],
         );
 
         let exposure = exposure_of(&state, None);
@@ -1242,7 +1485,10 @@ mod tests {
 
     #[test]
     fn baseline_position_is_excluded_from_session_delta() {
-        let state = state_with(&[(Exchange::Binance, dec!(3.0))], &[(Exchange::Binance, dec!(100.0))]);
+        let state = state_with(
+            &[(Exchange::Binance, dec!(3.0))],
+            &[(Exchange::Binance, dec!(100.0))],
+        );
         let baseline = HashMap::from([(Exchange::Binance, dec!(2.0))]);
 
         let exposure = exposure_of(&state, Some(&baseline));
@@ -1254,7 +1500,10 @@ mod tests {
 
     #[test]
     fn missing_baseline_defaults_to_zero() {
-        let state = state_with(&[(Exchange::Binance, dec!(3.0))], &[(Exchange::Binance, dec!(100.0))]);
+        let state = state_with(
+            &[(Exchange::Binance, dec!(3.0))],
+            &[(Exchange::Binance, dec!(100.0))],
+        );
         let exposure = exposure_of(&state, Some(&HashMap::new()));
         assert!((exposure.session_notional_delta - 300.0).abs() < 1e-9);
     }
@@ -1273,7 +1522,10 @@ mod tests {
 
     #[test]
     fn zero_positions_are_ignored() {
-        let state = state_with(&[(Exchange::Binance, dec!(0.0))], &[(Exchange::Binance, dec!(100.0))]);
+        let state = state_with(
+            &[(Exchange::Binance, dec!(0.0))],
+            &[(Exchange::Binance, dec!(100.0))],
+        );
         assert_eq!(exposure_of(&state, None), SymbolExposure::default());
     }
 }

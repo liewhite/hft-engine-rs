@@ -20,7 +20,10 @@ impl IbkrAuth for IbkrGateway {
     }
 
     fn ws_url(&self) -> String {
-        let ws_base = self.base_url.replace("https://", "wss://").replace("http://", "ws://");
+        let ws_base = self
+            .base_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
         format!("{}ws", ws_base)
     }
 

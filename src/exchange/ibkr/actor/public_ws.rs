@@ -41,7 +41,9 @@
 //! request to continue to retrieve data for the instrument"，见 Voyz/ibind#145）。故以**更紧
 //! 的 10 分钟**为约束（见 `SMD_SERVER_TTL`），刷新周期取 8 分钟。
 
-use crate::domain::{now_ms, Decimal, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO};
+use crate::domain::{
+    now_ms, Decimal, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO,
+};
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::client::IbkrClient;
@@ -200,9 +202,13 @@ async fn connect(
     // 只打印 host。
     tracing::info!(host = %host, "Connecting IBKR WebSocket");
 
-    crate::net::ws_connect(ws_request, connector, crate::exchange::ws_loop::CONNECT_TIMEOUT)
-        .await
-        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e))
+    crate::net::ws_connect(
+        ws_request,
+        connector,
+        crate::exchange::ws_loop::CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e))
 }
 
 /// IBKR 公共 WS 组件（实际混发公私两类 topic，见 [`IbkrPublicWsArgs::account_bus`]）
@@ -268,7 +274,10 @@ impl IbkrPublicWs {
             Err(e) => tracing::error!(error = %e, "Failed to send IBKR sor subscription"),
         }
         // 订阅成交推送 (str topic)
-        match conn.send(r#"str+{"realtimeUpdatesOnly":true}"#.to_string()).await {
+        match conn
+            .send(r#"str+{"realtimeUpdatesOnly":true}"#.to_string())
+            .await
+        {
             Ok(()) => tracing::info!("IBKR str (trades) subscription sent"),
             Err(e) => tracing::error!(error = %e, "Failed to send IBKR str subscription"),
         }
@@ -441,7 +450,9 @@ impl IbkrPublicWs {
                 return Ok(());
             }
             if topic.starts_with("str") {
-                return self.fills.on_trade_message(&value, local_ts, Instant::now());
+                return self
+                    .fills
+                    .on_trade_message(&value, local_ts, Instant::now());
             }
         }
 
@@ -787,7 +798,11 @@ impl FillPairing {
                 match commission {
                     Some(fee) => {
                         pending.fill.fee = fee;
-                        tracing::info!(execution_id, fee, "IBKR fill: commission received, publishing");
+                        tracing::info!(
+                            execution_id,
+                            fee,
+                            "IBKR fill: commission received, publishing"
+                        );
                     }
                     // 字段缺失是"这条没带手续费"，不是"手续费为 0" —— 按 0 发布与超时
                     // 路径同口径，但日志必须如实说明，不能谎报 "commission received"
@@ -814,10 +829,7 @@ impl FillPairing {
                 }
             };
 
-            let order_ref = item
-                .get("order_ref")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let order_ref = item.get("order_ref").and_then(|v| v.as_str()).unwrap_or("");
 
             let side_str = item.get("side").and_then(|v| v.as_str()).unwrap_or("");
             let side = match side_str {
@@ -834,7 +846,8 @@ impl FillPairing {
             // （没让 0 进账本），但**丢弃整笔成交**同样致命：本地持仓从此落后于交易所，
             // 只能等对账连续失配后停机兜底。宁可现在就死。
             // 措辞区分"字段缺失"与"值非法"：两者都致命，但归因时不该把缺失说成 0
-            let (Some(price), Some(size)) = (wire_decimal(item, "price")?, wire_decimal(item, "size")?)
+            let (Some(price), Some(size)) =
+                (wire_decimal(item, "price")?, wire_decimal(item, "size")?)
             else {
                 return Err(WsError::ParseError(format!(
                     "IBKR 成交 {execution_id} 缺 price/size 字段，丢弃即持仓失真: {item}"
@@ -850,7 +863,11 @@ impl FillPairing {
                 exchange: Exchange::IBKR,
                 symbol: symbol.clone(),
                 order_id: execution_id.clone(),
-                client_order_id: if order_ref.is_empty() { None } else { Some(order_ref.to_string()) },
+                client_order_id: if order_ref.is_empty() {
+                    None
+                } else {
+                    Some(order_ref.to_string())
+                },
                 side,
                 price,
                 size,
@@ -1046,7 +1063,9 @@ mod tests {
     #[test]
     fn merge_reports_change_on_first_quote() {
         let mut cache = BboCache::default();
-        assert!(cache.merge(&serde_json::json!({"84": "1,234.5", "86": 1235.0, "88": 100, "85": 200})));
+        assert!(
+            cache.merge(&serde_json::json!({"84": "1,234.5", "86": 1235.0, "88": 100, "85": 200}))
+        );
         assert_eq!(cache.bid_price, dec!(1234.5));
         assert_eq!(cache.ask_price, dec!(1235));
         assert_eq!(cache.bid_size, dec!(100));
@@ -1061,7 +1080,10 @@ mod tests {
         let quote = serde_json::json!({"84": 1234.5, "86": 1235.0, "88": 100, "85": 200});
         assert!(cache.merge(&quote));
         assert!(!cache.merge(&quote), "同值回包不是新报价");
-        assert!(!cache.merge(&serde_json::json!({"84": "1,234.5"})), "换个线路形态也还是同一个值");
+        assert!(
+            !cache.merge(&serde_json::json!({"84": "1,234.5"})),
+            "换个线路形态也还是同一个值"
+        );
     }
 
     /// 同一 conid 上他方字段（借券可借量/费率/可用性）的推送同样会路由进 handle_bbo，
@@ -1214,12 +1236,19 @@ mod tests {
 
         fills.on_trade_message(&trade("E1", None), 1, now).unwrap();
         assert_eq!(fills.pending_fills.len(), 1, "第一条不带 commission 应暂存");
-        fills.on_trade_message(&trade("E1", Some(1.25)), 2, now).unwrap();
+        fills
+            .on_trade_message(&trade("E1", Some(1.25)), 2, now)
+            .unwrap();
         let fill = expect_fill(next(&mut rx).await);
-        assert_eq!((fill.fee, fill.price, fill.size, fill.side), (1.25, dec!(150.5), dec!(10), Side::Long));
+        assert_eq!(
+            (fill.fee, fill.price, fill.size, fill.side),
+            (1.25, dec!(150.5), dec!(10), Side::Long)
+        );
         expect_filled_update(next(&mut rx).await);
 
-        fills.on_trade_message(&trade("E1", Some(1.25)), 3, now).unwrap();
+        fills
+            .on_trade_message(&trade("E1", Some(1.25)), 3, now)
+            .unwrap();
         fills.expire_due(now + FILL_COMMISSION_TIMEOUT);
         root.shutdown().await.unwrap();
         assert!(rx.recv().await.is_none(), "已发布的成交不得重复发布");
@@ -1243,7 +1272,9 @@ mod tests {
         expect_filled_update(next(&mut rx).await);
         assert_eq!(fills.next_deadline(), None);
 
-        fills.on_trade_message(&trade("E2", Some(1.0)), 2, t0).unwrap();
+        fills
+            .on_trade_message(&trade("E2", Some(1.0)), 2, t0)
+            .unwrap();
         root.shutdown().await.unwrap();
         assert!(rx.recv().await.is_none(), "迟到的第二条不得重复发布");
     }
@@ -1255,7 +1286,10 @@ mod tests {
         let mut fills = FillPairing::new(AccountBus::new("account"), conid_map());
         let now = Instant::now();
         let mut no_id = trade("", None);
-        no_id["args"][0].as_object_mut().unwrap().remove("execution_id");
+        no_id["args"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_id");
         assert!(fills.on_trade_message(&no_id, 1, now).is_err());
         let mut bad_side = trade("E3", None);
         bad_side["args"][0]["side"] = serde_json::json!("X");
@@ -1308,11 +1342,19 @@ mod tests {
             })
             .await
             .unwrap();
-        Harness { root, frames, _sent: sent, rx }
+        Harness {
+            root,
+            frames,
+            _sent: sent,
+            rx,
+        }
     }
 
     async fn feed(h: &Harness, msg: serde_json::Value) {
-        h.frames.send(Ok(WsMessage::Text(msg.to_string()))).await.unwrap();
+        h.frames
+            .send(Ok(WsMessage::Text(msg.to_string())))
+            .await
+            .unwrap();
     }
 
     /// **停机补发送达总线**：还在等 commission 的成交，在 IbkrPublicWs 停机时以 fee=0 直接

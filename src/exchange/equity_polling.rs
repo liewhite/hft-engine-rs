@@ -35,7 +35,11 @@ impl EquityPoller {
         group.spawn_periodic(
             format!("{exchange}EquityPoller"),
             Duration::from_millis(interval_ms),
-            Self { client, account_bus, guard },
+            Self {
+                client,
+                account_bus,
+                guard,
+            },
         )
     }
 }
@@ -63,7 +67,10 @@ impl Periodic for EquityPoller {
             }
             Err(e) => {
                 self.guard.check_failure(&e).map_err(|reason| {
-                    anyhow::anyhow!("{} 账户净值长期取不到（陈旧净值会让杠杆闸门失准）: {reason}", self.client.exchange())
+                    anyhow::anyhow!(
+                        "{} 账户净值长期取不到（陈旧净值会让杠杆闸门失准）: {reason}",
+                        self.client.exchange()
+                    )
                 })?;
                 tracing::warn!(
                     exchange = %self.client.exchange(),

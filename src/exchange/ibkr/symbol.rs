@@ -28,15 +28,9 @@ pub async fn resolve_conids(
     let admitted = crate::exchange::ibkr::LIMITER
         .query(&crate::exchange::ibkr::request_costs("GET", &url))
         .await?;
-    let auth_header = auth.sign_request(
-        "GET",
-        &url,
-        Some(&[("symbols", &symbols_param)]),
-    )?;
+    let auth_header = auth.sign_request("GET", &url, Some(&[("symbols", &symbols_param)]))?;
 
-    let mut req = http
-        .get(&full_url)
-        .header("User-Agent", "ibind-rs");
+    let mut req = http.get(&full_url).header("User-Agent", "ibind-rs");
 
     if let Some(header) = auth_header {
         req = req.header("Authorization", header);
@@ -119,7 +113,10 @@ enum ConidChoice {
     /// 命中 isUS 美股/ADR 合约
     Us { conid: i64 },
     /// 无美股合约、回退到唯一的非美合约（如韩股 000660→KRX）
-    NonUsFallback { conid: i64, exchange: Option<String> },
+    NonUsFallback {
+        conid: i64,
+        exchange: Option<String>,
+    },
     /// 跨多个非美市场、无法判别——拒绝解析（不猜、不订错市场）
     Ambiguous { exchanges: Vec<String> },
     /// 无任何带 conid 的合约
@@ -144,7 +141,10 @@ fn select_conid(entries: &[serde_json::Value]) -> ConidChoice {
                 Some(c) => c,
                 None => continue,
             };
-            let is_us = contract.get("isUS").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_us = contract
+                .get("isUS")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if is_us {
                 return ConidChoice::Us { conid };
             }
@@ -182,17 +182,23 @@ mod tests {
     #[test]
     fn prefers_us_contract() {
         // SKHY：只有一个 US ADR 合约
-        let c = pick(json!([{"contracts": [{"conid": 899700992, "isUS": true, "exchange": "NASDAQ"}]}]));
+        let c = pick(
+            json!([{"contracts": [{"conid": 899700992, "isUS": true, "exchange": "NASDAQ"}]}]),
+        );
         assert_eq!(c, ConidChoice::Us { conid: 899700992 });
     }
 
     #[test]
     fn falls_back_to_unique_non_us() {
         // 000660：只有 KRX 合约，isUS=false —— 旧逻辑会漏掉，新逻辑回退取到，且带交易所
-        let c = pick(json!([{"contracts": [{"conid": 17382246, "isUS": false, "exchange": "KRX"}]}]));
+        let c =
+            pick(json!([{"contracts": [{"conid": 17382246, "isUS": false, "exchange": "KRX"}]}]));
         assert_eq!(
             c,
-            ConidChoice::NonUsFallback { conid: 17382246, exchange: Some("KRX".into()) }
+            ConidChoice::NonUsFallback {
+                conid: 17382246,
+                exchange: Some("KRX".into())
+            }
         );
     }
 
@@ -231,7 +237,10 @@ mod tests {
         ]));
         assert_eq!(
             c,
-            ConidChoice::NonUsFallback { conid: 17382246, exchange: Some("KRX".into()) }
+            ConidChoice::NonUsFallback {
+                conid: 17382246,
+                exchange: Some("KRX".into())
+            }
         );
     }
 
@@ -244,13 +253,19 @@ mod tests {
         ]));
         assert_eq!(
             c,
-            ConidChoice::NonUsFallback { conid: 17382246, exchange: Some("KRX".into()) }
+            ConidChoice::NonUsFallback {
+                conid: 17382246,
+                exchange: Some("KRX".into())
+            }
         );
     }
 
     #[test]
     fn none_when_no_contract_has_conid() {
-        assert_eq!(pick(json!([{"contracts": [{"isUS": true}]}])), ConidChoice::None);
+        assert_eq!(
+            pick(json!([{"contracts": [{"isUS": true}]}])),
+            ConidChoice::None
+        );
         assert_eq!(select_conid(&[]), ConidChoice::None);
     }
 }

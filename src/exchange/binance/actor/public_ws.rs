@@ -42,7 +42,9 @@ impl BinancePublicWs {
         let (_, addr) = group
             .spawn_addressed(name, move |scope: Scope, inbox| async move {
                 // 第一次连不上即上冒停机（受控退出）；运行中断线由 run 原地重连（#762）
-                let conn = ReconnectingWs::connect(scope.group("conn"), name, url, WsKeepalive::binance()).await?;
+                let conn =
+                    ReconnectingWs::connect(scope.group("conn"), name, url, WsKeepalive::binance())
+                        .await?;
                 tracing::info!(url, "{name} started");
                 Ok(Self {
                     inbox,
@@ -78,9 +80,7 @@ impl BinancePublicWs {
     /// 发送取消订阅消息
     async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
         let stream = kind_to_stream(kind, &self.quote).ok_or_else(|| {
-            WsError::ParseError(
-                "Binance Candle 订阅未实现，无法取消订阅".to_string(),
-            )
+            WsError::ParseError("Binance Candle 订阅未实现，无法取消订阅".to_string())
         })?;
         let msg = json!({
             "method": "UNSUBSCRIBE",
@@ -121,8 +121,9 @@ impl BinancePublicWs {
             if self.subscribed_kinds.contains(&kind) {
                 continue;
             }
-            let stream = kind_to_stream(&kind, &self.quote)
-                .ok_or_else(|| anyhow::anyhow!("Binance 不支持的订阅到了公共 WS（投产校验漏了）: {kind:?}"))?;
+            let stream = kind_to_stream(&kind, &self.quote).ok_or_else(|| {
+                anyhow::anyhow!("Binance 不支持的订阅到了公共 WS（投产校验漏了）: {kind:?}")
+            })?;
             if !self.subscribed_streams.contains(&stream) {
                 new_streams.push(stream);
             }
@@ -144,7 +145,9 @@ impl BinancePublicWs {
                 "Batch subscribing to streams"
             );
 
-            self.conn.send(Self::subscribe_msg(unique_streams.iter().cloned())).await;
+            self.conn
+                .send(Self::subscribe_msg(unique_streams.iter().cloned()))
+                .await;
 
             for stream in unique_streams {
                 self.subscribed_streams.insert(stream);
@@ -234,13 +237,10 @@ pub(crate) fn parse_public_message(
     }
 
     // 提取交易所事件时间 (E 字段，毫秒)
-    let exchange_ts = value
-        .get("E")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| {
-            tracing::warn!(raw, "Missing exchange timestamp (E), using local_ts");
-            local_ts
-        });
+    let exchange_ts = value.get("E").and_then(|v| v.as_u64()).unwrap_or_else(|| {
+        tracing::warn!(raw, "Missing exchange timestamp (E), using local_ts");
+        local_ts
+    });
 
     // 根据事件类型解析
     let event_type = value
@@ -252,41 +252,34 @@ pub(crate) fn parse_public_message(
         "markPriceUpdate" => {
             let update: MarkPriceUpdate = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
-            let symbol = update.symbol(quote)
-                ?;
+            let symbol = update.symbol(quote)?;
 
             let mut events = Vec::new();
 
             // 根据订阅的 kinds 生成对应的事件
-            if subscribed_kinds.contains(&SubscriptionKind::FundingRate { symbol: symbol.clone() })
-            {
+            if subscribed_kinds.contains(&SubscriptionKind::FundingRate {
+                symbol: symbol.clone(),
+            }) {
                 events.push(MarketEvent {
                     exchange_ts,
                     local_ts,
-                    data: MarketData::FundingRate(
-                        update.to_funding_rate(quote, exchange_ts)
-                            ?,
-                    ),
+                    data: MarketData::FundingRate(update.to_funding_rate(quote, exchange_ts)?),
                 });
             }
-            if subscribed_kinds.contains(&SubscriptionKind::MarkPrice { symbol: symbol.clone() }) {
+            if subscribed_kinds.contains(&SubscriptionKind::MarkPrice {
+                symbol: symbol.clone(),
+            }) {
                 events.push(MarketEvent {
                     exchange_ts,
                     local_ts,
-                    data: MarketData::MarkPrice(
-                        update.to_mark_price(quote, exchange_ts)
-                            ?,
-                    ),
+                    data: MarketData::MarkPrice(update.to_mark_price(quote, exchange_ts)?),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
                 events.push(MarketEvent {
                     exchange_ts,
                     local_ts,
-                    data: MarketData::IndexPrice(
-                        update.to_index_price(quote, exchange_ts)
-                            ?,
-                    ),
+                    data: MarketData::IndexPrice(update.to_index_price(quote, exchange_ts)?),
                 });
             }
 
@@ -295,8 +288,7 @@ pub(crate) fn parse_public_message(
         "bookTicker" => {
             let ticker: BookTicker = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
-            let bbo = ticker.to_bbo(quote)
-                ?;
+            let bbo = ticker.to_bbo(quote)?;
             Ok(vec![MarketEvent {
                 exchange_ts,
                 local_ts,
@@ -306,8 +298,7 @@ pub(crate) fn parse_public_message(
         "aggTrade" => {
             let agg: AggTrade = serde_json::from_str(raw)
                 .map_err(|e| WsError::ParseError(format!("aggTrade parse: {}", e)))?;
-            let trade = agg.to_market_trade(quote)
-                ?;
+            let trade = agg.to_market_trade(quote)?;
             Ok(vec![MarketEvent {
                 exchange_ts: trade.timestamp,
                 local_ts,
@@ -364,7 +355,9 @@ mod tests {
     /// 属"静默无数据"故障，故用单测把 kind -> 端点/stream 的映射钉住。
     #[test]
     fn trades_routes_to_market_ws_with_agg_trade_stream() {
-        let kind = SubscriptionKind::Trades { symbol: "BTC".to_string() };
+        let kind = SubscriptionKind::Trades {
+            symbol: "BTC".to_string(),
+        };
         assert_eq!(pick_ws_target(&kind), WsTarget::Market);
         assert_eq!(
             kind_to_stream(&kind, "USDT").as_deref(),
@@ -374,7 +367,9 @@ mod tests {
 
     #[test]
     fn bbo_routes_to_public_high_freq_ws() {
-        let kind = SubscriptionKind::BBO { symbol: "BTC".to_string() };
+        let kind = SubscriptionKind::BBO {
+            symbol: "BTC".to_string(),
+        };
         assert_eq!(pick_ws_target(&kind), WsTarget::PublicHighFreq);
         assert_eq!(
             kind_to_stream(&kind, "USDT").as_deref(),

@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
-use hft_engine_rs::engine::{load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, StrategySpec};
+use hft_engine_rs::engine::{
+    load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, StrategySpec,
+};
 use hft_engine_rs::strategy::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
 use md5::{Digest, Md5};
 use serde::Deserialize;
@@ -251,7 +253,9 @@ mod tests {
     fn bucket_assignment_is_pinned() {
         let assigned = |symbol: &str| {
             (0..4u64)
-                .find(|&index| SymbolBucketConfig { buckets: 4, index }.contains(&symbol.to_string()))
+                .find(|&index| {
+                    SymbolBucketConfig { buckets: 4, index }.contains(&symbol.to_string())
+                })
                 .expect("每个 symbol 必属于某个桶")
         };
 

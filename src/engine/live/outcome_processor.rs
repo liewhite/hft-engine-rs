@@ -4,7 +4,9 @@
 //! [`ExchangeOrder`]（折算 + 按交易所精度取整）后才发给交易所。回测不经过本模块，
 //! 因此 `SimState` 拿到的同样是币本位订单 —— 两条路径在策略侧口径一致。
 
-use crate::domain::{now_ms, AccountId, Exchange, Order, PlaceError, RejectReason, Symbol, SymbolMeta};
+use crate::domain::{
+    now_ms, AccountId, Exchange, Order, PlaceError, RejectReason, Symbol, SymbolMeta,
+};
 use crate::exchange::{AccountClient, ExchangeOrder};
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, OrderRequestResult, RequestOutcome, SymbolAccountData,
@@ -43,7 +45,12 @@ impl RequestKind {
 
 impl OrderRequestCounts {
     fn bump(&self, exchange: Exchange, kind: RequestKind) {
-        *self.0.lock().expect("请求计数锁被毒化").entry((exchange, kind)).or_default() += 1;
+        *self
+            .0
+            .lock()
+            .expect("请求计数锁被毒化")
+            .entry((exchange, kind))
+            .or_default() += 1;
     }
 
     #[cfg(test)]
@@ -55,8 +62,13 @@ impl OrderRequestCounts {
 
     /// 当前各 (所, 种类) 的累计次数
     pub fn snapshot(&self) -> Vec<(Exchange, RequestKind, u64)> {
-        let mut v: Vec<_> =
-            self.0.lock().expect("请求计数锁被毒化").iter().map(|(&(ex, k), &n)| (ex, k, n)).collect();
+        let mut v: Vec<_> = self
+            .0
+            .lock()
+            .expect("请求计数锁被毒化")
+            .iter()
+            .map(|(&(ex, k), &n)| (ex, k, n))
+            .collect();
         v.sort_by_key(|&(ex, k, _)| (ex.to_string(), k.label()));
         v
     }
@@ -152,7 +164,12 @@ impl OrderGateway {
         let Some(client) = self.accounts.get(&order.exchange).cloned() else {
             let reason = format!("{} 没有账户（未配置凭证），无法下单", order.exchange);
             tracing::error!(exchange = %order.exchange, "{}", reason);
-            self.report(&order.exchange, &order.symbol, &order.client_order_id, RequestOutcome::PlaceRejected { reason });
+            self.report(
+                &order.exchange,
+                &order.symbol,
+                &order.client_order_id,
+                RequestOutcome::PlaceRejected { reason },
+            );
             return;
         };
 
@@ -172,7 +189,10 @@ impl OrderGateway {
         // 故宁可拒掉并 error（缺 meta 属启动期配置错误，应当刺眼）。
         // 数量下界（取整为 0 / 低于最小下单量）也在这里拦下：这种单发出去必被交易所拒，
         // 本地拦截让失败原因可定位，且不白打 REST。
-        let wire = match self.symbol_metas.get(&(order.exchange, order.symbol.clone())) {
+        let wire = match self
+            .symbol_metas
+            .get(&(order.exchange, order.symbol.clone()))
+        {
             None => Err(format!(
                 "No SymbolMeta for {}/{}, cannot convert order quantity to exchange unit",
                 order.exchange, order.symbol
@@ -189,7 +209,12 @@ impl OrderGateway {
                     %reason,
                     "订单未通过出向校验，未发送"
                 );
-                self.report(&order.exchange, &order.symbol, &order.client_order_id, RequestOutcome::PlaceRejected { reason });
+                self.report(
+                    &order.exchange,
+                    &order.symbol,
+                    &order.client_order_id,
+                    RequestOutcome::PlaceRejected { reason },
+                );
                 return;
             }
         };
@@ -218,7 +243,12 @@ impl OrderGateway {
                     client_order_id = %order.client_order_id,
                     "Order placed successfully"
                 );
-                self.report(&order.exchange, &order.symbol, &order.client_order_id, RequestOutcome::Placed { order_id });
+                self.report(
+                    &order.exchange,
+                    &order.symbol,
+                    &order.client_order_id,
+                    RequestOutcome::Placed { order_id },
+                );
             }
             Err(e) if exchange_spoke => {
                 tracing::warn!(
@@ -253,7 +283,12 @@ impl OrderGateway {
             );
         }
         let reason = PlaceError::Rejected(reason).to_string();
-        self.report(&order.exchange, &order.symbol, &order.client_order_id, RequestOutcome::PlaceRejected { reason });
+        self.report(
+            &order.exchange,
+            &order.symbol,
+            &order.client_order_id,
+            RequestOutcome::PlaceRejected { reason },
+        );
     }
 
     /// 结果不确定且交易所回报流没认领：停机。不回报（那会让策略以为单子没了）。
@@ -285,15 +320,25 @@ impl OrderGateway {
             Some(client) => {
                 tracing::info!(%exchange, %symbol, %client_order_id, "Cancelling order");
                 self.requests.bump(exchange, RequestKind::Cancel);
-                client.cancel_order(&symbol, &client_order_id).await.map_err(|e| e.to_string())
+                client
+                    .cancel_order(&symbol, &client_order_id)
+                    .await
+                    .map_err(|e| e.to_string())
             }
         };
         match result {
-            Ok(()) => tracing::info!(%exchange, %symbol, %client_order_id, "Cancel request accepted"),
+            Ok(()) => {
+                tracing::info!(%exchange, %symbol, %client_order_id, "Cancel request accepted")
+            }
             Err(reason) => {
                 // 最常见的原因是单刚成交或刚撤掉（交易所说「订单不存在」），终态回报随后就到
                 tracing::warn!(%exchange, %symbol, %client_order_id, %reason, "撤单失败");
-                self.report(&exchange, &symbol, &client_order_id, RequestOutcome::CancelFailed { reason });
+                self.report(
+                    &exchange,
+                    &symbol,
+                    &client_order_id,
+                    RequestOutcome::CancelFailed { reason },
+                );
             }
         }
     }
@@ -307,7 +352,13 @@ impl OrderGateway {
     }
 
     /// 发布一次请求的结论（策略的订单跟踪表据此推进）
-    fn report(&self, exchange: &Exchange, symbol: &Symbol, client_order_id: &str, outcome: RequestOutcome) {
+    fn report(
+        &self,
+        exchange: &Exchange,
+        symbol: &Symbol,
+        client_order_id: &str,
+        outcome: RequestOutcome,
+    ) {
         let local_ts = now_ms();
         self.account_bus.publish(AccountEvent {
             account: AccountId::Live,
@@ -337,7 +388,10 @@ enum Msg {
 
 /// 账户总线的订阅过滤：只要 `OrderUpdate`，不吃全量账户事件
 fn is_order_update(e: &AccountEvent) -> bool {
-    matches!(e.data, AccountData::Symbol(SymbolAccountData::OrderUpdate(_)))
+    matches!(
+        e.data,
+        AccountData::Symbol(SymbolAccountData::OrderUpdate(_))
+    )
 }
 
 /// 订阅出向总线，把实盘账户的策略信号交给 [`OrderGateway`]。
@@ -370,7 +424,11 @@ impl OutcomeProcessor {
                 inbox.subscribe(&account_bus, is_order_update, Msg::OrderUpdate);
                 let requests = scope.group("requests");
                 tracing::info!("OutcomeProcessor started");
-                Ok(Self { gateway, inbox, requests })
+                Ok(Self {
+                    gateway,
+                    inbox,
+                    requests,
+                })
             })
             .await?;
         Ok(())
@@ -405,7 +463,11 @@ impl OutcomeProcessor {
         match tagged.event {
             // 自定义事件与交易所无关：它已随出向总线到达外部订阅者，本处理器只管下单/撤单
             OutcomeEvent::Emit(_) => {}
-            OutcomeEvent::CancelOrder { exchange, symbol, client_order_id } => {
+            OutcomeEvent::CancelOrder {
+                exchange,
+                symbol,
+                client_order_id,
+            } => {
                 let gateway = self.gateway.clone();
                 self.submit(format!("cancel:{client_order_id}"), async move {
                     gateway.cancel(exchange, symbol, client_order_id).await;
@@ -482,14 +544,15 @@ impl Task for OutcomeProcessor {
 /// [`OutcomeProcessor`] 的总线装配。
 #[cfg(test)]
 mod gateway_tests {
-    use rust_decimal_macros::dec;
     use super::*;
-    use crate::domain::{
-        AccountInfo, ExchangeError, OrderId, OrderStatus, OrderType, OrderUpdate, Position, Side, TimeInForce,
-    };
     use crate::domain::PriceStep;
+    use crate::domain::{
+        AccountInfo, ExchangeError, OrderId, OrderStatus, OrderType, OrderUpdate, Position, Side,
+        TimeInForce,
+    };
     use crate::engine::live::test_support::collect;
     use crate::tasks::Root;
+    use rust_decimal_macros::dec;
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
@@ -507,7 +570,11 @@ mod gateway_tests {
 
     impl FakeClient {
         fn placing(result: Result<OrderId, PlaceError>) -> Self {
-            Self { result: Mutex::new(Some(result)), gate: None, cancel_result: Ok(()) }
+            Self {
+                result: Mutex::new(Some(result)),
+                gate: None,
+                cancel_result: Ok(()),
+            }
         }
     }
 
@@ -526,7 +593,10 @@ mod gateway_tests {
         async fn cancel_order(&self, _s: &Symbol, _cid: &str) -> Result<(), ExchangeError> {
             self.cancel_result.clone().map_err(ExchangeError::Other)
         }
-        async fn fetch_pending_orders(&self, _s: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
+        async fn fetch_pending_orders(
+            &self,
+            _s: &Symbol,
+        ) -> Result<Vec<OrderUpdate>, ExchangeError> {
             unreachable!()
         }
         async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
@@ -593,7 +663,13 @@ mod gateway_tests {
                 root.fail_handle(),
                 root.machine_stop_flag(),
             ));
-            Self { root, group, account_bus, gateway, events }
+            Self {
+                root,
+                group,
+                account_bus,
+                gateway,
+                events,
+            }
         }
 
         /// 是否触发了停机（停机开关是同步生效的）
@@ -616,7 +692,10 @@ mod gateway_tests {
                 .iter()
                 .filter_map(|e| match &e.data {
                     AccountData::Symbol(SymbolAccountData::OrderRequest(r)) => {
-                        assert_eq!((r.exchange, r.symbol.as_str(), r.client_order_id.as_str()), (EX, SYM, CID));
+                        assert_eq!(
+                            (r.exchange, r.symbol.as_str(), r.client_order_id.as_str()),
+                            (EX, SYM, CID)
+                        );
                         Some(r.outcome.clone())
                     }
                     _ => None,
@@ -634,14 +713,22 @@ mod gateway_tests {
     async fn rest_accept_reports_placed() {
         let h = Harness::new(FakeClient::placing(Ok("ex-1".to_string()))).await;
         h.gateway.place(order(), "t").await;
-        assert_eq!(h.reports().await, vec![RequestOutcome::Placed { order_id: "ex-1".into() }]);
+        assert_eq!(
+            h.reports().await,
+            vec![RequestOutcome::Placed {
+                order_id: "ex-1".into()
+            }]
+        );
         h.finish().await;
     }
 
     /// 被拒绝（交易所从未回报）→ 回报 PlaceRejected 让跟踪表移出；不停机。reduce-only 已平同样
     #[tokio::test]
     async fn rejection_is_reported_without_halting() {
-        for reason in [RejectReason::Other("Margin is insufficient.".into()), RejectReason::ReduceOnlyClosed] {
+        for reason in [
+            RejectReason::Other("Margin is insufficient.".into()),
+            RejectReason::ReduceOnlyClosed,
+        ] {
             let h = Harness::new(FakeClient::placing(Err(PlaceError::Rejected(reason)))).await;
             h.gateway.place(order(), "t").await;
             assert!(is_rejected(&h.reports().await), "拒单必须回报");
@@ -653,8 +740,21 @@ mod gateway_tests {
     /// 出向校验不过（数量取整为 0）→ 不发 REST，回报 PlaceRejected
     #[tokio::test]
     async fn local_validation_failure_is_reported_as_rejected() {
-        let h = Harness::new(FakeClient { result: Mutex::new(None), gate: None, cancel_result: Ok(()) }).await;
-        h.gateway.place(Order { quantity: dec!(0.0001), ..order() }, "t").await;
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(None),
+            gate: None,
+            cancel_result: Ok(()),
+        })
+        .await;
+        h.gateway
+            .place(
+                Order {
+                    quantity: dec!(0.0001),
+                    ..order()
+                },
+                "t",
+            )
+            .await;
         assert!(is_rejected(&h.reports().await));
         h.finish().await;
     }
@@ -663,10 +763,16 @@ mod gateway_tests {
     /// 此后的新单一律不发（FakeClient 只备了一份结果，再调就 panic）
     #[tokio::test]
     async fn indeterminate_halts_without_report_and_stops_new_orders() {
-        let h = Harness::new(FakeClient::placing(Err(PlaceError::indeterminate("HTTP 503 Unknown error")))).await;
+        let h = Harness::new(FakeClient::placing(Err(PlaceError::indeterminate(
+            "HTTP 503 Unknown error",
+        ))))
+        .await;
         h.gateway.place(order(), "t").await;
         assert!(h.halted().await, "结果不确定必须停机");
-        assert!(h.reports().await.is_empty(), "结果不确定不能告诉策略单子没了");
+        assert!(
+            h.reports().await.is_empty(),
+            "结果不确定不能告诉策略单子没了"
+        );
 
         h.gateway.place(order(), "t").await; // 停机期间不再发新单（再发会 panic）
         h.finish().await;
@@ -682,14 +788,19 @@ mod gateway_tests {
             cancel_result: Err("Unknown order sent.".into()),
         })
         .await;
-        h.root.fail_handle().fail(anyhow::anyhow!("持仓漂移（模拟）"));
+        h.root
+            .fail_handle()
+            .fail(anyhow::anyhow!("持仓漂移（模拟）"));
 
         h.gateway.place(order(), "t").await;
         assert!(h.reports().await.is_empty(), "停机拒发不回报（策略正在停）");
 
         h.gateway.cancel(EX, SYM.to_string(), CID.to_string()).await;
         assert!(
-            matches!(h.reports().await.as_slice(), [RequestOutcome::CancelFailed { .. }]),
+            matches!(
+                h.reports().await.as_slice(),
+                [RequestOutcome::CancelFailed { .. }]
+            ),
             "停机途中撤单照常发出（此处撤单失败，如实回报）"
         );
         h.finish().await;
@@ -698,7 +809,12 @@ mod gateway_tests {
     /// 撤单成功不回报（交易所随后推 Cancelled）；失败回报 CancelFailed
     #[tokio::test]
     async fn cancel_reports_only_failures() {
-        let h = Harness::new(FakeClient { result: Mutex::new(None), gate: None, cancel_result: Ok(()) }).await;
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(None),
+            gate: None,
+            cancel_result: Ok(()),
+        })
+        .await;
         h.gateway.cancel(EX, SYM.to_string(), CID.to_string()).await;
         assert!(h.reports().await.is_empty());
         h.finish().await;
@@ -708,7 +824,10 @@ mod gateway_tests {
     /// 迟到的 REST 失败不回报「被拒」（那会让跟踪表删掉一张成交了的单），也不停机。
     #[tokio::test]
     async fn ws_report_during_rest_flight_voids_the_rest_failure() {
-        for failure in [PlaceError::indeterminate("late 503"), PlaceError::rejected("late reject")] {
+        for failure in [
+            PlaceError::indeterminate("late 503"),
+            PlaceError::rejected("late reject"),
+        ] {
             let (entered_tx, mut entered_rx) = mpsc::channel(1);
             let (proceed_tx, proceed_rx) = mpsc::channel(1);
             let h = Harness::new(FakeClient {
@@ -728,8 +847,14 @@ mod gateway_tests {
             proceed_tx.send(()).await.expect("放行 REST 返回失败");
             task.await.expect("task");
 
-            assert!(h.reports().await.is_empty(), "交易所已回报过，迟到的 REST 失败不该再回报");
-            assert!(!h.halted().await, "交易所回报流已认领该单，状态以回报为准，不必停机");
+            assert!(
+                h.reports().await.is_empty(),
+                "交易所已回报过，迟到的 REST 失败不该再回报"
+            );
+            assert!(
+                !h.halted().await,
+                "交易所回报流已认领该单，状态以回报为准，不必停机"
+            );
             h.finish().await;
         }
     }
@@ -758,10 +883,16 @@ mod gateway_tests {
     /// （FakeClient 只备一份结果，误认领会让请求子任务 panic、根进入停机）
     #[tokio::test]
     async fn live_signal_reaches_gateway_and_paper_signal_is_ignored() {
-        let h = Harness::new(FakeClient::placing(Err(PlaceError::rejected("Margin is insufficient.")))).await;
+        let h = Harness::new(FakeClient::placing(Err(PlaceError::rejected(
+            "Margin is insufficient.",
+        ))))
+        .await;
         let outcome_bus = spawn_processor(&h).await;
         outcome_bus.publish(signal(AccountId::Live));
-        assert!(is_rejected(&h.reports().await), "实盘信号应经网关下单（此处被拒、回报）");
+        assert!(
+            is_rejected(&h.reports().await),
+            "实盘信号应经网关下单（此处被拒、回报）"
+        );
         outcome_bus.publish(signal(AccountId::Paper("BTC".to_string())));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!h.halted().await, "模拟账户的信号被实盘出口认领了");
@@ -799,7 +930,10 @@ mod gateway_tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         proceed_tx.send(()).await.expect("放行 REST 返回失败");
-        assert!(h.reports().await.is_empty(), "交易所已回报过，迟到的 REST 失败不该再回报");
+        assert!(
+            h.reports().await.is_empty(),
+            "交易所已回报过，迟到的 REST 失败不该再回报"
+        );
         assert!(!h.halted().await, "交易所回报流已认领该单，不必停机");
         h.finish().await;
     }
@@ -820,7 +954,8 @@ mod gateway_tests {
         entered_rx.recv().await.expect("place_order 已进入");
         let shutdown = h.root.shutdown();
         tokio::pin!(shutdown);
-        let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown).await;
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown).await;
         assert!(early.is_err(), "在途请求还没返回，停机不该完成");
         proceed_tx.send(()).await.expect("放行 REST");
         shutdown.await.expect("正常停机");

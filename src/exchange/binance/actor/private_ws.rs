@@ -11,7 +11,9 @@ use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsRespons
 use crate::exchange::binance::{BinanceCredentials, WS_PRIVATE_URL};
 use crate::exchange::client::WsError;
 use crate::exchange::ws_loop::{self, WsConn};
-use crate::messaging::{AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData};
+use crate::messaging::{
+    AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData,
+};
 use crate::tasks::{ChildHandle, Group, Scope, Task};
 use anyhow::Context as _;
 use futures_util::StreamExt;
@@ -51,17 +53,27 @@ impl BinancePrivateWs {
                 // 订阅确认：币安私有流没有订阅请求，listenKey 在连接地址里，握手成功即订阅生效
                 // （OKX / HL 要另等回执，见 WsConn::await_subscriptions）
                 let url = format!("{}?listenKey={}", WS_PRIVATE_URL, listen_key);
-                let ws_stream = crate::exchange::ws_loop::connect(&url)
-                    .await
-                    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
+                let ws_stream = crate::exchange::ws_loop::connect(&url).await.map_err(|e| {
+                    ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string())
+                })?;
                 let (write, read) = ws_stream.split();
 
                 let children = scope.group("children");
-                let conn = WsConn::spawn(&children, "BinancePrivateWsLoop", read, write, ws_loop::WsKeepalive::binance())?;
+                let conn = WsConn::spawn(
+                    &children,
+                    "BinancePrivateWsLoop",
+                    read,
+                    write,
+                    ws_loop::WsKeepalive::binance(),
+                )?;
                 ListenKeyRefresher::spawn(&children, http, rest_base_url, credentials.api_key)?;
 
                 tracing::info!("BinancePrivateWs started");
-                Ok(Self { account_bus, quote, conn })
+                Ok(Self {
+                    account_bus,
+                    quote,
+                    conn,
+                })
             })
             .await
     }
@@ -113,13 +125,10 @@ fn parse_private_message(
     }
 
     // 提取交易所事件时间 (E 字段，毫秒)
-    let exchange_ts = value
-        .get("E")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| {
-            tracing::warn!(raw, "Missing exchange timestamp (E), using local_ts");
-            local_ts
-        });
+    let exchange_ts = value.get("E").and_then(|v| v.as_u64()).unwrap_or_else(|| {
+        tracing::warn!(raw, "Missing exchange timestamp (E), using local_ts");
+        local_ts
+    });
 
     // 根据事件类型解析
     let event_type = value
@@ -141,8 +150,7 @@ fn parse_private_message(
 
             // 处理所有 balance 更新
             for bal_data in &update.a.balances {
-                let balance = bal_data.to_balance()
-                    ?;
+                let balance = bal_data.to_balance()?;
                 events.push(AccountEvent {
                     // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
                     account: crate::domain::AccountId::Live,
@@ -175,8 +183,7 @@ fn parse_private_message(
             };
 
             // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
-            if let Some(fill) = update.to_fill(symbol.clone())
-                ? {
+            if let Some(fill) = update.to_fill(symbol.clone())? {
                 events.push(AccountEvent {
                     // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
                     account: crate::domain::AccountId::Live,
@@ -192,8 +199,7 @@ fn parse_private_message(
                 exchange_ts,
                 local_ts,
                 data: AccountData::Symbol(SymbolAccountData::OrderUpdate(
-                    update.to_order_update(symbol)
-                        ?,
+                    update.to_order_update(symbol)?,
                 )),
             });
 
@@ -201,7 +207,9 @@ fn parse_private_message(
         }
         "listenKeyExpired" => {
             // ListenKey 过期：交易所随后不再推私有回报（连接可能还开着），按断线处理、整支停
-            Err(WsError::AuthFailed(format!("ListenKey 已过期，私有回报从此中断: {raw}")))
+            Err(WsError::AuthFailed(format!(
+                "ListenKey 已过期，私有回报从此中断: {raw}"
+            )))
         }
         "TRADE_LITE" => {
             // 忽略 TRADE_LITE 消息（轻量成交通知，已在 ORDER_TRADE_UPDATE 中处理）
@@ -235,11 +243,13 @@ async fn create_listen_key(
         .await
         .map_err(|e| WsError::AuthFailed(e.to_string()))?;
     let resp = crate::net::send(
-        client.post(format!("{}/fapi/v1/listenKey", rest_base_url)).header("X-MBX-APIKEY", api_key),
+        client
+            .post(format!("{}/fapi/v1/listenKey", rest_base_url))
+            .header("X-MBX-APIKEY", api_key),
         admitted,
     )
     .await
-        .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+    .map_err(|e| WsError::AuthFailed(e.to_string()))?;
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -274,8 +284,12 @@ mod tests {
             .into_iter()
             .map(|e| match e.data {
                 AccountData::Symbol(SymbolAccountData::Fill(f)) => format!("fill:{}", f.symbol),
-                AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => format!("order:{}", u.symbol),
-                AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => format!("unmapped:{}", f.instrument),
+                AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
+                    format!("order:{}", u.symbol)
+                }
+                AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => {
+                    format!("unmapped:{}", f.instrument)
+                }
                 other => format!("{other:?}"),
             })
             .collect()
@@ -284,9 +298,15 @@ mod tests {
     /// 别的计价币、交割合约的回报不再让解析报错停机，也不串进同名 symbol
     #[test]
     fn other_quote_and_delivery_fills_are_reported_unmapped() {
-        assert_eq!(kinds(&order_push("BTCUSDT", "0.5")), ["fill:BTC", "order:BTC"]);
+        assert_eq!(
+            kinds(&order_push("BTCUSDT", "0.5")),
+            ["fill:BTC", "order:BTC"]
+        );
         assert_eq!(kinds(&order_push("BTCUSDC", "0.5")), ["unmapped:BTCUSDC"]);
-        assert_eq!(kinds(&order_push("BTCUSDT_251226", "0.5")), ["unmapped:BTCUSDT_251226"]);
+        assert_eq!(
+            kinds(&order_push("BTCUSDT_251226", "0.5")),
+            ["unmapped:BTCUSDT_251226"]
+        );
         assert!(kinds(&order_push("BTCUSDC", "0")).is_empty());
     }
 
@@ -295,7 +315,8 @@ mod tests {
     fn unknown_order_status_is_a_parse_error() {
         let raw = order_push("BTCUSDT", "0").replace(r#""X":"FILLED""#, r#""X":"SOMETHING_NEW""#);
         assert!(parse_private_message(&raw, "USDT", 0).is_err());
-        let stp = order_push("BTCUSDT", "0").replace(r#""X":"FILLED""#, r#""X":"EXPIRED_IN_MATCH""#);
+        let stp =
+            order_push("BTCUSDT", "0").replace(r#""X":"FILLED""#, r#""X":"EXPIRED_IN_MATCH""#);
         assert_eq!(kinds(&stp), ["order:BTC"]);
     }
 

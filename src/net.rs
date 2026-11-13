@@ -30,7 +30,10 @@ pub struct HttpSpec {
 
 /// 开始构造一个 HTTP client：`timeout` 是单个请求从发出到读完回复的上限
 pub fn http(timeout: Duration) -> HttpSpec {
-    HttpSpec { timeout, accept_invalid_certs: false }
+    HttpSpec {
+        timeout,
+        accept_invalid_certs: false,
+    }
 }
 
 impl HttpSpec {
@@ -74,11 +77,14 @@ pub(crate) async fn send(
 
 /// 发一个不受交易所限频约束的请求：只给 Pushgateway、告警这类非交易所接口用。
 #[allow(clippy::disallowed_methods)] // 唯一放行处，见 [`send`]
-pub async fn send_unmetered(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+pub async fn send_unmetered(
+    request: reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
     request.send().await
 }
 
-pub type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+pub type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// 建 WS 连接（TCP + TLS + WS 握手），限时 `timeout`：网络半死时握手可能一直挂着，不限时进程就
 /// 活着却一直起不来，也不响应停机（#764）。`tls` 为 `None` 用默认 TLS 配置。

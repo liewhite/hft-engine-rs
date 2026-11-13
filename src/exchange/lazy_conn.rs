@@ -36,15 +36,22 @@ impl LazyConn {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<Addr<ExchangeCmd>>> + Send + 'static,
     {
-        Self { name, state: State::Idle(Box::new(move || Box::pin(spawn()))) }
+        Self {
+            name,
+            state: State::Idle(Box::new(move || Box::pin(spawn()))),
+        }
     }
 
     /// 把订阅命令交给这条连接，第一条命令到时先建连。
     pub(crate) async fn send(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
         if let State::Idle(_) = self.state {
-            let State::Idle(spawn) = std::mem::replace(&mut self.state, State::Failed) else { unreachable!() };
+            let State::Idle(spawn) = std::mem::replace(&mut self.state, State::Failed) else {
+                unreachable!()
+            };
             tracing::info!(conn = self.name, "第一条订阅命令路由到这条连接，开始连接");
-            let addr = spawn().await.with_context(|| format!("{} 建连失败", self.name))?;
+            let addr = spawn()
+                .await
+                .with_context(|| format!("{} 建连失败", self.name))?;
             self.state = State::Up(addr);
         }
         match &self.state {
@@ -80,7 +87,9 @@ mod tests {
     }
 
     fn bbo() -> SubscriptionKind {
-        SubscriptionKind::BBO { symbol: "BTC".to_string() }
+        SubscriptionKind::BBO {
+            symbol: "BTC".to_string(),
+        }
     }
 
     /// 没有订阅就不建连；第一条订阅才建，之后复用同一条
@@ -92,7 +101,9 @@ mod tests {
         let counter = spawned.clone();
         let mut conn = LazyConn::new("TestWs", move || async move {
             counter.fetch_add(1, Ordering::SeqCst);
-            let (_, addr) = group.spawn_addressed("Sink", |_s: Scope, inbox| async move { Ok(Sink(inbox)) }).await?;
+            let (_, addr) = group
+                .spawn_addressed("Sink", |_s: Scope, inbox| async move { Ok(Sink(inbox)) })
+                .await?;
             Ok(addr)
         });
         assert!(!conn.is_up());

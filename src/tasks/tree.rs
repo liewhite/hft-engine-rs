@@ -324,7 +324,10 @@ impl Drop for Root {
             }
         }
         if !names.is_empty() {
-            tracing::error!(?names, "任务树的根未经 shutdown 就被丢弃：已向子任务发出停止信号，但没人等它们收尾");
+            tracing::error!(
+                ?names,
+                "任务树的根未经 shutdown 就被丢弃：已向子任务发出停止信号，但没人等它们收尾"
+            );
         }
     }
 }
@@ -399,7 +402,11 @@ impl Group {
 
     /// 起一个只有一段主循环、没有收尾的子任务。`f` 拿到子任务的 [`Scope`]，返回的 future
     /// 就是它的 `run`（规则同 [`Task::run`]）。不等待（没有构造阶段，分组也不能声明）。
-    pub fn spawn_fn<F, Fut>(&self, name: impl Into<String>, f: F) -> Result<ChildHandle, GroupClosed>
+    pub fn spawn_fn<F, Fut>(
+        &self,
+        name: impl Into<String>,
+        f: F,
+    ) -> Result<ChildHandle, GroupClosed>
     where
         F: FnOnce(Scope) -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -444,7 +451,11 @@ impl Group {
         let me = handle.clone();
         tokio::spawn(async move {
             // 框架自身万一 panic（本不该发生）：上报错误再标记完成，父节点既不会挂住、也不会误当正常退出
-            let mut guard = ExitGuard { done: me.done.clone(), owner: group.clone(), completed: false };
+            let mut guard = ExitGuard {
+                done: me.done.clone(),
+                owner: group.clone(),
+                completed: false,
+            };
             let outcome = run_node(&scope, build, started).await;
             let group = group.upgrade();
             // 顺序要紧：先上报，再从组里摘除，最后标记完成。父节点停机时要么还在组里看到它、
@@ -462,8 +473,15 @@ impl Group {
                 }
             }
             match &group {
-                Some(group) => group.state.lock().unwrap().children.retain(|c| c.id != me.id),
-                None => tracing::error!(task = %me.name, "所属任务组已销毁（根未经 shutdown 被丢弃？）"),
+                Some(group) => group
+                    .state
+                    .lock()
+                    .unwrap()
+                    .children
+                    .retain(|c| c.id != me.id),
+                None => {
+                    tracing::error!(task = %me.name, "所属任务组已销毁（根未经 shutdown 被丢弃？）")
+                }
             }
             guard.completed = true; // guard 在此 drop：最后才标记完成
         });
@@ -584,7 +602,9 @@ fn first_error<const N: usize>(
     failure: Option<anyhow::Error>,
     rest: [anyhow::Result<()>; N],
 ) -> anyhow::Error {
-    let mut errors = failure.into_iter().chain(rest.into_iter().filter_map(Result::err));
+    let mut errors = failure
+        .into_iter()
+        .chain(rest.into_iter().filter_map(Result::err));
     let first = errors.next().expect("调用方保证至少有一个错误");
     for other in errors {
         tracing::error!(root_cause = %format!("{first:#}"), error = %format!("{other:#}"), "同一节点的伴随错误");
@@ -670,7 +690,10 @@ impl ChildHandle {
 
 impl std::fmt::Debug for ChildHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChildHandle").field("name", &self.name).field("id", &self.id).finish()
+        f.debug_struct("ChildHandle")
+            .field("name", &self.name)
+            .field("id", &self.id)
+            .finish()
     }
 }
 
@@ -705,7 +728,10 @@ mod tests {
             if self.leaf {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
-            self.log.lock().unwrap().push(format!("{}:stopped", self.name));
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}:stopped", self.name));
             Ok(())
         }
     }
@@ -722,7 +748,11 @@ mod tests {
                     if depth > 0 {
                         spawn_chain(scope.group("kids"), depth - 1, log.clone()).await?;
                     }
-                    Ok(Node { name, leaf: depth == 0, log })
+                    Ok(Node {
+                        name,
+                        leaf: depth == 0,
+                        log,
+                    })
                 })
                 .await
         })
@@ -733,7 +763,9 @@ mod tests {
     async fn shutdown_stops_the_tree_bottom_up() {
         let log = log();
         let root = Root::new("root");
-        spawn_chain(root.group("main"), 2, log.clone()).await.unwrap();
+        spawn_chain(root.group("main"), 2, log.clone())
+            .await
+            .unwrap();
 
         root.shutdown().await.expect("正常停机不该报错");
 
@@ -784,7 +816,10 @@ mod tests {
             .unwrap();
 
         root.shutdown().await.unwrap();
-        assert_eq!(entries(&log), ["got 0", "got 1", "got 2", "consumer stopped"]);
+        assert_eq!(
+            entries(&log),
+            ["got 0", "got 1", "got 2", "consumer stopped"]
+        );
     }
 
     /// 组内并发：本组耗时 ≈ 最慢的那一个，不是全部之和
@@ -799,7 +834,11 @@ mod tests {
         let started = tokio::time::Instant::now();
         root.shutdown().await.unwrap();
         assert_eq!(entries(&log).len(), 3);
-        assert!(started.elapsed() < Duration::from_millis(600), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// 叶子出错：错误冒到根（根因保留），整棵树停下且都收了尾
@@ -811,16 +850,27 @@ mod tests {
         spawn_chain(main.clone(), 1, log.clone()).await.unwrap();
         let mid_log = log.clone();
         main.spawn("mid", |scope: Scope| async move {
-            scope.group("kids").spawn_fn("leaf", |_| async { anyhow::bail!("WS 断了") })?;
-            Ok(Node { name: "mid".into(), leaf: false, log: mid_log })
+            scope
+                .group("kids")
+                .spawn_fn("leaf", |_| async { anyhow::bail!("WS 断了") })?;
+            Ok(Node {
+                name: "mid".into(),
+                leaf: false,
+                log: mid_log,
+            })
         })
         .await
         .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(5), root.stopping()).await.expect("出错必须触发根停机");
+        tokio::time::timeout(Duration::from_secs(5), root.stopping())
+            .await
+            .expect("出错必须触发根停机");
         let err = root.shutdown().await.expect_err("根必须带着错误退出");
         let text = format!("{err:#}");
-        assert!(text.contains("WS 断了") && text.contains("leaf") && text.contains("mid"), "{text}");
+        assert!(
+            text.contains("WS 断了") && text.contains("leaf") && text.contains("mid"),
+            "{text}"
+        );
         let mut got = entries(&log);
         got.sort();
         assert_eq!(got, ["d0:stopped", "d1:stopped", "mid:stopped"]);
@@ -856,7 +906,9 @@ mod tests {
         let root = Root::new("root");
         root.group("g")
             .spawn("stuck", |scope: Scope| async move {
-                scope.group("kids").spawn_fn("leaf", |_| async { anyhow::bail!("断流") })?;
+                scope
+                    .group("kids")
+                    .spawn_fn("leaf", |_| async { anyhow::bail!("断流") })?;
                 Ok(Stuck)
             })
             .await
@@ -882,7 +934,9 @@ mod tests {
         root.group("a")
             .spawn("mid", |scope: Scope| async move {
                 scope.group("kids").spawn_fn("deep", |deep| async move {
-                    flags_tx.send((deep.stop_flag(), deep.machine_stop_flag())).unwrap();
+                    flags_tx
+                        .send((deep.stop_flag(), deep.machine_stop_flag()))
+                        .unwrap();
                     deep.stopping().await;
                     Ok(())
                 })?;
@@ -893,10 +947,17 @@ mod tests {
         let (own, machine) = flags_rx.await.unwrap();
         assert!(!machine.is_stopping());
 
-        root.group("b").spawn_fn("leaf", |_| async { anyhow::bail!("持仓漂移") }).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), root.stopping()).await.unwrap();
+        root.group("b")
+            .spawn_fn("leaf", |_| async { anyhow::bail!("持仓漂移") })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), root.stopping())
+            .await
+            .unwrap();
         assert!(machine.is_stopping(), "根一进入停机，整机视图就该是停机");
-        assert!(!own.is_stopping(), "节点自己的停止信号仍按分组顺序由根发下来");
+        assert!(
+            !own.is_stopping(),
+            "节点自己的停止信号仍按分组顺序由根发下来"
+        );
         assert!(root.shutdown().await.is_err());
     }
 
@@ -925,7 +986,9 @@ mod tests {
     #[tokio::test]
     async fn returning_ok_without_a_stop_request_is_an_error() {
         let root = Root::new("root");
-        root.group("g").spawn_fn("stream", |_| async { Ok(()) }).unwrap();
+        root.group("g")
+            .spawn_fn("stream", |_| async { Ok(()) })
+            .unwrap();
         root.stopping().await;
         let err = root.shutdown().await.unwrap_err();
         assert!(format!("{err:#}").contains("未经停止请求"), "{err:#}");
@@ -974,7 +1037,11 @@ mod tests {
                 })?;
                 anyhow::bail!("账本打不开");
                 #[allow(unreachable_code)]
-                Ok(Node { name: String::new(), leaf: false, log: log() })
+                Ok(Node {
+                    name: String::new(),
+                    leaf: false,
+                    log: log(),
+                })
             })
             .await
             .unwrap_err();
@@ -992,7 +1059,13 @@ mod tests {
         root.shutdown().await.unwrap();
         assert!(g.spawn_fn("late", |_| async { Ok(()) }).is_err());
         let err = g
-            .spawn("late", |_| async { Ok(Node { name: String::new(), leaf: false, log: log() }) })
+            .spawn("late", |_| async {
+                Ok(Node {
+                    name: String::new(),
+                    leaf: false,
+                    log: log(),
+                })
+            })
             .await
             .unwrap_err();
         assert!(err.downcast_ref::<GroupClosed>().is_some());
@@ -1053,6 +1126,8 @@ mod tests {
             })
             .unwrap();
         drop(root);
-        tokio::time::timeout(Duration::from_secs(5), h.finished()).await.expect("子任务应收到停止信号");
+        tokio::time::timeout(Duration::from_secs(5), h.finished())
+            .await
+            .expect("子任务应收到停止信号");
     }
 }

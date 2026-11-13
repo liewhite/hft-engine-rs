@@ -1,15 +1,17 @@
 //! funding_arb 策略经生产路径（StrategyRunner：状态更新 → 策略 → 登记挂单 → 精度取整）的场景测试。
 
 use hft_engine_rs::domain::{
-    dec, AccountId, Decimal, Exchange, Fill, FillReason, OrderStatus, OrderType, OrderUpdate, Position, SettledFunding,
-    Side, PriceStep, SymbolMeta, TimeInForce, BBO,
+    dec, AccountId, Decimal, Exchange, Fill, FillReason, OrderStatus, OrderType, OrderUpdate,
+    Position, PriceStep, SettledFunding, Side, SymbolMeta, TimeInForce, BBO,
 };
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::messaging::{
-    AccountData, CustomEvent, ExchangeAccountData, IncomeEvent, MarketData, OrderRequestResult, PositionBaseline,
-    PositionValues, RequestOutcome, SymbolAccountData,
+    AccountData, CustomEvent, ExchangeAccountData, IncomeEvent, MarketData, OrderRequestResult,
+    PositionBaseline, PositionValues, RequestOutcome, SymbolAccountData,
 };
-use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, OutcomeEvent, SettledFundingWindow};
+use hft_engine_rs::strategy::{
+    FundingArbConfig, FundingArbStrategy, OutcomeEvent, SettledFundingWindow,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -98,20 +100,36 @@ impl Sim {
         let exchanges: Vec<Exchange> = legs.iter().map(|(e, _)| *e).collect();
         let min_of = |ex: Exchange| mins.iter().find(|(e, _)| *e == ex).map_or(0.0, |(_, m)| *m);
         let mut runner = StrategyRunner::new(
-            Box::new(FundingArbStrategy::new(p, exchanges.iter().map(|&e| meta(e, min_of(e)).1).collect())),
-            Arc::new(exchanges.iter().map(|&e| meta(e, min_of(e))).collect::<HashMap<_, _>>()),
+            Box::new(FundingArbStrategy::new(
+                p,
+                exchanges.iter().map(|&e| meta(e, min_of(e)).1).collect(),
+            )),
+            Arc::new(
+                exchanges
+                    .iter()
+                    .map(|&e| meta(e, min_of(e)))
+                    .collect::<HashMap<_, _>>(),
+            ),
             AccountId::Live,
             Box::new(SequentialClientOrderIdGen::default()),
         );
         let baselines: Vec<PositionBaseline> = legs
             .iter()
             .map(|&(exchange, size)| PositionBaseline {
-                position: Position { exchange, symbol: SYM.into(), size },
+                position: Position {
+                    exchange,
+                    symbol: SYM.into(),
+                    size,
+                },
                 snapshot_req_ts: 1,
             })
             .collect();
         runner.seed_positions(&baselines);
-        Sim { runner, now: T0, fills: HashMap::new() }
+        Sim {
+            runner,
+            now: T0,
+            fills: HashMap::new(),
+        }
     }
 
     fn advance(&mut self, ms: u64) {
@@ -137,8 +155,22 @@ impl Sim {
         self.bbo_quote(ex, bid, ask, dec!(100))
     }
 
-    fn bbo_quote(&mut self, ex: Exchange, bid: Decimal, ask: Decimal, qty: Decimal) -> Vec<OutcomeEvent> {
-        let b = BBO { exchange: ex, symbol: SYM.into(), bid_price: bid, bid_qty: qty, ask_price: ask, ask_qty: qty, timestamp: 0 };
+    fn bbo_quote(
+        &mut self,
+        ex: Exchange,
+        bid: Decimal,
+        ask: Decimal,
+        qty: Decimal,
+    ) -> Vec<OutcomeEvent> {
+        let b = BBO {
+            exchange: ex,
+            symbol: SYM.into(),
+            bid_price: bid,
+            bid_qty: qty,
+            ask_price: ask,
+            ask_qty: qty,
+            timestamp: 0,
+        };
         let now = self.now;
         self.ev(IncomeEvent::market(now, now, MarketData::BBO(b)))
     }
@@ -152,16 +184,33 @@ impl Sim {
     /// 只推净值（交易所账户总持仓价值给个大数：杠杆闸门不该再用它）
     fn account_info(&mut self, ex: Exchange, equity: f64) -> Vec<OutcomeEvent> {
         let now = self.now;
-        let info = ExchangeAccountData::AccountInfo { exchange: ex, equity, notional: 1e9 };
-        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Exchange(info)))
+        let info = ExchangeAccountData::AccountInfo {
+            exchange: ex,
+            equity,
+            notional: 1e9,
+        };
+        self.ev(IncomeEvent::account(
+            AccountId::Live,
+            now,
+            now,
+            AccountData::Exchange(info),
+        ))
     }
 
     /// 本地持仓账本发来的该所各币持仓价值
     fn position_values(&mut self, ex: Exchange, values: &[(&str, f64)]) -> Vec<OutcomeEvent> {
         let now = self.now;
         let values = values.iter().map(|(s, v)| (s.to_string(), *v)).collect();
-        let pv = ExchangeAccountData::PositionValues(PositionValues { exchange: ex, values });
-        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Exchange(pv)))
+        let pv = ExchangeAccountData::PositionValues(PositionValues {
+            exchange: ex,
+            values,
+        });
+        self.ev(IncomeEvent::account(
+            AccountId::Live,
+            now,
+            now,
+            AccountData::Exchange(pv),
+        ))
     }
 
     /// 某所过去 24h 每小时一样的费率，使年化 = `apr`
@@ -173,24 +222,46 @@ impl Sim {
             window_start: start,
             fetched_at: T0,
             entries: (1..=24)
-                .map(|i| SettledFunding { exchange: ex, symbol: SYM.into(), rate: apr / 365.0 / 24.0, settle_time: start + i * H })
+                .map(|i| SettledFunding {
+                    exchange: ex,
+                    symbol: SYM.into(),
+                    rate: apr / 365.0 / 24.0,
+                    settle_time: start + i * H,
+                })
                 .collect(),
         };
         let now = self.now;
-        self.ev(IncomeEvent::market(now, now, MarketData::Custom(CustomEvent::for_symbol(ex, SYM.into(), w))))
+        self.ev(IncomeEvent::market(
+            now,
+            now,
+            MarketData::Custom(CustomEvent::for_symbol(ex, SYM.into(), w)),
+        ))
     }
 
     /// 交易所订单回报。累计成交：Filled 报全量，其余报已推过的成交之和（交易所与成交流一致的常态）
-    fn confirm(&mut self, o: &hft_engine_rs::domain::Order, status: OrderStatus) -> Vec<OutcomeEvent> {
+    fn confirm(
+        &mut self,
+        o: &hft_engine_rs::domain::Order,
+        status: OrderStatus,
+    ) -> Vec<OutcomeEvent> {
         let filled = match status {
             OrderStatus::Filled => o.quantity,
-            _ => self.fills.get(&o.client_order_id).copied().unwrap_or(Decimal::ZERO),
+            _ => self
+                .fills
+                .get(&o.client_order_id)
+                .copied()
+                .unwrap_or(Decimal::ZERO),
         };
         self.confirm_filled(o, status, filled)
     }
 
     /// 交易所订单回报，累计成交由调用方给（模拟终态先于成交到达）
-    fn confirm_filled(&mut self, o: &hft_engine_rs::domain::Order, status: OrderStatus, filled: Decimal) -> Vec<OutcomeEvent> {
+    fn confirm_filled(
+        &mut self,
+        o: &hft_engine_rs::domain::Order,
+        status: OrderStatus,
+        filled: Decimal,
+    ) -> Vec<OutcomeEvent> {
         let u = OrderUpdate {
             order_id: format!("oid-{}", o.client_order_id),
             client_order_id: Some(o.client_order_id.clone()),
@@ -202,18 +273,42 @@ impl Sim {
             filled_quantity: filled,
         };
         let now = self.now;
-        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Symbol(SymbolAccountData::OrderUpdate(u))))
+        self.ev(IncomeEvent::account(
+            AccountId::Live,
+            now,
+            now,
+            AccountData::Symbol(SymbolAccountData::OrderUpdate(u)),
+        ))
     }
 
     /// 本地 REST 请求的结论
-    fn request(&mut self, o: &hft_engine_rs::domain::Order, outcome: RequestOutcome) -> Vec<OutcomeEvent> {
-        let r = OrderRequestResult { exchange: o.exchange, symbol: SYM.into(), client_order_id: o.client_order_id.clone(), outcome };
+    fn request(
+        &mut self,
+        o: &hft_engine_rs::domain::Order,
+        outcome: RequestOutcome,
+    ) -> Vec<OutcomeEvent> {
+        let r = OrderRequestResult {
+            exchange: o.exchange,
+            symbol: SYM.into(),
+            client_order_id: o.client_order_id.clone(),
+            outcome,
+        };
         let now = self.now;
-        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Symbol(SymbolAccountData::OrderRequest(r))))
+        self.ev(IncomeEvent::account(
+            AccountId::Live,
+            now,
+            now,
+            AccountData::Symbol(SymbolAccountData::OrderRequest(r)),
+        ))
     }
 
     fn reject(&mut self, o: &hft_engine_rs::domain::Order) -> Vec<OutcomeEvent> {
-        self.request(o, RequestOutcome::PlaceRejected { reason: "margin is insufficient".into() })
+        self.request(
+            o,
+            RequestOutcome::PlaceRejected {
+                reason: "margin is insufficient".into(),
+            },
+        )
     }
 
     fn fill(&mut self, o: &hft_engine_rs::domain::Order, size: Decimal) -> Vec<OutcomeEvent> {
@@ -231,7 +326,12 @@ impl Sim {
             reason: FillReason::Normal,
         };
         let now = self.now;
-        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Symbol(SymbolAccountData::Fill(f))))
+        self.ev(IncomeEvent::account(
+            AccountId::Live,
+            now,
+            now,
+            AccountData::Symbol(SymbolAccountData::Fill(f)),
+        ))
     }
 }
 
@@ -271,8 +371,12 @@ fn opens_with_two_makers_short_on_high_funding_side() {
     let hl = o.iter().find(|o| o.exchange == HL).unwrap();
     assert_eq!(bn.side, Side::Short);
     assert_eq!(hl.side, Side::Long);
-    assert!(matches!(bn.order_type, OrderType::Limit { tif: TimeInForce::PostOnly, price } if price == dec!(100.2)));
-    assert!(matches!(hl.order_type, OrderType::Limit { tif: TimeInForce::PostOnly, price } if price == dec!(99.9)));
+    assert!(
+        matches!(bn.order_type, OrderType::Limit { tif: TimeInForce::PostOnly, price } if price == dec!(100.2))
+    );
+    assert!(
+        matches!(hl.order_type, OrderType::Limit { tif: TimeInForce::PostOnly, price } if price == dec!(99.9))
+    );
     // 200U / 100.05 = 1.99900…，按 0.001 向下取整
     assert_eq!(bn.quantity, dec!(1.999));
     assert_eq!(hl.quantity, bn.quantity, "两所同量");
@@ -326,7 +430,10 @@ fn unknown_position_values_block_opening() {
         s.bbo(ex);
     }
     s.funding(BN, 0.8);
-    assert!(placed(&s.funding(HL, 0.1)).is_empty(), "持仓价值未知，不能开仓");
+    assert!(
+        placed(&s.funding(HL, 0.1)).is_empty(),
+        "持仓价值未知，不能开仓"
+    );
     // HL 有了读数、BN 仍未知：还是不开
     assert!(placed(&s.position_values(HL, &[])).is_empty());
     assert_eq!(placed(&s.position_values(BN, &[])).len(), 2);
@@ -358,7 +465,10 @@ fn one_leg_fill_cancels_other_then_hedges_the_lagging_leg() {
     let out = s.confirm(&bn, OrderStatus::Cancelled);
     let h = placed(&out);
     assert_eq!(h.len(), 1, "{out:?}");
-    assert_eq!((h[0].exchange, h[0].side, h[0].quantity, h[0].reduce_only), (HL, Side::Long, dec!(1.0), false));
+    assert_eq!(
+        (h[0].exchange, h[0].side, h[0].quantity, h[0].reduce_only),
+        (HL, Side::Long, dec!(1.0), false)
+    );
     assert!(matches!(h[0].order_type, OrderType::Market));
 
     // 补腿单在途，不重复补
@@ -383,7 +493,10 @@ fn full_fill_before_terminal_cancels_only_the_other_leg() {
     s.confirm(&bn, OrderStatus::Filled);
     let h = placed(&s.confirm(&hl, OrderStatus::Cancelled));
     assert_eq!(h.len(), 1);
-    assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (HL, Side::Long, bn.quantity));
+    assert_eq!(
+        (h[0].exchange, h[0].side, h[0].quantity),
+        (HL, Side::Long, bn.quantity)
+    );
 }
 
 #[test]
@@ -395,7 +508,11 @@ fn reversal_closes_with_reduce_only_makers() {
     assert_eq!(o.len(), 2, "{out:?}");
     for x in &o {
         assert!(x.reduce_only);
-        let want = if x.exchange == BN { Side::Long } else { Side::Short };
+        let want = if x.exchange == BN {
+            Side::Long
+        } else {
+            Side::Short
+        };
         assert_eq!(x.side, want);
         assert_eq!(x.quantity, dec!(1.999));
     }
@@ -428,8 +545,15 @@ fn hl_terminal_before_fill_does_not_double_hedge() {
     let out = s.bbo(HL);
     assert!(placed(&out).is_empty(), "成交没到齐，不补也不重挂：{out:?}");
     let out = s.fill(&hl, dec!(1.998)); // 回报到达，两腿已平
-    assert!(placed(&out).iter().all(|o| !matches!(o.order_type, OrderType::Market)), "{out:?}");
-    assert!(placed(&s.bbo(HL)).iter().all(|o| !matches!(o.order_type, OrderType::Market)));
+    assert!(
+        placed(&out)
+            .iter()
+            .all(|o| !matches!(o.order_type, OrderType::Market)),
+        "{out:?}"
+    );
+    assert!(placed(&s.bbo(HL))
+        .iter()
+        .all(|o| !matches!(o.order_type, OrderType::Market)));
 }
 
 /// **#758 的漏洞**：HL 买单的「已成交」终态先到、成交晚到时，此前挂单列表一空、持仓还是 0，策略会在
@@ -447,14 +571,21 @@ fn terminal_before_fill_does_not_requote_on_the_same_exchange() {
 
     let out = s.confirm_filled(&hl, OrderStatus::Filled, hl.quantity);
     assert!(placed(&out).is_empty(), "成交没到，不能在 HL 再挂：{out:?}");
-    assert_eq!(cancels(&out), vec![BN], "那笔成交到了就是不平衡，先撤币安：{out:?}");
+    assert_eq!(
+        cancels(&out),
+        vec![BN],
+        "那笔成交到了就是不平衡，先撤币安：{out:?}"
+    );
     assert!(placed(&s.bbo(HL)).is_empty());
 
     let out = s.fill(&hl, hl.quantity);
     assert!(placed(&out).is_empty(), "币安的单还没撤完：{out:?}");
     let h = placed(&s.confirm(&bn, OrderStatus::Cancelled));
     assert_eq!(h.len(), 1, "{h:?}");
-    assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (BN, Side::Short, hl.quantity));
+    assert_eq!(
+        (h[0].exchange, h[0].side, h[0].quantity),
+        (BN, Side::Short, hl.quantity)
+    );
     assert!(matches!(h[0].order_type, OrderType::Market));
 }
 
@@ -469,7 +600,12 @@ fn unconfirmed_maker_is_cancelled_once_placed() {
     let out = s.funding(BN, 0.1); // 不再值得开
     assert!(cancels(&out).is_empty(), "下单还没结论，不发撤单：{out:?}");
     for x in &o {
-        let out = s.request(x, RequestOutcome::Placed { order_id: format!("oid-{}", x.client_order_id) });
+        let out = s.request(
+            x,
+            RequestOutcome::Placed {
+                order_id: format!("oid-{}", x.client_order_id),
+            },
+        );
         assert_eq!(cancels(&out), vec![x.exchange], "{out:?}");
     }
 }
@@ -499,7 +635,10 @@ fn leverage_gate_flipping_keeps_resting_makers() {
     }
     for ex in [BN, HL] {
         let out = s.bbo_px(ex, dec!(100.02), dec!(100.12));
-        assert!(cancels(&out).is_empty() && placed(&out).is_empty(), "{out:?}");
+        assert!(
+            cancels(&out).is_empty() && placed(&out).is_empty(),
+            "{out:?}"
+        );
     }
     // 超限期间挂单没了（撤掉或价格偏出容差），不再新挂
     let bn = o.iter().find(|x| x.exchange == BN).unwrap();
@@ -523,7 +662,12 @@ fn failed_cancel_is_retried() {
     assert!(cancels(&s.bbo(BN)).is_empty());
     // 撤单失败、单还开着：间隔内不重撤，过了间隔重撤
     for x in &o {
-        s.request(x, RequestOutcome::CancelFailed { reason: "busy".into() });
+        s.request(
+            x,
+            RequestOutcome::CancelFailed {
+                reason: "busy".into(),
+            },
+        );
     }
     assert!(cancels(&s.bbo(BN)).is_empty());
     s.advance(1_100);
@@ -549,14 +693,21 @@ fn three_exchanges_open_on_widest_pair_only() {
     assert_eq!(o.len(), 2, "{out:?}");
     let sell = o.iter().find(|o| o.side == Side::Short).unwrap();
     let buy = o.iter().find(|o| o.side == Side::Long).unwrap();
-    assert_eq!((sell.exchange, buy.exchange), (OKX, HL), "年化最高的 OKX 卖、最低的 HL 买，币安不动");
+    assert_eq!(
+        (sell.exchange, buy.exchange),
+        (OKX, HL),
+        "年化最高的 OKX 卖、最低的 HL 买，币安不动"
+    );
 }
 
 #[test]
 fn three_exchanges_wait_for_every_funding_before_opening() {
     let mut s = Sim::multi(&[(BN, dec!(0.0)), (HL, dec!(0.0)), (OKX, dec!(0.0))]);
     s.funding(BN, 0.9);
-    assert!(placed(&s.funding(HL, 0.0)).is_empty(), "OKX 年化未知时不知道哪对差最大");
+    assert!(
+        placed(&s.funding(HL, 0.0)).is_empty(),
+        "OKX 年化未知时不知道哪对差最大"
+    );
 }
 
 #[test]
@@ -564,12 +715,18 @@ fn close_below_threshold_leaves_third_exchange_alone() {
     // 币安空 2、HL 多 1、OKX 多 1；BN−HL 收益 5% < 10% → 平 HL×BN，OKX×BN 收益 20% 不动
     let mut s = Sim::multi(&[(BN, dec!(-2.0)), (HL, dec!(1.0)), (OKX, dec!(1.0))]);
     s.funding(OKX, -0.1);
-    assert!(placed(&s.funding(BN, 0.1)).is_empty(), "OKX×BN 收益 20% ≥ 门槛");
+    assert!(
+        placed(&s.funding(BN, 0.1)).is_empty(),
+        "OKX×BN 收益 20% ≥ 门槛"
+    );
     // 平仓只看这对两所的年化：HL 一到就平
     let out = s.funding(HL, 0.05);
     let o = placed(&out);
     assert_eq!(o.len(), 2, "{out:?}");
-    assert!(o.iter().all(|x| x.reduce_only && x.exchange != OKX), "{o:?}");
+    assert!(
+        o.iter().all(|x| x.reduce_only && x.exchange != OKX),
+        "{o:?}"
+    );
     let hl = o.iter().find(|x| x.exchange == HL).unwrap();
     assert_eq!(hl.side, Side::Short);
     assert_eq!(hl.quantity, dec!(1), "可平量 = min(HL 多 1, 币安空 2)");
@@ -597,8 +754,16 @@ fn three_exchanges_hedge_on_the_quoted_pair() {
     s.confirm(&okx, OrderStatus::Cancelled);
     let h = placed(&s.confirm(&hl, OrderStatus::Cancelled)); // 两张都结算完即补
     assert_eq!(h.len(), 1, "{h:?}");
-    assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (HL, Side::Long, dec!(1.0)), "OKX 卖成交 → 在 HL 买补，不碰币安");
-    assert_eq!(okx.quantity, dec!(1), "两腿同量：按 OKX 一手 1 个币向下取整");
+    assert_eq!(
+        (h[0].exchange, h[0].side, h[0].quantity),
+        (HL, Side::Long, dec!(1.0)),
+        "OKX 卖成交 → 在 HL 买补，不碰币安"
+    );
+    assert_eq!(
+        okx.quantity,
+        dec!(1),
+        "两腿同量：按 OKX 一手 1 个币向下取整"
+    );
     assert_eq!(hl.quantity, dec!(1));
     assert!(matches!(h[0].order_type, OrderType::Market));
 }
@@ -620,7 +785,9 @@ fn both_close_legs_filling_needs_no_hedge() {
     s.confirm(&hl, OrderStatus::Cancelled);
     s.confirm(&bn, OrderStatus::Cancelled);
     s.advance(600);
-    assert!(placed(&s.bbo(BN)).iter().all(|o| !matches!(o.order_type, OrderType::Market)));
+    assert!(placed(&s.bbo(BN))
+        .iter()
+        .all(|o| !matches!(o.order_type, OrderType::Market)));
 }
 
 #[test]
@@ -638,13 +805,21 @@ fn imbalance_below_one_lot_of_the_hedge_exchange_is_dust() {
     s.fill(&hl, dec!(0.5));
     s.advance(600);
     let out = s.bbo(HL);
-    assert!(placed(&out).iter().all(|o| !matches!(o.order_type, OrderType::Market)), "零头不补：{out:?}");
+    assert!(
+        placed(&out)
+            .iter()
+            .all(|o| !matches!(o.order_type, OrderType::Market)),
+        "零头不补：{out:?}"
+    );
     let c = cancels(&s.fill(&hl, dec!(0.5)));
     assert!(c.contains(&OKX), "差够一手：撤挂单准备补腿：{c:?}");
     s.confirm(&hl, OrderStatus::Filled);
     let h = placed(&s.confirm(&okx, OrderStatus::Cancelled));
     assert_eq!(h.len(), 1, "{h:?}");
-    assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (OKX, Side::Short, dec!(1.0)));
+    assert_eq!(
+        (h[0].exchange, h[0].side, h[0].quantity),
+        (OKX, Side::Short, dec!(1.0))
+    );
 }
 
 #[test]
@@ -663,7 +838,11 @@ fn hedge_larger_than_target_position_is_not_reduce_only() {
     let h = placed(&s.confirm(&bn, OrderStatus::Cancelled));
     assert_eq!(h.len(), 1, "{h:?}");
     assert_eq!((h[0].exchange, h[0].side), (BN, Side::Short));
-    assert!(!h[0].reduce_only, "补腿量 {} 大于币安多仓 0.05", h[0].quantity);
+    assert!(
+        !h[0].reduce_only,
+        "补腿量 {} 大于币安多仓 0.05",
+        h[0].quantity
+    );
 }
 
 #[test]
@@ -692,9 +871,15 @@ fn thin_book_keeps_resting_makers_instead_of_churning() {
     }
     // 测试配置最短挂单时间为 0：去留只看价格容差
     let out = s.bbo_depth(BN, dec!(0.05));
-    assert!(cancels(&out).is_empty() && placed(&out).is_empty(), "{out:?}");
+    assert!(
+        cancels(&out).is_empty() && placed(&out).is_empty(),
+        "{out:?}"
+    );
     let out = s.bbo(BN);
-    assert!(cancels(&out).is_empty() && placed(&out).is_empty(), "{out:?}");
+    assert!(
+        cancels(&out).is_empty() && placed(&out).is_empty(),
+        "{out:?}"
+    );
 }
 
 #[test]
@@ -714,14 +899,16 @@ fn unmapped_fill_is_ignored() {
         AccountId::Live,
         now,
         now,
-        AccountData::Exchange(ExchangeAccountData::UnmappedFill(hft_engine_rs::messaging::UnmappedFill {
-            exchange: HL,
-            instrument: "flx:TSLA".into(),
-            side: Side::Long,
-            size: dec!(1),
-            price: dec!(100),
-            timestamp: now,
-        })),
+        AccountData::Exchange(ExchangeAccountData::UnmappedFill(
+            hft_engine_rs::messaging::UnmappedFill {
+                exchange: HL,
+                instrument: "flx:TSLA".into(),
+                side: Side::Long,
+                size: dec!(1),
+                price: dec!(100),
+                timestamp: now,
+            },
+        )),
     ));
     s.funding(BN, 0.8);
     assert_eq!(placed(&s.funding(HL, 0.1)).len(), 2, "目录外成交后照常开仓");
@@ -759,7 +946,12 @@ fn imbalance_below_the_hedge_exchanges_min_notional_is_dust() {
     s.fill(&hl, dec!(0.3));
     s.advance(600);
     let out = s.bbo(HL);
-    assert!(placed(&out).iter().all(|o| !matches!(o.order_type, OrderType::Market)), "低于币安下限不补：{out:?}");
+    assert!(
+        placed(&out)
+            .iter()
+            .all(|o| !matches!(o.order_type, OrderType::Market)),
+        "低于币安下限不补：{out:?}"
+    );
     // 再成交 0.3（共 60U）够币安下限 → 撤挂单准备补腿
     let c = cancels(&s.fill(&hl, dec!(0.3)));
     assert!(c.contains(&BN), "{c:?}");
@@ -785,7 +977,12 @@ fn rejected_maker_backs_off_per_exchange() {
     assert_eq!(again[0].exchange, BN);
 
     // 连续第二次被拒：等待翻倍到 2000ms
-    s.confirm(&again[0], OrderStatus::Rejected { reason: "EXPIRED".into() });
+    s.confirm(
+        &again[0],
+        OrderStatus::Rejected {
+            reason: "EXPIRED".into(),
+        },
+    );
     s.advance(1500);
     assert!(placed(&s.bbo(BN)).is_empty(), "第二次被拒应等 2000ms");
     s.advance(500);
@@ -808,15 +1005,36 @@ fn gauges_report_aprs_spread_and_signal() {
     let g = s.runner.strategy_gauges(s.now);
     let value = |name: &str, labels: &[(&str, &str)]| {
         g.iter()
-            .find(|x| x.name == name && labels.iter().all(|(k, v)| x.labels.iter().any(|(a, b)| a == k && b == v)))
+            .find(|x| {
+                x.name == name
+                    && labels
+                        .iter()
+                        .all(|(k, v)| x.labels.iter().any(|(a, b)| a == k && b == v))
+            })
             .map(|x| x.value)
     };
     let bn = BN.to_string();
     let hl = HL.to_string();
-    assert!((value("funding_arb_apr", &[("exchange", &bn)]).unwrap() - 0.8).abs() < 1e-9, "{g:?}");
-    assert!((value("funding_arb_apr", &[("exchange", &hl)]).unwrap() - 0.1).abs() < 1e-9, "{g:?}");
-    assert!((value("funding_arb_apr_spread", &[("symbol", SYM)]).unwrap() - 0.7).abs() < 1e-9, "{g:?}");
-    assert_eq!(value("funding_arb_signal", &[("action", "open"), ("sell", &bn), ("buy", &hl)]), Some(1.0), "{g:?}");
+    assert!(
+        (value("funding_arb_apr", &[("exchange", &bn)]).unwrap() - 0.8).abs() < 1e-9,
+        "{g:?}"
+    );
+    assert!(
+        (value("funding_arb_apr", &[("exchange", &hl)]).unwrap() - 0.1).abs() < 1e-9,
+        "{g:?}"
+    );
+    assert!(
+        (value("funding_arb_apr_spread", &[("symbol", SYM)]).unwrap() - 0.7).abs() < 1e-9,
+        "{g:?}"
+    );
+    assert_eq!(
+        value(
+            "funding_arb_signal",
+            &[("action", "open"), ("sell", &bn), ("buy", &hl)]
+        ),
+        Some(1.0),
+        "{g:?}"
+    );
     assert_eq!(value("funding_arb_halted", &[("symbol", SYM)]), Some(0.0));
 }
 
@@ -834,12 +1052,22 @@ fn gauges_report_bbo_age_including_never_seen_exchanges() {
     let age = |ex: Exchange| {
         let ex = ex.to_string();
         g.iter()
-            .find(|x| x.name == "funding_arb_bbo_age_seconds" && x.labels.iter().any(|(k, v)| k == "exchange" && *v == ex))
+            .find(|x| {
+                x.name == "funding_arb_bbo_age_seconds"
+                    && x.labels.iter().any(|(k, v)| k == "exchange" && *v == ex)
+            })
             .map(|x| x.value)
     };
     // 事件的时刻取发事件前的 now（Sim::ev 发完再走 10ms）
-    assert_eq!(age(BN), Some((s.now - (bn_at - 10)) as f64 / 1000.0), "{g:?}");
-    assert!(age(HL).is_some_and(|a| a >= (s.now - first) as f64 / 1000.0), "从没来过盘口的所也要有读数，且不短于第一条事件以来的时长: {g:?}");
+    assert_eq!(
+        age(BN),
+        Some((s.now - (bn_at - 10)) as f64 / 1000.0),
+        "{g:?}"
+    );
+    assert!(
+        age(HL).is_some_and(|a| a >= (s.now - first) as f64 / 1000.0),
+        "从没来过盘口的所也要有读数，且不短于第一条事件以来的时长: {g:?}"
+    );
 }
 
 /// 在 `f` 里收集本线程打出的 WARN 日志文本

@@ -1,6 +1,6 @@
 pub(crate) mod actor;
-pub(crate) mod codec;
 mod client;
+pub(crate) mod codec;
 mod symbol;
 
 pub use actor::{BinanceArgs, BinanceNode};
@@ -31,7 +31,8 @@ pub(crate) static ORDERS_10S: Quota = Quota::new("下单数/10秒", 300, Duratio
 /// 按账户的下单数：1200 / 分钟（ORDERS）
 pub(crate) static ORDERS_1M: Quota = Quota::new("下单数/分钟", 1200, Duration::from_secs(60));
 /// `fapi/v1/fundingRate` 与 fundingInfo 共用：500 次 / 5 分钟 / IP（另计；是否同时占 IP 权重文档没写，按占 1 算）
-pub(crate) static FUNDING_RATE: Quota = Quota::new("fundingRate 次数/5分钟", 500, Duration::from_secs(300));
+pub(crate) static FUNDING_RATE: Quota =
+    Quota::new("fundingRate 次数/5分钟", 500, Duration::from_secs(300));
 
 /// Binance USDS-M Futures Public WS（盘口类高频数据：bookTicker、depth）
 ///

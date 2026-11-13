@@ -1,7 +1,7 @@
 use super::from_binance;
 use crate::domain::{
-    Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
-    OrderUpdate, Quantity, Side, Symbol, now_ms, BBO,
+    now_ms, Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
+    OrderUpdate, Quantity, Side, Symbol, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -70,8 +70,7 @@ impl MarkPriceUpdate {
 
     /// 获取 symbol (用于查询结算间隔)
     pub fn symbol(&self, quote: &str) -> Result<crate::domain::Symbol, String> {
-        from_binance(&self.s, quote)
-            .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))
+        from_binance(&self.s, quote).ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))
     }
 }
 
@@ -208,7 +207,7 @@ pub struct OrderTradeUpdate {
 #[allow(dead_code)]
 pub struct OrderData {
     pub s: String,
-    pub c: String,  // client_order_id
+    pub c: String, // client_order_id
     #[serde(rename = "S")]
     pub side: String, // "BUY" or "SELL"
     pub i: i64,
@@ -259,7 +258,8 @@ impl OrderTradeUpdate {
 
     /// 本次成交量，0 = 这条回报没有成交
     fn last_filled(&self) -> Result<Quantity, String> {
-        crate::domain::parse_decimal(&self.o.l).map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))
+        crate::domain::parse_decimal(&self.o.l)
+            .map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))
     }
 
     /// 本引擎未接入的合约上的成交：原样上报（见 `AccountData::UnmappedFill`）。无成交返回 `None`。
@@ -334,11 +334,12 @@ impl OrderTradeUpdate {
         // Binance: n 为正数表示收费
         // 走到这里说明确实有成交（上面已对 fill_sz == 0 提前返回），此时 Binance 必推
         // commission —— 缺失是交易所违约，如实报错而不是兜 0（兜 0 会让净利长期高估）
-        let fee_raw = self.o.n.as_deref().ok_or_else(|| {
-            format!("Binance 成交回报缺 commission 字段（订单 {}）", self.o.i)
-        })?;
-        let fee = f64::from_str(fee_raw)
-            .map_err(|_| format!("Failed to parse commission: {fee_raw}"))?;
+        let fee_raw =
+            self.o.n.as_deref().ok_or_else(|| {
+                format!("Binance 成交回报缺 commission 字段（订单 {}）", self.o.i)
+            })?;
+        let fee =
+            f64::from_str(fee_raw).map_err(|_| format!("Failed to parse commission: {fee_raw}"))?;
 
         Ok(Some(Fill {
             exchange: Exchange::Binance,
@@ -375,8 +376,8 @@ pub struct WsError {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use super::*;
+    use rust_decimal_macros::dec;
 
     /// 官方 aggTrade 样例载荷（含本结构未声明的 a/f/l 字段，应被忽略）
     const AGG_TRADE: &str = r#"{

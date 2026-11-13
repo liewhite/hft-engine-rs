@@ -78,7 +78,10 @@ pub(crate) fn decimal(v: &serde_json::Value) -> Option<Decimal> {
 }
 
 /// [`optional_number`] 的十进制版：缺失 / null → `Ok(None)`；在但解析不了 → `Err`
-pub(crate) fn optional_decimal(item: &serde_json::Value, field: &str) -> Result<Option<Decimal>, String> {
+pub(crate) fn optional_decimal(
+    item: &serde_json::Value,
+    field: &str,
+) -> Result<Option<Decimal>, String> {
     match item.get(field) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(v) => decimal(v)
@@ -141,8 +144,16 @@ mod tests {
     fn optional_number_separates_missing_from_unparsable() {
         let item = json!({"price": "1,234.5", "size": null, "commission": "n/a"});
         assert_eq!(optional_number(&item, "price").unwrap(), Some(1234.5));
-        assert_eq!(optional_number(&item, "size").unwrap(), None, "null 视为缺失");
-        assert_eq!(optional_number(&item, "absent").unwrap(), None, "缺失就是 None");
+        assert_eq!(
+            optional_number(&item, "size").unwrap(),
+            None,
+            "null 视为缺失"
+        );
+        assert_eq!(
+            optional_number(&item, "absent").unwrap(),
+            None,
+            "缺失就是 None"
+        );
         assert!(
             optional_number(&item, "commission").is_err(),
             "字段在但解析不了必须报错，兜 0 会把手续费/价量静默写错"
@@ -155,11 +166,25 @@ mod tests {
     /// 而把 `null` 变成 `"null"` 是另一个方向的错 —— 它会绕过复查对空 id 的保守分支。
     #[test]
     fn order_id_accepts_both_forms_and_never_fabricates() {
-        assert_eq!(order_id(Some(&json!(778901234))), Some("778901234".to_string()));
-        assert_eq!(order_id(Some(&json!("778901234"))), Some("778901234".to_string()));
+        assert_eq!(
+            order_id(Some(&json!(778901234))),
+            Some("778901234".to_string())
+        );
+        assert_eq!(
+            order_id(Some(&json!("778901234"))),
+            Some("778901234".to_string())
+        );
         assert_eq!(order_id(None), None, "字段缺失就是没有订单号");
-        assert_eq!(order_id(Some(&json!(null))), None, "null 不能变成字符串 \"null\"");
+        assert_eq!(
+            order_id(Some(&json!(null))),
+            None,
+            "null 不能变成字符串 \"null\""
+        );
         assert_eq!(order_id(Some(&json!(""))), None, "空串等于没有");
-        assert_eq!(order_id(Some(&json!({"a": 1}))), None, "非标量不能 to_string 顶上");
+        assert_eq!(
+            order_id(Some(&json!({"a": 1}))),
+            None,
+            "非标量不能 to_string 顶上"
+        );
     }
 }

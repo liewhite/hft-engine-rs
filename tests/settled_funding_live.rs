@@ -13,7 +13,10 @@ const DAY_MS: u64 = 24 * 3600 * 1000;
 #[ignore]
 async fn binance_last_day_has_settlements() {
     let client = BinanceClient::new("USDT".to_string(), None).unwrap();
-    let got = client.fetch_settled_funding(&"BTC".to_string(), now_ms() - DAY_MS).await.unwrap();
+    let got = client
+        .fetch_settled_funding(&"BTC".to_string(), now_ms() - DAY_MS)
+        .await
+        .unwrap();
     println!("{got:?}");
     // BTCUSDT 8h 周期，24h 内 3 次
     assert!((2..=4).contains(&got.len()), "{}", got.len());
@@ -25,17 +28,34 @@ async fn binance_last_day_has_settlements() {
 #[ignore]
 async fn hyperliquid_one_client_main_and_xyz() {
     use hft_engine_rs::exchange::ExchangeClient;
-    let client = HyperliquidClient::connect("USDC".to_string(), vec![String::new(), "xyz".to_string()], None)
-        .await
-        .unwrap();
+    let client = HyperliquidClient::connect(
+        "USDC".to_string(),
+        vec![String::new(), "xyz".to_string()],
+        None,
+    )
+    .await
+    .unwrap();
     let metas = client
         .fetch_symbol_meta(&["BTC".to_string(), "TSLA".to_string()])
         .await
         .unwrap();
-    println!("metas: {:?}", metas.iter().map(|m| (&m.symbol, m.size_step)).collect::<Vec<_>>());
-    assert_eq!(metas.len(), 2, "BTC 与 TSLA 都应在同一个 client 的品种目录里");
+    println!(
+        "metas: {:?}",
+        metas
+            .iter()
+            .map(|m| (&m.symbol, m.size_step))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        metas.len(),
+        2,
+        "BTC 与 TSLA 都应在同一个 client 的品种目录里"
+    );
     for sym in ["BTC", "TSLA"] {
-        let got = client.fetch_settled_funding(&sym.to_string(), now_ms() - DAY_MS).await.unwrap();
+        let got = client
+            .fetch_settled_funding(&sym.to_string(), now_ms() - DAY_MS)
+            .await
+            .unwrap();
         println!("{sym} n={} first={:?}", got.len(), got.first());
         // 1h 周期，24h 内约 24 次
         assert!((22..=25).contains(&got.len()), "{sym} {}", got.len());
