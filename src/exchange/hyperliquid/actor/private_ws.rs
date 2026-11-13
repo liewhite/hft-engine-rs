@@ -54,7 +54,7 @@ impl HyperliquidPrivateWs {
         group
             .spawn("HyperliquidPrivateWs", move |scope: Scope| async move {
                 // 1. 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
-                let (ws_stream, _) = tokio_tungstenite::connect_async(WS_URL)
+                let ws_stream = crate::exchange::ws_loop::connect(WS_URL)
                     .await
                     .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
                 let (write, read) = ws_stream.split();

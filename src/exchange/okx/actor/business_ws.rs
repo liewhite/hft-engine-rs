@@ -47,7 +47,7 @@ impl OkxBusinessWs {
         let (_, addr) = group
             .spawn_addressed("OkxBusinessWs", move |scope: Scope, inbox| async move {
                 // 连接 Business WebSocket（失败向上传播 → 启动期受控退出）
-                let (ws_stream, _) = tokio_tungstenite::connect_async(WS_BUSINESS_URL)
+                let ws_stream = crate::exchange::ws_loop::connect(WS_BUSINESS_URL)
                     .await
                     .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
                 let (write, read) = ws_stream.split();

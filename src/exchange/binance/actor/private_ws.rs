@@ -56,7 +56,7 @@ impl BinancePrivateWs {
                 // 订阅确认：币安私有流没有订阅请求，listenKey 在连接地址里，握手成功即订阅生效
                 // （OKX / HL 要另等回执，见 WsConn::await_subscriptions）
                 let url = format!("{}?listenKey={}", WS_PRIVATE_URL, listen_key);
-                let (ws_stream, _) = tokio_tungstenite::connect_async(&url)
+                let ws_stream = crate::exchange::ws_loop::connect(&url)
                     .await
                     .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
                 let (write, read) = ws_stream.split();
