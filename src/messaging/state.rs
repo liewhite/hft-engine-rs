@@ -323,7 +323,7 @@ impl SymbolPositions {
     /// 就会重复计算。为此：
     ///
     /// - `snapshot_req_ts` 是 REST 快照的**请求**时刻。在此之前送达（`local_ts <=`）的
-    ///   Fill 必已含在快照里，seed 之后到达时被 [`Self::apply`] 的 Fill 分支丢弃 ——
+    ///   Fill 必已含在快照里，seed 之后到达时被 [`Self::apply_fill`] 丢弃 ——
     ///   这条过滤规则对所有基线消费者（executor、对账镜像、观测镜像）同一份。
     /// - 只投产一次，每所只 seed 一次，且在任何 Fill 进来之前（executor 出生即带基线；镜像
     ///   注册与基线原子到达，未注册 symbol 的 Fill 不进镜像）。

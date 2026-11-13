@@ -17,7 +17,7 @@ use crate::domain::types::Quantity;
 /// 需要盈亏的地方都不该从这里取：
 /// - 模拟柜台与回测的净值/已实现盈亏由本地账本自己维护（[`crate::sim::BookPosition`]，
 ///   均价按成交流加权，与交易所报什么无关）；
-/// - 实盘账户净值走 [`crate::messaging::ExchangeEventData::AccountInfo`]（交易所算好的，
+/// - 实盘账户净值走 [`crate::messaging::ExchangeAccountData::AccountInfo`]（交易所算好的，
 ///   一个数、无需逐 symbol 对齐）；
 /// - 策略需要成本时自己从成交流记，口径由它自己定。
 ///

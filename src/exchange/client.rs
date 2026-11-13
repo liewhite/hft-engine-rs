@@ -119,7 +119,7 @@ pub struct ExchangeAccess<C> {
 /// 用独立类型把这条边界钉在类型系统里：
 /// - domain 里流转的一律是 `Order`（币本位），策略、`StrategyRunner`、`SimState`、回测同理
 /// - 只有 [`ExchangeOrder`] 携带交易所单位，且它**只能**由 [`ExchangeOrder::from_domain`] 产生
-/// - [`ExchangeClient::place_order`] 只收 `ExchangeOrder`，因此不可能把币本位数量直发上线
+/// - [`AccountClient::place_order`] 只收 `ExchangeOrder`，因此不可能把币本位数量直发上线
 ///
 /// 与入向的做法对称：入向由 codec 的签名要求 `&SymbolMeta` 来强制折算，出向由本类型的
 /// 构造函数要求 `&SymbolMeta` 来强制折算。两个方向的单位知识都收在本文件。
