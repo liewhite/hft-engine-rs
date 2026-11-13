@@ -386,22 +386,27 @@ impl FundingArbStrategy {
     /// 在该所把持仓从 `pos` 改到 `pos + delta` 后，单币与账户杠杆是否仍在上限内。
     /// 持仓绝对值不增（削减已有腿）时总是允许 —— 超限只停止开仓，不拦减仓。
     /// 净值或持仓总价值未知时不许加仓。
+    ///
+    /// 账户持仓总价值 = 本地持仓账本里该所**别的币**的持仓价值之和 + 本币开仓后的价值（#759，用户定：
+    /// 本地所有持仓价值相加）。本币用自己这一刻的持仓，不用账本那份（可能还没含刚到的成交）；
+    /// 别的币的成交由账本在成交后立刻发出，不等交易所轮询。只算配置里的币，账户里别的仓位不计。
     fn leverage_allows(&self, view: StrategyView<'_>, ex: Exchange, pos: f64, delta: f64, px: f64) -> bool {
         let before = pos.abs() * px;
         let after = (pos + delta).abs() * px;
         if after <= before {
             return true;
         }
-        let (Some(equity), Some(account)) = (view.equity(ex), view.account_notional(ex)) else {
+        let (Some(equity), Some(values)) = (view.equity(ex), view.position_values(ex)) else {
             return false;
         };
         if equity <= 0.0 {
             return false;
         }
-        let account_after = account - before + after;
+        let others: f64 = values.iter().filter(|(s, _)| *s != self.symbol()).map(|(_, v)| v).sum();
+        let account_after = others + after;
         let ok = after / equity <= self.p.max_symbol_leverage && account_after / equity <= self.p.max_account_leverage;
         if !ok {
-            tracing::debug!(symbol = %self.symbol(), %ex, equity, account, before, after, "杠杆到上限，不再开仓");
+            tracing::debug!(symbol = %self.symbol(), %ex, equity, others, before, after, "杠杆到上限，不再开仓");
         }
         ok
     }

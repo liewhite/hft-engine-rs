@@ -9,6 +9,13 @@
 //!
 //! 对外入口是 [`PositionLedgerHandle::live_positions`]，经 Manager 转发（快照面契约见同一份文档）。
 //!
+//! # 各所持仓价值读数（#759）
+//!
+//! 账本里有全部已跟踪币的实时持仓，所以账户级杠杆要的「本所持仓总价值」也由它给：每笔成交后发该所、
+//! 每个节拍发全部所的 [`PositionValues`]（币 → |持仓| × 盘口中间价）到账户总线，按所投给策略。
+//! 单币策略拿它加总别的币、再换上自己这一刻的持仓 —— 别的币刚成交，几毫秒内就能看到，不用等交易所
+//! 账户接口的轮询。盘口只为估值而订（行情总线上的 BBO）；有仓的币还没有盘口时不发（未知不当 0）。
+//!
 //! 持仓的权威值由「投产期 REST 基线 + 之后全程 Fill 累加」维护
 //! （见 [`crate::messaging::PositionBaseline`]）。这条通道会错：Fill 可能丢、可能被重复
 //! 计算、codec 可能算错单位或符号、也可能出现不伴随 Fill 的交易所侧变动。本组件用**独立
@@ -74,8 +81,12 @@ use super::executor::{ExecutorHandle, ExecutorId};
 use crate::domain::{Exchange, Position, Symbol, SymbolMeta};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
-use crate::messaging::{AccountBus, AccountEvent, PositionBaseline, PositionBook};
-use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, Task};
+use crate::domain::{now_ms, AccountId};
+use crate::messaging::{
+    AccountBus, AccountData, AccountEvent, ExchangeAccountData, MarketBus, MarketData, MarketEvent, PositionBaseline,
+    PositionBook, PositionValues,
+};
+use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, StopFlag, Task};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
@@ -205,6 +216,29 @@ impl Reconciler {
     /// 语义都在 [`PositionBook::apply`] 里，本层不再重复一遍）。
     pub fn on_event(&mut self, event: &AccountEvent) {
         self.mirror.apply(event);
+    }
+
+    /// 该所每个基线已写入的币的持仓价值 = |持仓| × `mid_of` 给的价（#759）。
+    ///
+    /// 有仓的币拿不到价时返回 `Err(那个币)`：价值未知，不能当 0 给出去（杠杆闸门会少算）。
+    /// 空仓的币不需要价，记 0。
+    pub fn position_values(
+        &self,
+        exchange: Exchange,
+        mid_of: impl Fn(&Symbol) -> Option<f64>,
+    ) -> Result<HashMap<Symbol, f64>, Symbol> {
+        self.mirror
+            .iter()
+            .filter(|(_, state)| state.is_seeded(exchange))
+            .map(|(symbol, state)| {
+                let size = state.position_size(exchange);
+                if size == 0.0 {
+                    return Ok((symbol.clone(), 0.0));
+                }
+                let px = mid_of(symbol).ok_or_else(|| symbol.clone())?;
+                Ok((symbol.clone(), size.abs() * px))
+            })
+            .collect()
     }
 
     /// 比对某所的一份完整读数。
@@ -380,8 +414,10 @@ pub struct PositionLedgerArgs {
     pub accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 用于取 `coin_size_step()`（币本位最小可交易增量）作为对账容差
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// 镜像的增量输入（只订实盘 Fill）
+    /// 镜像的增量输入（只订实盘 Fill），也是持仓价值读数（[`PositionValues`]）发布的地方
     pub account_bus: AccountBus,
+    /// 盘口（只订 BBO）：给持仓估值
+    pub market_bus: MarketBus,
     /// 轮询间隔（毫秒）
     pub interval_ms: u64,
     /// 连续多少次不一致判定为真实漂移
@@ -392,6 +428,8 @@ pub struct PositionLedgerArgs {
 pub enum PositionLedgerMsg {
     /// 账户总线上的实盘 Fill（订阅时已按 [`PositionBook::live_fill`] 过滤）
     Account(AccountEvent),
+    /// 行情总线上的 BBO（只用来给持仓估值）
+    Market(MarketEvent),
     /// 见 [`PositionLedgerHandle::register_symbols`]
     RegisterSymbols {
         symbols: Vec<Symbol>,
@@ -488,6 +526,14 @@ struct Ledger {
     executor_in_flight: HashSet<ExecutorId>,
     /// 在途的拉取与查询，由 `run` 与收件箱一起 poll
     pending: FuturesUnordered<BoxFuture<'static, Fetched>>,
+    /// 持仓价值读数的发布去处（见 [`Self::publish_values`]）
+    account_bus: AccountBus,
+    /// 各 (所, 币) 最新盘口中间价，给持仓估值
+    mids: HashMap<(Exchange, Symbol), f64>,
+    /// 整机停止状态：一进停机就不再发读数 —— 停机后不再下新单，读数没人用；而同在消费者组的
+    /// 订阅者（分发层、指标）此时可能已关箱，再发会记 ERROR「事件丢失」（回灌边，见
+    /// architecture.md V5）
+    machine_stop: StopFlag,
 }
 
 impl PositionLedger {
@@ -497,12 +543,17 @@ impl PositionLedger {
         args: PositionLedgerArgs,
     ) -> anyhow::Result<(ChildHandle, PositionLedgerHandle)> {
         let (child, addr) = group
-            .spawn_addressed("PositionLedger", move |_scope: Scope, mut inbox| async move {
+            .spawn_addressed("PositionLedger", move |scope: Scope, mut inbox| async move {
                 // 镜像的增量输入只有实盘 Fill：订阅过滤与账本同一判据（模拟成交绝不进实盘镜像）
                 inbox.subscribe(
                     &args.account_bus,
                     |e| PositionBook::live_fill(e).is_some(),
                     PositionLedgerMsg::Account,
+                );
+                inbox.subscribe(
+                    &args.market_bus,
+                    |e| matches!(e.data, MarketData::BBO(_)),
+                    PositionLedgerMsg::Market,
                 );
 
                 // 窗口从构造时刻起算，避免首次拉取前就被判成停摆
@@ -534,6 +585,9 @@ impl PositionLedger {
                         executors: HashMap::new(),
                         executor_in_flight: HashSet::new(),
                         pending: FuturesUnordered::new(),
+                        account_bus: args.account_bus,
+                        mids: HashMap::new(),
+                        machine_stop: scope.machine_stop_flag(),
                     },
                 })
             })
@@ -579,8 +633,18 @@ impl Ledger {
     fn handle(&mut self, msg: PositionLedgerMsg) {
         // 回执发送失败 = 提问方已不再等，没有人需要这份答复
         match msg {
-            // 账本只吃实盘 Fill（订阅时已预过滤，on_event 内按账户再过滤）
-            PositionLedgerMsg::Account(event) => self.reconciler.on_event(&event),
+            // 账本只吃实盘 Fill（订阅时已预过滤，on_event 内按账户再过滤）；
+            // 持仓一变就把该所的价值发出去，别的币的策略实例不用等节拍就能看到
+            PositionLedgerMsg::Account(event) => {
+                self.reconciler.on_event(&event);
+                if let AccountData::Symbol(d) = &event.data {
+                    self.publish_values(d.exchange());
+                }
+            }
+            PositionLedgerMsg::Market(MarketEvent { data: MarketData::BBO(bbo), .. }) => {
+                self.mids.insert((bbo.exchange, bbo.symbol.clone()), bbo.mid_price());
+            }
+            PositionLedgerMsg::Market(_) => {}
             PositionLedgerMsg::RegisterSymbols {
                 symbols,
                 baselines,
@@ -616,7 +680,38 @@ impl Ledger {
         self.check_in_flight_staleness()?;
         self.start_fetches();
         self.start_executor_queries();
+        // 没有成交时价格也在变：每拍按最新盘口重发一遍
+        let exchanges: Vec<Exchange> = self.accounts.keys().copied().collect();
+        for exchange in exchanges {
+            self.publish_values(exchange);
+        }
         Ok(())
+    }
+
+    /// 把该所各币的持仓价值发到账户总线（按所投给订了该所的策略）。有仓的币还没有盘口时
+    /// 不发：读数留在上一份（启动时就是「未知」，策略不开仓）。
+    fn publish_values(&self, exchange: Exchange) {
+        if self.machine_stop.is_stopping() {
+            return;
+        }
+        let mid_of = |symbol: &Symbol| self.mids.get(&(exchange, symbol.clone())).copied();
+        match self.reconciler.position_values(exchange, mid_of) {
+            Ok(values) => {
+                let ts = now_ms();
+                self.account_bus.publish(AccountEvent {
+                    account: AccountId::Live,
+                    exchange_ts: ts,
+                    local_ts: ts,
+                    data: AccountData::Exchange(ExchangeAccountData::PositionValues(PositionValues {
+                        exchange,
+                        values,
+                    })),
+                });
+            }
+            Err(symbol) => {
+                tracing::debug!(%exchange, %symbol, "该币有仓但还没有盘口，暂不发持仓价值");
+            }
+        }
     }
 
     /// 一次拉取或查询的结果：比对；`Err` = 确认漂移、分叉或通道停摆，应致命退出。
@@ -1191,6 +1286,28 @@ mod tests {
         );
     }
 
+    /// #759：持仓价值 = |持仓| × 中间价（空头也为正）；空仓的币不需要价；未 seed 的腿不报
+    #[test]
+    fn position_values_are_abs_size_times_mid_and_flat_legs_need_no_price() {
+        let mut r = Reconciler::new(metas(), 1);
+        r.register(&[SYM.to_string(), "ETH".to_string()], &[baseline_on(EX, -2.0), baseline_on(OTHER_EX, 0.0)]);
+        r.on_event(&fill_on(EX, Side::Short, 1.0, SNAPSHOT_TS + 1)); // EX: -3
+        let mid = |s: &Symbol| (s == SYM).then_some(100.0);
+        assert_eq!(r.position_values(EX, mid), Ok(HashMap::from([(SYM.to_string(), 300.0)])), "ETH 未 seed，不报");
+        assert_eq!(
+            r.position_values(OTHER_EX, |_: &Symbol| None),
+            Ok(HashMap::from([(SYM.to_string(), 0.0)])),
+            "空仓不需要价"
+        );
+    }
+
+    /// 有仓却没价：价值未知，不能当 0 报出去（杠杆闸门会少算）
+    #[test]
+    fn a_held_symbol_without_a_price_makes_the_values_unknown() {
+        let r = reconciler_with(1, &[baseline_on(EX, 1.0)]);
+        assert_eq!(r.position_values(EX, |_: &Symbol| None), Err(SYM.to_string()));
+    }
+
     /// 镜像只吃基线与成交：对账读数本身绝不能写进镜像（否则漂移会被自我抹平）
     #[test]
     fn report_never_feeds_the_mirror() {
@@ -1409,12 +1526,24 @@ mod task_tests {
         client: Arc<dyn AccountClient>,
         interval_ms: u64,
     ) -> PositionLedgerHandle {
+        ledger_on(root, client, interval_ms, AccountBus::new("account"), MarketBus::new("market")).await
+    }
+
+    /// 同 [`ledger`]，总线由调用方给（要往里发事件或收账本发出的读数时用）
+    async fn ledger_on(
+        root: &Root,
+        client: Arc<dyn AccountClient>,
+        interval_ms: u64,
+        account_bus: AccountBus,
+        market_bus: MarketBus,
+    ) -> PositionLedgerHandle {
         let (_child, ledger) = PositionLedger::spawn(
             &root.group("consumers"),
             PositionLedgerArgs {
                 accounts: HashMap::from([(EX, client)]),
                 symbol_metas: metas(),
-                account_bus: AccountBus::new("account"),
+                account_bus,
+                market_bus,
                 interval_ms,
                 max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
             },
@@ -1458,6 +1587,9 @@ mod task_tests {
             executors: HashMap::new(),
             executor_in_flight: HashSet::new(),
             pending: FuturesUnordered::new(),
+            account_bus: AccountBus::new("account"),
+            mids: HashMap::new(),
+            machine_stop: Root::new("t").machine_stop_flag(),
         };
 
         // 刚发出、还在容忍窗口内：只是慢，不该停机
@@ -1513,6 +1645,84 @@ mod task_tests {
 
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].size, 2.0, "应答的是账本真值（基线 2.0）");
+        root.shutdown().await.expect("正常停机");
+    }
+
+    /// 收账户总线上账本发出的持仓价值读数
+    struct ValuesProbe {
+        inbox: Inbox<AccountEvent>,
+        seen: Arc<std::sync::Mutex<Vec<PositionValues>>>,
+    }
+
+    impl Task for ValuesProbe {
+        async fn run(&mut self, _: &Scope) -> anyhow::Result<()> {
+            while let Some(ev) = self.inbox.recv().await {
+                if let AccountData::Exchange(ExchangeAccountData::PositionValues(v)) = ev.data {
+                    self.seen.lock().unwrap().push(v);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// #759 端到端：一笔成交后不等节拍，立刻按最新盘口发出该所的持仓价值
+    #[tokio::test]
+    async fn values_are_published_right_after_a_fill() {
+        let root = Root::new("t");
+        let (account_bus, market_bus) = (AccountBus::new("account"), MarketBus::new("market"));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe_seen = seen.clone();
+        let probe_bus = account_bus.clone();
+        root.group("consumers")
+            .spawn_addressed("ValuesProbe", move |_scope, mut inbox: Inbox<AccountEvent>| async move {
+                inbox.subscribe(
+                    &probe_bus,
+                    |e| matches!(e.data, AccountData::Exchange(ExchangeAccountData::PositionValues(_))),
+                    |e| e,
+                );
+                Ok(ValuesProbe { inbox, seen: probe_seen })
+            })
+            .await
+            .expect("探针应能起来");
+        let (client, _calls) = FaultyClient::pair(Faulty::Steady(2.0));
+        // 节拍很慢：首拍（立即）之后的读数只可能来自成交
+        let _ledger = ledger_on(&root, client, NEVER_AGAIN_MS, account_bus.clone(), market_bus.clone()).await;
+        // 盘口与成交按序进账本收件箱
+        market_bus.publish(MarketEvent {
+            exchange_ts: 0,
+            local_ts: 0,
+            data: MarketData::BBO(crate::domain::BBO {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                bid_price: 99.0,
+                bid_qty: 1.0,
+                ask_price: 101.0,
+                ask_qty: 1.0,
+                timestamp: 0,
+            }),
+        });
+        let last = || seen.lock().unwrap().last().cloned();
+        account_bus.publish(AccountEvent {
+            account: crate::domain::AccountId::Live,
+            exchange_ts: 2,
+            local_ts: 2,
+            data: AccountData::Symbol(crate::messaging::SymbolAccountData::Fill(crate::domain::Fill {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                side: crate::domain::Side::Long,
+                price: 100.0,
+                size: 1.0,
+                client_order_id: None,
+                order_id: "1".to_string(),
+                timestamp: 2,
+                fee: 0.0,
+                reason: crate::domain::FillReason::Normal,
+            })),
+        });
+        eventually("成交后立刻发出读数", || {
+            last().is_some_and(|v| v.exchange == EX && v.values.get(SYM) == Some(&300.0))
+        })
+        .await;
         root.shutdown().await.expect("正常停机");
     }
 

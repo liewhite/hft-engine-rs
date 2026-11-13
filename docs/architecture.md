@@ -182,7 +182,7 @@ CLAUDE.md 的七条是通用的，这里只写**本项目特有的、可以直�
  HlNode       │                  │   (按 symbol/账户路由) └─> (回测: BacktestEngine 直驱)
  IbkrNode     ┘                  │
       │                          │
-      └─────> AccountBus ────────┼─> PositionLedger (持仓真值 + REST 对账 + 对外供查)
+      └─────> AccountBus ────────┼─> PositionLedger (持仓真值 + REST 对账 + 对外供查 + 各所持仓价值回发 AccountBus)
                     ▲            │
                     │            └─> Metrics (观测，允许自己坏)
                     │
@@ -439,6 +439,8 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
   账本）可能已关箱，记 ERROR"事件丢失"。停机期间成交的单，交易所回报本进程收不到（交易所节点已先停），
   下次启动由 REST 持仓基线得到。
 - **本地柜台**延迟管道里未到期的模拟单/撤单随停机丢弃（记 warn）：模拟账户不持久化。
+- **`PositionLedger`**（#759 起）往账户总线发各所持仓价值读数（`PositionValues`）。整机一进停机就不再发：
+  停机后不再下新单，读数没人用，不制造「事件丢失」。
 
 再切一刀分组（把两个回灌源单独先停）能救回的只是那几条合成回报和柜台回报 —— 而这批数据一个字节
 都不持久化（paper 账户每次启动从零起步、实盘持仓走 REST 基线重建），不值得。

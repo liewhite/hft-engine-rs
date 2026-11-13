@@ -253,6 +253,24 @@ pub enum ExchangeAccountData {
     /// 本账户在**引擎品种目录之外**的成交（如 HL 未接入市场的合约、现货）。
     /// 不进任何 symbol 的持仓；框架只如实上报，怎么处理（忽略 / 停止交易）由策略决定。
     UnmappedFill(UnmappedFill),
+    /// 本地持仓账本里该所**每个已跟踪币**的持仓价值，见 [`PositionValues`]
+    PositionValues(PositionValues),
+}
+
+/// 本地持仓账本（`PositionLedger`：启动基线 + 之后全部实盘成交）里某所每个已跟踪币的
+/// 持仓价值 = |持仓| × 盘口中间价（#759）。
+///
+/// 与 [`ExchangeAccountData::AccountInfo`] 的 `notional`（交易所接口轮询的账户总持仓价值）
+/// 是两个来源：这一份在任何一个币成交后立刻更新（不等轮询），按币分开给出，让单币策略
+/// 能把自己那一项换成它自己最新的持仓。只含引擎跟踪的币（配置里的币），不含账户里别的仓位。
+///
+/// 账本在每笔成交后发该所的一份、每个对账节拍发全部所一份（价格变动）；某个有仓的币
+/// 还没有盘口时不发（价值未知，不能当 0）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionValues {
+    pub exchange: Exchange,
+    /// 币 → 持仓价值（非负，计价币）。空仓的币为 0
+    pub values: std::collections::HashMap<Symbol, f64>,
 }
 
 /// 品种目录外的一笔成交。`instrument` 是交易所原始写法（如 `flx:TSLA`、`@107`），
@@ -293,6 +311,7 @@ impl ExchangeAccountData {
             ExchangeAccountData::Greeks(g) => g.exchange,
             ExchangeAccountData::AccountInfo { exchange, .. } => *exchange,
             ExchangeAccountData::UnmappedFill(f) => f.exchange,
+            ExchangeAccountData::PositionValues(v) => v.exchange,
         }
     }
 }
