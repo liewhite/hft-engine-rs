@@ -501,7 +501,7 @@ impl FundingArbStrategy {
         }
         match &p.cancel {
             CancelState::None => {}
-            CancelState::Sent { .. } => return None,
+            CancelState::Sent => return None,
             CancelState::Failed { at, reason } => {
                 if now.saturating_sub(*at) < self.p.hedge_retry_ms {
                     return None;

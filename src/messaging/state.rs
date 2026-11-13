@@ -30,6 +30,8 @@ pub struct PendingOrder {
     pub reported_filled: Quantity,
     /// 撤单进行到哪一步
     pub cancel: CancelState,
+    /// 第一次发撤单的时刻。此后单该在 [`ORDER_STUCK_MS`] 内到终态，不管中间撤单失败、重撤了几次
+    cancel_first_sent_at: Option<Timestamp>,
     /// 收到终态的时刻
     terminal_at: Option<Timestamp>,
 }
@@ -40,7 +42,7 @@ pub enum CancelState {
     /// 没撤过
     None,
     /// 撤单已发出：等交易所推终态，或撤单失败的结论。期间框架不再重发（见 `StrategyRunner`）
-    Sent { at: Timestamp },
+    Sent,
     /// 撤单请求失败。单若还开着，要不要、隔多久重撤由策略定
     Failed { at: Timestamp, reason: String },
 }
@@ -56,8 +58,9 @@ impl PendingOrder {
         self.reported_filled - self.filled <= FILL_TOLERANCE * self.order.quantity.max(self.reported_filled)
     }
 
-    /// 在等交易所的什么、从什么时候起；`None` = 没在等（挂着，或撤单失败后等策略决定）。
-    /// 已终态的单还在表里，就是成交没到齐（到齐即移出）。
+    /// 在等交易所的什么、从什么时候起；`None` = 没在等（挂着、没撤过）。
+    /// 已终态的单还在表里，就是成交没到齐（到齐即移出）。撤过的单从第一次撤起算：撤单一直失败、
+    /// 交易所又不推终态时，策略会一直重撤（HL 白耗操作额度）、该币也一直挂不了新单（#767）。
     fn waiting_on_exchange(&self) -> Option<(Timestamp, &'static str)> {
         if let Some(at) = self.terminal_at {
             return Some((at, "终态已到、成交没到齐"));
@@ -65,10 +68,7 @@ impl PendingOrder {
         if self.status == OrderStatus::Created {
             return Some((self.created_at, "下单请求没有结论"));
         }
-        match self.cancel {
-            CancelState::Sent { at } => Some((at, "撤单已发出、交易所没推终态")),
-            CancelState::None | CancelState::Failed { .. } => None,
-        }
+        self.cancel_first_sent_at.map(|at| (at, "撤单发出后交易所没推终态"))
     }
 }
 
@@ -428,6 +428,7 @@ impl SymbolOrders {
             filled: 0.0,
             reported_filled: 0.0,
             cancel: CancelState::None,
+            cancel_first_sent_at: None,
             terminal_at: None,
         });
     }
@@ -450,10 +451,11 @@ impl SymbolOrders {
         if p.status == OrderStatus::Created {
             return Err("下单请求还没结论");
         }
-        if matches!(p.cancel, CancelState::Sent { .. }) {
+        if p.cancel == CancelState::Sent {
             return Err("上一次撤单还在等结论");
         }
-        p.cancel = CancelState::Sent { at: now };
+        p.cancel = CancelState::Sent;
+        p.cancel_first_sent_at.get_or_insert(now);
         Ok(())
     }
 
@@ -948,7 +950,7 @@ mod tests {
         assert!(!state.order_book().has_pending());
     }
 
-    /// 三种「等交易所」超过 [`ORDER_STUCK_MS`] 都报错；挂着不动、撤单失败后的单不算在等
+    /// 三种「等交易所」超过 [`ORDER_STUCK_MS`] 都报错；挂着不动不算；撤过的单从第一次撤起算，中间撤单失败、重撤不重新计时
     #[test]
     fn waiting_on_the_exchange_too_long_is_an_error() {
         let late = ORDER_STUCK_MS + 1;
@@ -966,9 +968,13 @@ mod tests {
         state.mark_cancel_sent(CID, 100).unwrap();
         assert!(state.check_stuck_orders(100 + ORDER_STUCK_MS).is_ok());
         assert!(state.check_stuck_orders(100 + late).is_err());
-        // 撤单失败：不在等交易所，等策略决定
+        // 撤单一直失败、反复重撤：仍从第一次撤起算（此前撤单失败后不算在等，该币会一直卡在只撤不挂）
         apply(&mut state, &request(RequestOutcome::CancelFailed { reason: "x".into() }, 200));
-        assert!(state.check_stuck_orders(10 * late).is_ok());
+        assert!(state.check_stuck_orders(100 + late).is_err());
+        state.mark_cancel_sent(CID, 50_000).unwrap();
+        apply(&mut state, &request(RequestOutcome::CancelFailed { reason: "x".into() }, 50_100));
+        assert!(state.check_stuck_orders(100 + ORDER_STUCK_MS).is_ok());
+        assert!(state.check_stuck_orders(100 + late).is_err(), "重撤不重新计时");
 
         // 终态到了、成交没到齐
         let mut state = with_order();
