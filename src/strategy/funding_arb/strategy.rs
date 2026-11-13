@@ -18,15 +18,13 @@
 //!
 //! # 停机（halt）
 //!
-//! 本策略把账户里该币的全部持仓当成自己的（框架持仓 = REST 基线 + 全部成交）。下面几种情况
-//! 说明账户里有不归本策略的仓位或交易，自动"对冲"会下错单，故停止交易（撤自己的挂单、不开不补）
-//! 并报 error，等人处理后重启：
+//! 账户由本策略全权托管（用户定），不检测外来交易（#760 用户定）：账户里该币的全部持仓都当成
+//! 自己的（框架持仓 = REST 基线 + 全部成交），别的单的成交按普通不平衡补；品种目录外的成交
+//! （框架以 `UnmappedFill` 上报）不理会。
+//!
+//! 只在不知道该在哪对所补时停止交易（撤自己的挂单、不开不补）并报 error，等人处理后重启：
 //! - 启动时各所持仓之和不为 0；
-//! - 运行中收到不是本策略下的单的成交；
-//! - 收到账户在品种目录外的成交（框架以 `UnmappedFill` 上报，如 HL 未接入市场的合约、现货，
-//!   币安 / OKX 上别的计价币或交割合约；账户由本策略全权托管时不会出现）：
-//!   那笔仓位与本策略共用保证金却不在杠杆口径里；
-//! - 不平衡出现时还没挂过任何单（不知道该在哪对所补）。
+//! - 不平衡出现时还没挂过任何单。
 //!
 //! # 残余窗口（如实声明）
 //!
@@ -42,14 +40,12 @@
 //!
 //! 所对切换的那一步，旧所对的挂单撤销在途时新所对已挂单；新旧同方向的单都成交时，补腿量是两笔、
 //! 不经杠杆检查，最多超出一笔挂单金额。
-//!
-//! 外来成交按订单号前缀判别（与框架同一判据）；HL 的前缀是格式要求，别的程序带 cloid 的单认不出。
 
 use super::config::PairParams;
 use super::signal::{decide, FundingAction, LegPair, SettledFundingWindow};
 use crate::domain::{Exchange, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, IncomeEvent, MarketData, MarketEvent, PendingOrder};
+use crate::messaging::{IncomeEvent, MarketData, MarketEvent, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
 use std::collections::{HashMap, HashSet};
 
@@ -287,7 +283,7 @@ impl FundingArbStrategy {
     /// 持仓差是不是零头（不补、不停机），全策略只此一处判据：补不出去就是零头（见 [`Self::tradable`]）。
     /// 有所对时看补腿所下不下得出；还没有所对（启动时）时，只要有任一所下不出就算零头
     /// —— 本策略留下的零头不超过当时补腿所的一笔最小单，而那一所事后未知，按最粗的一所放宽，
-    /// 免得每次重启都因自己的零头停机。代价：启动时不足最粗一所最小单的外来不平会被放过。
+    /// 免得每次重启都因自己的零头停机。代价：启动时不足最粗一所最小单的不平会被放过。
     fn is_dust(&self, net: f64, px: f64) -> bool {
         match self.leg {
             Some(pair) => !self.tradable(hedge_target(pair, net).0, net.abs(), px),
@@ -555,25 +551,6 @@ impl Strategy for FundingArbStrategy {
             IncomeEvent::Market(MarketEvent { data: MarketData::Custom(c), .. }) => {
                 if let Some(w) = c.get::<SettledFundingWindow>() {
                     self.funding.insert(w.exchange, w.clone());
-                }
-            }
-            IncomeEvent::Account(a) => {
-                if let AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) = &a.data {
-                    self.halt(format!(
-                        "{} 账户在品种目录外有成交：{} {:?} 数量 {}（交易所原始单位）@{}（与本策略共用保证金却不在杠杆口径里；覆盖该所的币都会停）",
-                        f.exchange, f.instrument, f.side, f.size, f.price
-                    ));
-                }
-                if let AccountData::Symbol(SymbolAccountData::Fill(f)) = &a.data {
-                    // 归属判据与框架同一份（订单号前缀）。盖不住本引擎另一个进程在同账户同币上交易；
-                    // 本策略一个进程覆盖全部币，不会出现。
-                    let ours = f.client_order_id.as_ref().is_some_and(|c| f.exchange.owns_cli_order_id(c));
-                    if !ours {
-                        self.halt(format!(
-                            "收到非本策略订单的成交：{} {:?} {} cid={:?}",
-                            f.exchange, f.side, f.size, f.client_order_id
-                        ));
-                    }
                 }
             }
             _ => {}
