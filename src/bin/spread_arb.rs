@@ -123,7 +123,7 @@ async fn run() -> anyhow::Result<()> {
     };
     // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
     run_engine(args, |manager| async move {
-        // 各交易所的 symbol metas（只含配了凭证的所——这就是"参与交易所"的单一数据源）
+        // 各交易所的 symbol metas（全部已装配的所；实盘策略涉及的所没配凭证会在投产时被拒）
         let metas: HashMap<Exchange, Vec<SymbolMeta>> = manager.all_symbol_metas();
         for (exchange, exchange_metas) in &metas {
             tracing::info!(%exchange, listed = exchange_metas.len(), "Exchange symbols listed");

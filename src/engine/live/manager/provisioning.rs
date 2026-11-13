@@ -197,25 +197,18 @@ fn validate_subscriptions(
 /// # 为什么必须每条都有
 ///
 /// 缺一条，策略就能观察到"这条腿的持仓未查询到"这个中间状态 —— 而那个状态对策略毫无
-/// 用处：它既不能据此下单（缺的腿要么是模拟账户、要么是该所没凭证，两种都不可交易），
-/// 又逼着每个调用点写一次 `Option` 分支。分支写对了是冗余，写错了（当它空仓照常开仓）
-/// 是事故。
+/// 用处，又逼着每个调用点写一次 `Option` 分支。分支写对了是冗余，写错了（当它空仓照常
+/// 开仓）是事故。把它填满之后，"未查询到"在策略消费第一条事件之前就已经不存在了。
 ///
-/// 把它填满之后，"未查询到"在策略消费第一条事件之前就已经不存在了 ——
-/// 这是品味 1.1 的做法：让错误不可表达，优先于让错误被发现。
-///
-/// # 三种来源，各自是什么真值
+/// # 两种来源
 ///
 /// | 情形 | 基线 | 它是什么的真值 |
 /// |---|---|---|
-/// | 实盘 + 该所配了凭证 | REST 快照 | 该账户在该所的**真实持仓** |
-/// | 实盘 + 该所无凭证 | `0` | **本引擎**在该所的持仓 —— 下不了单也收不到私有流，恒为 0 |
+/// | 实盘 | REST 快照 | 该账户在该所的**真实持仓** |
 /// | 模拟账户 | `0` | 模拟账户从零起步，不看也不该看真实持仓 |
 ///
-/// 第二行是唯一需要留神的：`0` 说的是"本引擎没在这儿建过仓"，**不是**"这个账户在这儿
-/// 没有持仓"（用户手工持有的仓位引擎看不见）。但引擎在该所既不能下单也收不到成交，
-/// 这两个量对策略的可行动性没有差别 —— 而这也正是改动前的行为（无记录时
-/// `position_size` 返回 `0`），本函数只是把它从"碰巧如此"变成"写明如此"。
+/// 实盘策略作用域内的所都配了凭证（`add` 投产前已校验），`fetch_baselines` 对每条都写了快照；
+/// 实盘取不到快照即不变式被破坏，报错拒绝投产，不补 0（补 0 会把真实持仓当成空仓；#767）。
 ///
 /// # 补 0 的基线取 `snapshot_req_ts = 0`，以及这里的边界
 ///
@@ -223,15 +216,14 @@ fn validate_subscriptions(
 /// 但那条规则的判据是 `local_ts <= seeded_ts` 且 `Timestamp = u64` ——
 /// **`local_ts == 0` 的 Fill 仍会被 ts=0 的基线丢掉**。说"不过滤任何 Fill"是不准确的。
 ///
-/// 今天不可达，三条各自独立：实盘与纸盘的 Fill `local_ts` 取 `now_ms()`，恒远大于 0；
-/// 回测不经投产、从不 seed；无凭证的所收不到任何 Fill。
+/// 今天不可达：纸盘的 Fill `local_ts` 取 `now_ms()`，恒远大于 0；回测不经投产、从不 seed。
 /// 由 `synthesised_baseline_only_swallows_a_zero_timestamp_fill` 钉住这条边界 ——
 /// 哪天有路径产生 `local_ts == 0` 的 Fill，那条测试会说明它会发生什么。
 fn executor_baselines(
     account: &AccountId,
     scope: &HashSet<(Exchange, Symbol)>,
     rest: &HashMap<(Exchange, Symbol), crate::messaging::PositionBaseline>,
-) -> Vec<crate::messaging::PositionBaseline> {
+) -> Result<Vec<crate::messaging::PositionBaseline>, ExchangeError> {
     let flat = |(exchange, symbol): &(Exchange, Symbol)| crate::messaging::PositionBaseline {
         position: crate::domain::Position {
             exchange: *exchange,
@@ -243,8 +235,13 @@ fn executor_baselines(
     scope
         .iter()
         .map(|key| match account {
-            AccountId::Live => rest.get(key).cloned().unwrap_or_else(|| flat(key)),
-            AccountId::Paper(_) => flat(key),
+            AccountId::Live => rest.get(key).cloned().ok_or_else(|| {
+                ExchangeError::Other(format!(
+                    "实盘策略作用域内的 {}/{} 没有持仓快照（该所应已校验配了凭证），拒绝投产",
+                    key.0, key.1
+                ))
+            }),
+            AccountId::Paper(_) => Ok(flat(key)),
         })
         .collect()
 }
@@ -497,7 +494,13 @@ impl Provisioner {
                 .iter()
                 .map(|(ex, kind)| (*ex, kind.symbol().clone()))
                 .collect();
-            let exec_baselines = executor_baselines(&account, &scope, &baselines);
+            let exec_baselines = match executor_baselines(&account, &scope, &baselines) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.rollback_executors(&spawned).await;
+                    return Err(e);
+                }
+            };
             let created = Executor::spawn(
                 &self.producers,
                 ExecutorArgs {
@@ -1019,30 +1022,28 @@ mod subscription_validation_tests {
                 .map(|b| b.position.size)
         }
 
-        /// **核心不变量**：无论账户类型，作用域内每条腿都拿到基线 ——
+        /// **核心不变量**：作用域内每条腿都拿到基线 ——
         /// 于是策略永远观察不到"这条腿的持仓未查询到"。
         #[test]
         fn every_leg_in_scope_gets_a_baseline() {
-            for account in [AccountId::Live, AccountId::Paper("x".to_string())] {
-                let b = executor_baselines(&account, &scope(), &rest());
-                assert_eq!(b.len(), scope().len(), "{account}: 作用域内的腿必须全部有基线");
-                assert!(size_at(&b, WITH_ACCOUNT).is_some());
-                assert!(size_at(&b, NO_ACCOUNT).is_some());
-            }
+            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest()).unwrap();
+            assert_eq!(b.len(), scope().len(), "作用域内的腿必须全部有基线");
+            let live_scope = HashSet::from([(WITH_ACCOUNT, SYM.to_string())]);
+            let b = executor_baselines(&AccountId::Live, &live_scope, &rest()).unwrap();
+            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(7.0), "实盘用 REST 真值");
         }
 
-        /// 实盘用 REST 真值；拉不到的（该所无凭证）补 0
+        /// 实盘作用域内有腿没有快照（该所没凭证，投产校验本该拦下）：报错，不补 0
         #[test]
-        fn live_takes_the_rest_snapshot_and_zeroes_the_rest() {
-            let b = executor_baselines(&AccountId::Live, &scope(), &rest());
-            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(7.0), "有凭证的所用 REST 真值");
-            assert_eq!(size_at(&b, NO_ACCOUNT), Some(0.0), "无凭证的所补 0");
+        fn live_leg_without_snapshot_is_an_error() {
+            let err = executor_baselines(&AccountId::Live, &scope(), &rest()).unwrap_err();
+            assert!(err.to_string().contains("没有持仓快照"), "{err}");
         }
 
         /// **模拟账户绝不能看到真实持仓**：即便 REST 快照就在手边，也一律从 0 起步
         #[test]
         fn paper_never_sees_real_positions() {
-            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest());
+            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest()).unwrap();
             assert_eq!(size_at(&b, WITH_ACCOUNT), Some(0.0), "模拟账户不得继承实盘存量");
             assert_eq!(size_at(&b, NO_ACCOUNT), Some(0.0));
         }
@@ -1050,7 +1051,7 @@ mod subscription_validation_tests {
         /// 补 0 的基线取 `snapshot_req_ts = 0`
         #[test]
         fn synthesised_baselines_use_a_zero_snapshot_timestamp() {
-            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest());
+            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest()).unwrap();
             assert!(b.iter().all(|x| x.snapshot_req_ts == 0));
         }
 
@@ -1065,7 +1066,7 @@ mod subscription_validation_tests {
         fn synthesised_baseline_only_swallows_a_zero_timestamp_fill() {
             use crate::messaging::{SymbolAccountData, AccountData, IncomeEvent, StateManager};
 
-            let baselines = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest());
+            let baselines = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest()).unwrap();
             let fill_at = |local_ts: u64| {
                 IncomeEvent::account(
                     AccountId::Live,
