@@ -198,6 +198,13 @@ impl Scope {
 
 impl ScopeInner {
     fn fail(&self, err: anyhow::Error) {
+        // 立刻请求根停机：错误本身仍逐层冒（根因随最终退出结果交出），但"整机要停"不必等
+        // 中间每一层的 run 返回 —— 某一层卡在不理会停止信号的 await 上时，根照样开始停机，
+        // 卡住的那层由"迟迟未返回/未停"告警和根的总期限暴露出来。
+        // 只取消根的信号，不越过分组顺序：停机仍由根自上而下逐组进行。
+        // 本节点已结束（错误无处上报）也照样请求：整机停止状态是下单出口的闸门（#710），
+        // 不能取决于报错方恰好挂在哪个节点、该节点是否还活着。
+        self.root_stop.cancel();
         {
             let mut slot = self.failure.lock().unwrap();
             if slot.finished {
@@ -215,11 +222,6 @@ impl ScopeInner {
             }
         }
         self.stop.cancel();
-        // 立刻请求根停机：错误本身仍逐层冒（根因随最终退出结果交出），但"整机要停"不必等
-        // 中间每一层的 run 返回 —— 某一层卡在不理会停止信号的 await 上时，根照样开始停机，
-        // 卡住的那层由"迟迟未返回/未停"告警和根的总期限暴露出来。
-        // 只取消根的信号，不越过分组顺序：停机仍由根自上而下逐组进行。
-        self.root_stop.cancel();
     }
 }
 
@@ -306,7 +308,9 @@ impl Drop for Root {
             return;
         }
         // 没走 shutdown 就被丢弃（调用方提前返回或 panic）：子任务的停止信号永远不会再发，
-        // 它们会一直跑。尽力而为：把信号全部发出去（不等收尾），并大声报出来。
+        // 它们会一直跑。尽力而为：先把根自己标为停机（整机停止状态立刻生效，如下单出口拒发新单），
+        // 再把信号全部发出去（不等收尾），并大声报出来。
+        self.scope.0.stop.cancel();
         let groups = std::mem::take(&mut self.scope.0.groups.lock().unwrap().groups);
         let mut names = Vec::new();
         for g in &groups {
@@ -892,6 +896,15 @@ mod tests {
         assert!(machine.is_stopping(), "根一进入停机，整机视图就该是停机");
         assert!(!own.is_stopping(), "节点自己的停止信号仍按分组顺序由根发下来");
         assert!(root.shutdown().await.is_err());
+    }
+
+    /// 根未经 shutdown 就被丢弃：整机停止状态也立刻生效（下单出口靠它拒发新单）
+    #[tokio::test]
+    async fn dropping_the_root_marks_the_machine_stopping() {
+        let root = Root::new("root");
+        let machine = root.machine_stop_flag();
+        drop(root);
+        assert!(machine.is_stopping());
     }
 
     /// panic 等同出错
