@@ -90,8 +90,7 @@ pub(crate) fn optional_decimal(item: &serde_json::Value, field: &str) -> Result<
 /// 取订单号：Number 与 String 两种形态都接。
 ///
 /// 返回 `None` = 该字段缺失、为 null、或类型压根不是标量 —— 一律按"**没有订单号**"处理，
-/// 绝不编一个字符串（如把 `Null` 变成 `"null"`）顶上：下游的撤单复查对空 id 有专门的
-/// 保守分支（`Unverifiable`，宁可留着也不误清活单），编造值会绕过它。
+/// 绝不编一个字符串（如把 `Null` 变成 `"null"`）顶上：编造的订单号会让日志与撤单指向不存在的单。
 pub(crate) fn order_id(v: Option<&serde_json::Value>) -> Option<String> {
     match v? {
         serde_json::Value::Number(n) => Some(n.to_string()),

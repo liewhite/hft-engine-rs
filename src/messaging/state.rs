@@ -297,7 +297,7 @@ impl SymbolMarket {
 impl SymbolPositions {
     /// 累加一笔成交。**持仓维护的增量输入只有这一条路。**
     ///
-    /// Fill 涵盖策略单、手动单、以及强平/ADL —— 三者都以 fill 形式经私有成交流到达，
+    /// Fill 涵盖策略单与强平/ADL 等不在跟踪表里的成交 —— 都以 fill 形式经私有成交流到达，
     /// 走同一路径（模型说明见 [`Self::seed`]）。
     ///
     /// # 防双计：已 seed 的所按快照请求时刻过滤
@@ -369,7 +369,7 @@ impl SymbolPositions {
     ///   外部成交会造成 executor 与镜像分歧（见 `activate_executors` 的窗口清单；
     ///   实盘 executor 与镜像的分歧由持仓账本检出并停机，#694）。
     ///
-    /// 都只可能来自投产瞬间的外部/手动成交，与旧的总线投递方案等宽。
+    /// 都只可能来自投产瞬间不在跟踪表里的成交（强平/ADL 等），与旧的总线投递方案等宽。
     pub fn seed(
         &mut self,
         symbol: &Symbol,

@@ -3,7 +3,7 @@ use crate::domain::types::{OrderId, Quantity};
 
 /// 交易所的订单回报：**只带跟踪一张单所必需的字段**。
 ///
-/// - `client_order_id`：本地跟踪表的主键、撤单的依据；交易所没给（如强平单）为 `None`。
+/// - `client_order_id`：本地跟踪表的主键、撤单的依据；交易所可能不给（如部分系统单）则为 `None`。
 ///   账户归本引擎独占（见 `docs/architecture.md`「账户独占」），不按它分辨是谁的单；
 /// - `order_id`：日志与人工排查（撤单按 `client_order_id`，见 `AccountClient::cancel_order`）；
 /// - `status`：生命周期；
