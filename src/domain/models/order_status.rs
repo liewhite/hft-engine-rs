@@ -1,40 +1,31 @@
 use serde::{Deserialize, Serialize};
 
-/// 订单状态
+/// 订单状态（交易所说的；只有 `Created` 是本地的：已发出、交易所还没说过话）
+///
+/// 本地 REST 调用的结论（下单被拒、撤单失败、下单已受理）不是订单状态，走
+/// [`crate::messaging::OrderRequestResult`]。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum OrderStatus {
     /// 本地已创建，等待交易所响应
     Created,
     /// 交易所已收到，等待成交
     Pending,
-    /// 部分成交
-    /// 部分成交。**不带成交量载荷**：本地挂单跟踪不区分"部分成交多少"（那要么看
-    /// Fill 流、要么看账本），而载荷会强迫四个所各自解析累计量并对齐口径。
+    /// 部分成交（累计量见 [`crate::domain::OrderUpdate::filled_quantity`]）
     PartiallyFilled,
     /// 完全成交
     Filled,
     /// 已取消
     Cancelled,
-    /// 被拒绝
+    /// 交易所拒单（含币安 EXPIRED 这类过期作废）
     Rejected { reason: String },
-    /// 下单请求发送失败（REST API 错误）
-    Error { reason: String },
 }
 
 impl OrderStatus {
-    /// 是否为终态 (订单生命周期结束)
+    /// 是否为终态 (订单生命周期结束；成交可能还没全部入账，见 `messaging::state::PendingOrder`)
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            OrderStatus::Filled
-                | OrderStatus::Cancelled
-                | OrderStatus::Rejected { .. }
-                | OrderStatus::Error { .. }
+            OrderStatus::Filled | OrderStatus::Cancelled | OrderStatus::Rejected { .. }
         )
-    }
-
-    /// 是否已被交易所确认 (非 Created 状态)
-    pub fn is_confirmed(&self) -> bool {
-        !matches!(self, OrderStatus::Created)
     }
 }

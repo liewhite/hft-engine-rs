@@ -301,6 +301,8 @@ impl OrderTradeUpdate {
 
         let quantity = f64::from_str(&self.o.q)
             .map_err(|_| format!("Failed to parse quantity: {}", self.o.q))?;
+        let filled_quantity = f64::from_str(&self.o.z)
+            .map_err(|_| format!("Failed to parse cumulative filled qty: {}", self.o.z))?;
 
         Ok(OrderUpdate {
             order_id: self.o.i.to_string(),
@@ -310,6 +312,7 @@ impl OrderTradeUpdate {
             side,
             status,
             quantity,
+            filled_quantity,
         })
     }
 

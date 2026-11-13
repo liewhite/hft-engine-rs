@@ -317,6 +317,8 @@ struct PendingOrderData {
     state: String,
     /// 订单数量 (张)
     sz: String,
+    /// 累计成交数量 (张)
+    acc_fill_sz: String,
 }
 
 #[derive(Deserialize)]
@@ -330,14 +332,9 @@ struct PendingOrdersResponse {
 ///
 /// # 一条解析不了 = 整份快照不可信 = `Err`（绝不跳过该条继续）
 ///
-/// 挂单快照的消费方都在做「不在列表里 ⇒ 该单已终态」的推断：
-/// - 启动期 `Manager::cancel_leftover_orders` 据此判定"遗留挂单已撤净"；
-/// - 运行期撤单失败复查（[`crate::engine::live`] 的 `cancel_recheck_verdict`）据此
-///   合成 Cancelled、清掉本地 pending。
-///
-/// 跳过一条就是对这两处谎报"这张单不存在"：轻则带着无人看管的活单开跑，重则**误清
-/// 活单**让策略在它旁边重复下单、形成双重敞口。返回 `Err` 时两处都有正确的失败分支
-/// （拒绝启动 / 保留 pending 待重试），所以报错是安全的，静默少一条不是。
+/// 挂单快照的消费方（启动期 `Manager::cancel_leftover_orders`）据「不在列表里 ⇒ 该单已终态」判定
+/// "遗留挂单已撤净"。跳过一条就是谎报"这张单不存在"，带着无人看管的活单开跑；返回 `Err` 则拒绝
+/// 启动，所以报错是安全的，静默少一条不是。
 ///
 /// 已知取舍：市价单的 `px` 为空串，在此判为解析失败。市价单不会 resting，出现在挂单
 /// 列表里本身就是异常，报错优于猜一个价格。
@@ -368,18 +365,22 @@ fn parse_pending_order(
         .parse::<f64>()
         .map(|v| v * contract_size)
         .map_err(|_| fail("sz", &d.sz))?;
+    let filled_quantity = d
+        .acc_fill_sz
+        .parse::<f64>()
+        .map(|v| v * contract_size)
+        .map_err(|_| fail("accFillSz", &d.acc_fill_sz))?;
 
     Ok(OrderUpdate {
         order_id: d.ord_id.clone(),
-        // 缺失就是缺失，**绝不用 ord_id 顶替**：撤单复查的 `Unverifiable` 安全分支判据
-        // 正是 `client_order_id.is_none()` —— 编造一个非 None 值会让该分支永不触发，
-        // 无法比对身份的活单被判 `Gone`、合成 Cancelled 误清本地 pending。
+        // 缺失就是缺失，**绝不用 ord_id 顶替**：归属识别（启动期只撤本引擎的单）靠它
         client_order_id: d.cl_ord_id.clone().filter(|s| !s.is_empty()),
         exchange: Exchange::OKX,
         symbol,
         side,
         status,
         quantity,
+        filled_quantity,
     })
 }
 
@@ -405,7 +406,7 @@ impl AccountClient for OkxClient {
         Exchange::OKX
     }
 
-    async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
+    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError> {
         let path = "/api/v5/trade/cancel-order";
         let inst_id = to_okx(symbol, &self.quote);
 
@@ -413,12 +414,12 @@ impl AccountClient for OkxClient {
         #[serde(rename_all = "camelCase")]
         struct CancelRequest {
             inst_id: String,
-            ord_id: String,
+            cl_ord_id: String,
         }
 
         let request = CancelRequest {
             inst_id,
-            ord_id: order_id.clone(),
+            cl_ord_id: client_order_id.to_string(),
         };
 
         let body = serde_json::to_string(&request)?;
@@ -885,6 +886,7 @@ mod pending_orders_tests {
             side: "buy".to_string(),
             state: "live".to_string(),
             sz: "3".to_string(),
+            acc_fill_sz: "0".to_string(),
         }
     }
 
@@ -900,9 +902,7 @@ mod pending_orders_tests {
 
     /// **Critical 回归防线**：clOrdId 缺失/为空时必须是 `None`，绝不用 ord_id 顶替。
     ///
-    /// 撤单复查的 `Unverifiable` 安全分支判据正是 `client_order_id.is_none()`：编造一个
-    /// 非 None 值会让该分支永不触发，无法比对身份的活单被判 `Gone` → 合成 Cancelled
-    /// 误清本地 pending → 策略重复下单、双重敞口。
+    /// 归属识别（启动期只撤本引擎的单）靠它：编造一个值会让别人的单被当成自己的、或反之。
     #[test]
     fn missing_client_order_id_stays_none() {
         for missing in [None, Some("")] {

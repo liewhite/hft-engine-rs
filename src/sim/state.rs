@@ -2,7 +2,7 @@ use crate::domain::{
     Exchange, Fill, MarketTrade, Order, OrderId, OrderType, OrderUpdate, OrderStatus, Position,
     Price, Quantity, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
 };
-use crate::messaging::{SymbolAccountData, AccountData, MarketData, MarketEvent};
+use crate::messaging::{AccountData, MarketData, MarketEvent, OrderRequestResult, RequestOutcome, SymbolAccountData};
 use crate::sim::ledger::Ledger;
 use crate::sim::matcher;
 use indexmap::IndexMap;
@@ -392,17 +392,24 @@ impl SimState {
         }
     }
 
-    /// 撤单到达撮合：仍在簿则移除并回报 Cancelled；已成交 (不在簿) 则无事发生。
+    /// 撤单（按客户端订单号）到达撮合：仍在簿则移除并回报 Cancelled；不在簿（已成交 / 已撤）
+    /// 则回报撤单失败 —— 与实盘交易所「订单不存在」的撤单失败同形。
     pub fn on_cancel_arrived(
         &mut self,
         now: Timestamp,
-        order_id: &OrderId,
+        symbol: &Symbol,
+        client_order_id: &str,
     ) -> Vec<(Timestamp, AccountData)> {
-        match self.resting.shift_remove(order_id) {
+        let order_id = self
+            .resting
+            .values()
+            .find(|o| o.client_order_id == client_order_id)
+            .map(|o| o.order_id.clone());
+        match order_id.and_then(|id| self.resting.shift_remove(&id)) {
             Some(o) => vec![(
                 now,
                 AccountData::Symbol(SymbolAccountData::OrderUpdate(OrderUpdate {
-                    order_id: order_id.clone(),
+                    order_id: o.order_id,
                     client_order_id: Some(o.client_order_id),
                     exchange: self.exchange,
                     symbol: o.symbol,
@@ -410,9 +417,18 @@ impl SimState {
                     status: OrderStatus::Cancelled,
                     quantity: o.quantity,
                     // 如实带上撤单前的累计成交（部分成交后撤单），不谎报 0
+                    filled_quantity: o.filled,
                 })),
             )],
-            None => Vec::new(),
+            None => vec![(
+                now,
+                AccountData::Symbol(SymbolAccountData::OrderRequest(OrderRequestResult {
+                    exchange: self.exchange,
+                    symbol: symbol.clone(),
+                    client_order_id: client_order_id.to_string(),
+                    outcome: RequestOutcome::CancelFailed { reason: "order not in book".to_string() },
+                })),
+            )],
         }
     }
 
@@ -441,8 +457,7 @@ impl SimState {
             Liquidity::Taker,
             order.reduce_only,
         );
-        if let FillResult::Traded { done: false, .. } = result
-        {
+        if let FillResult::Traded { done: false, effective } = result {
             events.push((
                 ts,
                 AccountData::Symbol(SymbolAccountData::OrderUpdate(OrderUpdate {
@@ -453,6 +468,7 @@ impl SimState {
                     side: order.side,
                     status: OrderStatus::Cancelled,
                     quantity: order.quantity,
+                    filled_quantity: effective,
                 })),
             ));
         }
@@ -528,6 +544,7 @@ impl SimState {
                     side,
                     status: OrderStatus::Cancelled,
                     quantity: order_qty,
+                    filled_quantity: already_filled,
                 })),
             )];
             return (FillResult::NoPositionToReduce, events);
@@ -556,6 +573,7 @@ impl SimState {
             side,
             status,
             quantity: order_qty,
+            filled_quantity: cumulative,
         };
         let f = Fill {
             exchange: self.exchange,
@@ -601,6 +619,7 @@ fn status_event(
             side: order.side,
             status,
             quantity: order.quantity,
+            filled_quantity: 0.0,
         })),
     )
 }
@@ -779,16 +798,21 @@ mod tests {
         let mut s = empty();
         s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
         s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
-        let evs = s.on_cancel_arrived(2, &"1".to_string());
+        let evs = s.on_cancel_arrived(2, &sym(), "b1");
         assert_eq!(statuses(&evs), vec![OrderStatus::Cancelled]);
         assert!(s.resting.is_empty());
     }
 
     #[test]
-    fn cancel_arrived_not_in_book_noop() {
+    fn cancel_arrived_not_in_book_reports_cancel_failed() {
         let mut s = empty();
-        let evs = s.on_cancel_arrived(1, &"404".to_string());
-        assert!(evs.is_empty());
+        let evs = s.on_cancel_arrived(1, &sym(), "404");
+        assert!(matches!(
+            evs.as_slice(),
+            [(_, AccountData::Symbol(SymbolAccountData::OrderRequest(OrderRequestResult {
+                outcome: RequestOutcome::CancelFailed { .. }, ..
+            })))]
+        ));
     }
 
     #[test]
@@ -886,10 +910,7 @@ mod tests {
         assert!((s.ledger.positions[&sym()].size - 1.2).abs() < 1e-9);
     }
 
-    /// **部分成交后撤单**：终态 Cancelled 带原始委托量。
-    ///
-    /// 累计成交量不在挂单回报里（见 `crate::domain::OrderUpdate` 的文档）—— 成交明细由
-    /// Fill 流承载，账本由柜台自己维护，回报只负责"这张单结束了"。
+    /// **部分成交后撤单**：终态 Cancelled 带原始委托量与撤单前的累计成交（策略的跟踪表据此等成交到齐）
     #[test]
     fn cancel_after_partial_fill_reports_original_quantity() {
         let mut s = empty();
@@ -898,19 +919,19 @@ mod tests {
         s.on_order_arrived(1, &o, &"1".to_string());
         // print 0.3 部分成交，剩 0.4 在簿
         s.on_market(&trade_ev_qty(99.0, 0.3, 2));
-        let evs = s.on_cancel_arrived(3, &"1".to_string());
-        let cancelled: Vec<f64> = evs
+        let evs = s.on_cancel_arrived(3, &sym(), "b1");
+        let cancelled: Vec<(f64, f64)> = evs
             .iter()
             .filter_map(|(_, d)| match d {
                 AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) if u.status == OrderStatus::Cancelled => {
-                    Some(u.quantity)
+                    Some((u.quantity, u.filled_quantity))
                 }
                 _ => None,
             })
             .collect();
         assert_eq!(cancelled.len(), 1);
-        near(cancelled[0], 0.7); // 原始委托量
-        // 已成交的 0.3 体现在账本持仓上，而不是撤单回报里
+        near(cancelled[0].0, 0.7); // 原始委托量
+        near(cancelled[0].1, 0.3); // 撤单前的累计成交
         near(s.ledger.positions[&sym()].size, 0.3);
         assert!(s.resting.is_empty());
     }

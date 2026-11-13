@@ -16,8 +16,6 @@ pub struct SpreadArbConfig {
     pub max_notional: f64,
     /// 最小下单金额 (USDT)，低于此金额的订单将被放弃
     pub min_notional: f64,
-    /// 订单超时时间 (毫秒)
-    pub order_timeout_ms: u64,
     /// 单 symbol 单交易所持仓名义价值上限 (USDT)
     ///
     /// - |新仓位| * mid_price 超过此值、且该单为增仓方向时，该侧不下单
@@ -64,9 +62,6 @@ impl SpreadArbConfig {
         if self.min_notional > self.max_notional {
             return Err("min_notional 不能大于 max_notional".to_string());
         }
-        if self.order_timeout_ms == 0 {
-            return Err("order_timeout_ms 必须 > 0（否则超时订单永不清理）".to_string());
-        }
         if !(self.max_position_notional.is_finite() && self.max_position_notional > 0.0) {
             return Err("max_position_notional 必须 > 0".to_string());
         }
@@ -105,7 +100,6 @@ mod tests {
             deviation_threshold: 0.004,
             max_notional: 1000.0,
             min_notional: 10.0,
-            order_timeout_ms: 10_000,
             max_position_notional: 5000.0,
             max_symbol_leverage: 0.5,
             max_account_leverage: 3.0,
@@ -146,10 +140,6 @@ mod tests {
             },
             SpreadArbConfig {
                 max_bbo_age_ms: 0,
-                ..valid()
-            },
-            SpreadArbConfig {
-                order_timeout_ms: 0,
                 ..valid()
             },
             SpreadArbConfig {

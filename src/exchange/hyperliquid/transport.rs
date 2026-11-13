@@ -20,7 +20,7 @@
 //! 宿主机给的编号它不信）。编号由 client 从 meta 解析一次、缓存，两个字段各取所需。
 
 use super::signing::{
-    action_hash, create_signer, sign_l1_action, BulkCancelAction, BulkOrderAction, CancelWire,
+    action_hash, create_signer, sign_l1_action, BulkOrderAction, CancelByCloidAction, CancelByCloidWire,
     ExchangeRequest, LimitOrder, OrderType as WireOrderType, OrderWire,
 };
 use crate::domain::{now_ms, Exchange, ExchangeError, PlaceError};
@@ -66,20 +66,20 @@ pub(crate) struct HlOrderIntent {
     pub cloid: Option<String>,
 }
 
-/// 一笔撤单意图（按交易所侧 oid）
+/// 一笔撤单意图（按客户端订单号 cloid：`0x` + 32 位小写十六进制）
 #[derive(Debug, Clone)]
 pub(crate) struct HlCancelIntent {
     pub coin: String,
     pub asset: u32,
-    pub oid: u64,
+    pub cloid: String,
 }
 
 /// 签名并提交到 HL 的通道。返回 HL `/exchange` 的原始回复。
 ///
 /// 拿不到回复时的失败按「确定没提交 / 结果不确定」归类（见 [`PlaceError`]）：只有通道自己
 /// 知道请求走到了哪一步（签名前失败、连接没建立、签名机拒签、已签名但提交超时……），所以
-/// 在这里定。拿到回复之后的解读（statuses 逐单判错）在 client。撤单不分这两类（撤单失败由
-/// `OrderGateway::cancel` 用挂单列表复查），按普通错误返回。
+//// 在这里定。拿到回复之后的解读（statuses 逐单判错）在 client。撤单不分这两类（撤单失败只回报
+/// 给策略，单在不在以交易所随后的订单回报为准），按普通错误返回。
 #[async_trait]
 pub(crate) trait HlSubmitter: Send + Sync {
     async fn place(&self, order: &HlOrderIntent) -> Result<Value, PlaceError>;
@@ -161,7 +161,7 @@ impl HlSubmitter for LocalKeySubmitter {
     }
 
     async fn cancel(&self, c: &HlCancelIntent) -> Result<Value, ExchangeError> {
-        let action = BulkCancelAction::new(vec![CancelWire { a: c.asset, o: c.oid }]);
+        let action = CancelByCloidAction::new(vec![CancelByCloidWire { asset: c.asset, cloid: c.cloid.clone() }]);
         self.sign_and_post(&action).await.map_err(cancel_error)
     }
 }
@@ -298,7 +298,7 @@ impl HlSubmitter for EnclaveSubmitter {
     }
 
     async fn cancel(&self, c: &HlCancelIntent) -> Result<Value, ExchangeError> {
-        self.exchange(json!({"type": "cancel", "cancels": [{"coin": c.coin, "oid": c.oid}]}))
+        self.exchange(json!({"type": "cancelByCloid", "cancels": [{"coin": c.coin, "cloid": c.cloid}]}))
             .await
             .map_err(cancel_error)
     }

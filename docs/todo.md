@@ -73,9 +73,9 @@ SymbolMeta 判据，加复审补的 `ibkr/wire.rs`）。遗留五项按需另立
   实盘出口与模拟柜台都接了，但 `BacktestEngine` 没有 SymbolMeta 来源 —— 实盘必拒的
   碎单在回测里照样成交。根治方向是把校验下沉到 SimState 的订单入口（构造时可选携带
   该所 metas），让三个持有方自动同规则，而不是每个持有方各自记得调用。
-- **非 `Created` 状态的挂单无超时**：`SymbolState::remove_timed_out_orders` 只清理 `Created`。
-  若某订单已被交易所确认（`Pending`）而终态更新丢失，该 symbol 会被 `has_pending_orders` 永久冻结。
-  当前依赖"WS 断开即进程退出 + docker 重启"来兜底。
+- **挂着的单终态丢失无超时**：订单跟踪表对「下单没结论 / 撤单发出后没终态 / 终态后成交没到齐」超过
+  1 分钟停机（`ORDER_STUCK_MS`，#758），但一张挂着、没撤过的单若终态回报丢失，会一直留在表里。
+  当前依赖"WS 断开即进程退出"兜底；策略撤它时会落进「撤单发出后没终态」被发现。
 - **持仓维护为增量 + 独立对账通道**：`Position` 基线一次性写入（manager 投产期点对点 +
   总线各一条路径），之后全靠 `Fill` 累加；`PositionLedger` 周期性拉 REST 读数，
   与「基线 + Fill」比对，连续差值稳定即停机。对账**只检测不修复**

@@ -75,9 +75,6 @@ impl Strategy for MeanRevertMaker {
         m
     }
 
-    fn order_timeout_ms(&self) -> u64 {
-        0
-    }
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         // 自己跟成交维护开仓成本（加权平均；平完即清零）
@@ -196,7 +193,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut engine = BacktestEngine::new(source.as_ref(), vec![runner], config, symbol_metas);
-    let result = engine.run();
+    let result = engine.run().map_err(|e| anyhow::anyhow!("回测中止: {e}"))?;
 
     println!("==================== Backtest Result ====================");
     println!("symbol         : {symbol}  [{start} .. {end}]");

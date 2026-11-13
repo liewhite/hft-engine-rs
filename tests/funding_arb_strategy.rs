@@ -5,7 +5,10 @@ use hft_engine_rs::domain::{
     Side, StepFormatter, SymbolMeta, TimeInForce, BBO,
 };
 use hft_engine_rs::engine::StrategyRunner;
-use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, CustomEvent, IncomeEvent, MarketData, PositionBaseline, PositionValues};
+use hft_engine_rs::messaging::{
+    AccountData, CustomEvent, ExchangeAccountData, IncomeEvent, MarketData, OrderRequestResult, PositionBaseline,
+    PositionValues, RequestOutcome, SymbolAccountData,
+};
 use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, OutcomeEvent, SettledFundingWindow};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +25,7 @@ fn config() -> FundingArbConfig {
     serde_json::from_value(serde_json::json!({
         "open_threshold_apr": 0.5, "close_threshold_apr": 0.1, "order_notional": 200.0, "min_order_notional": 11.0,
         "max_account_leverage": 1.5, "max_symbol_leverage": 0.2, "order_distance": 0.001,
-        "requote_ratio": 1.0, "hedge_retry_ms": 1000, "fill_settle_ms": 500, "min_requote_ms": 0, "max_bbo_age_ms": 5000,
+        "requote_ratio": 1.0, "hedge_retry_ms": 1000, "min_requote_ms": 0, "max_bbo_age_ms": 5000,
         "max_funding_age_ms": 7200000, "pairs": [{"symbol": SYM}]
     }))
     .unwrap()
@@ -49,6 +52,8 @@ fn meta(ex: Exchange, min_notional: f64) -> ((Exchange, String), SymbolMeta) {
 struct Sim {
     runner: StrategyRunner,
     now: u64,
+    /// 各单已推过的成交（client_order_id → 累计），订单回报默认按它报累计成交
+    fills: HashMap<String, f64>,
 }
 
 impl Sim {
@@ -105,7 +110,7 @@ impl Sim {
             })
             .collect();
         runner.seed_positions(&baselines);
-        Sim { runner, now: T0 }
+        Sim { runner, now: T0, fills: HashMap::new() }
     }
 
     fn advance(&mut self, ms: u64) {
@@ -114,7 +119,7 @@ impl Sim {
 
     fn ev(&mut self, e: IncomeEvent) -> Vec<OutcomeEvent> {
         self.now += 10;
-        self.runner.on_event(&e)
+        self.runner.on_event(&e).expect("订单跟踪表不该报错")
     }
 
     fn bbo(&mut self, ex: Exchange) -> Vec<OutcomeEvent> {
@@ -165,7 +170,17 @@ impl Sim {
         self.ev(IncomeEvent::market(now, now, MarketData::Custom(CustomEvent::for_symbol(ex, SYM.into(), w))))
     }
 
+    /// 交易所订单回报。累计成交：Filled 报全量，其余报已推过的成交之和（交易所与成交流一致的常态）
     fn confirm(&mut self, o: &hft_engine_rs::domain::Order, status: OrderStatus) -> Vec<OutcomeEvent> {
+        let filled = match status {
+            OrderStatus::Filled => o.quantity,
+            _ => self.fills.get(&o.client_order_id).copied().unwrap_or(0.0),
+        };
+        self.confirm_filled(o, status, filled)
+    }
+
+    /// 交易所订单回报，累计成交由调用方给（模拟终态先于成交到达）
+    fn confirm_filled(&mut self, o: &hft_engine_rs::domain::Order, status: OrderStatus, filled: f64) -> Vec<OutcomeEvent> {
         let u = OrderUpdate {
             order_id: format!("oid-{}", o.client_order_id),
             client_order_id: Some(o.client_order_id.clone()),
@@ -174,12 +189,25 @@ impl Sim {
             side: o.side,
             status,
             quantity: o.quantity,
+            filled_quantity: filled,
         };
         let now = self.now;
         self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Symbol(SymbolAccountData::OrderUpdate(u))))
     }
 
+    /// 本地 REST 请求的结论
+    fn request(&mut self, o: &hft_engine_rs::domain::Order, outcome: RequestOutcome) -> Vec<OutcomeEvent> {
+        let r = OrderRequestResult { exchange: o.exchange, symbol: SYM.into(), client_order_id: o.client_order_id.clone(), outcome };
+        let now = self.now;
+        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Symbol(SymbolAccountData::OrderRequest(r))))
+    }
+
+    fn reject(&mut self, o: &hft_engine_rs::domain::Order) -> Vec<OutcomeEvent> {
+        self.request(o, RequestOutcome::PlaceRejected { reason: "margin is insufficient".into() })
+    }
+
     fn fill(&mut self, o: &hft_engine_rs::domain::Order, size: f64) -> Vec<OutcomeEvent> {
+        *self.fills.entry(o.client_order_id.clone()).or_default() += size;
         let f = Fill {
             exchange: o.exchange,
             symbol: SYM.into(),
@@ -303,20 +331,20 @@ fn one_leg_fill_cancels_other_then_hedges_the_lagging_leg() {
     s.confirm(&bn, OrderStatus::Pending);
     s.confirm(&hl, OrderStatus::Pending);
 
-    // 币安卖单部分成交 1.0：撤两所挂单，HL 挂单未撤完前不补
-    s.confirm(&bn, OrderStatus::PartiallyFilled);
+    // 币安卖单部分成交 1.0：撤两所挂单，挂单未撤完前不补
     let out = s.fill(&bn, 1.0);
+    s.confirm(&bn, OrderStatus::PartiallyFilled);
     let mut c = cancels(&out);
     c.sort();
     assert_eq!(c, vec![BN, HL], "{out:?}");
-    assert!(placed(&out).is_empty(), "HL 挂单还在，不能补：{out:?}");
+    assert!(placed(&out).is_empty(), "挂单还在，不能补：{out:?}");
+    assert!(cancels(&s.bbo(HL)).is_empty(), "撤单在途不重发");
 
-    // HL 挂单撤掉：它的成交回报可能还在路上，结算窗口内不补
+    // HL 撤掉了，币安那张（还可能再成交）没撤完：不补
     let out = s.confirm(&hl, OrderStatus::Cancelled);
-    assert!(placed(&out).is_empty(), "结算窗口内不能补：{out:?}");
-    // 过了窗口 → 在 HL 市价买 1.0（开仓加短腿）
-    s.advance(600);
-    let out = s.bbo(HL);
+    assert!(placed(&out).is_empty(), "币安挂单还开着，不能补：{out:?}");
+    // 币安也撤掉、成交都已入账 → 立刻在 HL 市价买 1.0（开仓加短腿），不用等时间窗口
+    let out = s.confirm(&bn, OrderStatus::Cancelled);
     let h = placed(&out);
     assert_eq!(h.len(), 1, "{out:?}");
     assert_eq!((h[0].exchange, h[0].side, h[0].quantity, h[0].reduce_only), (HL, Side::Long, 1.0, false));
@@ -353,7 +381,7 @@ fn startup_imbalance_halts_instead_of_trading() {
 
 #[test]
 fn hl_terminal_before_fill_does_not_double_hedge() {
-    // HL maker 的「已成交」终态先到、成交回报晚到：窗口内不按旧持仓补
+    // HL maker 的「已成交」终态先到、成交回报晚到：不按旧持仓补，成交到了两腿已平
     let mut s = Sim::new(0.0, 0.0);
     s.funding(BN, 0.8);
     let o = placed(&s.funding(HL, 0.1));
@@ -363,14 +391,49 @@ fn hl_terminal_before_fill_does_not_double_hedge() {
     s.confirm(&hl, OrderStatus::Pending);
     s.fill(&bn, 1.998);
     s.confirm(&bn, OrderStatus::Filled);
-    s.confirm(&hl, OrderStatus::Filled); // HL 也成交了，回报还没到
+    s.confirm_filled(&hl, OrderStatus::Filled, 1.998); // HL 也成交了，成交回报还没到
+    s.advance(5_000);
     let out = s.bbo(HL);
-    assert!(placed(&out).is_empty(), "{out:?}");
-    s.advance(100);
+    assert!(placed(&out).is_empty(), "成交没到齐，不补也不重挂：{out:?}");
     let out = s.fill(&hl, 1.998); // 回报到达，两腿已平
     assert!(placed(&out).iter().all(|o| !matches!(o.order_type, OrderType::Market)), "{out:?}");
-    s.advance(600);
     assert!(placed(&s.bbo(HL)).iter().all(|o| !matches!(o.order_type, OrderType::Market)));
+}
+
+/// **#758 的漏洞**：HL 买单的「已成交」终态先到、成交晚到时，此前挂单列表一空、持仓还是 0，策略会在
+/// HL 立刻再挂一张买单 —— 成交到了之后那张也成交就多出一笔。现在单留在跟踪表里直到成交到齐：
+/// 不在 HL 重挂，先撤币安那张；成交到了、币安撤完再在币安市价卖补腿。
+#[test]
+fn terminal_before_fill_does_not_requote_on_the_same_exchange() {
+    let mut s = Sim::new(0.0, 0.0);
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    let bn = o.iter().find(|o| o.exchange == BN).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&bn, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::Pending);
+
+    let out = s.confirm_filled(&hl, OrderStatus::Filled, hl.quantity);
+    assert!(placed(&out).is_empty(), "成交没到，不能在 HL 再挂：{out:?}");
+    assert_eq!(cancels(&out), vec![BN], "那笔成交到了就是不平衡，先撤币安：{out:?}");
+    assert!(placed(&s.bbo(HL)).is_empty());
+
+    let out = s.fill(&hl, hl.quantity);
+    assert!(placed(&out).is_empty(), "币安的单还没撤完：{out:?}");
+    let h = placed(&s.confirm(&bn, OrderStatus::Cancelled));
+    assert_eq!(h.len(), 1, "{h:?}");
+    assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (BN, Side::Short, hl.quantity));
+    assert!(matches!(h[0].order_type, OrderType::Market));
+}
+
+/// 下单请求还没结论（交易所没确认）的单也能撤（按客户端订单号）
+#[test]
+fn unconfirmed_maker_can_be_cancelled() {
+    let mut s = Sim::new(0.0, 0.0);
+    s.funding(BN, 0.8);
+    assert_eq!(placed(&s.funding(HL, 0.1)).len(), 2);
+    let out = s.funding(BN, 0.1); // 不再值得开
+    assert_eq!(cancels(&out).len(), 2, "{out:?}");
 }
 
 #[test]
@@ -384,7 +447,13 @@ fn failed_cancel_is_retried() {
     // 资金费反转到持有以下 → 不挂，撤两张
     let out = s.funding(BN, 0.1);
     assert_eq!(cancels(&out).len(), 2, "{out:?}");
-    // 撤单失败（没有任何事件），间隔内不重撤，过了间隔重撤
+    // 撤单在途：不重发
+    s.advance(1_100);
+    assert!(cancels(&s.bbo(BN)).is_empty());
+    // 撤单失败、单还开着：间隔内不重撤，过了间隔重撤
+    for x in &o {
+        s.request(x, RequestOutcome::CancelFailed { reason: "busy".into() });
+    }
     assert!(cancels(&s.bbo(BN)).is_empty());
     s.advance(1_100);
     assert_eq!(cancels(&s.bbo(BN)).len(), 2);
@@ -455,9 +524,7 @@ fn three_exchanges_hedge_on_the_quoted_pair() {
     s.confirm(&hl, OrderStatus::Pending);
     s.fill(&okx, 1.0);
     s.confirm(&okx, OrderStatus::Cancelled);
-    s.confirm(&hl, OrderStatus::Cancelled);
-    s.advance(600);
-    let h = placed(&s.bbo(BN));
+    let h = placed(&s.confirm(&hl, OrderStatus::Cancelled)); // 两张都结算完即补
     assert_eq!(h.len(), 1, "{h:?}");
     assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (HL, Side::Long, 1.0), "OKX 卖成交 → 在 HL 买补，不碰币安");
     assert_eq!(okx.quantity, 1.0, "两腿同量：按 OKX 一手 1 个币向下取整");
@@ -504,9 +571,7 @@ fn imbalance_below_one_lot_of_the_hedge_exchange_is_dust() {
     let c = cancels(&s.fill(&hl, 0.5));
     assert!(c.contains(&OKX), "差够一手：撤挂单准备补腿：{c:?}");
     s.confirm(&hl, OrderStatus::Filled);
-    s.confirm(&okx, OrderStatus::Cancelled);
-    s.advance(600);
-    let h = placed(&s.bbo(HL));
+    let h = placed(&s.confirm(&okx, OrderStatus::Cancelled));
     assert_eq!(h.len(), 1, "{h:?}");
     assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (OKX, Side::Short, 1.0));
 }
@@ -524,9 +589,7 @@ fn hedge_larger_than_target_position_is_not_reduce_only() {
     s.confirm(&hl, OrderStatus::Pending);
     s.fill(&hl, hl.quantity);
     s.confirm(&hl, OrderStatus::Filled);
-    s.confirm(&bn, OrderStatus::Cancelled);
-    s.advance(600);
-    let h = placed(&s.bbo(BN));
+    let h = placed(&s.confirm(&bn, OrderStatus::Cancelled));
     assert_eq!(h.len(), 1, "{h:?}");
     assert_eq!((h[0].exchange, h[0].side), (BN, Side::Short));
     assert!(!h[0].reduce_only, "补腿量 {} 大于币安多仓 0.05", h[0].quantity);
@@ -643,7 +706,7 @@ fn rejected_maker_backs_off_per_exchange() {
     s.confirm(&hl, OrderStatus::Pending);
 
     // 第一次被拒：1000ms 内不重挂
-    s.confirm(&bn, OrderStatus::Error { reason: "margin is insufficient".into() });
+    s.reject(&bn);
     assert!(placed(&s.bbo(BN)).is_empty(), "刚被拒就重挂了");
     s.advance(1000);
     let again = placed(&s.bbo(BN));
@@ -660,7 +723,7 @@ fn rejected_maker_backs_off_per_exchange() {
 
     // 被接下后清零：之后再被拒又从 1000ms 起
     s.confirm(&third[0], OrderStatus::Pending);
-    s.confirm(&third[0], OrderStatus::Error { reason: "x".into() });
+    s.confirm(&third[0], OrderStatus::Rejected { reason: "x".into() });
     s.advance(1000);
     assert_eq!(placed(&s.bbo(BN)).len(), 1, "被接下后退避应清零");
 }

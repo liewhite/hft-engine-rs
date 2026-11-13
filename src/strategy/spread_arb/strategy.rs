@@ -870,9 +870,6 @@ impl Strategy for SpreadArbStrategy {
         streams
     }
 
-    fn order_timeout_ms(&self) -> u64 {
-        self.config.order_timeout_ms
-    }
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         // 获取本策略关注的 symbol 状态
@@ -945,7 +942,6 @@ mod tests {
             deviation_threshold: 0.004,
             max_notional: 1000.0,
             min_notional: 10.0,
-            order_timeout_ms: 10_000,
             max_position_notional: 5000.0,
             max_symbol_leverage: 0.5,
             max_account_leverage: 3.0,
@@ -989,9 +985,9 @@ mod tests {
     /// 经**生产路径**：盘口走行情事件、仓位走投产 seed。直接写字段更省事，
     /// 但那样测的就不是线上跑的那条路。
     fn fixture(positions: &[(Exchange, f64)]) -> Fixture {
-        let mut manager = StateManager::new(&[SYMBOL.to_string()], 10_000);
+        let mut manager = StateManager::new(&[SYMBOL.to_string()]);
         for b in [bbo(SHORT_EX, 100.0, 100.2, 10.0), bbo(LONG_EX, 99.8, 100.0, 10.0)] {
-            manager.apply(&IncomeEvent::market(0, 0, MarketData::BBO(b)));
+            manager.apply(&IncomeEvent::market(0, 0, MarketData::BBO(b))).unwrap();
         }
         manager.seed_positions(
             &positions
@@ -1022,7 +1018,7 @@ mod tests {
                         equity,
                         notional,
                     }),
-                ));
+                )).unwrap();
             }
             self
         }
@@ -1030,13 +1026,13 @@ mod tests {
         /// 显著错价：SHORT_EX 的 bid 被抬高、LONG_EX 的 ask 被压低
         fn mispriced(mut self) -> Self {
             for b in [bbo(SHORT_EX, 110.0, 110.2, 10.0), bbo(LONG_EX, 89.8, 90.0, 10.0)] {
-                self.manager.apply(&IncomeEvent::market(0, 0, MarketData::BBO(b)));
+                self.manager.apply(&IncomeEvent::market(0, 0, MarketData::BBO(b))).unwrap();
             }
             self
         }
 
         fn apply(&mut self, event: &IncomeEvent) {
-            self.manager.apply(event);
+            self.manager.apply(event).unwrap();
         }
 
         fn view(&self) -> StrategyView<'_> {

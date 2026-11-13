@@ -86,7 +86,7 @@ pub use manager::{
 pub use executor::{Executor, ExecutorArgs, ExecutorHandle, ExecutorId};
 pub use income_processor::{IncomeProcessor, IncomeProcessorHandle};
 pub use metrics::{Metrics, MetricsArgs, MetricsHandle, DEFAULT_REPORT_INTERVAL_MS};
-pub use outcome_processor::{OrderGateway, OrderRequestCounts, OutcomeProcessor, PlaceVerdict, RequestKind};
+pub use outcome_processor::{OrderGateway, OrderRequestCounts, OutcomeProcessor, RequestKind};
 pub use paper_counter::{PaperCounter, PaperCounterArgs};
 pub use position_ledger::{
     PositionLedger, PositionLedgerArgs, PositionLedgerHandle, Reconciler,

@@ -229,11 +229,38 @@ pub enum AccountData {
 /// 币级账户事件（封闭枚举）
 #[derive(Debug, Clone)]
 pub enum SymbolAccountData {
+    /// 交易所的订单回报
     OrderUpdate(OrderUpdate),
+    /// 本地一次下单 / 撤单 REST 请求的结论（实盘出口发出；模拟柜台撤不到单时也发），见 [`OrderRequestResult`]
+    OrderRequest(OrderRequestResult),
     /// 成交事件 (持仓的唯一增量来源，见 `SymbolState::seed_position` 的维护模型)
     Fill(Fill),
     /// 资费结算事件 (账户每次收/付资费时推送)
     FundingFee(FundingFee),
+}
+
+/// 本地一次下单 / 撤单请求的结论。和 [`OrderUpdate`] 分开：那是交易所说的订单状态，这是我们自己
+/// 的 REST 调用得出的结论，两者到达顺序没有保证，本地跟踪表各按各的规则处理（见
+/// `messaging::state::SymbolOrders`）。
+///
+/// 下单结果不确定（超时、5xx）时没有这个事件：实盘出口直接停机（见 `OrderGateway::place`）。
+/// 撤单成功也没有：交易所随后会推 `Cancelled`（或在撤单生效前成交）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderRequestResult {
+    pub exchange: Exchange,
+    pub symbol: Symbol,
+    pub client_order_id: String,
+    pub outcome: RequestOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestOutcome {
+    /// 下单 REST 返回成功：交易所已受理（订单号回填进跟踪表）
+    Placed { order_id: crate::domain::OrderId },
+    /// 下单确定没挂上：交易所明确拒单、请求没发出、或出口本地校验不过
+    PlaceRejected { reason: String },
+    /// 撤单请求失败（单可能已成交 / 已撤 / 还挂着，以交易所随后的订单回报为准）
+    CancelFailed { reason: String },
 }
 
 /// 所级账户事件（封闭枚举）
@@ -291,6 +318,7 @@ impl SymbolAccountData {
     pub fn exchange(&self) -> Exchange {
         match self {
             SymbolAccountData::OrderUpdate(u) => u.exchange,
+            SymbolAccountData::OrderRequest(r) => r.exchange,
             SymbolAccountData::Fill(f) => f.exchange,
             SymbolAccountData::FundingFee(fee) => fee.exchange,
         }
@@ -299,6 +327,7 @@ impl SymbolAccountData {
     pub fn symbol(&self) -> &Symbol {
         match self {
             SymbolAccountData::OrderUpdate(u) => &u.symbol,
+            SymbolAccountData::OrderRequest(r) => &r.symbol,
             SymbolAccountData::Fill(f) => &f.symbol,
             SymbolAccountData::FundingFee(fee) => &fee.symbol,
         }

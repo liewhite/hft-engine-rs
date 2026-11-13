@@ -5,8 +5,10 @@
 //!
 //! # 每个事件做一件事，按优先级
 //!
-//! 1. **各所持仓之和不为 0**（价值 ≥ 最小单额，且补腿所下得出这个量）：先撤掉全部挂单，等补腿那所没有任何在途单后，
-//!    在最近一次挂单的所对上市价补齐落后腿：多了就在该对的卖出所卖，少了就在买入所买。
+//! 0. **有单已结束、成交还在路上**（框架的订单跟踪表里有不再开着的单，见 `PendingOrder`）：持仓还会变，
+//!    只撤开着的 maker，等成交到齐。
+//! 1. **各所持仓之和不为 0**（价值 ≥ 最小单额，且补腿所下得出这个量）：先撤掉全部挂单，等本币所有单都结算完
+//!    （撤单确认、成交入账）后，在最近一次挂单的所对上市价补齐落后腿：多了就在该对的卖出所卖，少了就在买入所买。
 //!    这正是用户规格「开仓加短腿、平仓砍长腿」：没成交的那条腿就是落后腿，补它即补齐这次操作；
 //!    补过头（撤单期间另一边也成交）时反向补回的也是落后腿。补腿被交易所拒绝时框架回报失败，本策略隔
 //!    `hedge_retry_ms` 重试并记 error；补腿结果不确定（超时、5xx 等）时框架直接停机（#692）。
@@ -26,11 +28,11 @@
 //! - 启动时各所持仓之和不为 0；
 //! - 不平衡出现时还没挂过任何单。
 //!
-//! # 残余窗口（如实声明）
+//! # 成交与订单回报的先后
 //!
-//! 补腿前要求各所最近一张本策略的单离开挂单列表已过 `fill_settle_ms`。若某所的成交回报晚于
-//! 订单终态超过这个窗口，仍会多补一份：之后会反向补回（结果多一来回的手续费），或在开仓时两腿
-//! 各多出约一笔挂单金额（仍对冲，但不经杠杆检查）。每发生一次超出一笔，不会自动收回。
+//! 一张单要等交易所说它结束、且它的成交按交易所说的累计量全部入账，才离开框架的跟踪表（#758）。
+//! 所以「挂单没了」时持仓就是最终的：不会在成交还没到时以为两腿已平、在同所再挂一张，也不会多补一份。
+//! 迟迟等不到的（一分钟）框架直接停机。
 //!
 //! # 零头（如实声明）
 //!
@@ -43,9 +45,11 @@
 
 use super::config::PairParams;
 use super::signal::{decide, FundingAction, LegPair, SettledFundingWindow};
-use crate::domain::{Exchange, Order, OrderId, OrderStatus, OrderType, OrderUpdate, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO};
+use crate::domain::{Exchange, Order, OrderStatus, OrderType, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{AccountData, IncomeEvent, MarketData, MarketEvent, PendingOrder, SymbolAccountData};
+use crate::messaging::{
+    AccountData, CancelState, IncomeEvent, MarketData, MarketEvent, PendingOrder, RequestOutcome, SymbolAccountData,
+};
 use crate::observability::Gauge;
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
 use std::collections::{HashMap, HashSet};
@@ -73,13 +77,6 @@ pub struct FundingArbStrategy {
     bbo_local_ts: HashMap<Exchange, Timestamp>,
     /// 最近一次挂 maker 的所对：不平衡时在这对所上补腿
     leg: Option<LegPair>,
-    /// 已发出撤单、尚未离开挂单列表的订单号 → 发出撤单的时刻。超过 `hedge_retry_ms` 仍在
-    /// 就重撤：撤单 REST 失败时框架只返回错误、不发事件，由策略重试。
-    cancelling: HashMap<OrderId, Timestamp>,
-    /// 上一步看到的本策略挂单（client_order_id → 所），用来发现"离开挂单列表"
-    prev_pending: HashMap<String, Exchange>,
-    /// 各所最近一张本策略的单离开挂单列表的时刻（补腿结算窗口的起点）
-    last_departure: HashMap<Exchange, Timestamp>,
     /// 首次拿到全部所盘口时做过启动检查没有
     startup_checked: bool,
     /// 停止交易的原因
@@ -134,9 +131,6 @@ impl FundingArbStrategy {
             funding: HashMap::new(),
             bbo_local_ts: HashMap::new(),
             leg: None,
-            cancelling: HashMap::new(),
-            prev_pending: HashMap::new(),
-            last_departure: HashMap::new(),
             startup_checked: false,
             halted: None,
             last_hedge_ts: None,
@@ -162,20 +156,6 @@ impl FundingArbStrategy {
         self.bbo_fresh(pair.sell, now) && self.bbo_fresh(pair.buy, now)
     }
 
-    /// 跟踪本策略挂单的出现与离开
-    fn track_pending(&mut self, sv: SymbolView<'_>, now: Timestamp) {
-        let current: HashMap<String, Exchange> =
-            sv.pending_orders().map(|p| (p.order.client_order_id.clone(), p.order.exchange)).collect();
-        for (cid, ex) in &self.prev_pending {
-            if !current.contains_key(cid) {
-                self.last_departure.insert(*ex, now);
-            }
-        }
-        self.prev_pending = current;
-        let live: HashSet<OrderId> = sv.pending_orders().map(|p| p.order.id.clone()).collect();
-        self.cancelling.retain(|id, _| live.contains(id));
-    }
-
     fn halt(&mut self, reason: String) {
         if self.halted.is_none() {
             tracing::error!(symbol = %self.symbol(), %reason, "停止交易：撤掉本策略挂单，不再开仓或补腿，需人工处理后重启");
@@ -184,9 +164,13 @@ impl FundingArbStrategy {
     }
 
     fn step(&mut self, sv: SymbolView<'_>, view: StrategyView<'_>, now: Timestamp) -> Vec<OutcomeEvent> {
-        self.track_pending(sv, now);
         if self.halted.is_some() {
             return self.maintain(sv, &[], now);
+        }
+        // 有单已结束、成交还在路上：持仓还会变，按现在的持仓开平或补腿都会错。那笔成交一到就是不平衡，
+        // 开着的 maker 本来也要撤，先撤
+        if sv.pending_orders().any(|p| !p.is_open()) {
+            return self.cancel_makers(sv, now);
         }
 
         // 不要求每所都有盘口：某所品种暂停、迟迟没盘口时，其余所的补腿和停机检查照常；
@@ -412,11 +396,25 @@ impl FundingArbStrategy {
         ok
     }
 
-    /// 记下本策略一张单的结局：被拒（交易所拒或本地 REST 失败）则加长该所的退避，被接下则清零
-    fn note_order_outcome(&mut self, update: &OrderUpdate, now: Timestamp) {
-        let ex = update.exchange;
-        match &update.status {
-            OrderStatus::Rejected { reason } | OrderStatus::Error { reason } => {
+    /// 记下本策略一张单的结局：被拒（交易所拒，或本地下单请求被拒）则加长该所的退避，被接下则清零
+    fn note_order_outcome(&mut self, data: &SymbolAccountData, now: Timestamp) {
+        let (ex, rejected) = match data {
+            SymbolAccountData::OrderUpdate(u) if u.client_order_id.as_ref().is_some_and(|c| u.exchange.owns_cli_order_id(c)) => {
+                match &u.status {
+                    OrderStatus::Rejected { reason } => (u.exchange, Some(reason)),
+                    OrderStatus::Pending | OrderStatus::PartiallyFilled | OrderStatus::Filled => (u.exchange, None),
+                    OrderStatus::Created | OrderStatus::Cancelled => return,
+                }
+            }
+            SymbolAccountData::OrderRequest(r) => match &r.outcome {
+                RequestOutcome::PlaceRejected { reason } => (r.exchange, Some(reason)),
+                RequestOutcome::Placed { .. } => (r.exchange, None),
+                RequestOutcome::CancelFailed { .. } => return,
+            },
+            _ => return,
+        };
+        match rejected {
+            Some(reason) => {
                 let delay_ms = self
                     .reject_backoff
                     .get(&ex)
@@ -424,10 +422,9 @@ impl FundingArbStrategy {
                 tracing::warn!(symbol = %self.symbol(), %ex, %reason, delay_ms, "下单被拒，该所暂停挂新单");
                 self.reject_backoff.insert(ex, RejectBackoff { until: now + delay_ms, delay_ms });
             }
-            OrderStatus::Pending | OrderStatus::PartiallyFilled | OrderStatus::Filled => {
+            None => {
                 self.reject_backoff.remove(&ex);
             }
-            OrderStatus::Created | OrderStatus::Cancelled => {}
         }
     }
 
@@ -491,50 +488,46 @@ impl FundingArbStrategy {
         }
     }
 
-    /// 撤已确认的挂单（Created 还没有交易所订单号，撤不了，等确认）
-    fn cancel(&mut self, p: &PendingOrder, now: Timestamp) -> Option<OutcomeEvent> {
-        if !p.status.is_confirmed() {
+    /// 撤一张开着的单。下单请求还没结论的也能撤（框架按客户端订单号撤）；撤单在途时不重发，
+    /// 撤单失败（多半是单刚成交、终态马上就到）后隔 `hedge_retry_ms` 再撤。
+    fn cancel(&self, p: &PendingOrder, now: Timestamp) -> Option<OutcomeEvent> {
+        if !p.is_open() {
             return None;
         }
-        if let Some(&sent) = self.cancelling.get(&p.order.id) {
-            if now.saturating_sub(sent) < self.p.hedge_retry_ms {
-                return None;
+        match &p.cancel {
+            CancelState::None => {}
+            CancelState::Sent { .. } => return None,
+            CancelState::Failed { at, reason } => {
+                if now.saturating_sub(*at) < self.p.hedge_retry_ms {
+                    return None;
+                }
+                tracing::warn!(symbol = %self.symbol(), exchange = %p.order.exchange, client_order_id = %p.order.client_order_id, %reason, "撤单失败且单还开着，重撤");
             }
-            tracing::warn!(symbol = %self.symbol(), exchange = %p.order.exchange, order_id = %p.order.id, "撤单未生效，重撤");
         }
-        self.cancelling.insert(p.order.id.clone(), now);
         Some(OutcomeEvent::CancelOrder {
             exchange: p.order.exchange,
             symbol: self.symbol().clone(),
-            order_id: p.order.id.clone(),
             client_order_id: p.order.client_order_id.clone(),
         })
     }
 
-    /// 持仓之和不为 0：撤所有 maker，补腿所无在途单且过了重试间隔时市价补齐。
-    fn hedge(&mut self, sv: SymbolView<'_>, pair: LegPair, net: f64, positions: &[(Exchange, f64)], now: Timestamp) -> Vec<OutcomeEvent> {
-        let mut out: Vec<OutcomeEvent> = sv
-            .pending_orders()
+    /// 撤掉全部开着的 maker
+    fn cancel_makers(&self, sv: SymbolView<'_>, now: Timestamp) -> Vec<OutcomeEvent> {
+        sv.pending_orders()
             .filter(|p| matches!(p.order.order_type, OrderType::Limit { .. }))
-            .cloned()
-            .collect::<Vec<_>>()
-            .iter()
             .filter_map(|p| self.cancel(p, now))
-            .collect();
+            .collect()
+    }
 
-        let (target, side) = hedge_target(pair, net);
-        if sv.pending_orders().any(|p| p.order.exchange == target) {
-            return out; // 等补腿所上的挂单撤完 / 在途补腿单出结果，免得重复成交
-        }
-        if self.last_hedge_ts.is_some_and(|t| now.saturating_sub(t) < self.p.hedge_retry_ms) {
+    /// 持仓之和不为 0：撤所有 maker，本币所有单都结算完、且过了重试间隔时市价补齐。
+    fn hedge(&mut self, sv: SymbolView<'_>, pair: LegPair, net: f64, positions: &[(Exchange, f64)], now: Timestamp) -> Vec<OutcomeEvent> {
+        let out = self.cancel_makers(sv, now);
+        // 等全部单结算完：开着的 maker 还可能成交、在途补腿单还没结果，此时补会补错量
+        if sv.has_pending_orders() {
             return out;
         }
-        // 成交回报结算窗口：刚有单离开挂单列表时，它的成交可能还没到（见模块文档）
-        if self
-            .exchanges
-            .iter()
-            .any(|ex| self.last_departure.get(ex).is_some_and(|&t| now.saturating_sub(t) < self.p.fill_settle_ms))
-        {
+        let (target, side) = hedge_target(pair, net);
+        if self.last_hedge_ts.is_some_and(|t| now.saturating_sub(t) < self.p.hedge_retry_ms) {
             return out;
         }
         let target_pos = positions.iter().find(|(e, _)| *e == target).map_or(0.0, |(_, p)| *p);
@@ -549,6 +542,7 @@ impl FundingArbStrategy {
         }
         self.hedge_attempts += 1;
         self.last_hedge_ts = Some(now);
+        let mut out = out;
         out.push(OutcomeEvent::PlaceOrders {
             orders: vec![Order {
                 id: String::new(),
@@ -590,10 +584,6 @@ impl Strategy for FundingArbStrategy {
             .collect()
     }
 
-    /// 只作用于迟迟未获交易所确认（Created）的单；挂着的 maker 由本策略按价格偏离自行撤换
-    fn order_timeout_ms(&self) -> u64 {
-        60_000
-    }
 
     /// 看板与告警用：各所年化与数据年龄、年化差、最近一次判断的信号（停止交易或补腿期间不再判断，
     /// 停在最后一次）、门槛、是否停止交易
@@ -649,10 +639,8 @@ impl Strategy for FundingArbStrategy {
                 }
             }
             IncomeEvent::Account(a) => {
-                if let AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) = &a.data {
-                    if u.client_order_id.as_ref().is_some_and(|c| u.exchange.owns_cli_order_id(c)) {
-                        self.note_order_outcome(u, now);
-                    }
+                if let AccountData::Symbol(d) = &a.data {
+                    self.note_order_outcome(d, now);
                 }
             }
             _ => {}

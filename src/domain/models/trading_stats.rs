@@ -83,14 +83,16 @@ impl TradingStats {
         }
     }
 
-    /// 累加一条订单更新（只统计失败终态）
+    /// 累加一条交易所订单回报（只统计拒单）
     pub fn apply_order_update(&mut self, update: &OrderUpdate) {
-        match update.status {
-            OrderStatus::Rejected { .. } | OrderStatus::Error { .. } => {
-                self.rejected_orders += 1;
-            }
-            _ => {}
+        if matches!(update.status, OrderStatus::Rejected { .. }) {
+            self.rejected_orders += 1;
         }
+    }
+
+    /// 累加一次本地下单请求被拒（REST 拒单、出口校验不过；口径与交易所拒单合在一个计数里）
+    pub fn apply_place_rejected(&mut self) {
+        self.rejected_orders += 1;
     }
 
     /// 总盈亏 = 累计现金流 + 当前持仓市值
@@ -183,6 +185,7 @@ mod tests {
                 reason: "insufficient margin".to_string(),
             },
             quantity: 0.0,
+            filled_quantity: 0.0,
         };
         stats.apply_order_update(&update);
         update.status = OrderStatus::Filled;

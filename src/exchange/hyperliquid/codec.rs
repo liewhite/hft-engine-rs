@@ -455,9 +455,6 @@ impl WsOrderUpdate {
 
         let status = map_hyperliquid_order_status(&self.status, filled_quantity)?;
 
-        // Hyperliquid 不直接提供本次成交量，使用 filled_quantity
-        // 对于 IOC 订单（一次性成交），这等于实际成交量
-
         Ok(crate::domain::OrderUpdate {
             order_id: self.order.oid.to_string(),
             client_order_id: self.order.cloid.clone(),
@@ -466,6 +463,8 @@ impl WsOrderUpdate {
             side,
             status,
             quantity: orig_sz,
+            // origSz - sz：剩余量之外的就是累计成交（HL 是币本位）
+            filled_quantity: filled_quantity.max(0.0),
         })
     }
 }

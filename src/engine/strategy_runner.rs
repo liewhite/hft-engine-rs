@@ -90,7 +90,7 @@ impl StrategyRunner {
                 .flat_map(|(ex, kinds)| kinds.iter().map(move |k| (*ex, k.symbol().clone()))),
         );
         let symbols: Vec<Symbol> = subscriptions.symbols().cloned().collect();
-        let state = StateManager::new(&symbols, strategy.order_timeout_ms());
+        let state = StateManager::new(&symbols);
         Self {
             strategy,
             state,
@@ -131,17 +131,22 @@ impl StrategyRunner {
         self.subscriptions.accepts(event)
     }
 
-    /// 更新状态并运行策略，返回信号 (下单已分配 id、登记 pending、按交易所精度取整)。
+    /// 更新状态并运行策略，返回信号 (下单已分配 id、登记 pending、按交易所精度取整；
+    /// 撤单只放行还开着、没有撤单在途的单，并记下「撤单已发」)。
     ///
     /// 产出订单是**币本位**且已取整；单位折算是出口的职责，见模块文档。
-    pub fn on_event(&mut self, event: &IncomeEvent) -> Vec<OutcomeEvent> {
-        self.state.apply(event);
+    ///
+    /// `Err` = 订单跟踪表已说不清挂单与持仓（有单等交易所太久，见 [`crate::messaging::ORDER_STUCK_MS`]），
+    /// 驱动方应停机。
+    pub fn on_event(&mut self, event: &IncomeEvent) -> Result<Vec<OutcomeEvent>, String> {
+        self.state.apply(event)?;
+        let now = event.local_ts();
         // 单一分发入口：一切事件（含 BorrowFee/ExchangeRate）都走 on_event，
         // 策略自行 match 关心的变体 —— 不存在第二套 typed 回调。
         let raw = self.strategy.on_event(event, StrategyView::new(&self.state));
-        raw
-            .into_iter()
-            .map(|signal| match signal {
+        let mut out = Vec::with_capacity(raw.len());
+        for signal in raw {
+            match signal {
                 OutcomeEvent::PlaceOrders { orders, comment } => {
                     let converted = orders
                         .into_iter()
@@ -150,20 +155,23 @@ impl StrategyRunner {
                             // 登记未取整的原始订单，与取整前的行为保持一致（策略比对自己
                             // 的挂单量时看到的仍是它请求的数量）
                             // created_at 取当前事件时刻 (回测=虚拟时间, 确定性), 不读墙钟
-                            self.state.add_pending_order(order.clone(), event.local_ts());
+                            self.state.add_pending_order(order.clone(), now);
                             self.round_to_exchange_precision(order)
                         })
                         .collect();
-                    OutcomeEvent::PlaceOrders {
-                        orders: converted,
-                        comment,
+                    out.push(OutcomeEvent::PlaceOrders { orders: converted, comment });
+                }
+                OutcomeEvent::CancelOrder { exchange, symbol, client_order_id } => {
+                    match self.state.mark_cancel_sent(&symbol, &client_order_id, now) {
+                        Ok(()) => out.push(OutcomeEvent::CancelOrder { exchange, symbol, client_order_id }),
+                        Err(why) => tracing::debug!(%exchange, %symbol, %client_order_id, why, "撤单不发出"),
                     }
                 }
-                cancel @ OutcomeEvent::CancelOrder { .. } => cancel,
                 // 自定义事件原样放行：无订单语义，不登记 pending、不过精度取整
-                emit @ OutcomeEvent::Emit(_) => emit,
-            })
-            .collect()
+                emit @ OutcomeEvent::Emit(_) => out.push(emit),
+            }
+        }
+        Ok(out)
     }
 
     /// 按交易所精度取整价格与数量，**保持币本位**。
@@ -246,9 +254,6 @@ mod tests {
                 }]),
             )])
         }
-        fn order_timeout_ms(&self) -> u64 {
-            0
-        }
         fn on_event(&mut self, _e: &IncomeEvent, _v: StrategyView<'_>) -> Vec<OutcomeEvent> {
             if self.placed {
                 return Vec::new();
@@ -285,7 +290,7 @@ mod tests {
             Box::new(SequentialClientOrderIdGen::default()),
         );
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);
-        match runner.on_event(&ev).into_iter().next().expect("signal") {
+        match runner.on_event(&ev).expect("无报错").into_iter().next().expect("signal") {
             OutcomeEvent::PlaceOrders { orders, .. } => orders.into_iter().next().unwrap(),
             other => panic!("unexpected {other:?}"),
         }
@@ -322,7 +327,7 @@ mod tests {
             Box::new(SequentialClientOrderIdGen::default()),
         );
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);
-        runner.on_event(&ev);
+        runner.on_event(&ev).unwrap();
         let state = runner.state().symbol_state(&SYM.to_string()).expect("state");
         let pending: Vec<f64> = state.order_book().iter().map(|p| p.order.quantity).collect();
         assert_eq!(pending, vec![0.125]);

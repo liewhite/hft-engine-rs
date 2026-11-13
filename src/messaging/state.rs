@@ -1,19 +1,75 @@
-use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, OrderType, Position, Side, Symbol, Timestamp, TimeInForce, BBO};
-use crate::messaging::event::{MarketData, SymbolAccountData};
-use std::collections::{HashMap, VecDeque};
+use crate::domain::{Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderStatus, Position, Quantity, Symbol, Timestamp, BBO};
+use crate::messaging::event::{MarketData, OrderRequestResult, RequestOutcome, SymbolAccountData};
+use std::collections::HashMap;
 
-/// 记住多少个最近到达**权威终态**的订单号（见 [`SymbolState::recent_terminal`]）。
+/// 一张单「等交易所」超过这么久就停机（见 [`SymbolOrders::check_stuck`]）。
 ///
-/// 只需覆盖"终态回报"与"迟到的非终态回报"之间的重排窗口 —— 那是跨投递路径的秒级错位，
-/// 512 远够用；环形淘汰让长会话下的内存有界。
-const TERMINAL_MEMORY: usize = 512;
+/// 三种等待：下单请求还没有结论（REST 自带 10s 超时，结论必到）、撤单已发出但交易所没推终态、
+/// 终态到了但成交没到齐。正常都在秒级以内；一分钟还没等到，说明回报丢了或解析错了 —— 跟踪表从此
+/// 说不清这张单和这个币的持仓，继续交易会在旁边重复挂单、按错的持仓补腿，故停机交人工核对。
+/// （此前是 60s 未确认就静默删单、确认迟到再重建 —— 删掉的单若还活着，策略会在旁边再挂一张。）
+pub const ORDER_STUCK_MS: u64 = 60_000;
 
-/// 待处理订单信息（保存完整订单 + 运行时状态）
+/// 成交是否到齐的相对容差：逐笔成交与累计量各自从张折成币（OKX），浮点和会差在末位
+const FILL_TOLERANCE: f64 = 1e-9;
+
+/// 本策略发出的一张单在本地的跟踪记录。
+///
+/// 策略发出时登记，**终态且成交都已入账**才移出：交易所说的累计成交（`reported_filled`）由按客户端
+/// 订单号收到的成交（`filled`）加满。所以表里的单只有两种：还开着的（[`Self::is_open`]，可能再成交），
+/// 和已结束、成交还在路上的 —— 后者在时，该币的持仓还会变。表空了，持仓就是这些单的最终结果。
 #[derive(Debug, Clone)]
 pub struct PendingOrder {
     pub order: Order,
+    /// 交易所说的最新状态；`Created` = 下单请求还没有任何结论。到终态后不再被改写
     pub status: OrderStatus,
     pub created_at: Timestamp,
+    /// 按客户端订单号收到的成交之和（币）
+    pub filled: Quantity,
+    /// 交易所回报里的累计成交（币，取见过的最大值）
+    pub reported_filled: Quantity,
+    /// 撤单进行到哪一步
+    pub cancel: CancelState,
+    /// 收到终态的时刻
+    terminal_at: Option<Timestamp>,
+}
+
+/// 一张单的撤单进行到哪一步
+#[derive(Debug, Clone, PartialEq)]
+pub enum CancelState {
+    /// 没撤过
+    None,
+    /// 撤单已发出：等交易所推终态，或撤单失败的结论。期间框架不再重发（见 `StrategyRunner`）
+    Sent { at: Timestamp },
+    /// 撤单请求失败。单若还开着，要不要、隔多久重撤由策略定
+    Failed { at: Timestamp, reason: String },
+}
+
+impl PendingOrder {
+    /// 交易所还在撮合它（没到终态）：可能再成交，也只有它能撤
+    pub fn is_open(&self) -> bool {
+        !self.status.is_terminal()
+    }
+
+    /// 成交都已入账：本地收到的成交加起来不少于交易所说的累计量
+    fn fills_settled(&self) -> bool {
+        self.reported_filled - self.filled <= FILL_TOLERANCE * self.order.quantity.max(self.reported_filled)
+    }
+
+    /// 在等交易所的什么、从什么时候起；`None` = 没在等（挂着，或撤单失败后等策略决定）。
+    /// 已终态的单还在表里，就是成交没到齐（到齐即移出）。
+    fn waiting_on_exchange(&self) -> Option<(Timestamp, &'static str)> {
+        if let Some(at) = self.terminal_at {
+            return Some((at, "终态已到、成交没到齐"));
+        }
+        if self.status == OrderStatus::Created {
+            return Some((self.created_at, "下单请求没有结论"));
+        }
+        match self.cancel {
+            CancelState::Sent { at } => Some((at, "撤单已发出、交易所没推终态")),
+            CancelState::None | CancelState::Failed { .. } => None,
+        }
+    }
 }
 
 
@@ -43,21 +99,16 @@ pub struct SymbolPositions {
     pub(crate) seeded_at: HashMap<Exchange, Timestamp>,
 }
 
-/// 单个交易对的**挂单**投影
+/// 单个交易对的**挂单**投影：本策略发出、还没结算完的单（见 [`PendingOrder`]）。
+///
+/// 输入四种：策略发单（[`Self::add`]）、策略撤单（[`Self::mark_cancel_sent`]）、交易所的订单回报与成交、
+/// 本地 REST 请求的结论（[`OrderRequestResult`]）。后两类走不同的路径，到达顺序没有保证，所以每条
+/// 规则都写成与顺序无关的形态：终态不被改写、下单受理只把 `Created` 往前推、成交与累计量谁先到都
+/// 一样算。不在表里的单的回报一律不重建记录。
 #[derive(Debug, Clone, Default)]
 pub struct SymbolOrders {
-    /// 待处理订单 (以 client_order_id 为 key)
-    pub(crate) pending_orders: HashMap<String, PendingOrder>,
-    /// 已到达**权威终态**的 client_order_id 环形记录（容量 [`TERMINAL_MEMORY`]）。
-    ///
-    /// 用途只有一个：拦住"迟到的非终态回报把已结束的订单复活成**永久** pending"
-    /// （见 [`SymbolState::apply_account`] 的重建分支）。
-    ///
-    /// 只记权威终态 —— `Filled`/`Cancelled`/`Rejected`，即交易所说的、或撤单后复查确认
-    /// 订单已不在挂单列表时合成的。**不记 `Error`**：那是本地 REST 调用的结论
-    /// （见 `crate::engine::OrderGateway`），订单可能实际活在交易所上，此时让随后到达的
-    /// 真实确认把它重新纳入跟踪正是我们要的。
-    pub(crate) recent_terminal: VecDeque<String>,
+    /// client_order_id → 记录
+    pub(crate) orders: HashMap<String, PendingOrder>,
 }
 
 /// 单个交易对在所有交易所的聚合状态：三个投影的门面。
@@ -367,68 +418,140 @@ impl SymbolPositions {
 }
 
 impl SymbolOrders {
-    /// 记下一个到达权威终态的订单号（环形淘汰，见 [`Self::recent_terminal`]）
-    fn remember_terminal(&mut self, client_order_id: &str) {
-        if self.recent_terminal.len() >= TERMINAL_MEMORY {
-            self.recent_terminal.pop_front();
-        }
-        self.recent_terminal.push_back(client_order_id.to_string());
-    }
-
-    /// 添加待处理订单 (发送订单信号时调用)
+    /// 登记策略刚发出的一张单（client_order_id 已分配）
     pub fn add(&mut self, order: Order, created_at: Timestamp) {
         let client_order_id = order.client_order_id.clone();
-        self.pending_orders.insert(client_order_id, PendingOrder {
+        self.orders.insert(client_order_id, PendingOrder {
             order,
             status: OrderStatus::Created,
             created_at,
+            filled: 0.0,
+            reported_filled: 0.0,
+            cancel: CancelState::None,
+            terminal_at: None,
         });
     }
 
-    /// 检查并移除超时订单，返回被移除的订单数量
+    /// 策略要撤这张单：记下「撤单已发」，返回 `Ok` 表示该发。
     ///
-    /// 仅清理 Created 状态超过 timeout_ms 的订单（交易所未确认，视为丢失）。
-    /// 已确认的挂单（Pending/PartiallyFilled）由策略决定何时撤单，不做超时清理。
-    pub fn remove_timed_out(
-        &mut self,
-        symbol: &Symbol,
-        now: Timestamp,
-        timeout_ms: u64,
-    ) -> usize {
-        if timeout_ms == 0 {
-            return 0;
+    /// 不该发的（`Err` 带原因）：不在表里、已到终态（撤不掉，发了白耗一次交易所操作）、上一次撤单还在等
+    /// 结论。
+    pub fn mark_cancel_sent(&mut self, client_order_id: &str, now: Timestamp) -> Result<(), &'static str> {
+        let Some(p) = self.orders.get_mut(client_order_id) else {
+            return Err("不在跟踪表里");
+        };
+        if !p.is_open() {
+            return Err("已到终态");
         }
-        let before = self.pending_orders.len();
-        self.pending_orders.retain(|client_id, pending| {
-            let elapsed = now.saturating_sub(pending.created_at);
-            if elapsed > timeout_ms && pending.status == OrderStatus::Created {
-                tracing::warn!(
-                    symbol = %symbol,
-                    client_order_id = %client_id,
-                    exchange = %pending.order.exchange,
-                    elapsed_ms = elapsed,
-                    "Order timed out (no exchange confirmation), removing from pending"
-                );
-                return false;
+        if matches!(p.cancel, CancelState::Sent { .. }) {
+            return Err("上一次撤单还在等结论");
+        }
+        p.cancel = CancelState::Sent { at: now };
+        Ok(())
+    }
+
+    /// 交易所的订单回报
+    fn apply_update(&mut self, symbol: &Symbol, update: &crate::domain::OrderUpdate, local_ts: Timestamp) {
+        let Some(client_id) = &update.client_order_id else {
+            return; // 没有客户端订单号：不是本引擎的单
+        };
+        if update.status == OrderStatus::Created {
+            // Created 是本地状态，交易所不会推；出现说明 codec 误映射
+            tracing::error!(%symbol, exchange = %update.exchange, %client_id, "交易所回报了 Created（codec 映射异常），忽略");
+            return;
+        }
+        let Some(p) = self.orders.get_mut(client_id) else {
+            if !update.status.is_terminal() && update.exchange.owns_cli_order_id(client_id) {
+                // 本引擎订单号、还开着、本地却没有：别的实例或上一个进程的单（启动时已撤净遗留挂单，
+                // 正常不会出现）。不接管：它的成交照常进持仓，由策略按普通不平衡处理
+                tracing::warn!(%symbol, exchange = %update.exchange, %client_id, status = ?update.status, "本引擎订单号的挂单不在跟踪表里，不接管");
             }
-            true
-        });
-        before - self.pending_orders.len()
+            return;
+        };
+        p.reported_filled = p.reported_filled.max(update.filled_quantity);
+        if p.order.id.is_empty() {
+            p.order.id = update.order_id.clone();
+        }
+        // 终态不被改写：同一频道内回报有序，这里只防将来有人把两条路径的回报混进来
+        if p.is_open() {
+            p.status = update.status.clone();
+            if p.status.is_terminal() {
+                p.terminal_at = Some(local_ts);
+            }
+        }
+        self.settle(symbol, client_id);
     }
 
-    /// 是否有未完成订单
+    /// 一笔成交计入它所属的单（持仓另由 [`SymbolPositions::apply_fill`] 累加）
+    fn apply_fill(&mut self, symbol: &Symbol, fill: &crate::domain::Fill) {
+        let Some(client_id) = &fill.client_order_id else {
+            return;
+        };
+        if let Some(p) = self.orders.get_mut(client_id) {
+            p.filled += fill.size;
+            self.settle(symbol, client_id);
+        }
+    }
+
+    /// 本地 REST 请求的结论。单已不在表里（交易所回报先到、已结算完）就不理。
+    fn apply_request(&mut self, symbol: &Symbol, r: &OrderRequestResult, local_ts: Timestamp) {
+        let Some(p) = self.orders.get_mut(&r.client_order_id) else {
+            return;
+        };
+        match &r.outcome {
+            RequestOutcome::Placed { order_id } => {
+                if p.order.id.is_empty() {
+                    p.order.id = order_id.clone();
+                }
+                // 只把「没有结论」往前推；交易所已说过的状态（含终态）不动
+                if p.status == OrderStatus::Created {
+                    p.status = OrderStatus::Pending;
+                }
+            }
+            RequestOutcome::PlaceRejected { reason } => {
+                // 确定没挂上（实盘出口只在交易所没对这张单说过话时才报拒单），也就不会有成交
+                tracing::info!(%symbol, exchange = %r.exchange, client_order_id = %r.client_order_id, %reason, "下单被拒，移出跟踪表");
+                self.orders.remove(&r.client_order_id);
+            }
+            RequestOutcome::CancelFailed { reason } => {
+                p.cancel = CancelState::Failed { at: local_ts, reason: reason.clone() };
+            }
+        }
+    }
+
+    /// 终态且成交到齐就移出
+    fn settle(&mut self, symbol: &Symbol, client_id: &str) {
+        if self.orders.get(client_id).is_some_and(|p| !p.is_open() && p.fills_settled()) {
+            let p = self.orders.remove(client_id).expect("刚查过");
+            tracing::info!(%symbol, exchange = %p.order.exchange, %client_id, status = ?p.status, filled = p.filled, "订单结算完，移出跟踪表");
+        }
+    }
+
+    /// 有单「等交易所」超过 [`ORDER_STUCK_MS`] 就报错（调用方停机）
+    fn check_stuck(&self, symbol: &Symbol, now: Timestamp) -> Result<(), String> {
+        for (client_id, p) in &self.orders {
+            if let Some((since, what)) = p.waiting_on_exchange() {
+                let waited = now.saturating_sub(since);
+                if waited > ORDER_STUCK_MS {
+                    return Err(format!(
+                        "{symbol} {} 订单 {client_id}（交易所号 {}）{what}已 {waited}ms：状态 {:?}，收到成交 {}，交易所说累计 {}，撤单 {:?}。\
+                         跟踪表说不清这张单和持仓，停机交人工核对挂单与持仓",
+                        p.order.exchange, p.order.id, p.status, p.filled, p.reported_filled, p.cancel
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 是否还有没结算完的单（开着的，或终态了、成交还在路上的）
     pub fn has_pending(&self) -> bool {
-        !self.pending_orders.is_empty()
+        !self.orders.is_empty()
     }
 
-    /// 是否有指定方向的未完成订单
-    pub fn has_pending_side(&self, side: Side) -> bool {
-        self.pending_orders.values().any(|p| p.order.side == side)
-    }
-
-    /// 获取所有待处理订单
+    /// 全部没结算完的单
     pub fn iter(&self) -> impl Iterator<Item = &PendingOrder> {
-        self.pending_orders.values()
+        self.orders.values()
     }
 }
 
@@ -461,135 +584,18 @@ impl SymbolState {
                     order_id = %update.order_id,
                     client_order_id = ?update.client_order_id,
                     status = ?update.status,
+                    filled_quantity = update.filled_quantity,
                     "Updating order status"
                 );
-                // 使用 client_order_id 跟踪订单状态
-                // 如果没有返回 client_order_id 说明不是我们发起的订单，忽略
-                if let Some(ref client_id) = update.client_order_id {
-                    match update.status {
-                        OrderStatus::Filled
-                        | OrderStatus::Cancelled
-                        | OrderStatus::Rejected { .. } => {
-                            // **权威**终态（交易所说的，或撤单后复查确认已不在挂单列表时
-                            // 合成的）：移除 pending，并记下订单号 —— 此后任何非终态回报
-                            // 都是迟到的陈旧消息，不得据此复活它（见下方重建分支）。
-                            self.order_book.pending_orders.remove(client_id);
-                            self.order_book.remember_terminal(client_id);
-                        }
-                        OrderStatus::Error { .. } => {
-                            // 本地 REST 调用的结论（交易所侧永不上报此状态，见
-                            // `crate::engine::OrderGateway`）：订单**可能仍活在交易所上**，
-                            // 故移除 pending 但**不记**权威终态 —— 随后到达的真实确认应当
-                            // 把它重新纳入跟踪，否则它在交易所上活着、本地却隐形。
-                            self.order_book.pending_orders.remove(client_id);
-                        }
-                        OrderStatus::Pending | OrderStatus::PartiallyFilled => {
-                            // 交易所已确认订单，更新状态并回填 order_id
-                            if let Some(pending) = self.order_book.pending_orders.get_mut(client_id) {
-                                pending.status = update.status.clone();
-                                if pending.order.id.is_empty() {
-                                    pending.order.id = update.order_id.clone();
-                                }
-                            } else if !update.exchange.owns_cli_order_id(client_id) {
-                                // **不是本引擎下的单**（人工经 UI 下单、其他程序、交易所系统单）。
-                                // 接管它会让它进入策略的 pending 集合，从而影响 has_pending_orders
-                                // 等判断 —— 等于让别人的单左右本策略的动作。只记录，不接管。
-                                tracing::info!(
-                                    symbol = %self.symbol,
-                                    exchange = %update.exchange,
-                                    client_order_id = %client_id,
-                                    "收到非本引擎挂单的更新，不纳入本地 pending"
-                                );
-                            } else if self.order_book.recent_terminal.iter().any(|id| id == client_id) {
-                                // 该单已到达权威终态，这条非终态回报是**迟到的陈旧消息**。
-                                //
-                                // 来路是跨投递路径的重排：撤单成功由 `OrderGateway` 在
-                                // spawn 出去的 REST 任务里合成 `Cancelled` 发布，而同一张
-                                // 单的 `PartiallyFilled` 由私有 WS 发布 —— 两条路径之间没有
-                                // 顺序保证，"先合成 Cancelled、后到达部分成交回报"完全可能。
-                                //
-                                // 若照重建，得到的是一张**永不消失**的 pending：终态已经过去
-                                // 不会再来，而超时清理只作用于 `Created` 态。后果是
-                                // `has_pending_orders` 恒真 —— spread_arb 直接以它为门
-                                // （`return vec![]`）且从不撤单，该 symbol 就此冻结到进程重启。
-                                tracing::warn!(
-                                    symbol = %self.symbol,
-                                    exchange = %update.exchange,
-                                    client_order_id = %client_id,
-                                    status = ?update.status,
-                                    "收到已终态订单的迟到非终态回报，忽略（不复活本地 pending）"
-                                );
-                            } else if update.quantity <= 0.0 {
-                                // 本引擎的单、本地无记录，但 update 的数量是无效值 ——
-                                // 数据不足以重建，**宁缺勿假**。真实来路：IBKR 的 sor 推送
-                                // 不含数量（适配层写死 0），若照建就是一张 qty=0 的幽灵挂单：
-                                // has_pending_orders 从此恒真、策略比对 qty 读到 0。缺席的
-                                // 代价（可能重复挂单）有界且可被交易所拒单/风控拦住；假单的
-                                // 代价（symbol 永久冻结）无界。
-                                tracing::warn!(
-                                    symbol = %self.symbol,
-                                    exchange = %update.exchange,
-                                    client_order_id = %client_id,
-                                    quantity = update.quantity,
-                                    "本引擎挂单确认迟到，但更新缺有效数量，不重建本地 pending"
-                                );
-                            } else {
-                                // 本引擎的单，但本地已无记录 —— 正常只有一种来路：下单后迟迟未获
-                                // 确认，被 remove_timed_out_orders 当作丢失清掉，之后确认才姗姗来迟。
-                                // 这时必须重新纳入跟踪，否则它在交易所上活着、在本地却隐形，策略
-                                // 会在它旁边重复挂单。
-                                //
-                                // （启动期交易所已存在的遗留挂单**不走这条路** —— 那些由
-                                // manager 在投产期直接撤掉，见 `cancel_leftover_orders`。）
-                                //
-                                // 权威字段直接取自 update：side/quantity/status。
-                                //
-                                // 价格与 reduce_only 无法从订单更新还原（OrderUpdate 不再带这两个
-                                // 字段 —— 四所里两所是写死的，见其文档），故重建的挂单价填 0、
-                                // reduce_only 填 false。这不影响跟踪判断：`has_pending_side` 看
-                                // side、gamma_scalp 看 side 与 quantity，都不读价格；出向的
-                                // reduce_only 只在策略自造订单上有意义，重建的单不会被再次发出。
-                                // tif 同理按 GTC 占位。
-                                self.order_book.pending_orders.insert(
-                                    client_id.clone(),
-                                    PendingOrder {
-                                        order: Order {
-                                            id: update.order_id.clone(),
-                                            exchange: update.exchange,
-                                            symbol: update.symbol.clone(),
-                                            side: update.side,
-                                            order_type: OrderType::Limit {
-                                                price: 0.0,
-                                                tif: TimeInForce::GTC,
-                                            },
-                                            quantity: update.quantity,
-                                            reduce_only: false,
-                                            client_order_id: client_id.clone(),
-                                        },
-                                        status: update.status.clone(),
-                                        // 重建时刻即本地知晓时刻（超时清理只作用于 Created 态，
-                                        // 而重建进来的必是 Pending/PartiallyFilled，不受影响）
-                                        created_at: local_ts,
-                                    },
-                                );
-                            }
-                        }
-                        OrderStatus::Created => {
-                            // 交易所不应推送 Created（这是本地状态）。若出现说明 codec 误映射，
-                            // 记录后忽略该条更新（不 panic；pending order 保持原样，等后续有效更新）。
-                            tracing::error!(
-                                symbol = %self.symbol,
-                                exchange = %update.exchange,
-                                order_id = %update.order_id,
-                                "交易所推送了 Created 状态（codec 映射异常），忽略此更新"
-                            );
-                        }
-                    }
-                }
+                self.order_book.apply_update(&self.symbol, update, local_ts);
+            }
+            SymbolAccountData::OrderRequest(r) => {
+                self.order_book.apply_request(&self.symbol, r, local_ts);
             }
             SymbolAccountData::Fill(fill) => {
                 // 不相交字段借用：symbol 与 position_book 是两个字段，无需为每条 Fill 克隆
                 self.position_book.apply_fill(&self.symbol, fill, local_ts);
+                self.order_book.apply_fill(&self.symbol, fill);
             }
             SymbolAccountData::FundingFee(_) => {
                 // 资费事件不修改本地 symbol 状态，下游策略自行去重与统计
@@ -626,14 +632,21 @@ impl SymbolState {
         self.order_book.add(order, created_at);
     }
 
-    pub fn remove_timed_out_orders(&mut self, now: Timestamp, timeout_ms: u64) -> usize {
-        self.order_book.remove_timed_out(&self.symbol, now, timeout_ms)
+    /// 策略要撤这张单，见 [`SymbolOrders::mark_cancel_sent`]
+    pub fn mark_cancel_sent(&mut self, client_order_id: &str, now: Timestamp) -> Result<(), &'static str> {
+        self.order_book.mark_cancel_sent(client_order_id, now)
+    }
+
+    /// 见 [`SymbolOrders::check_stuck`]
+    pub fn check_stuck_orders(&self, now: Timestamp) -> Result<(), String> {
+        self.order_book.check_stuck(&self.symbol, now)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Side;
 
     const SYMBOL: &str = "BTC";
 
@@ -748,58 +761,189 @@ mod tests {
         assert_eq!(state.position_book().position_size(EX), 2.0, "Binance 腿不受影响");
     }
 
-    // ===== 外部挂单：只接管本引擎自己的单 =====
+    // ===== 订单跟踪：结算完才移出、与到达顺序无关、不重建 =====
 
-    fn order_update(client_order_id: Option<String>, status: OrderStatus) -> Ev {
-        (SymbolAccountData::OrderUpdate(crate::domain::OrderUpdate {
-            order_id: "ex-1".to_string(),
-            client_order_id,
+    const CID: &str = "cid-1";
+
+    fn tracked_order(qty: f64) -> Order {
+        Order {
+            id: String::new(),
             exchange: EX,
             symbol: SYMBOL.to_string(),
             side: Side::Long,
-            status,
-            quantity: 1.0,
-        }), 1)
-    }
-
-    /// 本引擎的单在本地无记录时要重新纳入跟踪。
-    ///
-    /// 来路：下单后迟迟未获确认、被超时清理，之后确认姗姗来迟。若不重新纳入，它在交易所上
-    /// 活着、在本地却隐形，策略会在旁边重复挂单。
-    #[test]
-    fn own_order_missing_locally_is_re_registered() {
-        let mut state = SymbolState::new(SYMBOL.to_string());
-        let own_id = EX.new_cli_order_id();
-
-        apply(&mut state, &order_update(Some(own_id.clone()), OrderStatus::Pending));
-
-        let tracked: Vec<String> = state
-            .order_book().iter()
-            .map(|p| p.order.client_order_id.clone())
-            .collect();
-        assert_eq!(tracked, vec![own_id]);
-    }
-
-    /// **不接管别人的单**：人工经 UI 下单 / 其他程序 / 交易所系统单。
-    ///
-    /// 接管会让它进入策略的 pending 集合，从而左右 has_pending_orders 等判断 ——
-    /// 等于让别人的挂单决定本策略的动作。
-    #[test]
-    fn foreign_order_is_not_adopted_into_pending() {
-        let mut state = SymbolState::new(SYMBOL.to_string());
-
-        // Binance 网页/App 下单的典型 client_order_id 形态
-        for foreign in ["web_1a2b3c", "android_9f8e", "x-someone-else"] {
-            apply(&mut state, &order_update(
-                Some(foreign.to_string()),
-                OrderStatus::Pending,
-            ));
+            order_type: crate::domain::OrderType::Limit { price: 100.0, tif: crate::domain::TimeInForce::GTC },
+            quantity: qty,
+            reduce_only: false,
+            client_order_id: CID.to_string(),
         }
-        assert!(
-            !state.order_book().has_pending(),
-            "外部挂单被接管进了本地 pending：{:?}",
-            state.order_book().iter().map(|p| &p.order.client_order_id).collect::<Vec<_>>()
-        );
+    }
+
+    /// 登记一张 1.0 的单（t=0）
+    fn with_order() -> SymbolState {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        state.add_pending_order(tracked_order(1.0), 0);
+        state
+    }
+
+    fn update(cid: &str, status: OrderStatus, filled: f64, ts: u64) -> Ev {
+        (
+            SymbolAccountData::OrderUpdate(crate::domain::OrderUpdate {
+                order_id: "ex-1".to_string(),
+                client_order_id: Some(cid.to_string()),
+                exchange: EX,
+                symbol: SYMBOL.to_string(),
+                side: Side::Long,
+                status,
+                quantity: 1.0,
+                filled_quantity: filled,
+            }),
+            ts,
+        )
+    }
+
+    fn own_fill(size: f64, ts: u64) -> Ev {
+        let (mut data, ts) = fill_at(EX, Side::Long, size, ts);
+        if let SymbolAccountData::Fill(f) = &mut data {
+            f.client_order_id = Some(CID.to_string());
+        }
+        (data, ts)
+    }
+
+    fn request(outcome: RequestOutcome, ts: u64) -> Ev {
+        (
+            SymbolAccountData::OrderRequest(OrderRequestResult {
+                exchange: EX,
+                symbol: SYMBOL.to_string(),
+                client_order_id: CID.to_string(),
+                outcome,
+            }),
+            ts,
+        )
+    }
+
+    fn the_order(state: &SymbolState) -> Option<&PendingOrder> {
+        state.order_book().iter().find(|p| p.order.client_order_id == CID)
+    }
+
+    /// **#758 的漏洞**：HL 的终态回报先于成交到达时，单必须留在表里（不再开着），直到成交加满。
+    /// 此前终态一到就移出：策略看到「没挂单、持仓还平」，在同所再挂一张。
+    #[test]
+    fn terminal_before_fills_stays_until_fills_add_up() {
+        let mut state = with_order();
+        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 1));
+        let p = the_order(&state).expect("成交没到齐，还在表里");
+        assert!(!p.is_open());
+
+        apply(&mut state, &own_fill(0.4, 2));
+        assert!(the_order(&state).is_some(), "只到了 0.4");
+        apply(&mut state, &own_fill(0.6, 3));
+        assert!(!state.order_book().has_pending(), "成交加满即移出");
+        assert!((state.position_book().position_size(EX) - 1.0).abs() < 1e-12);
+    }
+
+    /// 反过来：成交先到、终态后到，终态一到即移出；没有成交的撤单也是终态即移出
+    #[test]
+    fn fills_first_or_no_fills_settle_on_terminal() {
+        let mut state = with_order();
+        apply(&mut state, &own_fill(1.0, 1));
+        assert!(the_order(&state).is_some_and(|p| p.is_open()), "没终态前还开着");
+        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 2));
+        assert!(!state.order_book().has_pending());
+
+        let mut state = with_order();
+        apply(&mut state, &update(CID, OrderStatus::Cancelled, 0.0, 1));
+        assert!(!state.order_book().has_pending());
+    }
+
+    /// 部分成交后撤单：累计量以交易所说的为准，不是订单总量；部分成交回报里的累计量也算
+    #[test]
+    fn partial_fill_then_cancel_waits_for_the_reported_amount() {
+        let mut state = with_order();
+        apply(&mut state, &update(CID, OrderStatus::PartiallyFilled, 0.3, 1));
+        apply(&mut state, &update(CID, OrderStatus::Cancelled, 0.0, 2)); // 有的所撤单回报不带累计，取见过的最大
+        assert!(the_order(&state).is_some(), "0.3 的成交还没到");
+        apply(&mut state, &own_fill(0.3, 3));
+        assert!(!state.order_book().has_pending());
+    }
+
+    /// 终态不被改写：下单受理的本地结论晚于交易所的终态到达，不能把它拉回「挂着」
+    #[test]
+    fn placed_after_terminal_does_not_reopen() {
+        let mut state = with_order();
+        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 1));
+        apply(&mut state, &request(RequestOutcome::Placed { order_id: "ex-1".into() }, 2));
+        assert!(the_order(&state).is_some_and(|p| !p.is_open()));
+    }
+
+    /// 下单受理：回填订单号、Created → Pending；被拒：移出；撤单失败：记在单上、单还开着
+    #[test]
+    fn request_results_drive_the_record() {
+        let mut state = with_order();
+        apply(&mut state, &request(RequestOutcome::Placed { order_id: "77".into() }, 1));
+        let p = the_order(&state).unwrap();
+        assert_eq!((p.status.clone(), p.order.id.as_str()), (OrderStatus::Pending, "77"));
+
+        state.mark_cancel_sent(CID, 2).unwrap();
+        assert_eq!(state.mark_cancel_sent(CID, 3), Err("上一次撤单还在等结论"), "撤单在途不重发");
+        apply(&mut state, &request(RequestOutcome::CancelFailed { reason: "busy".into() }, 4));
+        let p = the_order(&state).unwrap();
+        assert!(p.is_open());
+        assert_eq!(p.cancel, CancelState::Failed { at: 4, reason: "busy".into() });
+        assert!(state.mark_cancel_sent(CID, 5).is_ok(), "失败后可以再撤");
+
+        let mut state = with_order();
+        apply(&mut state, &request(RequestOutcome::PlaceRejected { reason: "margin".into() }, 1));
+        assert!(!state.order_book().has_pending());
+    }
+
+    /// 已到终态的单不发撤单（撤不掉，HL 还白耗一次操作额度）；不在表里的也不发
+    #[test]
+    fn no_cancel_for_finished_or_unknown_orders() {
+        let mut state = with_order();
+        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 1));
+        assert_eq!(state.mark_cancel_sent(CID, 2), Err("已到终态"));
+        assert_eq!(state.mark_cancel_sent("other", 2), Err("不在跟踪表里"));
+    }
+
+    /// 不在表里的单的回报不重建记录：本引擎的、别人的、终态的、开着的都一样
+    #[test]
+    fn updates_of_untracked_orders_never_create_records() {
+        let mut state = SymbolState::new(SYMBOL.to_string());
+        let own = EX.new_cli_order_id();
+        for cid in [own.as_str(), "web_1a2b3c", "android_9f8e"] {
+            apply(&mut state, &update(cid, OrderStatus::Pending, 0.0, 1));
+            apply(&mut state, &update(cid, OrderStatus::PartiallyFilled, 0.5, 2));
+        }
+        assert!(!state.order_book().has_pending());
+    }
+
+    /// 三种「等交易所」超过 [`ORDER_STUCK_MS`] 都报错；挂着不动、撤单失败后的单不算在等
+    #[test]
+    fn waiting_on_the_exchange_too_long_is_an_error() {
+        let late = ORDER_STUCK_MS + 1;
+        // 下单请求没有结论
+        let state = with_order();
+        assert!(state.check_stuck_orders(ORDER_STUCK_MS).is_ok());
+        assert!(state.check_stuck_orders(late).is_err());
+
+        // 挂着：多久都不算
+        let mut state = with_order();
+        apply(&mut state, &update(CID, OrderStatus::Pending, 0.0, 1));
+        assert!(state.check_stuck_orders(10 * late).is_ok());
+
+        // 撤单发出后交易所没推终态
+        state.mark_cancel_sent(CID, 100).unwrap();
+        assert!(state.check_stuck_orders(100 + ORDER_STUCK_MS).is_ok());
+        assert!(state.check_stuck_orders(100 + late).is_err());
+        // 撤单失败：不在等交易所，等策略决定
+        apply(&mut state, &request(RequestOutcome::CancelFailed { reason: "x".into() }, 200));
+        assert!(state.check_stuck_orders(10 * late).is_ok());
+
+        // 终态到了、成交没到齐
+        let mut state = with_order();
+        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 1_000));
+        assert!(state.check_stuck_orders(1_000 + ORDER_STUCK_MS).is_ok());
+        assert!(state.check_stuck_orders(1_000 + late).is_err());
     }
 
     /// 没有基线时，第一条 Fill 从 0 起算（策略启动初期确实空仓）
@@ -833,82 +977,4 @@ mod tests {
         assert!((state.position_book().position(EX).expect("position").size + 2.0).abs() < 1e-12);
     }
 
-    /// **Critical 回归防线**：已到达权威终态的订单，不得被迟到的非终态回报复活。
-    ///
-    /// 真实来路是跨投递路径的重排：撤单成功由 `OrderGateway` 在 spawn 出去的 REST 任务里
-    /// 合成 `Cancelled`，而同一张单的 `PartiallyFilled` 由私有 WS 发布 —— 两条路径无顺序
-    /// 保证。若复活，得到的是一张**永不消失**的 pending（终态不会再来，而超时清理只作用于
-    /// `Created` 态），`has_pending_orders` 就此恒真：spread_arb 以它为硬门且从不撤单，
-    /// 该 symbol 冻结到进程重启。
-    #[test]
-    fn stale_non_terminal_never_resurrects_a_finished_order() {
-        let mut state = SymbolState::new(SYMBOL.to_string());
-        let own_id = EX.new_cli_order_id();
-
-        // 下单 → 交易所确认 → 撤单成功（合成 Cancelled，权威终态）
-        state.add_pending_order(
-            Order {
-                id: String::new(),
-                exchange: EX,
-                symbol: SYMBOL.to_string(),
-                side: Side::Long,
-                order_type: OrderType::Limit { price: 100.0, tif: TimeInForce::GTC },
-                quantity: 1.0,
-                reduce_only: false,
-                client_order_id: own_id.clone(),
-            },
-            0,
-        );
-        apply(&mut state, &order_update(Some(own_id.clone()), OrderStatus::Pending));
-        apply(&mut state, &order_update(Some(own_id.clone()), OrderStatus::Cancelled));
-        assert!(!state.order_book().has_pending(), "撤单确认后应无挂单");
-
-        // 迟到的部分成交回报（撤单前那一刻发生的成交，WS 走另一条路径后到）
-        apply(&mut state, &order_update(Some(own_id), OrderStatus::PartiallyFilled));
-        assert!(
-            !state.order_book().has_pending(),
-            "已终态订单被迟到回报复活成永久 pending —— 该 symbol 将冻结到进程重启"
-        );
-    }
-
-    /// 反面：`Error` 是**本地** REST 结论（交易所侧永不上报），订单可能仍活在交易所上 ——
-    /// 随后到达的真实确认必须能把它重新纳入跟踪，否则它在交易所上活着、本地却隐形，
-    /// 策略会在它旁边重复挂单。
-    #[test]
-    fn local_rest_error_still_allows_rebuild_on_late_confirmation() {
-        let mut state = SymbolState::new(SYMBOL.to_string());
-        let own_id = EX.new_cli_order_id();
-
-        apply(&mut state, &order_update(
-            Some(own_id.clone()),
-            OrderStatus::Error { reason: "REST timeout".to_string() },
-        ));
-        // 交易所其实收到了这张单，确认姗姗来迟
-        apply(&mut state, &order_update(Some(own_id), OrderStatus::Pending));
-        assert!(
-            state.order_book().has_pending(),
-            "本地 REST 失败后到达的真实确认必须重新纳入跟踪"
-        );
-    }
-
-    /// **宁缺勿假**：update 缺有效价格/数量（IBKR sor 推送写死 0）时不重建本地 pending。
-    ///
-    /// 照建就是一张 qty=0 的幽灵挂单：has_pending_orders 从此恒真、策略比对数量
-    /// 读到 0 —— symbol 被永久冻结。
-    #[test]
-    fn re_registration_requires_valid_quantity() {
-        let mut state = SymbolState::new(SYMBOL.to_string());
-        let own_id = EX.new_cli_order_id();
-
-        let mut ghost = order_update(Some(own_id), OrderStatus::Pending);
-        if let SymbolAccountData::OrderUpdate(u) = &mut ghost.0 {
-            u.quantity = 0.0;
-        }
-        apply(&mut state, &ghost);
-
-        assert!(
-            !state.order_book().has_pending(),
-            "qty 为 0 的更新被重建成了幽灵挂单"
-        );
-    }
 }

@@ -206,32 +206,30 @@ impl BulkOrderAction {
     }
 }
 
-/// 单笔撤单（按交易所侧的 `oid`）
+/// 按客户端订单号撤单的一项。
 ///
-/// 字段顺序**必须**与 Hyperliquid 的签名约定一致：action 经 msgpack 序列化后参与
-/// [`action_hash`]，字段顺序变了哈希就变，签名会被拒。
+/// 字段顺序**必须**与 Hyperliquid 的签名约定一致（hyperliquid-python-sdk `bulk_cancel_by_cloid`）：
+/// action 经 msgpack 序列化后参与 [`action_hash`]，字段顺序变了哈希就变，签名会被拒。
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CancelWire {
-    /// asset index（与下单时同一套编号，见 `HyperliquidClient::get_asset_index`）
-    pub a: u32,
-    /// order id
-    pub o: u64,
+pub struct CancelByCloidWire {
+    /// asset index（与下单时同一套编号）
+    pub asset: u32,
+    /// `0x` + 32 位小写十六进制
+    pub cloid: String,
 }
 
-/// 批量撤单 action，与 [`BulkOrderAction`] 对位
+/// 按客户端订单号撤单的 action，与 [`BulkOrderAction`] 对位
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BulkCancelAction {
+pub struct CancelByCloidAction {
     #[serde(rename = "type")]
     pub action_type: String,
-    pub cancels: Vec<CancelWire>,
+    pub cancels: Vec<CancelByCloidWire>,
 }
 
-impl BulkCancelAction {
-    pub fn new(cancels: Vec<CancelWire>) -> Self {
+impl CancelByCloidAction {
+    pub fn new(cancels: Vec<CancelByCloidWire>) -> Self {
         Self {
-            action_type: "cancel".to_string(),
+            action_type: "cancelByCloid".to_string(),
             cancels,
         }
     }
@@ -340,5 +338,20 @@ mod tests {
 
         let hash = action_hash(&action, 1234567890000, None).expect("hash should succeed");
         assert_eq!(hash.len(), 32);
+    }
+
+    /// 撤单 action 的签名哈希与签名机（enclave-hyperliquid-signer testdata/vectors.json 的
+    /// cancel_by_cloid，同 python SDK 生成）逐字节一致：字段名或顺序错了，HL 会拒签名
+    #[test]
+    fn cancel_by_cloid_hash_matches_reference_vector() {
+        let action = CancelByCloidAction::new(vec![
+            CancelByCloidWire { asset: 2, cloid: "0x00000000000000000000000000000001".into() },
+            CancelByCloidWire { asset: 0, cloid: "0xdeadbeefdeadbeefdeadbeefdeadbeef".into() },
+        ]);
+        let hash = action_hash(&action, 1762444800123, None).unwrap();
+        assert_eq!(
+            format!("{hash:#x}"),
+            "0xb36246966fb148f8efbc5ebf1da8f9c1c2a01bdd2b510f372794493753b20e37"
+        );
     }
 }

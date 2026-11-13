@@ -533,14 +533,14 @@ impl AccountClient for BinanceClient {
         Exchange::Binance
     }
 
-    async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
+    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError> {
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
 
         let inst = to_binance(symbol, &self.quote);
         let query = self
-            .build_signed_query(&[("symbol", &inst), ("orderId", order_id)])
+            .build_signed_query(&[("symbol", &inst), ("origClientOrderId", client_order_id)])
             .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
 
         let resp = self
@@ -576,6 +576,7 @@ impl AccountClient for BinanceClient {
             side: String,
             status: String,
             orig_qty: String,
+            executed_qty: String,
         }
 
         let inst = to_binance(symbol, &self.quote);
@@ -644,7 +645,7 @@ impl AccountClient for BinanceClient {
                 side,
                 status,
                 quantity: parse_field(&o.orig_qty, "origQty")?,
-                // 快照没有"本次成交量"这一概念
+                filled_quantity: parse_field(&o.executed_qty, "executedQty")?,
             });
         }
 

@@ -95,9 +95,6 @@ pub trait Strategy: Send + Sync {
     /// 范围外的 symbol 与交易所，其行情、私有回报、账户读数都不会送达。
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>>;
 
-    /// 挂单多久没有终态就判超时清理
-    fn order_timeout_ms(&self) -> u64;
-
     /// 唯一的事件入口。行情、私有回报、账户读数、券源汇率、Clock 全部经此到达。
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent>;
 }

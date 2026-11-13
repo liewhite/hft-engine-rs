@@ -89,9 +89,6 @@ impl Strategy for OneShotBuy {
         m.insert(EX, kinds);
         m
     }
-    fn order_timeout_ms(&self) -> u64 {
-        0
-    }
     fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let is_market = matches!(
             event,
@@ -174,7 +171,7 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
     let result = {
         let mut engine = BacktestEngine::new(&source, vec![runner], config, metas())
             .with_observer(move |ev: &IncomeEvent| sink_obs.borrow_mut().push(event_sig(ev)));
-        engine.run()
+        engine.run().expect("回测不该中止")
     };
     let trace = Rc::try_unwrap(sink).unwrap().into_inner();
     (result, trace)
@@ -228,7 +225,7 @@ fn trade_print_matching_fills_resting_limit() {
         ..SimConfig::default()
     };
     let mut engine = BacktestEngine::new(&source, vec![runner], config, metas());
-    let r = engine.run();
+    let r = engine.run().expect("回测不该中止");
     assert_eq!(r.fills, 1);
     assert_eq!(r.market_events, 3);
     let pos = r.positions.iter().find(|p| p.symbol == SYM).unwrap();
@@ -248,9 +245,6 @@ impl Strategy for EmitOnBbo {
         kinds.insert(SubscriptionKind::BBO { symbol: SYM.to_string() });
         m.insert(EX, kinds);
         m
-    }
-    fn order_timeout_ms(&self) -> u64 {
-        0
     }
     fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let IncomeEvent::Market(m) = event else {
@@ -299,7 +293,7 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
                     obs_sink.borrow_mut().push((runner_idx, sig.mid));
                 }
             });
-        engine.run();
+        engine.run().expect("回测不该中止");
     }
     assert_eq!(
         seen_by_strategy.load(std::sync::atomic::Ordering::Relaxed),
@@ -325,9 +319,6 @@ impl Strategy for CustomProbe {
         kinds.insert(SubscriptionKind::BBO { symbol: self.symbol.clone() });
         m.insert(EX, kinds);
         m
-    }
-    fn order_timeout_ms(&self) -> u64 {
-        0
     }
     fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         if let IncomeEvent::Market(m) = event {
@@ -376,7 +367,7 @@ fn inbound_custom_events_route_by_scope() {
             Box::new(SequentialClientOrderIdGen::default()),
         ),
     ];
-    BacktestEngine::new(&source, runners, SimConfig::default(), metas()).run();
+    BacktestEngine::new(&source, runners, SimConfig::default(), metas()).run().expect("回测不该中止");
     assert_eq!(
         *seen_btc.lock().unwrap(),
         vec!["btc", "all"],

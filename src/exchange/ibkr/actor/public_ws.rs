@@ -613,6 +613,7 @@ impl IbkrPublicWs {
                 side,
                 status,
                 quantity: 0.0,
+                filled_quantity: filled_qty,
             };
 
             self.account_bus.publish(AccountEvent {
@@ -994,6 +995,8 @@ fn build_order_update(
         side,
         status: OrderStatus::Filled,
         quantity: size,
+        // 逐笔成交推出的 Filled 只知道这一笔的量（IBKR 的已知简化：部分成交也报 Filled）
+        filled_quantity: size,
     })
 }
 

@@ -222,8 +222,9 @@ pub trait AccountClient: Send + Sync + 'static {
     /// 结果不确定。拿不准的一律报不确定 —— 报错了的代价是停机，报成拒绝的代价是重复下单。
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError>;
 
-    /// 撤单
-    async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError>;
+    /// 按**客户端订单号**撤单（本引擎下单时分配的 `client_order_id`）：下单请求还没结论、
+    /// 还不知道交易所订单号的单也能撤。返回 `Ok` 只表示交易所受理了撤单，终态以订单回报为准。
+    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError>;
 
     /// 查询当前挂单（live + partially_filled）
     async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError>;

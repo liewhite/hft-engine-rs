@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::domain::{now_ms, AccountId, Exchange, Symbol, Timestamp, TradingStats};
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, IncomeEvent, MarketBus,
-    MarketEvent, PositionBaseline, StateManager, SymbolAccountData, SymbolState,
+    MarketEvent, PositionBaseline, RequestOutcome, StateManager, SymbolAccountData, SymbolState,
 };
 use crate::observability::{Gauge, MetricsPushConfig, PromText, Pusher};
 use crate::tasks::{Addr, Gone, Group, Inbox, Scope, Task};
@@ -31,9 +31,6 @@ use tokio::time::MissedTickBehavior;
 
 /// 默认指标报告间隔
 pub const DEFAULT_REPORT_INTERVAL_MS: u64 = 60_000;
-
-/// 观测层不做订单超时清理（挂单的生命周期由策略侧负责，这里只如实反映）
-const NO_ORDER_TIMEOUT: u64 = 0;
 
 /// 资金费收入的统计窗口：过去 24h（交易所的资费轮询器每次也是重发最近 24h，靠结算 ID 去重）
 const FUNDING_FEE_WINDOW_MS: u64 = 24 * 3600 * 1000;
@@ -115,8 +112,11 @@ pub struct MetricsArgs {
 
 /// 从事件流重建的聚合视图（纯状态，不含收件与定时；单测直接构造）
 struct MetricsView {
-    /// 账户 / 持仓 / 挂单视图（复用策略侧同一实现）
+    /// 账户 / 持仓视图（复用策略侧同一实现）。订单跟踪表不用它的：那份只认本进程策略发出的单，
+    /// 观测这里看不到策略发单，见 [`Self::open_orders`]
     state: StateManager,
+    /// 交易所说还开着的本引擎挂单：symbol -> (所, client_order_id)。按订单回报增删（非终态加、终态删）
+    open_orders: HashMap<Symbol, HashSet<(Exchange, String)>>,
     /// 正在跟踪的 symbol（由 [`MetricsHandle::register_symbols`] 注册）
     tracked: HashSet<Symbol>,
     /// 会话起始仓位基线：symbol -> (exchange -> 仓位)
@@ -158,7 +158,8 @@ struct MetricsView {
 impl MetricsView {
     fn new(order_requests: Arc<OrderRequestCounts>) -> Self {
         Self {
-            state: StateManager::new(&[], NO_ORDER_TIMEOUT),
+            state: StateManager::new(&[]),
+            open_orders: HashMap::new(),
             tracked: HashSet::new(),
             baseline: HashMap::new(),
             per_symbol: HashMap::new(),
@@ -202,7 +203,7 @@ impl MetricsView {
                 return;
             }
         }
-        self.state.apply(&IncomeEvent::Market(msg));
+        self.apply_state(IncomeEvent::Market(msg));
     }
 
     /// 账户事件入口：实盘进实盘视图（state/total），模拟账户按账户分账 —— 分道由事件
@@ -249,11 +250,44 @@ impl MetricsView {
                         TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL)
                     })
                     .apply_order_update(update);
+                self.track_open_order(update);
+                return; // 订单回报不进 state（见 state 字段说明）
+            }
+            AccountData::Symbol(SymbolAccountData::OrderRequest(r)) => {
+                if matches!(r.outcome, RequestOutcome::PlaceRejected { .. }) {
+                    self.total.apply_place_rejected();
+                    self.per_symbol
+                        .entry(r.symbol.clone())
+                        .or_insert_with(|| TradingStats::with_recent_capacity(NO_PER_SYMBOL_FILL_DETAIL))
+                        .apply_place_rejected();
+                }
+                return;
             }
             _ => {}
         }
-        // 账户 / 持仓 / 挂单视图
-        self.state.apply(&IncomeEvent::Account(msg));
+        // 账户 / 持仓视图（观测侧没有订单跟踪表，state 里不会有单，不会报单子卡住）
+        self.apply_state(IncomeEvent::Account(msg));
+    }
+
+    /// 喂进 state。观测视图从不登记订单，「有单等交易所太久」的报错不会发生；真出现只记 error
+    fn apply_state(&mut self, event: IncomeEvent) {
+        if let Err(e) = self.state.apply(&event) {
+            tracing::error!(error = %e, "观测视图的订单跟踪报错（不该发生：这里不登记订单）");
+        }
+    }
+
+    /// 按交易所回报维护「还开着的本引擎挂单」
+    fn track_open_order(&mut self, update: &crate::domain::OrderUpdate) {
+        let Some(cid) = update.client_order_id.as_ref().filter(|c| update.exchange.owns_cli_order_id(c)) else {
+            return;
+        };
+        let orders = self.open_orders.entry(update.symbol.clone()).or_default();
+        let key = (update.exchange, cid.clone());
+        if update.status.is_terminal() {
+            orders.remove(&key);
+        } else {
+            orders.insert(key);
+        }
     }
     /// 模拟账户事件的分账逻辑（纯状态转移，供 handler 委托与单测直调）。
     /// **绝不**触碰实盘视图（total / state）—— 串账防线，见 paper_stats 字段说明。
@@ -379,7 +413,7 @@ impl MetricsView {
 
         for (symbol, symbol_state) in self.state.symbol_states() {
             let exposure = exposure_of(symbol_state, self.baseline.get(symbol));
-            let pending = symbol_state.order_book().iter().count();
+            let pending = self.open_orders.get(symbol).map_or(0, |o| o.len());
             pending_orders += pending;
             session_position_value += exposure.session_notional_delta;
             gross_notional += exposure.gross_notional;
@@ -1007,7 +1041,7 @@ mod tests {
                 1,
                 1,
                 AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, equity, notional: 500.0 }),
-            ));
+            )).unwrap();
         }
         let body = metrics.render().into_body();
         let leverage: Vec<&str> = body.lines().filter(|l| l.starts_with("hft_account_leverage")).collect();
@@ -1098,7 +1132,7 @@ mod tests {
                 ask_qty: 1.0,
                 timestamp: 0,
             }),
-        ));
+        )).unwrap();
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
         let exposure = exposure_of(state, metrics.baseline.get(&symbol));
@@ -1130,7 +1164,7 @@ mod tests {
             1,
             1,
             data,
-        ));
+        )).unwrap();
         metrics.state.apply(&IncomeEvent::market(
             0,
             0,
@@ -1143,7 +1177,7 @@ mod tests {
                 ask_qty: 1.0,
                 timestamp: 0,
             }),
-        ));
+        )).unwrap();
 
         let state = metrics.state.symbol_state(&symbol).unwrap();
         let exposure = exposure_of(state, metrics.baseline.get(&symbol));

@@ -397,13 +397,12 @@ impl Manager {
         //    都调它），新增账户类型时它编译失败。
         //
         //    OrderGateway 是**唯一**的实盘下单出口，只交给出向处理器（OutcomeProcessor）：
-        //    in_flight 判据、失败反馈、dry_run 语义对一切下单一致，系统不存在第二个下单出口。
+        //    in_flight 判据、请求结论回报对一切下单一致，系统不存在第二个下单出口。
         let order_gateway = Arc::new(OrderGateway::new(
             accounts.clone(),
             account_bus.clone(),
             // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
             symbol_metas.clone(),
-            /* dry_run */ false,
             // 下单结果不确定时停机：经本节点上报错误，整棵树受控停机
             scope.fail_handle(),
             // 整机一开始停机（任何原因）就不再发新单：此时消费者组还在排空信号，

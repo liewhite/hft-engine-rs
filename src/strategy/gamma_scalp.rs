@@ -15,7 +15,7 @@
 //! **注**：ox-demo 的 MACD 方向性间距偏移 (KlineSeries/MACD overlay) 暂未移植，本实现为**对称对冲**
 //! (买卖间距同为 `base_offset_ratio`)，是 gamma scalp 的最小核心形态。
 
-use crate::domain::{Exchange, Order, OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce};
+use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Side, Symbol, TimeInForce};
 use crate::exchange::{AccountStream, SubscriptionKind};
 use crate::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
@@ -42,8 +42,6 @@ pub struct GammaScalpStrategy {
     /// 最小对冲数量 (币本位)，低于此不挂单避免碎单
     min_hedge_qty: Quantity,
 
-    /// 已发出撤单、尚未确认移除的订单，防止重复撤单
-    cancelling: HashSet<OrderId>,
     /// 最新真实成交价 (greeks 触发对冲时作基准)
     last_price: Option<Price>,
 }
@@ -64,7 +62,6 @@ impl GammaScalpStrategy {
             base_offset_ratio,
             qty_tolerance_ratio: DEFAULT_QTY_TOLERANCE_RATIO,
             min_hedge_qty: DEFAULT_MIN_HEDGE_QTY,
-            cancelling: HashSet::new(),
             last_price: None,
         }
     }
@@ -90,20 +87,13 @@ impl GammaScalpStrategy {
             return Vec::new();
         };
 
-        // 清理已不在簿的撤单标记
-        let live_ids: HashSet<OrderId> = symbol_state
-            .pending_orders()
-            .map(|p| p.order.id.clone())
-            .collect();
-        self.cancelling.retain(|id| live_ids.contains(id));
-
         let net_delta = greeks.delta + symbol_state.position_size(self.exchange);
         let pending = symbol_state.pending_orders().next().cloned();
 
         match self.desired_hedge(ref_price, net_delta) {
             // 带内：撤掉残留的在途对冲单
             None => pending
-                .and_then(|p| self.cancel_confirmed(&p))
+                .map(|p| self.cancel(&p))
                 .into_iter()
                 .collect(),
             // 越带：维护单张对冲单
@@ -126,7 +116,7 @@ impl GammaScalpStrategy {
                     let side_changed = p.order.side != side;
                     let qty_drift = (p.order.quantity - qty).abs() / qty > self.qty_tolerance_ratio;
                     if side_changed || qty_drift {
-                        self.cancel_confirmed(&p).into_iter().collect()
+                        vec![self.cancel(&p)]
                     } else {
                         Vec::new()
                     }
@@ -160,24 +150,18 @@ impl GammaScalpStrategy {
         }
     }
 
-    /// 撤掉已确认挂单 (Created 无 orderId 不能撤，等确认)；防止重复撤单。
-    fn cancel_confirmed(&mut self, pending: &PendingOrder) -> Option<OutcomeEvent> {
-        if pending.status.is_confirmed() && !self.cancelling.contains(&pending.order.id) {
-            self.cancelling.insert(pending.order.id.clone());
-            tracing::debug!(
-                symbol = %self.symbol,
-                order_id = %pending.order.id,
-                side = ?pending.order.side,
-                "gamma_hedge cancel (side flip / qty drift / back-in-band)"
-            );
-            Some(OutcomeEvent::CancelOrder {
-                exchange: self.exchange,
-                symbol: self.symbol.clone(),
-                order_id: pending.order.id.clone(),
-                client_order_id: pending.order.client_order_id.clone(),
-            })
-        } else {
-            None
+    /// 撤掉对冲单。已结束的单、撤单还在途的单由框架丢弃（见 `OutcomeEvent::CancelOrder`），这里不用记
+    fn cancel(&self, pending: &PendingOrder) -> OutcomeEvent {
+        tracing::debug!(
+            symbol = %self.symbol,
+            client_order_id = %pending.order.client_order_id,
+            side = ?pending.order.side,
+            "gamma_hedge cancel (side flip / qty drift / back-in-band)"
+        );
+        OutcomeEvent::CancelOrder {
+            exchange: self.exchange,
+            symbol: self.symbol.clone(),
+            client_order_id: pending.order.client_order_id.clone(),
         }
     }
 }
@@ -198,10 +182,6 @@ impl Strategy for GammaScalpStrategy {
     /// 希腊值来自对冲所的账户读数（见 on_event 里按 exchange 过滤）
     fn account_streams(&self) -> HashMap<Exchange, HashSet<AccountStream>> {
         HashMap::from([(self.exchange, HashSet::from([AccountStream::Greeks]))])
-    }
-
-    fn order_timeout_ms(&self) -> u64 {
-        5000
     }
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {

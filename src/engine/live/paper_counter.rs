@@ -77,7 +77,8 @@ struct ApplyPlace {
 struct ApplyCancel {
     account: AccountId,
     exchange: Exchange,
-    order_id: OrderId,
+    symbol: Symbol,
+    client_order_id: String,
 }
 
 /// 在延迟队列里等到期的消息（见 [`PaperCounter::schedule`]）
@@ -356,15 +357,9 @@ impl PaperCounter {
                     );
                 }
             }
-            OutcomeEvent::CancelOrder {
-                exchange,
-                symbol,
-                order_id,
-                // 柜台的 SimState 以 order_id 为键撮合/撤单，回报里自带 client_order_id
-                client_order_id: _,
-            } => {
+            OutcomeEvent::CancelOrder { exchange, symbol, client_order_id } => {
                 tracing::info!(
-                    %account, %exchange, %symbol, %order_id, delay_ms = delay,
+                    %account, %exchange, %symbol, %client_order_id, delay_ms = delay,
                     "[PAPER] Cancel accepted by local counter"
                 );
                 self.schedule(
@@ -372,7 +367,8 @@ impl PaperCounter {
                     Delayed::Cancel(ApplyCancel {
                         account,
                         exchange,
-                        order_id,
+                        symbol,
+                        client_order_id,
                     }),
                 );
             }
@@ -391,17 +387,10 @@ impl PaperCounter {
                 self.publish_reports(&p.account, reports);
             }
             Delayed::Cancel(c) => {
+                // 不在簿（已成交 / 已撤）时柜台回报撤单失败，与实盘同形
                 let reports = self
                     .state_mut(&c.account, c.exchange)
-                    .on_cancel_arrived(now, &c.order_id);
-                if reports.is_empty() {
-                    tracing::info!(
-                        account = %c.account,
-                        exchange = %c.exchange,
-                        order_id = %c.order_id,
-                        "[PAPER] Cancel had no effect (order already filled or unknown)"
-                    );
-                }
+                    .on_cancel_arrived(now, &c.symbol, &c.client_order_id);
                 self.publish_reports(&c.account, reports);
             }
         }
@@ -627,18 +616,6 @@ mod tests {
                 .iter()
                 .filter_map(|e| match &e.data {
                     AccountData::Symbol(SymbolAccountData::Fill(f)) => Some((f.price, f.size)),
-                    _ => None,
-                })
-                .collect()
-        }
-
-        fn order_ids(&self) -> Vec<String> {
-            self.events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|e| match &e.data {
-                    AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => Some(u.order_id.clone()),
                     _ => None,
                 })
                 .collect()
@@ -934,14 +911,12 @@ mod tests {
         h.bbo(100.0, 100.1).await;
         h.place(Side::Long, 99.0, 0.5).await;
         h.settle(50).await;
-        let order_id = h.order_ids().first().cloned().expect("order id");
 
         h.outcome(AccountOutcome {
             account: account(),
             event: OutcomeEvent::CancelOrder {
                 exchange: EX,
                 symbol: SYM.to_string(),
-                order_id,
                 client_order_id: "c1".to_string(),
             },
         });

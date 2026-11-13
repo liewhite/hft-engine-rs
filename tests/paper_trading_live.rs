@@ -83,9 +83,6 @@ impl Strategy for DipMaker {
         )])
     }
 
-    fn order_timeout_ms(&self) -> u64 {
-        0
-    }
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let IncomeEvent::Market(MarketEvent {

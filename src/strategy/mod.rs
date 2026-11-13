@@ -11,7 +11,7 @@ pub use funding_arb::{
 pub use gamma_scalp::GammaScalpStrategy;
 pub use view::{StrategyView, SymbolView};
 
-use crate::domain::{Exchange, Order, OrderId, Symbol, Timestamp};
+use crate::domain::{Exchange, Order, Symbol, Timestamp};
 use crate::observability::Gauge;
 use crate::exchange::{AccountStream, SubscriptionKind};
 use crate::messaging::{CustomEvent, IncomeEvent};
@@ -27,15 +27,13 @@ pub enum OutcomeEvent {
         /// 信号意图描述，如 "spread_open | spread=0.30% | qty=10"
         comment: String,
     },
-    /// 撤单信号
+    /// 撤单信号（按客户端订单号撤：下单请求还没有结论、没有交易所订单号的单也能撤）。
+    ///
+    /// 框架只对还开着、且没有撤单在途的单发出，其余丢弃（见 `SymbolOrders::mark_cancel_sent`）；撤单失败以
+    /// [`crate::messaging::RequestOutcome::CancelFailed`] 回报，记在单的 `cancel` 上。
     CancelOrder {
         exchange: Exchange,
         symbol: Symbol,
-        /// 交易所订单号：撤单请求发给交易所时用它
-        order_id: OrderId,
-        /// 本地订单号：撤单确认回报用它清除本地 pending
-        /// （[`crate::messaging::SymbolState`] 的 pending 以 client_order_id 为键，
-        /// 若合成回报里没有它，撤掉的单会永远留在本地 pending 里）
         client_order_id: String,
     },
     /// 向外发布自定义事件（见 [`CustomEvent`] 的方向与路由文档）。
@@ -61,9 +59,6 @@ pub trait Strategy: Send + Sync {
     fn account_streams(&self) -> HashMap<Exchange, HashSet<AccountStream>> {
         HashMap::new()
     }
-
-    /// 订单超时时间 (毫秒)
-    fn order_timeout_ms(&self) -> u64;
 
     /// 处理事件，可产出零到多个信号。
     ///

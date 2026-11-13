@@ -352,6 +352,8 @@ pub struct OrderPushData {
     pub sz: String,
     /// 本次成交数量 (张)
     pub fill_sz: String,
+    /// 累计成交数量 (张)
+    pub acc_fill_sz: String,
     /// 本次成交价格
     pub fill_px: String,
     /// **本次成交**的手续费（OKX 文档：last filled fee）。无成交的推送里没有该字段。
@@ -374,9 +376,13 @@ impl OrderPushData {
             f64::from_str(&self.sz).map_err(|_| format!("Failed to parse sz: {}", self.sz))?,
         );
 
+        let acc_fill_sz = meta.qty_to_coin(
+            f64::from_str(&self.acc_fill_sz)
+                .map_err(|_| format!("Failed to parse accFillSz: {}", self.acc_fill_sz))?,
+        );
+
         let side = parse_side(&self.side)?;
 
-        // 注意 status 内嵌的 PartiallyFilled 同样是数量，必须用折算后的值
         let status = map_okx_order_state(&self.state)?;
 
         Ok(OrderUpdate {
@@ -387,6 +393,7 @@ impl OrderPushData {
             side,
             status,
             quantity: sz,
+            filled_quantity: acc_fill_sz,
         })
     }
 

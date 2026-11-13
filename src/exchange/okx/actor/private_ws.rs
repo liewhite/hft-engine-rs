@@ -403,7 +403,7 @@ mod tests {
     fn push(inst_id: &str, state: &str, fill_sz: &str, trade_id: &str) -> String {
         format!(
             r#"{{"arg":{{"channel":"orders","instType":"SWAP"}},"data":[{{"instId":"{inst_id}","ordId":"1",
-            "clOrdId":"x-a","side":"buy","state":"{state}","sz":"5","fillSz":"{fill_sz}",
+            "clOrdId":"x-a","side":"buy","state":"{state}","sz":"5","fillSz":"{fill_sz}","accFillSz":"{fill_sz}",
             "fillPx":"60000","fillFee":"-0.1","tradeId":"{trade_id}"}}]}}"#
         )
     }

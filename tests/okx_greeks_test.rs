@@ -49,10 +49,6 @@ impl Strategy for GreeksPrintStrategy {
         HashMap::from([(Exchange::OKX, HashSet::from([AccountStream::Greeks]))])
     }
 
-    fn order_timeout_ms(&self) -> u64 {
-        30_000
-    }
-
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         if let IncomeEvent::Account(a) = event {
             if let AccountData::Exchange(ExchangeAccountData::Greeks(raw)) = &a.data {

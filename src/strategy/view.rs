@@ -156,7 +156,7 @@ mod tests {
     /// 空状态会让策略以为该 symbol 空仓、无挂单，进而照常下单（品味 1.3）。
     #[test]
     fn symbols_outside_the_registered_set_are_not_visible() {
-        let m = StateManager::new(&[SYM.to_string()], 0);
+        let m = StateManager::new(&[SYM.to_string()]);
         let view = StrategyView::new(&m);
         assert!(view.symbol(&SYM.to_string()).is_some());
         assert!(view.symbol(&"ETH".to_string()).is_none());
@@ -165,7 +165,7 @@ mod tests {
     /// 市场状态默认 `Closed`（安全侧）：读数未到达与休市导向同一个动作，不下单
     #[test]
     fn market_status_defaults_to_closed() {
-        let m = StateManager::new(&[SYM.to_string()], 0);
+        let m = StateManager::new(&[SYM.to_string()]);
         let view = StrategyView::new(&m);
         assert_eq!(view.market_status(Exchange::IBKR), MarketStatus::Closed);
     }

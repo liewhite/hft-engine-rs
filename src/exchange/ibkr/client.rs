@@ -378,8 +378,17 @@ impl AccountClient for IbkrClient {
         Exchange::IBKR
     }
 
-    async fn cancel_order(&self, _symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
-        // IBKR 按 orderId 撤单，与 symbol 无关（orderId 在账户内唯一）
+    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError> {
+        // IBKR 只能按 orderId 撤单：先从挂单列表里按 cOID（响应里叫 order_ref）找到它
+        let order_id = self
+            .fetch_pending_orders(symbol)
+            .await?
+            .into_iter()
+            .find(|o| o.client_order_id.as_deref() == Some(client_order_id))
+            .map(|o| o.order_id)
+            .ok_or_else(|| {
+                ExchangeError::Other(format!("IBKR 挂单列表里没有 cOID={client_order_id} 的单（已终态或未受理）"))
+            })?;
         let url = format!(
             "{}iserver/account/{}/order/{}",
             self.auth.base_url(),
@@ -404,7 +413,7 @@ impl AccountClient for IbkrClient {
         }
 
         // IBKR 会以 200 返回 `{"error": "..."}`，不展开检查就会把失败当成功 ——
-        // 而调用方（启动期/降级撤单）正是靠返回值判断遗留挂单是否已清理。
+        // 而调用方（启动期撤遗留单、策略撤单）正是靠返回值判断撤单是否受理。
         if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
                 return Err(ExchangeError::Other(format!(
@@ -516,7 +525,7 @@ impl AccountClient for IbkrClient {
             // 通配 `_ => continue` 会把没见过的状态一律当成"已终态"丢弃，而
             // `PendingCancel`（撤单已请求未确认）的单**仍活在簿上**：撤单若被拒它会回到
             // Submitted。把它丢掉正好落进消费方"不在列表里 ⇒ 已终态"的推断：启动期判
-            // "遗留单已撤净"放行启动、撤单复查合成 Cancelled 清掉一张可能复活的单的 pending。
+            // "遗留单已撤净"放行启动；按 cOID 撤单时找不到它。
             let order_status = match raw_status {
                 "Submitted" if filled > 0.0 => OrderStatus::PartiallyFilled,
                 // PendingCancel 仍在簿上，按未终结处理
@@ -542,7 +551,7 @@ impl AccountClient for IbkrClient {
                 ))
             })?;
             // 方向认不出**不能跳过**：这份列表的消费方在做「不在列表里 ⇒ 该单已终态」
-            // 的推断（启动期判"遗留单已撤净"、撤单复查合成 Cancelled 清本地 pending），
+            // 的推断（启动期判"遗留单已撤净"、按 cOID 撤单找单），
             // 跳过一条等于谎报该单不存在 —— 与 OKX 挂单快照同一个模式，同样必须整份报错。
             let side = match o.side.as_deref().unwrap_or_default() {
                 "BUY" | "B" => Side::Long,
@@ -561,11 +570,9 @@ impl AccountClient for IbkrClient {
                 symbol: symbol.clone(),
                 side,
                 status: order_status,
-                // 缺失按 0：挂单快照的用途是"这张单还在吗 + 怎么撤",价量不参与
-                // 判定（本地 pending 重建对 price<=0 有专门守卫，见 messaging::state）
-                // IBKR live orders 不含 reduce-only 信息
+                // 缺失按 0：挂单快照的用途是"这张单还在吗 + 怎么撤"，价量不参与判定
                 quantity: order_number(&o.total_size, "totalSize", 0.0)?,
-                // 快照没有"本次成交量"这一概念
+                filled_quantity: filled,
             });
         }
 

@@ -747,16 +747,12 @@ impl AccountClient for HyperliquidClient {
         Exchange::Hyperliquid
     }
 
-    async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError> {
+    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError> {
         let submitter = &self.account()?.submitter;
-
-        // `order_id` 是交易所侧的 oid（见 fetch_pending_orders / private_ws 的映射）
-        let oid: u64 = order_id.parse().map_err(|_| {
-            ExchangeError::ParseError(format!("Hyperliquid order_id 不是合法的 oid: {order_id}"))
-        })?;
         let HlAsset { coin, asset, .. } = self.markets.asset(symbol)?.clone();
+        let cloid = client_order_id.to_string();
 
-        let raw = submitter.cancel(&HlCancelIntent { coin, asset, oid }).await?;
+        let raw = submitter.cancel(&HlCancelIntent { coin, asset, cloid }).await?;
         let response: CancelResponse = serde_json::from_value(raw.clone()).map_err(|e| {
             ExchangeError::ParseError(format!("Failed to parse cancel response: {e} (body: {raw})"))
         })?;
@@ -768,7 +764,7 @@ impl AccountClient for HyperliquidClient {
         }
 
         // 外层 ok 不代表这一笔撤掉了：statuses 里对应位置可能是 {"error": "..."}。
-        // 不展开检查会把"没撤掉"当成撤掉了 —— 而调用方（启动期/降级撤单）正是靠返回值
+        // 不展开检查会把"没撤掉"当成撤掉了 —— 而调用方（启动期撤遗留单、策略撤单）正是靠返回值
         // 判断要不要继续，谎报成功会让遗留挂单被当成已清理。
         let statuses = response
             .response
@@ -780,7 +776,7 @@ impl AccountClient for HyperliquidClient {
             for status in statuses {
                 if let Some(err) = status.get("error").and_then(|e| e.as_str()) {
                     return Err(ExchangeError::Other(format!(
-                        "Hyperliquid cancel oid={oid} failed: {err}"
+                        "Hyperliquid cancel cloid={client_order_id} failed: {err}"
                     )));
                 }
             }
@@ -843,8 +839,8 @@ impl AccountClient for HyperliquidClient {
             // Hyperliquid 是币本位（contract_size = 1），无需折算
             updates.push(crate::domain::OrderUpdate {
                 order_id: o.oid.to_string(),
-                // 挂单列表接口不带 cloid，逐单补一次（每张一次 info 请求）。调用方是启动期撤遗留单
-                // 和撤单失败后的复查，都按币查，N 是该币当前挂单数：maker 策略每所一两张。
+                // 挂单列表接口不带 cloid，逐单补一次（每张一次 info 请求）。调用方只有启动期撤遗留单，
+                // 按币查，N 是该币当前挂单数：maker 策略每所一两张。
                 client_order_id: self.cloid_of(wallet, o.oid).await?,
                 exchange: Exchange::Hyperliquid,
                 symbol: symbol.clone(),
@@ -855,6 +851,7 @@ impl AccountClient for HyperliquidClient {
                     crate::domain::OrderStatus::Pending
                 },
                 quantity: orig_sz,
+                filled_quantity: filled,
             });
         }
 

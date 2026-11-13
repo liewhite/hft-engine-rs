@@ -158,7 +158,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             });
-        engine.run()
+        engine.run().map_err(|e| anyhow::anyhow!("回测中止: {e}"))?
     };
 
     // ==================== P&L 拆解 ====================

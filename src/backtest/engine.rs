@@ -62,7 +62,8 @@ enum Action {
     /// 交易所侧事件到达策略/观察者
     Deliver(IncomeEvent),
     OrderArrive(Order, OrderId),
-    CancelArrive(Exchange, OrderId),
+    /// 按客户端订单号撤单
+    CancelArrive(Exchange, Symbol, String),
     Clock,
 }
 
@@ -123,6 +124,8 @@ pub struct BacktestEngine<'a> {
     first_ts: Timestamp,
     /// 源是否仍有行情待注入 (决定时钟是否续期, 保证终止)
     more_data: bool,
+    /// 某个策略的订单跟踪表报错（见 [`StrategyRunner::on_event`]）：回测就此中止
+    failure: Option<String>,
 }
 
 impl<'a> BacktestEngine<'a> {
@@ -157,6 +160,7 @@ impl<'a> BacktestEngine<'a> {
             market_events: 0,
             first_ts: 0,
             more_data: true,
+            failure: None,
         }
     }
 
@@ -188,15 +192,16 @@ impl<'a> BacktestEngine<'a> {
         }));
     }
 
-    /// 跑完整个数据源，返回汇总结果。
-    pub fn run(&mut self) -> BacktestResult {
+    /// 跑完整个数据源，返回汇总结果。`Err` = 某个策略的订单跟踪表说不清挂单与持仓
+    /// （等价实盘的停机，见 [`StrategyRunner::on_event`]），回测中止。
+    pub fn run(&mut self) -> Result<BacktestResult, String> {
         let mut src = self.source.events().peekable();
         let first = match src.peek() {
             Some(ev) => ev.exchange_ts(),
             None => {
                 tracing::warn!("no market data; empty backtest");
                 let bal = self.config.initial_balance_usdt;
-                return BacktestResult {
+                return Ok(BacktestResult {
                     initial_balance: bal,
                     final_equity: bal,
                     realized_pnl: 0.0,
@@ -205,7 +210,7 @@ impl<'a> BacktestEngine<'a> {
                     positions: Vec::new(),
                     first_ts: 0,
                     last_ts: 0,
-                };
+                });
             }
         };
         self.first_ts = first;
@@ -214,6 +219,9 @@ impl<'a> BacktestEngine<'a> {
         self.schedule(self.now + self.clock_interval_ms, Action::Clock);
 
         while src.peek().is_some() || !self.pq.is_empty() {
+            if let Some(e) = self.failure.take() {
+                return Err(e);
+            }
             self.more_data = src.peek().is_some();
             let src_ts = src.peek().map(|e| e.exchange_ts());
             let pq_ts = self.pq.peek().map(|r| r.0.time);
@@ -233,6 +241,9 @@ impl<'a> BacktestEngine<'a> {
                 (None, Some(_)) => self.run_queued(),
                 (None, None) => break,
             }
+        }
+        if let Some(e) = self.failure.take() {
+            return Err(e);
         }
 
         // 回测结果里的持仓带上本地账本的均价与浮盈（BookSnapshot），并补上所属交易所 ——
@@ -281,7 +292,7 @@ impl<'a> BacktestEngine<'a> {
             final_equity = result.final_equity,
             "backtest done"
         );
-        result
+        Ok(result)
     }
 
     /// 注入一条历史源事件：行情按事件自身的 exchange 路由到对应柜台撮合，行情本身与
@@ -366,13 +377,13 @@ impl<'a> BacktestEngine<'a> {
                     .on_order_arrived(self.now, &order, &id);
                 self.enqueue_replies(replies);
             }
-            Action::CancelArrive(exchange, id) => {
+            Action::CancelArrive(exchange, symbol, client_order_id) => {
                 self.ensure_state(exchange);
                 let replies = self
                     .states
                     .get_mut(&exchange)
                     .expect("ensure_state 刚创建")
-                    .on_cancel_arrived(self.now, &id);
+                    .on_cancel_arrived(self.now, &symbol, &client_order_id);
                 self.enqueue_replies(replies);
             }
             Action::Clock => {
@@ -407,7 +418,14 @@ impl<'a> BacktestEngine<'a> {
             if !self.runners[i].accepts(&ev) {
                 continue;
             }
-            let outcomes = self.runners[i].on_event(&ev);
+            let outcomes = match self.runners[i].on_event(&ev) {
+                Ok(outcomes) => outcomes,
+                Err(e) => {
+                    tracing::error!(runner = i, error = %e, "策略订单跟踪表报错，回测中止");
+                    self.failure.get_or_insert(e);
+                    return;
+                }
+            };
             for outcome in outcomes {
                 // 全部信号先过 outcome 观察者（与实盘 Outcome 总线"订阅者看到一切"同构）
                 for j in 0..self.outcome_observers.len() {
@@ -421,10 +439,10 @@ impl<'a> BacktestEngine<'a> {
                             self.schedule(self.now + order_delay, Action::OrderArrive(o, id));
                         }
                     }
-                    OutcomeEvent::CancelOrder { exchange, order_id, .. } => {
+                    OutcomeEvent::CancelOrder { exchange, symbol, client_order_id } => {
                         self.schedule(
                             self.now + order_delay,
-                            Action::CancelArrive(exchange, order_id),
+                            Action::CancelArrive(exchange, symbol, client_order_id),
                         );
                     }
                     // Emit 已随上面的 outcome 观察者送达（等价实盘 Outcome 总线的外部

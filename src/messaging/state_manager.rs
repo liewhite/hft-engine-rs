@@ -115,13 +115,11 @@ pub struct StateManager {
     ///
     /// 公共行情，不属于 [`AccountView`]；又是账户级而非 per-symbol，故留在本层。
     market_statuses: HashMap<Exchange, MarketStatus>,
-    /// 订单超时时间 (毫秒)
-    order_timeout_ms: u64,
 }
 
 impl StateManager {
     /// 创建状态管理器
-    pub fn new(symbols: &[Symbol], order_timeout_ms: u64) -> Self {
+    pub fn new(symbols: &[Symbol]) -> Self {
         let mut states = HashMap::new();
         for symbol in symbols {
             states.insert(symbol.clone(), SymbolState::new(symbol.clone()));
@@ -131,7 +129,6 @@ impl StateManager {
             states,
             account: AccountView::default(),
             market_statuses: HashMap::new(),
-            order_timeout_ms,
         }
     }
 
@@ -187,6 +184,14 @@ impl StateManager {
         state.add_pending_order(order, created_at);
     }
 
+    /// 策略要撤这张单：记下「撤单已发」，`Ok` 表示该发（见 [`crate::messaging::SymbolOrders::mark_cancel_sent`]）
+    pub fn mark_cancel_sent(&mut self, symbol: &Symbol, client_order_id: &str, now: Timestamp) -> Result<(), &'static str> {
+        match self.states.get_mut(symbol) {
+            Some(state) => state.mark_cancel_sent(client_order_id, now),
+            None => Err("symbol 未注册"),
+        }
+    }
+
     // ==================== 状态查询 ====================
 
     /// 获取指定 symbol 的状态
@@ -219,11 +224,12 @@ impl StateManager {
 
     // ==================== 事件处理 ====================
 
-    /// 处理事件，更新状态。
+    /// 处理事件，更新状态。`Err` = 有单「等交易所」太久（见 [`crate::messaging::ORDER_STUCK_MS`]），
+    /// 跟踪表已说不清挂单与持仓，调用方应停机。
     ///
     /// 两层 match 都不带默认分支：新增一种事件时这里编译失败，必须明确写出它的处理
     /// （哪怕是空处理），不会悄悄落进某个兜底分支。
-    pub fn apply(&mut self, event: &IncomeEvent) {
+    pub fn apply(&mut self, event: &IncomeEvent) -> Result<(), String> {
         match event {
             IncomeEvent::Market(m) => match &m.data {
                 // 全局事件: ExchangeStatus
@@ -234,11 +240,10 @@ impl StateManager {
                 MarketData::BorrowFee(_) | MarketData::ExchangeRate(_) => {}
                 // 自定义事件：框架只运送不理解，策略在 on_event 里自行消费并自持。
                 MarketData::Custom(_) => {}
-                // 全局事件: Clock (检查订单超时)
+                // 全局事件: Clock (检查有没有单等交易所太久)
                 MarketData::Clock => {
-                    let now = m.local_ts;
-                    for state in self.states.values_mut() {
-                        state.remove_timed_out_orders(now, self.order_timeout_ms);
+                    for state in self.states.values() {
+                        state.check_stuck_orders(m.local_ts)?;
                     }
                 }
                 // 币级行情: 委托对应 SymbolState（各变体直接取自己的 symbol）
@@ -259,6 +264,7 @@ impl StateManager {
                 AccountData::Exchange(data) => self.apply_exchange_account(data),
             },
         }
+        Ok(())
     }
 
     fn route_market(&mut self, symbol: &Symbol, data: &MarketData) {
@@ -372,7 +378,7 @@ mod tests {
     /// 基线只写一次：第二次 seed 静默跳过（同一 symbol 再次投产时的正常形态），存量不被覆写
     #[test]
     fn seed_is_idempotent_and_never_overwrites() {
-        let mut manager = StateManager::new(&[SYM.to_string()], 0);
+        let mut manager = StateManager::new(&[SYM.to_string()]);
         manager.seed_positions(&[baseline(2.0, 10)]);
         manager.seed_positions(&[baseline(99.0, 20)]);
 
@@ -384,14 +390,14 @@ mod tests {
     /// 之后送达的照常累加。这条规则对 executor / 对账镜像 / 观测镜像同一份。
     #[test]
     fn fills_covered_by_snapshot_are_dropped_after_seed() {
-        let mut manager = StateManager::new(&[SYM.to_string()], 0);
+        let mut manager = StateManager::new(&[SYM.to_string()]);
         // 快照请求时刻 t=10，读到存量 2.0
         manager.seed_positions(&[baseline(2.0, 10)]);
 
         // t=5 送达的 Fill（成交已含在快照里）迟到进入 —— 丢弃
-        manager.apply(&fill_at(1.0, 5));
+        manager.apply(&fill_at(1.0, 5)).unwrap();
         // t=15 送达的 Fill 是快照之后的新成交 —— 累加
-        manager.apply(&fill_at(1.0, 15));
+        manager.apply(&fill_at(1.0, 15)).unwrap();
 
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
         assert_eq!(state.position_book().position_size(EX), 3.0, "应为 2.0(快照) + 1.0(新成交)");
@@ -400,8 +406,8 @@ mod tests {
     /// 未 seed 的所从 0 起算（模拟账户、未配置凭证的所）：Fill 直接累加，不受过滤影响
     #[test]
     fn unseeded_exchange_accumulates_from_zero() {
-        let mut manager = StateManager::new(&[SYM.to_string()], 0);
-        manager.apply(&fill_at(1.5, 5));
+        let mut manager = StateManager::new(&[SYM.to_string()]);
+        manager.apply(&fill_at(1.5, 5)).unwrap();
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
         assert_eq!(state.position_book().position_size(EX), 1.5);
     }
@@ -409,7 +415,7 @@ mod tests {
     /// 未注册 symbol 的基线被跳过（不 panic、不隐式建状态）
     #[test]
     fn baseline_for_unregistered_symbol_is_skipped() {
-        let mut manager = StateManager::new(&[], 0);
+        let mut manager = StateManager::new(&[]);
         manager.seed_positions(&[baseline(2.0, 10)]);
         assert!(manager.symbol_state(&SYM.to_string()).is_none());
     }

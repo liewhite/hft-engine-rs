@@ -370,7 +370,9 @@ impl Provisioner {
             "[STARTUP] 发现本引擎遗留的挂单，全部撤掉（不接管）"
         );
         for order in &ours {
-            if let Err(e) = client.cancel_order(symbol, &order.order_id).await {
+            // own_pending_orders 只留本引擎的单，必有 client_order_id
+            let cid = order.client_order_id.as_deref().expect("本引擎的挂单带 client_order_id");
+            if let Err(e) = client.cancel_order(symbol, cid).await {
                 tracing::warn!(
                     %exchange, %symbol, order_id = %order.order_id, error = %e,
                     "撤单请求失败，由复查裁定是否真的还在"
@@ -768,9 +770,9 @@ mod leftover_order_tests {
         async fn cancel_order(
             &self,
             _symbol: &Symbol,
-            order_id: &OrderId,
+            client_order_id: &str,
         ) -> Result<(), ExchangeError> {
-            self.cancelled.lock().unwrap().push(order_id.clone());
+            self.cancelled.lock().unwrap().push(client_order_id.to_string());
             Ok(())
         }
         async fn place_order(&self, _order: ExchangeOrder) -> Result<OrderId, crate::domain::PlaceError> {
@@ -793,6 +795,7 @@ mod leftover_order_tests {
             side: Side::Long,
             status: OrderStatus::Pending,
             quantity: 1.0,
+            filled_quantity: 0.0,
         }
     }
 
@@ -835,7 +838,7 @@ mod leftover_order_tests {
 
         assert_eq!(
             *cancelled.lock().unwrap(),
-            vec!["ex-own".to_string()],
+            vec![own.clone()],
             "只应撤掉本引擎的那一张"
         );
     }
@@ -1072,9 +1075,9 @@ mod subscription_validation_tests {
                 )
             };
 
-            let mut swallowed = StateManager::new(&[SYM.to_string()], 0);
+            let mut swallowed = StateManager::new(&[SYM.to_string()]);
             swallowed.seed_positions(&baselines);
-            swallowed.apply(&fill_at(0));
+            swallowed.apply(&fill_at(0)).unwrap();
             assert_eq!(
                 swallowed
                     .symbol_state(&SYM.to_string())
@@ -1084,9 +1087,9 @@ mod subscription_validation_tests {
                 "local_ts == 0 的 Fill 会被 ts=0 的基线判成「已含在快照里」而丢弃"
             );
 
-            let mut kept = StateManager::new(&[SYM.to_string()], 0);
+            let mut kept = StateManager::new(&[SYM.to_string()]);
             kept.seed_positions(&baselines);
-            kept.apply(&fill_at(1));
+            kept.apply(&fill_at(1)).unwrap();
             assert_eq!(
                 kept.symbol_state(&SYM.to_string())
                     .expect("state")

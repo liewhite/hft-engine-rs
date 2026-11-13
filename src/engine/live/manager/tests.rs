@@ -178,9 +178,6 @@ impl Strategy for NeedsStreams {
     fn account_streams(&self) -> HashMap<Exchange, HashSet<crate::exchange::AccountStream>> {
         self.0.clone()
     }
-    fn order_timeout_ms(&self) -> u64 {
-        1000
-    }
     fn on_event(
         &mut self,
         _: &crate::messaging::IncomeEvent,

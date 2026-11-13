@@ -1485,7 +1485,7 @@ mod task_tests {
         async fn cancel_order(
             &self,
             _symbol: &Symbol,
-            _order_id: &OrderId,
+            _client_order_id: &str,
         ) -> Result<(), ExchangeError> {
             unreachable!("账本不撤单")
         }
@@ -1765,9 +1765,6 @@ mod task_tests {
                     symbol: SYM.to_string(),
                 }]),
             )])
-        }
-        fn order_timeout_ms(&self) -> u64 {
-            0
         }
         fn on_event(
             &mut self,

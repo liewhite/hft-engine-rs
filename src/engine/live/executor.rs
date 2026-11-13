@@ -176,10 +176,10 @@ impl Executor {
         Ok((child, ExecutorHandle { id, addr }))
     }
 
-    fn handle(&mut self, msg: ExecutorMsg) {
+    fn handle(&mut self, msg: ExecutorMsg) -> anyhow::Result<()> {
         // 回执发送失败 = 提问方已不再等（超时放弃或自身已退出），没有人需要这份答复
         match msg {
-            ExecutorMsg::Event(event) => self.handle_event(event),
+            ExecutorMsg::Event(event) => self.handle_event(event)?,
             ExecutorMsg::GetSeededPositions(reply) => {
                 let positions = self
                     .runner
@@ -191,12 +191,15 @@ impl Executor {
                 let _ = reply.send(positions);
             }
         }
+        Ok(())
     }
 
-    /// 处理 IncomeEvent，委托 runner 运行策略并发布返回的信号
-    fn handle_event(&mut self, event: IncomeEvent) {
+    /// 处理 IncomeEvent，委托 runner 运行策略并发布返回的信号。
+    /// `Err` = 订单跟踪表说不清挂单与持仓（见 [`StrategyRunner::on_event`]），本实例带错退出、整机停机。
+    fn handle_event(&mut self, event: IncomeEvent) -> anyhow::Result<()> {
         self.check_pipeline_lag(&event);
-        for signal in self.runner.on_event(&event) {
+        let signals = self.runner.on_event(&event).map_err(|e| anyhow::anyhow!(e))?;
+        for signal in signals {
             // 发布不会失败；订阅者（出口）停止收件时由总线记 ERROR「事件丢失」
             self.outcome_bus.publish(AccountOutcome {
                 account: self.account.clone(),
@@ -209,6 +212,7 @@ impl Executor {
             let _ = self.metrics.strategy_gauges(self.id, self.account.clone(), gauges);
             let _ = self.metrics.event_lag(self.account.clone(), std::mem::take(&mut self.max_lag_ms));
         }
+        Ok(())
     }
 
     /// 管线滞后自查：策略此刻拿到的这条事件，距适配层收到它已经过了多久。
@@ -263,7 +267,7 @@ impl Task for Executor {
     async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
         // 停止时收件箱先关、再把已收到的事件处理完才返回 None：撤下前已转来的事件不会丢
         while let Some(msg) = self.inbox.recv().await {
-            self.handle(msg);
+            self.handle(msg)?;
         }
         // 撤下的实例不再有读数：交一份空的，让它的旧读数从指标里消失
         let _ = self.metrics.strategy_gauges(self.id, self.account.clone(), Vec::new());
