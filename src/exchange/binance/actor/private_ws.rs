@@ -2,7 +2,7 @@
 //!
 //! 职责:
 //! - 获取 ListenKey 并建立私有 WebSocket 连接
-//! - 子任务：读循环、ListenKey 定时续期（失败即整支停）
+//! - 子任务：读循环、ListenKey 定时续期（连续续不上约 50 分钟才整支停）
 //! - 直接解析消息并发布到账户总线
 
 use super::listen_key::ListenKeyRefresher;
@@ -204,6 +204,10 @@ fn parse_private_message(
 
             Ok(events)
         }
+        "listenKeyExpired" => {
+            // ListenKey 过期：交易所随后不再推私有回报（连接可能还开着），按断线处理、整支停
+            Err(WsError::AuthFailed(format!("ListenKey 已过期，私有回报从此中断: {raw}")))
+        }
         "TRADE_LITE" => {
             // 忽略 TRADE_LITE 消息（轻量成交通知，已在 ORDER_TRADE_UPDATE 中处理）
             Ok(Vec::new())
@@ -297,5 +301,13 @@ mod tests {
         assert!(parse_private_message(&raw, "USDT", 0).is_err());
         let stp = order_push("BTCUSDT", "0").replace(r#""X":"FILLED""#, r#""X":"EXPIRED_IN_MATCH""#);
         assert_eq!(kinds(&stp), ["order:BTC"]);
+    }
+
+    /// ListenKey 过期即出错（私有回报从此中断），不当未知事件忽略
+    #[test]
+    fn listen_key_expired_is_an_error() {
+        let raw = r#"{"e":"listenKeyExpired","E":1736996475556,"listenKey":"k"}"#;
+        let err = parse_private_message(raw, "USDT", 0).unwrap_err();
+        assert!(err.to_string().contains("ListenKey 已过期"), "{err}");
     }
 }
