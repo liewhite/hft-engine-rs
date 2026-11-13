@@ -295,39 +295,6 @@ impl HyperliquidClient {
         Ok(resp.order.and_then(|envelope| envelope.order.cloid))
     }
 
-    /// 拉取账户资费结算明细（`POST /info` `type: "userFunding"`）。
-    ///
-    /// 与 Binance 的 `GET /fapi/v1/income?incomeType=FUNDING_FEE` 对位：两边都由各自的
-    /// polling actor 定时调用，产出统一的 [`FundingFee`]，下游凭 `tran_id` 去重。
-    ///
-    /// # 与官方文档不一致之处（以实测为准）
-    ///
-    /// 文档示例里每条记录带一个非零 `hash`，看起来像天然的去重键。实测 **funding 类型的
-    /// 记录 `hash` 恒为全零**（同一账户 363 条记录只有这一个取值），拿它当 ID 会让所有
-    /// 资费塌缩成同一条。故 `tran_id` 由 `(time, coin)` 派生，见 [`funding_tran_id`]。
-    ///
-    /// # 符号约定
-    ///
-    /// HL 的 `usdc` 已经是站在账户角度的带符号金额（实测：空头遇正费率为正 = 收到，
-    /// 空头遇负费率为负 = 支付），与 [`FundingFee`] 的约定一致，不做翻转。
-    pub async fn fetch_funding_fees(
-        &self,
-        start_ms: Timestamp,
-        end_ms: Timestamp,
-    ) -> Result<Vec<FundingFee>, ExchangeError> {
-        let user = &self.account()?.credentials.wallet_address;
-        let entries: Vec<UserFundingEntry> = self
-            .post_info(serde_json::json!({
-                "type": "userFunding",
-                "user": user,
-                "startTime": start_ms,
-                "endTime": end_ms,
-            }))
-            .await?;
-
-        parse_user_funding(entries, &self.markets, &self.quote)
-    }
-
 }
 
 /// POST /info（构造期还没有 `Self`，故抽成自由函数）
@@ -717,6 +684,50 @@ impl ExchangeClient for HyperliquidClient {
             .into_iter()
             .filter(|m| symbol_set.contains(&m.symbol))
             .collect())
+    }
+}
+
+#[async_trait]
+impl crate::exchange::FundingFeeSource for HyperliquidClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::Hyperliquid
+    }
+
+    /// 拉取账户资费结算明细（`POST /info` `type: "userFunding"`）。
+    ///
+    /// 由通用的 `FundingFeePoller`（`crate::exchange::funding_fee_polling`）定时调用，
+    /// 下游凭 `tran_id` 去重。
+    ///
+    /// 为什么走 REST 而不是 WS `userFundings` 订阅：去重需要稳定的 ID，WS 推送不带任何 ID，
+    /// 且重连时会重推整份 snapshot；REST 这条同样不带可用 ID，但至少能由 `(time, coin)`
+    /// 稳定派生，且拉取窗口可控。
+    ///
+    /// # 与官方文档不一致之处（以实测为准）
+    ///
+    /// 文档示例里每条记录带一个非零 `hash`，看起来像天然的去重键。实测 **funding 类型的
+    /// 记录 `hash` 恒为全零**（同一账户 363 条记录只有这一个取值），拿它当 ID 会让所有
+    /// 资费塌缩成同一条。故 `tran_id` 由 `(time, coin)` 派生，见 [`funding_tran_id`]。
+    ///
+    /// # 符号约定
+    ///
+    /// HL 的 `usdc` 已经是站在账户角度的带符号金额（实测：空头遇正费率为正 = 收到，
+    /// 空头遇负费率为负 = 支付），与 [`FundingFee`] 的约定一致，不做翻转。
+    async fn fetch_funding_fees(
+        &self,
+        start_ms: Timestamp,
+        end_ms: Timestamp,
+    ) -> Result<Vec<FundingFee>, ExchangeError> {
+        let user = &self.account()?.credentials.wallet_address;
+        let entries: Vec<UserFundingEntry> = self
+            .post_info(serde_json::json!({
+                "type": "userFunding",
+                "user": user,
+                "startTime": start_ms,
+                "endTime": end_ms,
+            }))
+            .await?;
+
+        parse_user_funding(entries, &self.markets, &self.quote)
     }
 }
 

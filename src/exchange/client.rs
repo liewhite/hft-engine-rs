@@ -278,6 +278,22 @@ pub trait SettledFundingSource: Send + Sync + 'static {
     ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError>;
 }
 
+/// **本账户**资金费收付流水的拉取（需要凭证；与 [`SettledFundingSource`] 的公共费率不同）。
+/// 由通用的 `FundingFeePoller` 定时调用并发布到账户总线，所别只在各所的实现里；
+/// 加一所只实现本 trait、在该所节点里起一个轮询器。
+#[async_trait]
+pub trait FundingFeeSource: Send + Sync + 'static {
+    fn exchange(&self) -> Exchange;
+
+    /// `[start_ms, end_ms]` 区间内本账户的资金费结算明细。每条的 `tran_id` 在该所内稳定唯一，
+    /// 调用方据此去重（同一笔可能在相邻两次拉取里都出现）。
+    async fn fetch_funding_fees(
+        &self,
+        start_ms: crate::domain::Timestamp,
+        end_ms: crate::domain::Timestamp,
+    ) -> Result<Vec<crate::domain::FundingFee>, ExchangeError>;
+}
+
 // ============================================================================
 // 交易所节点的命令与句柄
 // ============================================================================

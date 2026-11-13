@@ -5,6 +5,7 @@ pub mod ibkr;
 pub mod okx;
 pub mod crypto_status;
 pub(crate) mod equity_polling;
+pub(crate) mod funding_fee_polling;
 pub mod staleness;
 pub mod ws_loop;
 
@@ -15,5 +16,5 @@ mod trades_conformance;
 pub use crypto_status::CryptoStatus;
 pub use client::{
     AccountClient, ExchangeAccess, ExchangeClient, ExchangeCmd, ExchangeHandle, ExchangeOrder,
-    SettledFundingSource, SubscriptionKind,
+    FundingFeeSource, SettledFundingSource, SubscriptionKind,
 };

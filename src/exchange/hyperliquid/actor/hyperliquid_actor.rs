@@ -13,14 +13,14 @@
 //! ├── HyperliquidPublicWs
 //! ├── HyperliquidPrivateWs（需要凭证）
 //! ├── EquityPoller（需要凭证）
-//! ├── HyperliquidFundingFeePoller（需要凭证）
+//! ├── FundingFeePoller（需要凭证）
 //! └── CryptoStatus
 
-use super::funding_fee_polling::HyperliquidFundingFeePoller;
 use super::private_ws::HyperliquidPrivateWs;
 use super::public_ws::HyperliquidPublicWs;
 use crate::exchange::client::{ExchangeCmd, ExchangeHandle};
 use crate::exchange::equity_polling::EquityPoller;
+use crate::exchange::funding_fee_polling::FundingFeePoller;
 use crate::exchange::hyperliquid::HyperliquidClient;
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
@@ -92,7 +92,7 @@ impl HyperliquidNode {
                 // 2. 账户轮询（净值、资费结算）：与私有 WS 一样按凭证门控
                 if has_private_ws {
                     EquityPoller::spawn(&children, client.clone(), args.account_bus.clone(), EQUITY_POLL_INTERVAL_MS)?;
-                    HyperliquidFundingFeePoller::spawn(
+                    FundingFeePoller::spawn(
                         &children,
                         client,
                         args.account_bus.clone(),
