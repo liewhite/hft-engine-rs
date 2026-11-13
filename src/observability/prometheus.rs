@@ -163,7 +163,7 @@ impl Task for Pusher {
     async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
         // 被要求停止后 recv 先交完箱里剩下的快照，再返回 None
         while let Some(body) = self.inbox.recv().await {
-            match self.client.put(&self.endpoint).body(body).send().await {
+            match crate::net::send_unmetered(self.client.put(&self.endpoint).body(body)).await {
                 Ok(resp) if !resp.status().is_success() => {
                     tracing::warn!(status = %resp.status(), endpoint = %self.endpoint, "pushgateway 拒绝了本次推送");
                 }

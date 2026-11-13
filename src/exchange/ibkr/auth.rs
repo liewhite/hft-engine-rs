@@ -3,14 +3,38 @@
 //! OAuth 和 Gateway 两种模式共享同一套业务逻辑（REST + WS），
 //! 仅在认证方式、URL、TLS 配置上有差异。
 
+use crate::domain::PlaceError;
+use crate::exchange::ibkr::{request_costs, LIMITER};
+use crate::exchange::rate_limit::Admitted;
+
+/// 查询：先按地址取限频额度（没有就排队），再签名（签名带时间戳，等久了会过期）
+pub(crate) async fn query_request(
+    auth: &dyn IbkrAuth,
+    http: &reqwest::Client,
+    method: &str,
+    url: &str,
+) -> anyhow::Result<(reqwest::RequestBuilder, Admitted)> {
+    let admitted = LIMITER.query(&request_costs(method, url)).await?;
+    Ok((auth.authed_request(http, method, url)?, admitted))
+}
+
+/// 交易动作（下单、撤单）：先取限频额度（没有就拒绝），再签名
+pub(crate) fn action_request(
+    auth: &dyn IbkrAuth,
+    http: &reqwest::Client,
+    method: &str,
+    url: &str,
+) -> Result<(reqwest::RequestBuilder, Admitted), PlaceError> {
+    let admitted = LIMITER.action(&request_costs(method, url))?;
+    let req = auth.authed_request(http, method, url).map_err(PlaceError::unsent)?;
+    Ok((req, admitted))
+}
+
 /// 调用 POST /tickle，返回 session_id
 pub async fn tickle(auth: &dyn IbkrAuth, http: &reqwest::Client) -> anyhow::Result<String> {
     let tickle_url = format!("{}tickle", auth.base_url());
-    let resp = auth
-        .authed_request(http, "POST", &tickle_url)?
-        .header("Content-Length", "0")
-        .send()
-        .await?;
+    let (req, admitted) = query_request(auth, http, "POST", &tickle_url).await?;
+    let resp = crate::net::send(req.header("Content-Length", "0"), admitted).await?;
     if !resp.status().is_success() {
         return Err(anyhow::anyhow!("Tickle failed: {}", resp.status()));
     }

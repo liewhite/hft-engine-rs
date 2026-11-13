@@ -230,11 +230,15 @@ async fn create_listen_key(
         listen_key: String,
     }
 
-    let resp = client
-        .post(format!("{}/fapi/v1/listenKey", rest_base_url))
-        .header("X-MBX-APIKEY", api_key)
-        .send()
+    let admitted = crate::exchange::binance::LIMITER
+        .query(&[crate::exchange::binance::IP_WEIGHT.cost(1)])
         .await
+        .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+    let resp = crate::net::send(
+        client.post(format!("{}/fapi/v1/listenKey", rest_base_url)).header("X-MBX-APIKEY", api_key),
+        admitted,
+    )
+    .await
         .map_err(|e| WsError::AuthFailed(e.to_string()))?;
 
     if !resp.status().is_success() {

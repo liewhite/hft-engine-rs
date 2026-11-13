@@ -38,6 +38,7 @@ struct BboTicker {
 }
 
 /// 获取 BBO (REST API)
+#[allow(clippy::disallowed_methods)] // 联网手测的行情辅助查询，偶发一次，不经实盘限频闸门
 async fn fetch_bbo(symbol: &Symbol) -> Result<(Decimal, Decimal), Box<dyn std::error::Error>> {
     let client = hft_engine_rs::net::http(std::time::Duration::from_secs(10)).build()?;
     let binance_symbol = format!("{}{}", symbol, TEST_QUOTE);

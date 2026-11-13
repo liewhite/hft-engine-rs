@@ -33,7 +33,6 @@ use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, SettledFundi
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use hft_engine_rs::tasks::Periodic;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,66 +113,51 @@ async fn run() -> anyhow::Result<()> {
             })
             .collect();
         let gap = Duration::from_secs(config.funding_poll_secs) / requests.len().max(1) as u32;
-        // 第一轮（含重启后）按 WARMUP_GAP 快速拉齐，之后才按 gap 摊开：否则重启后要等一整轮
-        // （默认几分钟）才拿齐各币各所的数据，这段时间策略只平不开
-        let beat = gap.min(WARMUP_GAP);
         tracing::info!(requests = requests.len(), gap_ms = gap.as_millis() as u64, "资金费轮询器启动");
-        let poller = FundingPoller {
-            warmup_left: requests.len(),
-            // 第一轮之后每隔几拍拉一项：按拍数算，不拿墙钟比（节拍与记时差零点几毫秒就会多等一拍）
-            every_beats: gap.as_millis().div_ceil(beat.as_millis().max(1)).max(1) as u32,
-            beats_since_fetch: 0,
-            requests,
-            next: 0,
-            failures: HashMap::new(),
-            manager: manager.clone(),
-        };
-        manager.observers().spawn_periodic("FundingPoller", beat, poller)?;
+        let mut poller = FundingPoller { requests, next: 0, failures: HashMap::new(), manager: manager.clone() };
+        manager.observers().spawn_fn("FundingPoller", move |scope| async move {
+            // 第一轮（含重启后）背靠背拉齐，之后每 gap 拉一项：否则重启后要等一整轮（默认几分钟）
+            // 才拿齐各币各所的数据，这段时间策略只平不开。第一轮多快由各所适配层的限流决定，这里不管。
+            let mut warmup_left = poller.requests.len();
+            loop {
+                let wait = if warmup_left > 0 { Duration::ZERO } else { gap };
+                tokio::select! {
+                    // 停止优先；拉取本身只读，停机时中途放弃无害
+                    biased;
+                    _ = scope.stopping() => return Ok(()),
+                    _ = async { tokio::time::sleep(wait).await; poller.fetch_next().await } => {}
+                }
+                if warmup_left > 0 {
+                    warmup_left -= 1;
+                    if warmup_left == 0 {
+                        tracing::info!("资金费第一轮已拉完，之后按常规间隔轮询");
+                    }
+                }
+            }
+        })?;
         Ok(())
     })
     .await
 }
 
-/// 第一轮拉取的单项间隔。限速余量：每秒一项时 HL info 约 20×60=1200 权重/分钟封顶（实际只有
-/// 三分之一的项打 HL），币安 fundingRate 60 次/分钟（限 100），OKX 每 2 秒 2 次（限 10）
-const WARMUP_GAP: Duration = Duration::from_secs(1);
-
-/// 资金费轮询器：第一轮每 [`WARMUP_GAP`] 拉一项尽快拉齐，之后每个单项间隔（= 一整轮
-/// `funding_poll_secs` / 项数）拉一项（一个币在一个所过去
-/// 24h 的已结算费率），整窗作为自定义事件投递给对应策略；请求均匀摊在一轮里（HL info 按 IP
-/// 每分钟 1200 权重，fundingHistory 一次约 20；币安 fundingRate 500 次 / 5 分钟；OKX 10 次 / 2 秒）。
-/// 一拍只拉一项；请求慢（断网时每项要等到超时）时错过的拍不补跑，恢复后不连发。
+/// 资金费轮询器：第一轮背靠背拉齐，之后每个单项间隔（= 一整轮 `funding_poll_secs` / 项数）拉一项
+/// （一个币在一个所过去 24h 的已结算费率），整窗作为自定义事件投递给对应策略。请求均匀摊在一轮里；
+/// 各所的限频由适配层的限流器管，这里不按各所限额算间隔。
+/// 一次只拉一项；请求慢（断网时每项要等到超时）时下一项顺延，恢复后不连发补拍。
 /// 偶发失败记 warn（网络会间歇掉线，下一轮就补上）；同一项连续失败 3 轮记 error —— 此时策略侧
 /// 数据会过期变"未知"，该币不开仓、只平两所数据都在的仓位对。
 struct FundingPoller {
     /// 每个 (币, 该币上市的所) 一项，轮流拉
     requests: Vec<(Symbol, Arc<dyn SettledFundingSource>)>,
     next: usize,
-    /// 第一轮还剩几项没拉（每拍拉一项）
-    warmup_left: usize,
-    /// 第一轮之后每隔几拍拉一项
-    every_beats: u32,
-    beats_since_fetch: u32,
     failures: HashMap<(Symbol, Exchange), u32>,
     manager: ManagerHandle,
 }
 
-impl Periodic for FundingPoller {
-    async fn tick(&mut self) -> anyhow::Result<()> {
-        // 节拍按第一轮的快间隔走：第一轮每拍拉一项，之后每 every_beats 拍拉一项
-        if self.warmup_left > 0 {
-            self.warmup_left -= 1;
-            if self.warmup_left == 0 {
-                tracing::info!("资金费第一轮已拉完，之后按常规间隔轮询");
-            }
-        } else {
-            self.beats_since_fetch += 1;
-            if self.beats_since_fetch < self.every_beats {
-                return Ok(());
-            }
-            self.beats_since_fetch = 0;
-        }
-        let Some((symbol, source)) = self.requests.get(self.next).cloned() else { return Ok(()) };
+impl FundingPoller {
+    /// 拉下一项并投递
+    async fn fetch_next(&mut self) {
+        let Some((symbol, source)) = self.requests.get(self.next).cloned() else { return };
         self.next = (self.next + 1) % self.requests.len();
         let ex = source.exchange();
         let start = now_ms().saturating_sub(FUNDING_WINDOW_MS);
@@ -199,6 +183,5 @@ impl Periodic for FundingPoller {
                 }
             }
         }
-        Ok(())
     }
 }

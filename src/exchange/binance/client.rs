@@ -6,7 +6,7 @@ use crate::domain::{
     SettledFunding, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
-use crate::exchange::binance::REST_BASE_URL;
+use crate::exchange::binance::{FUNDING_RATE, IP_WEIGHT, LIMITER, ORDERS_10S, ORDERS_1M, REST_BASE_URL};
 use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
 use crate::domain::{Decimal, PriceStep};
 use async_trait::async_trait;
@@ -160,10 +160,9 @@ impl BinanceClient {
         }
 
         let url = format!("{}/fapi/v1/ticker/24hr", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
+        // 不带 symbol 取全部：权重 40
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(40)]).await?;
+        let resp = crate::net::send(self.client.get(&url), admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
         let status = resp.status();
@@ -260,10 +259,8 @@ impl BinanceClient {
 
     /// 获取所有交易对信息
     async fn get_all_exchange_info(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        let resp = self
-            .client
-            .get(format!("{}/fapi/v1/exchangeInfo", self.base_url))
-            .send()
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(1)]).await?;
+        let resp = crate::net::send(self.client.get(format!("{}/fapi/v1/exchangeInfo", self.base_url)), admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
@@ -298,16 +295,18 @@ impl BinanceClient {
             position_side: String,
         }
 
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(5)]).await?;
         let query = self
             .build_signed_query(&[])
             .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
 
-        let resp = self
-            .client
-            .get(format!("{}/fapi/v2/positionRisk?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
+        let resp = crate::net::send(
+            self.client
+                .get(format!("{}/fapi/v2/positionRisk?{}", self.base_url, query))
+                .header("X-MBX-APIKEY", api_key),
+            admitted,
+        )
+        .await
             .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
@@ -375,16 +374,18 @@ impl BinanceClient {
             notional: String,
         }
 
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(5)]).await?;
         let query = self
             .build_signed_query(&[])
             .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
 
-        let resp = self
-            .client
-            .get(format!("{}/fapi/v3/account?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
+        let resp = crate::net::send(
+            self.client
+                .get(format!("{}/fapi/v3/account?{}", self.base_url, query))
+                .header("X-MBX-APIKEY", api_key),
+            admitted,
+        )
+        .await
             .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
@@ -472,6 +473,7 @@ impl crate::exchange::FundingFeeSource for BinanceClient {
 
         let start_str = start_ms.to_string();
         let end_str = end_ms.to_string();
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(30)]).await?;
         let query = self
             .build_signed_query(&[
                 ("incomeType", "FUNDING_FEE"),
@@ -481,12 +483,13 @@ impl crate::exchange::FundingFeeSource for BinanceClient {
             ])
             .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
 
-        let resp = self
-            .client
-            .get(format!("{}/fapi/v1/income?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
+        let resp = crate::net::send(
+            self.client
+                .get(format!("{}/fapi/v1/income?{}", self.base_url, query))
+                .header("X-MBX-APIKEY", api_key),
+            admitted,
+        )
+        .await
             .map_err(Self::map_reqwest_error)?;
 
         if !resp.status().is_success() {
@@ -538,17 +541,19 @@ impl AccountClient for BinanceClient {
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
 
+        let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
         let inst = to_binance(symbol, &self.quote);
         let query = self
             .build_signed_query(&[("symbol", &inst), ("origClientOrderId", client_order_id)])
             .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
 
-        let resp = self
-            .client
-            .delete(format!("{}/fapi/v1/order?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
+        let resp = crate::net::send(
+            self.client
+                .delete(format!("{}/fapi/v1/order?{}", self.base_url, query))
+                .header("X-MBX-APIKEY", api_key),
+            admitted,
+        )
+        .await
             .map_err(Self::map_reqwest_error)?;
 
         let status = resp.status();
@@ -579,17 +584,20 @@ impl AccountClient for BinanceClient {
             executed_qty: String,
         }
 
+        // 带 symbol：权重 1
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(1)]).await?;
         let inst = to_binance(symbol, &self.quote);
         let query = self
             .build_signed_query(&[("symbol", &inst)])
             .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
 
-        let resp = self
-            .client
-            .get(format!("{}/fapi/v1/openOrders?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
+        let resp = crate::net::send(
+            self.client
+                .get(format!("{}/fapi/v1/openOrders?{}", self.base_url, query))
+                .header("X-MBX-APIKEY", api_key),
+            admitted,
+        )
+        .await
             .map_err(Self::map_reqwest_error)?;
 
         let status = resp.status();
@@ -687,16 +695,19 @@ impl AccountClient for BinanceClient {
             params.push(("newClientOrderId", &order.client_order_id));
         }
 
+        // 下单不占 IP 权重，占账户下单数；签名放在取额度之后
+        let admitted = LIMITER.action(&[ORDERS_10S.cost(1), ORDERS_1M.cost(1)])?;
         let query = self
             .build_signed_query(&params)
             .ok_or_else(|| PlaceError::unsent("Failed to sign request"))?;
 
-        let resp = self
-            .client
-            .post(format!("{}/fapi/v1/order?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
+        let resp = crate::net::send(
+            self.client
+                .post(format!("{}/fapi/v1/order?{}", self.base_url, query))
+                .header("X-MBX-APIKEY", api_key),
+            admitted,
+        )
+        .await
             .map_err(|e| place_send_error(Exchange::Binance, e))?;
         let status = resp.status().as_u16();
         let text = resp
@@ -837,8 +848,7 @@ impl crate::exchange::SettledFundingSource for BinanceClient {
     /// 拉取某交易对自 `start_ms` 起**已结算**的公共资金费率（`GET /fapi/v1/fundingRate`，
     /// 无需凭证），按结算时间升序。
     ///
-    /// 限频：该接口与 fundingInfo 共用 500 次 / 5 分钟 / IP，调用方按需拉取（结算才变，
-    /// 每小时一轮足够），别按行情频率轮询。单次最多 1000 条，24h 窗口最多 24 条（1h 周期）。
+    /// 限频由本所闸门管（[`FUNDING_RATE`]）。单次最多 1000 条，24h 窗口最多 24 条（1h 周期）。
     async fn fetch_settled_funding(
         &self,
         symbol: &Symbol,
@@ -850,7 +860,8 @@ impl crate::exchange::SettledFundingSource for BinanceClient {
             to_binance(symbol, &self.quote),
             start_ms
         );
-        let resp = self.client.get(&url).send().await.map_err(Self::map_reqwest_error)?;
+        let admitted = LIMITER.query(&[FUNDING_RATE.cost(1), IP_WEIGHT.cost(1)]).await?;
+        let resp = crate::net::send(self.client.get(&url), admitted).await.map_err(Self::map_reqwest_error)?;
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         if !status.is_success() {

@@ -25,6 +25,7 @@ use super::signing::{
 };
 use crate::domain::{now_ms, Decimal, Exchange, ExchangeError, PlaceError};
 use crate::exchange::client::place_send_error;
+use crate::exchange::rate_limit::Admitted;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -80,10 +81,12 @@ pub(crate) struct HlCancelIntent {
 /// 知道请求走到了哪一步（签名前失败、连接没建立、签名机拒签、已签名但提交超时……），所以
 /// 在这里定。拿到回复之后的解读（statuses 逐单判错）在 client。撤单不分这两类（撤单失败只回报
 /// 给策略，单在不在以交易所随后的订单回报为准），按普通错误返回。
+///
+/// 两种通道最终都从本机 IP 提交到 HL，调用方先取限频额度（`admitted`）。
 #[async_trait]
 pub(crate) trait HlSubmitter: Send + Sync {
-    async fn place(&self, order: &HlOrderIntent) -> Result<Value, PlaceError>;
-    async fn cancel(&self, cancel: &HlCancelIntent) -> Result<Value, ExchangeError>;
+    async fn place(&self, order: &HlOrderIntent, admitted: Admitted) -> Result<Value, PlaceError>;
+    async fn cancel(&self, cancel: &HlCancelIntent, admitted: Admitted) -> Result<Value, ExchangeError>;
 }
 
 /// 价格 / 数量 → HL 规范小数字符串，与 hyperliquid-python-sdk 的 `float_to_wire` 同口径：
@@ -125,7 +128,7 @@ impl LocalKeySubmitter {
         Ok(Self { http, base_url, signer, is_mainnet })
     }
 
-    async fn sign_and_post<A: serde::Serialize>(&self, action: &A) -> Result<Value, PlaceError> {
+    async fn sign_and_post<A: serde::Serialize>(&self, action: &A, admitted: Admitted) -> Result<Value, PlaceError> {
         let nonce = next_nonce(now_ms());
         let connection_id = action_hash(action, nonce, None)
             .map_err(|e| PlaceError::unsent(format!("Action hash failed: {e}")))?;
@@ -139,13 +142,13 @@ impl LocalKeySubmitter {
             signature: signature.to_api_format(),
             vault_address: None,
         };
-        post_json(&self.http, &format!("{}/exchange", self.base_url), &request).await
+        post_json(&self.http, &format!("{}/exchange", self.base_url), &request, admitted).await
     }
 }
 
 #[async_trait]
 impl HlSubmitter for LocalKeySubmitter {
-    async fn place(&self, o: &HlOrderIntent) -> Result<Value, PlaceError> {
+    async fn place(&self, o: &HlOrderIntent, admitted: Admitted) -> Result<Value, PlaceError> {
         let action = BulkOrderAction::new(vec![OrderWire {
             asset: o.asset,
             is_buy: o.is_buy,
@@ -155,12 +158,12 @@ impl HlSubmitter for LocalKeySubmitter {
             order_type: WireOrderType::Limit(LimitOrder { tif: o.tif.as_str().to_string() }),
             cloid: o.cloid.clone(),
         }]);
-        self.sign_and_post(&action).await
+        self.sign_and_post(&action, admitted).await
     }
 
-    async fn cancel(&self, c: &HlCancelIntent) -> Result<Value, ExchangeError> {
+    async fn cancel(&self, c: &HlCancelIntent, admitted: Admitted) -> Result<Value, ExchangeError> {
         let action = CancelByCloidAction::new(vec![CancelByCloidWire { asset: c.asset, cloid: c.cloid.clone() }]);
-        self.sign_and_post(&action).await.map_err(cancel_error)
+        self.sign_and_post(&action, admitted).await.map_err(cancel_error)
     }
 }
 
@@ -190,11 +193,8 @@ fn cancel_error(e: PlaceError) -> ExchangeError {
 }
 
 /// POST JSON 到 HL `/exchange`，HTTP 层的失败按 [`classify_hl_http`] 归类。
-async fn post_json<B: serde::Serialize>(http: &Client, url: &str, body: &B) -> Result<Value, PlaceError> {
-    let resp = http
-        .post(url)
-        .json(body)
-        .send()
+async fn post_json<B: serde::Serialize>(http: &Client, url: &str, body: &B, admitted: Admitted) -> Result<Value, PlaceError> {
+    let resp = crate::net::send(http.post(url).json(body), admitted)
         .await
         .map_err(|e| place_send_error(Exchange::Hyperliquid, e))?;
     let status = resp.status().as_u16();
@@ -235,12 +235,8 @@ impl EnclaveSubmitter {
         Self { http, url: url.trim_end_matches('/').to_string() }
     }
 
-    async fn exchange(&self, intent: Value) -> Result<Value, PlaceError> {
-        let resp = self
-            .http
-            .post(format!("{}/exchange", self.url))
-            .json(&json!({ "intent": intent }))
-            .send()
+    async fn exchange(&self, intent: Value, admitted: Admitted) -> Result<Value, PlaceError> {
+        let resp = crate::net::send(self.http.post(format!("{}/exchange", self.url)).json(&json!({ "intent": intent })), admitted)
             .await
             // 连不上 hostd（is_connect）= 请求没送到，确定没提交；其余可能已提交
             .map_err(|e| place_send_error(Exchange::Hyperliquid, e))?;
@@ -280,7 +276,7 @@ fn classify_signer_reply(status: u16, body: Value) -> Result<Value, PlaceError> 
 
 #[async_trait]
 impl HlSubmitter for EnclaveSubmitter {
-    async fn place(&self, o: &HlOrderIntent) -> Result<Value, PlaceError> {
+    async fn place(&self, o: &HlOrderIntent, admitted: Admitted) -> Result<Value, PlaceError> {
         let mut order = json!({
             "coin": o.coin,
             "isBuy": o.is_buy,
@@ -292,11 +288,11 @@ impl HlSubmitter for EnclaveSubmitter {
         if let Some(cloid) = &o.cloid {
             order["cloid"] = json!(cloid);
         }
-        self.exchange(json!({"type": "order", "grouping": "na", "orders": [order]})).await
+        self.exchange(json!({"type": "order", "grouping": "na", "orders": [order]}), admitted).await
     }
 
-    async fn cancel(&self, c: &HlCancelIntent) -> Result<Value, ExchangeError> {
-        self.exchange(json!({"type": "cancelByCloid", "cancels": [{"coin": c.coin, "cloid": c.cloid}]}))
+    async fn cancel(&self, c: &HlCancelIntent, admitted: Admitted) -> Result<Value, ExchangeError> {
+        self.exchange(json!({"type": "cancelByCloid", "cancels": [{"coin": c.coin, "cloid": c.cloid}]}), admitted)
             .await
             .map_err(cancel_error)
     }

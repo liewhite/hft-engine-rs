@@ -5,7 +5,8 @@ use crate::domain::{
     TimeInForce,
 };
 use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
-use crate::exchange::ibkr::auth::IbkrAuth;
+use crate::exchange::ibkr::auth::{action_request, query_request, IbkrAuth};
+use crate::exchange::rate_limit::Admitted;
 use crate::exchange::ibkr::symbol::resolve_conids;
 use crate::exchange::ibkr::wire;
 use crate::exchange::ibkr::IbkrCredentials;
@@ -47,10 +48,10 @@ impl IbkrClient {
 
         // 2. 初始化交易会话 (POST /iserver/auth/ssodh/init)
         let init_url = format!("{}iserver/auth/ssodh/init", base_url);
-        let resp = auth.authed_request(&http, "POST", &init_url)
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
-            .json(&serde_json::json!({"publish": true, "compete": true}))
-            .send()
+        let (req, admitted) = query_request(&*auth, &http, "POST", &init_url)
+            .await
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+        let resp = crate::net::send(req.json(&serde_json::json!({"publish": true, "compete": true})), admitted)
             .await
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
 
@@ -58,9 +59,10 @@ impl IbkrClient {
 
         // 3. 获取 account_id (GET /portfolio/accounts)
         let accounts_url = format!("{}portfolio/accounts", base_url);
-        let resp = auth.authed_request(&http, "GET", &accounts_url)
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
-            .send()
+        let (req, admitted) = query_request(&*auth, &http, "GET", &accounts_url)
+            .await
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+        let resp = crate::net::send(req, admitted)
             .await
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
 
@@ -82,10 +84,10 @@ impl IbkrClient {
 
         // 4. Switch account (POST /iserver/account)
         let switch_url = format!("{}iserver/account", base_url);
-        let resp = auth.authed_request(&http, "POST", &switch_url)
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
-            .json(&serde_json::json!({"acctId": account_id}))
-            .send()
+        let (req, admitted) = query_request(&*auth, &http, "POST", &switch_url)
+            .await
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+        let resp = crate::net::send(req.json(&serde_json::json!({"acctId": account_id})), admitted)
             .await
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
 
@@ -98,10 +100,10 @@ impl IbkrClient {
 
         // 5. 禁用下单确认 (POST /iserver/questions/suppress)
         let suppress_url = format!("{}iserver/questions/suppress", base_url);
-        match auth.authed_request(&http, "POST", &suppress_url)
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
-            .json(&serde_json::json!({"messageIds": SUPPRESS_MESSAGE_IDS}))
-            .send()
+        let (req, admitted) = query_request(&*auth, &http, "POST", &suppress_url)
+            .await
+            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+        match crate::net::send(req.json(&serde_json::json!({"messageIds": SUPPRESS_MESSAGE_IDS})), admitted)
             .await
         {
             Ok(r) if !r.status().is_success() => {
@@ -161,7 +163,8 @@ impl IbkrClient {
 
         // 先预热 portfolio accounts 缓存
         let recv_url = format!("{}portfolio/accounts", base_url);
-        if let Err(e) = self.authed_request("GET", &recv_url)?.send().await {
+        let (req, admitted) = self.request("GET", &recv_url).await?;
+        if let Err(e) = crate::net::send(req, admitted).await {
             tracing::warn!(error = %e, "IBKR portfolio/accounts prefetch failed");
         }
 
@@ -172,9 +175,8 @@ impl IbkrClient {
             base_url, self.account_id
         );
 
-        let resp = self
-            .authed_request("GET", &url)?
-            .send()
+        let (req, admitted) = self.request("GET", &url).await?;
+        let resp = crate::net::send(req, admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
@@ -255,9 +257,8 @@ impl IbkrClient {
             self.auth.base_url()
         );
 
-        let resp = self
-            .authed_request("GET", &url)?
-            .send()
+        let (req, admitted) = self.request("GET", &url).await?;
+        let resp = crate::net::send(req, admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
@@ -324,13 +325,14 @@ impl IbkrClient {
     }
 
     /// 构建带认证 header 的请求
-    fn authed_request(
+    /// 查询请求：取限频额度（没有就排队）后签名，见 [`query_request`]
+    async fn request(
         &self,
         method: &str,
         url: &str,
-    ) -> Result<reqwest::RequestBuilder, ExchangeError> {
-        self.auth
-            .authed_request(&self.http, method, url)
+    ) -> Result<(reqwest::RequestBuilder, Admitted), ExchangeError> {
+        query_request(&*self.auth, &self.http, method, url)
+            .await
             .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))
     }
 
@@ -396,9 +398,9 @@ impl AccountClient for IbkrClient {
             order_id
         );
 
-        let resp = self
-            .authed_request("DELETE", &url)?
-            .send()
+        let (req, admitted) = action_request(&*self.auth, &self.http, "DELETE", &url)
+            .map_err(|e| ExchangeError::Other(format!("IBKR cancel: {e}")))?;
+        let resp = crate::net::send(req, admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
@@ -489,9 +491,8 @@ impl AccountClient for IbkrClient {
         }
 
         let url = format!("{}iserver/account/orders", self.auth.base_url());
-        let resp = self
-            .authed_request("GET", &url)?
-            .send()
+        let (req, admitted) = self.request("GET", &url).await?;
+        let resp = crate::net::send(req, admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
@@ -633,11 +634,8 @@ impl AccountClient for IbkrClient {
 
         let body = serde_json::json!({ "orders": [order_body] });
 
-        let resp = self
-            .authed_request("POST", &url)
-            .map_err(PlaceError::unsent)?
-            .json(&body)
-            .send()
+        let (req, admitted) = action_request(&*self.auth, &self.http, "POST", &url)?;
+        let resp = crate::net::send(req.json(&body), admitted)
             .await
             .map_err(|e| place_send_error(Exchange::IBKR, e))?;
 
@@ -659,10 +657,8 @@ impl AccountClient for IbkrClient {
 
         // 先 receive brokerage accounts (预热缓存)
         let recv_url = format!("{}portfolio/accounts", base_url);
-        if let Err(e) = self
-            .authed_request("GET", &recv_url)?
-            .send()
-            .await
+        let (req, admitted) = self.request("GET", &recv_url).await?;
+        if let Err(e) = crate::net::send(req, admitted).await
         {
             tracing::warn!(error = %e, "IBKR portfolio/accounts prefetch failed");
         }
@@ -673,9 +669,8 @@ impl AccountClient for IbkrClient {
             base_url, self.account_id
         );
 
-        let resp = self
-            .authed_request("GET", &summary_url)?
-            .send()
+        let (req, admitted) = self.request("GET", &summary_url).await?;
+        let resp = crate::net::send(req, admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
@@ -758,9 +753,8 @@ impl IbkrClient {
         );
 
         for attempt in 0..3u8 {
-            let resp = self
-                .authed_request("GET", &url)?
-                .send()
+            let (req, admitted) = self.request("GET", &url).await?;
+            let resp = crate::net::send(req, admitted)
                 .await
                 .map_err(Self::map_reqwest_error)?;
 
@@ -827,9 +821,8 @@ impl IbkrClient {
         let url = snapshot_url(self.auth.base_url(), conid, fields);
 
         for attempt in 0..3u8 {
-            let resp = self
-                .authed_request("GET", &url)?
-                .send()
+            let (req, admitted) = self.request("GET", &url).await?;
+            let resp = crate::net::send(req, admitted)
                 .await
                 .map_err(Self::map_reqwest_error)?;
             let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
@@ -873,8 +866,8 @@ impl IbkrClient {
         fields: &[&str],
     ) -> Result<(), ExchangeError> {
         let url = snapshot_url(self.auth.base_url(), conid, fields);
-        self.authed_request("GET", &url)?
-            .send()
+        let (req, admitted) = self.request("GET", &url).await?;
+        crate::net::send(req, admitted)
             .await
             .map_err(Self::map_reqwest_error)?
             .error_for_status()
@@ -901,9 +894,8 @@ impl IbkrClient {
         );
 
         for attempt in 0..3u8 {
-            let resp = self
-                .authed_request("GET", &url)?
-                .send()
+            let (req, admitted) = self.request("GET", &url).await?;
+            let resp = crate::net::send(req, admitted)
                 .await
                 .map_err(Self::map_reqwest_error)?;
             let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
@@ -956,11 +948,11 @@ impl IbkrClient {
                             reply_id
                         );
 
-                        let resp = self
-                            .authed_request("POST", &reply_url)
-                            .map_err(PlaceError::indeterminate)?
-                            .json(&serde_json::json!({"confirmed": true}))
-                            .send()
+                        // 确认是已提交订单的后续步骤，不能因没额度半途放弃：按查询排队
+                        let (req, admitted) = query_request(&*self.auth, &self.http, "POST", &reply_url)
+                            .await
+                            .map_err(PlaceError::indeterminate)?;
+                        let resp = crate::net::send(req.json(&serde_json::json!({"confirmed": true})), admitted)
                             .await
                             .map_err(PlaceError::indeterminate)?;
 
@@ -981,9 +973,8 @@ impl IbkrClient {
     /// 查询当天 live orders (原始 JSON)
     pub async fn fetch_live_orders(&self) -> Result<serde_json::Value, ExchangeError> {
         let url = format!("{}iserver/account/orders", self.auth.base_url());
-        let resp = self
-            .authed_request("GET", &url)?
-            .send()
+        let (req, admitted) = self.request("GET", &url).await?;
+        let resp = crate::net::send(req, admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
         resp.json().await.map_err(Self::map_reqwest_error)
@@ -996,9 +987,9 @@ impl IbkrClient {
             self.auth.base_url(),
             self.account_id
         );
-        match self.authed_request("POST", &url) {
-            Ok(req) => {
-                if let Err(e) = req.send().await {
+        match self.request("POST", &url).await {
+            Ok((req, admitted)) => {
+                if let Err(e) = crate::net::send(req, admitted).await {
                     tracing::warn!(error = %e, "IBKR invalidate positions cache failed");
                 }
             }

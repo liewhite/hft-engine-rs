@@ -103,8 +103,8 @@ pub struct FundingArbStrategy {
 /// 某所连续被拒单时的退避：第一次拒后等 `hedge_retry_ms` 再挂新的 maker，之后每连续拒一次等待
 /// 翻倍，封顶 [`MAX_REJECT_BACKOFF_MS`]；该所有一张单被交易所接下（挂上或成交）就清零。
 ///
-/// 不退避时，被拒的单离开挂单列表后下一个盘口事件就重挂：持续性拒单（保证金不足、币安
-/// -2027 杠杆档位、限频）会按 REST 往返的速度刷单，招来币安 418 封 IP、耗光 HL 每日操作额度。
+/// 不退避时，被拒的单离开挂单列表后下一个盘口事件就重挂：持续性拒单（保证金不足、
+/// 杠杆档位、本地或交易所限频）会按 REST 往返的速度刷单，白耗下单次数。
 /// post-only 会吃单被拒这类偶发拒单只等一个间隔，对资费套利无关紧要，故不按拒单原因区分。
 /// 口径是该所本策略的任何单：市价补腿被拒也会让该所的 maker 退避，补腿成交也会清零；
 /// 但退避只拦新挂 maker，不拦补腿（补腿另有 `hedge_retry_ms` 的重试间隔）。同一张单的拒单若
@@ -361,7 +361,7 @@ impl FundingArbStrategy {
         let pos = |ex: Exchange| positions.iter().find(|(e, _)| *e == ex).map_or(Quantity::ZERO, |(_, p)| *p);
         for (ex, delta) in [(pair.sell, -qty), (pair.buy, qty)] {
             // 超限和「定不出量」同一处理：不新挂，已挂的按价格容差留着。持仓卡在上限边上时闸门随盘口
-            // 小跳来回翻，超限就撤会挂了即撤、白耗 HL 操作额度（#769）。已挂的单是在放行时按成交后不超限
+            // 小跳来回翻，超限就撤会挂了即撤、白耗下单撤单次数（#769）。已挂的单是在放行时按成交后不超限
             // 定的量，留着成交只会因之后的价格、净值波动略超一点
             if !self.leverage_allows(view, ex, pos(ex), delta, bbos[&ex].mid_price()) {
                 return self.pair_quotes(pair, bbos, Quantity::ZERO, px, false);

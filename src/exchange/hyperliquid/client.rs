@@ -17,7 +17,8 @@ use crate::exchange::hyperliquid::transport::{
     decimal_to_wire, EnclaveSubmitter, HlCancelIntent, HlOrderIntent, HlSubmitter, HlTif,
     LocalKeySubmitter,
 };
-use crate::exchange::hyperliquid::{HyperliquidCredentials, HyperliquidSigning, REST_BASE_URL};
+use crate::exchange::hyperliquid::{HyperliquidCredentials, HyperliquidSigning, IP_WEIGHT, LIMITER, REST_BASE_URL};
+use crate::exchange::rate_limit::Admitted;
 use crate::domain::{Decimal, PriceRule};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -95,10 +96,10 @@ impl HyperliquidClient {
 
         // 品种目录
         let perp_dexs: Vec<Option<serde_json::Value>> =
-            post_info_with(&client, &base_url, serde_json::json!({"type": "perpDexs"})).await?;
+            info(&client, &base_url, serde_json::json!({"type": "perpDexs"})).await?;
         // 计价币的 spot token 编号：各 dex 的保证金币种必须就是它（统一账户净值只读这一个币）
         let spot_meta: serde_json::Value =
-            post_info_with(&client, &base_url, serde_json::json!({"type": "spotMeta"})).await?;
+            info(&client, &base_url, serde_json::json!({"type": "spotMeta"})).await?;
         let quote_token = spot_meta["tokens"]
             .as_array()
             .and_then(|ts| ts.iter().find(|t| t["name"].as_str() == Some(quote.as_str())))
@@ -107,7 +108,7 @@ impl HyperliquidClient {
         let (client_ref, base_ref, perp_dexs_ref, quote_ref) = (&client, &base_url, &perp_dexs, &quote);
         let metas = futures_util::future::try_join_all(dexes.iter().map(|dex| async move {
             let meta: MetaResponse =
-                post_info_with(client_ref, base_ref, serde_json::json!({"type": "meta", "dex": dex})).await?;
+                info(client_ref, base_ref, serde_json::json!({"type": "meta", "dex": dex})).await?;
             // 保证金币种不是计价币的 dex（如以 USDT 为保证金的 cash）：净值口径对不上，拒绝
             if u64::from(meta.collateral_token) != quote_token {
                 return Err(other(format!(
@@ -128,7 +129,7 @@ impl HyperliquidClient {
         let account = match credentials {
             None => None,
             Some(credentials) => {
-                let raw: String = post_info_with(&client, &base_url, serde_json::json!({
+                let raw: String = info(&client, &base_url, serde_json::json!({
                     "type": "userAbstraction",
                     "user": credentials.wallet_address,
                 }))
@@ -177,12 +178,12 @@ impl HyperliquidClient {
             .ok_or(ExchangeError::AuthenticationFailed(Exchange::Hyperliquid))
     }
 
-    /// 发送 POST /info 请求
+    /// 发送 POST /info 查询（按类型取限频额度，没有就排队）
     async fn post_info<T: for<'de> Deserialize<'de>>(
         &self,
         body: serde_json::Value,
     ) -> Result<T, ExchangeError> {
-        post_info_with(&self.client, &self.base_url, body).await
+        info(&self.client, &self.base_url, body).await
     }
 
     /// 已接入的每个 dex 各查一次 clearinghouseState，**全部成功才返回**（任一失败整体
@@ -203,10 +204,12 @@ impl HyperliquidClient {
     /// 市价单的 IOC 限价：取当前盘口对手价，往不利方向让配置的 `market_order_slippage`，
     /// 按 HL 价格精度取整。多一次 `l2Book` 查询；对延迟敏感的路径应由策略自己用 BBO
     /// 下 IOC 限价单，不走市价单。
+    ///
+    /// 这次查询是下单的一部分，按交易动作取额度（没有就拒单，不排队等）。
     async fn market_limit_px(&self, coin: &str, is_buy: bool, sz_decimals: u32) -> Result<String, ExchangeError> {
-        let book: serde_json::Value = self
-            .post_info(serde_json::json!({"type": "l2Book", "coin": coin}))
-            .await?;
+        let body = serde_json::json!({"type": "l2Book", "coin": coin});
+        let admitted = LIMITER.action(&[IP_WEIGHT.cost(info_weight(&body))])?;
+        let book: serde_json::Value = post_info_with(&self.client, &self.base_url, body, admitted).await?;
         let side = if is_buy { 1 } else { 0 }; // levels = [bids, asks]
         let top = book["levels"][side][0]["px"]
             .as_str()
@@ -293,19 +296,62 @@ impl HyperliquidClient {
 
 }
 
-/// POST /info（构造期还没有 `Self`，故抽成自由函数）
-async fn post_info_with<T: for<'de> Deserialize<'de>>(
+/// `/info` 请求的 IP 权重（官方文档 Rate limits）：这几种 2，`userRole` 60，其余 20。
+fn info_weight(body: &serde_json::Value) -> u32 {
+    match body["type"].as_str().unwrap_or_default() {
+        "l2Book" | "allMids" | "clearinghouseState" | "orderStatus" | "spotClearinghouseState" | "exchangeStatus" => 2,
+        "userRole" => 60,
+        _ => 20,
+    }
+}
+
+/// 这几种 `/info` 按返回条数另加权重：每 20 条加 1（官方文档 Rate limits）
+const INFO_PER_ITEM_TYPES: &[&str] = &[
+    "recentTrades",
+    "historicalOrders",
+    "userFills",
+    "userFillsByTime",
+    "fundingHistory",
+    "userFunding",
+    "nonUserFundingUpdates",
+    "twapHistory",
+    "userTwapSliceFills",
+    "userTwapSliceFillsByTime",
+    "delegatorHistory",
+    "delegatorRewards",
+    "validatorStats",
+];
+
+/// POST /info 查询：先按类型取额度（没有就排队），按返回条数另加的权重收到回复后补记。
+/// 构造期还没有 `Self`，故是自由函数。
+async fn info<T: for<'de> Deserialize<'de>>(
     client: &Client,
     base_url: &str,
     body: serde_json::Value,
 ) -> Result<T, ExchangeError> {
-    let resp = client
-        .post(format!("{base_url}/info"))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
+    let admitted = LIMITER.query(&[IP_WEIGHT.cost(info_weight(&body))]).await?;
+    let per_item = INFO_PER_ITEM_TYPES.contains(&body["type"].as_str().unwrap_or_default());
+    let raw: serde_json::Value = post_info_with(client, base_url, body, admitted).await?;
+    if per_item {
+        let items = raw.as_array().map_or(0, Vec::len) as u32;
+        LIMITER.record(&[IP_WEIGHT.cost(items / 20)]);
+    }
+    serde_json::from_value(raw).map_err(|e| ExchangeError::ParseError(format!("HL /info 回复解析失败: {e}")))
+}
+
+/// POST /info（已取到额度）
+async fn post_info_with<T: for<'de> Deserialize<'de>>(
+    client: &Client,
+    base_url: &str,
+    body: serde_json::Value,
+    admitted: Admitted,
+) -> Result<T, ExchangeError> {
+    let resp = crate::net::send(
+        client.post(format!("{base_url}/info")).header("Content-Type", "application/json").json(&body),
+        admitted,
+    )
+    .await
+    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -752,7 +798,8 @@ impl AccountClient for HyperliquidClient {
         let HlAsset { coin, asset, .. } = self.markets.asset(symbol)?.clone();
         let cloid = client_order_id.to_string();
 
-        let raw = submitter.cancel(&HlCancelIntent { coin, asset, cloid }).await?;
+        let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
+        let raw = submitter.cancel(&HlCancelIntent { coin, asset, cloid }, admitted).await?;
         let response: CancelResponse = serde_json::from_value(raw.clone()).map_err(|e| {
             ExchangeError::ParseError(format!("Failed to parse cancel response: {e} (body: {raw})"))
         })?;
@@ -863,7 +910,8 @@ impl AccountClient for HyperliquidClient {
         let order = order.inner();
         let submitter = &self.account().map_err(PlaceError::unsent)?.submitter;
         let intent = self.order_intent(order).await.map_err(PlaceError::unsent)?;
-        let raw = submitter.place(&intent).await?;
+        let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
+        let raw = submitter.place(&intent, admitted).await?;
         parse_place_reply(raw)
     }
 

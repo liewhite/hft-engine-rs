@@ -24,6 +24,10 @@ pub async fn resolve_conids(
     let url = format!("{}trsrv/stocks", auth.base_url());
     let full_url = format!("{}?symbols={}", url, symbols_param);
 
+    // 先取额度再签名（签名带时间戳）
+    let admitted = crate::exchange::ibkr::LIMITER
+        .query(&crate::exchange::ibkr::request_costs("GET", &url))
+        .await?;
     let auth_header = auth.sign_request(
         "GET",
         &url,
@@ -38,8 +42,7 @@ pub async fn resolve_conids(
         req = req.header("Authorization", header);
     }
 
-    let resp = req
-        .send()
+    let resp = crate::net::send(req, admitted)
         .await
         .map_err(|e| anyhow::anyhow!("resolve_conids request failed: {}", e))?;
 

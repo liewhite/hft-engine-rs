@@ -115,7 +115,11 @@ impl OkxBusinessWs {
             data: Vec<CandleRawData>,
         }
 
-        let resp = self.http_client.get(&url).send().await
+        let admitted = crate::exchange::okx::LIMITER
+            .query(&[crate::exchange::okx::CANDLES.cost(1)])
+            .await
+            .map_err(|e| WsError::Network(e.to_string()))?;
+        let resp = crate::net::send(self.http_client.get(&url), admitted).await
             .map_err(|e| WsError::Network(format!("History candles request failed: {}", e)))?;
 
         let data: Response = resp.json().await

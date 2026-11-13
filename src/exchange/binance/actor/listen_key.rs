@@ -50,12 +50,17 @@ impl ListenKeyRefresher {
 
     /// 刷新 ListenKey
     async fn refresh_listen_key(&self) -> Result<(), WsError> {
-        let resp = self
-            .client
-            .put(format!("{}/fapi/v1/listenKey", self.rest_base_url))
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
+        let admitted = crate::exchange::binance::LIMITER
+            .query(&[crate::exchange::binance::IP_WEIGHT.cost(1)])
             .await
+            .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+        let resp = crate::net::send(
+            self.client
+                .put(format!("{}/fapi/v1/listenKey", self.rest_base_url))
+                .header("X-MBX-APIKEY", &self.api_key),
+            admitted,
+        )
+        .await
             .map_err(|e| WsError::AuthFailed(e.to_string()))?;
 
         if !resp.status().is_success() {

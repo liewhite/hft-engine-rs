@@ -18,6 +18,23 @@ pub const CLIENT_ORDER_IDS: super::CliOrderIdFormat = super::CliOrderIdFormat::n
 /// Hyperliquid REST API 地址
 pub const REST_BASE_URL: &str = "https://api.hyperliquid.xyz";
 
+// ---------------------------------------------------------------------------
+// 限频（#791，机制见 crate::exchange::rate_limit）。数字取自官方文档 Rate limits and user limits
+// （2026-11 实查）：REST 按 IP 共用 1200 权重 / 分钟；`/exchange` 每个动作 1，`/info` 按类型 2 / 20 / 60，
+// 部分接口按返回条数另加（见 client 的 `info_weight`）。
+//
+// 按地址的动作额度（累计成交 1 USDC 换 1 次、起始 1 万次，撤单另有更宽的额度，超了每 10 秒放 1 次）
+// 不在本地计：它是随成交回补的累计余额，超了交易所只是放慢、不封禁，本地照搬还得启动时查余额、
+// 按成交回补，多一套机制换不来什么。
+// ---------------------------------------------------------------------------
+
+/// 本进程访问 HL 的唯一限频闸门（经签名机提交的动作也从本机 IP 发出，同样计入）
+pub(crate) static LIMITER: std::sync::LazyLock<crate::exchange::rate_limit::RateLimiter> =
+    std::sync::LazyLock::new(|| crate::exchange::rate_limit::RateLimiter::new(crate::domain::Exchange::Hyperliquid));
+/// 按 IP 的 REST 权重：1200 / 分钟
+pub(crate) static IP_WEIGHT: crate::exchange::rate_limit::Quota =
+    crate::exchange::rate_limit::Quota::new("IP 权重/分钟", 1200, std::time::Duration::from_secs(60));
+
 /// Hyperliquid WebSocket 地址
 pub const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 

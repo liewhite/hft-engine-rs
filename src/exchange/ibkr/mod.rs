@@ -23,6 +23,42 @@ pub const OAUTH_BASE_URL: &str = "https://api.ibkr.com/v1/api/";
 /// IBKR REST 单个请求的上限（网关 / OAuth 两种接入共用）
 pub(crate) const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+// ---------------------------------------------------------------------------
+// 限频（#791，机制见 crate::exchange::rate_limit）。数字取自官方 Web API「Pacing Limitations」
+// （2026-11 实查）：全局 10 次 / 秒（经 CP Gateway；OAuth 是 50，按严的算），部分接口另有更严的限额。
+// 超限返回 429，IP 进 10–15 分钟的惩罚区，屡犯永久封禁。请求一律经 [`auth::query_request`] /
+// [`auth::action_request`] 发，按地址取额度。
+// ---------------------------------------------------------------------------
+
+use crate::exchange::rate_limit::{Quota, RateLimiter, Use};
+use std::time::Duration;
+
+/// 本进程访问 IBKR 的唯一限频闸门
+pub(crate) static LIMITER: std::sync::LazyLock<RateLimiter> =
+    std::sync::LazyLock::new(|| RateLimiter::new(crate::domain::Exchange::IBKR));
+/// 全局：10 次 / 秒
+static GLOBAL: Quota = Quota::new("全局", 10, Duration::from_secs(1));
+/// `GET /iserver/account/orders`：1 次 / 5 秒
+static ACCOUNT_ORDERS: Quota = Quota::new("iserver/account/orders", 1, Duration::from_secs(5));
+/// `/portfolio/accounts`：1 次 / 5 秒
+static PORTFOLIO_ACCOUNTS: Quota = Quota::new("portfolio/accounts", 1, Duration::from_secs(5));
+/// `/tickle`：1 次 / 秒
+static TICKLE: Quota = Quota::new("tickle", 1, Duration::from_secs(1));
+
+/// 一个请求要花的额度：全局 1 次，命中有单独限额的接口再加那一项。`url` 是完整地址。
+pub(crate) fn request_costs(method: &str, url: &str) -> Vec<Use<'static>> {
+    let path = url.split('?').next().unwrap_or(url).trim_end_matches('/');
+    let mut costs = vec![GLOBAL.cost(1)];
+    if method == "GET" && path.ends_with("/iserver/account/orders") {
+        costs.push(ACCOUNT_ORDERS.cost(1));
+    } else if path.ends_with("/portfolio/accounts") {
+        costs.push(PORTFOLIO_ACCOUNTS.cost(1));
+    } else if path.ends_with("/tickle") {
+        costs.push(TICKLE.cost(1));
+    }
+    costs
+}
+
 fn default_gateway_url() -> String {
     "https://localhost:5000/v1/api/".to_string()
 }

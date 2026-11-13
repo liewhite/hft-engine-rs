@@ -14,10 +14,10 @@
 不是标定结果。该阈值必须同时覆盖双边 taker 费率 + `ioc_slippage` 让价 + 期望净收益
 （配置校验只保证 `threshold > ioc_slippage`，不保证覆盖手续费——手续费不在代码里建模）。
 
-### 2. 下单限速 / 多 WebSocket 连接（未做）
-- 全链路无下单限速：`OutcomeProcessor` 每笔订单直接 `tokio::spawn` 打 REST。
-  当前风险闸门是 `max_position_notional`（限最终暴露）+ 每 symbol 单批在途（`has_pending_orders`），
-  **不限频率**。symbol 数量大时可能触发交易所限频/封禁。
+### 2. 多 WebSocket 连接（未做）
+- 下单限速已做（#791）：各所适配层自带限流（`src/exchange/rate_limit.rs`，额度数字在各所模块），
+  交易所 REST 请求只能经 `crate::net::send` 带额度发出（clippy 名单拦直接 `send`）；下单撤单没额度当场拒，
+  查询排队。
 - 公共行情单连接订阅全部 symbol：symbol 数量继续增长会撞上单连接订阅数上限。
   需要按 symbol 分片建多条 public WS 连接。
 

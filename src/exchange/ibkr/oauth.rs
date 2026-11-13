@@ -187,6 +187,10 @@ async fn dh_exchange(
     let endpoint = "oauth/live_session_token";
     let url = format!("{}{}", base_url, endpoint);
 
+    // 先取额度再签名（签名带时间戳）
+    let admitted = crate::exchange::ibkr::LIMITER
+        .query(&crate::exchange::ibkr::request_costs("POST", &url))
+        .await?;
     let timestamp = current_timestamp();
     let nonce = generate_nonce();
 
@@ -209,13 +213,14 @@ async fn dh_exchange(
     let auth_header = generate_authorization_header(&headers, "limited_poa");
 
     // 4. POST 请求 (必须带 Content-Length: 0，否则 411)
-    let resp = http
-        .post(&url)
-        .header("Authorization", &auth_header)
-        .header("User-Agent", "ibind-rs")
-        .header("Content-Length", "0")
-        .send()
-        .await
+    let resp = crate::net::send(
+        http.post(&url)
+            .header("Authorization", &auth_header)
+            .header("User-Agent", "ibind-rs")
+            .header("Content-Length", "0"),
+        admitted,
+    )
+    .await
         .map_err(|e| anyhow::anyhow!("LST request failed: {}", e))?;
 
     let status = resp.status();

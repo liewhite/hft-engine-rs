@@ -68,6 +68,7 @@ struct Level {
 }
 
 /// 获取 BBO (REST API)
+#[allow(clippy::disallowed_methods)] // 联网手测的行情辅助查询，偶发一次，不经实盘限频闸门
 async fn fetch_bbo(coin: &str) -> Result<(Decimal, Decimal), Box<dyn std::error::Error>> {
     let client = hft_engine_rs::net::http(std::time::Duration::from_secs(10)).build().expect("http client");
     let resp: L2Book = client
@@ -167,6 +168,7 @@ async fn test_xyz_fetch_bbo() {
 /// 测试获取 XYZ DEX meta 和 asset contexts
 #[tokio::test]
 #[ignore = "需要网络"]
+#[allow(clippy::disallowed_methods)] // 联网手测的行情辅助查询，偶发一次，不经实盘限频闸门
 async fn test_xyz_fetch_meta_and_asset_ctxs() {
     let http = hft_engine_rs::net::http(std::time::Duration::from_secs(10)).build().expect("http client");
     let resp: serde_json::Value = http

@@ -8,7 +8,11 @@ use crate::domain::{
 use crate::exchange::okx::codec::{parse_account_info, GreeksData, PositionData};
 use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
 pub use crate::exchange::okx::OkxCredentials;
-use crate::exchange::okx::REST_BASE_URL;
+use crate::exchange::okx::{
+    BALANCE, BILLS, CANCEL, FUNDING_HISTORY, GREEKS, INSTRUMENTS, LIMITER, ORDERS_PENDING, PLACE, PLACE_ACCOUNT, POSITIONS,
+    REST_BASE_URL,
+};
+use crate::exchange::rate_limit::Quota;
 use crate::domain::{Decimal, PriceStep};
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
@@ -131,15 +135,13 @@ impl OkxClient {
             ct_val: String,
         }
 
-        let resp = self
-            .client
-            .get(format!(
-                "{}/api/v5/public/instruments?instType=SWAP",
-                self.base_url
-            ))
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
+        let admitted = LIMITER.query(&[INSTRUMENTS.cost(1)]).await?;
+        let resp = crate::net::send(
+            self.client.get(format!("{}/api/v5/public/instruments?instType=SWAP", self.base_url)),
+            admitted,
+        )
+        .await
+        .map_err(Self::map_reqwest_error)?;
 
         let data: Response = resp.json().await.map_err(Self::map_reqwest_error)?;
 
@@ -189,6 +191,7 @@ impl OkxClient {
     /// 查询账户希腊值 (GET /api/v5/account/greeks)
     pub async fn fetch_greeks(&self) -> Result<Vec<Greeks>, ExchangeError> {
         let path = "/api/v5/account/greeks";
+        let admitted = LIMITER.query(&[GREEKS.cost(1)]).await?;
         let timestamp = Self::iso_timestamp();
         let sign = self
             .sign(&timestamp, "GET", path, "")
@@ -204,11 +207,7 @@ impl OkxClient {
             data: Vec<GreeksData>,
         }
 
-        let resp = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
-            .headers(headers)
-            .send()
+        let resp = crate::net::send(self.client.get(format!("{}{}", self.base_url, path)).headers(headers), admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
@@ -232,8 +231,8 @@ impl OkxClient {
         Ok(result)
     }
 
-    /// 签名 GET，返回 `data` 数组；顶层 code 非 0 即错误。
-    async fn signed_get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<Vec<T>, ExchangeError> {
+    /// 签名 GET（先按 `quota` 取额度），返回 `data` 数组；顶层 code 非 0 即错误。
+    async fn signed_get<T: for<'de> Deserialize<'de>>(&self, quota: &'static Quota, path: &str) -> Result<Vec<T>, ExchangeError> {
         #[derive(Deserialize)]
         struct Response<T> {
             code: String,
@@ -241,6 +240,7 @@ impl OkxClient {
             #[serde(default = "Vec::new")]
             data: Vec<T>,
         }
+        let admitted = LIMITER.query(&[quota.cost(1)]).await?;
         let timestamp = Self::iso_timestamp();
         let sign = self
             .sign(&timestamp, "GET", path, "")
@@ -248,11 +248,7 @@ impl OkxClient {
         let headers = self
             .build_headers(&sign, &timestamp)
             .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
-        let resp = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
-            .headers(headers)
-            .send()
+        let resp = crate::net::send(self.client.get(format!("{}{}", self.base_url, path)).headers(headers), admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
@@ -277,6 +273,7 @@ impl OkxClient {
         if let Some(cursor) = after {
             path.push_str(&format!("&after={cursor}"));
         }
+        let admitted = LIMITER.query(&[ORDERS_PENDING.cost(1)]).await?;
         let timestamp = Self::iso_timestamp();
         let sign = self
             .sign(&timestamp, "GET", &path, "")
@@ -285,11 +282,7 @@ impl OkxClient {
             .build_headers(&sign, &timestamp)
             .ok_or_else(|| ExchangeError::Other("Failed to build headers".to_string()))?;
 
-        let resp = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
-            .headers(headers)
-            .send()
+        let resp = crate::net::send(self.client.get(format!("{}{}", self.base_url, path)).headers(headers), admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
         let data: PendingOrdersResponse = resp.json().await.map_err(Self::map_reqwest_error)?;
@@ -413,6 +406,7 @@ impl AccountClient for OkxClient {
             cl_ord_id: String,
         }
 
+        let admitted = LIMITER.action(&[CANCEL.cost_in(&inst_id, 1)])?;
         let request = CancelRequest {
             inst_id,
             cl_ord_id: client_order_id.to_string(),
@@ -441,12 +435,7 @@ impl AccountClient for OkxClient {
             data: Vec<CancelData>,
         }
 
-        let resp = self
-            .client
-            .post(format!("{}{}", self.base_url, path))
-            .headers(headers)
-            .body(body)
-            .send()
+        let resp = crate::net::send(self.client.post(format!("{}{}", self.base_url, path)).headers(headers).body(body), admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
@@ -531,6 +520,7 @@ impl AccountClient for OkxClient {
             cl_ord_id: Option<String>,
         }
 
+        let admitted = LIMITER.action(&[PLACE.cost_in(&inst_id, 1), PLACE_ACCOUNT.cost(1)])?;
         let request = OrderRequest {
             inst_id,
             td_mode: "cross".to_string(),
@@ -555,12 +545,7 @@ impl AccountClient for OkxClient {
             .build_headers(&sign, &timestamp)
             .ok_or_else(|| PlaceError::unsent("Failed to build headers"))?;
 
-        let resp = self
-            .client
-            .post(format!("{}{}", self.base_url, path))
-            .headers(headers)
-            .body(body)
-            .send()
+        let resp = crate::net::send(self.client.post(format!("{}{}", self.base_url, path)).headers(headers).body(body), admitted)
             .await
             .map_err(|e| place_send_error(Exchange::OKX, e))?;
         let status = resp.status().as_u16();
@@ -585,17 +570,18 @@ impl AccountClient for OkxClient {
             pos: String,
             notional_usd: String,
         }
-        let balance: Vec<BalanceData> = self.signed_get("/api/v5/account/balance").await?;
+        let balance: Vec<BalanceData> = self.signed_get(&BALANCE, "/api/v5/account/balance").await?;
         let total_eq = balance
             .first()
             .ok_or_else(|| ExchangeError::ParseError("OKX account/balance 返回空 data".to_string()))?;
-        let positions: Vec<PositionNotional> = self.signed_get("/api/v5/account/positions").await?;
+        let positions: Vec<PositionNotional> = self.signed_get(&POSITIONS, "/api/v5/account/positions").await?;
         let notionals: Vec<(&str, &str)> = positions.iter().map(|p| (p.pos.as_str(), p.notional_usd.as_str())).collect();
         parse_account_info(&total_eq.total_eq, &notionals).map_err(ExchangeError::ParseError)
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
         let path = "/api/v5/account/positions?instType=SWAP";
+        let admitted = LIMITER.query(&[POSITIONS.cost(1)]).await?;
         let timestamp = Self::iso_timestamp();
         let sign = self
             .sign(&timestamp, "GET", path, "")
@@ -611,11 +597,7 @@ impl AccountClient for OkxClient {
             data: Vec<PositionData>,
         }
 
-        let resp = self
-            .client
-            .get(format!("{}{}", self.base_url, path))
-            .headers(headers)
-            .send()
+        let resp = crate::net::send(self.client.get(format!("{}{}", self.base_url, path)).headers(headers), admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
 
@@ -809,18 +791,15 @@ impl crate::exchange::SettledFundingSource for OkxClient {
     /// 无需凭证），按结算时间升序。取 `realizedRate`（实际收付的费率）。
     ///
     /// 单次最多 100 条（最新的在前）；OKX 最短 1h 一结，24h 窗口最多 24 条，一页足够。
-    /// 限频 10 次 / 2 秒 / IP。
     async fn fetch_settled_funding(
         &self,
         symbol: &Symbol,
         start_ms: crate::domain::Timestamp,
     ) -> Result<Vec<crate::domain::SettledFunding>, ExchangeError> {
-        let url = format!(
-            "{}/api/v5/public/funding-rate-history?instId={}&limit=100",
-            self.base_url,
-            to_okx(symbol, &self.quote)
-        );
-        let resp = self.client.get(&url).send().await.map_err(Self::map_reqwest_error)?;
+        let inst_id = to_okx(symbol, &self.quote);
+        let url = format!("{}/api/v5/public/funding-rate-history?instId={inst_id}&limit=100", self.base_url);
+        let admitted = LIMITER.query(&[FUNDING_HISTORY.cost_in(&inst_id, 1)]).await?;
+        let resp = crate::net::send(self.client.get(&url), admitted).await.map_err(Self::map_reqwest_error)?;
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         parse_settled_funding(&text, symbol, start_ms)
     }
@@ -1046,7 +1025,7 @@ impl crate::exchange::FundingFeeSource for OkxClient {
             if let Some(cursor) = &after {
                 path.push_str(&format!("&after={cursor}"));
             }
-            let page: Vec<Bill> = self.signed_get(&path).await?;
+            let page: Vec<Bill> = self.signed_get(&BILLS, &path).await?;
             let full = page.len() >= PAGE;
             after = page.last().map(|b| b.bill_id.clone());
             for b in page {

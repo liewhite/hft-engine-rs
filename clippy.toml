@@ -1,4 +1,4 @@
-# 出站 HTTP / WS 只能经 crate::net 建（必须给期限，见 src/net.rs）。`reqwest::Client::default()` 是 trait
+# 出站 HTTP / WS 只能经 crate::net 建（必须给期限，见 src/net.rs），交易所 HTTP 请求只能经 crate::net::send 发（要限频额度）。`reqwest::Client::default()` 是 trait
 # 方法、名单拦不到，别用。检查（funding-arb-ops 的 deploy.sh build 出包前也跑）：
 #   cargo clippy --all-targets -- -A clippy::all -D clippy::disallowed_methods
 disallowed-methods = [
@@ -18,4 +18,6 @@ disallowed-methods = [
     { path = "tokio_tungstenite::client_async_tls", reason = "用 crate::net::ws_connect(.., 期限)" },
     { path = "tokio_tungstenite::client_async_tls_with_config", reason = "用 crate::net::ws_connect(.., 期限)" },
     { path = "tokio_tungstenite::tungstenite::connect", reason = "用 crate::net::ws_connect(.., 期限)" },
+    # 交易所请求要先取限频额度（#791，见 src/exchange/rate_limit.rs）
+    { path = "reqwest::RequestBuilder::send", reason = "交易所请求用 crate::net::send(请求, 本所限频额度)；非交易所接口用 crate::net::send_unmetered" },
 ]

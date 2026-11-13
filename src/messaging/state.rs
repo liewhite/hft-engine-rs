@@ -36,7 +36,7 @@ pub struct PendingOrder {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderStage {
     /// 下单请求已发出，下单结论和交易所回报都还没到。此时不撤：撤单可能先于下单到交易所、报「单不存在」
-    /// （#769 HL 多挂 2 秒、白耗操作额度）
+    /// （#769 多挂 2 秒、白耗一次撤单）
     Placing,
     /// 交易所在撮合，没撤过
     Live,
@@ -947,7 +947,7 @@ mod tests {
         assert!(the_order(&state).is_some_and(|p| p.is_open()));
     }
 
-    /// 下单没结论、已到终态的单不发撤单（撤不掉，HL 还白耗一次操作额度）；不在表里的也不发
+    /// 下单没结论、已到终态的单不发撤单（撤不掉，还白耗一次撤单）；不在表里的也不发
     #[test]
     fn no_cancel_for_finished_or_unknown_orders() {
         let mut state = with_order();

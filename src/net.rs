@@ -62,6 +62,22 @@ impl HttpSpec {
     }
 }
 
+/// 发一个交易所 REST 请求：要先在该所的限频闸门取到额度（见 [`crate::exchange::rate_limit`]）。
+/// 直接调 `RequestBuilder::send` 由 `clippy.toml` 拦下，本函数和 [`send_unmetered`] 是唯一放行处。
+#[allow(clippy::disallowed_methods)] // 唯一放行处，见上
+pub(crate) async fn send(
+    request: reqwest::RequestBuilder,
+    _admitted: crate::exchange::rate_limit::Admitted,
+) -> reqwest::Result<reqwest::Response> {
+    request.send().await
+}
+
+/// 发一个不受交易所限频约束的请求：只给 Pushgateway、告警、回测数据下载这类非交易所接口用。
+#[allow(clippy::disallowed_methods)] // 唯一放行处，见 [`send`]
+pub async fn send_unmetered(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+    request.send().await
+}
+
 pub type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// 建 WS 连接（TCP + TLS + WS 握手），限时 `timeout`：网络半死时握手可能一直挂着，不限时进程就

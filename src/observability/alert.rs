@@ -111,23 +111,21 @@ struct HttpSink {
 impl AlertSink for HttpSink {
     async fn send(&self, text: &str) -> Result<(), String> {
         match &self.config {
-            AlertWebhookConfig::Webhook { url } => self
-                .client
-                .post(url)
-                .json(&serde_json::json!({ "text": text }))
-                .send()
-                .await
-                .and_then(|r| r.error_for_status())
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            AlertWebhookConfig::SlackBot { token, channel } => {
-                let resp: serde_json::Value = self
-                    .client
-                    .post(SLACK_POST_MESSAGE)
-                    .bearer_auth(token)
-                    .json(&serde_json::json!({ "channel": channel, "text": text }))
-                    .send()
+            AlertWebhookConfig::Webhook { url } => {
+                crate::net::send_unmetered(self.client.post(url).json(&serde_json::json!({ "text": text })))
                     .await
+                    .and_then(|r| r.error_for_status())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+            AlertWebhookConfig::SlackBot { token, channel } => {
+                let resp: serde_json::Value = crate::net::send_unmetered(
+                    self.client
+                        .post(SLACK_POST_MESSAGE)
+                        .bearer_auth(token)
+                        .json(&serde_json::json!({ "channel": channel, "text": text })),
+                )
+                .await
                     .map_err(|e| e.to_string())?
                     .json()
                     .await
