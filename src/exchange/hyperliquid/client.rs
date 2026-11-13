@@ -289,7 +289,7 @@ impl HyperliquidClient {
             }))
             .await?;
 
-        Ok(super::CLIENT_ORDER_IDS.claim(resp.order.and_then(|envelope| envelope.order.cloid).as_deref()))
+        Ok(own_cloid(resp))
     }
 
 }
@@ -910,6 +910,11 @@ impl AccountClient for HyperliquidClient {
 ///
 /// 提到模块级只为让嵌套层次能被测试锁住 —— 少一层或多一层都会让 `cloid` 静默取不到，
 /// 而那会让启动期撤单认不出自己的单。
+/// orderStatus 应答里的 cloid 归属判定：只给本引擎的单（null、别人格式的都是 `None`）
+fn own_cloid(resp: OrderStatusResponse) -> Option<String> {
+    super::CLIENT_ORDER_IDS.claim(resp.order.and_then(|envelope| envelope.order.cloid).as_deref())
+}
+
 #[derive(Deserialize)]
 struct OrderStatusResponse {
     #[serde(default)]
@@ -973,15 +978,14 @@ mod order_status_tests {
         assert!(resp.order.is_none());
     }
 
-    /// 人工经 UI 下单 / 强平等系统单是 `cloid: null` —— 无法证明归属，不该被认领
+    /// 人工经 UI 下单 / 强平等系统单是 `cloid: null`，别的程序可能带别的格式 —— 都不该被认领
     #[test]
-    fn null_cloid_is_not_owned() {
-        let raw = REAL_ORDER_STATUS.replace(
-            r#""cloid":"0x3f4b6d0f9d2f452b8eed2858b58959eb""#,
-            r#""cloid":null"#,
-        );
-        let resp: OrderStatusResponse = serde_json::from_str(&raw).expect("解析");
-        assert!(resp.order.and_then(|e| e.order.cloid).is_none());
+    fn foreign_or_null_cloid_is_not_owned() {
+        for foreign in [r#""cloid":null"#, r#""cloid":"abc""#] {
+            let raw = REAL_ORDER_STATUS.replace(r#""cloid":"0x3f4b6d0f9d2f452b8eed2858b58959eb""#, foreign);
+            let resp: OrderStatusResponse = serde_json::from_str(&raw).expect("解析");
+            assert!(own_cloid(resp).is_none(), "{foreign}");
+        }
     }
 }
 

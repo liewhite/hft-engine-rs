@@ -155,8 +155,7 @@ impl Executor {
         let name = format!("Executor{id}[{account}]");
         let (child, addr) = group
             .spawn_addressed(name, move |_scope: Scope, inbox| async move {
-                let mut runner =
-                    StrategyRunner::new(
+                let mut runner = StrategyRunner::new(
                     args.strategy,
                     args.symbol_metas,
                     account.clone(),

@@ -30,7 +30,7 @@ use hft_engine_rs::domain::{
 };
 use hft_engine_rs::engine::{
     AccountBinding, AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, Metrics, MetricsArgs, OutcomeBus,
-    PaperCounter, PaperCounterArgs,
+    NewClientOrderId, PaperCounter, PaperCounterArgs,
 };
 use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
@@ -43,6 +43,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const EX: Exchange = Exchange::Binance;
+
+fn bn_client_order_id() -> String {
+    hft_engine_rs::exchange::binance::CLIENT_ORDER_IDS.generate()
+}
 /// 本测试的模拟账户
 const PAPER_LABEL: &str = "BTC";
 static PAPER_ACCOUNT: std::sync::LazyLock<AccountId> =
@@ -271,7 +275,7 @@ async fn paper_counter_fills_from_live_trades() {
             strategy: Box::new(DipMaker(Arc::clone(&log))),
             binding: AccountBinding::Paper { label: PAPER_LABEL.to_string(), legs: HashSet::new() },
             symbol_metas: metas_by_key.clone(),
-            client_order_ids: std::sync::Arc::new(std::collections::HashMap::from([(EX, (|| hft_engine_rs::exchange::binance::CLIENT_ORDER_IDS.generate()) as hft_engine_rs::engine::NewClientOrderId)])),
+            client_order_ids: Arc::new(HashMap::from([(EX, bn_client_order_id as NewClientOrderId)])),
             outcome_bus: outcome_bus.clone(),
             metrics,
         },

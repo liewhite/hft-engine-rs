@@ -897,12 +897,12 @@ mod pending_orders_tests {
         assert_eq!(u.client_order_id.as_deref(), Some("x-abc"));
     }
 
-    /// **Critical 回归防线**：clOrdId 缺失/为空时必须是 `None`，绝不用 ord_id 顶替。
+    /// **Critical 回归防线**：clOrdId 缺失/为空/别人的格式时必须是 `None`，绝不用 ord_id 顶替。
     ///
     /// 归属识别（启动期只撤本引擎的单）靠它：编造一个值会让别人的单被当成自己的、或反之。
     #[test]
     fn missing_client_order_id_stays_none() {
-        for missing in [None, Some("")] {
+        for missing in [None, Some(""), Some("web1a2b"), Some("0x3f4b6d0f9d2f452b8eed2858b58959eb")] {
             let u = parse_pending_order(&raw(missing), "USDT", dec!(1.0)).unwrap();
             assert_eq!(
                 u.client_order_id, None,
