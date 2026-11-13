@@ -117,12 +117,17 @@ impl Ledger {
                 .sum::<f64>()
     }
 
-    /// 总持仓名义价值 (用于杠杆率)
+    /// 总持仓名义价值 (用于杠杆率) = 各 symbol 持仓价值之和
     pub fn notional(&self, mark_of: impl Fn(&Symbol) -> f64) -> f64 {
+        self.position_values(mark_of).values().sum()
+    }
+
+    /// 各 symbol 持仓价值 = |持仓| × 估值价（与实盘账本的 `PositionValues` 同一含义，#759）
+    pub fn position_values(&self, mark_of: impl Fn(&Symbol) -> f64) -> std::collections::HashMap<Symbol, f64> {
         self.positions
             .iter()
-            .map(|(symbol, p)| p.size.abs() * mark_of(symbol))
-            .sum()
+            .map(|(symbol, p)| (symbol.clone(), p.size.abs() * mark_of(symbol)))
+            .collect()
     }
 
     /// 非空仓位的快照（回填按 `mark_of` 算出的未实现盈亏）

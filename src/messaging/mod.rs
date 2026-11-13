@@ -4,7 +4,7 @@ mod state_manager;
 
 pub use event::{
     AccountData, AccountEvent, CustomEvent, Delivery, ExchangeAccountData, HistoryCandles,
-    IncomeEvent, MarketData, MarketEvent, SymbolAccountData, UnmappedFill,
+    IncomeEvent, MarketData, MarketEvent, PositionValues, SymbolAccountData, UnmappedFill,
 };
 mod bus;
 mod position_book;

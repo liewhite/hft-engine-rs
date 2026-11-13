@@ -30,6 +30,7 @@
 
 use crate::domain::{AccountInfo, Exchange, Greeks, MarketStatus, Symbol, BBO};
 use crate::messaging::{PendingOrder, StateManager, SymbolState};
+use std::collections::HashMap;
 
 /// 策略视图：本策略订阅范围内的状态。
 ///
@@ -60,12 +61,10 @@ impl<'a> StrategyView<'a> {
         self.state.account_view().account_info(exchange)
     }
 
-    /// 某所账户总持仓名义价值。读数尚未到达返回 `None`。
-    ///
-    /// 与 [`Self::equity`] 配对算账户杠杆。`account_info()` 同时给出两者且保证原子，
-    /// 只要其中一个时用这个更直白。
-    pub fn account_notional(&self, exchange: Exchange) -> Option<f64> {
-        self.state.account_view().account_notional(exchange)
+    /// 本地持仓账本里该所各币的持仓价值（币 → |持仓| × 中间价），含别的策略实例的币。
+    /// 账本还没发过该所读数时返回 `None`（未知，不是 0）。见 [`crate::messaging::PositionValues`]。
+    pub fn position_values(&self, exchange: Exchange) -> Option<&'a HashMap<Symbol, f64>> {
+        self.state.account_view().position_values(exchange)
     }
 
     /// 某所某币种的希腊值（delta 已按现货余额修正）

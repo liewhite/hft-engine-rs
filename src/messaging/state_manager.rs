@@ -32,6 +32,8 @@ pub struct AccountView {
     greeks: HashMap<(Exchange, String), Greeks>,
     /// 币种现金余额 (per exchange, per ccy) — 用于修正 greeks delta
     cash_balances: HashMap<(Exchange, String), f64>,
+    /// 本地持仓账本给出的各币持仓价值 (per exchange)，见 [`crate::messaging::PositionValues`]
+    position_values: HashMap<Exchange, HashMap<Symbol, f64>>,
 }
 
 impl AccountView {
@@ -81,6 +83,13 @@ impl AccountView {
     /// 获取所有交易所的总持仓名义价值（仅包含已收到数据的交易所）
     pub fn total_account_notional(&self) -> f64 {
         self.account_infos.values().map(|i| i.notional).sum()
+    }
+
+    /// 本地持仓账本里该所各币的持仓价值（币 → |持仓| × 中间价）。
+    ///
+    /// 返回 None 表示账本还没发过该所的读数（价值未知，不是 0）。
+    pub fn position_values(&self, exchange: Exchange) -> Option<&HashMap<Symbol, f64>> {
+        self.position_values.get(&exchange)
     }
 
     /// 获取指定交易所和币种的希腊值 (delta 已包含现货余额修正)
@@ -298,6 +307,9 @@ impl StateManager {
             }
             // 品种目录外的成交：不属于任何 symbol 状态，框架只运送，策略在 on_event 里自行处理
             ExchangeAccountData::UnmappedFill(_) => {}
+            ExchangeAccountData::PositionValues(v) => {
+                self.account.position_values.insert(v.exchange, v.values.clone());
+            }
         }
     }
 

@@ -424,6 +424,7 @@ impl Manager {
                 accounts: accounts.clone(),
                 symbol_metas: symbol_metas.clone(),
                 account_bus: account_bus.clone(),
+                market_bus: market_bus.clone(),
                 interval_ms: DEFAULT_POSITION_POLL_INTERVAL_MS,
                 max_consecutive_mismatches: DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
             },

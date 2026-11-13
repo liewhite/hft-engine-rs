@@ -5,7 +5,7 @@ use hft_engine_rs::domain::{
     Side, StepFormatter, SymbolMeta, TimeInForce, BBO,
 };
 use hft_engine_rs::engine::StrategyRunner;
-use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, CustomEvent, IncomeEvent, MarketData, PositionBaseline};
+use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, CustomEvent, IncomeEvent, MarketData, PositionBaseline, PositionValues};
 use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, OutcomeEvent, SettledFundingWindow};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,6 +76,19 @@ impl Sim {
 
     /// 指定某些所的交易所最小下单金额（其余为 0），不推盘口
     fn with_exchange_min(legs: &[(Exchange, f64)], mins: &[(Exchange, f64)]) -> Self {
+        let mut s = Self::bare_with_min(legs, mins);
+        for &(ex, _) in legs {
+            s.equity(ex, 10_000.0, 0.0);
+        }
+        s
+    }
+
+    /// 带初始持仓，不推净值、持仓价值和盘口
+    fn bare(legs: &[(Exchange, f64)]) -> Self {
+        Self::bare_with_min(legs, &[])
+    }
+
+    fn bare_with_min(legs: &[(Exchange, f64)], mins: &[(Exchange, f64)]) -> Self {
         let p = config().params().remove(0);
         let exchanges: Vec<Exchange> = legs.iter().map(|(e, _)| *e).collect();
         let min_of = |ex: Exchange| mins.iter().find(|(e, _)| *e == ex).map_or(0.0, |(_, m)| *m);
@@ -92,11 +105,7 @@ impl Sim {
             })
             .collect();
         runner.seed_positions(&baselines);
-        let mut s = Sim { runner, now: T0 };
-        for ex in exchanges {
-            s.equity(ex, 10_000.0, 0.0);
-        }
-        s
+        Sim { runner, now: T0 }
     }
 
     fn advance(&mut self, ms: u64) {
@@ -119,9 +128,25 @@ impl Sim {
         self.ev(IncomeEvent::market(now, now, MarketData::BBO(b)))
     }
 
-    fn equity(&mut self, ex: Exchange, equity: f64, notional: f64) -> Vec<OutcomeEvent> {
+    /// 某所净值，以及本地持仓账本给出的该所别的币的持仓价值合计 `others`（记在一个别的币名下）
+    fn equity(&mut self, ex: Exchange, equity: f64, others: f64) -> Vec<OutcomeEvent> {
+        self.account_info(ex, equity);
+        self.position_values(ex, &[("OTHER", others)])
+    }
+
+    /// 只推净值（交易所账户总持仓价值给个大数：杠杆闸门不该再用它）
+    fn account_info(&mut self, ex: Exchange, equity: f64) -> Vec<OutcomeEvent> {
         let now = self.now;
-        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange: ex, equity, notional })))
+        let info = ExchangeAccountData::AccountInfo { exchange: ex, equity, notional: 1e9 };
+        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Exchange(info)))
+    }
+
+    /// 本地持仓账本发来的该所各币持仓价值
+    fn position_values(&mut self, ex: Exchange, values: &[(&str, f64)]) -> Vec<OutcomeEvent> {
+        let now = self.now;
+        let values = values.iter().map(|(s, v)| (s.to_string(), *v)).collect();
+        let pv = ExchangeAccountData::PositionValues(PositionValues { exchange: ex, values });
+        self.ev(IncomeEvent::account(AccountId::Live, now, now, AccountData::Exchange(pv)))
     }
 
     /// 某所过去 24h 每小时一样的费率，使年化 = `apr`
@@ -227,10 +252,45 @@ fn below_threshold_holds() {
 #[test]
 fn leverage_cap_blocks_opening() {
     let mut s = Sim::new(0.0, 0.0);
-    // HL 账户已有 1.49 倍杠杆，再加 200U 超 1.5
+    // HL 账户别的币已有 1.49 倍杠杆，再加 200U 超 1.5
     s.equity(HL, 10_000.0, 14_900.0);
     s.funding(BN, 0.8);
     assert!(placed(&s.funding(HL, 0.1)).is_empty());
+}
+
+/// #759：账户持仓总价值 = 本地账本里别的币之和 + 本币自己的持仓；账本里本币那一项（可能还没含
+/// 刚到的成交）不算，交易所轮询的账户总持仓价值也不再用
+#[test]
+fn account_leverage_sums_other_symbols_from_the_ledger_and_own_position_locally() {
+    let mut s = Sim::new(0.0, 0.0);
+    // 账本里本币一项再大也不算（本币用策略自己的持仓），别的币合计 14_700 + 本次 200 = 1.49 倍
+    s.position_values(HL, &[(SYM, 1e9), ("OTHER", 10_000.0), ("ANOTHER", 4_700.0)]);
+    s.funding(BN, 0.8);
+    assert_eq!(placed(&s.funding(HL, 0.1)).len(), 2);
+}
+
+#[test]
+fn account_leverage_blocks_when_other_symbols_sum_over_the_cap() {
+    let mut s = Sim::new(0.0, 0.0);
+    // 两个别的币合计 14_900，再加 200 超 1.5
+    s.position_values(HL, &[("OTHER", 10_000.0), ("ANOTHER", 4_900.0)]);
+    s.funding(BN, 0.8);
+    assert!(placed(&s.funding(HL, 0.1)).is_empty());
+}
+
+#[test]
+fn unknown_position_values_block_opening() {
+    // 只有净值、账本还没发过持仓价值
+    let mut s = Sim::bare(&[(BN, 0.0), (HL, 0.0)]);
+    for ex in [BN, HL] {
+        s.account_info(ex, 10_000.0);
+        s.bbo(ex);
+    }
+    s.funding(BN, 0.8);
+    assert!(placed(&s.funding(HL, 0.1)).is_empty(), "持仓价值未知，不能开仓");
+    // HL 有了读数、BN 仍未知：还是不开
+    assert!(placed(&s.position_values(HL, &[])).is_empty());
+    assert_eq!(placed(&s.position_values(BN, &[])).len(), 2);
 }
 
 #[test]
