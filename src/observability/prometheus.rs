@@ -7,6 +7,8 @@
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use crate::tasks::{Addr, Group, Inbox, Scope, Task};
+
 /// 指标推送配置
 #[derive(Debug, Clone)]
 pub struct MetricsPushConfig {
@@ -61,34 +63,55 @@ impl PromText {
     }
 }
 
-/// 推送一份快照（失败只记 warn —— 观测出口绝不拖垮引擎）。请求自带 10s 超时。
+/// 单次推送的超时：pushgateway 不通时，停机最多为最后一份快照多等这么久
+const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 推送器：挂在任务树上的子任务，收件箱里每来一份快照就推一次（逐份串行）。
 ///
-/// 平时用 [`spawn_push`] 不阻塞调用方；停机前的最后一份要 await 它：游离的任务在进程退出时
-/// 直接被丢掉，最后一份就推不出去。
-pub async fn push(config: &MetricsPushConfig, body: String) {
-    use std::sync::OnceLock;
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("默认 reqwest client 构建不该失败")
-    });
-    let endpoint = format!("{}/metrics/job/{}", config.url.trim_end_matches('/'), config.job);
-    match client.post(&endpoint).body(body).send().await {
-        Ok(resp) if !resp.status().is_success() => {
-            tracing::warn!(status = %resp.status(), %endpoint, "pushgateway 拒绝了本次推送");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, %endpoint, "pushgateway 推送失败");
-        }
-        Ok(_) => {}
+/// 挂在树上而不是每份快照 `tokio::spawn` 一次：停机时收件箱先排空再退出（见
+/// [`crate::tasks::Inbox::recv`]），父节点停机前交来的最后一份快照一定推完（或超时）才算
+/// 停完。游离任务会被进程退出直接砍断，最后一份快照恰恰最容易丢。
+///
+/// 推送失败只记 warn、不退出 —— 观测出口绝不拖垮引擎。
+pub struct Pusher {
+    inbox: Inbox<String>,
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl Pusher {
+    /// 在 `group` 下起推送器，返回投递快照的地址。
+    pub async fn spawn(group: &Group, config: MetricsPushConfig) -> anyhow::Result<Addr<String>> {
+        let (_, addr) = group
+            .spawn_addressed("MetricsPusher", move |_scope: Scope, inbox: Inbox<String>| async move {
+                let client = reqwest::Client::builder()
+                    .timeout(PUSH_TIMEOUT)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("指标推送器构建 HTTP client 失败: {e}"))?;
+                let endpoint = format!("{}/metrics/job/{}", config.url.trim_end_matches('/'), config.job);
+                Ok(Self { inbox, client, endpoint })
+            })
+            .await?;
+        Ok(addr)
     }
 }
 
-/// 异步推送一份快照（spawn，不阻塞调用方），见 [`push`]
-pub fn spawn_push(config: MetricsPushConfig, body: String) {
-    tokio::spawn(async move { push(&config, body).await });
+impl Task for Pusher {
+    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+        // 被要求停止后 recv 先交完箱里剩下的快照，再返回 None
+        while let Some(body) = self.inbox.recv().await {
+            match self.client.post(&self.endpoint).body(body).send().await {
+                Ok(resp) if !resp.status().is_success() => {
+                    tracing::warn!(status = %resp.status(), endpoint = %self.endpoint, "pushgateway 拒绝了本次推送");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, endpoint = %self.endpoint, "pushgateway 推送失败");
+                }
+                Ok(_) => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

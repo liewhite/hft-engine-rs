@@ -2,8 +2,8 @@
 //!
 //! 核心原则：**未配置观测出口时，引擎行为与没有本模块完全一致**（pushgateway 与 Slack
 //! 曾作为内置功能删除过，见 docs/todo.md；现在以可选出口重新提供，默认关闭）。如实说明依赖方向：
-//! 编译期是引擎引用本模块（metrics 填充推送文本、bootstrap 挂告警层），本模块不反向
-//! 依赖引擎运行时；运行期出口全部旁路（异步、失败降级、限流），绝不拖垮交易。
+//! 编译期是引擎引用本模块（metrics 填充推送文本并把推送器挂在自己名下、bootstrap 挂告警层），本模块只用
+//! 任务树（`crate::tasks`），不反向依赖引擎运行时；运行期出口全部旁路（异步、失败降级、限流），绝不拖垮交易。
 //! - 告警外送（[`alert`]）：tracing 的 WARN/ERROR 事件经 Layer 旁路推 webhook ——
 //!   零业务侵入，对账漂移/投产失败/断流退出等既有告警点自动覆盖
 //! - 指标推送（[`prometheus`]）：`Metrics` 的周期快照可选推 Prometheus pushgateway
@@ -20,4 +20,4 @@ pub mod alert;
 pub mod prometheus;
 
 pub(crate) use alert::{spawn_alert_webhook_layer, AlertHandle, AlertWebhookConfig};
-pub use prometheus::{MetricsPushConfig, PromText};
+pub use prometheus::{MetricsPushConfig, PromText, Pusher};

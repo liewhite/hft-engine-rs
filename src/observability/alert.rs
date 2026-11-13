@@ -20,6 +20,13 @@
 //!
 //! Layer 内只做同步格式化 + `unbounded_send`，不做任何 IO；发送任务自己的日志用
 //! [`SELF_TARGET`]，Layer 精确排除，不会自激回环。
+//!
+//! # 为什么发送任务不挂在任务树上
+//!
+//! 它的一生必须盖住整棵树的一生：树根建立之前就要试发，停机途中各节点的 WARN/ERROR 要照发，
+//! 根停完之后还要发退出原因。挂在树上就会先于最要紧的那几条被停掉。它的收尾由进程入口负责：
+//! `engine::run_main` 在返回前用 [`AlertHandle::flush`] 限时等它把队列发完（进程正常退出、
+//! 出错退出、主流程 panic 都走这一步），所以它不是无人等的游离任务。
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -172,6 +179,7 @@ pub fn spawn_alert_webhook_layer(config: AlertWebhookConfig) -> anyhow::Result<(
 
 fn spawn_with_sink(sink: impl AlertSink) -> (AlertWebhookLayer, AlertHandle) {
     let (tx, rx) = mpsc::unbounded_channel::<Msg>();
+    // 不挂任务树、收尾靠 run_main 的 flush：见模块文档「为什么发送任务不挂在任务树上」
     tokio::spawn(sender_task(sink, rx));
     (AlertWebhookLayer { tx: tx.clone() }, AlertHandle { tx })
 }

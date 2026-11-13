@@ -105,7 +105,7 @@
 
 契约 2（宿主处理任何消息都不得阻塞在 IO 上）淘汰了其他候选：
 
-- `Metrics` —— 推送是 `spawn_push` 出去的，收件箱不碰 IO，**合格**；但它是观测组件，
+- `Metrics` —— 推送交给它的子任务推送器（`observability::prometheus::Pusher`），收件箱不碰 IO，**合格**；但它是观测组件，
   明确声明"故障不得拖垮交易"，让它当权威数据源会反转这条边界。
 - `PositionLedger`（原 `PositionReconcileActor`）—— 原本**不合格**：`poll_and_reconcile` 在 handler 里
   `join_all` 各所 REST，最长阻塞一个 client 超时。这次把拉取移出 handler（见下）后合格，且它本就是
