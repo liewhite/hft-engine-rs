@@ -1,6 +1,8 @@
 //! Hyperliquid ExchangeClient 实现 (REST)
 
-use super::markets::{dex_of_coin, dex_offset, hl_price_rule, DexUniverse, HlAsset, HlMarkets};
+use super::markets::{
+    dex_of_coin, dex_offset, hl_price_rule, perp_dex_names, DexUniverse, HlAsset, HlMarkets,
+};
 use super::symbol::from_hyperliquid;
 use crate::domain::{
     AccountInfo, Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, PlaceError,
@@ -934,9 +936,11 @@ impl AccountClient for HyperliquidClient {
             .await
     }
 
-    /// 已接入各 dex 上的全部挂单（任一 dex 查询失败整体报错）。
+    /// 账户在**全部** perp dex 上的挂单（不只本引擎接入的 dex：统一账户下别的 dex 的挂单同样占保证金、
+    /// 同样会成交）。任一请求失败整体报错。没接入的 dex 上的挂单撤不了（没有它的品种目录），
+    /// 由清场复查报出、拒绝启动。
     ///
-    /// 用 `openOrders` 按 dex 查：账户级挂单列表不带 dex 参数时只回主站。
+    /// `openOrders` 按 dex 查：不带 dex 参数时只回主站。
     async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
         let wallet = &self.account()?.credentials.wallet_address;
 
@@ -946,14 +950,17 @@ impl AccountClient for HyperliquidClient {
             oid: u64,
         }
 
-        let per_dex =
-            futures_util::future::try_join_all(self.markets.dexes().iter().map(|dex| async move {
-                self.post_info::<Vec<Row>>(
-                    serde_json::json!({"type": "openOrders", "user": wallet, "dex": dex}),
-                )
-                .await
-            }))
+        let perp_dexs: Vec<Option<serde_json::Value>> = self
+            .post_info(serde_json::json!({"type": "perpDexs"}))
             .await?;
+        let dexes = perp_dex_names(&perp_dexs).map_err(ExchangeError::ParseError)?;
+        let per_dex = futures_util::future::try_join_all(dexes.iter().map(|dex| async move {
+            self.post_info::<Vec<Row>>(
+                serde_json::json!({"type": "openOrders", "user": wallet, "dex": dex}),
+            )
+            .await
+        }))
+        .await?;
         Ok(per_dex
             .into_iter()
             .flatten()

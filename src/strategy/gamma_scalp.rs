@@ -21,7 +21,7 @@ use crate::domain::{
 };
 use crate::exchange::{AccountStream, SubscriptionKind};
 use crate::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData, PendingOrder};
-use crate::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
+use crate::strategy::{Signal, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
 
 /// 对冲数量相对目标漂移超该比例则撤单重挂 (默认值)
@@ -141,7 +141,7 @@ impl GammaScalpStrategy {
                 if qty < self.min_hedge_qty {
                     Vec::new()
                 } else {
-                    vec![OutcomeEvent::PlaceOrders {
+                    vec![Signal::PlaceOrders {
                         orders: vec![OrderIntent {
                             exchange: self.exchange,
                             symbol: self.symbol.clone(),
@@ -162,7 +162,7 @@ impl GammaScalpStrategy {
         }
     }
 
-    /// 撤掉对冲单。下单还没受理、已结束、撤单还在途的单由框架丢弃（见 `OutcomeEvent::CancelOrder`），这里不用记；
+    /// 撤掉对冲单。下单还没受理、已结束、撤单还在途的单由框架丢弃（见 `Signal::CancelOrder`），这里不用记；
     /// 被丢弃的撤单在下一次重算（逐笔成交或 greeks 事件）时再发
     fn cancel(&self, pending: &PendingOrder) -> Signal {
         tracing::debug!(
@@ -171,8 +171,7 @@ impl GammaScalpStrategy {
             side = ?pending.order.side,
             "gamma_hedge cancel (side flip / qty drift / back-in-band)"
         );
-        OutcomeEvent::CancelOrder {
-            exchange: self.exchange,
+        Signal::CancelOrder {
             symbol: self.symbol.clone(),
             client_order_id: pending.order.client_order_id.clone(),
         }

@@ -34,7 +34,7 @@ use hft_engine_rs::engine::{
 use hft_engine_rs::exchange::SubscriptionKind;
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
+use hft_engine_rs::strategy::{Signal, Strategy, StrategyView};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
@@ -102,7 +102,7 @@ impl Strategy for DipMaker {
         let Some(quantity) = from_f64(self.order_notional / to_f64(price)) else {
             return Vec::new();
         };
-        vec![OutcomeEvent::PlaceOrders {
+        vec![Signal::PlaceOrders {
             orders: vec![OrderIntent {
                 exchange: self.exchange,
                 symbol: bbo.symbol.clone(),

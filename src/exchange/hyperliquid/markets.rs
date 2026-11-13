@@ -163,6 +163,24 @@ pub(crate) fn dex_of_coin(coin: &str) -> &str {
     coin.split_once(':').map_or("", |(dex, _)| dex)
 }
 
+/// `perpDexs` 响应里的全部 perp dex 名（"" = 主站，即列表第 0 项 `null`）。名字解析不了报错：
+/// 清场要查遍账户所有 dex 的挂单，少一个就会谎报干净
+pub(crate) fn perp_dex_names(
+    perp_dexs: &[Option<serde_json::Value>],
+) -> Result<Vec<String>, String> {
+    perp_dexs
+        .iter()
+        .map(|e| match e {
+            None => Ok(String::new()),
+            Some(v) => v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| format!("HL perpDexs 条目没有 name：{v}")),
+        })
+        .collect()
+}
+
 /// 由 `perpDexs` 响应求某 dex 的资产编号偏移。列表第 0 项是主站（`null`）。
 pub(crate) fn dex_offset(
     perp_dexs: &[Option<serde_json::Value>],
@@ -224,6 +242,18 @@ impl PriceRule for HlSigFigs {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    /// 清场要查遍的 dex：主站（列表第 0 项 null）+ 各 builder dex，名字解析不了就报错
+    #[test]
+    fn perp_dex_names_include_main_and_every_builder_dex() {
+        let raw: Vec<Option<serde_json::Value>> =
+            serde_json::from_str(r#"[null, {"name":"xyz","fullName":"XYZ"}, {"name":"flx"}]"#)
+                .unwrap();
+        assert_eq!(perp_dex_names(&raw).unwrap(), vec!["", "xyz", "flx"]);
+        let broken: Vec<Option<serde_json::Value>> =
+            serde_json::from_str(r#"[null, {"fullName":"?"}]"#).unwrap();
+        assert!(perp_dex_names(&broken).is_err());
+    }
 
     fn info(name: &str, sz: i32, extra: &str) -> AssetInfo {
         serde_json::from_str(&format!(

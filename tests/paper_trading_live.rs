@@ -39,7 +39,7 @@ use hft_engine_rs::messaging::{
     SymbolAccountData,
 };
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
+use hft_engine_rs::strategy::{Signal, Strategy, StrategyView};
 use hft_engine_rs::tasks::{Inbox, Root, Scope, Task};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -115,7 +115,7 @@ impl Strategy for DipMaker {
         }
         let price = bbo.bid_price * (Decimal::ONE - OFFSET_BP / dec!(10000));
         self.0.lock().unwrap().limit_price = Some(price);
-        vec![OutcomeEvent::PlaceOrders {
+        vec![Signal::PlaceOrders {
             orders: vec![OrderIntent {
                 exchange: EX,
                 symbol: COIN.to_string(),

@@ -55,7 +55,7 @@ use crate::messaging::{
     RequestOutcome, SymbolAccountData,
 };
 use crate::observability::Gauge;
-use crate::strategy::{OutcomeEvent, Signal, Strategy, StrategyView, SymbolView};
+use crate::strategy::{Signal, Strategy, StrategyView, SymbolView};
 use std::collections::{HashMap, HashSet};
 
 /// 想在某所挂的一张 maker 单
@@ -117,8 +117,8 @@ struct RejectBackoff {
     until: Timestamp,
     /// 本次等待时长（下次再拒就翻倍）
     delay_ms: u64,
-    /// 最近一次计入的拒单是哪张单（客户端订单号；订单回报不带单号时为空，不去重）
-    client_order_id: Option<String>,
+    /// 最近一次计入的拒单是哪张单（客户端订单号）
+    client_order_id: String,
 }
 
 /// 拒单退避的上限：持续拒单时每所每币最多 5 分钟试一次
@@ -517,7 +517,11 @@ impl FundingArbStrategy {
                     }
                     OrderStatus::Cancelled => return,
                 };
-                (u.exchange, u.client_order_id.as_deref(), rejected)
+                // 不带客户端订单号的不是本引擎的单（引擎的单都带，账户独占），不计
+                let Some(cid) = u.client_order_id.as_deref() else {
+                    return;
+                };
+                (u.exchange, cid, rejected)
             }
             SymbolAccountData::OrderRequest(r) => {
                 let rejected = match &r.outcome {
@@ -525,28 +529,26 @@ impl FundingArbStrategy {
                     RequestOutcome::Placed { .. } => None,
                     RequestOutcome::CancelFailed { .. } => return,
                 };
-                (r.exchange, Some(r.client_order_id.as_str()), rejected)
+                (r.exchange, r.client_order_id.as_str(), rejected)
             }
             _ => return,
         };
         match rejected {
             Some(reason) => {
                 let previous = self.reject_backoff.get(&ex);
-                if client_order_id.is_some()
-                    && previous.is_some_and(|b| b.client_order_id.as_deref() == client_order_id)
-                {
+                if previous.is_some_and(|b| b.client_order_id == client_order_id) {
                     return; // 这张单的拒单已从另一条路计入
                 }
                 let delay_ms = previous.map_or(self.p.hedge_retry_ms, |b| {
                     (b.delay_ms * 2).min(MAX_REJECT_BACKOFF_MS)
                 });
-                tracing::warn!(symbol = %self.symbol(), %ex, ?client_order_id, %reason, delay_ms, "下单被拒，该所暂停挂新单");
+                tracing::warn!(symbol = %self.symbol(), %ex, %client_order_id, %reason, delay_ms, "下单被拒，该所暂停挂新单");
                 self.reject_backoff.insert(
                     ex,
                     RejectBackoff {
                         until: now + delay_ms,
                         delay_ms,
-                        client_order_id: client_order_id.map(str::to_string),
+                        client_order_id: client_order_id.to_string(),
                     },
                 );
             }
@@ -603,7 +605,7 @@ impl FundingArbStrategy {
     }
 
     fn place(&self, q: &Quote, qty: Quantity) -> Signal {
-        OutcomeEvent::PlaceOrders {
+        Signal::PlaceOrders {
             orders: vec![OrderIntent {
                 exchange: q.exchange,
                 symbol: self.symbol().clone(),
@@ -636,8 +638,7 @@ impl FundingArbStrategy {
             }
             tracing::warn!(symbol = %self.symbol(), exchange = %p.order.exchange, client_order_id = %p.order.client_order_id, %reason, "撤单失败且单还开着，重撤");
         }
-        Some(OutcomeEvent::CancelOrder {
-            exchange: p.order.exchange,
+        Some(Signal::CancelOrder {
             symbol: self.symbol().clone(),
             client_order_id: p.order.client_order_id.clone(),
         })
@@ -689,7 +690,7 @@ impl FundingArbStrategy {
         self.hedge_attempts += 1;
         self.last_hedge_ts = Some(now);
         let mut out = out;
-        out.push(OutcomeEvent::PlaceOrders {
+        out.push(Signal::PlaceOrders {
             orders: vec![OrderIntent {
                 exchange: target,
                 symbol: self.symbol().clone(),

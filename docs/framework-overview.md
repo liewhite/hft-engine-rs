@@ -120,17 +120,22 @@ pub trait Strategy: Send + Sync {
 产出：
 
 ```rust
-pub type Signal = OutcomeEvent<OrderIntent>;   // 策略产出
-pub enum OutcomeEvent<O = Order> {             // StrategyRunner 处理后发往出口的是 OutcomeEvent<Order>
-    PlaceOrders { orders: Vec<O>, comment: String },
-    CancelOrder { exchange, symbol, client_order_id },
+pub enum Signal {                    // 策略产出
+    PlaceOrders { orders: Vec<OrderIntent>, comment: String },
+    CancelOrder { symbol, client_order_id },   // 所由框架从跟踪表查
     Emit(CustomEvent),   // 发给外部订阅者，下单出口对它 no-op
+}
+pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
+    PlaceOrders { orders: Vec<Order>, comment: String },
+    CancelOrder { exchange, symbol, client_order_id },
+    Emit(CustomEvent),
 }
 ```
 
 策略只给下单意图 `OrderIntent`（所、币、方向、类型、数量、只减仓），没有订单号、不必取整。
 `StrategyRunner` 是**下单范围的唯一闸门**：(所, 币) 不在本策略订阅范围内、没有合约规格或该所没装配，
 整机停机；否则分配客户端订单号、按交易所精度取整成 `Order`，登记进订单跟踪表的就是这张发出的单。
+撤单同样只能撤范围内的币，撤哪个所取自跟踪表。
 
 ### 3.2 `engine` —— 装配与运行时
 

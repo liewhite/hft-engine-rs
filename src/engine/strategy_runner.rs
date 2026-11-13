@@ -20,7 +20,7 @@
 
 use crate::domain::{AccountId, Exchange, Order, OrderIntent, OrderType, Symbol, SymbolMeta};
 use crate::messaging::{IncomeEvent, StateManager, SubscriptionScope};
-use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
+use crate::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -131,13 +131,13 @@ impl StrategyRunner {
         self.subscriptions.accepts(event)
     }
 
-    /// 更新状态并运行策略，返回信号（下单意图已过范围闸门、分配订单号、按交易所精度取整并登记
-    /// 跟踪表；撤单只放行下单已受理、还开着、没有撤单在途的单，并记下「撤单已发」）。
+    /// 更新状态并运行策略，把策略的信号处理成发往出口的事件（下单意图已过范围闸门、分配订单号、按交易所
+    /// 精度取整并登记跟踪表；撤单只放行下单已受理、还开着、没有撤单在途的单，所取自跟踪表，并记下「撤单已发」）。
     ///
     /// 产出订单是**币本位**且已取整；单位折算是出口的职责，见模块文档。
     ///
     /// `Err` = 订单跟踪表已说不清挂单与持仓（有单等交易所太久，见 [`crate::messaging::ORDER_STUCK_MS`]），
-    /// 或策略对范围外的 (所, 币) 下单（见 [`Self::admit`]），驱动方应停机。同一批里闸门前已登记的单
+    /// 或策略对范围外的 (所, 币) 下单（见 [`Self::admit`]）、撤范围外的币的单，驱动方应停机。同一批里闸门前已登记的单
     /// 随停机作废：停机后不发任何新单（用户定 #710）。
     pub fn on_event(&mut self, event: &IncomeEvent) -> Result<Vec<OutcomeEvent>, String> {
         self.state.apply(event)?;
@@ -150,7 +150,7 @@ impl StrategyRunner {
         let mut out = Vec::with_capacity(raw.len());
         for signal in raw {
             match signal {
-                OutcomeEvent::PlaceOrders { orders, comment } => {
+                Signal::PlaceOrders { orders, comment } => {
                     let mut admitted = Vec::with_capacity(orders.len());
                     for intent in orders {
                         let order = self.admit(intent)?;
@@ -163,22 +163,30 @@ impl StrategyRunner {
                         comment,
                     });
                 }
-                OutcomeEvent::CancelOrder {
-                    exchange,
+                Signal::CancelOrder {
                     symbol,
                     client_order_id,
-                } => match self.state.mark_cancel_sent(&symbol, &client_order_id, now) {
-                    Ok(()) => out.push(OutcomeEvent::CancelOrder {
-                        exchange,
-                        symbol,
-                        client_order_id,
-                    }),
-                    Err(why) => {
-                        tracing::debug!(%exchange, %symbol, %client_order_id, why, "撤单不发出")
+                } => {
+                    // 范围外的币没有跟踪表：与下单同一道闸门，策略写错了就停机
+                    if self.state.symbol_state(&symbol).is_none() {
+                        return Err(format!(
+                            "策略撤订阅范围外的 {symbol} 的单（{client_order_id}）"
+                        ));
                     }
-                },
+                    // 所取自跟踪表里那张单，策略不填
+                    match self.state.mark_cancel_sent(&symbol, &client_order_id, now) {
+                        Ok(exchange) => out.push(OutcomeEvent::CancelOrder {
+                            exchange,
+                            symbol,
+                            client_order_id,
+                        }),
+                        Err(why) => {
+                            tracing::debug!(%symbol, %client_order_id, why, "撤单不发出")
+                        }
+                    }
+                }
                 // 自定义事件原样放行：无订单语义，不登记 pending、不过精度取整
-                OutcomeEvent::Emit(custom) => out.push(OutcomeEvent::Emit(custom)),
+                Signal::Emit(custom) => out.push(OutcomeEvent::Emit(custom)),
             }
         }
         Ok(out)
@@ -302,7 +310,7 @@ mod tests {
                 return Vec::new();
             }
             self.placed = true;
-            vec![OutcomeEvent::PlaceOrders {
+            vec![Signal::PlaceOrders {
                 orders: vec![OrderIntent {
                     exchange: self.exchange,
                     symbol: self.symbol.to_string(),
@@ -392,6 +400,31 @@ mod tests {
                 .symbol_state(&SYM.to_string())
                 .is_some_and(|s| !s.order_book().has_pending()));
         }
+    }
+
+    /// 撤范围外的币的单同样停机（与下单同一道闸门）
+    #[test]
+    fn cancels_outside_the_subscription_scope_stop_the_engine() {
+        struct CancelEth;
+        impl Strategy for CancelEth {
+            fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
+                OneShot::new(dec!(1), dec!(1)).public_streams()
+            }
+            fn on_event(&mut self, _e: &IncomeEvent, _v: StrategyView<'_>) -> Vec<Signal> {
+                vec![Signal::CancelOrder {
+                    symbol: "ETH".to_string(),
+                    client_order_id: "x".to_string(),
+                }]
+            }
+        }
+        let mut runner = StrategyRunner::new(
+            Box::new(CancelEth),
+            metas(),
+            crate::backtest::backtest_account(),
+            Box::new(SequentialClientOrderIdGen::default()),
+        );
+        let err = runner.on_event(&clock()).expect_err("范围外撤单应报错");
+        assert!(err.contains("订阅范围外"), "{err}");
     }
 
     /// 范围内但没有合约规格（取不了整）同样停机，不按原值照发

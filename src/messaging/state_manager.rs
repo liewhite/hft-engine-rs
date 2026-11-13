@@ -177,17 +177,18 @@ impl StateManager {
             .add_pending_order(order, created_at);
     }
 
-    /// 策略要撤这张单：记下「撤单已发」，`Ok` 表示该发（见 [`crate::messaging::SymbolOrders::mark_cancel_sent`]）
+    /// 策略要撤这张单：记下「撤单已发」，`Ok` 带这张单所在的所、表示该发（见
+    /// [`crate::messaging::SymbolOrders::mark_cancel_sent`]）。调用方已确认币在范围内
     pub fn mark_cancel_sent(
         &mut self,
         symbol: &Symbol,
         client_order_id: &str,
         now: Timestamp,
-    ) -> Result<(), &'static str> {
-        match self.states.get_mut(symbol) {
-            Some(state) => state.mark_cancel_sent(client_order_id, now),
-            None => Err("symbol 未注册"),
-        }
+    ) -> Result<Exchange, &'static str> {
+        self.states
+            .get_mut(symbol)
+            .expect("调用方已确认币在订阅范围内（已注册）")
+            .mark_cancel_sent(client_order_id, now)
     }
 
     // ==================== 状态查询 ====================

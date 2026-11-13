@@ -22,7 +22,7 @@ use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
 use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, SymbolAccountData};
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
+use hft_engine_rs::strategy::{Signal, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -55,7 +55,7 @@ impl MeanRevertMaker {
         reduce_only: bool,
         comment: &str,
     ) -> Signal {
-        OutcomeEvent::PlaceOrders {
+        Signal::PlaceOrders {
             orders: vec![OrderIntent {
                 exchange: EX,
                 symbol: self.symbol.clone(),

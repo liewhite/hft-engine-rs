@@ -525,7 +525,7 @@ impl SymbolOrders {
         );
     }
 
-    /// 策略要撤这张单：记下「撤单在途」，返回 `Ok` 表示该发。
+    /// 策略要撤这张单：记下「撤单在途」，返回 `Ok`（带这张单所在的所）表示该发。
     ///
     /// 不该发的（`Err` 带原因）：不在表里、已到终态或收到的成交已加满单量（撤不掉，发了白耗一次交易所操作）、
     /// 下单请求还没结论、上一次撤单还在等结论（见 [`OrderStage`]）。下单没结论时不撤：受理的结论（或交易所回报）一到
@@ -534,11 +534,10 @@ impl SymbolOrders {
         &mut self,
         client_order_id: &str,
         now: Timestamp,
-    ) -> Result<(), &'static str> {
-        match self.orders.get_mut(client_order_id) {
-            Some(p) => p.request_cancel(now),
-            None => Err("不在跟踪表里"),
-        }
+    ) -> Result<Exchange, &'static str> {
+        let p = self.orders.get_mut(client_order_id).ok_or("不在跟踪表里")?;
+        p.request_cancel(now)?;
+        Ok(p.order.exchange)
     }
 
     /// 交易所的订单回报
@@ -735,7 +734,7 @@ impl SymbolState {
         &mut self,
         client_order_id: &str,
         now: Timestamp,
-    ) -> Result<(), &'static str> {
+    ) -> Result<Exchange, &'static str> {
         self.order_book.mark_cancel_sent(client_order_id, now)
     }
 

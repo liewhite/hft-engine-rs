@@ -4,7 +4,7 @@ use crate::domain::{
 };
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{IncomeEvent, MarketData, MarketEvent};
-use crate::strategy::{OutcomeEvent, Signal, Strategy, StrategyView, SymbolView};
+use crate::strategy::{Signal, Strategy, StrategyView, SymbolView};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -948,7 +948,7 @@ impl Strategy for SpreadArbStrategy {
                     processed.long_deviation * 100.0,
                     net_exposure,
                 );
-                return vec![OutcomeEvent::PlaceOrders { orders, comment }];
+                return vec![Signal::PlaceOrders { orders, comment }];
             }
         }
 

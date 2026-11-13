@@ -17,25 +17,36 @@ use crate::messaging::{CustomEvent, IncomeEvent};
 use crate::observability::Gauge;
 use std::collections::{HashMap, HashSet};
 
-/// 策略产出的信号：下单只给意图（[`OrderIntent`]，没有订单号、未取整）
-pub type Signal = OutcomeEvent<OrderIntent>;
-
-/// 信号。两段生命用同一个枚举、只有单的类型不同：策略产出 [`Signal`]（下单意图），
-/// 框架（`StrategyRunner`）查范围、赋号、取整后发到出向总线的是 `OutcomeEvent<Order>`。
+/// 策略产出的信号。由框架（`StrategyRunner`）处理成发往出口的 [`OutcomeEvent`]：
+/// 下单意图过范围闸门、赋号、取整；撤单按跟踪表补上所在的所。
 #[derive(Debug, Clone)]
-pub enum OutcomeEvent<O = Order> {
-    /// 下单信号（一次决策可包含多个关联订单）
+pub enum Signal {
+    /// 下单（一次决策可包含多个关联订单）：只给意图（[`OrderIntent`]，没有订单号、未取整）
     PlaceOrders {
-        /// 关联订单列表
-        orders: Vec<O>,
+        orders: Vec<OrderIntent>,
         /// 信号意图描述，如 "spread_open | spread=0.30% | qty=10"
         comment: String,
     },
-    /// 撤单信号（按客户端订单号撤，不等交易所订单号）。
+    /// 撤本策略的一张单（按客户端订单号，不等交易所订单号）。在哪个所由框架从跟踪表查，策略不填，
+    /// 也就填不错。
     ///
-    /// 框架只对下单已受理、还开着（收到的成交也没加满单量）、且没有撤单在途的单发出，其余丢弃（见 `SymbolOrders::mark_cancel_sent`），
-    /// 策略要在之后的事件里重新要求；撤单失败以
+    /// 框架只对下单已受理、还开着（收到的成交也没加满单量）、且没有撤单在途的单发出，其余丢弃（见
+    /// `SymbolOrders::mark_cancel_sent`），策略要在之后的事件里重新要求；撤单失败以
     /// [`crate::messaging::RequestOutcome::CancelFailed`] 回报，记在单的撤单状态上（[`crate::messaging::CancelAttempt::Failed`]）。
+    CancelOrder {
+        symbol: Symbol,
+        client_order_id: String,
+    },
+    /// 向外发布自定义事件（见 [`OutcomeEvent::Emit`]）
+    Emit(CustomEvent),
+}
+
+/// 框架发往出向总线的事件（由 [`Signal`] 处理而来，见 `StrategyRunner::on_event`）
+#[derive(Debug, Clone)]
+pub enum OutcomeEvent {
+    /// 要发出的单：已过范围闸门、已赋号、已按交易所精度取整，且已登记跟踪表
+    PlaceOrders { orders: Vec<Order>, comment: String },
+    /// 要发出的撤单（所取自跟踪表）
     CancelOrder {
         exchange: Exchange,
         symbol: Symbol,

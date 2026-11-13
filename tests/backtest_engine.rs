@@ -101,7 +101,7 @@ impl Strategy for OneShotBuy {
         );
         if is_market && !self.placed {
             self.placed = true;
-            return vec![OutcomeEvent::PlaceOrders {
+            return vec![Signal::PlaceOrders {
                 orders: vec![OrderIntent {
                     exchange: EX,
                     symbol: SYM.to_string(),
@@ -267,11 +267,11 @@ impl Strategy for EmitOnBbo {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Vec::new()
             }
-            MarketData::BBO(b) => vec![OutcomeEvent::Emit(
-                hft_engine_rs::messaging::CustomEvent::new(PingSignal {
+            MarketData::BBO(b) => vec![Signal::Emit(hft_engine_rs::messaging::CustomEvent::new(
+                PingSignal {
                     mid: (b.bid_price + b.ask_price) / dec!(2),
-                }),
-            )],
+                },
+            ))],
             _ => Vec::new(),
         }
     }
