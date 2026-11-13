@@ -1,7 +1,7 @@
 use super::from_binance;
 use crate::domain::{
     Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
-    OrderUpdate, Quantity, Side, Symbol, now_ms, Decimal, BBO,
+    OrderUpdate, Quantity, Side, Symbol, now_ms, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -42,7 +42,7 @@ impl MarkPriceUpdate {
     pub fn to_mark_price(&self, quote: &str, timestamp: u64) -> Result<MarkPrice, String> {
         let symbol = from_binance(&self.s, quote)
             .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
-        let price = Decimal::from_str(&self.p)
+        let price = crate::domain::parse_decimal(&self.p)
             .map_err(|_| format!("Failed to parse mark price: {}", self.p))?;
 
         Ok(MarkPrice {
@@ -57,7 +57,7 @@ impl MarkPriceUpdate {
     pub fn to_index_price(&self, quote: &str, timestamp: u64) -> Result<IndexPrice, String> {
         let symbol = from_binance(&self.s, quote)
             .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
-        let price = Decimal::from_str(&self.i)
+        let price = crate::domain::parse_decimal(&self.i)
             .map_err(|_| format!("Failed to parse index price: {}", self.i))?;
 
         Ok(IndexPrice {
@@ -95,13 +95,13 @@ impl BookTicker {
     pub fn to_bbo(&self, quote: &str) -> Result<BBO, String> {
         let symbol = from_binance(&self.s, quote)
             .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
-        let bid_price = Decimal::from_str(&self.b)
+        let bid_price = crate::domain::parse_decimal(&self.b)
             .map_err(|_| format!("Failed to parse bid price: {}", self.b))?;
-        let bid_qty = Decimal::from_str(&self.bid_qty)
+        let bid_qty = crate::domain::parse_decimal(&self.bid_qty)
             .map_err(|_| format!("Failed to parse bid qty: {}", self.bid_qty))?;
-        let ask_price = Decimal::from_str(&self.a)
+        let ask_price = crate::domain::parse_decimal(&self.a)
             .map_err(|_| format!("Failed to parse ask price: {}", self.a))?;
-        let ask_qty = Decimal::from_str(&self.ask_qty)
+        let ask_qty = crate::domain::parse_decimal(&self.ask_qty)
             .map_err(|_| format!("Failed to parse ask qty: {}", self.ask_qty))?;
 
         Ok(BBO {
@@ -139,9 +139,9 @@ impl AggTrade {
     pub fn to_market_trade(&self, quote: &str) -> Result<MarketTrade, String> {
         let symbol = from_binance(&self.s, quote)
             .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
-        let price = Decimal::from_str(&self.p)
+        let price = crate::domain::parse_decimal(&self.p)
             .map_err(|_| format!("Failed to parse trade price: {}", self.p))?;
-        let qty = Decimal::from_str(&self.q)
+        let qty = crate::domain::parse_decimal(&self.q)
             .map_err(|_| format!("Failed to parse trade qty: {}", self.q))?;
 
         Ok(MarketTrade {
@@ -259,7 +259,7 @@ impl OrderTradeUpdate {
 
     /// 本次成交量，0 = 这条回报没有成交
     fn last_filled(&self) -> Result<Quantity, String> {
-        Decimal::from_str(&self.o.l).map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))
+        crate::domain::parse_decimal(&self.o.l).map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))
     }
 
     /// 本引擎未接入的合约上的成交：原样上报（见 `AccountData::UnmappedFill`）。无成交返回 `None`。
@@ -273,7 +273,7 @@ impl OrderTradeUpdate {
             instrument: self.o.s.clone(),
             side: self.side()?,
             size,
-            price: Decimal::from_str(&self.o.last_price)
+            price: crate::domain::parse_decimal(&self.o.last_price)
                 .map_err(|_| format!("Failed to parse last price: {}", self.o.last_price))?,
             timestamp: now_ms(),
         }))
@@ -299,9 +299,9 @@ impl OrderTradeUpdate {
             other => return Err(format!("Binance 订单状态未知: {other}")),
         };
 
-        let quantity = Decimal::from_str(&self.o.q)
+        let quantity = crate::domain::parse_decimal(&self.o.q)
             .map_err(|_| format!("Failed to parse quantity: {}", self.o.q))?;
-        let filled_quantity = Decimal::from_str(&self.o.z)
+        let filled_quantity = crate::domain::parse_decimal(&self.o.z)
             .map_err(|_| format!("Failed to parse cumulative filled qty: {}", self.o.z))?;
 
         Ok(OrderUpdate {
@@ -326,7 +326,7 @@ impl OrderTradeUpdate {
             return Ok(None);
         }
 
-        let last_price = Decimal::from_str(&self.o.last_price)
+        let last_price = crate::domain::parse_decimal(&self.o.last_price)
             .map_err(|_| format!("Failed to parse last price: {}", self.o.last_price))?;
 
         let side = self.side()?;

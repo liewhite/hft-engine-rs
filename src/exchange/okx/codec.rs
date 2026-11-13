@@ -110,17 +110,17 @@ impl BboData {
         if ask.len() < 2 {
             return Err(format!("BBO ask data incomplete: {:?}", ask));
         }
-        let ask_price = Decimal::from_str(&ask[0])
+        let ask_price = crate::domain::parse_decimal(&ask[0])
             .map_err(|_| format!("Failed to parse ask price: {}", ask[0]))?;
-        let ask_qty = Decimal::from_str(&ask[1])
+        let ask_qty = crate::domain::parse_decimal(&ask[1])
             .map_err(|_| format!("Failed to parse ask qty: {}", ask[1]))?;
 
         if bid.len() < 2 {
             return Err(format!("BBO bid data incomplete: {:?}", bid));
         }
-        let bid_price = Decimal::from_str(&bid[0])
+        let bid_price = crate::domain::parse_decimal(&bid[0])
             .map_err(|_| format!("Failed to parse bid price: {}", bid[0]))?;
-        let bid_qty = Decimal::from_str(&bid[1])
+        let bid_qty = crate::domain::parse_decimal(&bid[1])
             .map_err(|_| format!("Failed to parse bid qty: {}", bid[1]))?;
 
         let timestamp = self.ts.parse::<u64>()
@@ -159,9 +159,9 @@ pub struct TradeData {
 impl TradeData {
     /// 转为公共成交印记，数量已折算为币本位。
     pub fn to_market_trade(&self, meta: &SymbolMeta) -> Result<MarketTrade, String> {
-        let price = Decimal::from_str(&self.px)
+        let price = crate::domain::parse_decimal(&self.px)
             .map_err(|_| format!("Failed to parse trade price: {}", self.px))?;
-        let qty = Decimal::from_str(&self.sz)
+        let qty = crate::domain::parse_decimal(&self.sz)
             .map_err(|_| format!("Failed to parse trade qty: {}", self.sz))?;
         let timestamp = self
             .ts
@@ -196,7 +196,7 @@ impl MarkPriceData {
     pub fn to_mark_price(&self, quote: &str) -> Result<MarkPrice, String> {
         let symbol = from_okx(&self.inst_id, quote)
             .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
-        let price = Decimal::from_str(&self.mark_px)
+        let price = crate::domain::parse_decimal(&self.mark_px)
             .map_err(|_| format!("Failed to parse mark price: {}", self.mark_px))?;
         let timestamp = self.ts.parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
@@ -224,7 +224,7 @@ impl IndexTickerData {
         // index-tickers 返回 BTC-USDT 格式，使用 from_okx_index 解析
         let symbol = from_okx_index(&self.inst_id, quote)
             .ok_or_else(|| format!("Unknown OKX index symbol: {}", self.inst_id))?;
-        let price = Decimal::from_str(&self.idx_px)
+        let price = crate::domain::parse_decimal(&self.idx_px)
             .map_err(|_| format!("Failed to parse index price: {}", self.idx_px))?;
         let timestamp = self.ts.parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
@@ -278,7 +278,7 @@ impl PositionData {
         let contracts = if self.pos.is_empty() {
             Decimal::ZERO
         } else {
-            Decimal::from_str(&self.pos).map_err(|_| format!("Failed to parse pos: {}", self.pos))?
+            crate::domain::parse_decimal(&self.pos).map_err(|_| format!("Failed to parse pos: {}", self.pos))?
         };
         Ok(Position {
             exchange: Exchange::OKX,
@@ -372,11 +372,11 @@ impl OrderPushData {
     pub fn to_order_update(&self, meta: &SymbolMeta) -> Result<OrderUpdate, String> {
         // 线路上三个数量字段都是张数，此处一次性折算为币本位
         let sz = meta.qty_to_coin(
-            Decimal::from_str(&self.sz).map_err(|_| format!("Failed to parse sz: {}", self.sz))?,
+            crate::domain::parse_decimal(&self.sz).map_err(|_| format!("Failed to parse sz: {}", self.sz))?,
         );
 
         let acc_fill_sz = meta.qty_to_coin(
-            Decimal::from_str(&self.acc_fill_sz)
+            crate::domain::parse_decimal(&self.acc_fill_sz)
                 .map_err(|_| format!("Failed to parse accFillSz: {}", self.acc_fill_sz))?,
         );
 
@@ -400,7 +400,7 @@ impl OrderPushData {
     /// `AccountData::UnmappedFill`），数量是交易所原始张数 —— 没有可信的折算系数。
     /// 无成交（`fillSz` 为 0）返回 `None`。
     pub fn to_unmapped_fill(&self) -> Result<Option<crate::messaging::UnmappedFill>, String> {
-        let size = Decimal::from_str(&self.fill_sz)
+        let size = crate::domain::parse_decimal(&self.fill_sz)
             .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?;
         if size.is_zero() {
             return Ok(None);
@@ -410,7 +410,7 @@ impl OrderPushData {
             instrument: self.inst_id.clone(),
             side: parse_side(&self.side)?,
             size,
-            price: Decimal::from_str(&self.fill_px)
+            price: crate::domain::parse_decimal(&self.fill_px)
                 .map_err(|_| format!("Failed to parse fill_px: {}", self.fill_px))?,
             timestamp: now_ms(),
         }))
@@ -419,7 +419,7 @@ impl OrderPushData {
     /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）。数量折算为币本位。
     pub fn to_fill(&self, meta: &SymbolMeta) -> Result<Option<Fill>, String> {
         let fill_sz = meta.qty_to_coin(
-            Decimal::from_str(&self.fill_sz)
+            crate::domain::parse_decimal(&self.fill_sz)
                 .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?,
         );
 
@@ -428,7 +428,7 @@ impl OrderPushData {
             return Ok(None);
         }
 
-        let fill_px = Decimal::from_str(&self.fill_px)
+        let fill_px = crate::domain::parse_decimal(&self.fill_px)
             .map_err(|_| format!("Failed to parse fill_px: {}", self.fill_px))?;
 
         let side = parse_side(&self.side)?;
@@ -555,13 +555,13 @@ pub fn parse_candle_data(
         .ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
     let open_time: u64 = raw[0].parse()
         .map_err(|_| format!("Failed to parse candle ts: {}", raw[0]))?;
-    let open = Decimal::from_str(&raw[1])
+    let open = crate::domain::parse_decimal(&raw[1])
         .map_err(|_| format!("Failed to parse candle open: {}", raw[1]))?;
-    let high = Decimal::from_str(&raw[2])
+    let high = crate::domain::parse_decimal(&raw[2])
         .map_err(|_| format!("Failed to parse candle high: {}", raw[2]))?;
-    let low = Decimal::from_str(&raw[3])
+    let low = crate::domain::parse_decimal(&raw[3])
         .map_err(|_| format!("Failed to parse candle low: {}", raw[3]))?;
-    let close = Decimal::from_str(&raw[4])
+    let close = crate::domain::parse_decimal(&raw[4])
         .map_err(|_| format!("Failed to parse candle close: {}", raw[4]))?;
     let volume = f64::from_str(&raw[5])
         .map_err(|_| format!("Failed to parse candle vol: {}", raw[5]))?;

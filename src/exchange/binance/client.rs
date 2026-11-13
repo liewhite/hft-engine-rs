@@ -88,11 +88,11 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
         for filter in s.filters {
             match filter {
                 Filter::PriceFilter { tick_size } => {
-                    price_step = tick_size.parse().ok();
+                    price_step = crate::domain::parse_decimal(&tick_size).ok();
                 }
                 Filter::LotSize { step_size, min_qty } => {
-                    size_step = step_size.parse().ok();
-                    min_order_size = min_qty.parse().ok();
+                    size_step = crate::domain::parse_decimal(&step_size).ok();
+                    min_order_size = crate::domain::parse_decimal(&min_qty).ok();
                 }
                 Filter::MinNotional { notional } => {
                     min_notional = notional.parse().ok();
@@ -339,7 +339,7 @@ impl BinanceClient {
                 Some(s) => s,
                 None => continue, // 非当前 quote 的交易对，跳过
             };
-            let size: Decimal = p.position_amt.parse()
+            let size: Decimal = crate::domain::parse_decimal(&p.position_amt)
                 .map_err(|_| ExchangeError::Other(format!(
                     "Failed to parse position_amt '{}' for {}", p.position_amt, p.symbol)))?;
             // 跳过空仓位
@@ -662,7 +662,7 @@ impl AccountClient for BinanceClient {
         let symbol = to_binance(&order.symbol, &self.quote);
         let side = side_to_binance(order.side);
         let (order_type, price, tif) = order_type_to_binance(&order.order_type);
-        let qty = order.quantity.to_string();
+        let qty = crate::domain::to_wire(order.quantity);
         let reduce_only = if order.reduce_only { "true" } else { "false" };
 
         let mut params: Vec<(&str, &str)> = vec![
@@ -795,7 +795,7 @@ fn order_type_to_binance(
                 TimeInForce::FOK => "FOK",
                 TimeInForce::PostOnly => "GTX",
             };
-            ("LIMIT", Some(price.to_string()), Some(tif_str))
+            ("LIMIT", Some(crate::domain::to_wire(*price)), Some(tif_str))
         }
     }
 }

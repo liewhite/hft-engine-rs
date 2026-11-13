@@ -50,7 +50,7 @@ impl SymbolMeta {
 
     /// 价格取到合法精度后写成下单字符串（无尾零、无科学计数法）
     pub fn format_price(&self, price: Price) -> String {
-        self.round_price(price).normalize().to_string()
+        crate::domain::to_wire(self.round_price(price))
     }
 
     /// 将价格取到最近的合法精度

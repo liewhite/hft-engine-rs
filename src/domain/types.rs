@@ -42,6 +42,20 @@ pub fn from_f64(x: f64) -> Option<Decimal> {
     Decimal::from_f64(x)
 }
 
+/// 交易所下发的十进制字符串 → 数量 / 价格。**解析口径的唯一出处**（各所 codec、client 都经此）：
+/// 普通小数，或科学计数法（`1e-5`，f64 时代能接受，防交易所偶发这种写法时整条回报解析失败）。
+pub fn parse_decimal(raw: &str) -> Result<Decimal, String> {
+    use std::str::FromStr;
+    Decimal::from_str(raw)
+        .or_else(|_| Decimal::from_scientific(raw))
+        .map_err(|_| format!("数值非法: '{raw}'"))
+}
+
+/// 数量 / 价格 → 下单字符串：去尾零、不用科学计数法（`62562.60` → `62562.6`）。三所共用
+pub fn to_wire(d: Decimal) -> String {
+    d.normalize().to_string()
+}
+
 /// 费率类型
 pub type Rate = f64;
 
@@ -60,3 +74,26 @@ pub fn now_ms() -> Timestamp {
         .as_millis() as u64
 }
 pub use rust_decimal_macros::dec;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_decimal_accepts_plain_and_scientific_exactly() {
+        assert_eq!(parse_decimal("0.29").unwrap(), dec!(0.29));
+        assert_eq!(parse_decimal("-12").unwrap(), dec!(-12));
+        assert_eq!(parse_decimal("1e-5").unwrap(), dec!(0.00001));
+        assert_eq!(parse_decimal("0E-8").unwrap(), dec!(0));
+        assert!(parse_decimal("").is_err());
+        assert!(parse_decimal("NaN").is_err());
+    }
+
+    #[test]
+    fn wire_has_no_trailing_zeros_or_exponent() {
+        assert_eq!(to_wire(dec!(62562.60)), "62562.6");
+        assert_eq!(to_wire(dec!(0.00100000)), "0.001");
+        assert_eq!(to_wire(dec!(4870)), "4870");
+        assert_eq!(to_wire(dec!(0.00000001)), "0.00000001");
+    }
+}

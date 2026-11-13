@@ -133,13 +133,13 @@ impl WsBbo {
             return Ok(None); // 单边盘口
         };
 
-        let bid_price = Decimal::from_str(&bid.px)
+        let bid_price = crate::domain::parse_decimal(&bid.px)
             .map_err(|_| format!("Failed to parse bid price: {}", bid.px))?;
-        let bid_qty = Decimal::from_str(&bid.sz)
+        let bid_qty = crate::domain::parse_decimal(&bid.sz)
             .map_err(|_| format!("Failed to parse bid size: {}", bid.sz))?;
-        let ask_price = Decimal::from_str(&ask.px)
+        let ask_price = crate::domain::parse_decimal(&ask.px)
             .map_err(|_| format!("Failed to parse ask price: {}", ask.px))?;
-        let ask_qty = Decimal::from_str(&ask.sz)
+        let ask_qty = crate::domain::parse_decimal(&ask.sz)
             .map_err(|_| format!("Failed to parse ask size: {}", ask.sz))?;
 
         Ok(Some(BBO {
@@ -228,9 +228,9 @@ pub fn aggregate_trades(trades: &[WsTrade]) -> Result<Vec<MarketTrade>, String> 
         let taker_side = parse_side(&t.side)?;
         // 主动卖 (A) 时买方为挂单方
         let is_buyer_maker = taker_side == Side::Short;
-        let price = Decimal::from_str(&t.px)
+        let price = crate::domain::parse_decimal(&t.px)
             .map_err(|_| format!("Failed to parse trade price: {}", t.px))?;
-        let qty = Decimal::from_str(&t.sz)
+        let qty = crate::domain::parse_decimal(&t.sz)
             .map_err(|_| format!("Failed to parse trade size: {}", t.sz))?;
 
         let key = (
@@ -286,7 +286,7 @@ impl WsActiveAssetCtx {
     /// 转换为 MarkPrice
     pub fn to_mark_price(&self, timestamp: u64) -> Result<MarkPrice, String> {
         let symbol = from_hyperliquid(&self.coin);
-        let price = Decimal::from_str(&self.ctx.mark_px)
+        let price = crate::domain::parse_decimal(&self.ctx.mark_px)
             .map_err(|_| format!("Failed to parse mark_px: {}", self.ctx.mark_px))?;
 
         Ok(MarkPrice {
@@ -300,7 +300,7 @@ impl WsActiveAssetCtx {
     /// 转换为 IndexPrice (使用 oracle_px 作为指数价格)
     pub fn to_index_price(&self, timestamp: u64) -> Result<IndexPrice, String> {
         let symbol = from_hyperliquid(&self.coin);
-        let price = Decimal::from_str(&self.ctx.oracle_px)
+        let price = crate::domain::parse_decimal(&self.ctx.oracle_px)
             .map_err(|_| format!("Failed to parse oracle_px: {}", self.ctx.oracle_px))?;
 
         Ok(IndexPrice {
@@ -405,7 +405,7 @@ pub struct PositionLeverage {
 impl AssetPosition {
     pub fn to_position(&self) -> Result<crate::domain::Position, String> {
         let symbol = from_hyperliquid(&self.coin);
-        let size = Decimal::from_str(&self.szi)
+        let size = crate::domain::parse_decimal(&self.szi)
             .map_err(|_| format!("Failed to parse szi: {}", self.szi))?;
         // 只取数量：均价与浮盈不进域模型（见 crate::domain::Position 的文档）——
         // 这也是 entry_px 的"空仓为 null / 在而解析不了"那套三态守卫可以整个删掉的原因
@@ -443,9 +443,9 @@ pub struct WsBasicOrder {
 impl WsOrderUpdate {
     pub fn to_order_update(&self) -> Result<crate::domain::OrderUpdate, String> {
         let symbol = from_hyperliquid(&self.order.coin);
-        let orig_sz = Decimal::from_str(&self.order.orig_sz)
+        let orig_sz = crate::domain::parse_decimal(&self.order.orig_sz)
             .map_err(|_| format!("Failed to parse orig_sz: {}", self.order.orig_sz))?;
-        let current_sz = Decimal::from_str(&self.order.sz)
+        let current_sz = crate::domain::parse_decimal(&self.order.sz)
             .map_err(|_| format!("Failed to parse sz: {}", self.order.sz))?;
         let filled_quantity = orig_sz - current_sz;
 
@@ -527,17 +527,17 @@ impl WsFill {
             exchange: Exchange::Hyperliquid,
             instrument: self.coin.clone(),
             side: parse_side(&self.side)?,
-            size: Decimal::from_str(&self.sz).map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?,
-            price: Decimal::from_str(&self.px).map_err(|_| format!("Failed to parse fill px: {}", self.px))?,
+            size: crate::domain::parse_decimal(&self.sz).map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?,
+            price: crate::domain::parse_decimal(&self.px).map_err(|_| format!("Failed to parse fill px: {}", self.px))?,
             timestamp: self.time,
         })
     }
 
     pub fn to_fill(&self) -> Result<Fill, String> {
         let symbol = from_hyperliquid(&self.coin);
-        let price = Decimal::from_str(&self.px)
+        let price = crate::domain::parse_decimal(&self.px)
             .map_err(|_| format!("Failed to parse fill px: {}", self.px))?;
-        let size = Decimal::from_str(&self.sz)
+        let size = crate::domain::parse_decimal(&self.sz)
             .map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?;
 
         // 本账户这一笔成交的方向

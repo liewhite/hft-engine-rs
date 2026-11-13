@@ -111,6 +111,9 @@ impl FundingArbConfig {
                 return Err(format!("pairs 里 {} 重复", p.symbol));
             }
             pos(&format!("{}.order_distance", p.symbol), p.order_distance)?;
+            if p.order_distance >= 1.0 {
+                return Err(format!("{}.order_distance 必须 < 1（挂单价 = 盘口价 × (1 ± 它)），当前 {}", p.symbol, p.order_distance));
+            }
             pos(&format!("{}.max_symbol_leverage", p.symbol), p.max_symbol_leverage)?;
             if p.max_symbol_leverage > p.max_account_leverage {
                 return Err(format!("{} 单币杠杆上限大于账户杠杆上限", p.symbol));

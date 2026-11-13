@@ -230,7 +230,7 @@ impl LastTrades {
     /// 没有 `tradeId` 的成交无从去重，当新成交。
     fn is_new_fill(&mut self, data: &OrderPushData) -> bool {
         // 解析不了的 fillSz 留给 to_fill 报错，这里当有成交
-        let has_fill = data.fill_sz.parse::<f64>().map_or(true, |sz| sz != 0.0);
+        let has_fill = crate::domain::parse_decimal(&data.fill_sz).map_or(true, |sz| !sz.is_zero());
         let repeated = has_fill && !data.trade_id.is_empty() && self.0.get(&data.ord_id) == Some(&data.trade_id);
         if repeated {
             tracing::warn!(

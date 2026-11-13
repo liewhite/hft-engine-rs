@@ -70,7 +70,7 @@ pub(crate) fn decimal(v: &serde_json::Value) -> Option<Decimal> {
         serde_json::Value::String(s) => s.replace(',', ""),
         _ => return None,
     };
-    let parsed = raw.parse::<Decimal>().or_else(|_| Decimal::from_scientific(&raw)).ok();
+    let parsed = crate::domain::parse_decimal(&raw).ok();
     if parsed.is_none() {
         tracing::warn!(raw = %v, "Failed to parse IB decimal");
     }

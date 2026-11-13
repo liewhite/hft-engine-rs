@@ -482,7 +482,7 @@ impl FundingArbStrategy {
         let young = now.saturating_sub(p.created_at) < self.p.min_requote_ms;
         p.order.side == q.side
             && p.order.reduce_only == q.reduce_only
-            && (young || to_f64((price - q.price).abs() / q.price) <= self.p.order_distance * self.p.requote_ratio)
+            && (young || to_f64((price - q.price).abs()) <= to_f64(q.price) * self.p.order_distance * self.p.requote_ratio)
     }
 
     fn place(&self, q: &Quote, qty: Quantity) -> OutcomeEvent {

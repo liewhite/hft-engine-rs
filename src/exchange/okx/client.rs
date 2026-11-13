@@ -160,7 +160,7 @@ impl OkxClient {
             let Some(symbol) = from_okx(&d.inst_id, &self.quote) else {
                 continue;
             };
-            let positive = |raw: &str| raw.parse::<Decimal>().ok().filter(|v| *v > Decimal::ZERO);
+            let positive = |raw: &str| crate::domain::parse_decimal(&raw).ok().filter(|v| *v > Decimal::ZERO);
             let parsed = (|| {
                 Some(SymbolMeta {
                     exchange: Exchange::OKX,
@@ -360,14 +360,10 @@ fn parse_pending_order(
         "partially_filled" => OrderStatus::PartiallyFilled,
         other => return Err(fail("state", other)),
     };
-    let quantity = d
-        .sz
-        .parse::<Decimal>()
+    let quantity = crate::domain::parse_decimal(&d.sz)
         .map(|v| v * contract_size)
         .map_err(|_| fail("sz", &d.sz))?;
-    let filled_quantity = d
-        .acc_fill_sz
-        .parse::<Decimal>()
+    let filled_quantity = crate::domain::parse_decimal(&d.acc_fill_sz)
         .map(|v| v * contract_size)
         .map_err(|_| fail("accFillSz", &d.acc_fill_sz))?;
 
@@ -516,7 +512,7 @@ impl AccountClient for OkxClient {
         let inst_id = to_okx(&order.symbol, &self.quote);
         let side = side_to_okx(order.side);
         let (ord_type, price) = order_type_to_okx(&order.order_type);
-        let sz = order.quantity.to_string();
+        let sz = crate::domain::to_wire(order.quantity);
         let reduce_only = order.reduce_only;
 
         #[derive(Serialize)]
@@ -798,7 +794,7 @@ fn order_type_to_okx(order_type: &OrderType) -> (&'static str, Option<String>) {
                 TimeInForce::FOK => "fok",
                 TimeInForce::PostOnly => "post_only",
             };
-            (ord_type, Some(price.to_string()))
+            (ord_type, Some(crate::domain::to_wire(*price)))
         }
     }
 }

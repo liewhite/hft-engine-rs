@@ -4,8 +4,7 @@
 //! - Binance / OKX / IBKR：固定步长（tick），见 [`PriceStep`]
 //! - Hyperliquid：5 位有效数字且小数位不超过 `6 - szDecimals`，见 [`HlSigFigs`]
 //!
-//! 下单字符串一律由取整后的价格 `normalize()` 写出（[`crate::domain::SymbolMeta::format_price`]），
-//! 无尾零、无科学计数法，规则里不再各自拼字符串。
+//! 下单字符串一律由 [`crate::domain::to_wire`] 写出（无尾零、无科学计数法），规则里不再各自拼字符串。
 
 use crate::domain::Price;
 use rust_decimal::{Decimal, RoundingStrategy};

@@ -203,7 +203,7 @@ async fn okx_trades_matches_codec() {
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|t| t["sz"].as_str().and_then(|s| s.parse::<Decimal>().ok()))
+                .filter_map(|t| t["sz"].as_str().and_then(|s| crate::domain::parse_decimal(&s).ok()))
                 .collect::<Vec<_>>()
         })
         .sum();
