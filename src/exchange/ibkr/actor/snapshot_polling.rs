@@ -9,7 +9,7 @@
 //! `max_staleness_ms`（含启动宽限）即判定数据源失效 → 本组件出错退出 → 经任务树上冒，
 //! 整个系统致命退出（宁可重启，绝不糊弄）。
 
-use crate::domain::{now_ms, BorrowFee, Exchange, ExchangeRate};
+use crate::domain::{now_ms, BorrowFee, Exchange, ExchangeError, ExchangeRate};
 use crate::exchange::ibkr::IbkrClient;
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{ChildHandle, Group, Periodic};
@@ -116,7 +116,7 @@ impl IbkrSnapshotPoller {
 
     /// 拉借券费 + 可借量 → BorrowFee 事件；成功则更新 last_borrow_ok_ms
     async fn poll_borrow(&mut self) {
-        match self
+        match within_budget(self
             .client
             .fetch_snapshot_raw(
                 self.borrow_conid,
@@ -129,7 +129,7 @@ impl IbkrSnapshotPoller {
                 // borrow_frozen 豁免处理。**不能把 6509 算进必需**——IBKR 总会返回它，那样重试
                 // 判据恒真、空壳会被当成拿到 (曾因此每轮报"字段缺失")。
                 &[self.cfg.fee_field.as_str()],
-            )
+            ))
             .await
         {
             Ok(obj) => {
@@ -183,9 +183,7 @@ impl IbkrSnapshotPoller {
     /// 用专用汇率端点而非 snapshot last：受限货币休市/冻结时 last 为空、bid/ask 不返回，
     /// 只有 `/iserver/exchangerate` 盘外仍给参考汇率——否则 7×24 常驻每逢休市即被 is_stale 误杀。
     async fn poll_fx(&mut self) {
-        match self
-            .client
-            .fetch_exchange_rate(&self.cfg.fx_target, &self.cfg.fx_source)
+        match within_budget(self.client.fetch_exchange_rate(&self.cfg.fx_target, &self.cfg.fx_source))
             .await
         {
             // 有效性校验：汇率须为正(与下游 er.rate>0 采纳条件一致)。拿到但无效不算成功。
@@ -242,6 +240,25 @@ impl Periodic for IbkrSnapshotPoller {
         );
         Ok(())
     }
+}
+
+/// 借券、汇率各自一次拉取（含 client 内最多 3 轮重试）的总时限。
+///
+/// 共用的 IBKR HTTP client 单请求超时 30s，重试叠加后一拍最长可达三分钟；而定时任务停机时
+/// 要等正在做的一拍做完（见 [`Group::spawn_periodic`]），会把停机拖过根的 30s 总期限（#713）。
+/// 两步各 10s，一拍 ≤ 20s。超时按拉取失败处理（不计成功，由 max_staleness 判定失效）；
+/// 丢弃的是只读 GET，中途放弃无副作用。
+const POLL_STEP_BUDGET: Duration = Duration::from_secs(10);
+
+async fn within_budget<T>(
+    fut: impl std::future::Future<Output = Result<T, ExchangeError>>,
+) -> Result<T, ExchangeError> {
+    tokio::time::timeout(POLL_STEP_BUDGET, fut).await.unwrap_or_else(|_| {
+        Err(ExchangeError::Other(format!(
+            "IBKR 拉取超过 {}s 时限",
+            POLL_STEP_BUDGET.as_secs()
+        )))
+    })
 }
 
 /// 过期判定（纯函数，便于单测）：fx 任一超期即致命；借券腿仅在**非冻结**时计入过期。
@@ -308,6 +325,15 @@ fn parse_field(obj: &serde_json::Value, field: &str) -> Option<f64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 卡住的拉取在时限到点时按失败返回，不拖住整拍（#713）
+    #[tokio::test(start_paused = true)]
+    async fn stuck_fetch_fails_at_budget() {
+        let start = tokio::time::Instant::now();
+        let r: Result<(), _> = within_budget(std::future::pending()).await;
+        assert!(r.is_err());
+        assert_eq!(start.elapsed(), POLL_STEP_BUDGET);
+    }
 
     #[test]
     fn parse_field_number_and_string() {

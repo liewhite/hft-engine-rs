@@ -20,12 +20,18 @@ pub(super) struct ListenKeyRefresher {
 }
 
 impl ListenKeyRefresher {
-    pub(super) fn spawn(group: &Group, rest_base_url: String, api_key: String) -> Result<ChildHandle, GroupClosed> {
+    /// `client` 由私有 WS 传入（与创建 ListenKey 同一个，带请求超时）
+    pub(super) fn spawn(
+        group: &Group,
+        client: reqwest::Client,
+        rest_base_url: String,
+        api_key: String,
+    ) -> Result<ChildHandle, GroupClosed> {
         tracing::info!("Binance ListenKeyRefresher started");
         group.spawn_periodic(
             "BinanceListenKeyRefresher",
             Duration::from_secs(LISTEN_KEY_REFRESH_INTERVAL_SECS),
-            Self { rest_base_url, api_key, client: reqwest::Client::new() },
+            Self { rest_base_url, api_key, client },
         )
     }
 

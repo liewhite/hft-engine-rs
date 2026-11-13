@@ -15,6 +15,7 @@ use crate::messaging::{AccountBus, AccountData, AccountEvent, ExchangeAccountDat
 use crate::tasks::{ChildHandle, Group, Scope, Task};
 use anyhow::Context as _;
 use futures_util::StreamExt;
+use std::time::Duration;
 
 /// 私有 WebSocket 组件（没有收件箱：只读不收命令）
 pub(super) struct BinancePrivateWs {
@@ -35,8 +36,15 @@ impl BinancePrivateWs {
     ) -> anyhow::Result<ChildHandle> {
         group
             .spawn("BinancePrivateWs", move |scope: Scope| async move {
+                // 0. ListenKey 创建与续期共用的 HTTP client，必须带超时：续期是定时任务，停机要等
+                //    正在做的一次做完，卡住的请求会把停机拖过根的总期限（#713）
+                let http = reqwest::Client::builder()
+                    .timeout(LISTEN_KEY_HTTP_TIMEOUT)
+                    .build()
+                    .context("Binance listenKey HTTP client build")?;
+
                 // 1. 获取 ListenKey（失败向上传播 → 启动期受控退出；属鉴权语义）
-                let listen_key = create_listen_key(&rest_base_url, &credentials.api_key)
+                let listen_key = create_listen_key(&http, &rest_base_url, &credentials.api_key)
                     .await
                     .map_err(|e| {
                         tracing::error!(error = %e, "Failed to create Binance listen key");
@@ -55,7 +63,7 @@ impl BinancePrivateWs {
 
                 let children = scope.group("children");
                 let conn = WsConn::spawn(&children, "BinancePrivateWsLoop", read, write, ws_loop::WsKeepalive::binance())?;
-                ListenKeyRefresher::spawn(&children, rest_base_url, credentials.api_key)?;
+                ListenKeyRefresher::spawn(&children, http, rest_base_url, credentials.api_key)?;
 
                 tracing::info!("BinancePrivateWs started");
                 Ok(Self { account_bus, quote, conn })
@@ -212,14 +220,20 @@ fn parse_private_message(
 // 辅助函数
 // ============================================================================
 
-async fn create_listen_key(rest_base_url: &str, api_key: &str) -> Result<String, WsError> {
+/// ListenKey 创建/续期单个请求的超时（与 Binance REST client 一致）
+const LISTEN_KEY_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn create_listen_key(
+    client: &reqwest::Client,
+    rest_base_url: &str,
+    api_key: &str,
+) -> Result<String, WsError> {
     #[derive(serde::Deserialize)]
     struct Response {
         #[serde(rename = "listenKey")]
         listen_key: String,
     }
 
-    let client = reqwest::Client::new();
     let resp = client
         .post(format!("{}/fapi/v1/listenKey", rest_base_url))
         .header("X-MBX-APIKEY", api_key)
