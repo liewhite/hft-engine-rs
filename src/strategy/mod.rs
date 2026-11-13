@@ -74,7 +74,8 @@ pub trait Strategy: Send + Sync {
     ///
     /// 实盘里框架每个 Clock 拍取一次，交给指标出口（`Metrics`，配了 pushgateway 就推出去，
     /// 读数自动加上实例账户标签）；实例撤下后它的读数随之消失。`now` 是这一拍的本地时刻。
-    /// 指标名请带策略前缀，避免与框架的 `hft_*` 及别的策略撞名。默认没有读数。
+    /// 名字与标签名须合 Prometheus 格式、不用框架的 `hft_` 前缀，名字加标签不重复；不合格的行
+    /// 框架丢掉并记 warn（见 [`Gauge::validate`]）。名字请带策略前缀，免得与别的策略撞名。默认没有读数。
     fn gauges(&self, _now: Timestamp) -> Vec<Gauge> {
         Vec::new()
     }

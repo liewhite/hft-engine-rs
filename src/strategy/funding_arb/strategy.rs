@@ -546,7 +546,8 @@ impl Strategy for FundingArbStrategy {
         60_000
     }
 
-    /// 看板与告警用：各所年化与数据年龄、年化差、当前信号、门槛、是否停止交易
+    /// 看板与告警用：各所年化与数据年龄、年化差、最近一次判断的信号（停止交易或补腿期间不再判断，
+    /// 停在最后一次）、门槛、是否停止交易
     fn gauges(&self, now: Timestamp) -> Vec<Gauge> {
         let sym = self.symbol().as_str();
         let mut out = Vec::new();

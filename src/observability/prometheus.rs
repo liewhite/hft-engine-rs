@@ -18,12 +18,18 @@ pub struct MetricsPushConfig {
 
 impl MetricsPushConfig {
     /// 从环境变量装配：`PUSHGATEWAY_URL` 未设置即关闭（None）；
-    /// `PUSHGATEWAY_JOB` 缺省 `hft_engine`
+    /// `PUSHGATEWAY_JOB` 缺省为程序名。推送用 PUT 整组替换，两个进程同 job 会互相清空，
+    /// 所以缺省不用固定名字：不同程序天然不撞，同一程序起多份时才需要各配一个
     pub fn from_env() -> Option<Self> {
         let url = std::env::var("PUSHGATEWAY_URL")
             .ok()
             .filter(|s| !s.trim().is_empty())?;
-        let job = std::env::var("PUSHGATEWAY_JOB").unwrap_or_else(|_| "hft_engine".to_string());
+        let job = std::env::var("PUSHGATEWAY_JOB").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "hft_engine".to_string())
+        });
         Some(Self { url, job })
     }
 }
@@ -38,6 +44,27 @@ pub struct Gauge {
 }
 
 impl Gauge {
+    /// 名字与标签名是否合 Prometheus 文本格式、且不占用框架的 `hft_` 前缀。
+    /// 外部（策略）交来的读数推送前过这一关：pushgateway 整份收或整份拒，一行坏的会连带
+    /// 框架自己的指标一起推不出去，看板停在旧值上
+    pub fn validate(&self) -> Result<(), String> {
+        let ident = |s: &str, colon: bool| {
+            let mut chars = s.chars();
+            chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || (colon && c == ':'))
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || (colon && c == ':'))
+        };
+        if !ident(&self.name, true) {
+            return Err(format!("指标名非法: {:?}", self.name));
+        }
+        if self.name.starts_with("hft_") {
+            return Err(format!("{} 占用了框架的 hft_ 前缀", self.name));
+        }
+        if let Some((k, _)) = self.labels.iter().find(|(k, _)| !ident(k, false) || k.starts_with("__")) {
+            return Err(format!("{} 的标签名非法: {k:?}", self.name));
+        }
+        Ok(())
+    }
+
     pub fn new(name: impl Into<String>, labels: &[(&str, &str)], value: f64) -> Self {
         Self {
             name: name.into(),
@@ -68,10 +95,17 @@ impl PromText {
             }
             let _ = write!(self.0, "}}");
         }
-        let _ = writeln!(self.0, " {value}");
+        // 文本格式只认 NaN / +Inf / -Inf；Rust 写成 inf 会让整份推送被拒
+        let _ = match value {
+            v if v.is_nan() => writeln!(self.0, " NaN"),
+            v if v == f64::INFINITY => writeln!(self.0, " +Inf"),
+            v if v == f64::NEG_INFINITY => writeln!(self.0, " -Inf"),
+            v => writeln!(self.0, " {v}"),
+        };
     }
 
-    /// 追加一个 [`Gauge`]，另加 `extra` 标签（如实例所属账户）
+    /// 追加一个 [`Gauge`]，另加 `extra` 标签（如实例所属账户）。调用方须先用
+    /// [`Gauge::validate`] 把关：一行非法会让 pushgateway 拒掉整份推送
     pub fn push(&mut self, g: &Gauge, extra: &[(&str, &str)]) {
         let labels: Vec<(&str, &str)> = g
             .labels
@@ -130,10 +164,11 @@ mod tests {
         t.gauge("hft_equity", &[("exchange", "Binance")], 1234.5);
         t.gauge("hft_fills", &[], 42.0);
         t.gauge("hft_x", &[("a", "q\"uo\\te")], 1.0);
+        t.gauge("hft_inf", &[], f64::INFINITY);
         let body = t.into_body();
         assert_eq!(
             body,
-            "hft_equity{exchange=\"Binance\"} 1234.5\nhft_fills 42\nhft_x{a=\"q\\\"uo\\\\te\"} 1\n"
+            "hft_equity{exchange=\"Binance\"} 1234.5\nhft_fills 42\nhft_x{a=\"q\\\"uo\\\\te\"} 1\nhft_inf +Inf\n"
         );
     }
 }

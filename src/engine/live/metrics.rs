@@ -506,10 +506,19 @@ impl MetricsView {
         tracing::info!(target: "metrics", funding_fee_24h = format!("{:.4}", funding_total), "metrics.funding");
 
         // ---------- 策略自报读数 ----------
+        // 逐行把关（见 Gauge::validate），名字加标签重复的也丢：pushgateway 整份收或整份拒
+        let mut seen: HashSet<String> = HashSet::new();
         for (account, gauges) in self.strategy_gauges.values() {
             let account_label = account.to_string();
             for g in gauges {
-                prom.push(g, &[("account", account_label.as_str())]);
+                let verdict = g.validate().and_then(|()| {
+                    let key = format!("{}{:?}{account_label}", g.name, g.labels);
+                    seen.insert(key).then_some(()).ok_or_else(|| format!("{} 重复: {:?}", g.name, g.labels))
+                });
+                match verdict {
+                    Ok(()) => prom.push(g, &[("account", account_label.as_str())]),
+                    Err(e) => tracing::warn!(target: "metrics", error = %e, "策略读数不合格，本轮不推"),
+                }
             }
         }
 
@@ -802,6 +811,21 @@ mod tests {
         assert!(body.contains("x_apr{symbol=\"BTC\",account=\"live\"} 0.5"), "{body}");
         metrics.set_strategy_gauges(id, AccountId::Live, Vec::new());
         assert!(!metrics.render().into_body().contains("x_apr"));
+    }
+
+    /// 不合格的策略读数（占框架前缀、名字非法、重复）丢掉，其余照推
+    #[test]
+    fn bad_strategy_gauges_are_dropped_not_pushed() {
+        let mut metrics = view();
+        let g = |name: &str, sym: &str| Gauge::new(name, &[("symbol", sym)], 1.0);
+        metrics.set_strategy_gauges(
+            ExecutorId::for_test(1),
+            AccountId::Live,
+            vec![g("hft_equity", "A"), g("bad-name", "A"), g("ok_x", "A"), g("ok_x", "A"), g("ok_x", "B")],
+        );
+        let body = metrics.render().into_body();
+        assert_eq!(body.lines().filter(|l| l.starts_with("ok_x")).count(), 2, "{body}");
+        assert!(!body.contains("bad-name") && !body.contains("hft_equity{symbol"), "{body}");
     }
 
     /// 各所分腿持仓按所推出（净仓为 0 时也看得到两条腿）
