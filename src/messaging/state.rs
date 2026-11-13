@@ -509,9 +509,16 @@ impl SymbolOrders {
                 }
             }
             RequestOutcome::PlaceRejected { reason } => {
-                // 确定没挂上（实盘出口只在交易所没对这张单说过话时才报拒单），也就不会有成交
-                tracing::info!(%symbol, exchange = %r.exchange, client_order_id = %r.client_order_id, %reason, "下单被拒，移出跟踪表");
-                self.orders.remove(&r.client_order_id);
+                // 确定没挂上（实盘出口只在交易所没对这张单说过话时才报拒单），也就不会有成交。
+                // 交易所已对这张单说过话（拒单结论和交易所回报在出口前后脚到）时以交易所为准：
+                // 单留在表里由回报走完生命周期，不能移出后让策略在旁边再挂一张（#764 审查）
+                if p.status == OrderStatus::Created {
+                    tracing::info!(%symbol, exchange = %r.exchange, client_order_id = %r.client_order_id, %reason, "下单被拒，移出跟踪表");
+                    self.orders.remove(&r.client_order_id);
+                } else {
+                    tracing::error!(%symbol, exchange = %r.exchange, client_order_id = %r.client_order_id, %reason, status = ?p.status,
+                        "下单报被拒，但交易所已回报过这张单：以交易所回报为准，不移出");
+                }
             }
             RequestOutcome::CancelFailed { reason } => {
                 p.cancel = CancelState::Failed { at: local_ts, reason: reason.clone() };
@@ -523,6 +530,11 @@ impl SymbolOrders {
     fn settle(&mut self, symbol: &Symbol, client_id: &str) {
         if self.orders.get(client_id).is_some_and(|p| !p.is_open() && p.fills_settled()) {
             let p = self.orders.remove(client_id).expect("刚查过");
+            if p.filled - p.reported_filled > FILL_TOLERANCE * p.order.quantity.max(p.reported_filled) {
+                // 持仓对账随后会发现漂移并停机；这里先记下是哪张单多收了成交，便于排查（#764 审查）
+                tracing::error!(%symbol, exchange = %p.order.exchange, %client_id, filled = p.filled, reported_filled = p.reported_filled,
+                    "本地收到的成交多于交易所说的累计成交量（成交可能被重复计入）");
+            }
             tracing::info!(%symbol, exchange = %p.order.exchange, %client_id, status = ?p.status, filled = p.filled, "订单结算完，移出跟踪表");
         }
     }
@@ -894,6 +906,15 @@ mod tests {
         let mut state = with_order();
         apply(&mut state, &request(RequestOutcome::PlaceRejected { reason: "margin".into() }, 1));
         assert!(!state.order_book().has_pending());
+    }
+
+    /// 拒单结论晚于交易所回报到：以交易所为准，单不移出（否则策略会在旁边再挂一张）
+    #[test]
+    fn rejection_after_exchange_update_keeps_the_order() {
+        let mut state = with_order();
+        apply(&mut state, &update(CID, OrderStatus::Pending, 0.0, 1));
+        apply(&mut state, &request(RequestOutcome::PlaceRejected { reason: "margin".into() }, 2));
+        assert!(the_order(&state).is_some_and(|p| p.is_open()));
     }
 
     /// 已到终态的单不发撤单（撤不掉，HL 还白耗一次操作额度）；不在表里的也不发

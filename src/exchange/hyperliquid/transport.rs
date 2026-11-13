@@ -78,7 +78,7 @@ pub(crate) struct HlCancelIntent {
 ///
 /// 拿不到回复时的失败按「确定没提交 / 结果不确定」归类（见 [`PlaceError`]）：只有通道自己
 /// 知道请求走到了哪一步（签名前失败、连接没建立、签名机拒签、已签名但提交超时……），所以
-//// 在这里定。拿到回复之后的解读（statuses 逐单判错）在 client。撤单不分这两类（撤单失败只回报
+/// 在这里定。拿到回复之后的解读（statuses 逐单判错）在 client。撤单不分这两类（撤单失败只回报
 /// 给策略，单在不在以交易所随后的订单回报为准），按普通错误返回。
 #[async_trait]
 pub(crate) trait HlSubmitter: Send + Sync {

@@ -125,9 +125,16 @@ impl SymbolMeta {
         let coin = Decimal::from_f64(coin_amount)?;
         let cs = Decimal::from_f64(self.contract_size).filter(|d| !d.is_zero())?;
         let step = Decimal::from_f64(self.size_step).filter(|d| !d.is_zero())?;
-        Some(((coin / cs / step).floor() * step, cs))
+        // 几所浮点持仓相加的差会落在整步稍下方（0.7 - 0.64 → 0.0599999999999999，按 0.01 取整只剩
+        // 5 步）：补腿少下一步，剩下那一步又被当零头永远不补（#764 审查）。按步数留 1e-9 的余量，
+        // 浮点噪声（约 1e-14 步）被吸收，真实的零头（远大于 1e-9 步）照常舍掉；取整仍幂等。
+        let steps = (coin / cs / step + STEP_EPSILON).floor();
+        Some((steps * step, cs))
     }
 }
+
+/// 向下取整时按步数留的余量，见 `qty_floor_dec`
+const STEP_EPSILON: Decimal = Decimal::from_parts(1, 0, 0, false, 9);
 
 /// Decimal → f64 总能成功（取最近值）
 fn dec_to_f64(d: Decimal) -> f64 {
@@ -179,5 +186,14 @@ mod tests {
         assert_eq!(m.round_coin_size_down(0.299), 0.29);
         assert!(m.checked_exchange_qty(0.009).is_err());
         assert!(m.checked_exchange_qty(f64::NAN).is_err());
+    }
+
+    /// 浮点相减落在整步稍下方的量不丢一步（补腿量来自几所持仓相加，#764 审查）
+    #[test]
+    fn float_noise_below_a_step_is_not_lost() {
+        let m = meta(1.0, 0.01);
+        assert_eq!(m.round_coin_size_down(0.7 - 0.64), 0.06);
+        assert_eq!(m.round_coin_size_down(-(0.7 - 0.64)), -0.06);
+        assert_eq!(m.round_coin_size_down(0.0599), 0.05);
     }
 }
