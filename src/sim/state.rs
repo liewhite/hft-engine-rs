@@ -115,17 +115,13 @@ impl SimState {
         }
     }
 
-    /// 估值价格：标记价 > BBO 中间价 > 最新成交价 (trade-only 行情用最新成交价估值)
-    pub fn mark_of(&self, symbol: &Symbol) -> f64 {
-        if let Some(m) = self.last_mark.get(symbol) {
-            to_f64(*m)
-        } else if let Some(b) = self.last_bbo.get(symbol) {
-            to_f64(b.mid_price())
-        } else if let Some(t) = self.last_trade.get(symbol) {
-            to_f64(*t)
-        } else {
-            0.0
-        }
+    /// 估值价格：标记价 > BBO 中间价 > 最新成交价 (trade-only 行情用最新成交价估值)；三者都没收到过为 `None`
+    pub fn mark_of(&self, symbol: &Symbol) -> Option<Price> {
+        self.last_mark
+            .get(symbol)
+            .copied()
+            .or_else(|| self.last_bbo.get(symbol).map(BBO::mid_price))
+            .or_else(|| self.last_trade.get(symbol).copied())
     }
 
     // ==================== 上游行情到达 (用于撮合) ====================
@@ -266,133 +262,103 @@ impl SimState {
 
     // ==================== 下单到达撮合 ====================
 
-    /// 订单到达撮合：按类型/TIF 决定 resting / 成交 / 拒单。
+    /// 订单到达撮合：先给出与实盘出口同样的**下单请求结论**（[`RequestOutcome`]：受理 / 被拒），
+    /// 受理的再按类型 / TIF 挂进簿或成交。
+    ///
+    /// # 请求结论与实盘一致（#812）
+    ///
+    /// 实盘下单先由 REST 给结论：受理（`Placed`，带交易所订单号）或被拒（`PlaceRejected`），之后
+    /// 交易所回报流接手。柜台照同样的形状回：被拒的单只有一条 `PlaceRejected`、不发订单状态；受理的
+    /// 先发 `Placed`，再发挂上（`Pending`）或成交回报。这样策略处理请求结论的那段代码回测里也走得到。
+    ///
+    /// 柜台拒单的几种（实盘交易所在 REST 上同样直接拒）：数量低于下界（取整为 0 / 低于
+    /// `min_order_size`，与实盘出口同一出处 [`SymbolMeta::checked_exchange_qty`]）、PostOnly 会吃单、
+    /// 市价单没有任何行情可参考。精度取整已在下单闸门（`StrategyRunner::admit`）做过，这里不再取整。
     ///
     /// # 可成交性的参考价：盘口对手价，缺盘口退化用最新成交价
     ///
-    /// 此前只认 BBO —— trade-native 行情（默认回测路径、模拟盘只订成交流时）下：
-    /// 市价单永远被拒、PostOnly 永不被拒（穿价挂单照挂、还按 maker 费成交）、深度穿价的
-    /// GTC 挂进簿里按 limit 价成交。三者都系统性偏离真实交易所行为，且方向上一致高估
-    /// 挂单策略的收益（回测调好的参数上线即漂移）。
+    /// 只认 BBO 的话，trade-native 行情（默认回测路径、模拟盘只订成交流时）下市价单永远被拒、
+    /// PostOnly 永不被拒、深度穿价的 GTC 挂进簿里按 limit 价成交，系统性高估挂单策略的收益。
     ///
-    /// 回报时间戳一律用到达时刻 `now`：此前有盘口时取"最后一条 BBO 的 ts"，行情停推时
-    /// 订单回报的时间被冻在过去，订单超时判定（按回报时间起算）随之失效。
-    ///
-    /// # 市场规则在柜台强制执行（与真实交易所一致）
-    ///
-    /// 数量下界（取整为 0 / 低于 `min_order_size`）与精度取整在此校验，规则出处是
-    /// [`SymbolMeta::checked_exchange_qty`] —— 与实盘出口
-    /// [`crate::exchange::ExchangeOrder::from_domain`] 同一个函数。这保证**实盘必拒的单，
-    /// 模拟盘与回测也拒**；此前回测路径没有这道校验，小额残单在回测里照常成交、
-    /// 实盘却被拒 —— 回测调好的参数上线即漂移。缺 SymbolMeta 同样拒单（真实交易所
-    /// 不存在"没有元数据的合约"，缺失属装配错误，应当刺眼）。
+    /// 回报时间戳一律用到达时刻 `now`（行情停推时也不会冻在过去）。
     pub fn on_order_arrived(
         &mut self,
         now: Timestamp,
         order: &Order,
         order_id: &OrderId,
     ) -> Vec<(Timestamp, AccountData)> {
-        // 与 on_market 同一守卫：喂错所的订单是路由 bug，拒单并记 error ——
-        // 绝不拿本所的行情去撮合别的所的订单
-        if order.exchange != self.exchange {
-            tracing::error!(
-                counter_exchange = %self.exchange,
-                order_exchange = %order.exchange,
-                order_id = %order_id,
-                "SimState 收到其他交易所的订单（路由 bug），拒单"
-            );
-            return vec![status_event(
-                self.exchange,
-                order,
-                order_id,
-                OrderStatus::Rejected {
-                    reason: "order routed to wrong exchange counter".to_string(),
-                },
-                now,
-            )];
-        }
-        // 市场规则校验 + 按交易所精度向下取整（策略请求 0.0016 而 step=0.001 时，
-        // 实盘只会成交 0.001，柜台必须同量 —— 否则模拟盘每单多成交至多一个 step）
-        let key = (self.exchange, order.symbol.clone());
-        let checked = match self.symbol_metas.get(&key) {
-            None => Err(format!(
-                "no SymbolMeta for {}/{}",
-                order.exchange, order.symbol
-            )),
-            Some(meta) => meta
-                .checked_exchange_qty(order.quantity)
-                .map(|_| meta.round_coin_size_down(order.quantity)),
-        };
-        let order = &match checked {
-            Ok(quantity) => Order {
-                quantity,
-                ..order.clone()
-            },
-            Err(reason) => {
-                return vec![status_event(
-                    self.exchange,
-                    order,
-                    order_id,
-                    OrderStatus::Rejected { reason },
-                    now,
-                )];
-            }
-        };
+        // 柜台按所分实例，持有方按订单的所路由；喂错所是程序写错
+        assert_eq!(
+            order.exchange, self.exchange,
+            "订单 {} 路由到了别的所的柜台",
+            order.client_order_id
+        );
+        let meta = self
+            .symbol_metas
+            .get(&(self.exchange, order.symbol.clone()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}/{} 没有合约规格却收到下单（下单闸门漏了）",
+                    order.exchange, order.symbol
+                )
+            });
         // taker 参考价：对手价 > 最新成交价；两者皆无 = 无从判定可成交性
         let reference: Option<Price> = match self.last_bbo.get(&order.symbol) {
             Some(b) => Some(matcher::touch_price(order.side, b)),
             None => self.last_trade.get(&order.symbol).copied(),
         };
-        let ts = now;
-        match &order.order_type {
-            OrderType::Market => match reference {
-                Some(price) => self.taker_fill(order, order_id, price, ts),
-                None => vec![status_event(
+        // 到达即可成交时的成交价（None = 不可成交）。判定与 resting 越价同口径（marketable_at 含等）
+        let taker_price: Option<Price> = match &order.order_type {
+            OrderType::Market => reference,
+            OrderType::Limit { price, .. } => {
+                reference.filter(|r| matcher::marketable_at(order.side, *price, *r))
+            }
+        };
+        let refused = meta.checked_exchange_qty(order.quantity).err().or_else(|| {
+            match (&order.order_type, taker_price) {
+                (OrderType::Market, None) => Some("no market data for market order".to_string()),
+                (
+                    OrderType::Limit {
+                        tif: TimeInForce::PostOnly,
+                        ..
+                    },
+                    Some(_),
+                ) => Some("post-only would take liquidity".to_string()),
+                _ => None,
+            }
+        });
+        if let Some(reason) = refused {
+            return vec![request_event(
+                self.exchange,
+                order,
+                RequestOutcome::PlaceRejected { reason },
+                now,
+            )];
+        }
+        let mut out = vec![request_event(
+            self.exchange,
+            order,
+            RequestOutcome::Placed {
+                order_id: order_id.clone(),
+            },
+            now,
+        )];
+        out.extend(match (&order.order_type, taker_price) {
+            (_, Some(p)) => self.taker_fill(order, order_id, p, now),
+            (OrderType::Limit { price, tif }, None) => match tif {
+                TimeInForce::PostOnly | TimeInForce::GTC => self.rest(order, order_id, *price, now),
+                // 无深度模型，不可成交即整单取消（不 resting）
+                TimeInForce::IOC | TimeInForce::FOK => vec![status_event(
                     self.exchange,
                     order,
                     order_id,
-                    OrderStatus::Rejected {
-                        reason: "no market data for market order".to_string(),
-                    },
-                    ts,
+                    OrderStatus::Cancelled,
+                    now,
                 )],
             },
-            OrderType::Limit { price: limit, tif } => {
-                // 到达即可成交时的成交价 (None = 不可成交)。判定与 resting 越价同口径
-                // （marketable_at 含等，见 matcher）。
-                let taker_price: Option<Price> =
-                    reference.filter(|r| matcher::marketable_at(order.side, *limit, *r));
-                match tif {
-                    TimeInForce::PostOnly => match taker_price {
-                        Some(_) => vec![status_event(
-                            self.exchange,
-                            order,
-                            order_id,
-                            OrderStatus::Rejected {
-                                reason: "post-only would take liquidity".to_string(),
-                            },
-                            ts,
-                        )],
-                        None => self.rest(order, order_id, *limit, ts),
-                    },
-                    TimeInForce::GTC => match taker_price {
-                        Some(p) => self.taker_fill(order, order_id, p, ts),
-                        None => self.rest(order, order_id, *limit, ts),
-                    },
-                    TimeInForce::IOC | TimeInForce::FOK => match taker_price {
-                        // 无深度模型, 可成交即全量成交, 否则整单取消 (不 resting)
-                        Some(p) => self.taker_fill(order, order_id, p, ts),
-                        None => vec![status_event(
-                            self.exchange,
-                            order,
-                            order_id,
-                            OrderStatus::Cancelled,
-                            ts,
-                        )],
-                    },
-                }
-            }
-        }
+            (OrderType::Market, None) => unreachable!("没有参考价的市价单上面已拒"),
+        });
+        out
     }
 
     /// 撤单（按客户端订单号）到达撮合：仍在簿则移除并回报 Cancelled；不在簿（已成交 / 已撤）
@@ -624,6 +590,24 @@ impl SimState {
 }
 
 /// 构造状态回报：时间戳一律取确定性的 ts，杜绝墙钟。
+/// 下单请求的结论（与实盘出口发的同一种事件）
+fn request_event(
+    exchange: Exchange,
+    order: &Order,
+    outcome: RequestOutcome,
+    ts: Timestamp,
+) -> (Timestamp, AccountData) {
+    (
+        ts,
+        AccountData::Symbol(SymbolAccountData::OrderRequest(OrderRequestResult {
+            exchange,
+            symbol: order.symbol.clone(),
+            client_order_id: order.client_order_id.clone(),
+            outcome,
+        })),
+    )
+}
+
 fn status_event(
     exchange: Exchange,
     order: &Order,
@@ -741,6 +725,16 @@ mod tests {
             })
             .collect()
     }
+    /// 下单请求被拒的原因（柜台与实盘出口同样以「请求被拒」回，不发订单状态）
+    fn rejection(evs: &[(Timestamp, AccountData)]) -> Option<String> {
+        evs.iter().find_map(|(_, d)| match d {
+            AccountData::Symbol(SymbolAccountData::OrderRequest(OrderRequestResult {
+                outcome: RequestOutcome::PlaceRejected { reason },
+                ..
+            })) => Some(reason.clone()),
+            _ => None,
+        })
+    }
     fn fills(evs: &[(Timestamp, AccountData)]) -> Vec<Fill> {
         evs.iter()
             .filter_map(|(_, d)| match d {
@@ -773,9 +767,11 @@ mod tests {
             &limit(Side::Long, dec!(50001.0), TimeInForce::PostOnly, "b1"),
             &"1".to_string(),
         );
-        assert!(statuses(&evs)
-            .iter()
-            .any(|st| matches!(st, OrderStatus::Rejected { .. })));
+        assert!(rejection(&evs).is_some(), "{evs:?}");
+        assert!(
+            statuses(&evs).is_empty(),
+            "被拒的单不发订单状态（与实盘一致）"
+        );
         assert!(s.resting.is_empty());
         assert!(fills(&evs).is_empty());
     }
@@ -957,7 +953,7 @@ mod tests {
             .map(|p| p.is_empty())
             .unwrap_or(true));
         // 估值口径已更新
-        assert_eq!(s.mark_of(&sym()), (49990.0 + 49994.0) / 2.0);
+        assert_eq!(s.mark_of(&sym()), Some(dec!(49992)));
         // 真实成交穿过挂单价才成交
         let evs = s.on_market(&trade_ev(dec!(49994.0), 3));
         assert_eq!(
@@ -1068,69 +1064,66 @@ mod tests {
         let mut o = limit(Side::Long, dec!(99.0), TimeInForce::GTC, "b1");
         o.quantity = dec!(0.0004); // < size_step 0.001
         let evs = s.on_order_arrived(1, &o, &"1".to_string());
-        assert!(
-            statuses(&evs)
-                .iter()
-                .any(|st| matches!(st, OrderStatus::Rejected { .. })),
-            "低于下界必须拒单: {:?}",
-            statuses(&evs)
-        );
+        assert!(rejection(&evs).is_some(), "低于下界必须拒单: {evs:?}");
         assert!(s.resting.is_empty(), "未通过校验的单不得入簿");
         // 即使成交穿价也不得成交
         let evs = s.on_market(&trade_ev(dec!(98.0), 2));
         assert!(fills(&evs).is_empty());
     }
 
-    /// 缺 SymbolMeta 拒单：真实交易所不存在"没有元数据的合约"，缺失属装配错误
+    /// 缺合约规格：下单闸门（`StrategyRunner::admit`）已拦，柜台收到就是程序写错，停下
     #[test]
-    fn missing_symbol_meta_is_rejected() {
+    #[should_panic(expected = "没有合约规格")]
+    fn missing_symbol_meta_panics() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.1), 1)));
         let mut o = limit(Side::Long, dec!(99.0), TimeInForce::GTC, "b1");
         o.symbol = "UNKNOWN".to_string();
-        // meta 校验在参考价判定之前，无该 symbol 的行情也应以"缺 SymbolMeta"被拒
-        let evs = s.on_order_arrived(1, &o, &"1".to_string());
-        assert!(
-            statuses(&evs).iter().any(
-                |st| matches!(st, OrderStatus::Rejected { reason } if reason.contains("SymbolMeta"))
-            ),
-            "缺元数据必须拒单并指明原因: {:?}",
-            statuses(&evs)
-        );
+        s.on_order_arrived(1, &o, &"1".to_string());
     }
 
-    /// 数量按交易所精度**向下取整**后撮合：策略请求 0.0016 而 step=0.001 时，
-    /// 实盘只会成交 0.001，柜台必须同量
+    /// 柜台不再取整（精度取整只在下单闸门做一次）：收到的量原样撮合
     #[test]
-    fn quantity_is_rounded_down_before_matching() {
+    fn quantity_is_matched_as_received() {
         let mut s = empty();
         s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.1), 1)));
         let mut o = limit(Side::Long, dec!(100.5), TimeInForce::GTC, "b1"); // 穿价 taker
-        o.quantity = dec!(0.0016);
+        o.quantity = dec!(0.002);
         let evs = s.on_order_arrived(1, &o, &"1".to_string());
         assert_eq!(
             fills(&evs).iter().map(|f| f.size).collect::<Vec<_>>(),
-            vec![dec!(0.001)],
-            "应按取整后的量成交"
+            vec![dec!(0.002)]
         );
     }
 
-    /// 喂错所的订单是路由 bug：拒单，不按本所行情撮合
+    /// 喂错所的订单是路由写错：停下，绝不按本所行情撮合
     #[test]
-    fn order_for_another_exchange_is_rejected() {
+    #[should_panic(expected = "路由到了别的所")]
+    fn order_for_another_exchange_panics() {
         let mut s = empty();
         s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.1), 1)));
-        let mut o = limit(Side::Long, dec!(200.0), TimeInForce::GTC, "b1"); // 深度穿价
-        o.exchange = Exchange::OKX; // 但属于别的所
-        let evs = s.on_order_arrived(1, &o, &"1".to_string());
-        assert!(
-            statuses(&evs)
-                .iter()
-                .any(|st| matches!(st, OrderStatus::Rejected { .. })),
-            "错所订单必须被拒: {:?}",
-            statuses(&evs)
+        let mut o = limit(Side::Long, dec!(200.0), TimeInForce::GTC, "b1");
+        o.exchange = Exchange::OKX;
+        s.on_order_arrived(1, &o, &"1".to_string());
+    }
+
+    /// 受理的单先回「下单受理」（带柜台订单号），再回挂上 —— 与实盘出口同样的请求结论（#812）
+    #[test]
+    fn accepted_order_reports_placed_before_pending() {
+        let mut s = empty();
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        let evs = s.on_order_arrived(
+            2,
+            &limit(Side::Long, dec!(49995.0), TimeInForce::PostOnly, "b1"),
+            &"7".to_string(),
         );
-        assert!(fills(&evs).is_empty(), "绝不能按本所行情撮合别的所的订单");
+        assert!(matches!(
+            &evs[0].1,
+            AccountData::Symbol(SymbolAccountData::OrderRequest(OrderRequestResult {
+                outcome: RequestOutcome::Placed { order_id },
+                ..
+            })) if order_id == "7"
+        ));
+        assert_eq!(statuses(&evs), vec![OrderStatus::Pending]);
     }
 
     // ===== trade-native 行情下的可成交性（参考价退化用最新成交价） =====
@@ -1162,11 +1155,8 @@ mod tests {
             &"1".to_string(),
         );
         assert!(
-            statuses(&evs)
-                .iter()
-                .any(|st| matches!(st, OrderStatus::Rejected { .. })),
-            "买单限价触及最新成交价，PostOnly 必须被拒: {:?}",
-            statuses(&evs)
+            rejection(&evs).is_some(),
+            "买单限价触及最新成交价，PostOnly 必须被拒: {evs:?}"
         );
         assert!(s.resting.is_empty());
     }
@@ -1203,7 +1193,7 @@ mod tests {
             &"1".to_string(),
         );
         let ts: Vec<u64> = evs.iter().map(|(ts, _)| *ts).collect();
-        assert_eq!(ts, vec![999], "回报时间被冻在旧行情的 ts 上: {ts:?}");
+        assert_eq!(ts, vec![999, 999], "回报时间被冻在旧行情的 ts 上: {ts:?}");
     }
 
     // ===== 手续费 (对应 SimStateFeeSpec) =====

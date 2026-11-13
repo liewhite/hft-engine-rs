@@ -19,9 +19,10 @@
 //!     [`crate::exchange::ExchangeOrder`]；回测不经过那里，因此全程币本位
 
 use crate::domain::{AccountId, Exchange, Order, OrderIntent, OrderType, Symbol, SymbolMeta};
+use crate::exchange::SubscriptionKind;
 use crate::messaging::{IncomeEvent, StateManager, SubscriptionScope};
 use crate::strategy::{OutcomeEvent, Signal, Strategy, StrategyView};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// client_order_id 生成策略 (注入点)。
@@ -58,6 +59,22 @@ impl ClientOrderIdGen for SequentialClientOrderIdGen {
     }
 }
 
+/// 策略的订阅范围 = 它声明的公共行情流（`Strategy::public_streams`）里每个 (所, 币)，绑定 `account`。
+///
+/// 推导规则只此一处：驱动方（实盘投产、回测）各算一次，再把同一份交给 runner（下单范围闸门）和
+/// 分发层（事件投递），两边不各推一遍。
+pub fn subscription_scope(
+    account: AccountId,
+    streams: &HashMap<Exchange, HashSet<SubscriptionKind>>,
+) -> SubscriptionScope {
+    SubscriptionScope::new(
+        account,
+        streams
+            .iter()
+            .flat_map(|(ex, kinds)| kinds.iter().map(move |k| (*ex, k.symbol().clone()))),
+    )
+}
+
 pub struct StrategyRunner {
     strategy: Box<dyn Strategy>,
     state: StateManager,
@@ -70,22 +87,15 @@ pub struct StrategyRunner {
 }
 
 impl StrategyRunner {
-    /// `account` 是本策略绑定的账户（只收它的私有事件）；`id_gen` 给策略的单分配订单号
-    /// （实盘 [`AdapterClientOrderIds`]，回测 [`SequentialClientOrderIdGen`] 以确保确定性）。
+    /// `subscriptions` 是本策略的订阅范围（由 [`subscription_scope`] 算出，含绑定的账户：只收它的
+    /// 私有事件）；`id_gen` 给策略的单分配订单号（实盘 [`AdapterClientOrderIds`]，回测
+    /// [`SequentialClientOrderIdGen`] 以确保确定性）。
     pub fn new(
         strategy: Box<dyn Strategy>,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-        account: AccountId,
+        subscriptions: SubscriptionScope,
         id_gen: Box<dyn ClientOrderIdGen>,
     ) -> Self {
-        // 从 public_streams 推导订阅范围
-        let subscriptions = SubscriptionScope::new(
-            account,
-            strategy
-                .public_streams()
-                .iter()
-                .flat_map(|(ex, kinds)| kinds.iter().map(move |k| (*ex, k.symbol().clone()))),
-        );
         let symbols: Vec<Symbol> = subscriptions.symbols().cloned().collect();
         let state = StateManager::new(&symbols);
         Self {
@@ -327,13 +337,23 @@ mod tests {
         }
     }
 
-    fn runner(strategy: OneShot) -> StrategyRunner {
+    /// 与驱动方同样的接线：先按策略声明的流算订阅范围，再交给 runner
+    fn runner_for(
+        strategy: impl Strategy + 'static,
+        metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+        account: AccountId,
+    ) -> StrategyRunner {
+        let scope = subscription_scope(account, &strategy.public_streams());
         StrategyRunner::new(
             Box::new(strategy),
-            metas(),
-            crate::backtest::backtest_account(),
+            metas,
+            scope,
             Box::new(SequentialClientOrderIdGen::default()),
         )
+    }
+
+    fn runner(strategy: OneShot) -> StrategyRunner {
+        runner_for(strategy, metas(), crate::backtest::backtest_account())
     }
 
     fn clock() -> IncomeEvent {
@@ -417,12 +437,7 @@ mod tests {
                 }]
             }
         }
-        let mut runner = StrategyRunner::new(
-            Box::new(CancelEth),
-            metas(),
-            crate::backtest::backtest_account(),
-            Box::new(SequentialClientOrderIdGen::default()),
-        );
+        let mut runner = runner_for(CancelEth, metas(), crate::backtest::backtest_account());
         let err = runner.on_event(&clock()).expect_err("范围外撤单应报错");
         assert!(err.contains("订阅范围外"), "{err}");
     }
@@ -430,11 +445,10 @@ mod tests {
     /// 范围内但没有合约规格（取不了整）同样停机，不按原值照发
     #[test]
     fn orders_without_symbol_meta_stop_the_engine() {
-        let mut runner = StrategyRunner::new(
-            Box::new(OneShot::new(dec!(1), dec!(1))),
+        let mut runner = runner_for(
+            OneShot::new(dec!(1), dec!(1)),
             Arc::new(HashMap::new()),
             crate::backtest::backtest_account(),
-            Box::new(SequentialClientOrderIdGen::default()),
         );
         let err = runner.on_event(&clock()).expect_err("缺规格应报错");
         assert!(err.contains("没有合约规格"), "{err}");
@@ -447,11 +461,10 @@ mod tests {
     /// 依赖的所集合，它是 `public_streams()` 的键集而非另存的副本。
     #[test]
     fn the_scope_is_derived_from_the_strategys_declared_streams() {
-        let runner = StrategyRunner::new(
-            Box::new(OneShot::new(dec!(1.0), dec!(1.0))),
+        let runner = runner_for(
+            OneShot::new(dec!(1.0), dec!(1.0)),
             metas(),
             crate::domain::AccountId::Live,
-            Box::new(SequentialClientOrderIdGen::default()),
         );
 
         let bbo = |exchange: Exchange, symbol: &str| {

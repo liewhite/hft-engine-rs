@@ -13,6 +13,6 @@ pub use live::{
     DEFAULT_POSITION_POLL_INTERVAL_MS,
 };
 pub use strategy_runner::{
-    AdapterClientOrderIds, ClientOrderIdGen, NewClientOrderId, SequentialClientOrderIdGen,
-    StrategyRunner,
+    subscription_scope, AdapterClientOrderIds, ClientOrderIdGen, NewClientOrderId,
+    SequentialClientOrderIdGen, StrategyRunner,
 };

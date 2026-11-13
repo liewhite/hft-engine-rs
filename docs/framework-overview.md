@@ -146,7 +146,7 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 | 账户绑定 | `StrategySpec::live(s)` / `StrategySpec::paper(s, label)` |
 | 流面 | `market_bus()` / `account_bus()` / `outcome_bus()`，观察者在构造时 `inbox.subscribe(bus, fn(&Event) -> bool, Msg::X)` |
 | 挂观察者 | `observers()`：manager 的消费者组，`spawn` / `spawn_addressed` / `spawn_periodic` |
-| 快照面 | `exchanges()` / `all_symbol_metas()` / `symbol_meta(ex, &sym)`（同步）/ `live_positions().await` |
+| 快照面 | `exchanges()` / `all_symbol_metas()` / `symbol_meta(ex, &sym)`（同步）；持仓不走快照面，订账户总线上持仓账本发的 `PositionValues` |
 | 各所公共能力 | `settled_funding(ex)`：已结算资金费率来源（用装配时建好的 client，不另建） |
 | 入向注入 | `publish_custom_event(CustomEvent)`（同步，直接发行情总线） |
 | 启动辅助 | `run_main`（日志与告警：启动试发、退出前发完）/ `load_config` / `run_engine(args, \|handle\| ..)`（启动 → 装配 → 运行 → 唯一停机路径） |
@@ -155,7 +155,7 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 **流面与快照面是两条独立的路**，不要合并成一个 `Query { kind }`：
 
 - **流面**：订阅事件，`fn` 过滤器在发布侧执行，覆盖每一个 `MarketData` / `AccountData` 变体
-- **快照面**：纯内存读、不打 REST、不经 manager 的收件箱（品种目录直接读句柄里那份，持仓问账本）
+- **快照面**：纯内存读、不打 REST、不经 manager 的收件箱（品种目录直接读句柄里那份）
 
 ### 3.3 `exchange` —— 加新交易所的扩展点
 
@@ -312,15 +312,15 @@ let observer = manager
 // 定时轮询（首拍立即、慢了不积压补跑，tick 返回 Err 整机停）
 manager.observers().spawn_periodic("MyPoller", Duration::from_secs(60), my_periodic)?;
 
-// 快照面
-let positions: Result<Vec<Position>, String> = manager.live_positions().await;
+// 持仓：订持仓账本发的读数（与策略风控闸门同一个数，见 external-data-access.md §三）
+inbox.subscribe(manager.account_bus(), |e| e.account == AccountId::Live
+    && matches!(e.data, AccountData::Exchange(ExchangeAccountData::PositionValues(_))), Msg::Positions);
 ```
 
 退订：没有显式原语，**订阅者停机即自动摘除**（订阅凭证存在收件箱里，收件箱关闭即退订）。
 观察者要收工，对 `spawn` 返回的 `ChildHandle` 调 `stop().await`，只收掉它自己。
 
-`live_positions()` 的 `Err`（账本不可达，或引擎在停机）**不等于"无持仓"**。结果里缺席的腿是
-"未知"而非"空仓"，不要为它报指标。
+读数里缺席的腿是"未知"而非"空仓"，不要为它报指标。
 
 ---
 

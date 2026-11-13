@@ -380,12 +380,6 @@ impl SymbolPositions {
         );
     }
 
-    /// **全部**腿，含未 seed 的（供观测镜像发布持仓：要的是"账上有什么"，
-    /// 而不是"哪些可参与对账"。对外快照请用 [`Self::seeded_positions`]）。
-    pub fn all(&self) -> impl Iterator<Item = &Position> {
-        self.positions.values()
-    }
-
     /// 写入持仓**基线**（投产握手的载荷，不是事件 —— 见 [`crate::messaging::PositionBaseline`]）。
     ///
     /// 持仓维护模型：**一次性基线 + 之后全程由 Fill 累加**。基线只能写一次，因为快照与

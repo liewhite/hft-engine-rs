@@ -7,7 +7,7 @@ use hft_engine_rs::domain::{
     dec, Exchange, OrderIntent, OrderType, Price, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
     BBO,
 };
-use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
+use hft_engine_rs::engine::{subscription_scope, SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::SubscriptionKind;
 use hft_engine_rs::messaging::{
     AccountData, ExchangeAccountData, IncomeEvent, MarketData, SymbolAccountData,
@@ -18,6 +18,20 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+
+/// 与驱动方同样的接线：按策略声明的流算订阅范围（回测账户），再交给 runner
+fn bt_runner(strategy: impl Strategy + 'static) -> StrategyRunner {
+    let scope = subscription_scope(
+        hft_engine_rs::backtest::backtest_account(),
+        &strategy.public_streams(),
+    );
+    StrategyRunner::new(
+        Box::new(strategy),
+        metas(),
+        scope,
+        Box::new(SequentialClientOrderIdGen::default()),
+    )
+}
 
 const EX: Exchange = Exchange::Binance;
 const SYM: &str = "BTCUSDT";
@@ -158,16 +172,11 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
             bbo_ev(dec!(99.7), dec!(99.8), 3000),
         ],
     };
-    let runner = StrategyRunner::new(
-        Box::new(OneShotBuy {
-            price: dec!(100.0),
-            tif: TimeInForce::PostOnly,
-            placed: false,
-        }),
-        metas(),
-        hft_engine_rs::backtest::backtest_account(),
-        Box::new(SequentialClientOrderIdGen::default()),
-    );
+    let runner = bt_runner(OneShotBuy {
+        price: dec!(100.0),
+        tif: TimeInForce::PostOnly,
+        placed: false,
+    });
     let config = SimConfig {
         initial_balance_usdt: 10_000.0,
         ..SimConfig::default()
@@ -219,16 +228,11 @@ fn trade_print_matching_fills_resting_limit() {
             trade_ev(dec!(98.0), 3000),
         ],
     };
-    let runner = StrategyRunner::new(
-        Box::new(OneShotBuy {
-            price: dec!(100.0),
-            tif: TimeInForce::GTC,
-            placed: false,
-        }),
-        metas(),
-        hft_engine_rs::backtest::backtest_account(),
-        Box::new(SequentialClientOrderIdGen::default()),
-    );
+    let runner = bt_runner(OneShotBuy {
+        price: dec!(100.0),
+        tif: TimeInForce::GTC,
+        placed: false,
+    });
     let config = SimConfig {
         initial_balance_usdt: 10_000.0,
         ..SimConfig::default()
@@ -294,14 +298,9 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
         ],
     };
     let seen_by_strategy = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let runner = StrategyRunner::new(
-        Box::new(EmitOnBbo {
-            seen_customs: Arc::clone(&seen_by_strategy),
-        }),
-        metas(),
-        hft_engine_rs::backtest::backtest_account(),
-        Box::new(SequentialClientOrderIdGen::default()),
-    );
+    let runner = bt_runner(EmitOnBbo {
+        seen_customs: Arc::clone(&seen_by_strategy),
+    });
     let seen_by_observer: Rc<RefCell<Vec<(usize, Price)>>> = Rc::new(RefCell::new(Vec::new()));
     let obs_sink = Rc::clone(&seen_by_observer);
     {
@@ -381,24 +380,14 @@ fn inbound_custom_events_route_by_scope() {
     let seen_btc = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_eth = Arc::new(std::sync::Mutex::new(Vec::new()));
     let runners = vec![
-        StrategyRunner::new(
-            Box::new(CustomProbe {
-                symbol: SYM.to_string(),
-                seen: Arc::clone(&seen_btc),
-            }),
-            metas(),
-            hft_engine_rs::backtest::backtest_account(),
-            Box::new(SequentialClientOrderIdGen::default()),
-        ),
-        StrategyRunner::new(
-            Box::new(CustomProbe {
-                symbol: SYM2.to_string(),
-                seen: Arc::clone(&seen_eth),
-            }),
-            metas(),
-            hft_engine_rs::backtest::backtest_account(),
-            Box::new(SequentialClientOrderIdGen::default()),
-        ),
+        bt_runner(CustomProbe {
+            symbol: SYM.to_string(),
+            seen: Arc::clone(&seen_btc),
+        }),
+        bt_runner(CustomProbe {
+            symbol: SYM2.to_string(),
+            seen: Arc::clone(&seen_eth),
+        }),
     ];
     BacktestEngine::new(&source, runners, SimConfig::default(), metas())
         .run()
@@ -409,4 +398,62 @@ fn inbound_custom_events_route_by_scope() {
         "BTC 策略应收到自己 symbol 的定向事件 + 广播事件，收不到别的 symbol 的"
     );
     assert_eq!(*seen_eth.lock().unwrap(), vec!["eth", "all"]);
+}
+
+/// 记下策略收到的下单请求结论，挂单逻辑同 [`OneShotBuy`]
+struct RequestProbe {
+    inner: OneShotBuy,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl Strategy for RequestProbe {
+    fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
+        self.inner.public_streams()
+    }
+    fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal> {
+        if let IncomeEvent::Account(a) = event {
+            if let AccountData::Symbol(SymbolAccountData::OrderRequest(r)) = &a.data {
+                self.seen.lock().unwrap().push(format!("{:?}", r.outcome));
+            }
+        }
+        self.inner.on_event(event, view)
+    }
+}
+
+/// 回测柜台回的下单结论与实盘出口同形（#812）：会吃单的 PostOnly 以「下单请求被拒」回到策略，
+/// 跟踪表随之移出这张单（不会一分钟后报卡单）；受理的单先回「下单受理」
+#[test]
+fn backtest_counter_reports_request_outcomes_like_live() {
+    let run = |price: Price| {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let source = FixedSource {
+            evs: vec![
+                bbo_ev(dec!(100.0), dec!(100.1), 1000),
+                bbo_ev(dec!(100.0), dec!(100.1), 2000),
+                // 超过卡单期限：被拒的单若还留在跟踪表里，这里会报错中止
+                bbo_ev(dec!(100.0), dec!(100.1), 200_000),
+            ],
+        };
+        let runner = bt_runner(RequestProbe {
+            inner: OneShotBuy {
+                price,
+                tif: TimeInForce::PostOnly,
+                placed: false,
+            },
+            seen: Arc::clone(&seen),
+        });
+        let mut engine = BacktestEngine::new(&source, vec![runner], SimConfig::default(), metas());
+        engine.run().expect("回测应跑完");
+        let seen = seen.lock().unwrap().clone();
+        seen
+    };
+    let rejected = run(dec!(100.5)); // 高于 ask，会吃单
+    assert!(
+        rejected.len() == 1 && rejected[0].starts_with("PlaceRejected"),
+        "{rejected:?}"
+    );
+    let placed = run(dec!(99.0));
+    assert!(
+        placed.len() == 1 && placed[0].starts_with("Placed"),
+        "{placed:?}"
+    );
 }

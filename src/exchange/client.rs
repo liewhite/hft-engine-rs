@@ -3,8 +3,8 @@
 //! ExchangeClient trait 封装交易所 REST 交互
 
 use crate::domain::{
-    AccountInfo, CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderType, PlaceError,
-    Position, Symbol, SymbolMeta,
+    AccountInfo, CandleInterval, Exchange, ExchangeError, Order, OrderId, PlaceError, Position,
+    Symbol, SymbolMeta,
 };
 use async_trait::async_trait;
 
@@ -113,7 +113,7 @@ impl<C> ExchangeAccess<C> {
 // 单位边界：ExchangeOrder
 // ============================================================================
 
-/// 已转换为**交易所下单单位**、并按交易所精度取整的订单。
+/// 已转换为**交易所下单单位**的订单（价格与数量的精度取整在 `StrategyRunner` 已做过）。
 ///
 /// # 为什么需要一个独立类型
 ///
@@ -134,33 +134,15 @@ impl<C> ExchangeAccess<C> {
 pub struct ExchangeOrder(Order);
 
 impl ExchangeOrder {
-    /// 币本位 -> 交易所下单单位，按交易所精度取整价格与数量，并校验数量下界。
+    /// 币本位 -> 交易所下单单位，并校验数量下界。
     ///
-    /// 取整方向**有意不同**（沿用改造前的行为，此处只是搬家）：
-    /// - 数量按 `SymbolMeta::checked_exchange_qty`：**向下**取整，宁可少下一点，也不超出策略意图的数量
-    /// - 价格 `round_price`：取**最近**的合法 tick（`PriceStep` 是四舍五入），因为价格
-    ///   向下取整对买单是让价、对卖单是抢价，方向语义不一致，反而更难推理
-    ///
-    /// # 数量下界校验
-    ///
-    /// 折算与下界校验统一走 [`SymbolMeta::checked_exchange_qty`]（模拟柜台同一出处，
-    /// 保证实盘必拒的单模拟盘也拒）。取整为 0 / 低于 `min_order_size` 都在本地拦下并
-    /// 返回可定位的原因，由调用方反馈为 `OrderUpdate(Error)` —— 策略能看到失败，
-    /// 而不是每个事件白打一次 REST。
+    /// 只换单位、不取整：价格与数量的精度取整只在下单闸门（`StrategyRunner::admit`）做一次，
+    /// 回测、模拟盘、实盘发出的是同一张单。换单位与下界校验走 [`SymbolMeta::checked_exchange_qty`]
+    /// （模拟柜台同一出处，保证实盘必拒的单模拟盘也拒）；取整为 0 / 低于 `min_order_size` 在本地拦下，
+    /// 返回可定位的原因，由调用方回报为「被拒」—— 策略能看到失败，而不是每个事件白打一次 REST。
     pub fn from_domain(order: Order, meta: &SymbolMeta) -> Result<Self, String> {
         let quantity = meta.checked_exchange_qty(order.quantity)?;
-        let order_type = match &order.order_type {
-            OrderType::Market => OrderType::Market,
-            OrderType::Limit { price, tif } => OrderType::Limit {
-                price: meta.round_price(*price),
-                tif: *tif,
-            },
-        };
-        Ok(Self(Order {
-            order_type,
-            quantity,
-            ..order
-        }))
+        Ok(Self(Order { quantity, ..order }))
     }
 
     /// 交易所单位的订单内容（供各 client 组装请求）。
@@ -415,7 +397,7 @@ mod tests {
         assert!(index_positions(vec![p("BTC", dec!(1.0)), p("BTC", dec!(5.0))]).is_err());
     }
     use crate::domain::PriceStep;
-    use crate::domain::{Side, TimeInForce};
+    use crate::domain::{OrderType, Side, TimeInForce};
     use std::sync::Arc;
 
     /// OKX BTC-USDT-SWAP：每张 0.01 币、价格步长 0.1、数量步长 1 张
@@ -463,13 +445,13 @@ mod tests {
         assert_eq!(wire.inner().quantity, dec!(12.0));
     }
 
+    /// 出口只换单位：价格原样发出（精度取整只在下单闸门做一次，#812）
     #[test]
-    fn price_is_rounded_to_exchange_tick() {
+    fn price_passes_through_unchanged() {
         let wire =
-            ExchangeOrder::from_domain(coin_order(dec!(0.12), dec!(62_500.17)), &okx_btc_meta())
+            ExchangeOrder::from_domain(coin_order(dec!(0.12), dec!(62_500.2)), &okx_btc_meta())
                 .expect("合法订单");
         match wire.inner().order_type {
-            // 价格取**最近** tick（62500.17 -> 62500.2），与数量的向下取整不同
             OrderType::Limit { price, .. } => assert_eq!(price, dec!(62500.2)),
             OrderType::Market => panic!("expected limit"),
         }

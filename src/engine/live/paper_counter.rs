@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
-use super::{outlet_for, to_paper_outlet, AccountOutcome, OutcomeBus, Outlet};
+use super::{to_paper_outlet, AccountOutcome, OutcomeBus};
 
 /// PaperCounter 构造参数
 pub struct PaperCounterArgs {
@@ -224,7 +224,7 @@ impl PaperCounter {
                 }),
             });
             // 与实盘账本同一读数：各币持仓价值（策略的账户杠杆闸门用它，#759）
-            let values = state.ledger.position_values(|s: &Symbol| state.mark_of(s));
+            let legs = state.ledger.position_values(|s: &Symbol| state.mark_of(s));
             self.account_bus.publish(AccountEvent {
                 account: account.clone(),
                 exchange_ts: ts,
@@ -232,7 +232,7 @@ impl PaperCounter {
                 data: AccountData::Exchange(ExchangeAccountData::PositionValues(
                     crate::messaging::PositionValues {
                         exchange: state.exchange,
-                        values,
+                        legs,
                     },
                 )),
             });
@@ -315,17 +315,7 @@ impl PaperCounter {
     // === 订单出向：改为落到本地柜台 ===
 
     fn on_outcome(&mut self, tagged: AccountOutcome) {
-        // 归属由订阅过滤器保证（见 [`Self::spawn`]）。这里再验一次**不是**重新分发：
-        // 判据仍是同一个 `outlet_for`，新增账户类型时它编译失败，不存在"两处各判各的"
-        // 那种静默漏改。留这道是因为投递路径本身没法在类型上收死（订阅过滤是运行期的），
-        // 而装配写错时"响亮失败"远好过静默双执行 —— 品味 1.1 的第二级。
-        if outlet_for(&tagged.account) != Outlet::Paper {
-            tracing::error!(
-                account = %tagged.account,
-                "非模拟账户的信号到达本地柜台 —— 订阅过滤器装配错误，丢弃"
-            );
-            return;
-        }
+        // 归属由订阅过滤器保证（见 [`Self::spawn`]，判据只有 `outlet_for` 一处）
         let account = tagged.account;
         let delay = self.config.order_to_exchange_delay_ms;
         match tagged.event {
@@ -627,6 +617,17 @@ mod tests {
                 .collect()
         }
 
+        /// 柜台回的「下单请求被拒」（与实盘出口同样的结论，#812）
+        fn rejected(&self) -> bool {
+            self.events.lock().unwrap().iter().any(|e| {
+                matches!(
+                    &e.data,
+                    AccountData::Symbol(SymbolAccountData::OrderRequest(r))
+                        if matches!(r.outcome, crate::messaging::RequestOutcome::PlaceRejected { .. })
+                )
+            })
+        }
+
         fn fills(&self) -> Vec<(Decimal, Decimal)> {
             self.events
                 .lock()
@@ -752,7 +753,7 @@ mod tests {
     }
 
     /// **与实盘同规则的下界校验**：实盘必拒的单（不足一个 size_step）模拟盘也拒，
-    /// 以 Rejected 终态回报（清策略侧 pending），绝不入簿成交 —— 否则模拟盘会成交
+    /// 以「下单请求被拒」回报（与实盘出口同形，清策略侧 pending），绝不入簿成交 —— 否则模拟盘会成交
     /// 实盘发不出去的单，仿真失真。校验由柜台状态机 SimState 统一执行（回测同一份）。
     #[tokio::test]
     async fn undersized_order_is_rejected_like_live() {
@@ -761,13 +762,7 @@ mod tests {
         // 0.0004 < size_step 0.001：实盘出口会拒，柜台同样拒
         h.place(Side::Long, dec!(99.0), dec!(0.0004)).await;
         h.settle(50).await;
-        assert!(
-            h.statuses()
-                .iter()
-                .any(|st| matches!(st, OrderStatus::Rejected { .. })),
-            "校验失败必须以 Rejected 终态回报: {:?}",
-            h.statuses()
-        );
+        assert!(h.rejected(), "校验失败必须回报请求被拒: {:?}", h.statuses());
         // 即使成交穿价，也不该有成交（单没入簿）
         h.trade(dec!(98.0)).await;
         h.settle(30).await;
@@ -964,13 +959,7 @@ mod tests {
         h.bbo(dec!(100.0), dec!(100.1)).await;
         h.place(Side::Long, dec!(100.5), dec!(0.5)).await; // 高于 ask，会吃单
         h.settle(50).await;
-        assert!(
-            h.statuses()
-                .iter()
-                .any(|s| matches!(s, OrderStatus::Rejected { .. })),
-            "得到 {:?}",
-            h.statuses()
-        );
+        assert!(h.rejected(), "得到 {:?}", h.statuses());
         assert!(h.fills().is_empty());
         h.finish().await;
     }

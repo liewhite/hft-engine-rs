@@ -12,6 +12,7 @@
 //! [`IncomeEvent`] 是策略与状态层的统一视图（两变体 enum）：策略的 `on_event` 仍然只有
 //! 一个入口，match 变为两层。
 
+use crate::domain::{to_f64, Price, Quantity};
 use crate::domain::{
     AccountId, Balance, BorrowFee, Candle, Exchange, ExchangeRate, Fill, FundingFee, FundingRate,
     Greeks, IndexPrice, MarkPrice, MarketStatus, MarketTrade, OrderUpdate, Symbol, Timestamp, BBO,
@@ -289,20 +290,58 @@ pub enum ExchangeAccountData {
 }
 
 /// 本地持仓账本（`PositionLedger`：启动基线 + 之后全部实盘成交）里某所每个已跟踪币的
-/// 持仓价值 = |持仓| × 盘口中间价（#759）。
+/// 持仓读数：数量 + 估值价（#759；#812 起带数量）。
+///
+/// **持仓与持仓价值在进程外的唯一来源**：风控闸门（策略的账户杠杆）和指标（看板上的持仓、
+/// 杠杆、会话盈亏）读的都是这一份，不各自折叠成交、各自估值（#812）。
 ///
 /// 与 [`ExchangeAccountData::AccountInfo`] 的 `notional`（交易所接口轮询的账户总持仓价值）
 /// 是两个来源：这一份在任何一个币成交后立刻更新（不等轮询），按币分开给出，让单币策略
 /// 能把自己那一项换成它自己最新的持仓。只含引擎跟踪的币（配置里的币），不含账户里别的仓位。
 ///
 /// 实盘由账本在每笔成交后发该所的一份、每个对账节拍发全部所一份（价格变动）；某个有仓的币
-/// 还没有盘口时不发（价值未知，不能当 0）—— 策略那边沿用上一份读数，启动时没有读数即「未知」。
+/// 还没有盘口时不发（价值未知，不能当 0）—— 消费方沿用上一份读数，启动时没有读数即「未知」。
 /// 模拟柜台与回测引擎随净值一起发同一读数（按自己的账本与估值价）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionValues {
     pub exchange: Exchange,
-    /// 币 → 持仓价值（非负，计价币）。空仓的币为 0
-    pub values: std::collections::HashMap<Symbol, f64>,
+    /// 币 → 该币在本所的持仓读数
+    pub legs: std::collections::HashMap<Symbol, LegValue>,
+}
+
+/// 一个币在一所的持仓读数。「有仓就有估值价」由构造保证（[`Self::new`]），读的一方不用再判。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LegValue {
+    size: Quantity,
+    mark: Option<Price>,
+}
+
+impl LegValue {
+    /// `size` 带符号持仓（币本位），`mark` 估值价（实盘是盘口中间价）。
+    /// 有仓却没有价时返回 `None`：价值未知，不能当 0 给出去。空仓没有价也可以。
+    pub fn new(size: Quantity, mark: Option<Price>) -> Option<Self> {
+        (size.is_zero() || mark.is_some()).then_some(Self { size, mark })
+    }
+
+    /// 带符号持仓（币本位）
+    pub fn size(&self) -> Quantity {
+        self.size
+    }
+
+    /// 估值价；只有空仓且还没有盘口时为 `None`
+    pub fn mark(&self) -> Option<Price> {
+        self.mark
+    }
+
+    /// 带符号持仓价值 = 持仓 × 估值价（空仓为 0）
+    pub fn signed_value(&self) -> f64 {
+        self.mark.map_or(0.0, |m| to_f64(self.size * m))
+    }
+
+    /// 持仓价值 = |持仓| × 估值价（非负，空仓为 0）
+    pub fn value(&self) -> f64 {
+        self.signed_value().abs()
+    }
 }
 
 /// 品种目录外的一笔成交。`instrument` 是交易所原始写法（如 `flx:TSLA`、`@107`），

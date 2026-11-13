@@ -29,8 +29,8 @@ use hft_engine_rs::domain::{
     AccountId, Exchange, OrderIntent, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
 use hft_engine_rs::engine::{
-    AccountBinding, AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, Metrics,
-    MetricsArgs, NewClientOrderId, OutcomeBus, PaperCounter, PaperCounterArgs,
+    subscription_scope, AccountBinding, AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor,
+    MarketBus, Metrics, MetricsArgs, NewClientOrderId, OutcomeBus, PaperCounter, PaperCounterArgs,
 };
 use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
@@ -279,7 +279,6 @@ async fn paper_counter_fills_from_live_trades() {
         MetricsArgs {
             interval_ms: 60_000,
             push: None,
-            market_bus: market_bus.clone(),
             account_bus: account_bus.clone(),
             order_requests: Default::default(),
         },
@@ -287,10 +286,13 @@ async fn paper_counter_fills_from_live_trades() {
     .await
     .expect("metrics");
 
+    let strategy = DipMaker(Arc::clone(&log));
+    let scope = subscription_scope(PAPER_ACCOUNT.clone(), &strategy.public_streams());
     let (_, executor) = Executor::spawn(
         &producers,
         ExecutorArgs {
-            strategy: Box::new(DipMaker(Arc::clone(&log))),
+            strategy: Box::new(strategy),
+            scope: scope.clone(),
             binding: AccountBinding::Paper {
                 label: PAPER_LABEL.to_string(),
                 legs: HashSet::new(),
@@ -307,16 +309,7 @@ async fn paper_counter_fills_from_live_trades() {
     .await
     .expect("executor");
     processor
-        .register(
-            executor,
-            HashSet::from([(
-                EX,
-                SubscriptionKind::BBO {
-                    symbol: COIN.to_string(),
-                },
-            )]),
-            PAPER_ACCOUNT.clone(),
-        )
+        .register(executor, scope)
         .await
         .expect("register executor");
 

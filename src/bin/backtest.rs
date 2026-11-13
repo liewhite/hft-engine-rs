@@ -17,7 +17,7 @@ use hft_engine_rs::domain::{
     dec, Decimal, Exchange, OrderIntent, OrderType, Price, Quantity, Side, Symbol, SymbolMeta,
     TimeInForce,
 };
-use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
+use hft_engine_rs::engine::{subscription_scope, SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
 use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, SymbolAccountData};
@@ -193,10 +193,14 @@ fn main() -> anyhow::Result<()> {
         entry_size: Decimal::ZERO,
     };
     // 回测用确定性 id 生成器 -> 同一输入同一逐笔回报序列
+    let scope = subscription_scope(
+        hft_engine_rs::backtest::backtest_account(),
+        &strategy.public_streams(),
+    );
     let runner = StrategyRunner::new(
         Box::new(strategy),
         symbol_metas.clone(),
-        hft_engine_rs::backtest::backtest_account(),
+        scope,
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {

@@ -1,6 +1,8 @@
 use crate::domain::AccountInfo;
 use crate::domain::{Exchange, Greeks, MarketStatus, Order, Position, Symbol, Timestamp, USDT};
-use crate::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData, SymbolState};
+use crate::messaging::{
+    AccountData, ExchangeAccountData, IncomeEvent, LegValue, MarketData, SymbolState,
+};
 use std::collections::HashMap;
 
 /// 一份持仓基线：某 (所, symbol) 的起始持仓 + 其 REST 快照的**请求**时刻。
@@ -32,16 +34,11 @@ pub struct AccountView {
     greeks: HashMap<(Exchange, String), Greeks>,
     /// 币种现金余额 (per exchange, per ccy) — 用于修正 greeks delta
     cash_balances: HashMap<(Exchange, String), f64>,
-    /// 本地持仓账本给出的各币持仓价值 (per exchange)，见 [`crate::messaging::PositionValues`]
-    position_values: HashMap<Exchange, HashMap<Symbol, f64>>,
+    /// 本地持仓账本给出的各币持仓读数 (per exchange)，见 [`crate::messaging::PositionValues`]
+    position_values: HashMap<Exchange, HashMap<Symbol, LegValue>>,
 }
 
 impl AccountView {
-    /// 遍历所有已收到账户信息的交易所（供观测层汇总）
-    pub fn account_infos(&self) -> impl Iterator<Item = (Exchange, &AccountInfo)> {
-        self.account_infos.iter().map(|(e, i)| (*e, i))
-    }
-
     /// 获取指定交易所的 USDT 余额
     ///
     /// 返回 None 表示该交易所的余额数据尚未到达
@@ -73,22 +70,10 @@ impl AccountView {
         self.account_infos.values().map(|i| i.equity).sum()
     }
 
-    /// 获取指定交易所的账户总持仓名义价值
-    ///
-    /// 返回 None 表示该交易所的名义价值数据尚未到达
-    pub fn account_notional(&self, exchange: Exchange) -> Option<f64> {
-        self.account_infos.get(&exchange).map(|i| i.notional)
-    }
-
-    /// 获取所有交易所的总持仓名义价值（仅包含已收到数据的交易所）
-    pub fn total_account_notional(&self) -> f64 {
-        self.account_infos.values().map(|i| i.notional).sum()
-    }
-
-    /// 本地持仓账本里该所各币的持仓价值（币 → |持仓| × 中间价）。
+    /// 本地持仓账本里该所各币的持仓读数（数量 + 估值价）。
     ///
     /// 返回 None 表示账本还没发过该所的读数（价值未知，不是 0）。
-    pub fn position_values(&self, exchange: Exchange) -> Option<&HashMap<Symbol, f64>> {
+    pub fn position_values(&self, exchange: Exchange) -> Option<&HashMap<Symbol, LegValue>> {
         self.position_values.get(&exchange)
     }
 
@@ -321,7 +306,7 @@ impl StateManager {
             ExchangeAccountData::PositionValues(v) => {
                 self.account
                     .position_values
-                    .insert(v.exchange, v.values.clone());
+                    .insert(v.exchange, v.legs.clone());
             }
         }
     }

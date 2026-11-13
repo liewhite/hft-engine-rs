@@ -1,7 +1,7 @@
 //! 实盘出向：OrderGateway（唯一下单出口）+ OutcomeProcessor（总线订阅薄壳）。
 //!
 //! **系统的出向单位边界**：策略与 `StrategyRunner` 产出的订单一律币本位，在此转为
-//! [`ExchangeOrder`]（折算 + 按交易所精度取整）后才发给交易所。回测不经过本模块，
+//! [`ExchangeOrder`]（换成交易所单位 + 数量下界校验；精度取整已在 `StrategyRunner` 做过）后才发给交易所。回测不经过本模块，
 //! 因此 `SimState` 拿到的同样是币本位订单 —— 两条路径在策略侧口径一致。
 
 use crate::domain::{
@@ -16,7 +16,7 @@ use crate::tasks::{FailHandle, Group, Inbox, Scope, StopFlag, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{outlet_for, to_live_outlet, AccountOutcome, OutcomeBus, Outlet};
+use super::{to_live_outlet, AccountOutcome, OutcomeBus};
 
 // ============================================================================
 // OrderGateway —— 唯一的实盘下单出口
@@ -81,12 +81,11 @@ impl OrderRequestCounts {
 /// 每次请求的结论以 [`OrderRequestResult`] 发到账户总线（策略的订单跟踪表据此推进），
 /// 只有一种例外：下单结果不确定时不发、直接停机（见 [`Self::place`]）。
 pub struct OrderGateway {
-    /// 各所的账户私有能力。键集 = 配了凭证的所 —— 不在表里就是"该所只接公共行情"，
-    /// 下单请求会被拒绝并回报，而不是静默丢弃。
+    /// 各所的账户私有能力。键集 = 配了凭证的所；实盘实例只会对这些所下单（投产时校验）
     accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 账户总线（发布请求结论，标 Live）
     account_bus: AccountBus,
-    /// Symbol 元数据：用于把币本位订单折算为交易所下单单位并取整
+    /// Symbol 元数据：用于把币本位订单折算为交易所下单单位
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 已发出 REST 下单请求、但交易所**还没对它说过任何话**的订单。
     ///
@@ -136,7 +135,7 @@ impl OrderGateway {
         self.requests.clone()
     }
 
-    /// 下一张单：出向校验（折算 + 取整 + 下界）→ 登记 in_flight → REST → 按三种结果处置。
+    /// 下一张单：出向校验（换单位 + 下界）→ 登记 in_flight → REST → 按三种结果处置。
     ///
     /// # 三种结果（见 [`PlaceError`]）
     ///
@@ -161,17 +160,22 @@ impl OrderGateway {
             return;
         }
 
-        let Some(client) = self.accounts.get(&order.exchange).cloned() else {
-            let reason = format!("{} 没有账户（未配置凭证），无法下单", order.exchange);
-            tracing::error!(exchange = %order.exchange, "{}", reason);
-            self.report(
-                &order.exchange,
-                &order.symbol,
-                &order.client_order_id,
-                RequestOutcome::PlaceRejected { reason },
-            );
-            return;
-        };
+        // 下单范围闸门（`StrategyRunner::admit`）已保证：所已装配、有合约规格；实盘实例要交易的所
+        // 投产时已校验配了凭证（`PlannedAccount::bind`）。这里查不到就是程序写错，停机
+        let client = self
+            .accounts
+            .get(&order.exchange)
+            .cloned()
+            .unwrap_or_else(|| panic!("{} 没有账户却收到实盘下单（投产校验漏了）", order.exchange));
+        let meta = self
+            .symbol_metas
+            .get(&(order.exchange, order.symbol.clone()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}/{} 没有合约规格却收到下单（下单闸门漏了）",
+                    order.exchange, order.symbol
+                )
+            });
 
         tracing::info!(
             exchange = %order.exchange,
@@ -184,22 +188,9 @@ impl OrderGateway {
             "Placing order"
         );
 
-        // 币本位 -> 交易所单位。缺 SymbolMeta 时无法算出正确数量：
-        // 若按原值发出，OKX 这类张数计价的所会静默错 contract_size 倍，
-        // 故宁可拒掉并 error（缺 meta 属启动期配置错误，应当刺眼）。
-        // 数量下界（取整为 0 / 低于最小下单量）也在这里拦下：这种单发出去必被交易所拒，
-        // 本地拦截让失败原因可定位，且不白打 REST。
-        let wire = match self
-            .symbol_metas
-            .get(&(order.exchange, order.symbol.clone()))
-        {
-            None => Err(format!(
-                "No SymbolMeta for {}/{}, cannot convert order quantity to exchange unit",
-                order.exchange, order.symbol
-            )),
-            Some(meta) => ExchangeOrder::from_domain(order.clone(), meta),
-        };
-        let exchange_order = match wire {
+        // 币本位 -> 交易所单位，并校验数量下界（取整为 0 / 低于最小下单量）：这种单发出去必被
+        // 交易所拒，本地拦下让失败原因可定位，且不白打 REST
+        let exchange_order = match ExchangeOrder::from_domain(order.clone(), meta) {
             Ok(wire) => wire,
             Err(reason) => {
                 tracing::error!(
@@ -315,17 +306,17 @@ impl OrderGateway {
     /// 失败回报 [`RequestOutcome::CancelFailed`]，单是否还挂着以交易所随后的订单回报为准，
     /// 要不要重撤由策略定。整机停机途中照常撤单。
     pub async fn cancel(&self, exchange: Exchange, symbol: Symbol, client_order_id: String) {
-        let result = match self.accounts.get(&exchange) {
-            None => Err(format!("{exchange} 没有账户（未配置凭证），无法撤单")),
-            Some(client) => {
-                tracing::info!(%exchange, %symbol, %client_order_id, "Cancelling order");
-                self.requests.bump(exchange, RequestKind::Cancel);
-                client
-                    .cancel_order(&symbol, &client_order_id)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        };
+        // 撤的是跟踪表里的单，它下单时已过账户检查（见 [`Self::place`]）
+        let client = self
+            .accounts
+            .get(&exchange)
+            .unwrap_or_else(|| panic!("{exchange} 没有账户却收到实盘撤单（投产校验漏了）"));
+        tracing::info!(%exchange, %symbol, %client_order_id, "Cancelling order");
+        self.requests.bump(exchange, RequestKind::Cancel);
+        let result = client
+            .cancel_order(&symbol, &client_order_id)
+            .await
+            .map_err(|e| e.to_string());
         match result {
             Ok(()) => {
                 tracing::info!(%exchange, %symbol, %client_order_id, "Cancel request accepted")
@@ -435,17 +426,7 @@ impl OutcomeProcessor {
     }
 
     fn on_outcome(&self, tagged: AccountOutcome) -> anyhow::Result<()> {
-        // 归属由订阅过滤器保证（见 [`Self::spawn`]）。这里再验一次**不是**重新分发：
-        // 判据仍是同一个 `outlet_for`，新增账户类型时它编译失败，不存在"两处各判各的"
-        // 那种静默漏改。留这道是因为投递路径本身没法在类型上收死（订阅过滤是运行期的），
-        // 而装配写错时"响亮失败"远好过静默双执行 —— 品味 1.1 的第二级。
-        if outlet_for(&tagged.account) != Outlet::Live {
-            tracing::error!(
-                account = %tagged.account,
-                "非实盘账户的信号到达实盘出口 —— 订阅过滤器装配错误，丢弃"
-            );
-            return Ok(());
-        }
+        // 归属由订阅过滤器保证（见 [`Self::spawn`]，判据只有 `outlet_for` 一处）
         // 下单/撤单一律各起一个子任务异步执行，**有意为之**：REST 往返可能上百 ms，
         // 若在收件循环里 await，后面的信号与交易所回报（ack）全部排队等它。
         //

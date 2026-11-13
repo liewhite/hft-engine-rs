@@ -1,4 +1,5 @@
 use crate::domain::{signed_qty, to_f64, Price, Quantity, Side, Symbol};
+use crate::messaging::LegValue;
 use std::collections::HashMap;
 
 /// 账本里的一笔持仓：数量 + **本地维护的持仓均价**。
@@ -108,53 +109,58 @@ impl Ledger {
     }
 
     /// 账户净值 = 现金 + 未实现盈亏 (`mark_of` 提供各 symbol 的估值价格)
-    pub fn equity(&self, mark_of: impl Fn(&Symbol) -> f64) -> f64 {
+    pub fn equity(&self, mark_of: impl Fn(&Symbol) -> Option<Price>) -> f64 {
         self.cash
             + self
-                .positions
-                .iter()
-                .map(|(symbol, p)| unrealized_pnl(p, mark_of(symbol)))
+                .held()
+                .map(|(symbol, p)| (held_mark(&mark_of, symbol) - p.entry_price) * to_f64(p.size))
                 .sum::<f64>()
     }
 
     /// 总持仓名义价值 (用于杠杆率) = 各 symbol 持仓价值之和
-    pub fn notional(&self, mark_of: impl Fn(&Symbol) -> f64) -> f64 {
-        self.position_values(mark_of).values().sum()
+    pub fn notional(&self, mark_of: impl Fn(&Symbol) -> Option<Price>) -> f64 {
+        self.position_values(mark_of)
+            .values()
+            .map(LegValue::value)
+            .sum()
     }
 
-    /// 各 symbol 持仓价值 = |持仓| × 估值价（与实盘账本的 `PositionValues` 同一含义，#759）
+    /// 各 symbol 持仓读数：数量 + 估值价（与实盘账本的 `PositionValues` 同一含义，#759）
     pub fn position_values(
         &self,
-        mark_of: impl Fn(&Symbol) -> f64,
-    ) -> std::collections::HashMap<Symbol, f64> {
+        mark_of: impl Fn(&Symbol) -> Option<Price>,
+    ) -> HashMap<Symbol, LegValue> {
         self.positions
             .iter()
-            .map(|(symbol, p)| (symbol.clone(), to_f64(p.size.abs()) * mark_of(symbol)))
+            .map(|(symbol, p)| {
+                let leg = LegValue::new(p.size, mark_of(symbol)).expect(HELD_HAS_MARK);
+                (symbol.clone(), leg)
+            })
             .collect()
     }
 
     /// 非空仓位的快照（回填按 `mark_of` 算出的未实现盈亏）
-    pub fn open_positions(&self, mark_of: impl Fn(&Symbol) -> f64) -> Vec<BookSnapshot> {
-        self.positions
-            .iter()
-            .filter(|(_, p)| !p.is_empty())
+    pub fn open_positions(&self, mark_of: impl Fn(&Symbol) -> Option<Price>) -> Vec<BookSnapshot> {
+        self.held()
             .map(|(symbol, p)| BookSnapshot {
                 symbol: symbol.clone(),
                 size: p.size,
                 entry_price: p.entry_price,
-                unrealized_pnl: unrealized_pnl(p, mark_of(symbol)),
+                unrealized_pnl: (held_mark(&mark_of, symbol) - p.entry_price) * to_f64(p.size),
             })
             .collect()
     }
+
+    fn held(&self) -> impl Iterator<Item = (&Symbol, &BookPosition)> {
+        self.positions.iter().filter(|(_, p)| !p.is_empty())
+    }
 }
 
-/// 未实现盈亏：(标记价 - 均价) * 带符号仓位；无估值价格 (mark<=0) 时记 0
-fn unrealized_pnl(pos: &BookPosition, mark: f64) -> f64 {
-    if mark <= 0.0 {
-        0.0
-    } else {
-        (mark - pos.entry_price) * to_f64(pos.size)
-    }
+/// 有仓的币在本柜台成交过，成交前柜台已收到它的盘口或成交价，所以必有估值价；没有就是程序写错
+const HELD_HAS_MARK: &str = "有仓的币在本柜台成交过，柜台必有它的估值价";
+
+fn held_mark(mark_of: &impl Fn(&Symbol) -> Option<Price>, symbol: &Symbol) -> f64 {
+    to_f64(mark_of(symbol).expect(HELD_HAS_MARK))
 }
 
 #[cfg(test)]
@@ -240,16 +246,19 @@ mod tests {
     fn equity_and_notional_use_unrealized() {
         let mut l = empty();
         l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(2.0), 0.0);
-        let mark_of = |_: &Symbol| 150.0;
+        let mark_of = |_: &Symbol| Some(dec!(150));
         assert_eq!(l.equity(mark_of), 10_000.0 + (150.0 - 100.0) * 2.0); // 10100
         assert_eq!(l.notional(mark_of), 2.0 * 150.0); // 300
         assert_eq!(l.open_positions(mark_of)[0].unrealized_pnl, 100.0);
     }
 
+    /// 平掉的币留在账本里，没有价也照样给出（空仓不需要价）
     #[test]
-    fn no_mark_price_zero_unrealized() {
+    fn flat_symbol_needs_no_mark() {
         let mut l = empty();
         l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(2.0), 0.0);
-        assert_eq!(l.equity(|_: &Symbol| 0.0), 10_000.0);
+        l.apply_fill(&sym(), Side::Short, dec!(110.0), dec!(2.0), 0.0);
+        assert_eq!(l.equity(|_: &Symbol| None), 10_020.0);
+        assert_eq!(l.position_values(|_: &Symbol| None)[&sym()].value(), 0.0);
     }
 }

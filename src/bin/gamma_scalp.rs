@@ -15,12 +15,12 @@ use hft_engine_rs::backtest::{
     BacktestEngine, BinanceDataKind, BinanceHistory, BsGreeksConfig, BsGreeksSource,
 };
 use hft_engine_rs::domain::{to_f64, Exchange, Symbol, SymbolMeta};
-use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
+use hft_engine_rs::engine::{subscription_scope, SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::ExchangeClient;
 use hft_engine_rs::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
-use hft_engine_rs::strategy::GammaScalpStrategy;
+use hft_engine_rs::strategy::{GammaScalpStrategy, Strategy};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -131,10 +131,14 @@ fn main() -> anyhow::Result<()> {
         delta_band,
         base_offset_ratio,
     );
+    let scope = subscription_scope(
+        hft_engine_rs::backtest::backtest_account(),
+        &strategy.public_streams(),
+    );
     let runner = StrategyRunner::new(
         Box::new(strategy),
         symbol_metas.clone(),
-        hft_engine_rs::backtest::backtest_account(),
+        scope,
         Box::new(SequentialClientOrderIdGen::default()),
     );
     let config = SimConfig {

@@ -469,7 +469,7 @@ impl<'a> BacktestEngine<'a> {
         };
         let values = ExchangeAccountData::PositionValues(crate::messaging::PositionValues {
             exchange,
-            values: state.ledger.position_values(mark_of),
+            legs: state.ledger.position_values(mark_of),
         });
         [info, values].map(|d| {
             IncomeEvent::account(

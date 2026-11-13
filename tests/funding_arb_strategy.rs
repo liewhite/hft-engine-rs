@@ -4,13 +4,13 @@ use hft_engine_rs::domain::{
     dec, AccountId, Decimal, Exchange, Fill, FillReason, OrderStatus, OrderType, OrderUpdate,
     Position, PriceStep, SettledFunding, Side, SymbolMeta, TimeInForce, BBO,
 };
-use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
+use hft_engine_rs::engine::{subscription_scope, SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::messaging::{
-    AccountData, CustomEvent, ExchangeAccountData, IncomeEvent, MarketData, OrderRequestResult,
-    PositionBaseline, PositionValues, RequestOutcome, SymbolAccountData,
+    AccountData, CustomEvent, ExchangeAccountData, IncomeEvent, LegValue, MarketData,
+    OrderRequestResult, PositionBaseline, PositionValues, RequestOutcome, SymbolAccountData,
 };
 use hft_engine_rs::strategy::{
-    FundingArbConfig, FundingArbStrategy, OutcomeEvent, SettledFundingWindow,
+    FundingArbConfig, FundingArbStrategy, OutcomeEvent, SettledFundingWindow, Strategy,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,18 +99,18 @@ impl Sim {
         let p = config().params().unwrap().remove(0);
         let exchanges: Vec<Exchange> = legs.iter().map(|(e, _)| *e).collect();
         let min_of = |ex: Exchange| mins.iter().find(|(e, _)| *e == ex).map_or(0.0, |(_, m)| *m);
+        let strategy =
+            FundingArbStrategy::new(p, exchanges.iter().map(|&e| meta(e, min_of(e)).1).collect());
+        let streams = strategy.public_streams();
         let mut runner = StrategyRunner::new(
-            Box::new(FundingArbStrategy::new(
-                p,
-                exchanges.iter().map(|&e| meta(e, min_of(e)).1).collect(),
-            )),
+            Box::new(strategy),
             Arc::new(
                 exchanges
                     .iter()
                     .map(|&e| meta(e, min_of(e)))
                     .collect::<HashMap<_, _>>(),
             ),
-            AccountId::Live,
+            subscription_scope(AccountId::Live, &streams),
             Box::new(SequentialClientOrderIdGen::default()),
         );
         let baselines: Vec<PositionBaseline> = legs
@@ -197,14 +197,20 @@ impl Sim {
         ))
     }
 
-    /// 本地持仓账本发来的该所各币持仓价值
+    /// 本地持仓账本发来的该所各币持仓价值（读数按估值价 1 给，持仓数 = 价值）
     fn position_values(&mut self, ex: Exchange, values: &[(&str, f64)]) -> Vec<OutcomeEvent> {
         let now = self.now;
-        let values = values.iter().map(|(s, v)| (s.to_string(), *v)).collect();
-        let pv = ExchangeAccountData::PositionValues(PositionValues {
-            exchange: ex,
-            values,
-        });
+        let legs = values
+            .iter()
+            .map(|(s, v)| {
+                let size = Decimal::try_from(*v).unwrap();
+                (
+                    s.to_string(),
+                    LegValue::new(size, Some(Decimal::ONE)).unwrap(),
+                )
+            })
+            .collect();
+        let pv = ExchangeAccountData::PositionValues(PositionValues { exchange: ex, legs });
         self.ev(IncomeEvent::account(
             AccountId::Live,
             now,

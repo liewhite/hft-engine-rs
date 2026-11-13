@@ -9,7 +9,7 @@
 
 use crate::domain::{now_ms, AccountId, Exchange, Position, Symbol, SymbolMeta, Timestamp};
 use crate::engine::{AdapterClientOrderIds, NewClientOrderId, StrategyRunner};
-use crate::messaging::{IncomeEvent, MarketData, MarketEvent};
+use crate::messaging::{IncomeEvent, MarketData, MarketEvent, SubscriptionScope};
 use crate::strategy::Strategy;
 use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, Task};
 use std::collections::HashMap;
@@ -72,6 +72,8 @@ pub struct ExecutorArgs {
     /// 本实例绑定的账户（决定订单落到实盘还是某个模拟账户）和它的出生持仓：实例**出生即带基线**，
     /// 在收到任何流事件之前写入 —— "Fill 早于基线、存量被丢"的竞态在结构上不可能
     pub binding: AccountBinding,
+    /// 订阅范围（投产时算一次，与分发层登记的是同一份，见 [`crate::engine::subscription_scope`]）
+    pub scope: SubscriptionScope,
     /// Symbol 元数据 (供 StrategyRunner 按交易所精度取整；单位折算不在此)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 各所的订单号生成函数（适配层提供）
@@ -161,7 +163,7 @@ impl Executor {
                 let mut runner = StrategyRunner::new(
                     args.strategy,
                     args.symbol_metas,
-                    account.clone(),
+                    args.scope,
                     Box::new(AdapterClientOrderIds(args.client_order_ids)),
                 );
                 // 基线先于一切流事件写入（构造完成前收件箱里的消息不会被处理）

@@ -20,12 +20,11 @@
 
 use super::executor::{ExecutorHandle, ExecutorId};
 use crate::domain::{AccountId, Exchange, Symbol};
-use crate::exchange::SubscriptionKind;
 use crate::messaging::{
     AccountBus, AccountEvent, Delivery, IncomeEvent, MarketBus, MarketEvent, SubscriptionScope,
 };
 use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, Task};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tokio::sync::oneshot;
 
 /// Executor 订阅信息
@@ -45,8 +44,7 @@ pub enum IncomeProcessorMsg {
     /// 见 [`IncomeProcessorHandle::register`]
     Register {
         executor: ExecutorHandle,
-        subscriptions: HashSet<(Exchange, SubscriptionKind)>,
-        account: AccountId,
+        scope: SubscriptionScope,
         reply: oneshot::Sender<()>,
     },
     /// 见 [`IncomeProcessorHandle::unregister`]
@@ -61,20 +59,19 @@ pub enum IncomeProcessorMsg {
 pub struct IncomeProcessorHandle(Addr<IncomeProcessorMsg>);
 
 impl IncomeProcessorHandle {
-    /// 注册 executor 及其订阅（该 executor 绑定 `account`）。返回即已生效：此后的事件按范围投给它。
+    /// 注册 executor 及其订阅范围（与它的 runner 是同一份，投产时算一次）。返回即已生效：
+    /// 此后的事件按范围投给它。
     ///
     /// 幂等：同一 executor 重复注册会先摘净旧索引再按新范围登记。
     pub async fn register(
         &self,
         executor: ExecutorHandle,
-        subscriptions: HashSet<(Exchange, SubscriptionKind)>,
-        account: AccountId,
+        scope: SubscriptionScope,
     ) -> Result<(), Gone> {
         self.0
             .ask(|reply| IncomeProcessorMsg::Register {
                 executor,
-                subscriptions,
-                account,
+                scope,
                 reply,
             })
             .await
@@ -133,11 +130,10 @@ impl IncomeProcessor {
             IncomeProcessorMsg::Account(event) => self.on_account(event),
             IncomeProcessorMsg::Register {
                 executor,
-                subscriptions,
-                account,
+                scope,
                 reply,
             } => {
-                self.register(executor, subscriptions, account);
+                self.register(executor, scope);
                 let _ = reply.send(());
             }
             IncomeProcessorMsg::Unregister { executor, reply } => {
@@ -151,24 +147,12 @@ impl IncomeProcessor {
         }
     }
 
-    fn register(
-        &mut self,
-        executor: ExecutorHandle,
-        subscriptions: HashSet<(Exchange, SubscriptionKind)>,
-        account: AccountId,
-    ) {
+    fn register(&mut self, executor: ExecutorHandle, scope: SubscriptionScope) {
         let id = executor.id();
         // 幂等：同一 executor 重复注册时先摘净旧索引 —— 否则 by_symbol/by_account 里
         // 出现重复 id，每条事件双份投递、Fill 双计仓位（危险侧、静默）。今天注册点单一
         // 且 ExecutorId 唯一，但这不该是巧合保护，而是结构保证。
         self.remove_from_indexes(id);
-
-        let scope = SubscriptionScope::new(
-            account,
-            subscriptions
-                .iter()
-                .map(|(ex, kind)| (*ex, kind.symbol().clone())),
-        );
 
         tracing::info!(executor = %id, scope = ?scope, "Executor registered");
 
@@ -254,26 +238,9 @@ impl IncomeProcessor {
                 continue;
             };
             if !sub.scope.accepts(&event) {
-                // 该账户的私有事件、但不在这个 executor 的订阅范围内。
-                // - Live：分桶部署的常态（账户级全量私有流含其他桶的 symbol），静默跳过；
-                // - Paper：柜台只为本进程策略的订单产回报，被过滤即异常 —— 策略对未订阅
-                //   symbol 下了单，回报回不来，订单会停在「下单中」、一分钟后卡单停机。
-                //   丢弃点必须可见。
-                //
-                // **只对币级事件 warn，所级刻意不 warn**：Paper 的所级事件只有柜台按
-                // (账户, 所) 发的 AccountInfo，它被丢弃的两种来路都不值得报 —— 多策略共享
-                // 同一模拟账户时丢的是别人的所（纯噪声）；策略真在范围外的所下了单时，
-                // 那张单的 OrderUpdate 是币级、已经在下面 warn 过了，可行动的信号没丢。
-                if account != AccountId::Live {
-                    if let Delivery::Symbol(exchange, symbol) = event.delivery() {
-                        tracing::warn!(
-                            %account,
-                            %exchange,
-                            %symbol,
-                            "模拟账户的私有回报被订阅范围过滤丢弃 —— 策略在未订阅的 symbol 上下了单？"
-                        );
-                    }
-                }
+                // 该账户的私有事件、但不在这个 executor 的订阅范围内：分桶部署下实盘账户级全量私有流
+                // 含其他桶的 symbol，多个实例共用一个模拟账户时是别的实例的回报，都是常态。策略只能在
+                // 订阅范围内下单（下单闸门 `StrategyRunner::admit`），自己的回报不会在这里被丢
                 continue;
             }
             Self::forward(sub, &event, &mut gone);
@@ -417,13 +384,9 @@ mod task_tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    fn btc_bbo() -> HashSet<(Exchange, SubscriptionKind)> {
-        HashSet::from([(
-            Exchange::Binance,
-            SubscriptionKind::BBO {
-                symbol: "BTC".to_string(),
-            },
-        )])
+    /// 实盘账户、只订 Binance BTC 的范围
+    fn btc_scope() -> SubscriptionScope {
+        SubscriptionScope::new(AccountId::Live, [(Exchange::Binance, "BTC".to_string())])
     }
 
     fn trade(symbol: &str) -> MarketEvent {
@@ -497,10 +460,7 @@ mod task_tests {
             .unwrap();
         let (_e, executor, got) = fake_executor(&root).await;
         let id = executor.id();
-        processor
-            .register(executor, btc_bbo(), AccountId::Live)
-            .await
-            .unwrap();
+        processor.register(executor, btc_scope()).await.unwrap();
 
         market.publish(trade("BTC"));
         market.publish(trade("ETH")); // 范围外
@@ -528,10 +488,7 @@ mod task_tests {
             .await
             .unwrap();
         let (child, executor, _got) = fake_executor(&root).await;
-        processor
-            .register(executor, btc_bbo(), AccountId::Live)
-            .await
-            .unwrap();
+        processor.register(executor, btc_scope()).await.unwrap();
         child.stop().await;
 
         market.publish(trade("BTC"));

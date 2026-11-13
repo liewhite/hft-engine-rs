@@ -17,10 +17,10 @@ use super::assembly::{ExchangeSetup, SpawnCtx};
 use super::{
     AccountBus, AccountOutcome, Clock, IncomeProcessor, MarketBus, Metrics, MetricsArgs,
     OrderGateway, OutcomeBus, OutcomeProcessor, PaperCounter, PaperCounterArgs, PositionLedger,
-    PositionLedgerArgs, PositionLedgerHandle, DEFAULT_MAX_CONSECUTIVE_MISMATCHES,
-    DEFAULT_POSITION_POLL_INTERVAL_MS, DEFAULT_REPORT_INTERVAL_MS,
+    PositionLedgerArgs, DEFAULT_MAX_CONSECUTIVE_MISMATCHES, DEFAULT_POSITION_POLL_INTERVAL_MS,
+    DEFAULT_REPORT_INTERVAL_MS,
 };
-use crate::domain::{now_ms, AccountId, Exchange, ExchangeError, Position, Symbol, SymbolMeta};
+use crate::domain::{now_ms, AccountId, Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::NewClientOrderId;
 use crate::exchange::{
     AccountClient, ExchangeClient, ExchangeHandle, SettledFundingSource, SubscriptionKind,
@@ -115,7 +115,6 @@ pub struct ManagerHandle {
     outcome_bus: BusTap<AccountOutcome>,
     /// 引擎级合约目录：构造时预加载一次、此后不变，与编排共享同一份
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    position_ledger: PositionLedgerHandle,
     /// 各所的公共已结算资金费来源（装配处给的，见 `ExchangeSetup::settled_funding`）
     settled_funding: Arc<HashMap<Exchange, Arc<dyn SettledFundingSource>>>,
     /// 接入的所，按装配顺序
@@ -195,21 +194,6 @@ impl ManagerHandle {
     /// client，不必为拉资金费另建。
     pub fn settled_funding(&self, exchange: Exchange) -> Option<Arc<dyn SettledFundingSource>> {
         self.settled_funding.get(&exchange).cloned()
-    }
-
-    /// 实盘持仓真值快照，取自持仓账本（唯一被 REST 持续校验的那份折叠 —— 外部读到的数字与
-    /// 风控守卫看到的数字必须是同一个）。
-    ///
-    /// 应答为**基线已写入**的全部腿（含 `size == 0` 的空仓腿）；未 seed 的腿不在结果里 ——
-    /// 那是"未知"而非"空仓"。
-    ///
-    /// 账本不可达时返回 `Err` 而**不是空 vec**：同一条"未知不得伪装成空仓"的规矩，对单条腿成立
-    /// 就对整份快照成立。空 vec 在下游会被当成"全部已平仓"，而账本不可达时真实持仓可能是任意值。
-    pub async fn live_positions(&self) -> Result<Vec<Position>, String> {
-        self.position_ledger.live_positions().await.map_err(|e| {
-            tracing::error!(error = %e, "持仓账本不可达，快照查询失败（取不到 ≠ 没有持仓）");
-            format!("持仓账本不可达: {e}")
-        })
     }
 
     // ------------------------------------------------------------------------
@@ -459,15 +443,14 @@ impl Manager {
             .await?;
         }
 
-        // 7. 观测层：订阅两条入向总线（只读事件流，不参与决策）。账户事件（实盘 + 全部模拟
-        //    账户）一次订阅，按事件自带的账户分账，绝不与实盘视图混淆
+        // 7. 观测层：订阅账户总线（只读事件流，不参与决策）。账户事件（实盘 + 全部模拟
+        //    账户）一次订阅，按事件自带的账户分账；持仓与持仓价值只读持仓账本发的读数（#812）
         let metrics = Metrics::spawn(
             &consumers,
             MetricsArgs {
                 interval_ms: DEFAULT_REPORT_INTERVAL_MS,
                 // PUSHGATEWAY_URL 环境变量启用，未设置 = 只输出日志
                 push: crate::observability::MetricsPushConfig::from_env(),
-                market_bus: market_bus.clone(),
                 account_bus: account_bus.clone(),
                 order_requests: order_gateway.request_counts(),
             },
@@ -478,7 +461,7 @@ impl Manager {
         //    与 Metrics 分开是刻意的——观测层故障不该拖垮交易，而对账确认漂移必须
         //    致命退出（本地持仓不可信时，策略的三道风控闸门全部失效）。
         //
-        //    它同时是快照面 `live_positions` 的数据源 —— 它是唯一被持续校验的那份折叠，
+        //    它同时是持仓读数（`PositionValues`）的唯一出口 —— 它是唯一被持续校验的那份折叠，
         //    外部读到的数字与风控守卫看到的数字必须是同一个。
         //
         //    读数由它**自行轮询**：读数只有这一个消费者，不上总线。收 `accounts` 而非
@@ -535,7 +518,6 @@ impl Manager {
             account_bus: account_bus.tap(),
             outcome_bus: outcome_bus.tap(),
             symbol_metas: symbol_metas.clone(),
-            position_ledger: position_ledger.clone(),
             settled_funding: Arc::new(settled_funding),
             exchanges: Arc::new(exchange_order),
         };

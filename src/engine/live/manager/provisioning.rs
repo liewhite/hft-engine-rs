@@ -34,9 +34,9 @@ use crate::engine::live::{
     Executor, ExecutorArgs, ExecutorHandle, ExecutorId, IncomeProcessorHandle, MetricsHandle,
     OutcomeBus, PositionLedgerHandle,
 };
-use crate::engine::NewClientOrderId;
+use crate::engine::{subscription_scope, NewClientOrderId};
 use crate::exchange::{AccountClient, AccountStream, ExchangeHandle, SubscriptionKind};
-use crate::messaging::AccountBus;
+use crate::messaging::{AccountBus, SubscriptionScope};
 use crate::tasks::{ChildHandle, Gone, Group, StopFlag};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -281,20 +281,16 @@ impl Provisioner {
             return Ok(());
         }
 
-        // 1. 收集所有策略的订阅，并按交易所分组
+        // 1. 收集所有策略的订阅；各实例的订阅范围（腿）在这里算一次，同一份交给它的 runner 和分发层
         let mut all_subscriptions: HashSet<(Exchange, SubscriptionKind)> = HashSet::new();
-        let mut strategy_subscriptions: Vec<HashSet<(Exchange, SubscriptionKind)>> = Vec::new();
+        let mut scopes: Vec<SubscriptionScope> = Vec::new();
 
         for spec in &strategies {
             let public_streams = spec.strategy.public_streams();
-            let subscriptions: HashSet<(Exchange, SubscriptionKind)> = public_streams
-                .iter()
-                .flat_map(|(exchange, kinds)| {
-                    kinds.iter().map(move |kind| (*exchange, kind.clone()))
-                })
-                .collect();
-            all_subscriptions.extend(subscriptions.clone());
-            strategy_subscriptions.push(subscriptions);
+            all_subscriptions.extend(public_streams.iter().flat_map(|(exchange, kinds)| {
+                kinds.iter().map(move |kind| (*exchange, kind.clone()))
+            }));
+            scopes.push(subscription_scope(spec.account.clone(), &public_streams));
         }
 
         // 1.5 投产期校验订阅可行性：交易所未配置、或适配层不支持该 kind，都在此刻
@@ -323,15 +319,11 @@ impl Provisioner {
             }
         }
         //     各实例绑定账户：实盘实例要交易的所没配凭证在此拒绝（见 `PlannedAccount::bind`）
-        let plans: Vec<PlannedAccount> = strategies
+        let plans: Vec<PlannedAccount> = scopes
             .iter()
-            .zip(&strategy_subscriptions)
-            .map(|(spec, subs)| {
-                let legs = subs
-                    .iter()
-                    .map(|(ex, kind)| (*ex, kind.symbol().clone()))
-                    .collect();
-                PlannedAccount::bind(spec.account.clone(), legs, &self.accounts)
+            .map(|scope| {
+                let legs = scope.pairs().map(|(ex, sym)| (ex, sym.clone())).collect();
+                PlannedAccount::bind(scope.account().clone(), legs, &self.accounts)
             })
             .collect::<Result<_, _>>()?;
 
@@ -359,13 +351,14 @@ impl Provisioner {
         //    "Fill 早于基线、存量被丢"的竞态在结构上不可能）；模拟账户从零起步，不需要
         //    也不应该看到真实持仓。此刻它们还没被注册，收不到任何事件。
         let mut spawned: Vec<Spawned> = Vec::new();
-        for (spec, binding) in strategies.into_iter().zip(bindings) {
+        for ((spec, binding), scope) in strategies.into_iter().zip(bindings).zip(&scopes) {
             let account = binding.account();
             let created = Executor::spawn(
                 &self.producers,
                 ExecutorArgs {
                     strategy: spec.strategy,
                     binding,
+                    scope: scope.clone(),
                     symbol_metas: self.symbol_metas.clone(),
                     client_order_ids: self.client_order_ids.clone(),
                     outcome_bus: self.outcome_bus.clone(),
@@ -394,7 +387,7 @@ impl Provisioner {
         if let Err(e) = self
             .activate_executors(
                 &spawned,
-                &strategy_subscriptions,
+                &scopes,
                 &exchange_symbols,
                 baselines,
                 exchange_subscriptions,
@@ -448,7 +441,7 @@ impl Provisioner {
     async fn activate_executors(
         &mut self,
         spawned: &[Spawned],
-        strategy_subscriptions: &[HashSet<(Exchange, SubscriptionKind)>],
+        scopes: &[SubscriptionScope],
         exchange_symbols: &HashSet<(Exchange, Symbol)>,
         baselines: Vec<crate::messaging::PositionBaseline>,
         exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>>,
@@ -486,12 +479,12 @@ impl Provisioner {
         }
 
         // 6.2 向 IncomeProcessor 注册各 Executor 的订阅（自此它们开始收流事件）
-        for (s, subscriptions) in spawned.iter().zip(strategy_subscriptions.iter()) {
+        for (s, scope) in spawned.iter().zip(scopes) {
             // 注册失败必须**向上传播**，不能只打日志：注册不上的实例收不到任何事件
             // （行情、成交全无），本函数却返回 Ok —— 留下一个"活着却永远收不到事件"的僵尸
             // 实例。与"返回 Ok 即已完整投产"的契约相悖。
             self.income_processor
-                .register(s.handle.clone(), subscriptions.clone(), s.account.clone())
+                .register(s.handle.clone(), scope.clone())
                 .await
                 .map_err(|e| {
                     ExchangeError::Other(format!(

@@ -1,20 +1,18 @@
-//! PositionLedger —— 实盘持仓账本：维护真值、用 REST 校验、对外供查。
+//! PositionLedger —— 实盘持仓账本：维护真值、用 REST 校验、对外发读数。
 //!
 //! # 三件事是同一件事
 //!
 //! 本组件持有的镜像是**进程内唯一被持续校验的持仓折叠**，因此也是唯一有资格对外称作
-//! 「真值」的那一份（另两份本地派生及其保留理由见 `docs/external-data-access.md`）。
-//! 校验与供查不是两个职责：账本没有守卫就是负债，守卫没有账本无物可守，而外部读到的数字
+//! 「真值」的那一份（策略实例自己那份决策用折叠及其保留理由见 `docs/external-data-access.md`）。
+//! 校验与对外不是两个职责：账本没有守卫就是负债，守卫没有账本无物可守，而外部读到的数字
 //! 与风控守卫看到的数字**必须是同一个**，否则看板绿着、引擎却在停机边缘。
 //!
-//! 对外入口是 [`PositionLedgerHandle::live_positions`]，经 Manager 转发（快照面契约见同一份文档）。
+//! # 各所持仓读数（#759，#812 起是对外的唯一出口）
 //!
-//! # 各所持仓价值读数（#759）
-//!
-//! 账本里有全部已跟踪币的实时持仓，所以账户级杠杆要的「本所持仓总价值」也由它给：每笔成交后发该所、
-//! 每个节拍发全部所的 [`PositionValues`]（币 → |持仓| × 盘口中间价）到账户总线，按所投给策略。
-//! 单币策略拿它加总别的币、再换上自己这一刻的持仓 —— 别的币刚成交，几毫秒内就能看到，不用等交易所
-//! 账户接口的轮询。盘口只为估值而订（行情总线上的 BBO）；有仓的币还没有盘口时不发（未知不当 0）。
+//! 每笔成交后发该所、每个节拍发全部所的 [`PositionValues`]（币 → 持仓 + 盘口中间价）到账户总线。
+//! 策略的账户杠杆闸门拿它加总别的币、再换上自己这一刻的持仓 —— 别的币刚成交，几毫秒内就能看到，
+//! 不用等交易所账户接口的轮询；指标（看板上的持仓、杠杆、会话盈亏）也只读它，不自己折叠、自己估值。
+//! 盘口只为估值而订（行情总线上的 BBO）；有仓的币还没有盘口时不发（未知不当 0）。
 //!
 //! 持仓的权威值由「投产期 REST 基线 + 之后全程 Fill 累加」维护
 //! （见 [`crate::messaging::PositionBaseline`]）。这条通道会错：Fill 可能丢、可能被重复
@@ -79,12 +77,12 @@
 
 use super::executor::{ExecutorHandle, ExecutorId};
 use crate::domain::{now_ms, AccountId};
-use crate::domain::{to_f64, Exchange, Position, Price, Quantity, Symbol};
+use crate::domain::{Exchange, Position, Price, Quantity, Symbol};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
 use crate::messaging::{
-    AccountBus, AccountData, AccountEvent, ExchangeAccountData, MarketBus, MarketData, MarketEvent,
-    PositionBaseline, PositionBook, PositionValues,
+    AccountBus, AccountData, AccountEvent, ExchangeAccountData, LegValue, MarketBus, MarketData,
+    MarketEvent, PositionBaseline, PositionBook, PositionValues,
 };
 use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, StopFlag, Task};
 use futures_util::future::BoxFuture;
@@ -198,39 +196,28 @@ impl Reconciler {
         self.mirror.seed(baselines);
     }
 
-    /// 当前账本快照：全部**基线已写入**的腿（含 `size == 0` 的空仓腿）。
-    ///
-    /// 未 seed 的腿不出现在结果里 —— 那是"未知"而不是"空仓"，见
-    /// [`SymbolState::seeded_positions`](crate::messaging::SymbolState::seeded_positions)。
-    pub fn positions(&self) -> Vec<Position> {
-        self.mirror.seeded_positions().cloned().collect()
-    }
-
     /// 喂入一条账户事件（账本只吃**实盘**的 Fill、且只吃跟踪范围内的 —— 判据与丢弃
     /// 语义都在 [`PositionBook::apply`] 里，本层不再重复一遍）。
     pub fn on_event(&mut self, event: &AccountEvent) {
         self.mirror.apply(event);
     }
 
-    /// 该所每个基线已写入的币的持仓价值 = |持仓| × `mid_of` 给的价（#759）。
+    /// 该所每个基线已写入的币的持仓读数：数量 + `mid_of` 给的估值价（#759，#812 起带数量）。
     ///
     /// 有仓的币拿不到价时返回 `Err(那个币)`：价值未知，不能当 0 给出去（杠杆闸门会少算）。
-    /// 空仓的币不需要价，记 0。
+    /// 空仓的币不需要价（有就带上，指标拿它给会话盈亏估值）。
     pub fn position_values(
         &self,
         exchange: Exchange,
         mid_of: impl Fn(&Symbol) -> Option<Price>,
-    ) -> Result<HashMap<Symbol, f64>, Symbol> {
+    ) -> Result<HashMap<Symbol, LegValue>, Symbol> {
         self.mirror
             .iter()
             .filter(|(_, state)| state.is_seeded(exchange))
             .map(|(symbol, state)| {
-                let size = state.position_size(exchange);
-                if size.is_zero() {
-                    return Ok((symbol.clone(), 0.0));
-                }
-                let px = mid_of(symbol).ok_or_else(|| symbol.clone())?;
-                Ok((symbol.clone(), to_f64(size.abs() * px)))
+                LegValue::new(state.position_size(exchange), mid_of(symbol))
+                    .map(|leg| (symbol.clone(), leg))
+                    .ok_or_else(|| symbol.clone())
             })
             .collect()
     }
@@ -413,8 +400,6 @@ pub enum PositionLedgerMsg {
         baselines: Vec<PositionBaseline>,
         reply: oneshot::Sender<()>,
     },
-    /// 见 [`PositionLedgerHandle::live_positions`]
-    GetLivePositions(oneshot::Sender<Vec<Position>>),
     /// 见 [`PositionLedgerHandle::watch`]
     Watch(ExecutorHandle, oneshot::Sender<()>),
     /// 见 [`PositionLedgerHandle::unwatch`]
@@ -439,14 +424,6 @@ impl PositionLedgerHandle {
                 reply,
             })
             .await
-    }
-
-    /// 对外快照查询：实盘持仓真值。经 Manager 转发，契约见 `docs/external-data-access.md`。
-    ///
-    /// 应答为**基线已写入**的全部腿（含 `size == 0` 的空仓腿）。未 seed 的腿不在结果里 ——
-    /// 那是"未知"而非"空仓"，调用方应当**不上报**这类腿，而不是当 0 处理。
-    pub async fn live_positions(&self) -> Result<Vec<Position>, Gone> {
-        self.0.ask(PositionLedgerMsg::GetLivePositions).await
     }
 
     /// 把一个实盘 executor 加入监视名单（编排在它开始收事件之前调，见模块文档）。
@@ -646,9 +623,6 @@ impl Ledger {
                 self.reconciler.register(&symbols, &baselines);
                 let _ = reply.send(());
             }
-            PositionLedgerMsg::GetLivePositions(reply) => {
-                let _ = reply.send(self.reconciler.positions());
-            }
             PositionLedgerMsg::Watch(executor, reply) => {
                 tracing::info!(executor = %executor.id(), "开始监视实盘 executor 的持仓");
                 self.executors.insert(executor.id(), executor);
@@ -688,14 +662,14 @@ impl Ledger {
         }
         let mid_of = |symbol: &Symbol| self.mids.get(&(exchange, symbol.clone())).copied();
         match self.reconciler.position_values(exchange, mid_of) {
-            Ok(values) => {
+            Ok(legs) => {
                 let ts = now_ms();
                 self.account_bus.publish(AccountEvent {
                     account: AccountId::Live,
                     exchange_ts: ts,
                     local_ts: ts,
                     data: AccountData::Exchange(ExchangeAccountData::PositionValues(
-                        PositionValues { exchange, values },
+                        PositionValues { exchange, legs },
                     )),
                 });
             }
@@ -1229,44 +1203,46 @@ mod tests {
         .expect("未 seed 的腿不比");
     }
 
-    /// 对外快照只含**基线已写入**的腿，且空仓腿必须如实报出 0。
+    /// 对外读数只含**基线已写入**的腿，且空仓腿必须如实报出 0。
     ///
     /// 两个方向都要守：漏报空仓腿会让下游把"已平仓"看成"未知"；把未 seed 的腿当 0 报出去
     /// 则相反 —— 下游会据此算出假的对冲完整性。
     #[test]
-    fn snapshot_contains_seeded_legs_only_including_flat_ones() {
+    fn readings_contain_seeded_legs_only_including_flat_ones() {
         let mut r = reconciler_with(
             1,
             &[baseline_on(EX, dec!(2.0)), baseline_on(OTHER_EX, dec!(0.0))],
         );
         r.on_event(&fill(Side::Long, dec!(1.0))); // EX 腿 -> 3.0
-
-        let snapshot = r.positions();
-        assert_eq!(snapshot.len(), 2, "两条腿都已 seed，都该出现: {snapshot:?}");
-        let ex_leg = snapshot.iter().find(|p| p.exchange == EX).expect("EX 腿");
-        let other_leg = snapshot
-            .iter()
-            .find(|p| p.exchange == OTHER_EX)
-            .expect("空仓腿也必须报出，否则下游分不清「已平仓」与「未知」");
-        assert_eq!(ex_leg.size, dec!(3.0));
-        assert_eq!(other_leg.size, dec!(0.0));
+        let size_on = |ex| {
+            r.position_values(ex, |_: &Symbol| Some(dec!(1)))
+                .unwrap()
+                .get(SYM)
+                .map(LegValue::size)
+        };
+        assert_eq!(size_on(EX), Some(dec!(3.0)));
+        assert_eq!(
+            size_on(OTHER_EX),
+            Some(dec!(0.0)),
+            "空仓腿也必须报出，否则下游分不清「已平仓」与「未知」"
+        );
     }
 
-    /// 未 seed 的腿绝不出现在快照里：那是"未知"，不是"空仓"。
+    /// 未 seed 的腿绝不出现在读数里：那是"未知"，不是"空仓"。
     #[test]
-    fn snapshot_omits_unseeded_legs() {
+    fn readings_omit_unseeded_legs() {
         // 注册了 symbol 但没有任何基线（该所未配置凭证）
         let mut r = reconciler_with(1, &[]);
         // 即便 Fill 已经累加出仓位，未 seed 也不外报 —— 起点未知，这个数没有意义
         r.on_event(&fill(Side::Long, dec!(1.0)));
+        let readings = r.position_values(EX, |_: &Symbol| Some(dec!(1))).unwrap();
         assert!(
-            r.positions().is_empty(),
-            "未 seed 的腿不得进入对外快照: {:?}",
-            r.positions()
+            readings.is_empty(),
+            "未 seed 的腿不得进入读数: {readings:?}"
         );
     }
 
-    /// #759：持仓价值 = |持仓| × 中间价（空头也为正）；空仓的币不需要价；未 seed 的腿不报
+    /// #759：读数带持仓与中间价，价值 = |持仓| × 中间价（空头也为正）；空仓的币不需要价；未 seed 的腿不报
     #[test]
     fn position_values_are_abs_size_times_mid_and_flat_legs_need_no_price() {
         let mut r = Reconciler::new(1);
@@ -1279,16 +1255,12 @@ mod tests {
         );
         r.on_event(&fill_on(EX, Side::Short, dec!(1.0), SNAPSHOT_TS + 1)); // EX: -3
         let mid = |s: &Symbol| (s == SYM).then_some(dec!(100));
-        assert_eq!(
-            r.position_values(EX, mid),
-            Ok(HashMap::from([(SYM.to_string(), 300.0)])),
-            "ETH 未 seed，不报"
-        );
-        assert_eq!(
-            r.position_values(OTHER_EX, |_: &Symbol| None),
-            Ok(HashMap::from([(SYM.to_string(), 0.0)])),
-            "空仓不需要价"
-        );
+        let held = r.position_values(EX, mid).unwrap();
+        assert_eq!(held.len(), 1, "ETH 未 seed，不报: {held:?}");
+        assert_eq!(held[SYM].size(), dec!(-3));
+        assert_eq!(held[SYM].value(), 300.0);
+        let flat = r.position_values(OTHER_EX, |_: &Symbol| None).unwrap();
+        assert_eq!(flat[SYM].value(), 0.0, "空仓不需要价");
     }
 
     /// 有仓却没价：价值未知，不能当 0 报出去（杠杆闸门会少算）
@@ -1651,25 +1623,25 @@ mod task_tests {
         );
     }
 
-    /// **回归防线**：REST 拉取卡死时，快照查询仍须应答。
+    /// **回归防线**：REST 拉取卡死时，收件箱照常处理（Fill 摄入、投产注册都在这里）。
     ///
-    /// 拉取一旦回到收件箱处理里 `await`（改动之前的形态），这个查询会永远排在那次网络
+    /// 拉取一旦回到收件箱处理里 `await`（改动之前的形态），这次注册会永远排在那次网络
     /// 超时后面，测试超时失败。
     #[tokio::test]
-    async fn a_hung_rest_fetch_never_blocks_the_snapshot_query() {
+    async fn a_hung_rest_fetch_never_blocks_the_inbox() {
         let root = Root::new("t");
         let (client, calls) = FaultyClient::pair(Faulty::Hang);
         let ledger = ledger(&root, client, NEVER_AGAIN_MS).await;
         // 首拍已发起一轮拉取（卡死在信号量上）
         eventually("首拍发起拉取", || calls.load(Ordering::SeqCst) >= 1).await;
 
-        let positions = tokio::time::timeout(Duration::from_secs(2), ledger.live_positions())
-            .await
-            .expect("拉取卡死时快照查询必须仍能应答")
-            .expect("应答应成功");
-
-        assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].size, dec!(2.0), "应答的是账本真值（基线 2.0）");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            ledger.register_symbols(vec!["ETH".to_string()], Vec::new()),
+        )
+        .await
+        .expect("拉取卡死时收件箱必须仍能应答")
+        .expect("应答应成功");
         root.shutdown().await.expect("正常停机");
     }
 
@@ -1765,7 +1737,9 @@ mod task_tests {
             )),
         });
         eventually("成交后立刻发出读数", || {
-            last().is_some_and(|v| v.exchange == EX && v.values.get(SYM) == Some(&300.0))
+            last().is_some_and(|v| {
+                v.exchange == EX && v.legs.get(SYM).map(LegValue::value) == Some(300.0)
+            })
         })
         .await;
         root.shutdown().await.expect("正常停机");
@@ -1818,6 +1792,10 @@ mod task_tests {
         Executor::spawn(
             &root.group("producers"),
             ExecutorArgs {
+                scope: crate::engine::subscription_scope(
+                    AccountId::Live,
+                    &crate::strategy::Strategy::public_streams(&Idle),
+                ),
                 strategy: Box::new(Idle),
                 binding: crate::engine::live::AccountBinding::Live(
                     crate::engine::live::LiveBaselines::for_test(vec![baseline(size)]),

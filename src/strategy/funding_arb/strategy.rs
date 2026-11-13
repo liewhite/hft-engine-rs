@@ -494,7 +494,7 @@ impl FundingArbStrategy {
         let others: f64 = values
             .iter()
             .filter(|(s, _)| *s != self.symbol())
-            .map(|(_, v)| v)
+            .map(|(_, leg)| leg.value())
             .sum();
         let account_after = others + after;
         let ok = after / equity <= self.p.max_symbol_leverage

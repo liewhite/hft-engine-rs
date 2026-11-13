@@ -118,11 +118,11 @@ CLAUDE.md 的七条是通用的，这里只写**本项目特有的、可以直�
 同一事实只有一个权威宿主。派生副本不是绝对禁止（纯函数、无锁、生命周期解耦都是正当理由），
 但**每一份派生都必须在代码里写明为什么不能查权威**。
 
-现行记录：持仓真值的权威在 `PositionLedger`；executor 的那份因为"策略是纯函数、决策中途
-不能 await"；metrics 的那份因为"需要持仓 × 价格的 join，且收尾快照不能依赖同组并发停机的
-组件"。见 [external-data-access.md](./external-data-access.md) §四。
+现行记录：持仓真值的权威在 `PositionLedger`，对外只经它发的 `PositionValues` 读数（策略杠杆闸门与
+指标同读这一份，#812）；executor 的那份因为"策略是纯函数、决策中途不能 await"。见
+[external-data-access.md](./external-data-access.md) §四。
 
-**新增第四份必须先证明它不能用 `ManagerHandle::live_positions` 替代。**
+**新增第三份必须先证明它不能用 `PositionValues` 读数替代。**
 
 ### P2 能力用类型表达，不用值域表达
 
@@ -212,7 +212,7 @@ CLAUDE.md 的七条是通用的，这里只写**本项目特有的、可以直�
 
  对外（bin 里的观察者，经 ManagerHandle）
    流面: market_bus() / account_bus() / outcome_bus()；观察者挂 observers() 组、构造时 inbox.subscribe + fn 过滤
-   快照面: all_symbol_metas() / live_positions()              见 external-data-access.md
+   快照面: all_symbol_metas()；持仓订 account_bus 上的 PositionValues   见 external-data-access.md
 ```
 
 模块职责：
@@ -344,9 +344,9 @@ Root("engine")                         ← bootstrap::run_engine 持有，唯一
 `SymbolPositions::apply_fill`，与 `seeded_at` 同住一处 —— 账本与策略门面共用一份，
 不会各自演化出差别（那种差别的表现是"对账偶尔误报漂移"，最难查）。
 
-**持仓折叠仍是三份宿主**（账本 / executor / metrics），数量没变但性质变了：
-账本那份现在最瘦最专一，而它正是唯一被 REST 持续校验的那份。
-executor 与 metrics 的保留理由见 [external-data-access.md](./external-data-access.md) §四。
+持仓折叠当时仍是三份宿主（账本 / executor / metrics）；#812 起 metrics 那份删掉，改读账本发的
+`PositionValues`，剩账本与 executor 两份。executor 的保留理由见
+[external-data-access.md](./external-data-access.md) §四。
 
 <details><summary>原文（保留以便对照判断标准）</summary>
 

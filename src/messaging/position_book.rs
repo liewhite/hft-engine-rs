@@ -4,7 +4,7 @@
 //!
 //! 持仓账本（`PositionLedger`）此前持有整个 [`StateManager`]，而它一辈子只用得到
 //! 持仓那一份：行情缓存、挂单跟踪、账户净值、希腊值它一个都不碰。这既是接口过宽
-//! （`docs/architecture.md` 原则 P3），也让"三份持仓折叠"里它那一份看起来像是重复
+//! （`docs/architecture.md` 原则 P3），也让几份持仓折叠里它那一份看起来像是重复
 //! 造出来的 —— 实际上它是**唯一被 REST 持续校验的那份**，理应是最瘦、最专一的。
 //!
 //! 拆出本类型之后：账本的字段类型就是它的职责声明，编译器保证它碰不到别的东西。
@@ -16,7 +16,7 @@
 //! 分发与注册范围管理 —— 规则只能有一份，否则账本与 executor 会各自演化出细微差别，
 //! 而那种差别的表现形式是"对账偶尔误报漂移"，最难查。
 
-use crate::domain::{Position, Symbol};
+use crate::domain::Symbol;
 use crate::messaging::state_manager::PositionBaseline;
 use crate::messaging::{AccountData, AccountEvent, SymbolAccountData, SymbolPositions};
 use std::collections::HashMap;
@@ -98,14 +98,6 @@ impl PositionBook {
     pub fn iter(&self) -> impl Iterator<Item = (&Symbol, &SymbolPositions)> {
         self.symbols.iter()
     }
-
-    /// 全部**基线已写入**的腿（含 `size == 0` 的空仓腿）。
-    ///
-    /// 未 seed 的腿不在结果里 —— 那是"未知"而非"空仓"，见
-    /// [`SymbolPositions::seeded_positions`]。对外快照（`ManagerHandle::live_positions`）用的就是它。
-    pub fn seeded_positions(&self) -> impl Iterator<Item = &Position> {
-        self.symbols.values().flat_map(|p| p.seeded_positions())
-    }
 }
 
 #[cfg(test)]
@@ -153,7 +145,7 @@ mod tests {
     }
 
     fn size_of(b: &PositionBook) -> Decimal {
-        b.seeded_positions().map(|p| p.size).sum()
+        b.iter().map(|(_, p)| p.position_size(EX)).sum()
     }
 
     /// **串账防线**：模拟账户的成交绝不能进实盘持仓账本。

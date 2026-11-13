@@ -61,9 +61,12 @@ impl<'a> StrategyView<'a> {
         self.state.account_view().account_info(exchange)
     }
 
-    /// 本地持仓账本里该所各币的持仓价值（币 → |持仓| × 中间价），含别的策略实例的币。
+    /// 本地持仓账本里该所各币的持仓读数（数量 + 估值价），含别的策略实例的币。
     /// 账本还没发过该所读数时返回 `None`（未知，不是 0）。见 [`crate::messaging::PositionValues`]。
-    pub fn position_values(&self, exchange: Exchange) -> Option<&'a HashMap<Symbol, f64>> {
+    pub fn position_values(
+        &self,
+        exchange: Exchange,
+    ) -> Option<&'a HashMap<Symbol, crate::messaging::LegValue>> {
         self.state.account_view().position_values(exchange)
     }
 
