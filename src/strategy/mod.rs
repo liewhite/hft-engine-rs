@@ -31,7 +31,7 @@ pub enum OutcomeEvent {
     ///
     /// 框架只对下单已受理、还开着、且没有撤单在途的单发出，其余丢弃（见 `SymbolOrders::mark_cancel_sent`），
     /// 策略要在之后的事件里重新要求；撤单失败以
-    /// [`crate::messaging::RequestOutcome::CancelFailed`] 回报，记在单的 `cancel` 上。
+    /// [`crate::messaging::RequestOutcome::CancelFailed`] 回报，记在单的撤单状态上（[`crate::messaging::CancelAttempt::Failed`]）。
     CancelOrder {
         exchange: Exchange,
         symbol: Symbol,

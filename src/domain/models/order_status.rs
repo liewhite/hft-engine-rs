@@ -1,13 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-/// 订单状态（交易所说的；只有 `Created` 是本地的：已发出、交易所还没说过话）
+/// 订单状态（交易所说的）。本地「已发出、交易所还没说过话」不是订单状态，见 `messaging::OrderStage::Placing`
 ///
 /// 本地 REST 调用的结论（下单被拒、撤单失败、下单已受理）不是订单状态，走
 /// [`crate::messaging::OrderRequestResult`]。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum OrderStatus {
-    /// 本地已创建，等待交易所响应
-    Created,
     /// 交易所已收到，等待成交
     Pending,
     /// 部分成交（累计量见 [`crate::domain::OrderUpdate::filled_quantity`]）

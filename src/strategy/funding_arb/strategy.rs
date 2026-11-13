@@ -51,7 +51,7 @@ use crate::domain::{
 };
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{
-    AccountData, CancelState, IncomeEvent, MarketData, MarketEvent, PendingOrder, RequestOutcome, SymbolAccountData,
+    AccountData, CancelAttempt, IncomeEvent, OrderStage, MarketData, MarketEvent, PendingOrder, RequestOutcome, SymbolAccountData,
 };
 use crate::observability::Gauge;
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
@@ -419,7 +419,7 @@ impl FundingArbStrategy {
                 match &u.status {
                     OrderStatus::Rejected { reason } => (u.exchange, Some(reason)),
                     OrderStatus::Pending | OrderStatus::PartiallyFilled | OrderStatus::Filled => (u.exchange, None),
-                    OrderStatus::Created | OrderStatus::Cancelled => return,
+                    OrderStatus::Cancelled => return,
                 }
             }
             SymbolAccountData::OrderRequest(r) => match &r.outcome {
@@ -507,13 +507,10 @@ impl FundingArbStrategy {
     /// 撤一张开着的单。下单请求还没结论的，框架丢弃这次撤单、受理的结论到了本策略重新判断时再撤；
     /// 撤单在途时不重发，撤单失败（多半是单刚成交、终态马上就到）后隔 `hedge_retry_ms` 再撤。
     fn cancel(&self, p: &PendingOrder, now: Timestamp) -> Option<OutcomeEvent> {
-        if !p.is_open() {
-            return None;
-        }
-        match &p.cancel {
-            CancelState::None => {}
-            CancelState::Sent => return None,
-            CancelState::Failed { at, reason } => {
+        match p.stage() {
+            OrderStage::Placing | OrderStage::Live => {}
+            OrderStage::Done { .. } | OrderStage::Cancelling { attempt: CancelAttempt::InFlight, .. } => return None,
+            OrderStage::Cancelling { attempt: CancelAttempt::Failed { at, reason }, .. } => {
                 if now.saturating_sub(*at) < self.p.hedge_retry_ms {
                     return None;
                 }

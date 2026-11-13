@@ -549,7 +549,7 @@ impl IbkrPublicWs {
                 "Filled" => OrderStatus::Filled,
                 "Cancelled" => OrderStatus::Cancelled,
                 // Inactive 是 IBKR 的异常中间状态，通常表示订单被暂停或有问题。
-                // 不更新 pending order 状态（保持 Created），让 timeout 机制正常清理。
+                // 不推状态（跟踪表里的单保持原状），等 REST 结论或后续 WS 推终态；一直等不到由卡单检查停机。
                 // 真正的结果会通过 REST 返回或后续 WS 推送终态。
                 "Inactive" => {
                     tracing::warn!(
