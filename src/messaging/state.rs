@@ -43,7 +43,7 @@ pub enum CancelState {
     None,
     /// 撤单已发出：等交易所推终态，或撤单失败的结论。期间框架不再重发（见 `StrategyRunner`）
     Sent,
-    /// 撤单请求失败。单若还开着，要不要、隔多久重撤由策略定
+    /// 撤单请求失败。单若还开着，隔多久重撤由策略定；但从第一次撤起 [`ORDER_STUCK_MS`] 内没到终态，框架停机
     Failed { at: Timestamp, reason: String },
 }
 

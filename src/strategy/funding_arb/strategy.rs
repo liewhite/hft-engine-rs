@@ -75,6 +75,8 @@ pub struct FundingArbStrategy {
     metas: HashMap<Exchange, SymbolMeta>,
     funding: HashMap<Exchange, SettledFundingWindow>,
     bbo_local_ts: HashMap<Exchange, Timestamp>,
+    /// 收到第一条事件的时刻：某所从没来过盘口时，盘口年龄指标从这里算起
+    first_event_at: Option<Timestamp>,
     /// 最近一次挂 maker 的所对：不平衡时在这对所上补腿
     leg: Option<LegPair>,
     /// 首次拿到全部所盘口时做过启动检查没有
@@ -130,6 +132,7 @@ impl FundingArbStrategy {
             metas: metas.into_iter().map(|m| (m.exchange, m)).collect(),
             funding: HashMap::new(),
             bbo_local_ts: HashMap::new(),
+            first_event_at: None,
             leg: None,
             startup_checked: false,
             halted: None,
@@ -599,9 +602,10 @@ impl Strategy for FundingArbStrategy {
         for &ex in &self.exchanges {
             let ex_label = ex.to_string();
             let labels = [("symbol", sym), ("exchange", ex_label.as_str())];
-            // 盘口年龄：公共流长时间断线或订阅静默无数据时，该币一直只撤不挂，日志里只有重连 warn（#767）
-            if let Some(&t) = self.bbo_local_ts.get(&ex) {
-                out.push(Gauge::new("funding_arb_bbo_age_seconds", &labels, now.saturating_sub(t) as f64 / 1000.0));
+            // 盘口年龄：公共流长时间断线或订阅静默无数据时，该币一直只撤不挂，日志里只有重连 warn（#767）。
+            // 从没来过盘口的所从收到第一条事件算起（启动起就静默的订阅也看得见）
+            if let Some(t) = self.bbo_local_ts.get(&ex).or(self.first_event_at.as_ref()) {
+                out.push(Gauge::new("funding_arb_bbo_age_seconds", &labels, now.saturating_sub(*t) as f64 / 1000.0));
             }
             let Some(w) = self.funding.get(&ex) else { continue };
             out.push(Gauge::new("funding_arb_funding_age_seconds", &labels, now.saturating_sub(w.fetched_at) as f64 / 1000.0));
@@ -637,6 +641,7 @@ impl Strategy for FundingArbStrategy {
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<OutcomeEvent> {
         let now = event.local_ts();
+        self.first_event_at.get_or_insert(now);
         // 分发层只投本币的事件，这里不再判 symbol（P4）
         match event {
             IncomeEvent::Market(MarketEvent { data: MarketData::BBO(bbo), .. }) => {

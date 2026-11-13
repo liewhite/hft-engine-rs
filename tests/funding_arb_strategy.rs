@@ -796,3 +796,25 @@ fn gauges_report_aprs_spread_and_signal() {
     assert_eq!(value("funding_arb_signal", &[("action", "open"), ("sell", &bn), ("buy", &hl)]), Some(1.0), "{g:?}");
     assert_eq!(value("funding_arb_halted", &[("symbol", SYM)]), Some(0.0));
 }
+
+/// 盘口年龄：来过盘口的所按最后一条算；从没来过的所从策略收到第一条事件算起（启动起就静默的订阅也有读数；#767）
+#[test]
+fn gauges_report_bbo_age_including_never_seen_exchanges() {
+    let mut s = Sim::without_bbo(0.0, 0.0);
+    s.funding(BN, 0.8);
+    let first = s.now;
+    s.advance(5_000);
+    s.bbo(BN);
+    let bn_at = s.now;
+    s.advance(2_000);
+    let g = s.runner.strategy_gauges(s.now);
+    let age = |ex: Exchange| {
+        let ex = ex.to_string();
+        g.iter()
+            .find(|x| x.name == "funding_arb_bbo_age_seconds" && x.labels.iter().any(|(k, v)| k == "exchange" && *v == ex))
+            .map(|x| x.value)
+    };
+    // 事件的时刻取发事件前的 now（Sim::ev 发完再走 10ms）
+    assert_eq!(age(BN), Some((s.now - (bn_at - 10)) as f64 / 1000.0), "{g:?}");
+    assert!(age(HL).is_some_and(|a| a >= (s.now - first) as f64 / 1000.0), "从没来过盘口的所也要有读数，且不短于第一条事件以来的时长: {g:?}");
+}
