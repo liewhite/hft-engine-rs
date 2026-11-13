@@ -264,17 +264,15 @@ impl StateManager {
                 if balance.asset == USDT {
                     tracing::debug!(
                         exchange = %balance.exchange,
-                        available = balance.available,
+                        cash = balance.cash,
                         "USDT balance updated"
                     );
-                    self.account
-                        .balances
-                        .insert(balance.exchange, balance.available);
+                    self.account.balances.insert(balance.exchange, balance.cash);
                 }
                 // 存储币种现金余额 (用于修正 greeks delta)
                 self.account
                     .cash_balances
-                    .insert((balance.exchange, balance.asset.clone()), balance.available);
+                    .insert((balance.exchange, balance.asset.clone()), balance.cash);
             }
             // equity + notional 原子写入
             ExchangeAccountData::AccountInfo {

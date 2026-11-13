@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// WS 保活与断流检测配置。
+/// WS 保活与断流检测配置。各所的取值是该所的线路知识，定义在各所模块里（`binance::KEEPALIVE` 等）。
 ///
 /// 此前整个项目没有应用层心跳与空闲检测：OKX 的空闲连接会被服务端 30 秒静默断开、
 /// Hyperliquid 60 秒；而"连接活着但数据停了"（半开连接、上游静默故障）无人能发现 ——
@@ -22,55 +22,14 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 /// - `idle_timeout`：超过此时长没有收到**任何**入站帧（含 Ping/Pong 控制帧）即判定
 ///   断流，按断线处理（[`WsConn`] 上冒停机，[`ReconnectingWs`] 重连）。
 ///   必须大于该所服务端/我方的 ping 周期，否则安静的私有流会被误杀。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct WsKeepalive {
     /// 周期性发送的应用层 ping 文本；None = 不主动 ping
-    pub ping_text: Option<String>,
+    pub ping_text: Option<&'static str>,
     /// ping 发送周期（ping_text 为 None 时仅作空闲检查周期）
     pub ping_interval: Duration,
     /// 空闲上限：超过即判定断流退出
     pub idle_timeout: Duration,
-}
-
-impl WsKeepalive {
-    /// OKX：文本 "ping"，服务端 30 秒无消息断开
-    pub fn okx() -> Self {
-        Self {
-            ping_text: Some("ping".to_string()),
-            ping_interval: Duration::from_secs(15),
-            idle_timeout: Duration::from_secs(60),
-        }
-    }
-
-    /// Hyperliquid：`{"method":"ping"}`，服务端 60 秒无消息断开
-    pub fn hyperliquid() -> Self {
-        Self {
-            ping_text: Some(r#"{"method":"ping"}"#.to_string()),
-            ping_interval: Duration::from_secs(30),
-            idle_timeout: Duration::from_secs(90),
-        }
-    }
-
-    /// Binance：服务端每 ~3 分钟主动 Ping（循环自动回 Pong），客户端无需发 ping；
-    /// 空闲上限 8 分钟的含义是**容忍恰好丢一个服务端 ping**（连丢两个即判定断流）——
-    /// 调小到 6 分钟以内会把偶发的单个 ping 丢失误杀成停机
-    pub fn binance() -> Self {
-        Self {
-            ping_text: None,
-            ping_interval: Duration::from_secs(60),
-            idle_timeout: Duration::from_secs(8 * 60),
-        }
-    }
-
-    /// IBKR：会话由 tickle 保活（REST），WS 侧只做空闲检测；smd 有 8 分钟重订阅周期，
-    /// 空闲上限给足余量
-    pub fn ibkr() -> Self {
-        Self {
-            ping_text: None,
-            ping_interval: Duration::from_secs(60),
-            idle_timeout: Duration::from_secs(12 * 60),
-        }
-    }
 }
 
 /// WS 入站缓冲：循环读得比组件处理快时在这里攒着，满了循环就暂停读（背压，不丢）
@@ -324,7 +283,7 @@ impl ReconnectingWs {
             format!("{name}Loop"),
             read,
             write,
-            keepalive.clone(),
+            *keepalive,
             OnLoss::Report,
         )
         .map_err(|e| ExchangeError::new(e.to_string()))
@@ -433,8 +392,8 @@ async fn run_ws_loop_inner(
                         last_activity.elapsed()
                     )));
                 }
-                if let Some(text) = &keepalive.ping_text {
-                    if write.send(WsMessage::Text(text.clone())).await.is_err() {
+                if let Some(text) = keepalive.ping_text {
+                    if write.send(WsMessage::Text(text.to_string())).await.is_err() {
                         return Err(ExchangeError::new("Ping send failed".to_string()));
                     }
                 }
@@ -471,8 +430,11 @@ async fn run_ws_loop_inner(
                                     return Ok(());
                                 }
                             }
+                            // 丢掉一帧就可能丢一条回报（私有流里是成交），按断线处理，不跳过
                             Err(e) => {
-                                tracing::warn!(error = %e, "ws_loop: binary message is not valid UTF-8");
+                                return Err(ExchangeError::new(format!(
+                                    "收到非 UTF-8 的二进制帧，按断线处理: {e}"
+                                )));
                             }
                         }
                     }
@@ -510,9 +472,9 @@ mod keepalive_tests {
 
     type Frame = Result<WsMessage, tokio_tungstenite::tungstenite::Error>;
 
-    fn keepalive(ping: Option<&str>, interval_s: u64, idle_s: u64) -> WsKeepalive {
+    fn keepalive(ping: Option<&'static str>, interval_s: u64, idle_s: u64) -> WsKeepalive {
         WsKeepalive {
-            ping_text: ping.map(str::to_string),
+            ping_text: ping,
             ping_interval: Duration::from_secs(interval_s),
             idle_timeout: Duration::from_secs(idle_s),
         }
@@ -661,6 +623,31 @@ mod keepalive_tests {
             .await_subscriptions(Exchange::OKX, &["orders"], by_prefix)
             .await
             .is_err());
+    }
+
+    /// 非 UTF-8 的二进制帧按断线处理（跳过它可能丢一条成交回报）
+    #[tokio::test]
+    async fn non_utf8_binary_frame_is_a_disconnect() {
+        let read = stream::iter(vec![Ok::<_, tokio_tungstenite::tungstenite::Error>(
+            WsMessage::Binary(vec![0xff, 0xfe]),
+        )])
+        .chain(stream::pending());
+        let (w_tx, _w_rx) = mpsc::channel::<WsMessage>(64);
+        let (_out_tx, out_rx) = mpsc::channel::<String>(8);
+        let (in_tx, _in_rx) = mpsc::channel::<String>(8);
+        let err = run_ws_loop(
+            Box::pin(read),
+            PollSender::new(w_tx),
+            out_rx,
+            in_tx,
+            keepalive(None, 60, 3600),
+        )
+        .await
+        .expect_err("非 UTF-8 帧必须是 Err");
+        assert!(
+            err.to_string().contains("UTF-8") || format!("{err:#}").contains("UTF-8"),
+            "{err:#}"
+        );
     }
 
     /// 配置了 ping_text 的所（OKX/HL）按周期发送应用层 ping

@@ -227,7 +227,7 @@ impl<S: MarketDataSource> MarketDataSource for BsGreeksSource<S> {
                     AccountData::Exchange(ExchangeAccountData::Balance(Balance {
                         exchange: self.config.exchange,
                         asset: self.config.ccy.clone(),
-                        available: self.config.spot_holding,
+                        cash: self.config.spot_holding,
                     })),
                 );
                 vec![ev, balance_ev, greeks_ev]

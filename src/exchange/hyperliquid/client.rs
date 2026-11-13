@@ -278,14 +278,13 @@ impl HyperliquidAccount {
                 let tif = match tif {
                     crate::domain::TimeInForce::GTC => HlTif::Gtc,
                     crate::domain::TimeInForce::IOC => HlTif::Ioc,
+                    // HL 只有 Gtc / Ioc / Alo。FOK 要么全成要么不成，换成 IOC 会部分成交，
+                    // 语义不同，不偷偷降级：拒单（请求没发出）
                     crate::domain::TimeInForce::FOK => {
-                        // FOK 要求全部成交或取消，IOC 允许部分成交，语义不同
-                        // Hyperliquid 不支持 FOK，记录警告
-                        tracing::warn!(
-                            symbol = %order.symbol,
-                            "FOK not supported on Hyperliquid, using IOC (may result in partial fill)"
-                        );
-                        HlTif::Ioc
+                        return Err(ExchangeError::new(format!(
+                            "HL 不支持 FOK（{}），拒单",
+                            order.symbol
+                        )))
                     }
                     crate::domain::TimeInForce::PostOnly => HlTif::Alo,
                 };

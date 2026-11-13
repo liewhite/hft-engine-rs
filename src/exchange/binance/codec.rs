@@ -178,13 +178,13 @@ pub struct AccountBalance {
 
 impl AccountBalance {
     pub fn to_balance(&self) -> Result<Balance, String> {
-        let available = f64::from_str(&self.cw)
-            .map_err(|_| format!("Failed to parse available balance: {}", self.cw))?;
+        let cash = f64::from_str(&self.cw)
+            .map_err(|_| format!("Failed to parse cross wallet balance: {}", self.cw))?;
 
         Ok(Balance {
             exchange: Exchange::Binance,
             asset: self.a.clone(),
-            available,
+            cash,
         })
     }
 }

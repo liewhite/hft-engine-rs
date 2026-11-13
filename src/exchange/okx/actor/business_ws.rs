@@ -13,7 +13,7 @@ use crate::exchange::okx::codec::{
     WsPush,
 };
 use crate::exchange::okx::{to_okx, REST_BASE_URL, WS_BUSINESS_URL};
-use crate::exchange::ws_loop::{self, WsConn};
+use crate::exchange::ws_loop::WsConn;
 use crate::messaging::{HistoryCandles, MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
@@ -56,7 +56,7 @@ impl OkxBusinessWs {
                     "OkxBusinessWsLoop",
                     read,
                     write,
-                    ws_loop::WsKeepalive::okx(),
+                    crate::exchange::okx::KEEPALIVE,
                 )?;
 
                 let http_client = crate::exchange::client::exchange_http_client(Exchange::OKX)?;

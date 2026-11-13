@@ -42,6 +42,14 @@ pub(crate) static IP_WEIGHT: crate::exchange::rate_limit::Quota =
 /// Hyperliquid WebSocket 地址
 pub const WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
+/// WS 保活：`{"method":"ping"}`，服务端 60 秒无消息断开
+pub(crate) const KEEPALIVE: crate::exchange::ws_loop::WsKeepalive =
+    crate::exchange::ws_loop::WsKeepalive {
+        ping_text: Some(r#"{"method":"ping"}"#),
+        ping_interval: std::time::Duration::from_secs(30),
+        idle_timeout: std::time::Duration::from_secs(90),
+    };
+
 /// Hyperliquid 的接入配置（与其他所的 `ExchangeAccess` 同形，多一个 `dexes`）。
 ///
 /// ```json

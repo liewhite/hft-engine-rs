@@ -12,7 +12,7 @@ use crate::exchange::okx::codec::{
     resolve_meta, BboData, FundingRateData, IndexTickerData, MarkPriceData, TradeData, WsPush,
 };
 use crate::exchange::okx::{to_okx, to_okx_index, WS_PUBLIC_URL};
-use crate::exchange::ws_loop::{ReconnectingWs, WsKeepalive};
+use crate::exchange::ws_loop::ReconnectingWs;
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
@@ -49,7 +49,7 @@ impl OkxPublicWs {
                     scope.group("conn"),
                     "OkxPublicWs",
                     WS_PUBLIC_URL,
-                    WsKeepalive::okx(),
+                    crate::exchange::okx::KEEPALIVE,
                 )
                 .await?;
                 tracing::info!("OkxPublicWs started");

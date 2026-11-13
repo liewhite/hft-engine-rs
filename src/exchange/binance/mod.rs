@@ -47,6 +47,16 @@ pub const WS_MARKET_URL: &str = "wss://fstream.binance.com/market/ws";
 /// Binance USDS-M Futures Private WS（用户数据流，需拼 ?listenKey={key}）
 pub const WS_PRIVATE_URL: &str = "wss://fstream.binance.com/private/ws";
 
+/// WS 保活：服务端每 ~3 分钟主动 Ping（读循环自动回 Pong），客户端无需发 ping；
+/// 空闲上限 8 分钟的含义是**容忍恰好丢一个服务端 ping**（连丢两个即判定断流）——
+/// 调小到 6 分钟以内会把偶发的单个 ping 丢失误杀成停机
+pub(crate) const KEEPALIVE: crate::exchange::ws_loop::WsKeepalive =
+    crate::exchange::ws_loop::WsKeepalive {
+        ping_text: None,
+        ping_interval: Duration::from_secs(60),
+        idle_timeout: Duration::from_secs(8 * 60),
+    };
+
 /// Binance 凭证
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct BinanceCredentials {

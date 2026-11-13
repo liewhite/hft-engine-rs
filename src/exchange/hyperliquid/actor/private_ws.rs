@@ -15,7 +15,7 @@ use crate::domain::{now_ms, Exchange, ExchangeError};
 use crate::exchange::hyperliquid::codec::{WsOrderUpdate, WsUserFills};
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
-use crate::exchange::ws_loop::{self, WsConn};
+use crate::exchange::ws_loop::WsConn;
 use crate::messaging::{AccountBus, AccountData, AccountEvent, SymbolAccountData};
 use crate::tasks::{ChildHandle, Group, Scope, Task};
 use anyhow::Context as _;
@@ -67,7 +67,7 @@ impl HyperliquidPrivateWs {
                     "HyperliquidPrivateWsLoop",
                     read,
                     write,
-                    ws_loop::WsKeepalive::hyperliquid(),
+                    crate::exchange::hyperliquid::KEEPALIVE,
                 )?;
 
                 // 3. 订阅账户频道：orderUpdates（订单更新）、userFills（成交）

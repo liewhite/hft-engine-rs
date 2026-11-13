@@ -48,7 +48,7 @@ use crate::exchange::client::{ExchangeCmd, SubscriptionKind};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::client::IbkrClient;
 use crate::exchange::ibkr::wire;
-use crate::exchange::ws_loop::{self, WsConn};
+use crate::exchange::ws_loop::WsConn;
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, MarketBus, MarketData, MarketEvent, SymbolAccountData,
 };
@@ -265,7 +265,7 @@ impl IbkrPublicWs {
             "IbkrPublicWsLoop",
             read,
             write,
-            ws_loop::WsKeepalive::ibkr(),
+            crate::exchange::ibkr::KEEPALIVE,
         )?;
 
         // 订阅订单状态推送 (sor topic)。发送失败只可能是读循环已退出，原因由它自己上报

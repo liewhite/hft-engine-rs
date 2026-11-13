@@ -10,7 +10,7 @@ use crate::domain::ExchangeError;
 use crate::exchange::binance::codec::{AggTrade, BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind};
-use crate::exchange::ws_loop::{ReconnectingWs, WsKeepalive};
+use crate::exchange::ws_loop::ReconnectingWs;
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
@@ -43,9 +43,13 @@ impl BinancePublicWs {
         let (_, addr) = group
             .spawn_addressed(name, move |scope: Scope, inbox| async move {
                 // 第一次连不上即上冒停机（受控退出）；运行中断线由 run 原地重连（#762）
-                let conn =
-                    ReconnectingWs::connect(scope.group("conn"), name, url, WsKeepalive::binance())
-                        .await?;
+                let conn = ReconnectingWs::connect(
+                    scope.group("conn"),
+                    name,
+                    url,
+                    crate::exchange::binance::KEEPALIVE,
+                )
+                .await?;
                 tracing::info!(url, "{name} started");
                 Ok(Self {
                     inbox,

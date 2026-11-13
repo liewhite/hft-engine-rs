@@ -59,6 +59,14 @@ pub const WS_PUBLIC_URL: &str = "wss://ws.okx.com:8443/ws/v5/public";
 pub const WS_PRIVATE_URL: &str = "wss://ws.okx.com:8443/ws/v5/private";
 pub const WS_BUSINESS_URL: &str = "wss://ws.okx.com:8443/ws/v5/business";
 
+/// WS 保活：文本 "ping"，服务端 30 秒无消息断开
+pub(crate) const KEEPALIVE: crate::exchange::ws_loop::WsKeepalive =
+    crate::exchange::ws_loop::WsKeepalive {
+        ping_text: Some("ping"),
+        ping_interval: Duration::from_secs(15),
+        idle_timeout: Duration::from_secs(60),
+    };
+
 /// OKX 凭证
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct OkxCredentials {

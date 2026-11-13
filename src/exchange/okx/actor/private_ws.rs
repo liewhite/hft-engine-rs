@@ -10,7 +10,7 @@ use crate::exchange::okx::codec::{
     resolve_meta, AccountData as OkxAccountPush, OrderPushData, WsEvent, WsPush,
 };
 use crate::exchange::okx::{OkxCredentials, WS_PRIVATE_URL};
-use crate::exchange::ws_loop::{self, WsConn};
+use crate::exchange::ws_loop::WsConn;
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData,
 };
@@ -89,7 +89,7 @@ impl OkxPrivateWs {
                     "OkxPrivateWsLoop",
                     read,
                     write,
-                    ws_loop::WsKeepalive::okx(),
+                    crate::exchange::okx::KEEPALIVE,
                 )?;
 
                 // 5. 等两个频道都确认才算启动完成；期间收到的帧之后由 recv 先交出
@@ -355,7 +355,7 @@ fn parse_private_message(
                         data: AccountData::Exchange(ExchangeAccountData::Balance(Balance {
                             exchange: Exchange::OKX,
                             asset: detail.ccy.clone(),
-                            available: cash_bal,
+                            cash: cash_bal,
                         })),
                     });
                 }

@@ -11,7 +11,7 @@ use crate::exchange::client::{ExchangeCmd, SubscriptionKind};
 use crate::exchange::hyperliquid::codec::{aggregate_trades, WsActiveAssetCtx, WsBbo, WsTrade};
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
-use crate::exchange::ws_loop::{ReconnectingWs, WsKeepalive};
+use crate::exchange::ws_loop::ReconnectingWs;
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
@@ -138,7 +138,7 @@ impl HyperliquidPublicWs {
                         scope.group("conn"),
                         "HyperliquidPublicWs",
                         WS_URL,
-                        WsKeepalive::hyperliquid(),
+                        crate::exchange::hyperliquid::KEEPALIVE,
                     )
                     .await?;
                     tracing::info!("HyperliquidPublicWs started");

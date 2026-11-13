@@ -9,7 +9,7 @@ use super::listen_key::ListenKeyRefresher;
 use crate::domain::{now_ms, Exchange, ExchangeError};
 use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsResponse};
 use crate::exchange::binance::{BinanceAccount, WS_PRIVATE_URL};
-use crate::exchange::ws_loop::{self, WsConn};
+use crate::exchange::ws_loop::WsConn;
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData,
 };
@@ -58,7 +58,7 @@ impl BinancePrivateWs {
                     "BinancePrivateWsLoop",
                     read,
                     write,
-                    ws_loop::WsKeepalive::binance(),
+                    crate::exchange::binance::KEEPALIVE,
                 )?;
                 ListenKeyRefresher::spawn(&children, account)?;
 

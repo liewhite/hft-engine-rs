@@ -23,6 +23,15 @@ pub const OAUTH_BASE_URL: &str = "https://api.ibkr.com/v1/api/";
 /// IBKR REST 单个请求的上限（网关 / OAuth 两种接入共用）
 pub(crate) const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// WS 保活：会话由 tickle 保活（REST），WS 侧只做空闲检测；smd 有 8 分钟重订阅周期，
+/// 空闲上限给足余量
+pub(crate) const KEEPALIVE: crate::exchange::ws_loop::WsKeepalive =
+    crate::exchange::ws_loop::WsKeepalive {
+        ping_text: None,
+        ping_interval: std::time::Duration::from_secs(60),
+        idle_timeout: std::time::Duration::from_secs(12 * 60),
+    };
+
 // ---------------------------------------------------------------------------
 // 限频（#791，机制见 crate::exchange::rate_limit）。数字取自官方 Web API「Pacing Limitations」
 // （2026-11 实查）：全局 10 次 / 秒（经 CP Gateway；OAuth 是 50，按严的算），部分接口另有更严的限额。
