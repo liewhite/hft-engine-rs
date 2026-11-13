@@ -32,7 +32,7 @@ use crate::engine::live::{
     OutcomeBus, PositionLedgerHandle,
 };
 use crate::domain::{
-    AccountId, Exchange, ExchangeError, OrderUpdate, Symbol, SymbolMeta,
+    AccountId, Exchange, ExchangeError, Symbol, SymbolMeta,
 };
 use crate::engine::live::account_binding::{snapshot, PlannedAccount};
 use crate::engine::live::assembly::StartAccountStream;
@@ -263,67 +263,39 @@ impl Provisioner {
             .map_err(|_| format!("等待实例停止超时（{}s）", EXECUTOR_STOP_TIMEOUT.as_secs()))
     }
 
-    /// 列出**本引擎**在该 (所, symbol) 上的挂单。
+    /// 撤掉该 (所, symbol) 上遗留的全部挂单，并**复查确认撤净**。
     ///
-    /// 同一个交易所账户上可能还有人工下单或其他程序下的单：归属由适配层解析挂单时判定，
-    /// 只有本引擎的单带 `client_order_id`（见 [`crate::exchange::CliOrderIdFormat`]）。
-    /// 认不出归属的一律**保留** —— 撤错别人的单不可接受，而漏撤会由调用方的复查兜住。
-    async fn own_pending_orders(
-        client: &Arc<dyn AccountClient>,
-        exchange: Exchange,
-        symbol: &Symbol,
-    ) -> Result<Vec<OrderUpdate>, ExchangeError> {
-        let all = client.fetch_pending_orders(symbol).await?;
-        Ok(all
-            .into_iter()
-            .filter(|update| {
-                let own = update.client_order_id.is_some();
-                if !own {
-                    tracing::info!(%exchange, %symbol, order_id = %update.order_id, "挂单不属于本引擎，保留不动");
-                }
-                own
-            })
-            .collect())
-    }
-
-    /// 撤掉本引擎在该 (所, symbol) 上遗留的挂单，并**复查确认撤净**。
+    /// 前提：账户归本引擎独占（见 `docs/architecture.md`「账户独占」），所以挂单都是本引擎上次运行
+    /// 留下的，不分辨是谁下的，一律撤。撤单按订单号发；没有订单号的挂单说明前提被破坏
+    /// （有人在这个账户上手动下了单），撤不了，由复查报出、拒绝启动。
     ///
     /// 单笔撤单失败不直接判死：它可能只是"撤之前那张单刚好成交或已被撤"这类良性竞态。
-    /// 是否真的撤净由**复查**裁定 —— 比按各所错误码猜测"是不是 order not found"可靠得多，
-    /// 也不需要为此在错误类型上增加变体。
-    ///
-    /// 复查后仍有遗留 → 返回 `Err` 拒绝启动。留着一张无人看管的挂单开跑，策略会在它旁边
-    /// 重复挂单；而启动期失败是**最便宜的失败时机**（还没开始交易）。
+    /// 是否真的撤净由**复查**裁定。复查后仍有遗留 → 返回 `Err` 拒绝启动：留着一张无人看管的
+    /// 挂单开跑，策略会在它旁边重复挂单；而启动期失败是**最便宜的失败时机**（还没开始交易）。
     async fn cancel_leftover_orders(
         client: &Arc<dyn AccountClient>,
         exchange: Exchange,
         symbol: &Symbol,
     ) -> Result<(), ExchangeError> {
-        let ours = Self::own_pending_orders(client, exchange, symbol).await?;
-        if ours.is_empty() {
+        let leftover = client.fetch_pending_orders(symbol).await?;
+        if leftover.is_empty() {
             return Ok(());
         }
-
-        tracing::warn!(
-            %exchange, %symbol, count = ours.len(),
-            "[STARTUP] 发现本引擎遗留的挂单，全部撤掉（不接管）"
-        );
-        for order in &ours {
-            // own_pending_orders 只留本引擎的单，必有 client_order_id
-            let cid = order.client_order_id.as_deref().expect("本引擎的挂单带 client_order_id");
+        tracing::warn!(%exchange, %symbol, count = leftover.len(), "[STARTUP] 发现遗留挂单，全部撤掉（不接管）");
+        for order in &leftover {
+            let Some(cid) = order.client_order_id.as_deref() else {
+                continue; // 没有订单号：撤不了，复查报出
+            };
             if let Err(e) = client.cancel_order(symbol, cid).await {
-                tracing::warn!(
-                    %exchange, %symbol, order_id = %order.order_id, error = %e,
-                    "撤单请求失败，由复查裁定是否真的还在"
-                );
+                tracing::warn!(%exchange, %symbol, order_id = %order.order_id, error = %e, "撤单请求失败，由复查裁定是否真的还在");
             }
         }
 
-        let remaining = Self::own_pending_orders(client, exchange, symbol).await?;
+        let remaining = client.fetch_pending_orders(symbol).await?;
         if !remaining.is_empty() {
             return Err(ExchangeError::Other(format!(
-                "{exchange}/{symbol}: 撤单后复查仍有 {} 张本引擎遗留挂单，拒绝启动\
-                 （留着无人看管的挂单开跑，策略会在旁边重复挂单）；order_id: {:?}",
+                "{exchange}/{symbol}: 撤单后复查仍有 {} 张遗留挂单，拒绝启动\
+                 （留着无人看管的挂单开跑，策略会在旁边重复挂单；没有订单号的是账户上有人手动下单）；order_id: {:?}",
                 remaining.len(),
                 remaining.iter().map(|o| &o.order_id).collect::<Vec<_>>()
             )));
@@ -620,7 +592,7 @@ impl Provisioner {
 mod leftover_order_tests {
     use rust_decimal_macros::dec;
     use super::*;
-    use crate::domain::{AccountInfo, OrderId, OrderStatus, Position, Side};
+    use crate::domain::{AccountInfo, OrderId, OrderStatus, OrderUpdate, Position, Side};
     use crate::exchange::ExchangeOrder;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -693,15 +665,7 @@ mod leftover_order_tests {
         }
     }
 
-    /// 别人的挂单（人工 / 其他程序 / 系统单）：适配层解析时已判定归属，不带 client_order_id
-    fn foreign_order(order_id: &str) -> OrderUpdate {
-        OrderUpdate {
-            client_order_id: None,
-            ..order("", order_id)
-        }
-    }
-
-    /// 没有本引擎的挂单时，一个撤单请求都不该发
+    /// 没有挂单时，一个撤单请求都不该发
     #[tokio::test]
     async fn nothing_to_cancel_sends_no_request() {
         let (client, cancelled) = FakeClient::new(vec![vec![]]);
@@ -711,29 +675,26 @@ mod leftover_order_tests {
         assert!(cancelled.lock().unwrap().is_empty());
     }
 
-    /// **只撤本引擎的单**：别人的单（适配层给的 client_order_id 为 None）都不能动。
-    /// 撤错别人的挂单是不可接受的。
+    /// 遗留挂单全部撤掉，复查撤净即通过
     #[tokio::test]
-    async fn only_own_orders_are_cancelled() {
-        let own = "own-1".to_string();
-        let foreign = vec![foreign_order("ex-foreign-1"), foreign_order("ex-foreign-2")];
-        let mut first = foreign.clone();
-        first.push(order(&own, "ex-own"));
-
-        // 复查时只剩外部单 —— 本引擎的那张已撤掉
-        let (client, cancelled) = FakeClient::new(vec![first, foreign]);
-        Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
-            .await
-            .expect("外部单残留不该导致失败");
-
-        assert_eq!(
-            *cancelled.lock().unwrap(),
-            vec![own.clone()],
-            "只应撤掉本引擎的那一张"
-        );
+    async fn all_leftover_orders_are_cancelled() {
+        let (client, cancelled) = FakeClient::new(vec![vec![order("a", "ex-a"), order("b", "ex-b")], vec![]]);
+        Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string()).await.expect("撤净应通过");
+        assert_eq!(*cancelled.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
     }
 
-    /// 复查仍有本引擎的挂单 -> 拒绝启动。
+    /// 没有订单号的挂单（账户上有人手动下单，前提被破坏）：撤不了，拒绝启动
+    #[tokio::test]
+    async fn order_without_client_order_id_refuses_startup() {
+        let manual = OrderUpdate { client_order_id: None, ..order("", "ex-manual") };
+        let (client, _cancelled) = FakeClient::new(vec![vec![manual.clone()], vec![manual]]);
+        let err = Provisioner::cancel_leftover_orders(&client, EX, &SYM.to_string())
+            .await
+            .expect_err("应拒绝启动");
+        assert!(err.to_string().contains("ex-manual"), "{err}");
+    }
+
+    /// 复查仍有挂单 -> 拒绝启动。
     ///
     /// 留着无人看管的挂单开跑，策略会在它旁边重复挂单，它还可能成交、开出一个没人管的仓位。
     #[tokio::test]

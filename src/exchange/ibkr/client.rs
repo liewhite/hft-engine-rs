@@ -451,9 +451,7 @@ impl AccountClient for IbkrClient {
             order_id: Option<serde_json::Value>,
             /// 下单时带上的 client_order_id：请求里叫 `cOID`，而**响应里 IBKR 用
             /// `order_ref` 回传**（本仓库 WS 侧两个处理器都是取 order_ref，见
-            /// `actor/public_ws.rs`）。两个名字都接，缺一就会让归属识别全线失效：
-            /// `own_pending_orders` 认不出自己的单 → 启动期"撤净遗留挂单"谎报成功、
-            /// 撤单复查因 client_order_id 全为 None 而无法核实。
+            /// `actor/public_ws.rs`）。两个名字都接，缺一就会让启动期撤遗留挂单按订单号撤不掉。
             #[serde(rename = "cOID", alias = "order_ref", default)]
             coid: Option<String>,
             #[serde(default)]
@@ -565,7 +563,7 @@ impl AccountClient for IbkrClient {
             };
             updates.push(crate::domain::OrderUpdate {
                 order_id,
-                client_order_id: super::CLIENT_ORDER_IDS.claim(o.coid.as_deref()),
+                client_order_id: o.coid.filter(|s| !s.is_empty()),
                 exchange: Exchange::IBKR,
                 symbol: symbol.clone(),
                 side,

@@ -295,27 +295,6 @@ mod tests {
         assert_eq!(kinds(&stp), ["order:BTC"]);
     }
 
-    /// 订单号归属在适配层判定：本引擎格式的照带，别人的单（网页下单等）回报和成交都不带订单号
-    #[test]
-    fn foreign_client_order_ids_are_dropped_at_ingress() {
-        let cids = |raw: &str| -> Vec<Option<String>> {
-            parse_private_message(raw, "USDT", 0)
-                .unwrap()
-                .into_iter()
-                .map(|e| match e.data {
-                    AccountData::Symbol(SymbolAccountData::Fill(f)) => f.client_order_id,
-                    AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => u.client_order_id,
-                    other => panic!("{other:?}"),
-                })
-                .collect()
-        };
-        let own = crate::exchange::binance::CLIENT_ORDER_IDS.generate();
-        let raw = order_push("BTCUSDT", "0.5").replace(r#""c":"x-a""#, &format!(r#""c":"{own}""#));
-        assert_eq!(cids(&raw), [Some(own.clone()), Some(own)]);
-        let raw = order_push("BTCUSDT", "0.5").replace(r#""c":"x-a""#, r#""c":"web_1a2b3c""#);
-        assert_eq!(cids(&raw), [None, None]);
-    }
-
     /// ListenKey 过期即出错（私有回报从此中断），不当未知事件忽略
     #[test]
     fn listen_key_expired_is_an_error() {

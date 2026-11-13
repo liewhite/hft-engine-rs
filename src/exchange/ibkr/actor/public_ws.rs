@@ -508,7 +508,7 @@ impl IbkrPublicWs {
     /// 处理 sor 订单状态更新
     ///
     /// IBKR WS `sor` topic 推送订单更新，包含 order_ref (= 我们的 cOID)。
-    /// 无 order_ref 的跳过；有 order_ref 但不是本引擎格式的照发，订单号为 `None`（见 `CLIENT_ORDER_IDS`）。
+    /// 跳过无 order_ref 的订单。
     fn handle_order_update(&self, value: &serde_json::Value, local_ts: u64) {
         let args = match value.get("args").and_then(|v| v.as_array()) {
             Some(arr) => arr,
@@ -597,7 +597,7 @@ impl IbkrPublicWs {
 
             let update = OrderUpdate {
                 order_id,
-                client_order_id: crate::exchange::ibkr::CLIENT_ORDER_IDS.claim(Some(order_ref)),
+                client_order_id: Some(order_ref.to_string()),
                 exchange: Exchange::IBKR,
                 symbol,
                 side,
@@ -850,7 +850,7 @@ impl FillPairing {
                 exchange: Exchange::IBKR,
                 symbol: symbol.clone(),
                 order_id: execution_id.clone(),
-                client_order_id: crate::exchange::ibkr::CLIENT_ORDER_IDS.claim(Some(order_ref)),
+                client_order_id: if order_ref.is_empty() { None } else { Some(order_ref.to_string()) },
                 side,
                 price,
                 size,
@@ -965,7 +965,7 @@ impl FillPairing {
     }
 }
 
-/// 构建 Filled OrderUpdate（只给本引擎的单）
+/// 构建 Filled OrderUpdate（如有 order_ref）
 fn build_order_update(
     item: &serde_json::Value,
     order_ref: &str,
@@ -973,12 +973,13 @@ fn build_order_update(
     side: Side,
     size: Decimal,
 ) -> Option<OrderUpdate> {
-    // 只给本引擎的单合成回报：别人的单不在跟踪表里，合成了也没人用
-    let client_order_id = crate::exchange::ibkr::CLIENT_ORDER_IDS.claim(Some(order_ref))?;
+    if order_ref.is_empty() {
+        return None;
+    }
     let order_id = wire::order_id(item.get("orderId")).unwrap_or_default();
     Some(OrderUpdate {
         order_id,
-        client_order_id: Some(client_order_id),
+        client_order_id: Some(order_ref.to_string()),
         exchange: Exchange::IBKR,
         symbol: symbol.to_string(),
         side,
@@ -1222,21 +1223,6 @@ mod tests {
         fills.expire_due(now + FILL_COMMISSION_TIMEOUT);
         root.shutdown().await.unwrap();
         assert!(rx.recv().await.is_none(), "已发布的成交不得重复发布");
-    }
-
-    /// 别人的单（order_ref 不是本引擎格式）：成交照发、订单号为 None，不合成 Filled 回报
-    #[tokio::test]
-    async fn foreign_order_ref_fill_carries_no_client_order_id() {
-        let root = Root::new("t");
-        let bus = AccountBus::new("account");
-        let mut rx = collect(&root.group("consumers"), &bus).await;
-        let mut fills = FillPairing::new(bus, conid_map());
-        let mut msg = trade("E9", Some(0.5));
-        msg["args"][0]["order_ref"] = serde_json::json!("web_1a2b");
-        fills.on_trade_message(&msg, 1, Instant::now()).unwrap();
-        assert_eq!(expect_fill(next(&mut rx).await).client_order_id, None);
-        root.shutdown().await.unwrap();
-        assert!(rx.recv().await.is_none(), "别人的单不该合成订单回报");
     }
 
     /// commission 等不到：到期以 fee=0 发布，之后迟到的第二条不再重复发布

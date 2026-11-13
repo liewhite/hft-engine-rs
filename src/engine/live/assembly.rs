@@ -65,7 +65,7 @@ pub struct ExchangeSetup {
     /// `supports_subscription`，随 setup 携带 —— 投产校验用，无集中能力表）
     pub(crate) supports: fn(&SubscriptionKind) -> bool,
     /// 生成本引擎在该所的订单号（格式是适配层的线路知识，见 [`crate::exchange::CliOrderIdFormat`]；
-    /// 回报上的订单号归属也由适配层在解析时判定，框架只拿不透明的字符串）
+    /// 框架只拿不透明的字符串）
     pub(crate) new_client_order_id: NewClientOrderId,
     /// 公共的已结算资金费率来源（该所适配层提供时）。交给 manager，bin 经
     /// `ManagerHandle::settled_funding` 取用，不为它另建 client

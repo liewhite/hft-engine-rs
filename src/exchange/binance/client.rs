@@ -639,7 +639,7 @@ impl AccountClient for BinanceClient {
             // Binance USDⓈ-M 的数量本身就是币本位（contract_size = 1），无需折算
             updates.push(crate::domain::OrderUpdate {
                 order_id: o.order_id.to_string(),
-                client_order_id: super::CLIENT_ORDER_IDS.claim(Some(&o.client_order_id)),
+                client_order_id: (!o.client_order_id.is_empty()).then_some(o.client_order_id),
                 exchange: Exchange::Binance,
                 symbol: symbol.clone(),
                 side,

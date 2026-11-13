@@ -292,7 +292,7 @@ impl OrderTradeUpdate {
             "REJECTED" | "EXPIRED" | "EXPIRED_IN_MATCH" => OrderStatus::Rejected {
                 reason: self.o.status.clone(),
             },
-            // 强平接管（保险基金 / ADL）的系统单，不是本引擎的单，只是挂着
+            // 强平接管（保险基金 / ADL）的系统单，只是挂着
             "NEW_INSURANCE" | "NEW_ADL" => OrderStatus::Pending,
             // 不认识的状态不猜：当成终态会把可能还活着的单从本地挂单里删掉（它之后成交就是
             // 「外来」成交），当成挂着会让已结束的单永远挂在本地 —— 按解析失败处理
@@ -306,7 +306,7 @@ impl OrderTradeUpdate {
 
         Ok(OrderUpdate {
             order_id: self.o.i.to_string(),
-            client_order_id: super::CLIENT_ORDER_IDS.claim(Some(&self.o.c)),
+            client_order_id: (!self.o.c.is_empty()).then(|| self.o.c.clone()),
             exchange: Exchange::Binance,
             symbol,
             side,
@@ -346,7 +346,7 @@ impl OrderTradeUpdate {
             side,
             price: last_price,
             size: fill_sz,
-            client_order_id: super::CLIENT_ORDER_IDS.claim(Some(&self.o.c)),
+            client_order_id: (!self.o.c.is_empty()).then(|| self.o.c.clone()),
             order_id: self.o.i.to_string(),
             timestamp: now_ms(),
             fee,

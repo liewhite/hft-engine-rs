@@ -268,14 +268,13 @@ impl HyperliquidClient {
     /// # 为什么要单独一次请求
     ///
     /// HL 的挂单列表接口（`openOrders` / `frontendOpenOrders`）**都不返回 `cloid`**，而
-    /// 归属判定必须有它 —— 启动期撤掉遗留挂单时，撤错别人的单是不可接受的。`orderStatus`
-    /// 是能按 oid 拿到 `cloid` 的接口。
+    /// 启动期撤遗留挂单按 cloid 撤（`AccountClient::cancel_order`）。`orderStatus` 是能按 oid
+    /// 拿到 `cloid` 的接口。
     ///
     /// 响应是**双层嵌套**（2026-08 实测）：
     /// `{"status":"order","order":{"order":{...,"cloid":...},"status":...,"statusTimestamp":...}}`
     ///
-    /// 返回 `None` 表示该单查不到、它本就没有 cloid（人工经 UI 下单与强平等系统单都是
-    /// `cloid: null`）、或 cloid 不是本引擎的格式 —— 都当别人的单，调用方保守地不动。
+    /// 返回 `None` 表示该单查不到、或它本就没有 cloid（人工经 UI 下单是 `cloid: null`）。
     async fn cloid_of(
         &self,
         wallet_address: &str,
@@ -289,7 +288,7 @@ impl HyperliquidClient {
             }))
             .await?;
 
-        Ok(own_cloid(resp))
+        Ok(resp.order.and_then(|envelope| envelope.order.cloid))
     }
 
 }
@@ -795,7 +794,7 @@ impl AccountClient for HyperliquidClient {
         /// `frontendOpenOrders` 的条目。
         ///
         /// 用 `frontendOpenOrders` 而非 `openOrders`：后者不返回 `origSz` 与 `reduceOnly`
-        /// （2026-08 实测 + 官方文档）。**两者都不返回 `cloid`**，故归属信息要另外补，
+        /// （2026-08 实测 + 官方文档）。**两者都不返回 `cloid`**，故要另外补，
         /// 见下方 `cloid_of`。
         ///
         /// 也**不能**用 `historicalOrders` 代替：它是按状态变更记录的**日志**（同一张单
@@ -902,11 +901,6 @@ impl AccountClient for HyperliquidClient {
     }
 }
 
-/// orderStatus 应答里的 cloid 归属判定：只给本引擎的单（null、别人格式的都是 `None`）
-fn own_cloid(resp: OrderStatusResponse) -> Option<String> {
-    super::CLIENT_ORDER_IDS.claim(resp.order.and_then(|envelope| envelope.order.cloid).as_deref())
-}
-
 /// `POST /info {"type":"orderStatus"}` 的响应。
 ///
 /// **双层嵌套**（2026-08 实测）：
@@ -967,8 +961,6 @@ mod order_status_tests {
             Some("0x3f4b6d0f9d2f452b8eed2858b58959eb"),
             "双层嵌套解析错误会让 cloid 静默丢失"
         );
-        // 该 cloid 是本引擎格式，归属判定应认领它
-        assert!(super::super::CLIENT_ORDER_IDS.owns(&cloid.unwrap()));
     }
 
     #[test]
@@ -978,14 +970,12 @@ mod order_status_tests {
         assert!(resp.order.is_none());
     }
 
-    /// 人工经 UI 下单 / 强平等系统单是 `cloid: null`，别的程序可能带别的格式 —— 都不该被认领
+    /// 人工经 UI 下单是 `cloid: null`：解析成 `None`，不报错
     #[test]
-    fn foreign_or_null_cloid_is_not_owned() {
-        for foreign in [r#""cloid":null"#, r#""cloid":"abc""#] {
-            let raw = REAL_ORDER_STATUS.replace(r#""cloid":"0x3f4b6d0f9d2f452b8eed2858b58959eb""#, foreign);
-            let resp: OrderStatusResponse = serde_json::from_str(&raw).expect("解析");
-            assert!(own_cloid(resp).is_none(), "{foreign}");
-        }
+    fn null_cloid_is_none() {
+        let raw = REAL_ORDER_STATUS.replace(r#""cloid":"0x3f4b6d0f9d2f452b8eed2858b58959eb""#, r#""cloid":null"#);
+        let resp: OrderStatusResponse = serde_json::from_str(&raw).expect("解析");
+        assert!(resp.order.and_then(|e| e.order.cloid).is_none());
     }
 }
 

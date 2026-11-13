@@ -369,8 +369,8 @@ fn parse_pending_order(
 
     Ok(OrderUpdate {
         order_id: d.ord_id.clone(),
-        // 缺失就是缺失，**绝不用 ord_id 顶替**：归属识别（启动期只撤本引擎的单）靠它
-        client_order_id: super::CLIENT_ORDER_IDS.claim(d.cl_ord_id.as_deref()),
+        // 缺失就是缺失，**绝不用 ord_id 顶替**：撤单按它发，编一个会撤错单
+        client_order_id: d.cl_ord_id.clone().filter(|s| !s.is_empty()),
         exchange: Exchange::OKX,
         symbol,
         side,
@@ -897,12 +897,10 @@ mod pending_orders_tests {
         assert_eq!(u.client_order_id.as_deref(), Some("x-abc"));
     }
 
-    /// **Critical 回归防线**：clOrdId 缺失/为空/别人的格式时必须是 `None`，绝不用 ord_id 顶替。
-    ///
-    /// 归属识别（启动期只撤本引擎的单）靠它：编造一个值会让别人的单被当成自己的、或反之。
+    /// **Critical 回归防线**：clOrdId 缺失/为空时必须是 `None`，绝不用 ord_id 顶替（撤单按它发）。
     #[test]
     fn missing_client_order_id_stays_none() {
-        for missing in [None, Some(""), Some("web1a2b"), Some("0x3f4b6d0f9d2f452b8eed2858b58959eb")] {
+        for missing in [None, Some("")] {
             let u = parse_pending_order(&raw(missing), "USDT", dec!(1.0)).unwrap();
             assert_eq!(
                 u.client_order_id, None,

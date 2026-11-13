@@ -3,9 +3,8 @@ use crate::domain::types::{OrderId, Quantity};
 
 /// 交易所的订单回报：**只带跟踪一张单所必需的字段**。
 ///
-/// - `client_order_id`：本引擎的单才有（本地跟踪表的主键）；别人的单（人工、其他程序、强平等系统单）
-///   为 `None` —— 归属由各所适配层解析回报时判定（见 `crate::exchange::CliOrderIdFormat`），
-///   框架核心与策略见到 `Some` 就是本引擎的单，不再自己判断；
+/// - `client_order_id`：本地跟踪表的主键、撤单的依据；交易所没给（如强平单）为 `None`。
+///   账户归本引擎独占（见 `docs/architecture.md`「账户独占」），不按它分辨是谁的单；
 /// - `order_id`：日志与人工排查（撤单按 `client_order_id`，见 `AccountClient::cancel_order`）；
 /// - `status`：生命周期；
 /// - `side` 与 `quantity`：策略比对是否该撤单重挂；

@@ -7,7 +7,7 @@ pub use actor::{BinanceArgs, BinanceNode};
 pub use client::BinanceClient;
 pub use symbol::{from_binance, to_binance};
 
-/// 本引擎在 Binance 的订单号：`0x` + 32 hex（与 Hyperliquid 同形，两所账户不会混在一起）
+/// 本引擎在 Binance 的订单号：`0x` + 32 hex
 pub const CLIENT_ORDER_IDS: super::CliOrderIdFormat = super::CliOrderIdFormat::new("0x", 32);
 
 /// Binance 永续合约 REST API 地址

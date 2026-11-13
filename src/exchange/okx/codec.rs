@@ -386,7 +386,7 @@ impl OrderPushData {
 
         Ok(OrderUpdate {
             order_id: self.ord_id.clone(),
-            client_order_id: super::CLIENT_ORDER_IDS.claim(self.cl_ord_id.as_deref()),
+            client_order_id: self.cl_ord_id.clone().filter(|s| !s.is_empty()),
             exchange: Exchange::OKX,
             symbol: meta.symbol.clone(),
             side,
@@ -460,7 +460,7 @@ impl OrderPushData {
             side,
             price: fill_px,
             size: fill_sz,
-            client_order_id: super::CLIENT_ORDER_IDS.claim(self.cl_ord_id.as_deref()),
+            client_order_id: self.cl_ord_id.clone().filter(|s| !s.is_empty()),
             order_id: self.ord_id.clone(),
             timestamp: now_ms(),
             fee: -fee,
@@ -765,22 +765,4 @@ mod trade_tests {
         assert!(d.to_fill(&btc_meta()).is_err(), "缺 fillFee 应报错而非回退到 fee");
     }
 
-    /// 订单号归属在适配层判定：别人的 clOrdId（网页单等）回报和成交都不带订单号，本引擎的照带
-    #[test]
-    fn foreign_cl_ord_id_is_dropped_at_ingress() {
-        let push = |cid: &str| -> OrderPushData {
-            serde_json::from_str(&format!(
-                r#"{{"instId":"BTC-USDT-SWAP","ordId":"1","clOrdId":"{cid}","side":"buy",
-                "state":"partially_filled","px":"42000","sz":"3","fillSz":"1","fillPx":"42000",
-                "accFillSz":"1","avgPx":"42000","fee":"-0.1","fillFee":"-0.1","feeCcy":"USDT"}}"#
-            ))
-            .unwrap()
-        };
-        let meta = btc_meta();
-        for (cid, want) in [("web1a2b", None), ("", None), ("xabc", Some("xabc"))] {
-            let d = push(cid);
-            assert_eq!(d.to_order_update(&meta).unwrap().client_order_id.as_deref(), want, "{cid:?}");
-            assert_eq!(d.to_fill(&meta).unwrap().unwrap().client_order_id.as_deref(), want, "{cid:?}");
-        }
-    }
 }

@@ -456,7 +456,7 @@ impl WsOrderUpdate {
 
         Ok(crate::domain::OrderUpdate {
             order_id: self.order.oid.to_string(),
-            client_order_id: super::CLIENT_ORDER_IDS.claim(self.order.cloid.as_deref()),
+            client_order_id: self.order.cloid.clone(),
             exchange: Exchange::Hyperliquid,
             symbol,
             side,
@@ -559,7 +559,7 @@ impl WsFill {
             side,
             price,
             size,
-            client_order_id: super::CLIENT_ORDER_IDS.claim(self.cloid.as_deref()),
+            client_order_id: self.cloid.clone(),
             order_id: self.oid.to_string(),
             timestamp: self.time,
             fee,
@@ -808,21 +808,4 @@ mod bbo_tests {
         assert_eq!(bbo.ask_price, dec!(100.0));
     }
 
-    /// 订单号归属在适配层判定：cloid 为 null（UI 单、强平）或别的格式都不带订单号，本引擎的照带
-    #[test]
-    fn foreign_cloid_is_dropped_at_ingress() {
-        let own = super::super::CLIENT_ORDER_IDS.generate();
-        for (cloid, want) in [("null".to_string(), None), (r#""abc""#.to_string(), None), (format!(r#""{own}""#), Some(own.as_str()))] {
-            let fill: WsFill = serde_json::from_str(&format!(
-                r#"{{"coin":"BTC","px":"100","sz":"1","side":"B","time":1,"oid":7,"cloid":{cloid},"fee":"0.01","closedPnl":"0"}}"#
-            ))
-            .unwrap();
-            assert_eq!(fill.to_fill().unwrap().client_order_id.as_deref(), want, "{cloid}");
-            let update: WsOrderUpdate = serde_json::from_str(&format!(
-                r#"{{"order":{{"coin":"BTC","side":"B","limitPx":"100","sz":"0","oid":7,"timestamp":1,"origSz":"1","cloid":{cloid}}},"status":"filled","statusTimestamp":1}}"#
-            ))
-            .unwrap();
-            assert_eq!(update.to_order_update().unwrap().client_order_id.as_deref(), want, "{cloid}");
-        }
-    }
 }
