@@ -90,8 +90,13 @@ async fn test_okx_limit_buy() {
 
     // 获取 SymbolMeta 用于格式化价格
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
 
@@ -140,8 +145,13 @@ async fn test_okx_limit_sell() {
 
     // 获取 SymbolMeta 用于格式化价格
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
 

@@ -399,18 +399,6 @@ impl ExchangeClient for IbkrClient {
 
         Ok(metas)
     }
-
-    async fn fetch_symbol_meta(
-        &self,
-        symbols: &[Symbol],
-    ) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        let all = self.fetch_all_symbol_metas().await?;
-        let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
-        Ok(all
-            .into_iter()
-            .filter(|m| symbol_set.contains(&m.symbol))
-            .collect())
-    }
 }
 
 #[async_trait]

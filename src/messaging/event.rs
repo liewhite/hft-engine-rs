@@ -26,14 +26,11 @@ use std::sync::Arc;
 /// 本类型是枚举上唯一的**开放**扩展点：新事件类型只需定义一个 payload struct，
 /// 不改框架任何代码。
 ///
-/// # 两个方向、两条既有总线（不新增分发机制）
+/// # 只有一个方向：外部向策略
 ///
-/// - **策略向外**：策略返回 [`crate::strategy::OutcomeEvent::Emit`]，事件随其他信号发布
-///   到 Outcome 总线，外部观察者订阅 `ManagerHandle::outcome_bus()`（带账户归属）。**不会回流给
-///   任何策略** —— 策略间不能直接通信，回环在结构上不可能；确需转发时由外部处理者显式
-///   经入向入口注入，转发点可见可控。
-/// - **外部向策略**：经 `ManagerHandle::publish_custom_event` 注入行情总线，
-///   按 scope 路由（见下）后进入订阅者的 `Strategy::on_event`。
+/// 经 `ManagerHandle::publish_custom_event` 注入行情总线，按 scope 路由（见下）后进入订阅者的
+/// `Strategy::on_event`。策略向外发自定义事件的出口（`Signal::Emit`）没有用户，已删（#814）；
+/// 策略要对外报读数用 `Strategy::gauges`。
 ///
 /// # 路由与账户归属
 ///

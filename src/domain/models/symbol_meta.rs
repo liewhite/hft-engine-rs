@@ -33,14 +33,6 @@ pub struct SymbolMeta {
 }
 
 impl SymbolMeta {
-    /// **币本位**的最小可交易增量 = `size_step × contract_size`。
-    ///
-    /// `size_step` 是**交易所下单单位**（OKX 的 SWAP 是张）的步长，不能直接当币量用；
-    /// 合法的币数量是本值的整数倍（见 [`Self::round_coin_size_down`]）。
-    pub fn coin_size_step(&self) -> Quantity {
-        self.size_step * self.contract_size
-    }
-
     /// 将下单数量转换为币本位数量
     ///
     /// 例如: 下单 5 张, OKX cval=0.1, 则返回 0.5 ETH

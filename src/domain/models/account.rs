@@ -20,14 +20,6 @@ pub enum AccountId {
 }
 
 impl AccountId {
-    /// 模拟账户的标签；实盘账户返回 `None`
-    pub fn paper_label(&self) -> Option<&str> {
-        match self {
-            AccountId::Live => None,
-            AccountId::Paper(label) => Some(label),
-        }
-    }
-
     pub fn is_paper(&self) -> bool {
         matches!(self, AccountId::Paper(_))
     }

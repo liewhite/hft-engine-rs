@@ -138,8 +138,13 @@ async fn ibkr_fill_observe() {
     println!("\n{} bid={} ask={}", symbol, bid, ask);
 
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到 SymbolMeta");
 

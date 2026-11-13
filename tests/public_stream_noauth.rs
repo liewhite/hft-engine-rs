@@ -117,18 +117,33 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
 
     let symbol = COIN.to_string();
     let binance_metas = binance_client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("binance meta (public REST)");
     assert_eq!(binance_metas.len(), 1, "币安品种目录里应有 {symbol}");
     let okx_metas = okx_client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("okx meta (public REST)");
     // HL 节点直接用 client 的品种目录，这里只确认目录里有该币
     let hl_metas = hl_client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("hl meta");
     assert_eq!(hl_metas.len(), 1, "HL 品种目录里应有 {symbol}");
 

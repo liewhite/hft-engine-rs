@@ -47,7 +47,7 @@ pub struct SpawnCtx {
     pub(crate) symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
 }
 
-/// 装配产物：交易所节点的句柄（订阅 / 退订行情用）。节点的生死归任务树管，句柄只是地址。
+/// 装配产物：交易所节点的句柄（订阅行情用）。节点的生死归任务树管，句柄只是地址。
 pub(crate) type SpawnFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<ExchangeHandle, ExchangeError>> + Send>,
 >;

@@ -100,22 +100,18 @@ pub trait Strategy: Send + Sync {
 }
 ```
 
-策略能读到的状态就这 9 个方法，读不到的东西编译期就不存在：
+策略能读到的状态就这几个方法，读不到的东西编译期就不存在：
 
 | 类型 | 方法 |
 |---|---|
-| `StrategyView<'_>` | `symbol(&Symbol) -> Option<SymbolView>` / `equity(Exchange)` / `account_notional(Exchange)` / `account_info(Exchange)` / `greeks(Exchange, ccy)` / `market_status(Exchange)` |
+| `StrategyView<'_>` | `symbol(&Symbol) -> Option<SymbolView>` / `equity(Exchange)` / `account_notional(Exchange)` / `account_info(Exchange)` / `greeks(Exchange, ccy)` |
 | `SymbolView<'_>` | `bbo(Exchange)` / `position_size(Exchange)` / `position_sizes()` / `has_pending_orders()` / `pending_orders()` |
 
 读数取不到一律 `None`，不返回默认值——净值取不到与净值为零是两回事。
 
-**两个要留意的**：
-
-- **持仓没有"未查询到"这个状态**。作用域内每条 (所, symbol) 在策略消费第一条事件之前
+**要留意的**：**持仓没有"未查询到"这个状态**。作用域内每条 (所, symbol) 在策略消费第一条事件之前
   就已写入基线（executor 出生时由投产握手写满），所以 `position_size()` 返回的 `0.0`
   永远是"确定空仓"。策略不必、也无法检查"这条腿查到了没有"。
-- `market_status(ex)` 是唯一有默认值的读数（默认 `Closed`）。这里的默认是刻意的：
-  休市判据只有"要不要下单"一个用途，"不知道开没开"与"确定没开"应导向同一个动作。
 
 产出：
 
@@ -123,12 +119,10 @@ pub trait Strategy: Send + Sync {
 pub enum Signal {                    // 策略产出
     PlaceOrders { orders: Vec<OrderIntent>, comment: String },
     CancelOrder { symbol, client_order_id },   // 所由框架从跟踪表查
-    Emit(CustomEvent),   // 发给外部订阅者，下单出口对它 no-op
 }
 pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
     PlaceOrders { orders: Vec<Order>, comment: String },
     CancelOrder { exchange, symbol, client_order_id },
-    Emit(CustomEvent),
 }
 ```
 
@@ -164,7 +158,6 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 #[async_trait] pub trait ExchangeClient: Send + Sync + 'static {
     fn exchange(&self) -> Exchange;
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError>;
-    async fn fetch_symbol_meta(&self, symbols: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError>;
 }
 
 /// 账户私有：只有配了凭证的所才有这个对象
@@ -334,7 +327,7 @@ inbox.subscribe(manager.account_bus(), |e| e.account == AccountId::Live
 | 新策略 | 实现 `Strategy` | 否 |
 | 新交易所 | 实现 `ExchangeClient` + `AccountClient`，写一个 `setup_xxx` | 否，manager 零改动 |
 | 新数据源（回测）| 实现 `MarketDataSource` | 否 |
-| 新事件类型（用户域）| `CustomEvent` + `publish_custom_event` / `OutcomeEvent::Emit` | 否，框架只运送不理解 |
+| 新事件类型（用户域）| `CustomEvent` + `publish_custom_event`（外部向策略） | 否，框架只运送不理解 |
 | 新事件变体（框架域）| 给 `MarketData` / `AccountData` 加变体 | 是，且所有 `match` 会**编译失败**，漏改不了 |
 
 ---

@@ -319,8 +319,6 @@ impl PaperCounter {
         let account = tagged.account;
         let delay = self.config.order_to_exchange_delay_ms;
         match tagged.event {
-            // 自定义事件不进柜台：它已随出向总线到达外部订阅者，柜台只撮合下单/撤单
-            OutcomeEvent::Emit(_) => {}
             OutcomeEvent::PlaceOrders { orders, comment } => {
                 for order in orders {
                     // 市场规则校验（下界 + 取整）不在此处：柜台状态机 SimState 在订单

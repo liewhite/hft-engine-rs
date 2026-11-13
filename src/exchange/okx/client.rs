@@ -203,20 +203,6 @@ impl ExchangeClient for OkxClient {
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         Ok(self.instruments().await?.to_vec())
     }
-
-    async fn fetch_symbol_meta(
-        &self,
-        symbols: &[Symbol],
-    ) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
-        Ok(self
-            .instruments()
-            .await?
-            .iter()
-            .filter(|m| symbol_set.contains(&m.symbol))
-            .cloned()
-            .collect())
-    }
 }
 
 /// `funding-rate-history` 的单条记录

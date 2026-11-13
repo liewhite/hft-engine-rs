@@ -2,7 +2,7 @@
 //!
 //! 职责:
 //! - 维护 WebSocket 连接（读循环是子任务）
-//! - 处理订阅/退订命令
+//! - 处理订阅命令
 //! - 直接解析消息并发布到行情总线
 
 use crate::domain::ExchangeError;
@@ -162,18 +162,6 @@ impl HyperliquidPublicWs {
         Ok(())
     }
 
-    /// 发送取消订阅消息
-    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), ExchangeError> {
-        let subscription = self.book.subscription(kind)?;
-        let msg = json!({
-            "method": "unsubscribe",
-            "subscription": subscription
-        })
-        .to_string();
-        self.conn.send(msg).await;
-        Ok(())
-    }
-
     /// 断线重连：重发全部订阅；trades 订阅时刻一并刷新（重订阅后 HL 又会先推一批历史回填）
     async fn reconnect(&mut self, scope: &Scope) -> anyhow::Result<bool> {
         let subscriptions = self
@@ -210,9 +198,7 @@ impl HyperliquidPublicWs {
 
     async fn handle_cmd(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
         match cmd {
-            ExchangeCmd::Subscribe(kind) => self.subscribe_batch(vec![kind]).await,
             ExchangeCmd::SubscribeBatch(kinds) => self.subscribe_batch(kinds).await,
-            ExchangeCmd::Unsubscribe(kind) => self.unsubscribe(kind).await,
         }
     }
 
@@ -259,38 +245,6 @@ impl HyperliquidPublicWs {
                     .insert(symbol.clone(), subscribed_at);
             }
             self.book.subscribed_kinds.insert(kind);
-        }
-        Ok(())
-    }
-
-    async fn unsubscribe(&mut self, kind: SubscriptionKind) -> anyhow::Result<()> {
-        if let SubscriptionKind::Trades { symbol } = &kind {
-            self.book.trades_subscribed_at.remove(symbol);
-        }
-        if !self.book.subscribed_kinds.remove(&kind) {
-            return Ok(());
-        }
-
-        // 检查是否还有其他 kinds 使用同一个 stream
-        // Candle 从不进入 subscribed_kinds（订阅期已跳过），此处若为 None 属路由 bug，记录并跳过
-        let Some(stream) = self.book.stream(&kind) else {
-            tracing::error!(
-                ?kind,
-                "Candle routed to HyperliquidPublicWs unsubscribe (routing bug), skipping"
-            );
-            return Ok(());
-        };
-        let stream_still_needed = self
-            .book
-            .subscribed_kinds
-            .iter()
-            .any(|k| self.book.stream(k).as_ref() == Some(&stream));
-
-        if !stream_still_needed {
-            self.send_unsubscribe(&kind)
-                .await
-                .context("Hyperliquid 取消订阅发送失败")?;
-            self.book.subscribed_streams.remove(&stream);
         }
         Ok(())
     }

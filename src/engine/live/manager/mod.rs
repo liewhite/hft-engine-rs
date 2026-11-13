@@ -28,7 +28,7 @@ use crate::exchange::{
 use crate::messaging::{AccountEvent, CustomEvent, MarketData, MarketEvent};
 use crate::strategy::Strategy;
 use crate::tasks::{Addr, BusTap, Group, Inbox, Scope, Task};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -44,8 +44,8 @@ const CLOCK_INTERVAL_MS: u64 = 1000;
 
 /// [`Manager::spawn`] 的参数
 pub struct ManagerArgs {
-    /// 参与的交易所（在 bin 侧用各所的 `setup_*` 装配，见 [`super::assembly`]）。
-    /// manager 对"有哪些所"彻底无知 —— 加新交易所零改 manager。
+    /// 参与的交易所（bin 侧用 [`super::assembly::setup_all`] 按配置装配：配置每所一个字段，
+    /// 同一所不会出现两次）。manager 对"有哪些所"彻底无知 —— 加新交易所零改 manager。
     pub exchanges: Vec<ExchangeSetup>,
     /// 本地柜台（模拟账户）的撮合与账本配置；`None` = 不起模拟柜台（只跑实盘的进程）。
     ///
@@ -305,21 +305,6 @@ impl Manager {
         // 1. 收下 bin 侧装配好的交易所（阶段 1 的 client 已建好；阶段 2 的节点装配
         //    延迟到 metas 就绪后并发执行）。manager 只做收集与循环，不知道具体是哪些所。
         let setups = args.exchanges;
-
-        //    同所重复是装配错误，必须在此拦下：Vec 让"同一交易所装配两次"成为可表达
-        //    状态（旧 Option 字段在类型上排除了它），放行的后果是两套交易所节点向
-        //    总线发布**双份**行情与私有事件 —— 最难查的静默双计。
-        {
-            let mut seen = HashSet::new();
-            for setup in &setups {
-                if !seen.insert(setup.exchange) {
-                    anyhow::bail!(
-                        "{} 被装配了两次（bin 侧重复 push 同一交易所的 setup），拒绝启动",
-                        setup.exchange
-                    );
-                }
-            }
-        }
 
         //    模拟盘也需要 client：symbol metas 走公共 REST，与是否有凭证无关
         let clients: HashMap<Exchange, Arc<dyn ExchangeClient>> = setups

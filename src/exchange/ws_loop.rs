@@ -112,7 +112,7 @@ impl WsConn {
         })
     }
 
-    /// 发一帧文本（订阅/退订请求等）。循环已退出时返回 `Err`。
+    /// 发一帧文本（订阅请求等）。循环已退出时返回 `Err`。
     pub async fn send(&self, text: String) -> Result<(), ExchangeError> {
         self.outgoing
             .send(text)
@@ -288,7 +288,7 @@ impl ReconnectingWs {
         .map_err(|e| ExchangeError::new(e.to_string()))
     }
 
-    /// 发一帧文本（订阅/退订）。连接已断时丢掉：重连时组件会重发全部订阅。
+    /// 发一帧文本（订阅）。连接已断时丢掉：重连时组件会重发全部订阅。
     pub async fn send(&self, text: String) {
         if self.conn.send(text).await.is_err() {
             tracing::debug!(conn = %self.name, "连接已断，报文丢弃（重连时按全部订阅重发）");

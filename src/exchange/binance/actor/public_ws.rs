@@ -2,7 +2,7 @@
 //!
 //! 职责:
 //! - 维护公开 WebSocket 连接（读循环是子任务）
-//! - 处理订阅/退订命令
+//! - 处理订阅命令
 //! - 直接解析消息并发布到行情总线
 
 use crate::domain::now_ms;
@@ -82,21 +82,6 @@ impl BinancePublicWs {
         vec![Self::subscribe_msg(self.subscribed_streams.iter().cloned())]
     }
 
-    /// 发送取消订阅消息
-    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), ExchangeError> {
-        let stream = kind_to_stream(kind, &self.quote).ok_or_else(|| {
-            ExchangeError::new("Binance Candle 订阅未实现，无法取消订阅".to_string())
-        })?;
-        let msg = json!({
-            "method": "UNSUBSCRIBE",
-            "params": [stream],
-            "id": 2
-        })
-        .to_string();
-        self.conn.send(msg).await;
-        Ok(())
-    }
-
     /// 解析并处理消息
     fn handle_message(&self, raw: &str) -> anyhow::Result<()> {
         let events = parse_public_message(raw, &self.quote, now_ms(), &self.subscribed_kinds)
@@ -109,9 +94,7 @@ impl BinancePublicWs {
 
     async fn handle_cmd(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
         match cmd {
-            ExchangeCmd::Subscribe(kind) => self.subscribe_batch(vec![kind]).await,
             ExchangeCmd::SubscribeBatch(kinds) => self.subscribe_batch(kinds).await,
-            ExchangeCmd::Unsubscribe(kind) => self.unsubscribe(kind).await,
         }
     }
 
@@ -162,33 +145,6 @@ impl BinancePublicWs {
         // 3. 记录已订阅的 kinds
         for kind in new_kinds {
             self.subscribed_kinds.insert(kind);
-        }
-        Ok(())
-    }
-
-    async fn unsubscribe(&mut self, kind: SubscriptionKind) -> anyhow::Result<()> {
-        if !self.subscribed_kinds.remove(&kind) {
-            return Ok(());
-        }
-
-        // 检查是否还有其他 kinds 使用同一个 stream
-        let stream = match kind_to_stream(&kind, &self.quote) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(?kind, "Binance Candle 订阅未实现，忽略取消订阅");
-                return Ok(());
-            }
-        };
-        let stream_still_needed = self
-            .subscribed_kinds
-            .iter()
-            .any(|k| kind_to_stream(k, &self.quote).as_deref() == Some(stream.as_str()));
-
-        if !stream_still_needed {
-            self.send_unsubscribe(&kind)
-                .await
-                .context("Binance 取消订阅发送失败")?;
-            self.subscribed_streams.remove(&stream);
         }
         Ok(())
     }

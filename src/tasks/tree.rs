@@ -669,11 +669,6 @@ impl ChildHandle {
         self.done.is_cancelled()
     }
 
-    /// 等它（连同子树）收尾完，不发停止请求
-    pub async fn finished(&self) {
-        self.done.cancelled().await;
-    }
-
     async fn wait_done(&self, group: &'static str) {
         let mut waited = Duration::ZERO;
         loop {
@@ -1005,7 +1000,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        h.finished().await;
+        h.done.cancelled().await;
         assert!(!root.is_stopping());
         root.shutdown().await.unwrap();
     }
@@ -1126,7 +1121,7 @@ mod tests {
             })
             .unwrap();
         drop(root);
-        tokio::time::timeout(Duration::from_secs(5), h.finished())
+        tokio::time::timeout(Duration::from_secs(5), h.done.cancelled())
             .await
             .expect("子任务应收到停止信号");
     }

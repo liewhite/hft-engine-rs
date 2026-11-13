@@ -183,10 +183,6 @@ pub trait ExchangeClient: Send + Sync + 'static {
 
     /// 获取所有交易对元数据
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError>;
-
-    /// 获取指定交易对元数据
-    async fn fetch_symbol_meta(&self, symbols: &[Symbol])
-        -> Result<Vec<SymbolMeta>, ExchangeError>;
 }
 
 /// **账户私有**接口：只有配了凭证的所才有这个对象。
@@ -323,12 +319,11 @@ pub trait FundingFeeSource: Send + Sync + 'static {
 /// 发给交易所节点的命令（各所节点的收件箱消息类型）
 #[derive(Debug, Clone)]
 pub enum ExchangeCmd {
-    Subscribe(SubscriptionKind),
+    /// 订阅一批行情（只在投产时发一次；不退订）
     SubscribeBatch(Vec<SubscriptionKind>),
-    Unsubscribe(SubscriptionKind),
 }
 
-/// 一个交易所节点的句柄：引擎经它订阅/退订行情。各所装配函数（`engine::live::assembly`）
+/// 一个交易所节点的句柄：引擎经它订阅行情。各所装配函数（`engine::live::assembly`）
 /// 起好节点后交出它；节点的生死归任务树管，句柄只是地址。
 #[derive(Debug, Clone)]
 pub struct ExchangeHandle(crate::tasks::Addr<ExchangeCmd>);
@@ -338,16 +333,8 @@ impl ExchangeHandle {
         Self(addr)
     }
 
-    pub fn subscribe(&self, kind: SubscriptionKind) -> Result<(), crate::tasks::Gone> {
-        self.0.send(ExchangeCmd::Subscribe(kind))
-    }
-
     pub fn subscribe_batch(&self, kinds: Vec<SubscriptionKind>) -> Result<(), crate::tasks::Gone> {
         self.0.send(ExchangeCmd::SubscribeBatch(kinds))
-    }
-
-    pub fn unsubscribe(&self, kind: SubscriptionKind) -> Result<(), crate::tasks::Gone> {
-        self.0.send(ExchangeCmd::Unsubscribe(kind))
     }
 }
 

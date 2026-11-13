@@ -28,7 +28,7 @@
 //!
 //! 见品味 1.3：净值取不到与净值为零是两回事，前者伪装成后者会让杠杆闸门直接放行。
 
-use crate::domain::{AccountInfo, Exchange, Greeks, MarketStatus, Quantity, Symbol, BBO};
+use crate::domain::{AccountInfo, Exchange, Greeks, Quantity, Symbol, BBO};
 use crate::messaging::{PendingOrder, StateManager, SymbolState};
 use std::collections::HashMap;
 
@@ -74,30 +74,12 @@ impl<'a> StrategyView<'a> {
     pub fn greeks(&self, exchange: Exchange, ccy: &str) -> Option<Greeks> {
         self.state.account_view().greeks(exchange, ccy)
     }
-
-    /// 某所的市场状态。**默认 `Closed`（安全侧）** —— 读数未到达与休市不作区分。
-    ///
-    /// 这里的默认值是刻意的，与品味 1.3 不冲突 —— 但只在**门控**这个用途上成立：
-    /// 拿它决定要不要下单时，"不知道开没开"和"确定没开"应导向同一个动作（不下单）。
-    /// 而 `equity` 那类读数返回 `None`，是因为拿它算杠杆时未知与零会导向**相反**的动作。
-    ///
-    /// **边界**：若在 `Closed` 上做**主动**动作（撤单、平仓、切换到夜盘逻辑），
-    /// 这个默认值就不再安全 —— 启动期"读数还没到"会被当成"已休市"而触发那些动作。
-    /// 有这种需求时不要扩展本方法的语义，去订阅 `MarketData::ExchangeStatus` 事件本身：
-    /// 事件到达才是"确实收到了状态"，与"尚未收到"天然可分。
-    ///
-    /// 未订阅的所恒为 `Closed`：`ExchangeStatus` 是 [`crate::messaging::Delivery::Exchange`]
-    /// 档，压根不会送达 —— 与本方法的默认值自然一致，不必另行裁剪。
-    pub fn market_status(&self, exchange: Exchange) -> MarketStatus {
-        self.state.market_status(exchange)
-    }
 }
 
 /// 单个 symbol 的跨所视图。
 ///
-/// 方法集就是实测的策略调用面。`SymbolState` 上其余的读方法（`mark_price` /
-/// `best_long_exchange` / `exposure` / 三个投影的直通访问器…）没有策略消费者，
-/// 是观测层与 executor 用的，不在此暴露。
+/// 方法集就是实测的策略调用面。`SymbolState` 上其余的读方法（`mark_price` / 三个投影的直通
+/// 访问器…）没有策略消费者，是观测层与 executor 用的，不在此暴露。
 #[derive(Clone, Copy)]
 pub struct SymbolView<'a> {
     state: &'a SymbolState,
@@ -163,13 +145,5 @@ mod tests {
         let view = StrategyView::new(&m);
         assert!(view.symbol(&SYM.to_string()).is_some());
         assert!(view.symbol(&"ETH".to_string()).is_none());
-    }
-
-    /// 市场状态默认 `Closed`（安全侧）：读数未到达与休市导向同一个动作，不下单
-    #[test]
-    fn market_status_defaults_to_closed() {
-        let m = StateManager::new(&[SYM.to_string()]);
-        let view = StrategyView::new(&m);
-        assert_eq!(view.market_status(Exchange::IBKR), MarketStatus::Closed);
     }
 }

@@ -326,7 +326,7 @@ impl IbkrPublicWs {
         self.conn.send(smd_message(conid, &fields)).await
     }
 
-    /// 发送 WebSocket 取消订阅消息
+    /// 发送 WebSocket 取消订阅消息（重订阅时先退再订）
     async fn send_unsubscribe(&self, conid: i64) -> Result<(), ExchangeError> {
         self.conn.send(umd_message(conid)).await
     }
@@ -369,9 +369,7 @@ impl IbkrPublicWs {
 
     async fn handle_cmd(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
         match cmd {
-            ExchangeCmd::Subscribe(kind) => self.subscribe_batch(vec![kind]).await,
             ExchangeCmd::SubscribeBatch(kinds) => self.subscribe_batch(kinds).await,
-            ExchangeCmd::Unsubscribe(kind) => self.unsubscribe(kind).await,
         }
     }
 
@@ -412,20 +410,6 @@ impl IbkrPublicWs {
 
             self.subscribed.insert(kind);
             tracing::info!(exchange = "IBKR", symbol = %symbol, conid, "Subscribed to BBO");
-        }
-        Ok(())
-    }
-
-    async fn unsubscribe(&mut self, kind: SubscriptionKind) -> anyhow::Result<()> {
-        if !self.subscribed.remove(&kind) {
-            return Ok(());
-        }
-        if let SubscriptionKind::BBO { ref symbol } = kind {
-            if let Some(&conid) = self.conids.get(symbol) {
-                self.send_unsubscribe(conid)
-                    .await
-                    .with_context(|| format!("IBKR 退订 {symbol} (conid={conid}) 失败"))?;
-            }
         }
         Ok(())
     }

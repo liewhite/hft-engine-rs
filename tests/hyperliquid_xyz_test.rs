@@ -134,8 +134,13 @@ async fn test_xyz_fetch_symbol_meta() {
     let symbol: Symbol = TEST_SYMBOL.to_string();
 
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("获取 SymbolMeta 失败");
 
     assert_eq!(metas.len(), 1, "应该返回 1 个 SymbolMeta");
@@ -249,8 +254,13 @@ async fn place_test_order(side: Side) {
 
     // 获取 SymbolMeta 用于格式化价格
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
     println!(

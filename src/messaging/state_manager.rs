@@ -1,5 +1,5 @@
 use crate::domain::AccountInfo;
-use crate::domain::{Exchange, Greeks, MarketStatus, Order, Position, Symbol, Timestamp, USDT};
+use crate::domain::{Exchange, Greeks, Order, Position, Symbol, Timestamp};
 use crate::messaging::{
     AccountData, ExchangeAccountData, IncomeEvent, LegValue, MarketData, SymbolState,
 };
@@ -26,8 +26,6 @@ pub struct PositionBaseline {
 /// 不按 symbol 索引，所以住在 [`StateManager`] 上而不在 `SymbolState` 里。
 #[derive(Debug, Clone, Default)]
 pub struct AccountView {
-    /// 全局 USDT 余额 (per exchange)
-    balances: HashMap<Exchange, f64>,
     /// 账户信息: 净值 + 总持仓名义价值 (per exchange)
     account_infos: HashMap<Exchange, AccountInfo>,
     /// 账户希腊值 (per exchange, per ccy)
@@ -39,18 +37,6 @@ pub struct AccountView {
 }
 
 impl AccountView {
-    /// 获取指定交易所的 USDT 余额
-    ///
-    /// 返回 None 表示该交易所的余额数据尚未到达
-    pub fn usdt_balance(&self, exchange: Exchange) -> Option<f64> {
-        self.balances.get(&exchange).copied()
-    }
-
-    /// 获取所有交易所的 USDT 总余额（仅包含已收到数据的交易所）
-    pub fn total_usdt_balance(&self) -> f64 {
-        self.balances.values().sum()
-    }
-
     /// 获取指定交易所的账户信息 (equity + notional 原子性保证)
     ///
     /// 返回 None 表示该交易所的账户数据尚未到达
@@ -96,10 +82,6 @@ pub struct StateManager {
     states: HashMap<Symbol, SymbolState>,
     /// 账户投影
     account: AccountView,
-    /// 交易所市场状态 (per exchange)。
-    ///
-    /// 公共行情，不属于 [`AccountView`]；又是账户级而非 per-symbol，故留在本层。
-    market_statuses: HashMap<Exchange, MarketStatus>,
 }
 
 impl StateManager {
@@ -113,7 +95,6 @@ impl StateManager {
         Self {
             states,
             account: AccountView::default(),
-            market_statuses: HashMap::new(),
         }
     }
 
@@ -185,14 +166,6 @@ impl StateManager {
         &self.account
     }
 
-    /// 获取指定交易所的市场状态（默认 Closed，安全侧）
-    pub fn market_status(&self, exchange: Exchange) -> MarketStatus {
-        self.market_statuses
-            .get(&exchange)
-            .copied()
-            .unwrap_or(MarketStatus::Closed)
-    }
-
     // ==================== 事件处理 ====================
 
     /// 处理事件，更新状态。`Err` = 有单「等交易所」太久（见 [`crate::messaging::ORDER_STUCK_MS`]），
@@ -203,12 +176,10 @@ impl StateManager {
     pub fn apply(&mut self, event: &IncomeEvent) -> Result<(), String> {
         match event {
             IncomeEvent::Market(m) => match &m.data {
-                // 全局事件: ExchangeStatus
-                MarketData::ExchangeStatus { exchange, status } => {
-                    self.market_statuses.insert(*exchange, *status);
-                }
-                // 券源/汇率读数 —— 策略在 on_event 里自行消费并自持，StateManager 不缓存。
-                MarketData::BorrowFee(_) | MarketData::ExchangeRate(_) => {}
+                // 市场状态/券源/汇率读数 —— 策略在 on_event 里自行消费并自持，StateManager 不缓存。
+                MarketData::ExchangeStatus { .. }
+                | MarketData::BorrowFee(_)
+                | MarketData::ExchangeRate(_) => {}
                 // 自定义事件：框架只运送不理解，策略在 on_event 里自行消费并自持。
                 MarketData::Custom(_) => {}
                 // 全局事件: Clock (检查有没有单等交易所太久)
@@ -248,14 +219,6 @@ impl StateManager {
     fn apply_exchange_account(&mut self, data: &ExchangeAccountData) {
         match data {
             ExchangeAccountData::Balance(balance) => {
-                if balance.asset == USDT {
-                    tracing::debug!(
-                        exchange = %balance.exchange,
-                        cash = balance.cash,
-                        "USDT balance updated"
-                    );
-                    self.account.balances.insert(balance.exchange, balance.cash);
-                }
                 // 存储币种现金余额 (用于修正 greeks delta)
                 self.account
                     .cash_balances

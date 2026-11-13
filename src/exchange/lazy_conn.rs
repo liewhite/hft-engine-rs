@@ -107,8 +107,12 @@ mod tests {
             Ok(addr)
         });
         assert!(!conn.is_up());
-        conn.send(ExchangeCmd::Subscribe(bbo())).await.unwrap();
-        conn.send(ExchangeCmd::Unsubscribe(bbo())).await.unwrap();
+        conn.send(ExchangeCmd::SubscribeBatch(vec![bbo()]))
+            .await
+            .unwrap();
+        conn.send(ExchangeCmd::SubscribeBatch(vec![bbo()]))
+            .await
+            .unwrap();
         assert_eq!(spawned.load(Ordering::SeqCst), 1);
         assert!(conn.is_up());
         root.shutdown().await.unwrap();
@@ -118,8 +122,14 @@ mod tests {
     #[tokio::test]
     async fn connect_failure_is_reported_and_not_retried() {
         let mut conn = LazyConn::new("TestWs", || async { anyhow::bail!("连不上") });
-        let err = conn.send(ExchangeCmd::Subscribe(bbo())).await.unwrap_err();
+        let err = conn
+            .send(ExchangeCmd::SubscribeBatch(vec![bbo()]))
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("连不上"), "{err:#}");
-        assert!(conn.send(ExchangeCmd::Subscribe(bbo())).await.is_err());
+        assert!(conn
+            .send(ExchangeCmd::SubscribeBatch(vec![bbo()]))
+            .await
+            .is_err());
     }
 }

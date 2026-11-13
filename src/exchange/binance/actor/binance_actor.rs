@@ -2,7 +2,7 @@
 //!
 //! 职责:
 //! - 管理公共/私有 WS 和各轮询子任务
-//! - 把订阅/退订命令按 kind 路由到对应的公共 WS
+//! - 把订阅命令按 kind 路由到对应的公共 WS
 //! - WS 组件直接解析消息并发布到对应总线
 //!
 //! 树:
@@ -160,10 +160,6 @@ impl BinanceNode {
     /// 按目标 WS 路由命令。批量订阅按目标拆分，避免把 markPrice 流发到 /public/ws 被拒
     async fn route(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
         match cmd {
-            ExchangeCmd::Subscribe(ref kind) | ExchangeCmd::Unsubscribe(ref kind) => {
-                let target = pick_ws_target(kind);
-                self.ws_for(target).send(cmd).await
-            }
             ExchangeCmd::SubscribeBatch(kinds) => {
                 let (public_kinds, market_kinds): (Vec<_>, Vec<_>) = kinds
                     .into_iter()

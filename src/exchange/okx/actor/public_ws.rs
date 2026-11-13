@@ -2,7 +2,7 @@
 //!
 //! 职责:
 //! - 维护公开 WebSocket 连接（读循环是子任务）
-//! - 处理订阅/退订命令
+//! - 处理订阅命令
 //! - 直接解析消息并发布到行情总线
 
 use crate::domain::ExchangeError;
@@ -98,22 +98,6 @@ impl OkxPublicWs {
         vec![Self::subscribe_msg(args)]
     }
 
-    /// 发送取消订阅消息
-    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), ExchangeError> {
-        let arg = kind_to_arg(kind, &self.quote).ok_or_else(|| {
-            ExchangeError::new(
-                "Candle kind reached OkxPublicWs unsubscribe (routing bug)".to_string(),
-            )
-        })?;
-        let msg = json!({
-            "op": "unsubscribe",
-            "args": [arg]
-        })
-        .to_string();
-        self.conn.send(msg).await;
-        Ok(())
-    }
-
     /// 解析并处理消息
     fn handle_message(&self, raw: &str) -> anyhow::Result<()> {
         let events = parse_public_message(raw, &self.quote, now_ms(), &self.symbol_metas)
@@ -126,9 +110,7 @@ impl OkxPublicWs {
 
     async fn handle_cmd(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
         match cmd {
-            ExchangeCmd::Subscribe(kind) => self.subscribe_batch(vec![kind]).await,
             ExchangeCmd::SubscribeBatch(kinds) => self.subscribe_batch(kinds).await,
-            ExchangeCmd::Unsubscribe(kind) => self.unsubscribe(kind).await,
         }
     }
 
@@ -164,16 +146,6 @@ impl OkxPublicWs {
         for kind in new_kinds {
             self.subscribed.insert(kind);
         }
-        Ok(())
-    }
-
-    async fn unsubscribe(&mut self, kind: SubscriptionKind) -> anyhow::Result<()> {
-        if !self.subscribed.remove(&kind) {
-            return Ok(());
-        }
-        self.send_unsubscribe(&kind)
-            .await
-            .context("OKX 取消订阅发送失败")?;
         Ok(())
     }
 }

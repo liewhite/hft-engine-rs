@@ -227,8 +227,13 @@ async fn paper_counter_fills_from_live_trades() {
     let client = Arc::new(BinanceClient::new("USDT".to_string()).expect("client"));
     let symbol = COIN.to_string();
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("public symbol meta");
     let metas_by_key: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> = Arc::new(
         metas

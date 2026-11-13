@@ -53,11 +53,6 @@ pub struct BacktestResult {
 /// 旁路观察者：与策略共享同一事件流但不参与撮合 (如成交记录器)。
 type Observer<'a> = Box<dyn FnMut(&IncomeEvent) + 'a>;
 
-/// Outcome 旁路观察者：策略每产出一条信号立即回调 (runner 下标, 信号)。
-/// 等价实盘 Outcome 总线的外部订阅者（订阅 `ManagerHandle::outcome_bus()`）—— 两个方向各有各的观察口，
-/// 不把 outcome 包装成 income 混进 [`Observer`]（那会丢失方向与发出者归属）。
-type OutcomeObserver<'a> = Box<dyn FnMut(usize, &OutcomeEvent) + 'a>;
-
 /// 队列内的延迟动作。
 enum Action {
     /// 交易所侧事件到达策略/观察者
@@ -111,7 +106,6 @@ pub struct BacktestEngine<'a> {
     /// 否则策略侧取整与柜台校验会按两套规则各行其是（bin 侧统一构建一份 Arc）。
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     observers: Vec<Observer<'a>>,
-    outcome_observers: Vec<OutcomeObserver<'a>>,
     clock_interval_ms: u64,
 
     // ---- 运行期状态 ----
@@ -150,7 +144,6 @@ impl<'a> BacktestEngine<'a> {
             config,
             symbol_metas,
             observers: Vec::new(),
-            outcome_observers: Vec::new(),
             clock_interval_ms: 1000,
             states: BTreeMap::new(),
             pq: BinaryHeap::new(),
@@ -168,13 +161,6 @@ impl<'a> BacktestEngine<'a> {
     /// 注册旁路观察者 (如成交记录器)，与策略共享同一事件流但不参与撮合。
     pub fn with_observer(mut self, obs: impl FnMut(&IncomeEvent) + 'a) -> Self {
         self.observers.push(Box::new(obs));
-        self
-    }
-
-    /// 注册 Outcome 旁路观察者：策略每产出一条信号（下单/撤单/Emit）立即回调，
-    /// 带 runner 下标标识发出者。等价实盘订阅 `ManagerHandle::outcome_bus()`。
-    pub fn with_outcome_observer(mut self, obs: impl FnMut(usize, &OutcomeEvent) + 'a) -> Self {
-        self.outcome_observers.push(Box::new(obs));
         self
     }
 
@@ -428,10 +414,6 @@ impl<'a> BacktestEngine<'a> {
                 }
             };
             for outcome in outcomes {
-                // 全部信号先过 outcome 观察者（与实盘 Outcome 总线"订阅者看到一切"同构）
-                for j in 0..self.outcome_observers.len() {
-                    (self.outcome_observers[j])(i, &outcome);
-                }
                 match outcome {
                     OutcomeEvent::PlaceOrders { orders, .. } => {
                         for o in orders {
@@ -450,9 +432,6 @@ impl<'a> BacktestEngine<'a> {
                             Action::CancelArrive(exchange, symbol, client_order_id),
                         );
                     }
-                    // Emit 已随上面的 outcome 观察者送达（等价实盘 Outcome 总线的外部
-                    // 订阅者），此处无事可做 —— **绝不回流给策略**，策略间不能直接通信。
-                    OutcomeEvent::Emit(_) => {}
                 }
             }
         }

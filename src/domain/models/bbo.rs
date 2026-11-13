@@ -14,11 +14,6 @@ pub struct BBO {
 }
 
 impl BBO {
-    /// 计算买卖价差
-    pub fn spread(&self) -> Price {
-        self.ask_price - self.bid_price
-    }
-
     /// 计算中间价
     pub fn mid_price(&self) -> Price {
         (self.bid_price + self.ask_price) / Decimal::TWO

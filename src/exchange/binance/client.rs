@@ -93,36 +93,6 @@ impl BinanceClient {
         &self.quote
     }
 
-    /// 拉取各交易对最近 24 小时的**计价币成交额**（USDT 名义额）。
-    ///
-    /// 用于按流动性挑选标的：低流动性 symbol 的盘口很差，在其上跑出的模拟结论本身不可信。
-    ///
-    /// 返回的是**内部基础符号**，且只含当前 quote 的交易对；调用方通常还要与
-    /// [`ExchangeClient::fetch_all_symbol_metas`] 取交集，以排除不可交易的标的
-    /// （本接口按 24h 行情返回，含已停牌/交割品种）。
-    pub async fn fetch_quote_volumes(&self) -> Result<Vec<(Symbol, f64)>, ExchangeError> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Ticker24h {
-            symbol: String,
-            /// 24h 计价币成交额
-            quote_volume: String,
-        }
-
-        // 不带 symbol 取全部：权重 40
-        let admitted = LIMITER.query(&[IP_WEIGHT.cost(40)]).await?;
-        let text = call(self.http.get(url("/fapi/v1/ticker/24hr")), admitted).await?;
-        let tickers: Vec<Ticker24h> = parse("ticker/24hr", &text)?;
-        Ok(tickers
-            .into_iter()
-            .filter_map(|t| {
-                let symbol = from_binance(&t.symbol, &self.quote)?;
-                let volume = t.quote_volume.parse::<f64>().ok()?;
-                Some((symbol, volume))
-            })
-            .collect())
-    }
-
     /// 获取所有交易对信息
     async fn get_all_exchange_info(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         let admitted = LIMITER.query(&[IP_WEIGHT.cost(1)]).await?;
@@ -230,18 +200,6 @@ impl ExchangeClient for BinanceClient {
 
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         self.get_all_exchange_info().await
-    }
-
-    async fn fetch_symbol_meta(
-        &self,
-        symbols: &[Symbol],
-    ) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        let all = self.get_all_exchange_info().await?;
-        let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
-        Ok(all
-            .into_iter()
-            .filter(|m| symbol_set.contains(&m.symbol))
-            .collect())
     }
 }
 

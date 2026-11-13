@@ -442,8 +442,6 @@ impl OutcomeProcessor {
         // 子任务内的结论由 gateway 以 OrderRequestResult 发到账户总线；下单结果不确定时 gateway
         // 自己停机（见 `OrderGateway::place`）。
         match tagged.event {
-            // 自定义事件与交易所无关：它已随出向总线到达外部订阅者，本处理器只管下单/撤单
-            OutcomeEvent::Emit(_) => {}
             OutcomeEvent::CancelOrder {
                 exchange,
                 symbol,

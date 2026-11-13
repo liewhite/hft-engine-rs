@@ -32,10 +32,13 @@ async fn hyperliquid_one_client_main_and_xyz() {
         HyperliquidClient::connect("USDC".to_string(), vec![String::new(), "xyz".to_string()])
             .await
             .unwrap();
-    let metas = client
-        .fetch_symbol_meta(&["BTC".to_string(), "TSLA".to_string()])
+    let metas: Vec<_> = client
+        .fetch_all_symbol_metas()
         .await
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.symbol == "BTC" || m.symbol == "TSLA")
+        .collect();
     println!(
         "metas: {:?}",
         metas

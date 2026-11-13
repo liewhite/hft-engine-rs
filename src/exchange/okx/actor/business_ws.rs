@@ -2,7 +2,7 @@
 //!
 //! 职责:
 //! - 维护 Business WebSocket 连接 (wss://ws.okx.com:8443/ws/v5/business)
-//! - 处理 Candle 类型的订阅/退订命令
+//! - 处理 Candle 类型的订阅命令
 //! - 收到订阅时先通过 REST 获取 100 根历史 K线并发布，再 WS 订阅实时推送
 //! - 直接解析消息并发布到行情总线
 
@@ -86,21 +86,6 @@ impl OkxBusinessWs {
         let msg = json!({
             "op": "subscribe",
             "args": args
-        })
-        .to_string();
-        self.conn.send(msg).await
-    }
-
-    /// 发送 WS 取消订阅消息
-    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), ExchangeError> {
-        let arg = kind_to_business_arg(kind, &self.quote).ok_or_else(|| {
-            ExchangeError::new(
-                "Non-Candle kind reached OkxBusinessWs unsubscribe (routing bug)".to_string(),
-            )
-        })?;
-        let msg = json!({
-            "op": "unsubscribe",
-            "args": [arg]
         })
         .to_string();
         self.conn.send(msg).await
@@ -198,9 +183,7 @@ impl OkxBusinessWs {
 
     async fn handle_cmd(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
         match cmd {
-            ExchangeCmd::Subscribe(kind) => self.subscribe_batch(vec![kind]).await,
             ExchangeCmd::SubscribeBatch(kinds) => self.subscribe_batch(kinds).await,
-            ExchangeCmd::Unsubscribe(kind) => self.unsubscribe(kind).await,
         }
     }
 
@@ -246,16 +229,6 @@ impl OkxBusinessWs {
         for kind in new_kinds {
             self.subscribed.insert(kind);
         }
-        Ok(())
-    }
-
-    async fn unsubscribe(&mut self, kind: SubscriptionKind) -> anyhow::Result<()> {
-        if !self.subscribed.remove(&kind) {
-            return Ok(());
-        }
-        self.send_unsubscribe(&kind)
-            .await
-            .context("OKX business 取消订阅发送失败")?;
         Ok(())
     }
 }

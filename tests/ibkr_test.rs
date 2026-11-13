@@ -115,10 +115,15 @@ async fn test_ibkr_symbol_metas() {
     println!("全部 SymbolMeta ({} 个): {:?}", all_metas.len(), all_metas);
     assert!(!all_metas.is_empty(), "应至少有一个 SymbolMeta");
 
-    // fetch_symbol_meta (单个)
+    // 按品种取（从全量目录里筛）
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("获取 SymbolMeta 失败");
     assert_eq!(metas.len(), 1, "应返回 1 个 SymbolMeta");
     let meta = &metas[0];
@@ -201,8 +206,13 @@ async fn test_ibkr_limit_buy() {
 
     // 获取 SymbolMeta 格式化价格
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
 
@@ -249,8 +259,13 @@ async fn test_ibkr_limit_sell() {
 
     // 获取 SymbolMeta 格式化价格
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
 
@@ -429,8 +444,13 @@ async fn test_ibkr_place_order_and_verify_fill() {
     // 3. 按 ask + 滑点 买入 (IOC，确保成交)
     let slippage = 0.05; // $0.05 滑点
     let metas = client
-        .fetch_symbol_meta(std::slice::from_ref(&symbol))
+        .fetch_all_symbol_metas()
         .await
+        .map(|all| {
+            all.into_iter()
+                .filter(|m| m.symbol == symbol)
+                .collect::<Vec<_>>()
+        })
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到 SymbolMeta");
     let buy_price: Decimal = meta

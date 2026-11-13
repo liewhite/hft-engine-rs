@@ -8,61 +8,6 @@ pub struct FundingRate {
     pub symbol: Symbol,
     pub rate: Rate,
     pub next_settle_time: Timestamp,
-    /// 数据时间戳（毫秒），用于计算基于剩余时间的日化费率
+    /// 数据时间戳（毫秒）
     pub timestamp: Timestamp,
-}
-
-impl FundingRate {
-    /// 基于剩余时间的日化费率
-    ///
-    /// 公式：rate * 24 / hours_to_settle
-    ///
-    /// 例如：
-    /// - binance 距离下次资费 5 小时，费率 0.05%，日化 = 0.05% * 24 / 5 = 0.24%
-    /// - hyperliquid 距离下次资费 1 小时，费率 0.02%，日化 = 0.02% * 24 / 1 = 0.48%
-    pub fn daily_rate(&self) -> Rate {
-        if self.timestamp >= self.next_settle_time {
-            // 已过结算时间，返回 0（数据过期）
-            return 0.0;
-        }
-
-        let ms_to_settle = self.next_settle_time - self.timestamp;
-        let hours_to_settle = ms_to_settle as f64 / (1000.0 * 60.0 * 60.0);
-
-        if hours_to_settle <= 0.0 {
-            return 0.0;
-        }
-
-        // 为防止临近结算时日化费率过高，设置最小时间为 1 小时
-        let effective_hours = hours_to_settle.max(1.0);
-        self.rate * (24.0 / effective_hours)
-    }
-
-    /// 基于指定时间基准的日化费率
-    ///
-    /// 用于跨交易所比较时，统一使用最近的结算时间作为基准
-    ///
-    /// # 参数
-    /// - `base_settle_time`: 统一的结算时间基准（通常取所有交易所中最近的）
-    /// - `current_time`: 当前时间
-    pub fn daily_rate_with_base_time(
-        &self,
-        base_settle_time: Timestamp,
-        current_time: Timestamp,
-    ) -> Rate {
-        if current_time >= base_settle_time {
-            return 0.0;
-        }
-
-        let ms_to_settle = base_settle_time - current_time;
-        let hours_to_settle = ms_to_settle as f64 / (1000.0 * 60.0 * 60.0);
-
-        if hours_to_settle <= 0.0 {
-            return 0.0;
-        }
-
-        // 为防止临近结算时日化费率过高，设置最小时间为 1 小时
-        let effective_hours = hours_to_settle.max(1.0);
-        self.rate * (24.0 / effective_hours)
-    }
 }

@@ -8,6 +8,7 @@ use crate::messaging::{AccountData, ExchangeAccountData};
 use crate::tasks::Root;
 use async_trait::async_trait;
 use rust_decimal_macros::dec;
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 type Log = Arc<Mutex<Vec<String>>>;
@@ -30,9 +31,6 @@ impl ExchangeClient for FakeClient {
             min_notional: 0.0,
             contract_size: dec!(1.0),
         }])
-    }
-    async fn fetch_symbol_meta(&self, _: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        Ok(Vec::new())
     }
 }
 
