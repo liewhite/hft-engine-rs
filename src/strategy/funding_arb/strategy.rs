@@ -180,8 +180,8 @@ impl FundingArbStrategy {
         if bbos.is_empty() {
             return Vec::new();
         }
-        // 参考价只用新鲜盘口（暂停所的旧价会把杠杆闸门算偏）；都不新鲜时退回全部盘口 ——
-        // 此时只用于零头判定和补腿，挂单另要求所对两所盘口新鲜，不会用到它
+        // 参考价（币↔金额换算：挂单量、零头判定；杠杆闸门用各所自己的价）只用新鲜盘口；都不新鲜时
+        // 退回全部盘口 —— 此时只用于零头判定和补腿，挂单另要求所对两所盘口新鲜，不会用到它
         let fresh_mids: Vec<f64> =
             bbos.iter().filter(|(ex, _)| self.bbo_fresh(**ex, now)).map(|(_, b)| b.mid_price()).collect();
         let mids: Vec<f64> = if fresh_mids.is_empty() { bbos.values().map(|b| b.mid_price()).collect() } else { fresh_mids };
@@ -349,8 +349,11 @@ impl FundingArbStrategy {
         let qty = notional / px;
         let pos = |ex: Exchange| positions.iter().find(|(e, _)| *e == ex).map_or(0.0, |(_, p)| *p);
         for (ex, delta) in [(pair.sell, -qty), (pair.buy, qty)] {
-            if !self.leverage_allows(view, ex, pos(ex), delta, px) {
-                return Vec::new();
+            // 超限和「定不出量」同一处理：不新挂，已挂的按价格容差留着。持仓卡在上限边上时闸门随盘口
+            // 小跳来回翻，超限就撤会挂了即撤、白耗 HL 操作额度（#769）。已挂的单是在放行时按成交后不超限
+            // 定的量，留着成交只会因之后的价格、净值波动略超一点
+            if !self.leverage_allows(view, ex, pos(ex), delta, bbos[&ex].mid_price()) {
+                return self.pair_quotes(pair, bbos, 0.0, px, false);
             }
         }
         // 不设只减仓：开仓可能顺带削减该所已有的腿（用户允许），并可能越过 0 变成反向仓
@@ -369,6 +372,8 @@ impl FundingArbStrategy {
     }
 
     /// 在该所把持仓从 `pos` 改到 `pos + delta` 后，单币与账户杠杆是否仍在上限内。
+    /// `px` 是该所自己的盘口中间价：杠杆每所各算，用该所的价才和交易所、账本里别的币的口径一致
+    /// （几所均价会把价高的所低估，#769）。
     /// 持仓绝对值不增（削减已有腿）时总是允许 —— 超限只停止开仓，不拦减仓。
     /// 净值或持仓总价值未知时不许加仓。
     ///
@@ -488,8 +493,8 @@ impl FundingArbStrategy {
         }
     }
 
-    /// 撤一张开着的单。下单请求还没结论的也能撤（框架按客户端订单号撤）；撤单在途时不重发，
-    /// 撤单失败（多半是单刚成交、终态马上就到）后隔 `hedge_retry_ms` 再撤。
+    /// 撤一张开着的单。下单请求还没结论的，框架丢弃这次撤单、受理的结论到了本策略重新判断时再撤；
+    /// 撤单在途时不重发，撤单失败（多半是单刚成交、终态马上就到）后隔 `hedge_retry_ms` 再撤。
     fn cancel(&self, p: &PendingOrder, now: Timestamp) -> Option<OutcomeEvent> {
         if !p.is_open() {
             return None;

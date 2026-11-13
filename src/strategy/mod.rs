@@ -27,9 +27,10 @@ pub enum OutcomeEvent {
         /// 信号意图描述，如 "spread_open | spread=0.30% | qty=10"
         comment: String,
     },
-    /// 撤单信号（按客户端订单号撤：下单请求还没有结论、没有交易所订单号的单也能撤）。
+    /// 撤单信号（按客户端订单号撤，不等交易所订单号）。
     ///
-    /// 框架只对还开着、且没有撤单在途的单发出，其余丢弃（见 `SymbolOrders::mark_cancel_sent`）；撤单失败以
+    /// 框架只对下单已受理、还开着、且没有撤单在途的单发出，其余丢弃（见 `SymbolOrders::mark_cancel_sent`），
+    /// 策略要在之后的事件里重新要求；撤单失败以
     /// [`crate::messaging::RequestOutcome::CancelFailed`] 回报，记在单的 `cancel` 上。
     CancelOrder {
         exchange: Exchange,

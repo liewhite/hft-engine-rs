@@ -128,7 +128,16 @@ impl Sim {
 
     /// 第一档量为 `qty` 的盘口
     fn bbo_depth(&mut self, ex: Exchange, qty: f64) -> Vec<OutcomeEvent> {
-        let b = BBO { exchange: ex, symbol: SYM.into(), bid_price: 100.0, bid_qty: qty, ask_price: 100.1, ask_qty: qty, timestamp: 0 };
+        self.bbo_quote(ex, 100.0, 100.1, qty)
+    }
+
+    /// 买一 `bid`、卖一 `ask` 的盘口，每档 100 个
+    fn bbo_px(&mut self, ex: Exchange, bid: f64, ask: f64) -> Vec<OutcomeEvent> {
+        self.bbo_quote(ex, bid, ask, 100.0)
+    }
+
+    fn bbo_quote(&mut self, ex: Exchange, bid: f64, ask: f64, qty: f64) -> Vec<OutcomeEvent> {
+        let b = BBO { exchange: ex, symbol: SYM.into(), bid_price: bid, bid_qty: qty, ask_price: ask, ask_qty: qty, timestamp: 0 };
         let now = self.now;
         self.ev(IncomeEvent::market(now, now, MarketData::BBO(b)))
     }
@@ -426,14 +435,53 @@ fn terminal_before_fill_does_not_requote_on_the_same_exchange() {
     assert!(matches!(h[0].order_type, OrderType::Market));
 }
 
-/// 下单请求还没结论（交易所没确认）的单也能撤（按客户端订单号）
+/// 下单请求还没结论的单先不撤（#769：HL 的撤单会先于下单到达、报「never placed」，单在盘口多挂一个
+/// 重撤间隔），受理的结论一到就撤
 #[test]
-fn unconfirmed_maker_can_be_cancelled() {
+fn unconfirmed_maker_is_cancelled_once_placed() {
     let mut s = Sim::new(0.0, 0.0);
     s.funding(BN, 0.8);
-    assert_eq!(placed(&s.funding(HL, 0.1)).len(), 2);
+    let o = placed(&s.funding(HL, 0.1));
+    assert_eq!(o.len(), 2);
     let out = s.funding(BN, 0.1); // 不再值得开
-    assert_eq!(cancels(&out).len(), 2, "{out:?}");
+    assert!(cancels(&out).is_empty(), "下单还没结论，不发撤单：{out:?}");
+    for x in &o {
+        let out = s.request(x, RequestOutcome::Placed { order_id: format!("oid-{}", x.client_order_id) });
+        assert_eq!(cancels(&out), vec![x.exchange], "{out:?}");
+    }
+}
+
+/// #769：杠杆按该所自己的盘口价算该所持仓价值，不用几所的平均价。
+/// 币安 100、HL 90（均价约 95）；币安空 17.9 再卖 2.1：按 100 算 2000U 以上超 0.2，按均价算放行
+#[test]
+fn leverage_uses_each_exchanges_own_price() {
+    let mut s = Sim::new(-17.9, 17.9);
+    s.bbo_px(HL, 90.0, 90.1);
+    s.funding(BN, 0.8);
+    let out = s.funding(HL, 0.1);
+    assert!(placed(&out).is_empty(), "{out:?}");
+}
+
+/// #769：挂单后盘口小跳让杠杆闸门翻成「超限」时，已挂的单在价格容差内照留，不撤也不新挂。
+/// 此前闸门一翻就撤、再翻回来又挂，几毫秒内挂了又撤（实盘 XMR 卡在单币 0.2 边上）
+#[test]
+fn leverage_gate_flipping_keeps_resting_makers() {
+    // 两所各 17.99，再加 1.998：按 100.05 算 1999.8U（放行），按 100.07 算 2000.2U（超 0.2）
+    let mut s = Sim::new(-17.99, 17.99);
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    assert_eq!(o.len(), 2);
+    for x in &o {
+        s.confirm(x, OrderStatus::Pending);
+    }
+    for ex in [BN, HL] {
+        let out = s.bbo_px(ex, 100.02, 100.12);
+        assert!(cancels(&out).is_empty() && placed(&out).is_empty(), "{out:?}");
+    }
+    // 超限期间挂单没了（撤掉或价格偏出容差），不再新挂
+    let bn = o.iter().find(|x| x.exchange == BN).unwrap();
+    let out = s.confirm(bn, OrderStatus::Cancelled);
+    assert!(placed(&out).is_empty(), "{out:?}");
 }
 
 #[test]

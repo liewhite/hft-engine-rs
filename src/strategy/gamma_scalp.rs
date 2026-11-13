@@ -150,7 +150,8 @@ impl GammaScalpStrategy {
         }
     }
 
-    /// 撤掉对冲单。已结束的单、撤单还在途的单由框架丢弃（见 `OutcomeEvent::CancelOrder`），这里不用记
+    /// 撤掉对冲单。下单还没受理、已结束、撤单还在途的单由框架丢弃（见 `OutcomeEvent::CancelOrder`），这里不用记；
+    /// 被丢弃的撤单在下一次重算（逐笔成交或 greeks 事件）时再发
     fn cancel(&self, pending: &PendingOrder) -> OutcomeEvent {
         tracing::debug!(
             symbol = %self.symbol,

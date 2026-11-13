@@ -434,14 +434,21 @@ impl SymbolOrders {
 
     /// 策略要撤这张单：记下「撤单已发」，返回 `Ok` 表示该发。
     ///
-    /// 不该发的（`Err` 带原因）：不在表里、已到终态（撤不掉，发了白耗一次交易所操作）、上一次撤单还在等
-    /// 结论。
+    /// 不该发的（`Err` 带原因）：不在表里、已到终态（撤不掉，发了白耗一次交易所操作）、下单请求还没结论、
+    /// 上一次撤单还在等结论。
+    ///
+    /// 下单没结论时不撤：下单与撤单是两个独立请求，撤单可能先到交易所、报「单不存在」—— 白耗一次
+    /// 操作（HL 有每日额度），单还要等策略的重撤间隔才撤掉（#769 实盘 HL 多挂了 2 秒）。受理的结论（或交易所
+    /// 回报）一到策略就会被调用、可以再撤，只晚一个往返。
     pub fn mark_cancel_sent(&mut self, client_order_id: &str, now: Timestamp) -> Result<(), &'static str> {
         let Some(p) = self.orders.get_mut(client_order_id) else {
             return Err("不在跟踪表里");
         };
         if !p.is_open() {
             return Err("已到终态");
+        }
+        if p.status == OrderStatus::Created {
+            return Err("下单请求还没结论");
         }
         if matches!(p.cancel, CancelState::Sent { .. }) {
             return Err("上一次撤单还在等结论");
@@ -917,10 +924,13 @@ mod tests {
         assert!(the_order(&state).is_some_and(|p| p.is_open()));
     }
 
-    /// 已到终态的单不发撤单（撤不掉，HL 还白耗一次操作额度）；不在表里的也不发
+    /// 下单没结论、已到终态的单不发撤单（撤不掉，HL 还白耗一次操作额度）；不在表里的也不发
     #[test]
     fn no_cancel_for_finished_or_unknown_orders() {
         let mut state = with_order();
+        assert_eq!(state.mark_cancel_sent(CID, 1), Err("下单请求还没结论"), "撤单会先于下单到交易所");
+        assert_eq!(the_order(&state).unwrap().cancel, CancelState::None, "没记成已撤，受理后还能撤");
+
         apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 1));
         assert_eq!(state.mark_cancel_sent(CID, 2), Err("已到终态"));
         assert_eq!(state.mark_cancel_sent("other", 2), Err("不在跟踪表里"));
