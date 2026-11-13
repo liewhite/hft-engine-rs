@@ -5,16 +5,15 @@
 //! - 处理订阅/退订命令
 //! - 直接解析消息并发布到行情总线
 
-use crate::domain::{now_ms, Exchange, ExchangeError, Symbol};
+use crate::domain::{now_ms, Symbol};
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
 use crate::exchange::hyperliquid::codec::{aggregate_trades, WsActiveAssetCtx, WsBbo, WsTrade};
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
-use crate::exchange::ws_loop::{self, WsConn};
+use crate::exchange::ws_loop::{ReconnectingWs, WsKeepalive};
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
-use futures_util::StreamExt;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -22,7 +21,7 @@ use std::sync::Arc;
 /// 公共 WebSocket 组件
 pub(super) struct HyperliquidPublicWs {
     inbox: Inbox<ExchangeCmd>,
-    conn: WsConn,
+    conn: ReconnectingWs,
     /// 行情总线（发布事件）
     market_bus: MarketBus,
     /// 订阅记账（品种目录、已订阅的 stream / kind、trades 订阅时刻）
@@ -69,6 +68,20 @@ impl SubscriptionBook {
         Ok(json!({"type": channel, "coin": coin}))
     }
 
+    fn subscribe_msg(&self, kind: &SubscriptionKind) -> Result<String, WsError> {
+        Ok(json!({"method": "subscribe", "subscription": self.subscription(kind)?}).to_string())
+    }
+
+    /// 全部订阅报文，每个底层 stream 一条（断线重连后重发）
+    fn all_subscriptions(&self) -> Result<Vec<String>, WsError> {
+        let mut streams = HashSet::new();
+        self.subscribed_kinds
+            .iter()
+            .filter(|kind| self.stream(kind).is_some_and(|s| streams.insert(s)))
+            .map(|kind| self.subscribe_msg(kind))
+            .collect()
+    }
+
     /// 底层 stream 标识（同一 stream 可被多个 kind 共用，用于去重）
     fn stream(&self, kind: &SubscriptionKind) -> Option<String> {
         Some(format!("{}:{}", kind_channel(kind)?, self.markets.coin(kind.symbol())?))
@@ -108,18 +121,10 @@ impl HyperliquidPublicWs {
     ) -> anyhow::Result<Addr<ExchangeCmd>> {
         let (_, addr) = group
             .spawn_addressed("HyperliquidPublicWs", move |scope: Scope, inbox| async move {
-                // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
-                let (ws_stream, _) = tokio_tungstenite::connect_async(WS_URL)
-                    .await
-                    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
-                let (write, read) = ws_stream.split();
-                let conn = WsConn::spawn(
-                    &scope.group("conn"),
-                    "HyperliquidPublicWsLoop",
-                    read,
-                    write,
-                    ws_loop::WsKeepalive::hyperliquid(),
-                )?;
+                // 启动时连不上即启动失败（受控退出）；运行中断线由 run 原地重连（#762）
+                let conn =
+                    ReconnectingWs::connect(scope.group("conn"), "HyperliquidPublicWs", WS_URL, WsKeepalive::hyperliquid())
+                        .await?;
                 tracing::info!("HyperliquidPublicWs started");
                 Ok(Self { inbox, conn, market_bus, book: SubscriptionBook::new(markets) })
             })
@@ -130,13 +135,7 @@ impl HyperliquidPublicWs {
     /// 批量发送订阅消息（发送多条消息，无速率限制）
     async fn send_subscribe_batch(&self, kinds: &[SubscriptionKind]) -> Result<(), WsError> {
         for kind in kinds {
-            let subscription = self.book.subscription(kind)?;
-            let msg = json!({
-                "method": "subscribe",
-                "subscription": subscription
-            })
-            .to_string();
-            self.conn.send(msg).await?;
+            self.conn.send(self.book.subscribe_msg(kind)?).await;
         }
         Ok(())
     }
@@ -149,7 +148,21 @@ impl HyperliquidPublicWs {
             "subscription": subscription
         })
         .to_string();
-        self.conn.send(msg).await
+        self.conn.send(msg).await;
+        Ok(())
+    }
+
+    /// 断线重连：重发全部订阅；trades 订阅时刻一并刷新（重订阅后 HL 又会先推一批历史回填）
+    async fn reconnect(&mut self, scope: &Scope) -> anyhow::Result<bool> {
+        let subscriptions = self.book.all_subscriptions().context("Hyperliquid 重连时生成订阅报文")?;
+        if !self.conn.reconnect(scope, subscriptions).await {
+            return Ok(false);
+        }
+        let now = now_ms();
+        for at in self.book.trades_subscribed_at.values_mut() {
+            *at = now;
+        }
+        Ok(true)
     }
 
     /// 解析并处理消息
@@ -255,14 +268,21 @@ impl HyperliquidPublicWs {
 }
 
 impl Task for HyperliquidPublicWs {
-    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+    async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 cmd = self.inbox.recv() => match cmd {
                     Some(cmd) => self.handle_cmd(cmd).await?,
                     None => return Ok(()),
                 },
-                frame = self.conn.recv() => self.handle_message(&frame?)?,
+                frame = self.conn.recv() => match frame {
+                    Some(raw) => self.handle_message(&raw)?,
+                    None => {
+                        if !self.reconnect(scope).await? {
+                            return Ok(());
+                        }
+                    }
+                },
             }
         }
     }
@@ -509,5 +529,34 @@ mod tests {
         );
         assert!(book.stream(&bbo("AAPL")).is_none());
         assert!(book.subscription(&bbo("AAPL")).is_err());
+    }
+
+    /// 重连重发：共用一个 stream 的多个 kind（资金费率、标记价格都走 activeAssetCtx）只发一条
+    #[tokio::test]
+    async fn resubscription_sends_one_message_per_stream() {
+        let mut book = book_with_subscription(None);
+        for kind in [
+            SubscriptionKind::BBO { symbol: "BTC".into() },
+            SubscriptionKind::FundingRate { symbol: "BTC".into() },
+            SubscriptionKind::MarkPrice { symbol: "BTC".into() },
+            SubscriptionKind::BBO { symbol: "TSLA".into() },
+        ] {
+            book.subscribed_kinds.insert(kind);
+        }
+        let mut coins: Vec<(String, String)> = book
+            .all_subscriptions()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let v: serde_json::Value = serde_json::from_str(m).unwrap();
+                assert_eq!(v["method"], "subscribe");
+                (v["subscription"]["type"].as_str().unwrap().into(), v["subscription"]["coin"].as_str().unwrap().into())
+            })
+            .collect();
+        coins.sort();
+        assert_eq!(
+            coins,
+            [("activeAssetCtx", "BTC"), ("bbo", "BTC"), ("bbo", "xyz:TSLA")].map(|(a, b)| (a.to_string(), b.to_string()))
+        );
     }
 }

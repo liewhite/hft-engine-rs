@@ -1,6 +1,9 @@
 //! 公共 WebSocket 循环模块
 //!
-//! 提供统一的 WebSocket 循环逻辑（[`WsConn`]），各所 WS 组件共用
+//! 提供统一的 WebSocket 循环逻辑，各所 WS 组件共用。断线怎么办由连接的用途决定，用类型分开：
+//! - [`WsConn`]：断线即出错上冒、整机停机（私有流：断线期间可能漏成交，持仓就对不上了）。
+//! - [`ReconnectingWs`]：断线原地重连、重发全部订阅（公共行情流：断档不会漏成交，
+//!   断档期间盘口不新鲜，策略自己不挂单；#762）。
 
 use crate::domain::{Exchange, ExchangeError};
 use crate::exchange::client::WsError;
@@ -18,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 /// - `ping_text`：周期发送的应用层 ping（各所报文不同，由调用方给出；None = 该所由
 ///   服务端主动 ping，客户端回 pong 即可，见循环里的 Ping 分支）
 /// - `idle_timeout`：超过此时长没有收到**任何**入站帧（含 Ping/Pong 控制帧）即判定
-///   断流，按既有 fail-fast 姿态退出（错误上冒 -> 整机受控停机，交外部重启），不重连。
+///   断流，按断线处理（[`WsConn`] 上冒停机，[`ReconnectingWs`] 重连）。
 ///   必须大于该所服务端/我方的 ping 周期，否则安静的私有流会被误杀。
 #[derive(Debug, Clone)]
 pub struct WsKeepalive {
@@ -79,6 +82,7 @@ const INCOMING_BUFFER: usize = 100;
 ///
 /// 循环出错（断线、空闲超时、写失败）时子任务以 `Err` 退出、按任务树规则上冒，整支停下
 /// （fail-fast，不重连，交外部重启）；组件这边随后从 [`Self::recv`] 拿到"连接已断"的错误。
+/// 断线要重连的公共流用 [`ReconnectingWs`]。
 /// 组件停机时，它的 `run` 先返回、之后框架才停这个子任务，所以收尾期间连接仍在。
 ///
 /// 取帧有两种写法：
@@ -105,20 +109,42 @@ impl WsConn {
         write: impl SinkExt<WsMessage> + Unpin + Send + 'static,
         keepalive: WsKeepalive,
     ) -> Result<Self, GroupClosed> {
+        Self::spawn_loop(group, name, read, write, keepalive, OnLoss::Escalate)
+    }
+
+    fn spawn_loop(
+        group: &Group,
+        name: impl Into<String>,
+        read: impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin
+            + Send
+            + 'static,
+        write: impl SinkExt<WsMessage> + Unpin + Send + 'static,
+        keepalive: WsKeepalive,
+        on_loss: OnLoss,
+    ) -> Result<Self, GroupClosed> {
+        let name = name.into();
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
         let (incoming_tx, incoming_rx) = mpsc::channel::<String>(INCOMING_BUFFER);
-        group.spawn_fn(name, move |scope| async move {
+        group.spawn_fn(name.clone(), move |scope| async move {
             tokio::select! {
                 _ = scope.stopping() => Ok(()),
-                r = run_ws_loop(read, write, outgoing_rx, incoming_tx, keepalive) => {
-                    if r.is_ok() {
+                r = run_ws_loop(read, write, outgoing_rx, incoming_tx, keepalive) => match (r, on_loss) {
+                    (Err(e), OnLoss::Escalate) => Err(e),
+                    (Err(e), OnLoss::Report) => {
+                        // 不上冒：本循环收工（收发端随之关闭），组件从 recv 得知断线后自己重连
+                        tracing::warn!(conn = %name, error = %format!("{e:#}"), "WS 断线，交组件重连");
+                        scope.request_stop();
+                        Ok(())
+                    }
+                    (Ok(()), _) => {
                         // 组件丢掉了收发端：它已退出（正常停机，或构造/运行出错）。它自己的结果由
                         // 它自己上报，这里按主动收工退出 —— 否则框架把"未经停止请求就自行结束"
                         // 记成错误，可能抢在组件的真正根因（如构造失败）之前报到父节点。
                         scope.request_stop();
+                        Ok(())
                     }
-                    r
-                }
+                },
             }
         })?;
         Ok(Self { outgoing: outgoing_tx, incoming: incoming_rx, replay: Default::default() })
@@ -208,6 +234,123 @@ impl WsConn {
 
 /// 私有订阅确认的等待上限：超时未集齐即启动失败（受控退出，不重试）
 pub const SUBSCRIPTION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 读循环出错（断线）时怎么办
+#[derive(Clone, Copy)]
+enum OnLoss {
+    /// 错误上冒、整机停机（[`WsConn`]）
+    Escalate,
+    /// 记日志、读循环收工，交组件重连（[`ReconnectingWs`]）
+    Report,
+}
+
+/// 一次建连（握手）的上限：网络半死时握手可能一直挂着
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 重连失败后的等待：从 1 秒起翻倍，封顶 30 秒，一直重试到连上或停机
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// 断线可原地重连的连接，只给公共行情流用（私有流用 [`WsConn`]：断线就可能漏成交）。
+///
+/// 订阅归组件管，连接不记：断线后组件调 [`Self::reconnect`] 并交出**全部**订阅报文，
+/// 连上后按序重发。组件的用法：
+///
+/// ```ignore
+/// frame = self.conn.recv() => match frame {
+///     Some(raw) => self.handle_message(&raw)?,
+///     None => if !self.conn.reconnect(scope, self.all_subscriptions()).await { return Ok(()) },
+/// }
+/// ```
+///
+/// 断线期间组件照常处理订阅命令：[`Self::send`] 发不出去就丢掉，组件照常记账，重连时随
+/// 全部订阅一起重发 —— 所以组件记账不能以"发送成功"为条件。
+pub struct ReconnectingWs {
+    group: Group,
+    name: String,
+    url: String,
+    keepalive: WsKeepalive,
+    conn: WsConn,
+}
+
+impl ReconnectingWs {
+    /// 启动时建连，读循环挂在 `group` 下（组件构造时调用，分组只能在构造阶段声明）。
+    /// 启动时连不上即启动失败（不重试）。
+    pub async fn connect(
+        group: Group,
+        name: impl Into<String>,
+        url: impl Into<String>,
+        keepalive: WsKeepalive,
+    ) -> anyhow::Result<Self> {
+        let (name, url) = (name.into(), url.into());
+        let conn = Self::open(&group, &name, &url, &keepalive)
+            .await
+            .map_err(|e| anyhow::anyhow!("{name} 连接 {url} 失败: {e}"))?;
+        Ok(Self { group, name, url, keepalive, conn })
+    }
+
+    async fn open(group: &Group, name: &str, url: &str, keepalive: &WsKeepalive) -> Result<WsConn, WsError> {
+        let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
+            .await
+            .map_err(|_| WsError::ConnectionFailed(format!("握手超过 {}s", CONNECT_TIMEOUT.as_secs())))?
+            .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
+        let (write, read) = ws.split();
+        WsConn::spawn_loop(group, format!("{name}Loop"), read, write, keepalive.clone(), OnLoss::Report)
+            .map_err(|e| WsError::ConnectionFailed(e.to_string()))
+    }
+
+    /// 发一帧文本（订阅/退订）。连接已断时丢掉：重连时组件会重发全部订阅。
+    pub async fn send(&self, text: String) {
+        if self.conn.send(text).await.is_err() {
+            tracing::debug!(conn = %self.name, "连接已断，报文丢弃（重连时按全部订阅重发）");
+        }
+    }
+
+    /// 下一帧入站文本；`None` = 连接已断，该调 [`Self::reconnect`] 了。可安全地放在 `select!` 里。
+    pub async fn recv(&mut self) -> Option<String> {
+        self.conn.recv().await.ok()
+    }
+
+    /// 断线后重连：退避重试直到连上，连上后按序发出 `subscriptions`（组件的全部订阅报文）。
+    /// 返回 `true` = 已连上；`false` = 重连途中 `scope`（组件自己的）被要求停止，组件该收工了。
+    /// 不设放弃期限：断档多久都只是盘口不新鲜（策略自己不挂单），放弃重启也一样要等网络恢复。
+    ///
+    /// 重发的订阅若又被服务端拒绝，照常由组件的报文解析当致命错误处理。
+    pub async fn reconnect(&mut self, scope: &Scope, subscriptions: Vec<String>) -> bool {
+        let lost_at = tokio::time::Instant::now();
+        let mut backoff = RECONNECT_BACKOFF_MIN;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let opened = tokio::select! {
+                _ = scope.stopping() => return false,
+                r = Self::open(&self.group, &self.name, &self.url, &self.keepalive) => r,
+            };
+            match opened {
+                Ok(conn) => {
+                    self.conn = conn;
+                    let count = subscriptions.len();
+                    for text in subscriptions {
+                        self.send(text).await;
+                    }
+                    tracing::info!(
+                        conn = %self.name,
+                        attempt,
+                        down_secs = lost_at.elapsed().as_secs_f64(),
+                        resubscribed = count,
+                        "WS 已重连并重发订阅"
+                    );
+                    return true;
+                }
+                Err(e) => tracing::warn!(conn = %self.name, attempt, error = %e, retry_in = ?backoff, "WS 重连失败"),
+            }
+            tokio::select! {
+                _ = scope.stopping() => return false,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+        }
+    }
+}
 
 /// 读循环：转发出站帧、把入站文本帧交给组件、心跳与空闲判定。
 ///
@@ -496,6 +639,110 @@ mod keepalive_tests {
         root.shutdown().await.unwrap();
         assert_eq!(got_rx.await.unwrap(), ["b", "c"]);
         drop(tx);
+    }
+
+    /// 本机 WS 服务端，只接 `max_conns` 条连接（之后关掉监听，再连就被拒）。每接一条，把
+    /// （收到的文本帧的接收端，往客户端发帧的发送端）交出来；发送端被丢掉就关闭该连接
+    async fn local_ws_server(
+        max_conns: usize,
+    ) -> (String, mpsc::Receiver<(mpsc::Receiver<String>, mpsc::Sender<String>)>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (conns_tx, conns_rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            for _ in 0..max_conns {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let (mut write, mut read) = ws.split();
+                let (got_tx, got_rx) = mpsc::channel(16);
+                let (push_tx, mut push_rx) = mpsc::channel::<String>(16);
+                if conns_tx.send((got_rx, push_tx)).await.is_err() {
+                    return;
+                }
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            m = read.next() => match m {
+                                Some(Ok(WsMessage::Text(t))) => { let _ = got_tx.send(t).await; }
+                                Some(Ok(_)) => {}
+                                _ => return,
+                            },
+                            p = push_rx.recv() => match p {
+                                Some(t) => { let _ = write.send(WsMessage::Text(t)).await; }
+                                None => { let _ = write.send(WsMessage::Close(None)).await; return; }
+                            },
+                        }
+                    }
+                });
+            }
+        });
+        (url, conns_rx)
+    }
+
+    /// 公共流断线：不上冒、整机不停；重连到新连接并按序重发全部订阅，之后照常收帧
+    #[tokio::test]
+    async fn reconnecting_ws_resubscribes_on_a_new_connection_without_stopping() {
+        let root = crate::tasks::Root::new("t");
+        let (url, mut conns) = local_ws_server(2).await;
+        let conn_group = root.group("conn");
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            // 第一条连接：收到订阅后服务端关掉
+            let (mut got, push) = conns.recv().await.unwrap();
+            assert_eq!(got.recv().await.unwrap(), "sub-a");
+            drop(push);
+            // 第二条连接：应收到全部订阅，然后推一帧
+            let (mut got, push) = conns.recv().await.unwrap();
+            assert_eq!(got.recv().await.unwrap(), "sub-a");
+            assert_eq!(got.recv().await.unwrap(), "sub-b");
+            push.send("hello".into()).await.unwrap();
+            done_rx.await.unwrap();
+        });
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        root.group("c")
+            .spawn_fn("c", move |scope| async move {
+                let mut ws = ReconnectingWs::connect(conn_group, "pub", url, keepalive(None, 60, 3600)).await?;
+                ws.send("sub-a".into()).await;
+                assert_eq!(ws.recv().await, None, "服务端关连接后 recv 应报断线");
+                assert!(!scope.is_stopping() && !scope.machine_stop_flag().is_stopping(), "断线不应触发停机");
+                assert!(ws.reconnect(&scope, vec!["sub-a".into(), "sub-b".into()]).await);
+                result_tx.send(ws.recv().await).unwrap();
+                scope.stopping().await;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(result_rx.await.unwrap().as_deref(), Some("hello"));
+        assert!(!root.is_stopping());
+        done_tx.send(()).unwrap();
+        server.await.unwrap();
+        root.shutdown().await.unwrap();
+    }
+
+    /// 重连途中停机：reconnect 返回 false，组件正常收工，不报错
+    #[tokio::test]
+    async fn reconnect_gives_way_to_shutdown() {
+        let root = crate::tasks::Root::new("t");
+        let (url, mut conns) = local_ws_server(1).await;
+        let conn_group = root.group("conn");
+        let (lost_tx, lost_rx) = tokio::sync::oneshot::channel();
+        root.group("c")
+            .spawn_fn("c", move |scope| async move {
+                let mut ws = ReconnectingWs::connect(conn_group, "pub", url, keepalive(None, 60, 3600)).await?;
+                assert_eq!(ws.recv().await, None);
+                lost_tx.send(()).unwrap();
+                assert!(!ws.reconnect(&scope, vec!["sub".into()]).await, "停机时 reconnect 应让路");
+                Ok(())
+            })
+            .unwrap();
+        // 关掉唯一的连接；服务端已不再监听，重连一直被拒、在退避里等
+        let (_got, push) = conns.recv().await.unwrap();
+        drop(push);
+        lost_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::timeout(Duration::from_secs(5), root.shutdown())
+            .await
+            .expect("停机不应被重连拖住")
+            .unwrap();
     }
 
     /// 组件构造失败（已起读循环、随即丢掉连接）：根上报的是构造错误，而不是读循环的

@@ -5,15 +5,14 @@
 //! - 处理订阅/退订命令
 //! - 直接解析消息并发布到行情总线
 
-use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Symbol, SymbolMeta};
 use crate::exchange::binance::codec::{AggTrade, BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
-use crate::exchange::ws_loop::{self, WsConn};
+use crate::exchange::ws_loop::{ReconnectingWs, WsKeepalive};
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
-use futures_util::StreamExt;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,7 +20,7 @@ use std::sync::Arc;
 /// 公开 WebSocket 组件
 pub(crate) struct BinancePublicWs {
     inbox: Inbox<ExchangeCmd>,
-    conn: WsConn,
+    conn: ReconnectingWs,
     market_bus: MarketBus,
     /// Symbol 元数据（用于过滤不存在的 symbol）
     symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
@@ -46,12 +45,8 @@ impl BinancePublicWs {
     ) -> anyhow::Result<Addr<ExchangeCmd>> {
         let (_, addr) = group
             .spawn_addressed(name, move |scope: Scope, inbox| async move {
-                // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
-                let (ws_stream, _) = tokio_tungstenite::connect_async(url)
-                    .await
-                    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
-                let (write, read) = ws_stream.split();
-                let conn = WsConn::spawn(&scope.group("conn"), format!("{name}Loop"), read, write, ws_loop::WsKeepalive::binance())?;
+                // 启动时连不上即启动失败（受控退出）；运行中断线由 run 原地重连（#762）
+                let conn = ReconnectingWs::connect(scope.group("conn"), name, url, WsKeepalive::binance()).await?;
                 tracing::info!(url, "{name} started");
                 Ok(Self {
                     inbox,
@@ -67,18 +62,22 @@ impl BinancePublicWs {
         Ok(addr)
     }
 
-    /// 批量发送订阅消息（一条 WebSocket 消息包含多个 streams）
-    async fn send_subscribe_batch(&self, streams: Vec<String>) -> Result<(), WsError> {
-        if streams.is_empty() {
-            return Ok(());
-        }
-        let msg = json!({
+    /// 订阅报文（一条 WebSocket 消息包含多个 streams）
+    fn subscribe_msg(streams: impl IntoIterator<Item = String>) -> String {
+        json!({
             "method": "SUBSCRIBE",
-            "params": streams,
+            "params": streams.into_iter().collect::<Vec<_>>(),
             "id": 1
         })
-        .to_string();
-        self.conn.send(msg).await
+        .to_string()
+    }
+
+    /// 断线重连后要重发的全部订阅
+    fn all_subscriptions(&self) -> Vec<String> {
+        if self.subscribed_streams.is_empty() {
+            return Vec::new();
+        }
+        vec![Self::subscribe_msg(self.subscribed_streams.iter().cloned())]
     }
 
     /// 发送取消订阅消息
@@ -94,7 +93,8 @@ impl BinancePublicWs {
             "id": 2
         })
         .to_string();
-        self.conn.send(msg).await
+        self.conn.send(msg).await;
+        Ok(())
     }
 
     /// 解析并处理消息
@@ -163,9 +163,7 @@ impl BinancePublicWs {
                 "Batch subscribing to streams"
             );
 
-            self.send_subscribe_batch(unique_streams.clone())
-                .await
-                .context("Binance 批量订阅发送失败")?;
+            self.conn.send(Self::subscribe_msg(unique_streams.iter().cloned())).await;
 
             for stream in unique_streams {
                 self.subscribed_streams.insert(stream);
@@ -208,14 +206,21 @@ impl BinancePublicWs {
 }
 
 impl Task for BinancePublicWs {
-    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+    async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 cmd = self.inbox.recv() => match cmd {
                     Some(cmd) => self.handle_cmd(cmd).await?,
                     None => return Ok(()),
                 },
-                frame = self.conn.recv() => self.handle_message(&frame?)?,
+                frame = self.conn.recv() => match frame {
+                    Some(raw) => self.handle_message(&raw)?,
+                    None => {
+                        if !self.conn.reconnect(scope, self.all_subscriptions()).await {
+                            return Ok(());
+                        }
+                    }
+                },
             }
         }
     }

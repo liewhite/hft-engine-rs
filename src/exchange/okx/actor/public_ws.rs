@@ -5,17 +5,16 @@
 //! - 处理订阅/退订命令
 //! - 直接解析消息并发布到行情总线
 
-use crate::domain::{now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Symbol, SymbolMeta};
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
 use crate::exchange::okx::codec::{
     resolve_meta, BboData, FundingRateData, IndexTickerData, MarkPriceData, TradeData, WsPush,
 };
 use crate::exchange::okx::{to_okx, to_okx_index, WS_PUBLIC_URL};
-use crate::exchange::ws_loop::{self, WsConn};
+use crate::exchange::ws_loop::{ReconnectingWs, WsKeepalive};
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
-use futures_util::StreamExt;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -23,7 +22,7 @@ use std::sync::Arc;
 /// 公开 WebSocket 组件
 pub(super) struct OkxPublicWs {
     inbox: Inbox<ExchangeCmd>,
-    conn: WsConn,
+    conn: ReconnectingWs,
     /// 行情总线（发布事件）
     market_bus: MarketBus,
     /// Symbol 元数据（用于过滤不存在的 symbol）
@@ -44,12 +43,8 @@ impl OkxPublicWs {
     ) -> anyhow::Result<Addr<ExchangeCmd>> {
         let (_, addr) = group
             .spawn_addressed("OkxPublicWs", move |scope: Scope, inbox| async move {
-                // 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
-                let (ws_stream, _) = tokio_tungstenite::connect_async(WS_PUBLIC_URL)
-                    .await
-                    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
-                let (write, read) = ws_stream.split();
-                let conn = WsConn::spawn(&scope.group("conn"), "OkxPublicWsLoop", read, write, ws_loop::WsKeepalive::okx())?;
+                // 启动时连不上即启动失败（受控退出）；运行中断线由 run 原地重连（#762）
+                let conn = ReconnectingWs::connect(scope.group("conn"), "OkxPublicWs", WS_PUBLIC_URL, WsKeepalive::okx()).await?;
                 tracing::info!("OkxPublicWs started");
                 Ok(Self {
                     inbox,
@@ -64,17 +59,23 @@ impl OkxPublicWs {
         Ok(addr)
     }
 
-    /// 批量发送订阅消息（一条 WebSocket 消息包含多个 args）
-    async fn send_subscribe_batch(&self, args: Vec<serde_json::Value>) -> Result<(), WsError> {
-        if args.is_empty() {
-            return Ok(());
-        }
-        let msg = json!({
+    /// 订阅报文（一条 WebSocket 消息包含多个 args）
+    fn subscribe_msg(args: Vec<serde_json::Value>) -> String {
+        json!({
             "op": "subscribe",
             "args": args
         })
-        .to_string();
-        self.conn.send(msg).await
+        .to_string()
+    }
+
+    /// 断线重连后要重发的全部订阅
+    fn all_subscriptions(&self) -> Vec<String> {
+        // subscribed 里只有订阅时 kind_to_arg 成功的 kind，这里不会过滤掉什么
+        let args: Vec<_> = self.subscribed.iter().filter_map(|k| kind_to_arg(k, &self.quote)).collect();
+        if args.is_empty() {
+            return Vec::new();
+        }
+        vec![Self::subscribe_msg(args)]
     }
 
     /// 发送取消订阅消息
@@ -87,7 +88,8 @@ impl OkxPublicWs {
             "args": [arg]
         })
         .to_string();
-        self.conn.send(msg).await
+        self.conn.send(msg).await;
+        Ok(())
     }
 
     /// 解析并处理消息
@@ -146,9 +148,7 @@ impl OkxPublicWs {
                 count = new_args.len(),
                 "Batch subscribing to channels"
             );
-            self.send_subscribe_batch(new_args)
-                .await
-                .context("OKX 批量订阅发送失败")?;
+            self.conn.send(Self::subscribe_msg(new_args)).await;
         }
 
         // 3. 记录已订阅的 kinds
@@ -170,14 +170,21 @@ impl OkxPublicWs {
 }
 
 impl Task for OkxPublicWs {
-    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
+    async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 cmd = self.inbox.recv() => match cmd {
                     Some(cmd) => self.handle_cmd(cmd).await?,
                     None => return Ok(()),
                 },
-                frame = self.conn.recv() => self.handle_message(&frame?)?,
+                frame = self.conn.recv() => match frame {
+                    Some(raw) => self.handle_message(&raw)?,
+                    None => {
+                        if !self.conn.reconnect(scope, self.all_subscriptions()).await {
+                            return Ok(());
+                        }
+                    }
+                },
             }
         }
     }

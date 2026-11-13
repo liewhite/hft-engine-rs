@@ -267,8 +267,10 @@ impl Task for Foo {
 }
 ```
 
-各所 WS 连接统一用 `exchange::ws_loop::WsConn`：`WsConn::spawn(&scope.group("conn"), ..)` 把读循环挂成子任务
-（断线/空闲超时 = 子任务 Err 上冒）；私有 WS 构造时 `await_subscriptions` 等订阅确认；取帧用
+各所私有 WS 连接统一用 `exchange::ws_loop::WsConn`：`WsConn::spawn(&scope.group("conn"), ..)` 把读循环挂成子任务
+（断线/空闲超时 = 子任务 Err 上冒，断线期间可能漏成交，所以不重连）。BN/HL/OKX 的公共行情 WS 用
+`ws_loop::ReconnectingWs`（#762）：断线不上冒，`recv()` 返回 `None` 后组件调 `reconnect(scope, 全部订阅报文)`
+原地退避重连并重发订阅（断档期间盘口不新鲜，策略自己不挂单）；OKX K 线（business）与 IBKR 公共流仍用 `WsConn`。私有 WS 构造时 `await_subscriptions` 等订阅确认；取帧用
 `conn.next(scope)`（停机时把已缓冲的回报交完再返回 `None`，没有收件箱的私有 WS 整个 `run` 就是
 `while let Some(raw) = conn.next(scope).await? {..}`），停机信号另有来源的 `select!` 分支里用 `conn.recv()`。
 
