@@ -39,14 +39,11 @@ impl LazyConn {
         Self { name, state: State::Idle(Box::new(move || Box::pin(spawn()))) }
     }
 
-    /// 把订阅命令交给这条连接，第一次有订阅时先建连。没连过的连接上的退订直接忽略（没有可退的）。
+    /// 把订阅命令交给这条连接，第一条命令到时先建连。
     pub(crate) async fn send(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
-        if matches!(cmd, ExchangeCmd::Unsubscribe(_)) && matches!(self.state, State::Idle(_)) {
-            return Ok(());
-        }
         if let State::Idle(_) = self.state {
             let State::Idle(spawn) = std::mem::replace(&mut self.state, State::Failed) else { unreachable!() };
-            tracing::info!(conn = self.name, "第一次有订阅路由到这条连接，开始连接");
+            tracing::info!(conn = self.name, "第一条订阅命令路由到这条连接，开始连接");
             let addr = spawn().await.with_context(|| format!("{} 建连失败", self.name))?;
             self.state = State::Up(addr);
         }
@@ -86,7 +83,7 @@ mod tests {
         SubscriptionKind::BBO { symbol: "BTC".to_string() }
     }
 
-    /// 没有订阅就不建连；第一条订阅才建，之后复用同一条；没连过时的退订不建连
+    /// 没有订阅就不建连；第一条订阅才建，之后复用同一条
     #[tokio::test]
     async fn connects_on_first_subscription_only() {
         let root = Root::new("t");
@@ -98,8 +95,6 @@ mod tests {
             let (_, addr) = group.spawn_addressed("Sink", |_s: Scope, inbox| async move { Ok(Sink(inbox)) }).await?;
             Ok(addr)
         });
-        conn.send(ExchangeCmd::Unsubscribe(bbo())).await.unwrap();
-        assert_eq!(spawned.load(Ordering::SeqCst), 0, "退订不该建连");
         assert!(!conn.is_up());
         conn.send(ExchangeCmd::Subscribe(bbo())).await.unwrap();
         conn.send(ExchangeCmd::Unsubscribe(bbo())).await.unwrap();

@@ -519,10 +519,10 @@ impl MetricsView {
         tracing::info!(target: "metrics", funding_fee_24h = format!("{:.4}", funding_total), "metrics.funding");
 
         // ---------- 执行管线 ----------
-        // 下单 / 撤单请求累计次数（本进程启动以来；Grafana 用 increase 看 24h 用量，进程重启计数归零它能识别）
+        // 下单 / 撤单请求累计次数（本进程启动以来，只增不减；Grafana 用 increase 看 24h 用量，进程重启归零它能识别）
         for (exchange, kind, n) in self.order_requests.snapshot() {
             prom.gauge(
-                "hft_order_requests_total",
+                "hft_order_requests",
                 &[("exchange", &exchange.to_string()), ("kind", kind.label())],
                 n as f64,
             );
@@ -978,8 +978,8 @@ mod tests {
         metrics.record_event_lag(AccountId::Live, 900);
         metrics.record_event_lag(AccountId::Live, 10);
         let body = metrics.report().into_body();
-        assert_eq!(line_value(&body, "hft_order_requests_total{exchange=\"Hyperliquid\",kind=\"place\"}"), Some(3.0), "{body}");
-        assert_eq!(line_value(&body, "hft_order_requests_total{exchange=\"Hyperliquid\",kind=\"cancel\"}"), Some(2.0), "{body}");
+        assert_eq!(line_value(&body, "hft_order_requests{exchange=\"Hyperliquid\",kind=\"place\"}"), Some(3.0), "{body}");
+        assert_eq!(line_value(&body, "hft_order_requests{exchange=\"Hyperliquid\",kind=\"cancel\"}"), Some(2.0), "{body}");
         assert_eq!(line_value(&body, "hft_event_lag_max_ms{account=\"live\"}"), Some(900.0), "{body}");
         let next = metrics.report().into_body();
         assert!(!next.contains("hft_event_lag_max_ms"), "报过的周期应清零: {next}");

@@ -77,7 +77,7 @@ impl HyperliquidNode {
                         HyperliquidPublicWs::spawn(&group, market_bus, markets).await
                     })
                 };
-                tracing::info!(exchange = "Hyperliquid", has_private_ws, dexes = ?markets.dexes(), "WS ready");
+                tracing::info!(exchange = "Hyperliquid", has_private_ws, dexes = ?markets.dexes(), "私有 WS ready");
 
                 // 2. 账户轮询（净值、资费结算）：与私有 WS 一样按凭证门控
                 if has_private_ws {

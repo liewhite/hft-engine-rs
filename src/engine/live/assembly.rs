@@ -229,7 +229,7 @@ pub async fn setup_ibkr(
 /// 配置里的 `exchanges` 段：配了哪所就接哪所，不认识的键报错。各 bin 共用这一份，交给
 /// [`setup_all`] 装配。IBKR 的接入形状不同（网关凭证 + 快照配置）、目前没有 bin 用，仍用
 /// [`setup_ibkr`] 单独装配。
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExchangesConfig {
     #[serde(default)]
@@ -238,17 +238,6 @@ pub struct ExchangesConfig {
     pub hyperliquid: Option<HyperliquidAccess>,
     #[serde(default)]
     pub okx: Option<ExchangeAccess<OkxCredentials>>,
-}
-
-impl ExchangesConfig {
-    /// 配了几所
-    pub fn len(&self) -> usize {
-        [self.binance.is_some(), self.hyperliquid.is_some(), self.okx.is_some()].into_iter().filter(|&b| b).count()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 /// 按配置装配全部所（加一所：[`ExchangesConfig`] 加一个字段、这里加一段）

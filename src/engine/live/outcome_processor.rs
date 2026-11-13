@@ -22,12 +22,8 @@ use super::{outlet_for, to_live_outlet, AccountOutcome, OutcomeBus, Outlet};
 // OrderGateway —— 唯一的实盘下单出口
 // ============================================================================
 
-/// 实盘出向执行器：系统里**唯一**知道"怎么把订单发到交易所"的组件。
-///
-/// 由 [`OutcomeProcessor`] 独占：策略信号各起一个子任务执行，不阻塞事件流。系统里不存在第二个下单
-/// 出口，in_flight 假警报防护、失败合成回报、dry_run 语义对一切下单一致。
 /// 实盘网关发往各所的下单 / 撤单 REST 请求累计次数（本进程启动以来）。网关是唯一写入方，
-/// 指标出口只读（推成 `hft_order_requests_total`，看 HL 每日 5 万次用户操作额度用了多少）。
+/// 指标出口只读（推成 `hft_order_requests`，看 HL 每日 5 万次用户操作额度用了多少）。
 #[derive(Debug, Default)]
 pub struct OrderRequestCounts(std::sync::Mutex<HashMap<(Exchange, RequestKind), u64>>);
 
@@ -68,6 +64,10 @@ impl OrderRequestCounts {
     }
 }
 
+/// 实盘出向执行器：系统里**唯一**知道"怎么把订单发到交易所"的组件。
+///
+/// 由 [`OutcomeProcessor`] 独占：策略信号各起一个子任务执行，不阻塞事件流。系统里不存在第二个下单
+/// 出口，in_flight 假警报防护、失败合成回报、dry_run 语义对一切下单一致。
 pub struct OrderGateway {
     /// 各所的账户私有能力。键集 = 配了凭证的所 —— 不在表里就是"该所只接公共行情"，
     /// 下单请求会被拒绝并合成失败回报，而不是静默丢弃。

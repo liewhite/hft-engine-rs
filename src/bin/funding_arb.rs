@@ -65,7 +65,7 @@ async fn run() -> anyhow::Result<()> {
 
     let setups = setup_all(&config.exchanges).await?;
     anyhow::ensure!(setups.len() >= 2, "exchanges 至少要配两所，当前 {}", setups.len());
-    tracing::info!(exchanges = config.exchanges.len(), pairs = config.strategy.pairs.len(), "funding_arb starting");
+    tracing::info!(exchanges = setups.len(), pairs = config.strategy.pairs.len(), "funding_arb starting");
 
     let args = ManagerArgs {
         exchanges: setups,
@@ -75,23 +75,17 @@ async fn run() -> anyhow::Result<()> {
     // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
     run_engine(args, |manager| async move {
         // 每个币在哪几所做：该币在各所品种目录里出现的所（按配置的所顺序），不足两所拒绝启动
-        let metas = manager.all_symbol_metas();
         let exchanges = manager.exchanges();
         // 各所的公共资金费来源：用引擎装配时建好的 client，不另建
         let funding_sources: Vec<Arc<dyn SettledFundingSource>> = exchanges
             .iter()
             .map(|&ex| manager.settled_funding(ex).ok_or_else(|| anyhow::anyhow!("{ex} 不提供已结算资金费")))
             .collect::<anyhow::Result<_>>()?;
-        let listed: HashMap<(Exchange, Symbol), SymbolMeta> = metas
-            .into_iter()
-            .flat_map(|(ex, ms)| ms.into_iter().map(move |m| ((ex, m.symbol.clone()), m)))
-            .collect();
         let mut specs = Vec::new();
         let mut coverage: Vec<(Symbol, Vec<Exchange>)> = Vec::new();
         let mut lonely: Vec<String> = Vec::new();
         for p in config.strategy.params() {
-            let on: Vec<SymbolMeta> =
-                exchanges.iter().filter_map(|&ex| listed.get(&(ex, p.symbol.clone())).cloned()).collect();
+            let on: Vec<SymbolMeta> = exchanges.iter().filter_map(|&ex| manager.symbol_meta(ex, &p.symbol)).collect();
             let on_ex: Vec<Exchange> = on.iter().map(|m| m.exchange).collect();
             tracing::info!(symbol = %p.symbol, exchanges = ?on_ex, "币种覆盖");
             if on.len() < 2 {
@@ -125,11 +119,12 @@ async fn run() -> anyhow::Result<()> {
         let beat = gap.min(WARMUP_GAP);
         tracing::info!(requests = requests.len(), gap_ms = gap.as_millis() as u64, "资金费轮询器启动");
         let poller = FundingPoller {
+            warmup_left: requests.len(),
+            // 第一轮之后每隔几拍拉一项：按拍数算，不拿墙钟比（节拍与记时差零点几毫秒就会多等一拍）
+            every_beats: gap.as_millis().div_ceil(beat.as_millis().max(1)).max(1) as u32,
+            beats_since_fetch: 0,
             requests,
             next: 0,
-            warm: false,
-            gap,
-            last_fetch: None,
             failures: HashMap::new(),
             manager: manager.clone(),
         };
@@ -154,28 +149,32 @@ struct FundingPoller {
     /// 每个 (币, 该币上市的所) 一项，轮流拉
     requests: Vec<(Symbol, Arc<dyn SettledFundingSource>)>,
     next: usize,
-    /// 第一轮已拉完（之后按 `gap` 拉）
-    warm: bool,
-    /// 第一轮之后的单项间隔
-    gap: Duration,
-    last_fetch: Option<std::time::Instant>,
+    /// 第一轮还剩几项没拉（每拍拉一项）
+    warmup_left: usize,
+    /// 第一轮之后每隔几拍拉一项
+    every_beats: u32,
+    beats_since_fetch: u32,
     failures: HashMap<(Symbol, Exchange), u32>,
     manager: ManagerHandle,
 }
 
 impl Periodic for FundingPoller {
     async fn tick(&mut self) -> anyhow::Result<()> {
-        // 节拍按第一轮的快间隔走；第一轮之后没到 gap 的拍跳过
-        if self.warm && self.last_fetch.is_some_and(|t| t.elapsed() < self.gap) {
-            return Ok(());
+        // 节拍按第一轮的快间隔走：第一轮每拍拉一项，之后每 every_beats 拍拉一项
+        if self.warmup_left > 0 {
+            self.warmup_left -= 1;
+            if self.warmup_left == 0 {
+                tracing::info!("资金费第一轮已拉完，之后按常规间隔轮询");
+            }
+        } else {
+            self.beats_since_fetch += 1;
+            if self.beats_since_fetch < self.every_beats {
+                return Ok(());
+            }
+            self.beats_since_fetch = 0;
         }
         let Some((symbol, source)) = self.requests.get(self.next).cloned() else { return Ok(()) };
-        self.last_fetch = Some(std::time::Instant::now());
         self.next = (self.next + 1) % self.requests.len();
-        if self.next == 0 && !self.warm {
-            self.warm = true;
-            tracing::info!("资金费第一轮已拉完，之后按常规间隔轮询");
-        }
         let ex = source.exchange();
         let start = now_ms().saturating_sub(FUNDING_WINDOW_MS);
         match source.fetch_settled_funding(&symbol, start).await {
