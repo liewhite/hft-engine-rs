@@ -245,7 +245,7 @@ enum OnLoss {
 }
 
 /// 一次建连（握手）的上限：网络半死时握手可能一直挂着
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 建 WS 连接，限时 [`CONNECT_TIMEOUT`]（见 [`crate::net::ws_connect`]）。公共流重连和三所私有流启动共用。
 pub(crate) async fn connect(url: &str) -> Result<crate::net::WsStream, WsError> {

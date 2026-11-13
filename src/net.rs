@@ -4,7 +4,8 @@
 //! `reqwest::Client::builder()`，超时一处处补（#713 ListenKey、#764 私有流建连、空闲连接），
 //! 漏一处就是一次事故。现在建 client、建 WS 连接只有本模块的入口，期限是必填参数；
 //! 直接调 reqwest / tokio-tungstenite 的构造函数由 `clippy.toml` 的 disallowed-methods 拦下
-//! （`cargo clippy -- -D clippy::disallowed_methods`），本模块是唯一放行处。
+//! （`cargo clippy -- -D clippy::disallowed_methods`，出部署包前跑；`Client::default()` 拦不到，别用），
+//! 本模块是唯一放行处。
 //!
 //! 所有 HTTP client 共用的设置（一条知识一处）：
 //! - **User-Agent**：不带 UA 的请求会被部分 CDN 拒；

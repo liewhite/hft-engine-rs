@@ -34,9 +34,8 @@ use crate::engine::live::{
 use crate::domain::{
     AccountId, Exchange, ExchangeError, OrderUpdate, Symbol, SymbolMeta,
 };
-use crate::engine::live::account_binding::{snapshot_live, Leg};
+use crate::engine::live::account_binding::{snapshot, PlannedAccount};
 use crate::engine::live::assembly::StartAccountStream;
-use crate::engine::live::AccountBinding;
 use crate::exchange::{AccountClient, AccountStream, ExchangeHandle, SubscriptionKind};
 use crate::messaging::AccountBus;
 use crate::tasks::{ChildHandle, Gone, Group, StopFlag};
@@ -379,6 +378,15 @@ impl Provisioner {
                 )));
             }
         }
+        //     各实例绑定账户：实盘实例要交易的所没配凭证在此拒绝（见 `PlannedAccount::bind`）
+        let plans: Vec<PlannedAccount> = strategies
+            .iter()
+            .zip(&strategy_subscriptions)
+            .map(|(spec, subs)| {
+                let legs = subs.iter().map(|(ex, kind)| (*ex, kind.symbol().clone())).collect();
+                PlannedAccount::bind(spec.account.clone(), legs, &self.accounts)
+            })
+            .collect::<Result<_, _>>()?;
 
         // 2. 按交易所分组订阅
         let mut exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>> = HashMap::new();
@@ -417,30 +425,15 @@ impl Provisioner {
         }
 
         // 5. 拉取持仓基线：**一次快照喂全部账本消费者**（executor / 对账镜像 / 观测镜像
-        //    —— 三者同一份快照、同一 seed 语义、同一条防双计规则，口径天然一致）。实盘实例要交易的
-        //    所没配凭证在这里报错（见 `snapshot_live`）。此步只读 REST、无副作用，失败即"什么都没发生"。
-        let scopes: Vec<HashSet<Leg>> = strategy_subscriptions
-            .iter()
-            .map(|subs| subs.iter().map(|(ex, kind)| (*ex, kind.symbol().clone())).collect())
-            .collect();
-        let live_scopes: Vec<&HashSet<Leg>> = strategies
-            .iter()
-            .zip(&scopes)
-            .filter(|(spec, _)| spec.account == AccountId::Live)
-            .map(|(_, legs)| legs)
-            .collect();
-        let (live_baselines, baselines) = snapshot_live(&self.accounts, &live_scopes, &exchange_symbols).await?;
+        //    —— 三者同一份快照、同一 seed 语义、同一条防双计规则，口径天然一致）。快照必须在撤单
+        //    之后拉：撤单前遗留单还可能成交。此步只读 REST、无副作用，失败即"什么都没发生"。
+        let (bindings, baselines) = snapshot(plans, &exchange_symbols, &self.accounts).await?;
 
         // 6. 批量创建 Executor：实盘实例**出生即带基线**（在收到任何流事件之前写入，
         //    "Fill 早于基线、存量被丢"的竞态在结构上不可能）；模拟账户从零起步，不需要
         //    也不应该看到真实持仓。此刻它们还没被注册，收不到任何事件。
         let mut spawned: Vec<Spawned> = Vec::new();
-        let mut live_baselines = live_baselines.into_iter();
-        for (spec, legs) in strategies.into_iter().zip(scopes) {
-            let binding = match spec.account {
-                AccountId::Live => AccountBinding::Live(live_baselines.next().expect("snapshot_live 按 live_scopes 同序给出")),
-                AccountId::Paper(label) => AccountBinding::Paper { label, legs },
-            };
+        for (spec, binding) in strategies.into_iter().zip(bindings) {
             let account = binding.account();
             let created = Executor::spawn(
                 &self.producers,

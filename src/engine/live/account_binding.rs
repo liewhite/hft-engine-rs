@@ -1,12 +1,13 @@
 //! 策略实例绑定的账户，连同它出生时的持仓（投产握手，见 [`PositionBaseline`]）。
 //!
-//! 实盘实例只能带着 [`LiveBaselines`] 出生，而 [`LiveBaselines`] 只能由 [`snapshot_live`] 造出：
-//! 它对实例要交易的每个所用**该所的账户（配了凭证才有）**拉一次 REST 持仓快照。于是「实盘实例
-//! 要交易的所没配凭证」「实盘腿没有快照、只好补 0」都写不出来 —— 此前这两件事靠投产时的两道
-//! 运行时检查拦（#767 a800755、a4d4aea），漏检就是把真实持仓当空仓、或下单在出口被拒留单边敞口。
+//! 实盘实例只能带着 [`LiveBaselines`] 出生；[`LiveBaselines`] 只能由 [`snapshot`] 从 [`LiveLegs`]
+//! 造出，[`LiveLegs`] 只能由 [`PlannedAccount::bind`] 给每条腿绑上该所账户造出。于是「实盘腿没有
+//! 快照、只好补 0」写不出来，「实盘实例要交易的所没配凭证」只在绑定这一处判断 —— 此前这两件事
+//! 靠投产时散在两处的运行时检查拦（#767 a800755、a4d4aea），漏检就是把真实持仓当空仓、或下单在
+//! 出口被拒留单边敞口。
 //!
-//! 策略要在哪些所交易是它运行时声明的（`public_streams`），所以「这个所有没有账户」仍是一次运行时
-//! 判断，但只在拉快照、真正要用账户的这一处，之后的环节拿到的都是已经齐全的类型。
+//! 策略要在哪些所交易是它运行时声明的（`public_streams`），所以「这个所有没有账户」仍是运行时
+//! 判断，不是编译期保证；但只有绑定这一处，之后的环节拿到的都是已经齐全的类型。
 
 use crate::domain::{now_ms, AccountId, Exchange, ExchangeError, Position, Quantity, Symbol, Timestamp};
 use crate::exchange::AccountClient;
@@ -18,8 +19,8 @@ use std::sync::Arc;
 pub type Leg = (Exchange, Symbol);
 
 /// 实盘实例的出生持仓：作用域内**每条腿**一条，都来自交易所 REST 快照（交易所没列出的腿 = 交易所
-/// 说它空仓，不是补的）。字段私有，只能由 [`snapshot_live`] 构造。
-#[derive(Debug, Clone)]
+/// 说它空仓，不是补的）。字段私有，只能由 [`snapshot`] 构造。
+#[derive(Debug)]
 pub struct LiveBaselines(Vec<PositionBaseline>);
 
 impl LiveBaselines {
@@ -66,43 +67,74 @@ impl AccountBinding {
     }
 }
 
-/// 一批投产的 REST 持仓快照（每个所只拉一次，executor / 对账镜像 / 观测镜像同一份，口径一致）。
+/// 一个实盘实例的腿，每条都已绑上该所的账户（配了凭证才有）。字段私有，只能由
+/// [`PlannedAccount::bind`] 造出：投产第一步就绑，没凭证的所当场拒绝，此时还没有任何副作用。
+pub(crate) struct LiveLegs(Vec<(Leg, Arc<dyn AccountClient>)>);
+
+/// 投产计划里一个实例的账户（还没拉快照）
+pub(crate) enum PlannedAccount {
+    Live(LiveLegs),
+    Paper { label: String, legs: HashSet<Leg> },
+}
+
+impl PlannedAccount {
+    /// 绑定账户。实盘实例要交易的所没配凭证即报错拒绝投产：没凭证的所下单在出口被拒，补腿补不上
+    /// 就留单边敞口。
+    pub(crate) fn bind(
+        account: AccountId,
+        legs: HashSet<Leg>,
+        accounts: &HashMap<Exchange, Arc<dyn AccountClient>>,
+    ) -> Result<Self, ExchangeError> {
+        match account {
+            AccountId::Paper(label) => Ok(Self::Paper { label, legs }),
+            AccountId::Live => legs
+                .into_iter()
+                .map(|leg| match accounts.get(&leg.0) {
+                    Some(client) => Ok((leg, client.clone())),
+                    None => Err(ExchangeError::Other(format!(
+                        "实盘策略要在 {0} 交易，但 {0} 没配凭证（下单会被拒、补腿补不上），拒绝投产",
+                        leg.0
+                    ))),
+                })
+                .collect::<Result<_, _>>()
+                .map(|legs| Self::Live(LiveLegs(legs))),
+        }
+    }
+}
+
+/// 拉本批投产的 REST 持仓快照，把计划变成实例的 [`AccountBinding`]（与 `plans` 同序）。每个所只拉
+/// 一次，executor / 对账镜像 / 观测镜像用同一份，口径一致。
 ///
-/// - `live_scopes`：每个实盘实例的作用域。其中的所必须有账户（配了凭证），否则报错拒绝投产 ——
-///   没凭证的所下单在出口被拒，补腿补不上就留单边敞口；
-/// - `watched`：本批涉及的全部腿，有账户的那些也拉快照，交给对账与观测镜像（没账户的所跳过：
-///   下不了单也收不到成交，没什么可对的）。
-///
-/// 返回：与 `live_scopes` 同序的实盘基线，以及 `watched` 里有账户的腿的基线。
+/// `watched`：本批涉及的全部腿，有账户的也拉快照交给对账与观测镜像（没账户的所跳过：下不了单也
+/// 收不到成交，没什么可对的），作为第二个返回值。
 ///
 /// 拉取失败即拒绝投产：基线只有这一次机会，之后全程靠 Fill 累加，没有第二个来源能纠正它；
 /// 从「仓位 0」起算会让杠杆、仓位上限等闸门基于错误的持仓放行。
-pub(crate) async fn snapshot_live(
-    accounts: &HashMap<Exchange, Arc<dyn AccountClient>>,
-    live_scopes: &[&HashSet<Leg>],
+pub(crate) async fn snapshot(
+    plans: Vec<PlannedAccount>,
     watched: &HashSet<Leg>,
-) -> Result<(Vec<LiveBaselines>, Vec<PositionBaseline>), ExchangeError> {
-    let mut wanted: HashMap<Exchange, &Arc<dyn AccountClient>> = HashMap::new();
-    for (exchange, _) in live_scopes.iter().flat_map(|s| s.iter()) {
-        let account = accounts.get(exchange).ok_or_else(|| {
-            ExchangeError::Other(format!(
-                "实盘策略要在 {exchange} 交易，但 {exchange} 没配凭证（下单会被拒、补腿补不上），拒绝投产"
-            ))
-        })?;
-        wanted.insert(*exchange, account);
+    accounts: &HashMap<Exchange, Arc<dyn AccountClient>>,
+) -> Result<(Vec<AccountBinding>, Vec<PositionBaseline>), ExchangeError> {
+    let mut wanted: HashMap<Exchange, Arc<dyn AccountClient>> = HashMap::new();
+    for plan in &plans {
+        if let PlannedAccount::Live(LiveLegs(legs)) = plan {
+            for ((exchange, _), client) in legs {
+                wanted.insert(*exchange, client.clone());
+            }
+        }
     }
     for (exchange, _) in watched {
-        if let Some(account) = accounts.get(exchange) {
-            wanted.insert(*exchange, account);
+        if let Some(client) = accounts.get(exchange) {
+            wanted.insert(*exchange, client.clone());
         }
     }
 
     let mut snapshots: HashMap<Exchange, (Timestamp, HashMap<Symbol, Position>)> = HashMap::new();
-    for (exchange, account) in wanted {
+    for (exchange, client) in wanted {
         // 快照**请求**时刻：在此之前已由私有流送达的 Fill，其成交必然已包含在快照里 —— 消费者
         // seed 之后据此过滤，避免「快照已含 + 再累加」的双计（见 SymbolState::seed_position）
         let snapshot_req_ts = now_ms();
-        let positions = account.fetch_positions().await.map_err(|e| {
+        let positions = client.fetch_positions().await.map_err(|e| {
             ExchangeError::Other(format!(
                 "无法获取 {exchange} 的初始持仓基线，拒绝启动（基线只有一次机会，错了之后无从纠正）: {e}"
             ))
@@ -112,7 +144,7 @@ pub(crate) async fn snapshot_live(
         snapshots.insert(exchange, (snapshot_req_ts, by_symbol));
     }
 
-    // 上面已为 live_scopes 的每个所、watched 里有账户的每个所拉了快照，这里按腿取必然取得到
+    // 交易所没列出的腿 = 交易所说它空仓
     let baseline = |(exchange, symbol): &Leg| -> Option<PositionBaseline> {
         let (snapshot_req_ts, by_symbol) = snapshots.get(exchange)?;
         let position = by_symbol.get(symbol).cloned().unwrap_or(Position {
@@ -122,15 +154,21 @@ pub(crate) async fn snapshot_live(
         });
         Some(PositionBaseline { position, snapshot_req_ts: *snapshot_req_ts })
     };
-    let live = live_scopes
-        .iter()
-        .map(|scope| LiveBaselines(scope.iter().map(|leg| baseline(leg).expect("实盘作用域的所已拉快照")).collect()))
+    let bindings = plans
+        .into_iter()
+        .map(|plan| match plan {
+            // 上面已为每个实盘腿的所拉了快照
+            PlannedAccount::Live(LiveLegs(legs)) => AccountBinding::Live(LiveBaselines(
+                legs.iter().map(|(leg, _)| baseline(leg).expect("实盘腿的所已拉快照")).collect(),
+            )),
+            PlannedAccount::Paper { label, legs } => AccountBinding::Paper { label, legs },
+        })
         .collect();
     let watched: Vec<PositionBaseline> = watched.iter().filter_map(baseline).collect();
     for b in &watched {
         tracing::info!(exchange = %b.position.exchange, symbol = %b.position.symbol, size = %b.position.size, "Initial position loaded");
     }
-    Ok((live, watched))
+    Ok((bindings, watched))
 }
 
 #[cfg(test)]
@@ -185,8 +223,9 @@ mod tests {
     #[tokio::test]
     async fn live_scope_gets_every_leg_from_the_snapshot() {
         let scope = HashSet::from([leg(WITH_ACCOUNT, SYM), leg(WITH_ACCOUNT, "ETH")]);
-        let (live, _) = snapshot_live(&accounts(), &[&scope], &scope).await.unwrap();
-        let b = AccountBinding::Live(live.into_iter().next().unwrap()).into_baselines();
+        let plan = PlannedAccount::bind(AccountId::Live, scope.clone(), &accounts()).unwrap();
+        let (bindings, _) = snapshot(vec![plan], &scope, &accounts()).await.unwrap();
+        let b = bindings.into_iter().next().unwrap().into_baselines();
         assert_eq!(b.len(), 2);
         assert_eq!(size_at(&b, &leg(WITH_ACCOUNT, SYM)), Some(dec!(7.0)));
         assert_eq!(size_at(&b, &leg(WITH_ACCOUNT, "ETH")), Some(dec!(0)));
@@ -194,10 +233,10 @@ mod tests {
     }
 
     /// 实盘实例要交易的所没配凭证：拒绝投产（下单会被拒、补腿补不上）
-    #[tokio::test]
-    async fn live_scope_on_an_exchange_without_account_is_rejected() {
+    #[test]
+    fn live_scope_on_an_exchange_without_account_is_rejected() {
         let scope = HashSet::from([leg(WITH_ACCOUNT, SYM), leg(NO_ACCOUNT, SYM)]);
-        let err = snapshot_live(&accounts(), &[&scope], &scope).await.unwrap_err();
+        let Err(err) = PlannedAccount::bind(AccountId::Live, scope, &accounts()) else { panic!("应拒绝") };
         assert!(err.to_string().contains("OKX 没配凭证"), "{err}");
     }
 
@@ -205,8 +244,9 @@ mod tests {
     #[tokio::test]
     async fn watched_legs_skip_exchanges_without_account() {
         let watched = HashSet::from([leg(WITH_ACCOUNT, SYM), leg(NO_ACCOUNT, SYM)]);
-        let (live, b) = snapshot_live(&accounts(), &[], &watched).await.unwrap();
-        assert!(live.is_empty());
+        let paper = PlannedAccount::bind(AccountId::Paper("x".to_string()), watched.clone(), &accounts()).unwrap();
+        let (bindings, b) = snapshot(vec![paper], &watched, &accounts()).await.unwrap();
+        assert!(matches!(&bindings[..], [AccountBinding::Paper { .. }]), "模拟账户不拿真实快照");
         assert_eq!(b.len(), 1);
         assert_eq!(size_at(&b, &leg(WITH_ACCOUNT, SYM)), Some(dec!(7.0)));
     }

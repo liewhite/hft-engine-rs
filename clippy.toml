@@ -1,8 +1,11 @@
-# 出站 HTTP / WS 只能经 crate::net 建（必须给期限，见 src/net.rs）。检查：
+# 出站 HTTP / WS 只能经 crate::net 建（必须给期限，见 src/net.rs）。`reqwest::Client::default()` 是 trait
+# 方法、名单拦不到，别用。检查（funding-arb-ops 的 deploy.sh build 出包前也跑）：
 #   cargo clippy --all-targets -- -A clippy::all -D clippy::disallowed_methods
 disallowed-methods = [
     { path = "reqwest::Client::new", reason = "用 crate::net::http(期限).build()" },
     { path = "reqwest::Client::builder", reason = "用 crate::net::http(期限).build()" },
+    { path = "reqwest::ClientBuilder::new", reason = "用 crate::net::http(期限).build()" },
+    { path = "reqwest::blocking::ClientBuilder::new", reason = "用 crate::net::http(期限).build_blocking()" },
     { path = "reqwest::blocking::Client::new", reason = "用 crate::net::http(期限).build_blocking()" },
     { path = "reqwest::blocking::Client::builder", reason = "用 crate::net::http(期限).build_blocking()" },
     { path = "reqwest::get", reason = "用 crate::net::http(期限).build()" },
@@ -10,4 +13,9 @@ disallowed-methods = [
     { path = "tokio_tungstenite::connect_async", reason = "用 crate::net::ws_connect(.., 期限)" },
     { path = "tokio_tungstenite::connect_async_with_config", reason = "用 crate::net::ws_connect(.., 期限)" },
     { path = "tokio_tungstenite::connect_async_tls_with_config", reason = "用 crate::net::ws_connect(.., 期限)" },
+    { path = "tokio_tungstenite::client_async", reason = "用 crate::net::ws_connect(.., 期限)" },
+    { path = "tokio_tungstenite::client_async_with_config", reason = "用 crate::net::ws_connect(.., 期限)" },
+    { path = "tokio_tungstenite::client_async_tls", reason = "用 crate::net::ws_connect(.., 期限)" },
+    { path = "tokio_tungstenite::client_async_tls_with_config", reason = "用 crate::net::ws_connect(.., 期限)" },
+    { path = "tokio_tungstenite::tungstenite::connect", reason = "用 crate::net::ws_connect(.., 期限)" },
 ]

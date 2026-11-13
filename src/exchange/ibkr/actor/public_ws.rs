@@ -200,7 +200,7 @@ async fn connect(
     // 只打印 host。
     tracing::info!(host = %host, "Connecting IBKR WebSocket");
 
-    crate::net::ws_connect(ws_request, connector, super::super::WS_CONNECT_TIMEOUT)
+    crate::net::ws_connect(ws_request, connector, crate::exchange::ws_loop::CONNECT_TIMEOUT)
         .await
         .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e))
 }

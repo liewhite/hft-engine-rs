@@ -44,8 +44,9 @@ use std::time::Duration;
 
 const EX: Exchange = Exchange::Binance;
 /// 本测试的模拟账户
+const PAPER_LABEL: &str = "BTC";
 static PAPER_ACCOUNT: std::sync::LazyLock<AccountId> =
-    std::sync::LazyLock::new(|| AccountId::Paper("BTC".to_string()));
+    std::sync::LazyLock::new(|| AccountId::Paper(PAPER_LABEL.to_string()));
 const COIN: &str = "BTC";
 /// 挂单相对买价的下偏幅度（bp）。
 ///
@@ -268,7 +269,7 @@ async fn paper_counter_fills_from_live_trades() {
         &producers,
         ExecutorArgs {
             strategy: Box::new(DipMaker(Arc::clone(&log))),
-            binding: AccountBinding::Paper { label: "BTC".to_string(), legs: HashSet::new() },
+            binding: AccountBinding::Paper { label: PAPER_LABEL.to_string(), legs: HashSet::new() },
             symbol_metas: metas_by_key.clone(),
             outcome_bus: outcome_bus.clone(),
             metrics,
