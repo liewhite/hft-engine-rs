@@ -22,7 +22,6 @@ use crate::domain::PriceFormatter;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::Duration;
 
 
 /// 账户的保证金口径（`POST /info {"type":"userAbstraction"}`，启动时查一次）。
@@ -91,10 +90,7 @@ impl HyperliquidClient {
             return Err(other(format!("HL dexes 配置重复: \"{}\"", dup.1)));
         }
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
+        let client = crate::exchange::client::exchange_http_client(Exchange::Hyperliquid)?;
         let base_url = REST_BASE_URL.to_string();
 
         // 品种目录
@@ -822,8 +818,8 @@ impl AccountClient for HyperliquidClient {
             // Hyperliquid 是币本位（contract_size = 1），无需折算
             updates.push(crate::domain::OrderUpdate {
                 order_id: o.oid.to_string(),
-                // 挂单列表接口不带 cloid，逐单补一次。N 是**遗留挂单数**（IOC 策略下几乎
-                // 恒为 0），且只在启动期发生，代价与问题规模成正比。
+                // 挂单列表接口不带 cloid，逐单补一次（每张一次 info 请求）。调用方是启动期撤遗留单
+                // 和撤单失败后的复查，都按币查，N 是该币当前挂单数：maker 策略每所一两张。
                 client_order_id: self.cloid_of(wallet, o.oid).await?,
                 exchange: Exchange::Hyperliquid,
                 symbol: symbol.clone(),

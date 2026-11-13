@@ -264,13 +264,11 @@ impl MetricsView {
             .or_insert(size);
     }
 
-    /// 输出一次完整报告（结构化日志；配置了 pushgateway 时同一份数字同时推送）
-    fn report(&self) {
+    /// 输出一次完整报告（结构化日志）。配置了 pushgateway 时返回同一份数字的推送内容，
+    /// 由调用方决定异步推（平时）还是等推完（停机前最后一份）
+    fn report(&self) -> Option<(MetricsPushConfig, String)> {
         let prom = self.render();
-        // 配置了 pushgateway 就把同一份数字推出去（异步、失败只记 warn，不拖垮引擎）
-        if let Some(config) = &self.push {
-            prometheus::spawn_push(config.clone(), prom.into_body());
-        }
+        let push = self.push.as_ref().map(|config| (config.clone(), prom.into_body()));
         if self.total.forced_fills > 0 {
             tracing::warn!(
                 target: "metrics",
@@ -294,6 +292,7 @@ impl MetricsView {
                 "metrics.recent_fill"
             );
         }
+        push
     }
 
     /// 本轮全部指标（同时写结构化日志）
@@ -577,14 +576,21 @@ impl Task for Metrics {
                     // 已被要求停止，收件箱已排空
                     None => return Ok(()),
                 },
-                _ = tick.tick() => self.view.report(),
+                _ = tick.tick() => {
+                    // 异步推送，不阻塞收件；失败只记 warn
+                    if let Some((config, body)) = self.view.report() {
+                        prometheus::spawn_push(config, body);
+                    }
+                }
             }
         }
     }
 
     async fn stop(&mut self) -> anyhow::Result<()> {
-        // 停机前留一份最终快照，便于事后复盘
-        self.view.report();
+        // 停机前留一份最终快照，便于事后复盘；等它推完（至多 10s）再走，否则进程退出就丢了
+        if let Some((config, body)) = self.view.report() {
+            prometheus::push(&config, body).await;
+        }
         tracing::info!("Metrics stopped");
         Ok(())
     }

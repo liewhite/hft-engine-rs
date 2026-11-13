@@ -133,10 +133,7 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
 impl BinanceClient {
     /// 创建新的 Binance 客户端
     pub fn new(quote: String, credentials: Option<BinanceCredentials>) -> Result<Self, ExchangeError> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string()))?;
+        let client = crate::exchange::client::exchange_http_client(Exchange::Binance)?;
 
         Ok(Self {
             client,

@@ -123,7 +123,7 @@ impl ExchangeOrder {
     /// 币本位 -> 交易所下单单位，按交易所精度取整价格与数量，并校验数量下界。
     ///
     /// 取整方向**有意不同**（沿用改造前的行为，此处只是搬家）：
-    /// - 数量 `round_size_down`：**向下**取整，宁可少下一点，也不超出策略意图的数量
+    /// - 数量按 `SymbolMeta::checked_exchange_qty`：**向下**取整，宁可少下一点，也不超出策略意图的数量
     /// - 价格 `round_price`：取**最近**的合法 tick（`StepFormatter` 是四舍五入），因为价格
     ///   向下取整对买单是让价、对卖单是抢价，方向语义不一致，反而更难推理
     ///
@@ -235,6 +235,24 @@ pub trait AccountClient: Send + Sync + 'static {
     /// 消费方用 [`index_positions`] 建索引，重复即报错。数量口径为币本位，见 trait 级文档。
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError>;
 }
+
+/// 交易所 REST 客户端的统一配置（三所的 client 都由它建）。
+///
+/// - 单次请求 10s 超时；
+/// - 空闲连接只在池里留 [`POOL_IDLE_TIMEOUT`]：交易所侧会关掉空闲过久的长连接（常见 60s 上下），
+///   而 reqwest 默认留 90s。下单请求恰好发在对方关连接的时刻，会以「连接中途断开」失败，按
+///   [`place_send_error`] 归为结果不确定 → 整机停机。让我们先于交易所丢弃空闲连接，
+///   代价是空闲超过它之后的第一个请求多一次建连（TLS 握手）。
+pub(crate) fn exchange_http_client(exchange: Exchange) -> Result<reqwest::Client, ExchangeError> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .build()
+        .map_err(|e| ExchangeError::ConnectionFailed(exchange, e.to_string()))
+}
+
+/// 见 [`exchange_http_client`]
+pub(crate) const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 下单 HTTP 请求在拿到回复之前就失败了：连接都没建立（`is_connect`）说明请求没送到交易所，
 /// 确定没挂上；其余（超时、连接中途断开、读回复失败）请求可能已到交易所，结果不确定。

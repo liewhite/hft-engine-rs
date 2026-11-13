@@ -289,4 +289,13 @@ mod tests {
         assert_eq!(kinds(&order_push("BTCUSDT_251226", "0.5")), ["unmapped:BTCUSDT_251226"]);
         assert!(kinds(&order_push("BTCUSDC", "0")).is_empty());
     }
+
+    /// 不认识的订单状态按解析失败处理（不当成拒单终态）
+    #[test]
+    fn unknown_order_status_is_a_parse_error() {
+        let raw = order_push("BTCUSDT", "0").replace(r#""X":"FILLED""#, r#""X":"SOMETHING_NEW""#);
+        assert!(parse_private_message(&raw, "USDT", 0).is_err());
+        let stp = order_push("BTCUSDT", "0").replace(r#""X":"FILLED""#, r#""X":"EXPIRED_IN_MATCH""#);
+        assert_eq!(kinds(&stp), ["order:BTC"]);
+    }
 }

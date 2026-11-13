@@ -453,7 +453,7 @@ impl WsOrderUpdate {
         // 本账户这一笔挂单的方向
         let side = parse_side(&self.order.side)?;
 
-        let status = map_hyperliquid_order_status(&self.status, filled_quantity);
+        let status = map_hyperliquid_order_status(&self.status, filled_quantity)?;
 
         // Hyperliquid 不直接提供本次成交量，使用 filled_quantity
         // 对于 IOC 订单（一次性成交），这等于实际成交量
@@ -470,25 +470,23 @@ impl WsOrderUpdate {
     }
 }
 
-/// Hyperliquid 订单状态映射
-fn map_hyperliquid_order_status(status: &str, filled: f64) -> crate::domain::OrderStatus {
-    match status {
-        "open" => {
-            if filled > 0.0 {
-                crate::domain::OrderStatus::PartiallyFilled
-            } else {
-                crate::domain::OrderStatus::Pending
-            }
-        }
-        "filled" => crate::domain::OrderStatus::Filled,
-        "canceled" | "cancelled" => crate::domain::OrderStatus::Cancelled,
-        "rejected" => crate::domain::OrderStatus::Rejected {
-            reason: "Order rejected".to_string(),
-        },
-        other => crate::domain::OrderStatus::Rejected {
-            reason: format!("Unknown status: {}", other),
-        },
-    }
+/// Hyperliquid 订单状态映射。
+///
+/// HL 的终态有一大族（文档 orderStatus 表）：`canceled` 与 `xxxCanceled`（保证金不足、
+/// 自成交、强平……撤单）、`scheduledCancel`，`rejected` 与 `xxxRejected`（价格精度、金额下限、
+/// post-only 会吃单……拒单）。按文档的命名约定认后缀；别的（含本引擎不用的触发单 `triggered`）
+/// 不猜（理由同 Binance 的 `to_order_update`），按解析失败处理。
+fn map_hyperliquid_order_status(status: &str, filled: f64) -> Result<crate::domain::OrderStatus, String> {
+    use crate::domain::OrderStatus;
+    Ok(match status {
+        "open" if filled > 0.0 => OrderStatus::PartiallyFilled,
+        "open" => OrderStatus::Pending,
+        "filled" => OrderStatus::Filled,
+        "canceled" | "scheduledCancel" => OrderStatus::Cancelled,
+        s if s.ends_with("Canceled") => OrderStatus::Cancelled,
+        s if s == "rejected" || s.ends_with("Rejected") => OrderStatus::Rejected { reason: s.to_string() },
+        other => return Err(format!("Hyperliquid 订单状态未知: {other}")),
+    })
 }
 
 // ============================================================================
@@ -605,6 +603,23 @@ mod clearinghouse_tests {
       ],
       "time": 1785923125277
     }"#;
+
+    /// 文档里的整族撤单 / 拒单状态按后缀认成终态；别的不认识的按解析失败处理
+    #[test]
+    fn order_status_family() {
+        use crate::domain::OrderStatus;
+        assert_eq!(map_hyperliquid_order_status("open", 0.0).unwrap(), OrderStatus::Pending);
+        assert_eq!(map_hyperliquid_order_status("open", 1.0).unwrap(), OrderStatus::PartiallyFilled);
+        for s in ["canceled", "marginCanceled", "selfTradeCanceled", "scheduledCancel"] {
+            assert_eq!(map_hyperliquid_order_status(s, 0.0).unwrap(), OrderStatus::Cancelled, "{s}");
+        }
+        for s in ["rejected", "badAloPxRejected", "perpMarginRejected"] {
+            assert!(matches!(map_hyperliquid_order_status(s, 0.0).unwrap(), OrderStatus::Rejected { .. }), "{s}");
+        }
+        for s in ["triggered", "somethingNew", ""] {
+            assert!(map_hyperliquid_order_status(s, 0.0).is_err(), "{s}");
+        }
+    }
 
     /// 整份响应能解析（任一必需字段缺失都会让持仓基线拿不到，故整体解析必须有测试守着）
     #[test]

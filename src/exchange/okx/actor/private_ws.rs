@@ -37,6 +37,8 @@ pub(super) struct OkxPrivateWs {
     /// 计价币：只有该计价币的永续映射到内部 symbol（见 `okx::symbol`）
     quote: String,
     conn: WsConn,
+    /// 成交去重（见 [`LastTrades`]）
+    last_trades: LastTrades,
 }
 
 impl OkxPrivateWs {
@@ -85,15 +87,15 @@ impl OkxPrivateWs {
                 conn.await_subscriptions(Exchange::OKX, &REQUIRED_CHANNELS, subscription_confirmed).await?;
 
                 tracing::info!("OkxPrivateWs started");
-                Ok(Self { account_bus, symbol_metas, quote, conn })
+                Ok(Self { account_bus, symbol_metas, quote, conn, last_trades: LastTrades::default() })
             })
             .await
     }
 
     /// 解析并发布一帧
-    fn handle_message(&self, raw: &str) -> anyhow::Result<()> {
+    fn handle_message(&mut self, raw: &str) -> anyhow::Result<()> {
         tracing::debug!(raw, "OKX private message received");
-        let events = parse_private_message(raw, now_ms(), &self.quote, &self.symbol_metas)
+        let events = parse_private_message(raw, now_ms(), &self.quote, &self.symbol_metas, &mut self.last_trades)
             .with_context(|| format!("OKX 私有 WS 解析失败: {raw}"))?;
         tracing::debug!(count = events.len(), "OKX private events parsed");
         for event in events {
@@ -212,11 +214,45 @@ fn subscription_confirmed(raw: &str) -> Result<Option<String>, WsError> {
     }
 }
 
+/// 各未结束订单最近一笔已上报成交的 `tradeId`，用来识别重复的成交字段。
+///
+/// OKX orders 频道的 `fillSz` / `tradeId` 是该单「最近一笔」成交，不是「这次推送带来的新成交」：
+/// 同一张单之后的推送（如部分成交后被撤）若仍带着上一笔的成交字段，照样上报就会把同一笔算两次
+/// —— 策略以为两所不平，去市价补出一笔真敞口，再被持仓对账停机。是否真会重发未核实（实盘
+/// 没有部分成交后撤单的样本），按 `tradeId` 去重对两种情况都对。`tradeId` 在同一合约内唯一。
+///
+/// 订单不再能成交（已全部成交 / 已撤）时删掉它的记录，只保留挂着的单。
+#[derive(Default)]
+struct LastTrades(HashMap<String, String>);
+
+impl LastTrades {
+    /// 这条推送的成交字段是不是一笔还没上报过的成交（没有成交时为 false）。
+    /// 没有 `tradeId` 的成交无从去重，当新成交。
+    fn is_new_fill(&mut self, data: &OrderPushData) -> bool {
+        // 解析不了的 fillSz 留给 to_fill 报错，这里当有成交
+        let has_fill = data.fill_sz.parse::<f64>().map_or(true, |sz| sz != 0.0);
+        let repeated = has_fill && !data.trade_id.is_empty() && self.0.get(&data.ord_id) == Some(&data.trade_id);
+        if repeated {
+            tracing::warn!(
+                ord_id = %data.ord_id, trade_id = %data.trade_id, state = %data.state, fill_sz = %data.fill_sz,
+                "OKX 推送重复带了已上报过的成交，不再计入"
+            );
+        }
+        if !matches!(data.state.as_str(), "live" | "partially_filled") {
+            self.0.remove(&data.ord_id);
+        } else if has_fill && !data.trade_id.is_empty() {
+            self.0.insert(data.ord_id.clone(), data.trade_id.clone());
+        }
+        has_fill && !repeated
+    }
+}
+
 fn parse_private_message(
     raw: &str,
     local_ts: u64,
     quote: &str,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
+    last_trades: &mut LastTrades,
 ) -> Result<Vec<AccountEvent>, WsError> {
     // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
     if raw == "pong" {
@@ -293,8 +329,9 @@ fn parse_private_message(
                 // 成交以 UnmappedFill 原样上报，不进任何 symbol 的持仓 —— 绝不能按张数下发
                 // 或当成同名的 USDT 合约。市场元数据加载的是该计价币的全部永续，故「映射得到却无
                 // meta」只剩字段异常被剔除的合约（加载处已 error 留痕）。
+                let new_fill = last_trades.is_new_fill(data);
                 let Some(meta) = resolve_meta(&data.inst_id, quote, symbol_metas) else {
-                    if let Some(f) = data.to_unmapped_fill().map_err(WsError::ParseError)? {
+                    if let Some(f) = data.to_unmapped_fill().map_err(WsError::ParseError)?.filter(|_| new_fill) {
                         events.push(AccountEvent {
                             account: crate::domain::AccountId::Live,
                             exchange_ts: local_ts,
@@ -308,8 +345,7 @@ fn parse_private_message(
                 let order_update = data.to_order_update(meta)?;
 
                 // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
-                if let Some(fill) = data.to_fill(meta)
-                    ? {
+                if let Some(fill) = data.to_fill(meta)?.filter(|_| new_fill) {
                     events.push(AccountEvent {
                         // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
                         account: crate::domain::AccountId::Live,
@@ -361,15 +397,23 @@ mod tests {
     }
 
     fn order_push(inst_id: &str, fill_sz: &str) -> String {
+        push(inst_id, "filled", fill_sz, "7")
+    }
+
+    fn push(inst_id: &str, state: &str, fill_sz: &str, trade_id: &str) -> String {
         format!(
             r#"{{"arg":{{"channel":"orders","instType":"SWAP"}},"data":[{{"instId":"{inst_id}","ordId":"1",
-            "clOrdId":"x-a","side":"buy","state":"filled","sz":"{fill_sz}","fillSz":"{fill_sz}",
-            "fillPx":"60000","fillFee":"-0.1"}}]}}"#
+            "clOrdId":"x-a","side":"buy","state":"{state}","sz":"5","fillSz":"{fill_sz}",
+            "fillPx":"60000","fillFee":"-0.1","tradeId":"{trade_id}"}}]}}"#
         )
     }
 
     fn kinds(raw: &str) -> Vec<String> {
-        parse_private_message(raw, 0, "USDT", &metas())
+        kinds_with(raw, &mut LastTrades::default())
+    }
+
+    fn kinds_with(raw: &str, last_trades: &mut LastTrades) -> Vec<String> {
+        parse_private_message(raw, 0, "USDT", &metas(), last_trades)
             .unwrap()
             .into_iter()
             .map(|e| match e.data {
@@ -402,6 +446,31 @@ mod tests {
         assert_eq!(kinds(&order_push("BTC-USD-SWAP", "3")), ["unmapped:BTC-USD-SWAP:3"]);
         // 无成交的订单状态：不关心
         assert!(kinds(&order_push("BTC-USDC-SWAP", "0")).is_empty());
+    }
+
+    /// 同一笔成交（同一 tradeId）在后续推送里重复出现只计一次；新的 tradeId 照计
+    #[test]
+    fn repeated_trade_id_is_counted_once() {
+        let mut seen = LastTrades::default();
+        let sym = "BTC-USDT-SWAP";
+        assert_eq!(kinds_with(&push(sym, "live", "0", ""), &mut seen), ["order:BTC"]);
+        assert_eq!(kinds_with(&push(sym, "partially_filled", "2", "10"), &mut seen), ["fill:BTC:0.02", "order:BTC"]);
+        assert_eq!(kinds_with(&push(sym, "partially_filled", "1", "11"), &mut seen), ["fill:BTC:0.01", "order:BTC"]);
+        // 部分成交后被撤，推送仍带上一笔的成交字段
+        assert_eq!(kinds_with(&push(sym, "canceled", "1", "11"), &mut seen), ["order:BTC"]);
+        assert!(seen.0.is_empty(), "结束的单不留记录");
+        // 品种目录外的合约同样去重
+        let other = "BTC-USDC-SWAP";
+        assert_eq!(kinds_with(&push(other, "partially_filled", "3", "20"), &mut seen), ["unmapped:BTC-USDC-SWAP:3"]);
+        assert!(kinds_with(&push(other, "canceled", "3", "20"), &mut seen).is_empty());
+    }
+
+    /// 不认识的订单状态按解析失败处理（不当成拒单终态）
+    #[test]
+    fn unknown_order_state_is_a_parse_error() {
+        let raw = push("BTC-USDT-SWAP", "something_new", "0", "");
+        assert!(parse_private_message(&raw, 0, "USDT", &metas(), &mut LastTrades::default()).is_err());
+        assert_eq!(kinds(&push("BTC-USDT-SWAP", "mmp_canceled", "0", "")), ["order:BTC"]);
     }
 
     /// 联网只读：真登录 OKX 私有流，启动（spawn 返回）即 account / orders 都已确认。

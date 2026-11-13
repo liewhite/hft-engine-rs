@@ -29,6 +29,7 @@ use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// HL 的 time-in-force（wire 上的写法）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +128,7 @@ impl LocalKeySubmitter {
     }
 
     async fn sign_and_post<A: serde::Serialize>(&self, action: &A) -> Result<Value, PlaceError> {
-        let nonce = now_ms();
+        let nonce = next_nonce(now_ms());
         let connection_id = action_hash(action, nonce, None)
             .map_err(|e| PlaceError::unsent(format!("Action hash failed: {e}")))?;
         let signature = sign_l1_action(&self.signer, connection_id, self.is_mainnet)
@@ -162,6 +163,26 @@ impl HlSubmitter for LocalKeySubmitter {
     async fn cancel(&self, c: &HlCancelIntent) -> Result<Value, ExchangeError> {
         let action = BulkCancelAction::new(vec![CancelWire { a: c.asset, o: c.oid }]);
         self.sign_and_post(&action).await.map_err(cancel_error)
+    }
+}
+
+/// 本进程签出的上一个 nonce（见 [`next_nonce`]）。单测会把它推到墙钟之后数小时，HL 允许领先 1 天，无害
+static LAST_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// 下一个签名 nonce：`max(当前毫秒, 上一个 + 1)`。
+///
+/// HL 要求同一签名地址的 nonce 不重复（且落在最近 100 个最大值之上）。每笔下单 / 撤单各在
+/// 自己的任务里并发签名，同一毫秒签两笔时直接取毫秒会撞号、后到的被拒。取整个进程一个计数
+/// （而不是每个签名者一个）：一个进程就算有多个持同一私钥的客户端也不会撞，严格递增对 HL
+/// 也总是合法的。只在每秒超过 1000 笔时才会领先墙钟，HL 允许领先 1 天。
+fn next_nonce(now: u64) -> u64 {
+    let mut last = LAST_NONCE.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last + 1);
+        match LAST_NONCE.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => last = actual,
+        }
     }
 }
 
@@ -330,6 +351,23 @@ mod tests {
         }
         let e = classify_signer_reply(502, json!({"error": "vsock"})).unwrap_err();
         assert!(matches!(e, PlaceError::Rejected(_)), "{e:?}");
+    }
+
+    /// 同一毫秒并发签名也拿到互不相同、严格递增的 nonce；墙钟往前走时跟上墙钟
+    #[test]
+    fn nonces_never_repeat_within_a_millisecond() {
+        let now = now_ms() + 10_000_000; // 远高于别的测试可能用过的值
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(move || (0..1000).map(|_| next_nonce(now)).collect::<Vec<_>>()))
+            .collect();
+        let mut all: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        all.sort_unstable();
+        let n = all.len();
+        all.dedup();
+        assert_eq!(all.len(), n, "有重复 nonce");
+        assert!(all[0] >= now);
+        let later = all[n - 1] + 1_000;
+        assert_eq!(next_nonce(later), later, "墙钟超过计数后应取墙钟");
     }
 
     #[test]

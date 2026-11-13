@@ -61,28 +61,34 @@ impl PromText {
     }
 }
 
-/// 异步推送一份快照（spawn，不阻塞调用方；失败只记 warn —— 观测出口绝不拖垮引擎）
-pub fn spawn_push(config: MetricsPushConfig, body: String) {
+/// 推送一份快照（失败只记 warn —— 观测出口绝不拖垮引擎）。请求自带 10s 超时。
+///
+/// 平时用 [`spawn_push`] 不阻塞调用方；停机前的最后一份要 await 它：游离的任务在进程退出时
+/// 直接被丢掉，最后一份就推不出去。
+pub async fn push(config: &MetricsPushConfig, body: String) {
     use std::sync::OnceLock;
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    tokio::spawn(async move {
-        let client = CLIENT.get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("默认 reqwest client 构建不该失败")
-        });
-        let endpoint = format!("{}/metrics/job/{}", config.url.trim_end_matches('/'), config.job);
-        match client.post(&endpoint).body(body).send().await {
-            Ok(resp) if !resp.status().is_success() => {
-                tracing::warn!(status = %resp.status(), %endpoint, "pushgateway 拒绝了本次推送");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, %endpoint, "pushgateway 推送失败");
-            }
-            Ok(_) => {}
-        }
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("默认 reqwest client 构建不该失败")
     });
+    let endpoint = format!("{}/metrics/job/{}", config.url.trim_end_matches('/'), config.job);
+    match client.post(&endpoint).body(body).send().await {
+        Ok(resp) if !resp.status().is_success() => {
+            tracing::warn!(status = %resp.status(), %endpoint, "pushgateway 拒绝了本次推送");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, %endpoint, "pushgateway 推送失败");
+        }
+        Ok(_) => {}
+    }
+}
+
+/// 异步推送一份快照（spawn，不阻塞调用方），见 [`push`]
+pub fn spawn_push(config: MetricsPushConfig, body: String) {
+    tokio::spawn(async move { push(&config, body).await });
 }
 
 #[cfg(test)]

@@ -43,10 +43,7 @@ pub struct OkxClient {
 impl OkxClient {
     /// 创建新的 OKX 客户端
     pub fn new(quote: String, credentials: Option<OkxCredentials>) -> Result<Self, ExchangeError> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
+        let client = crate::exchange::client::exchange_http_client(Exchange::OKX)?;
 
         Ok(Self {
             instruments: tokio::sync::OnceCell::new(),

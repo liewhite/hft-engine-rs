@@ -570,3 +570,37 @@ fn imbalance_below_the_hedge_exchanges_min_notional_is_dust() {
     let c = cancels(&s.fill(&hl, 0.3));
     assert!(c.contains(&BN), "{c:?}");
 }
+
+/// 拒单退避：某所的 maker 被拒后不在下一个盘口事件立刻重挂，等 hedge_retry_ms；连续被拒等待翻倍；
+/// 有一张被接下（挂上）后清零。另一所不受影响。
+#[test]
+fn rejected_maker_backs_off_per_exchange() {
+    let mut s = Sim::new(0.0, 0.0);
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    let bn = o.iter().find(|o| o.exchange == BN).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&hl, OrderStatus::Pending);
+
+    // 第一次被拒：1000ms 内不重挂
+    s.confirm(&bn, OrderStatus::Error { reason: "margin is insufficient".into() });
+    assert!(placed(&s.bbo(BN)).is_empty(), "刚被拒就重挂了");
+    s.advance(1000);
+    let again = placed(&s.bbo(BN));
+    assert_eq!(again.len(), 1, "退避到期应重挂");
+    assert_eq!(again[0].exchange, BN);
+
+    // 连续第二次被拒：等待翻倍到 2000ms
+    s.confirm(&again[0], OrderStatus::Rejected { reason: "EXPIRED".into() });
+    s.advance(1500);
+    assert!(placed(&s.bbo(BN)).is_empty(), "第二次被拒应等 2000ms");
+    s.advance(500);
+    let third = placed(&s.bbo(BN));
+    assert_eq!(third.len(), 1);
+
+    // 被接下后清零：之后再被拒又从 1000ms 起
+    s.confirm(&third[0], OrderStatus::Pending);
+    s.confirm(&third[0], OrderStatus::Error { reason: "x".into() });
+    s.advance(1000);
+    assert_eq!(placed(&s.bbo(BN)).len(), 1, "被接下后退避应清零");
+}

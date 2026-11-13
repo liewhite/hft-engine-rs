@@ -360,6 +360,9 @@ pub struct OrderPushData {
     /// 手续费被反复累加（见 `to_fill` 的说明）。
     #[serde(default)]
     pub fill_fee: Option<String>,
+    /// 该单最近一笔成交的成交号（同一合约内唯一），没有成交时为空串。私有流拿它给成交去重
+    #[serde(default)]
+    pub trade_id: String,
 }
 
 impl OrderPushData {
@@ -374,7 +377,7 @@ impl OrderPushData {
         let side = parse_side(&self.side)?;
 
         // 注意 status 内嵌的 PartiallyFilled 同样是数量，必须用折算后的值
-        let status = map_okx_order_state(&self.state);
+        let status = map_okx_order_state(&self.state)?;
 
         Ok(OrderUpdate {
             order_id: self.ord_id.clone(),
@@ -460,17 +463,16 @@ impl OrderPushData {
     }
 }
 
-/// OKX 订单状态映射
-fn map_okx_order_state(state: &str) -> OrderStatus {
-    match state {
+/// OKX 订单状态映射。不认识的状态不猜（理由同 Binance 的 `to_order_update`），按解析失败处理
+fn map_okx_order_state(state: &str) -> Result<OrderStatus, String> {
+    Ok(match state {
         "live" => OrderStatus::Pending,
         "partially_filled" => OrderStatus::PartiallyFilled,
         "filled" => OrderStatus::Filled,
-        "canceled" | "cancelled" => OrderStatus::Cancelled,
-        other => OrderStatus::Rejected {
-            reason: format!("Unknown state: {}", other),
-        },
-    }
+        // mmp_canceled：做市商保护触发的撤单
+        "canceled" | "cancelled" | "mmp_canceled" => OrderStatus::Cancelled,
+        other => return Err(format!("OKX 订单状态未知: {other}")),
+    })
 }
 
 /// Account Greeks 数据 (account-greeks channel)

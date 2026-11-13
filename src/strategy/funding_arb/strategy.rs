@@ -43,9 +43,9 @@
 
 use super::config::PairParams;
 use super::signal::{decide, FundingAction, LegPair, SettledFundingWindow};
-use crate::domain::{Exchange, Order, OrderId, OrderType, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO};
+use crate::domain::{Exchange, Order, OrderId, OrderStatus, OrderType, OrderUpdate, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO};
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{IncomeEvent, MarketData, MarketEvent, PendingOrder};
+use crate::messaging::{AccountData, IncomeEvent, MarketData, MarketEvent, PendingOrder, SymbolAccountData};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView, SymbolView};
 use std::collections::{HashMap, HashSet};
 
@@ -91,7 +91,29 @@ pub struct FundingArbStrategy {
     close_stuck: Option<LegPair>,
     /// 上一次是否有所的资金费未知（只在变成未知时打一次 warn）
     funding_unknown: bool,
+    /// 各所下单被拒后的退避（见 [`RejectBackoff`]）
+    reject_backoff: HashMap<Exchange, RejectBackoff>,
 }
+
+/// 某所连续被拒单时的退避：第一次拒后等 `hedge_retry_ms` 再挂新的 maker，之后每连续拒一次等待
+/// 翻倍，封顶 [`MAX_REJECT_BACKOFF_MS`]；该所有一张单被交易所接下（挂上或成交）就清零。
+///
+/// 不退避时，被拒的单离开挂单列表后下一个盘口事件就重挂：持续性拒单（保证金不足、币安
+/// -2027 杠杆档位、限频）会按 REST 往返的速度刷单，招来币安 418 封 IP、耗光 HL 每日操作额度。
+/// post-only 会吃单被拒这类偶发拒单只等一个间隔，对资费套利无关紧要，故不按拒单原因区分。
+/// 口径是该所本策略的任何单：市价补腿被拒也会让该所的 maker 退避，补腿成交也会清零；
+/// 但退避只拦新挂 maker，不拦补腿（补腿另有 `hedge_retry_ms` 的重试间隔）。同一张单的拒单若
+/// 经 REST 与私有流各到一次会翻倍两次，有封顶，不处理。
+#[derive(Debug, Clone, Copy)]
+struct RejectBackoff {
+    /// 这之前不在该所挂新的 maker
+    until: Timestamp,
+    /// 本次等待时长（下次再拒就翻倍）
+    delay_ms: u64,
+}
+
+/// 拒单退避的上限：持续拒单时每所每币最多 5 分钟试一次
+const MAX_REJECT_BACKOFF_MS: u64 = 5 * 60_000;
 
 impl FundingArbStrategy {
     /// `metas`：该币在各所的合约规格，一所一份、至少两所，顺序即所的顺序（装配处按各所品种目录给出）
@@ -121,6 +143,7 @@ impl FundingArbStrategy {
             last_action: None,
             close_stuck: None,
             funding_unknown: false,
+            reject_backoff: HashMap::new(),
         }
     }
 
@@ -383,7 +406,30 @@ impl FundingArbStrategy {
         ok
     }
 
-    /// 让各所的挂单与 `quotes` 一致：不符的撤，缺的挂。
+    /// 记下本策略一张单的结局：被拒（交易所拒或本地 REST 失败）则加长该所的退避，被接下则清零
+    fn note_order_outcome(&mut self, update: &OrderUpdate, now: Timestamp) {
+        let ex = update.exchange;
+        match &update.status {
+            OrderStatus::Rejected { reason } | OrderStatus::Error { reason } => {
+                let delay_ms = self
+                    .reject_backoff
+                    .get(&ex)
+                    .map_or(self.p.hedge_retry_ms, |b| (b.delay_ms * 2).min(MAX_REJECT_BACKOFF_MS));
+                tracing::warn!(symbol = %self.symbol(), %ex, %reason, delay_ms, "下单被拒，该所暂停挂新单");
+                self.reject_backoff.insert(ex, RejectBackoff { until: now + delay_ms, delay_ms });
+            }
+            OrderStatus::Pending | OrderStatus::PartiallyFilled | OrderStatus::Filled => {
+                self.reject_backoff.remove(&ex);
+            }
+            OrderStatus::Created | OrderStatus::Cancelled => {}
+        }
+    }
+
+    fn backing_off(&self, ex: Exchange, now: Timestamp) -> bool {
+        self.reject_backoff.get(&ex).is_some_and(|b| now < b.until)
+    }
+
+    /// 让各所的挂单与 `quotes` 一致：不符的撤，缺的挂（拒单退避中的所不挂）。
     fn maintain(&mut self, sv: SymbolView<'_>, quotes: &[Quote], now: Timestamp) -> Vec<OutcomeEvent> {
         let mut out = Vec::new();
         for ex in self.exchanges.clone() {
@@ -391,7 +437,9 @@ impl FundingArbStrategy {
             let pendings: Vec<&PendingOrder> = sv.pending_orders().filter(|p| p.order.exchange == ex).collect();
             if pendings.is_empty() {
                 if let Some((q, qty)) = want.and_then(|q| q.qty.map(|n| (q, n))) {
-                    out.push(self.place(q, qty));
+                    if !self.backing_off(ex, now) {
+                        out.push(self.place(q, qty));
+                    }
                 }
                 continue;
             }
@@ -551,6 +599,13 @@ impl Strategy for FundingArbStrategy {
             IncomeEvent::Market(MarketEvent { data: MarketData::Custom(c), .. }) => {
                 if let Some(w) = c.get::<SettledFundingWindow>() {
                     self.funding.insert(w.exchange, w.clone());
+                }
+            }
+            IncomeEvent::Account(a) => {
+                if let AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) = &a.data {
+                    if u.client_order_id.as_ref().is_some_and(|c| u.exchange.owns_cli_order_id(c)) {
+                        self.note_order_outcome(u, now);
+                    }
                 }
             }
             _ => {}

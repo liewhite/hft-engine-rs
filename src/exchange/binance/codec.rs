@@ -288,12 +288,15 @@ impl OrderTradeUpdate {
             "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
             "FILLED" => OrderStatus::Filled,
             "CANCELED" | "CANCELLED" => OrderStatus::Cancelled,
-            "REJECTED" | "EXPIRED" => OrderStatus::Rejected {
+            // EXPIRED_IN_MATCH：自成交保护撤单
+            "REJECTED" | "EXPIRED" | "EXPIRED_IN_MATCH" => OrderStatus::Rejected {
                 reason: self.o.status.clone(),
             },
-            other => OrderStatus::Rejected {
-                reason: format!("Unknown status: {}", other),
-            },
+            // 强平接管（保险基金 / ADL）的系统单，不是本引擎的单，只是挂着
+            "NEW_INSURANCE" | "NEW_ADL" => OrderStatus::Pending,
+            // 不认识的状态不猜：当成终态会把可能还活着的单从本地挂单里删掉（它之后成交就是
+            // 「外来」成交），当成挂着会让已结束的单永远挂在本地 —— 按解析失败处理
+            other => return Err(format!("Binance 订单状态未知: {other}")),
         };
 
         let quantity = f64::from_str(&self.o.q)

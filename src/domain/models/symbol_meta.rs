@@ -31,18 +31,6 @@ pub struct SymbolMeta {
 }
 
 impl SymbolMeta {
-    /// 检查元数据是否有效
-    pub fn is_valid(&self) -> bool {
-        self.size_step > 0.0 && self.contract_size > 0.0
-    }
-
-    /// 将币本位数量转换为下单数量
-    ///
-    /// 例如: 想下 0.5 ETH, OKX cval=0.1, 则返回 5 (张)
-    pub fn coin_to_qty(&self, coin_amount: f64) -> f64 {
-        coin_amount / self.contract_size
-    }
-
     /// **币本位**的最小可交易增量 = `size_step × contract_size`。
     ///
     /// `size_step` 是**交易所下单单位**（OKX 的 SWAP 是张）的步长，不能直接当币量用；
@@ -72,11 +60,6 @@ impl SymbolMeta {
             .unwrap_or(price)
     }
 
-    /// 将**交易所下单单位**的数量调整到合法精度 (向下取整)
-    pub fn round_size_down(&self, size: f64) -> f64 {
-        Self::round_to_step(size, self.size_step, RoundingStrategy::ToNegativeInfinity)
-    }
-
     /// 币本位 -> 交易所下单单位：折算、按精度向下取整，并校验数量下界。
     ///
     /// **出向数量校验的唯一出处**：实盘出口（`crate::exchange::ExchangeOrder::from_domain`）
@@ -92,7 +75,13 @@ impl SymbolMeta {
         if !coin_amount.is_finite() {
             return Err(format!("数量不是有限值：{coin_amount}"));
         }
-        let quantity = self.round_size_down(self.coin_to_qty(coin_amount));
+        let Some((quantity, _)) = self.qty_floor_dec(coin_amount) else {
+            return Err(format!(
+                "品种规格无效或数量超范围：请求 {coin_amount}，step={}，contract_size={}",
+                self.size_step, self.contract_size
+            ));
+        };
+        let quantity = dec_to_f64(quantity);
         if quantity <= 0.0 {
             return Err(format!(
                 "数量取整后为 0：请求 {coin_amount} 币不足一个 size_step（step={}, contract_size={}）",
@@ -117,25 +106,78 @@ impl SymbolMeta {
     /// - 单位折算是**线路细节**，只发生在交易所出口 (见 [`crate::exchange::ExchangeOrder`])
     ///
     /// 二者曾被合并在一个函数里，搬到出口后回测就悄悄丢掉了取整（同一天回测 PnL 出现偏差）。
+    /// 规格无效（步长或乘数为 0）、数量非有限或超范围时返回 0，下游校验会拒。
     pub fn round_coin_size_down(&self, coin_amount: f64) -> f64 {
-        self.qty_to_coin(self.round_size_down(self.coin_to_qty(coin_amount)))
+        self.qty_floor_dec(coin_amount).map_or(0.0, |(qty, cs)| dec_to_f64(qty * cs))
     }
 
-    /// 使用 Decimal 精确计算，按 step 取整
+    /// 币本位 → 交易所下单单位并按 `size_step` 向下取整，连同合约乘数一起以 Decimal 返回。
+    /// **数量取整规则的唯一实现。**
     ///
-    /// value 和 step 正常来自交易所 API 的合法浮点数（非 NaN/Infinity）。若出现非有限值，
-    /// 无法用 Decimal 精确取整，记录后返回原值兜底（不 panic）。
-    fn round_to_step(value: f64, step: f64, strategy: RoundingStrategy) -> f64 {
-        let (Some(value_dec), Some(step_dec)) = (Decimal::from_f64(value), Decimal::from_f64(step))
-        else {
-            tracing::warn!(value, step, "round_to_step: 非有限输入，返回原值不取整");
-            return value;
-        };
+    /// **折算、取整、折回都在 Decimal 里做**：浮点除法会把恰好在步长上的量算小一点
+    /// （0.29 / 0.01 = 28.999999999999996），向下取整就少一步；策略、运行器、出口依次对同一个量
+    /// 取整，每一次都可能再丢一步 —— 两所挂单量差一步、卡在最小下单量上的单被本地拒掉
+    /// （11-13 框架审查）。精确运算下取整是幂等的：f64 转 Decimal 取最短十进制写法
+    /// （0.29 → 0.29），Decimal 转回 f64 取最近值，取整过的量再取整不变。
+    ///
+    /// `None`：数量非有限或超出 Decimal 范围，或规格的步长 / 乘数为 0。
+    fn qty_floor_dec(&self, coin_amount: f64) -> Option<(Decimal, Decimal)> {
+        let coin = Decimal::from_f64(coin_amount)?;
+        let cs = Decimal::from_f64(self.contract_size).filter(|d| !d.is_zero())?;
+        let step = Decimal::from_f64(self.size_step).filter(|d| !d.is_zero())?;
+        Some(((coin / cs / step).floor() * step, cs))
+    }
+}
 
-        let ticks = value_dec / step_dec;
-        let rounded_ticks = ticks.round_dp_with_strategy(0, strategy);
+/// Decimal → f64 总能成功（取最近值）
+fn dec_to_f64(d: Decimal) -> f64 {
+    d.to_f64().expect("Decimal 转 f64 不会失败")
+}
 
-        let result = rounded_ticks * step_dec;
-        result.to_f64().unwrap_or(value)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::StepFormatter;
+
+    fn meta(contract_size: f64, size_step: f64) -> SymbolMeta {
+        SymbolMeta {
+            exchange: Exchange::OKX,
+            symbol: "X".into(),
+            price_formatter: Arc::new(StepFormatter::new(0.01)),
+            size_step,
+            min_order_size: size_step,
+            min_notional: 0.0,
+            contract_size,
+        }
+    }
+
+    /// 恰好在步长上的量取整不丢步，取整过的量再取整不变（幂等）；出口换算的张数就是那个步数。
+    /// 旧实现（浮点除法）在 contract_size=0.01、k=29 等处少一步。
+    #[test]
+    fn rounding_is_exact_and_idempotent() {
+        for (cs, step) in [(0.01, 1.0), (0.1, 1.0), (0.001, 1.0), (1.0, 0.001), (10.0, 1.0), (100.0, 1.0), (0.1, 0.1), (1.0, 0.1), (0.0001, 1.0)] {
+            let m = meta(cs, step);
+            let exact = Decimal::from_f64(step).unwrap() * Decimal::from_f64(cs).unwrap();
+            for k in 1..20_000u32 {
+                // k 步对应的币量（最近的 f64），即上游第一次取整后交下来的量
+                let coin = (Decimal::from(k) * exact).to_f64().unwrap();
+                assert_eq!(m.round_coin_size_down(coin), coin, "cs={cs} step={step} k={k}");
+                let units = m.checked_exchange_qty(coin).unwrap();
+                assert_eq!(
+                    Decimal::from_f64(units).unwrap(),
+                    Decimal::from(k) * Decimal::from_f64(step).unwrap(),
+                    "cs={cs} step={step} k={k} coin={coin}"
+                );
+                assert_eq!(m.round_coin_size_down(coin), coin, "cs={cs} step={step} k={k}");
+            }
+        }
+    }
+
+    #[test]
+    fn rounds_down_between_steps() {
+        let m = meta(0.01, 1.0);
+        assert_eq!(m.round_coin_size_down(0.299), 0.29);
+        assert!(m.checked_exchange_qty(0.009).is_err());
+        assert!(m.checked_exchange_qty(f64::NAN).is_err());
     }
 }
