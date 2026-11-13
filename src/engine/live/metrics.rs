@@ -527,10 +527,7 @@ impl MetricsHandle {
 /// 交易指标观测组件。
 ///
 /// 观测组件故障**不得**拖垮交易：`run` 没有出错退出的路径（出错会经任务树让整机停机），
-/// pushgateway 推送失败只记 warn（见 [`Pusher`]）。
-///
-/// 配了推送时，推送器是本节点的子任务：本节点 `run` 返回后框架才停它、它排空收件箱才
-/// 算停完，所以 `run` 结尾交出的最终快照一定会推出去（或超时报 warn）。
+/// pushgateway 推送由子任务 [`Pusher`] 做，失败只记 warn。
 pub struct Metrics {
     inbox: Inbox<MetricsMsg>,
     /// 报告间隔
@@ -567,8 +564,7 @@ impl Metrics {
     fn report(&self) {
         let prom = self.view.report();
         if let Some(pusher) = &self.pusher {
-            // 推送器只会在本节点 run 返回后被停；在那之前没了只能是它自己出错退出 ——
-            // 错误已经由任务树上报、整机在停，这里只说明这份快照没推
+            // 只可能是推送器自己出错退出（已由任务树上报）
             if pusher.send(prom.into_body()).is_err() {
                 tracing::warn!("指标推送器已退出，本次快照未推送");
             }
@@ -590,11 +586,10 @@ impl Task for Metrics {
                         // 提问方已不等回复（它自己放弃了）时无人可告知；注册本身已生效
                         let _ = reply.send(());
                     }
-                    // 已被要求停止，收件箱已排空：留一份最终快照（便于事后复盘）。放在这里
-                    // 而不是 stop 里：stop 在子任务（推送器）停完之后才调，那时已推不出去
+                    // 已被要求停止，收件箱已排空：留一份最终快照（在此而非 stop：见 Task::stop）
                     None => {
                         self.report();
-                        tracing::info!("Metrics stopped");
+                        tracing::info!("Metrics 最终快照已出（配了推送则已交推送器）");
                         return Ok(());
                     }
                 },

@@ -42,7 +42,9 @@ const SLOW_WARN_INTERVAL: Duration = Duration::from_secs(5);
 ///   [`Scope::request_stop`]。
 /// - [`Self::stop`] 是收尾，在它的全部子任务都收尾完之后才调用；`run` 出错或 panic 也照样调。
 ///   **收尾时要补发的东西（如成交）直接发到总线，不要经父节点转**：父节点的收件箱在停子任务
-///   之前就已关闭，发给它会失败（[`crate::tasks::Gone`]）。
+///   之前就已关闭，发给它会失败（[`crate::tasks::Gone`]）。反过来也一样：要交给**子任务**的最后一份
+///   东西（如停机前的最终快照）在 `run` 结尾发，不要放进 `stop`：那时子任务已停完；而 `run` 返回
+///   之前子任务一定还活着，它们停机时会先排空收件箱。
 ///
 /// 只有一段循环、没有收尾的组件用 [`Group::spawn_fn`]，不必实现本 trait。
 pub trait Task: Send + 'static {
