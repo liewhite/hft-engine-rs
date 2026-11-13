@@ -23,6 +23,8 @@ where
     use futures_util::FutureExt;
 
     let alerts = init_tracing()?;
+    // 第一行业务日志就是版本：日志里看本次启动跑的是哪版代码（体检脚本按它报版本）
+    tracing::info!(build = crate::build_info::BUILD_ID, "程序启动");
     if let Some(a) = &alerts {
         if let Err(e) = a.probe().await {
             tracing::error!(error = %e, "告警外送不通，拒绝启动");

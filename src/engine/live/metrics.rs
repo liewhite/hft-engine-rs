@@ -415,6 +415,8 @@ impl MetricsView {
         prom.gauge("hft_volume_total", &[], self.total.volume);
         prom.gauge("hft_fee_total", &[], self.total.fee);
         prom.gauge("hft_session_pnl", &[], total_session_pnl);
+        // 恒为 1，标签带提交号：看板据此显示在跑的版本，换版前后能对上（#742）
+        prom.gauge("hft_build_info", &[("commit", crate::build_info::GIT_COMMIT)], 1.0);
         tracing::info!(
             target: "metrics",
             exchanges = exchange_count,

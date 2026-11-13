@@ -1,4 +1,5 @@
 pub mod backtest;
+pub mod build_info;
 pub mod domain;
 pub mod engine;
 pub mod exchange;
