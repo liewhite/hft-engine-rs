@@ -841,3 +841,57 @@ fn gauges_report_bbo_age_including_never_seen_exchanges() {
     assert_eq!(age(BN), Some((s.now - (bn_at - 10)) as f64 / 1000.0), "{g:?}");
     assert!(age(HL).is_some_and(|a| a >= (s.now - first) as f64 / 1000.0), "从没来过盘口的所也要有读数，且不短于第一条事件以来的时长: {g:?}");
 }
+
+/// 在 `f` 里收集本线程打出的 WARN 日志文本
+fn warn_logs(f: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf::default();
+    let w = buf.clone();
+    let sub = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer(move || w.clone())
+        .finish();
+    tracing::subscriber::with_default(sub, f);
+    let bytes = buf.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}
+
+const CLOSE_STUCK: &str = "凑不出两所都下得出的一手";
+
+#[test]
+fn thin_book_during_close_does_not_warn_stuck() {
+    // 大仓位平仓中途盘口第一档暂时变薄、挂不出：不是零头，不报「需人工处理」（#799）
+    let mut s = Sim::new(dec!(-2.0), dec!(2.0));
+    let logs = warn_logs(|| {
+        s.bbo_depth(BN, dec!(0.05));
+        s.funding(BN, 0.1);
+        assert!(placed(&s.funding(HL, 0.2)).is_empty(), "盘口薄，不挂");
+        assert_eq!(placed(&s.bbo(BN)).len(), 2, "盘口恢复就挂平仓单");
+        s.bbo_depth(HL, dec!(0.05));
+    });
+    assert!(!logs.contains(CLOSE_STUCK), "{logs}");
+}
+
+#[test]
+fn close_quantity_below_one_lot_warns_once() {
+    // OKX 多 0.5、币安空 0.5：各自够最小金额（50U），但 OKX 一手 1 个币，凑不出一手 → 报一次
+    let mut s = Sim::multi(&[(OKX, dec!(0.5)), (BN, dec!(-0.5))]);
+    let logs = warn_logs(|| {
+        s.funding(BN, 0.1);
+        assert!(placed(&s.funding(OKX, 0.05)).is_empty());
+        s.bbo(BN);
+        s.bbo(OKX);
+    });
+    assert_eq!(logs.matches(CLOSE_STUCK).count(), 1, "{logs}");
+}

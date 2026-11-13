@@ -92,8 +92,9 @@ pub struct FundingArbStrategy {
     /// 本轮不平衡已发出的补腿单数；>0 时再发即是重试
     hedge_attempts: u32,
     last_action: Option<FundingAction>,
-    /// 已报过「挂不出平仓单」的所对（只报一次）
-    close_stuck: Option<LegPair>,
+    /// 最近一次报「凑不出一手平仓单」时的所对和可平量：同一所对、同一可平量只报一次，
+    /// 持仓变了（有成交）才可能再报
+    close_stuck: Option<(LegPair, Quantity)>,
     /// 上一次是否有所的资金费未知（只在变成未知时打一次 warn）
     funding_unknown: bool,
     /// 各所下单被拒后的退避（见 [`RejectBackoff`]）
@@ -237,17 +238,14 @@ impl FundingArbStrategy {
         if let (Some(pair), true) = (action_pair(action), sized) {
             self.leg = Some(pair);
         }
-        match action {
-            // 平仓信号在、盘口也新鲜，却挂不出单（量不足最小单或凑不齐两所都下得出的一手）：
-            // 仓位会一直拿着，要人看。每个所对只报一次
-            FundingAction::Close(pair) if !sized && self.pair_fresh(pair, now) => {
-                if self.close_stuck != Some(pair) {
-                    tracing::warn!(symbol = %self.symbol(), ?pair, ?positions, "该平仓但挂不出平仓单（量太小或下单粒度凑不齐），需人工处理");
-                    self.close_stuck = Some(pair);
-                }
+        // 平仓信号在、盘口也新鲜，可平量本身却凑不出两所都下得出的一手（不看盘口厚度：第一档薄只是
+        // 这一刻挂不出，下一跳就可能挂出，#799）：仓位会一直拿着，要人看
+        if let FundingAction::Close(pair) = action {
+            let held = close_held(pair, &positions);
+            if self.pair_fresh(pair, now) && self.pair_qty(pair, held, px).is_none() && self.close_stuck != Some((pair, held)) {
+                tracing::warn!(symbol = %self.symbol(), ?pair, ?positions, "该平仓但可平量凑不出两所都下得出的一手（零头或下单粒度凑不齐），需人工处理");
+                self.close_stuck = Some((pair, held));
             }
-            _ if sized => self.close_stuck = None,
-            _ => {}
         }
         self.maintain(sv, &quotes, now)
     }
@@ -327,8 +325,14 @@ impl FundingArbStrategy {
         meta.checked_exchange_qty(qty).is_ok() && notional(meta.round_coin_size_down(qty), px) >= self.min_notional(ex)
     }
 
-    /// 两所挂同样的量：按两所精度依次向下取整（各所步长都是 10 的幂次，取整后同为两所步长的整数倍）；
-    /// 任一所下不出则量为 `None`（不新挂，见 [`Quote::qty`]）。
+    /// 两所都下得出的量：按两所精度依次向下取整（各所步长都是 10 的幂次，取整后同为两所步长的整数倍）；
+    /// 任一所下不出则为 `None`
+    fn pair_qty(&self, pair: LegPair, qty: Quantity, px: Price) -> Option<Quantity> {
+        let qty = self.metas[&pair.buy].round_coin_size_down(self.metas[&pair.sell].round_coin_size_down(qty));
+        (self.tradable(pair.sell, qty, px) && self.tradable(pair.buy, qty, px)).then_some(qty)
+    }
+
+    /// 两所挂同样的量（取整见 [`Self::pair_qty`]）；任一所下不出则量为 `None`（不新挂，见 [`Quote::qty`]）。
     fn pair_quotes(
         &self,
         pair: LegPair,
@@ -337,8 +341,7 @@ impl FundingArbStrategy {
         px: Price,
         reduce_only: bool,
     ) -> Vec<Quote> {
-        let qty = self.metas[&pair.buy].round_coin_size_down(self.metas[&pair.sell].round_coin_size_down(qty));
-        let qty = (self.tradable(pair.sell, qty, px) && self.tradable(pair.buy, qty, px)).then_some(qty);
+        let qty = self.pair_qty(pair, qty, px);
         [(pair.sell, Side::Short), (pair.buy, Side::Long)]
             .into_iter()
             .map(|(ex, side)| Quote { exchange: ex, side, price: self.maker_price(bbos[&ex], side), qty, reduce_only })
@@ -372,13 +375,7 @@ impl FundingArbStrategy {
     }
 
     fn close_quotes(&self, pair: LegPair, bbos: &HashMap<Exchange, &BBO>, positions: &[(Exchange, Quantity)], px: Price) -> Vec<Quote> {
-        let pos = |ex: Exchange| positions.iter().find(|(e, _)| *e == ex).map_or(Quantity::ZERO, |(_, p)| *p);
-        // 卖出所持多、买入所持空（decide 保证），可平的量 = 两者绝对值较小的一个
-        let held = pos(pair.sell).max(Quantity::ZERO).min((-pos(pair.buy)).max(Quantity::ZERO));
-        let qty = qty_of(self.cap_notional(pair, bbos), px).min(held);
-        if notional(qty, px) < self.pair_min_notional(pair) {
-            return self.pair_quotes(pair, bbos, Quantity::ZERO, px, true);
-        }
+        let qty = qty_of(self.cap_notional(pair, bbos), px).min(close_held(pair, positions));
         self.pair_quotes(pair, bbos, qty, px, true)
     }
 
@@ -577,6 +574,12 @@ fn hedge_target(pair: LegPair, net: Quantity) -> (Exchange, Side) {
     } else {
         (pair.buy, Side::Long)
     }
+}
+
+/// 平仓所对的可平量：卖出所持多、买入所持空（decide 保证），取两者绝对值较小的一个
+fn close_held(pair: LegPair, positions: &[(Exchange, Quantity)]) -> Quantity {
+    let pos = |ex: Exchange| positions.iter().find(|(e, _)| *e == ex).map_or(Quantity::ZERO, |(_, p)| *p);
+    pos(pair.sell).max(Quantity::ZERO).min((-pos(pair.buy)).max(Quantity::ZERO))
 }
 
 /// 数量 × 价格 → 金额（计价币）
