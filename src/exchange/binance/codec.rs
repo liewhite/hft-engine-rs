@@ -1,6 +1,9 @@
+//! Binance 推送的编解码。只声明用得上的字段：声明了却不用的必填字段，交易所哪天改名或去掉它，
+//! 整条推送就解析不了（私有流因此停机）。
+
 use super::from_binance;
 use crate::domain::{
-    now_ms, Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
+    Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
     OrderUpdate, Quantity, Side, Symbol, BBO,
 };
 use serde::Deserialize;
@@ -8,9 +11,7 @@ use std::str::FromStr;
 
 /// Mark Price 更新 (包含资金费率)
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct MarkPriceUpdate {
-    pub e: String,
     pub s: String,
     pub p: String,
     pub i: String,
@@ -76,9 +77,7 @@ impl MarkPriceUpdate {
 
 /// Book Ticker (BBO)
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct BookTicker {
-    pub e: String,
     pub s: String,
     pub b: String,
     #[serde(rename = "B")]
@@ -123,9 +122,7 @@ impl BookTicker {
 ///
 /// 时间戳取 `T` (成交时间) 而非 `E` (事件推送时间)，与 `BookTicker` 取 `T` 的口径一致。
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct AggTrade {
-    pub e: String,
     pub s: String,
     pub p: String,
     pub q: String,
@@ -156,9 +153,7 @@ impl AggTrade {
 
 /// 账户更新
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct AccountUpdate {
-    pub e: String,
     pub a: AccountData,
 }
 
@@ -174,12 +169,11 @@ pub struct AccountData {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct AccountBalance {
+    /// 币种
     pub a: String,
-    pub wb: String,
+    /// 全仓钱包余额（cross wallet balance）
     pub cw: String,
-    pub bc: String,
 }
 
 impl AccountBalance {
@@ -197,14 +191,11 @@ impl AccountBalance {
 
 /// 订单更新
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct OrderTradeUpdate {
-    pub e: String,
     pub o: OrderData,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct OrderData {
     pub s: String,
     pub c: String, // client_order_id
@@ -214,9 +205,6 @@ pub struct OrderData {
     #[serde(rename = "X")]
     pub status: String,
     pub q: String,
-    /// 委托价 (Original price)。挂单态 ap 是 "0"，OrderUpdate.price 必须用它 ——
-    /// 否则本地按 update 重建挂单时会造出 price=0 的假单
-    pub p: String,
     /// 累计成交量 (Cumulative filled quantity)
     pub z: String,
     /// 本次成交量 (Last filled quantity)
@@ -224,8 +212,9 @@ pub struct OrderData {
     /// 本次成交价格 (Last filled price)
     #[serde(rename = "L")]
     pub last_price: String,
-    pub ap: String,
-    pub rp: String,
+    /// 成交时间（交易所时间，毫秒）
+    #[serde(rename = "T")]
+    pub trade_time: u64,
     /// 本次成交手续费 (Commission amount)。
     ///
     /// **可能缺失**：Binance 文档对 `n`/`N` 明确写着 "will not push if no commission"
@@ -236,9 +225,10 @@ pub struct OrderData {
     /// 有成交时它必然存在，所以 [`OrderTradeUpdate::to_fill`] 里缺失即报错（那才是真违约）。
     #[serde(default)]
     pub n: Option<String>,
-    /// reduce-only 标志
-    #[serde(rename = "R", default)]
-    pub reduce_only: bool,
+    /// 手续费币种（Commission asset），与 `n` 同进同出。开了 BNB 抵扣且合约账户有 BNB 时是 BNB，
+    /// 否则是计价币（2026-11-14 实查本账户：feeBurn=true、合约账户无 BNB，近期佣金全是 USDT）
+    #[serde(rename = "N", default)]
+    pub fee_asset: Option<String>,
 }
 
 impl OrderTradeUpdate {
@@ -300,8 +290,9 @@ impl OrderTradeUpdate {
     }
 
     /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）
-    /// `symbol` 来自 [`Self::symbol`]。
-    pub fn to_fill(&self, symbol: Symbol) -> Result<Option<Fill>, String> {
+    /// `symbol` 来自 [`Self::symbol`]；`quote` 是计价币：[`Fill::fee`] 以计价币计，手续费币种不是它
+    /// （如 BNB 抵扣）就报错，不把 BNB 数额当 USDT 记。
+    pub fn to_fill(&self, symbol: Symbol, quote: &str) -> Result<Option<Fill>, String> {
         let fill_sz = self.last_filled()?;
 
         // 没有成交则不生成 Fill
@@ -323,6 +314,17 @@ impl OrderTradeUpdate {
             })?;
         let fee =
             f64::from_str(fee_raw).map_err(|_| format!("Failed to parse commission: {fee_raw}"))?;
+        match self.o.fee_asset.as_deref() {
+            Some(asset) if asset == quote => {}
+            // 手续费为 0 时币种无所谓（0 换成哪个币都是 0）
+            _ if fee == 0.0 => {}
+            other => {
+                return Err(format!(
+                "Binance 成交手续费币种是 {other:?}（计价币 {quote}），手续费口径对不上（订单 {}）",
+                self.o.i
+            ))
+            }
+        }
 
         Ok(Some(Fill {
             exchange: Exchange::Binance,
@@ -332,7 +334,7 @@ impl OrderTradeUpdate {
             size: fill_sz,
             client_order_id: (!self.o.c.is_empty()).then(|| self.o.c.clone()),
             order_id: self.o.i.to_string(),
-            timestamp: now_ms(),
+            timestamp: self.o.trade_time,
             fee,
             // Binance 强平/ADL 也经 ORDER_TRADE_UPDATE 以 fill 到达并如常更新持仓；
             // 本 codec 暂未解析订单类型区分来源，统一标 Normal。
@@ -341,18 +343,15 @@ impl OrderTradeUpdate {
     }
 }
 
-/// WebSocket 订阅响应
+/// WebSocket 订阅响应（只看有没有错误）
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct WsResponse {
-    pub result: Option<serde_json::Value>,
-    pub error: Option<ExchangeError>,
+    pub error: Option<WsErrorReply>,
 }
 
-/// WebSocket 错误
+/// WebSocket 订阅响应里的错误
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct ExchangeError {
+pub struct WsErrorReply {
     pub code: i32,
     pub msg: String,
 }
@@ -379,6 +378,27 @@ mod tests {
         assert!(t.is_buyer_maker, "m=true -> 买方挂单 -> 主动卖");
         // 时间戳取 T (成交时间) 而非 E (推送时间)
         assert_eq!(t.timestamp, 123456785);
+    }
+
+    fn order_push(fee_asset: &str) -> OrderTradeUpdate {
+        serde_json::from_str(&format!(
+            r#"{{"e":"ORDER_TRADE_UPDATE","E":1,"o":{{"s":"BTCUSDT","c":"x","S":"BUY","i":7,"X":"FILLED",
+            "q":"0.5","p":"0","z":"0.5","l":"0.5","L":"60000","T":1700000000123,"ap":"60000","rp":"0",
+            "n":"0.01","N":"{fee_asset}"}}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// 成交时间取交易所的成交时间 T；手续费以计价币计，BNB 抵扣的成交报错（不把 BNB 数额当 USDT 记）
+    #[test]
+    fn fill_uses_trade_time_and_requires_quote_fee_asset() {
+        let fill = order_push("USDT")
+            .to_fill("BTC".into(), "USDT")
+            .unwrap()
+            .expect("有成交");
+        assert_eq!(fill.timestamp, 1700000000123);
+        assert!((fill.fee - 0.01).abs() < 1e-12);
+        assert!(order_push("BNB").to_fill("BTC".into(), "USDT").is_err());
     }
 
     #[test]

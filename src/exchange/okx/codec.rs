@@ -1,7 +1,7 @@
 use super::{from_okx, from_okx_index};
 use crate::domain::{
-    now_ms, Candle, CandleInterval, Decimal, Exchange, Fill, FundingRate, Greeks, IndexPrice,
-    MarkPrice, MarketTrade, OrderStatus, OrderUpdate, Position, Side, Symbol, SymbolMeta, BBO,
+    Candle, CandleInterval, Decimal, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice,
+    MarketTrade, OrderStatus, OrderUpdate, Position, Side, Symbol, SymbolMeta, BBO,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -380,6 +380,12 @@ pub struct OrderPushData {
     /// 手续费被反复累加（见 `to_fill` 的说明）。
     #[serde(default)]
     pub fill_fee: Option<String>,
+    /// 本次成交手续费的币种（USDT 本位永续是 USDT），与 `fill_fee` 同进同出
+    #[serde(default)]
+    pub fill_fee_ccy: Option<String>,
+    /// 本次成交时间（交易所时间，毫秒），没有成交时为空串
+    #[serde(default)]
+    pub fill_time: String,
     /// 该单最近一笔成交的成交号（同一合约内唯一），没有成交时为空串。私有流拿它给成交去重
     #[serde(default)]
     pub trade_id: String,
@@ -415,8 +421,9 @@ impl OrderPushData {
         })
     }
 
-    /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）。数量折算为币本位。
-    pub fn to_fill(&self, meta: &SymbolMeta) -> Result<Option<Fill>, String> {
+    /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）。数量折算为币本位。`quote` 是计价币：
+    /// [`Fill::fee`] 以计价币计，手续费币种不是它就报错。
+    pub fn to_fill(&self, meta: &SymbolMeta, quote: &str) -> Result<Option<Fill>, String> {
         let fill_sz = meta.qty_to_coin(
             crate::domain::parse_decimal(&self.fill_sz)
                 .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?,
@@ -447,6 +454,17 @@ impl OrderPushData {
         // OKX: 手续费为负数表示收费，取反统一为正数=收费
         let fee =
             f64::from_str(fill_fee).map_err(|_| format!("Failed to parse fillFee: {fill_fee}"))?;
+        // 手续费为 0 时币种无所谓（0 换成哪个币都是 0），交易所在这时给的币种也未核实
+        if fee != 0.0 && self.fill_fee_ccy.as_deref() != Some(quote) {
+            return Err(format!(
+                "OKX 成交手续费币种是 {:?}（计价币 {quote}），手续费口径对不上（订单 {}）",
+                self.fill_fee_ccy, self.ord_id
+            ));
+        }
+        let timestamp = self
+            .fill_time
+            .parse::<u64>()
+            .map_err(|_| format!("OKX 成交时间 fillTime 非法: {:?}", self.fill_time))?;
 
         let reason = match self.category.as_deref() {
             Some("adl") => crate::domain::FillReason::Adl,
@@ -462,7 +480,7 @@ impl OrderPushData {
             size: fill_sz,
             client_order_id: self.cl_ord_id.clone().filter(|s| !s.is_empty()),
             order_id: self.ord_id.clone(),
-            timestamp: now_ms(),
+            timestamp,
             fee: -fee,
             reason,
         }))
@@ -746,10 +764,15 @@ mod trade_tests {
         // 第三次推送：本次成交手续费 -0.1，而订单累计已达 -0.3
         let raw = r#"{"instId":"BTC-USDT-SWAP","ordId":"1","clOrdId":"x-a","side":"buy",
             "state":"partially_filled","px":"42000","sz":"3","fillSz":"1","fillPx":"42000",
-            "accFillSz":"3","avgPx":"42000","fee":"-0.3","fillFee":"-0.1","feeCcy":"USDT"}"#;
+            "accFillSz":"3","avgPx":"42000","fee":"-0.3","fillFee":"-0.1","feeCcy":"USDT",
+            "fillFeeCcy":"USDT","fillTime":"1700000000123"}"#;
         let d: OrderPushData = serde_json::from_str(raw).unwrap();
         let meta = btc_meta();
-        let fill = d.to_fill(&meta).unwrap().expect("有成交必产出 Fill");
+        let fill = d
+            .to_fill(&meta, "USDT")
+            .unwrap()
+            .expect("有成交必产出 Fill");
+        assert_eq!(fill.timestamp, 1700000000123, "成交时间取交易所的 fillTime");
         assert!(
             (fill.fee - 0.1).abs() < 1e-12,
             "取成了订单累计手续费（{}），分批成交会把手续费反复累加",
@@ -765,8 +788,18 @@ mod trade_tests {
             "accFillSz":"3","avgPx":"42000","fee":"-0.3","feeCcy":"USDT"}"#;
         let d: OrderPushData = serde_json::from_str(raw).unwrap();
         assert!(
-            d.to_fill(&btc_meta()).is_err(),
+            d.to_fill(&btc_meta(), "USDT").is_err(),
             "缺 fillFee 应报错而非回退到 fee"
         );
+    }
+
+    /// 手续费不是计价币：口径对不上，报错而不是当 USDT 记
+    #[test]
+    fn fill_fee_in_other_currency_is_an_error() {
+        let raw = r#"{"instId":"BTC-USDT-SWAP","ordId":"1","clOrdId":"x-a","side":"buy",
+            "state":"filled","sz":"1","fillSz":"1","fillPx":"42000","accFillSz":"1",
+            "fillFee":"-0.1","fillFeeCcy":"OKB","fillTime":"1"}"#;
+        let d: OrderPushData = serde_json::from_str(raw).unwrap();
+        assert!(d.to_fill(&btc_meta(), "USDT").is_err());
     }
 }

@@ -169,7 +169,7 @@ fn parse_private_message(
             };
 
             // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
-            if let Some(fill) = update.to_fill(symbol.clone())? {
+            if let Some(fill) = update.to_fill(symbol.clone(), quote)? {
                 events.push(AccountEvent {
                     // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
                     account: crate::domain::AccountId::Live,
@@ -216,7 +216,7 @@ mod tests {
     fn order_push(symbol: &str, last_filled: &str) -> String {
         format!(
             r#"{{"e":"ORDER_TRADE_UPDATE","E":1,"o":{{"s":"{symbol}","c":"x-a","S":"SELL","i":7,"X":"FILLED",
-            "q":"0.5","p":"0","z":"0.5","l":"{last_filled}","L":"60000","ap":"60000","rp":"0","n":"0.01"}}}}"#
+            "q":"0.5","p":"0","z":"0.5","l":"{last_filled}","L":"60000","T":2,"ap":"60000","rp":"0","n":"0.01","N":"USDT"}}}}"#
         )
     }
 

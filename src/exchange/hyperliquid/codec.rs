@@ -495,7 +495,8 @@ impl WsFill {
 
         let fee = f64::from_str(&self.fee)
             .map_err(|_| format!("Failed to parse fill fee: {}", self.fee))?;
-        if self.fee_token != quote {
+        // 手续费为 0 时币种无所谓（0 换成哪个币都是 0）
+        if fee != 0.0 && self.fee_token != quote {
             return Err(format!(
                 "HL 成交手续费币种是 {}（计价币 {quote}），手续费口径对不上（订单 {}）",
                 self.fee_token, self.oid
