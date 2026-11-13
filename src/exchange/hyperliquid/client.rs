@@ -592,7 +592,7 @@ mod place_reply_tests {
 
 /// `userFunding` 的单条记录。
 ///
-/// 只声明用得上的字段：`hash` 有意不取（恒为全零，见 [`HyperliquidClient::fetch_funding_fees`]），
+/// 只声明用得上的字段：`hash` 有意不取（恒为全零，见 [`FundingFeeSource::fetch_funding_fees`](crate::exchange::FundingFeeSource::fetch_funding_fees)），
 /// `szi` / `fundingRate` / `nSamples` 属于费率口径，不进 [`FundingFee`]。
 #[derive(Debug, Deserialize)]
 struct UserFundingEntry {
@@ -645,7 +645,7 @@ fn parse_user_funding(
 
 /// 由 `(结算时刻, coin)` 派生 [`FundingFee::tran_id`]。
 ///
-/// HL 不给资费记录任何可用的唯一 ID（`hash` 恒为全零，见 [`HyperliquidClient::fetch_funding_fees`]），
+/// HL 不给资费记录任何可用的唯一 ID（`hash` 恒为全零，见 [`FundingFeeSource::fetch_funding_fees`](crate::exchange::FundingFeeSource::fetch_funding_fees)），
 /// 而实测 `(time, coin)` 是唯一的 —— `time` 单独**不**唯一：同一结算时刻会同时结算多个
 /// 标的（实测 311 个时刻里有 52 个是多标的）。因此 coin 必须进哈希：下游若按
 /// `(exchange, tran_id)` 去重（不含 symbol），只用 time 会让同一时刻的第二个标的被当成
