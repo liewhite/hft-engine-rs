@@ -20,4 +20,5 @@ pub mod alert;
 pub mod prometheus;
 
 pub(crate) use alert::{spawn_alert_webhook_layer, AlertHandle, AlertWebhookConfig};
-pub use prometheus::{MetricsPushConfig, PromText, Pusher};
+pub use prometheus::{MetricsPushConfig, PromText};
+pub(crate) use prometheus::Pusher;
