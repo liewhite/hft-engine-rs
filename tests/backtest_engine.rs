@@ -9,6 +9,7 @@ use hft_engine_rs::domain::{
 };
 use hft_engine_rs::engine::{subscription_scope, SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::SubscriptionKind;
+use hft_engine_rs::messaging::SymbolMarketData;
 use hft_engine_rs::messaging::{
     AccountData, ExchangeAccountData, IncomeEvent, MarketData, SymbolAccountData,
 };
@@ -55,7 +56,7 @@ fn bbo_ev(bid: Price, ask: Price, ts: Timestamp) -> IncomeEvent {
     IncomeEvent::market(
         ts,
         ts,
-        MarketData::BBO(BBO {
+        MarketData::Symbol(SymbolMarketData::BBO(BBO {
             exchange: EX,
             symbol: SYM.to_string(),
             bid_price: bid,
@@ -63,7 +64,7 @@ fn bbo_ev(bid: Price, ask: Price, ts: Timestamp) -> IncomeEvent {
             ask_price: ask,
             ask_qty: dec!(1.0),
             timestamp: ts,
-        }),
+        })),
     )
 }
 
@@ -71,14 +72,16 @@ fn trade_ev(price: Price, ts: Timestamp) -> IncomeEvent {
     IncomeEvent::market(
         ts,
         ts,
-        MarketData::MarketTrade(hft_engine_rs::domain::MarketTrade {
-            exchange: EX,
-            symbol: SYM.to_string(),
-            price,
-            qty: dec!(1.0),
-            is_buyer_maker: false,
-            timestamp: ts,
-        }),
+        MarketData::Symbol(SymbolMarketData::MarketTrade(
+            hft_engine_rs::domain::MarketTrade {
+                exchange: EX,
+                symbol: SYM.to_string(),
+                price,
+                qty: dec!(1.0),
+                is_buyer_maker: false,
+                timestamp: ts,
+            },
+        )),
     )
 }
 
@@ -111,7 +114,7 @@ impl Strategy for OneShotBuy {
     fn on_event(&mut self, event: &IncomeEvent, _view: StrategyView<'_>) -> Vec<Signal> {
         let is_market = matches!(
             event,
-            IncomeEvent::Market(m) if matches!(m.data, MarketData::BBO(_) | MarketData::MarketTrade(_))
+            IncomeEvent::Market(m) if matches!(m.data, MarketData::Symbol(SymbolMarketData::BBO(_)) | MarketData::Symbol(SymbolMarketData::MarketTrade(_)))
         );
         if is_market && !self.placed {
             self.placed = true;
@@ -152,7 +155,7 @@ fn event_sig(ev: &IncomeEvent) -> String {
             other => format!("{other:?}"),
         },
         IncomeEvent::Market(m) => match &m.data {
-            MarketData::BBO(b) => {
+            MarketData::Symbol(SymbolMarketData::BBO(b)) => {
                 format!(
                     "BBO ts={} bid={} ask={}",
                     m.exchange_ts, b.bid_price, b.ask_price

@@ -16,6 +16,7 @@
 //! ```sh
 //! cargo test --test public_stream_noauth -- --ignored --nocapture
 //! ```
+use hft_engine_rs::messaging::SymbolMarketData;
 use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{to_f64, Exchange, Symbol, SymbolMeta};
@@ -63,12 +64,12 @@ impl Task for Collector {
         while let Some(ev) = self.inbox.recv().await {
             let mut guard = self.shared.lock().expect("collector mutex");
             match &ev.data {
-                MarketData::BBO(b) => {
+                MarketData::Symbol(SymbolMarketData::BBO(b)) => {
                     let e = guard.entry(b.exchange).or_default();
                     e.bbo_count += 1;
                     e.last_bbo = Some((to_f64(b.bid_price), to_f64(b.bid_qty), to_f64(b.ask_qty)));
                 }
-                MarketData::MarketTrade(t) => {
+                MarketData::Symbol(SymbolMarketData::MarketTrade(t)) => {
                     let e = guard.entry(t.exchange).or_default();
                     e.trade_count += 1;
                     e.trade_qtys.push(to_f64(t.qty));

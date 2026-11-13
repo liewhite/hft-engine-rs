@@ -2,6 +2,7 @@ use crate::domain::{
     to_f64, Exchange, Fill, MarketTrade, Order, OrderId, OrderStatus, OrderType, OrderUpdate,
     Price, Quantity, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
 };
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{
     AccountData, MarketData, MarketEvent, OrderRequestResult, RequestOutcome, SymbolAccountData,
 };
@@ -164,16 +165,16 @@ impl SimState {
             }
         }
         match &ev.data {
-            MarketData::BBO(bbo) => {
+            MarketData::Symbol(SymbolMarketData::BBO(bbo)) => {
                 self.last_bbo.insert(bbo.symbol.clone(), bbo.clone());
                 self.match_crossing(&bbo.clone())
             }
-            MarketData::MarketTrade(t) => {
+            MarketData::Symbol(SymbolMarketData::MarketTrade(t)) => {
                 // trade-print 撮合：真实成交价严格越过挂单价即成交 (无 bbo 行情时的撮合来源)
                 self.last_trade.insert(t.symbol.clone(), t.price);
                 self.match_trade(&t.clone())
             }
-            MarketData::MarkPrice(mp) => {
+            MarketData::Symbol(SymbolMarketData::MarkPrice(mp)) => {
                 self.last_mark.insert(mp.symbol.clone(), mp.price);
                 Vec::new()
             }
@@ -675,7 +676,7 @@ mod tests {
         MarketEvent {
             exchange_ts: b.timestamp,
             local_ts: b.timestamp,
-            data: MarketData::BBO(b),
+            data: MarketData::Symbol(SymbolMarketData::BBO(b)),
         }
     }
     fn trade_ev(price: Price, ts: Timestamp) -> MarketEvent {
@@ -685,14 +686,14 @@ mod tests {
         MarketEvent {
             exchange_ts: ts,
             local_ts: ts,
-            data: MarketData::MarketTrade(MarketTrade {
+            data: MarketData::Symbol(SymbolMarketData::MarketTrade(MarketTrade {
                 exchange: EX,
                 symbol: sym(),
                 price,
                 qty,
                 is_buyer_maker: false,
                 timestamp: ts,
-            }),
+            })),
         }
     }
     fn limit(side: Side, price: Price, tif: TimeInForce, cid: &str) -> Order {

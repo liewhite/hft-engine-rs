@@ -13,6 +13,7 @@ use crate::exchange::okx::codec::{
 };
 use crate::exchange::okx::{to_okx, to_okx_index, WS_PUBLIC_URL};
 use crate::exchange::ws_loop::ReconnectingWs;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
@@ -229,7 +230,7 @@ pub(crate) fn parse_public_message(
                 events.push(MarketEvent {
                     exchange_ts: local_ts,
                     local_ts,
-                    data: MarketData::FundingRate(rate),
+                    data: MarketData::Symbol(SymbolMarketData::FundingRate(rate)),
                 });
             }
             Ok(events)
@@ -259,7 +260,7 @@ pub(crate) fn parse_public_message(
                 events.push(MarketEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,
-                    data: MarketData::BBO(bbo),
+                    data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
                 });
             }
             Ok(events)
@@ -284,7 +285,7 @@ pub(crate) fn parse_public_message(
                 events.push(MarketEvent {
                     exchange_ts: trade.timestamp,
                     local_ts,
-                    data: MarketData::MarketTrade(trade),
+                    data: MarketData::Symbol(SymbolMarketData::MarketTrade(trade)),
                 });
             }
             Ok(events)
@@ -299,7 +300,7 @@ pub(crate) fn parse_public_message(
                 events.push(MarketEvent {
                     exchange_ts: mp.timestamp,
                     local_ts,
-                    data: MarketData::MarkPrice(mp),
+                    data: MarketData::Symbol(SymbolMarketData::MarkPrice(mp)),
                 });
             }
             Ok(events)
@@ -314,7 +315,7 @@ pub(crate) fn parse_public_message(
                 events.push(MarketEvent {
                     exchange_ts: ip.timestamp,
                     local_ts,
-                    data: MarketData::IndexPrice(ip),
+                    data: MarketData::Symbol(SymbolMarketData::IndexPrice(ip)),
                 });
             }
             Ok(events)
@@ -399,7 +400,7 @@ mod tests {
         events
             .into_iter()
             .filter_map(|e| match e.data {
-                MarketData::MarketTrade(t) => Some(t),
+                MarketData::Symbol(SymbolMarketData::MarketTrade(t)) => Some(t),
                 _ => None,
             })
             .collect()

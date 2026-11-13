@@ -3,6 +3,7 @@ use crate::domain::{
     Symbol, TimeInForce, Timestamp,
 };
 use crate::exchange::SubscriptionKind;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{IncomeEvent, MarketData, MarketEvent};
 use crate::strategy::{Signal, Strategy, StrategyView, SymbolView};
 use std::cmp::Ordering;
@@ -911,7 +912,7 @@ impl Strategy for SpreadArbStrategy {
 
         // BBO 事件时更新该交易所的 bid/ask EMA 与本地接收时刻
         if let IncomeEvent::Market(MarketEvent {
-            data: MarketData::BBO(bbo),
+            data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
             ..
         }) = event
         {
@@ -1021,7 +1022,11 @@ mod tests {
             bbo(LONG_EX, dec!(99.8), dec!(100.0), dec!(10.0)),
         ] {
             manager
-                .apply(&IncomeEvent::market(0, 0, MarketData::BBO(b)))
+                .apply(&IncomeEvent::market(
+                    0,
+                    0,
+                    MarketData::Symbol(SymbolMarketData::BBO(b)),
+                ))
                 .unwrap();
         }
         manager.seed_positions(
@@ -1067,7 +1072,11 @@ mod tests {
                 bbo(LONG_EX, dec!(89.8), dec!(90.0), dec!(10.0)),
             ] {
                 self.manager
-                    .apply(&IncomeEvent::market(0, 0, MarketData::BBO(b)))
+                    .apply(&IncomeEvent::market(
+                        0,
+                        0,
+                        MarketData::Symbol(SymbolMarketData::BBO(b)),
+                    ))
                     .unwrap();
             }
             self
@@ -1116,7 +1125,7 @@ mod tests {
                 let event = IncomeEvent::market(
                     local_ts,
                     local_ts,
-                    MarketData::BBO(bbo(exchange, bid, ask, dec!(10.0))),
+                    MarketData::Symbol(SymbolMarketData::BBO(bbo(exchange, bid, ask, dec!(10.0)))),
                 );
                 f.apply(&event);
                 strategy.on_event(&event, f.view());
@@ -1388,7 +1397,12 @@ mod tests {
         let event = IncomeEvent::market(
             0,
             0,
-            MarketData::BBO(bbo(SHORT_EX, dec!(100.0), dec!(100.2), dec!(10.0))),
+            MarketData::Symbol(SymbolMarketData::BBO(bbo(
+                SHORT_EX,
+                dec!(100.0),
+                dec!(100.2),
+                dec!(10.0),
+            ))),
         );
         f.apply(&event);
 
@@ -1549,7 +1563,11 @@ mod tests {
         // 中断后恢复：价格已整体上移 10%，但 EMA 还停在 100 附近
         let gap_end = cfg.max_bbo_age_ms + 1;
         let recovered = bbo(SHORT_EX, dec!(110.0), dec!(110.2), dec!(10.0));
-        let event = IncomeEvent::market(gap_end, gap_end, MarketData::BBO(recovered));
+        let event = IncomeEvent::market(
+            gap_end,
+            gap_end,
+            MarketData::Symbol(SymbolMarketData::BBO(recovered)),
+        );
         f.apply(&event);
         let outcome = strategy.on_event(&event, f.view());
 
@@ -1572,7 +1590,12 @@ mod tests {
         let event = IncomeEvent::market(
             cfg.max_bbo_age_ms,
             cfg.max_bbo_age_ms,
-            MarketData::BBO(bbo(SHORT_EX, dec!(100.0), dec!(100.2), dec!(10.0))),
+            MarketData::Symbol(SymbolMarketData::BBO(bbo(
+                SHORT_EX,
+                dec!(100.0),
+                dec!(100.2),
+                dec!(10.0),
+            ))),
         );
         f.apply(&event);
         strategy.on_event(&event, f.view());

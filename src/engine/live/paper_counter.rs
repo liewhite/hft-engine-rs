@@ -39,6 +39,7 @@
 use crate::domain::{
     now_ms, AccountId, Exchange, Order, OrderId, Symbol, SymbolMeta, Timestamp, BBO,
 };
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, MarketBus, MarketData, MarketEvent,
 };
@@ -269,7 +270,7 @@ impl PaperCounter {
 
     fn on_market(&mut self, ev: &MarketEvent) {
         match &ev.data {
-            MarketData::BBO(bbo) => {
+            MarketData::Symbol(SymbolMarketData::BBO(bbo)) => {
                 // 行情没有账户归属：缓存一份供新柜台播种，并同步给**本所**的已开柜台
                 self.last_quotes
                     .insert((bbo.exchange, bbo.symbol.clone()), bbo.clone());
@@ -279,7 +280,7 @@ impl PaperCounter {
                     }
                 }
             }
-            MarketData::MarketTrade(trade) => {
+            MarketData::Symbol(SymbolMarketData::MarketTrade(trade)) => {
                 // 缓存一份供**新柜台**播种参考价（与 BBO 同理，见 last_trades 字段说明）
                 self.last_trades
                     .insert((trade.exchange, trade.symbol.clone()), trade.price);
@@ -288,7 +289,9 @@ impl PaperCounter {
                 // symbol 的原因之一；若要放到全量，应把"共享行情"从 SimState 里拆出来只存一份。
                 self.match_on_exchange(trade.exchange, ev);
             }
-            MarketData::MarkPrice(mp) => self.match_on_exchange(mp.exchange, ev),
+            MarketData::Symbol(SymbolMarketData::MarkPrice(mp)) => {
+                self.match_on_exchange(mp.exchange, ev)
+            }
             MarketData::Clock => self.publish_account_info(ev.local_ts),
             _ => {}
         }
@@ -542,7 +545,7 @@ mod tests {
             let ev = MarketEvent {
                 exchange_ts: 1,
                 local_ts: 1,
-                data: MarketData::BBO(BBO {
+                data: MarketData::Symbol(SymbolMarketData::BBO(BBO {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     bid_price: bid,
@@ -550,7 +553,7 @@ mod tests {
                     ask_price: ask,
                     ask_qty: dec!(1.0),
                     timestamp: 1,
-                }),
+                })),
             };
             self.market(ev);
         }
@@ -560,14 +563,14 @@ mod tests {
             let ev = MarketEvent {
                 exchange_ts: 2,
                 local_ts: 2,
-                data: MarketData::MarketTrade(MarketTrade {
+                data: MarketData::Symbol(SymbolMarketData::MarketTrade(MarketTrade {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     price,
                     qty: dec!(1.0),
                     is_buyer_maker: false,
                     timestamp: 2,
-                }),
+                })),
             };
             self.market(ev);
         }
@@ -653,14 +656,14 @@ mod tests {
         let okx_trade = MarketEvent {
             exchange_ts: 2,
             local_ts: 2,
-            data: MarketData::MarketTrade(MarketTrade {
+            data: MarketData::Symbol(SymbolMarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::OKX,
                 symbol: SYM.to_string(),
                 price: dec!(98.0),
                 qty: dec!(1.0),
                 is_buyer_maker: false,
                 timestamp: 2,
-            }),
+            })),
         };
         h.market(okx_trade);
         h.settle(50).await;
@@ -972,12 +975,12 @@ mod tests {
         h.market(MarketEvent {
             exchange_ts: 3,
             local_ts: 3,
-            data: MarketData::MarkPrice(crate::domain::MarkPrice {
+            data: MarketData::Symbol(SymbolMarketData::MarkPrice(crate::domain::MarkPrice {
                 exchange: EX,
                 symbol: SYM.to_string(),
                 price: dec!(100.0),
                 timestamp: 3,
-            }),
+            })),
         });
         h.settle(50).await;
         // 柜台只往总线发 AccountEvent，而 AccountData 没有行情变体 —— 「回显行情」在类型上

@@ -4,6 +4,7 @@
 //! 支持 Gateway 和 OAuth 两种模式。
 //!
 //! 运行: cargo test ibkr -- --ignored
+use hft_engine_rs::messaging::SymbolMarketData;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -31,7 +32,7 @@ struct BboCollector {
 impl Task for BboCollector {
     async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
         while let Some(msg) = self.inbox.recv().await {
-            if let MarketData::BBO(bbo) = msg.data {
+            if let MarketData::Symbol(SymbolMarketData::BBO(bbo)) = msg.data {
                 println!(
                     "收到 BBO: {} bid={} ask={}",
                     bbo.symbol, bbo.bid_price, bbo.ask_price

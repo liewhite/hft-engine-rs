@@ -14,6 +14,7 @@ use crate::exchange::okx::codec::{
 };
 use crate::exchange::okx::{to_okx, REST_BASE_URL, WS_BUSINESS_URL};
 use crate::exchange::ws_loop::WsConn;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{HistoryCandles, MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
@@ -155,11 +156,11 @@ impl OkxBusinessWs {
         self.market_bus.publish(MarketEvent {
             exchange_ts: local_ts,
             local_ts,
-            data: MarketData::HistoryCandles(HistoryCandles {
+            data: MarketData::Symbol(SymbolMarketData::HistoryCandles(HistoryCandles {
                 exchange: Exchange::OKX,
                 symbol: symbol.clone(),
                 candles,
-            }),
+            })),
         });
 
         tracing::info!(
@@ -308,7 +309,7 @@ fn parse_business_message(
             events.push(MarketEvent {
                 exchange_ts: candle.open_time,
                 local_ts,
-                data: MarketData::Candle(candle),
+                data: MarketData::Symbol(SymbolMarketData::Candle(candle)),
             });
         }
         return Ok(events);

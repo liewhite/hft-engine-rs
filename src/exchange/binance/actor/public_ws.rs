@@ -11,6 +11,7 @@ use crate::exchange::binance::codec::{AggTrade, BookTicker, MarkPriceUpdate, WsR
 use crate::exchange::binance::to_binance;
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind};
 use crate::exchange::ws_loop::ReconnectingWs;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
@@ -224,7 +225,9 @@ pub(crate) fn parse_public_message(
                 events.push(MarketEvent {
                     exchange_ts,
                     local_ts,
-                    data: MarketData::FundingRate(update.to_funding_rate(quote, exchange_ts)?),
+                    data: MarketData::Symbol(SymbolMarketData::FundingRate(
+                        update.to_funding_rate(quote, exchange_ts)?,
+                    )),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::MarkPrice {
@@ -233,14 +236,18 @@ pub(crate) fn parse_public_message(
                 events.push(MarketEvent {
                     exchange_ts,
                     local_ts,
-                    data: MarketData::MarkPrice(update.to_mark_price(quote, exchange_ts)?),
+                    data: MarketData::Symbol(SymbolMarketData::MarkPrice(
+                        update.to_mark_price(quote, exchange_ts)?,
+                    )),
                 });
             }
             if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
                 events.push(MarketEvent {
                     exchange_ts,
                     local_ts,
-                    data: MarketData::IndexPrice(update.to_index_price(quote, exchange_ts)?),
+                    data: MarketData::Symbol(SymbolMarketData::IndexPrice(
+                        update.to_index_price(quote, exchange_ts)?,
+                    )),
                 });
             }
 
@@ -253,7 +260,7 @@ pub(crate) fn parse_public_message(
             Ok(vec![MarketEvent {
                 exchange_ts,
                 local_ts,
-                data: MarketData::BBO(bbo),
+                data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
             }])
         }
         "aggTrade" => {
@@ -263,7 +270,7 @@ pub(crate) fn parse_public_message(
             Ok(vec![MarketEvent {
                 exchange_ts: trade.timestamp,
                 local_ts,
-                data: MarketData::MarketTrade(trade),
+                data: MarketData::Symbol(SymbolMarketData::MarketTrade(trade)),
             }])
         }
         _ => {

@@ -49,6 +49,7 @@ use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::client::IbkrClient;
 use crate::exchange::ibkr::wire;
 use crate::exchange::ws_loop::WsConn;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, MarketBus, MarketData, MarketEvent, SymbolAccountData,
 };
@@ -495,7 +496,7 @@ impl IbkrPublicWs {
             self.market_bus.publish(MarketEvent {
                 exchange_ts: local_ts,
                 local_ts,
-                data: MarketData::BBO(bbo),
+                data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
             });
         }
     }

@@ -20,6 +20,7 @@ use hft_engine_rs::domain::{
 use hft_engine_rs::engine::{subscription_scope, SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
+use hft_engine_rs::messaging::SymbolMarketData;
 use hft_engine_rs::messaging::{AccountData, IncomeEvent, MarketData, SymbolAccountData};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{Signal, Strategy, StrategyView};
@@ -111,7 +112,7 @@ impl Strategy for MeanRevertMaker {
         let IncomeEvent::Market(m) = event else {
             return Vec::new();
         };
-        let MarketData::MarketTrade(t) = &m.data else {
+        let MarketData::Symbol(SymbolMarketData::MarketTrade(t)) = &m.data else {
             return Vec::new();
         };
         let Some(symbol_state) = view.symbol(&self.symbol) else {

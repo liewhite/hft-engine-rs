@@ -2,7 +2,9 @@ use crate::domain::{
     Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderId, OrderStatus, Position, Quantity,
     Symbol, Timestamp, BBO,
 };
-use crate::messaging::event::{MarketData, OrderRequestResult, RequestOutcome, SymbolAccountData};
+use crate::messaging::event::{
+    OrderRequestResult, RequestOutcome, SymbolAccountData, SymbolMarketData,
+};
 use std::collections::HashMap;
 
 /// 一张单「等交易所」超过这么久就停机（见 [`SymbolOrders::check_stuck`]）。
@@ -238,40 +240,25 @@ impl SymbolMarket {
     }
 
     /// 行情类事件的状态转移（BBO/标记价/指数价/资金费率入缓存，其余策略自取）
-    pub fn apply(&mut self, symbol: &Symbol, data: &MarketData) {
+    pub fn apply(&mut self, data: &SymbolMarketData) {
         match data {
-            MarketData::FundingRate(rate) => {
+            SymbolMarketData::FundingRate(rate) => {
                 self.funding_rates.insert(rate.exchange, rate.clone());
             }
-            MarketData::BBO(bbo) => {
+            SymbolMarketData::BBO(bbo) => {
                 self.bbos.insert(bbo.exchange, bbo.clone());
             }
-            MarketData::MarketTrade(_) => {
-                // 公共成交印记仅作市场信号 (策略自取)，不修改聚合状态
-            }
-            MarketData::MarkPrice(mp) => {
+            SymbolMarketData::MarkPrice(mp) => {
                 self.mark_prices.insert(mp.exchange, mp.clone());
             }
-            MarketData::IndexPrice(ip) => {
+            SymbolMarketData::IndexPrice(ip) => {
                 self.index_prices.insert(ip.exchange, ip.clone());
             }
-            MarketData::Candle(_) | MarketData::HistoryCandles(_) => {
-                // K线数据由策略层处理，SymbolState 不存储
-            }
-            MarketData::BorrowFee(_) => {
-                // 券源读数由策略自行消费，SymbolState 不缓存
-            }
-            // 其余变体无 symbol（Status/汇率/Clock）或由 StateManager 提前拦截（Custom），
-            // 到达即路由 bug：记录后忽略（不 panic）
-            MarketData::ExchangeStatus { .. }
-            | MarketData::ExchangeRate(_)
-            | MarketData::Clock
-            | MarketData::Custom(_) => {
-                tracing::error!(
-                    %symbol,
-                    "全局行情事件错误地进入 SymbolState（路由 bug），忽略"
-                );
-            }
+            // 公共成交印记、K 线、券源读数由策略在 on_event 里自取，不进聚合状态
+            SymbolMarketData::MarketTrade(_)
+            | SymbolMarketData::Candle(_)
+            | SymbolMarketData::HistoryCandles(_)
+            | SymbolMarketData::BorrowFee(_) => {}
         }
     }
 }
@@ -550,13 +537,15 @@ impl SymbolState {
     }
 
     /// 行情事件的状态转移。调用方（`StateManager`）已按 symbol 路由。
-    pub fn apply_market(&mut self, data: &MarketData) {
+    ///
+    /// 只收 [`SymbolMarketData`]：所级与全局行情在类型上就到不了这里。
+    pub fn apply_market(&mut self, data: &SymbolMarketData) {
         debug_assert_eq!(
             data.symbol(),
-            Some(&self.symbol),
+            &self.symbol,
             "行情被路由到了别的 symbol 状态"
         );
-        self.market.apply(&self.symbol, data);
+        self.market.apply(data);
     }
 
     /// 币级账户事件的状态转移（挂单跟踪 + 持仓累加）。调用方已按 symbol 路由。

@@ -121,50 +121,97 @@ pub struct MarketEvent {
     pub data: MarketData,
 }
 
-/// 公共市场数据（封闭枚举，引擎穷尽处理；开放扩展走 [`CustomEvent`]）
+/// 公共市场数据。像 [`AccountData`] 一样，定位精度在**类型**上分档：币级（带 (所, symbol)）、
+/// 所级（只带所）、全局（时钟）；自定义事件的范围由构造方给出。
+///
+/// 分档而不是一张平铺枚举：状态层按档分派时没有默认分支，币级状态（`SymbolState`）收不到
+/// 所级或全局事件；新增一种行情先选档、再在该档的穷举 match 里写处理，漏了编译不过。
 #[derive(Debug, Clone)]
 pub enum MarketData {
-    FundingRate(FundingRate),
-    BBO(BBO),
-    /// 公共成交印记 (市场匿名成交)；回测/模拟盘撮合的成交来源
-    MarketTrade(MarketTrade),
-    MarkPrice(MarkPrice),
-    IndexPrice(IndexPrice),
-    /// 交易所市场状态变更
-    ExchangeStatus {
-        exchange: Exchange,
-        status: MarketStatus,
-    },
-    /// K线实时推送
-    Candle(Candle),
-    /// 历史K线批量数据（订阅时一次性推送）
-    HistoryCandles(HistoryCandles),
-    /// 融券券源读数 (借券费 + 可借量)；参考数据，策略在 on_event 里消费
-    BorrowFee(BorrowFee),
-    /// 汇率读数 (货币对)；参考数据，策略在 on_event 里消费
-    ExchangeRate(ExchangeRate),
-    /// 时钟事件 (用于超时检测等定时任务)
+    /// 币级：属于某个 (所, symbol)
+    Symbol(SymbolMarketData),
+    /// 所级：属于某个所
+    Exchange(ExchangeMarketData),
+    /// 时钟（全局，用于超时检测等定时任务）
     Clock,
     /// 用户域自定义事件（唯一的开放扩展点，见 [`CustomEvent`]）。
     /// 框架的状态层（`StateManager`/`SymbolState`）对它一律 no-op —— 只运送，不理解。
     Custom(CustomEvent),
 }
 
+/// 币级行情（封闭枚举）
+#[derive(Debug, Clone)]
+pub enum SymbolMarketData {
+    FundingRate(FundingRate),
+    BBO(BBO),
+    /// 公共成交印记 (市场匿名成交)；回测/模拟盘撮合的成交来源
+    MarketTrade(MarketTrade),
+    MarkPrice(MarkPrice),
+    IndexPrice(IndexPrice),
+    /// K线实时推送
+    Candle(Candle),
+    /// 历史K线批量数据（订阅时一次性推送）
+    HistoryCandles(HistoryCandles),
+    /// 融券券源读数 (借券费 + 可借量)；参考数据，策略在 on_event 里消费
+    BorrowFee(BorrowFee),
+}
+
+/// 所级行情（封闭枚举）
+#[derive(Debug, Clone)]
+pub enum ExchangeMarketData {
+    /// 交易所市场状态变更
+    ExchangeStatus {
+        exchange: Exchange,
+        status: MarketStatus,
+    },
+    /// 汇率读数 (货币对)；参考数据，策略在 on_event 里消费
+    ExchangeRate(ExchangeRate),
+}
+
+impl SymbolMarketData {
+    pub fn exchange(&self) -> Exchange {
+        match self {
+            SymbolMarketData::FundingRate(r) => r.exchange,
+            SymbolMarketData::BBO(b) => b.exchange,
+            SymbolMarketData::MarketTrade(t) => t.exchange,
+            SymbolMarketData::MarkPrice(mp) => mp.exchange,
+            SymbolMarketData::IndexPrice(ip) => ip.exchange,
+            SymbolMarketData::Candle(c) => c.exchange,
+            SymbolMarketData::HistoryCandles(h) => h.exchange,
+            SymbolMarketData::BorrowFee(bf) => bf.exchange,
+        }
+    }
+
+    pub fn symbol(&self) -> &Symbol {
+        match self {
+            SymbolMarketData::FundingRate(r) => &r.symbol,
+            SymbolMarketData::BBO(b) => &b.symbol,
+            SymbolMarketData::MarketTrade(t) => &t.symbol,
+            SymbolMarketData::MarkPrice(mp) => &mp.symbol,
+            SymbolMarketData::IndexPrice(ip) => &ip.symbol,
+            SymbolMarketData::Candle(c) => &c.symbol,
+            SymbolMarketData::HistoryCandles(h) => &h.symbol,
+            SymbolMarketData::BorrowFee(bf) => &bf.symbol,
+        }
+    }
+}
+
+impl ExchangeMarketData {
+    pub fn exchange(&self) -> Exchange {
+        match self {
+            ExchangeMarketData::ExchangeStatus { exchange, .. } => *exchange,
+            ExchangeMarketData::ExchangeRate(er) => er.exchange,
+        }
+    }
+}
+
 impl MarketData {
-    /// 这条行情该投给谁：**每个变体自己声明定位精度**（穷举 match，新增变体编译即要求
-    /// 给出档位）。投递范围的唯一出处 —— `symbol()` / `exchange()` 都由它派生。
+    /// 这条行情该投给谁：由类型分档直接给出。投递范围的唯一出处 —— `symbol()` / `exchange()`
+    /// 都由它派生。
     pub fn delivery(&self) -> Delivery<'_> {
         match self {
-            MarketData::FundingRate(r) => Delivery::Symbol(r.exchange, &r.symbol),
-            MarketData::BBO(b) => Delivery::Symbol(b.exchange, &b.symbol),
-            MarketData::MarketTrade(t) => Delivery::Symbol(t.exchange, &t.symbol),
-            MarketData::MarkPrice(mp) => Delivery::Symbol(mp.exchange, &mp.symbol),
-            MarketData::IndexPrice(ip) => Delivery::Symbol(ip.exchange, &ip.symbol),
-            MarketData::Candle(c) => Delivery::Symbol(c.exchange, &c.symbol),
-            MarketData::HistoryCandles(h) => Delivery::Symbol(h.exchange, &h.symbol),
-            MarketData::BorrowFee(bf) => Delivery::Symbol(bf.exchange, &bf.symbol),
-            MarketData::ExchangeRate(er) => Delivery::Exchange(er.exchange),
-            MarketData::ExchangeStatus { exchange, .. } => Delivery::Exchange(*exchange),
+            MarketData::Symbol(d) => Delivery::Symbol(d.exchange(), d.symbol()),
+            MarketData::Exchange(d) => Delivery::Exchange(d.exchange()),
             // 自定义事件的 scope 由构造方决定（for_symbol 定向 / new 广播）
             MarketData::Custom(c) => match c.scope() {
                 Some((e, s)) => Delivery::Symbol(*e, s),
@@ -403,7 +450,7 @@ impl AccountData {
 ///
 /// - [`Delivery::Symbol`]：行情与币级私有回报（BBO / OrderUpdate / Fill…）
 /// - [`Delivery::Exchange`]：某个所的**所级读数**，无 symbol —— [`ExchangeAccountData`]
-///   全部变体，以及公共的 `ExchangeStatus` / `ExchangeRate`。
+///   与 [`ExchangeMarketData`] 的全部变体。
 ///   只投给订了这个所的消费者：一个策略拿不到自己没订的所的净值与希腊值。
 /// - [`Delivery::Broadcast`]：与交易所无关的全局事件（`Clock`、无 scope 的自定义事件）
 ///

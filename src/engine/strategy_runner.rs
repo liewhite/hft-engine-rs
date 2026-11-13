@@ -254,6 +254,7 @@ mod tests {
     use crate::domain::PriceStep;
     use crate::domain::{OrderType, Side, TimeInForce};
     use crate::exchange::SubscriptionKind;
+    use crate::messaging::SymbolMarketData;
     use crate::messaging::{IncomeEvent, MarketData};
     use crate::strategy::{OutcomeEvent, Signal, Strategy};
     use rust_decimal::Decimal;
@@ -469,7 +470,7 @@ mod tests {
             IncomeEvent::market(
                 0,
                 0,
-                MarketData::BBO(crate::domain::BBO {
+                MarketData::Symbol(SymbolMarketData::BBO(crate::domain::BBO {
                     exchange,
                     symbol: symbol.to_string(),
                     bid_price: dec!(1.0),
@@ -477,7 +478,7 @@ mod tests {
                     ask_price: dec!(1.0),
                     ask_qty: dec!(1.0),
                     timestamp: 0,
-                }),
+                })),
             )
         };
         let account_info = |exchange: Exchange| {

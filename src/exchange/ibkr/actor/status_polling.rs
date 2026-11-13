@@ -7,6 +7,7 @@
 use crate::domain::{now_ms, Exchange, MarketStatus};
 use crate::exchange::ibkr::client::TradingSchedule;
 use crate::exchange::ibkr::IbkrClient;
+use crate::messaging::ExchangeMarketData;
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{ChildHandle, Group, GroupClosed, Periodic};
 use chrono::{Datelike, Timelike};
@@ -76,10 +77,10 @@ impl Periodic for IbkrStatusPoller {
         self.market_bus.publish(MarketEvent {
             exchange_ts: local_ts,
             local_ts,
-            data: MarketData::ExchangeStatus {
+            data: MarketData::Exchange(ExchangeMarketData::ExchangeStatus {
                 exchange: Exchange::IBKR,
                 status,
-            },
+            }),
         });
         Ok(())
     }

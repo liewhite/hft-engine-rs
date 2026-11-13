@@ -11,6 +11,7 @@
 
 use crate::domain::{now_ms, BorrowFee, Exchange, ExchangeError, ExchangeRate};
 use crate::exchange::ibkr::IbkrClient;
+use crate::messaging::{ExchangeMarketData, SymbolMarketData};
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{ChildHandle, Group, Periodic};
 use serde::Deserialize;
@@ -142,13 +143,13 @@ impl IbkrSnapshotPoller {
                         if sh.is_finite() && sh >= 0.0 && fe.is_finite() && fe >= 0.0 =>
                     {
                         let ts = now_ms();
-                        self.publish(MarketData::BorrowFee(BorrowFee {
+                        self.publish(MarketData::Symbol(SymbolMarketData::BorrowFee(BorrowFee {
                             exchange: Exchange::IBKR,
                             symbol: self.cfg.borrow_symbol.clone(),
                             fee_annual: fe * self.cfg.fee_scale,
                             shortable_shares: sh,
                             timestamp: ts,
-                        }));
+                        })));
                         self.last_borrow_ok_ms = Some(ts);
                     }
                     (Some(sh), Some(fe)) => tracing::error!(
@@ -190,13 +191,15 @@ impl IbkrSnapshotPoller {
             // 有效性校验：汇率须为正(与下游 er.rate>0 采纳条件一致)。拿到但无效不算成功。
             Ok(rate) if rate.is_finite() && rate > 0.0 => {
                 let ts = now_ms();
-                self.publish(MarketData::ExchangeRate(ExchangeRate {
-                    exchange: Exchange::IBKR,
-                    base: self.cfg.fx_source.clone(),
-                    quote: self.cfg.fx_target.clone(),
-                    rate,
-                    timestamp: ts,
-                }));
+                self.publish(MarketData::Exchange(ExchangeMarketData::ExchangeRate(
+                    ExchangeRate {
+                        exchange: Exchange::IBKR,
+                        base: self.cfg.fx_source.clone(),
+                        quote: self.cfg.fx_target.clone(),
+                        rate,
+                        timestamp: ts,
+                    },
+                )));
                 self.last_fx_ok_ms = Some(ts);
             }
             Ok(rate) => tracing::error!(rate, "IBKR 汇率值无效 (应为正)，不计入成功"),

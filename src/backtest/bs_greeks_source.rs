@@ -10,6 +10,7 @@
 
 use crate::backtest::source::MarketDataSource;
 use crate::domain::{to_f64, Balance, Exchange, Greeks, Symbol, Timestamp};
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData};
 use crate::option::{self, OptionRight, MILLIS_PER_YEAR};
 use std::cell::RefCell;
@@ -166,7 +167,9 @@ impl<S: MarketDataSource> MarketDataSource for BsGreeksSource<S> {
             // 仅对标的逐笔成交合成希腊字母，其余事件原样透传
             let trade = match &ev {
                 IncomeEvent::Market(m) => match &m.data {
-                    MarketData::MarketTrade(t) if t.symbol == self.config.underlying_symbol => {
+                    MarketData::Symbol(SymbolMarketData::MarketTrade(t))
+                        if t.symbol == self.config.underlying_symbol =>
+                    {
                         // 期权定价数学用 f64，成交价在此边界转换
                         Some((to_f64(t.price), m.exchange_ts))
                     }
@@ -253,14 +256,14 @@ mod tests {
         IncomeEvent::market(
             ts,
             ts,
-            MarketData::MarketTrade(MarketTrade {
+            MarketData::Symbol(SymbolMarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Binance,
                 symbol: "ETH".to_string(),
                 price,
                 qty: dec!(1.0),
                 is_buyer_maker: false,
                 timestamp: ts,
-            }),
+            })),
         )
     }
 

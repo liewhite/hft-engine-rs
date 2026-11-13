@@ -1,5 +1,6 @@
 use crate::backtest::source::MarketDataSource;
 use crate::domain::BBO;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{IncomeEvent, MarketData, MarketEvent};
 
 /// 把成交印记 (trades) 还原为合成零价差 L1 行情的数据源装饰器。
@@ -26,11 +27,11 @@ impl<S: MarketDataSource> MarketDataSource for TradePrintBboSource<S> {
             IncomeEvent::Market(MarketEvent {
                 exchange_ts,
                 local_ts,
-                data: MarketData::MarketTrade(t),
+                data: MarketData::Symbol(SymbolMarketData::MarketTrade(t)),
             }) => IncomeEvent::market(
                 exchange_ts,
                 local_ts,
-                MarketData::BBO(BBO {
+                MarketData::Symbol(SymbolMarketData::BBO(BBO {
                     exchange: t.exchange,
                     symbol: t.symbol,
                     bid_price: t.price,
@@ -38,7 +39,7 @@ impl<S: MarketDataSource> MarketDataSource for TradePrintBboSource<S> {
                     ask_price: t.price,
                     ask_qty: t.qty,
                     timestamp: t.timestamp,
-                }),
+                })),
             ),
             other => other,
         }))

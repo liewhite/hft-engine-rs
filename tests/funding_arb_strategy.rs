@@ -5,6 +5,7 @@ use hft_engine_rs::domain::{
     Position, PriceStep, SettledFunding, Side, SymbolMeta, TimeInForce, BBO,
 };
 use hft_engine_rs::engine::{subscription_scope, SequentialClientOrderIdGen, StrategyRunner};
+use hft_engine_rs::messaging::SymbolMarketData;
 use hft_engine_rs::messaging::{
     AccountData, CustomEvent, ExchangeAccountData, IncomeEvent, LegValue, MarketData,
     OrderRequestResult, PositionBaseline, PositionValues, RequestOutcome, SymbolAccountData,
@@ -172,7 +173,11 @@ impl Sim {
             timestamp: 0,
         };
         let now = self.now;
-        self.ev(IncomeEvent::market(now, now, MarketData::BBO(b)))
+        self.ev(IncomeEvent::market(
+            now,
+            now,
+            MarketData::Symbol(SymbolMarketData::BBO(b)),
+        ))
     }
 
     /// 某所净值，以及本地持仓账本给出的该所别的币的持仓价值合计 `others`（记在一个别的币名下）

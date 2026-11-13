@@ -50,6 +50,7 @@ use crate::domain::{
     Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
 };
 use crate::exchange::SubscriptionKind;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{
     AccountData, CancelAttempt, IncomeEvent, MarketData, MarketEvent, OrderStage, PendingOrder,
     RequestOutcome, SymbolAccountData,
@@ -844,7 +845,7 @@ impl Strategy for FundingArbStrategy {
         // 分发层只投本币的事件，这里不再判 symbol（P4）
         match event {
             IncomeEvent::Market(MarketEvent {
-                data: MarketData::BBO(bbo),
+                data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
                 ..
             }) => {
                 self.bbo_local_ts.insert(bbo.exchange, now);

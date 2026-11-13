@@ -12,6 +12,7 @@ use crate::exchange::hyperliquid::codec::{aggregate_trades, WsActiveAssetCtx, Ws
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
 use crate::exchange::ws_loop::ReconnectingWs;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
@@ -102,7 +103,7 @@ impl SubscriptionBook {
     /// 判据：成交时间早于本 symbol 的 trades 订阅时刻。无订阅记录时不判为回填
     /// (宁可放过也不误杀实时成交)。
     fn is_trade_backfill(&self, event: &MarketEvent) -> bool {
-        let MarketData::MarketTrade(trade) = &event.data else {
+        let MarketData::Symbol(SymbolMarketData::MarketTrade(trade)) = &event.data else {
             return false;
         };
         let Some(&subscribed_at) = self.trades_subscribed_at.get(&trade.symbol) else {
@@ -331,9 +332,9 @@ pub(crate) fn parse_public_message(
                     events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: MarketData::FundingRate(
+                        data: MarketData::Symbol(SymbolMarketData::FundingRate(
                             ctx.to_funding_rate(symbol.clone(), local_ts)?,
-                        ),
+                        )),
                     });
                 }
                 if subscribed_kinds.contains(&SubscriptionKind::MarkPrice {
@@ -342,7 +343,9 @@ pub(crate) fn parse_public_message(
                     events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: MarketData::MarkPrice(ctx.to_mark_price(symbol.clone(), local_ts)?),
+                        data: MarketData::Symbol(SymbolMarketData::MarkPrice(
+                            ctx.to_mark_price(symbol.clone(), local_ts)?,
+                        )),
                     });
                 }
                 if subscribed_kinds.contains(&SubscriptionKind::IndexPrice {
@@ -351,7 +354,9 @@ pub(crate) fn parse_public_message(
                     events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: MarketData::IndexPrice(ctx.to_index_price(symbol, local_ts)?),
+                        data: MarketData::Symbol(SymbolMarketData::IndexPrice(
+                            ctx.to_index_price(symbol, local_ts)?,
+                        )),
                     });
                 }
 
@@ -371,7 +376,7 @@ pub(crate) fn parse_public_message(
                 return Ok(vec![MarketEvent {
                     exchange_ts: bbo.timestamp,
                     local_ts,
-                    data: MarketData::BBO(bbo),
+                    data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
                 }]);
             }
             "trades" => {
@@ -385,7 +390,7 @@ pub(crate) fn parse_public_message(
                     .map(|trade| MarketEvent {
                         exchange_ts: trade.timestamp,
                         local_ts,
-                        data: MarketData::MarketTrade(trade),
+                        data: MarketData::Symbol(SymbolMarketData::MarketTrade(trade)),
                     })
                     .collect();
                 return Ok(events);
@@ -442,14 +447,14 @@ mod tests {
         MarketEvent {
             exchange_ts: ts,
             local_ts: SUBSCRIBED_AT,
-            data: MarketData::MarketTrade(MarketTrade {
+            data: MarketData::Symbol(SymbolMarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Hyperliquid,
                 symbol: "BTC".to_string(),
                 price: dec!(62_500.0),
                 qty: dec!(0.1),
                 is_buyer_maker: false,
                 timestamp: ts,
-            }),
+            })),
         }
     }
 

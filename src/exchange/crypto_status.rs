@@ -16,6 +16,7 @@
 //! 新增一个有交易时段的所就自己写"这件事，在目录上也看得出来了。
 
 use crate::domain::{now_ms, Exchange, MarketStatus};
+use crate::messaging::ExchangeMarketData;
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{ChildHandle, Group, GroupClosed, Periodic};
 use std::time::Duration;
@@ -52,10 +53,10 @@ impl Periodic for CryptoStatus {
         self.market_bus.publish(MarketEvent {
             exchange_ts: local_ts,
             local_ts,
-            data: MarketData::ExchangeStatus {
+            data: MarketData::Exchange(ExchangeMarketData::ExchangeStatus {
                 exchange: self.exchange,
                 status: MarketStatus::Liquid,
-            },
+            }),
         });
         Ok(())
     }

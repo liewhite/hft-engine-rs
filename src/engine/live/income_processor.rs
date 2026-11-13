@@ -252,6 +252,7 @@ impl Task for IncomeProcessor {
 mod routing_tests {
     use super::*;
     use crate::domain::{Exchange, Fill, FillReason, MarketTrade, Side};
+    use crate::messaging::SymbolMarketData;
     use crate::messaging::{AccountData, MarketData, SymbolAccountData};
     use rust_decimal_macros::dec;
 
@@ -279,14 +280,14 @@ mod routing_tests {
         MarketEvent {
             exchange_ts: 1,
             local_ts: 1,
-            data: MarketData::MarketTrade(MarketTrade {
+            data: MarketData::Symbol(SymbolMarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Binance,
                 symbol: "BTC".to_string(),
                 price: dec!(100.0),
                 qty: dec!(1.0),
                 is_buyer_maker: false,
                 timestamp: 1,
-            }),
+            })),
         }
     }
 
@@ -350,6 +351,7 @@ mod task_tests {
     use super::*;
     use crate::domain::{Fill, FillReason, MarketTrade, Side};
     use crate::engine::live::executor::ExecutorMsg;
+    use crate::messaging::SymbolMarketData;
     use crate::messaging::{AccountData, MarketData, SymbolAccountData};
     use crate::tasks::Root;
     use rust_decimal_macros::dec;
@@ -365,14 +367,14 @@ mod task_tests {
         MarketEvent {
             exchange_ts: 1,
             local_ts: 1,
-            data: MarketData::MarketTrade(MarketTrade {
+            data: MarketData::Symbol(SymbolMarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Binance,
                 symbol: symbol.to_string(),
                 price: dec!(100.0),
                 qty: dec!(1.0),
                 is_buyer_maker: false,
                 timestamp: 1,
-            }),
+            })),
         }
     }
 

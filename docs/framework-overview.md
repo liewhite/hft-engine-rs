@@ -300,7 +300,7 @@ let observer = manager
     .spawn("MyObserver", move |scope: Scope| async move {
         // 收件箱只能从树上的 Scope 建：能订阅的一定是有人监督的组件
         let (_addr, mut inbox) = scope.inbox::<MarketEvent>();
-        inbox.subscribe(&bus, |e| matches!(e.data, MarketData::BBO(_)), |e| e); // fn 指针，发布侧执行
+        inbox.subscribe(&bus, |e| matches!(e.data, MarketData::Symbol(SymbolMarketData::BBO(_))), |e| e); // fn 指针，发布侧执行
         Ok(MyObserver { inbox })
     })
     .await?;
@@ -328,7 +328,7 @@ inbox.subscribe(manager.account_bus(), |e| e.account == AccountId::Live
 | 新交易所 | 实现 `ExchangeClient` + `AccountClient`，写一个 `setup_xxx` | 否，manager 零改动 |
 | 新数据源（回测）| 实现 `MarketDataSource` | 否 |
 | 新事件类型（用户域）| `CustomEvent` + `publish_custom_event`（外部向策略） | 否，框架只运送不理解 |
-| 新事件变体（框架域）| 给 `MarketData` / `AccountData` 加变体 | 是，且所有 `match` 会**编译失败**，漏改不了 |
+| 新事件变体（框架域）| 选档（币级 / 所级）后给 `SymbolMarketData` / `ExchangeMarketData` / `SymbolAccountData` / `ExchangeAccountData` 加变体 | 是，且所有 `match` 会**编译失败**，漏改不了 |
 
 ---
 

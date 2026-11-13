@@ -32,6 +32,7 @@ use hft_engine_rs::engine::{
     load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, StrategySpec,
 };
 use hft_engine_rs::exchange::SubscriptionKind;
+use hft_engine_rs::messaging::SymbolMarketData;
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{Signal, Strategy, StrategyView};
@@ -77,7 +78,7 @@ impl Strategy for DipMaker {
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal> {
         let IncomeEvent::Market(MarketEvent {
-            data: MarketData::BBO(bbo),
+            data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
             ..
         }) = event
         else {

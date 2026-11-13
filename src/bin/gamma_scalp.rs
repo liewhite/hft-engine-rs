@@ -18,6 +18,7 @@ use hft_engine_rs::domain::{to_f64, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{subscription_scope, SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::ExchangeClient;
+use hft_engine_rs::messaging::SymbolMarketData;
 use hft_engine_rs::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{GammaScalpStrategy, Strategy};
@@ -160,7 +161,7 @@ fn main() -> anyhow::Result<()> {
                 let mut s = sampler_obs.borrow_mut();
                 match ev {
                     IncomeEvent::Market(m) => {
-                        if let MarketData::MarketTrade(t) = &m.data {
+                        if let MarketData::Symbol(SymbolMarketData::MarketTrade(t)) = &m.data {
                             // 采样器只做 PnL 曲线统计，成交价在此转 f64
                             s.last_price = to_f64(t.price);
                         }

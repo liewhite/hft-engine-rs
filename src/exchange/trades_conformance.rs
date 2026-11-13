@@ -19,6 +19,7 @@
 use crate::domain::{Decimal, PriceStep};
 use crate::domain::{Exchange, MarketTrade, Symbol, SymbolMeta};
 use crate::exchange::SubscriptionKind;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{MarketData, MarketEvent};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal_macros::dec;
@@ -87,7 +88,7 @@ async fn observe(
         let parsed: Vec<MarketTrade> = events
             .into_iter()
             .filter_map(|ev| match ev.data {
-                MarketData::MarketTrade(t) => Some(t),
+                MarketData::Symbol(SymbolMarketData::MarketTrade(t)) => Some(t),
                 _ => None,
             })
             .collect();

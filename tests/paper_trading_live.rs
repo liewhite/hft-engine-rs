@@ -22,6 +22,7 @@
 //! ```sh
 //! cargo test --test paper_trading_live -- --ignored --nocapture
 //! ```
+use hft_engine_rs::messaging::SymbolMarketData;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -95,7 +96,7 @@ impl Strategy for DipMaker {
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal> {
         let IncomeEvent::Market(MarketEvent {
-            data: MarketData::BBO(bbo),
+            data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
             ..
         }) = event
         else {
@@ -190,7 +191,7 @@ impl Task for Watcher {
                     _ => {}
                 },
                 WatcherMsg::Market(ev) => {
-                    if let MarketData::MarketTrade(t) = &ev.data {
+                    if let MarketData::Symbol(SymbolMarketData::MarketTrade(t)) = &ev.data {
                         log.trade_count += 1;
                         log.min_trade_price = Some(
                             log.min_trade_price

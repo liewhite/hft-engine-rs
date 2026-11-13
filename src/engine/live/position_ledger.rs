@@ -79,6 +79,7 @@ use crate::domain::{now_ms, AccountId};
 use crate::domain::{Exchange, Position, Price, Quantity, Symbol};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, LegValue, MarketBus, MarketData,
     MarketEvent, PositionBaseline, PositionBook, PositionValues,
@@ -497,7 +498,7 @@ impl PositionLedger {
                     );
                     inbox.subscribe(
                         &args.market_bus,
-                        |e| matches!(e.data, MarketData::BBO(_)),
+                        |e| matches!(e.data, MarketData::Symbol(SymbolMarketData::BBO(_))),
                         PositionLedgerMsg::Market,
                     );
 
@@ -591,7 +592,7 @@ impl Ledger {
                 }
             }
             PositionLedgerMsg::Market(MarketEvent {
-                data: MarketData::BBO(bbo),
+                data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
                 ..
             }) => {
                 let mid = bbo.mid_price();
@@ -1668,7 +1669,7 @@ mod task_tests {
         market_bus.publish(MarketEvent {
             exchange_ts: 0,
             local_ts: 0,
-            data: MarketData::BBO(crate::domain::BBO {
+            data: MarketData::Symbol(SymbolMarketData::BBO(crate::domain::BBO {
                 exchange: EX,
                 symbol: SYM.to_string(),
                 bid_price: dec!(99.0),
@@ -1676,7 +1677,7 @@ mod task_tests {
                 ask_price: dec!(101.0),
                 ask_qty: dec!(1.0),
                 timestamp: 0,
-            }),
+            })),
         });
         let last = || seen.lock().unwrap().last().cloned();
         account_bus.publish(AccountEvent {

@@ -20,6 +20,7 @@ use crate::domain::{
     Symbol, TimeInForce,
 };
 use crate::exchange::{AccountStream, SubscriptionKind};
+use crate::messaging::SymbolMarketData;
 use crate::messaging::{AccountData, ExchangeAccountData, IncomeEvent, MarketData, PendingOrder};
 use crate::strategy::{Signal, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
@@ -200,7 +201,7 @@ impl Strategy for GammaScalpStrategy {
         match event {
             // 逐笔成交：以最新成交价为基准评估对冲
             IncomeEvent::Market(m) => match &m.data {
-                MarketData::MarketTrade(t)
+                MarketData::Symbol(SymbolMarketData::MarketTrade(t))
                     if t.exchange == self.exchange && t.symbol == self.symbol =>
                 {
                     self.last_price = Some(t.price);

@@ -176,10 +176,14 @@ impl StateManager {
     pub fn apply(&mut self, event: &IncomeEvent) -> Result<(), String> {
         match event {
             IncomeEvent::Market(m) => match &m.data {
-                // 市场状态/券源/汇率读数 —— 策略在 on_event 里自行消费并自持，StateManager 不缓存。
-                MarketData::ExchangeStatus { .. }
-                | MarketData::BorrowFee(_)
-                | MarketData::ExchangeRate(_) => {}
+                // 币级行情: 委托对应 SymbolState
+                MarketData::Symbol(data) => {
+                    if let Some(state) = self.routed_state(data.symbol()) {
+                        state.apply_market(data);
+                    }
+                }
+                // 所级行情（市场状态 / 汇率）：策略在 on_event 里自行消费并自持，StateManager 不缓存
+                MarketData::Exchange(_) => {}
                 // 自定义事件：框架只运送不理解，策略在 on_event 里自行消费并自持。
                 MarketData::Custom(_) => {}
                 // 全局事件: Clock (检查有没有单等交易所太久)
@@ -188,14 +192,6 @@ impl StateManager {
                         state.check_stuck_orders(m.local_ts)?;
                     }
                 }
-                // 币级行情: 委托对应 SymbolState（各变体直接取自己的 symbol）
-                MarketData::FundingRate(r) => self.route_market(&r.symbol, &m.data),
-                MarketData::BBO(b) => self.route_market(&b.symbol, &m.data),
-                MarketData::MarketTrade(t) => self.route_market(&t.symbol, &m.data),
-                MarketData::MarkPrice(mp) => self.route_market(&mp.symbol, &m.data),
-                MarketData::IndexPrice(ip) => self.route_market(&ip.symbol, &m.data),
-                MarketData::Candle(c) => self.route_market(&c.symbol, &m.data),
-                MarketData::HistoryCandles(h) => self.route_market(&h.symbol, &m.data),
             },
             IncomeEvent::Account(a) => match &a.data {
                 AccountData::Symbol(data) => {
@@ -207,12 +203,6 @@ impl StateManager {
             },
         }
         Ok(())
-    }
-
-    fn route_market(&mut self, symbol: &Symbol, data: &MarketData) {
-        if let Some(state) = self.routed_state(symbol) {
-            state.apply_market(data);
-        }
     }
 
     /// 所级账户事件写进账户投影
