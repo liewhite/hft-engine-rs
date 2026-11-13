@@ -92,9 +92,9 @@ pub struct FundingArbStrategy {
     /// 本轮不平衡已发出的补腿单数；>0 时再发即是重试
     hedge_attempts: u32,
     last_action: Option<FundingAction>,
-    /// 最近一次报「凑不出一手平仓单」时的所对和可平量：同一所对、同一可平量只报一次，
-    /// 持仓变了（有成交）才可能再报
-    close_stuck: Option<(LegPair, Quantity)>,
+    /// 最近一次判断：该平仓、盘口也新鲜，可平量却凑不出两所都下得出的一手（进指标
+    /// `funding_arb_close_stuck`，要人看；补腿或停止交易期间不判断，停在最后一次）
+    close_stuck: bool,
     /// 上一次是否有所的资金费未知（只在变成未知时打一次 warn）
     funding_unknown: bool,
     /// 各所下单被拒后的退避（见 [`RejectBackoff`]）
@@ -158,7 +158,7 @@ impl FundingArbStrategy {
             last_hedge_ts: None,
             hedge_attempts: 0,
             last_action: None,
-            close_stuck: None,
+            close_stuck: false,
             funding_unknown: false,
             reject_backoff: HashMap::new(),
         }
@@ -274,16 +274,19 @@ impl FundingArbStrategy {
         }
         // 平仓信号在、盘口也新鲜，可平量本身却凑不出两所都下得出的一手（不看盘口厚度：第一档薄只是
         // 这一刻挂不出，下一跳就可能挂出，#799）：仓位会一直拿着，要人看
-        if let FundingAction::Close(pair) = action {
-            let held = close_held(pair, &positions);
-            if self.pair_fresh(sv, pair, now)
-                && self.pair_qty(pair, held, px).is_none()
-                && self.close_stuck != Some((pair, held))
-            {
-                tracing::warn!(symbol = %self.symbol(), ?pair, ?positions, "该平仓但可平量凑不出两所都下得出的一手（零头或下单粒度凑不齐），需人工处理");
-                self.close_stuck = Some((pair, held));
+        let stuck = match action {
+            FundingAction::Close(pair) => {
+                self.pair_fresh(sv, pair, now)
+                    && self
+                        .pair_qty(pair, close_held(pair, &positions), px)
+                        .is_none()
             }
+            FundingAction::Open(_) | FundingAction::Hold => false,
+        };
+        if stuck && !self.close_stuck {
+            tracing::warn!(symbol = %self.symbol(), ?action, ?positions, "该平仓但可平量凑不出两所都下得出的一手（零头或下单粒度凑不齐），需人工处理");
         }
+        self.close_stuck = stuck;
         self.maintain(sv, &quotes, now)
     }
 
@@ -829,6 +832,11 @@ impl Strategy for FundingArbStrategy {
             "funding_arb_close_threshold_apr",
             &[("symbol", sym)],
             self.p.close_threshold_apr,
+        ));
+        out.push(Gauge::new(
+            "funding_arb_close_stuck",
+            &[("symbol", sym)],
+            if self.close_stuck { 1.0 } else { 0.0 },
         ));
         out.push(Gauge::new(
             "funding_arb_halted",

@@ -1102,6 +1102,15 @@ fn warn_logs(f: impl FnOnce()) -> String {
 
 const CLOSE_STUCK: &str = "凑不出两所都下得出的一手";
 
+/// 「该平仓却凑不出一手」的指标读数
+fn close_stuck_gauge(s: &Sim) -> Option<f64> {
+    s.runner
+        .strategy_gauges(s.now)
+        .iter()
+        .find(|g| g.name == "funding_arb_close_stuck")
+        .map(|g| g.value)
+}
+
 #[test]
 fn thin_book_during_close_does_not_warn_stuck() {
     // 大仓位平仓中途盘口第一档暂时变薄、挂不出：不是零头，不报「需人工处理」（#799）
@@ -1114,11 +1123,13 @@ fn thin_book_during_close_does_not_warn_stuck() {
         s.bbo_depth(HL, dec!(0.05));
     });
     assert!(!logs.contains(CLOSE_STUCK), "{logs}");
+    assert_eq!(close_stuck_gauge(&s), Some(0.0));
 }
 
 #[test]
-fn close_quantity_below_one_lot_warns_once() {
-    // OKX 多 0.5、币安空 0.5：各自够最小金额（50U），但 OKX 一手 1 个币，凑不出一手 → 报一次
+fn close_quantity_below_one_lot_is_reported() {
+    // OKX 多 0.5、币安空 0.5：各自够最小金额（50U），但 OKX 一手 1 个币，凑不出一手 →
+    // 指标读数为 1，日志只在变成凑不出时报一次
     let mut s = Sim::multi(&[(OKX, dec!(0.5)), (BN, dec!(-0.5))]);
     let logs = warn_logs(|| {
         s.funding(BN, 0.1);
@@ -1127,4 +1138,5 @@ fn close_quantity_below_one_lot_warns_once() {
         s.bbo(OKX);
     });
     assert_eq!(logs.matches(CLOSE_STUCK).count(), 1, "{logs}");
+    assert_eq!(close_stuck_gauge(&s), Some(1.0));
 }
