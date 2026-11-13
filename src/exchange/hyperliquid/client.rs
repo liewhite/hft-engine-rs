@@ -56,19 +56,10 @@ impl HlAccountMode {
     }
 }
 
-/// 有凭证时才有的账户能力：查询地址、签名通道、保证金口径三者同生同灭，放在一起
-struct HlAccount {
-    credentials: HyperliquidCredentials,
-    submitter: Arc<dyn HlSubmitter>,
-    mode: HlAccountMode,
-}
-
-/// Hyperliquid 交易所客户端。一个 client 可接多个 perp dex（共用一个钱包），
-/// 品种目录见 [`HlMarkets`]。
+/// Hyperliquid 公共接口（品种目录、行情、已结算资金费率），不需要凭证。一个 client 可接多个
+/// perp dex，品种目录见 [`HlMarkets`]。账户接口是 [`HyperliquidAccount`]，只有配了凭证才有。
 pub struct HyperliquidClient {
     client: Client,
-    /// 有凭证才有；没有时账户类方法报 AuthenticationFailed
-    account: Option<HlAccount>,
     base_url: String,
     /// 计价币种 (e.g., "USDC")；统一账户的净值读 spot 里这个币的余额
     quote: String,
@@ -77,16 +68,11 @@ pub struct HyperliquidClient {
 }
 
 impl HyperliquidClient {
-    /// 建客户端：拉各 dex 的 meta 建品种目录；有凭证时再查一次账户模式。
+    /// 建客户端：拉各 dex 的 meta 建品种目录。
     ///
     /// `dexes`：接入的 perp dex（"" = 主站，"xyz" = 股票），不能为空、不能重复。
-    /// 以下组合在这里就报错（启动失败，不带病运行）：同名品种出现在两个已接入 dex、
-    /// 标准账户配了多个 dex、账户模式未支持。
-    pub async fn connect(
-        quote: String,
-        dexes: Vec<String>,
-        credentials: Option<HyperliquidCredentials>,
-    ) -> Result<Self, ExchangeError> {
+    /// 同名品种出现在两个已接入 dex 时在这里就报错（启动失败，不带病运行）。
+    pub async fn connect(quote: String, dexes: Vec<String>) -> Result<Self, ExchangeError> {
         let other = |m: String| ExchangeError::new(m);
         if dexes.is_empty() {
             return Err(other("HL 至少要接一个 dex（\"\" = 主站）".into()));
@@ -137,50 +123,8 @@ impl HyperliquidClient {
         .await?;
         let markets = Arc::new(HlMarkets::build(metas).map_err(other)?);
 
-        // 账户
-        let account = match credentials {
-            None => None,
-            Some(credentials) => {
-                let raw: String = info(
-                    &client,
-                    &base_url,
-                    serde_json::json!({
-                        "type": "userAbstraction",
-                        "user": credentials.wallet_address,
-                    }),
-                )
-                .await?;
-                let mode = HlAccountMode::parse(&raw).map_err(other)?;
-                if mode == HlAccountMode::Standard && dexes.len() > 1 {
-                    return Err(other(format!(
-                        "HL 账户是标准模式（{raw}，各 dex 保证金分开），不支持一个进程接多个 dex {dexes:?}；\
-                         改成统一账户或只接一个 dex"
-                    )));
-                }
-                // 只支持主网：网络只在构造签名通道时决定一次
-                let is_mainnet = true;
-                let submitter: Arc<dyn HlSubmitter> = match &credentials.signing {
-                    HyperliquidSigning::PrivateKey(key) => Arc::new(LocalKeySubmitter::new(
-                        client.clone(),
-                        base_url.clone(),
-                        key,
-                        is_mainnet,
-                    )?),
-                    HyperliquidSigning::Signer { url } => {
-                        Arc::new(EnclaveSubmitter::new(client.clone(), url.clone()))
-                    }
-                };
-                Some(HlAccount {
-                    credentials,
-                    submitter,
-                    mode,
-                })
-            }
-        };
-
         Ok(Self {
             client,
-            account,
             base_url,
             quote,
             markets,
@@ -195,21 +139,6 @@ impl HyperliquidClient {
     /// 计价币（各已接入 dex 的保证金币种，`connect` 时校验过）
     pub(crate) fn quote(&self) -> &str {
         &self.quote
-    }
-
-    /// 查询地址（主钱包）。没配凭证时为 None
-    pub(crate) fn private_feed(&self) -> Option<String> {
-        self.account
-            .as_ref()
-            .map(|a| a.credentials.wallet_address.clone())
-    }
-
-    /// 账户能力；没配凭证时本不该走到这里（AccountClient 只在有凭证时装配）
-    fn account(&self) -> Result<&HlAccount, ExchangeError> {
-        self.account.as_ref().ok_or(ExchangeError::new(format!(
-            "{} 鉴权失败",
-            Exchange::Hyperliquid
-        )))
     }
 
     /// 发送 POST /info 查询（按类型取限频额度，没有就排队）
@@ -236,6 +165,66 @@ impl HyperliquidClient {
         }))
         .await
     }
+}
+
+/// Hyperliquid 账户接口（下单、撤单、持仓、净值、资金费流水）。只有配了凭证才构造，持有它即
+/// 「该所有账户」（见 [`AccountClient`]）：查询地址、签名通道、保证金口径三者同生同灭。
+pub struct HyperliquidAccount {
+    public: Arc<HyperliquidClient>,
+    credentials: HyperliquidCredentials,
+    submitter: Arc<dyn HlSubmitter>,
+    mode: HlAccountMode,
+}
+
+impl HyperliquidAccount {
+    /// 查一次账户模式、建签名通道。标准账户配了多个 dex、账户模式未支持时报错（启动失败）。
+    pub async fn connect(
+        public: Arc<HyperliquidClient>,
+        credentials: HyperliquidCredentials,
+    ) -> Result<Self, ExchangeError> {
+        let other = ExchangeError::new;
+        let (client, base_url, dexes) = (&public.client, &public.base_url, public.markets.dexes());
+        let raw: String = info(
+            client,
+            base_url,
+            serde_json::json!({
+                "type": "userAbstraction",
+                "user": credentials.wallet_address,
+            }),
+        )
+        .await?;
+        let mode = HlAccountMode::parse(&raw).map_err(other)?;
+        if mode == HlAccountMode::Standard && dexes.len() > 1 {
+            return Err(other(format!(
+                "HL 账户是标准模式（{raw}，各 dex 保证金分开），不支持一个进程接多个 dex {dexes:?}；\
+                 改成统一账户或只接一个 dex"
+            )));
+        }
+        // 只支持主网：网络只在构造签名通道时决定一次
+        let is_mainnet = true;
+        let submitter: Arc<dyn HlSubmitter> = match &credentials.signing {
+            HyperliquidSigning::PrivateKey(key) => Arc::new(LocalKeySubmitter::new(
+                client.clone(),
+                base_url.clone(),
+                key,
+                is_mainnet,
+            )?),
+            HyperliquidSigning::Signer { url } => {
+                Arc::new(EnclaveSubmitter::new(client.clone(), url.clone()))
+            }
+        };
+        Ok(Self {
+            public,
+            credentials,
+            submitter,
+            mode,
+        })
+    }
+
+    /// 查询地址（主钱包；私有 WS 订阅用）
+    pub(crate) fn wallet_address(&self) -> &str {
+        &self.credentials.wallet_address
+    }
 
     /// 市价单的 IOC 限价：取当前盘口对手价，往不利方向让配置的 `market_order_slippage`，
     /// 按 HL 价格精度取整。多一次 `l2Book` 查询；对延迟敏感的路径应由策略自己用 BBO
@@ -251,14 +240,14 @@ impl HyperliquidClient {
         let body = serde_json::json!({"type": "l2Book", "coin": coin});
         let admitted = LIMITER.action(&[IP_WEIGHT.cost(info_weight(&body))])?;
         let book: serde_json::Value =
-            post_info_with(&self.client, &self.base_url, body, admitted).await?;
+            post_info_with(&self.public.client, &self.public.base_url, body, admitted).await?;
         let side = if is_buy { 1 } else { 0 }; // levels = [bids, asks]
         let top = book["levels"][side][0]["px"]
             .as_str()
             .and_then(|s| crate::domain::parse_decimal(s).ok())
             .filter(|p| *p > Decimal::ZERO)
             .ok_or_else(|| ExchangeError::new(format!("{coin} 盘口无对手价，市价单无法定价")))?;
-        let slippage = self.account()?.credentials.market_order_slippage;
+        let slippage = self.credentials.market_order_slippage;
         let slippage = crate::domain::from_f64(slippage)
             .ok_or_else(|| ExchangeError::new(format!("HL 市价滑点配置非法: {slippage}")))?;
         let px = if is_buy {
@@ -276,7 +265,7 @@ impl HyperliquidClient {
             asset,
             sz_decimals,
             ..
-        } = self.markets.asset(&order.symbol)?.clone();
+        } = self.public.markets.asset(&order.symbol)?.clone();
 
         let is_buy = matches!(order.side, Side::Long);
 
@@ -318,7 +307,7 @@ impl HyperliquidClient {
 
     /// 按客户端订单号撤一张单。`Ok` 只表示交易所受理了撤单
     async fn cancel_by_cloid(&self, asset: HlAsset, cloid: String) -> Result<(), ExchangeError> {
-        let submitter = &self.account()?.submitter;
+        let submitter = &self.submitter;
         let HlAsset { coin, asset, .. } = asset;
         let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
         let raw = submitter
@@ -382,6 +371,7 @@ impl HyperliquidClient {
         oid: u64,
     ) -> Result<Option<String>, ExchangeError> {
         let resp: OrderStatusResponse = self
+            .public
             .post_info(serde_json::json!({
                 "type": "orderStatus",
                 "user": wallet_address,
@@ -873,7 +863,7 @@ impl ExchangeClient for HyperliquidClient {
 }
 
 #[async_trait]
-impl crate::exchange::FundingFeeSource for HyperliquidClient {
+impl crate::exchange::FundingFeeSource for HyperliquidAccount {
     fn exchange(&self) -> Exchange {
         Exchange::Hyperliquid
     }
@@ -905,11 +895,12 @@ impl crate::exchange::FundingFeeSource for HyperliquidClient {
         // 带时间段的查询一次最多回 500 条：满页就从最后一条的时刻接着取。同一毫秒可能有
         // 几个币（HL 同时结算全部币），所以下一页从该时刻（含）起，重叠的几条由下游按结算 ID 去重
         const PAGE: usize = 500;
-        let user = &self.account()?.credentials.wallet_address;
+        let user = &self.credentials.wallet_address;
         let mut entries: Vec<UserFundingEntry> = Vec::new();
         let mut from = start_ms;
         loop {
             let page: Vec<UserFundingEntry> = self
+                .public
                 .post_info(serde_json::json!({
                     "type": "userFunding",
                     "user": user,
@@ -926,12 +917,12 @@ impl crate::exchange::FundingFeeSource for HyperliquidClient {
                 _ => break,
             }
         }
-        parse_user_funding(entries, &self.markets, &self.quote)
+        parse_user_funding(entries, &self.public.markets, &self.public.quote)
     }
 }
 
 #[async_trait]
-impl AccountClient for HyperliquidClient {
+impl AccountClient for HyperliquidAccount {
     fn exchange(&self) -> Exchange {
         Exchange::Hyperliquid
     }
@@ -941,7 +932,7 @@ impl AccountClient for HyperliquidClient {
         symbol: &Symbol,
         client_order_id: &str,
     ) -> Result<(), ExchangeError> {
-        let asset = self.markets.asset(symbol)?.clone();
+        let asset = self.public.markets.asset(symbol)?.clone();
         self.cancel_by_cloid(asset, client_order_id.to_string())
             .await
     }
@@ -952,7 +943,7 @@ impl AccountClient for HyperliquidClient {
     ///
     /// `openOrders` 按 dex 查：不带 dex 参数时只回主站。
     async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
-        let wallet = &self.account()?.credentials.wallet_address;
+        let wallet = &self.credentials.wallet_address;
 
         #[derive(Deserialize)]
         struct Row {
@@ -961,14 +952,16 @@ impl AccountClient for HyperliquidClient {
         }
 
         let perp_dexs: Vec<Option<serde_json::Value>> = self
+            .public
             .post_info(serde_json::json!({"type": "perpDexs"}))
             .await?;
         let dexes = perp_dex_names(&perp_dexs).map_err(ExchangeError::new)?;
         let per_dex = futures_util::future::try_join_all(dexes.iter().map(|dex| async move {
-            self.post_info::<Vec<Row>>(
-                serde_json::json!({"type": "openOrders", "user": wallet, "dex": dex}),
-            )
-            .await
+            self.public
+                .post_info::<Vec<Row>>(
+                    serde_json::json!({"type": "openOrders", "user": wallet, "dex": dex}),
+                )
+                .await
         }))
         .await?;
         Ok(per_dex
@@ -984,8 +977,12 @@ impl AccountClient for HyperliquidClient {
     /// 按 cloid 撤（签名服务只放行按 cloid 撤单）：先按 oid 查出 cloid，每张多一次 info 请求，
     /// 只在启动清场用、张数很少。没有 cloid 的（人工经 UI 下单）撤不了，报错由清场复查拒绝启动。
     async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError> {
-        let wallet = &self.account()?.credentials.wallet_address;
-        let asset = self.markets.asset_of_coin(&order.instrument)?.clone();
+        let wallet = &self.credentials.wallet_address;
+        let asset = self
+            .public
+            .markets
+            .asset_of_coin(&order.instrument)?
+            .clone();
         let oid: u64 = order
             .order_id
             .parse()
@@ -1002,7 +999,7 @@ impl AccountClient for HyperliquidClient {
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {
         // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
         let order = order.inner();
-        let submitter = &self.account().map_err(PlaceError::unsent)?.submitter;
+        let submitter = &self.submitter;
         let intent = self.order_intent(order).await.map_err(PlaceError::unsent)?;
         let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
         let raw = submitter.place(&intent, admitted).await?;
@@ -1015,21 +1012,20 @@ impl AccountClient for HyperliquidClient {
     ///
     /// 由账户净值轮询定时调用；任一请求失败整体报错（不拿半份数据拼净值）。
     async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
-        let account = self.account()?;
-        let user = account.credentials.wallet_address.as_str();
-        match account.mode {
+        let user = self.credentials.wallet_address.as_str();
+        match self.mode {
             HlAccountMode::Unified => {
                 let (spot, states) = tokio::try_join!(
-                    self.post_info::<SpotClearinghouseState>(
+                    self.public.post_info::<SpotClearinghouseState>(
                         serde_json::json!({"type": "spotClearinghouseState", "user": user})
                     ),
-                    self.fetch_clearinghouse_states(user),
+                    self.public.fetch_clearinghouse_states(user),
                 )?;
-                unified_account_info(&spot, &states, &self.quote)
+                unified_account_info(&spot, &states, &self.public.quote)
             }
             HlAccountMode::Standard => {
                 // connect 已保证标准账户只接一个 dex
-                let states = self.fetch_clearinghouse_states(user).await?;
+                let states = self.public.fetch_clearinghouse_states(user).await?;
                 standard_account_info(&states[0].1)
             }
         }
@@ -1037,9 +1033,11 @@ impl AccountClient for HyperliquidClient {
 
     /// 已接入全部 dex 的完整持仓（任一 dex 查询失败整体报错，见 [`positions_from_states`]）
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
-        let user = &self.account()?.credentials.wallet_address;
-        let states = self.fetch_clearinghouse_states(user).await?;
-        positions_from_states(&self.markets, &states)
+        let states = self
+            .public
+            .fetch_clearinghouse_states(&self.credentials.wallet_address)
+            .await?;
+        positions_from_states(&self.public.markets, &states)
     }
 }
 

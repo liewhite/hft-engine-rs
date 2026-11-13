@@ -32,7 +32,7 @@ use hft_engine_rs::engine::{
     subscription_scope, AccountBinding, AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor,
     MarketBus, Metrics, MetricsArgs, NewClientOrderId, OutcomeBus, PaperCounter, PaperCounterArgs,
 };
-use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
+use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode};
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
 use hft_engine_rs::messaging::{
     AccountData, AccountEvent, ExchangeAccountData, IncomeEvent, MarketData, MarketEvent,
@@ -224,7 +224,7 @@ async fn paper_counter_fills_from_live_trades() {
         .try_init();
 
     // ---- 无凭证 client + 公共 symbol meta ----
-    let client = Arc::new(BinanceClient::new("USDT".to_string(), None).expect("client"));
+    let client = Arc::new(BinanceClient::new("USDT".to_string()).expect("client"));
     let symbol = COIN.to_string();
     let metas = client
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
@@ -331,9 +331,7 @@ async fn paper_counter_fills_from_live_trades() {
     let binance = BinanceNode::spawn(
         &producers,
         BinanceArgs {
-            client: None,
-            credentials: None,
-            rest_base_url: REST_BASE_URL.to_string(),
+            account: None,
             market_bus: market_bus.clone(),
             account_bus: account_bus.clone(),
             quote: "USDT".to_string(),

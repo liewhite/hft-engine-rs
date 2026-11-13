@@ -102,13 +102,6 @@ pub struct ExchangeAccess<C> {
     pub credentials: Option<C>,
 }
 
-impl<C> ExchangeAccess<C> {
-    /// 是否具备私有访问能力（下单 / 私有流）
-    pub fn has_credentials(&self) -> bool {
-        self.credentials.is_some()
-    }
-}
-
 // ============================================================================
 // 单位边界：ExchangeOrder
 // ============================================================================
@@ -198,9 +191,10 @@ pub trait ExchangeClient: Send + Sync + 'static {
 
 /// **账户私有**接口：只有配了凭证的所才有这个对象。
 ///
-/// 持有一个 `Arc<dyn AccountClient>` 即意味着"该所有账户可用"—— 这是能力的**唯一**表达，
-/// 约束点在各 `setup_*`：仅当 [`ExchangeAccess::has_credentials`] 为真时才装进
-/// `ExchangeSetup.account`。因此本 trait 的任何方法都**不得**为"没有凭证"返回占位值。
+/// 持有一个 `Arc<dyn AccountClient>` 即意味着"该所有账户可用"—— 这是能力的**唯一**表达。
+/// 各所的实现是单独的账户类型（`BinanceAccount` / `OkxAccount` / `HyperliquidAccount`），凭证是
+/// 它的必填字段，只在配了凭证时由 `setup_*` 构造（#813）；公共接口（[`ExchangeClient`]）是另一个
+/// 不带凭证的类型。因此本 trait 的任何方法都没有「没有凭证」这条路。
 ///
 /// # 出向数量口径
 ///

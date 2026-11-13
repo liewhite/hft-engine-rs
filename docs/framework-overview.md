@@ -181,7 +181,10 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 ```
 
 "有没有账户"由 `ExchangeSetup.account: Option<Arc<dyn AccountClient>>` 表达，不另存 bool：
-只有 `ExchangeAccess::has_credentials()` 为真时才装进来，拿到 `Some` 即可直接下单。
+各所的公共接口与账户接口是两个类型（`BinanceClient` / `BinanceAccount`、`OkxClient` / `OkxAccount`、
+`HyperliquidClient` / `HyperliquidAccount`），账户类型的凭证是必填字段，只在配了凭证时由 `setup_*`
+构造（#813）；拿到 `Some` 即可直接下单。签名请求每所只有一处（`BinanceAccount::signed`、
+`OkxAccount::signed`、HL 的签名通道 `HlSubmitter`）。
 
 ### 3.4 `messaging` —— 事件与投递
 

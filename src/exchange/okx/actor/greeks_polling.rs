@@ -4,7 +4,7 @@
 //! 官方限速 10/2s，配置为每秒 3 次。
 
 use crate::domain::Exchange;
-use crate::exchange::okx::OkxClient;
+use crate::exchange::okx::OkxAccount;
 use crate::exchange::staleness::{stamped_on_receipt, StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::messaging::{AccountBus, AccountData, AccountEvent, ExchangeAccountData};
 use crate::tasks::{ChildHandle, Group, GroupClosed, Periodic};
@@ -17,7 +17,7 @@ pub(crate) const GREEKS_POLLING_INTERVAL_MS: u64 = 1000;
 
 /// 定时查询希腊值
 pub(crate) struct OkxGreeksPoller {
-    client: Arc<OkxClient>,
+    account: Arc<OkxAccount>,
     account_bus: AccountBus,
     /// 缓存每个 ccy 的上次 timestamp，用于去重
     last_ts: HashMap<String, u64>,
@@ -30,7 +30,7 @@ impl OkxGreeksPoller {
     /// 在 `group` 下起轮询，每 `interval_ms` 毫秒一次（首次立即）
     pub(crate) fn spawn(
         group: &Group,
-        client: Arc<OkxClient>,
+        account: Arc<OkxAccount>,
         account_bus: AccountBus,
         interval_ms: u64,
     ) -> Result<ChildHandle, GroupClosed> {
@@ -39,7 +39,7 @@ impl OkxGreeksPoller {
             "OkxGreeksPoller",
             Duration::from_millis(interval_ms),
             Self {
-                client,
+                account,
                 account_bus,
                 last_ts: HashMap::new(),
                 guard: StalenessGuard::new("OKX 账户希腊值", MAX_POLL_STALENESS_MS),
@@ -52,7 +52,7 @@ impl Periodic for OkxGreeksPoller {
     /// 拉一次希腊值并发布。`Err` = 已停摆过久，整支停（陈旧读数会让 delta 敞口判断失准）。
     async fn tick(&mut self) -> anyhow::Result<()> {
         // 戳在响应到手之后取，理由见 `stamped_on_receipt`
-        let (read, local_ts) = stamped_on_receipt(self.client.fetch_greeks()).await;
+        let (read, local_ts) = stamped_on_receipt(self.account.fetch_greeks()).await;
 
         match read {
             Ok(greeks_list) => {

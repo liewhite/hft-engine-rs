@@ -15,7 +15,9 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
-use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
+use hft_engine_rs::exchange::hyperliquid::{
+    HyperliquidAccount, HyperliquidClient, HyperliquidCredentials,
+};
 use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder};
 use serde::Deserialize;
 
@@ -43,18 +45,9 @@ fn load_credentials() -> HyperliquidCredentials {
 
 /// 创建 XYZ DEX 客户端（无凭证，仅用于公开接口）
 async fn create_public_client() -> HyperliquidClient {
-    let creds = HyperliquidCredentials::with_private_key(
-        "0x0000000000000000000000000000000000000000".to_string(),
-        "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
-        0.05,
-    );
-    HyperliquidClient::connect(
-        TEST_QUOTE.to_string(),
-        vec![TEST_DEX.to_string()],
-        Some(creds),
-    )
-    .await
-    .expect("创建公开客户端失败")
+    HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()])
+        .await
+        .expect("创建公开客户端失败")
 }
 
 /// L2 订单簿响应
@@ -238,13 +231,14 @@ async fn test_xyz_fetch_meta_and_asset_ctxs() {
 /// 下单测试辅助函数
 async fn place_test_order(side: Side) {
     let credentials = load_credentials();
-    let client = HyperliquidClient::connect(
-        TEST_QUOTE.to_string(),
-        vec![TEST_DEX.to_string()],
-        Some(credentials),
-    )
-    .await
-    .expect("创建客户端失败");
+    let client = std::sync::Arc::new(
+        HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()])
+            .await
+            .expect("创建客户端失败"),
+    );
+    let account = HyperliquidAccount::connect(client.clone(), credentials)
+        .await
+        .expect("账户");
 
     // 内部 symbol 不带 dex 前缀
     let symbol: Symbol = TEST_SYMBOL.to_string();
@@ -293,7 +287,7 @@ async fn place_test_order(side: Side) {
 
     println!("提交订单: {:?}", order);
 
-    let order_id = client
+    let order_id = account
         .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");

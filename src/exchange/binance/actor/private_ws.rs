@@ -8,7 +8,7 @@
 use super::listen_key::ListenKeyRefresher;
 use crate::domain::{now_ms, Exchange, ExchangeError};
 use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsResponse};
-use crate::exchange::binance::{BinanceCredentials, WS_PRIVATE_URL};
+use crate::exchange::binance::{BinanceAccount, WS_PRIVATE_URL};
 use crate::exchange::ws_loop::{self, WsConn};
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData,
@@ -16,6 +16,7 @@ use crate::messaging::{
 use crate::tasks::{ChildHandle, Group, Scope, Task};
 use anyhow::Context as _;
 use futures_util::StreamExt;
+use std::sync::Arc;
 
 /// 私有 WebSocket 组件（没有收件箱：只读不收命令）
 pub(super) struct BinancePrivateWs {
@@ -29,23 +30,17 @@ impl BinancePrivateWs {
     /// 在 `group` 下起私有 WS，等连接建好、ListenKey 续期就位
     pub(super) async fn spawn(
         group: &Group,
-        credentials: BinanceCredentials,
-        rest_base_url: String,
+        account: Arc<BinanceAccount>,
         account_bus: AccountBus,
         quote: String,
     ) -> anyhow::Result<ChildHandle> {
         group
             .spawn("BinancePrivateWs", move |scope: Scope| async move {
-                // 0. ListenKey 创建与续期共用的 HTTP client（与 REST client 同一套配置）
-                let http = crate::exchange::client::exchange_http_client(Exchange::Binance)?;
-
-                // 1. 获取 ListenKey（失败向上传播 → 启动期受控退出；属鉴权语义）
-                let listen_key = create_listen_key(&http, &rest_base_url, &credentials.api_key)
+                // 1. 获取 ListenKey（失败向上传播 → 启动期受控退出）
+                let listen_key = account
+                    .create_listen_key()
                     .await
-                    .map_err(|e| {
-                        tracing::error!(error = %e, "Failed to create Binance listen key");
-                        ExchangeError::new(format!("{} 鉴权失败", Exchange::Binance))
-                    })?;
+                    .context("Binance 创建 ListenKey 失败")?;
 
                 // 2. 连接私有 WebSocket（迁移后用 query 参数传 listenKey；未带 events 让交易所推全部事件）
                 // 失败向上传播 → 启动期受控退出，不重试/不重连。
@@ -54,7 +49,7 @@ impl BinancePrivateWs {
                 let url = format!("{}?listenKey={}", WS_PRIVATE_URL, listen_key);
                 let ws_stream = crate::exchange::ws_loop::connect(&url)
                     .await
-                    .map_err(|e| ExchangeError::transport(Exchange::Binance, e.to_string()))?;
+                    .map_err(|e| ExchangeError::transport(Exchange::Binance, e))?;
                 let (write, read) = ws_stream.split();
 
                 let children = scope.group("children");
@@ -65,7 +60,7 @@ impl BinancePrivateWs {
                     write,
                     ws_loop::WsKeepalive::binance(),
                 )?;
-                ListenKeyRefresher::spawn(&children, http, rest_base_url, credentials.api_key)?;
+                ListenKeyRefresher::spawn(&children, account)?;
 
                 tracing::info!("BinancePrivateWs started");
                 Ok(Self {
@@ -212,50 +207,6 @@ fn parse_private_message(
             Ok(Vec::new())
         }
     }
-}
-
-// ============================================================================
-// 辅助函数
-// ============================================================================
-
-async fn create_listen_key(
-    client: &reqwest::Client,
-    rest_base_url: &str,
-    api_key: &str,
-) -> Result<String, ExchangeError> {
-    #[derive(serde::Deserialize)]
-    struct Response {
-        #[serde(rename = "listenKey")]
-        listen_key: String,
-    }
-
-    let admitted = crate::exchange::binance::LIMITER
-        .query(&[crate::exchange::binance::IP_WEIGHT.cost(1)])
-        .await
-        .map_err(|e| ExchangeError::new(format!("鉴权失败: {}", e)))?;
-    let resp = crate::net::send(
-        client
-            .post(format!("{}/fapi/v1/listenKey", rest_base_url))
-            .header("X-MBX-APIKEY", api_key),
-        admitted,
-    )
-    .await
-    .map_err(|e| ExchangeError::new(format!("鉴权失败: {}", e)))?;
-
-    if !resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(ExchangeError::new(format!(
-            "Failed to create listen key: {}",
-            text
-        )));
-    }
-
-    let data: Response = resp
-        .json()
-        .await
-        .map_err(|e| ExchangeError::new(format!("鉴权失败: {}", e)))?;
-
-    Ok(data.listen_key)
 }
 
 #[cfg(test)]

@@ -21,7 +21,7 @@ use super::public_ws::HyperliquidPublicWs;
 use crate::exchange::client::{ExchangeCmd, ExchangeHandle};
 use crate::exchange::equity_polling::EquityPoller;
 use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
-use crate::exchange::hyperliquid::HyperliquidClient;
+use crate::exchange::hyperliquid::{HyperliquidAccount, HyperliquidClient};
 use crate::exchange::lazy_conn::LazyConn;
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
@@ -38,8 +38,10 @@ const EQUITY_POLL_INTERVAL_MS: u64 = 2_000;
 
 /// HyperliquidNode 构造参数
 pub struct HyperliquidArgs {
-    /// 装配处建好的 client（品种目录、凭证都在里面；与 ExchangeSetup 里的是同一个）
+    /// 公共接口（品种目录在里面；与 ExchangeSetup 里的是同一个）
     pub client: Arc<HyperliquidClient>,
+    /// 账户接口（私有 WS 的查询地址、净值与资金费轮询用）。只在配了凭证时有
+    pub account: Option<Arc<HyperliquidAccount>>,
     /// 公共行情总线（public WS / 状态广播用）
     pub market_bus: MarketBus,
     /// 账户私有事件总线（private WS / 账户轮询用）
@@ -61,15 +63,20 @@ impl HyperliquidNode {
             .spawn_addressed("HyperliquidNode", move |scope: Scope, inbox| async move {
                 let client = args.client;
                 let markets = client.markets().clone();
-                // 有凭证 = client 有账户（同一个 Option 的两面），私有 WS 与各轮询都按它门控
-                let private_feed = client.private_feed();
-                let has_private_ws = private_feed.is_some();
+                let has_private_ws = args.account.is_some();
                 let children = scope.group("children");
 
                 // 1. 私有 WS 启动时就连（含订阅确认，要在投产前生效）；失败 → 向上传播。
                 //    公共 WS 等第一条订阅路由过来才连（见 LazyConn）
-                if let Some(wallet_address) = private_feed {
-                    HyperliquidPrivateWs::spawn(&children, wallet_address, args.account_bus.clone(), markets.clone(), client.quote().to_string()).await?;
+                if let Some(account) = &args.account {
+                    HyperliquidPrivateWs::spawn(
+                        &children,
+                        account.wallet_address().to_string(),
+                        args.account_bus.clone(),
+                        markets.clone(),
+                        client.quote().to_string(),
+                    )
+                    .await?;
                 }
                 let public_ws = {
                     let (group, market_bus, markets) = (children.clone(), args.market_bus.clone(), markets.clone());
@@ -80,11 +87,11 @@ impl HyperliquidNode {
                 tracing::info!(exchange = "Hyperliquid", has_private_ws, dexes = ?markets.dexes(), "私有 WS ready");
 
                 // 2. 账户轮询（净值、资费结算）：与私有 WS 一样按凭证门控
-                if has_private_ws {
-                    EquityPoller::spawn(&children, client.clone(), args.account_bus.clone(), EQUITY_POLL_INTERVAL_MS)?;
+                if let Some(account) = args.account {
+                    EquityPoller::spawn(&children, account.clone(), args.account_bus.clone(), EQUITY_POLL_INTERVAL_MS)?;
                     FundingFeePoller::spawn(
                         &children,
-                        client,
+                        account,
                         args.account_bus.clone(),
                         FUNDING_FEE_POLL_INTERVAL_MS,
                     )?;

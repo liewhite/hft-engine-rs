@@ -12,7 +12,7 @@ const DAY_MS: u64 = 24 * 3600 * 1000;
 #[tokio::test]
 #[ignore]
 async fn binance_last_day_has_settlements() {
-    let client = BinanceClient::new("USDT".to_string(), None).unwrap();
+    let client = BinanceClient::new("USDT".to_string()).unwrap();
     let got = client
         .fetch_settled_funding(&"BTC".to_string(), now_ms() - DAY_MS)
         .await
@@ -28,13 +28,10 @@ async fn binance_last_day_has_settlements() {
 #[ignore]
 async fn hyperliquid_one_client_main_and_xyz() {
     use hft_engine_rs::exchange::ExchangeClient;
-    let client = HyperliquidClient::connect(
-        "USDC".to_string(),
-        vec![String::new(), "xyz".to_string()],
-        None,
-    )
-    .await
-    .unwrap();
+    let client =
+        HyperliquidClient::connect("USDC".to_string(), vec![String::new(), "xyz".to_string()])
+            .await
+            .unwrap();
     let metas = client
         .fetch_symbol_meta(&["BTC".to_string(), "TSLA".to_string()])
         .await

@@ -20,7 +20,7 @@ use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{to_f64, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{AccountBus, MarketBus};
-use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
+use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode};
 use hft_engine_rs::exchange::hyperliquid::{HyperliquidArgs, HyperliquidClient, HyperliquidNode};
 use hft_engine_rs::exchange::okx::{OkxArgs, OkxClient, OkxNode};
 use hft_engine_rs::exchange::{ExchangeClient, SubscriptionKind};
@@ -107,11 +107,10 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
         .try_init();
 
     // ---- 1. 无凭证 client：symbol meta 走公共 REST，不需要签名 ----
-    let binance_client =
-        Arc::new(BinanceClient::new("USDT".to_string(), None).expect("binance client"));
-    let okx_client = Arc::new(OkxClient::new("USDT".to_string(), None).expect("okx client"));
+    let binance_client = Arc::new(BinanceClient::new("USDT".to_string()).expect("binance client"));
+    let okx_client = Arc::new(OkxClient::new("USDT".to_string()).expect("okx client"));
     let hl_client = Arc::new(
-        HyperliquidClient::connect("USDC".to_string(), vec![String::new()], None)
+        HyperliquidClient::connect("USDC".to_string(), vec![String::new()])
             .await
             .expect("hl client"),
     );
@@ -168,9 +167,7 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
     let binance = BinanceNode::spawn(
         &producers,
         BinanceArgs {
-            client: None,
-            credentials: None,
-            rest_base_url: REST_BASE_URL.to_string(),
+            account: None,
             market_bus: market_bus.clone(),
             account_bus: account_bus.clone(),
             quote: "USDT".to_string(),
@@ -181,8 +178,7 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
     let okx = OkxNode::spawn(
         &producers,
         OkxArgs {
-            credentials: None,
-            client: None,
+            account: None,
             symbol_metas: metas_of(okx_metas),
             market_bus: market_bus.clone(),
             account_bus: account_bus.clone(),
@@ -195,6 +191,7 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
         &producers,
         HyperliquidArgs {
             client: hl_client.clone(),
+            account: None,
             market_bus: market_bus.clone(),
             account_bus: account_bus.clone(),
         },

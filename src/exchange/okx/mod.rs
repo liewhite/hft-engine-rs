@@ -5,7 +5,7 @@ mod symbol;
 
 pub use actor::{OkxArgs, OkxNode};
 pub(crate) use actor::{OkxGreeksPoller, GREEKS_POLLING_INTERVAL_MS};
-pub use client::OkxClient;
+pub use client::{OkxAccount, OkxClient};
 pub use symbol::{from_okx, from_okx_index, to_okx, to_okx_index};
 
 use base64::{engine::general_purpose, Engine as _};
@@ -68,14 +68,18 @@ pub struct OkxCredentials {
 }
 
 impl OkxCredentials {
+    /// OKX 签名：`base64(HMAC-SHA256(secret, prehash))`。REST（`OkxAccount::signed`）与私有 WS
+    /// 登录共用这一处，各自只拼自己的 prehash。
+    pub(crate) fn sign(&self, prehash: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.secret.as_bytes())
+            .expect("HMAC 接受任意长度的密钥");
+        mac.update(prehash.as_bytes());
+        general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    }
+
     /// WebSocket 登录签名
     pub fn sign_ws_login(&self, timestamp: &str) -> String {
-        let message = format!("{}GET/users/self/verify", timestamp);
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(self.secret.as_bytes()).expect("HMAC accepts any size");
-        mac.update(message.as_bytes());
-        let result = mac.finalize();
-        general_purpose::STANDARD.encode(result.into_bytes())
+        self.sign(&format!("{timestamp}GET/users/self/verify"))
     }
 }
 

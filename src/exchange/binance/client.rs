@@ -1,10 +1,14 @@
-//! Binance ExchangeClient 实现 (仅 REST)
+//! Binance U 本位合约 REST：公共接口 [`BinanceClient`]（不要凭证）与账户接口 [`BinanceAccount`]
+//! （只有配了凭证才有）。
+//!
+//! 「有没有凭证」由类型表达：账户类请求只在 [`BinanceAccount`] 上，它的凭证不是 `Option`，
+//! 没有「每个私有方法现场判一次有没有 key」的分支。签名请求只有 [`BinanceAccount::signed`]
+//! 一处，回复的状态检查与解析只有 [`call`] 一处（#813）。
 
 use super::symbol::{from_binance, to_binance};
-use crate::domain::{Decimal, PriceStep};
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, OrderId, OrderType, PlaceError, RejectReason,
-    SettledFunding, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
+    now_ms, Decimal, Exchange, ExchangeError, FundingFee, OrderId, OrderType, PlaceError,
+    PriceStep, RejectReason, SettledFunding, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::{
@@ -13,27 +17,122 @@ use crate::exchange::binance::{
 use crate::exchange::client::{
     place_send_error, AccountClient, ExchangeClient, ExchangeOrder, OpenOrder,
 };
+use crate::exchange::rate_limit::Admitted;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
-use reqwest::Client;
+use reqwest::{Client, Method, RequestBuilder};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::sync::Arc;
 
-/// Binance 交易所客户端
+// ============================================================================
+// 请求与回复（公共、账户共用）
+// ============================================================================
+
+/// 发一个请求，拿回 2xx 的回复正文。没拿到回复 → 请求失败；非 2xx → 交易所的
+/// `{code, msg}`（解析不了就带 HTTP 状态与正文开头）。
+async fn call(req: RequestBuilder, admitted: Admitted) -> Result<String, ExchangeError> {
+    let transport = |e| ExchangeError::transport(Exchange::Binance, e);
+    let resp = crate::net::send(req, admitted).await.map_err(transport)?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(transport)?;
+    if !status.is_success() {
+        #[derive(Deserialize)]
+        struct Failed {
+            code: i32,
+            msg: String,
+        }
+        return Err(match serde_json::from_str::<Failed>(&text) {
+            Ok(f) => ExchangeError::api(Exchange::Binance, f.code, f.msg),
+            Err(_) => ExchangeError::api(Exchange::Binance, status, preview(&text)),
+        });
+    }
+    Ok(text)
+}
+
+/// 解析 2xx 回复正文；解析不了是回复格式不对（不是连接问题），带上正文开头
+fn parse<T: DeserializeOwned>(what: &str, text: &str) -> Result<T, ExchangeError> {
+    serde_json::from_str(text).map_err(|e| {
+        ExchangeError::new(format!(
+            "Binance {what} 回复解析失败: {e}; body: {}",
+            preview(text)
+        ))
+    })
+}
+
+fn preview(text: &str) -> String {
+    text.chars().take(300).collect()
+}
+
+fn url(path: &str) -> String {
+    format!("{REST_BASE_URL}{path}")
+}
+
+// ============================================================================
+// 公共接口
+// ============================================================================
+
+/// Binance 公共 REST（行情、合约规格、已结算资金费率），不需要凭证
 pub struct BinanceClient {
-    /// HTTP 客户端
-    client: Client,
-    /// 凭证（可选）
-    credentials: Option<BinanceCredentials>,
-    /// REST API 基础 URL
-    base_url: String,
+    http: Client,
     /// 计价币种 (e.g., "USDT")
     quote: String,
 }
 
+impl BinanceClient {
+    pub fn new(quote: String) -> Result<Self, ExchangeError> {
+        Ok(Self {
+            http: crate::exchange::client::exchange_http_client(Exchange::Binance)?,
+            quote,
+        })
+    }
+
+    /// 计价币种
+    pub fn quote(&self) -> &str {
+        &self.quote
+    }
+
+    /// 拉取各交易对最近 24 小时的**计价币成交额**（USDT 名义额）。
+    ///
+    /// 用于按流动性挑选标的：低流动性 symbol 的盘口很差，在其上跑出的模拟结论本身不可信。
+    ///
+    /// 返回的是**内部基础符号**，且只含当前 quote 的交易对；调用方通常还要与
+    /// [`ExchangeClient::fetch_all_symbol_metas`] 取交集，以排除不可交易的标的
+    /// （本接口按 24h 行情返回，含已停牌/交割品种）。
+    pub async fn fetch_quote_volumes(&self) -> Result<Vec<(Symbol, f64)>, ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Ticker24h {
+            symbol: String,
+            /// 24h 计价币成交额
+            quote_volume: String,
+        }
+
+        // 不带 symbol 取全部：权重 40
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(40)]).await?;
+        let text = call(self.http.get(url("/fapi/v1/ticker/24hr")), admitted).await?;
+        let tickers: Vec<Ticker24h> = parse("ticker/24hr", &text)?;
+        Ok(tickers
+            .into_iter()
+            .filter_map(|t| {
+                let symbol = from_binance(&t.symbol, &self.quote)?;
+                let volume = t.quote_volume.parse::<f64>().ok()?;
+                Some((symbol, volume))
+            })
+            .collect())
+    }
+
+    /// 获取所有交易对信息
+    async fn get_all_exchange_info(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(1)]).await?;
+        let text = call(self.http.get(url("/fapi/v1/exchangeInfo")), admitted).await?;
+        parse_exchange_info(&text, &self.quote)
+    }
+}
+
 /// 解析 `fapi/v1/exchangeInfo`：只收配置计价币的永续，缺任一必需过滤器的品种剔除并记 error。
-fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, String> {
+fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, ExchangeError> {
     #[derive(Deserialize)]
     struct ExchangeInfo {
         symbols: Vec<SymbolInfo>,
@@ -67,15 +166,9 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
         Other,
     }
 
-    let info: ExchangeInfo = serde_json::from_str(text).map_err(|e| {
-        format!(
-            "Failed to parse exchangeInfo: {}, response preview: {}",
-            e,
-            &text[..text.len().min(500)]
-        )
-    })?;
+    let info: ExchangeInfo = parse("exchangeInfo", text)?;
 
-    // 剔除必须留痕（与 OKX 同口径，见那边的说明）：被剔掉的 symbol 会一路静默失效，
+    // 剔除必须留痕（与 OKX、HL 同口径）：被剔掉的 symbol 会一路静默失效，
     // 而三种症状（下单被拒 / 订阅被忽略 / 回报无法折算）看不出共同的根因。
     // 这里只记录不报错，真正的拦截在投产期 `validate_subscriptions`。
     let mut metas = Vec::new();
@@ -83,34 +176,30 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
         let Some(symbol) = from_binance(&s.symbol, quote) else {
             continue; // 非当前 quote 的交易对，不属于本引擎的宇宙
         };
+        let positive = |raw: &str| {
+            crate::domain::parse_decimal(raw)
+                .ok()
+                .filter(|v| *v > Decimal::ZERO)
+        };
         let mut price_step: Option<Decimal> = None;
         let mut size_step: Option<Decimal> = None;
         let mut min_order_size: Option<Decimal> = None;
         let mut min_notional: Option<f64> = None;
-
         for filter in s.filters {
             match filter {
-                Filter::Price { tick_size } => {
-                    price_step = crate::domain::parse_decimal(&tick_size).ok();
-                }
+                Filter::Price { tick_size } => price_step = positive(&tick_size),
                 Filter::LotSize { step_size, min_qty } => {
-                    size_step = crate::domain::parse_decimal(&step_size).ok();
-                    min_order_size = crate::domain::parse_decimal(&min_qty).ok();
+                    size_step = positive(&step_size);
+                    min_order_size = positive(&min_qty);
                 }
                 Filter::MinNotional { notional } => {
-                    min_notional = notional.parse().ok();
+                    min_notional = notional.parse().ok().filter(|v: &f64| *v > 0.0);
                 }
                 Filter::Other => {}
             }
         }
 
-        let positive = |v: Option<Decimal>| v.filter(|v| *v > Decimal::ZERO);
-        match (
-            positive(price_step),
-            positive(size_step),
-            positive(min_order_size),
-            min_notional.filter(|&v| v > 0.0),
-        ) {
+        match (price_step, size_step, min_order_size, min_notional) {
             (Some(price_step), Some(size_step), Some(min_order_size), Some(min_notional)) => {
                 metas.push(SymbolMeta {
                     exchange: Exchange::Binance,
@@ -131,303 +220,6 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
     }
 
     Ok(metas)
-}
-
-impl BinanceClient {
-    /// 创建新的 Binance 客户端
-    pub fn new(
-        quote: String,
-        credentials: Option<BinanceCredentials>,
-    ) -> Result<Self, ExchangeError> {
-        let client = crate::exchange::client::exchange_http_client(Exchange::Binance)?;
-
-        Ok(Self {
-            client,
-            credentials,
-            base_url: REST_BASE_URL.to_string(),
-            quote,
-        })
-    }
-
-    /// 拉取各交易对最近 24 小时的**计价币成交额**（USDT 名义额）。
-    ///
-    /// 用于按流动性挑选标的：低流动性 symbol 的盘口很差，在其上跑出的模拟结论本身不可信。
-    ///
-    /// 返回的是**内部基础符号**，且只含当前 quote 的交易对；调用方通常还要与
-    /// [`ExchangeClient::fetch_all_symbol_metas`] 取交集，以排除不可交易的标的
-    /// （本接口按 24h 行情返回，含已停牌/交割品种）。
-    pub async fn fetch_quote_volumes(&self) -> Result<Vec<(Symbol, f64)>, ExchangeError> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Ticker24h {
-            symbol: String,
-            /// 24h 计价币成交额
-            quote_volume: String,
-        }
-
-        let url = format!("{}/fapi/v1/ticker/24hr", self.base_url);
-        // 不带 symbol 取全部：权重 40
-        let admitted = LIMITER.query(&[IP_WEIGHT.cost(40)]).await?;
-        let resp = crate::net::send(self.client.get(&url), admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(ExchangeError::new(format!(
-                "ticker/24hr failed: {status}, body: {}",
-                &text[..text.len().min(500)]
-            )));
-        }
-        let tickers: Vec<Ticker24h> = serde_json::from_str(&text)
-            .map_err(|e| ExchangeError::new(format!("Failed to parse ticker/24hr: {e}")))?;
-
-        Ok(tickers
-            .into_iter()
-            .filter_map(|t| {
-                let symbol = from_binance(&t.symbol, &self.quote)?;
-                let volume = t.quote_volume.parse::<f64>().ok()?;
-                Some((symbol, volume))
-            })
-            .collect())
-    }
-
-    /// 获取计价币种
-    pub fn quote(&self) -> &str {
-        &self.quote
-    }
-
-    /// 获取凭证（供装配层创建 BinanceNode 使用）
-    pub fn credentials(&self) -> Option<&BinanceCredentials> {
-        self.credentials.as_ref()
-    }
-
-    /// 获取 REST API 基础 URL
-    pub fn rest_base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    /// 获取 API Key（如果有）
-    fn api_key(&self) -> Option<&str> {
-        self.credentials.as_ref().map(|c| c.api_key.as_str())
-    }
-
-    /// 获取 Secret（如果有）
-    fn secret(&self) -> Option<&str> {
-        self.credentials.as_ref().map(|c| c.secret.as_str())
-    }
-
-    /// reqwest 错误转换
-    fn map_reqwest_error(e: reqwest::Error) -> ExchangeError {
-        ExchangeError::transport(Exchange::Binance, e.to_string())
-    }
-
-    /// 签名
-    fn sign(&self, query_string: &str) -> Option<String> {
-        let secret = self.secret()?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
-        mac.update(query_string.as_bytes());
-        let result = mac.finalize();
-        Some(hex::encode(result.into_bytes()))
-    }
-
-    /// 构建带签名的请求参数
-    fn build_signed_query(&self, params: &[(&str, &str)]) -> Option<String> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
-        let mut query_parts: Vec<String> =
-            params.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        query_parts.push(format!("timestamp={}", timestamp));
-
-        let query_string = query_parts.join("&");
-        let signature = self.sign(&query_string)?;
-
-        Some(format!("{}&signature={}", query_string, signature))
-    }
-
-    /// 解析错误响应
-    fn parse_error(&self, text: &str) -> Option<ExchangeError> {
-        #[derive(Deserialize)]
-        struct ErrorResponse {
-            code: i32,
-            msg: String,
-        }
-
-        let err: ErrorResponse = serde_json::from_str(text).ok()?;
-        Some(ExchangeError::api(Exchange::Binance, err.code, err.msg))
-    }
-
-    /// 获取所有交易对信息
-    async fn get_all_exchange_info(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        let admitted = LIMITER.query(&[IP_WEIGHT.cost(1)]).await?;
-        let resp = crate::net::send(
-            self.client
-                .get(format!("{}/fapi/v1/exchangeInfo", self.base_url)),
-            admitted,
-        )
-        .await
-        .map_err(Self::map_reqwest_error)?;
-
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-
-        if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-
-        parse_exchange_info(&text, &self.quote).map_err(ExchangeError::new)
-    }
-
-    /// 查询所有持仓（内部实现；ExchangeClient::fetch_positions 委托到这里）
-    async fn fetch_positions_impl(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
-        let api_key = self
-            .api_key()
-            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        #[allow(dead_code)]
-        struct PositionInfo {
-            symbol: String,
-            position_amt: String,
-            leverage: String,
-            /// 单向模式恒为 "BOTH"；双向（对冲）模式为 "LONG"/"SHORT"
-            position_side: String,
-        }
-
-        let admitted = LIMITER.query(&[IP_WEIGHT.cost(5)]).await?;
-        let query = self
-            .build_signed_query(&[])
-            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
-
-        let resp = crate::net::send(
-            self.client
-                .get(format!("{}/fapi/v2/positionRisk?{}", self.base_url, query))
-                .header("X-MBX-APIKEY", api_key),
-            admitted,
-        )
-        .await
-        .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-
-        let positions: Vec<PositionInfo> = resp.json().await.map_err(Self::map_reqwest_error)?;
-
-        let mut result = Vec::new();
-        for p in positions {
-            // 双向（对冲）持仓模式下同一 symbol 返回 LONG/SHORT 两行，照单全收会产出
-            // 两条同 symbol 的 Position —— 基线与对账全部串账。本系统按单向净持仓建模，
-            // 检测到双向模式直接报错拒绝（与 OKX 适配层在 codec 里拒绝 long/short
-            // posSide 的立场一致），由使用者去交易所切换持仓模式。
-            if p.position_side != "BOTH" {
-                return Err(ExchangeError::new(format!(
-                    "Binance 账户处于双向持仓模式（{} positionSide={}），本系统只支持单向\
-                     净持仓，请在交易所切换为单向模式",
-                    p.symbol, p.position_side
-                )));
-            }
-            let symbol = match from_binance(&p.symbol, &self.quote) {
-                Some(s) => s,
-                None => continue, // 非当前 quote 的交易对，跳过
-            };
-            let size: Decimal = crate::domain::parse_decimal(&p.position_amt).map_err(|_| {
-                ExchangeError::new(format!(
-                    "Failed to parse position_amt '{}' for {}",
-                    p.position_amt, p.symbol
-                ))
-            })?;
-            // 跳过空仓位
-            if size.is_zero() {
-                continue;
-            }
-            result.push(crate::domain::Position {
-                exchange: Exchange::Binance,
-                symbol,
-                size,
-            });
-        }
-
-        Ok(result)
-    }
-
-    /// 查询账户信息 (净值 + 总持仓名义价值)
-    async fn get_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
-        let api_key = self
-            .api_key()
-            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct AccountResponse {
-            total_margin_balance: String,
-            positions: Vec<PositionInfo>,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct PositionInfo {
-            notional: String,
-        }
-
-        let admitted = LIMITER.query(&[IP_WEIGHT.cost(5)]).await?;
-        let query = self
-            .build_signed_query(&[])
-            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
-
-        let resp = crate::net::send(
-            self.client
-                .get(format!("{}/fapi/v3/account?{}", self.base_url, query))
-                .header("X-MBX-APIKEY", api_key),
-            admitted,
-        )
-        .await
-        .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-
-        let account: AccountResponse = resp.json().await.map_err(Self::map_reqwest_error)?;
-
-        let equity: f64 = account.total_margin_balance.parse().map_err(|_| {
-            ExchangeError::new(format!(
-                "Binance parse totalMarginBalance: {}",
-                account.total_margin_balance
-            ))
-        })?;
-
-        // 汇总所有持仓的 notional (取绝对值)
-        let mut notional: f64 = 0.0;
-        for p in &account.positions {
-            let value: f64 = p.notional.parse().map_err(|_| {
-                ExchangeError::new(format!("Binance parse notional: {}", p.notional))
-            })?;
-            notional += value.abs();
-        }
-
-        Ok(crate::domain::AccountInfo { equity, notional })
-    }
 }
 
 #[async_trait]
@@ -453,358 +245,6 @@ impl ExchangeClient for BinanceClient {
     }
 }
 
-#[async_trait]
-impl crate::exchange::FundingFeeSource for BinanceClient {
-    fn exchange(&self) -> Exchange {
-        Exchange::Binance
-    }
-
-    /// 查询资费历史
-    ///
-    /// 调用 `GET /fapi/v1/income?incomeType=FUNDING_FEE`，返回区间内所有结算明细。
-    /// 非当前 quote 币种（如币本位合约）会被自动跳过。
-    ///
-    /// 同一笔记录的 `tran_id` 在交易所侧唯一，调用方负责去重。
-    async fn fetch_funding_fees(
-        &self,
-        start_ms: Timestamp,
-        end_ms: Timestamp,
-    ) -> Result<Vec<FundingFee>, ExchangeError> {
-        let api_key = self
-            .api_key()
-            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
-
-        #[derive(Deserialize)]
-        #[allow(dead_code)]
-        struct IncomeEntry {
-            symbol: String,
-            #[serde(rename = "incomeType")]
-            income_type: String,
-            income: String,
-            asset: String,
-            time: u64,
-            #[serde(rename = "tranId")]
-            tran_id: u64,
-        }
-
-        let start_str = start_ms.to_string();
-        let end_str = end_ms.to_string();
-        let admitted = LIMITER.query(&[IP_WEIGHT.cost(30)]).await?;
-        let query = self
-            .build_signed_query(&[
-                ("incomeType", "FUNDING_FEE"),
-                ("startTime", &start_str),
-                ("endTime", &end_str),
-                ("limit", "1000"),
-            ])
-            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
-
-        let resp = crate::net::send(
-            self.client
-                .get(format!("{}/fapi/v1/income?{}", self.base_url, query))
-                .header("X-MBX-APIKEY", api_key),
-            admitted,
-        )
-        .await
-        .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-
-        let entries: Vec<IncomeEntry> = resp.json().await.map_err(Self::map_reqwest_error)?;
-
-        let mut result = Vec::with_capacity(entries.len());
-        for e in entries {
-            let symbol = match from_binance(&e.symbol, &self.quote) {
-                Some(s) => s,
-                None => continue, // 跨 quote 合约（如币本位），跳过
-            };
-            let amount: f64 = e.income.parse().map_err(|_| {
-                ExchangeError::new(format!(
-                    "Failed to parse funding income '{}' for {}",
-                    e.income, e.symbol
-                ))
-            })?;
-            result.push(FundingFee {
-                exchange: Exchange::Binance,
-                symbol,
-                asset: e.asset,
-                amount,
-                timestamp: e.time,
-                tran_id: e.tran_id,
-            });
-        }
-
-        Ok(result)
-    }
-}
-
-#[async_trait]
-impl AccountClient for BinanceClient {
-    fn exchange(&self) -> Exchange {
-        Exchange::Binance
-    }
-
-    async fn cancel_order(
-        &self,
-        symbol: &Symbol,
-        client_order_id: &str,
-    ) -> Result<(), ExchangeError> {
-        let api_key = self
-            .api_key()
-            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
-
-        let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
-        let inst = to_binance(symbol, &self.quote);
-        let query = self
-            .build_signed_query(&[("symbol", &inst), ("origClientOrderId", client_order_id)])
-            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
-
-        let resp = crate::net::send(
-            self.client
-                .delete(format!("{}/fapi/v1/order?{}", self.base_url, query))
-                .header("X-MBX-APIKEY", api_key),
-            admitted,
-        )
-        .await
-        .map_err(Self::map_reqwest_error)?;
-
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-        Ok(())
-    }
-
-    async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
-        let api_key = self
-            .api_key()
-            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Row {
-            symbol: String,
-            order_id: i64,
-        }
-
-        // 不带 symbol：返回 U 本位合约账户的全部挂单，权重 40
-        let admitted = LIMITER.query(&[IP_WEIGHT.cost(40)]).await?;
-        let query = self
-            .build_signed_query(&[])
-            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
-        let resp = crate::net::send(
-            self.client
-                .get(format!("{}/fapi/v1/openOrders?{}", self.base_url, query))
-                .header("X-MBX-APIKEY", api_key),
-            admitted,
-        )
-        .await
-        .map_err(Self::map_reqwest_error)?;
-
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-        let rows: Vec<Row> = serde_json::from_str(&text)
-            .map_err(|e| ExchangeError::new(format!("Failed to parse Binance openOrders: {e}")))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| OpenOrder {
-                instrument: r.symbol,
-                order_id: r.order_id.to_string(),
-            })
-            .collect())
-    }
-
-    async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError> {
-        let api_key = self
-            .api_key()
-            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
-        let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
-        let query = self
-            .build_signed_query(&[
-                ("symbol", order.instrument.as_str()),
-                ("orderId", order.order_id.as_str()),
-            ])
-            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
-        let resp = crate::net::send(
-            self.client
-                .delete(format!("{}/fapi/v1/order?{}", self.base_url, query))
-                .header("X-MBX-APIKEY", api_key),
-            admitted,
-        )
-        .await
-        .map_err(Self::map_reqwest_error)?;
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-        Ok(())
-    }
-
-    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {
-        // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
-        let order = order.inner();
-        let api_key = self
-            .api_key()
-            .ok_or_else(|| PlaceError::unsent("No API key"))?;
-
-        let symbol = to_binance(&order.symbol, &self.quote);
-        let side = side_to_binance(order.side);
-        let (order_type, price, tif) = order_type_to_binance(&order.order_type);
-        let qty = crate::domain::to_wire(order.quantity);
-        let reduce_only = if order.reduce_only { "true" } else { "false" };
-
-        let mut params: Vec<(&str, &str)> = vec![
-            ("symbol", &symbol),
-            ("side", side),
-            ("type", order_type),
-            ("quantity", &qty),
-            ("reduceOnly", reduce_only),
-        ];
-
-        let price_str;
-        if let Some(p) = price {
-            price_str = p;
-            params.push(("price", &price_str));
-        }
-
-        if let Some(t) = tif {
-            params.push(("timeInForce", t));
-        }
-
-        params.push(("newClientOrderId", &order.client_order_id));
-
-        // 下单不占 IP 权重，占账户下单数；签名放在取额度之后
-        let admitted = LIMITER.action(&[ORDERS_10S.cost(1), ORDERS_1M.cost(1)])?;
-        let query = self
-            .build_signed_query(&params)
-            .ok_or_else(|| PlaceError::unsent("Failed to sign request"))?;
-
-        let resp = crate::net::send(
-            self.client
-                .post(format!("{}/fapi/v1/order?{}", self.base_url, query))
-                .header("X-MBX-APIKEY", api_key),
-            admitted,
-        )
-        .await
-        .map_err(|e| place_send_error(Exchange::Binance, e))?;
-        let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| {
-            PlaceError::indeterminate(format!("Binance 读下单回复失败 (HTTP {status}): {e}"))
-        })?;
-        parse_place_reply(status, &text)
-    }
-
-    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
-        self.get_account_info().await
-    }
-
-    async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
-        self.fetch_positions_impl().await
-    }
-}
-
-/// 币安自己说「执行状态未知」的错误码（官方文档）：
-/// -1000 UNKNOWN、-1001 DISCONNECTED（内部错误）、-1006 UNEXPECTED_RESP、-1007 TIMEOUT
-/// （"Send status unknown; execution status unknown"）。
-const BINANCE_UNKNOWN_STATUS_CODES: &[i32] = &[-1000, -1001, -1006, -1007];
-
-/// 下单回复 → 三种结论。纯函数，按币安文档的约定：
-/// - 2xx 带 `orderId`：成功；2xx 但解析不了：单已受理却拿不到编号，结果不确定；
-/// - 回复是 `{code, msg}`：`code` 属于「状态未知」那几个 → 不确定；-1008（服务过载，文档写明
-///   请求失败）→ 拒绝；其余 5xx 与 408（等后端超时）→ 不确定（文档：不代表失败，可能已执行）；其余 4xx → 拒绝
-///   （格式/精度/余额/限频/只挂 maker 会吃单 -5022 等，单没进撮合）；
-/// - 非 2xx 又解析不出 `{code, msg}`（网关 HTML、空回复）：不确定。
-fn parse_place_reply(status: u16, text: &str) -> Result<OrderId, PlaceError> {
-    #[derive(Deserialize)]
-    struct Accepted {
-        #[serde(rename = "orderId")]
-        order_id: i64,
-    }
-    #[derive(Deserialize)]
-    struct Failed {
-        code: i32,
-        msg: String,
-    }
-    let body: String = text.chars().take(300).collect();
-    if (200..300).contains(&status) {
-        return serde_json::from_str::<Accepted>(text)
-            .map(|a| a.order_id.to_string())
-            .map_err(|e| {
-                PlaceError::indeterminate(format!(
-                    "Binance 下单回复解析不了 (HTTP {status}): {e}; body: {body}"
-                ))
-            });
-    }
-    let Ok(Failed { code, msg }) = serde_json::from_str::<Failed>(text) else {
-        return Err(PlaceError::indeterminate(format!(
-            "Binance 下单失败且回复解析不了 (HTTP {status}): {body}"
-        )));
-    };
-    let detail = format!("HTTP {status}, code={code}, msg={msg}");
-    if BINANCE_UNKNOWN_STATUS_CODES.contains(&code) {
-        return Err(PlaceError::indeterminate(format!("Binance {detail}")));
-    }
-    if code == -2022 {
-        // "ReduceOnly Order is rejected" —— reduce-only 单因仓位已平被拒
-        return Err(PlaceError::Rejected(RejectReason::ReduceOnlyClosed));
-    }
-    if (status >= 500 || status == 408) && code != -1008 {
-        return Err(PlaceError::indeterminate(format!("Binance {detail}")));
-    }
-    Err(PlaceError::Rejected(RejectReason::Other(detail)))
-}
-
-/// Side 转换
-fn side_to_binance(side: Side) -> &'static str {
-    match side {
-        Side::Long => "BUY",
-        Side::Short => "SELL",
-    }
-}
-
-/// OrderType 转换
-fn order_type_to_binance(
-    order_type: &OrderType,
-) -> (&'static str, Option<String>, Option<&'static str>) {
-    match order_type {
-        OrderType::Market => ("MARKET", None, None),
-        OrderType::Limit { price, tif } => {
-            let tif_str = match tif {
-                TimeInForce::GTC => "GTC",
-                TimeInForce::IOC => "IOC",
-                TimeInForce::FOK => "FOK",
-                TimeInForce::PostOnly => "GTX",
-            };
-            ("LIMIT", Some(crate::domain::to_wire(*price)), Some(tif_str))
-        }
-    }
-}
-
 /// 解析 `/fapi/v1/fundingRate` 的回复。`symbol` 是请求时的内部符号（回复里的是交易所写法，
 /// 不再反解一遍）。费率解析失败整批报错：少一条结算会让 24h 累计静默偏小。
 fn parse_settled_funding(
@@ -817,19 +257,13 @@ fn parse_settled_funding(
         funding_time: u64,
         funding_rate: String,
     }
-    let entries: Vec<Entry> = serde_json::from_str(text).map_err(|e| {
-        ExchangeError::new(format!(
-            "fundingRate: {e} (body: {})",
-            text.chars().take(300).collect::<String>()
-        ))
-    })?;
+    let entries: Vec<Entry> = parse("fundingRate", text)?;
     entries
         .into_iter()
         .map(|e| {
-            let rate = e
-                .funding_rate
-                .parse::<f64>()
-                .map_err(|_| ExchangeError::new(format!("fundingRate 非法: {}", e.funding_rate)))?;
+            let rate = e.funding_rate.parse::<f64>().map_err(|_| {
+                ExchangeError::new(format!("Binance fundingRate 非法: {}", e.funding_rate))
+            })?;
             Ok(SettledFunding {
                 exchange: Exchange::Binance,
                 symbol: symbol.clone(),
@@ -855,28 +289,400 @@ impl crate::exchange::SettledFundingSource for BinanceClient {
         symbol: &Symbol,
         start_ms: Timestamp,
     ) -> Result<Vec<SettledFunding>, ExchangeError> {
-        let url = format!(
-            "{}/fapi/v1/fundingRate?symbol={}&startTime={}&limit=1000",
-            self.base_url,
-            to_binance(symbol, &self.quote),
-            start_ms
-        );
+        let req = self.http.get(url("/fapi/v1/fundingRate")).query(&[
+            ("symbol", to_binance(symbol, &self.quote)),
+            ("startTime", start_ms.to_string()),
+            ("limit", "1000".to_string()),
+        ]);
         let admitted = LIMITER
             .query(&[FUNDING_RATE.cost(1), IP_WEIGHT.cost(1)])
             .await?;
-        let resp = crate::net::send(self.client.get(&url), admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
+        parse_settled_funding(&call(req, admitted).await?, symbol)
+    }
+}
+
+// ============================================================================
+// 账户接口
+// ============================================================================
+
+/// Binance 账户 REST（下单、撤单、持仓、净值、资金费流水、ListenKey）。只有配了凭证才构造，
+/// 持有它即「该所有账户」（见 [`AccountClient`]）。
+pub struct BinanceAccount {
+    http: Client,
+    quote: String,
+    credentials: BinanceCredentials,
+}
+
+impl BinanceAccount {
+    /// 与公共接口共用同一个 HTTP client 与计价币
+    pub fn new(public: &BinanceClient, credentials: BinanceCredentials) -> Self {
+        Self {
+            http: public.http.clone(),
+            quote: public.quote.clone(),
+            credentials,
         }
-        parse_settled_funding(&text, symbol)
+    }
+
+    /// 签名请求（`HMAC-SHA256(query)`，`timestamp` 与 `signature` 附在 query 末尾）。
+    /// 本所全部签名请求都经这里。
+    fn signed(&self, method: Method, path: &str, params: &[(&str, &str)]) -> RequestBuilder {
+        let mut query: String = params.iter().map(|(k, v)| format!("{k}={v}&")).collect();
+        query.push_str(&format!("timestamp={}", now_ms()));
+        let signature = sign(&self.credentials.secret, &query);
+        self.with_key(self.http.request(
+            method,
+            format!("{}?{query}&signature={signature}", url(path)),
+        ))
+    }
+
+    /// 只要 API key、不要签名的请求（ListenKey）
+    fn with_key(&self, req: RequestBuilder) -> RequestBuilder {
+        req.header("X-MBX-APIKEY", &self.credentials.api_key)
+    }
+
+    /// 创建（或取回已有的）私有流 ListenKey
+    pub(crate) async fn create_listen_key(&self) -> Result<String, ExchangeError> {
+        #[derive(Deserialize)]
+        struct Response {
+            #[serde(rename = "listenKey")]
+            listen_key: String,
+        }
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(1)]).await?;
+        let text = call(
+            self.with_key(self.http.post(url("/fapi/v1/listenKey"))),
+            admitted,
+        )
+        .await?;
+        Ok(parse::<Response>("listenKey", &text)?.listen_key)
+    }
+
+    /// 续期 ListenKey（有效期从此再延 60 分钟）
+    pub(crate) async fn keepalive_listen_key(&self) -> Result<(), ExchangeError> {
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(1)]).await?;
+        call(
+            self.with_key(self.http.put(url("/fapi/v1/listenKey"))),
+            admitted,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 签名 GET：先排队取 `weight` 的 IP 权重，返回 2xx 正文
+    async fn signed_get(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        weight: u32,
+    ) -> Result<String, ExchangeError> {
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(weight)]).await?;
+        call(self.signed(Method::GET, path, params), admitted).await
+    }
+
+    /// 撤单（交易动作：没额度就失败，不排队）
+    async fn cancel(&self, params: &[(&str, &str)]) -> Result<(), ExchangeError> {
+        let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
+        call(
+            self.signed(Method::DELETE, "/fapi/v1/order", params),
+            admitted,
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl crate::exchange::FundingFeeSource for BinanceAccount {
+    fn exchange(&self) -> Exchange {
+        Exchange::Binance
+    }
+
+    /// 查询资费历史
+    ///
+    /// 调用 `GET /fapi/v1/income?incomeType=FUNDING_FEE`，返回区间内所有结算明细。
+    /// 非当前 quote 币种（如币本位合约）会被自动跳过。
+    ///
+    /// 同一笔记录的 `tran_id` 在交易所侧唯一，调用方负责去重。
+    async fn fetch_funding_fees(
+        &self,
+        start_ms: Timestamp,
+        end_ms: Timestamp,
+    ) -> Result<Vec<FundingFee>, ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct IncomeEntry {
+            symbol: String,
+            income: String,
+            asset: String,
+            time: u64,
+            tran_id: u64,
+        }
+
+        let (start, end) = (start_ms.to_string(), end_ms.to_string());
+        let text = self
+            .signed_get(
+                "/fapi/v1/income",
+                &[
+                    ("incomeType", "FUNDING_FEE"),
+                    ("startTime", &start),
+                    ("endTime", &end),
+                    ("limit", "1000"),
+                ],
+                30,
+            )
+            .await?;
+        let entries: Vec<IncomeEntry> = parse("income", &text)?;
+
+        let mut result = Vec::with_capacity(entries.len());
+        for e in entries {
+            let Some(symbol) = from_binance(&e.symbol, &self.quote) else {
+                continue; // 跨 quote 合约（如币本位），跳过
+            };
+            let amount: f64 = e.income.parse().map_err(|_| {
+                ExchangeError::new(format!(
+                    "Binance 资金费金额非法 '{}' ({})",
+                    e.income, e.symbol
+                ))
+            })?;
+            result.push(FundingFee {
+                exchange: Exchange::Binance,
+                symbol,
+                asset: e.asset,
+                amount,
+                timestamp: e.time,
+                tran_id: e.tran_id,
+            });
+        }
+        Ok(result)
+    }
+}
+
+#[async_trait]
+impl AccountClient for BinanceAccount {
+    fn exchange(&self) -> Exchange {
+        Exchange::Binance
+    }
+
+    async fn cancel_order(
+        &self,
+        symbol: &Symbol,
+        client_order_id: &str,
+    ) -> Result<(), ExchangeError> {
+        let inst = to_binance(symbol, &self.quote);
+        self.cancel(&[("symbol", &inst), ("origClientOrderId", client_order_id)])
+            .await
+    }
+
+    async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Row {
+            symbol: String,
+            order_id: i64,
+        }
+        // 不带 symbol：返回 U 本位合约账户的全部挂单，权重 40
+        let text = self.signed_get("/fapi/v1/openOrders", &[], 40).await?;
+        let rows: Vec<Row> = parse("openOrders", &text)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| OpenOrder {
+                instrument: r.symbol,
+                order_id: r.order_id.to_string(),
+            })
+            .collect())
+    }
+
+    async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError> {
+        self.cancel(&[
+            ("symbol", order.instrument.as_str()),
+            ("orderId", order.order_id.as_str()),
+        ])
+        .await
+    }
+
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {
+        // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
+        let order = order.inner();
+        let symbol = to_binance(&order.symbol, &self.quote);
+        let qty = crate::domain::to_wire(order.quantity);
+        let mut params: Vec<(&str, String)> = vec![
+            ("symbol", symbol),
+            ("side", side_to_binance(order.side).to_string()),
+            ("quantity", qty),
+            ("reduceOnly", order.reduce_only.to_string()),
+            ("newClientOrderId", order.client_order_id.clone()),
+        ];
+        match &order.order_type {
+            OrderType::Market => params.push(("type", "MARKET".to_string())),
+            OrderType::Limit { price, tif } => {
+                params.push(("type", "LIMIT".to_string()));
+                params.push(("price", crate::domain::to_wire(*price)));
+                params.push(("timeInForce", tif_to_binance(*tif).to_string()));
+            }
+        }
+        let params: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+        // 下单不占 IP 权重，占账户下单数；签名放在取额度之后
+        let admitted = LIMITER.action(&[ORDERS_10S.cost(1), ORDERS_1M.cost(1)])?;
+        let resp = crate::net::send(
+            self.signed(Method::POST, "/fapi/v1/order", &params),
+            admitted,
+        )
+        .await
+        .map_err(|e| place_send_error(Exchange::Binance, e))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.map_err(|e| {
+            PlaceError::indeterminate(format!("Binance 读下单回复失败 (HTTP {status}): {e}"))
+        })?;
+        parse_place_reply(status, &text)
+    }
+
+    /// 净值 = `fapi/v3/account` 的 `totalMarginBalance`；持仓总价值 = 各仓 `notional` 绝对值之和
+    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AccountResponse {
+            total_margin_balance: String,
+            positions: Vec<PositionNotional>,
+        }
+        #[derive(Deserialize)]
+        struct PositionNotional {
+            notional: String,
+        }
+
+        let text = self.signed_get("/fapi/v3/account", &[], 5).await?;
+        let account: AccountResponse = parse("account", &text)?;
+        let number = |field: &str, v: &str| {
+            v.parse::<f64>()
+                .map_err(|_| ExchangeError::new(format!("Binance account {field} 非法: {v}")))
+        };
+        let equity = number("totalMarginBalance", &account.total_margin_balance)?;
+        let mut notional = 0.0;
+        for p in &account.positions {
+            notional += number("notional", &p.notional)?.abs();
+        }
+        Ok(crate::domain::AccountInfo { equity, notional })
+    }
+
+    async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PositionInfo {
+            symbol: String,
+            position_amt: String,
+            /// 单向模式恒为 "BOTH"；双向（对冲）模式为 "LONG"/"SHORT"
+            position_side: String,
+        }
+
+        let text = self.signed_get("/fapi/v2/positionRisk", &[], 5).await?;
+        let positions: Vec<PositionInfo> = parse("positionRisk", &text)?;
+
+        let mut result = Vec::new();
+        for p in positions {
+            // 双向（对冲）持仓模式下同一 symbol 返回 LONG/SHORT 两行，照单全收会产出
+            // 两条同 symbol 的 Position —— 基线与对账全部串账。本系统按单向净持仓建模，
+            // 检测到双向模式直接报错拒绝（与 OKX 适配层在 codec 里拒绝 long/short
+            // posSide 的立场一致），由使用者去交易所切换持仓模式。
+            if p.position_side != "BOTH" {
+                return Err(ExchangeError::new(format!(
+                    "Binance 账户处于双向持仓模式（{} positionSide={}），本系统只支持单向\
+                     净持仓，请在交易所切换为单向模式",
+                    p.symbol, p.position_side
+                )));
+            }
+            let Some(symbol) = from_binance(&p.symbol, &self.quote) else {
+                continue; // 非当前 quote 的交易对，跳过
+            };
+            let size: Decimal = crate::domain::parse_decimal(&p.position_amt).map_err(|_| {
+                ExchangeError::new(format!(
+                    "Binance positionAmt 非法 '{}' ({})",
+                    p.position_amt, p.symbol
+                ))
+            })?;
+            if size.is_zero() {
+                continue;
+            }
+            result.push(crate::domain::Position {
+                exchange: Exchange::Binance,
+                symbol,
+                size,
+            });
+        }
+        Ok(result)
+    }
+}
+
+/// 签名 = hex(HMAC-SHA256(secret, query))
+fn sign(secret: &str, query: &str) -> String {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC 接受任意长度的密钥");
+    mac.update(query.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// 币安自己说「执行状态未知」的错误码（官方文档）：
+/// -1000 UNKNOWN、-1001 DISCONNECTED（内部错误）、-1006 UNEXPECTED_RESP、-1007 TIMEOUT
+/// （"Send status unknown; execution status unknown"）。
+const BINANCE_UNKNOWN_STATUS_CODES: &[i32] = &[-1000, -1001, -1006, -1007];
+
+/// 下单回复 → 三种结论。纯函数，按币安文档的约定：
+/// - 2xx 带 `orderId`：成功；2xx 但解析不了：单已受理却拿不到编号，结果不确定；
+/// - 回复是 `{code, msg}`：`code` 属于「状态未知」那几个 → 不确定；-1008（服务过载，文档写明
+///   请求失败）→ 拒绝；其余 5xx 与 408（等后端超时）→ 不确定（文档：不代表失败，可能已执行）；其余 4xx → 拒绝
+///   （格式/精度/余额/限频/只挂 maker 会吃单 -5022 等，单没进撮合）；
+/// - 非 2xx 又解析不出 `{code, msg}`（网关 HTML、空回复）：不确定。
+fn parse_place_reply(status: u16, text: &str) -> Result<OrderId, PlaceError> {
+    #[derive(Deserialize)]
+    struct Accepted {
+        #[serde(rename = "orderId")]
+        order_id: i64,
+    }
+    #[derive(Deserialize)]
+    struct Failed {
+        code: i32,
+        msg: String,
+    }
+    let body = preview(text);
+    if (200..300).contains(&status) {
+        return serde_json::from_str::<Accepted>(text)
+            .map(|a| a.order_id.to_string())
+            .map_err(|e| {
+                PlaceError::indeterminate(format!(
+                    "Binance 下单回复解析不了 (HTTP {status}): {e}; body: {body}"
+                ))
+            });
+    }
+    let Ok(Failed { code, msg }) = serde_json::from_str::<Failed>(text) else {
+        return Err(PlaceError::indeterminate(format!(
+            "Binance 下单失败且回复解析不了 (HTTP {status}): {body}"
+        )));
+    };
+    let detail = format!("HTTP {status}, code={code}, msg={msg}");
+    if BINANCE_UNKNOWN_STATUS_CODES.contains(&code) {
+        return Err(PlaceError::indeterminate(format!("Binance {detail}")));
+    }
+    if code == -2022 {
+        // "ReduceOnly Order is rejected" —— reduce-only 单因仓位已平被拒
+        return Err(PlaceError::Rejected(RejectReason::ReduceOnlyClosed));
+    }
+    if (status >= 500 || status == 408) && code != -1008 {
+        return Err(PlaceError::indeterminate(format!("Binance {detail}")));
+    }
+    Err(PlaceError::rejected(detail))
+}
+
+fn side_to_binance(side: Side) -> &'static str {
+    match side {
+        Side::Long => "BUY",
+        Side::Short => "SELL",
+    }
+}
+
+fn tif_to_binance(tif: TimeInForce) -> &'static str {
+    match tif {
+        TimeInForce::GTC => "GTC",
+        TimeInForce::IOC => "IOC",
+        TimeInForce::FOK => "FOK",
+        TimeInForce::PostOnly => "GTX",
     }
 }
 
@@ -899,6 +705,21 @@ mod settled_funding_tests {
     fn bad_rate_fails_the_whole_batch() {
         let body = r#"[{"fundingTime":1,"fundingRate":"x"}]"#;
         assert!(parse_settled_funding(body, &"BTC".to_string()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sign_tests {
+    /// 官方文档（SIGNED Endpoint Examples）的样例：密钥、query 与签名照抄
+    #[test]
+    fn signature_matches_the_documented_example() {
+        assert_eq!(
+            super::sign(
+                "NhqPtmdSJYdKjVHjA7PZj4Mge3R5YNiP1e3UZjInClVN65XAbvqqM6A7H5fATj0j",
+                "symbol=LTCBTC&side=BUY&type=LIMIT&timeInForce=GTC&quantity=1&price=0.1&recvWindow=5000&timestamp=1499827319559"
+            ),
+            "c8db56825ae71d6d79447849e617115f4a920fa2acdcab2b053c4b2838bd6b71"
+        );
     }
 }
 

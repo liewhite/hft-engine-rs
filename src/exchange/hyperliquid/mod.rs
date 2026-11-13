@@ -8,7 +8,7 @@ pub(crate) mod testkit;
 mod transport;
 
 pub use actor::{HyperliquidArgs, HyperliquidNode};
-pub use client::HyperliquidClient;
+pub use client::{HyperliquidAccount, HyperliquidClient};
 
 /// 本引擎在 Hyperliquid 的订单号（cloid）：协议要求 128-bit 十六进制，即 `0x` + 32 hex。
 pub const CLIENT_ORDER_IDS: super::CliOrderIdFormat = super::CliOrderIdFormat::new("0x", 32);

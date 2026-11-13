@@ -17,9 +17,7 @@
 
 use super::private_ws::BinancePrivateWs;
 use super::public_ws::BinancePublicWs;
-use crate::exchange::binance::{
-    BinanceClient, BinanceCredentials, WS_MARKET_URL, WS_PUBLIC_HIGH_FREQ_URL,
-};
+use crate::exchange::binance::{BinanceAccount, WS_MARKET_URL, WS_PUBLIC_HIGH_FREQ_URL};
 use crate::exchange::client::{ExchangeCmd, ExchangeHandle, SubscriptionKind};
 use crate::exchange::equity_polling::EquityPoller;
 use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
@@ -34,13 +32,9 @@ const STATUS_BROADCAST_INTERVAL_MS: u64 = 60_000;
 
 /// BinanceNode 构造参数
 pub struct BinanceArgs {
-    /// 装配处建好的带凭证 client（净值、资金费轮询用；与 ExchangeSetup 里的是同一个）。
-    /// 只在有凭证时给，"能不能轮询"由 Option 表达
-    pub client: Option<Arc<BinanceClient>>,
-    /// 凭证（可选）
-    pub credentials: Option<BinanceCredentials>,
-    /// REST 基础 URL（用于 ListenKey）
-    pub rest_base_url: String,
+    /// 账户接口（私有流的 ListenKey、净值与资金费轮询用；与 ExchangeSetup 里的是同一个）。
+    /// 只在配了凭证时有，没有就只接公共行情
+    pub account: Option<Arc<BinanceAccount>>,
     /// 公共行情总线（public WS / 状态广播用）
     pub market_bus: MarketBus,
     /// 账户私有事件总线（private WS / 账户轮询用）
@@ -100,9 +94,7 @@ impl BinanceNode {
         let (_, addr) = group
             .spawn_addressed("BinanceNode", move |scope: Scope, inbox| async move {
                 let BinanceArgs {
-                    client,
-                    credentials,
-                    rest_base_url,
+                    account,
                     market_bus,
                     account_bus,
                     quote,
@@ -111,12 +103,11 @@ impl BinanceNode {
 
                 // 1. 私有 WS 启动时就连（要在投产前确认订阅生效）；失败 → 向上传播。
                 //    两条公共 WS 等第一条订阅路由过来才连（见 LazyConn）
-                let has_private_ws = credentials.is_some();
-                if let Some(credentials) = credentials {
+                let has_private_ws = account.is_some();
+                if let Some(account) = &account {
                     BinancePrivateWs::spawn(
                         &children,
-                        credentials,
-                        rest_base_url,
+                        account.clone(),
                         account_bus.clone(),
                         quote.clone(),
                     )
@@ -131,13 +122,12 @@ impl BinanceNode {
                 };
                 let public_ws = lazy_public("BinancePublicWs", WsTarget::PublicHighFreq);
                 let market_ws = lazy_public("BinanceMarketWs", WsTarget::Market);
-                // 2. 私有轮询与私有 WS 一样按凭证门控：装配处只在有凭证时才给 client
-                //    （见 assembly 的 setup_binance），无凭证时只接公共行情
-                if let Some(client) = client {
-                    EquityPoller::spawn(&children, client.clone(), account_bus.clone(), 1000)?;
+                // 2. 私有轮询与私有 WS 一样只在有账户时起
+                if let Some(account) = account {
+                    EquityPoller::spawn(&children, account.clone(), account_bus.clone(), 1000)?;
                     FundingFeePoller::spawn(
                         &children,
-                        client,
+                        account,
                         account_bus.clone(),
                         FUNDING_FEE_POLL_INTERVAL_MS,
                     )?;

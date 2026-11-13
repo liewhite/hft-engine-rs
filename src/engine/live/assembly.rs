@@ -15,13 +15,13 @@ use super::AccountBus;
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
 use crate::engine::NewClientOrderId;
 use crate::exchange::binance::{
-    BinanceArgs, BinanceClient, BinanceCredentials, BinanceNode, REST_BASE_URL,
+    BinanceAccount, BinanceArgs, BinanceClient, BinanceCredentials, BinanceNode,
 };
 use crate::exchange::hyperliquid::{
-    HyperliquidAccess, HyperliquidArgs, HyperliquidClient, HyperliquidNode,
+    HyperliquidAccess, HyperliquidAccount, HyperliquidArgs, HyperliquidClient, HyperliquidNode,
 };
 use crate::exchange::ibkr::{IbkrArgs, IbkrClient, IbkrCredentials, IbkrNode, IbkrSnapshotConfig};
-use crate::exchange::okx::{OkxArgs, OkxClient, OkxCredentials, OkxNode};
+use crate::exchange::okx::{OkxAccount, OkxArgs, OkxClient, OkxCredentials, OkxNode};
 use crate::exchange::okx::{OkxGreeksPoller, GREEKS_POLLING_INTERVAL_MS};
 use crate::exchange::{
     AccountClient, AccountStream, ExchangeAccess, ExchangeClient, ExchangeHandle,
@@ -62,8 +62,8 @@ pub struct ExchangeSetup {
     /// 账户私有能力。`None` = 只接公共行情。
     ///
     /// "有没有账户"就由这个 `Option` 表达，不另存 bool（见 `docs/architecture.md` P2）：
-    /// 只有 [`ExchangeAccess::has_credentials`] 为真时才装进来，因此下游拿到 `Some`
-    /// 即可直接下单/对账，不必再问一次"配了凭证没有"。
+    /// 只有配了凭证时才构造各所的账户类型装进来，因此下游拿到 `Some` 即可直接下单/对账，
+    /// 不必再问一次"配了凭证没有"。
     pub(crate) account: Option<Arc<dyn AccountClient>>,
     /// 能力查询：该所适配层是否实现某种公共订阅（知识在各适配层的
     /// `supports_subscription`，随 setup 携带 —— 投产校验用，无集中能力表）
@@ -94,15 +94,14 @@ fn start_failed(name: &str, e: anyhow::Error) -> ExchangeError {
 pub fn setup_binance(
     access: ExchangeAccess<BinanceCredentials>,
 ) -> Result<ExchangeSetup, ExchangeError> {
-    let client = Arc::new(BinanceClient::new(
-        access.quote.clone(),
-        access.credentials.clone(),
-    )?);
-    let authed = access.has_credentials().then(|| client.clone());
+    let client = Arc::new(BinanceClient::new(access.quote.clone())?);
+    let account = access
+        .credentials
+        .map(|c| Arc::new(BinanceAccount::new(&client, c)));
     Ok(ExchangeSetup {
         exchange: Exchange::Binance,
         client: client.clone(),
-        account: authed.clone().map(|c| c as Arc<dyn AccountClient>),
+        account: account.clone().map(|a| a as Arc<dyn AccountClient>),
         supports: crate::exchange::binance::supports_subscription,
         new_client_order_id: || crate::exchange::binance::CLIENT_ORDER_IDS.generate(),
         settled_funding: Some(client),
@@ -112,9 +111,7 @@ pub fn setup_binance(
                 BinanceNode::spawn(
                     &ctx.producers,
                     BinanceArgs {
-                        client: authed,
-                        credentials: access.credentials,
-                        rest_base_url: REST_BASE_URL.to_string(),
+                        account,
                         market_bus: ctx.market_bus,
                         account_bus: ctx.account_bus,
                         quote: access.quote,
@@ -128,17 +125,17 @@ pub fn setup_binance(
 }
 
 pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup, ExchangeError> {
-    let client = Arc::new(OkxClient::new(
-        access.quote.clone(),
-        access.credentials.clone(),
-    )?);
-    let authed = access.has_credentials().then(|| client.clone());
+    let client = Arc::new(OkxClient::new(access.quote.clone())?);
+    let account = access
+        .credentials
+        .map(|c| OkxAccount::new(client.clone(), c).map(Arc::new))
+        .transpose()?;
     let mut account_streams: HashMap<AccountStream, StartAccountStream> = HashMap::new();
-    if let Some(c) = authed.clone() {
+    if let Some(a) = account.clone() {
         account_streams.insert(
             AccountStream::Greeks,
             Box::new(move |group: &Group, account_bus: AccountBus| {
-                OkxGreeksPoller::spawn(group, c.clone(), account_bus, GREEKS_POLLING_INTERVAL_MS)
+                OkxGreeksPoller::spawn(group, a.clone(), account_bus, GREEKS_POLLING_INTERVAL_MS)
                     .map(|_| ())
             }),
         );
@@ -146,7 +143,7 @@ pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup
     Ok(ExchangeSetup {
         exchange: Exchange::OKX,
         client: client.clone(),
-        account: authed.clone().map(|c| c as Arc<dyn AccountClient>),
+        account: account.clone().map(|a| a as Arc<dyn AccountClient>),
         supports: crate::exchange::okx::supports_subscription,
         new_client_order_id: || crate::exchange::okx::CLIENT_ORDER_IDS.generate(),
         settled_funding: Some(client),
@@ -156,9 +153,7 @@ pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup
                 OkxNode::spawn(
                     &ctx.producers,
                     OkxArgs {
-                        credentials: access.credentials.clone(),
-                        // 只在有凭证时给 —— 账户轮询是私有能力，"能不能轮询"由 Option 表达
-                        client: authed,
+                        account,
                         symbol_metas: ctx.symbol_metas,
                         market_bus: ctx.market_bus,
                         account_bus: ctx.account_bus,
@@ -172,18 +167,20 @@ pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup
     })
 }
 
-/// 构造是异步的：client 启动时要拉各 dex 的 meta 建品种目录、查账户模式（见
-/// [`HyperliquidClient::connect`]），一个 client 覆盖配置里的全部 dex。
+/// 构造是异步的：client 启动时要拉各 dex 的 meta 建品种目录（见 [`HyperliquidClient::connect`]），
+/// 有凭证时再查账户模式（见 [`HyperliquidAccount::connect`]）；一个 client 覆盖配置里的全部 dex。
 pub async fn setup_hyperliquid(access: HyperliquidAccess) -> Result<ExchangeSetup, ExchangeError> {
-    let has_credentials = access.credentials.is_some();
-    let client =
-        Arc::new(HyperliquidClient::connect(access.quote, access.dexes, access.credentials).await?);
-    let account: Option<Arc<dyn AccountClient>> =
-        has_credentials.then(|| client.clone() as Arc<dyn AccountClient>);
+    let client = Arc::new(HyperliquidClient::connect(access.quote, access.dexes).await?);
+    let account = match access.credentials {
+        Some(c) => Some(Arc::new(
+            HyperliquidAccount::connect(client.clone(), c).await?,
+        )),
+        None => None,
+    };
     Ok(ExchangeSetup {
         exchange: Exchange::Hyperliquid,
         client: client.clone(),
-        account,
+        account: account.clone().map(|a| a as Arc<dyn AccountClient>),
         supports: crate::exchange::hyperliquid::supports_subscription,
         new_client_order_id: || crate::exchange::hyperliquid::CLIENT_ORDER_IDS.generate(),
         settled_funding: Some(client.clone()),
@@ -194,6 +191,7 @@ pub async fn setup_hyperliquid(access: HyperliquidAccess) -> Result<ExchangeSetu
                     &ctx.producers,
                     HyperliquidArgs {
                         client,
+                        account,
                         market_bus: ctx.market_bus,
                         account_bus: ctx.account_bus,
                     },

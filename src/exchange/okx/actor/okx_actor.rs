@@ -24,7 +24,7 @@ use crate::exchange::client::{ExchangeCmd, ExchangeHandle, SubscriptionKind};
 use crate::exchange::equity_polling::EquityPoller;
 use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
 use crate::exchange::lazy_conn::LazyConn;
-use crate::exchange::okx::{OkxClient, OkxCredentials};
+use crate::exchange::okx::OkxAccount;
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
 use crate::tasks::{Group, Inbox, Scope, Task};
@@ -39,10 +39,9 @@ const EQUITY_POLL_INTERVAL_MS: u64 = 2_000;
 
 /// OkxNode 构造参数
 pub struct OkxArgs {
-    /// 凭证（可选）
-    pub credentials: Option<OkxCredentials>,
-    /// 带凭证的 REST client（净值、资金费轮询用；只在有凭证时给）
-    pub client: Option<Arc<OkxClient>>,
+    /// 账户接口（私有 WS 登录、净值与资金费轮询用；与 ExchangeSetup 里的是同一个）。
+    /// 只在配了凭证时有，没有就只接公共行情
+    pub account: Option<Arc<OkxAccount>>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 公共行情总线（public WS / 状态广播用）
@@ -74,8 +73,7 @@ impl OkxNode {
         let (_, addr) = group
             .spawn_addressed("OkxNode", move |scope: Scope, inbox| async move {
                 let OkxArgs {
-                    credentials,
-                    client,
+                    account,
                     symbol_metas,
                     market_bus,
                     account_bus,
@@ -85,11 +83,11 @@ impl OkxNode {
 
                 // 1. 私有 WS 启动时就连（含登录与订阅确认，要在投产前生效）；失败 → 向上传播。
                 //    两条公共 WS 等第一条订阅路由过来才连（见 LazyConn）
-                let has_private_ws = credentials.is_some();
-                if let Some(credentials) = credentials {
+                let has_private_ws = account.is_some();
+                if let Some(account) = &account {
                     OkxPrivateWs::spawn(
                         &children,
-                        credentials,
+                        account.credentials().clone(),
                         account_bus.clone(),
                         symbol_metas.clone(),
                         quote.clone(),
@@ -115,18 +113,18 @@ impl OkxNode {
                     })
                 };
 
-                // 2. 账户轮询按凭证门控：装配处只在有凭证时才给 client（见 assembly::setup_okx）
-                if let Some(client) = client {
+                // 2. 账户轮询与私有 WS 一样只在有账户时起
+                if let Some(account) = account {
                     // 净值与持仓总价值走 REST 轮询：私有 WS 推送的 notionalUsd 在单币种保证金模式下是空串
                     EquityPoller::spawn(
                         &children,
-                        client.clone(),
+                        account.clone(),
                         account_bus.clone(),
                         EQUITY_POLL_INTERVAL_MS,
                     )?;
                     FundingFeePoller::spawn(
                         &children,
-                        client,
+                        account,
                         account_bus.clone(),
                         FUNDING_FEE_POLL_INTERVAL_MS,
                     )?;

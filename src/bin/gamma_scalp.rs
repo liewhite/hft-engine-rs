@@ -78,7 +78,7 @@ fn main() -> anyhow::Result<()> {
     let end = NaiveDate::parse_from_str(&end_str, "%Y-%m-%d").context("parse END")?;
 
     // 真实 Binance (无凭证) 拉取 symbol 元数据 (精度)
-    let client = BinanceClient::new("USDT".to_string(), None)
+    let client = BinanceClient::new("USDT".to_string())
         .map_err(|e| anyhow::anyhow!("binance client: {e}"))?;
     let metas_vec = tokio::runtime::Runtime::new()?
         .block_on(client.fetch_all_symbol_metas())

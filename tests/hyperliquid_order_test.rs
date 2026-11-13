@@ -7,7 +7,9 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
-use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
+use hft_engine_rs::exchange::hyperliquid::{
+    HyperliquidAccount, HyperliquidClient, HyperliquidCredentials,
+};
 use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder};
 use serde::Deserialize;
 
@@ -82,13 +84,14 @@ async fn fetch_bbo(symbol: &Symbol) -> Result<(Decimal, Decimal), Box<dyn std::e
 async fn test_hyperliquid_limit_buy() {
     let credentials =
         get_credentials().expect("需要设置 HYPERLIQUID_WALLET_ADDRESS 和 HYPERLIQUID_PRIVATE_KEY");
-    let client = HyperliquidClient::connect(
-        TEST_QUOTE.to_string(),
-        vec![TEST_DEX.to_string()],
-        Some(credentials),
-    )
-    .await
-    .expect("创建客户端失败");
+    let client = std::sync::Arc::new(
+        HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()])
+            .await
+            .expect("创建客户端失败"),
+    );
+    let account = HyperliquidAccount::connect(client.clone(), credentials)
+        .await
+        .expect("账户");
 
     let symbol: Symbol = TEST_BASE.to_string();
 
@@ -125,7 +128,7 @@ async fn test_hyperliquid_limit_buy() {
 
     println!("提交买单: {:?}", order);
 
-    let order_id = client
+    let order_id = account
         .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");
@@ -138,13 +141,14 @@ async fn test_hyperliquid_limit_buy() {
 async fn test_hyperliquid_limit_sell() {
     let credentials =
         get_credentials().expect("需要设置 HYPERLIQUID_WALLET_ADDRESS 和 HYPERLIQUID_PRIVATE_KEY");
-    let client = HyperliquidClient::connect(
-        TEST_QUOTE.to_string(),
-        vec![TEST_DEX.to_string()],
-        Some(credentials),
-    )
-    .await
-    .expect("创建客户端失败");
+    let client = std::sync::Arc::new(
+        HyperliquidClient::connect(TEST_QUOTE.to_string(), vec![TEST_DEX.to_string()])
+            .await
+            .expect("创建客户端失败"),
+    );
+    let account = HyperliquidAccount::connect(client.clone(), credentials)
+        .await
+        .expect("账户");
 
     let symbol: Symbol = TEST_BASE.to_string();
 
@@ -181,7 +185,7 @@ async fn test_hyperliquid_limit_sell() {
 
     println!("提交卖单: {:?}", order);
 
-    let order_id = client
+    let order_id = account
         .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");

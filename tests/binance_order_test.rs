@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
-use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
+use hft_engine_rs::exchange::binance::{BinanceAccount, BinanceClient, BinanceCredentials};
 use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder};
 use serde::Deserialize;
 
@@ -61,8 +61,8 @@ async fn fetch_bbo(symbol: &Symbol) -> Result<(Decimal, Decimal), Box<dyn std::e
 #[ignore = "需要真实凭证和网络"]
 async fn test_binance_limit_buy() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
-    let client =
-        BinanceClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
+    let client = BinanceClient::new(TEST_QUOTE.to_string()).expect("创建客户端失败");
+    let _account = BinanceAccount::new(&client, credentials);
 
     let symbol: Symbol = TEST_BASE.to_string();
 
@@ -98,7 +98,7 @@ async fn test_binance_limit_buy() {
 
     println!("提交买单: {:?}", order);
 
-    // let order_id = client.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
+    // let order_id = _account.place_order(ExchangeOrder::from_domain(order, &meta).expect("订单未通过出向校验")).await.expect("下单失败");
     // println!("买单成功，订单ID: {}", order_id);
 }
 
@@ -107,8 +107,8 @@ async fn test_binance_limit_buy() {
 #[ignore = "需要真实凭证和网络"]
 async fn test_binance_limit_sell() {
     let credentials = get_credentials().expect("需要设置 BINANCE_API_KEY 和 BINANCE_SECRET");
-    let client =
-        BinanceClient::new(TEST_QUOTE.to_string(), Some(credentials)).expect("创建客户端失败");
+    let client = BinanceClient::new(TEST_QUOTE.to_string()).expect("创建客户端失败");
+    let account = BinanceAccount::new(&client, credentials);
 
     let symbol: Symbol = TEST_BASE.to_string();
 
@@ -144,7 +144,7 @@ async fn test_binance_limit_sell() {
 
     println!("提交卖单: {:?}", order);
 
-    let order_id = client
+    let order_id = account
         .place_order(ExchangeOrder::from_domain(order, meta).expect("订单未通过出向校验"))
         .await
         .expect("下单失败");

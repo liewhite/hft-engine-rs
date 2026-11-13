@@ -4,7 +4,7 @@ pub(crate) mod codec;
 mod symbol;
 
 pub use actor::{BinanceArgs, BinanceNode};
-pub use client::BinanceClient;
+pub use client::{BinanceAccount, BinanceClient};
 pub use symbol::{from_binance, to_binance};
 
 /// 本引擎在 Binance 的订单号：`0x` + 32 hex

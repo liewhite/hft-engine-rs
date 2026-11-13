@@ -3,7 +3,9 @@
 //!
 //! 运行：`HL_WALLET=0x… cargo test --test hyperliquid_account_readonly -- --ignored --nocapture`
 
-use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
+use hft_engine_rs::exchange::hyperliquid::{
+    HyperliquidAccount, HyperliquidClient, HyperliquidCredentials,
+};
 use hft_engine_rs::exchange::AccountClient;
 
 #[tokio::test]
@@ -12,15 +14,16 @@ async fn unified_account_equity_and_positions_across_dexes() {
     let wallet = std::env::var("HL_WALLET").expect("HL_WALLET");
     // 占位签名机：本测试只读，不会提交任何签名请求
     let creds = HyperliquidCredentials::with_signer(wallet, "http://127.0.0.1:1".to_string(), 0.05);
-    let client = HyperliquidClient::connect(
-        "USDC".to_string(),
-        vec![String::new(), "xyz".to_string()],
-        Some(creds),
-    )
-    .await
-    .expect("统一账户应能同时接主站与 xyz");
-    let info = client.fetch_account_info().await.expect("净值");
-    let positions = client.fetch_positions().await.expect("持仓");
+    let client = std::sync::Arc::new(
+        HyperliquidClient::connect("USDC".to_string(), vec![String::new(), "xyz".to_string()])
+            .await
+            .expect("统一账户应能同时接主站与 xyz"),
+    );
+    let account = HyperliquidAccount::connect(client.clone(), creds)
+        .await
+        .expect("账户");
+    let info = account.fetch_account_info().await.expect("净值");
+    let positions = account.fetch_positions().await.expect("持仓");
     println!(
         "equity={} notional={} positions={positions:?}",
         info.equity, info.notional
