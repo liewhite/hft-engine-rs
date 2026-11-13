@@ -6,7 +6,6 @@
 //!   断档期间盘口不新鲜，策略自己不挂单；#762）。
 
 use crate::domain::{Exchange, ExchangeError};
-use crate::exchange::client::WsError;
 use crate::tasks::{Group, GroupClosed, Scope};
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
@@ -155,21 +154,24 @@ impl WsConn {
     }
 
     /// 发一帧文本（订阅/退订请求等）。循环已退出时返回 `Err`。
-    pub async fn send(&self, text: String) -> Result<(), WsError> {
+    pub async fn send(&self, text: String) -> Result<(), ExchangeError> {
         self.outgoing
             .send(text)
             .await
-            .map_err(|_| WsError::Network("WS 循环已退出，发送失败".to_string()))
+            .map_err(|_| ExchangeError::new("WS 循环已退出，发送失败".to_string()))
     }
 
     /// 下一帧入站文本。循环已退出（断线等，原因由循环子任务自己上报）时返回 `Err`。
     /// 可安全地放在 `select!` 里（取消不丢帧）。
-    pub async fn recv(&mut self) -> Result<String, WsError> {
+    pub async fn recv(&mut self) -> Result<String, ExchangeError> {
         if let Some(text) = self.replay.pop_front() {
             return Ok(text);
         }
         self.incoming.recv().await.ok_or_else(|| {
-            WsError::ServerClosed("WS 循环已退出（原因见循环子任务的错误）".to_string())
+            ExchangeError::new(format!(
+                "服务端关闭连接: {}",
+                "WS 循环已退出（原因见循环子任务的错误）"
+            ))
         })
     }
 
@@ -179,7 +181,7 @@ impl WsConn {
     /// 停机时把已到手的帧交完是为了不丢回报：私有流里可能有成交，而读循环在组件 `run`
     /// 返回后才停，缓冲里的帧没人取就随连接一起没了。停机期间循环仍在读，紧接着到的帧
     /// 也会被交出；循环已退出时交完缓冲即 `None`（断线原因由循环子任务自己上报）。
-    pub async fn next(&mut self, scope: &Scope) -> Result<Option<String>, WsError> {
+    pub async fn next(&mut self, scope: &Scope) -> Result<Option<String>, ExchangeError> {
         if !scope.is_stopping() {
             tokio::select! {
                 // 帧优先：与停止信号同时就绪时不跳过（反正之后也要排空）
@@ -207,17 +209,16 @@ impl WsConn {
         &mut self,
         exchange: Exchange,
         required: &[&str],
-        confirms: impl Fn(&str) -> Result<Option<String>, WsError>,
+        confirms: impl Fn(&str) -> Result<Option<String>, ExchangeError>,
     ) -> Result<(), ExchangeError> {
         let mut pending: std::collections::HashSet<&str> = required.iter().copied().collect();
         let incoming = &mut self.incoming;
         let replay = &mut self.replay;
         let wait = async {
             while !pending.is_empty() {
-                let text = incoming
-                    .recv()
-                    .await
-                    .ok_or_else(|| WsError::ServerClosed("等订阅确认时连接已断".to_string()))?;
+                let text = incoming.recv().await.ok_or_else(|| {
+                    ExchangeError::new(format!("服务端关闭连接: {}", "等订阅确认时连接已断"))
+                })?;
                 if let Some(sub) = confirms(&text)? {
                     if pending.remove(sub.as_str()) {
                         tracing::info!(%exchange, subscription = %sub, remaining = pending.len(), "私有订阅已确认生效");
@@ -225,14 +226,12 @@ impl WsConn {
                 }
                 replay.push_back(text);
             }
-            Ok::<(), WsError>(())
+            Ok::<(), ExchangeError>(())
         };
         match tokio::time::timeout(SUBSCRIPTION_CONFIRM_TIMEOUT, wait).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(ExchangeError::WebSocketError(format!(
-                "{exchange} 私有订阅: {e}"
-            ))),
-            Err(_) => Err(ExchangeError::Timeout(format!(
+            Ok(Err(e)) => Err(ExchangeError::new(format!("{exchange} 私有订阅: {e}"))),
+            Err(_) => Err(ExchangeError::new(format!(
                 "{exchange} 私有订阅 {pending:?} 未在 {}s 内确认，私有回报不可信",
                 SUBSCRIPTION_CONFIRM_TIMEOUT.as_secs()
             ))),
@@ -256,10 +255,10 @@ enum OnLoss {
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 建 WS 连接，限时 [`CONNECT_TIMEOUT`]（见 [`crate::net::ws_connect`]）。公共流重连和三所私有流启动共用。
-pub(crate) async fn connect(url: &str) -> Result<crate::net::WsStream, WsError> {
+pub(crate) async fn connect(url: &str) -> Result<crate::net::WsStream, ExchangeError> {
     crate::net::ws_connect(url, None, CONNECT_TIMEOUT)
         .await
-        .map_err(WsError::ConnectionFailed)
+        .map_err(ExchangeError::new)
 }
 /// 重连失败后的等待：从 1 秒起翻倍，封顶 30 秒，一直重试到连上或停机
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -317,7 +316,7 @@ impl ReconnectingWs {
         name: &str,
         url: &str,
         keepalive: &WsKeepalive,
-    ) -> Result<WsConn, WsError> {
+    ) -> Result<WsConn, ExchangeError> {
         let ws = connect(url).await?;
         let (write, read) = ws.split();
         WsConn::spawn_loop(
@@ -328,7 +327,7 @@ impl ReconnectingWs {
             keepalive.clone(),
             OnLoss::Report,
         )
-        .map_err(|e| WsError::ConnectionFailed(e.to_string()))
+        .map_err(|e| ExchangeError::new(e.to_string()))
     }
 
     /// 发一帧文本（订阅/退订）。连接已断时丢掉：重连时组件会重发全部订阅。
@@ -419,7 +418,7 @@ async fn run_ws_loop_inner(
     outgoing_rx: &mut mpsc::Receiver<String>,
     incoming_tx: &mpsc::Sender<String>,
     keepalive: &WsKeepalive,
-) -> Result<(), WsError> {
+) -> Result<(), ExchangeError> {
     let mut ping_timer = tokio::time::interval(keepalive.ping_interval);
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping_timer.tick().await; // interval 的首个 tick 立即到期，跳过
@@ -429,14 +428,14 @@ async fn run_ws_loop_inner(
             // 心跳节拍：发应用层 ping（若该所需要），并检查空闲
             _ = ping_timer.tick() => {
                 if last_activity.elapsed() > keepalive.idle_timeout {
-                    return Err(WsError::Network(format!(
+                    return Err(ExchangeError::new(format!(
                         "idle timeout: 已 {:?} 未收到任何入站帧（含控制帧），判定断流",
                         last_activity.elapsed()
                     )));
                 }
                 if let Some(text) = &keepalive.ping_text {
                     if write.send(WsMessage::Text(text.clone())).await.is_err() {
-                        return Err(WsError::Network("Ping send failed".to_string()));
+                        return Err(ExchangeError::new("Ping send failed".to_string()));
                     }
                 }
             }
@@ -446,7 +445,7 @@ async fn run_ws_loop_inner(
                 match msg {
                     Some(text) => {
                         if write.send(WsMessage::Text(text)).await.is_err() {
-                            return Err(WsError::Network("Send failed".to_string()));
+                            return Err(ExchangeError::new("Send failed".to_string()));
                         }
                     }
                     // 组件丢了发送端（组件已退出），无人再收
@@ -479,20 +478,20 @@ async fn run_ws_loop_inner(
                     }
                     Some(Ok(WsMessage::Ping(data))) => {
                         write.send(WsMessage::Pong(data)).await.map_err(|_| {
-                            WsError::Network("Failed to send pong".to_string())
+                            ExchangeError::new("Failed to send pong".to_string())
                         })?;
                     }
                     Some(Ok(WsMessage::Close(frame))) => {
                         let reason = frame
                             .map(|f| format!("code={}, reason={}", f.code, f.reason))
                             .unwrap_or_else(|| "no reason".to_string());
-                        return Err(WsError::ServerClosed(reason));
+                        return Err(ExchangeError::new(format!("服务端关闭连接: {}", reason)));
                     }
                     Some(Err(e)) => {
-                        return Err(WsError::Network(e.to_string()));
+                        return Err(ExchangeError::new(e.to_string()));
                     }
                     None => {
-                        return Err(WsError::ServerClosed("connection dropped".to_string()));
+                        return Err(ExchangeError::new(format!("服务端关闭连接: {}", "connection dropped")));
                     }
                     // 其它帧类型 (Pong/Frame 等) 忽略
                     _ => {}
@@ -598,10 +597,10 @@ mod keepalive_tests {
         assert!(format!("{e:#}").contains("connection dropped"), "{e:#}");
     }
 
-    fn by_prefix(raw: &str) -> Result<Option<String>, WsError> {
+    fn by_prefix(raw: &str) -> Result<Option<String>, ExchangeError> {
         match raw.split_once(':') {
             Some(("ack", sub)) | Some(("data", sub)) => Ok(Some(sub.to_string())),
-            Some(("error", e)) => Err(WsError::ParseError(e.to_string())),
+            Some(("error", e)) => Err(ExchangeError::new(e.to_string())),
             _ => Ok(None),
         }
     }
@@ -654,10 +653,7 @@ mod keepalive_tests {
             .await
             .err()
             .unwrap();
-        assert!(
-            matches!(e, ExchangeError::Timeout(_)) && e.to_string().contains("fills"),
-            "超时要点名缺哪条: {e}"
-        );
+        assert!(e.to_string().contains("fills"), "超时要点名缺哪条: {e}");
 
         let (mut conn, tx) = conn_fed_by(&[]);
         drop(tx);

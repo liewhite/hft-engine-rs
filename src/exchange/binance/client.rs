@@ -19,7 +19,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::Sha256;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Binance 交易所客户端
 pub struct BinanceClient {
@@ -175,13 +174,13 @@ impl BinanceClient {
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         if !status.is_success() {
-            return Err(ExchangeError::Other(format!(
+            return Err(ExchangeError::new(format!(
                 "ticker/24hr failed: {status}, body: {}",
                 &text[..text.len().min(500)]
             )));
         }
         let tickers: Vec<Ticker24h> = serde_json::from_str(&text)
-            .map_err(|e| ExchangeError::Other(format!("Failed to parse ticker/24hr: {e}")))?;
+            .map_err(|e| ExchangeError::new(format!("Failed to parse ticker/24hr: {e}")))?;
 
         Ok(tickers
             .into_iter()
@@ -220,7 +219,7 @@ impl BinanceClient {
 
     /// reqwest 错误转换
     fn map_reqwest_error(e: reqwest::Error) -> ExchangeError {
-        ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string())
+        ExchangeError::transport(Exchange::Binance, e.to_string())
     }
 
     /// 签名
@@ -258,7 +257,7 @@ impl BinanceClient {
         }
 
         let err: ErrorResponse = serde_json::from_str(text).ok()?;
-        Some(map_binance_error(err.code, &err.msg))
+        Some(ExchangeError::api(Exchange::Binance, err.code, err.msg))
     }
 
     /// 获取所有交易对信息
@@ -276,21 +275,21 @@ impl BinanceClient {
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
 
         if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
                 Exchange::Binance,
                 status.as_u16() as i32,
                 text,
             )));
         }
 
-        parse_exchange_info(&text, &self.quote).map_err(ExchangeError::Other)
+        parse_exchange_info(&text, &self.quote).map_err(ExchangeError::new)
     }
 
     /// 查询所有持仓（内部实现；ExchangeClient::fetch_positions 委托到这里）
     async fn fetch_positions_impl(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
         let api_key = self
             .api_key()
-            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
 
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -306,7 +305,7 @@ impl BinanceClient {
         let admitted = LIMITER.query(&[IP_WEIGHT.cost(5)]).await?;
         let query = self
             .build_signed_query(&[])
-            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
 
         let resp = crate::net::send(
             self.client
@@ -320,7 +319,7 @@ impl BinanceClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
                 Exchange::Binance,
                 status.as_u16() as i32,
                 text,
@@ -336,7 +335,7 @@ impl BinanceClient {
             // 检测到双向模式直接报错拒绝（与 OKX 适配层在 codec 里拒绝 long/short
             // posSide 的立场一致），由使用者去交易所切换持仓模式。
             if p.position_side != "BOTH" {
-                return Err(ExchangeError::Other(format!(
+                return Err(ExchangeError::new(format!(
                     "Binance 账户处于双向持仓模式（{} positionSide={}），本系统只支持单向\
                      净持仓，请在交易所切换为单向模式",
                     p.symbol, p.position_side
@@ -347,7 +346,7 @@ impl BinanceClient {
                 None => continue, // 非当前 quote 的交易对，跳过
             };
             let size: Decimal = crate::domain::parse_decimal(&p.position_amt).map_err(|_| {
-                ExchangeError::Other(format!(
+                ExchangeError::new(format!(
                     "Failed to parse position_amt '{}' for {}",
                     p.position_amt, p.symbol
                 ))
@@ -370,7 +369,7 @@ impl BinanceClient {
     async fn get_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         let api_key = self
             .api_key()
-            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
 
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -388,7 +387,7 @@ impl BinanceClient {
         let admitted = LIMITER.query(&[IP_WEIGHT.cost(5)]).await?;
         let query = self
             .build_signed_query(&[])
-            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
 
         let resp = crate::net::send(
             self.client
@@ -402,7 +401,7 @@ impl BinanceClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
                 Exchange::Binance,
                 status.as_u16() as i32,
                 text,
@@ -412,7 +411,7 @@ impl BinanceClient {
         let account: AccountResponse = resp.json().await.map_err(Self::map_reqwest_error)?;
 
         let equity: f64 = account.total_margin_balance.parse().map_err(|_| {
-            ExchangeError::ParseError(format!(
+            ExchangeError::new(format!(
                 "Binance parse totalMarginBalance: {}",
                 account.total_margin_balance
             ))
@@ -422,7 +421,7 @@ impl BinanceClient {
         let mut notional: f64 = 0.0;
         for p in &account.positions {
             let value: f64 = p.notional.parse().map_err(|_| {
-                ExchangeError::ParseError(format!("Binance parse notional: {}", p.notional))
+                ExchangeError::new(format!("Binance parse notional: {}", p.notional))
             })?;
             notional += value.abs();
         }
@@ -473,7 +472,7 @@ impl crate::exchange::FundingFeeSource for BinanceClient {
     ) -> Result<Vec<FundingFee>, ExchangeError> {
         let api_key = self
             .api_key()
-            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
 
         #[derive(Deserialize)]
         #[allow(dead_code)]
@@ -498,7 +497,7 @@ impl crate::exchange::FundingFeeSource for BinanceClient {
                 ("endTime", &end_str),
                 ("limit", "1000"),
             ])
-            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
 
         let resp = crate::net::send(
             self.client
@@ -512,7 +511,7 @@ impl crate::exchange::FundingFeeSource for BinanceClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
                 Exchange::Binance,
                 status.as_u16() as i32,
                 text,
@@ -528,7 +527,7 @@ impl crate::exchange::FundingFeeSource for BinanceClient {
                 None => continue, // 跨 quote 合约（如币本位），跳过
             };
             let amount: f64 = e.income.parse().map_err(|_| {
-                ExchangeError::Other(format!(
+                ExchangeError::new(format!(
                     "Failed to parse funding income '{}' for {}",
                     e.income, e.symbol
                 ))
@@ -560,13 +559,13 @@ impl AccountClient for BinanceClient {
     ) -> Result<(), ExchangeError> {
         let api_key = self
             .api_key()
-            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
 
         let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
         let inst = to_binance(symbol, &self.quote);
         let query = self
             .build_signed_query(&[("symbol", &inst), ("origClientOrderId", client_order_id)])
-            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
 
         let resp = crate::net::send(
             self.client
@@ -580,7 +579,7 @@ impl AccountClient for BinanceClient {
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
                 Exchange::Binance,
                 status.as_u16() as i32,
                 text,
@@ -592,7 +591,7 @@ impl AccountClient for BinanceClient {
     async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
         let api_key = self
             .api_key()
-            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
 
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -605,7 +604,7 @@ impl AccountClient for BinanceClient {
         let admitted = LIMITER.query(&[IP_WEIGHT.cost(40)]).await?;
         let query = self
             .build_signed_query(&[])
-            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
         let resp = crate::net::send(
             self.client
                 .get(format!("{}/fapi/v1/openOrders?{}", self.base_url, query))
@@ -618,15 +617,14 @@ impl AccountClient for BinanceClient {
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
                 Exchange::Binance,
                 status.as_u16() as i32,
                 text,
             )));
         }
-        let rows: Vec<Row> = serde_json::from_str(&text).map_err(|e| {
-            ExchangeError::ParseError(format!("Failed to parse Binance openOrders: {e}"))
-        })?;
+        let rows: Vec<Row> = serde_json::from_str(&text)
+            .map_err(|e| ExchangeError::new(format!("Failed to parse Binance openOrders: {e}")))?;
         Ok(rows
             .into_iter()
             .map(|r| OpenOrder {
@@ -639,14 +637,14 @@ impl AccountClient for BinanceClient {
     async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError> {
         let api_key = self
             .api_key()
-            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("No API key".to_string()))?;
         let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
         let query = self
             .build_signed_query(&[
                 ("symbol", order.instrument.as_str()),
                 ("orderId", order.order_id.as_str()),
             ])
-            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+            .ok_or_else(|| ExchangeError::new("Failed to sign request".to_string()))?;
         let resp = crate::net::send(
             self.client
                 .delete(format!("{}/fapi/v1/order?{}", self.base_url, query))
@@ -658,7 +656,7 @@ impl AccountClient for BinanceClient {
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
                 Exchange::Binance,
                 status.as_u16() as i32,
                 text,
@@ -781,20 +779,6 @@ fn parse_place_reply(status: u16, text: &str) -> Result<OrderId, PlaceError> {
     Err(PlaceError::Rejected(RejectReason::Other(detail)))
 }
 
-/// 错误码映射
-fn map_binance_error(code: i32, msg: &str) -> ExchangeError {
-    match code {
-        -1003 => ExchangeError::RateLimited(Exchange::Binance, Duration::from_secs(60)),
-        -2010 | -2019 => ExchangeError::InsufficientBalance(Exchange::Binance, 0.0, 0.0),
-        -4028 => ExchangeError::ApiError(
-            Exchange::Binance,
-            code,
-            format!("Leverage exceeded: {}", msg),
-        ),
-        _ => ExchangeError::ApiError(Exchange::Binance, code, msg.to_string()),
-    }
-}
-
 /// Side 转换
 fn side_to_binance(side: Side) -> &'static str {
     match side {
@@ -834,7 +818,7 @@ fn parse_settled_funding(
         funding_rate: String,
     }
     let entries: Vec<Entry> = serde_json::from_str(text).map_err(|e| {
-        ExchangeError::ParseError(format!(
+        ExchangeError::new(format!(
             "fundingRate: {e} (body: {})",
             text.chars().take(300).collect::<String>()
         ))
@@ -842,9 +826,10 @@ fn parse_settled_funding(
     entries
         .into_iter()
         .map(|e| {
-            let rate = e.funding_rate.parse::<f64>().map_err(|_| {
-                ExchangeError::ParseError(format!("fundingRate 非法: {}", e.funding_rate))
-            })?;
+            let rate = e
+                .funding_rate
+                .parse::<f64>()
+                .map_err(|_| ExchangeError::new(format!("fundingRate 非法: {}", e.funding_rate)))?;
             Ok(SettledFunding {
                 exchange: Exchange::Binance,
                 symbol: symbol.clone(),
@@ -885,7 +870,7 @@ impl crate::exchange::SettledFundingSource for BinanceClient {
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         if !status.is_success() {
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::api(
                 Exchange::Binance,
                 status.as_u16() as i32,
                 text,

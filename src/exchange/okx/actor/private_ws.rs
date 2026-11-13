@@ -6,7 +6,6 @@
 //! - 直接解析消息并发布到账户总线
 
 use crate::domain::{now_ms, Balance, Exchange, ExchangeError, OrderStatus, Symbol, SymbolMeta};
-use crate::exchange::client::WsError;
 use crate::exchange::okx::codec::{
     resolve_meta, AccountData as OkxAccountPush, OrderPushData, WsEvent, WsPush,
 };
@@ -59,7 +58,7 @@ impl OkxPrivateWs {
                 // 1. 连接私有 WebSocket（失败向上传播 → 启动期受控退出）
                 let ws_stream = crate::exchange::ws_loop::connect(WS_PRIVATE_URL)
                     .await
-                    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::OKX, e.to_string()))?;
+                    .map_err(|e| ExchangeError::transport(Exchange::OKX, e.to_string()))?;
                 let (mut write, mut read) = ws_stream.split();
 
                 // 2. 登录（带超时；任何失败向上传播 → 启动期受控退出，不重试）
@@ -82,9 +81,7 @@ impl OkxPrivateWs {
                 write
                     .send(WsMessage::Text(subscribe_msg))
                     .await
-                    .map_err(|e| {
-                        ExchangeError::WebSocketError(format!("OKX send private subscribe: {e}"))
-                    })?;
+                    .map_err(|e| ExchangeError::new(format!("OKX send private subscribe: {e}")))?;
 
                 // 4. 起读循环（心跳、回 Pong、断线判定都归它）
                 let mut conn = WsConn::spawn(
@@ -148,7 +145,7 @@ async fn login(
 ) -> Result<(), ExchangeError> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| ExchangeError::Other(format!("系统时钟早于 UNIX 纪元: {e}")))?
+        .map_err(|e| ExchangeError::new(format!("系统时钟早于 UNIX 纪元: {e}")))?
         .as_secs()
         .to_string();
     let sign = credentials.sign_ws_login(&timestamp);
@@ -167,7 +164,7 @@ async fn login(
     write
         .send(WsMessage::Text(login_msg))
         .await
-        .map_err(|e| ExchangeError::WebSocketError(format!("OKX send login: {e}")))?;
+        .map_err(|e| ExchangeError::new(format!("OKX send login: {e}")))?;
 
     let login_wait = async {
         loop {
@@ -179,23 +176,27 @@ async fn login(
                                 tracing::info!("OKX private login success");
                                 return Ok(());
                             } else {
-                                return Err(ExchangeError::AuthenticationFailed(Exchange::OKX));
+                                return Err(ExchangeError::new(format!(
+                                    "{} 鉴权失败",
+                                    Exchange::OKX
+                                )));
                             }
                         }
                     }
                 }
                 Some(Ok(WsMessage::Ping(data))) => {
-                    write.send(WsMessage::Pong(data)).await.map_err(|e| {
-                        ExchangeError::WebSocketError(format!("OKX pong during login: {e}"))
-                    })?;
+                    write
+                        .send(WsMessage::Pong(data))
+                        .await
+                        .map_err(|e| ExchangeError::new(format!("OKX pong during login: {e}")))?;
                 }
                 Some(Err(e)) => {
-                    return Err(ExchangeError::WebSocketError(format!(
+                    return Err(ExchangeError::new(format!(
                         "OKX WS error during login: {e}"
                     )));
                 }
                 None => {
-                    return Err(ExchangeError::ConnectionFailed(
+                    return Err(ExchangeError::transport(
                         Exchange::OKX,
                         "WS closed during login".to_string(),
                     ));
@@ -207,7 +208,7 @@ async fn login(
     tokio::time::timeout(Duration::from_secs(LOGIN_TIMEOUT_SECS), login_wait)
         .await
         .map_err(|_| {
-            ExchangeError::Timeout(format!(
+            ExchangeError::new(format!(
                 "OKX private login timed out after {LOGIN_TIMEOUT_SECS}s"
             ))
         })?
@@ -217,7 +218,7 @@ async fn login(
 // 消息解析
 // ============================================================================
 
-fn server_error(value: &serde_json::Value) -> WsError {
+fn server_error(value: &serde_json::Value) -> ExchangeError {
     let code = value
         .get("code")
         .and_then(|v| v.as_str())
@@ -226,18 +227,18 @@ fn server_error(value: &serde_json::Value) -> WsError {
         .get("msg")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    WsError::ParseError(format!("OKX error: code={code}, msg={msg}"))
+    ExchangeError::new(format!("OKX error: code={code}, msg={msg}"))
 }
 
 /// 启动期订阅确认判据（见 [`WsConn::await_subscriptions`]）：订阅回执
 /// `{"event":"subscribe","arg":{"channel":"orders",…}}` 或该频道数据到达都算；
 /// `{"event":"error",…}`（如订阅被拒）启动失败
-fn subscription_confirmed(raw: &str) -> Result<Option<String>, WsError> {
+fn subscription_confirmed(raw: &str) -> Result<Option<String>, ExchangeError> {
     if raw == "pong" {
         return Ok(None);
     }
     let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+        serde_json::from_str(raw).map_err(|e| ExchangeError::new(e.to_string()))?;
     let channel = value
         .pointer("/arg/channel")
         .and_then(|c| c.as_str())
@@ -291,13 +292,13 @@ fn parse_private_message(
     quote: &str,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
     last_trades: &mut LastTrades,
-) -> Result<Vec<AccountEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, ExchangeError> {
     // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
     if raw == "pong" {
         return Ok(Vec::new());
     }
     let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+        serde_json::from_str(raw).map_err(|e| ExchangeError::new(e.to_string()))?;
 
     // 检查是否是事件响应（控制消息，返回空 Vec）
     if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
@@ -322,17 +323,17 @@ fn parse_private_message(
         .get("arg")
         .and_then(|a| a.get("channel"))
         .and_then(|c| c.as_str())
-        .ok_or_else(|| WsError::ParseError(format!("Missing channel: {}", raw)))?;
+        .ok_or_else(|| ExchangeError::new(format!("Missing channel: {}", raw)))?;
 
     match channel {
         "account" => {
             let push: WsPush<OkxAccountPush> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("account parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("account parse: {}", e)))?;
 
             let mut events = Vec::new();
             for data in &push.data {
                 let exchange_ts = data.u_time.parse::<u64>().map_err(|_| {
-                    WsError::ParseError(format!(
+                    ExchangeError::new(format!(
                         "Failed to parse OKX account timestamp: {}",
                         data.u_time
                     ))
@@ -341,7 +342,7 @@ fn parse_private_message(
                 // 推送每个币种的现金余额 (用于修正 greeks delta)
                 for detail in &data.details {
                     let cash_bal: f64 = detail.cash_bal.parse().map_err(|_| {
-                        WsError::ParseError(format!(
+                        ExchangeError::new(format!(
                             "Failed to parse cash_bal '{}' for ccy {}",
                             detail.cash_bal, detail.ccy
                         ))
@@ -363,7 +364,7 @@ fn parse_private_message(
         }
         "orders" => {
             let push: WsPush<OrderPushData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("orders parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("orders parse: {}", e)))?;
 
             let mut events = Vec::new();
             for data in &push.data {

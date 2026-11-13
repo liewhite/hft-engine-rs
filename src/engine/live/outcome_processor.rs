@@ -572,7 +572,7 @@ mod gateway_tests {
             self.result.lock().unwrap().take().expect("结果只取一次")
         }
         async fn cancel_order(&self, _s: &Symbol, _cid: &str) -> Result<(), ExchangeError> {
-            self.cancel_result.clone().map_err(ExchangeError::Other)
+            self.cancel_result.clone().map_err(ExchangeError::new)
         }
         async fn fetch_open_orders(
             &self,

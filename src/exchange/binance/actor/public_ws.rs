@@ -6,9 +6,10 @@
 //! - 直接解析消息并发布到行情总线
 
 use crate::domain::now_ms;
+use crate::domain::ExchangeError;
 use crate::exchange::binance::codec::{AggTrade, BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
-use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
+use crate::exchange::client::{ExchangeCmd, SubscriptionKind};
 use crate::exchange::ws_loop::{ReconnectingWs, WsKeepalive};
 use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
@@ -78,9 +79,9 @@ impl BinancePublicWs {
     }
 
     /// 发送取消订阅消息
-    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
+    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), ExchangeError> {
         let stream = kind_to_stream(kind, &self.quote).ok_or_else(|| {
-            WsError::ParseError("Binance Candle 订阅未实现，无法取消订阅".to_string())
+            ExchangeError::new("Binance Candle 订阅未实现，无法取消订阅".to_string())
         })?;
         let msg = json!({
             "method": "UNSUBSCRIBE",
@@ -219,15 +220,15 @@ pub(crate) fn parse_public_message(
     quote: &str,
     local_ts: u64,
     subscribed_kinds: &HashSet<SubscriptionKind>,
-) -> Result<Vec<MarketEvent>, WsError> {
+) -> Result<Vec<MarketEvent>, ExchangeError> {
     let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+        serde_json::from_str(raw).map_err(|e| ExchangeError::new(e.to_string()))?;
 
     // 检查是否是订阅响应（控制消息，返回空 Vec）
     if value.get("id").is_some() {
         if let Ok(resp) = serde_json::from_str::<WsResponse>(raw) {
             if let Some(err) = resp.error {
-                return Err(WsError::ParseError(format!(
+                return Err(ExchangeError::new(format!(
                     "Subscribe error: code={}, msg={}",
                     err.code, err.msg
                 )));
@@ -246,12 +247,12 @@ pub(crate) fn parse_public_message(
     let event_type = value
         .get("e")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| WsError::ParseError(format!("Missing event type: {}", raw)))?;
+        .ok_or_else(|| ExchangeError::new(format!("Missing event type: {}", raw)))?;
 
     match event_type {
         "markPriceUpdate" => {
             let update: MarkPriceUpdate = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("markPriceUpdate parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("markPriceUpdate parse: {}", e)))?;
             let symbol = update.symbol(quote)?;
 
             let mut events = Vec::new();
@@ -287,7 +288,7 @@ pub(crate) fn parse_public_message(
         }
         "bookTicker" => {
             let ticker: BookTicker = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("bookTicker parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("bookTicker parse: {}", e)))?;
             let bbo = ticker.to_bbo(quote)?;
             Ok(vec![MarketEvent {
                 exchange_ts,
@@ -297,7 +298,7 @@ pub(crate) fn parse_public_message(
         }
         "aggTrade" => {
             let agg: AggTrade = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("aggTrade parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("aggTrade parse: {}", e)))?;
             let trade = agg.to_market_trade(quote)?;
             Ok(vec![MarketEvent {
                 exchange_ts: trade.timestamp,

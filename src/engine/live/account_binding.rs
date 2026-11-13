@@ -97,7 +97,7 @@ impl PlannedAccount {
                 .into_iter()
                 .map(|leg| match accounts.get(&leg.0) {
                     Some(client) => Ok((leg, client.clone())),
-                    None => Err(ExchangeError::Other(format!(
+                    None => Err(ExchangeError::new(format!(
                         "实盘策略要在 {0} 交易，但 {0} 没配凭证（下单会被拒、补腿补不上），拒绝投产",
                         leg.0
                     ))),
@@ -141,12 +141,12 @@ pub(crate) async fn snapshot(
         // seed 之后据此过滤，避免「快照已含 + 再累加」的双计（见 SymbolState::seed_position）
         let snapshot_req_ts = now_ms();
         let positions = client.fetch_positions().await.map_err(|e| {
-            ExchangeError::Other(format!(
+            ExchangeError::new(format!(
                 "无法获取 {exchange} 的初始持仓基线，拒绝启动（基线只有一次机会，错了之后无从纠正）: {e}"
             ))
         })?;
         let by_symbol = crate::exchange::client::index_positions(positions)
-            .map_err(|e| ExchangeError::Other(format!("{e}，拒绝启动")))?;
+            .map_err(|e| ExchangeError::new(format!("{e}，拒绝启动")))?;
         snapshots.insert(exchange, (snapshot_req_ts, by_symbol));
     }
 

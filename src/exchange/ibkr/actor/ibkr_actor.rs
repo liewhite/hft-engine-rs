@@ -72,7 +72,7 @@ impl IbkrNode {
                     // 保留原始上下文（网络/非 2xx/解析/缺 session 等）便于诊断，
                     // tickle 内部错误信息不含 token/cookie，安全。
                     tracing::error!(exchange = "IBKR", error = %e, "Initial tickle failed");
-                    ExchangeError::AuthenticationFailed(Exchange::IBKR)
+                    ExchangeError::new(format!("{} 鉴权失败", Exchange::IBKR))
                 })?;
 
                 let children = scope.group("children");

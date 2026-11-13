@@ -5,8 +5,9 @@
 //! - 处理订阅/退订命令
 //! - 直接解析消息并发布到行情总线
 
+use crate::domain::ExchangeError;
 use crate::domain::{now_ms, Symbol, SymbolMeta};
-use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
+use crate::exchange::client::{ExchangeCmd, SubscriptionKind};
 use crate::exchange::okx::codec::{
     resolve_meta, BboData, FundingRateData, IndexTickerData, MarkPriceData, TradeData, WsPush,
 };
@@ -98,9 +99,9 @@ impl OkxPublicWs {
     }
 
     /// 发送取消订阅消息
-    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
+    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), ExchangeError> {
         let arg = kind_to_arg(kind, &self.quote).ok_or_else(|| {
-            WsError::ParseError(
+            ExchangeError::new(
                 "Candle kind reached OkxPublicWs unsubscribe (routing bug)".to_string(),
             )
         })?;
@@ -208,13 +209,13 @@ pub(crate) fn parse_public_message(
     quote: &str,
     local_ts: u64,
     symbol_metas: &HashMap<Symbol, SymbolMeta>,
-) -> Result<Vec<MarketEvent>, WsError> {
+) -> Result<Vec<MarketEvent>, ExchangeError> {
     // 应用层心跳应答：ws_loop 周期发文本 "ping"，OKX 回文本 "pong"（非 JSON）
     if raw == "pong" {
         return Ok(Vec::new());
     }
     let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+        serde_json::from_str(raw).map_err(|e| ExchangeError::new(e.to_string()))?;
 
     // 检查是否是事件响应（控制消息，返回空 Vec）
     if let Some(event) = value.get("event").and_then(|v| v.as_str()) {
@@ -229,7 +230,7 @@ pub(crate) fn parse_public_message(
                     .get("msg")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                return Err(WsError::ParseError(format!(
+                return Err(ExchangeError::new(format!(
                     "OKX error: code={}, msg={}",
                     code, msg
                 )));
@@ -243,12 +244,12 @@ pub(crate) fn parse_public_message(
         .get("arg")
         .and_then(|a| a.get("channel"))
         .and_then(|c| c.as_str())
-        .ok_or_else(|| WsError::ParseError(format!("Missing channel: {}", raw)))?;
+        .ok_or_else(|| ExchangeError::new(format!("Missing channel: {}", raw)))?;
 
     match channel {
         "funding-rate" => {
             let push: WsPush<FundingRateData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("funding-rate parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("funding-rate parse: {}", e)))?;
 
             let mut events = Vec::new();
             for data in &push.data {
@@ -263,12 +264,12 @@ pub(crate) fn parse_public_message(
         }
         "bbo-tbt" => {
             let push: WsPush<BboData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("bbo-tbt parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("bbo-tbt parse: {}", e)))?;
             let inst_id = push
                 .arg
                 .inst_id
                 .as_ref()
-                .ok_or_else(|| WsError::ParseError("Missing instId in bbo-tbt".into()))?;
+                .ok_or_else(|| ExchangeError::new("Missing instId in bbo-tbt"))?;
 
             // 盘口量也是张数，需按 meta 折算；缺 meta 无法折算，丢弃并告警
             let Some(meta) = resolve_meta(inst_id, quote, symbol_metas) else {
@@ -293,12 +294,12 @@ pub(crate) fn parse_public_message(
         }
         "trades" => {
             let push: WsPush<TradeData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("trades parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("trades parse: {}", e)))?;
             let inst_id = push
                 .arg
                 .inst_id
                 .as_ref()
-                .ok_or_else(|| WsError::ParseError("Missing instId in trades".into()))?;
+                .ok_or_else(|| ExchangeError::new("Missing instId in trades"))?;
 
             let Some(meta) = resolve_meta(inst_id, quote, symbol_metas) else {
                 tracing::warn!(exchange = "OKX", %inst_id, "Missing SymbolMeta for trades, dropping");
@@ -318,7 +319,7 @@ pub(crate) fn parse_public_message(
         }
         "mark-price" => {
             let push: WsPush<MarkPriceData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("mark-price parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("mark-price parse: {}", e)))?;
 
             let mut events = Vec::new();
             for data in &push.data {
@@ -333,7 +334,7 @@ pub(crate) fn parse_public_message(
         }
         "index-tickers" => {
             let push: WsPush<IndexTickerData> = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("index-tickers parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("index-tickers parse: {}", e)))?;
 
             let mut events = Vec::new();
             for data in &push.data {

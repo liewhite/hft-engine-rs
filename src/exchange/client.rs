@@ -261,7 +261,7 @@ pub trait AccountClient: Send + Sync + 'static {
 pub(crate) fn exchange_http_client(exchange: Exchange) -> Result<reqwest::Client, ExchangeError> {
     crate::net::http(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| ExchangeError::ConnectionFailed(exchange, e.to_string()))
+        .map_err(|e| ExchangeError::transport(exchange, e.to_string()))
 }
 
 /// 下单 HTTP 请求在拿到回复之前就失败了：连接都没建立（`is_connect`）说明请求没送到交易所，
@@ -354,27 +354,6 @@ impl ExchangeHandle {
 
     pub fn unsubscribe(&self, kind: SubscriptionKind) -> Result<(), crate::tasks::Gone> {
         self.0.send(ExchangeCmd::Unsubscribe(kind))
-    }
-}
-
-/// WebSocket 错误
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum WsError {
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
-    #[error("Network error: {0}")]
-    Network(String),
-    #[error("Authentication failed: {0}")]
-    AuthFailed(String),
-    #[error("Server closed connection: {0}")]
-    ServerClosed(String),
-    #[error("Parse error: {0}")]
-    ParseError(String),
-}
-
-impl From<String> for WsError {
-    fn from(s: String) -> Self {
-        WsError::ParseError(s)
     }
 }
 

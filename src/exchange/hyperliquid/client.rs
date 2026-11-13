@@ -87,7 +87,7 @@ impl HyperliquidClient {
         dexes: Vec<String>,
         credentials: Option<HyperliquidCredentials>,
     ) -> Result<Self, ExchangeError> {
-        let other = |m: String| ExchangeError::Other(m);
+        let other = |m: String| ExchangeError::new(m);
         if dexes.is_empty() {
             return Err(other("HL 至少要接一个 dex（\"\" = 主站）".into()));
         }
@@ -206,9 +206,10 @@ impl HyperliquidClient {
 
     /// 账户能力；没配凭证时本不该走到这里（AccountClient 只在有凭证时装配）
     fn account(&self) -> Result<&HlAccount, ExchangeError> {
-        self.account
-            .as_ref()
-            .ok_or(ExchangeError::AuthenticationFailed(Exchange::Hyperliquid))
+        self.account.as_ref().ok_or(ExchangeError::new(format!(
+            "{} 鉴权失败",
+            Exchange::Hyperliquid
+        )))
     }
 
     /// 发送 POST /info 查询（按类型取限频额度，没有就排队）
@@ -256,10 +257,10 @@ impl HyperliquidClient {
             .as_str()
             .and_then(|s| crate::domain::parse_decimal(s).ok())
             .filter(|p| *p > Decimal::ZERO)
-            .ok_or_else(|| ExchangeError::Other(format!("{coin} 盘口无对手价，市价单无法定价")))?;
+            .ok_or_else(|| ExchangeError::new(format!("{coin} 盘口无对手价，市价单无法定价")))?;
         let slippage = self.account()?.credentials.market_order_slippage;
         let slippage = crate::domain::from_f64(slippage)
-            .ok_or_else(|| ExchangeError::Other(format!("HL 市价滑点配置非法: {slippage}")))?;
+            .ok_or_else(|| ExchangeError::new(format!("HL 市价滑点配置非法: {slippage}")))?;
         let px = if is_buy {
             top * (Decimal::ONE + slippage)
         } else {
@@ -331,12 +332,12 @@ impl HyperliquidClient {
             )
             .await?;
         let response: CancelResponse = serde_json::from_value(raw.clone()).map_err(|e| {
-            ExchangeError::ParseError(format!(
+            ExchangeError::new(format!(
                 "Failed to parse cancel response: {e} (body: {raw})"
             ))
         })?;
         if response.status != "ok" {
-            return Err(ExchangeError::Other(format!(
+            return Err(ExchangeError::new(format!(
                 "Hyperliquid cancel rejected: {}",
                 response.response.map(|v| v.to_string()).unwrap_or_default()
             )));
@@ -354,7 +355,7 @@ impl HyperliquidClient {
         if let Some(statuses) = statuses {
             for status in statuses {
                 if let Some(err) = status.get("error").and_then(|e| e.as_str()) {
-                    return Err(ExchangeError::Other(format!(
+                    return Err(ExchangeError::new(format!(
                         "Hyperliquid cancel cloid={cloid} failed: {err}"
                     )));
                 }
@@ -438,7 +439,7 @@ async fn info<T: for<'de> Deserialize<'de>>(
         LIMITER.record(&[IP_WEIGHT.cost(items / 20)]);
     }
     serde_json::from_value(raw)
-        .map_err(|e| ExchangeError::ParseError(format!("HL /info 回复解析失败: {e}")))
+        .map_err(|e| ExchangeError::new(format!("HL /info 回复解析失败: {e}")))
 }
 
 /// POST /info（已取到额度）
@@ -456,12 +457,12 @@ async fn post_info_with<T: for<'de> Deserialize<'de>>(
         admitted,
     )
     .await
-    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))?;
+    .map_err(|e| ExchangeError::transport(Exchange::Hyperliquid, e.to_string()))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(ExchangeError::ApiError(
+        return Err(ExchangeError::api(
             Exchange::Hyperliquid,
             status.as_u16() as i32,
             text,
@@ -470,7 +471,7 @@ async fn post_info_with<T: for<'de> Deserialize<'de>>(
 
     resp.json::<T>()
         .await
-        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string()))
+        .map_err(|e| ExchangeError::transport(Exchange::Hyperliquid, e.to_string()))
 }
 
 /// 一份 clearinghouseState 里属于所查 dex 的仓位（按 coin 前缀）。持仓与持仓总价值共用：
@@ -487,7 +488,7 @@ fn own_positions<'a>(
 
 fn parse_num(field: &str, v: &str) -> Result<f64, ExchangeError> {
     v.parse::<f64>()
-        .map_err(|_| ExchangeError::ParseError(format!("HL {field} 非法: {v}")))
+        .map_err(|_| ExchangeError::new(format!("HL {field} 非法: {v}")))
 }
 
 /// 各 dex 的 clearinghouseState → 本引擎的持仓（纯函数，持仓基线与对账读数的唯一出处）。
@@ -505,7 +506,7 @@ pub(crate) fn positions_from_states(
     for (dex, state) in states {
         let mine: Vec<_> = own_positions(dex, state).collect();
         if mine.is_empty() && !state.asset_positions.is_empty() {
-            return Err(ExchangeError::ParseError(format!(
+            return Err(ExchangeError::new(format!(
                 "HL clearinghouseState(dex=\"{dex}\") 返回 {} 个持仓，但没有一个属于该 dex（实得: {:?}）；\
                  疑似 coin 前缀口径变了，持仓基线不能以空 Vec 蒙混过去",
                 state.asset_positions.len(),
@@ -517,11 +518,7 @@ pub(crate) fn positions_from_states(
                 tracing::debug!(coin = %w.position.coin, "HL 持仓不在品种目录里，不返回");
                 continue;
             };
-            positions.push(
-                w.position
-                    .to_position(symbol)
-                    .map_err(ExchangeError::ParseError)?,
-            );
+            positions.push(w.position.to_position(symbol).map_err(ExchangeError::new)?);
         }
     }
     Ok(positions)
@@ -614,6 +611,15 @@ fn parse_place_reply(raw: serde_json::Value) -> Result<OrderId, PlaceError> {
     match first {
         OrderStatus::Resting(r) => Ok(r.resting.oid.to_string()),
         OrderStatus::Filled(f) => Ok(f.filled.oid.to_string()),
+        // HL 不给错误码，reduce-only 单因仓位已平被拒时固定报这句（实测原文带 ". asset=N" 后缀）
+        OrderStatus::Error(e)
+            if e.error
+                .starts_with("Reduce only order would increase position") =>
+        {
+            Err(PlaceError::Rejected(
+                crate::domain::RejectReason::ReduceOnlyClosed,
+            ))
+        }
         OrderStatus::Error(e) => Err(PlaceError::rejected(format!("HL order error: {}", e.error))),
     }
 }
@@ -635,7 +641,7 @@ fn parse_funding_history(
         .into_iter()
         .map(|e| {
             let rate = e.funding_rate.parse::<f64>().map_err(|_| {
-                ExchangeError::ParseError(format!("HL fundingRate 非法: {}", e.funding_rate))
+                ExchangeError::new(format!("HL fundingRate 非法: {}", e.funding_rate))
             })?;
             Ok(crate::domain::SettledFunding {
                 exchange: Exchange::Hyperliquid,
@@ -806,7 +812,7 @@ fn parse_user_funding(
             continue;
         };
         let amount: f64 = e.delta.usdc.trim().parse().map_err(|_| {
-            ExchangeError::Other(format!(
+            ExchangeError::new(format!(
                 "Failed to parse Hyperliquid funding usdc '{}' for {}",
                 e.delta.usdc, e.delta.coin
             ))
@@ -957,7 +963,7 @@ impl AccountClient for HyperliquidClient {
         let perp_dexs: Vec<Option<serde_json::Value>> = self
             .post_info(serde_json::json!({"type": "perpDexs"}))
             .await?;
-        let dexes = perp_dex_names(&perp_dexs).map_err(ExchangeError::ParseError)?;
+        let dexes = perp_dex_names(&perp_dexs).map_err(ExchangeError::new)?;
         let per_dex = futures_util::future::try_join_all(dexes.iter().map(|dex| async move {
             self.post_info::<Vec<Row>>(
                 serde_json::json!({"type": "openOrders", "user": wallet, "dex": dex}),
@@ -983,9 +989,9 @@ impl AccountClient for HyperliquidClient {
         let oid: u64 = order
             .order_id
             .parse()
-            .map_err(|_| ExchangeError::ParseError(format!("HL oid 非法: {}", order.order_id)))?;
+            .map_err(|_| ExchangeError::new(format!("HL oid 非法: {}", order.order_id)))?;
         let cloid = self.cloid_of(wallet, oid).await?.ok_or_else(|| {
-            ExchangeError::Other(format!(
+            ExchangeError::new(format!(
                 "HL 挂单 {} oid={oid} 没有 cloid（不是程序下的单），撤不了",
                 order.instrument
             ))

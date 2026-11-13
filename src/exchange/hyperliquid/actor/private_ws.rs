@@ -12,7 +12,6 @@
 //! （`AccountClient::fetch_account_info`，见 `crate::exchange::equity_polling`）。
 
 use crate::domain::{now_ms, Exchange, ExchangeError};
-use crate::exchange::client::WsError;
 use crate::exchange::hyperliquid::codec::{WsOrderUpdate, WsUserFills};
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
@@ -59,9 +58,7 @@ impl HyperliquidPrivateWs {
                 // 1. 连接 WebSocket（失败向上传播 → 启动期受控退出，不重试/不重连）
                 let ws_stream = crate::exchange::ws_loop::connect(WS_URL)
                     .await
-                    .map_err(|e| {
-                        ExchangeError::ConnectionFailed(Exchange::Hyperliquid, e.to_string())
-                    })?;
+                    .map_err(|e| ExchangeError::transport(Exchange::Hyperliquid, e.to_string()))?;
                 let (write, read) = ws_stream.split();
 
                 // 2. 起读循环（心跳、回 Pong、断线判定都归它）
@@ -81,7 +78,7 @@ impl HyperliquidPrivateWs {
                     })
                     .to_string();
                     conn.send(msg).await.map_err(|e| {
-                        ExchangeError::WebSocketError(format!("Hyperliquid send {sub_type}: {e}"))
+                        ExchangeError::new(format!("Hyperliquid send {sub_type}: {e}"))
                     })?;
                 }
 
@@ -148,9 +145,9 @@ enum Frame {
     Ignored,
 }
 
-fn classify(raw: &str) -> Result<Frame, WsError> {
+fn classify(raw: &str) -> Result<Frame, ExchangeError> {
     let mut value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+        serde_json::from_str(raw).map_err(|e| ExchangeError::new(e.to_string()))?;
     let channel = value
         .get("channel")
         .and_then(|c| c.as_str())
@@ -159,7 +156,7 @@ fn classify(raw: &str) -> Result<Frame, WsError> {
     match channel.as_str() {
         // 服务端拒绝/报错：**必须致命**。此前它落进未知分支被 debug 掉，于是"订阅被拒
         // （地址格式、限流）"表现为：连接健康、ping/pong 正常、而订单与成交回报再也不来。
-        "error" => Err(WsError::ParseError(format!(
+        "error" => Err(ExchangeError::new(format!(
             "Hyperliquid 私有流返回错误: {}",
             value.get("data").unwrap_or(&value)
         ))),
@@ -194,7 +191,7 @@ fn classify(raw: &str) -> Result<Frame, WsError> {
 }
 
 /// 启动期订阅确认判据（见 [`WsConn::await_subscriptions`]）：回执或数据到达都算
-fn subscription_confirmed(raw: &str) -> Result<Option<String>, WsError> {
+fn subscription_confirmed(raw: &str) -> Result<Option<String>, ExchangeError> {
     Ok(match classify(raw)? {
         Frame::SubscriptionAck(sub) => Some(sub),
         Frame::Data { channel, .. } => Some(channel.to_string()),
@@ -207,7 +204,7 @@ fn parse_private_message(
     markets: &HlMarkets,
     quote: &str,
     local_ts: u64,
-) -> Result<Vec<AccountEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, ExchangeError> {
     match classify(raw)? {
         Frame::Data {
             channel: "orderUpdates",
@@ -230,17 +227,17 @@ fn parse_order_updates(
     data: &serde_json::Value,
     markets: &HlMarkets,
     local_ts: u64,
-) -> Result<Vec<AccountEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, ExchangeError> {
     let mut events = Vec::new();
 
     // orderUpdates 必须是一个数组
     let updates = data
         .as_array()
-        .ok_or_else(|| WsError::ParseError(format!("orderUpdates is not an array: {}", data)))?;
+        .ok_or_else(|| ExchangeError::new(format!("orderUpdates is not an array: {}", data)))?;
 
     for update in updates {
         let order_update: WsOrderUpdate = serde_json::from_value(update.clone())
-            .map_err(|e| WsError::ParseError(format!("orderUpdate parse: {}", e)))?;
+            .map_err(|e| ExchangeError::new(format!("orderUpdate parse: {}", e)))?;
         let Some(symbol) = markets.symbol_of(&order_update.order.coin) else {
             // 目录外的订单不理（#760）：挂单本身不改变持仓，它的成交 userFills 那边同样丢弃
             tracing::debug!(coin = %order_update.order.coin, "HL 目录外订单，跳过");
@@ -273,9 +270,9 @@ fn parse_user_fills(
     markets: &HlMarkets,
     quote: &str,
     local_ts: u64,
-) -> Result<Vec<AccountEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, ExchangeError> {
     let user_fills: WsUserFills = serde_json::from_value(data.clone())
-        .map_err(|e| WsError::ParseError(format!("userFills parse: {}", e)))?;
+        .map_err(|e| ExchangeError::new(format!("userFills parse: {}", e)))?;
 
     if user_fills.is_snapshot {
         tracing::debug!(
@@ -310,7 +307,7 @@ pub(crate) fn parse_user_fills_for_test(
     markets: &HlMarkets,
     raw: &str,
     local_ts: u64,
-) -> Result<Vec<AccountEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, ExchangeError> {
     parse_private_message(raw, markets, "USDC", local_ts)
 }
 

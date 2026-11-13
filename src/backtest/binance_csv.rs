@@ -75,18 +75,18 @@ fn map_rows(
     mut f: impl FnMut(&[&str]) -> Result<IncomeEvent, ExchangeError>,
 ) -> Result<Vec<IncomeEvent>, ExchangeError> {
     let mut archive = zip::ZipArchive::new(Cursor::new(zip_bytes))
-        .map_err(|e| ExchangeError::ParseError(format!("open zip: {e}")))?;
+        .map_err(|e| ExchangeError::new(format!("open zip: {e}")))?;
     if archive.is_empty() {
         return Ok(Vec::new());
     }
     let entry = archive
         .by_index(0)
-        .map_err(|e| ExchangeError::ParseError(format!("zip entry: {e}")))?;
+        .map_err(|e| ExchangeError::new(format!("zip entry: {e}")))?;
     let reader = BufReader::new(entry);
 
     let mut out = Vec::new();
     for line in reader.lines() {
-        let line = line.map_err(|e| ExchangeError::ParseError(format!("read csv line: {e}")))?;
+        let line = line.map_err(|e| ExchangeError::new(format!("read csv line: {e}")))?;
         if line.is_empty() || !is_data_row(&line) {
             continue;
         }
@@ -106,19 +106,19 @@ fn is_data_row(line: &str) -> bool {
 fn field_decimal(f: &[&str], idx: usize) -> Result<Decimal, ExchangeError> {
     let raw = f
         .get(idx)
-        .ok_or_else(|| ExchangeError::ParseError(format!("missing column {idx}")))?;
+        .ok_or_else(|| ExchangeError::new(format!("missing column {idx}")))?;
     raw.trim()
         .parse::<Decimal>()
-        .map_err(|e| ExchangeError::ParseError(format!("col {idx} '{raw}' as decimal: {e}")))
+        .map_err(|e| ExchangeError::new(format!("col {idx} '{raw}' as decimal: {e}")))
 }
 
 fn field_u64(f: &[&str], idx: usize) -> Result<u64, ExchangeError> {
     let raw = f
         .get(idx)
-        .ok_or_else(|| ExchangeError::ParseError(format!("missing column {idx}")))?;
+        .ok_or_else(|| ExchangeError::new(format!("missing column {idx}")))?;
     raw.trim()
         .parse::<u64>()
-        .map_err(|e| ExchangeError::ParseError(format!("col {idx} '{raw}' as u64: {e}")))
+        .map_err(|e| ExchangeError::new(format!("col {idx} '{raw}' as u64: {e}")))
 }
 
 #[cfg(test)]

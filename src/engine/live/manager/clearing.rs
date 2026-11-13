@@ -46,7 +46,7 @@ async fn clear(exchange: Exchange, client: &dyn AccountClient) -> Result<(), Exc
     if remaining.is_empty() {
         return Ok(());
     }
-    Err(ExchangeError::Other(format!(
+    Err(ExchangeError::new(format!(
         "{exchange}: 撤单后复查仍有 {} 张挂单，拒绝启动\
          （留着无人看管的挂单开跑，策略会在旁边重复挂单；撤不掉的多半是账户上有人手动下的单）：{remaining:?}",
         remaining.len()

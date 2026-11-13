@@ -9,7 +9,6 @@ use super::listen_key::ListenKeyRefresher;
 use crate::domain::{now_ms, Exchange, ExchangeError};
 use crate::exchange::binance::codec::{AccountUpdate, OrderTradeUpdate, WsResponse};
 use crate::exchange::binance::{BinanceCredentials, WS_PRIVATE_URL};
-use crate::exchange::client::WsError;
 use crate::exchange::ws_loop::{self, WsConn};
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData,
@@ -45,7 +44,7 @@ impl BinancePrivateWs {
                     .await
                     .map_err(|e| {
                         tracing::error!(error = %e, "Failed to create Binance listen key");
-                        ExchangeError::AuthenticationFailed(Exchange::Binance)
+                        ExchangeError::new(format!("{} 鉴权失败", Exchange::Binance))
                     })?;
 
                 // 2. 连接私有 WebSocket（迁移后用 query 参数传 listenKey；未带 events 让交易所推全部事件）
@@ -53,9 +52,9 @@ impl BinancePrivateWs {
                 // 订阅确认：币安私有流没有订阅请求，listenKey 在连接地址里，握手成功即订阅生效
                 // （OKX / HL 要另等回执，见 WsConn::await_subscriptions）
                 let url = format!("{}?listenKey={}", WS_PRIVATE_URL, listen_key);
-                let ws_stream = crate::exchange::ws_loop::connect(&url).await.map_err(|e| {
-                    ExchangeError::ConnectionFailed(Exchange::Binance, e.to_string())
-                })?;
+                let ws_stream = crate::exchange::ws_loop::connect(&url)
+                    .await
+                    .map_err(|e| ExchangeError::transport(Exchange::Binance, e.to_string()))?;
                 let (write, read) = ws_stream.split();
 
                 let children = scope.group("children");
@@ -107,15 +106,15 @@ fn parse_private_message(
     raw: &str,
     quote: &str,
     local_ts: u64,
-) -> Result<Vec<AccountEvent>, WsError> {
+) -> Result<Vec<AccountEvent>, ExchangeError> {
     let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+        serde_json::from_str(raw).map_err(|e| ExchangeError::new(e.to_string()))?;
 
     // 检查是否是订阅响应（控制消息，返回空 Vec）
     if value.get("id").is_some() {
         if let Ok(resp) = serde_json::from_str::<WsResponse>(raw) {
             if let Some(err) = resp.error {
-                return Err(WsError::ParseError(format!(
+                return Err(ExchangeError::new(format!(
                     "Subscribe error: code={}, msg={}",
                     err.code, err.msg
                 )));
@@ -134,12 +133,12 @@ fn parse_private_message(
     let event_type = value
         .get("e")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| WsError::ParseError(format!("Missing event type: {}", raw)))?;
+        .ok_or_else(|| ExchangeError::new(format!("Missing event type: {}", raw)))?;
 
     match event_type {
         "ACCOUNT_UPDATE" => {
             let update: AccountUpdate = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("ACCOUNT_UPDATE parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("ACCOUNT_UPDATE parse: {}", e)))?;
 
             let mut events = Vec::new();
 
@@ -164,7 +163,7 @@ fn parse_private_message(
         }
         "ORDER_TRADE_UPDATE" => {
             let update: OrderTradeUpdate = serde_json::from_str(raw)
-                .map_err(|e| WsError::ParseError(format!("ORDER_TRADE_UPDATE parse: {}", e)))?;
+                .map_err(|e| ExchangeError::new(format!("ORDER_TRADE_UPDATE parse: {}", e)))?;
 
             let mut events = Vec::new();
 
@@ -199,7 +198,7 @@ fn parse_private_message(
         }
         "listenKeyExpired" => {
             // ListenKey 过期：交易所随后不再推私有回报（连接可能还开着），按断线处理、整支停
-            Err(WsError::AuthFailed(format!(
+            Err(ExchangeError::new(format!(
                 "ListenKey 已过期，私有回报从此中断: {raw}"
             )))
         }
@@ -223,7 +222,7 @@ async fn create_listen_key(
     client: &reqwest::Client,
     rest_base_url: &str,
     api_key: &str,
-) -> Result<String, WsError> {
+) -> Result<String, ExchangeError> {
     #[derive(serde::Deserialize)]
     struct Response {
         #[serde(rename = "listenKey")]
@@ -233,7 +232,7 @@ async fn create_listen_key(
     let admitted = crate::exchange::binance::LIMITER
         .query(&[crate::exchange::binance::IP_WEIGHT.cost(1)])
         .await
-        .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+        .map_err(|e| ExchangeError::new(format!("鉴权失败: {}", e)))?;
     let resp = crate::net::send(
         client
             .post(format!("{}/fapi/v1/listenKey", rest_base_url))
@@ -241,11 +240,11 @@ async fn create_listen_key(
         admitted,
     )
     .await
-    .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+    .map_err(|e| ExchangeError::new(format!("鉴权失败: {}", e)))?;
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Err(WsError::AuthFailed(format!(
+        return Err(ExchangeError::new(format!(
             "Failed to create listen key: {}",
             text
         )));
@@ -254,7 +253,7 @@ async fn create_listen_key(
     let data: Response = resp
         .json()
         .await
-        .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+        .map_err(|e| ExchangeError::new(format!("鉴权失败: {}", e)))?;
 
     Ok(data.listen_key)
 }

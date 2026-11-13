@@ -119,7 +119,7 @@ impl HlMarkets {
     /// 下单 / 撤单用的品种信息；不在目录里报错
     pub(crate) fn asset(&self, symbol: &Symbol) -> Result<&HlAsset, ExchangeError> {
         self.by_symbol.get(symbol).ok_or_else(|| {
-            ExchangeError::Other(format!(
+            ExchangeError::new(format!(
                 "HL 已接入的 dex {:?} 里没有可交易的 {symbol}",
                 self.dexes
             ))
@@ -137,7 +137,7 @@ impl HlMarkets {
     /// 按 HL coin（带 dex 前缀）找品种；不在目录里报错
     pub(crate) fn asset_of_coin(&self, coin: &str) -> Result<&HlAsset, ExchangeError> {
         self.entry_of_coin(coin).map(|(_, a)| a).ok_or_else(|| {
-            ExchangeError::Other(format!(
+            ExchangeError::new(format!(
                 "HL 已接入的 dex {:?} 里没有可交易的 {coin}",
                 self.dexes
             ))

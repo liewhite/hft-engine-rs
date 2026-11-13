@@ -27,7 +27,7 @@ impl BinanceHistoryDownloader {
     ) -> Result<Self, ExchangeError> {
         let client = crate::net::http(Duration::from_secs(60))
             .build_blocking()
-            .map_err(|e| ExchangeError::Other(format!("build http client: {e}")))?;
+            .map_err(|e| ExchangeError::new(format!("build http client: {e}")))?;
         Ok(Self {
             client,
             cache,
@@ -46,12 +46,12 @@ impl BinanceHistoryDownloader {
             .client
             .get(&url)
             .send()
-            .map_err(|e| ExchangeError::Other(format!("download {url}: {e}")))?;
+            .map_err(|e| ExchangeError::new(format!("download {url}: {e}")))?;
         let status = resp.status();
         if status.is_success() {
             let bytes = resp
                 .bytes()
-                .map_err(|e| ExchangeError::Other(format!("read body {url}: {e}")))?
+                .map_err(|e| ExchangeError::new(format!("read body {url}: {e}")))?
                 .to_vec();
             self.cache.put(key, &bytes);
             Ok(Some(bytes))
@@ -59,7 +59,7 @@ impl BinanceHistoryDownloader {
             tracing::warn!(key, "no data (404)");
             Ok(None)
         } else {
-            Err(ExchangeError::Other(format!(
+            Err(ExchangeError::new(format!(
                 "download failed {status}: {url}"
             )))
         }

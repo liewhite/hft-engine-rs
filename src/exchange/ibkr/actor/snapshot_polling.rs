@@ -257,7 +257,7 @@ async fn within_budget<T>(
     tokio::time::timeout(POLL_STEP_BUDGET, fut)
         .await
         .unwrap_or_else(|_| {
-            Err(ExchangeError::Other(format!(
+            Err(ExchangeError::new(format!(
                 "IBKR 拉取超过 {}s 时限",
                 POLL_STEP_BUDGET.as_secs()
             )))

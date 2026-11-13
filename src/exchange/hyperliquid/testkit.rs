@@ -101,6 +101,6 @@ pub(crate) fn fills_from_ws(
     markets: &HlMarkets,
     raw: &str,
     local_ts: u64,
-) -> Result<Vec<AccountEvent>, crate::exchange::client::WsError> {
+) -> Result<Vec<AccountEvent>, crate::domain::ExchangeError> {
     super::actor::private_ws::parse_user_fills_for_test(markets, raw, local_ts)
 }

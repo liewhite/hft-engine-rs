@@ -5,8 +5,9 @@
 //! - 处理订阅/退订命令
 //! - 直接解析消息并发布到行情总线
 
+use crate::domain::ExchangeError;
 use crate::domain::{now_ms, Symbol};
-use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
+use crate::exchange::client::{ExchangeCmd, SubscriptionKind};
 use crate::exchange::hyperliquid::codec::{aggregate_trades, WsActiveAssetCtx, WsBbo, WsTrade};
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
@@ -58,14 +59,14 @@ impl SubscriptionBook {
 
     /// kind 对应的订阅报文；只对已过订阅期筛选的 kind 调用（Candle 与目录外的 symbol
     /// 在订阅时就被跳过），走到这里还查不到属路由 bug
-    fn subscription(&self, kind: &SubscriptionKind) -> Result<serde_json::Value, WsError> {
+    fn subscription(&self, kind: &SubscriptionKind) -> Result<serde_json::Value, ExchangeError> {
         let channel = kind_channel(kind).ok_or_else(|| {
-            WsError::ParseError(format!(
+            ExchangeError::new(format!(
                 "{kind:?} reached HyperliquidPublicWs (routing bug)"
             ))
         })?;
         let coin = self.markets.coin(kind.symbol()).ok_or_else(|| {
-            WsError::ParseError(format!(
+            ExchangeError::new(format!(
                 "{} 不在 HL 品种目录里 (routing bug)",
                 kind.symbol()
             ))
@@ -73,12 +74,12 @@ impl SubscriptionBook {
         Ok(json!({"type": channel, "coin": coin}))
     }
 
-    fn subscribe_msg(&self, kind: &SubscriptionKind) -> Result<String, WsError> {
+    fn subscribe_msg(&self, kind: &SubscriptionKind) -> Result<String, ExchangeError> {
         Ok(json!({"method": "subscribe", "subscription": self.subscription(kind)?}).to_string())
     }
 
     /// 全部订阅报文，每个底层 stream 一条（断线重连后重发）
-    fn all_subscriptions(&self) -> Result<Vec<String>, WsError> {
+    fn all_subscriptions(&self) -> Result<Vec<String>, ExchangeError> {
         let mut streams = HashSet::new();
         self.subscribed_kinds
             .iter()
@@ -154,7 +155,7 @@ impl HyperliquidPublicWs {
     }
 
     /// 批量发送订阅消息（发送多条消息，无速率限制）
-    async fn send_subscribe_batch(&self, kinds: &[SubscriptionKind]) -> Result<(), WsError> {
+    async fn send_subscribe_batch(&self, kinds: &[SubscriptionKind]) -> Result<(), ExchangeError> {
         for kind in kinds {
             self.conn.send(self.book.subscribe_msg(kind)?).await;
         }
@@ -162,7 +163,7 @@ impl HyperliquidPublicWs {
     }
 
     /// 发送取消订阅消息
-    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), WsError> {
+    async fn send_unsubscribe(&self, kind: &SubscriptionKind) -> Result<(), ExchangeError> {
         let subscription = self.book.subscription(kind)?;
         let msg = json!({
             "method": "unsubscribe",
@@ -325,15 +326,15 @@ pub(crate) fn parse_public_message(
     local_ts: u64,
     markets: &HlMarkets,
     subscribed_kinds: &HashSet<SubscriptionKind>,
-) -> Result<Vec<MarketEvent>, WsError> {
+) -> Result<Vec<MarketEvent>, ExchangeError> {
     // 公共流只订阅品种目录里的 coin：推来目录外的说明订阅记账出了错，按解析失败处理
     let symbol_of = |coin: &str| {
         markets
             .symbol_of(coin)
-            .ok_or_else(|| WsError::ParseError(format!("HL 公共流推来品种目录外的 coin: {coin}")))
+            .ok_or_else(|| ExchangeError::new(format!("HL 公共流推来品种目录外的 coin: {coin}")))
     };
     let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+        serde_json::from_str(raw).map_err(|e| ExchangeError::new(e.to_string()))?;
 
     if value.get("channel").is_some() {
         let channel = value["channel"].as_str().unwrap_or("");
@@ -348,7 +349,7 @@ pub(crate) fn parse_public_message(
             // 公共流不做私有流那样的逐条订阅记账（订阅是随策略增减的动态集合，记账
             // 成本高）：错误报文即致命已经覆盖"订阅被拒"这一主要来路。
             "error" => {
-                return Err(WsError::ParseError(format!(
+                return Err(ExchangeError::new(format!(
                     "Hyperliquid 公共流返回错误: {}",
                     value.get("data").unwrap_or(&value)
                 )));
@@ -364,7 +365,7 @@ pub(crate) fn parse_public_message(
                 // 资产上下文（包含资金费率、标记价格、指数价格）
                 let data = &value["data"];
                 let ctx: WsActiveAssetCtx = serde_json::from_value(data.clone())
-                    .map_err(|e| WsError::ParseError(format!("activeAssetCtx parse: {}", e)))?;
+                    .map_err(|e| ExchangeError::new(format!("activeAssetCtx parse: {}", e)))?;
 
                 let symbol = symbol_of(&ctx.coin)?;
                 let mut events = Vec::new();
@@ -406,7 +407,7 @@ pub(crate) fn parse_public_message(
                 // BBO 数据
                 let data = &value["data"];
                 let bbo_data: WsBbo = serde_json::from_value(data.clone())
-                    .map_err(|e| WsError::ParseError(format!("bbo parse: {}", e)))?;
+                    .map_err(|e| ExchangeError::new(format!("bbo parse: {}", e)))?;
 
                 // Ok(None) = 单边盘口（稀薄品种的合法状态），跳过即可
                 let Some(bbo) = bbo_data.to_bbo(symbol_of(&bbo_data.coin)?)? else {
@@ -422,7 +423,7 @@ pub(crate) fn parse_public_message(
             "trades" => {
                 // trades 一次推送一个数组
                 let trades: Vec<WsTrade> = serde_json::from_value(value["data"].clone())
-                    .map_err(|e| WsError::ParseError(format!("trades parse: {}", e)))?;
+                    .map_err(|e| ExchangeError::new(format!("trades parse: {}", e)))?;
 
                 // 归集为 aggTrade 口径（HL 线路逐笔，Binance/OKX 下发的已是归集结果）
                 let events = aggregate_trades(&trades, markets)?

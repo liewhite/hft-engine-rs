@@ -85,7 +85,7 @@ fn fake_setup(exchange: Exchange, log: Log, fail: Option<&'static str>) -> Excha
         spawn_actor: Box::new(move |ctx: SpawnCtx| {
             Box::pin(async move {
                 if let Some(msg) = fail {
-                    return Err(ExchangeError::Other(msg.to_string()));
+                    return Err(ExchangeError::new(msg.to_string()));
                 }
                 let (_, addr) = ctx
                     .producers
@@ -98,7 +98,7 @@ fn fake_setup(exchange: Exchange, log: Log, fail: Option<&'static str>) -> Excha
                         })
                     })
                     .await
-                    .map_err(|e| ExchangeError::Other(format!("{e:#}")))?;
+                    .map_err(|e| ExchangeError::new(format!("{e:#}")))?;
                 Ok(ExchangeHandle::new(addr))
             })
         }),

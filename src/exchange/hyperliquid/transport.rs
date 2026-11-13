@@ -100,10 +100,10 @@ pub(crate) trait HlSubmitter: Send + Sync {
 pub(crate) fn decimal_to_wire(x: Decimal) -> Result<String, ExchangeError> {
     let x = x.normalize();
     if x.is_sign_negative() && !x.is_zero() {
-        return Err(ExchangeError::Other(format!("HL 价格/数量非法: {x}")));
+        return Err(ExchangeError::new(format!("HL 价格/数量非法: {x}")));
     }
     if x.scale() > 8 {
-        return Err(ExchangeError::Other(format!(
+        return Err(ExchangeError::new(format!(
             "HL 价格/数量超过 8 位小数: {x}"
         )));
     }
@@ -134,7 +134,7 @@ impl LocalKeySubmitter {
         is_mainnet: bool,
     ) -> Result<Self, ExchangeError> {
         let signer = create_signer(private_key)
-            .map_err(|e| ExchangeError::Other(format!("Failed to create signer: {e}")))?;
+            .map_err(|e| ExchangeError::new(format!("Failed to create signer: {e}")))?;
         Ok(Self {
             http,
             base_url,
@@ -221,7 +221,7 @@ fn next_nonce(now: u64) -> u64 {
 
 /// 撤单不区分两类失败，转成普通错误（只为日志可读）
 fn cancel_error(e: PlaceError) -> ExchangeError {
-    ExchangeError::Other(format!("Hyperliquid cancel: {e}"))
+    ExchangeError::new(format!("Hyperliquid cancel: {e}"))
 }
 
 /// POST JSON 到 HL `/exchange`，HTTP 层的失败按 [`classify_hl_http`] 归类。

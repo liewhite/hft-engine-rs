@@ -39,11 +39,11 @@ impl IbkrClient {
         let auth = credentials
             .create_auth()
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
 
         let http = auth
             .build_http_client()
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
 
         let base_url = auth.base_url().to_string();
 
@@ -51,13 +51,13 @@ impl IbkrClient {
         let init_url = format!("{}iserver/auth/ssodh/init", base_url);
         let (req, admitted) = query_request(&*auth, &http, "POST", &init_url)
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
         let resp = crate::net::send(
             req.json(&serde_json::json!({"publish": true, "compete": true})),
             admitted,
         )
         .await
-        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+        .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
 
         tracing::info!(status = %resp.status(), "IBKR brokerage session init");
 
@@ -65,22 +65,22 @@ impl IbkrClient {
         let accounts_url = format!("{}portfolio/accounts", base_url);
         let (req, admitted) = query_request(&*auth, &http, "GET", &accounts_url)
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
         let resp = crate::net::send(req, admitted)
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
 
         let accounts: Vec<serde_json::Value> = resp
             .json()
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
 
         let account_id = accounts
             .first()
             .and_then(|a| a.get("accountId"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                ExchangeError::ConnectionFailed(Exchange::IBKR, "No accounts found".to_string())
+                ExchangeError::transport(Exchange::IBKR, "No accounts found".to_string())
             })?
             .to_string();
 
@@ -90,16 +90,16 @@ impl IbkrClient {
         let switch_url = format!("{}iserver/account", base_url);
         let (req, admitted) = query_request(&*auth, &http, "POST", &switch_url)
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
         let resp = crate::net::send(
             req.json(&serde_json::json!({"acctId": account_id})),
             admitted,
         )
         .await
-        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+        .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(ExchangeError::ConnectionFailed(
+            return Err(ExchangeError::transport(
                 Exchange::IBKR,
                 format!("switch account failed: {}", resp.status()),
             ));
@@ -109,7 +109,7 @@ impl IbkrClient {
         let suppress_url = format!("{}iserver/questions/suppress", base_url);
         let (req, admitted) = query_request(&*auth, &http, "POST", &suppress_url)
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
         match crate::net::send(
             req.json(&serde_json::json!({"messageIds": SUPPRESS_MESSAGE_IDS})),
             admitted,
@@ -131,7 +131,7 @@ impl IbkrClient {
         let symbols = credentials.symbols();
         let conids = resolve_conids(&http, &*auth, symbols)
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?;
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))?;
 
         Ok(Self {
             http,
@@ -206,7 +206,7 @@ impl IbkrClient {
         // 累加且永不纠正 —— 与 Hyperliquid 那个"过滤全空即报错"守卫防的是同一类静默错账。
         let arr = body.as_array().ok_or_else(|| {
             let preview = body.to_string();
-            ExchangeError::ParseError(format!(
+            ExchangeError::new(format!(
                 "IBKR positions 响应不是数组（持仓基线不能以空列表蒙混过去）: {}",
                 &preview[..preview.len().min(500)]
             ))
@@ -224,7 +224,7 @@ impl IbkrClient {
             // （两条通道共用本函数）—— 字段名/类型一变，基线 0、读数也 0，对账判
             // "一致"，漂移检测结构性失明。与 Hyperliquid 的"过滤全空即报错"同口径。
             let conid = conid.ok_or_else(|| {
-                ExchangeError::ParseError(format!(
+                ExchangeError::new(format!(
                     "IBKR 持仓条目的 conid 缺失或无法解析，整份持仓读数不可信: {item}"
                 ))
             })?;
@@ -243,7 +243,7 @@ impl IbkrClient {
                 .get("position")
                 .and_then(wire::decimal)
                 .ok_or_else(|| {
-                    ExchangeError::ParseError(format!(
+                    ExchangeError::new(format!(
                         "IBKR {symbol} 持仓数量缺失或无法解析，整份持仓读数不可信: {item}"
                     ))
                 })?;
@@ -366,11 +366,11 @@ impl IbkrClient {
     ) -> Result<(reqwest::RequestBuilder, Admitted), ExchangeError> {
         query_request(&*self.auth, &self.http, method, url)
             .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))
+            .map_err(|e| ExchangeError::transport(Exchange::IBKR, e.to_string()))
     }
 
     fn map_reqwest_error(e: reqwest::Error) -> ExchangeError {
-        ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string())
+        ExchangeError::transport(Exchange::IBKR, e.to_string())
     }
 }
 
@@ -433,7 +433,7 @@ impl AccountClient for IbkrClient {
             .find(|o| Some(o.conid) == conid && o.coid.as_deref() == Some(client_order_id))
             .map(|o| o.order_id)
             .ok_or_else(|| {
-                ExchangeError::Other(format!(
+                ExchangeError::new(format!(
                     "IBKR 挂单列表里没有 cOID={client_order_id} 的单（已终态或未受理）"
                 ))
             })?;
@@ -460,10 +460,11 @@ impl AccountClient for IbkrClient {
         // 入参已是交易所单位并已取整（见 ExchangeOrder），此处只负责组装请求
         let order = order.inner();
         let conid = self.conids.get(&order.symbol).ok_or_else(|| {
-            PlaceError::unsent(ExchangeError::SymbolNotFound(
+            PlaceError::unsent(ExchangeError::new(format!(
+                "{} 没有品种 {}",
                 Exchange::IBKR,
-                order.symbol.clone(),
-            ))
+                order.symbol.clone()
+            )))
         })?;
 
         let side = match order.side {
@@ -563,14 +564,14 @@ impl AccountClient for IbkrClient {
         // 调用方 account_polling 有 Err 分支，报错不会静默丢失。
         let equity = extract_summary_value(&summary, &["netliquidation", "netLiquidationValue"])
             .ok_or_else(|| {
-                ExchangeError::ParseError(format!(
+                ExchangeError::new(format!(
                     "IBKR 账户摘要缺 equity（netliquidation/netLiquidationValue）: {summary}"
                 ))
             })?;
 
         let notional = extract_summary_value(&summary, &["grosspositionvalue", "securitiesGVP"])
             .ok_or_else(|| {
-                ExchangeError::ParseError(format!(
+                ExchangeError::new(format!(
                     "IBKR 账户摘要缺 notional（grosspositionvalue/securitiesGVP）—— \
                      兜 0 会让账户杠杆闸门恒定通过: {summary}"
                 ))
@@ -629,7 +630,7 @@ impl IbkrClient {
         );
 
         let (req, admitted) = action_request(&*self.auth, &self.http, "DELETE", &url, |e| {
-            ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string())
+            ExchangeError::transport(Exchange::IBKR, e.to_string())
         })?;
         let resp = crate::net::send(req, admitted)
             .await
@@ -638,7 +639,7 @@ impl IbkrClient {
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         if !status.is_success() {
-            return Err(ExchangeError::ApiError(
+            return Err(ExchangeError::api(
                 Exchange::IBKR,
                 status.as_u16() as i32,
                 text,
@@ -649,7 +650,7 @@ impl IbkrClient {
         // 而调用方（启动清场、策略撤单）正是靠返回值判断撤单是否受理。
         if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
-                return Err(ExchangeError::Other(format!(
+                return Err(ExchangeError::new(format!(
                     "IBKR cancel order {order_id} failed: {err}"
                 )));
             }
@@ -696,14 +697,14 @@ impl IbkrClient {
         let status = resp.status();
         let text = resp.text().await.map_err(Self::map_reqwest_error)?;
         if !status.is_success() {
-            return Err(ExchangeError::ApiError(
+            return Err(ExchangeError::api(
                 Exchange::IBKR,
                 status.as_u16() as i32,
                 text,
             ));
         }
         let body: Response = serde_json::from_str(&text).map_err(|e| {
-            ExchangeError::ParseError(format!(
+            ExchangeError::new(format!(
                 "解析 IBKR live orders 失败: {e}; 响应: {}",
                 &text[..text.len().min(500)]
             ))
@@ -720,7 +721,7 @@ impl IbkrClient {
                     continue
                 }
                 other => {
-                    return Err(ExchangeError::ParseError(format!(
+                    return Err(ExchangeError::new(format!(
                         "IBKR live order 状态无法识别（'{other}'，conid={:?}），\
                          无法判断它是否还挂在簿上，整份挂单快照不可信",
                         o.conid
@@ -729,13 +730,13 @@ impl IbkrClient {
             }
             // 双态解析收在 wire::order_id 一处（WS 两条路径共用，见该模块文档）
             let order_id = wire::order_id(o.order_id.as_ref()).ok_or_else(|| {
-                ExchangeError::ParseError(format!(
+                ExchangeError::new(format!(
                     "IBKR live order 缺少 orderId，无法撤单: conid={:?} status={raw_status}",
                     o.conid
                 ))
             })?;
             let conid = o.conid.ok_or_else(|| {
-                ExchangeError::ParseError(format!("IBKR live order {order_id} 缺少 conid"))
+                ExchangeError::new(format!("IBKR live order {order_id} 缺少 conid"))
             })?;
             rows.push(LiveOrderRow {
                 conid,
@@ -754,7 +755,7 @@ impl IbkrClient {
         let conid = self
             .conids
             .get(symbol)
-            .ok_or_else(|| ExchangeError::SymbolNotFound(Exchange::IBKR, symbol.to_string()))?;
+            .ok_or_else(|| ExchangeError::new(format!("{} 没有品种 {}", Exchange::IBKR, symbol)))?;
 
         let url = snapshot_url(
             self.auth.base_url(),
@@ -771,14 +772,11 @@ impl IbkrClient {
             let body: serde_json::Value = resp.json().await.map_err(Self::map_reqwest_error)?;
 
             let arr = body.as_array().ok_or_else(|| {
-                ExchangeError::ConnectionFailed(
-                    Exchange::IBKR,
-                    format!("snapshot 响应不是数组: {}", body),
-                )
+                ExchangeError::transport(Exchange::IBKR, format!("snapshot 响应不是数组: {}", body))
             })?;
 
             let first = arr.first().ok_or_else(|| {
-                ExchangeError::ConnectionFailed(Exchange::IBKR, "snapshot 响应数组为空".to_string())
+                ExchangeError::transport(Exchange::IBKR, "snapshot 响应数组为空".to_string())
             })?;
 
             let bid = parse_snapshot_field(first, SNAPSHOT_FIELD_BID);
@@ -794,7 +792,7 @@ impl IbkrClient {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
 
-        Err(ExchangeError::ConnectionFailed(
+        Err(ExchangeError::transport(
             Exchange::IBKR,
             format!("3 次尝试后仍无法获取 {} 的 snapshot 价格", symbol),
         ))
@@ -850,7 +848,7 @@ impl IbkrClient {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
 
-        Err(ExchangeError::ConnectionFailed(
+        Err(ExchangeError::transport(
             Exchange::IBKR,
             format!(
                 "3 次尝试后 conid={} 的 snapshot 仍缺必需字段 {:?} (请求字段 {:?})",
@@ -916,7 +914,7 @@ impl IbkrClient {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
 
-        Err(ExchangeError::ConnectionFailed(
+        Err(ExchangeError::transport(
             Exchange::IBKR,
             format!("3 次尝试后仍无法获取 {source}/{target} 汇率"),
         ))

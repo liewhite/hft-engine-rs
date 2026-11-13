@@ -86,7 +86,7 @@ pub trait IbkrAuth: Send + Sync + 'static {
             "POST" => http.post(url),
             "DELETE" => http.delete(url),
             other => {
-                return Err(crate::domain::ExchangeError::Other(format!(
+                return Err(crate::domain::ExchangeError::new(format!(
                     "unsupported HTTP method: {other}"
                 ))
                 .into())

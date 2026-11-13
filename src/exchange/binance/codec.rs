@@ -230,7 +230,7 @@ pub struct OrderData {
     ///
     /// **可能缺失**：Binance 文档对 `n`/`N` 明确写着 "will not push if no commission"
     /// —— NEW / CANCELED 这类无成交事件不带该字段。此前声明为必填 `String`，于是一条
-    /// **完全合法**的回报会让整个 `OrderTradeUpdate` 反序列化失败 → `WsError::ParseError`
+    /// **完全合法**的回报会让整个 `OrderTradeUpdate` 反序列化失败 → `ExchangeError::new`
     /// → kill actor → 级联整机停机。schema 必须如实描述交易所会发什么。
     ///
     /// 有成交时它必然存在，所以 [`OrderTradeUpdate::to_fill`] 里缺失即报错（那才是真违约）。
@@ -346,13 +346,13 @@ impl OrderTradeUpdate {
 #[allow(dead_code)]
 pub struct WsResponse {
     pub result: Option<serde_json::Value>,
-    pub error: Option<WsError>,
+    pub error: Option<ExchangeError>,
 }
 
 /// WebSocket 错误
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-pub struct WsError {
+pub struct ExchangeError {
     pub code: i32,
     pub msg: String,
 }

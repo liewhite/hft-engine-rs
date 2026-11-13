@@ -158,7 +158,7 @@ impl AccountStreams {
             }
             let start = self.starters.get(key).expect("投产时已校验");
             start(group, self.account_bus.clone()).map_err(|e| {
-                ExchangeError::Other(format!("起 {} 的 {:?} 失败: {e}", key.0, key.1))
+                ExchangeError::new(format!("起 {} 的 {:?} 失败: {e}", key.0, key.1))
             })?;
             tracing::info!(exchange = %key.0, stream = ?key.1, "账户数据流已按策略需要启动");
             self.started.insert(*key);
@@ -298,7 +298,7 @@ impl Provisioner {
         //     靠"一直没数据"事后发现（最难查的一类故障）。此时尚无任何副作用，Err 即
         //     "什么都没发生"。
         validate_subscriptions(&all_subscriptions, &self.capabilities, &self.symbol_metas)
-            .map_err(ExchangeError::Other)?;
+            .map_err(ExchangeError::new)?;
         let account_streams: HashSet<(Exchange, AccountStream)> = strategies
             .iter()
             .flat_map(|spec| spec.strategy.account_streams())
@@ -306,13 +306,13 @@ impl Provisioner {
             .collect();
         self.account_streams
             .validate(&account_streams)
-            .map_err(ExchangeError::Other)?;
+            .map_err(ExchangeError::new)?;
         if !self.paper_counter {
             if let Some(spec) = strategies
                 .iter()
                 .find(|s| matches!(s.account, AccountId::Paper(_)))
             {
-                return Err(ExchangeError::Other(format!(
+                return Err(ExchangeError::new(format!(
                     "策略绑定了模拟账户 {}，但没配模拟柜台（ManagerArgs::paper），它的单没人撮合，拒绝投产",
                     spec.account
                 )));
@@ -376,7 +376,7 @@ impl Provisioner {
                     // 起实例失败（构造出错会自己冒到根、整机停机，或生产者组已在停机）：
                     // 已起好的同批实例尚未注册、收不到事件，停掉它们再报错
                     self.rollback_executors(&spawned).await;
-                    return Err(ExchangeError::Other(format!("起策略实例失败: {e:#}")));
+                    return Err(ExchangeError::new(format!("起策略实例失败: {e:#}")));
                 }
             }
         }
@@ -463,7 +463,7 @@ impl Provisioner {
                 .register_symbols(symbols.clone(), baselines.clone())
                 .await
                 .map_err(|e| {
-                    ExchangeError::Other(format!(
+                    ExchangeError::new(format!(
                         "向 Metrics 注册 symbol 失败（盈亏基线将丢失）: {e}"
                     ))
                 })?;
@@ -471,7 +471,7 @@ impl Provisioner {
                 .register_symbols(symbols, baselines)
                 .await
                 .map_err(|e| {
-                    ExchangeError::Other(format!(
+                    ExchangeError::new(format!(
                         "向 PositionLedger 注册 symbol 失败（对账通道静默失效，\
                          且这批 symbol 不会出现在对外持仓快照里）: {e}"
                     ))
@@ -487,7 +487,7 @@ impl Provisioner {
                 .register(s.handle.clone(), scope.clone())
                 .await
                 .map_err(|e| {
-                    ExchangeError::Other(format!(
+                    ExchangeError::new(format!(
                         "向 IncomeProcessor 注册策略实例失败（该实例将收不到任何事件）: {e}"
                     ))
                 })?;
@@ -498,7 +498,7 @@ impl Provisioner {
                     .watch(s.handle.clone())
                     .await
                     .map_err(|e| {
-                        ExchangeError::Other(format!(
+                        ExchangeError::new(format!(
                             "把实盘实例纳入持仓对账失败（它的持仓将无人校验）: {e}"
                         ))
                     })?;
@@ -509,7 +509,7 @@ impl Provisioner {
         for (exchange, kinds) in exchange_subscriptions {
             if let Some(node) = self.exchanges.get(&exchange) {
                 node.subscribe_batch(kinds).map_err(|e| {
-                    ExchangeError::Other(format!("向 {exchange} 节点发送行情订阅失败: {e}"))
+                    ExchangeError::new(format!("向 {exchange} 节点发送行情订阅失败: {e}"))
                 })?;
             }
         }

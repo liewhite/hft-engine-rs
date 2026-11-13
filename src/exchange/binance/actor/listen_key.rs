@@ -4,7 +4,7 @@
 //! 距上次成功超过 50 分钟仍续不上才出错退出，整支（私有 WS 及以上）停下 —— 再拖下去 ListenKey
 //! 过期，私有流会静默断（#767：此前 30 分钟一次、失败一次就停机）。
 
-use crate::exchange::client::WsError;
+use crate::domain::ExchangeError;
 use crate::exchange::staleness::StalenessGuard;
 use crate::tasks::{ChildHandle, Group, GroupClosed, Periodic};
 use std::time::Duration;
@@ -49,11 +49,11 @@ impl ListenKeyRefresher {
     }
 
     /// 刷新 ListenKey
-    async fn refresh_listen_key(&self) -> Result<(), WsError> {
+    async fn refresh_listen_key(&self) -> Result<(), ExchangeError> {
         let admitted = crate::exchange::binance::LIMITER
             .query(&[crate::exchange::binance::IP_WEIGHT.cost(1)])
             .await
-            .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+            .map_err(|e| ExchangeError::new(format!("鉴权失败: {}", e)))?;
         let resp = crate::net::send(
             self.client
                 .put(format!("{}/fapi/v1/listenKey", self.rest_base_url))
@@ -61,11 +61,11 @@ impl ListenKeyRefresher {
             admitted,
         )
         .await
-        .map_err(|e| WsError::AuthFailed(e.to_string()))?;
+        .map_err(|e| ExchangeError::new(format!("鉴权失败: {}", e)))?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(WsError::AuthFailed(format!(
+            return Err(ExchangeError::new(format!(
                 "ListenKey refresh failed: {}",
                 text
             )));

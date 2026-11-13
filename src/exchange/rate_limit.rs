@@ -110,7 +110,7 @@ impl From<Throttled> for PlaceError {
 /// 撤单没额度：撤单失败（策略按撤单失败的间隔重撤）
 impl From<Throttled> for ExchangeError {
     fn from(t: Throttled) -> Self {
-        ExchangeError::RateLimited(t.exchange, t.retry_after)
+        ExchangeError::new(t)
     }
 }
 

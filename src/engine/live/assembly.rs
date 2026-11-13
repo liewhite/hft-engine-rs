@@ -88,7 +88,7 @@ pub(crate) type StartAccountStream =
 
 /// 节点启动失败转成装配错误（带上根因链）
 fn start_failed(name: &str, e: anyhow::Error) -> ExchangeError {
-    ExchangeError::Other(format!("{name} failed to start: {e:#}"))
+    ExchangeError::new(format!("{name} failed to start: {e:#}"))
 }
 
 pub fn setup_binance(

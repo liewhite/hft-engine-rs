@@ -44,7 +44,7 @@
 use crate::domain::{
     now_ms, Decimal, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO,
 };
-use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
+use crate::exchange::client::{ExchangeCmd, SubscriptionKind};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::client::IbkrClient;
 use crate::exchange::ibkr::wire;
@@ -177,14 +177,14 @@ async fn connect(
     let ws_url = auth.ws_url();
     let connector = auth
         .ws_connector()
-        .map_err(|e| ExchangeError::Other(format!("IBKR failed to build WS connector: {e}")))?;
+        .map_err(|e| ExchangeError::new(format!("IBKR failed to build WS connector: {e}")))?;
     let cookie = auth.format_ws_cookie(session_id);
     let uri: http::Uri = ws_url
         .parse()
-        .map_err(|e| ExchangeError::Other(format!("IBKR invalid WS URL: {e}")))?;
+        .map_err(|e| ExchangeError::new(format!("IBKR invalid WS URL: {e}")))?;
     let host = uri
         .host()
-        .ok_or_else(|| ExchangeError::Other("IBKR WS URL missing host".into()))?;
+        .ok_or_else(|| ExchangeError::new("IBKR WS URL missing host"))?;
     let ws_key = generate_key();
     let ws_request = http::Request::builder()
         .uri(&ws_url)
@@ -196,7 +196,7 @@ async fn connect(
         .header("Cookie", &cookie)
         .header("User-Agent", "ClientPortalGW/1")
         .body(())
-        .map_err(|e| ExchangeError::Other(format!("IBKR failed to build WS request: {e}")))?;
+        .map_err(|e| ExchangeError::new(format!("IBKR failed to build WS request: {e}")))?;
 
     // 安全：ws_url 含 OAuth access_token，cookie 是 session cookie，严禁进日志。
     // 只打印 host。
@@ -208,7 +208,7 @@ async fn connect(
         crate::exchange::ws_loop::CONNECT_TIMEOUT,
     )
     .await
-    .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e))
+    .map_err(|e| ExchangeError::transport(Exchange::IBKR, e))
 }
 
 /// IBKR 公共 WS 组件（实际混发公私两类 topic，见 [`IbkrPublicWsArgs::account_bus`]）
@@ -317,17 +317,17 @@ impl IbkrPublicWs {
     /// 预热失败即**致命**（Err 上抛 → 本组件出错退出 → 经任务树整机退出，与借券
     /// snapshot poller 的"数据源失效即退出"同口径）：没预热的订阅是一条假活的行情线——有价、
     /// 但永远陈旧，比没有行情更危险。宁可退出重来，不留降级分支。
-    async fn send_subscribe(&self, conid: i64) -> Result<(), WsError> {
+    async fn send_subscribe(&self, conid: i64) -> Result<(), ExchangeError> {
         let fields: Vec<&str> = self.md_fields.iter().map(|s| s.as_str()).collect();
         self.client
             .preflight_market_data(conid, &fields)
             .await
-            .map_err(|e| WsError::Network(format!("行情预热失败 conid={conid}: {e}")))?;
+            .map_err(|e| ExchangeError::new(format!("行情预热失败 conid={conid}: {e}")))?;
         self.conn.send(smd_message(conid, &fields)).await
     }
 
     /// 发送 WebSocket 取消订阅消息
-    async fn send_unsubscribe(&self, conid: i64) -> Result<(), WsError> {
+    async fn send_unsubscribe(&self, conid: i64) -> Result<(), ExchangeError> {
         self.conn.send(umd_message(conid)).await
     }
 
@@ -344,7 +344,7 @@ impl IbkrPublicWs {
     /// 共用），`umd+` 会把它整个拆掉、`smd+` 按本次请求重建。曾经只重建 BBO 四字段，于是每逢
     /// 刷新借券 poller 就拿到没有 7636/7637 的空壳。现在订阅用的是 `md_fields`（BBO ∪ 他方
     /// 字段），刷新即把所有人的字段一起重新武装——不留"拆掉再等它自己回来"的窗口。
-    async fn refresh_subscriptions(&self) -> Result<(), WsError> {
+    async fn refresh_subscriptions(&self) -> Result<(), ExchangeError> {
         for kind in &self.subscribed {
             let SubscriptionKind::BBO { symbol } = kind else {
                 continue;
@@ -437,11 +437,11 @@ impl IbkrPublicWs {
     }
 
     /// 解析并处理 WebSocket 消息
-    fn handle_message(&mut self, raw: &str) -> Result<(), WsError> {
+    fn handle_message(&mut self, raw: &str) -> Result<(), ExchangeError> {
         let local_ts = now_ms();
 
         let value: serde_json::Value =
-            serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
+            serde_json::from_str(raw).map_err(|e| ExchangeError::new(e.to_string()))?;
 
         // 路由: topic 以 "sor" 开头 → 订单状态更新; "str" 开头 → 成交推送
         if let Some(topic) = value.get("topic").and_then(|v| v.as_str()) {
@@ -734,7 +734,7 @@ impl FillPairing {
         value: &serde_json::Value,
         local_ts: u64,
         now: Instant,
-    ) -> Result<(), WsError> {
+    ) -> Result<(), ExchangeError> {
         let args = match value.get("args").and_then(|v| v.as_array()) {
             Some(arr) => arr,
             None => {
@@ -754,7 +754,7 @@ impl FillPairing {
             // 成交既无法发布也无法追回 —— 丢一笔成交 = 本地持仓从此永久落后于交易所，
             // 必须致命（与本模块"预热失败即致命"同一姿态）。
             if execution_id.is_empty() {
-                return Err(WsError::ParseError(format!(
+                return Err(ExchangeError::new(format!(
                     "IBKR 成交推送缺 execution_id，无法去重与配对，丢弃即持仓失真: {item}"
                 )));
             }
@@ -779,7 +779,7 @@ impl FillPairing {
                 // 忽略告警。此前两个字段缺失时兜 0，导致每笔成交都误报不一致。
                 if let Some(price2) = wire_decimal(item, "price")? {
                     if price2 != pending.fill.price {
-                        return Err(WsError::ParseError(format!(
+                        return Err(ExchangeError::new(format!(
                             "IBKR 成交 {execution_id} 两条消息价格不一致（{} vs {price2}），\
                              本地持仓均价会失真",
                             pending.fill.price
@@ -788,7 +788,7 @@ impl FillPairing {
                 }
                 if let Some(size2) = wire_decimal(item, "size")? {
                     if size2 != pending.fill.size {
-                        return Err(WsError::ParseError(format!(
+                        return Err(ExchangeError::new(format!(
                             "IBKR 成交 {execution_id} 两条消息数量不一致（{} vs {size2}），\
                              本地持仓会失真",
                             pending.fill.size
@@ -836,7 +836,7 @@ impl FillPairing {
                 "BUY" | "B" => Side::Long,
                 "SELL" | "S" => Side::Short,
                 other => {
-                    return Err(WsError::ParseError(format!(
+                    return Err(ExchangeError::new(format!(
                         "IBKR 成交 {execution_id} 方向无法识别（'{other}'），丢弃即持仓失真"
                     )));
                 }
@@ -849,12 +849,12 @@ impl FillPairing {
             let (Some(price), Some(size)) =
                 (wire_decimal(item, "price")?, wire_decimal(item, "size")?)
             else {
-                return Err(WsError::ParseError(format!(
+                return Err(ExchangeError::new(format!(
                     "IBKR 成交 {execution_id} 缺 price/size 字段，丢弃即持仓失真: {item}"
                 )));
             };
             if price <= Decimal::ZERO || size <= Decimal::ZERO {
-                return Err(WsError::ParseError(format!(
+                return Err(ExchangeError::new(format!(
                     "IBKR 成交 {execution_id} 价量非法（price={price}, size={size}）: {item}"
                 )));
             }
@@ -1011,14 +1011,14 @@ fn build_order_update(
 // 辅助函数
 // ============================================================================
 
-/// [`wire::optional_number`] 的 WS 侧封装：解析失败即 `WsError`（→ 本组件出错退出）
-fn wire_number(item: &serde_json::Value, field: &str) -> Result<Option<f64>, WsError> {
-    wire::optional_number(item, field).map_err(WsError::ParseError)
+/// [`wire::optional_number`] 的 WS 侧封装：解析失败即 `ExchangeError`（→ 本组件出错退出）
+fn wire_number(item: &serde_json::Value, field: &str) -> Result<Option<f64>, ExchangeError> {
+    wire::optional_number(item, field).map_err(ExchangeError::new)
 }
 
 /// [`wire::optional_decimal`] 的 WS 侧封装（价格、数量）
-fn wire_decimal(item: &serde_json::Value, field: &str) -> Result<Option<Decimal>, WsError> {
-    wire::optional_decimal(item, field).map_err(WsError::ParseError)
+fn wire_decimal(item: &serde_json::Value, field: &str) -> Result<Option<Decimal>, ExchangeError> {
+    wire::optional_decimal(item, field).map_err(ExchangeError::new)
 }
 
 #[cfg(test)]
