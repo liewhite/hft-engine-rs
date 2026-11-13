@@ -165,9 +165,11 @@ pub enum OutcomeEvent<O = Order> {             // StrategyRunner 处理后发往
 /// 账户私有：只有配了凭证的所才有这个对象
 #[async_trait] pub trait AccountClient: Send + Sync + 'static {
     fn exchange(&self) -> Exchange;
-    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, ExchangeError>;
-    async fn cancel_order(&self, symbol: &Symbol, order_id: &OrderId) -> Result<(), ExchangeError>;
-    async fn fetch_pending_orders(&self, symbol: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError>;
+    async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError>;
+    async fn cancel_order(&self, symbol: &Symbol, client_order_id: &str) -> Result<(), ExchangeError>;
+    /// 账户上全部挂单（启动清场用，不限本引擎接入的币）及按交易所订单号撤
+    async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError>;
+    async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError>;
     async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError>;
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError>;
 }
