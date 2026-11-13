@@ -126,8 +126,10 @@ mod tests {
             0,
             AccountData::Exchange(ExchangeAccountData::AccountInfo {
                 exchange,
-                equity: 1.0,
-                notional: 0.0,
+                info: crate::domain::AccountInfo {
+                    equity: 1.0,
+                    notional: 0.0,
+                },
             }),
         )
     }

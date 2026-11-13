@@ -191,8 +191,10 @@ impl Sim {
         let now = self.now;
         let info = ExchangeAccountData::AccountInfo {
             exchange: ex,
-            equity,
-            notional: 1e9,
+            info: hft_engine_rs::domain::AccountInfo {
+                equity,
+                notional: 1e9,
+            },
         };
         self.ev(IncomeEvent::account(
             AccountId::Live,

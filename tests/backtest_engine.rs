@@ -149,7 +149,10 @@ fn event_sig(ev: &IncomeEvent) -> String {
                 "FL ts={} cid={:?} oid={} {:?} px={} sz={} fee={}",
                 a.exchange_ts, f.client_order_id, f.order_id, f.side, f.price, f.size, f.fee
             ),
-            AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) => {
+            AccountData::Exchange(ExchangeAccountData::AccountInfo {
+                info: hft_engine_rs::domain::AccountInfo { equity, .. },
+                ..
+            }) => {
                 format!("ACC ts={} eq={}", a.exchange_ts, equity)
             }
             other => format!("{other:?}"),

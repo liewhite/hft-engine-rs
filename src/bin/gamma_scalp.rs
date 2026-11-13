@@ -168,7 +168,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     IncomeEvent::Account(a) => {
                         if let AccountData::Exchange(ExchangeAccountData::AccountInfo {
-                            equity,
+                            info: hft_engine_rs::domain::AccountInfo { equity, .. },
                             ..
                         }) = &a.data
                         {

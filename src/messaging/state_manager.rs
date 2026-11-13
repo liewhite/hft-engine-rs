@@ -215,24 +215,9 @@ impl StateManager {
                     .insert((balance.exchange, balance.asset.clone()), balance.cash);
             }
             // equity + notional 原子写入
-            ExchangeAccountData::AccountInfo {
-                exchange,
-                equity,
-                notional,
-            } => {
-                tracing::debug!(
-                    exchange = %exchange,
-                    equity = equity,
-                    notional = notional,
-                    "AccountInfo updated"
-                );
-                self.account.account_infos.insert(
-                    *exchange,
-                    AccountInfo {
-                        equity: *equity,
-                        notional: *notional,
-                    },
-                );
+            ExchangeAccountData::AccountInfo { exchange, info } => {
+                tracing::debug!(%exchange, equity = info.equity, notional = info.notional, "AccountInfo updated");
+                self.account.account_infos.insert(*exchange, *info);
             }
             ExchangeAccountData::Greeks(g) => {
                 self.account

@@ -192,7 +192,9 @@ impl MetricsView {
         let data = match msg.data {
             AccountData::Symbol(d) => d,
             AccountData::Exchange(ExchangeAccountData::AccountInfo {
-                exchange, equity, ..
+                exchange,
+                info: crate::domain::AccountInfo { equity, .. },
+                ..
             }) => {
                 self.equities.insert(exchange, equity);
                 return;
@@ -279,8 +281,7 @@ impl MetricsView {
             }
             AccountData::Exchange(ExchangeAccountData::AccountInfo {
                 exchange,
-                equity,
-                notional,
+                info: crate::domain::AccountInfo { equity, notional },
             }) => {
                 self.paper_accounts
                     .insert((account.clone(), *exchange), (*equity, *notional));
@@ -971,8 +972,10 @@ mod tests {
             local_ts: 1,
             data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
                 exchange: Exchange::OKX,
-                equity: 4321.0,
-                notional: 0.0,
+                info: crate::domain::AccountInfo {
+                    equity: 4321.0,
+                    notional: 0.0,
+                },
             }),
         });
         root.shutdown().await.unwrap();
@@ -1162,9 +1165,11 @@ mod tests {
     fn equity(exchange: Exchange, equity: f64) -> AccountEvent {
         live(AccountData::Exchange(ExchangeAccountData::AccountInfo {
             exchange,
-            equity,
-            // 交易所报的持仓总值不进看板（看板只读账本读数，#812）
-            notional: 1e9,
+            info: crate::domain::AccountInfo {
+                equity,
+                // 交易所报的持仓总值不进看板（看板只读账本读数，#812）
+                notional: 1e9,
+            },
         }))
     }
 

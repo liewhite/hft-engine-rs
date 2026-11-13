@@ -1056,8 +1056,7 @@ mod tests {
                         0,
                         AccountData::Exchange(ExchangeAccountData::AccountInfo {
                             exchange,
-                            equity,
-                            notional,
+                            info: crate::domain::AccountInfo { equity, notional },
                         }),
                     ))
                     .unwrap();

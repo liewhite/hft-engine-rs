@@ -64,8 +64,10 @@ fn final_report(exchange: Exchange) -> AccountEvent {
         local_ts: 1,
         data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
             exchange,
-            equity: 1.0,
-            notional: 0.0,
+            info: crate::domain::AccountInfo {
+                equity: 1.0,
+                notional: 0.0,
+            },
         }),
     }
 }

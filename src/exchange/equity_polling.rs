@@ -60,8 +60,7 @@ impl Periodic for EquityPoller {
                     local_ts,
                     data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
                         exchange: self.client.exchange(),
-                        equity: info.equity,
-                        notional: info.notional,
+                        info,
                     }),
                 });
             }

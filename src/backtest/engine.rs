@@ -443,8 +443,10 @@ impl<'a> BacktestEngine<'a> {
         let mark_of = |s: &Symbol| state.mark_of(s);
         let info = ExchangeAccountData::AccountInfo {
             exchange,
-            equity: state.ledger.equity(mark_of),
-            notional: state.ledger.notional(mark_of),
+            info: crate::domain::AccountInfo {
+                equity: state.ledger.equity(mark_of),
+                notional: state.ledger.notional(mark_of),
+            },
         };
         let values = ExchangeAccountData::PositionValues(crate::messaging::PositionValues {
             exchange,

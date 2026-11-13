@@ -325,8 +325,10 @@ mod routing_tests {
             crate::messaging::AccountData::Exchange(
                 crate::messaging::ExchangeAccountData::AccountInfo {
                     exchange: Exchange::Binance,
-                    equity: 1.0,
-                    notional: 0.0,
+                    info: crate::domain::AccountInfo {
+                        equity: 1.0,
+                        notional: 0.0,
+                    },
                 },
             ),
         );

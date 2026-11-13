@@ -321,10 +321,7 @@ pub enum ExchangeAccountData {
     /// 账户信息 (净值 + 总持仓名义价值)
     AccountInfo {
         exchange: Exchange,
-        /// 账户净值 (balance + unrealized_pnl)
-        equity: f64,
-        /// 账户总持仓名义价值 (用于计算杠杆率)
-        notional: f64,
+        info: crate::domain::AccountInfo,
     },
     /// 本地持仓账本里该所**每个已跟踪币**的持仓价值，见 [`PositionValues`]
     PositionValues(PositionValues),

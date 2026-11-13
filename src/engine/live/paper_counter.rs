@@ -220,8 +220,7 @@ impl PaperCounter {
                 local_ts: ts,
                 data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
                     exchange: state.exchange,
-                    equity,
-                    notional,
+                    info: crate::domain::AccountInfo { equity, notional },
                 }),
             });
             // 与实盘账本同一读数：各币持仓价值（策略的账户杠杆闸门用它，#759）
@@ -1004,7 +1003,10 @@ mod tests {
         });
         h.settle(30).await;
         let equity = h.events.lock().unwrap().iter().find_map(|e| match &e.data {
-            AccountData::Exchange(ExchangeAccountData::AccountInfo { equity, .. }) => Some(*equity),
+            AccountData::Exchange(ExchangeAccountData::AccountInfo {
+                info: crate::domain::AccountInfo { equity, .. },
+                ..
+            }) => Some(*equity),
             _ => None,
         });
         assert_eq!(equity, Some(10_000.0));
