@@ -20,7 +20,7 @@ use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, IncomeEvent, MarketBus,
     MarketEvent, PositionBaseline, StateManager, SymbolAccountData, SymbolState,
 };
-use crate::observability::{prometheus, MetricsPushConfig, PromText};
+use crate::observability::{MetricsPushConfig, PromText, Pusher};
 use crate::tasks::{Addr, Gone, Group, Inbox, Scope, Task};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -127,8 +127,6 @@ struct MetricsView {
     /// symbol 事件也推给本实例。它的用途是"本实例的跟踪范围与事件流是否对得上"的参考量，
     /// 不是错误计数。若为单实例全量部署且此数持续增长，才说明注册范围有问题。
     untracked_events: u64,
-    /// 可选的 pushgateway 推送配置
-    push: Option<MetricsPushConfig>,
     /// 模拟账户累计成交统计（来自账户总线上带 Paper 标签的事件）。
     ///
     /// **与实盘视图分账**：模拟事件绝不喂进 `state`（StateManager 按 exchange 键控，
@@ -141,7 +139,7 @@ struct MetricsView {
 }
 
 impl MetricsView {
-    fn new(push: Option<MetricsPushConfig>) -> Self {
+    fn new() -> Self {
         Self {
             state: StateManager::new(&[], NO_ORDER_TIMEOUT),
             tracked: HashSet::new(),
@@ -149,7 +147,6 @@ impl MetricsView {
             per_symbol: HashMap::new(),
             total: TradingStats::default(),
             untracked_events: 0,
-            push,
             paper_stats: HashMap::new(),
             paper_accounts: HashMap::new(),
         }
@@ -264,13 +261,9 @@ impl MetricsView {
             .or_insert(size);
     }
 
-    /// 输出一次完整报告（结构化日志；配置了 pushgateway 时同一份数字同时推送）
-    fn report(&self) {
+    /// 输出一次完整报告（结构化日志），返回同一份数字的推送文本
+    fn report(&self) -> PromText {
         let prom = self.render();
-        // 配置了 pushgateway 就把同一份数字推出去（异步、失败只记 warn，不拖垮引擎）
-        if let Some(config) = &self.push {
-            prometheus::spawn_push(config.clone(), prom.into_body());
-        }
         if self.total.forced_fills > 0 {
             tracing::warn!(
                 target: "metrics",
@@ -294,6 +287,7 @@ impl MetricsView {
                 "metrics.recent_fill"
             );
         }
+        prom
     }
 
     /// 本轮全部指标（同时写结构化日志）
@@ -533,30 +527,52 @@ impl MetricsHandle {
 /// 交易指标观测组件。
 ///
 /// 观测组件故障**不得**拖垮交易：`run` 没有出错退出的路径（出错会经任务树让整机停机），
-/// pushgateway 推送失败只记 warn（见 [`prometheus::spawn_push`]）。
+/// pushgateway 推送失败只记 warn（见 [`Pusher`]）。
+///
+/// 配了推送时，推送器是本节点的子任务：本节点 `run` 返回后框架才停它、它排空收件箱才
+/// 算停完，所以 `run` 结尾交出的最终快照一定会推出去（或超时报 warn）。
 pub struct Metrics {
     inbox: Inbox<MetricsMsg>,
     /// 报告间隔
     every: Duration,
     view: MetricsView,
+    /// 推送器地址（未配置 pushgateway 为 None）
+    pusher: Option<Addr<String>>,
 }
 
 impl Metrics {
     /// 在 `group` 下起指标观测，等它订阅完成，返回句柄。订阅见 [`MetricsArgs`] 各字段。
     pub async fn spawn(group: &Group, args: MetricsArgs) -> anyhow::Result<MetricsHandle> {
         let (_, addr) = group
-            .spawn_addressed("Metrics", move |_scope: Scope, mut inbox: Inbox<MetricsMsg>| async move {
+            .spawn_addressed("Metrics", move |scope: Scope, mut inbox: Inbox<MetricsMsg>| async move {
+                let pusher = match args.push {
+                    Some(config) => Some(Pusher::spawn(&scope.group("push"), config).await?),
+                    None => None,
+                };
                 inbox.subscribe(&args.market_bus, |_| true, MetricsMsg::Market);
                 inbox.subscribe(&args.account_bus, |_| true, MetricsMsg::Account);
                 tracing::info!(interval_ms = args.interval_ms, "Metrics started");
                 Ok(Self {
                     inbox,
                     every: Duration::from_millis(args.interval_ms),
-                    view: MetricsView::new(args.push),
+                    view: MetricsView::new(),
+                    pusher,
                 })
             })
             .await?;
         Ok(MetricsHandle(addr))
+    }
+
+    /// 输出一次报告；配了推送就把同一份数字交给推送器
+    fn report(&self) {
+        let prom = self.view.report();
+        if let Some(pusher) = &self.pusher {
+            // 推送器只会在本节点 run 返回后被停；在那之前没了只能是它自己出错退出 ——
+            // 错误已经由任务树上报、整机在停，这里只说明这份快照没推
+            if pusher.send(prom.into_body()).is_err() {
+                tracing::warn!("指标推送器已退出，本次快照未推送");
+            }
+        }
     }
 }
 
@@ -574,19 +590,17 @@ impl Task for Metrics {
                         // 提问方已不等回复（它自己放弃了）时无人可告知；注册本身已生效
                         let _ = reply.send(());
                     }
-                    // 已被要求停止，收件箱已排空
-                    None => return Ok(()),
+                    // 已被要求停止，收件箱已排空：留一份最终快照（便于事后复盘）。放在这里
+                    // 而不是 stop 里：stop 在子任务（推送器）停完之后才调，那时已推不出去
+                    None => {
+                        self.report();
+                        tracing::info!("Metrics stopped");
+                        return Ok(());
+                    }
                 },
-                _ = tick.tick() => self.view.report(),
+                _ = tick.tick() => self.report(),
             }
         }
-    }
-
-    async fn stop(&mut self) -> anyhow::Result<()> {
-        // 停机前留一份最终快照，便于事后复盘
-        self.view.report();
-        tracing::info!("Metrics stopped");
-        Ok(())
     }
 }
 
@@ -624,7 +638,7 @@ mod tests {
 
     /// 直接构造聚合视图（不起组件），用于测试纯状态累积逻辑
     fn view() -> MetricsView {
-        MetricsView::new(None)
+        MetricsView::new()
     }
 
     /// 注册经句柄等到完成；组件停止后句柄报 Gone（调用方据此报错，而不是静默丢掉基线）
@@ -648,6 +662,89 @@ mod tests {
         root.shutdown().await.unwrap();
         let (symbols, baselines) = register();
         assert!(handle.register_symbols(symbols, baselines).await.is_err(), "停止后应报 Gone");
+    }
+
+    /// 假 pushgateway：每个请求先拖 `delay` 再回 200，回完才记下请求体
+    async fn slow_gateway(delay: Duration) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = got.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // 读到头部结束且正文收满为止
+                    let body = loop {
+                        let n = sock.read(&mut chunk).await.unwrap();
+                        assert!(n > 0, "请求没读完连接就断了");
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len: usize = text[..end]
+                                .lines()
+                                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break text[end + 4..].to_string();
+                            }
+                        }
+                    };
+                    tokio::time::sleep(delay).await;
+                    sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    record.lock().unwrap().push(body);
+                });
+            }
+        });
+        (url, got)
+    }
+
+    /// 停机时最后一份快照推完才算停完（#712：以前是游离 spawn，进程一退就可能被砍断）
+    #[tokio::test]
+    async fn final_snapshot_is_pushed_before_shutdown_returns() {
+        let (url, got) = slow_gateway(Duration::from_millis(300)).await;
+        let account_bus = AccountBus::new("account");
+        let root = crate::tasks::Root::new("t");
+        Metrics::spawn(
+            &root.group("g"),
+            MetricsArgs {
+                interval_ms: DEFAULT_REPORT_INTERVAL_MS,
+                push: Some(MetricsPushConfig { url, job: "t".to_string() }),
+                market_bus: MarketBus::new("market"),
+                account_bus: account_bus.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        // 等首拍那份推完（首拍立即触发，那时还没有任何净值）
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while got.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("首拍快照没推出来");
+        assert!(!got.lock().unwrap()[0].contains("hft_equity"));
+
+        account_bus.publish(AccountEvent {
+            account: AccountId::Live,
+            exchange_ts: 1,
+            local_ts: 1,
+            data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
+                exchange: Exchange::OKX,
+                equity: 4321.0,
+                notional: 0.0,
+            }),
+        });
+        root.shutdown().await.unwrap();
+
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 2, "停机返回时最终快照应已推完: {got:?}");
+        assert!(got[1].contains("hft_equity{exchange=\"OKX\"} 4321"), "最终快照要含停机前收到的净值: {}", got[1]);
     }
 
     /// 净值 ≤0 时杠杆算不出：不推杠杆点（看板断线），不得报成 0 冒充「很安全」
