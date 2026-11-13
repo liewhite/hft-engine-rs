@@ -23,7 +23,8 @@
 
 use super::codec::{size_step, AssetInfo};
 use super::symbol::from_hyperliquid;
-use crate::domain::{Decimal, Exchange, ExchangeError, HlSigFigs, Symbol, SymbolMeta};
+use crate::domain::{Decimal, Exchange, ExchangeError, Price, PriceRule, Symbol, SymbolMeta};
+use rust_decimal::RoundingStrategy;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -169,9 +170,38 @@ pub(crate) fn hl_price_rule(sz_decimals: u32) -> HlSigFigs {
     HlSigFigs::new(sz_decimals)
 }
 
+/// Hyperliquid 永续：至多 5 位有效数字，且小数位不超过 `6 - szDecimals`；整数价格总是合法。
+#[derive(Debug, Clone)]
+pub(crate) struct HlSigFigs {
+    sz_decimals: u32,
+}
+
+impl HlSigFigs {
+    pub(crate) fn new(sz_decimals: u32) -> Self {
+        Self { sz_decimals }
+    }
+}
+
+impl PriceRule for HlSigFigs {
+    fn round(&self, price: Price) -> Price {
+        if price <= Decimal::ZERO || price.fract().is_zero() {
+            return price;
+        }
+        // 首位有效数字的十进制指数：12345.6 → 4，0.000251 → -4。
+        // normalize 后 price = mantissa × 10^-scale，mantissa 有 n 位，首位指数 = n - 1 - scale
+        let p = price.normalize();
+        let digits = p.mantissa().unsigned_abs().to_string().len() as i64;
+        let lead_exp = digits - 1 - p.scale() as i64;
+        let sig_fig_decimals = (4 - lead_exp).max(0) as u32;
+        let max_decimals = 6_u32.saturating_sub(self.sz_decimals);
+        price.round_dp_with_strategy(sig_fig_decimals.min(max_decimals), RoundingStrategy::MidpointAwayFromZero)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     fn info(name: &str, sz: i32, extra: &str) -> AssetInfo {
         serde_json::from_str(&format!(
@@ -269,5 +299,27 @@ mod tests {
         }])
         .unwrap_err();
         assert!(err.contains("不属于它"), "{err}");
+    }
+
+    #[test]
+    fn hl_significant_figures() {
+        let s = |rule: &dyn PriceRule, p: Decimal| rule.round(p).normalize().to_string();
+        let f0 = HlSigFigs::new(0);
+        assert_eq!(s(&f0, dec!(0.000251)), "0.000251");
+        assert_eq!(s(&f0, dec!(0.00012345)), "0.000123", "受 6 位小数限制");
+        let f2 = HlSigFigs::new(2);
+        assert_eq!(s(&f2, dec!(0.12345)), "0.1235", "受 max_decimals=4 限制");
+        assert_eq!(s(&f2, dec!(1234.5)), "1234.5");
+        assert_eq!(s(&f2, dec!(1234.56)), "1234.6");
+        assert_eq!(s(&f2, dec!(100000)), "100000");
+        assert_eq!(s(&f2, dec!(123456789)), "123456789", "整数价格总是合法");
+        let f5 = HlSigFigs::new(5);
+        assert_eq!(s(&f5, dec!(106290.4)), "106290");
+        assert_eq!(s(&f5, dec!(99999.6)), "100000");
+        assert_eq!(s(&f5, dec!(70010.2)), "70010");
+        assert_eq!(s(&f5, dec!(12345.6)), "12346");
+        let f1 = HlSigFigs::new(1);
+        assert_eq!(s(&f1, dec!(0.123456)), "0.12346");
+        assert_eq!(s(&f1, dec!(1.000001)), "1");
     }
 }
