@@ -248,12 +248,13 @@ async fn hyperliquid_trades_matches_codec() {
     let channel = kind_channel(&kind).expect("Trades 必须能映射到订阅");
     let subscription = serde_json::json!({"type": channel, "coin": kind.symbol()});
     let subscribed: HashSet<SubscriptionKind> = HashSet::from([kind]);
+    let markets = crate::exchange::hyperliquid::testkit::markets(&[""]);
 
     let (trades, raws) = observe(
         "Hyperliquid",
         WS_URL,
         json!({"method": "subscribe", "subscription": subscription}),
-        |raw| parse_public_message(raw, 0, &subscribed).map_err(|e| e.to_string()),
+        |raw| parse_public_message(raw, 0, &markets, &subscribed).map_err(|e| e.to_string()),
     )
     .await;
 

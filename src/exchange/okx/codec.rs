@@ -415,26 +415,6 @@ impl OrderPushData {
         })
     }
 
-    /// 本引擎未接入的合约（别的计价币、币本位、交割）上的成交：原样上报（见
-    /// `AccountData::UnmappedFill`），数量是交易所原始张数 —— 没有可信的折算系数。
-    /// 无成交（`fillSz` 为 0）返回 `None`。
-    pub fn to_unmapped_fill(&self) -> Result<Option<crate::messaging::UnmappedFill>, String> {
-        let size = crate::domain::parse_decimal(&self.fill_sz)
-            .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?;
-        if size.is_zero() {
-            return Ok(None);
-        }
-        Ok(Some(crate::messaging::UnmappedFill {
-            exchange: Exchange::OKX,
-            instrument: self.inst_id.clone(),
-            side: parse_side(&self.side)?,
-            size,
-            price: crate::domain::parse_decimal(&self.fill_px)
-                .map_err(|_| format!("Failed to parse fill_px: {}", self.fill_px))?,
-            timestamp: now_ms(),
-        }))
-    }
-
     /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）。数量折算为币本位。
     pub fn to_fill(&self, meta: &SymbolMeta) -> Result<Option<Fill>, String> {
         let fill_sz = meta.qty_to_coin(

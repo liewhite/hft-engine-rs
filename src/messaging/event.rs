@@ -282,9 +282,6 @@ pub enum ExchangeAccountData {
         /// 账户总持仓名义价值 (用于计算杠杆率)
         notional: f64,
     },
-    /// 本账户在**引擎品种目录之外**的成交（如 HL 未接入市场的合约、现货）。
-    /// 不进任何 symbol 的持仓；框架只如实上报，怎么处理（忽略 / 停止交易）由策略决定。
-    UnmappedFill(UnmappedFill),
     /// 本地持仓账本里该所**每个已跟踪币**的持仓价值，见 [`PositionValues`]
     PositionValues(PositionValues),
 }
@@ -344,19 +341,6 @@ impl LegValue {
     }
 }
 
-/// 品种目录外的一笔成交。`instrument` 是交易所原始写法（如 `flx:TSLA`、`@107`），
-/// 不是内部 symbol —— 它本来就映射不到内部 symbol。
-#[derive(Debug, Clone, PartialEq)]
-pub struct UnmappedFill {
-    pub exchange: Exchange,
-    pub instrument: String,
-    pub side: crate::domain::Side,
-    /// 交易所原始数量
-    pub size: crate::domain::Quantity,
-    pub price: crate::domain::Price,
-    pub timestamp: Timestamp,
-}
-
 impl SymbolAccountData {
     pub fn exchange(&self) -> Exchange {
         match self {
@@ -383,7 +367,6 @@ impl ExchangeAccountData {
             ExchangeAccountData::Balance(b) => b.exchange,
             ExchangeAccountData::Greeks(g) => g.exchange,
             ExchangeAccountData::AccountInfo { exchange, .. } => *exchange,
-            ExchangeAccountData::UnmappedFill(f) => f.exchange,
             ExchangeAccountData::PositionValues(v) => v.exchange,
         }
     }

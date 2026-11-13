@@ -23,7 +23,7 @@
 | 总线 | 覆盖 |
 |---|---|
 | `market_bus()` | `MarketData` 全部 variant：BBO、MarketTrade、MarkPrice、IndexPrice、FundingRate、Candle、HistoryCandles、BorrowFee、ExchangeRate、ExchangeStatus、Clock、Custom |
-| `account_bus()` | `AccountData` 全部 variant：OrderUpdate、OrderRequest、Fill、Balance、FundingFee、Greeks、AccountInfo、UnmappedFill、PositionValues（持仓账本发的持仓读数，见 §三） |
+| `account_bus()` | `AccountData` 全部 variant：OrderUpdate、OrderRequest、Fill、Balance、FundingFee、Greeks、AccountInfo、PositionValues（持仓账本发的持仓读数，见 §三） |
 | `outcome_bus()` | 策略信号（下单 / 撤单 / 自定义事件），带 `account` 标签 |
 
 **契约**

@@ -301,8 +301,6 @@ impl StateManager {
                     .greeks
                     .insert((g.exchange, g.ccy.clone()), g.clone());
             }
-            // 品种目录外的成交：不属于任何 symbol 状态，框架只运送，策略在 on_event 里自行处理
-            ExchangeAccountData::UnmappedFill(_) => {}
             ExchangeAccountData::PositionValues(v) => {
                 self.account
                     .position_values

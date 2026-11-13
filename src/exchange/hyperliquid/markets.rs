@@ -8,8 +8,10 @@
 //! 只能查各 dex 的 meta。把这件事收在本目录里、启动时建好：
 //! - 出向（下单、撤单、订阅、查费率）只问 [`HlMarkets::asset`] / [`HlMarkets::coin`]，
 //!   查不到就报错，不会拼出一个不存在的 coin；
-//! - 入向（成交、订单、持仓、资费流水）只问 [`HlMarkets::owns`]，不在目录里的 coin 一律
-//!   不进本引擎 —— Fill 流、持仓基线、对账读数、资费用的是同一条判据，口径不会分叉。
+//! - 入向（行情、成交、订单、持仓、资费流水）只问 [`HlMarkets::symbol_of`]，一步得到内部
+//!   symbol；不在目录里的 coin 得到 `None`，一律不进本引擎 —— Fill 流、持仓基线、对账读数、
+//!   资费用的是同一条判据，口径不会分叉。剥 dex 前缀是本模块的私事，外面没有「先判断、再剥」
+//!   两步可以写漏。
 //!
 //! 运行期新上的品种不在目录里，要重启才能交易（与 symbol metas 只在投产期预加载一致）。
 //!
@@ -21,8 +23,7 @@
 //! 品种起不来。不在集合里的 coin（包括这个 `xyz:STX`）的成交与持仓不进账本：它们不可能
 //! 是本引擎下的单，也不在任何策略的对账范围里。
 
-use super::codec::{size_step, AssetInfo};
-use super::symbol::from_hyperliquid;
+use super::codec::{size_step, AssetInfo, MarginMode};
 use crate::domain::{Decimal, Exchange, ExchangeError, Price, PriceRule, Symbol, SymbolMeta};
 use rust_decimal::RoundingStrategy;
 use std::collections::HashMap;
@@ -59,7 +60,7 @@ pub(crate) struct DexUniverse {
 pub(crate) struct HlMarkets {
     /// 接入的 dex，按配置顺序
     dexes: Vec<String>,
-    /// 内部 symbol -> 品种。入向判据 [`Self::owns`] 也查它（按 coin 反查），
+    /// 内部 symbol -> 品种。入向 [`Self::symbol_of`] 也查它（剥前缀后再核对 coin），
     /// 不另存反向表：目录只读、品种数百个，线性查找的代价可忽略，换来只有一份数据。
     by_symbol: HashMap<Symbol, HlAsset>,
 }
@@ -72,8 +73,18 @@ impl HlMarkets {
         let mut by_symbol: HashMap<Symbol, HlAsset> = HashMap::new();
         for u in universes {
             for (idx, info) in u.universe.iter().enumerate() {
-                if info.is_delisted || !info.supports_cross_margin() {
+                if info.is_delisted {
                     continue;
+                }
+                match info.margin_mode() {
+                    Ok(MarginMode::Cross) => {}
+                    Ok(MarginMode::IsolatedOnly) => continue,
+                    // 不认识的保证金模式不猜成全仓：剔除并留痕（与 BN/OKX 元数据异常的处置一致），
+                    // 策略要用它时由投产校验拒绝
+                    Err(e) => {
+                        tracing::error!(coin = %info.name, error = %e, "HL 品种保证金模式未知，该品种不可交易");
+                        continue;
+                    }
                 }
                 // 前缀与所查 dex 不符说明 meta 口径变了，编号和归属都不可信
                 if dex_of_coin(&info.name) != u.dex {
@@ -82,7 +93,7 @@ impl HlMarkets {
                         u.dex, info.name
                     ));
                 }
-                let symbol = from_hyperliquid(&info.name);
+                let symbol = strip_dex(&info.name).to_string();
                 let asset = HlAsset {
                     coin: info.name.clone(),
                     dex: u.dex.clone(),
@@ -115,17 +126,22 @@ impl HlMarkets {
         })
     }
 
+    /// 按 HL coin（带 dex 前缀）找品种；不在目录里为 `None`。剥前缀后还要核对完整 coin：
+    /// `flx:TSLA` 剥完是 `TSLA`，但目录里的 `TSLA` 是 `xyz:TSLA`，不是同一个品种。
+    fn entry_of_coin(&self, coin: &str) -> Option<(&Symbol, &HlAsset)> {
+        self.by_symbol
+            .get_key_value(strip_dex(coin))
+            .filter(|(_, a)| a.coin == coin)
+    }
+
     /// 按 HL coin（带 dex 前缀）找品种；不在目录里报错
     pub(crate) fn asset_of_coin(&self, coin: &str) -> Result<&HlAsset, ExchangeError> {
-        self.by_symbol
-            .get(&from_hyperliquid(coin))
-            .filter(|a| a.coin == coin)
-            .ok_or_else(|| {
-                ExchangeError::Other(format!(
-                    "HL 已接入的 dex {:?} 里没有可交易的 {coin}",
-                    self.dexes
-                ))
-            })
+        self.entry_of_coin(coin).map(|(_, a)| a).ok_or_else(|| {
+            ExchangeError::Other(format!(
+                "HL 已接入的 dex {:?} 里没有可交易的 {coin}",
+                self.dexes
+            ))
+        })
     }
 
     /// 内部 symbol 对应的 HL coin
@@ -133,12 +149,13 @@ impl HlMarkets {
         self.by_symbol.get(symbol).map(|a| a.coin.as_str())
     }
 
-    /// 入向判据：这个 coin 的成交 / 订单 / 持仓 / 资费是否属于本引擎。
+    /// 入向唯一的换算：HL coin → 内部 symbol；不属于本引擎（不在品种目录里）为 `None`。
     ///
-    /// 账户级推送与查询（userFills、orderUpdates、userFunding）一次返回该地址在**所有**
-    /// dex 上的记录；剥掉前缀后同名的两个品种会被认成一个，故入口一律先过这道判据。
-    pub(crate) fn owns(&self, coin: &str) -> bool {
-        self.asset_of_coin(coin).is_ok()
+    /// 账户级推送与查询（userFills、orderUpdates、userFunding、clearinghouseState）一次返回该地址
+    /// 在**所有** dex 上的记录；单剥前缀会把同名的两个品种认成一个，故「属不属于本引擎」与
+    /// 「对应哪个 symbol」在这里一步给出。
+    pub(crate) fn symbol_of(&self, coin: &str) -> Option<Symbol> {
+        self.entry_of_coin(coin).map(|(s, _)| s.clone())
     }
 
     /// 全部可交易品种的 SymbolMeta
@@ -161,6 +178,12 @@ impl HlMarkets {
 /// coin 所属的 dex：`xyz:TSLA` → "xyz"，`BTC` → ""（主站）
 pub(crate) fn dex_of_coin(coin: &str) -> &str {
     coin.split_once(':').map_or("", |(dex, _)| dex)
+}
+
+/// 去掉 dex 前缀：`xyz:TSLA` → `TSLA`，`BTC` → `BTC`。只在本模块内用：入向换算一律经
+/// [`HlMarkets::symbol_of`]（连同「在不在目录里」一起判），不单独剥前缀。
+fn strip_dex(coin: &str) -> &str {
+    coin.split_once(':').map_or(coin, |(_, name)| name)
 }
 
 /// `perpDexs` 响应里的全部 perp dex 名（"" = 主站，即列表第 0 项 `null`）。名字解析不了报错：
@@ -327,18 +350,34 @@ mod tests {
         assert_eq!(names, ["BTC", "ETH", "STX", "TSLA", "XYZ100"]);
     }
 
-    /// 入向判据：只认目录里的 coin。同名不同 dex 的（xyz:STX 对主站 STX）、未接入 dex 的
-    /// （flx:TSLA）、已接入 dex 上不可交易的（xyz:AAPL）都不认 —— 否则剥前缀后会串到同名品种上
+    /// 入向换算：只认目录里的 coin，一步给出剥前缀后的 symbol。同名不同 dex 的（xyz:STX 对
+    /// 主站 STX）、未接入 dex 的（flx:TSLA）、已接入 dex 上不可交易的（xyz:AAPL）都不认 ——
+    /// 否则剥前缀后会串到同名品种上
     #[test]
-    fn owns_only_catalogued_coins() {
+    fn symbol_of_only_catalogued_coins() {
         let m = two_dex_markets();
-        assert!(m.owns("BTC"));
-        assert!(m.owns("xyz:TSLA"));
-        assert!(m.owns("STX"));
-        assert!(!m.owns("xyz:STX"));
-        assert!(!m.owns("flx:TSLA"));
-        assert!(!m.owns("TSLA"));
-        assert!(!m.owns("xyz:AAPL"));
+        assert_eq!(m.symbol_of("BTC").as_deref(), Some("BTC"));
+        assert_eq!(m.symbol_of("xyz:TSLA").as_deref(), Some("TSLA"));
+        assert_eq!(m.symbol_of("STX").as_deref(), Some("STX"));
+        for foreign in ["xyz:STX", "flx:TSLA", "TSLA", "xyz:AAPL", "@107"] {
+            assert_eq!(m.symbol_of(foreign), None, "{foreign}");
+        }
+    }
+
+    /// 保证金模式不认识的品种不当全仓收进来（剔除，不影响别的品种）
+    #[test]
+    fn unknown_margin_mode_is_excluded_not_treated_as_cross() {
+        let m = HlMarkets::build(vec![DexUniverse {
+            dex: String::new(),
+            offset: 0,
+            universe: vec![
+                info("BTC", 5, ""),
+                info("ETH", 4, r#","marginMode":"somethingNew""#),
+            ],
+        }])
+        .unwrap();
+        assert!(m.asset(&"BTC".into()).is_ok());
+        assert!(m.asset(&"ETH".into()).is_err());
     }
 
     /// 同名品种在两个已接入 dex 都可交易：启动即报错，不静默挑一个

@@ -69,7 +69,7 @@ impl HyperliquidNode {
                 // 1. 私有 WS 启动时就连（含订阅确认，要在投产前生效）；失败 → 向上传播。
                 //    公共 WS 等第一条订阅路由过来才连（见 LazyConn）
                 if let Some(wallet_address) = private_feed {
-                    HyperliquidPrivateWs::spawn(&children, wallet_address, args.account_bus.clone(), markets.clone()).await?;
+                    HyperliquidPrivateWs::spawn(&children, wallet_address, args.account_bus.clone(), markets.clone(), client.quote().to_string()).await?;
                 }
                 let public_ws = {
                     let (group, market_bus, markets) = (children.clone(), args.market_bus.clone(), markets.clone());

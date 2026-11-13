@@ -21,6 +21,8 @@ use serde::Deserialize;
 
 /// 测试交易对 (XYZ DEX 上的 NVDA 股票永续)
 const TEST_COIN: &str = "xyz:NVDA";
+/// TEST_COIN 对应的内部 symbol（不带 dex 前缀）
+const TEST_SYMBOL: &str = "NVDA";
 const TEST_QUOTE: &str = "USDC";
 const TEST_DEX: &str = "xyz";
 
@@ -136,7 +138,7 @@ async fn test_xyz_fetch_all_symbol_metas() {
 async fn test_xyz_fetch_symbol_meta() {
     let client = create_public_client().await;
     // 内部 symbol 不带 dex 前缀
-    let symbol: Symbol = hft_engine_rs::exchange::hyperliquid::from_hyperliquid(TEST_COIN);
+    let symbol: Symbol = TEST_SYMBOL.to_string();
 
     let metas = client
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
@@ -245,7 +247,7 @@ async fn place_test_order(side: Side) {
     .expect("创建客户端失败");
 
     // 内部 symbol 不带 dex 前缀
-    let symbol: Symbol = hft_engine_rs::exchange::hyperliquid::from_hyperliquid(TEST_COIN);
+    let symbol: Symbol = TEST_SYMBOL.to_string();
 
     // 获取 BBO
     let (bid, ask) = fetch_bbo(TEST_COIN).await.expect("获取 BBO 失败");

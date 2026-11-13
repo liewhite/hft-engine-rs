@@ -243,7 +243,7 @@ pub struct OrderData {
 
 impl OrderTradeUpdate {
     /// 这笔回报对应的内部 symbol；`None` = 本引擎未接入的合约（别的计价币、交割），
-    /// 由调用方按目录外处理（见 [`Self::to_unmapped_fill`]）。
+    /// 调用方整条丢弃。
     pub fn symbol(&self, quote: &str) -> Option<Symbol> {
         from_binance(&self.o.s, quote)
     }
@@ -260,23 +260,6 @@ impl OrderTradeUpdate {
     fn last_filled(&self) -> Result<Quantity, String> {
         crate::domain::parse_decimal(&self.o.l)
             .map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))
-    }
-
-    /// 本引擎未接入的合约上的成交：原样上报（见 `AccountData::UnmappedFill`）。无成交返回 `None`。
-    pub fn to_unmapped_fill(&self) -> Result<Option<crate::messaging::UnmappedFill>, String> {
-        let size = self.last_filled()?;
-        if size.is_zero() {
-            return Ok(None);
-        }
-        Ok(Some(crate::messaging::UnmappedFill {
-            exchange: Exchange::Binance,
-            instrument: self.o.s.clone(),
-            side: self.side()?,
-            size,
-            price: crate::domain::parse_decimal(&self.o.last_price)
-                .map_err(|_| format!("Failed to parse last price: {}", self.o.last_price))?,
-            timestamp: now_ms(),
-        }))
     }
 
     /// `symbol` 来自 [`Self::symbol`]。

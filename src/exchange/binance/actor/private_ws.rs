@@ -168,17 +168,9 @@ fn parse_private_message(
 
             let mut events = Vec::new();
 
-            // 同账户里别的计价币、交割合约的单也会推过来：映射不到本引擎 symbol 的，订单状态
-            // 不关心，成交以 UnmappedFill 原样上报，不进任何 symbol 的持仓
+            // 同账户里别的计价币、交割合约的单也会推过来：映射不到本引擎 symbol 的整条丢弃
+            // （目录外成交不理，#760），不进任何 symbol 的持仓
             let Some(symbol) = update.symbol(quote) else {
-                if let Some(f) = update.to_unmapped_fill().map_err(WsError::ParseError)? {
-                    events.push(AccountEvent {
-                        account: crate::domain::AccountId::Live,
-                        exchange_ts,
-                        local_ts,
-                        data: AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)),
-                    });
-                }
                 return Ok(events);
             };
 
@@ -287,27 +279,20 @@ mod tests {
                 AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
                     format!("order:{}", u.symbol)
                 }
-                AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => {
-                    format!("unmapped:{}", f.instrument)
-                }
                 other => format!("{other:?}"),
             })
             .collect()
     }
 
-    /// 别的计价币、交割合约的回报不再让解析报错停机，也不串进同名 symbol
+    /// 别的计价币、交割合约的回报不让解析报错停机，也不串进同名 symbol：整条丢弃
     #[test]
-    fn other_quote_and_delivery_fills_are_reported_unmapped() {
+    fn other_quote_and_delivery_pushes_are_dropped() {
         assert_eq!(
             kinds(&order_push("BTCUSDT", "0.5")),
             ["fill:BTC", "order:BTC"]
         );
-        assert_eq!(kinds(&order_push("BTCUSDC", "0.5")), ["unmapped:BTCUSDC"]);
-        assert_eq!(
-            kinds(&order_push("BTCUSDT_251226", "0.5")),
-            ["unmapped:BTCUSDT_251226"]
-        );
-        assert!(kinds(&order_push("BTCUSDC", "0")).is_empty());
+        assert!(kinds(&order_push("BTCUSDC", "0.5")).is_empty());
+        assert!(kinds(&order_push("BTCUSDT_251226", "0.5")).is_empty());
     }
 
     /// 不认识的订单状态按解析失败处理（不当成拒单终态）

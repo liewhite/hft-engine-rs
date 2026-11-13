@@ -17,9 +17,7 @@ use crate::exchange::hyperliquid::codec::{WsOrderUpdate, WsUserFills};
 use crate::exchange::hyperliquid::markets::HlMarkets;
 use crate::exchange::hyperliquid::WS_URL;
 use crate::exchange::ws_loop::{self, WsConn};
-use crate::messaging::{
-    AccountBus, AccountData, AccountEvent, ExchangeAccountData, SymbolAccountData,
-};
+use crate::messaging::{AccountBus, AccountData, AccountEvent, SymbolAccountData};
 use crate::tasks::{ChildHandle, Group, Scope, Task};
 use anyhow::Context as _;
 use futures_util::StreamExt;
@@ -35,10 +33,12 @@ pub(super) struct HyperliquidPrivateWs {
     /// 账户私有事件总线（发布事件，标 Live）
     account_bus: AccountBus,
     /// 品种目录：**账户级**推送（orderUpdates / userFills）下发该钱包在所有 dex 上的记录，
-    /// 只收目录里的 coin（与 REST 侧持仓基线、对账读数同一判据 [`HlMarkets::owns`]），
+    /// 只收目录里的 coin（与 REST 侧持仓基线、对账读数同一判据 [`HlMarkets::symbol_of`]），
     /// 否则别的 dex 上的成交会被剥掉前缀后当成同名标的的 Fill，直接污染「基线 + Fill」
     /// 维护的持仓。
     markets: Arc<HlMarkets>,
+    /// 计价币：成交手续费必须以它计
+    quote: String,
     conn: WsConn,
 }
 
@@ -52,6 +52,7 @@ impl HyperliquidPrivateWs {
         wallet_address: String,
         account_bus: AccountBus,
         markets: Arc<HlMarkets>,
+        quote: String,
     ) -> anyhow::Result<ChildHandle> {
         group
             .spawn("HyperliquidPrivateWs", move |scope: Scope| async move {
@@ -100,6 +101,7 @@ impl HyperliquidPrivateWs {
                 Ok(Self {
                     account_bus,
                     markets,
+                    quote,
                     conn,
                 })
             })
@@ -108,7 +110,7 @@ impl HyperliquidPrivateWs {
 
     /// 解析并发布一帧
     fn handle_message(&self, raw: &str) -> anyhow::Result<()> {
-        let events = parse_private_message(raw, &self.markets, now_ms())
+        let events = parse_private_message(raw, &self.markets, &self.quote, now_ms())
             .with_context(|| format!("Hyperliquid 私有 WS 解析失败: {raw}"))?;
         for event in events {
             self.account_bus.publish(event);
@@ -203,6 +205,7 @@ fn subscription_confirmed(raw: &str) -> Result<Option<String>, WsError> {
 fn parse_private_message(
     raw: &str,
     markets: &HlMarkets,
+    quote: &str,
     local_ts: u64,
 ) -> Result<Vec<AccountEvent>, WsError> {
     match classify(raw)? {
@@ -213,15 +216,15 @@ fn parse_private_message(
         Frame::Data {
             channel: "userFills",
             data,
-        } => parse_user_fills(&data, markets, local_ts),
+        } => parse_user_fills(&data, markets, quote, local_ts),
         Frame::Data { .. } | Frame::SubscriptionAck(_) | Frame::Ignored => Ok(Vec::new()),
     }
 }
 
 /// 解析 orderUpdates 消息。
 ///
-/// **过滤在剥前缀之前**：orderUpdates 是账户级推送（一个钱包在所有 perp dex 上
-/// 的订单都从这里下发），只收品种目录里的 coin（[`HlMarkets::owns`]）。不过滤的话，
+/// orderUpdates 是账户级推送（一个钱包在所有 perp dex 上的订单都从这里下发），只收品种
+/// 目录里的 coin（[`HlMarkets::symbol_of`] 一步判断并换成 symbol）：单剥前缀的话，
 /// "xyz:AAPL" 会被剥成 "AAPL"，与主站的同名标的混在一起。
 fn parse_order_updates(
     data: &serde_json::Value,
@@ -238,12 +241,12 @@ fn parse_order_updates(
     for update in updates {
         let order_update: WsOrderUpdate = serde_json::from_value(update.clone())
             .map_err(|e| WsError::ParseError(format!("orderUpdate parse: {}", e)))?;
-        if !markets.owns(&order_update.order.coin) {
-            // 挂单本身不改变持仓；它若成交，userFills 那边以 UnmappedFill 上报
-            tracing::warn!(coin = %order_update.order.coin, "HL 外来订单（不在品种目录里），跳过");
+        let Some(symbol) = markets.symbol_of(&order_update.order.coin) else {
+            // 目录外的订单不理（#760）：挂单本身不改变持仓，它的成交 userFills 那边同样丢弃
+            tracing::debug!(coin = %order_update.order.coin, "HL 目录外订单，跳过");
             continue;
-        }
-        let update = order_update.to_order_update()?;
+        };
+        let update = order_update.to_order_update(symbol)?;
         events.push(AccountEvent {
             // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
             account: crate::domain::AccountId::Live,
@@ -261,14 +264,14 @@ fn parse_order_updates(
 /// 解析 userFills 消息。
 ///
 /// userFills 是账户级推送：已接入 dex 上目录内品种的成交进 Fill 流；**其余成交**（未接入的
-/// dex、不可交易品种、现货）作为 [`AccountData::UnmappedFill`] 原样上报，不进任何 symbol 的
-/// 持仓 —— 剥掉前缀后会被当成同名品种的 Fill，污染「基线 + Fill」维护的持仓。
-/// 这类成交意味着什么（忽略 / 停止交易）由策略决定，框架只报事实。
-/// 判据与持仓基线、对账读数相同（[`HlMarkets::owns`]），两条通道口径一致。
-/// 初始快照（`isSnapshot`）是历史成交，不入账也不上报：现存持仓由持仓查询给出。
+/// dex、不可交易品种、现货）丢弃（#760：目录外成交不理），不进任何 symbol 的持仓 ——
+/// 剥掉前缀后会被当成同名品种的 Fill，污染「基线 + Fill」维护的持仓。
+/// 判据与持仓基线、对账读数相同（[`HlMarkets::symbol_of`]），两条通道口径一致。
+/// 初始快照（`isSnapshot`）是历史成交，不入账：现存持仓由持仓查询给出。
 fn parse_user_fills(
     data: &serde_json::Value,
     markets: &HlMarkets,
+    quote: &str,
     local_ts: u64,
 ) -> Result<Vec<AccountEvent>, WsError> {
     let user_fills: WsUserFills = serde_json::from_value(data.clone())
@@ -285,19 +288,16 @@ fn parse_user_fills(
 
     let mut events = Vec::new();
     for ws_fill in &user_fills.fills {
-        let data = if markets.owns(&ws_fill.coin) {
-            AccountData::Symbol(SymbolAccountData::Fill(ws_fill.to_fill()?))
-        } else {
-            AccountData::Exchange(ExchangeAccountData::UnmappedFill(
-                ws_fill.to_unmapped_fill()?,
-            ))
+        let Some(symbol) = markets.symbol_of(&ws_fill.coin) else {
+            tracing::debug!(coin = %ws_fill.coin, "HL 目录外成交，丢弃");
+            continue;
         };
         events.push(AccountEvent {
             // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
             account: crate::domain::AccountId::Live,
             exchange_ts: ws_fill.time,
             local_ts,
-            data,
+            data: AccountData::Symbol(SymbolAccountData::Fill(ws_fill.to_fill(symbol, quote)?)),
         });
     }
 
@@ -311,7 +311,7 @@ pub(crate) fn parse_user_fills_for_test(
     raw: &str,
     local_ts: u64,
 ) -> Result<Vec<AccountEvent>, WsError> {
-    parse_private_message(raw, markets, local_ts)
+    parse_private_message(raw, markets, "USDC", local_ts)
 }
 
 #[cfg(test)]
@@ -329,7 +329,7 @@ mod tests {
             "time": 1u64,
             "oid": 1u64,
             "fee": "0.01",
-            "closedPnl": "0.0"
+            "feeToken": "USDC"
         })
     }
 
@@ -350,20 +350,17 @@ mod tests {
     }
 
     /// **错账防线**：userFills 是账户级推送。已接入的每个 dex 的成交都进 Fill 流；
-    /// 未接入 dex、目录外品种、现货的成交以 UnmappedFill 原样上报 —— 绝不剥前缀当成
-    /// 同名标的的 Fill（"flx:TSLA" 不能累进 xyz 的 TSLA 持仓）。
+    /// 未接入 dex、目录外品种、现货的成交丢弃 —— 绝不剥前缀当成同名标的的 Fill
+    /// （"flx:TSLA" 不能累进 xyz 的 TSLA 持仓）。
     #[test]
-    fn fills_of_connected_dexes_flow_and_others_are_reported_unmapped() {
+    fn fills_of_connected_dexes_flow_and_others_are_dropped() {
         let kinds = |m: &HlMarkets, fills: Vec<serde_json::Value>| -> Vec<String> {
             let data = json!({"user": "0xabc", "fills": fills});
-            parse_user_fills(&data, m, 1)
+            parse_user_fills(&data, m, "USDC", 1)
                 .unwrap()
                 .into_iter()
                 .map(|e| match e.data {
                     AccountData::Symbol(SymbolAccountData::Fill(f)) => format!("fill:{}", f.symbol),
-                    AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => {
-                        format!("unmapped:{}", f.instrument)
-                    }
                     other => panic!("unexpected {other:?}"),
                 })
                 .collect()
@@ -375,21 +372,21 @@ mod tests {
         );
         assert_eq!(
             kinds(&both, vec![fill_json("BTC"), fill_json("flx:TSLA")]),
-            ["fill:BTC", "unmapped:flx:TSLA"]
+            ["fill:BTC"]
         );
-        assert_eq!(kinds(&both, vec![fill_json("ETH")]), ["unmapped:ETH"]);
-        assert_eq!(
-            kinds(&testkit::markets(&[""]), vec![fill_json("xyz:TSLA")]),
-            ["unmapped:xyz:TSLA"]
-        );
-        assert_eq!(
-            kinds(&both, vec![fill_json("@107"), fill_json("PURR/USDC")]),
-            ["unmapped:@107", "unmapped:PURR/USDC"]
-        );
-        assert_eq!(
-            kinds(&testkit::markets(&["xyz"]), vec![fill_json("BTC")]),
-            ["unmapped:BTC"]
-        );
+        assert!(kinds(&both, vec![fill_json("ETH")]).is_empty());
+        assert!(kinds(&testkit::markets(&[""]), vec![fill_json("xyz:TSLA")]).is_empty());
+        assert!(kinds(&both, vec![fill_json("@107"), fill_json("PURR/USDC")]).is_empty());
+        assert!(kinds(&testkit::markets(&["xyz"]), vec![fill_json("BTC")]).is_empty());
+    }
+
+    /// 手续费不是计价币（USDC）的成交：手续费口径对不上，报错而不是当 USDC 记
+    #[test]
+    fn fill_fee_in_other_token_is_an_error() {
+        let mut f = fill_json("BTC");
+        f["feeToken"] = json!("HYPE");
+        let data = json!({"user": "0xabc", "fills": [f]});
+        assert!(parse_user_fills(&data, &testkit::markets(&[""]), "USDC", 1).is_err());
     }
 
     /// 初始快照是历史成交：不入账、不上报
@@ -397,7 +394,7 @@ mod tests {
     fn snapshot_fills_are_ignored() {
         let m = testkit::markets(&[""]);
         let data = json!({"user": "0xabc", "isSnapshot": true, "fills": [fill_json("BTC"), fill_json("flx:TSLA")]});
-        assert!(parse_user_fills(&data, &m, 1).unwrap().is_empty());
+        assert!(parse_user_fills(&data, &m, "USDC", 1).unwrap().is_empty());
     }
 
     /// **Critical 回归防线**：服务端的错误报文必须致命。
@@ -409,7 +406,7 @@ mod tests {
     #[test]
     fn server_error_message_is_fatal() {
         let raw = r#"{"channel":"error","data":"Invalid subscription {\"type\":\"userFills\"}"}"#;
-        let err = parse_private_message(raw, &testkit::markets(&[""]), 1)
+        let err = parse_private_message(raw, &testkit::markets(&[""]), "USDC", 1)
             .expect_err("服务端错误报文被吞掉了 —— 订阅被拒会表现为静默断流");
         assert!(
             err.to_string().contains("Invalid subscription"),
@@ -451,9 +448,11 @@ mod tests {
             r#"{{"channel":"clearinghouseState","data":{{"user":"0xabc","dex":"","clearinghouseState":{}}}}}"#,
             testkit::OWN_EMPTY_STATE
         );
-        assert!(parse_private_message(&raw, &testkit::markets(&[""]), 1)
-            .unwrap()
-            .is_empty());
+        assert!(
+            parse_private_message(&raw, &testkit::markets(&[""]), "USDC", 1)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// orderUpdates 同口径过滤
@@ -494,6 +493,7 @@ mod tests {
             wallet,
             AccountBus::new("account"),
             Arc::new(testkit::markets(&[""])),
+            "USDC".to_string(),
         )
         .await
         .expect("订阅应在启动期确认");

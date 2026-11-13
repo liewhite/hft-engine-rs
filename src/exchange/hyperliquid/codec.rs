@@ -1,13 +1,15 @@
 //! Hyperliquid 数据编解码
 //!
-//! 解析 Hyperliquid REST API 和 WebSocket 消息
+//! 解析 Hyperliquid REST API 和 WebSocket 消息。只声明用得上的字段：声明了却不用的必填字段，
+//! 交易所哪天改名或去掉它，整条报文就解析不了 —— 持仓基线、对账、私有流会因此停机。
+//!
+//! coin → 内部 symbol 不在这里换：由调用方经 [`super::markets::HlMarkets::symbol_of`] 一步得到（不在
+//! 品种目录里的不进本引擎），再传给这里的转换函数。
 
-#![allow(dead_code)]
-
-use super::from_hyperliquid;
+use super::markets::HlMarkets;
 use crate::domain::{
     now_ms, Decimal, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, Quantity,
-    Side, BBO,
+    Side, Symbol, BBO,
 };
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -43,64 +45,53 @@ pub struct MetaResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetInfo {
-    /// 币种名 (e.g., "BTC", "ETH")
+    /// 币种名 (e.g., "BTC", "xyz:TSLA")
     pub name: String,
     /// 数量小数位数
     pub sz_decimals: u32,
-    /// 最大杠杆
-    pub max_leverage: u32,
     /// 是否已下架
     #[serde(default)]
     pub is_delisted: bool,
-    /// 保证金模式 (None = 默认允许全仓, "strictIsolated" = 仅逐仓, "noCross" = 不支持全仓)
-    pub margin_mode: Option<String>,
+    /// 保证金模式，见 [`Self::margin_mode`]
+    margin_mode: Option<String>,
+}
+
+/// 品种允许的保证金模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarginMode {
+    /// 可以全仓（字段缺省）
+    Cross,
+    /// 只许逐仓（`strictIsolated` / `noCross`）
+    IsolatedOnly,
 }
 
 impl AssetInfo {
-    /// 是否支持全仓保证金模式
-    pub fn supports_cross_margin(&self) -> bool {
+    /// 2026-11 实查主站与 xyz 的 meta，只出现过缺省、`strictIsolated`、`noCross` 三种。
+    /// 别的值不猜（猜成全仓会在不许全仓的品种上下单），报错由调用方剔除该品种。
+    pub(crate) fn margin_mode(&self) -> Result<MarginMode, String> {
         match self.margin_mode.as_deref() {
-            None => true, // 默认允许全仓
-            Some("strictIsolated") | Some("noCross") => false,
-            Some(_) => true, // 其他模式默认允许
+            None => Ok(MarginMode::Cross),
+            Some("strictIsolated") | Some("noCross") => Ok(MarginMode::IsolatedOnly),
+            Some(other) => Err(format!("未知的 marginMode: {other}")),
         }
     }
 }
 
-/// 资产上下文 (包含资金费率等实时数据)
+/// 资产上下文（资金费率、标记价、oracle 价）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetCtx {
     /// 当前资金费率
     pub funding: String,
-    /// 持仓量
-    pub open_interest: String,
     /// 标记价格
     pub mark_px: String,
-    /// 中间价
-    pub mid_px: String,
     /// oracle 价格
     pub oracle_px: String,
-    /// 冲击价格 [bid_impact, ask_impact]
-    pub impact_pxs: Option<Vec<String>>,
 }
 
 // ============================================================================
 // WebSocket 消息结构
 // ============================================================================
-
-/// WebSocket 订阅响应
-#[derive(Debug, Deserialize)]
-pub struct WsSubscriptionResponse {
-    pub channel: String,
-    pub data: serde_json::Value,
-}
-
-/// AllMids 数据 (所有中间价)
-#[derive(Debug, Deserialize)]
-pub struct AllMids {
-    pub mids: std::collections::HashMap<String, String>,
-}
 
 /// BBO 数据
 /// API 格式: { coin, time, bbo: [bid_level | null, ask_level | null] }
@@ -119,17 +110,13 @@ pub struct WsLevel {
     pub px: String,
     /// 数量
     pub sz: String,
-    /// 订单数量
-    pub n: u32,
 }
 
 impl WsBbo {
     /// 返回 `Ok(None)` = **单边盘口**（bid 或 ask 为 null）：稀薄品种的合法市场状态，
     /// 不是坏报文 —— 调用方跳过即可。此前按解析错误返回 Err，会经 fail-fast 链路
     /// kill actor、级联整机停机。`Err` 只留给真正的报文损坏。
-    pub fn to_bbo(&self) -> Result<Option<BBO>, String> {
-        let symbol = from_hyperliquid(&self.coin);
-
+    pub fn to_bbo(&self, symbol: Symbol) -> Result<Option<BBO>, String> {
         let (Some(bid), Some(ask)) = (self.bbo[0].as_ref(), self.bbo[1].as_ref()) else {
             return Ok(None); // 单边盘口
         };
@@ -205,6 +192,7 @@ impl WsTrade {
 }
 
 /// 把一批线路成交归集为 **aggTrade 口径**：同一主动单在同一价位的多笔撮合合并为一条。
+/// coin 不在品种目录里即报错（公共流只订阅目录内的品种，推来别的说明订阅记账出了错）。
 ///
 /// Hyperliquid 逐笔下发，而 Binance/OKX 下发的已是归集结果。若不在此归一，"成交笔数 /
 /// 单笔均量 / 到达强度"这类因子跨所不可比 —— 故归集放在适配层，让 domain 口径统一
@@ -221,11 +209,17 @@ impl WsTrade {
 /// 宁可接受这个有界误差，也不为归集去等时间窗口（那才是延迟敏感策略无法接受的）。
 ///
 /// 用 [`IndexMap`] 保持首次出现顺序，保证同一输入必得同一输出顺序 (回测确定性)。
-pub fn aggregate_trades(trades: &[WsTrade]) -> Result<Vec<MarketTrade>, String> {
+pub fn aggregate_trades(
+    trades: &[WsTrade],
+    markets: &HlMarkets,
+) -> Result<Vec<MarketTrade>, String> {
     let mut out: IndexMap<(Option<String>, Option<String>, Decimal, bool), MarketTrade> =
         IndexMap::new();
 
     for t in trades {
+        let symbol = markets
+            .symbol_of(&t.coin)
+            .ok_or_else(|| format!("HL trades 推来品种目录外的 coin: {}", t.coin))?;
         let taker_side = parse_side(&t.side)?;
         // 主动卖 (A) 时买方为挂单方
         let is_buyer_maker = taker_side == Side::Short;
@@ -247,7 +241,7 @@ pub fn aggregate_trades(trades: &[WsTrade]) -> Result<Vec<MarketTrade>, String> 
             })
             .or_insert_with(|| MarketTrade {
                 exchange: Exchange::Hyperliquid,
-                symbol: from_hyperliquid(&t.coin),
+                symbol,
                 price,
                 qty,
                 is_buyer_maker,
@@ -269,8 +263,7 @@ impl WsActiveAssetCtx {
     /// 转换为 FundingRate
     /// Hyperliquid 每小时整点结算
     /// timestamp: 数据时间戳（毫秒）
-    pub fn to_funding_rate(&self, timestamp: u64) -> Result<FundingRate, String> {
-        let symbol = from_hyperliquid(&self.coin);
+    pub fn to_funding_rate(&self, symbol: Symbol, timestamp: u64) -> Result<FundingRate, String> {
         let rate = f64::from_str(&self.ctx.funding)
             .map_err(|_| format!("Failed to parse funding rate: {}", self.ctx.funding))?;
 
@@ -285,8 +278,7 @@ impl WsActiveAssetCtx {
     }
 
     /// 转换为 MarkPrice
-    pub fn to_mark_price(&self, timestamp: u64) -> Result<MarkPrice, String> {
-        let symbol = from_hyperliquid(&self.coin);
+    pub fn to_mark_price(&self, symbol: Symbol, timestamp: u64) -> Result<MarkPrice, String> {
         let price = crate::domain::parse_decimal(&self.ctx.mark_px)
             .map_err(|_| format!("Failed to parse mark_px: {}", self.ctx.mark_px))?;
 
@@ -299,8 +291,7 @@ impl WsActiveAssetCtx {
     }
 
     /// 转换为 IndexPrice (使用 oracle_px 作为指数价格)
-    pub fn to_index_price(&self, timestamp: u64) -> Result<IndexPrice, String> {
-        let symbol = from_hyperliquid(&self.coin);
+    pub fn to_index_price(&self, symbol: Symbol, timestamp: u64) -> Result<IndexPrice, String> {
         let price = crate::domain::parse_decimal(&self.ctx.oracle_px)
             .map_err(|_| format!("Failed to parse oracle_px: {}", self.ctx.oracle_px))?;
 
@@ -310,11 +301,6 @@ impl WsActiveAssetCtx {
             price,
             timestamp,
         })
-    }
-
-    /// 获取 symbol
-    pub fn symbol(&self) -> crate::domain::Symbol {
-        from_hyperliquid(&self.coin)
     }
 }
 
@@ -336,26 +322,16 @@ pub fn size_step(sz_decimals: u32) -> Decimal {
 }
 
 // ============================================================================
-// WebSocket 账户订阅消息结构
+// 账户状态（REST clearinghouseState）
 // ============================================================================
 
-/// WebData3 响应 (账户状态)
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WsWebData3 {
-    pub clearinghouse_state: Option<ClearinghouseState>,
-}
-
-/// Clearinghouse 状态 (仓位和余额)
+/// Clearinghouse 状态（仓位与保证金摘要）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClearinghouseState {
     pub asset_positions: Vec<AssetPositionWrapper>,
-    /// 总账户保证金摘要（全仓 + 逐仓）
+    /// 总账户保证金摘要（全仓 + 逐仓）；只有标准账户读它
     pub margin_summary: MarginSummary,
-    /// 全仓部分的保证金摘要
-    pub cross_margin_summary: MarginSummary,
-    pub withdrawable: String,
 }
 
 /// MarginSummary (保证金摘要)
@@ -364,16 +340,12 @@ pub struct ClearinghouseState {
 pub struct MarginSummary {
     pub account_value: String,
     pub total_ntl_pos: String,
-    pub total_raw_usd: String,
-    pub total_margin_used: String,
 }
 
 /// AssetPosition 包装器
 #[derive(Debug, Deserialize)]
 pub struct AssetPositionWrapper {
     pub position: AssetPosition,
-    #[serde(rename = "type")]
-    pub position_type: String,
 }
 
 /// AssetPosition (单个仓位)
@@ -383,29 +355,12 @@ pub struct AssetPosition {
     pub coin: String,
     /// 带符号的仓位大小 (负数为空头)
     pub szi: String,
-    pub entry_px: Option<String>,
-    pub leverage: PositionLeverage,
-    pub liquidation_px: Option<String>,
-    pub unrealized_pnl: String,
-    pub margin_used: String,
     pub position_value: String,
-    pub return_on_equity: String,
-    pub max_leverage: u32,
-}
-
-/// 杠杆信息
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PositionLeverage {
-    #[serde(rename = "type")]
-    pub leverage_type: String, // "cross" or "isolated"
-    pub value: u32,
-    pub raw_usd: Option<String>,
 }
 
 impl AssetPosition {
-    pub fn to_position(&self) -> Result<crate::domain::Position, String> {
-        let symbol = from_hyperliquid(&self.coin);
+    /// `symbol` 由调用方经 [`HlMarkets::symbol_of`] 得到
+    pub fn to_position(&self, symbol: Symbol) -> Result<crate::domain::Position, String> {
         let size = crate::domain::parse_decimal(&self.szi)
             .map_err(|_| format!("Failed to parse szi: {}", self.szi))?;
         // 只取数量：均价与浮盈不进域模型（见 crate::domain::Position 的文档）——
@@ -433,17 +388,16 @@ pub struct WsOrderUpdate {
 pub struct WsBasicOrder {
     pub coin: String,
     pub side: String, // "A" (ask/sell) or "B" (bid/buy)
-    pub limit_px: String,
+    /// 剩余未成交量
     pub sz: String,
     pub oid: u64,
-    pub timestamp: u64,
     pub orig_sz: String,
     pub cloid: Option<String>,
 }
 
 impl WsOrderUpdate {
-    pub fn to_order_update(&self) -> Result<crate::domain::OrderUpdate, String> {
-        let symbol = from_hyperliquid(&self.order.coin);
+    /// `symbol` 由调用方经 [`HlMarkets::symbol_of`] 得到
+    pub fn to_order_update(&self, symbol: Symbol) -> Result<crate::domain::OrderUpdate, String> {
         let orig_sz = crate::domain::parse_decimal(&self.order.orig_sz)
             .map_err(|_| format!("Failed to parse orig_sz: {}", self.order.orig_sz))?;
         let current_sz = crate::domain::parse_decimal(&self.order.sz)
@@ -520,29 +474,17 @@ pub struct WsFill {
     #[serde(default)]
     pub cloid: Option<String>,
     pub fee: String,
-    pub closed_pnl: String,
+    /// 手续费币种（永续成交是 USDC；返佣、现货等另论）
+    pub fee_token: String,
     /// 强平信息对象——仅强平成交时存在 (HL userFills `liquidation` 字段)
     #[serde(default)]
     pub liquidation: Option<serde_json::Value>,
 }
 
 impl WsFill {
-    /// 品种目录外的成交：交易所原始写法原样上报（见 `AccountData::UnmappedFill`）
-    pub fn to_unmapped_fill(&self) -> Result<crate::messaging::UnmappedFill, String> {
-        Ok(crate::messaging::UnmappedFill {
-            exchange: Exchange::Hyperliquid,
-            instrument: self.coin.clone(),
-            side: parse_side(&self.side)?,
-            size: crate::domain::parse_decimal(&self.sz)
-                .map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?,
-            price: crate::domain::parse_decimal(&self.px)
-                .map_err(|_| format!("Failed to parse fill px: {}", self.px))?,
-            timestamp: self.time,
-        })
-    }
-
-    pub fn to_fill(&self) -> Result<Fill, String> {
-        let symbol = from_hyperliquid(&self.coin);
+    /// `symbol` 由调用方经 [`HlMarkets::symbol_of`] 得到；`quote` 是计价币（手续费必须以它计，
+    /// 否则 [`Fill::fee`] 的口径就不对了，报错）
+    pub fn to_fill(&self, symbol: Symbol, quote: &str) -> Result<Fill, String> {
         let price = crate::domain::parse_decimal(&self.px)
             .map_err(|_| format!("Failed to parse fill px: {}", self.px))?;
         let size = crate::domain::parse_decimal(&self.sz)
@@ -553,6 +495,12 @@ impl WsFill {
 
         let fee = f64::from_str(&self.fee)
             .map_err(|_| format!("Failed to parse fill fee: {}", self.fee))?;
+        if self.fee_token != quote {
+            return Err(format!(
+                "HL 成交手续费币种是 {}（计价币 {quote}），手续费口径对不上（订单 {}）",
+                self.fee_token, self.oid
+            ));
+        }
 
         // HL 强平成交带 `liquidation` 对象；HL 无独立 ADL 语义，故只区分 Liquidation
         let reason = if self.liquidation.is_some() {
@@ -657,7 +605,6 @@ mod clearinghouse_tests {
 
         assert_eq!(state.margin_summary.account_value, "24217.394304");
         assert_eq!(state.margin_summary.total_ntl_pos, "12100.48");
-        assert_eq!(state.withdrawable, "17832.00223");
         assert_eq!(state.asset_positions.len(), 1);
     }
 
@@ -681,10 +628,12 @@ mod clearinghouse_tests {
     #[test]
     fn short_position_keeps_negative_sign() {
         let state: ClearinghouseState = serde_json::from_str(REAL_CLEARINGHOUSE_STATE).unwrap();
-        let position = state.asset_positions[0].position.to_position().unwrap();
+        let position = state.asset_positions[0]
+            .position
+            .to_position("NVDA".into())
+            .unwrap();
 
         assert_eq!(position.exchange, Exchange::Hyperliquid);
-        // dex 前缀由 from_hyperliquid 剥掉，得到内部 symbol
         assert_eq!(position.symbol, "NVDA");
         assert_eq!(position.size, dec!(-56.0), "got {}", position.size);
     }
@@ -694,6 +643,11 @@ mod clearinghouse_tests {
 mod trade_tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    /// 品种目录：主站 BTC、xyz 的 NVDA
+    fn m() -> HlMarkets {
+        crate::exchange::hyperliquid::testkit::markets(&["", "xyz"])
+    }
 
     fn trade(side: &str, px: &str, sz: &str, time: u64, hash: &str, users: [&str; 2]) -> WsTrade {
         WsTrade {
@@ -721,7 +675,7 @@ mod trade_tests {
             "0xabc",
             ["0xbuyer", TAKER],
         );
-        let out = aggregate_trades(&[t]).expect("aggregate");
+        let out = aggregate_trades(&[t], &m()).expect("aggregate");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].exchange, Exchange::Hyperliquid);
         assert_eq!(out[0].symbol, "BTC");
@@ -737,21 +691,27 @@ mod trade_tests {
     fn trade_side_uses_b_a_encoding_only() {
         for (side, expect_buyer_maker) in [("B", false), ("A", true)] {
             let t = trade(side, "1.0", "1.0", 1, "0xabc", ["0xb", "0xs"]);
-            let out = aggregate_trades(&[t]).unwrap();
+            let out = aggregate_trades(&[t], &m()).unwrap();
             assert_eq!(out[0].is_buyer_maker, expect_buyer_maker, "side={side}");
         }
         for side in ["Buy", "Sell", "buy", "sell"] {
             let t = trade(side, "1.0", "1.0", 1, "0xabc", ["0xb", "0xs"]);
-            assert!(aggregate_trades(&[t]).is_err(), "side={side} 应被拒绝");
+            assert!(
+                aggregate_trades(&[t], &m()).is_err(),
+                "side={side} 应被拒绝"
+            );
         }
     }
 
-    /// dex 前缀应被剥离为 base symbol
+    /// coin 经品种目录换成内部 symbol（剥 dex 前缀）；目录外的 coin 报错
     #[test]
-    fn trade_strips_dex_prefix() {
+    fn trade_coin_maps_through_the_catalogue() {
         let mut t = trade("B", "1.0", "1.0", 1, "0xabc", ["0xb", "0xs"]);
         t.coin = "xyz:NVDA".to_string();
-        assert_eq!(aggregate_trades(&[t]).unwrap()[0].symbol, "NVDA");
+        assert_eq!(aggregate_trades(&[t], &m()).unwrap()[0].symbol, "NVDA");
+        let mut foreign = trade("B", "1.0", "1.0", 1, "0xabc", ["0xb", "0xs"]);
+        foreign.coin = "flx:NVDA".to_string();
+        assert!(aggregate_trades(&[foreign], &m()).is_err());
     }
 
     /// 同一主动单在同一价位的多笔撮合合并为一条（aggTrade 口径）
@@ -762,7 +722,7 @@ mod trade_tests {
             trade("A", "62508.0", "0.005", 100, "0xdeal", ["0xm2", TAKER]),
             trade("A", "62508.0", "0.003", 120, "0xdeal", ["0xm3", TAKER]),
         ];
-        let out = aggregate_trades(&trades).unwrap();
+        let out = aggregate_trades(&trades, &m()).unwrap();
         assert_eq!(out.len(), 1, "同单同价应合并为一条");
         assert_eq!(out[0].qty, dec!(0.010), "数量应求和, got {}", out[0].qty);
         assert_eq!(out[0].timestamp, 120, "时间取该组最后一笔");
@@ -775,7 +735,7 @@ mod trade_tests {
             trade("A", "62508.0", "0.002", 100, "0xdeal", ["0xm1", TAKER]),
             trade("A", "62506.0", "0.004", 100, "0xdeal", ["0xm2", TAKER]),
         ];
-        let out = aggregate_trades(&trades).unwrap();
+        let out = aggregate_trades(&trades, &m()).unwrap();
         assert_eq!(out.len(), 2);
         // 保持首次出现顺序 -> 回测确定性
         assert_eq!(out[0].price, dec!(62508.0));
@@ -791,7 +751,7 @@ mod trade_tests {
             // 同价位但不同主动方 -> 不能合并
             trade("A", "62503.0", "0.004", 100, ZERO_HASH, ["0xm3", "0xother"]),
         ];
-        let out = aggregate_trades(&trades).unwrap();
+        let out = aggregate_trades(&trades, &m()).unwrap();
         assert_eq!(out.len(), 2, "不同主动方不得合并");
         assert_eq!(out[0].qty, dec!(0.003));
         assert_eq!(out[1].qty, dec!(0.004));
@@ -804,7 +764,7 @@ mod trade_tests {
             trade("B", "62503.0", "0.001", 100, ZERO_HASH, [TAKER, "0xm1"]),
             trade("A", "62503.0", "0.002", 100, ZERO_HASH, ["0xm2", TAKER]),
         ];
-        assert_eq!(aggregate_trades(&trades).unwrap().len(), 2);
+        assert_eq!(aggregate_trades(&trades, &m()).unwrap().len(), 2);
     }
 
     /// 缺 users 字段时不按地址归集，但仍按 hash 归集（不 panic、不误合并）
@@ -814,7 +774,7 @@ mod trade_tests {
         let mut b = trade("A", "1.0", "2.0", 1, "0xdeal", ["0xb", "0xs"]);
         a.users = None;
         b.users = None;
-        let out = aggregate_trades(&[a, b]).unwrap();
+        let out = aggregate_trades(&[a, b], &m()).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].qty, dec!(3.0));
     }
@@ -831,15 +791,15 @@ mod bbo_tests {
     fn one_sided_book_is_skipped_not_fatal() {
         let raw = r#"{"coin":"ETH","time":1,"bbo":[null,{"px":"100.0","sz":"1.0","n":1}]}"#;
         let d: WsBbo = serde_json::from_str(raw).unwrap();
-        assert!(d.to_bbo().expect("不是错误").is_none());
+        assert!(d.to_bbo("ETH".into()).expect("不是错误").is_none());
 
         let raw = r#"{"coin":"ETH","time":1,"bbo":[{"px":"99.0","sz":"1.0","n":1},null]}"#;
         let d: WsBbo = serde_json::from_str(raw).unwrap();
-        assert!(d.to_bbo().expect("不是错误").is_none());
+        assert!(d.to_bbo("ETH".into()).expect("不是错误").is_none());
 
         let raw = r#"{"coin":"ETH","time":1,"bbo":[{"px":"99.0","sz":"1.0","n":1},{"px":"100.0","sz":"1.0","n":1}]}"#;
         let d: WsBbo = serde_json::from_str(raw).unwrap();
-        let bbo = d.to_bbo().expect("不是错误").expect("双边盘口");
+        let bbo = d.to_bbo("ETH".into()).expect("不是错误").expect("双边盘口");
         assert_eq!(bbo.bid_price, dec!(99.0));
         assert_eq!(bbo.ask_price, dec!(100.0));
     }

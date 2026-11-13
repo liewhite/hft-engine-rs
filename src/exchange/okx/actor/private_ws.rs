@@ -367,26 +367,14 @@ fn parse_private_message(
             let mut events = Vec::new();
             for data in &push.data {
                 // 私有流订阅的是 `instType=SWAP` 全账户推送，别的计价币、币本位合约的单也会
-                // 推过来。映射不到本引擎 symbol（或无 meta、无法折算张数）的：订单状态不关心，
-                // 成交以 UnmappedFill 原样上报，不进任何 symbol 的持仓 —— 绝不能按张数下发
-                // 或当成同名的 USDT 合约。市场元数据加载的是该计价币的全部永续，故「映射得到却无
-                // meta」只剩字段异常被剔除的合约（加载处已 error 留痕）。
-                let new_fill = last_trades.is_new_fill(data);
+                // 推过来。映射不到本引擎 symbol（或无 meta、无法折算张数）的整条丢弃（#760：目录外
+                // 成交不理），不进任何 symbol 的持仓 —— 绝不能按张数下发或当成同名的 USDT 合约。
+                // 市场元数据加载的是该计价币的全部永续，故「映射得到却无 meta」只剩字段异常被剔除的
+                // 合约（加载处已 error 留痕）。
                 let Some(meta) = resolve_meta(&data.inst_id, quote, symbol_metas) else {
-                    if let Some(f) = data
-                        .to_unmapped_fill()
-                        .map_err(WsError::ParseError)?
-                        .filter(|_| new_fill)
-                    {
-                        events.push(AccountEvent {
-                            account: crate::domain::AccountId::Live,
-                            exchange_ts: local_ts,
-                            local_ts,
-                            data: AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)),
-                        });
-                    }
                     continue;
                 };
+                let new_fill = last_trades.is_new_fill(data);
                 // 数量折算由签名强制完成（含 status 内嵌的 PartiallyFilled）
                 let order_update = data.to_order_update(meta)?;
 
@@ -470,9 +458,6 @@ mod tests {
                 AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
                     format!("order:{}", u.symbol)
                 }
-                AccountData::Exchange(ExchangeAccountData::UnmappedFill(f)) => {
-                    format!("unmapped:{}:{}", f.instrument, f.size)
-                }
                 other => format!("{other:?}"),
             })
             .collect()
@@ -504,23 +489,15 @@ mod tests {
             .contains("60018"));
     }
 
-    /// 同名不同计价币 / 币本位的成交不串进 BTC：原样以 UnmappedFill 上报（张数不折算）
+    /// 同名不同计价币 / 币本位的推送不串进 BTC：整条丢弃
     #[test]
-    fn other_quote_and_inverse_fills_do_not_leak_into_btc() {
+    fn other_quote_and_inverse_pushes_do_not_leak_into_btc() {
         assert_eq!(
             kinds(&order_push("BTC-USDT-SWAP", "3")),
             ["fill:BTC:0.03", "order:BTC"]
         );
-        assert_eq!(
-            kinds(&order_push("BTC-USDC-SWAP", "3")),
-            ["unmapped:BTC-USDC-SWAP:3"]
-        );
-        assert_eq!(
-            kinds(&order_push("BTC-USD-SWAP", "3")),
-            ["unmapped:BTC-USD-SWAP:3"]
-        );
-        // 无成交的订单状态：不关心
-        assert!(kinds(&order_push("BTC-USDC-SWAP", "0")).is_empty());
+        assert!(kinds(&order_push("BTC-USDC-SWAP", "3")).is_empty());
+        assert!(kinds(&order_push("BTC-USD-SWAP", "3")).is_empty());
     }
 
     /// 同一笔成交（同一 tradeId）在后续推送里重复出现只计一次；新的 tradeId 照计
@@ -546,13 +523,13 @@ mod tests {
             ["order:BTC"]
         );
         assert!(seen.0.is_empty(), "结束的单不留记录");
-        // 品种目录外的合约同样去重
-        let other = "BTC-USDC-SWAP";
-        assert_eq!(
-            kinds_with(&push(other, "partially_filled", "3", "20"), &mut seen),
-            ["unmapped:BTC-USDC-SWAP:3"]
-        );
-        assert!(kinds_with(&push(other, "canceled", "3", "20"), &mut seen).is_empty());
+        // 品种目录外的合约不进去重表
+        assert!(kinds_with(
+            &push("BTC-USDC-SWAP", "partially_filled", "3", "20"),
+            &mut seen
+        )
+        .is_empty());
+        assert!(seen.0.is_empty());
     }
 
     /// 不认识的订单状态按解析失败处理（不当成拒单终态）

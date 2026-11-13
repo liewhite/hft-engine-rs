@@ -3,7 +3,6 @@
 use super::markets::{
     dex_of_coin, dex_offset, hl_price_rule, perp_dex_names, DexUniverse, HlAsset, HlMarkets,
 };
-use super::symbol::from_hyperliquid;
 use crate::domain::{
     AccountInfo, Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, PlaceError,
     Position, Side, Symbol, SymbolMeta, Timestamp,
@@ -191,6 +190,11 @@ impl HyperliquidClient {
     /// 已接入 dex 的品种目录（适配层内的 WS actor 共用同一份）
     pub(crate) fn markets(&self) -> &Arc<HlMarkets> {
         &self.markets
+    }
+
+    /// 计价币（各已接入 dex 的保证金币种，`connect` 时校验过）
+    pub(crate) fn quote(&self) -> &str {
+        &self.quote
     }
 
     /// 查询地址（主钱包）。没配凭证时为 None
@@ -492,7 +496,7 @@ fn parse_num(field: &str, v: &str) -> Result<f64, ExchangeError> {
 /// - 某 dex 响应非空、却没有一个仓位属于它 —— coin 前缀口径变了的征兆，报错而不是返回空：
 ///   本函数是持仓基线的唯一来源，静默返回空会让基线变成全零、此后由 Fill 累加永不纠正；
 /// - 不在品种目录里的仓位（如人工开的逐仓股票）不返回：它们映射不到内部 symbol，本引擎
-///   不交易它们（与 Fill 流同一判据 [`HlMarkets::owns`]）。
+///   不交易它们（与 Fill 流同一判据 [`HlMarkets::symbol_of`]）。
 pub(crate) fn positions_from_states(
     markets: &HlMarkets,
     states: &[(String, ClearinghouseState)],
@@ -509,13 +513,13 @@ pub(crate) fn positions_from_states(
             )));
         }
         for w in mine {
-            if !markets.owns(&w.position.coin) {
+            let Some(symbol) = markets.symbol_of(&w.position.coin) else {
                 tracing::debug!(coin = %w.position.coin, "HL 持仓不在品种目录里，不返回");
                 continue;
-            }
+            };
             positions.push(
                 w.position
-                    .to_position()
+                    .to_position(symbol)
                     .map_err(ExchangeError::ParseError)?,
             );
         }
@@ -798,9 +802,9 @@ fn parse_user_funding(
         }
         // 账户级接口返回所有 dex 的记录，只留品种目录里的（与 Fill 流同一判据），
         // 否则别的 dex 的同名标的会被剥掉前缀算进来
-        if !markets.owns(&e.delta.coin) {
+        let Some(symbol) = markets.symbol_of(&e.delta.coin) else {
             continue;
-        }
+        };
         let amount: f64 = e.delta.usdc.trim().parse().map_err(|_| {
             ExchangeError::Other(format!(
                 "Failed to parse Hyperliquid funding usdc '{}' for {}",
@@ -809,7 +813,7 @@ fn parse_user_funding(
         })?;
         result.push(FundingFee {
             exchange: Exchange::Hyperliquid,
-            symbol: from_hyperliquid(&e.delta.coin),
+            symbol,
             asset: quote.to_string(),
             amount,
             timestamp: e.time,

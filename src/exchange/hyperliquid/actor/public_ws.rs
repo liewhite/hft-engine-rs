@@ -191,8 +191,13 @@ impl HyperliquidPublicWs {
 
     /// 解析并处理消息
     fn handle_message(&self, raw: &str) -> anyhow::Result<()> {
-        let events = parse_public_message(raw, now_ms(), &self.book.subscribed_kinds)
-            .with_context(|| format!("Hyperliquid 公共 WS 解析失败: {raw}"))?;
+        let events = parse_public_message(
+            raw,
+            now_ms(),
+            &self.book.markets,
+            &self.book.subscribed_kinds,
+        )
+        .with_context(|| format!("Hyperliquid 公共 WS 解析失败: {raw}"))?;
         for event in events {
             if self.book.is_trade_backfill(&event) {
                 continue;
@@ -318,8 +323,15 @@ impl Task for HyperliquidPublicWs {
 pub(crate) fn parse_public_message(
     raw: &str,
     local_ts: u64,
+    markets: &HlMarkets,
     subscribed_kinds: &HashSet<SubscriptionKind>,
 ) -> Result<Vec<MarketEvent>, WsError> {
+    // 公共流只订阅品种目录里的 coin：推来目录外的说明订阅记账出了错，按解析失败处理
+    let symbol_of = |coin: &str| {
+        markets
+            .symbol_of(coin)
+            .ok_or_else(|| WsError::ParseError(format!("HL 公共流推来品种目录外的 coin: {coin}")))
+    };
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| WsError::ParseError(e.to_string()))?;
 
@@ -354,7 +366,7 @@ pub(crate) fn parse_public_message(
                 let ctx: WsActiveAssetCtx = serde_json::from_value(data.clone())
                     .map_err(|e| WsError::ParseError(format!("activeAssetCtx parse: {}", e)))?;
 
-                let symbol = ctx.symbol();
+                let symbol = symbol_of(&ctx.coin)?;
                 let mut events = Vec::new();
 
                 // 根据订阅的 kinds 生成对应的事件
@@ -364,7 +376,9 @@ pub(crate) fn parse_public_message(
                     events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: MarketData::FundingRate(ctx.to_funding_rate(local_ts)?),
+                        data: MarketData::FundingRate(
+                            ctx.to_funding_rate(symbol.clone(), local_ts)?,
+                        ),
                     });
                 }
                 if subscribed_kinds.contains(&SubscriptionKind::MarkPrice {
@@ -373,14 +387,16 @@ pub(crate) fn parse_public_message(
                     events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: MarketData::MarkPrice(ctx.to_mark_price(local_ts)?),
+                        data: MarketData::MarkPrice(ctx.to_mark_price(symbol.clone(), local_ts)?),
                     });
                 }
-                if subscribed_kinds.contains(&SubscriptionKind::IndexPrice { symbol }) {
+                if subscribed_kinds.contains(&SubscriptionKind::IndexPrice {
+                    symbol: symbol.clone(),
+                }) {
                     events.push(MarketEvent {
                         exchange_ts: local_ts,
                         local_ts,
-                        data: MarketData::IndexPrice(ctx.to_index_price(local_ts)?),
+                        data: MarketData::IndexPrice(ctx.to_index_price(symbol, local_ts)?),
                     });
                 }
 
@@ -393,7 +409,7 @@ pub(crate) fn parse_public_message(
                     .map_err(|e| WsError::ParseError(format!("bbo parse: {}", e)))?;
 
                 // Ok(None) = 单边盘口（稀薄品种的合法状态），跳过即可
-                let Some(bbo) = bbo_data.to_bbo()? else {
+                let Some(bbo) = bbo_data.to_bbo(symbol_of(&bbo_data.coin)?)? else {
                     tracing::debug!(coin = %bbo_data.coin, "Hyperliquid 单边盘口，跳过该条 BBO");
                     return Ok(Vec::new());
                 };
@@ -409,7 +425,7 @@ pub(crate) fn parse_public_message(
                     .map_err(|e| WsError::ParseError(format!("trades parse: {}", e)))?;
 
                 // 归集为 aggTrade 口径（HL 线路逐笔，Binance/OKX 下发的已是归集结果）
-                let events = aggregate_trades(&trades)?
+                let events = aggregate_trades(&trades, markets)?
                     .into_iter()
                     .map(|trade| MarketEvent {
                         exchange_ts: trade.timestamp,

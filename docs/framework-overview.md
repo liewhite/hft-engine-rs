@@ -190,7 +190,7 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 
 `AccountData` 按定位精度在类型上分两档（#696）：
 - `Symbol(SymbolAccountData)`：`OrderUpdate` / `Fill` / `FundingFee`
-- `Exchange(ExchangeAccountData)`：`Balance` / `Greeks` / `AccountInfo` / `UnmappedFill`
+- `Exchange(ExchangeAccountData)`：`Balance` / `Greeks` / `AccountInfo` / `PositionValues`（品种目录外的成交适配层直接丢弃，不上报）
 
 状态层按档分派、不带默认分支；`SymbolState` 只收币级。新增账户事件先选档，漏处理编译不过。
 

@@ -896,30 +896,6 @@ fn thin_book_does_not_place_new_makers() {
     assert!(placed(&s.funding(HL, 0.1)).is_empty());
 }
 
-#[test]
-fn unmapped_fill_is_ignored() {
-    // 账户在品种目录外的成交（如 HL 别的市场、现货）：不检测、照常交易（#760 用户定）
-    let mut s = Sim::new(dec!(0.0), dec!(0.0));
-    let now = s.now;
-    s.ev(IncomeEvent::account(
-        AccountId::Live,
-        now,
-        now,
-        AccountData::Exchange(ExchangeAccountData::UnmappedFill(
-            hft_engine_rs::messaging::UnmappedFill {
-                exchange: HL,
-                instrument: "flx:TSLA".into(),
-                side: Side::Long,
-                size: dec!(1),
-                price: dec!(100),
-                timestamp: now,
-            },
-        )),
-    ));
-    s.funding(BN, 0.8);
-    assert_eq!(placed(&s.funding(HL, 0.1)).len(), 2, "目录外成交后照常开仓");
-}
-
 // ---------------------------------------------------------------- 交易所最小下单金额（#696）
 
 #[test]
