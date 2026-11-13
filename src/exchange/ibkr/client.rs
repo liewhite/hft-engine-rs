@@ -398,8 +398,9 @@ impl AccountClient for IbkrClient {
             order_id
         );
 
-        let (req, admitted) = action_request(&*self.auth, &self.http, "DELETE", &url)
-            .map_err(|e| ExchangeError::Other(format!("IBKR cancel: {e}")))?;
+        let (req, admitted) = action_request(&*self.auth, &self.http, "DELETE", &url, |e| {
+            ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string())
+        })?;
         let resp = crate::net::send(req, admitted)
             .await
             .map_err(Self::map_reqwest_error)?;
@@ -634,7 +635,7 @@ impl AccountClient for IbkrClient {
 
         let body = serde_json::json!({ "orders": [order_body] });
 
-        let (req, admitted) = action_request(&*self.auth, &self.http, "POST", &url)?;
+        let (req, admitted) = action_request(&*self.auth, &self.http, "POST", &url, PlaceError::unsent)?;
         let resp = crate::net::send(req.json(&body), admitted)
             .await
             .map_err(|e| place_send_error(Exchange::IBKR, e))?;

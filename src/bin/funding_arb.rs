@@ -116,11 +116,12 @@ async fn run() -> anyhow::Result<()> {
         tracing::info!(requests = requests.len(), gap_ms = gap.as_millis() as u64, "资金费轮询器启动");
         let mut poller = FundingPoller { requests, next: 0, failures: HashMap::new(), manager: manager.clone() };
         manager.observers().spawn_fn("FundingPoller", move |scope| async move {
-            // 第一轮（含重启后）背靠背拉齐，之后每 gap 拉一项：否则重启后要等一整轮（默认几分钟）
-            // 才拿齐各币各所的数据，这段时间策略只平不开。第一轮多快由各所适配层的限流决定，这里不管。
+            // 第一轮（含重启后）每 WARMUP_GAP 拉一项尽快拉齐，之后每 gap 拉一项：否则重启后要等一整轮
+            // （默认几分钟）才拿齐各币各所的数据，这段时间策略只平不开。第一轮不背靠背连发：各所查询
+            // 额度和持仓对账、净值轮询共用，一口气占满会让对账排队过久、触发停摆退出。
             let mut warmup_left = poller.requests.len();
             loop {
-                let wait = if warmup_left > 0 { Duration::ZERO } else { gap };
+                let wait = if warmup_left > 0 { gap.min(WARMUP_GAP) } else { gap };
                 tokio::select! {
                     // 停止优先；拉取本身只读，停机时中途放弃无害
                     biased;
@@ -140,7 +141,10 @@ async fn run() -> anyhow::Result<()> {
     .await
 }
 
-/// 资金费轮询器：第一轮背靠背拉齐，之后每个单项间隔（= 一整轮 `funding_poll_secs` / 项数）拉一项
+/// 第一轮拉取的单项间隔：不突发（理由见轮询循环）
+const WARMUP_GAP: Duration = Duration::from_secs(1);
+
+/// 资金费轮询器：第一轮每 [`WARMUP_GAP`] 一项尽快拉齐，之后每个单项间隔（= 一整轮 `funding_poll_secs` / 项数）拉一项
 /// （一个币在一个所过去 24h 的已结算费率），整窗作为自定义事件投递给对应策略。请求均匀摊在一轮里；
 /// 各所的限频由适配层的限流器管，这里不按各所限额算间隔。
 /// 一次只拉一项；请求慢（断网时每项要等到超时）时下一项顺延，恢复后不连发补拍。

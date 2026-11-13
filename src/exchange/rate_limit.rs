@@ -15,8 +15,9 @@
 //!   [`ExchangeError::RateLimited`]（撤单），上层按已有的拒单退避 / 撤单重试处理。
 //!
 //! 计数用滑动窗口：任意一段 `window` 长的时间内花掉的不超过上限。交易所按固定窗口（如每个
-//! 自然分钟）计时，滑动窗口内的量总不小于任一同长固定窗口内的量，所以本地放行的交易所也会放行
-//! （只差网络延迟的抖动，各所额度数字自己留余量）。
+//! 自然分钟）计时，滑动窗口内的量总不小于任一同长固定窗口内的量，所以本地放行的交易所也会放行。
+//! 各所额度照官方原值写，网络延迟抖动可能让交易所那边偶尔略超、回限频错误：下单按被拒走拒单退避，
+//! 查询下一轮再来，不另加处理。
 //!
 //! 带签名的请求要先取额度再签名：查询可能排队，签名里的时间戳等久了会过期被拒。
 //!
@@ -31,10 +32,10 @@ use tokio::time::Instant;
 /// 查询最多用到每个额度的百分之几（余下留给下单撤单，见模块文档；至少 1）
 pub(crate) const QUERY_SHARE_PCT: u32 = 80;
 
-/// 一项限额：任意 `window` 时长内最多花 `cap`。由各所适配层声明成 `static`。
+/// 一项限额：任意 `window` 时长内最多花 `cap`。由各所适配层声明成 `static`（计数按它的地址区分）。
 #[derive(Debug)]
 pub(crate) struct Quota {
-    /// 日志里的名字，同一所内唯一（也是计数的键）
+    /// 日志里的名字
     name: &'static str,
     cap: u32,
     window: Duration,
@@ -53,6 +54,11 @@ impl Quota {
     /// 在这项额度的 `scope` 分项上花 `cost`（每个分项各自计数，如 OKX 下单按品种分开计）
     pub(crate) fn cost_in<'a>(&'static self, scope: &'a str, cost: u32) -> Use<'a> {
         Use { quota: self, scope, cost }
+    }
+
+    /// 计数的键：额度的地址（各所的额度都是 `static`，地址唯一，不靠名字不重复）
+    fn key(&'static self) -> usize {
+        self as *const Self as usize
     }
 
     fn limit(&self, kind: Kind) -> u32 {
@@ -144,7 +150,8 @@ impl Window {
 #[derive(Debug)]
 pub(crate) struct RateLimiter {
     exchange: Exchange,
-    windows: Mutex<HashMap<(&'static str, String), Window>>,
+    /// 键：(额度的地址, 分项)
+    windows: Mutex<HashMap<(usize, String), Window>>,
 }
 
 impl RateLimiter {
@@ -152,17 +159,14 @@ impl RateLimiter {
         Self { exchange, windows: Mutex::new(HashMap::new()) }
     }
 
-    /// 查询取额度：没有就等。单次花费超过查询可用的上限（各所把花费写错了）永远等不到，报错。
+    /// 查询取额度：没有就等（最长一个窗口）。
     pub(crate) async fn query(&self, uses: &[Use<'_>]) -> Result<Admitted, ExchangeError> {
         loop {
-            let ready_at = match self.take(Instant::now(), uses, Kind::Query) {
+            let (ready_at, quota) = match self.take(Instant::now(), uses, Kind::Query) {
                 Ok(admitted) => return Ok(admitted),
-                Err(Blocked::Never(msg)) => return Err(ExchangeError::Other(msg)),
-                Err(Blocked::Until(at, quota)) => {
-                    tracing::debug!(exchange = %self.exchange, quota, wait_ms = at.duration_since(Instant::now()).as_millis() as u64, "查询等限频额度");
-                    at
-                }
+                Err(blocked) => blocked,
             };
+            tracing::debug!(exchange = %self.exchange, quota, wait_ms = ready_at.duration_since(Instant::now()).as_millis() as u64, "查询等限频额度");
             tokio::time::sleep_until(ready_at).await;
         }
     }
@@ -170,13 +174,10 @@ impl RateLimiter {
     /// 交易动作（下单、撤单）取额度：没有就当场拒绝，不排队。
     pub(crate) fn action(&self, uses: &[Use<'_>]) -> Result<Admitted, Throttled> {
         let now = Instant::now();
-        self.take(now, uses, Kind::Action).map_err(|blocked| match blocked {
-            Blocked::Until(at, quota) => Throttled {
-                exchange: self.exchange,
-                quota: quota.to_string(),
-                retry_after: at.duration_since(now),
-            },
-            Blocked::Never(msg) => Throttled { exchange: self.exchange, quota: msg, retry_after: Duration::MAX },
+        self.take(now, uses, Kind::Action).map_err(|(at, quota)| Throttled {
+            exchange: self.exchange,
+            quota: quota.to_string(),
+            retry_after: at.duration_since(now),
         })
     }
 
@@ -186,19 +187,20 @@ impl RateLimiter {
         let now = Instant::now();
         let mut windows = self.windows.lock().expect("限频表锁被毒化");
         for u in uses.iter().filter(|u| u.cost > 0) {
-            let w = windows.entry((u.quota.name, u.scope.to_string())).or_default();
+            let w = windows.entry((u.quota.key(), u.scope.to_string())).or_default();
             w.prune(now, u.quota.window);
             w.spent.push_back((now, u.cost));
             w.total += u.cost;
         }
     }
 
-    /// 各项都够才一起扣；任一项不够就都不扣，返回最晚恢复的那项
-    fn take(&self, now: Instant, uses: &[Use<'_>], kind: Kind) -> Result<Admitted, Blocked> {
+    /// 各项都够才一起扣；任一项不够就都不扣，返回最晚恢复的时刻和那项的名字。
+    /// 单次花费超过上限（永远够不着）是各所把花费常量写错了：当场 panic，不伪装成限流。
+    fn take(&self, now: Instant, uses: &[Use<'_>], kind: Kind) -> Result<Admitted, (Instant, &'static str)> {
         // 同一请求在同一项（同一分项）上的几笔花费合起来算
         let mut need: Vec<(&'static Quota, &str, u32)> = Vec::with_capacity(uses.len());
         for u in uses.iter().filter(|u| u.cost > 0) {
-            match need.iter_mut().find(|(q, s, _)| q.name == u.quota.name && *s == u.scope) {
+            match need.iter_mut().find(|(q, s, _)| q.key() == u.quota.key() && *s == u.scope) {
                 Some((_, _, c)) => *c += u.cost,
                 None => need.push((u.quota, u.scope, u.cost)),
             }
@@ -207,13 +209,13 @@ impl RateLimiter {
         let mut blocked: Option<(Instant, &'static str)> = None;
         for &(quota, scope, cost) in &need {
             let limit = quota.limit(kind);
-            if cost > limit {
-                return Err(Blocked::Never(format!(
-                    "{} 单次花费 {cost} 超过 {} 的上限 {limit}，永远发不出去（适配层花费写错了）",
-                    self.exchange, quota.name
-                )));
-            }
-            let w = windows.entry((quota.name, scope.to_string())).or_default();
+            assert!(
+                cost <= limit,
+                "{} 单次花费 {cost} 超过 {} 的上限 {limit}，永远发不出去（适配层花费写错了）",
+                self.exchange,
+                quota.name
+            );
+            let w = windows.entry((quota.key(), scope.to_string())).or_default();
             w.prune(now, quota.window);
             if let Some(at) = w.ready_at(cost, limit, quota.window) {
                 if blocked.is_none_or(|(b, _)| at > b) {
@@ -221,23 +223,16 @@ impl RateLimiter {
                 }
             }
         }
-        if let Some((at, quota)) = blocked {
-            return Err(Blocked::Until(at, quota));
+        if let Some(blocked) = blocked {
+            return Err(blocked);
         }
         for &(quota, scope, cost) in &need {
-            let w = windows.get_mut(&(quota.name, scope.to_string())).expect("上面已建");
+            let w = windows.get_mut(&(quota.key(), scope.to_string())).expect("上面已建");
             w.spent.push_back((now, cost));
             w.total += cost;
         }
         Ok(Admitted(()))
     }
-}
-
-enum Blocked {
-    /// 到这个时刻才够（最晚恢复的那项额度的名字）
-    Until(Instant, &'static str),
-    /// 单次花费超过上限，永远不够
-    Never(String),
 }
 
 #[cfg(test)]
@@ -310,16 +305,31 @@ mod tests {
         let _ = l.action(&[ORDERS.cost_in("ETH", 2)]).unwrap();
     }
 
-    /// 补记的花费让后面的查询多等；单次超上限当场报错，不会永远等
+    /// 补记的花费让后面的查询多等
     #[tokio::test(start_paused = true)]
-    async fn record_delays_later_queries_and_oversized_cost_errors() {
+    async fn record_delays_later_queries() {
         let l = limiter();
         l.record(&[IP.cost(12)]);
         let start = Instant::now();
         let _ = l.query(&[IP.cost(1)]).await.unwrap();
         assert_eq!(Instant::now() - start, SEC);
-        assert!(l.query(&[IP.cost(9)]).await.is_err());
-        assert_eq!(l.action(&[IP.cost(11)]).unwrap_err().retry_after, Duration::MAX);
+    }
+
+    /// 单次花费超上限是花费常量写错了：当场 panic，不伪装成限流
+    #[test]
+    #[should_panic(expected = "永远发不出去")]
+    fn oversized_cost_panics() {
+        let _ = limiter().action(&[IP.cost(11)]);
+    }
+
+    /// 同名的两项额度各自计数（按地址区分）
+    #[test]
+    fn same_name_quotas_count_separately() {
+        static A: Quota = Quota::new("X", 1, SEC);
+        static B: Quota = Quota::new("X", 1, SEC);
+        let l = limiter();
+        let _ = l.action(&[A.cost(1)]).unwrap();
+        let _ = l.action(&[B.cost(1)]).unwrap();
     }
 
     /// 上限只有 1 的额度查询也能用（分不出余量），用过之后等满一个窗口

@@ -72,7 +72,7 @@ pub(crate) async fn send(
     request.send().await
 }
 
-/// 发一个不受交易所限频约束的请求：只给 Pushgateway、告警、回测数据下载这类非交易所接口用。
+/// 发一个不受交易所限频约束的请求：只给 Pushgateway、告警这类非交易所接口用。
 #[allow(clippy::disallowed_methods)] // 唯一放行处，见 [`send`]
 pub async fn send_unmetered(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
     request.send().await

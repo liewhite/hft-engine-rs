@@ -3,9 +3,8 @@
 //! OAuth 和 Gateway 两种模式共享同一套业务逻辑（REST + WS），
 //! 仅在认证方式、URL、TLS 配置上有差异。
 
-use crate::domain::PlaceError;
 use crate::exchange::ibkr::{request_costs, LIMITER};
-use crate::exchange::rate_limit::Admitted;
+use crate::exchange::rate_limit::{Admitted, Throttled};
 
 /// 查询：先按地址取限频额度（没有就排队），再签名（签名带时间戳，等久了会过期）
 pub(crate) async fn query_request(
@@ -18,15 +17,16 @@ pub(crate) async fn query_request(
     Ok((auth.authed_request(http, method, url)?, admitted))
 }
 
-/// 交易动作（下单、撤单）：先取限频额度（没有就拒绝），再签名
-pub(crate) fn action_request(
+/// 交易动作（下单、撤单）：先取限频额度（没有就拒绝，限流按调用方自己的错误类型转换），再签名
+pub(crate) fn action_request<E: From<Throttled>>(
     auth: &dyn IbkrAuth,
     http: &reqwest::Client,
     method: &str,
     url: &str,
-) -> Result<(reqwest::RequestBuilder, Admitted), PlaceError> {
+    sign_error: impl FnOnce(anyhow::Error) -> E,
+) -> Result<(reqwest::RequestBuilder, Admitted), E> {
     let admitted = LIMITER.action(&request_costs(method, url))?;
-    let req = auth.authed_request(http, method, url).map_err(PlaceError::unsent)?;
+    let req = auth.authed_request(http, method, url).map_err(sign_error)?;
     Ok((req, admitted))
 }
 

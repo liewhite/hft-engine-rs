@@ -21,7 +21,7 @@ use super::{outlet_for, to_live_outlet, AccountOutcome, OutcomeBus, Outlet};
 // ============================================================================
 
 /// 实盘网关发往各所的下单 / 撤单 REST 请求累计次数（本进程启动以来）。网关是唯一写入方，
-/// 指标出口只读（推成 `hft_order_requests`，看各所下单、撤单用了多少次）。
+/// 指标出口只读（推成 `hft_order_requests`，看各所下单、撤单用了多少次；含被本地限流拒掉、没发出去的）。
 #[derive(Debug, Default)]
 pub struct OrderRequestCounts(std::sync::Mutex<HashMap<(Exchange, RequestKind), u64>>);
 
