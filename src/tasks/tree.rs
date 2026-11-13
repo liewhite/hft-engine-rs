@@ -21,6 +21,7 @@
 //! 中间层等子任务只告警、不放弃：中间层超时放弃会逐层叠加成提前返回，正在收尾的子孙被
 //! runtime drop 砍断。总期限由根的调用方设（见 `crate::engine::bootstrap`）。
 
+use super::{Addr, Inbox};
 use futures_util::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -400,6 +401,40 @@ impl Group {
         }
     }
 
+    /// 起一个有收件箱的组件，等它构造完成，返回句柄和它的地址。几乎每个"父节点要给子节点发
+    /// 消息"的地方都要这一步（交易所节点、WS 子任务、executor、各处理器），不收拢的话每处都要
+    /// 自己拿 oneshot 把地址从构造闭包里带出来。
+    ///
+    /// `build` 拿到子任务的 [`Scope`] 和收件箱（在里面订阅总线、起孙任务），返回组件本身。
+    /// 失败语义同 [`Group::spawn`]。
+    pub async fn spawn_addressed<M, T, B, Fut>(
+        &self,
+        name: impl Into<String>,
+        build: B,
+    ) -> anyhow::Result<(ChildHandle, Addr<M>)>
+    where
+        M: Send + 'static,
+        T: Task,
+        B: FnOnce(Scope, Inbox<M>) -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
+    {
+        let name = name.into();
+        let (addr_tx, addr_rx) = oneshot::channel();
+        let handle = self
+            .spawn(name.clone(), move |scope| async move {
+                let (addr, inbox) = scope.inbox::<M>();
+                // 接收端在本函数里等着，构造成功前不会被丢弃
+                let _ = addr_tx.send(addr);
+                build(scope, inbox).await
+            })
+            .await?;
+        // 构造成功说明闭包已跑过上面的 send
+        let addr = addr_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("{name} 构造成功却没有交出地址（不该发生）"))?;
+        Ok((handle, addr))
+    }
+
     /// 起一个只有一段主循环、没有收尾的子任务。`f` 拿到子任务的 [`Scope`]，返回的 future
     /// 就是它的 `run`（规则同 [`Task::run`]）。不等待（没有构造阶段，分组也不能声明）。
     pub fn spawn_fn<F, Fut>(
@@ -616,15 +651,17 @@ fn first_error<const N: usize>(
 async fn catch<R>(fut: impl Future<Output = anyhow::Result<R>>) -> anyhow::Result<R> {
     match AssertUnwindSafe(fut).catch_unwind().await {
         Ok(r) => r,
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "（非文本 panic）".to_string());
-            Err(anyhow::anyhow!("panic: {msg}"))
-        }
+        Err(payload) => Err(anyhow::anyhow!("panic: {}", panic_text(&*payload))),
     }
+}
+
+/// panic 载荷里的文字（`panic!` 的两种载荷：字面量 `&str` 与格式化出的 `String`）
+pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "（非文本 panic）".to_string())
 }
 
 /// [`Group::spawn_fn`] 的适配：一段 future 当 `run`
@@ -1124,5 +1161,47 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), h.done.cancelled())
             .await
             .expect("子任务应收到停止信号");
+    }
+
+    /// 地址在构造完成时交到调用方手里，消息送达
+    #[tokio::test]
+    async fn spawn_addressed_hands_back_the_address() {
+        struct Echo(Inbox<oneshot::Sender<u32>>);
+        impl Task for Echo {
+            async fn run(&mut self, _: &Scope) -> anyhow::Result<()> {
+                while let Some(reply) = self.0.recv().await {
+                    let _ = reply.send(42);
+                }
+                Ok(())
+            }
+        }
+        let root = Root::new("t");
+        let (_h, addr) = root
+            .group("g")
+            .spawn_addressed("echo", |_scope, inbox| async move { Ok(Echo(inbox)) })
+            .await
+            .unwrap();
+        assert_eq!(addr.ask(|tx| tx).await.unwrap(), 42);
+        root.shutdown().await.unwrap();
+    }
+
+    /// 构造失败照常返回 Err
+    #[tokio::test]
+    async fn spawn_addressed_build_failure_is_an_error() {
+        struct Never;
+        impl Task for Never {
+            async fn run(&mut self, _: &Scope) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let root = Root::new("t");
+        let r = root
+            .group("g")
+            .spawn_addressed::<u32, Never, _, _>("bad", |_s, _i| async move {
+                anyhow::bail!("连不上")
+            })
+            .await;
+        assert!(format!("{:#}", r.unwrap_err()).contains("连不上"));
+        assert!(root.shutdown().await.is_err());
     }
 }
