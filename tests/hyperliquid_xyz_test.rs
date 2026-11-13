@@ -17,7 +17,6 @@ use rust_decimal_macros::dec;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
 use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder};
-use reqwest::Client;
 use serde::Deserialize;
 
 /// 测试交易对 (XYZ DEX 上的 NVDA 股票永续)
@@ -70,7 +69,7 @@ struct Level {
 
 /// 获取 BBO (REST API)
 async fn fetch_bbo(coin: &str) -> Result<(Decimal, Decimal), Box<dyn std::error::Error>> {
-    let client = Client::new();
+    let client = hft_engine_rs::net::http(std::time::Duration::from_secs(10)).build().expect("http client");
     let resp: L2Book = client
         .post("https://api.hyperliquid.xyz/info")
         .header("Content-Type", "application/json")
@@ -169,7 +168,7 @@ async fn test_xyz_fetch_bbo() {
 #[tokio::test]
 #[ignore = "需要网络"]
 async fn test_xyz_fetch_meta_and_asset_ctxs() {
-    let http = Client::new();
+    let http = hft_engine_rs::net::http(std::time::Duration::from_secs(10)).build().expect("http client");
     let resp: serde_json::Value = http
         .post("https://api.hyperliquid.xyz/info")
         .header("Content-Type", "application/json")

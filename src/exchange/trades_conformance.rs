@@ -26,7 +26,6 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 /// 观测标的（三个所都有的高流动性品种，保证观测窗口内必有成交）
@@ -56,7 +55,7 @@ async fn observe(
     mut parse: impl FnMut(&str) -> Result<Vec<MarketEvent>, String>,
 ) -> (Vec<MarketTrade>, Vec<String>) {
     println!("[{exchange_name}] url={url} subscribe={subscribe}");
-    let (mut ws, _) = connect_async(url)
+    let mut ws = crate::exchange::ws_loop::connect(url)
         .await
         .unwrap_or_else(|e| panic!("[{exchange_name}] connect {url} failed: {e}"));
 

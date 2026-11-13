@@ -17,6 +17,11 @@ use std::sync::Arc;
 /// IBKR OAuth REST API 基础 URL
 pub const OAUTH_BASE_URL: &str = "https://api.ibkr.com/v1/api/";
 
+/// IBKR REST 单个请求的上限（网关 / OAuth 两种接入共用）
+pub(crate) const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// IBKR WS 握手的上限
+pub(crate) const WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn default_gateway_url() -> String {
     "https://localhost:5000/v1/api/".to_string()
 }

@@ -55,16 +55,9 @@ async fn connect_ws(
         .body(())
         .expect("Failed to build WS request");
 
-    let (ws_stream, _) = match connector {
-        Some(conn) => {
-            tokio_tungstenite::connect_async_tls_with_config(ws_request, None, false, Some(conn))
-                .await
-                .expect("WS connect failed")
-        }
-        None => tokio_tungstenite::connect_async(ws_request)
-            .await
-            .expect("WS connect failed"),
-    };
+    let ws_stream = hft_engine_rs::net::ws_connect(ws_request, connector, std::time::Duration::from_secs(10))
+        .await
+        .expect("WS connect failed");
 
     ws_stream.split()
 }

@@ -200,17 +200,9 @@ async fn connect(
     // 只打印 host。
     tracing::info!(host = %host, "Connecting IBKR WebSocket");
 
-    let (ws_stream, _) = match connector {
-        Some(conn) => {
-            tokio_tungstenite::connect_async_tls_with_config(ws_request, None, false, Some(conn))
-                .await
-                .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?
-        }
-        None => tokio_tungstenite::connect_async(ws_request)
-            .await
-            .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string()))?,
-    };
-    Ok(ws_stream)
+    crate::net::ws_connect(ws_request, connector, super::super::WS_CONNECT_TIMEOUT)
+        .await
+        .map_err(|e| ExchangeError::ConnectionFailed(Exchange::IBKR, e))
 }
 
 /// IBKR 公共 WS 组件（实际混发公私两类 topic，见 [`IbkrPublicWsArgs::account_bus`]）

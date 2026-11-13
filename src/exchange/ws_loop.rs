@@ -247,16 +247,9 @@ enum OnLoss {
 /// 一次建连（握手）的上限：网络半死时握手可能一直挂着
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 建 WS 连接（TCP + TLS + WS 握手），限时 [`CONNECT_TIMEOUT`]。公共流重连和三所私有流启动共用：
-/// 握手卡住时不限时，进程就活着却一直起不来，也不响应停机（#764 审查）。
-pub(crate) async fn connect(
-    url: &str,
-) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, WsError> {
-    let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
-        .await
-        .map_err(|_| WsError::ConnectionFailed(format!("握手超过 {}s", CONNECT_TIMEOUT.as_secs())))?
-        .map_err(|e| WsError::ConnectionFailed(e.to_string()))?;
-    Ok(ws)
+/// 建 WS 连接，限时 [`CONNECT_TIMEOUT`]（见 [`crate::net::ws_connect`]）。公共流重连和三所私有流启动共用。
+pub(crate) async fn connect(url: &str) -> Result<crate::net::WsStream, WsError> {
+    crate::net::ws_connect(url, None, CONNECT_TIMEOUT).await.map_err(WsError::ConnectionFailed)
 }
 /// 重连失败后的等待：从 1 秒起翻倍，封顶 30 秒，一直重试到连上或停机
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);

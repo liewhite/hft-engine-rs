@@ -134,7 +134,7 @@ impl IbkrClient {
     #[cfg(test)]
     pub(crate) fn for_test(conids: HashMap<String, i64>) -> Self {
         Self {
-            http: Client::new(),
+            http: crate::net::http(std::time::Duration::from_secs(1)).build().expect("建不联网的测试 client"),
             auth: Arc::new(super::gateway::IbkrGateway::new("https://127.0.0.1:1/v1/api/".into())),
             account_id: "TEST".into(),
             symbols: conids.keys().cloned().collect(),

@@ -9,7 +9,6 @@ use rust_decimal_macros::dec;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
 use hft_engine_rs::exchange::{AccountClient, ExchangeClient, ExchangeOrder};
-use reqwest::Client;
 use serde::Deserialize;
 
 /// 测试交易对
@@ -40,7 +39,7 @@ struct BboTicker {
 
 /// 获取 BBO (REST API)
 async fn fetch_bbo(symbol: &Symbol) -> Result<(Decimal, Decimal), Box<dyn std::error::Error>> {
-    let client = Client::new();
+    let client = hft_engine_rs::net::http(std::time::Duration::from_secs(10)).build()?;
     let binance_symbol = format!("{}{}", symbol, TEST_QUOTE);
 
     let resp: BboTicker = client

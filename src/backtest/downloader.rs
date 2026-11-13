@@ -22,9 +22,8 @@ impl BinanceHistoryDownloader {
     }
 
     pub fn with_base_url(cache: Box<dyn DataCache>, base_url: String) -> Result<Self, ExchangeError> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
+        let client = crate::net::http(Duration::from_secs(60))
+            .build_blocking()
             .map_err(|e| ExchangeError::Other(format!("build http client: {e}")))?;
         Ok(Self {
             client,

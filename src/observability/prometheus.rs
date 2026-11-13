@@ -148,10 +148,7 @@ impl Pusher {
     pub async fn spawn(group: &Group, config: MetricsPushConfig) -> anyhow::Result<Addr<String>> {
         let (_, addr) = group
             .spawn_addressed("MetricsPusher", move |_scope: Scope, inbox: Inbox<String>| async move {
-                let client = reqwest::Client::builder()
-                    .timeout(PUSH_TIMEOUT)
-                    // 不带 UA 的请求会被部分 CDN 拒
-                    .user_agent(concat!("hft-engine-rs/", env!("CARGO_PKG_VERSION")))
+                let client = crate::net::http(PUSH_TIMEOUT)
                     .build()
                     .map_err(|e| anyhow::anyhow!("指标推送器构建 HTTP client 失败: {e}"))?;
                 let endpoint = format!("{}/metrics/job/{}", config.url.trim_end_matches('/'), config.job);

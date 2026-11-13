@@ -16,7 +16,7 @@ use reqwest::Client;
 use rsa::{Pkcs1v15Encrypt, Pkcs1v15Sign, RsaPrivateKey};
 use sha1::Sha1;
 use sha2::Sha256;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// percent-encoding 字符集: 编码除 unreserved 字符外的所有字符
 /// unreserved = ALPHA / DIGIT / '-' / '.' / '_' / '~'
@@ -74,9 +74,7 @@ impl IbkrOAuth {
         let base_url = super::OAUTH_BASE_URL.to_string();
 
         // DH 密钥交换
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let http = crate::net::http(super::HTTP_TIMEOUT).build()?;
 
         let live_session_token = dh_exchange(
             &http,
@@ -146,8 +144,7 @@ impl IbkrAuth for IbkrOAuth {
     }
 
     fn build_http_client(&self) -> anyhow::Result<reqwest::Client> {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+        crate::net::http(super::HTTP_TIMEOUT)
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))
     }

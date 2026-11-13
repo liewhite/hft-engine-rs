@@ -53,10 +53,7 @@ impl OkxBusinessWs {
                 let (write, read) = ws_stream.split();
                 let conn = WsConn::spawn(&scope.group("conn"), "OkxBusinessWsLoop", read, write, ws_loop::WsKeepalive::okx())?;
 
-                let http_client = Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .map_err(|e| ExchangeError::Other(format!("OKX business HTTP client build: {e}")))?;
+                let http_client = crate::exchange::client::exchange_http_client(Exchange::OKX)?;
 
                 tracing::info!("OkxBusinessWs started");
                 Ok(Self {

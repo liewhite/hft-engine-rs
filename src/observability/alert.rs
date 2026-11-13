@@ -170,8 +170,7 @@ enum Msg {
 /// —— EnvFilter 不能全局挂（会连带灭掉告警外送），告警层不能裸挂（无过滤器的 layer
 /// 会把全局 max level hint 退化到 TRACE，依赖库的 trace 事件全部被构造派发）。
 pub fn spawn_alert_webhook_layer(config: AlertWebhookConfig) -> anyhow::Result<(AlertWebhookLayer, AlertHandle)> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+    let client = crate::net::http(Duration::from_secs(10))
         .build()
         .map_err(|e| anyhow::anyhow!("告警发送器构建 HTTP client 失败: {e}"))?;
     Ok(spawn_with_sink(HttpSink { config, client }))

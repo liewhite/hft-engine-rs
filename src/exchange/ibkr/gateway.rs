@@ -3,7 +3,6 @@
 //! 无 OAuth 签名，本地自签名证书需跳过验证。
 
 use super::auth::IbkrAuth;
-use std::time::Duration;
 
 pub struct IbkrGateway {
     base_url: String,
@@ -35,9 +34,8 @@ impl IbkrAuth for IbkrGateway {
     }
 
     fn build_http_client(&self) -> anyhow::Result<reqwest::Client> {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .danger_accept_invalid_certs(true)
+        crate::net::http(super::HTTP_TIMEOUT)
+            .accept_invalid_certs()
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))
     }
