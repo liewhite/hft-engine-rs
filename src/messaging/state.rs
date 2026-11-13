@@ -1,6 +1,5 @@
 use crate::domain::{
-    Exchange, FundingRate, IndexPrice, MarkPrice, Order, OrderId, OrderStatus, Position, Quantity,
-    Symbol, Timestamp, BBO,
+    Exchange, Order, OrderId, OrderStatus, Position, Quantity, Symbol, Timestamp, BBO,
 };
 use crate::messaging::event::{
     OrderRequestResult, RequestOutcome, SymbolAccountData, SymbolMarketData,
@@ -173,18 +172,15 @@ impl PendingOrder {
     }
 }
 
-/// 单个交易对的**行情**投影：各所的盘口 / 标记价 / 指数价 / 资金费率。
+/// 单个交易对的**行情**投影：各所最新盘口（其余行情策略在 on_event 里自取，框架不缓存）。
 ///
 /// 三个投影（行情 / 持仓 / 挂单）分开的理由见 `docs/architecture.md` V1：它们的消费者
 /// 互不重叠 —— 对账只要持仓，策略要行情 + 持仓 + 挂单，观测还要账户。焊在一个结构里的
 /// 直接后果是"想只查持仓"做不到，只能整份复制。
 #[derive(Debug, Clone, Default)]
 pub struct SymbolMarket {
-    pub funding_rates: HashMap<Exchange, FundingRate>,
     /// 各所最新盘口，连同它的本地接收时刻（策略判盘口新不新鲜用，见 [`Self::bbo_received_at`]）
     bbos: HashMap<Exchange, (BBO, Timestamp)>,
-    pub mark_prices: HashMap<Exchange, MarkPrice>,
-    pub index_prices: HashMap<Exchange, IndexPrice>,
 }
 
 /// 单个交易对的**持仓**投影：「投产基线 + Fill 累加」的折叠结果。
@@ -235,33 +231,16 @@ impl SymbolMarket {
         self.bbos.get(&exchange).map(|(_, at)| *at)
     }
 
-    /// 获取某个交易所的标记价格
-    pub fn mark_price(&self, exchange: Exchange) -> Option<&MarkPrice> {
-        self.mark_prices.get(&exchange)
-    }
-
-    /// 获取某个交易所的指数价格
-    pub fn index_price(&self, exchange: Exchange) -> Option<&IndexPrice> {
-        self.index_prices.get(&exchange)
-    }
-
-    /// 行情类事件的状态转移（BBO/标记价/指数价/资金费率入缓存，其余策略自取）
+    /// 行情类事件的状态转移（只缓存盘口，其余策略在 on_event 里自取）
     pub fn apply(&mut self, data: &SymbolMarketData, local_ts: Timestamp) {
         match data {
-            SymbolMarketData::FundingRate(rate) => {
-                self.funding_rates.insert(rate.exchange, rate.clone());
-            }
             SymbolMarketData::BBO(bbo) => {
                 self.bbos.insert(bbo.exchange, (bbo.clone(), local_ts));
             }
-            SymbolMarketData::MarkPrice(mp) => {
-                self.mark_prices.insert(mp.exchange, mp.clone());
-            }
-            SymbolMarketData::IndexPrice(ip) => {
-                self.index_prices.insert(ip.exchange, ip.clone());
-            }
-            // 公共成交印记、K 线、券源读数由策略在 on_event 里自取，不进聚合状态
-            SymbolMarketData::MarketTrade(_)
+            SymbolMarketData::FundingRate(_)
+            | SymbolMarketData::MarkPrice(_)
+            | SymbolMarketData::IndexPrice(_)
+            | SymbolMarketData::MarketTrade(_)
             | SymbolMarketData::Candle(_)
             | SymbolMarketData::HistoryCandles(_)
             | SymbolMarketData::BorrowFee(_) => {}

@@ -316,7 +316,6 @@ impl MetricsView {
         }
     }
 
-    /// 记录会话起始仓位基线（每个 (symbol, exchange) 只记一次）
     /// 输出一次完整报告（结构化日志），返回同一份数字的推送文本
     fn report(&mut self) -> PromText {
         self.prune_funding_fees(now_ms());

@@ -194,7 +194,9 @@ mod tests {
         SymbolMeta {
             exchange,
             symbol: symbol.to_string(),
-            price_rule: Arc::new(PriceStep::new(dec!(0.01))),
+            price_rule: Arc::new(PriceStep::new(
+                hft_engine_rs::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
+            )),
             size_step: hft_engine_rs::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
             min_order_size: hft_engine_rs::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
             min_notional: 0.0,

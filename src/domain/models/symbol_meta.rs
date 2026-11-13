@@ -112,7 +112,9 @@ mod tests {
         SymbolMeta {
             exchange: Exchange::OKX,
             symbol: "X".into(),
-            price_rule: Arc::new(PriceStep::new(dec!(0.01))),
+            price_rule: Arc::new(PriceStep::new(
+                crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
+            )),
             size_step,
             min_order_size: size_step,
             min_notional: 0.0,
@@ -188,7 +190,9 @@ mod tests {
     #[test]
     fn price_is_written_without_trailing_zeros() {
         let mut m = meta(dec!(1), dec!(1));
-        m.price_rule = Arc::new(PriceStep::new(dec!(0.10)));
+        m.price_rule = Arc::new(PriceStep::new(
+            crate::domain::PositiveDecimal::new(dec!(0.10)).unwrap(),
+        ));
         assert_eq!(m.format_price(dec!(100.04)), "100");
         assert_eq!(m.format_price(dec!(4870)), "4870");
         assert_eq!(m.format_price(dec!(0.25)), "0.3");

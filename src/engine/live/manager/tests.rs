@@ -25,7 +25,9 @@ impl ExchangeClient for FakeClient {
         Ok(vec![SymbolMeta {
             exchange: self.0,
             symbol: "BTC".to_string(),
-            price_rule: Arc::new(crate::domain::PriceStep::new(dec!(0.1))),
+            price_rule: Arc::new(crate::domain::PriceStep::new(
+                crate::domain::PositiveDecimal::new(dec!(0.1)).unwrap(),
+            )),
             size_step: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
             min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
             min_notional: 0.0,

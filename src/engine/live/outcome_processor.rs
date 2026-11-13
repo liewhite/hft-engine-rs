@@ -611,7 +611,9 @@ mod gateway_tests {
             SymbolMeta {
                 exchange: EX,
                 symbol: SYM.to_string(),
-                price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+                price_rule: Arc::new(PriceStep::new(
+                    crate::domain::PositiveDecimal::new(dec!(0.1)).unwrap(),
+                )),
                 size_step: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
                 min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
                 min_notional: 0.0,

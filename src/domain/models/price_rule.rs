@@ -6,7 +6,7 @@
 //! 规则只取整、不拼字符串：下单字符串由各所出口写（币安、OKX 用 [`crate::domain::to_wire`]，
 //! Hyperliquid 用自己更严的 `decimal_to_wire`）。
 
-use crate::domain::Price;
+use crate::domain::{PositiveDecimal, Price};
 use rust_decimal::{Decimal, RoundingStrategy};
 use std::fmt::Debug;
 
@@ -23,10 +23,9 @@ pub struct PriceStep {
 }
 
 impl PriceStep {
-    /// `step` 必须为正：交易所规格里的 tick 不可能是 0 或负数，是了就是解析错，当场报错
-    pub fn new(step: Decimal) -> Self {
-        assert!(step > Decimal::ZERO, "价格步长必须为正：{step}");
-        Self { step }
+    /// 步长在类型上就严格为正（不合法的规格在各所加载处剔除）
+    pub fn new(step: PositiveDecimal) -> Self {
+        Self { step: step.get() }
     }
 }
 
@@ -48,28 +47,37 @@ mod tests {
 
     #[test]
     fn step_rounds_to_nearest_tick() {
-        let f = PriceStep::new(dec!(0.01));
+        let f = PriceStep::new(crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap());
         assert_eq!(s(&f, dec!(100.123)), "100.12");
         assert_eq!(s(&f, dec!(100.126)), "100.13");
         assert_eq!(s(&f, dec!(100.125)), "100.13", "中点远离 0，不是银行家舍入");
         assert_eq!(s(&f, dec!(100)), "100");
         assert_eq!(s(&f, dec!(10000000000)), "10000000000");
-        let f1 = PriceStep::new(dec!(1));
+        let f1 = PriceStep::new(crate::domain::PositiveDecimal::new(dec!(1)).unwrap());
         assert_eq!(s(&f1, dec!(4870)), "4870", "整数末尾的 0 不能删");
         assert_eq!(s(&f1, dec!(4869.6)), "4870");
-        let q = PriceStep::new(dec!(0.25));
+        let q = PriceStep::new(crate::domain::PositiveDecimal::new(dec!(0.25)).unwrap());
         assert_eq!(s(&q, dec!(100.25)), "100.25");
         assert_eq!(s(&q, dec!(100.3)), "100.25");
-        assert_eq!(s(&PriceStep::new(dec!(0.005)), dec!(1.2345)), "1.235");
         assert_eq!(
-            s(&PriceStep::new(dec!(0.00001)), dec!(0.0000123456)),
+            s(
+                &PriceStep::new(crate::domain::PositiveDecimal::new(dec!(0.005)).unwrap()),
+                dec!(1.2345)
+            ),
+            "1.235"
+        );
+        assert_eq!(
+            s(
+                &PriceStep::new(crate::domain::PositiveDecimal::new(dec!(0.00001)).unwrap()),
+                dec!(0.0000123456)
+            ),
             "0.00001"
         );
     }
 
     #[test]
     fn step_rounding_is_idempotent() {
-        let f = PriceStep::new(dec!(0.1));
+        let f = PriceStep::new(crate::domain::PositiveDecimal::new(dec!(0.1)).unwrap());
         for k in 0..10_000i64 {
             let p = Decimal::new(k, 1); // k × 0.1
             assert_eq!(f.round(p), p);

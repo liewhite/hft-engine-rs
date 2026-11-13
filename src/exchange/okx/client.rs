@@ -176,7 +176,7 @@ impl OkxClient {
                 (Some(tick), Some(lot), Some(min), Some(ct_val)) => metas.push(SymbolMeta {
                     exchange: Exchange::OKX,
                     symbol,
-                    price_rule: Arc::new(PriceStep::new(tick.get())),
+                    price_rule: Arc::new(PriceStep::new(tick)),
                     size_step: lot,
                     min_order_size: min,
                     min_notional: 0.0,

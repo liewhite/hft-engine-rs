@@ -83,7 +83,7 @@
 
 | 通道 | 现状 | 删除收益 | 我的建议 |
 |---|---|---|---|
-| `FundingRate`（含 `daily_rate*`、`unified_time_base`、`best_short/long_exchange`） | 3 所 codec + 6 处订阅/dispatch + `SymbolState` 约 60 行死逻辑全部零读者 | 高。⚠️ HL 专门合成 `next_hourly_settle_time`（交易所不给结算时刻）、两处 `.max(1.0)` 小时钳制都是为跨所日化可比写的 | **保留**：`docs/todo.md` 第三节明确有"资费维度"策略计划（资费日化高则平仓更严格），删了要重写 |
+| `FundingRate`（含 `daily_rate*`、`unified_time_base`、`best_short/long_exchange`） | 3 所 codec + 6 处订阅/dispatch + `SymbolState` 约 60 行死逻辑全部零读者 | 高。⚠️ HL 专门合成 `next_hourly_settle_time`（交易所不给结算时刻）、两处 `.max(1.0)` 小时钳制都是为跨所日化可比写的 | **#814 删除** `daily_rate*`、`unified_time_base`、`best_short/long_exchange` 与 SymbolState 的资金费缓存（替策略做决定、零读者）；`FundingRate` 事件照常运送，策略要用自己在 on_event 里取 |
 | `FundingFee`（含凭空合成的 `tran_id`） | 两个完整 polling actor 零读者 | 中。⚠️ HL 没有原生 ID，`tran_id` 是 `md5(time, coin)` 合成的，注释声明的"下游去重"不存在 | **与 FundingRate 一起决定**：资费策略要做，流水是它的账 |
 | `MarkPrice` + `IndexPrice` | 6 份 codec + 6 处 dispatch + 2 个订阅 kind + 两个死 getter | 中，且是**干净删除**（无特殊对齐逻辑） | **可删**：重写成本低（每所约 20 行），要用时再加 |
 | `Candle` + `CandleInterval` + `HistoryCandles` | OKX 独家实现，但**整条 business WS 通道基本只为它存在** | 高 | **可删**，但先确认没有 K 线策略计划 |

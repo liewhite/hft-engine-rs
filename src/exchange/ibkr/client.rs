@@ -390,7 +390,9 @@ impl ExchangeClient for IbkrClient {
             .map(|s| SymbolMeta {
                 exchange: Exchange::IBKR,
                 symbol: s.clone(),
-                price_rule: Arc::new(PriceStep::new(dec!(0.01))),
+                price_rule: Arc::new(PriceStep::new(
+                    crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
+                )),
                 size_step: PositiveDecimal::ONE,
                 min_order_size: PositiveDecimal::ONE,
                 min_notional: 0.0,

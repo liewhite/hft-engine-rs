@@ -175,7 +175,7 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Excha
                 metas.push(SymbolMeta {
                     exchange: Exchange::Binance,
                     symbol,
-                    price_rule: Arc::new(PriceStep::new(price_step.get())),
+                    price_rule: Arc::new(PriceStep::new(price_step)),
                     size_step,
                     min_order_size,
                     min_notional,

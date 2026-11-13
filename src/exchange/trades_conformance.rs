@@ -316,7 +316,9 @@ fn okx_btc_metas() -> HashMap<Symbol, SymbolMeta> {
         SymbolMeta {
             exchange: Exchange::OKX,
             symbol: COIN.to_string(),
-            price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+            price_rule: Arc::new(PriceStep::new(
+                crate::domain::PositiveDecimal::new(dec!(0.1)).unwrap(),
+            )),
             size_step: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
             min_order_size: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
             min_notional: 0.0,

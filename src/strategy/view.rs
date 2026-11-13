@@ -78,8 +78,8 @@ impl<'a> StrategyView<'a> {
 
 /// 单个 symbol 的跨所视图。
 ///
-/// 方法集就是实测的策略调用面。`SymbolState` 上其余的读方法（`mark_price` / 三个投影的直通
-/// 访问器…）没有策略消费者，是观测层与 executor 用的，不在此暴露。
+/// 方法集就是实测的策略调用面。`SymbolState` 上其余的读方法（三个投影的直通访问器…）没有
+/// 策略消费者，是 executor 与测试用的，不在此暴露。
 #[derive(Clone, Copy)]
 pub struct SymbolView<'a> {
     state: &'a SymbolState,

@@ -649,7 +649,9 @@ mod tests {
             SymbolMeta {
                 exchange: EX,
                 symbol: sym(),
-                price_rule: Arc::new(PriceStep::new(dec!(0.001))),
+                price_rule: Arc::new(PriceStep::new(
+                    crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
+                )),
                 size_step: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
                 min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
                 min_notional: 0.0,
