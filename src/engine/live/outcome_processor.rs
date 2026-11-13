@@ -12,7 +12,7 @@ use crate::exchange::{AccountClient, ExchangeOrder};
 use crate::domain::AccountId;
 use crate::messaging::{AccountBus, AccountData, AccountEvent, SymbolAccountData};
 use crate::strategy::OutcomeEvent;
-use crate::tasks::{FailHandle, Group, Inbox, Scope, Task};
+use crate::tasks::{FailHandle, Group, Inbox, Scope, StopFlag, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -55,8 +55,10 @@ pub struct OrderGateway {
     /// 触发 = manager 带错退出、整棵树停机，`run_engine` 以错误返回、进程退出 ——
     /// 与持仓对账确认漂移时同一条停机路径。
     halt: FailHandle,
-    /// 已因结果不确定触发停机：此后不再发任何新单（停机收尾期间策略可能还在出信号）
-    halted: std::sync::atomic::AtomicBool,
+    /// 整机是否已开始停机（任何原因：下单结果不确定、持仓漂移、外部停机信号……）。
+    /// 一旦停机就不再发新单：停机收尾期间策略可能还在出信号，这些单挂到交易所上、进程退出后
+    /// 无人看管（#710）。撤单不受影响。
+    machine_stopping: StopFlag,
 }
 
 /// [`OrderGateway::place`] 的结构化结论，给**编排方**消费（策略侧的闭环走事件回报，
@@ -78,13 +80,16 @@ pub enum PlaceVerdict {
 }
 
 impl OrderGateway {
-    /// `halt`：下单结果不确定时要停掉的那个节点（manager）的 `scope.fail_handle()`。
+    /// `halt` / `machine_stopping`：manager 的 `scope.fail_handle()` 与 `scope.machine_stop_flag()`。
+    /// 前者触发会立刻让后者变为「在停机」（任何节点出错都同步请求根停机），故结果不确定
+    /// 之后的新单由同一道闸拦下。
     pub fn new(
         accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
         account_bus: AccountBus,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
         dry_run: bool,
         halt: FailHandle,
+        machine_stopping: StopFlag,
     ) -> Self {
         Self {
             accounts,
@@ -93,7 +98,7 @@ impl OrderGateway {
             dry_run,
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             halt,
-            halted: std::sync::atomic::AtomicBool::new(false),
+            machine_stopping,
         }
     }
 
@@ -106,17 +111,20 @@ impl OrderGateway {
     /// - 错误（结果不确定，单子可能已挂上或已成交）：**不**反馈 Error —— 那会让策略以为单子
     ///   没了，再挂一张、再补一次腿。若交易所回报流已经认领了这张单（in_flight 已被摘掉），
     ///   策略手里就有真实状态，以回报为准、继续运行；否则框架无从得知真相，停机交人工核对
-    ///   （经构造时传入的 `FailHandle` 停掉 manager），停机期间不再发新单。
+    ///   （经构造时传入的 `FailHandle` 停掉 manager）。
+    ///
+    /// 整机一旦开始停机（不论什么原因），新单一律不发、直接返回 `Err`，也不反馈 Error 回报
+    /// （策略正在停，没人再按它重挂）。
     ///
     /// # 返回值是给**编排方**的结论（策略侧的闭环走事件回报）
     ///
     /// - `Ok(verdict)`：见 [`PlaceVerdict`] 各变体 —— 特别地，`ExchangeSpoke` 不是成功，
     ///   只是"REST 的结论已被交易所回报作废"。
-    /// - `Err`：这张单没有成功挂上（被拒绝、未发出），或结果不确定且引擎已在停机 ——
+    /// - `Err`：这张单没有成功挂上（被拒绝、未发出、引擎已在停机），或结果不确定、引擎因此停机 ——
     ///   调用方（降级平仓）都如实计入"未完成"。
     pub async fn place(&self, order: Order, comment: &str) -> Result<PlaceVerdict, String> {
-        if self.halted.load(std::sync::atomic::Ordering::SeqCst) {
-            let reason = "引擎因下单结果不确定正在停机，不再发新单".to_string();
+        if self.machine_stopping.is_stopping() {
+            let reason = "引擎正在停机，不再发新单".to_string();
             tracing::warn!(
                 exchange = %order.exchange,
                 symbol = %order.symbol,
@@ -275,7 +283,6 @@ impl OrderGateway {
 
     /// 结果不确定且交易所回报流没认领：停机。不反馈 Error（那会让策略以为单子没了）。
     fn halt_on_indeterminate(&self, order: &Order, detail: &str) -> String {
-        self.halted.store(true, std::sync::atomic::Ordering::SeqCst);
         tracing::error!(
             exchange = %order.exchange,
             symbol = %order.symbol,
@@ -753,7 +760,7 @@ mod gateway_tests {
             self.result.lock().unwrap().take().expect("结果只取一次")
         }
         async fn cancel_order(&self, _s: &Symbol, _o: &OrderId) -> Result<(), ExchangeError> {
-            unreachable!("place 契约测试不撤单")
+            Ok(())
         }
         async fn fetch_pending_orders(&self, _s: &Symbol) -> Result<Vec<OrderUpdate>, ExchangeError> {
             unreachable!()
@@ -821,6 +828,7 @@ mod gateway_tests {
                 metas(),
                 false,
                 root.fail_handle(),
+                root.machine_stop_flag(),
             ));
             Self { root, group, account_bus, gateway, events }
         }
@@ -908,6 +916,29 @@ mod gateway_tests {
 
         let again = h.gateway.place(order(), "t").await;
         assert!(again.is_err(), "停机期间不再发新单: {again:?}");
+        h.finish().await;
+    }
+
+    /// 整机因**别的原因**开始停机（如持仓对账确认漂移）→ 新单不再发到交易所、不反馈 Error；
+    /// 撤单照常放行（#710）。FakeClient 没备下单结果，误发就会 panic。
+    #[tokio::test]
+    async fn machine_stopping_refuses_new_orders_but_allows_cancel() {
+        let h = Harness::new(FakeClient {
+            result: Mutex::new(None),
+            gate: None,
+        })
+        .await;
+        h.root.fail_handle().fail(anyhow::anyhow!("持仓漂移（模拟）"));
+
+        let verdict = h.gateway.place(order(), "t").await;
+        assert!(verdict.is_err(), "停机途中不该发新单: {verdict:?}");
+        assert!(!h.error_reported().await, "停机拒发不反馈 Error（策略正在停）");
+
+        let cancel = h
+            .gateway
+            .cancel(EX, SYM.to_string(), "ex-1".to_string(), CID.to_string())
+            .await;
+        assert_eq!(cancel, Ok(()), "停机途中撤单必须放行");
         h.finish().await;
     }
 

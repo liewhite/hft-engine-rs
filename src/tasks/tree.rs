@@ -61,8 +61,9 @@ pub struct Scope(Arc<ScopeInner>);
 
 struct ScopeInner {
     name: String,
-    /// 树根：任何节点出错都立刻请求根停机（见 [`ScopeInner::fail`]）。根自己为 None
-    root: Option<Weak<ScopeInner>>,
+    /// 树根的停止信号（根自己就是 `stop` 的克隆）：任何节点出错都立刻请求根停机（见
+    /// [`ScopeInner::fail`]）；也是 [`Scope::machine_stop_flag`] 的来源
+    root_stop: CancellationToken,
     /// 本节点的停止请求：父节点框架轮到本组时发出，或本节点出错 / 主动收工时发出
     stop: CancellationToken,
     /// 按声明顺序排列的子任务分组，停机时依次停
@@ -89,11 +90,13 @@ struct FailureSlot {
 }
 
 impl Scope {
-    fn new(name: String, root: Option<Weak<ScopeInner>>) -> Self {
+    /// `root_stop`：所在树根的停止信号；`None` = 本节点就是根
+    fn new(name: String, root_stop: Option<CancellationToken>) -> Self {
+        let stop = CancellationToken::new();
         Self(Arc::new(ScopeInner {
             name,
-            root,
-            stop: CancellationToken::new(),
+            root_stop: root_stop.unwrap_or_else(|| stop.clone()),
+            stop,
             groups: Mutex::new(GroupList::default()),
             failure: Mutex::new(FailureSlot::default()),
         }))
@@ -117,6 +120,13 @@ impl Scope {
     /// `Scope` —— 连同起子任务、报错、请求停止的能力 —— 交出去）
     pub fn stop_flag(&self) -> StopFlag {
         StopFlag(self.0.stop.clone())
+    }
+
+    /// 整机（树根）停止状态的只读视图：任何节点出错、或外部要求停机，根都会**立刻**进入停止，
+    /// 早于停止信号按分组顺序逐层传到本节点。给「整机一开始停就不该再做某事」的协作方用
+    /// （如实盘下单出口：停机途中不再发新单）。
+    pub fn machine_stop_flag(&self) -> StopFlag {
+        StopFlag(self.0.root_stop.clone())
     }
 
     /// 主动收工：请求本节点停止，`run` 随后返回 `Ok` 即算正常退出（见 [`Task::run`]）。
@@ -209,9 +219,7 @@ impl ScopeInner {
         // 中间每一层的 run 返回 —— 某一层卡在不理会停止信号的 await 上时，根照样开始停机，
         // 卡住的那层由"迟迟未返回/未停"告警和根的总期限暴露出来。
         // 只取消根的信号，不越过分组顺序：停机仍由根自上而下逐组进行。
-        if let Some(root) = self.root.as_ref().and_then(Weak::upgrade) {
-            root.stop.cancel();
-        }
+        self.root_stop.cancel();
     }
 }
 
@@ -272,6 +280,11 @@ impl Root {
 
     pub fn fail_handle(&self) -> FailHandle {
         self.scope.fail_handle()
+    }
+
+    /// 见 [`Scope::machine_stop_flag`]
+    pub fn machine_stop_flag(&self) -> StopFlag {
+        self.scope.machine_stop_flag()
     }
 
     /// 按声明顺序逐组停掉全部子任务，等全部收尾完，交出最终结果（根因错误，若有）。
@@ -404,7 +417,7 @@ impl Group {
         B: FnOnce(Scope) -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
     {
-        let scope = Scope::new(name.clone(), Some(self.root()));
+        let scope = Scope::new(name.clone(), Some(self.root_stop()));
         let handle = ChildHandle {
             id: NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed),
             name: Arc::from(name.as_str()),
@@ -451,14 +464,16 @@ impl Group {
         Ok(handle)
     }
 
-    /// 本组所在树的根
-    fn root(&self) -> Weak<ScopeInner> {
+    /// 本组所在树根的停止信号。所属节点已销毁时（根未经 shutdown 被丢弃）给一个已取消的
+    /// 信号：此时整棵树本就在停，新节点不该当作「整机在跑」
+    fn root_stop(&self) -> CancellationToken {
         match self.0.owner.upgrade() {
-            Some(owner) => match &owner.root {
-                Some(root) => root.clone(),
-                None => Arc::downgrade(&owner),
-            },
-            None => Weak::new(),
+            Some(owner) => owner.root_stop.clone(),
+            None => {
+                let stopped = CancellationToken::new();
+                stopped.cancel();
+                stopped
+            }
         }
     }
 
@@ -843,6 +858,40 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), root.stopping())
             .await
             .expect("根必须在中间层卡住时也收到停机请求");
+    }
+
+    /// 整机停止视图：别的分支出错的那一刻，深层节点就能看到「整机在停」，
+    /// 而它自己的停止信号要等根按分组顺序逐层发下来
+    #[tokio::test]
+    async fn machine_stop_flag_sees_a_failure_elsewhere_immediately() {
+        struct Idle;
+        impl Task for Idle {
+            async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
+                scope.stopping().await;
+                Ok(())
+            }
+        }
+        let root = Root::new("root");
+        let (flags_tx, flags_rx) = oneshot::channel();
+        root.group("a")
+            .spawn("mid", |scope: Scope| async move {
+                scope.group("kids").spawn_fn("deep", |deep| async move {
+                    flags_tx.send((deep.stop_flag(), deep.machine_stop_flag())).unwrap();
+                    deep.stopping().await;
+                    Ok(())
+                })?;
+                Ok(Idle)
+            })
+            .await
+            .unwrap();
+        let (own, machine) = flags_rx.await.unwrap();
+        assert!(!machine.is_stopping());
+
+        root.group("b").spawn_fn("leaf", |_| async { anyhow::bail!("持仓漂移") }).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), root.stopping()).await.unwrap();
+        assert!(machine.is_stopping(), "根一进入停机，整机视图就该是停机");
+        assert!(!own.is_stopping(), "节点自己的停止信号仍按分组顺序由根发下来");
+        assert!(root.shutdown().await.is_err());
     }
 
     /// panic 等同出错

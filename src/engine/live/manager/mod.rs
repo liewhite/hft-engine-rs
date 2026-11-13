@@ -379,6 +379,9 @@ impl Manager {
             /* dry_run */ false,
             // 下单结果不确定时停机：经本节点上报错误，整棵树受控停机
             scope.fail_handle(),
+            // 整机一开始停机（任何原因）就不再发新单：此时消费者组还在排空信号，
+            // 发出去的单在进程退出后无人看管（#710）
+            scope.machine_stop_flag(),
         ));
         //    出向处理器还订交易所回报（只订 OrderUpdate），用来作废迟到的 REST 失败结论
         //    （见 OrderGateway::in_flight）
