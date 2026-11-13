@@ -119,6 +119,7 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("binance meta (public REST)");
+    assert_eq!(binance_metas.len(), 1, "币安品种目录里应有 {symbol}");
     let okx_metas = okx_client
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
@@ -165,8 +166,8 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
     let binance = BinanceNode::spawn(
         &producers,
         BinanceArgs {
+            client: None,
             credentials: None,
-            symbol_metas: metas_of(binance_metas),
             rest_base_url: REST_BASE_URL.to_string(),
             market_bus: market_bus.clone(),
             account_bus: account_bus.clone(),
@@ -179,7 +180,7 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
         &producers,
         OkxArgs {
             credentials: None,
-            client: Some(okx_client.clone()),
+            client: None,
             symbol_metas: metas_of(okx_metas),
             market_bus: market_bus.clone(),
             account_bus: account_bus.clone(),

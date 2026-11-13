@@ -67,6 +67,8 @@ fn fake_setup(exchange: Exchange, log: Log, fail: Option<&'static str>) -> Excha
         client: Arc::new(FakeClient(exchange)),
         account: None,
         supports: |_| true,
+        settled_funding: None,
+        account_streams: HashMap::new(),
         spawn_actor: Box::new(move |ctx: SpawnCtx| {
             Box::pin(async move {
                 if let Some(msg) = fail {
@@ -116,7 +118,7 @@ async fn producers_stop_before_consumers_and_their_last_reports_arrive() {
         &root.group("main"),
         ManagerArgs {
             exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)],
-            paper: crate::sim::SimConfig::default(),
+            paper: None,
         },
     )
     .await
@@ -153,7 +155,7 @@ async fn exchange_startup_failure_cascades_to_the_root() {
                 fake_setup(Exchange::Binance, log.clone(), None),
                 fake_setup(Exchange::OKX, log.clone(), Some("OKX 私有订阅被拒")),
             ],
-            paper: crate::sim::SimConfig::default(),
+            paper: None,
         },
     )
     .await;
@@ -164,4 +166,83 @@ async fn exchange_startup_failure_cascades_to_the_root() {
     let root_err = format!("{:#}", root.shutdown().await.unwrap_err());
     assert!(root_err.contains("OKX 私有订阅被拒"), "{root_err}");
     assert_eq!(*log.lock().unwrap(), ["Binance 节点收尾"], "已起来的节点必须被停下收尾");
+}
+
+/// 只声明要哪些账户数据流、别的什么都不做的策略
+struct NeedsStreams(HashMap<Exchange, HashSet<crate::exchange::AccountStream>>);
+
+impl Strategy for NeedsStreams {
+    fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>> {
+        HashMap::new()
+    }
+    fn account_streams(&self) -> HashMap<Exchange, HashSet<crate::exchange::AccountStream>> {
+        self.0.clone()
+    }
+    fn order_timeout_ms(&self) -> u64 {
+        1000
+    }
+    fn on_event(
+        &mut self,
+        _: &crate::messaging::IncomeEvent,
+        _: crate::strategy::StrategyView<'_>,
+    ) -> Vec<crate::strategy::OutcomeEvent> {
+        Vec::new()
+    }
+}
+
+fn greeks_on(exchange: Exchange) -> Box<dyn Strategy> {
+    Box::new(NeedsStreams(HashMap::from([(exchange, HashSet::from([crate::exchange::AccountStream::Greeks]))])))
+}
+
+/// 账户数据流按策略声明才起，同所同种只起一份；没登记的所拒绝投产（#757）
+#[tokio::test]
+async fn account_streams_start_on_demand_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut okx = fake_setup(Exchange::OKX, log.clone(), None);
+    let counter = started.clone();
+    okx.account_streams.insert(
+        crate::exchange::AccountStream::Greeks,
+        Box::new(move |_: &Group, _: AccountBus| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+    );
+    let root = Root::new("engine");
+    let handle = Manager::spawn(
+        &root.group("main"),
+        ManagerArgs { exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None), okx], paper: None },
+    )
+    .await
+    .expect("Manager 起不来");
+    assert_eq!(started.load(Ordering::SeqCst), 0, "没有策略要，就不该起");
+
+    let err = handle.add_strategy(StrategySpec::live(greeks_on(Exchange::Binance))).await.unwrap_err();
+    assert!(err.to_string().contains("Binance 不提供 Greeks"), "{err}");
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+
+    handle.add_strategy(StrategySpec::live(greeks_on(Exchange::OKX))).await.unwrap();
+    handle.add_strategy(StrategySpec::live(greeks_on(Exchange::OKX))).await.unwrap();
+    assert_eq!(started.load(Ordering::SeqCst), 1, "同所同种只起一份");
+    root.shutdown().await.expect("正常停机");
+}
+
+/// 没配模拟柜台时，绑定模拟账户的策略拒绝投产（它的单没人撮合）
+#[tokio::test]
+async fn paper_strategy_is_rejected_without_paper_counter() {
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let root = Root::new("engine");
+    let handle = Manager::spawn(
+        &root.group("main"),
+        ManagerArgs { exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)], paper: None },
+    )
+    .await
+    .expect("Manager 起不来");
+    let err = handle
+        .add_strategy(StrategySpec::paper(Box::new(NeedsStreams(HashMap::new())), "p"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("没配模拟柜台"), "{err}");
+    root.shutdown().await.expect("正常停机");
 }

@@ -25,13 +25,9 @@
 
 use hft_engine_rs::domain::{now_ms, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{
-    load_config, setup_binance, setup_hyperliquid, setup_okx, run_engine, run_main, ExchangeSetup, ManagerArgs,
-    ManagerHandle, StrategySpec,
+    load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, ManagerHandle, StrategySpec,
 };
-use hft_engine_rs::exchange::binance::{BinanceClient, BinanceCredentials};
-use hft_engine_rs::exchange::hyperliquid::{HyperliquidAccess, HyperliquidClient};
-use hft_engine_rs::exchange::okx::{OkxClient, OkxCredentials};
-use hft_engine_rs::exchange::{ExchangeAccess, SettledFundingSource};
+use hft_engine_rs::exchange::SettledFundingSource;
 use hft_engine_rs::messaging::CustomEvent;
 use hft_engine_rs::strategy::{FundingArbConfig, FundingArbStrategy, SettledFundingWindow, Strategy, FUNDING_WINDOW_MS};
 use serde::Deserialize;
@@ -40,18 +36,6 @@ use std::sync::Arc;
 use hft_engine_rs::tasks::Periodic;
 use std::time::Duration;
 
-/// 要接的所：配了就接。加一所 = 这里加一个字段 + `connect` 里加一段
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExchangesConfig {
-    #[serde(default)]
-    binance: Option<ExchangeAccess<BinanceCredentials>>,
-    #[serde(default)]
-    hyperliquid: Option<HyperliquidAccess>,
-    #[serde(default)]
-    okx: Option<ExchangeAccess<OkxCredentials>>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -59,30 +43,6 @@ struct Config {
     strategy: FundingArbConfig,
     /// 资金费轮询间隔（秒）。费率只在结算时变，HL 每小时一次，几分钟一轮足够
     funding_poll_secs: u64,
-}
-
-/// 每所一份：引擎装配 + 公共资金费数据源（不带凭证）
-struct Connected {
-    setups: Vec<ExchangeSetup>,
-    funding_sources: Vec<Arc<dyn SettledFundingSource>>,
-}
-
-async fn connect(cfg: &ExchangesConfig) -> anyhow::Result<Connected> {
-    let mut c = Connected { setups: Vec::new(), funding_sources: Vec::new() };
-    if let Some(a) = &cfg.binance {
-        c.setups.push(setup_binance(a.clone())?);
-        c.funding_sources.push(Arc::new(BinanceClient::new(a.quote.clone(), None)?));
-    }
-    if let Some(a) = &cfg.hyperliquid {
-        c.setups.push(setup_hyperliquid(a.clone()).await?);
-        c.funding_sources.push(Arc::new(HyperliquidClient::connect(a.quote.clone(), a.dexes.clone(), None).await?));
-    }
-    if let Some(a) = &cfg.okx {
-        c.setups.push(setup_okx(a.clone())?);
-        c.funding_sources.push(Arc::new(OkxClient::new(a.quote.clone(), None)?));
-    }
-    anyhow::ensure!(c.setups.len() >= 2, "exchanges 至少要配两所，当前 {}", c.setups.len());
-    Ok(c)
 }
 
 #[tokio::main]
@@ -103,19 +63,25 @@ async fn run() -> anyhow::Result<()> {
         config.strategy.max_funding_age_ms
     );
 
-    let Connected { setups, funding_sources } = connect(&config.exchanges).await?;
-    let exchanges: Vec<Exchange> = funding_sources.iter().map(|s| s.exchange()).collect();
-    tracing::info!(?exchanges, pairs = config.strategy.pairs.len(), "funding_arb starting");
+    let setups = setup_all(&config.exchanges).await?;
+    anyhow::ensure!(setups.len() >= 2, "exchanges 至少要配两所，当前 {}", setups.len());
+    tracing::info!(exchanges = config.exchanges.len(), pairs = config.strategy.pairs.len(), "funding_arb starting");
 
     let args = ManagerArgs {
         exchanges: setups,
-        // 只跑实盘（用户定：不做模拟盘），柜台配置用默认值
-        paper: Default::default(),
+        // 只跑实盘（用户定：不做模拟盘），不起模拟柜台
+        paper: None,
     };
     // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
     run_engine(args, |manager| async move {
         // 每个币在哪几所做：该币在各所品种目录里出现的所（按配置的所顺序），不足两所拒绝启动
         let metas = manager.all_symbol_metas();
+        let exchanges = manager.exchanges();
+        // 各所的公共资金费来源：用引擎装配时建好的 client，不另建
+        let funding_sources: Vec<Arc<dyn SettledFundingSource>> = exchanges
+            .iter()
+            .map(|&ex| manager.settled_funding(ex).ok_or_else(|| anyhow::anyhow!("{ex} 不提供已结算资金费")))
+            .collect::<anyhow::Result<_>>()?;
         let listed: HashMap<(Exchange, Symbol), SymbolMeta> = metas
             .into_iter()
             .flat_map(|(ex, ms)| ms.into_iter().map(move |m| ((ex, m.symbol.clone()), m)))
@@ -154,15 +120,31 @@ async fn run() -> anyhow::Result<()> {
             })
             .collect();
         let gap = Duration::from_secs(config.funding_poll_secs) / requests.len().max(1) as u32;
+        // 第一轮（含重启后）按 WARMUP_GAP 快速拉齐，之后才按 gap 摊开：否则重启后要等一整轮
+        // （默认几分钟）才拿齐各币各所的数据，这段时间策略只平不开
+        let beat = gap.min(WARMUP_GAP);
         tracing::info!(requests = requests.len(), gap_ms = gap.as_millis() as u64, "资金费轮询器启动");
-        let poller = FundingPoller { requests, next: 0, failures: HashMap::new(), manager: manager.clone() };
-        manager.observers().spawn_periodic("FundingPoller", gap, poller)?;
+        let poller = FundingPoller {
+            requests,
+            next: 0,
+            warm: false,
+            gap,
+            last_fetch: None,
+            failures: HashMap::new(),
+            manager: manager.clone(),
+        };
+        manager.observers().spawn_periodic("FundingPoller", beat, poller)?;
         Ok(())
     })
     .await
 }
 
-/// 资金费轮询器：每个单项间隔（= 一整轮 `funding_poll_secs` / 项数）拉一项（一个币在一个所过去
+/// 第一轮拉取的单项间隔。限速余量：每秒一项时 HL info 约 20×60=1200 权重/分钟封顶（实际只有
+/// 三分之一的项打 HL），币安 fundingRate 60 次/分钟（限 100），OKX 每 2 秒 2 次（限 10）
+const WARMUP_GAP: Duration = Duration::from_secs(1);
+
+/// 资金费轮询器：第一轮每 [`WARMUP_GAP`] 拉一项尽快拉齐，之后每个单项间隔（= 一整轮
+/// `funding_poll_secs` / 项数）拉一项（一个币在一个所过去
 /// 24h 的已结算费率），整窗作为自定义事件投递给对应策略；请求均匀摊在一轮里（HL info 按 IP
 /// 每分钟 1200 权重，fundingHistory 一次约 20；币安 fundingRate 500 次 / 5 分钟；OKX 10 次 / 2 秒）。
 /// 一拍只拉一项；请求慢（断网时每项要等到超时）时错过的拍不补跑，恢复后不连发。
@@ -172,14 +154,28 @@ struct FundingPoller {
     /// 每个 (币, 该币上市的所) 一项，轮流拉
     requests: Vec<(Symbol, Arc<dyn SettledFundingSource>)>,
     next: usize,
+    /// 第一轮已拉完（之后按 `gap` 拉）
+    warm: bool,
+    /// 第一轮之后的单项间隔
+    gap: Duration,
+    last_fetch: Option<std::time::Instant>,
     failures: HashMap<(Symbol, Exchange), u32>,
     manager: ManagerHandle,
 }
 
 impl Periodic for FundingPoller {
     async fn tick(&mut self) -> anyhow::Result<()> {
+        // 节拍按第一轮的快间隔走；第一轮之后没到 gap 的拍跳过
+        if self.warm && self.last_fetch.is_some_and(|t| t.elapsed() < self.gap) {
+            return Ok(());
+        }
         let Some((symbol, source)) = self.requests.get(self.next).cloned() else { return Ok(()) };
+        self.last_fetch = Some(std::time::Instant::now());
         self.next = (self.next + 1) % self.requests.len();
+        if self.next == 0 && !self.warm {
+            self.warm = true;
+            tracing::info!("资金费第一轮已拉完，之后按常规间隔轮询");
+        }
         let ex = source.exchange();
         let start = now_ms().saturating_sub(FUNDING_WINDOW_MS);
         match source.fetch_settled_funding(&symbol, start).await {

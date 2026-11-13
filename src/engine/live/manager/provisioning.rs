@@ -34,7 +34,9 @@ use crate::engine::live::{
 use crate::domain::{
     now_ms, AccountId, Exchange, ExchangeError, OrderUpdate, Symbol, SymbolMeta,
 };
-use crate::exchange::{AccountClient, ExchangeHandle, SubscriptionKind};
+use crate::engine::live::assembly::StartAccountStream;
+use crate::exchange::{AccountClient, AccountStream, ExchangeHandle, SubscriptionKind};
+use crate::messaging::AccountBus;
 use crate::tasks::{ChildHandle, Gone, Group, StopFlag};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -60,6 +62,8 @@ pub(super) struct Collaborators {
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     pub accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     pub capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
+    pub account_streams: AccountStreams,
+    pub paper_counter: bool,
     pub income_processor: IncomeProcessorHandle,
     pub metrics: MetricsHandle,
     pub position_ledger: PositionLedgerHandle,
@@ -82,6 +86,11 @@ pub(super) struct Provisioner {
     accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 各所的订阅能力查询（知识在适配层，随 ExchangeSetup 携带；投产校验用）
     capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
+    /// 各所能起的账户类数据流与已起的（策略声明需要才起，见 [`AccountStreams`]）
+    account_streams: AccountStreams,
+    /// 起没起模拟柜台（`ManagerArgs::paper` 配了才起）：没起时绑定模拟账户的策略拒绝投产 ——
+    /// 否则它的单没人撮合，信号石沉大海
+    paper_counter: bool,
     /// 事件分发层（注册 / 注销 executor 的订阅）
     income_processor: IncomeProcessorHandle,
     /// 观测镜像（投产时随 symbol 一起收基线）
@@ -92,6 +101,52 @@ pub(super) struct Provisioner {
     outcome_bus: OutcomeBus,
     /// 各所交易所节点（放行 / 收回行情订阅）
     exchanges: HashMap<Exchange, ExchangeHandle>,
+}
+
+/// 账户类数据流（[`AccountStream`]）的登记与启动：装配处登记各所能起哪几种（只在配了凭证时
+/// 登记，见 `ExchangeSetup::account_streams`），投产时按策略声明起，同一所同一种只起一份。
+///
+/// 起好的流挂在 manager 的生产者组下（与交易所节点同组：它们往账户总线发事件）。投产回滚时
+/// 不停已起的流 —— 与已发出的行情订阅同理，多一份读数无害，别的实例可能也在用。
+pub(crate) struct AccountStreams {
+    starters: HashMap<(Exchange, AccountStream), StartAccountStream>,
+    started: HashSet<(Exchange, AccountStream)>,
+    account_bus: AccountBus,
+}
+
+impl AccountStreams {
+    pub(crate) fn new(starters: HashMap<(Exchange, AccountStream), StartAccountStream>, account_bus: AccountBus) -> Self {
+        Self { starters, started: HashSet::new(), account_bus }
+    }
+
+    /// 投产期校验：每个要的流都得有所登记过（一次列全）
+    fn validate(&self, wanted: &HashSet<(Exchange, AccountStream)>) -> Result<(), String> {
+        let mut missing: Vec<String> = wanted
+            .iter()
+            .filter(|key| !self.starters.contains_key(key))
+            .map(|(ex, stream)| format!("{ex} 不提供 {stream:?}（适配层没有，或该所没配凭证）"))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        missing.sort();
+        Err(format!("策略要的账户数据流不可行，拒绝投产: {}", missing.join("; ")))
+    }
+
+    /// 起还没起的那些（已校验过）
+    fn start(&mut self, group: &Group, wanted: &HashSet<(Exchange, AccountStream)>) -> Result<(), ExchangeError> {
+        for key in wanted {
+            if self.started.contains(key) {
+                continue;
+            }
+            let start = self.starters.get(key).expect("投产时已校验");
+            start(group, self.account_bus.clone())
+                .map_err(|e| ExchangeError::Other(format!("起 {} 的 {:?} 失败: {e}", key.0, key.1)))?;
+            tracing::info!(exchange = %key.0, stream = ?key.1, "账户数据流已按策略需要启动");
+            self.started.insert(*key);
+        }
+        Ok(())
+    }
 }
 
 /// 投产期订阅可行性校验（纯函数，供单测）。
@@ -204,6 +259,8 @@ impl Provisioner {
             symbol_metas: c.symbol_metas,
             accounts: c.accounts,
             capabilities: c.capabilities,
+            account_streams: c.account_streams,
+            paper_counter: c.paper_counter,
             income_processor: c.income_processor,
             metrics: c.metrics,
             position_ledger: c.position_ledger,
@@ -361,6 +418,20 @@ impl Provisioner {
         //     "什么都没发生"。
         validate_subscriptions(&all_subscriptions, &self.capabilities, &self.symbol_metas)
             .map_err(ExchangeError::Other)?;
+        let account_streams: HashSet<(Exchange, AccountStream)> = strategies
+            .iter()
+            .flat_map(|spec| spec.strategy.account_streams())
+            .flat_map(|(ex, streams)| streams.into_iter().map(move |s| (ex, s)))
+            .collect();
+        self.account_streams.validate(&account_streams).map_err(ExchangeError::Other)?;
+        if !self.paper_counter {
+            if let Some(spec) = strategies.iter().find(|s| matches!(s.account, AccountId::Paper(_))) {
+                return Err(ExchangeError::Other(format!(
+                    "策略绑定了模拟账户 {}，但没配模拟柜台（ManagerArgs::paper），它的单没人撮合，拒绝投产",
+                    spec.account
+                )));
+            }
+        }
 
         // 2. 按交易所分组订阅
         let mut exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>> = HashMap::new();
@@ -447,6 +518,7 @@ impl Provisioner {
                 &exchange_symbols,
                 baselines.into_values().collect(),
                 exchange_subscriptions,
+                &account_streams,
             )
             .await
         {
@@ -547,6 +619,7 @@ impl Provisioner {
         exchange_symbols: &HashSet<(Exchange, Symbol)>,
         baselines: Vec<crate::messaging::PositionBaseline>,
         exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>>,
+        account_streams: &HashSet<(Exchange, AccountStream)>,
     ) -> Result<(), ExchangeError> {
         // 7.1 注册观测层与对账层：symbol 范围 + 持仓基线一次送达。
         //     注册失败必须向上传播：对账层注册不上，该 symbol 的 Fill 会被镜像丢弃
@@ -614,6 +687,8 @@ impl Provisioner {
                 })?;
             }
         }
+        // 7.4 起策略要的账户数据流（同所同种只起一份）
+        self.account_streams.start(&self.producers, account_streams)?;
 
         Ok(())
     }

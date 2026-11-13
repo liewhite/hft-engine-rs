@@ -15,7 +15,8 @@
 //! - 默认只输出日志；配置 `PUSHGATEWAY_URL` 后同一份数字推送 pushgateway
 //!   （见 [`crate::observability`]，未配置时无外部依赖、行为与从前一致）
 
-use super::ExecutorId;
+use super::{ExecutorId, OrderRequestCounts};
+use std::sync::Arc;
 use crate::domain::{now_ms, AccountId, Exchange, Symbol, Timestamp, TradingStats};
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, IncomeEvent, MarketBus,
@@ -108,6 +109,8 @@ pub struct MetricsArgs {
     pub market_bus: MarketBus,
     /// 订阅：全量账户事件（实盘 + 全部模拟账户一次订阅，按事件自带的账户分账）
     pub account_bus: AccountBus,
+    /// 实盘网关的下单 / 撤单请求计数（网关写、这里只读，见 [`OrderRequestCounts`]）
+    pub order_requests: Arc<OrderRequestCounts>,
 }
 
 /// 从事件流重建的聚合视图（纯状态，不含收件与定时；单测直接构造）
@@ -146,10 +149,14 @@ struct MetricsView {
     /// 实盘账户收到 / 付出的资金费：(所, 结算 ID) -> (币, 金额, 结算时刻)。
     /// 交易所轮询器每次重发最近 24h，同一笔按结算 ID 只记一次；超出窗口的在报告时清掉
     funding_fees: HashMap<(Exchange, u64), (Symbol, f64, Timestamp)>,
+    /// 本上报周期内各账户策略实例消费事件的最大滞后（毫秒），每次报告后清零
+    event_lag_max_ms: HashMap<AccountId, u64>,
+    /// 实盘网关请求计数（只读）
+    order_requests: Arc<OrderRequestCounts>,
 }
 
 impl MetricsView {
-    fn new() -> Self {
+    fn new(order_requests: Arc<OrderRequestCounts>) -> Self {
         Self {
             state: StateManager::new(&[], NO_ORDER_TIMEOUT),
             tracked: HashSet::new(),
@@ -161,7 +168,15 @@ impl MetricsView {
             paper_accounts: HashMap::new(),
             strategy_gauges: HashMap::new(),
             funding_fees: HashMap::new(),
+            event_lag_max_ms: HashMap::new(),
+            order_requests,
         }
+    }
+
+    /// 某实例报来的一拍内最大事件滞后，按账户取本周期最大值
+    fn record_event_lag(&mut self, account: AccountId, max_lag_ms: u64) {
+        let v = self.event_lag_max_ms.entry(account).or_default();
+        *v = (*v).max(max_lag_ms);
     }
 
     /// 投产注册：跟踪范围 + 会话起始仓位基线（见 [`MetricsHandle::register_symbols`]）
@@ -296,6 +311,8 @@ impl MetricsView {
     fn report(&mut self) -> PromText {
         self.prune_funding_fees(now_ms());
         let prom = self.render();
+        // 滞后按上报周期取最大：这一份已报，下一周期重新累计
+        self.event_lag_max_ms.clear();
         if self.total.forced_fills > 0 {
             tracing::warn!(
                 target: "metrics",
@@ -501,6 +518,22 @@ impl MetricsView {
         prom.gauge("hft_funding_fee_24h_total", &[], funding_total);
         tracing::info!(target: "metrics", funding_fee_24h = format!("{:.4}", funding_total), "metrics.funding");
 
+        // ---------- 执行管线 ----------
+        // 下单 / 撤单请求累计次数（本进程启动以来；Grafana 用 increase 看 24h 用量，进程重启计数归零它能识别）
+        for (exchange, kind, n) in self.order_requests.snapshot() {
+            prom.gauge(
+                "hft_order_requests_total",
+                &[("exchange", &exchange.to_string()), ("kind", kind.label())],
+                n as f64,
+            );
+        }
+        // 本周期策略消费事件的最大滞后，按账户
+        let mut lags: Vec<_> = self.event_lag_max_ms.iter().collect();
+        lags.sort_by_key(|(a, _)| a.to_string());
+        for (account, ms) in lags {
+            prom.gauge("hft_event_lag_max_ms", &[("account", &account.to_string())], *ms as f64);
+        }
+
         // ---------- 策略自报读数 ----------
         // 逐行把关（见 Gauge::validate），名字加标签重复的也丢：pushgateway 整份收或整份拒
         let mut seen: HashSet<String> = HashSet::new();
@@ -580,6 +613,8 @@ enum MetricsMsg {
         account: AccountId,
         gauges: Vec<Gauge>,
     },
+    /// 见 [`MetricsHandle::event_lag`]
+    EventLag { account: AccountId, max_lag_ms: u64 },
     /// 见 [`MetricsHandle::register_symbols`]
     Register {
         symbols: Vec<Symbol>,
@@ -602,6 +637,12 @@ impl MetricsHandle {
         gauges: Vec<Gauge>,
     ) -> Result<(), Gone> {
         self.0.send(MetricsMsg::StrategyGauges { executor, account, gauges })
+    }
+
+    /// 策略实例报告一拍（一个 Clock 周期）内消费事件的最大滞后（事件被适配层收到到被策略
+    /// 处理之间的毫秒数）。指标按账户取上报周期内的最大值推出
+    pub fn event_lag(&self, account: AccountId, max_lag_ms: u64) -> Result<(), Gone> {
+        self.0.send(MetricsMsg::EventLag { account, max_lag_ms })
     }
 
     /// 投产注册握手：要跟踪的 symbol 集合 + 它们的持仓基线（同一份快照，与 executor /
@@ -649,7 +690,7 @@ impl Metrics {
                 Ok(Self {
                     inbox,
                     every: Duration::from_millis(args.interval_ms),
-                    view: MetricsView::new(),
+                    view: MetricsView::new(args.order_requests),
                     pusher,
                 })
             })
@@ -678,6 +719,7 @@ impl Metrics {
                 push: None,
                 market_bus: MarketBus::new("market"),
                 account_bus: AccountBus::new("account"),
+                order_requests: Default::default(),
             },
         )
         .await
@@ -697,6 +739,7 @@ impl Task for Metrics {
                     Some(MetricsMsg::StrategyGauges { executor, account, gauges }) => {
                         self.view.set_strategy_gauges(executor, account, gauges)
                     }
+                    Some(MetricsMsg::EventLag { account, max_lag_ms }) => self.view.record_event_lag(account, max_lag_ms),
                     Some(MetricsMsg::Register { symbols, baselines, reply }) => {
                         self.view.register(symbols, baselines);
                         // 提问方已不等回复（它自己放弃了）时无人可告知；注册本身已生效
@@ -749,7 +792,7 @@ mod tests {
 
     /// 直接构造聚合视图（不起组件），用于测试纯状态累积逻辑
     fn view() -> MetricsView {
-        MetricsView::new()
+        MetricsView::new(Default::default())
     }
 
     /// 注册经句柄等到完成；组件停止后句柄报 Gone（调用方据此报错，而不是静默丢掉基线）
@@ -763,6 +806,7 @@ mod tests {
                 push: None,
                 market_bus: MarketBus::new("market"),
                 account_bus: AccountBus::new("account"),
+                order_requests: Default::default(),
             },
         )
         .await
@@ -827,6 +871,7 @@ mod tests {
                 push: Some(MetricsPushConfig { url, job: "t".to_string() }),
                 market_bus: MarketBus::new("market"),
                 account_bus: account_bus.clone(),
+                order_requests: Default::default(),
             },
         )
         .await
@@ -920,6 +965,24 @@ mod tests {
         let body = metrics.render().into_body();
         assert_eq!(body.lines().filter(|l| l.starts_with("ok_x")).count(), 2, "{body}");
         assert!(!body.contains("bad-name") && !body.contains("hft_equity{symbol"), "{body}");
+    }
+
+    /// 下单 / 撤单请求计数按所按种类推出；事件滞后按账户取周期内最大值，报完清零（#757）
+    #[test]
+    fn order_requests_and_event_lag_are_reported() {
+        let counts = Arc::new(OrderRequestCounts::default());
+        let mut metrics = MetricsView::new(counts.clone());
+        counts.bump_for_test(Exchange::Hyperliquid, super::super::RequestKind::Place, 3);
+        counts.bump_for_test(Exchange::Hyperliquid, super::super::RequestKind::Cancel, 2);
+        metrics.record_event_lag(AccountId::Live, 40);
+        metrics.record_event_lag(AccountId::Live, 900);
+        metrics.record_event_lag(AccountId::Live, 10);
+        let body = metrics.report().into_body();
+        assert_eq!(line_value(&body, "hft_order_requests_total{exchange=\"Hyperliquid\",kind=\"place\"}"), Some(3.0), "{body}");
+        assert_eq!(line_value(&body, "hft_order_requests_total{exchange=\"Hyperliquid\",kind=\"cancel\"}"), Some(2.0), "{body}");
+        assert_eq!(line_value(&body, "hft_event_lag_max_ms{account=\"live\"}"), Some(900.0), "{body}");
+        let next = metrics.report().into_body();
+        assert!(!next.contains("hft_event_lag_max_ms"), "报过的周期应清零: {next}");
     }
 
     /// 各所分腿持仓按所推出（净仓为 0 时也看得到两条腿）

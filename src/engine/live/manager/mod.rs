@@ -21,7 +21,7 @@ use super::{
     DEFAULT_POSITION_POLL_INTERVAL_MS, DEFAULT_REPORT_INTERVAL_MS,
 };
 use crate::domain::{now_ms, AccountId, Exchange, ExchangeError, Position, Symbol, SymbolMeta};
-use crate::exchange::{AccountClient, ExchangeClient, ExchangeHandle, SubscriptionKind};
+use crate::exchange::{AccountClient, ExchangeClient, ExchangeHandle, SettledFundingSource, SubscriptionKind};
 use crate::messaging::{AccountEvent, CustomEvent, MarketData, MarketEvent};
 use crate::strategy::Strategy;
 use crate::tasks::{Addr, BusTap, Group, Inbox, Scope, Task};
@@ -43,12 +43,13 @@ pub struct ManagerArgs {
     /// 参与的交易所（在 bin 侧用各所的 `setup_*` 装配，见 [`super::assembly`]）。
     /// manager 对"有哪些所"彻底无知 —— 加新交易所零改 manager。
     pub exchanges: Vec<ExchangeSetup>,
-    /// 本地柜台（模拟账户）的撮合与账本配置。
+    /// 本地柜台（模拟账户）的撮合与账本配置；`None` = 不起模拟柜台（只跑实盘的进程）。
     ///
-    /// 实盘与模拟**并行**：两个 outcome 消费者常驻，各按账户取自己的那份
-    /// （见 [`crate::domain::AccountId`]）。因此不再有"整个进程的运行模式"这一概念 ——
+    /// 配了就与实盘**并行**：两个 outcome 消费者并存，各按账户取自己的那份
+    /// （见 [`crate::domain::AccountId`]）。因此没有"整个进程的运行模式"这一概念 ——
     /// 一个 symbol 上完全可以模拟先跑、出信号后再拉起实盘，两者互不可见。
-    pub paper: crate::sim::SimConfig,
+    /// 没配时，绑定模拟账户的策略在投产时被拒（它的单没人撮合）。
+    pub paper: Option<crate::sim::SimConfig>,
 }
 
 /// 策略实例 + 它绑定的账户。
@@ -108,6 +109,10 @@ pub struct ManagerHandle {
     /// 引擎级合约目录：构造时预加载一次、此后不变，与编排共享同一份
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     position_ledger: PositionLedgerHandle,
+    /// 各所的公共已结算资金费来源（装配处给的，见 `ExchangeSetup::settled_funding`）
+    settled_funding: Arc<HashMap<Exchange, Arc<dyn SettledFundingSource>>>,
+    /// 接入的所，按装配顺序
+    exchanges: Arc<Vec<Exchange>>,
 }
 
 impl ManagerHandle {
@@ -166,6 +171,22 @@ impl ManagerHandle {
             result.entry(*exchange).or_default().push(meta.clone());
         }
         result
+    }
+
+    /// 接入的所，按装配（配置）顺序
+    pub fn exchanges(&self) -> Vec<Exchange> {
+        self.exchanges.as_ref().clone()
+    }
+
+    /// 某所某币的合约元数据（启动时预加载的那份）；不在目录里返回 `None`
+    pub fn symbol_meta(&self, exchange: Exchange, symbol: &Symbol) -> Option<SymbolMeta> {
+        self.symbol_metas.get(&(exchange, symbol.clone())).cloned()
+    }
+
+    /// 某所的公共已结算资金费来源（该所适配层不提供时为 `None`）。用的是装配时建好的那个
+    /// client，不必为拉资金费另建。
+    pub fn settled_funding(&self, exchange: Exchange) -> Option<Arc<dyn SettledFundingSource>> {
+        self.settled_funding.get(&exchange).cloned()
     }
 
     /// 实盘持仓真值快照，取自持仓账本（唯一被 REST 持续校验的那份折叠 —— 外部读到的数字与
@@ -317,6 +338,20 @@ impl Manager {
         // 能力表：投产校验用（知识在各适配层的 supports_subscription，随 setup 携带）
         let capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool> =
             setups.iter().map(|s| (s.exchange, s.supports)).collect();
+        let exchange_order: Vec<Exchange> = setups.iter().map(|s| s.exchange).collect();
+        let settled_funding: HashMap<Exchange, Arc<dyn SettledFundingSource>> = setups
+            .iter()
+            .filter_map(|s| s.settled_funding.clone().map(|f| (s.exchange, f)))
+            .collect();
+        //    账户类数据流的启动器：从各 setup 里取走（闭包不可克隆），交给投产编排
+        let mut setups = setups;
+        let account_stream_starters: HashMap<_, _> = setups
+            .iter_mut()
+            .flat_map(|s| {
+                let exchange = s.exchange;
+                std::mem::take(&mut s.account_streams).into_iter().map(move |(k, v)| ((exchange, k), v))
+            })
+            .collect();
 
         // 2. 预加载所有交易所的 symbol metas（引擎级合约目录，此后不变，各组件共享这一份）
         let symbol_metas = Arc::new(Self::preload_all_symbol_metas(&clients).await?);
@@ -377,22 +412,25 @@ impl Manager {
         ));
         //    出向处理器还订交易所回报（只订 OrderUpdate），用来作废迟到的 REST 失败结论
         //    （见 OrderGateway::in_flight）
-        OutcomeProcessor::spawn(&consumers, order_gateway, &outcome_bus, &account_bus)
+        OutcomeProcessor::spawn(&consumers, order_gateway.clone(), &outcome_bus, &account_bus)
             .await?;
 
-        //    本地柜台：订阅信号总线（认领 Paper 账户的订单）与行情总线（撮合 + Clock 发净值），
-        //    回报以 Paper 标签发布到账户总线 —— 与实盘适配层同一条总线、同一个类型
-        PaperCounter::spawn(
-            &consumers,
-            PaperCounterArgs {
-                config: args.paper,
-                symbol_metas: symbol_metas.clone(),
-                market_bus: market_bus.clone(),
-                outcome_bus: outcome_bus.clone(),
-                account_bus: account_bus.clone(),
-            },
-        )
-        .await?;
+        //    本地柜台（配了才起）：订阅信号总线（认领 Paper 账户的订单）与行情总线（撮合 +
+        //    Clock 发净值），回报以 Paper 标签发布到账户总线 —— 与实盘适配层同一条总线、同一个类型
+        let paper_counter = args.paper.is_some();
+        if let Some(config) = args.paper {
+            PaperCounter::spawn(
+                &consumers,
+                PaperCounterArgs {
+                    config,
+                    symbol_metas: symbol_metas.clone(),
+                    market_bus: market_bus.clone(),
+                    outcome_bus: outcome_bus.clone(),
+                    account_bus: account_bus.clone(),
+                },
+            )
+            .await?;
+        }
 
         // 7. 观测层：订阅两条入向总线（只读事件流，不参与决策）。账户事件（实盘 + 全部模拟
         //    账户）一次订阅，按事件自带的账户分账，绝不与实盘视图混淆
@@ -404,6 +442,7 @@ impl Manager {
                 push: crate::observability::MetricsPushConfig::from_env(),
                 market_bus: market_bus.clone(),
                 account_bus: account_bus.clone(),
+                order_requests: order_gateway.request_counts(),
             },
         )
         .await?;
@@ -467,6 +506,8 @@ impl Manager {
             outcome_bus: outcome_bus.tap(),
             symbol_metas: symbol_metas.clone(),
             position_ledger: position_ledger.clone(),
+            settled_funding: Arc::new(settled_funding),
+            exchanges: Arc::new(exchange_order),
         };
         let manager = Self {
             inbox,
@@ -476,6 +517,8 @@ impl Manager {
                 symbol_metas,
                 accounts,
                 capabilities,
+                account_streams: provisioning::AccountStreams::new(account_stream_starters, account_bus.clone()),
+                paper_counter,
                 income_processor,
                 metrics,
                 position_ledger,

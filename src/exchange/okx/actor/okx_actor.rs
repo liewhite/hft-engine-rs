@@ -7,16 +7,16 @@
 //!
 //! 树:
 //! OkxNode
-//! ├── OkxPublicWs
-//! ├── OkxBusinessWs（K线）
+//! ├── OkxPublicWs（第一条订阅时才连）
+//! ├── OkxBusinessWs（K线，第一条 K 线订阅时才连）
 //! ├── OkxPrivateWs（需要凭证）
 //! ├── EquityPoller（需要凭证；净值 / 持仓总价值）
-//! ├── OkxGreeksPoller（需要凭证）
 //! ├── FundingFeePoller（需要凭证）
 //! └── CryptoStatus
+//!
+//! 希腊值轮询不在节点下：策略声明要才起（见 `crate::exchange::AccountStream`）。
 
 use super::business_ws::OkxBusinessWs;
-use super::greeks_polling::OkxGreeksPoller;
 use super::private_ws::OkxPrivateWs;
 use super::public_ws::OkxPublicWs;
 use crate::domain::{Symbol, SymbolMeta};
@@ -24,10 +24,10 @@ use crate::exchange::client::{ExchangeCmd, ExchangeHandle, SubscriptionKind};
 use crate::exchange::equity_polling::EquityPoller;
 use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
 use crate::exchange::okx::{OkxClient, OkxCredentials};
+use crate::exchange::lazy_conn::LazyConn;
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
-use crate::tasks::{Addr, Group, Inbox, Scope, Task};
-use anyhow::Context as _;
+use crate::tasks::{Group, Inbox, Scope, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -37,14 +37,11 @@ const STATUS_BROADCAST_INTERVAL_MS: u64 = 60_000;
 /// 净值 REST 轮询间隔 (毫秒)。一次 = balance + positions 各一次，两者官方限速各 10/2s
 const EQUITY_POLL_INTERVAL_MS: u64 = 2_000;
 
-/// Greeks REST 轮询间隔 (毫秒) — 每秒 1 次，官方限速 10/2s
-const GREEKS_POLLING_INTERVAL_MS: u64 = 1000;
-
 /// OkxNode 构造参数
 pub struct OkxArgs {
     /// 凭证（可选）
     pub credentials: Option<OkxCredentials>,
-    /// REST client (用于净值 / Greeks 轮询)
+    /// 带凭证的 REST client（净值、资金费轮询用；只在有凭证时给）
     pub client: Option<Arc<OkxClient>>,
     /// Symbol 元数据
     pub symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
@@ -59,10 +56,10 @@ pub struct OkxArgs {
 /// OKX 交易所节点
 pub struct OkxNode {
     inbox: Inbox<ExchangeCmd>,
-    /// 公共 WebSocket（除 K 线外的全部行情）
-    public_ws: Addr<ExchangeCmd>,
-    /// Business WebSocket（K 线）
-    business_ws: Addr<ExchangeCmd>,
+    /// 公共 WebSocket（除 K 线外的全部行情），第一条订阅时才连
+    public_ws: LazyConn,
+    /// Business WebSocket（K 线），第一条 K 线订阅时才连
+    business_ws: LazyConn,
 }
 
 /// 按订阅 kind 选择落到哪条 WS：K 线只在 business 线上有
@@ -71,7 +68,7 @@ fn is_business(kind: &SubscriptionKind) -> bool {
 }
 
 impl OkxNode {
-    /// 在 `group` 下起 OKX 节点，等全部 WS 连好（私有的含登录与订阅确认），返回句柄。
+    /// 在 `group` 下起 OKX 节点，等私有 WS 连好（含登录与订阅确认），返回句柄。
     /// 任一失败 → 返回 Err 并上冒（启动期受控退出，不重试）。
     pub async fn spawn(group: &Group, args: OkxArgs) -> anyhow::Result<ExchangeHandle> {
         let (_, addr) = group
@@ -79,36 +76,31 @@ impl OkxNode {
                 let OkxArgs { credentials, client, symbol_metas, market_bus, account_bus, quote } = args;
                 let children = scope.group("children");
 
-                // 1. 三条 WS 并发连接；任一失败 → 向上传播（启动期受控退出，不重试）
+                // 1. 私有 WS 启动时就连（含登录与订阅确认，要在投产前生效）；失败 → 向上传播。
+                //    两条公共 WS 等第一条订阅路由过来才连（见 LazyConn）
                 let has_private_ws = credentials.is_some();
-                let private = async {
-                    match credentials {
-                        Some(credentials) => OkxPrivateWs::spawn(
-                            &children,
-                            credentials,
-                            account_bus.clone(),
-                            symbol_metas.clone(),
-                            quote.clone(),
-                        )
-                        .await
-                        .map(|_| ()),
-                        None => Ok(()),
-                    }
+                if let Some(credentials) = credentials {
+                    OkxPrivateWs::spawn(&children, credentials, account_bus.clone(), symbol_metas.clone(), quote.clone())
+                        .await?;
+                }
+                let public_ws = {
+                    let (group, market_bus, metas, quote) =
+                        (children.clone(), market_bus.clone(), symbol_metas.clone(), quote.clone());
+                    LazyConn::new("OkxPublicWs", move || async move {
+                        OkxPublicWs::spawn(&group, market_bus, metas, quote).await
+                    })
                 };
-                let (public_ws, business_ws, ()) = tokio::try_join!(
-                    OkxPublicWs::spawn(&children, market_bus.clone(), symbol_metas.clone(), quote.clone()),
-                    OkxBusinessWs::spawn(&children, market_bus.clone(), symbol_metas.clone(), quote.clone()),
-                    private,
-                )?;
-                tracing::info!(exchange = "OKX", has_private_ws, "WS ready");
+                let business_ws = {
+                    let (group, market_bus, quote) = (children.clone(), market_bus.clone(), quote.clone());
+                    LazyConn::new("OkxBusinessWs", move || async move {
+                        OkxBusinessWs::spawn(&group, market_bus, quote).await
+                    })
+                };
 
-                // 2. Greeks 轮询要签名，故按**凭证**门控：装配处只在有凭证时才给 client
-                // （见 assembly::setup_okx），所以这里 `Some` 即"可轮询"，不必再判一次 bool。
-                // 无凭证时不起它 —— 否则 non-auth 模式会每秒失败刷日志。
+                // 2. 账户轮询按凭证门控：装配处只在有凭证时才给 client（见 assembly::setup_okx）
                 if let Some(client) = client {
                     // 净值与持仓总价值走 REST 轮询：私有 WS 推送的 notionalUsd 在单币种保证金模式下是空串
                     EquityPoller::spawn(&children, client.clone(), account_bus.clone(), EQUITY_POLL_INTERVAL_MS)?;
-                    OkxGreeksPoller::spawn(&children, client.clone(), account_bus.clone(), GREEKS_POLLING_INTERVAL_MS)?;
                     FundingFeePoller::spawn(&children, client, account_bus.clone(), FUNDING_FEE_POLL_INTERVAL_MS)?;
                 }
                 CryptoStatus::spawn(
@@ -125,35 +117,32 @@ impl OkxNode {
         Ok(ExchangeHandle::new(addr))
     }
 
-    fn ws_for(&self, kind: &SubscriptionKind) -> &Addr<ExchangeCmd> {
+    fn ws_for(&mut self, kind: &SubscriptionKind) -> &mut LazyConn {
         if is_business(kind) {
-            &self.business_ws
+            &mut self.business_ws
         } else {
-            &self.public_ws
+            &mut self.public_ws
         }
     }
 
     /// 按目标 WS 路由命令；批量订阅按目标拆分
-    fn route(&self, cmd: ExchangeCmd) -> anyhow::Result<()> {
+    async fn route(&mut self, cmd: ExchangeCmd) -> anyhow::Result<()> {
         match cmd {
             ExchangeCmd::Subscribe(ref kind) | ExchangeCmd::Unsubscribe(ref kind) => {
-                self.ws_for(kind)
-                    .send(cmd)
-                    .context("转发订阅命令失败：OKX WS 已停止收件")?;
+                self.ws_for(kind).send(cmd).await
             }
             ExchangeCmd::SubscribeBatch(kinds) => {
                 let (business_kinds, public_kinds): (Vec<_>, Vec<_>) =
                     kinds.into_iter().partition(is_business);
-                for (target, kinds) in [(&self.public_ws, public_kinds), (&self.business_ws, business_kinds)] {
-                    if !kinds.is_empty() {
-                        target
-                            .send(ExchangeCmd::SubscribeBatch(kinds))
-                            .context("转发批量订阅失败：OKX WS 已停止收件")?;
-                    }
+                if !public_kinds.is_empty() {
+                    self.public_ws.send(ExchangeCmd::SubscribeBatch(public_kinds)).await?;
                 }
+                if !business_kinds.is_empty() {
+                    self.business_ws.send(ExchangeCmd::SubscribeBatch(business_kinds)).await?;
+                }
+                Ok(())
             }
         }
-        Ok(())
     }
 }
 
@@ -161,7 +150,7 @@ impl Task for OkxNode {
     async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
         // 子 WS 只在出错时提前停止收件（出错会自己上冒），转发失败就整支停
         while let Some(cmd) = self.inbox.recv().await {
-            self.route(cmd)?;
+            self.route(cmd).await?;
         }
         Ok(())
     }

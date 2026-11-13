@@ -13,7 +13,7 @@ pub use view::{StrategyView, SymbolView};
 
 use crate::domain::{Exchange, Order, OrderId, Symbol, Timestamp};
 use crate::observability::Gauge;
-use crate::exchange::SubscriptionKind;
+use crate::exchange::{AccountStream, SubscriptionKind};
 use crate::messaging::{CustomEvent, IncomeEvent};
 use std::collections::{HashMap, HashSet};
 
@@ -54,6 +54,13 @@ pub enum OutcomeEvent {
 pub trait Strategy: Send + Sync {
     /// 策略需要订阅的公共数据流
     fn public_streams(&self) -> HashMap<Exchange, HashSet<SubscriptionKind>>;
+
+    /// 策略需要的账户类数据流（见 [`AccountStream`]，如 OKX 的希腊值）。投产时框架在对应的所
+    /// 起它们（同一所同一种只起一份，多个策略共用）；该所不提供或没配凭证则拒绝投产。
+    /// 净值、持仓、成交、资金费流水不在此列：它们框架总是提供。默认不要。
+    fn account_streams(&self) -> HashMap<Exchange, HashSet<AccountStream>> {
+        HashMap::new()
+    }
 
     /// 订单超时时间 (毫秒)
     fn order_timeout_ms(&self) -> u64;

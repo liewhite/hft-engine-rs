@@ -212,8 +212,6 @@ async fn paper_counter_fills_from_live_trades() {
         .fetch_symbol_meta(std::slice::from_ref(&symbol))
         .await
         .expect("public symbol meta");
-    let metas_by_symbol: Arc<HashMap<Symbol, SymbolMeta>> =
-        Arc::new(metas.iter().cloned().map(|m| (m.symbol.clone(), m)).collect());
     let metas_by_key: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> =
         Arc::new(metas.into_iter().map(|m| ((EX, m.symbol.clone()), m)).collect());
 
@@ -261,6 +259,7 @@ async fn paper_counter_fills_from_live_trades() {
             push: None,
             market_bus: market_bus.clone(),
             account_bus: account_bus.clone(),
+            order_requests: Default::default(),
         },
     )
     .await
@@ -312,8 +311,8 @@ async fn paper_counter_fills_from_live_trades() {
     let binance = BinanceNode::spawn(
         &producers,
         BinanceArgs {
+            client: None,
             credentials: None,
-            symbol_metas: metas_by_symbol,
             rest_base_url: REST_BASE_URL.to_string(),
             market_bus: market_bus.clone(),
             account_bus: account_bus.clone(),

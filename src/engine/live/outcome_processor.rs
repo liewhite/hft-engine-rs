@@ -26,6 +26,48 @@ use super::{outlet_for, to_live_outlet, AccountOutcome, OutcomeBus, Outlet};
 ///
 /// 由 [`OutcomeProcessor`] 独占：策略信号各起一个子任务执行，不阻塞事件流。系统里不存在第二个下单
 /// 出口，in_flight 假警报防护、失败合成回报、dry_run 语义对一切下单一致。
+/// 实盘网关发往各所的下单 / 撤单 REST 请求累计次数（本进程启动以来）。网关是唯一写入方，
+/// 指标出口只读（推成 `hft_order_requests_total`，看 HL 每日 5 万次用户操作额度用了多少）。
+#[derive(Debug, Default)]
+pub struct OrderRequestCounts(std::sync::Mutex<HashMap<(Exchange, RequestKind), u64>>);
+
+/// 计数的请求种类
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RequestKind {
+    Place,
+    Cancel,
+}
+
+impl RequestKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RequestKind::Place => "place",
+            RequestKind::Cancel => "cancel",
+        }
+    }
+}
+
+impl OrderRequestCounts {
+    fn bump(&self, exchange: Exchange, kind: RequestKind) {
+        *self.0.lock().expect("请求计数锁被毒化").entry((exchange, kind)).or_default() += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bump_for_test(&self, exchange: Exchange, kind: RequestKind, n: u64) {
+        for _ in 0..n {
+            self.bump(exchange, kind);
+        }
+    }
+
+    /// 当前各 (所, 种类) 的累计次数
+    pub fn snapshot(&self) -> Vec<(Exchange, RequestKind, u64)> {
+        let mut v: Vec<_> =
+            self.0.lock().expect("请求计数锁被毒化").iter().map(|(&(ex, k), &n)| (ex, k, n)).collect();
+        v.sort_by_key(|&(ex, k, _)| (ex.to_string(), k.label()));
+        v
+    }
+}
+
 pub struct OrderGateway {
     /// 各所的账户私有能力。键集 = 配了凭证的所 —— 不在表里就是"该所只接公共行情"，
     /// 下单请求会被拒绝并合成失败回报，而不是静默丢弃。
@@ -54,6 +96,8 @@ pub struct OrderGateway {
     /// 一旦停机就不再发新单：停机收尾期间策略可能还在出信号，这些单挂到交易所上、进程退出后
     /// 无人看管（#710）。撤单不受影响。
     machine_stopping: StopFlag,
+    /// 真正发出去的下单 / 撤单 REST 请求计数（dry-run、本地拦下的不算）
+    requests: Arc<OrderRequestCounts>,
 }
 
 /// [`OrderGateway::place`] 的结构化结论。策略侧的闭环走事件回报，不读它；它把一次下单落在
@@ -93,7 +137,13 @@ impl OrderGateway {
             in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             halt,
             machine_stopping,
+            requests: Arc::default(),
         }
+    }
+
+    /// 请求计数（交给指标出口读）
+    pub fn request_counts(&self) -> Arc<OrderRequestCounts> {
+        self.requests.clone()
     }
 
     /// 下一张单：出向校验（折算 + 取整 + 下界）→ 登记 in_flight → REST → 按三种结果处置。
@@ -199,6 +249,7 @@ impl OrderGateway {
             .expect("in_flight 锁被毒化")
             .insert(order.client_order_id.clone());
 
+        self.requests.bump(order.exchange, RequestKind::Place);
         match client.place_order(exchange_order).await {
             Ok(order_id) => {
                 // REST 已给出结论，此后不再需要"在飞"登记
@@ -318,6 +369,7 @@ impl OrderGateway {
         }
 
         tracing::info!(%exchange, %symbol, %order_id, "Cancelling order");
+        self.requests.bump(exchange, RequestKind::Cancel);
         match client.cancel_order(&symbol, &order_id).await {
             Ok(()) => {
                 tracing::info!(%exchange, %symbol, %order_id, "Order cancelled successfully");

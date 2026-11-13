@@ -7,28 +7,15 @@
 use std::collections::{BTreeMap, HashMap};
 
 use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
-use hft_engine_rs::engine::{
-    load_config, run_engine, run_main, ManagerArgs, setup_binance, setup_hyperliquid, setup_okx, StrategySpec,
-};
-use hft_engine_rs::exchange::binance::BinanceCredentials;
-use hft_engine_rs::exchange::ExchangeAccess;
-use hft_engine_rs::exchange::hyperliquid::HyperliquidAccess;
-use hft_engine_rs::exchange::okx::OkxCredentials;
+use hft_engine_rs::engine::{load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, StrategySpec};
 use hft_engine_rs::strategy::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
 use md5::{Digest, Md5};
 use serde::Deserialize;
 
-/// 交易所凭证配置（缺省即该所不参与）
-///
-/// **有意只支持加密永续三所，不接 IBKR**：本策略靠 symbol 同名跨所配对，而美股 ticker 与
-/// 永续 ticker 存在真实重名（SOL / COIN / MARA 等）。把股票和永续配成"跨所价差对"是两个
-/// 无关标的对冲，且股票有交易时段、与 7x24 的永续无法持续对冲。要做跨市场套利应另起策略。
-#[derive(Debug, Clone, Deserialize)]
-struct ExchangesConfig {
-    binance: Option<ExchangeAccess<BinanceCredentials>>,
-    okx: Option<ExchangeAccess<OkxCredentials>>,
-    hyperliquid: Option<HyperliquidAccess>,
-}
+// 交易所接入用框架的 ExchangesConfig（缺省即该所不参与）。
+// **有意只支持加密永续三所，不接 IBKR**：本策略靠 symbol 同名跨所配对，而美股 ticker 与
+// 永续 ticker 存在真实重名（SOL / COIN / MARA 等）。把股票和永续配成"跨所价差对"是两个
+// 无关标的对冲，且股票有交易时段、与 7x24 的永续无法持续对冲。要做跨市场套利应另起策略。
 
 /// symbol 分桶配置
 ///
@@ -127,21 +114,12 @@ async fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("strategy.spread_arb 配置非法: {e}"))?;
 
     // 装配参与的交易所（缺省即该所不参与）—— manager 对"有哪些所"无知
-    let mut exchanges = Vec::new();
-    if let Some(access) = config.exchanges.binance.clone() {
-        exchanges.push(setup_binance(access)?);
-    }
-    if let Some(access) = config.exchanges.okx.clone() {
-        exchanges.push(setup_okx(access)?);
-    }
-    if let Some(access) = config.exchanges.hyperliquid.clone() {
-        exchanges.push(setup_hyperliquid(access).await?);
-    }
+    let exchanges = setup_all(&config.exchanges).await?;
 
     let args = ManagerArgs {
         exchanges,
-        // 实盘策略；本 bin 不跑模拟账户，柜台配置用默认值即可
-        paper: Default::default(),
+        // 实盘策略；本 bin 不跑模拟账户，不起模拟柜台
+        paper: None,
     };
     // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
     run_engine(args, |manager| async move {

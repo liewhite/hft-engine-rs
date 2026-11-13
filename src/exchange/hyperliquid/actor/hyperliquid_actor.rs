@@ -10,7 +10,7 @@
 //!
 //! 树:
 //! HyperliquidNode
-//! ├── HyperliquidPublicWs
+//! ├── HyperliquidPublicWs（第一条订阅时才连）
 //! ├── HyperliquidPrivateWs（需要凭证）
 //! ├── EquityPoller（需要凭证）
 //! ├── FundingFeePoller（需要凭证）
@@ -22,10 +22,10 @@ use crate::exchange::client::{ExchangeCmd, ExchangeHandle};
 use crate::exchange::equity_polling::EquityPoller;
 use crate::exchange::funding_fee_polling::{FundingFeePoller, FUNDING_FEE_POLL_INTERVAL_MS};
 use crate::exchange::hyperliquid::HyperliquidClient;
+use crate::exchange::lazy_conn::LazyConn;
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
-use crate::tasks::{Addr, Group, Inbox, Scope, Task};
-use anyhow::Context as _;
+use crate::tasks::{Group, Inbox, Scope, Task};
 use std::sync::Arc;
 
 /// 市场状态广播间隔 (毫秒)
@@ -49,12 +49,12 @@ pub struct HyperliquidArgs {
 /// Hyperliquid 交易所节点
 pub struct HyperliquidNode {
     inbox: Inbox<ExchangeCmd>,
-    /// 公共 WebSocket（全部订阅命令都转给它）
-    public_ws: Addr<ExchangeCmd>,
+    /// 公共 WebSocket（全部订阅命令都转给它），第一条订阅时才连
+    public_ws: LazyConn,
 }
 
 impl HyperliquidNode {
-    /// 在 `group` 下起 Hyperliquid 节点，等全部 WS 连好（私有的含订阅确认），返回句柄。
+    /// 在 `group` 下起 Hyperliquid 节点，等私有 WS 连好（含订阅确认），返回句柄。
     /// 任一失败 → 返回 Err 并上冒（启动期受控退出，不重试/不重连）。
     pub async fn spawn(group: &Group, args: HyperliquidArgs) -> anyhow::Result<ExchangeHandle> {
         let (_, addr) = group
@@ -66,24 +66,17 @@ impl HyperliquidNode {
                 let has_private_ws = private_feed.is_some();
                 let children = scope.group("children");
 
-                // 1. 两条 WS 并发连接；任一失败 → 向上传播
-                let private = async {
-                    match private_feed.clone() {
-                        Some(wallet_address) => HyperliquidPrivateWs::spawn(
-                            &children,
-                            wallet_address,
-                            args.account_bus.clone(),
-                            markets.clone(),
-                        )
-                        .await
-                        .map(|_| ()),
-                        None => Ok(()),
-                    }
+                // 1. 私有 WS 启动时就连（含订阅确认，要在投产前生效）；失败 → 向上传播。
+                //    公共 WS 等第一条订阅路由过来才连（见 LazyConn）
+                if let Some(wallet_address) = private_feed {
+                    HyperliquidPrivateWs::spawn(&children, wallet_address, args.account_bus.clone(), markets.clone()).await?;
+                }
+                let public_ws = {
+                    let (group, market_bus, markets) = (children.clone(), args.market_bus.clone(), markets.clone());
+                    LazyConn::new("HyperliquidPublicWs", move || async move {
+                        HyperliquidPublicWs::spawn(&group, market_bus, markets).await
+                    })
                 };
-                let (public_ws, ()) = tokio::try_join!(
-                    HyperliquidPublicWs::spawn(&children, args.market_bus.clone(), markets.clone()),
-                    private,
-                )?;
                 tracing::info!(exchange = "Hyperliquid", has_private_ws, dexes = ?markets.dexes(), "WS ready");
 
                 // 2. 账户轮询（净值、资费结算）：与私有 WS 一样按凭证门控
@@ -117,9 +110,7 @@ impl Task for HyperliquidNode {
     async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
         // 子 WS 只在出错时提前停止收件（出错会自己上冒），转发失败就整支停
         while let Some(cmd) = self.inbox.recv().await {
-            self.public_ws
-                .send(cmd)
-                .context("转发订阅命令失败：Hyperliquid 公共 WS 已停止收件")?;
+            self.public_ws.send(cmd).await?;
         }
         Ok(())
     }

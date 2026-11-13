@@ -9,7 +9,7 @@
 use hft_engine_rs::domain::Exchange;
 use hft_engine_rs::engine::{Manager, ManagerArgs, StrategySpec};
 use hft_engine_rs::exchange::okx::OkxCredentials;
-use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
+use hft_engine_rs::exchange::{AccountStream, ExchangeAccess, SubscriptionKind};
 
 const TEST_QUOTE: &str = "USDT";
 use hft_engine_rs::messaging::{ExchangeAccountData, AccountData, IncomeEvent};
@@ -43,6 +43,10 @@ impl Strategy for GreeksPrintStrategy {
         let mut map = HashMap::new();
         map.insert(Exchange::OKX, kinds);
         map
+    }
+
+    fn account_streams(&self) -> HashMap<Exchange, HashSet<AccountStream>> {
+        HashMap::from([(Exchange::OKX, HashSet::from([AccountStream::Greeks]))])
     }
 
     fn order_timeout_ms(&self) -> u64 {
@@ -89,7 +93,7 @@ async fn test_okx_greeks_push() {
         &root.group("main"),
         ManagerArgs {
             exchanges: vec![okx],
-            paper: Default::default(),
+            paper: None,
         },
     )
     .await

@@ -8,7 +8,7 @@ pub use strategy_runner::{
 };
 pub use live::{
     AccountBus, AccountOutcome, Clock, Executor, ExecutorArgs, ExecutorHandle, ExecutorId,
-    setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup,
+    setup_all, setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup, ExchangesConfig,
     IncomeProcessor, IncomeProcessorHandle, Manager, ManagerArgs, ManagerError, ManagerHandle,
     MarketBus, Metrics, MetricsArgs, MetricsHandle, OrderGateway, OutcomeBus, OutcomeProcessor,
     PlaceVerdict, PaperCounter, PaperCounterArgs,

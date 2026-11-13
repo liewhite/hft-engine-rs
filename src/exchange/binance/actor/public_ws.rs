@@ -5,7 +5,7 @@
 //! - 处理订阅/退订命令
 //! - 直接解析消息并发布到行情总线
 
-use crate::domain::{now_ms, Symbol, SymbolMeta};
+use crate::domain::now_ms;
 use crate::exchange::binance::codec::{AggTrade, BookTicker, MarkPriceUpdate, WsResponse};
 use crate::exchange::binance::to_binance;
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
@@ -14,16 +14,13 @@ use crate::messaging::{MarketBus, MarketData, MarketEvent};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
 use anyhow::Context as _;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 
 /// 公开 WebSocket 组件
 pub(crate) struct BinancePublicWs {
     inbox: Inbox<ExchangeCmd>,
     conn: ReconnectingWs,
     market_bus: MarketBus,
-    /// Symbol 元数据（用于过滤不存在的 symbol）
-    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
     quote: String,
     /// 已订阅的底层 stream (用于 WebSocket 去重)
@@ -40,19 +37,17 @@ impl BinancePublicWs {
         name: &'static str,
         url: &'static str,
         market_bus: MarketBus,
-        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
         quote: String,
     ) -> anyhow::Result<Addr<ExchangeCmd>> {
         let (_, addr) = group
             .spawn_addressed(name, move |scope: Scope, inbox| async move {
-                // 启动时连不上即启动失败（受控退出）；运行中断线由 run 原地重连（#762）
+                // 第一次连不上即上冒停机（受控退出）；运行中断线由 run 原地重连（#762）
                 let conn = ReconnectingWs::connect(scope.group("conn"), name, url, WsKeepalive::binance()).await?;
                 tracing::info!(url, "{name} started");
                 Ok(Self {
                     inbox,
                     conn,
                     market_bus,
-                    symbol_metas,
                     quote,
                     subscribed_streams: HashSet::new(),
                     subscribed_kinds: HashSet::new(),
@@ -121,27 +116,13 @@ impl BinancePublicWs {
         let mut new_kinds = Vec::new();
 
         for kind in kinds {
-            let symbol = kind.symbol();
-            if !self.symbol_metas.contains_key(symbol) {
-                tracing::warn!(
-                    exchange = "Binance",
-                    symbol = %symbol,
-                    "Symbol not found in symbol_metas, ignoring subscription"
-                );
-                continue;
-            }
-
+            // 品种在不在目录、这一所支不支持这种订阅，投产时已校验（provisioning::validate_subscriptions）；
+            // 到这里还对不上就是校验的 bug，报错停机，不静默跳过
             if self.subscribed_kinds.contains(&kind) {
                 continue;
             }
-
-            let stream = match kind_to_stream(&kind, &self.quote) {
-                Some(s) => s,
-                None => {
-                    tracing::warn!(?kind, "Binance Candle 订阅未实现，忽略");
-                    continue;
-                }
-            };
+            let stream = kind_to_stream(&kind, &self.quote)
+                .ok_or_else(|| anyhow::anyhow!("Binance 不支持的订阅到了公共 WS（投产校验漏了）: {kind:?}"))?;
             if !self.subscribed_streams.contains(&stream) {
                 new_streams.push(stream);
             }

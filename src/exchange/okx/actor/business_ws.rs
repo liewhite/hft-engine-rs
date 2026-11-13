@@ -6,7 +6,7 @@
 //! - 收到订阅时先通过 REST 获取 100 根历史 K线并发布，再 WS 订阅实时推送
 //! - 直接解析消息并发布到行情总线
 
-use crate::domain::{CandleInterval, now_ms, Exchange, ExchangeError, Symbol, SymbolMeta};
+use crate::domain::{CandleInterval, now_ms, Exchange, ExchangeError, Symbol};
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
 use crate::exchange::okx::codec::{
     CandleRawData, WsPush, candle_interval_to_okx_bar, okx_channel_to_candle_interval,
@@ -21,8 +21,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
 
 /// Business WebSocket 组件 (K线)
 pub(super) struct OkxBusinessWs {
@@ -30,8 +29,6 @@ pub(super) struct OkxBusinessWs {
     conn: WsConn,
     /// 行情总线（发布事件）
     market_bus: MarketBus,
-    /// Symbol 元数据（用于过滤不存在的 symbol）
-    symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
     /// 计价币种 (e.g., "USDT")
     quote: String,
     /// 已订阅的 kinds (用于去重)
@@ -45,7 +42,6 @@ impl OkxBusinessWs {
     pub(super) async fn spawn(
         group: &Group,
         market_bus: MarketBus,
-        symbol_metas: Arc<HashMap<Symbol, SymbolMeta>>,
         quote: String,
     ) -> anyhow::Result<Addr<ExchangeCmd>> {
         let (_, addr) = group
@@ -67,7 +63,6 @@ impl OkxBusinessWs {
                     inbox,
                     conn,
                     market_bus,
-                    symbol_metas,
                     quote,
                     subscribed: HashSet::new(),
                     http_client,
@@ -196,29 +191,15 @@ impl OkxBusinessWs {
         let mut new_kinds = Vec::new();
 
         for kind in kinds {
-            let symbol = kind.symbol();
-            if !self.symbol_metas.contains_key(symbol) {
-                tracing::warn!(
-                    exchange = "OKX",
-                    symbol = %symbol,
-                    "Symbol not found in symbol_metas, ignoring candle subscription"
-                );
-                continue;
-            }
-
+            // 品种在不在目录、这一所支不支持这种订阅，投产时已校验（provisioning::validate_subscriptions）；
+            // 到这里还对不上就是路由或校验的 bug，报错停机，不静默跳过
             if self.subscribed.contains(&kind) {
                 continue;
             }
-
-            match kind_to_business_arg(&kind, &self.quote) {
-                Some(arg) => {
-                    new_args.push(arg);
-                    new_kinds.push(kind);
-                }
-                None => {
-                    tracing::error!(?kind, "Non-Candle routed to OkxBusinessWs (routing bug), skipping");
-                }
-            }
+            let arg = kind_to_business_arg(&kind, &self.quote)
+                .ok_or_else(|| anyhow::anyhow!("非 K 线订阅被路由到 OkxBusinessWs（路由 bug）: {kind:?}"))?;
+            new_args.push(arg);
+            new_kinds.push(kind);
         }
 
         // 1. 对每个新订阅先获取历史 K线（阻塞式，保证历史数据先于实时到达）

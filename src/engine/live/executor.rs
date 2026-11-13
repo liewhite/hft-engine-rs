@@ -139,6 +139,8 @@ pub struct Executor {
     lagging_events: u64,
     /// 上次滞后告警的时刻；0 = 从未告警（见 [`lag_warn_due`]）
     last_lag_warn_ms: Timestamp,
+    /// 自上一个 Clock 拍以来消费事件的最大滞后（毫秒），每拍报给指标后清零
+    max_lag_ms: u64,
 }
 
 impl Executor {
@@ -167,6 +169,7 @@ impl Executor {
                     metrics: args.metrics,
                     lagging_events: 0,
                     last_lag_warn_ms: 0,
+                    max_lag_ms: 0,
                 })
             })
             .await?;
@@ -204,6 +207,7 @@ impl Executor {
             // Metrics 先于本实例停下时交不出去，读数随停机作废，无需处理
             let gauges = self.runner.strategy_gauges(*local_ts);
             let _ = self.metrics.strategy_gauges(self.id, self.account.clone(), gauges);
+            let _ = self.metrics.event_lag(self.account.clone(), std::mem::take(&mut self.max_lag_ms));
         }
     }
 
@@ -236,6 +240,7 @@ impl Executor {
     fn check_pipeline_lag(&mut self, event: &IncomeEvent) {
         let now = now_ms();
         let lag_ms = now.saturating_sub(event.local_ts());
+        self.max_lag_ms = self.max_lag_ms.max(lag_ms);
         if lag_ms <= MAX_PIPELINE_LAG_MS {
             return;
         }

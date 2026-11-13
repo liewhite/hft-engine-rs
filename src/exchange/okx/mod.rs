@@ -4,6 +4,7 @@ mod client;
 mod symbol;
 
 pub use actor::{OkxArgs, OkxNode};
+pub(crate) use actor::{OkxGreeksPoller, GREEKS_POLLING_INTERVAL_MS};
 pub use client::OkxClient;
 pub use symbol::{from_okx, from_okx_index, to_okx, to_okx_index};
 

@@ -1,6 +1,10 @@
 //! 交易所装配层（组合根）：每所一个 `setup_*`，产出 [`ExchangeSetup`] 交给
 //! `ManagerArgs::exchanges` —— manager 对"有哪些所"彻底无知，只做收集与循环。
 //!
+//! 各 bin 不自己挨个装配：配置里的 `exchanges` 段解析成 [`ExchangesConfig`]，交给
+//! [`setup_all`] 一次装好（#757）。各所的公共能力（如已结算资金费）随装配产物交给 manager，
+//! bin 经 `ManagerHandle` 取用，不另建 client。
+//!
 //! 装配天然分两阶段：**建 client** 必须先于 symbol metas 预加载（预加载要用它），
 //! **起交易所节点**必须后于预加载（节点要用 metas）。每所把两阶段封进一个
 //! `setup_*` 函数：阶段 1 立即执行产出 client，阶段 2 以闭包延迟到 metas 就绪。
@@ -13,9 +17,13 @@ use crate::exchange::binance::{BinanceArgs, BinanceClient, BinanceCredentials, B
 use crate::exchange::hyperliquid::{HyperliquidAccess, HyperliquidArgs, HyperliquidClient, HyperliquidNode};
 use crate::exchange::ibkr::{IbkrArgs, IbkrClient, IbkrCredentials, IbkrNode, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxArgs, OkxClient, OkxCredentials, OkxNode};
-use crate::exchange::{AccountClient, ExchangeAccess, ExchangeClient, ExchangeHandle, SubscriptionKind};
+use crate::exchange::okx::{OkxGreeksPoller, GREEKS_POLLING_INTERVAL_MS};
+use crate::exchange::{
+    AccountClient, AccountStream, ExchangeAccess, ExchangeClient, ExchangeHandle, SettledFundingSource,
+    SubscriptionKind,
+};
 use crate::messaging::MarketBus;
-use crate::tasks::Group;
+use crate::tasks::{Group, GroupClosed};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -55,10 +63,19 @@ pub struct ExchangeSetup {
     /// 能力查询：该所适配层是否实现某种公共订阅（知识在各适配层的
     /// `supports_subscription`，随 setup 携带 —— 投产校验用，无集中能力表）
     pub(crate) supports: fn(&SubscriptionKind) -> bool,
+    /// 公共的已结算资金费率来源（该所适配层提供时）。交给 manager，bin 经
+    /// `ManagerHandle::settled_funding` 取用，不为它另建 client
+    pub(crate) settled_funding: Option<Arc<dyn SettledFundingSource>>,
+    /// 该所能起的账户类数据流，策略声明需要时投产编排才起（见 [`AccountStream`]）。
+    /// 只在配了凭证时登记 —— 没凭证就没有账户可读，键不在即"不提供"
+    pub(crate) account_streams: HashMap<AccountStream, StartAccountStream>,
     /// 延迟执行的节点装配：在生产者组下起节点并等它构造完成，返回它的句柄。
     /// 各 setup 的 future 由 manager 构造时并发 join。
     pub(crate) spawn_actor: Box<dyn FnOnce(SpawnCtx) -> SpawnFuture + Send>,
 }
+
+/// 起一种账户类数据流（见 [`AccountStream`]）：在给定分组下起它，读数发到账户总线
+pub(crate) type StartAccountStream = Box<dyn Fn(&Group, AccountBus) -> Result<(), GroupClosed> + Send + Sync>;
 
 /// 节点启动失败转成装配错误（带上根因链）
 fn start_failed(name: &str, e: anyhow::Error) -> ExchangeError {
@@ -70,20 +87,21 @@ pub fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<Excha
         access.quote.clone(),
         access.credentials.clone(),
     )?);
-    let account: Option<Arc<dyn AccountClient>> =
-        access.has_credentials().then(|| client.clone() as Arc<dyn AccountClient>);
+    let authed = access.has_credentials().then(|| client.clone());
     Ok(ExchangeSetup {
         exchange: Exchange::Binance,
         client: client.clone(),
-        account,
+        account: authed.clone().map(|c| c as Arc<dyn AccountClient>),
         supports: crate::exchange::binance::supports_subscription,
+        settled_funding: Some(client),
+        account_streams: HashMap::new(),
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
                 BinanceNode::spawn(
                     &ctx.producers,
                     BinanceArgs {
+                        client: authed,
                         credentials: access.credentials,
-                        symbol_metas: ctx.symbol_metas,
                         rest_base_url: REST_BASE_URL.to_string(),
                         market_bus: ctx.market_bus,
                         account_bus: ctx.account_bus,
@@ -99,22 +117,31 @@ pub fn setup_binance(access: ExchangeAccess<BinanceCredentials>) -> Result<Excha
 
 pub fn setup_okx(access: ExchangeAccess<OkxCredentials>) -> Result<ExchangeSetup, ExchangeError> {
     let client = Arc::new(OkxClient::new(access.quote.clone(), access.credentials.clone())?);
-    let account: Option<Arc<dyn AccountClient>> =
-        access.has_credentials().then(|| client.clone() as Arc<dyn AccountClient>);
+    let authed = access.has_credentials().then(|| client.clone());
+    let mut account_streams: HashMap<AccountStream, StartAccountStream> = HashMap::new();
+    if let Some(c) = authed.clone() {
+        account_streams.insert(
+            AccountStream::Greeks,
+            Box::new(move |group: &Group, account_bus: AccountBus| {
+                OkxGreeksPoller::spawn(group, c.clone(), account_bus, GREEKS_POLLING_INTERVAL_MS).map(|_| ())
+            }),
+        );
+    }
     Ok(ExchangeSetup {
         exchange: Exchange::OKX,
         client: client.clone(),
-        account,
+        account: authed.clone().map(|c| c as Arc<dyn AccountClient>),
         supports: crate::exchange::okx::supports_subscription,
+        settled_funding: Some(client),
+        account_streams,
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
                 OkxNode::spawn(
                     &ctx.producers,
                     OkxArgs {
                         credentials: access.credentials.clone(),
-                        // 只在有凭证时给 —— Greeks 轮询是账户私有能力，
-                        // "能不能轮询"由 Option 表达，不再靠节点内部另判 bool
-                        client: access.credentials.is_some().then_some(client),
+                        // 只在有凭证时给 —— 账户轮询是私有能力，"能不能轮询"由 Option 表达
+                        client: authed,
                         symbol_metas: ctx.symbol_metas,
                         market_bus: ctx.market_bus,
                         account_bus: ctx.account_bus,
@@ -142,6 +169,8 @@ pub async fn setup_hyperliquid(
         client: client.clone(),
         account,
         supports: crate::exchange::hyperliquid::supports_subscription,
+        settled_funding: Some(client.clone()),
+        account_streams: HashMap::new(),
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
                 HyperliquidNode::spawn(
@@ -175,6 +204,8 @@ pub async fn setup_ibkr(
         // 走到这里必然有账户
         account: Some(client.clone()),
         supports: crate::exchange::ibkr::supports_subscription,
+        settled_funding: None,
+        account_streams: HashMap::new(),
         spawn_actor: Box::new(move |ctx| {
             Box::pin(async move {
                 IbkrNode::spawn(
@@ -193,4 +224,44 @@ pub async fn setup_ibkr(
             })
         }),
     })
+}
+
+/// 配置里的 `exchanges` 段：配了哪所就接哪所，不认识的键报错。各 bin 共用这一份，交给
+/// [`setup_all`] 装配。IBKR 的接入形状不同（网关凭证 + 快照配置）、目前没有 bin 用，仍用
+/// [`setup_ibkr`] 单独装配。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExchangesConfig {
+    #[serde(default)]
+    pub binance: Option<ExchangeAccess<BinanceCredentials>>,
+    #[serde(default)]
+    pub hyperliquid: Option<HyperliquidAccess>,
+    #[serde(default)]
+    pub okx: Option<ExchangeAccess<OkxCredentials>>,
+}
+
+impl ExchangesConfig {
+    /// 配了几所
+    pub fn len(&self) -> usize {
+        [self.binance.is_some(), self.hyperliquid.is_some(), self.okx.is_some()].into_iter().filter(|&b| b).count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// 按配置装配全部所（加一所：[`ExchangesConfig`] 加一个字段、这里加一段）
+pub async fn setup_all(cfg: &ExchangesConfig) -> Result<Vec<ExchangeSetup>, ExchangeError> {
+    let mut setups = Vec::new();
+    if let Some(a) = &cfg.binance {
+        setups.push(setup_binance(a.clone())?);
+    }
+    if let Some(a) = &cfg.hyperliquid {
+        setups.push(setup_hyperliquid(a.clone()).await?);
+    }
+    if let Some(a) = &cfg.okx {
+        setups.push(setup_okx(a.clone())?);
+    }
+    Ok(setups)
 }

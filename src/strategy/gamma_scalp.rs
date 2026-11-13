@@ -16,7 +16,7 @@
 //! (买卖间距同为 `base_offset_ratio`)，是 gamma scalp 的最小核心形态。
 
 use crate::domain::{Exchange, Order, OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce};
-use crate::exchange::SubscriptionKind;
+use crate::exchange::{AccountStream, SubscriptionKind};
 use crate::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
 use std::collections::{HashMap, HashSet};
@@ -193,6 +193,11 @@ impl Strategy for GammaScalpStrategy {
         let mut m = HashMap::new();
         m.insert(self.exchange, kinds);
         m
+    }
+
+    /// 希腊值来自对冲所的账户读数（见 on_event 里按 exchange 过滤）
+    fn account_streams(&self) -> HashMap<Exchange, HashSet<AccountStream>> {
+        HashMap::from([(self.exchange, HashSet::from([AccountStream::Greeks]))])
     }
 
     fn order_timeout_ms(&self) -> u64 {

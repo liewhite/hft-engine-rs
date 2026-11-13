@@ -12,8 +12,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Greeks REST 轮询间隔 (毫秒) — 每秒 1 次，官方限速 10/2s
+pub(crate) const GREEKS_POLLING_INTERVAL_MS: u64 = 1000;
+
 /// 定时查询希腊值
-pub(super) struct OkxGreeksPoller {
+pub(crate) struct OkxGreeksPoller {
     client: Arc<OkxClient>,
     account_bus: AccountBus,
     /// 缓存每个 ccy 的上次 timestamp，用于去重
@@ -25,7 +28,7 @@ pub(super) struct OkxGreeksPoller {
 
 impl OkxGreeksPoller {
     /// 在 `group` 下起轮询，每 `interval_ms` 毫秒一次（首次立即）
-    pub(super) fn spawn(
+    pub(crate) fn spawn(
         group: &Group,
         client: Arc<OkxClient>,
         account_bus: AccountBus,

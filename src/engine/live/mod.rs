@@ -78,7 +78,7 @@ pub fn to_paper_outlet(o: &AccountOutcome) -> bool {
 }
 
 
-pub use assembly::{setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup};
+pub use assembly::{setup_all, setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup, ExchangesConfig};
 pub use clock::Clock;
 pub use manager::{
     Manager, ManagerArgs, ManagerError, ManagerHandle, StrategySpec,
@@ -86,7 +86,7 @@ pub use manager::{
 pub use executor::{Executor, ExecutorArgs, ExecutorHandle, ExecutorId};
 pub use income_processor::{IncomeProcessor, IncomeProcessorHandle};
 pub use metrics::{Metrics, MetricsArgs, MetricsHandle, DEFAULT_REPORT_INTERVAL_MS};
-pub use outcome_processor::{OrderGateway, OutcomeProcessor, PlaceVerdict};
+pub use outcome_processor::{OrderGateway, OrderRequestCounts, OutcomeProcessor, PlaceVerdict, RequestKind};
 pub use paper_counter::{PaperCounter, PaperCounterArgs};
 pub use position_ledger::{
     PositionLedger, PositionLedgerArgs, PositionLedgerHandle, Reconciler,

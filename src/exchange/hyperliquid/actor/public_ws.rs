@@ -196,17 +196,11 @@ impl HyperliquidPublicWs {
                 continue;
             }
 
-            let stream = match self.book.stream(&kind) {
-                Some(stream) => stream,
-                None => {
-                    tracing::warn!(
-                        exchange = "Hyperliquid",
-                        ?kind,
-                        "不支持的订阅类型或 symbol 不在 HL 品种目录里，忽略"
-                    );
-                    continue;
-                }
-            };
+            // 支不支持这种订阅、品种在不在目录，投产时已校验（provisioning::validate_subscriptions）；
+            // 到这里还对不上就是校验的 bug，报错停机，不静默跳过
+            let stream = self.book.stream(&kind).ok_or_else(|| {
+                anyhow::anyhow!("HL 不支持的订阅类型或品种不在目录里（投产校验漏了）: {kind:?}")
+            })?;
             if !self.book.subscribed_streams.contains(&stream) {
                 new_stream_kinds.push(kind.clone());
                 self.book.subscribed_streams.insert(stream);

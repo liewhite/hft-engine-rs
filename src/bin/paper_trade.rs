@@ -26,28 +26,13 @@
 
 use anyhow::Context;
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
-use hft_engine_rs::engine::{
-    load_config, run_engine, run_main, ManagerArgs,
-    setup_binance, setup_hyperliquid, setup_okx,
-    StrategySpec,
-};
-use hft_engine_rs::exchange::binance::BinanceCredentials;
-use hft_engine_rs::exchange::hyperliquid::HyperliquidAccess;
-use hft_engine_rs::exchange::okx::OkxCredentials;
-use hft_engine_rs::exchange::{ExchangeAccess, SubscriptionKind};
+use hft_engine_rs::engine::{load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, StrategySpec};
+use hft_engine_rs::exchange::SubscriptionKind;
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
 use hft_engine_rs::sim::SimConfig;
 use hft_engine_rs::strategy::{OutcomeEvent, Strategy, StrategyView};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-
-/// 交易所接入配置：模拟盘下 `credentials` 可整段省略
-#[derive(Debug, Clone, Deserialize)]
-struct ExchangesConfig {
-    binance: Option<ExchangeAccess<BinanceCredentials>>,
-    okx: Option<ExchangeAccess<OkxCredentials>>,
-    hyperliquid: Option<HyperliquidAccess>,
-}
 
 #[derive(Debug, Clone, Deserialize)]
 struct PaperTradeConfig {
@@ -160,20 +145,12 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // 装配参与的交易所（缺省即该所不参与）—— manager 对"有哪些所"无知
-    let mut exchanges = Vec::new();
-    if let Some(access) = config.exchanges.binance.clone() {
-        exchanges.push(setup_binance(access)?);
-    }
-    if let Some(access) = config.exchanges.okx.clone() {
-        exchanges.push(setup_okx(access)?);
-    }
-    if let Some(access) = config.exchanges.hyperliquid.clone() {
-        exchanges.push(setup_hyperliquid(access).await?);
-    }
+    // 交易所接入用框架的 ExchangesConfig：模拟盘下 `credentials` 可整段省略
+    let exchanges = setup_all(&config.exchanges).await?;
 
     let args = ManagerArgs {
         exchanges,
-        paper: config.paper,
+        paper: Some(config.paper),
     };
     // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
     run_engine(args, |manager| async move {

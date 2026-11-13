@@ -126,29 +126,15 @@ impl OkxPublicWs {
         let mut new_kinds = Vec::new();
 
         for kind in kinds {
-            let symbol = kind.symbol();
-            if !self.symbol_metas.contains_key(symbol) {
-                tracing::warn!(
-                    exchange = "OKX",
-                    symbol = %symbol,
-                    "Symbol not found in symbol_metas, ignoring subscription"
-                );
-                continue;
-            }
-
+            // 品种在不在目录、这一所支不支持这种订阅，投产时已校验（provisioning::validate_subscriptions）；
+            // 到这里还对不上就是路由或校验的 bug，报错停机，不静默跳过
             if self.subscribed.contains(&kind) {
                 continue;
             }
-
-            match kind_to_arg(&kind, &self.quote) {
-                Some(arg) => {
-                    new_args.push(arg);
-                    new_kinds.push(kind);
-                }
-                None => {
-                    tracing::error!(?kind, "Candle routed to OkxPublicWs (routing bug), skipping");
-                }
-            }
+            let arg = kind_to_arg(&kind, &self.quote)
+                .ok_or_else(|| anyhow::anyhow!("K 线订阅被路由到 OkxPublicWs（路由 bug）: {kind:?}"))?;
+            new_args.push(arg);
+            new_kinds.push(kind);
         }
 
         // 2. 批量发送订阅请求

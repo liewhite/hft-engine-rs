@@ -48,8 +48,12 @@
   (按 Delivery 分发)    (观测镜像)         (对账镜像,REST)    (inbox.subscribe)
 ```
 
-**实盘与模拟并行**，不是两种"运行模式"：两个 outcome 消费者常驻，各按事件自带的
-`AccountId` 取自己那份。同一个 symbol 上完全可以模拟先跑、出信号后再拉起实盘。
+**实盘与模拟并行**，不是两种"运行模式"：配了模拟柜台（`ManagerArgs::paper`）时两个
+outcome 消费者并存，各按事件自带的 `AccountId` 取自己那份。同一个 symbol 上完全可以模拟先跑、
+出信号后再拉起实盘。只跑实盘的进程 `paper: None`，不起模拟柜台；此时绑定模拟账户的策略投产被拒。
+
+**连接与账户轮询按需起**（#757）：各所公共 WS 在第一条订阅路由到它时才连；账户类数据流
+（如 OKX 希腊值，见 `AccountStream`）由策略的 `account_streams()` 声明，投产时才起。
 
 **回测与实盘共享 `StrategyRunner`**：实盘由 `Executor` 驱动（一个任务串行消费自己的收件箱），
 回测由 `BacktestEngine` 驱动（单线程虚拟时间循环）。策略代码一个字节都不用改。
@@ -130,12 +134,13 @@ pub enum OutcomeEvent {
 
 | 类别 | 接口 |
 |---|---|
-| 装配 | `setup_binance` / `setup_okx` / `setup_hyperliquid` / `setup_ibkr` → `ExchangeSetup`；`ManagerArgs { exchanges, paper }` |
+| 装配 | 配置里 `exchanges` 段解析成 `ExchangesConfig`，`setup_all(&cfg)` → `Vec<ExchangeSetup>`（IBKR 单独 `setup_ibkr`）；`ManagerArgs { exchanges, paper: Option<SimConfig> }` |
 | 投产（`ManagerHandle`） | `add_strategy(spec)` / `add_strategies(specs)`，`.await -> Result<(), ManagerError>` |
 | 账户绑定 | `StrategySpec::live(s)` / `StrategySpec::paper(s, label)` |
 | 流面 | `market_bus()` / `account_bus()` / `outcome_bus()`，观察者在构造时 `inbox.subscribe(bus, fn(&Event) -> bool, Msg::X)` |
 | 挂观察者 | `observers()`：manager 的消费者组，`spawn` / `spawn_addressed` / `spawn_periodic` |
-| 快照面 | `all_symbol_metas()`（同步）/ `live_positions().await` |
+| 快照面 | `exchanges()` / `all_symbol_metas()` / `symbol_meta(ex, &sym)`（同步）/ `live_positions().await` |
+| 各所公共能力 | `settled_funding(ex)`：已结算资金费率来源（用装配时建好的 client，不另建） |
 | 入向注入 | `publish_custom_event(CustomEvent)`（同步，直接发行情总线） |
 | 启动辅助 | `run_main`（日志与告警：启动试发、退出前发完）/ `load_config` / `run_engine(args, \|handle\| ..)`（启动 → 装配 → 运行 → 唯一停机路径） |
 | 纯逻辑核心 | `StrategyRunner`（回测直接驱动它）、`ClientOrderIdGen` |
@@ -200,8 +205,7 @@ pub enum OutcomeEvent {
 ```rust
 use hft_engine_rs::engine::{
     load_config, run_engine, run_main,
-    ManagerArgs, StrategySpec,
-    setup_binance, setup_okx,
+    ManagerArgs, StrategySpec, setup_all,
 };
 
 #[tokio::main]
@@ -212,15 +216,14 @@ async fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let config: MyConfig = load_config("config.json")?;
 
-    // 1. 装配参与的交易所。缺省即该所不参与 —— manager 对"有哪些所"彻底无知
-    let mut exchanges = Vec::new();
-    if let Some(a) = config.exchanges.binance { exchanges.push(setup_binance(a)?); }
-    if let Some(a) = config.exchanges.okx     { exchanges.push(setup_okx(a)?); }
+    // 1. 装配参与的交易所（config.exchanges: ExchangesConfig）。缺省即该所不参与 ——
+    //    manager 对"有哪些所"彻底无知
+    let exchanges = setup_all(&config.exchanges).await?;
 
     // 2. run_engine 建任务树、起 manager（建三条总线、在生产者/消费者两组下起全部子任务；
     //    返回前各所私有推送都已确认订阅生效），再跑装配闭包，然后等停机信号或任何节点出错。
     //    闭包出错也先停机再返回 —— 装配到一半的引擎不会被丢下不管。
-    run_engine(ManagerArgs { exchanges, paper: config.paper }, |manager| async move {
+    run_engine(ManagerArgs { exchanges, paper: Some(config.paper) }, |manager| async move {
         // 3. 注册策略。live 走真实下单，paper(label) 落本地柜台，两者可同时跑
         manager.add_strategies(vec![
             StrategySpec::live(Box::new(my_strategy)),
