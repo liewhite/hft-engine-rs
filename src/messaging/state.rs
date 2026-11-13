@@ -181,7 +181,8 @@ impl PendingOrder {
 #[derive(Debug, Clone, Default)]
 pub struct SymbolMarket {
     pub funding_rates: HashMap<Exchange, FundingRate>,
-    pub bbos: HashMap<Exchange, BBO>,
+    /// 各所最新盘口，连同它的本地接收时刻（策略判盘口新不新鲜用，见 [`Self::bbo_received_at`]）
+    bbos: HashMap<Exchange, (BBO, Timestamp)>,
     pub mark_prices: HashMap<Exchange, MarkPrice>,
     pub index_prices: HashMap<Exchange, IndexPrice>,
 }
@@ -226,7 +227,12 @@ pub struct SymbolState {
 impl SymbolMarket {
     /// 获取某个交易所的 BBO
     pub fn bbo(&self, exchange: Exchange) -> Option<&BBO> {
-        self.bbos.get(&exchange)
+        self.bbos.get(&exchange).map(|(bbo, _)| bbo)
+    }
+
+    /// 某所最新盘口的本地接收时刻（与事件的 `local_ts` 同一时钟；没收到过为 `None`）
+    pub fn bbo_received_at(&self, exchange: Exchange) -> Option<Timestamp> {
+        self.bbos.get(&exchange).map(|(_, at)| *at)
     }
 
     /// 获取某个交易所的标记价格
@@ -240,13 +246,13 @@ impl SymbolMarket {
     }
 
     /// 行情类事件的状态转移（BBO/标记价/指数价/资金费率入缓存，其余策略自取）
-    pub fn apply(&mut self, data: &SymbolMarketData) {
+    pub fn apply(&mut self, data: &SymbolMarketData, local_ts: Timestamp) {
         match data {
             SymbolMarketData::FundingRate(rate) => {
                 self.funding_rates.insert(rate.exchange, rate.clone());
             }
             SymbolMarketData::BBO(bbo) => {
-                self.bbos.insert(bbo.exchange, bbo.clone());
+                self.bbos.insert(bbo.exchange, (bbo.clone(), local_ts));
             }
             SymbolMarketData::MarkPrice(mp) => {
                 self.mark_prices.insert(mp.exchange, mp.clone());
@@ -539,13 +545,13 @@ impl SymbolState {
     /// 行情事件的状态转移。调用方（`StateManager`）已按 symbol 路由。
     ///
     /// 只收 [`SymbolMarketData`]：所级与全局行情在类型上就到不了这里。
-    pub fn apply_market(&mut self, data: &SymbolMarketData) {
+    pub fn apply_market(&mut self, data: &SymbolMarketData, local_ts: Timestamp) {
         debug_assert_eq!(
             data.symbol(),
             &self.symbol,
             "行情被路由到了别的 symbol 状态"
         );
-        self.market.apply(data);
+        self.market.apply(data, local_ts);
     }
 
     /// 币级账户事件的状态转移（挂单跟踪 + 持仓累加）。调用方已按 symbol 路由。

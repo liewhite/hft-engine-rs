@@ -28,7 +28,7 @@
 //!
 //! 见品味 1.3：净值取不到与净值为零是两回事，前者伪装成后者会让杠杆闸门直接放行。
 
-use crate::domain::{AccountInfo, Exchange, Greeks, Quantity, Symbol, BBO};
+use crate::domain::{AccountInfo, Exchange, Greeks, Quantity, Symbol, Timestamp, BBO};
 use crate::messaging::{PendingOrder, StateManager, SymbolState};
 use std::collections::HashMap;
 
@@ -93,6 +93,12 @@ impl<'a> SymbolView<'a> {
     /// 某所盘口。未到达返回 `None`。
     pub fn bbo(&self, exchange: Exchange) -> Option<&'a BBO> {
         self.state.market().bbo(exchange)
+    }
+
+    /// 某所最新盘口的本地接收时刻（与事件的 `local_ts` 同一时钟；没收到过为 `None`）。
+    /// 判盘口新不新鲜用它，策略不必自己再记一份
+    pub fn bbo_received_at(&self, exchange: Exchange) -> Option<Timestamp> {
+        self.state.market().bbo_received_at(exchange)
     }
 
     /// 某所持仓大小（带符号，正多负空）。

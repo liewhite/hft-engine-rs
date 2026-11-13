@@ -50,7 +50,6 @@ use crate::domain::{
     Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
 };
 use crate::exchange::SubscriptionKind;
-use crate::messaging::SymbolMarketData;
 use crate::messaging::{
     AccountData, CancelAttempt, IncomeEvent, MarketData, MarketEvent, OrderStage, PendingOrder,
     RequestOutcome, SymbolAccountData,
@@ -81,7 +80,6 @@ pub struct FundingArbStrategy {
     /// 各所合约规格：判断一个数量在该所下不下得出（精度与最小下单量的唯一出处）
     metas: HashMap<Exchange, SymbolMeta>,
     funding: HashMap<Exchange, SettledFundingWindow>,
-    bbo_local_ts: HashMap<Exchange, Timestamp>,
     /// 收到第一条事件的时刻：某所从没来过盘口时，盘口年龄指标从这里算起
     first_event_at: Option<Timestamp>,
     /// 最近一次挂 maker 的所对：不平衡时在这对所上补腿
@@ -153,7 +151,6 @@ impl FundingArbStrategy {
             exchanges,
             metas: metas.into_iter().map(|m| (m.exchange, m)).collect(),
             funding: HashMap::new(),
-            bbo_local_ts: HashMap::new(),
             first_event_at: None,
             leg: None,
             startup_checked: false,
@@ -171,14 +168,13 @@ impl FundingArbStrategy {
         &self.p.symbol
     }
 
-    fn bbo_fresh(&self, ex: Exchange, now: Timestamp) -> bool {
-        self.bbo_local_ts
-            .get(&ex)
-            .is_some_and(|&t| now.saturating_sub(t) <= self.p.max_bbo_age_ms)
+    fn bbo_fresh(&self, sv: SymbolView<'_>, ex: Exchange, now: Timestamp) -> bool {
+        sv.bbo_received_at(ex)
+            .is_some_and(|t| now.saturating_sub(t) <= self.p.max_bbo_age_ms)
     }
 
-    fn pair_fresh(&self, pair: LegPair, now: Timestamp) -> bool {
-        self.bbo_fresh(pair.sell, now) && self.bbo_fresh(pair.buy, now)
+    fn pair_fresh(&self, sv: SymbolView<'_>, pair: LegPair, now: Timestamp) -> bool {
+        self.bbo_fresh(sv, pair.sell, now) && self.bbo_fresh(sv, pair.buy, now)
     }
 
     fn halt(&mut self, reason: String) {
@@ -212,7 +208,7 @@ impl FundingArbStrategy {
         // 退回全部盘口 —— 此时只用于零头判定和补腿，挂单另要求所对两所盘口新鲜，不会用到它
         let fresh_mids: Vec<Price> = bbos
             .iter()
-            .filter(|(ex, _)| self.bbo_fresh(**ex, now))
+            .filter(|(ex, _)| self.bbo_fresh(sv, **ex, now))
             .map(|(_, b)| b.mid_price())
             .collect();
         let mids: Vec<Price> = if fresh_mids.is_empty() {
@@ -264,10 +260,10 @@ impl FundingArbStrategy {
 
         let action = self.funding_action(&positions, px, now);
         let quotes = match action {
-            FundingAction::Open(pair) if self.pair_fresh(pair, now) => {
+            FundingAction::Open(pair) if self.pair_fresh(sv, pair, now) => {
                 self.open_quotes(pair, &bbos, &positions, px, view)
             }
-            FundingAction::Close(pair) if self.pair_fresh(pair, now) => {
+            FundingAction::Close(pair) if self.pair_fresh(sv, pair, now) => {
                 self.close_quotes(pair, &bbos, &positions, px)
             }
             _ => Vec::new(),
@@ -280,7 +276,7 @@ impl FundingArbStrategy {
         // 这一刻挂不出，下一跳就可能挂出，#799）：仓位会一直拿着，要人看
         if let FundingAction::Close(pair) = action {
             let held = close_held(pair, &positions);
-            if self.pair_fresh(pair, now)
+            if self.pair_fresh(sv, pair, now)
                 && self.pair_qty(pair, held, px).is_none()
                 && self.close_stuck != Some((pair, held))
             {
@@ -764,7 +760,7 @@ impl Strategy for FundingArbStrategy {
 
     /// 看板与告警用：各所年化、资金费与盘口数据年龄、年化差、最近一次判断的信号（停止交易或补腿期间不再判断，
     /// 停在最后一次）、门槛、是否停止交易
-    fn gauges(&self, now: Timestamp) -> Vec<Gauge> {
+    fn gauges(&self, view: StrategyView<'_>, now: Timestamp) -> Vec<Gauge> {
         let sym = self.symbol().as_str();
         let mut out = Vec::new();
         let mut known = Vec::new();
@@ -773,11 +769,14 @@ impl Strategy for FundingArbStrategy {
             let labels = [("symbol", sym), ("exchange", ex_label.as_str())];
             // 盘口年龄：公共流长时间断线或订阅静默无数据时，该币一直只撤不挂，日志里只有重连 warn（#767）。
             // 从没来过盘口的所从收到第一条事件算起（启动起就静默的订阅也看得见）
-            if let Some(t) = self.bbo_local_ts.get(&ex).or(self.first_event_at.as_ref()) {
+            let received = view
+                .symbol(self.symbol())
+                .and_then(|sv| sv.bbo_received_at(ex));
+            if let Some(t) = received.or(self.first_event_at) {
                 out.push(Gauge::new(
                     "funding_arb_bbo_age_seconds",
                     &labels,
-                    now.saturating_sub(*t) as f64 / 1000.0,
+                    now.saturating_sub(t) as f64 / 1000.0,
                 ));
             }
             let Some(w) = self.funding.get(&ex) else {
@@ -844,12 +843,6 @@ impl Strategy for FundingArbStrategy {
         self.first_event_at.get_or_insert(now);
         // 分发层只投本币的事件，这里不再判 symbol（P4）
         match event {
-            IncomeEvent::Market(MarketEvent {
-                data: MarketData::Symbol(SymbolMarketData::BBO(bbo)),
-                ..
-            }) => {
-                self.bbo_local_ts.insert(bbo.exchange, now);
-            }
             IncomeEvent::Market(MarketEvent {
                 data: MarketData::Custom(c),
                 ..

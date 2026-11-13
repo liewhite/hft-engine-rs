@@ -117,7 +117,8 @@ impl StrategyRunner {
         &self,
         now: crate::domain::Timestamp,
     ) -> Vec<crate::observability::Gauge> {
-        self.strategy.gauges(now)
+        self.strategy
+            .gauges(crate::strategy::StrategyView::new(&self.state), now)
     }
 
     /// 写入持仓基线（投产握手）。

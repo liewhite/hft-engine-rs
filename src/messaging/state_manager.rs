@@ -179,7 +179,7 @@ impl StateManager {
                 // 币级行情: 委托对应 SymbolState
                 MarketData::Symbol(data) => {
                     if let Some(state) = self.routed_state(data.symbol()) {
-                        state.apply_market(data);
+                        state.apply_market(data, m.local_ts);
                     }
                 }
                 // 所级行情（市场状态 / 汇率）：策略在 on_event 里自行消费并自持，StateManager 不缓存
