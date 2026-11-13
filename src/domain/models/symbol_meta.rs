@@ -1,12 +1,13 @@
 use crate::domain::models::{Exchange, Symbol};
-use crate::domain::{Price, PriceRule, Quantity};
+use crate::domain::{PositiveDecimal, Price, PriceRule, Quantity};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 
 /// 交易对元数据
 ///
 /// 步长、最小下单量、合约乘数都是精确十进制（交易所规格本来就是十进制字符串）：
-/// 按步长取整、单位折算都是精确运算，没有浮点余量。
+/// 按步长取整、单位折算都是精确运算，没有浮点余量。三者在类型上就严格为正
+/// （[`PositiveDecimal`]），不合法的规格在各所加载处就被剔除，取整与折算不再判 0。
 #[derive(Debug, Clone)]
 pub struct SymbolMeta {
     pub exchange: Exchange,
@@ -14,9 +15,9 @@ pub struct SymbolMeta {
     /// 价格精度规则
     pub price_rule: Arc<dyn PriceRule>,
     /// 数量精度 (最小数量变动单位，交易所下单单位)
-    pub size_step: Decimal,
+    pub size_step: PositiveDecimal,
     /// 最小下单数量（交易所下单单位）
-    pub min_order_size: Decimal,
+    pub min_order_size: PositiveDecimal,
     /// 交易所要求的最小下单金额（计价币，如 USDT）：币安 `MIN_NOTIONAL`、HL 10 USD；
     /// 只按数量限制的所（OKX 按一手、IBKR）为 0。
     ///
@@ -29,7 +30,7 @@ pub struct SymbolMeta {
     /// 表示每张合约对应的币本位数量
     /// - OKX ETH: cval=0.1, 下单 qty=1 表示 0.1 ETH
     /// - Binance: 直接按币的数量下单, 等效于 cval=1
-    pub contract_size: Decimal,
+    pub contract_size: PositiveDecimal,
 }
 
 impl SymbolMeta {
@@ -37,7 +38,7 @@ impl SymbolMeta {
     ///
     /// 例如: 下单 5 张, OKX cval=0.1, 则返回 0.5 ETH
     pub fn qty_to_coin(&self, qty: Decimal) -> Quantity {
-        qty * self.contract_size
+        qty * self.contract_size.get()
     }
 
     /// 价格取到合法精度后写成下单字符串（无尾零、无科学计数法）
@@ -64,19 +65,14 @@ impl SymbolMeta {
         if coin_amount.is_sign_negative() {
             return Err(format!("数量为负：{coin_amount}"));
         }
-        let quantity = self.units_trunc(coin_amount).ok_or_else(|| {
-            format!(
-                "品种规格无效：请求 {coin_amount}，step={}，contract_size={}",
-                self.size_step, self.contract_size
-            )
-        })?;
+        let quantity = self.units_trunc(coin_amount);
         if quantity.is_zero() {
             return Err(format!(
                 "数量取整后为 0：请求 {coin_amount} 币不足一个 size_step（step={}, contract_size={}）",
                 self.size_step, self.contract_size
             ));
         }
-        if quantity < self.min_order_size {
+        if quantity < self.min_order_size.get() {
             return Err(format!(
                 "数量低于交易所最小下单量：取整后 {quantity}，最小 {}（交易所单位）",
                 self.min_order_size
@@ -93,20 +89,15 @@ impl SymbolMeta {
     ///   撮合结果失真），故留在 domain 路径、用币本位表达
     /// - 单位折算是**线路细节**，只发生在交易所出口 (见 [`crate::exchange::ExchangeOrder`])
     ///
-    /// 规格无效（步长或乘数为 0）时返回 0，下游校验会拒。精确运算，取整幂等。
+    /// 精确运算，取整幂等。
     pub fn round_coin_size_down(&self, coin_amount: Quantity) -> Quantity {
-        self.units_trunc(coin_amount)
-            .map_or(Decimal::ZERO, |units| units * self.contract_size)
+        self.units_trunc(coin_amount) * self.contract_size.get()
     }
 
     /// 币本位 → 交易所下单单位并按 `size_step` 向 0 取整。**数量取整规则的唯一实现。**
-    /// `None`：规格的步长 / 乘数为 0。
-    fn units_trunc(&self, coin_amount: Quantity) -> Option<Decimal> {
-        let steps = coin_amount
-            .checked_div(self.contract_size)?
-            .checked_div(self.size_step)?
-            .trunc();
-        Some(steps * self.size_step)
+    fn units_trunc(&self, coin_amount: Quantity) -> Decimal {
+        let step = self.size_step.get();
+        (coin_amount / self.contract_size.get() / step).trunc() * step
     }
 }
 
@@ -117,6 +108,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     fn meta(contract_size: Decimal, size_step: Decimal) -> SymbolMeta {
+        let size_step = PositiveDecimal::new(size_step).unwrap();
         SymbolMeta {
             exchange: Exchange::OKX,
             symbol: "X".into(),
@@ -124,7 +116,7 @@ mod tests {
             size_step,
             min_order_size: size_step,
             min_notional: 0.0,
-            contract_size,
+            contract_size: PositiveDecimal::new(contract_size).unwrap(),
         }
     }
 
@@ -188,7 +180,7 @@ mod tests {
     #[test]
     fn below_min_order_size_is_rejected() {
         let mut m = meta(dec!(1), dec!(0.001));
-        m.min_order_size = dec!(0.01);
+        m.min_order_size = PositiveDecimal::new(dec!(0.01)).unwrap();
         assert!(m.checked_exchange_qty(dec!(0.009)).is_err());
         assert_eq!(m.checked_exchange_qty(dec!(0.0109)).unwrap(), dec!(0.010));
     }

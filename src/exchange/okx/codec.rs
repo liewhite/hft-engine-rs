@@ -621,10 +621,10 @@ mod trade_tests {
             exchange: Exchange::OKX,
             symbol: "BTC".to_string(),
             price_rule: Arc::new(PriceStep::new(dec!(0.1))),
-            size_step: dec!(0.01),
-            min_order_size: dec!(0.01),
+            size_step: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
+            min_order_size: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
             min_notional: 0.0,
-            contract_size: CONTRACT_SIZE,
+            contract_size: crate::domain::PositiveDecimal::new(CONTRACT_SIZE).unwrap(),
         }
     }
 

@@ -613,10 +613,10 @@ mod gateway_tests {
                 exchange: EX,
                 symbol: SYM.to_string(),
                 price_rule: Arc::new(PriceStep::new(dec!(0.1))),
-                size_step: dec!(0.001),
-                min_order_size: dec!(0.001),
+                size_step: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
+                min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
                 min_notional: 0.0,
-                contract_size: dec!(1.0),
+                contract_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
             },
         )]))
     }

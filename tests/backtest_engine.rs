@@ -42,10 +42,10 @@ fn metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
         exchange: EX,
         symbol: SYM.to_string(),
         price_rule: Arc::new(PriceStep::new(dec!(0.01))),
-        size_step: dec!(0.001),
-        min_order_size: dec!(0.001),
+        size_step: hft_engine_rs::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
+        min_order_size: hft_engine_rs::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
         min_notional: 0.0,
-        contract_size: dec!(1.0),
+        contract_size: hft_engine_rs::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
     };
     let mut m = HashMap::new();
     m.insert((EX, SYM.to_string()), meta);

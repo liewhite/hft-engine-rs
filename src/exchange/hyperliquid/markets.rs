@@ -24,6 +24,7 @@
 //! 是本引擎下的单，也不在任何策略的对账范围里。
 
 use super::codec::{size_step, AssetInfo, MarginMode};
+use crate::domain::PositiveDecimal;
 use crate::domain::{Decimal, Exchange, ExchangeError, Price, PriceRule, Symbol, SymbolMeta};
 use rust_decimal::RoundingStrategy;
 use std::collections::HashMap;
@@ -169,7 +170,7 @@ impl HlMarkets {
                 size_step: size_step(a.sz_decimals),
                 min_order_size: size_step(a.sz_decimals), // 最小下单量为一个精度单位
                 min_notional: MIN_ORDER_NOTIONAL,
-                contract_size: Decimal::ONE, // 币本位，合约乘数为 1
+                contract_size: PositiveDecimal::ONE, // 币本位，合约乘数为 1
             })
             .collect()
     }

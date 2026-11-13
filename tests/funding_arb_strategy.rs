@@ -44,10 +44,10 @@ fn meta(ex: Exchange, min_notional: f64) -> ((Exchange, String), SymbolMeta) {
             exchange: ex,
             symbol: SYM.to_string(),
             price_rule: Arc::new(PriceStep::new(dec!(0.01))),
-            size_step: step,
-            min_order_size: step,
+            size_step: hft_engine_rs::domain::PositiveDecimal::new(step).unwrap(),
+            min_order_size: hft_engine_rs::domain::PositiveDecimal::new(step).unwrap(),
             min_notional,
-            contract_size: dec!(1),
+            contract_size: hft_engine_rs::domain::PositiveDecimal::new(dec!(1)).unwrap(),
         },
     )
 }

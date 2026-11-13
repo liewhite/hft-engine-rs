@@ -366,10 +366,10 @@ mod tests {
             exchange: Exchange::OKX,
             symbol: "BTC".to_string(),
             price_rule: Arc::new(PriceStep::new(dec!(0.1))),
-            size_step: dec!(1.0),
-            min_order_size: dec!(1.0),
+            size_step: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
+            min_order_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
             min_notional: 0.0,
-            contract_size: dec!(0.01),
+            contract_size: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
         }
     }
 
@@ -424,10 +424,10 @@ mod tests {
             exchange: Exchange::Binance,
             symbol: "BTC".to_string(),
             price_rule: Arc::new(PriceStep::new(dec!(0.1))),
-            size_step: dec!(0.001),
-            min_order_size: dec!(0.001),
+            size_step: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
+            min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
             min_notional: 0.0,
-            contract_size: dec!(1.0),
+            contract_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
         };
         let wire = ExchangeOrder::from_domain(coin_order(dec!(0.1234), dec!(62_500.0)), &meta)
             .expect("合法订单");
@@ -449,8 +449,8 @@ mod tests {
     #[test]
     fn quantity_below_min_order_size_is_rejected() {
         let mut meta = okx_btc_meta();
-        meta.min_order_size = dec!(5.0); // 最小 5 张
-                                         // 0.03 币 = 3 张 < 5 张
+        meta.min_order_size = crate::domain::PositiveDecimal::new(dec!(5.0)).unwrap(); // 最小 5 张
+                                                                                       // 0.03 币 = 3 张 < 5 张
         let err = ExchangeOrder::from_domain(coin_order(dec!(0.03), dec!(62_500.0)), &meta)
             .expect_err("低于最小下单量的订单必须被拒");
         assert!(err.contains("最小下单量"), "got: {err}");

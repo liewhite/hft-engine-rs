@@ -6,6 +6,7 @@
 //! [`envelope`] 一处（#813）。
 
 use super::symbol::{from_okx, to_okx};
+use crate::domain::PositiveDecimal;
 use crate::domain::{
     Decimal, Exchange, ExchangeError, FundingFee, Greeks, OrderId, OrderType, PlaceError,
     PriceStep, RejectReason, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
@@ -125,7 +126,7 @@ impl OkxClient {
             .await?
             .iter()
             .find(|m| &m.symbol == symbol)
-            .map(|m| m.contract_size)
+            .map(|m| m.contract_size.get())
             .ok_or_else(|| ExchangeError::new(format!("OKX 合约目录里没有 {symbol}")))
     }
 
@@ -164,7 +165,7 @@ impl OkxClient {
             let positive = |raw: &str| {
                 crate::domain::parse_decimal(raw)
                     .ok()
-                    .filter(|v| *v > Decimal::ZERO)
+                    .and_then(PositiveDecimal::new)
             };
             match (
                 positive(&d.tick_sz),
@@ -175,7 +176,7 @@ impl OkxClient {
                 (Some(tick), Some(lot), Some(min), Some(ct_val)) => metas.push(SymbolMeta {
                     exchange: Exchange::OKX,
                     symbol,
-                    price_rule: Arc::new(PriceStep::new(tick)),
+                    price_rule: Arc::new(PriceStep::new(tick.get())),
                     size_step: lot,
                     min_order_size: min,
                     min_notional: 0.0,

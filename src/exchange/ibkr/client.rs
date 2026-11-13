@@ -1,6 +1,7 @@
 //! IBKR ExchangeClient 实现 (仅 REST)
 
-use crate::domain::{dec, Decimal, PriceStep};
+use crate::domain::PositiveDecimal;
+use crate::domain::{dec, PriceStep};
 use crate::domain::{
     Exchange, ExchangeError, OrderId, OrderType, PlaceError, Side, Symbol, SymbolMeta, TimeInForce,
 };
@@ -390,10 +391,10 @@ impl ExchangeClient for IbkrClient {
                 exchange: Exchange::IBKR,
                 symbol: s.clone(),
                 price_rule: Arc::new(PriceStep::new(dec!(0.01))),
-                size_step: Decimal::ONE,
-                min_order_size: Decimal::ONE,
+                size_step: PositiveDecimal::ONE,
+                min_order_size: PositiveDecimal::ONE,
                 min_notional: 0.0,
-                contract_size: Decimal::ONE,
+                contract_size: PositiveDecimal::ONE,
             })
             .collect();
 

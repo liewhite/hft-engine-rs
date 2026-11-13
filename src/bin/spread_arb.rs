@@ -195,10 +195,10 @@ mod tests {
             exchange,
             symbol: symbol.to_string(),
             price_rule: Arc::new(PriceStep::new(dec!(0.01))),
-            size_step: dec!(0.001),
-            min_order_size: dec!(0.001),
+            size_step: hft_engine_rs::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
+            min_order_size: hft_engine_rs::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
             min_notional: 0.0,
-            contract_size: dec!(1),
+            contract_size: hft_engine_rs::domain::PositiveDecimal::new(dec!(1)).unwrap(),
         }
     }
 

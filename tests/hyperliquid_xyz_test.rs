@@ -278,7 +278,7 @@ async fn place_test_order(side: Side) {
     println!("下单价格: {} (格式化后: {})", raw_price, price);
 
     // XYZ DEX 股票永续有最小 notional 要求，使用 1 股
-    let quantity = dec!(1).max(meta.min_order_size);
+    let quantity = dec!(1).max(meta.min_order_size.get());
     println!("下单数量: {}", quantity);
 
     let cli_id = hft_engine_rs::exchange::hyperliquid::CLIENT_ORDER_IDS.generate();

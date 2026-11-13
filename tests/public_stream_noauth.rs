@@ -152,7 +152,7 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
     let okx_contract_size = okx_metas
         .iter()
         .find(|m| m.symbol == symbol)
-        .map(|m| m.contract_size)
+        .map(|m| m.contract_size.get())
         .expect("okx BTC meta");
     println!("OKX BTC contract_size (ctVal) = {okx_contract_size}");
     assert!(

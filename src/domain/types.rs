@@ -57,6 +57,30 @@ pub fn to_wire(d: Decimal) -> String {
     d.normalize().to_string()
 }
 
+/// 严格为正的十进制：品种规格里的步长、最小下单量、合约乘数。只能经 [`Self::new`] 构造，
+/// 所以拿它做除数、按它取整不用再判 0（交易所给的规格不合法，在加载处就被拒，不会流到下单路径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PositiveDecimal(Decimal);
+
+impl PositiveDecimal {
+    pub const ONE: Self = Self(Decimal::ONE);
+
+    /// 不为正返回 `None`
+    pub fn new(value: Decimal) -> Option<Self> {
+        (value > Decimal::ZERO).then_some(Self(value))
+    }
+
+    pub fn get(self) -> Decimal {
+        self.0
+    }
+}
+
+impl std::fmt::Display for PositiveDecimal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// 费率类型
 pub type Rate = f64;
 

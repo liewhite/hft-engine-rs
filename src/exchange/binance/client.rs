@@ -6,6 +6,7 @@
 //! 一处，回复的状态检查与解析只有 [`call`] 一处（#813）。
 
 use super::symbol::{from_binance, to_binance};
+use crate::domain::PositiveDecimal;
 use crate::domain::{
     now_ms, Decimal, Exchange, ExchangeError, FundingFee, OrderId, OrderType, PlaceError,
     PriceStep, RejectReason, SettledFunding, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
@@ -149,11 +150,11 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Excha
         let positive = |raw: &str| {
             crate::domain::parse_decimal(raw)
                 .ok()
-                .filter(|v| *v > Decimal::ZERO)
+                .and_then(PositiveDecimal::new)
         };
-        let mut price_step: Option<Decimal> = None;
-        let mut size_step: Option<Decimal> = None;
-        let mut min_order_size: Option<Decimal> = None;
+        let mut price_step: Option<PositiveDecimal> = None;
+        let mut size_step: Option<PositiveDecimal> = None;
+        let mut min_order_size: Option<PositiveDecimal> = None;
         let mut min_notional: Option<f64> = None;
         for filter in s.filters {
             match filter {
@@ -174,11 +175,11 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Excha
                 metas.push(SymbolMeta {
                     exchange: Exchange::Binance,
                     symbol,
-                    price_rule: Arc::new(PriceStep::new(price_step)),
+                    price_rule: Arc::new(PriceStep::new(price_step.get())),
                     size_step,
                     min_order_size,
                     min_notional,
-                    contract_size: Decimal::ONE,
+                    contract_size: PositiveDecimal::ONE,
                 });
             }
             _ => tracing::error!(

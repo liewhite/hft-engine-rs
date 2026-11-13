@@ -316,9 +316,9 @@ fn next_hourly_settle_time() -> u64 {
     current_hour + hour_ms
 }
 
-/// 计算数量精度
-pub fn size_step(sz_decimals: u32) -> Decimal {
-    Decimal::new(1, sz_decimals)
+/// 计算数量精度（10 的负 `sz_decimals` 次方，恒为正）
+pub fn size_step(sz_decimals: u32) -> crate::domain::PositiveDecimal {
+    crate::domain::PositiveDecimal::new(Decimal::new(1, sz_decimals)).expect("10 的负幂恒为正")
 }
 
 // ============================================================================
