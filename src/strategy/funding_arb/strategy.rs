@@ -590,7 +590,7 @@ impl Strategy for FundingArbStrategy {
     }
 
 
-    /// 看板与告警用：各所年化与数据年龄、年化差、最近一次判断的信号（停止交易或补腿期间不再判断，
+    /// 看板与告警用：各所年化、资金费与盘口数据年龄、年化差、最近一次判断的信号（停止交易或补腿期间不再判断，
     /// 停在最后一次）、门槛、是否停止交易
     fn gauges(&self, now: Timestamp) -> Vec<Gauge> {
         let sym = self.symbol().as_str();
@@ -599,6 +599,10 @@ impl Strategy for FundingArbStrategy {
         for &ex in &self.exchanges {
             let ex_label = ex.to_string();
             let labels = [("symbol", sym), ("exchange", ex_label.as_str())];
+            // 盘口年龄：公共流长时间断线或订阅静默无数据时，该币一直只撤不挂，日志里只有重连 warn（#767）
+            if let Some(&t) = self.bbo_local_ts.get(&ex) {
+                out.push(Gauge::new("funding_arb_bbo_age_seconds", &labels, now.saturating_sub(t) as f64 / 1000.0));
+            }
             let Some(w) = self.funding.get(&ex) else { continue };
             out.push(Gauge::new("funding_arb_funding_age_seconds", &labels, now.saturating_sub(w.fetched_at) as f64 / 1000.0));
             if let Some(apr) = w.apr(now, self.p.max_funding_age_ms) {
