@@ -12,10 +12,9 @@
 //! ├── BinancePrivateWs（需要凭证）
 //! │   └── ListenKeyRefresher
 //! ├── EquityPoller（需要凭证）
-//! ├── BinanceFundingFeePoller（需要凭证）
+//! ├── FundingFeePoller（需要凭证）
 //! └── CryptoStatus
 
-use super::funding_fee_polling::BinanceFundingFeePoller;
 use super::private_ws::BinancePrivateWs;
 use super::public_ws::BinancePublicWs;
 use crate::domain::{Symbol, SymbolMeta};
@@ -24,6 +23,7 @@ use crate::exchange::binance::{
 };
 use crate::exchange::client::{ExchangeCmd, ExchangeHandle, SubscriptionKind};
 use crate::exchange::equity_polling::EquityPoller;
+use crate::exchange::funding_fee_polling::FundingFeePoller;
 use crate::exchange::CryptoStatus;
 use crate::messaging::{AccountBus, MarketBus};
 use crate::tasks::{Addr, Group, Inbox, Scope, Task};
@@ -159,7 +159,7 @@ impl BinanceNode {
                 // 净值查询是账户私有能力，只有 AccountClient 提供
                 if let Some(client) = binance_client {
                     EquityPoller::spawn(&children, client.clone(), account_bus.clone(), 1000)?;
-                    BinanceFundingFeePoller::spawn(&children, client, account_bus.clone(), 60_000)?;
+                    FundingFeePoller::spawn(&children, client, account_bus.clone(), 60_000)?;
                 }
                 CryptoStatus::spawn(
                     &children,

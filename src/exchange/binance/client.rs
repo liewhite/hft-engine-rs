@@ -356,90 +356,6 @@ impl BinanceClient {
         Ok(result)
     }
 
-    /// 查询资费历史
-    ///
-    /// 调用 `GET /fapi/v1/income?incomeType=FUNDING_FEE`，返回区间内所有结算明细。
-    /// 非当前 quote 币种（如币本位合约）会被自动跳过。
-    ///
-    /// 同一笔记录的 `tran_id` 在交易所侧唯一，调用方负责去重。
-    pub async fn fetch_funding_fees(
-        &self,
-        start_ms: Timestamp,
-        end_ms: Timestamp,
-    ) -> Result<Vec<FundingFee>, ExchangeError> {
-        let api_key = self
-            .api_key()
-            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
-
-        #[derive(Deserialize)]
-        #[allow(dead_code)]
-        struct IncomeEntry {
-            symbol: String,
-            #[serde(rename = "incomeType")]
-            income_type: String,
-            income: String,
-            asset: String,
-            time: u64,
-            #[serde(rename = "tranId")]
-            tran_id: u64,
-        }
-
-        let start_str = start_ms.to_string();
-        let end_str = end_ms.to_string();
-        let query = self
-            .build_signed_query(&[
-                ("incomeType", "FUNDING_FEE"),
-                ("startTime", &start_str),
-                ("endTime", &end_str),
-                ("limit", "1000"),
-            ])
-            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
-
-        let resp = self
-            .client
-            .get(format!("{}/fapi/v1/income?{}", self.base_url, query))
-            .header("X-MBX-APIKEY", api_key)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
-                Exchange::Binance,
-                status.as_u16() as i32,
-                text,
-            )));
-        }
-
-        let entries: Vec<IncomeEntry> = resp.json().await.map_err(Self::map_reqwest_error)?;
-
-        let mut result = Vec::with_capacity(entries.len());
-        for e in entries {
-            let symbol = match from_binance(&e.symbol, &self.quote) {
-                Some(s) => s,
-                None => continue, // 跨 quote 合约（如币本位），跳过
-            };
-            let amount: f64 = e.income.parse().map_err(|_| {
-                ExchangeError::Other(format!(
-                    "Failed to parse funding income '{}' for {}",
-                    e.income, e.symbol
-                ))
-            })?;
-            result.push(FundingFee {
-                exchange: Exchange::Binance,
-                symbol,
-                asset: e.asset,
-                amount,
-                timestamp: e.time,
-                tran_id: e.tran_id,
-            });
-        }
-
-        Ok(result)
-    }
-
     /// 查询账户信息 (净值 + 总持仓名义价值)
     async fn get_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
         let api_key = self
@@ -517,6 +433,97 @@ impl ExchangeClient for BinanceClient {
         let all = self.get_all_exchange_info().await?;
         let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
         Ok(all.into_iter().filter(|m| symbol_set.contains(&m.symbol)).collect())
+    }
+}
+
+#[async_trait]
+impl crate::exchange::FundingFeeSource for BinanceClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::Binance
+    }
+
+    /// 查询资费历史
+    ///
+    /// 调用 `GET /fapi/v1/income?incomeType=FUNDING_FEE`，返回区间内所有结算明细。
+    /// 非当前 quote 币种（如币本位合约）会被自动跳过。
+    ///
+    /// 同一笔记录的 `tran_id` 在交易所侧唯一，调用方负责去重。
+    async fn fetch_funding_fees(
+        &self,
+        start_ms: Timestamp,
+        end_ms: Timestamp,
+    ) -> Result<Vec<FundingFee>, ExchangeError> {
+        let api_key = self
+            .api_key()
+            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct IncomeEntry {
+            symbol: String,
+            #[serde(rename = "incomeType")]
+            income_type: String,
+            income: String,
+            asset: String,
+            time: u64,
+            #[serde(rename = "tranId")]
+            tran_id: u64,
+        }
+
+        let start_str = start_ms.to_string();
+        let end_str = end_ms.to_string();
+        let query = self
+            .build_signed_query(&[
+                ("incomeType", "FUNDING_FEE"),
+                ("startTime", &start_str),
+                ("endTime", &end_str),
+                ("limit", "1000"),
+            ])
+            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+
+        let resp = self
+            .client
+            .get(format!("{}/fapi/v1/income?{}", self.base_url, query))
+            .header("X-MBX-APIKEY", api_key)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
+        }
+
+        let entries: Vec<IncomeEntry> = resp.json().await.map_err(Self::map_reqwest_error)?;
+
+        let mut result = Vec::with_capacity(entries.len());
+        for e in entries {
+            let symbol = match from_binance(&e.symbol, &self.quote) {
+                Some(s) => s,
+                None => continue, // 跨 quote 合约（如币本位），跳过
+            };
+            let amount: f64 = e.income.parse().map_err(|_| {
+                ExchangeError::Other(format!(
+                    "Failed to parse funding income '{}' for {}",
+                    e.income, e.symbol
+                ))
+            })?;
+            result.push(FundingFee {
+                exchange: Exchange::Binance,
+                symbol,
+                asset: e.asset,
+                amount,
+                timestamp: e.time,
+                tran_id: e.tran_id,
+            });
+        }
+
+        Ok(result)
     }
 }
 
