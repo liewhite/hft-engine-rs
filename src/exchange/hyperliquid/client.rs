@@ -7,8 +7,8 @@ use crate::domain::{
     Position, Side, Symbol, SymbolMeta, Timestamp,
 };
 use crate::domain::{Decimal, PriceRule};
-use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder};
-use crate::exchange::hyperliquid::codec::{parse_side, ClearinghouseState, MetaResponse};
+use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder, OpenOrder};
+use crate::exchange::hyperliquid::codec::{ClearinghouseState, MetaResponse};
 use crate::exchange::hyperliquid::signing::{
     CancelResponse, OrderResponse, OrderResponseData, OrderStatus,
 };
@@ -307,6 +307,54 @@ impl HyperliquidClient {
             tif,
             cloid: order.client_order_id.clone(),
         })
+    }
+
+    /// 按客户端订单号撤一张单。`Ok` 只表示交易所受理了撤单
+    async fn cancel_by_cloid(&self, asset: HlAsset, cloid: String) -> Result<(), ExchangeError> {
+        let submitter = &self.account()?.submitter;
+        let HlAsset { coin, asset, .. } = asset;
+        let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
+        let raw = submitter
+            .cancel(
+                &HlCancelIntent {
+                    coin,
+                    asset,
+                    cloid: cloid.clone(),
+                },
+                admitted,
+            )
+            .await?;
+        let response: CancelResponse = serde_json::from_value(raw.clone()).map_err(|e| {
+            ExchangeError::ParseError(format!(
+                "Failed to parse cancel response: {e} (body: {raw})"
+            ))
+        })?;
+        if response.status != "ok" {
+            return Err(ExchangeError::Other(format!(
+                "Hyperliquid cancel rejected: {}",
+                response.response.map(|v| v.to_string()).unwrap_or_default()
+            )));
+        }
+
+        // 外层 ok 不代表这一笔撤掉了：statuses 里对应位置可能是 {"error": "..."}。
+        // 不展开检查会把"没撤掉"当成撤掉了 —— 而调用方（启动清场、策略撤单）正是靠返回值
+        // 判断要不要继续，谎报成功会让遗留挂单被当成已清理。
+        let statuses = response
+            .response
+            .as_ref()
+            .and_then(|v| v.get("data"))
+            .and_then(|d| d.get("statuses"))
+            .and_then(|s| s.as_array());
+        if let Some(statuses) = statuses {
+            for status in statuses {
+                if let Some(err) = status.get("error").and_then(|e| e.as_str()) {
+                    return Err(ExchangeError::Other(format!(
+                        "Hyperliquid cancel cloid={cloid} failed: {err}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 查某个 `oid` 的 `cloid`（`POST /info` `type: "orderStatus"`）。
@@ -881,118 +929,57 @@ impl AccountClient for HyperliquidClient {
         symbol: &Symbol,
         client_order_id: &str,
     ) -> Result<(), ExchangeError> {
-        let submitter = &self.account()?.submitter;
-        let HlAsset { coin, asset, .. } = self.markets.asset(symbol)?.clone();
-        let cloid = client_order_id.to_string();
-
-        let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
-        let raw = submitter
-            .cancel(&HlCancelIntent { coin, asset, cloid }, admitted)
-            .await?;
-        let response: CancelResponse = serde_json::from_value(raw.clone()).map_err(|e| {
-            ExchangeError::ParseError(format!(
-                "Failed to parse cancel response: {e} (body: {raw})"
-            ))
-        })?;
-        if response.status != "ok" {
-            return Err(ExchangeError::Other(format!(
-                "Hyperliquid cancel rejected: {}",
-                response.response.map(|v| v.to_string()).unwrap_or_default()
-            )));
-        }
-
-        // 外层 ok 不代表这一笔撤掉了：statuses 里对应位置可能是 {"error": "..."}。
-        // 不展开检查会把"没撤掉"当成撤掉了 —— 而调用方（启动期撤遗留单、策略撤单）正是靠返回值
-        // 判断要不要继续，谎报成功会让遗留挂单被当成已清理。
-        let statuses = response
-            .response
-            .as_ref()
-            .and_then(|v| v.get("data"))
-            .and_then(|d| d.get("statuses"))
-            .and_then(|s| s.as_array());
-        if let Some(statuses) = statuses {
-            for status in statuses {
-                if let Some(err) = status.get("error").and_then(|e| e.as_str()) {
-                    return Err(ExchangeError::Other(format!(
-                        "Hyperliquid cancel cloid={client_order_id} failed: {err}"
-                    )));
-                }
-            }
-        }
-        Ok(())
+        let asset = self.markets.asset(symbol)?.clone();
+        self.cancel_by_cloid(asset, client_order_id.to_string())
+            .await
     }
 
-    async fn fetch_pending_orders(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
+    /// 已接入各 dex 上的全部挂单（任一 dex 查询失败整体报错）。
+    ///
+    /// 用 `openOrders` 按 dex 查：账户级挂单列表不带 dex 参数时只回主站。
+    async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
         let wallet = &self.account()?.credentials.wallet_address;
-        let target = self.markets.asset(symbol)?;
 
-        /// `frontendOpenOrders` 的条目。
-        ///
-        /// 用 `frontendOpenOrders` 而非 `openOrders`：后者不返回 `origSz` 与 `reduceOnly`
-        /// （2026-08 实测 + 官方文档）。**两者都不返回 `cloid`**，故要另外补，
-        /// 见下方 `cloid_of`。
-        ///
-        /// 也**不能**用 `historicalOrders` 代替：它是按状态变更记录的**日志**（同一张单
-        /// 每次状态变化一条），且有条数上限，无法作为"当前挂单"的权威完整列表 ——
-        /// 而完整性正是对账/撤单的前提（漏一张就等于谎报干净）。
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OpenOrder {
+        struct Row {
             coin: String,
-            /// `"A"` = ask/卖，`"B"` = bid/买
-            side: String,
-            /// 剩余未成交量
-            sz: String,
-            /// 原始下单量
-            orig_sz: String,
             oid: u64,
         }
 
-        // 按该品种所在的 dex 查；coin 带前缀，精确比对即可（不会认错别的 dex 的同名品种）
-        let orders: Vec<OpenOrder> = self
-            .post_info(serde_json::json!({
-                "type": "frontendOpenOrders",
-                "user": wallet,
-                "dex": target.dex,
+        let per_dex =
+            futures_util::future::try_join_all(self.markets.dexes().iter().map(|dex| async move {
+                self.post_info::<Vec<Row>>(
+                    serde_json::json!({"type": "openOrders", "user": wallet, "dex": dex}),
+                )
+                .await
             }))
             .await?;
+        Ok(per_dex
+            .into_iter()
+            .flatten()
+            .map(|r| OpenOrder {
+                instrument: r.coin,
+                order_id: r.oid.to_string(),
+            })
+            .collect())
+    }
 
-        let mut updates = Vec::new();
-        for o in orders.into_iter().filter(|o| o.coin == target.coin) {
-            // 不认识的方向当场报错：跳过会让启动撤残单漏单，漏掉的单之后成交即成外来成交
-            let side = parse_side(&o.side).map_err(ExchangeError::ParseError)?;
-            let orig_sz: Decimal = o
-                .orig_sz
-                .parse()
-                .map_err(|_| ExchangeError::ParseError(format!("HL origSz 非法: {}", o.orig_sz)))?;
-            let remaining: Decimal =
-                o.sz.parse()
-                    .map_err(|_| ExchangeError::ParseError(format!("HL sz 非法: {}", o.sz)))?;
-            let filled = (orig_sz - remaining).max(Decimal::ZERO);
-
-            // Hyperliquid 是币本位（contract_size = 1），无需折算
-            updates.push(crate::domain::OrderUpdate {
-                order_id: o.oid.to_string(),
-                // 挂单列表接口不带 cloid，逐单补一次（每张一次 info 请求）。调用方只有启动期撤遗留单，
-                // 按币查，N 是该币当前挂单数：maker 策略每所一两张。
-                client_order_id: self.cloid_of(wallet, o.oid).await?,
-                exchange: Exchange::Hyperliquid,
-                symbol: symbol.clone(),
-                side,
-                status: if filled > Decimal::ZERO {
-                    crate::domain::OrderStatus::PartiallyFilled
-                } else {
-                    crate::domain::OrderStatus::Pending
-                },
-                quantity: orig_sz,
-                filled_quantity: filled,
-            });
-        }
-
-        Ok(updates)
+    /// 按 cloid 撤（签名服务只放行按 cloid 撤单）：先按 oid 查出 cloid，每张多一次 info 请求，
+    /// 只在启动清场用、张数很少。没有 cloid 的（人工经 UI 下单）撤不了，报错由清场复查拒绝启动。
+    async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError> {
+        let wallet = &self.account()?.credentials.wallet_address;
+        let asset = self.markets.asset_of_coin(&order.instrument)?.clone();
+        let oid: u64 = order
+            .order_id
+            .parse()
+            .map_err(|_| ExchangeError::ParseError(format!("HL oid 非法: {}", order.order_id)))?;
+        let cloid = self.cloid_of(wallet, oid).await?.ok_or_else(|| {
+            ExchangeError::Other(format!(
+                "HL 挂单 {} oid={oid} 没有 cloid（不是程序下的单），撤不了",
+                order.instrument
+            ))
+        })?;
+        self.cancel_by_cloid(asset, cloid).await
     }
 
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {

@@ -115,6 +115,19 @@ impl HlMarkets {
         })
     }
 
+    /// 按 HL coin（带 dex 前缀）找品种；不在目录里报错
+    pub(crate) fn asset_of_coin(&self, coin: &str) -> Result<&HlAsset, ExchangeError> {
+        self.by_symbol
+            .get(&from_hyperliquid(coin))
+            .filter(|a| a.coin == coin)
+            .ok_or_else(|| {
+                ExchangeError::Other(format!(
+                    "HL 已接入的 dex {:?} 里没有可交易的 {coin}",
+                    self.dexes
+                ))
+            })
+    }
+
     /// 内部 symbol 对应的 HL coin
     pub(crate) fn coin(&self, symbol: &Symbol) -> Option<&str> {
         self.by_symbol.get(symbol).map(|a| a.coin.as_str())
@@ -125,9 +138,7 @@ impl HlMarkets {
     /// 账户级推送与查询（userFills、orderUpdates、userFunding）一次返回该地址在**所有**
     /// dex 上的记录；剥掉前缀后同名的两个品种会被认成一个，故入口一律先过这道判据。
     pub(crate) fn owns(&self, coin: &str) -> bool {
-        self.by_symbol
-            .get(&from_hyperliquid(coin))
-            .is_some_and(|a| a.coin == coin)
+        self.asset_of_coin(coin).is_ok()
     }
 
     /// 全部可交易品种的 SymbolMeta

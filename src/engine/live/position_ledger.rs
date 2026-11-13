@@ -1414,9 +1414,7 @@ mod hl_multi_dex_tests {
 #[cfg(test)]
 mod task_tests {
     use super::*;
-    use crate::domain::{
-        AccountInfo, Decimal, ExchangeError, OrderId, OrderUpdate, PriceStep, SymbolMeta,
-    };
+    use crate::domain::{AccountInfo, Decimal, ExchangeError, OrderId, PriceStep, SymbolMeta};
     use crate::engine::live::executor::{Executor, ExecutorArgs};
     use crate::engine::live::OutcomeBus;
     use crate::exchange::ExchangeOrder;
@@ -1496,10 +1494,15 @@ mod task_tests {
         ) -> Result<(), ExchangeError> {
             unreachable!("账本不撤单")
         }
-        async fn fetch_pending_orders(
+        async fn fetch_open_orders(
             &self,
-            _symbol: &Symbol,
-        ) -> Result<Vec<OrderUpdate>, ExchangeError> {
+        ) -> Result<Vec<crate::exchange::OpenOrder>, ExchangeError> {
+            unreachable!("账本不查挂单")
+        }
+        async fn cancel_open_order(
+            &self,
+            _: &crate::exchange::OpenOrder,
+        ) -> Result<(), ExchangeError> {
             unreachable!("账本不查挂单")
         }
         async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {

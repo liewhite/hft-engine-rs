@@ -3,10 +3,12 @@
 use super::symbol::{from_okx, to_okx};
 use crate::domain::{Decimal, PriceStep};
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, Greeks, OrderId, OrderStatus, OrderType, OrderUpdate,
-    PlaceError, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
+    Exchange, ExchangeError, FundingFee, Greeks, OrderId, OrderType, PlaceError, Side, Symbol,
+    SymbolMeta, TimeInForce, Timestamp,
 };
-use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{
+    place_send_error, AccountClient, ExchangeClient, ExchangeOrder, OpenOrder,
+};
 use crate::exchange::okx::codec::{parse_account_info, GreeksData, PositionData};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::{
@@ -290,15 +292,12 @@ impl OkxClient {
         Ok(data.data)
     }
 
-    /// 取一页挂单（`after` 为游标 = 上一页最后一条的 ordId，`None` 即首页）
+    /// 取一页挂单（全部品种；`after` 为游标 = 上一页最后一条的 ordId，`None` 即首页）
     async fn fetch_pending_orders_page(
         &self,
-        inst_id: &str,
         after: Option<&str>,
     ) -> Result<Vec<PendingOrderData>, ExchangeError> {
-        let mut path = format!(
-            "/api/v5/trade/orders-pending?instId={inst_id}&instType=SWAP&limit={PENDING_ORDERS_PAGE_LIMIT}"
-        );
+        let mut path = format!("/api/v5/trade/orders-pending?limit={PENDING_ORDERS_PAGE_LIMIT}");
         if let Some(cursor) = after {
             path.push_str(&format!("&after={cursor}"));
         }
@@ -325,141 +324,13 @@ impl OkxClient {
         }
         Ok(data.data)
     }
-}
 
-/// OKX `orders-pending` 的单页条数上限（交易所固定值）
-const PENDING_ORDERS_PAGE_LIMIT: usize = 100;
-/// 分页拉取的页数上限。用尽即报错而非静默截断 —— 1 万张挂单远超任何正常策略规模，
-/// 走到这里说明游标没有推进（交易所行为变化），继续循环只会挂死。
-const PENDING_ORDERS_MAX_PAGES: usize = 100;
-
-/// OKX 挂单快照的单条记录（REST `orders-pending`）
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PendingOrderData {
-    inst_id: String,
-    ord_id: String,
-    cl_ord_id: Option<String>,
-    side: String,
-    state: String,
-    /// 订单数量 (张)
-    sz: String,
-    /// 累计成交数量 (张)
-    acc_fill_sz: String,
-}
-
-#[derive(Deserialize)]
-struct PendingOrdersResponse {
-    code: String,
-    msg: String,
-    data: Vec<PendingOrderData>,
-}
-
-/// 解析一条挂单记录，数量字段按 `contract_size` 折算为币本位。
-///
-/// # 一条解析不了 = 整份快照不可信 = `Err`（绝不跳过该条继续）
-///
-/// 挂单快照的消费方（启动期 `Manager::cancel_leftover_orders`）据「不在列表里 ⇒ 该单已终态」判定
-/// "遗留挂单已撤净"。跳过一条就是谎报"这张单不存在"，带着无人看管的活单开跑；返回 `Err` 则拒绝
-/// 启动，所以报错是安全的，静默少一条不是。
-///
-/// 已知取舍：市价单的 `px` 为空串，在此判为解析失败。市价单不会 resting，出现在挂单
-/// 列表里本身就是异常，报错优于猜一个价格。
-fn parse_pending_order(
-    d: &PendingOrderData,
-    quote: &str,
-    contract_size: Decimal,
-) -> Result<OrderUpdate, ExchangeError> {
-    let fail = |field: &str, raw: &str| {
-        ExchangeError::Other(format!(
-            "OKX 挂单快照字段 {field} 无法解析（'{raw}'，ordId={}），整份快照不可信",
-            d.ord_id
-        ))
-    };
-    let symbol = from_okx(&d.inst_id, quote).ok_or_else(|| fail("instId", &d.inst_id))?;
-    let side = match d.side.as_str() {
-        "buy" => Side::Long,
-        "sell" => Side::Short,
-        other => return Err(fail("side", other)),
-    };
-    let status = match d.state.as_str() {
-        "live" => OrderStatus::Pending,
-        "partially_filled" => OrderStatus::PartiallyFilled,
-        other => return Err(fail("state", other)),
-    };
-    let quantity = crate::domain::parse_decimal(&d.sz)
-        .map(|v| v * contract_size)
-        .map_err(|_| fail("sz", &d.sz))?;
-    let filled_quantity = crate::domain::parse_decimal(&d.acc_fill_sz)
-        .map(|v| v * contract_size)
-        .map_err(|_| fail("accFillSz", &d.acc_fill_sz))?;
-
-    Ok(OrderUpdate {
-        order_id: d.ord_id.clone(),
-        // 缺失就是缺失，**绝不用 ord_id 顶替**：撤单按它发，编一个会撤错单
-        client_order_id: d.cl_ord_id.clone().filter(|s| !s.is_empty()),
-        exchange: Exchange::OKX,
-        symbol,
-        side,
-        status,
-        quantity,
-        filled_quantity,
-    })
-}
-
-#[async_trait]
-impl ExchangeClient for OkxClient {
-    fn exchange(&self) -> Exchange {
-        Exchange::OKX
-    }
-
-    async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        Ok(self.instruments().await?.to_vec())
-    }
-
-    async fn fetch_symbol_meta(
-        &self,
-        symbols: &[Symbol],
-    ) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
-        Ok(self
-            .instruments()
-            .await?
-            .iter()
-            .filter(|m| symbol_set.contains(&m.symbol))
-            .cloned()
-            .collect())
-    }
-}
-
-#[async_trait]
-impl AccountClient for OkxClient {
-    fn exchange(&self) -> Exchange {
-        Exchange::OKX
-    }
-
-    async fn cancel_order(
-        &self,
-        symbol: &Symbol,
-        client_order_id: &str,
-    ) -> Result<(), ExchangeError> {
+    /// 撤一张单（按客户端订单号或交易所订单号）。`Ok` 只表示交易所受理了撤单
+    async fn cancel(&self, inst_id: String, order: OrderRef) -> Result<(), ExchangeError> {
         let path = "/api/v5/trade/cancel-order";
-        let inst_id = to_okx(symbol, &self.quote);
-
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct CancelRequest {
-            inst_id: String,
-            cl_ord_id: String,
-        }
 
         let admitted = LIMITER.action(&[CANCEL.cost_in(&inst_id, 1)])?;
-        let request = CancelRequest {
-            inst_id,
-            cl_ord_id: client_order_id.to_string(),
-        };
-
-        let body = serde_json::to_string(&request)?;
+        let body = serde_json::to_string(&CancelRequest { inst_id, order })?;
         let timestamp = Self::iso_timestamp();
         let sign = self
             .sign(&timestamp, "POST", path, &body)
@@ -511,43 +382,119 @@ impl AccountClient for OkxClient {
 
         Ok(())
     }
+}
 
-    /// 拉取该 symbol 在 OKX 上的**全部**挂单。
-    ///
-    /// 完整性是这个接口的全部价值所在（见 [`parse_pending_order`] 与
-    /// [`PENDING_ORDERS_MAX_PAGES`]）：分页取不全、或有一条解析不了，都返回 `Err`，
-    /// 绝不返回一份"少了几张"的列表。
-    async fn fetch_pending_orders(
+/// OKX 撤单请求体
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelRequest {
+    inst_id: String,
+    #[serde(flatten)]
+    order: OrderRef,
+}
+
+/// 撤单时指认订单用哪个号（OKX 撤单请求里二选一的字段）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+enum OrderRef {
+    ClOrdId(String),
+    OrdId(String),
+}
+
+/// OKX `orders-pending` 的单页条数上限（交易所固定值）
+const PENDING_ORDERS_PAGE_LIMIT: usize = 100;
+/// 分页拉取的页数上限。用尽即报错而非静默截断 —— 1 万张挂单远超任何正常策略规模，
+/// 走到这里说明游标没有推进（交易所行为变化），继续循环只会挂死。
+const PENDING_ORDERS_MAX_PAGES: usize = 100;
+
+/// OKX 挂单快照的单条记录（REST `orders-pending`）：清场只要合约名与订单号
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingOrderData {
+    inst_id: String,
+    ord_id: String,
+}
+
+#[derive(Deserialize)]
+struct PendingOrdersResponse {
+    code: String,
+    msg: String,
+    data: Vec<PendingOrderData>,
+}
+
+#[async_trait]
+impl ExchangeClient for OkxClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::OKX
+    }
+
+    async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
+        Ok(self.instruments().await?.to_vec())
+    }
+
+    async fn fetch_symbol_meta(
+        &self,
+        symbols: &[Symbol],
+    ) -> Result<Vec<SymbolMeta>, ExchangeError> {
+        let symbol_set: std::collections::HashSet<_> = symbols.iter().collect();
+        Ok(self
+            .instruments()
+            .await?
+            .iter()
+            .filter(|m| symbol_set.contains(&m.symbol))
+            .cloned()
+            .collect())
+    }
+}
+
+#[async_trait]
+impl AccountClient for OkxClient {
+    fn exchange(&self) -> Exchange {
+        Exchange::OKX
+    }
+
+    async fn cancel_order(
         &self,
         symbol: &Symbol,
-    ) -> Result<Vec<OrderUpdate>, ExchangeError> {
-        let inst_id = to_okx(symbol, &self.quote);
-        // 张 -> 币：REST 全程用张数，此处一次取到乘数，所有数量字段统一折算
-        let contract_size = self.contract_size_of(symbol).await?;
+        client_order_id: &str,
+    ) -> Result<(), ExchangeError> {
+        self.cancel(
+            to_okx(symbol, &self.quote),
+            OrderRef::ClOrdId(client_order_id.to_string()),
+        )
+        .await
+    }
 
-        let mut updates = Vec::new();
+    /// 账户全部品种的挂单，翻页取全：取不全（页数上限用尽）就报错，不返回少了几张的列表
+    async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
+        let mut orders = Vec::new();
         let mut after: Option<String> = None;
         for _ in 0..PENDING_ORDERS_MAX_PAGES {
-            let page = self
-                .fetch_pending_orders_page(&inst_id, after.as_deref())
-                .await?;
+            let page = self.fetch_pending_orders_page(after.as_deref()).await?;
             // 取满一页说明后面还有：OKX 按 ordId 倒序返回，游标传本页最后一条
             let page_full = page.len() >= PENDING_ORDERS_PAGE_LIMIT;
             let last_ord_id = page.last().map(|d| d.ord_id.clone());
-            for d in &page {
-                updates.push(parse_pending_order(d, &self.quote, contract_size)?);
-            }
+            orders.extend(page.into_iter().map(|d| OpenOrder {
+                instrument: d.inst_id,
+                order_id: d.ord_id,
+            }));
             match last_ord_id {
                 Some(cursor) if page_full => after = Some(cursor),
                 // 未取满 或 空页：已到末页
-                _ => return Ok(updates),
+                _ => return Ok(orders),
             }
         }
-        // 页数上限用尽仍未取完：宁可报错，也不返回一份被截断的"挂单全集"
-        // —— 消费方会把"不在列表里"当成"该单已终态"（见 parse_pending_order）。
         Err(ExchangeError::Other(format!(
-            "OKX {inst_id} 挂单分页超过 {PENDING_ORDERS_MAX_PAGES} 页仍未取完，快照不可信"
+            "OKX 挂单分页超过 {PENDING_ORDERS_MAX_PAGES} 页仍未取完，快照不可信"
         )))
+    }
+
+    async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError> {
+        self.cancel(
+            order.instrument.clone(),
+            OrderRef::OrdId(order.order_id.clone()),
+        )
+        .await
     }
 
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {
@@ -953,78 +900,27 @@ mod account_info_tests {
 }
 
 #[cfg(test)]
-mod pending_orders_tests {
+mod cancel_tests {
     use super::*;
-    use rust_decimal_macros::dec;
 
-    fn raw(cl_ord_id: Option<&str>) -> PendingOrderData {
-        PendingOrderData {
-            inst_id: "BTC-USDT-SWAP".to_string(),
-            ord_id: "312269865356374016".to_string(),
-            cl_ord_id: cl_ord_id.map(str::to_string),
-            side: "buy".to_string(),
-            state: "live".to_string(),
-            sz: "3".to_string(),
-            acc_fill_sz: "0".to_string(),
-        }
-    }
-
-    /// 张 -> 币折算贯穿数量字段（ExchangeClient 的契约是币本位）
+    /// 撤单请求体：两种指认方式各只带自己的字段（字段名错了 OKX 会报参数错误）
     #[test]
-    fn quantities_are_converted_to_coin_unit() {
-        let u = parse_pending_order(&raw(Some("x-abc")), "USDT", dec!(0.01)).unwrap();
-        assert_eq!(u.symbol, "BTC");
-        assert_eq!(u.side, Side::Long);
-        assert_eq!(u.quantity, dec!(0.03), "sz 3 张 × 0.01 = 0.03 币");
-        assert_eq!(u.client_order_id.as_deref(), Some("x-abc"));
-    }
-
-    /// **Critical 回归防线**：clOrdId 缺失/为空时必须是 `None`，绝不用 ord_id 顶替（撤单按它发）。
-    #[test]
-    fn missing_client_order_id_stays_none() {
-        for missing in [None, Some("")] {
-            let u = parse_pending_order(&raw(missing), "USDT", dec!(1.0)).unwrap();
-            assert_eq!(
-                u.client_order_id, None,
-                "clOrdId 缺失时被编造成了 {:?} —— 撤单复查的活单保护会失效",
-                u.client_order_id
-            );
-        }
-    }
-
-    /// **Critical 回归防线**：任一字段解析不了 → 整份快照 `Err`，绝不跳过该条。
-    ///
-    /// 跳过一条 = 对"启动期撤净遗留单"与"撤单复查"谎报该单不存在（见函数文档）。
-    #[test]
-    fn any_unparsable_field_fails_the_whole_snapshot() {
-        type Corrupt = Box<dyn Fn(&mut PendingOrderData)>;
-        let cases: Vec<(&str, Corrupt)> = vec![
-            (
-                "instId",
-                Box::new(|d: &mut PendingOrderData| d.inst_id = "???".to_string()),
-            ),
-            (
-                "side",
-                Box::new(|d: &mut PendingOrderData| d.side = "sideways".to_string()),
-            ),
-            (
-                "state",
-                Box::new(|d: &mut PendingOrderData| d.state = "canceled".to_string()),
-            ),
-            (
-                "sz",
-                Box::new(|d: &mut PendingOrderData| d.sz = "n/a".to_string()),
-            ),
-        ];
-        for (field, corrupt) in cases {
-            let mut d = raw(Some("x-abc"));
-            corrupt(&mut d);
-            let err = parse_pending_order(&d, "USDT", dec!(1.0)).unwrap_err();
-            assert!(
-                err.to_string().contains(field),
-                "{field} 解析失败应让整份快照报错（含字段名以便定位），实际: {err}"
-            );
-        }
+    fn cancel_request_names_the_order_by_exactly_one_id() {
+        let body = |order| {
+            serde_json::to_value(CancelRequest {
+                inst_id: "BTC-USDT-SWAP".into(),
+                order,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            body(OrderRef::ClOrdId("x1".into())),
+            serde_json::json!({"instId": "BTC-USDT-SWAP", "clOrdId": "x1"})
+        );
+        assert_eq!(
+            body(OrderRef::OrdId("123".into())),
+            serde_json::json!({"instId": "BTC-USDT-SWAP", "ordId": "123"})
+        );
     }
 }
 

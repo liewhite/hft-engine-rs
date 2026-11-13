@@ -593,10 +593,15 @@ mod gateway_tests {
         async fn cancel_order(&self, _s: &Symbol, _cid: &str) -> Result<(), ExchangeError> {
             self.cancel_result.clone().map_err(ExchangeError::Other)
         }
-        async fn fetch_pending_orders(
+        async fn fetch_open_orders(
             &self,
-            _s: &Symbol,
-        ) -> Result<Vec<OrderUpdate>, ExchangeError> {
+        ) -> Result<Vec<crate::exchange::OpenOrder>, ExchangeError> {
+            unreachable!()
+        }
+        async fn cancel_open_order(
+            &self,
+            _: &crate::exchange::OpenOrder,
+        ) -> Result<(), ExchangeError> {
             unreachable!()
         }
         async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {

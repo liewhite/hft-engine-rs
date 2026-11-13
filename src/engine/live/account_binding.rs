@@ -185,7 +185,7 @@ pub(crate) async fn snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AccountInfo, OrderId, OrderUpdate};
+    use crate::domain::{AccountInfo, OrderId};
     use crate::exchange::ExchangeOrder;
     use rust_decimal_macros::dec;
 
@@ -201,10 +201,15 @@ mod tests {
         fn exchange(&self) -> Exchange {
             WITH_ACCOUNT
         }
-        async fn fetch_pending_orders(
+        async fn fetch_open_orders(
             &self,
-            _: &Symbol,
-        ) -> Result<Vec<OrderUpdate>, ExchangeError> {
+        ) -> Result<Vec<crate::exchange::OpenOrder>, ExchangeError> {
+            unreachable!("拉快照不查挂单")
+        }
+        async fn cancel_open_order(
+            &self,
+            _: &crate::exchange::OpenOrder,
+        ) -> Result<(), ExchangeError> {
             unreachable!("拉快照不查挂单")
         }
         async fn cancel_order(&self, _: &Symbol, _: &str) -> Result<(), ExchangeError> {

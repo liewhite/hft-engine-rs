@@ -3,14 +3,16 @@
 use super::symbol::{from_binance, to_binance};
 use crate::domain::{Decimal, PriceStep};
 use crate::domain::{
-    Exchange, ExchangeError, FundingFee, OrderId, OrderStatus, OrderType, PlaceError, RejectReason,
+    Exchange, ExchangeError, FundingFee, OrderId, OrderType, PlaceError, RejectReason,
     SettledFunding, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::{
     FUNDING_RATE, IP_WEIGHT, LIMITER, ORDERS_10S, ORDERS_1M, REST_BASE_URL,
 };
-use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{
+    place_send_error, AccountClient, ExchangeClient, ExchangeOrder, OpenOrder,
+};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
@@ -587,32 +589,23 @@ impl AccountClient for BinanceClient {
         Ok(())
     }
 
-    async fn fetch_pending_orders(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
+    async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
         let api_key = self
             .api_key()
             .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
 
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
-        struct OpenOrder {
+        struct Row {
+            symbol: String,
             order_id: i64,
-            client_order_id: String,
-            side: String,
-            status: String,
-            orig_qty: String,
-            executed_qty: String,
         }
 
-        // 带 symbol：权重 1
-        let admitted = LIMITER.query(&[IP_WEIGHT.cost(1)]).await?;
-        let inst = to_binance(symbol, &self.quote);
+        // 不带 symbol：返回 U 本位合约账户的全部挂单，权重 40
+        let admitted = LIMITER.query(&[IP_WEIGHT.cost(40)]).await?;
         let query = self
-            .build_signed_query(&[("symbol", &inst)])
+            .build_signed_query(&[])
             .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
-
         let resp = crate::net::send(
             self.client
                 .get(format!("{}/fapi/v1/openOrders?{}", self.base_url, query))
@@ -631,55 +624,47 @@ impl AccountClient for BinanceClient {
                 text,
             )));
         }
-
-        let orders: Vec<OpenOrder> = serde_json::from_str(&text).map_err(|e| {
+        let rows: Vec<Row> = serde_json::from_str(&text).map_err(|e| {
             ExchangeError::ParseError(format!("Failed to parse Binance openOrders: {e}"))
         })?;
-
-        /// 数值字段解析失败即**传播**，不取默认值。
-        ///
-        /// 静默取 0 会让一张真实挂单看起来是 0 价 0 量；虽然眼下 cancel_leftover_orders 只用
-        /// order_id / client_order_id 决策、不读这几个字段，但一旦有代码开始依赖它们，
-        /// 假数据是查不出来的（与 Hyperliquid 同一方法里的处理保持一致）。
-        fn parse_field(raw: &str, field: &str) -> Result<Decimal, ExchangeError> {
-            raw.parse().map_err(|_| {
-                ExchangeError::ParseError(format!("Binance openOrders {field} 非法: {raw}"))
+        Ok(rows
+            .into_iter()
+            .map(|r| OpenOrder {
+                instrument: r.symbol,
+                order_id: r.order_id.to_string(),
             })
-        }
+            .collect())
+    }
 
-        let mut updates = Vec::new();
-        for o in orders {
-            let side = match o.side.as_str() {
-                "BUY" => Side::Long,
-                "SELL" => Side::Short,
-                other => {
-                    tracing::warn!(side = other, "Binance openOrders 未知方向，跳过");
-                    continue;
-                }
-            };
-            // openOrders 只返回未终结的单，故只有这两种状态；其余按未知跳过而非猜测
-            let status = match o.status.as_str() {
-                "NEW" => OrderStatus::Pending,
-                "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
-                other => {
-                    tracing::warn!(status = other, "Binance openOrders 未预期状态，跳过");
-                    continue;
-                }
-            };
-            // Binance USDⓈ-M 的数量本身就是币本位（contract_size = 1），无需折算
-            updates.push(crate::domain::OrderUpdate {
-                order_id: o.order_id.to_string(),
-                client_order_id: (!o.client_order_id.is_empty()).then_some(o.client_order_id),
-                exchange: Exchange::Binance,
-                symbol: symbol.clone(),
-                side,
-                status,
-                quantity: parse_field(&o.orig_qty, "origQty")?,
-                filled_quantity: parse_field(&o.executed_qty, "executedQty")?,
-            });
+    async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError> {
+        let api_key = self
+            .api_key()
+            .ok_or_else(|| ExchangeError::Other("No API key".to_string()))?;
+        let admitted = LIMITER.action(&[IP_WEIGHT.cost(1)])?;
+        let query = self
+            .build_signed_query(&[
+                ("symbol", order.instrument.as_str()),
+                ("orderId", order.order_id.as_str()),
+            ])
+            .ok_or_else(|| ExchangeError::Other("Failed to sign request".to_string()))?;
+        let resp = crate::net::send(
+            self.client
+                .delete(format!("{}/fapi/v1/order?{}", self.base_url, query))
+                .header("X-MBX-APIKEY", api_key),
+            admitted,
+        )
+        .await
+        .map_err(Self::map_reqwest_error)?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(self.parse_error(&text).unwrap_or(ExchangeError::ApiError(
+                Exchange::Binance,
+                status.as_u16() as i32,
+                text,
+            )));
         }
-
-        Ok(updates)
+        Ok(())
     }
 
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {

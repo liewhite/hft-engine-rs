@@ -2,10 +2,11 @@
 
 use crate::domain::{dec, Decimal, PriceStep};
 use crate::domain::{
-    Exchange, ExchangeError, OrderId, OrderStatus, OrderType, PlaceError, Side, Symbol, SymbolMeta,
-    TimeInForce,
+    Exchange, ExchangeError, OrderId, OrderType, PlaceError, Side, Symbol, SymbolMeta, TimeInForce,
 };
-use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
+use crate::exchange::client::{
+    place_send_error, AccountClient, ExchangeClient, ExchangeOrder, OpenOrder,
+};
 use crate::exchange::ibkr::auth::{action_request, query_request, IbkrAuth};
 use crate::exchange::ibkr::symbol::resolve_conids;
 use crate::exchange::ibkr::wire;
@@ -424,203 +425,35 @@ impl AccountClient for IbkrClient {
         client_order_id: &str,
     ) -> Result<(), ExchangeError> {
         // IBKR 只能按 orderId 撤单：先从挂单列表里按 cOID（响应里叫 order_ref）找到它
+        let conid = self.conids.get(symbol).copied();
         let order_id = self
-            .fetch_pending_orders(symbol)
+            .live_orders()
             .await?
             .into_iter()
-            .find(|o| o.client_order_id.as_deref() == Some(client_order_id))
+            .find(|o| Some(o.conid) == conid && o.coid.as_deref() == Some(client_order_id))
             .map(|o| o.order_id)
             .ok_or_else(|| {
                 ExchangeError::Other(format!(
                     "IBKR 挂单列表里没有 cOID={client_order_id} 的单（已终态或未受理）"
                 ))
             })?;
-        let url = format!(
-            "{}iserver/account/{}/order/{}",
-            self.auth.base_url(),
-            self.account_id,
-            order_id
-        );
-
-        let (req, admitted) = action_request(&*self.auth, &self.http, "DELETE", &url, |e| {
-            ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string())
-        })?;
-        let resp = crate::net::send(req, admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(ExchangeError::ApiError(
-                Exchange::IBKR,
-                status.as_u16() as i32,
-                text,
-            ));
-        }
-
-        // IBKR 会以 200 返回 `{"error": "..."}`，不展开检查就会把失败当成功 ——
-        // 而调用方（启动期撤遗留单、策略撤单）正是靠返回值判断撤单是否受理。
-        if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
-                return Err(ExchangeError::Other(format!(
-                    "IBKR cancel order {order_id} failed: {err}"
-                )));
-            }
-        }
-        Ok(())
+        self.delete_order(&order_id).await
     }
 
-    async fn fetch_pending_orders(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<Vec<crate::domain::OrderUpdate>, ExchangeError> {
-        let Some(&target_conid) = self.conids.get(symbol) else {
-            // 未解析出 conid 的 symbol 本就下不了单，自然也不会有挂单
-            return Ok(Vec::new());
-        };
+    async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError> {
+        Ok(self
+            .live_orders()
+            .await?
+            .into_iter()
+            .map(|o| OpenOrder {
+                instrument: o.conid.to_string(),
+                order_id: o.order_id,
+            })
+            .collect())
+    }
 
-        #[derive(serde::Deserialize)]
-        struct Response {
-            #[serde(default)]
-            orders: Vec<LiveOrder>,
-        }
-
-        /// `GET /iserver/account/orders` 的条目。
-        ///
-        /// 字段一律 `Option` / `default`：IBKR 对不同订单类型返回的字段集并不齐整，
-        /// 缺字段是常态而非异常，不该让整条响应解析失败 —— 那会把启动挡在门外。
-        /// 真正必需的只有 `orderId`（撤单要用）与 `conid`（定位 symbol）。
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct LiveOrder {
-            #[serde(default)]
-            order_id: Option<serde_json::Value>,
-            /// 下单时带上的 client_order_id：请求里叫 `cOID`，而**响应里 IBKR 用
-            /// `order_ref` 回传**（本仓库 WS 侧两个处理器都是取 order_ref，见
-            /// `actor/public_ws.rs`）。两个名字都接，缺一就会让启动期撤遗留挂单按订单号撤不掉。
-            #[serde(rename = "cOID", alias = "order_ref", default)]
-            coid: Option<String>,
-            #[serde(default)]
-            conid: Option<i64>,
-            #[serde(default)]
-            side: Option<String>,
-            #[serde(default)]
-            status: Option<String>,
-            // 用 `Value` 而非 `Option<f64>`：`#[serde(default)]` 只兜"字段缺失"，
-            // **类型不符照样让整条响应反序列化失败** —— IBKR 把价量以字符串
-            // `"155.69"` 下发时，本方法会返回 ParseError，而它是启动期撤遗留挂单的
-            // 唯一数据源，于是整机启动被一个格式差异挡死。数字与字符串两种形态统一
-            // 交给 `wire::optional_number` 判定（见该模块文档）。
-            #[serde(default)]
-            total_size: Option<serde_json::Value>,
-            #[serde(default)]
-            filled_quantity: Option<serde_json::Value>,
-        }
-
-        /// 把 LiveOrder 的双态数量字段取成 Decimal；字段缺失按 `missing` 兜底（那是"交易所
-        /// 没给"，对挂单快照的用途无害：撤单只需要 order_id），**解析失败则报错**。
-        fn order_number(
-            raw: &Option<serde_json::Value>,
-            field: &str,
-            missing: Decimal,
-        ) -> Result<Decimal, ExchangeError> {
-            match raw {
-                None | Some(serde_json::Value::Null) => Ok(missing),
-                Some(v) => crate::exchange::ibkr::wire::decimal(v).ok_or_else(|| {
-                    ExchangeError::ParseError(format!(
-                        "IBKR live order 字段 {field} 无法解析为数字: {v}"
-                    ))
-                }),
-            }
-        }
-
-        let url = format!("{}iserver/account/orders", self.auth.base_url());
-        let (req, admitted) = self.request("GET", &url).await?;
-        let resp = crate::net::send(req, admitted)
-            .await
-            .map_err(Self::map_reqwest_error)?;
-
-        let status = resp.status();
-        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
-        if !status.is_success() {
-            return Err(ExchangeError::ApiError(
-                Exchange::IBKR,
-                status.as_u16() as i32,
-                text,
-            ));
-        }
-        let body: Response = serde_json::from_str(&text).map_err(|e| {
-            ExchangeError::ParseError(format!(
-                "解析 IBKR live orders 失败: {e}; 响应: {}",
-                &text[..text.len().min(500)]
-            ))
-        })?;
-
-        let mut updates = Vec::new();
-        for o in body.orders {
-            if o.conid != Some(target_conid) {
-                continue;
-            }
-            // 只保留**未终结**的单：本方法的用途是"还挂在簿上的是哪些"
-            let raw_status = o.status.as_deref().unwrap_or_default();
-            let filled = order_number(&o.filled_quantity, "filledQuantity", Decimal::ZERO)?;
-            // 终态**显式枚举**，未识别的 status 报错 —— 与下面 side 的处理同一姿态。
-            // 通配 `_ => continue` 会把没见过的状态一律当成"已终态"丢弃，而
-            // `PendingCancel`（撤单已请求未确认）的单**仍活在簿上**：撤单若被拒它会回到
-            // Submitted。把它丢掉正好落进消费方"不在列表里 ⇒ 已终态"的推断：启动期判
-            // "遗留单已撤净"放行启动；按 cOID 撤单时找不到它。
-            let order_status = match raw_status {
-                "Submitted" if filled > Decimal::ZERO => OrderStatus::PartiallyFilled,
-                // PendingCancel 仍在簿上，按未终结处理
-                "PendingSubmit" | "PreSubmitted" | "Submitted" | "PendingCancel" => {
-                    OrderStatus::Pending
-                }
-                "Filled" | "Cancelled" | "Inactive" | "ApiCancelled" | "Expired" | "Rejected" => {
-                    continue
-                }
-                other => {
-                    return Err(ExchangeError::ParseError(format!(
-                        "IBKR live order 状态无法识别（'{other}'，conid={target_conid}），\
-                         无法判断它是否还挂在簿上，整份挂单快照不可信"
-                    )));
-                }
-            };
-            // 双态解析收在 wire::order_id 一处（WS 两条路径共用，见该模块文档）。
-            // 没有 orderId 就撤不掉它 —— 不能悄悄跳过，否则启动期撤单会"复查通过"
-            // 但实际漏了一张。
-            let order_id = wire::order_id(o.order_id.as_ref()).ok_or_else(|| {
-                ExchangeError::ParseError(format!(
-                    "IBKR live order 缺少 orderId，无法撤单: conid={target_conid} status={raw_status}"
-                ))
-            })?;
-            // 方向认不出**不能跳过**：这份列表的消费方在做「不在列表里 ⇒ 该单已终态」
-            // 的推断（启动期判"遗留单已撤净"、按 cOID 撤单找单），
-            // 跳过一条等于谎报该单不存在 —— 与 OKX 挂单快照同一个模式，同样必须整份报错。
-            let side = match o.side.as_deref().unwrap_or_default() {
-                "BUY" | "B" => Side::Long,
-                "SELL" | "S" => Side::Short,
-                other => {
-                    return Err(ExchangeError::ParseError(format!(
-                        "IBKR live order 方向无法识别（'{other}'，orderId={order_id}），\
-                         整份挂单快照不可信"
-                    )));
-                }
-            };
-            updates.push(crate::domain::OrderUpdate {
-                order_id,
-                client_order_id: o.coid.filter(|s| !s.is_empty()),
-                exchange: Exchange::IBKR,
-                symbol: symbol.clone(),
-                side,
-                status: order_status,
-                // 缺失按 0：挂单快照的用途是"这张单还在吗 + 怎么撤"，价量不参与判定
-                quantity: order_number(&o.total_size, "totalSize", Decimal::ZERO)?,
-                filled_quantity: filled,
-            });
-        }
-
-        Ok(updates)
+    async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError> {
+        self.delete_order(&order.order_id).await
     }
 
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError> {
@@ -777,7 +610,142 @@ fn snapshot_url(base_url: &str, conid: i64, fields: &[&str]) -> String {
     )
 }
 
+/// 账户上一张还挂在簿上的单（[`IbkrClient::live_orders`]）
+struct LiveOrderRow {
+    conid: i64,
+    order_id: OrderId,
+    /// 下单时带的 cOID（人工下的单没有）
+    coid: Option<String>,
+}
+
 impl IbkrClient {
+    /// 按 orderId 撤单。`Ok` 只表示 IBKR 受理了撤单
+    async fn delete_order(&self, order_id: &str) -> Result<(), ExchangeError> {
+        let url = format!(
+            "{}iserver/account/{}/order/{}",
+            self.auth.base_url(),
+            self.account_id,
+            order_id
+        );
+
+        let (req, admitted) = action_request(&*self.auth, &self.http, "DELETE", &url, |e| {
+            ExchangeError::ConnectionFailed(Exchange::IBKR, e.to_string())
+        })?;
+        let resp = crate::net::send(req, admitted)
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(ExchangeError::ApiError(
+                Exchange::IBKR,
+                status.as_u16() as i32,
+                text,
+            ));
+        }
+
+        // IBKR 会以 200 返回 `{"error": "..."}`，不展开检查就会把失败当成功 ——
+        // 而调用方（启动清场、策略撤单）正是靠返回值判断撤单是否受理。
+        if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
+                return Err(ExchangeError::Other(format!(
+                    "IBKR cancel order {order_id} failed: {err}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 账户上全部还挂在簿上的单（未终结）。一条解析不了（缺 orderId / conid、状态认不出）就整份报错：
+    /// 消费方据「不在列表里 ⇒ 已终态」判定清场撤净、按 cOID 找单，少一条就是谎报。
+    async fn live_orders(&self) -> Result<Vec<LiveOrderRow>, ExchangeError> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            #[serde(default)]
+            orders: Vec<LiveOrder>,
+        }
+
+        /// `GET /iserver/account/orders` 的条目。
+        ///
+        /// 字段一律 `Option` / `default`：IBKR 对不同订单类型返回的字段集并不齐整，
+        /// 缺字段是常态而非异常，不该让整条响应解析失败 —— 那会把启动挡在门外。
+        /// 真正必需的只有 `orderId`（撤单要用）与 `conid`（定位合约）。
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LiveOrder {
+            #[serde(default)]
+            order_id: Option<serde_json::Value>,
+            /// 下单时带上的 client_order_id：请求里叫 `cOID`，而**响应里 IBKR 用
+            /// `order_ref` 回传**（本仓库 WS 侧两个处理器都是取 order_ref，见
+            /// `actor/public_ws.rs`）。两个名字都接，缺一就会按订单号撤不掉。
+            #[serde(rename = "cOID", alias = "order_ref", default)]
+            coid: Option<String>,
+            #[serde(default)]
+            conid: Option<i64>,
+            #[serde(default)]
+            status: Option<String>,
+        }
+
+        let url = format!("{}iserver/account/orders", self.auth.base_url());
+        let (req, admitted) = self.request("GET", &url).await?;
+        let resp = crate::net::send(req, admitted)
+            .await
+            .map_err(Self::map_reqwest_error)?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(Self::map_reqwest_error)?;
+        if !status.is_success() {
+            return Err(ExchangeError::ApiError(
+                Exchange::IBKR,
+                status.as_u16() as i32,
+                text,
+            ));
+        }
+        let body: Response = serde_json::from_str(&text).map_err(|e| {
+            ExchangeError::ParseError(format!(
+                "解析 IBKR live orders 失败: {e}; 响应: {}",
+                &text[..text.len().min(500)]
+            ))
+        })?;
+
+        let mut rows = Vec::new();
+        for o in body.orders {
+            let raw_status = o.status.as_deref().unwrap_or_default();
+            // 终态**显式枚举**，未识别的 status 报错：通配 `_ => continue` 会把没见过的状态一律当成
+            // 「已终态」丢弃，而 `PendingCancel`（撤单已请求未确认）的单**仍活在簿上**
+            match raw_status {
+                "PendingSubmit" | "PreSubmitted" | "Submitted" | "PendingCancel" => {}
+                "Filled" | "Cancelled" | "Inactive" | "ApiCancelled" | "Expired" | "Rejected" => {
+                    continue
+                }
+                other => {
+                    return Err(ExchangeError::ParseError(format!(
+                        "IBKR live order 状态无法识别（'{other}'，conid={:?}），\
+                         无法判断它是否还挂在簿上，整份挂单快照不可信",
+                        o.conid
+                    )));
+                }
+            }
+            // 双态解析收在 wire::order_id 一处（WS 两条路径共用，见该模块文档）
+            let order_id = wire::order_id(o.order_id.as_ref()).ok_or_else(|| {
+                ExchangeError::ParseError(format!(
+                    "IBKR live order 缺少 orderId，无法撤单: conid={:?} status={raw_status}",
+                    o.conid
+                ))
+            })?;
+            let conid = o.conid.ok_or_else(|| {
+                ExchangeError::ParseError(format!("IBKR live order {order_id} 缺少 conid"))
+            })?;
+            rows.push(LiveOrderRow {
+                conid,
+                order_id,
+                coid: o.coid.filter(|s| !s.is_empty()),
+            });
+        }
+        Ok(rows)
+    }
+
     /// 获取指定 symbol 的 snapshot BBO (bid, ask)
     ///
     /// IBKR 股票无公开 BBO REST API，通过 `/iserver/marketdata/snapshot` 获取。

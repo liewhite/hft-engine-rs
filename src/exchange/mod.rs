@@ -18,7 +18,7 @@ mod trades_conformance;
 
 pub use client::{
     AccountClient, AccountStream, ExchangeAccess, ExchangeClient, ExchangeCmd, ExchangeHandle,
-    ExchangeOrder, FundingFeeSource, SettledFundingSource, SubscriptionKind,
+    ExchangeOrder, FundingFeeSource, OpenOrder, SettledFundingSource, SubscriptionKind,
 };
 pub use client_order_id::CliOrderIdFormat;
 pub use crypto_status::CryptoStatus;

@@ -3,8 +3,8 @@
 //! ExchangeClient trait 封装交易所 REST 交互
 
 use crate::domain::{
-    AccountInfo, CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderType, OrderUpdate,
-    PlaceError, Position, Symbol, SymbolMeta,
+    AccountInfo, CandleInterval, Exchange, ExchangeError, Order, OrderId, OrderType, PlaceError,
+    Position, Symbol, SymbolMeta,
 };
 use async_trait::async_trait;
 
@@ -173,6 +173,16 @@ impl ExchangeOrder {
 // REST 接口：公共 / 账户两个 trait
 // ============================================================================
 
+/// 账户上的一张挂单，只为启动清场（见 [`AccountClient::fetch_open_orders`]）：交易所的合约名与订单号
+/// 原样保留、不映射成内部 symbol —— 要撤的包括本引擎不接入的品种，撤单由适配层按它们自己撤。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenOrder {
+    /// 交易所自己的合约名（如 `BTCUSDT`、`BTC-USDT-SWAP`、`xyz:TSLA`、IBKR conid）
+    pub instrument: String,
+    /// 交易所订单号
+    pub order_id: OrderId,
+}
+
 /// **公共**数据接口：不需要凭证，任何接入的交易所都提供。
 ///
 /// 仅封装 REST 交互，WebSocket Actor 由各适配层的 `setup_*` 创建。
@@ -234,11 +244,16 @@ pub trait AccountClient: Send + Sync + 'static {
         client_order_id: &str,
     ) -> Result<(), ExchangeError>;
 
-    /// 查询当前挂单（live + partially_filled）
-    async fn fetch_pending_orders(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<Vec<OrderUpdate>, ExchangeError>;
+    /// 账户上**全部**挂单：本适配层交易的产品线（币安 U 本位合约、OKX 全部品种、HL 已接入 dex 的
+    /// 永续、IBKR 本账户）上的每一张，不限本引擎接入的币、不管是谁下的。账户由引擎独占
+    /// （`docs/architecture.md`「账户独占」），启动时据此撤净（见 [`Self::cancel_open_order`]）。
+    ///
+    /// 必须完整：漏一张，清场就会谎报干净。翻页没取完、字段解析不了都报错，不返回半份。
+    async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError>;
+
+    /// 撤 [`Self::fetch_open_orders`] 列出的一张挂单（启动清场用）。返回 `Ok` 只表示交易所受理了撤单；
+    /// 撤净与否由调用方再查一次挂单确认。
+    async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError>;
 
     /// 获取账户信息 (净值 + 总持仓名义价值)
     async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError>;

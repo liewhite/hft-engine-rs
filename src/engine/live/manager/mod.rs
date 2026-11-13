@@ -32,6 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
+mod clearing;
 mod provisioning;
 #[cfg(test)]
 mod tests;
@@ -373,6 +374,10 @@ impl Manager {
 
         // 2. 预加载所有交易所的 symbol metas（引擎级合约目录，此后不变，各组件共享这一份）
         let symbol_metas = Arc::new(Self::preload_all_symbol_metas(&clients).await?);
+
+        // 2.5 启动清场：撤掉各所账户上的全部挂单（见 [`clearing`]）。在任何策略投产、任何私有流起来之前做：
+        //     此时还没有副作用要回滚，失败即拒绝启动
+        clearing::cancel_all_open_orders(&accounts).await?;
 
         // 3. 三条总线：行情 / 账户 / 信号。普通值，克隆给各组件；不属于任何停机分组 ——
         //    订阅跟着订阅者的收件箱走，收件箱关闭即退订（见 `crate::tasks::bus`）。
