@@ -5,7 +5,7 @@
 //! - 自动订阅私有频道 (account, orders)
 //! - 直接解析消息并发布到账户总线
 
-use crate::domain::{now_ms, Balance, Exchange, ExchangeError, Symbol, SymbolMeta};
+use crate::domain::{now_ms, Balance, Exchange, ExchangeError, OrderStatus, Symbol, SymbolMeta};
 use crate::exchange::client::WsError;
 use crate::exchange::okx::codec::{
     resolve_meta, AccountData as OkxAccountPush, OrderPushData, WsEvent, WsPush,
@@ -262,8 +262,9 @@ struct LastTrades(HashMap<String, String>);
 
 impl LastTrades {
     /// 这条推送的成交字段是不是一笔还没上报过的成交（没有成交时为 false）。
-    /// 没有 `tradeId` 的成交无从去重，当新成交。
-    fn is_new_fill(&mut self, data: &OrderPushData) -> bool {
+    /// 没有 `tradeId` 的成交无从去重，当新成交。`status` 是同一条推送经 codec 解析出的订单状态
+    /// （状态口径只在 codec 一处）。
+    fn is_new_fill(&mut self, data: &OrderPushData, status: &OrderStatus) -> bool {
         // 解析不了的 fillSz 留给 to_fill 报错，这里当有成交
         let has_fill = crate::domain::parse_decimal(&data.fill_sz).map_or(true, |sz| !sz.is_zero());
         let repeated = has_fill
@@ -275,7 +276,7 @@ impl LastTrades {
                 "OKX 推送重复带了已上报过的成交，不再计入"
             );
         }
-        if !matches!(data.state.as_str(), "live" | "partially_filled") {
+        if status.is_terminal() {
             self.0.remove(&data.ord_id);
         } else if has_fill && !data.trade_id.is_empty() {
             self.0.insert(data.ord_id.clone(), data.trade_id.clone());
@@ -374,9 +375,9 @@ fn parse_private_message(
                 let Some(meta) = resolve_meta(&data.inst_id, quote, symbol_metas) else {
                     continue;
                 };
-                let new_fill = last_trades.is_new_fill(data);
                 // 数量折算由签名强制完成（含 status 内嵌的 PartiallyFilled）
                 let order_update = data.to_order_update(meta)?;
+                let new_fill = last_trades.is_new_fill(data, &order_update.status);
 
                 // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
                 if let Some(fill) = data.to_fill(meta)?.filter(|_| new_fill) {
