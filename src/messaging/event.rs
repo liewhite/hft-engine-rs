@@ -309,8 +309,8 @@ pub struct UnmappedFill {
     pub instrument: String,
     pub side: crate::domain::Side,
     /// 交易所原始数量
-    pub size: f64,
-    pub price: f64,
+    pub size: crate::domain::Quantity,
+    pub price: crate::domain::Price,
     pub timestamp: Timestamp,
 }
 

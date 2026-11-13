@@ -377,8 +377,9 @@ fn parse_private_message(
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
     use super::*;
-    use crate::domain::StepFormatter;
+    use crate::domain::PriceStep;
 
     /// 已接入 BTC-USDT-SWAP（每张 0.01 BTC）
     fn metas() -> HashMap<Symbol, SymbolMeta> {
@@ -387,11 +388,11 @@ mod tests {
             SymbolMeta {
                 exchange: Exchange::OKX,
                 symbol: "BTC".to_string(),
-                price_formatter: Arc::new(StepFormatter::new(0.1)),
-                size_step: 1.0,
-                min_order_size: 1.0,
+                price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+                size_step: dec!(1.0),
+                min_order_size: dec!(1.0),
                 min_notional: 0.0,
-                contract_size: 0.01,
+                contract_size: dec!(0.01),
             },
         )])
     }

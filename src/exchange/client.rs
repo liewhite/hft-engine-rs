@@ -135,7 +135,7 @@ impl ExchangeOrder {
     ///
     /// 取整方向**有意不同**（沿用改造前的行为，此处只是搬家）：
     /// - 数量按 `SymbolMeta::checked_exchange_qty`：**向下**取整，宁可少下一点，也不超出策略意图的数量
-    /// - 价格 `round_price`：取**最近**的合法 tick（`StepFormatter` 是四舍五入），因为价格
+    /// - 价格 `round_price`：取**最近**的合法 tick（`PriceStep` 是四舍五入），因为价格
     ///   向下取整对买单是让价、对卖单是抢价，方向语义不一致，反而更难推理
     ///
     /// # 数量下界校验
@@ -382,18 +382,20 @@ impl From<String> for WsError {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use super::*;
 
     /// 快照里同一 symbol 两条（映射把两个合约混成了一个）必须报错，不能后一条覆盖前一条
     #[test]
     fn duplicate_symbol_in_position_snapshot_is_an_error() {
-        let p = |symbol: &str, size: f64| Position { exchange: Exchange::OKX, symbol: symbol.into(), size };
-        let ok = index_positions(vec![p("BTC", 1.0), p("ETH", -2.0)]).unwrap();
-        assert_eq!(ok["BTC"].size, 1.0);
-        assert!(index_positions(vec![p("BTC", 1.0), p("BTC", 5.0)]).is_err());
+        let p = |symbol: &str, size: Decimal| Position { exchange: Exchange::OKX, symbol: symbol.into(), size };
+        let ok = index_positions(vec![p("BTC", dec!(1.0)), p("ETH", dec!(-2.0))]).unwrap();
+        assert_eq!(ok["BTC"].size, dec!(1.0));
+        assert!(index_positions(vec![p("BTC", dec!(1.0)), p("BTC", dec!(5.0))]).is_err());
     }
     use crate::domain::{Side, TimeInForce};
-    use crate::domain::StepFormatter;
+    use crate::domain::PriceStep;
     use std::sync::Arc;
 
     /// OKX BTC-USDT-SWAP：每张 0.01 币、价格步长 0.1、数量步长 1 张
@@ -401,15 +403,15 @@ mod tests {
         SymbolMeta {
             exchange: Exchange::OKX,
             symbol: "BTC".to_string(),
-            price_formatter: Arc::new(StepFormatter::new(0.1)),
-            size_step: 1.0,
-            min_order_size: 1.0,
+            price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+            size_step: dec!(1.0),
+            min_order_size: dec!(1.0),
             min_notional: 0.0,
-            contract_size: 0.01,
+            contract_size: dec!(0.01),
         }
     }
 
-    fn coin_order(quantity: f64, price: f64) -> Order {
+    fn coin_order(quantity: Decimal, price: Decimal) -> Order {
         Order {
             id: String::new(),
             exchange: Exchange::OKX,
@@ -427,25 +429,25 @@ mod tests {
 
     #[test]
     fn coin_quantity_is_converted_to_contracts() {
-        let order = coin_order(0.12, 62_500.0);
+        let order = coin_order(dec!(0.12), dec!(62_500.0));
         let wire = ExchangeOrder::from_domain(order, &okx_btc_meta()).expect("合法订单");
         // 0.12 币 / 0.01 = 12 张
-        assert!((wire.inner().quantity - 12.0).abs() < 1e-9);
+        assert_eq!(wire.inner().quantity, dec!(12.0));
     }
 
     #[test]
     fn quantity_rounds_down_to_size_step() {
         // 0.125 币 = 12.5 张 -> 向下取整 12 张（宁可少下，不超出策略意图）
-        let wire = ExchangeOrder::from_domain(coin_order(0.125, 62_500.0), &okx_btc_meta()).expect("合法订单");
-        assert!((wire.inner().quantity - 12.0).abs() < 1e-9);
+        let wire = ExchangeOrder::from_domain(coin_order(dec!(0.125), dec!(62_500.0)), &okx_btc_meta()).expect("合法订单");
+        assert_eq!(wire.inner().quantity, dec!(12.0));
     }
 
     #[test]
     fn price_is_rounded_to_exchange_tick() {
-        let wire = ExchangeOrder::from_domain(coin_order(0.12, 62_500.17), &okx_btc_meta()).expect("合法订单");
+        let wire = ExchangeOrder::from_domain(coin_order(dec!(0.12), dec!(62_500.17)), &okx_btc_meta()).expect("合法订单");
         match wire.inner().order_type {
             // 价格取**最近** tick（62500.17 -> 62500.2），与数量的向下取整不同
-            OrderType::Limit { price, .. } => assert!((price - 62_500.2).abs() < 1e-9),
+            OrderType::Limit { price, .. } => assert_eq!(price, dec!(62500.2)),
             OrderType::Market => panic!("expected limit"),
         }
     }
@@ -456,14 +458,14 @@ mod tests {
         let meta = SymbolMeta {
             exchange: Exchange::Binance,
             symbol: "BTC".to_string(),
-            price_formatter: Arc::new(StepFormatter::new(0.1)),
-            size_step: 0.001,
-            min_order_size: 0.001,
+            price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+            size_step: dec!(0.001),
+            min_order_size: dec!(0.001),
             min_notional: 0.0,
-            contract_size: 1.0,
+            contract_size: dec!(1.0),
         };
-        let wire = ExchangeOrder::from_domain(coin_order(0.1234, 62_500.0), &meta).expect("合法订单");
-        assert!((wire.inner().quantity - 0.123).abs() < 1e-9);
+        let wire = ExchangeOrder::from_domain(coin_order(dec!(0.1234), dec!(62_500.0)), &meta).expect("合法订单");
+        assert_eq!(wire.inner().quantity, dec!(0.123));
     }
 
     /// 不足一个 size_step 的量取整为 0，必须本地拒绝 —— 照发必被交易所拒，
@@ -471,7 +473,7 @@ mod tests {
     #[test]
     fn quantity_rounding_to_zero_is_rejected() {
         // 0.004 币 = 0.4 张 -> 向下取整 0 张
-        let err = ExchangeOrder::from_domain(coin_order(0.004, 62_500.0), &okx_btc_meta())
+        let err = ExchangeOrder::from_domain(coin_order(dec!(0.004), dec!(62_500.0)), &okx_btc_meta())
             .expect_err("取整为 0 的订单必须被拒");
         assert!(err.contains("取整后为 0"), "got: {err}");
     }
@@ -480,25 +482,25 @@ mod tests {
     #[test]
     fn quantity_below_min_order_size_is_rejected() {
         let mut meta = okx_btc_meta();
-        meta.min_order_size = 5.0; // 最小 5 张
+        meta.min_order_size = dec!(5.0); // 最小 5 张
         // 0.03 币 = 3 张 < 5 张
-        let err = ExchangeOrder::from_domain(coin_order(0.03, 62_500.0), &meta)
+        let err = ExchangeOrder::from_domain(coin_order(dec!(0.03), dec!(62_500.0)), &meta)
             .expect_err("低于最小下单量的订单必须被拒");
         assert!(err.contains("最小下单量"), "got: {err}");
     }
 
-    /// 上游算出 NaN 时本地拒绝（NaN 比较恒假，曾穿过两道下界检查）
+    /// 上游算出负数量时本地拒绝（方向在 Side 里，负数是上游算错）
     #[test]
-    fn non_finite_quantity_is_rejected() {
-        let err = ExchangeOrder::from_domain(coin_order(f64::NAN, 62_500.0), &okx_btc_meta())
-            .expect_err("NaN 数量必须被拒");
-        assert!(err.contains("有限值"), "got: {err}");
+    fn negative_quantity_is_rejected() {
+        let err = ExchangeOrder::from_domain(coin_order(dec!(-0.12), dec!(62_500.0)), &okx_btc_meta())
+            .expect_err("负数量必须被拒");
+        assert!(err.contains("为负"), "got: {err}");
     }
 
     /// 其余字段原样透传（方向/reduce_only/client_order_id 不属于单位换算范畴）
     #[test]
     fn non_quantity_fields_pass_through() {
-        let mut order = coin_order(0.12, 62_500.0);
+        let mut order = coin_order(dec!(0.12), dec!(62_500.0));
         order.reduce_only = true;
         order.side = Side::Short;
         let wire = ExchangeOrder::from_domain(order, &okx_btc_meta()).expect("合法订单");

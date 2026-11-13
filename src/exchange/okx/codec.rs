@@ -1,5 +1,5 @@
 use super::{from_okx, from_okx_index};
-use crate::domain::{Candle, CandleInterval, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice, MarketTrade, OrderStatus, OrderUpdate, Position, Side, Symbol, SymbolMeta, now_ms, BBO};
+use crate::domain::{Candle, CandleInterval, Decimal, Exchange, Fill, FundingRate, Greeks, IndexPrice, MarkPrice, MarketTrade, OrderStatus, OrderUpdate, Position, Side, Symbol, SymbolMeta, now_ms, BBO};
 use std::collections::HashMap;
 use serde::Deserialize;
 use std::str::FromStr;
@@ -110,17 +110,17 @@ impl BboData {
         if ask.len() < 2 {
             return Err(format!("BBO ask data incomplete: {:?}", ask));
         }
-        let ask_price = f64::from_str(&ask[0])
+        let ask_price = Decimal::from_str(&ask[0])
             .map_err(|_| format!("Failed to parse ask price: {}", ask[0]))?;
-        let ask_qty = f64::from_str(&ask[1])
+        let ask_qty = Decimal::from_str(&ask[1])
             .map_err(|_| format!("Failed to parse ask qty: {}", ask[1]))?;
 
         if bid.len() < 2 {
             return Err(format!("BBO bid data incomplete: {:?}", bid));
         }
-        let bid_price = f64::from_str(&bid[0])
+        let bid_price = Decimal::from_str(&bid[0])
             .map_err(|_| format!("Failed to parse bid price: {}", bid[0]))?;
-        let bid_qty = f64::from_str(&bid[1])
+        let bid_qty = Decimal::from_str(&bid[1])
             .map_err(|_| format!("Failed to parse bid qty: {}", bid[1]))?;
 
         let timestamp = self.ts.parse::<u64>()
@@ -159,9 +159,9 @@ pub struct TradeData {
 impl TradeData {
     /// 转为公共成交印记，数量已折算为币本位。
     pub fn to_market_trade(&self, meta: &SymbolMeta) -> Result<MarketTrade, String> {
-        let price = f64::from_str(&self.px)
+        let price = Decimal::from_str(&self.px)
             .map_err(|_| format!("Failed to parse trade price: {}", self.px))?;
-        let qty = f64::from_str(&self.sz)
+        let qty = Decimal::from_str(&self.sz)
             .map_err(|_| format!("Failed to parse trade qty: {}", self.sz))?;
         let timestamp = self
             .ts
@@ -196,7 +196,7 @@ impl MarkPriceData {
     pub fn to_mark_price(&self, quote: &str) -> Result<MarkPrice, String> {
         let symbol = from_okx(&self.inst_id, quote)
             .ok_or_else(|| format!("Unknown OKX symbol: {}", self.inst_id))?;
-        let price = f64::from_str(&self.mark_px)
+        let price = Decimal::from_str(&self.mark_px)
             .map_err(|_| format!("Failed to parse mark price: {}", self.mark_px))?;
         let timestamp = self.ts.parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
@@ -224,7 +224,7 @@ impl IndexTickerData {
         // index-tickers 返回 BTC-USDT 格式，使用 from_okx_index 解析
         let symbol = from_okx_index(&self.inst_id, quote)
             .ok_or_else(|| format!("Unknown OKX index symbol: {}", self.inst_id))?;
-        let price = f64::from_str(&self.idx_px)
+        let price = Decimal::from_str(&self.idx_px)
             .map_err(|_| format!("Failed to parse index price: {}", self.idx_px))?;
         let timestamp = self.ts.parse::<u64>()
             .map_err(|_| format!("Failed to parse timestamp: {}", self.ts))?;
@@ -266,7 +266,7 @@ impl PositionData {
     ///
     /// 这让"空仓时 OKX 用空串表示数值字段"那套三态守卫整个消失 —— 空串只可能出现在
     /// `pos` 上，而空仓的数量就是 0，如实且无歧义。
-    pub fn to_position(&self, symbol: Symbol, contract_size: f64) -> Result<Position, String> {
+    pub fn to_position(&self, symbol: Symbol, contract_size: Decimal) -> Result<Position, String> {
         if self.pos_side != POS_SIDE_NET {
             return Err(format!(
                 "OKX {} 处于双向持仓模式 (posSide={})，本项目仅支持单向净持仓；\
@@ -276,9 +276,9 @@ impl PositionData {
         }
         // 空仓时 pos 为空串 —— 那就是 0 张，如实解析；非空则必须解析成功
         let contracts = if self.pos.is_empty() {
-            0.0
+            Decimal::ZERO
         } else {
-            f64::from_str(&self.pos).map_err(|_| format!("Failed to parse pos: {}", self.pos))?
+            Decimal::from_str(&self.pos).map_err(|_| format!("Failed to parse pos: {}", self.pos))?
         };
         Ok(Position {
             exchange: Exchange::OKX,
@@ -370,14 +370,13 @@ pub struct OrderPushData {
 impl OrderPushData {
     /// 全部数量字段折算为币本位，折算由签名强制（见 [`crate::domain::Quantity`]）。
     pub fn to_order_update(&self, meta: &SymbolMeta) -> Result<OrderUpdate, String> {
-        // market order px 为空字符串，此时 price 为 0.0
         // 线路上三个数量字段都是张数，此处一次性折算为币本位
         let sz = meta.qty_to_coin(
-            f64::from_str(&self.sz).map_err(|_| format!("Failed to parse sz: {}", self.sz))?,
+            Decimal::from_str(&self.sz).map_err(|_| format!("Failed to parse sz: {}", self.sz))?,
         );
 
         let acc_fill_sz = meta.qty_to_coin(
-            f64::from_str(&self.acc_fill_sz)
+            Decimal::from_str(&self.acc_fill_sz)
                 .map_err(|_| format!("Failed to parse accFillSz: {}", self.acc_fill_sz))?,
         );
 
@@ -401,9 +400,9 @@ impl OrderPushData {
     /// `AccountData::UnmappedFill`），数量是交易所原始张数 —— 没有可信的折算系数。
     /// 无成交（`fillSz` 为 0）返回 `None`。
     pub fn to_unmapped_fill(&self) -> Result<Option<crate::messaging::UnmappedFill>, String> {
-        let size = f64::from_str(&self.fill_sz)
+        let size = Decimal::from_str(&self.fill_sz)
             .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?;
-        if size == 0.0 {
+        if size.is_zero() {
             return Ok(None);
         }
         Ok(Some(crate::messaging::UnmappedFill {
@@ -411,7 +410,7 @@ impl OrderPushData {
             instrument: self.inst_id.clone(),
             side: parse_side(&self.side)?,
             size,
-            price: f64::from_str(&self.fill_px)
+            price: Decimal::from_str(&self.fill_px)
                 .map_err(|_| format!("Failed to parse fill_px: {}", self.fill_px))?,
             timestamp: now_ms(),
         }))
@@ -420,16 +419,16 @@ impl OrderPushData {
     /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）。数量折算为币本位。
     pub fn to_fill(&self, meta: &SymbolMeta) -> Result<Option<Fill>, String> {
         let fill_sz = meta.qty_to_coin(
-            f64::from_str(&self.fill_sz)
+            Decimal::from_str(&self.fill_sz)
                 .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?,
         );
 
         // 没有成交则不生成 Fill
-        if fill_sz == 0.0 {
+        if fill_sz.is_zero() {
             return Ok(None);
         }
 
-        let fill_px = f64::from_str(&self.fill_px)
+        let fill_px = Decimal::from_str(&self.fill_px)
             .map_err(|_| format!("Failed to parse fill_px: {}", self.fill_px))?;
 
         let side = parse_side(&self.side)?;
@@ -556,13 +555,13 @@ pub fn parse_candle_data(
         .ok_or_else(|| format!("Unknown OKX symbol: {}", inst_id))?;
     let open_time: u64 = raw[0].parse()
         .map_err(|_| format!("Failed to parse candle ts: {}", raw[0]))?;
-    let open = f64::from_str(&raw[1])
+    let open = Decimal::from_str(&raw[1])
         .map_err(|_| format!("Failed to parse candle open: {}", raw[1]))?;
-    let high = f64::from_str(&raw[2])
+    let high = Decimal::from_str(&raw[2])
         .map_err(|_| format!("Failed to parse candle high: {}", raw[2]))?;
-    let low = f64::from_str(&raw[3])
+    let low = Decimal::from_str(&raw[3])
         .map_err(|_| format!("Failed to parse candle low: {}", raw[3]))?;
-    let close = f64::from_str(&raw[4])
+    let close = Decimal::from_str(&raw[4])
         .map_err(|_| format!("Failed to parse candle close: {}", raw[4]))?;
     let volume = f64::from_str(&raw[5])
         .map_err(|_| format!("Failed to parse candle vol: {}", raw[5]))?;
@@ -612,20 +611,21 @@ pub fn okx_channel_to_candle_interval(channel: &str) -> Option<CandleInterval> {
 
 #[cfg(test)]
 mod trade_tests {
+    use rust_decimal_macros::dec;
     use super::*;
-    use crate::domain::StepFormatter;
+    use crate::domain::PriceStep;
     use std::sync::Arc;
 
     /// BTC-USDT-SWAP: ctVal = 0.01 BTC/张
-    const CONTRACT_SIZE: f64 = 0.01;
+    const CONTRACT_SIZE: Decimal = dec!(0.01);
 
     fn btc_meta() -> SymbolMeta {
         SymbolMeta {
             exchange: Exchange::OKX,
             symbol: "BTC".to_string(),
-            price_formatter: Arc::new(StepFormatter::new(0.1)),
-            size_step: 0.01,
-            min_order_size: 0.01,
+            price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+            size_step: dec!(0.01),
+            min_order_size: dec!(0.01),
             min_notional: 0.0,
             contract_size: CONTRACT_SIZE,
         }
@@ -647,9 +647,9 @@ mod trade_tests {
             .expect("to_market_trade");
         assert_eq!(t.exchange, Exchange::OKX);
         assert_eq!(t.symbol, "BTC");
-        assert_eq!(t.price, 42219.9);
+        assert_eq!(t.price, dec!(42219.9));
         // 12 张 x 0.01 = 0.12 BTC —— 折算由签名强制，漏折算会是 12（差 100 倍）
-        assert!((t.qty - 0.12).abs() < 1e-12, "got {}", t.qty);
+        assert_eq!(t.qty, dec!(0.12), "got {}", t.qty);
         assert!(t.is_buyer_maker, "side=sell 是主动卖 -> 买方为挂单方");
         assert_eq!(t.timestamp, 1630048897897);
     }
@@ -683,9 +683,9 @@ mod trade_tests {
         let d: BboData = serde_json::from_str(raw).unwrap();
         let bbo = d.to_bbo(&btc_meta()).unwrap().expect("双边盘口");
         assert_eq!(bbo.symbol, "BTC");
-        assert_eq!(bbo.bid_price, 42219.9);
-        assert!((bbo.bid_qty - 0.12).abs() < 1e-12, "got {}", bbo.bid_qty);
-        assert!((bbo.ask_qty - 0.30).abs() < 1e-12, "got {}", bbo.ask_qty);
+        assert_eq!(bbo.bid_price, dec!(42219.9));
+        assert_eq!(bbo.bid_qty, dec!(0.12), "got {}", bbo.bid_qty);
+        assert_eq!(bbo.ask_qty, dec!(0.30), "got {}", bbo.ask_qty);
     }
 
     /// 持仓同样折算，且方向符号保留
@@ -696,7 +696,7 @@ mod trade_tests {
         let d: PositionData = serde_json::from_str(raw).unwrap();
         let p = d.to_position("BTC".to_string(), CONTRACT_SIZE).unwrap();
         assert_eq!(p.symbol, "BTC");
-        assert!((p.size - (-0.12)).abs() < 1e-12, "got {}", p.size);
+        assert_eq!(p.size, dec!(-0.12), "got {}", p.size);
     }
 
     /// 空仓时 OKX 的数值字段是**空串**，按 0 处理而非解析失败
@@ -705,7 +705,7 @@ mod trade_tests {
         let raw = r#"{"instId":"BTC-USDT-SWAP","pos":"","posSide":"net","avgPx":"","upl":""}"#;
         let d: PositionData = serde_json::from_str(raw).unwrap();
         let p = d.to_position("BTC".to_string(), CONTRACT_SIZE).unwrap();
-        assert_eq!(p.size, 0.0);
+        assert_eq!(p.size, dec!(0.0));
     }
 
 

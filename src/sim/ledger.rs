@@ -1,4 +1,4 @@
-use crate::domain::{signed_qty, Price, Quantity, Side, Symbol};
+use crate::domain::{signed_qty, to_f64, Price, Quantity, Side, Symbol};
 use std::collections::HashMap;
 
 /// 账本里的一笔持仓：数量 + **本地维护的持仓均价**。
@@ -11,16 +11,14 @@ use std::collections::HashMap;
 pub struct BookPosition {
     /// 带符号数量：正多负空
     pub size: Quantity,
-    /// 持仓均价（本地按成交加权，见 [`Self::apply_fill`]）
-    pub entry_price: Price,
+    /// 持仓均价（本地按成交加权，见 [`Self::apply_fill`]）。是记账用的派生量，不是可下单的价格，
+    /// 故为 `f64`
+    pub entry_price: f64,
 }
 
 impl BookPosition {
-    /// 空仓判定的浮点阈值（与域模型同一口径）
-    const EPSILON: f64 = crate::domain::Position::EPSILON;
-
     pub fn is_empty(&self) -> bool {
-        self.size.abs() < Self::EPSILON
+        self.size.is_zero()
     }
 
     /// 应用一笔成交：维护带符号数量与持仓均价，返回**已实现盈亏**（不含手续费）。
@@ -34,28 +32,30 @@ impl BookPosition {
         let old_size = self.size;
         let new_size = old_size + signed;
 
-        if old_size.abs() < Self::EPSILON || (old_size > 0.0) == (signed > 0.0) {
+        let price_f = to_f64(price);
+        if old_size.is_zero() || (old_size > Quantity::ZERO) == (signed > Quantity::ZERO) {
             // 新开 / 同向加仓：加权平均
-            self.entry_price = if old_size.abs() < Self::EPSILON {
-                price
+            self.entry_price = if old_size.is_zero() {
+                price_f
             } else {
-                (old_size.abs() * self.entry_price + qty * price) / (old_size.abs() + qty)
+                let (old, add) = (to_f64(old_size.abs()), to_f64(qty));
+                (old * self.entry_price + add * price_f) / (old + add)
             };
             self.size = new_size;
             0.0
         } else {
             // 反向：平仓（可能反手）
-            let close_qty = qty.min(old_size.abs());
-            let dir = if old_size > 0.0 { 1.0 } else { -1.0 };
-            let realized = (price - self.entry_price) * close_qty * dir;
+            let close_qty = to_f64(qty.min(old_size.abs()));
+            let dir = if old_size > Quantity::ZERO { 1.0 } else { -1.0 };
+            let realized = (price_f - self.entry_price) * close_qty * dir;
             self.entry_price = if signed.abs() <= old_size.abs() {
-                if new_size.abs() < Self::EPSILON {
+                if new_size.is_zero() {
                     0.0
                 } else {
                     self.entry_price
                 }
             } else {
-                price // 反手：剩余在成交价重开
+                price_f // 反手：剩余在成交价重开
             };
             self.size = new_size;
             realized
@@ -68,7 +68,7 @@ impl BookPosition {
 pub struct BookSnapshot {
     pub symbol: Symbol,
     pub size: Quantity,
-    pub entry_price: Price,
+    pub entry_price: f64,
     pub unrealized_pnl: f64,
 }
 
@@ -126,7 +126,7 @@ impl Ledger {
     pub fn position_values(&self, mark_of: impl Fn(&Symbol) -> f64) -> std::collections::HashMap<Symbol, f64> {
         self.positions
             .iter()
-            .map(|(symbol, p)| (symbol.clone(), p.size.abs() * mark_of(symbol)))
+            .map(|(symbol, p)| (symbol.clone(), to_f64(p.size.abs()) * mark_of(symbol)))
             .collect()
     }
 
@@ -150,13 +150,14 @@ fn unrealized_pnl(pos: &BookPosition, mark: f64) -> f64 {
     if mark <= 0.0 {
         0.0
     } else {
-        (mark - pos.entry_price) * pos.size
+        (mark - pos.entry_price) * to_f64(pos.size)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     fn sym() -> Symbol {
         "BTCUSDT".to_string()
@@ -164,8 +165,8 @@ mod tests {
     fn empty() -> Ledger {
         Ledger::empty(10_000.0)
     }
-    fn size_of(l: &Ledger) -> f64 {
-        l.positions.get(&sym()).map(|p| p.size).unwrap_or(0.0)
+    fn size_of(l: &Ledger) -> Quantity {
+        l.positions.get(&sym()).map_or(Quantity::ZERO, |p| p.size)
     }
     fn entry_of(l: &Ledger) -> f64 {
         l.positions.get(&sym()).map(|p| p.entry_price).unwrap_or(0.0)
@@ -174,8 +175,8 @@ mod tests {
     #[test]
     fn open_long_records_entry_cash_unchanged() {
         let mut l = empty();
-        l.apply_fill(&sym(), Side::Long, 100.0, 2.0, 0.0);
-        assert_eq!(size_of(&l), 2.0);
+        l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(2.0), 0.0);
+        assert_eq!(size_of(&l), dec!(2.0));
         assert_eq!(entry_of(&l), 100.0);
         assert_eq!(l.cash, 10_000.0);
     }
@@ -183,9 +184,9 @@ mod tests {
     #[test]
     fn add_same_side_weighted_average() {
         let mut l = empty();
-        l.apply_fill(&sym(), Side::Long, 100.0, 2.0, 0.0);
-        l.apply_fill(&sym(), Side::Long, 110.0, 2.0, 0.0);
-        assert_eq!(size_of(&l), 4.0);
+        l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(2.0), 0.0);
+        l.apply_fill(&sym(), Side::Long, dec!(110.0), dec!(2.0), 0.0);
+        assert_eq!(size_of(&l), dec!(4.0));
         assert_eq!(entry_of(&l), 105.0); // (2*100 + 2*110)/4
         assert_eq!(l.cash, 10_000.0);
     }
@@ -193,9 +194,9 @@ mod tests {
     #[test]
     fn partial_close_realizes_pnl_entry_unchanged() {
         let mut l = empty();
-        l.apply_fill(&sym(), Side::Long, 100.0, 4.0, 0.0);
-        l.apply_fill(&sym(), Side::Short, 120.0, 1.0, 0.0); // 平 1, 盈利 20
-        assert_eq!(size_of(&l), 3.0);
+        l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(4.0), 0.0);
+        l.apply_fill(&sym(), Side::Short, dec!(120.0), dec!(1.0), 0.0); // 平 1, 盈利 20
+        assert_eq!(size_of(&l), dec!(3.0));
         assert_eq!(entry_of(&l), 100.0);
         assert_eq!(l.cash, 10_020.0);
     }
@@ -203,9 +204,9 @@ mod tests {
     #[test]
     fn full_close_zeroes_position_and_entry() {
         let mut l = empty();
-        l.apply_fill(&sym(), Side::Long, 100.0, 2.0, 0.0);
-        l.apply_fill(&sym(), Side::Short, 90.0, 2.0, 0.0); // 平 2, 亏损 20
-        assert_eq!(size_of(&l), 0.0);
+        l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(2.0), 0.0);
+        l.apply_fill(&sym(), Side::Short, dec!(90.0), dec!(2.0), 0.0); // 平 2, 亏损 20
+        assert_eq!(size_of(&l), dec!(0.0));
         assert_eq!(entry_of(&l), 0.0);
         assert_eq!(l.cash, 9_980.0);
     }
@@ -213,9 +214,9 @@ mod tests {
     #[test]
     fn reverse_closes_then_reopens_remainder() {
         let mut l = empty();
-        l.apply_fill(&sym(), Side::Long, 100.0, 2.0, 0.0);
-        l.apply_fill(&sym(), Side::Short, 120.0, 5.0, 0.0); // 平多 2(+40), 反手开空 3 @120
-        assert_eq!(size_of(&l), -3.0);
+        l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(2.0), 0.0);
+        l.apply_fill(&sym(), Side::Short, dec!(120.0), dec!(5.0), 0.0); // 平多 2(+40), 反手开空 3 @120
+        assert_eq!(size_of(&l), dec!(-3.0));
         assert_eq!(entry_of(&l), 120.0);
         assert_eq!(l.cash, 10_040.0);
     }
@@ -223,16 +224,16 @@ mod tests {
     #[test]
     fn short_close_pnl_direction() {
         let mut l = empty();
-        l.apply_fill(&sym(), Side::Short, 100.0, 2.0, 0.0);
-        l.apply_fill(&sym(), Side::Long, 90.0, 2.0, 0.0); // 空头平于低价, 盈利 20
-        assert_eq!(size_of(&l), 0.0);
+        l.apply_fill(&sym(), Side::Short, dec!(100.0), dec!(2.0), 0.0);
+        l.apply_fill(&sym(), Side::Long, dec!(90.0), dec!(2.0), 0.0); // 空头平于低价, 盈利 20
+        assert_eq!(size_of(&l), dec!(0.0));
         assert_eq!(l.cash, 10_020.0);
     }
 
     #[test]
     fn equity_and_notional_use_unrealized() {
         let mut l = empty();
-        l.apply_fill(&sym(), Side::Long, 100.0, 2.0, 0.0);
+        l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(2.0), 0.0);
         let mark_of = |_: &Symbol| 150.0;
         assert_eq!(l.equity(mark_of), 10_000.0 + (150.0 - 100.0) * 2.0); // 10100
         assert_eq!(l.notional(mark_of), 2.0 * 150.0); // 300
@@ -242,7 +243,7 @@ mod tests {
     #[test]
     fn no_mark_price_zero_unrealized() {
         let mut l = empty();
-        l.apply_fill(&sym(), Side::Long, 100.0, 2.0, 0.0);
+        l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(2.0), 0.0);
         assert_eq!(l.equity(|_: &Symbol| 0.0), 10_000.0);
     }
 }

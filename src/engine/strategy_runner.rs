@@ -210,9 +210,11 @@ impl StrategyRunner {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{OrderType, Side, TimeInForce};
-    use crate::domain::StepFormatter;
+    use crate::domain::PriceStep;
     use crate::exchange::SubscriptionKind;
     use crate::messaging::{IncomeEvent, MarketData};
     use std::collections::HashSet;
@@ -221,7 +223,7 @@ mod tests {
     const EX: Exchange = Exchange::OKX;
     const SYM: &str = "BTC";
     /// OKX BTC-USDT-SWAP：每张 0.01 币，数量步长 1 张 -> 合法币量是 0.01 的整数倍
-    const CONTRACT_SIZE: f64 = 0.01;
+    const CONTRACT_SIZE: Decimal = dec!(0.01);
 
     fn metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
         Arc::new(HashMap::from([(
@@ -229,9 +231,9 @@ mod tests {
             SymbolMeta {
                 exchange: EX,
                 symbol: SYM.to_string(),
-                price_formatter: Arc::new(StepFormatter::new(0.1)),
-                size_step: 1.0,
-                min_order_size: 1.0,
+                price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+                size_step: dec!(1.0),
+                min_order_size: dec!(1.0),
                 min_notional: 0.0,
                 contract_size: CONTRACT_SIZE,
             },
@@ -240,8 +242,8 @@ mod tests {
 
     /// 一次性下一张指定数量/价格的挂单
     struct OneShot {
-        quantity: f64,
-        price: f64,
+        quantity: Decimal,
+        price: Decimal,
         placed: bool,
     }
 
@@ -278,7 +280,7 @@ mod tests {
         }
     }
 
-    fn run_once(quantity: f64, price: f64) -> Order {
+    fn run_once(quantity: Decimal, price: Decimal) -> Order {
         let mut runner = StrategyRunner::with_id_gen(
             Box::new(OneShot {
                 quantity,
@@ -301,14 +303,14 @@ mod tests {
     #[test]
     fn emitted_order_is_coin_denominated_and_rounded() {
         // 0.125 币 = 12.5 张 -> 向下取整 12 张 = 0.12 币（**不是** 12）
-        let order = run_once(0.125, 62_500.17);
+        let order = run_once(dec!(0.125), dec!(62_500.17));
         assert!(
-            (order.quantity - 0.12).abs() < 1e-12,
+            order.quantity == dec!(0.12),
             "应为币本位 0.12，若得到 12 说明单位折算错误地留在了 runner 里: {}",
             order.quantity
         );
         match order.order_type {
-            OrderType::Limit { price, .. } => assert!((price - 62_500.2).abs() < 1e-9),
+            OrderType::Limit { price, .. } => assert_eq!(price, dec!(62500.2)),
             OrderType::Market => panic!("expected limit"),
         }
     }
@@ -318,8 +320,8 @@ mod tests {
     fn pending_order_keeps_strategy_requested_quantity() {
         let mut runner = StrategyRunner::with_id_gen(
             Box::new(OneShot {
-                quantity: 0.125,
-                price: 62_500.0,
+                quantity: dec!(0.125),
+                price: dec!(62_500.0),
                 placed: false,
             }),
             metas(),
@@ -329,8 +331,8 @@ mod tests {
         let ev = IncomeEvent::market(1, 1, MarketData::Clock);
         runner.on_event(&ev).unwrap();
         let state = runner.state().symbol_state(&SYM.to_string()).expect("state");
-        let pending: Vec<f64> = state.order_book().iter().map(|p| p.order.quantity).collect();
-        assert_eq!(pending, vec![0.125]);
+        let pending: Vec<Decimal> = state.order_book().iter().map(|p| p.order.quantity).collect();
+        assert_eq!(pending, vec![dec!(0.125)]);
     }
 
     /// **范围是从 `public_streams()` 推导出来的**。
@@ -342,8 +344,8 @@ mod tests {
     fn the_scope_is_derived_from_the_strategys_declared_streams() {
         let runner = StrategyRunner::new(
             Box::new(OneShot {
-                quantity: 1.0,
-                price: 1.0,
+                quantity: dec!(1.0),
+                price: dec!(1.0),
                 placed: false,
             }),
             metas(),
@@ -357,10 +359,10 @@ mod tests {
                 MarketData::BBO(crate::domain::BBO {
                     exchange,
                     symbol: symbol.to_string(),
-                    bid_price: 1.0,
-                    bid_qty: 1.0,
-                    ask_price: 1.0,
-                    ask_qty: 1.0,
+                    bid_price: dec!(1.0),
+                    bid_qty: dec!(1.0),
+                    ask_price: dec!(1.0),
+                    ask_qty: dec!(1.0),
                     timestamp: 0,
                 }),
             )

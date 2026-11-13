@@ -185,18 +185,18 @@ async fn run() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hft_engine_rs::domain::StepFormatter;
+    use hft_engine_rs::domain::{dec, PriceStep};
     use std::sync::Arc;
 
     fn meta(exchange: Exchange, symbol: &str) -> SymbolMeta {
         SymbolMeta {
             exchange,
             symbol: symbol.to_string(),
-            price_formatter: Arc::new(StepFormatter::new(0.01)),
-            size_step: 0.001,
-            min_order_size: 0.001,
+            price_rule: Arc::new(PriceStep::new(dec!(0.01))),
+            size_step: dec!(0.001),
+            min_order_size: dec!(0.001),
             min_notional: 0.0,
-            contract_size: 1.0,
+            contract_size: dec!(1),
         }
     }
 

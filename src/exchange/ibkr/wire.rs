@@ -11,6 +11,8 @@
 //! 所以解析口径必须**只有一处**。此前 orderId 的双态解析在三个地方各抄了一份
 //! （两条 WS 路径 + REST），行为还不一致，正是"改一处忘两处"的温床。
 
+use crate::domain::Decimal;
+
 /// 把一个 JSON 值取成数字：接受 Number 与 String（含千分位逗号）两种形态。
 ///
 /// 返回 `None` 表示**这个值不是数字**（而非"字段不存在"，那由调用方区分，
@@ -60,6 +62,31 @@ pub(crate) fn optional_number(
     }
 }
 
+/// 把一个 JSON 值取成精确十进制（价格、数量用，见 [`crate::domain::Quantity`]）：接受 Number 与
+/// String（含千分位逗号）两种形态，按十进制原文解析，不经 f64。NaN / inf 之类解析不了，归 `None`。
+pub(crate) fn decimal(v: &serde_json::Value) -> Option<Decimal> {
+    let raw = match v {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.replace(',', ""),
+        _ => return None,
+    };
+    let parsed = raw.parse::<Decimal>().or_else(|_| Decimal::from_scientific(&raw)).ok();
+    if parsed.is_none() {
+        tracing::warn!(raw = %v, "Failed to parse IB decimal");
+    }
+    parsed
+}
+
+/// [`optional_number`] 的十进制版：缺失 / null → `Ok(None)`；在但解析不了 → `Err`
+pub(crate) fn optional_decimal(item: &serde_json::Value, field: &str) -> Result<Option<Decimal>, String> {
+    match item.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => decimal(v)
+            .map(Some)
+            .ok_or_else(|| format!("IBKR 字段 {field} 无法解析为数字: {v}")),
+    }
+}
+
 /// 取订单号：Number 与 String 两种形态都接。
 ///
 /// 返回 `None` = 该字段缺失、为 null、或类型压根不是标量 —— 一律按"**没有订单号**"处理，
@@ -85,6 +112,18 @@ mod tests {
         assert_eq!(number(&json!("1,234.5")), Some(1234.5));
         assert_eq!(number(&json!("n/a")), None);
         assert_eq!(number(&json!(null)), None);
+    }
+
+    #[test]
+    fn decimals_accept_both_wire_forms_exactly() {
+        use rust_decimal_macros::dec;
+        assert_eq!(decimal(&json!(1234.5)), Some(dec!(1234.5)));
+        assert_eq!(decimal(&json!("1,234.5")), Some(dec!(1234.5)));
+        assert_eq!(decimal(&json!("0.1")), Some(dec!(0.1)));
+        assert_eq!(decimal(&json!("NaN")), None);
+        assert_eq!(decimal(&json!(null)), None);
+        assert!(optional_decimal(&json!({"size": "n/a"}), "size").is_err());
+        assert_eq!(optional_decimal(&json!({}), "size").unwrap(), None);
     }
 
     /// Rust 的 `parse::<f64>()` 会**成功**接受这些字面量。放行非有限值的后果：账本被 NaN

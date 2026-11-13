@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::domain::SymbolMeta;
+use rust_decimal_macros::dec;
 use crate::exchange::{ExchangeCmd, ExchangeHandle};
 use crate::messaging::{AccountData, ExchangeAccountData};
 use crate::tasks::Root;
@@ -23,11 +24,11 @@ impl ExchangeClient for FakeClient {
         Ok(vec![SymbolMeta {
             exchange: self.0,
             symbol: "BTC".to_string(),
-            price_formatter: Arc::new(crate::domain::StepFormatter::new(0.1)),
-            size_step: 0.001,
-            min_order_size: 0.001,
+            price_rule: Arc::new(crate::domain::PriceStep::new(dec!(0.1))),
+            size_step: dec!(0.001),
+            min_order_size: dec!(0.001),
             min_notional: 0.0,
-            contract_size: 1.0,
+            contract_size: dec!(1.0),
         }])
     }
     async fn fetch_symbol_meta(&self, _: &[Symbol]) -> Result<Vec<SymbolMeta>, ExchangeError> {

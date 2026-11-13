@@ -22,6 +22,8 @@
 //! ```sh
 //! cargo test --test paper_trading_live -- --ignored --nocapture
 //! ```
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{
     AccountId, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
@@ -50,9 +52,9 @@ const COIN: &str = "BTC";
 /// 取 0 即挂在当前买价上：PostOnly 不会吃单（bid < ask 故不可成交，正常入簿），此后**任何
 /// 严格低于该价的真实成交**都会触发成交 —— 买价下跳一次即可，比下偏挂单快得多。
 /// 撮合是严格越价（不含相等），所以成交在挂单价上打平不算成交。
-const OFFSET_BP: f64 = 0.0;
+const OFFSET_BP: Decimal = dec!(0);
 /// 单笔下单量（币）
-const ORDER_QTY: f64 = 0.002;
+const ORDER_QTY: Decimal = dec!(0.002);
 /// 订单到柜台的单程延迟
 const ORDER_DELAY_MS: u64 = 50;
 /// 观测窗口
@@ -97,14 +99,14 @@ impl Strategy for DipMaker {
             return Vec::new();
         };
         // 成交过就收手，本测试只需要一笔
-        if symbol_state.position_size(EX).abs() > 0.0 {
+        if !symbol_state.position_size(EX).is_zero() {
             return Vec::new();
         }
 
         if symbol_state.pending_orders().next().is_some() {
             return Vec::new();
         }
-        let price = bbo.bid_price * (1.0 - OFFSET_BP / 10_000.0);
+        let price = bbo.bid_price * (Decimal::ONE - OFFSET_BP / dec!(10000));
         self.0.lock().unwrap().limit_price = Some(price);
         vec![OutcomeEvent::PlaceOrders {
             orders: vec![Order {
@@ -132,19 +134,19 @@ impl Strategy for DipMaker {
 #[derive(Default)]
 struct Log {
     order_updates: Vec<(String, String)>,
-    fills: Vec<(f64, f64)>,
+    fills: Vec<(Decimal, Decimal)>,
     equity: Option<f64>,
     /// 诊断：柜台侧能看到多少条成交、价格区间走到哪里
     trade_count: usize,
-    min_trade_price: Option<f64>,
-    max_trade_price: Option<f64>,
+    min_trade_price: Option<Decimal>,
+    max_trade_price: Option<Decimal>,
     /// 挂单入簿后的限价（取整后）
     /// 策略挂出的价格（由策略自己写入，见 DipMaker）
-    limit_price: Option<f64>,
+    limit_price: Option<Decimal>,
     /// 挂单已被柜台确认入簿（收到 Pending 回报）
     resting: bool,
     /// **挂单入簿之后**的最低成交价 —— 蕴含判断只能用这个，入簿前的成交与该单无关
-    min_trade_after_rest: Option<f64>,
+    min_trade_after_rest: Option<Decimal>,
 }
 
 /// 观测者收的两类事件：柜台回报（账户事件，带 Paper 标签）与行情（成交价区间诊断）
@@ -179,11 +181,11 @@ impl Task for Watcher {
                 WatcherMsg::Market(ev) => {
                     if let MarketData::MarketTrade(t) = &ev.data {
                         log.trade_count += 1;
-                        log.min_trade_price = Some(log.min_trade_price.map_or(t.price, |m: f64| m.min(t.price)));
-                        log.max_trade_price = Some(log.max_trade_price.map_or(t.price, |m: f64| m.max(t.price)));
+                        log.min_trade_price = Some(log.min_trade_price.map_or(t.price, |m: Decimal| m.min(t.price)));
+                        log.max_trade_price = Some(log.max_trade_price.map_or(t.price, |m: Decimal| m.max(t.price)));
                         if log.resting {
                             log.min_trade_after_rest =
-                                Some(log.min_trade_after_rest.map_or(t.price, |m: f64| m.min(t.price)));
+                                Some(log.min_trade_after_rest.map_or(t.price, |m: Decimal| m.min(t.price)));
                         }
                     }
                 }
@@ -375,9 +377,9 @@ async fn paper_counter_fills_from_live_trades() {
                 "入簿后最低成交价 {min_after} 已严格跌破挂单价 {limit}，但柜台未给出成交 —— 撮合链路有问题"
             );
             for (price, size) in &log.fills {
-                assert!(*price > 0.0);
+                assert!(*price > dec!(0.0));
                 assert!(
-                    (*size - ORDER_QTY).abs() < 1e-12,
+                    *size == ORDER_QTY,
                     "不做部分成交：成交量应等于挂单量 {ORDER_QTY}，实际 {size}"
                 );
             }

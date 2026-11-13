@@ -14,7 +14,8 @@ use anyhow::Context;
 use chrono::NaiveDate;
 use hft_engine_rs::backtest::{BacktestEngine, BinanceDataKind, BinanceHistory};
 use hft_engine_rs::domain::{
-    Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
+    dec, Decimal, Exchange, Order, OrderType, Price, Quantity, Side, Symbol, SymbolMeta,
+    TimeInForce,
 };
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
@@ -37,15 +38,16 @@ const EX: Exchange = Exchange::Binance;
 /// 它要哪种；框架替所有人猜一种，反而是错的那种的人还得绕开它。
 struct MeanRevertMaker {
     symbol: Symbol,
-    offset_ratio: f64,
-    order_size: f64,
+    /// 挂单距成交价的比例（直接乘到价格上，故用 Decimal）
+    offset_ratio: Decimal,
+    order_size: Quantity,
     /// 本策略的持仓成本：按成交加权，空仓时清零
-    entry_price: f64,
-    entry_size: f64,
+    entry_price: Price,
+    entry_size: Quantity,
 }
 
 impl MeanRevertMaker {
-    fn place(&self, side: Side, price: f64, qty: f64, reduce_only: bool, comment: &str) -> OutcomeEvent {
+    fn place(&self, side: Side, price: Price, qty: Quantity, reduce_only: bool, comment: &str) -> OutcomeEvent {
         OutcomeEvent::PlaceOrders {
             orders: vec![Order {
                 id: String::new(),
@@ -85,14 +87,16 @@ impl Strategy for MeanRevertMaker {
             match f.side {
                 Side::Long => {
                     let total = self.entry_size + f.size;
-                    self.entry_price =
-                        (self.entry_size * self.entry_price + f.size * f.price) / total;
-                    self.entry_size = total;
+                    if !total.is_zero() {
+                        self.entry_price =
+                            (self.entry_size * self.entry_price + f.size * f.price) / total;
+                        self.entry_size = total;
+                    }
                 }
                 Side::Short => {
-                    self.entry_size = (self.entry_size - f.size).max(0.0);
-                    if self.entry_size < 1e-12 {
-                        self.entry_price = 0.0;
+                    self.entry_size = (self.entry_size - f.size).max(Decimal::ZERO);
+                    if self.entry_size.is_zero() {
+                        self.entry_price = Decimal::ZERO;
                     }
                 }
             }
@@ -112,18 +116,18 @@ impl Strategy for MeanRevertMaker {
         }
         let pos_size = symbol_state.position_size(EX);
 
-        if pos_size.abs() < 1e-9 {
+        if pos_size.is_zero() {
             // 空仓：在成交价下方挂买单
-            let price = t.price * (1.0 - self.offset_ratio);
+            let price = t.price * (Decimal::ONE - self.offset_ratio);
             vec![self.place(Side::Long, price, self.order_size, false, "open_long")]
-        } else if pos_size > 0.0 {
+        } else if pos_size > Decimal::ZERO {
             // 持多：在自己记的开仓价上方挂 reduce-only 卖单止盈
-            let entry = if self.entry_price > 0.0 {
+            let entry = if self.entry_price > Decimal::ZERO {
                 self.entry_price
             } else {
                 t.price
             };
-            let price = entry * (1.0 + self.offset_ratio);
+            let price = entry * (Decimal::ONE + self.offset_ratio);
             vec![self.place(Side::Short, price, pos_size.abs(), true, "take_profit")]
         } else {
             Vec::new()
@@ -173,10 +177,10 @@ fn main() -> anyhow::Result<()> {
 
     let strategy = MeanRevertMaker {
         symbol: symbol.clone(),
-        offset_ratio: 0.0003,
-        order_size: 0.01,
-        entry_price: 0.0,
-        entry_size: 0.0,
+        offset_ratio: dec!(0.0003),
+        order_size: dec!(0.01),
+        entry_price: Decimal::ZERO,
+        entry_size: Decimal::ZERO,
     };
     // 回测用确定性 id 生成器 -> 同一输入同一逐笔回报序列
     let runner = StrategyRunner::with_id_gen(

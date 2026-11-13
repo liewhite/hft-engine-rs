@@ -78,7 +78,7 @@
 //! 重放的机制随之删除；快照与 Fill 流的竞态由 seed 内置的时刻过滤统一兜住。
 
 use super::executor::{ExecutorHandle, ExecutorId};
-use crate::domain::{Exchange, Position, Symbol, SymbolMeta};
+use crate::domain::{to_f64, Exchange, Position, Price, Quantity, Symbol};
 use crate::exchange::staleness::{StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
 use crate::domain::{now_ms, AccountId};
@@ -127,8 +127,6 @@ pub struct Reconciler {
     /// - "哪条腿可参与对账"：`is_seeded` —— 基线未到（该所未配置凭证、无账户）时
     ///   本地持仓是"未知"而不是 0，拿未知去比对必然误判。
     mirror: PositionBook,
-    /// 容差来源：`coin_size_step()`（币本位最小可交易增量），小于它的差值不可能是真实漂移
-    symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// per (对手方, 所, symbol) 的不一致记录；一致一次即整条移除
     mismatches: HashMap<(Counterpart, Exchange, Symbol), MismatchRecord>,
     max_consecutive: u32,
@@ -179,17 +177,13 @@ struct MismatchRecord {
     /// 连续**同一差值**的不一致次数
     streak: u32,
     /// 上一次的**带符号**差值 `local - reported`（带符号：+X 与 -X 是不同的漂移）
-    last_diff: f64,
+    last_diff: Quantity,
 }
 
 impl Reconciler {
-    pub fn new(
-        symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-        max_consecutive: u32,
-    ) -> Self {
+    pub fn new(max_consecutive: u32) -> Self {
         Self {
             mirror: PositionBook::default(),
-            symbol_metas,
             mismatches: HashMap::new(),
             max_consecutive,
         }
@@ -225,18 +219,18 @@ impl Reconciler {
     pub fn position_values(
         &self,
         exchange: Exchange,
-        mid_of: impl Fn(&Symbol) -> Option<f64>,
+        mid_of: impl Fn(&Symbol) -> Option<Price>,
     ) -> Result<HashMap<Symbol, f64>, Symbol> {
         self.mirror
             .iter()
             .filter(|(_, state)| state.is_seeded(exchange))
             .map(|(symbol, state)| {
                 let size = state.position_size(exchange);
-                if size == 0.0 {
+                if size.is_zero() {
                     return Ok((symbol.clone(), 0.0));
                 }
                 let px = mid_of(symbol).ok_or_else(|| symbol.clone())?;
-                Ok((symbol.clone(), size.abs() * px))
+                Ok((symbol.clone(), to_f64(size.abs() * px)))
             })
             .collect()
     }
@@ -253,12 +247,12 @@ impl Reconciler {
         let reported = crate::exchange::client::index_positions(positions.to_vec())?;
 
         // 只比对**该所**基线已写入的腿（基线未到 = 本地未知，不是 0）
-        let legs: Vec<(Symbol, f64, f64)> = self
+        let legs: Vec<(Symbol, Quantity, Quantity)> = self
             .mirror
             .iter()
             .filter(|(_, state)| state.is_seeded(exchange))
             .map(|(symbol, state)| {
-                let reported_size = reported.get(symbol).map_or(0.0, |p| p.size);
+                let reported_size = reported.get(symbol).map_or(Quantity::ZERO, |p| p.size);
                 (symbol.clone(), state.position_size(exchange), reported_size)
             })
             .collect();
@@ -281,7 +275,7 @@ impl Reconciler {
     /// 致命退出 —— 策略正拿着错的持仓算下单量。
     pub fn reconcile_executor(&mut self, executor: ExecutorId, positions: &[Position]) -> Result<(), String> {
         let counterpart = Counterpart::Executor(executor);
-        let legs: Vec<(Exchange, Symbol, f64, f64)> = positions
+        let legs: Vec<(Exchange, Symbol, Quantity, Quantity)> = positions
             .iter()
             .filter_map(|p| {
                 let state = self.mirror.get(&p.symbol)?;
@@ -307,15 +301,14 @@ impl Reconciler {
         counterpart: Counterpart,
         exchange: Exchange,
         symbol: Symbol,
-        local: f64,
-        reported: f64,
+        local: Quantity,
+        reported: Quantity,
     ) -> Option<String> {
-        let tolerance = tolerance_of(&self.symbol_metas, exchange, &symbol);
         // 带符号差值：+X 与 -X 是方向相反的两种漂移，不能混为一谈
         let diff = local - reported;
         let key = (counterpart, exchange, symbol);
 
-        if diff.abs() <= tolerance {
+        if diff.is_zero() {
             // 一致即整条移除：记录衡量的是"当前正持续着的不一致"，不是历史累计
             self.mismatches.remove(&key);
             return None;
@@ -323,7 +316,7 @@ impl Reconciler {
 
         // 差值是否与上次相同 —— 区分真漂移与在途成交，见 MismatchRecord
         let prev = self.mismatches.get(&key).copied();
-        let stable = prev.is_some_and(|prev| (diff - prev.last_diff).abs() <= tolerance);
+        let stable = prev.is_some_and(|prev| diff == prev.last_diff);
         let streak = match prev {
             Some(prev) if stable => prev.streak + 1,
             _ => 1,
@@ -336,10 +329,9 @@ impl Reconciler {
             %counterpart,
             %exchange,
             %symbol,
-            local_size = format!("{local:.8}"),
-            reported_size = format!("{reported:.8}"),
-            diff = format!("{diff:.8}"),
-            tolerance = format!("{tolerance:.8}"),
+            local_size = %local,
+            reported_size = %reported,
+            diff = %diff,
             stable_diff = stable,
             streak,
             max_consecutive = self.max_consecutive,
@@ -349,7 +341,7 @@ impl Reconciler {
         let confirmed = (streak >= self.max_consecutive).then(|| {
             format!(
                 "{exchange}/{symbol}: 本地 {local} vs {counterpart} {reported} \
-                 (差 {diff}, 容差 {tolerance})"
+                 (差 {diff})"
             )
         });
         self.mismatches.insert(
@@ -381,28 +373,6 @@ impl Reconciler {
     }
 }
 
-/// 容差 = 该 symbol 的最小可交易**币量**增量（`size_step × contract_size`，见
-/// [`SymbolMeta::coin_size_step`]）。
-///
-/// 比对双方（本地持仓与交易所读数）都是币本位，容差必须同口径。直接用 `size_step`
-/// 是单位错误：它是**交易所下单单位**的步长 —— OKX BTC-USDT-SWAP（`size_step=1` 张、
-/// `contract_size=0.01`）会把容差放大成 1.0 BTC，反之 `contract_size > 1` 的品种会
-/// 过紧而误停机。
-///
-/// 缺 meta 说明该 symbol 未在此所上市（那么两边都是 0，容差取多少都一样），退化为浮点
-/// 误差量级。下界钉在 `Position::EPSILON`：步长再小也不该小于浮点噪声。
-fn tolerance_of(
-    symbol_metas: &HashMap<(Exchange, Symbol), SymbolMeta>,
-    exchange: Exchange,
-    symbol: &Symbol,
-) -> f64 {
-    symbol_metas
-        .get(&(exchange, symbol.clone()))
-        .map(|meta| meta.coin_size_step())
-        .unwrap_or(Position::EPSILON)
-        .max(Position::EPSILON)
-}
-
 // ============================================================================
 // 组件包装（含读数轮询）
 // ============================================================================
@@ -412,8 +382,6 @@ pub struct PositionLedgerArgs {
     /// 各所的账户私有能力（读数的来源）。键集 = 配了凭证的所 —— "没有账户的所不轮询"
     /// 由类型表达，本层不再过滤。
     pub accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
-    /// 用于取 `coin_size_step()`（币本位最小可交易增量）作为对账容差
-    pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     /// 镜像的增量输入（只订实盘 Fill），也是持仓价值读数（[`PositionValues`]）发布的地方
     pub account_bus: AccountBus,
     /// 盘口（只订 BBO）：给持仓估值
@@ -529,7 +497,7 @@ struct Ledger {
     /// 持仓价值读数的发布去处（见 [`Self::publish_values`]）
     account_bus: AccountBus,
     /// 各 (所, 币) 最新盘口中间价，给持仓估值
-    mids: HashMap<(Exchange, Symbol), f64>,
+    mids: HashMap<(Exchange, Symbol), Price>,
     /// 整机停止状态：一进停机就不再发读数 —— 停机后不再下新单，读数没人用；而同在消费者组的
     /// 订阅者（分发层、指标）此时可能已关箱，再发会记 ERROR「事件丢失」（回灌边，见
     /// architecture.md V5）
@@ -578,7 +546,7 @@ impl PositionLedger {
                     inbox,
                     interval: Duration::from_millis(args.interval_ms),
                     ledger: Ledger {
-                        reconciler: Reconciler::new(args.symbol_metas, args.max_consecutive_mismatches),
+                        reconciler: Reconciler::new(args.max_consecutive_mismatches),
                         accounts: args.accounts,
                         guards,
                         in_flight: HashSet::new(),
@@ -842,48 +810,26 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Fill, FillReason, Side};
     use crate::messaging::{AccountData, SymbolAccountData};
-    use crate::domain::StepFormatter;
 
     const EX: Exchange = Exchange::Binance;
     const OTHER_EX: Exchange = Exchange::OKX;
     const SYM: &str = "BTC";
-    const SIZE_STEP: f64 = 0.001;
     /// 测试基线统一的快照请求时刻；需要累加的 Fill 应带更晚的 local_ts
     const SNAPSHOT_TS: u64 = 1;
 
-    fn metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
-        Arc::new(
-            [EX, OTHER_EX]
-                .into_iter()
-                .map(|exchange| {
-                    (
-                        (exchange, SYM.to_string()),
-                        SymbolMeta {
-                            exchange,
-                            symbol: SYM.to_string(),
-                            price_formatter: Arc::new(StepFormatter::new(0.1)),
-                            size_step: SIZE_STEP,
-                            min_order_size: SIZE_STEP,
-                            min_notional: 0.0,
-                            contract_size: 1.0,
-                        },
-                    )
-                })
-                .collect(),
-        )
-    }
-
     /// 注册 + seed 基线（投产握手），SYM 一个 symbol
     fn reconciler_with(max_consecutive: u32, baselines: &[PositionBaseline]) -> Reconciler {
-        let mut r = Reconciler::new(metas(), max_consecutive);
+        let mut r = Reconciler::new(max_consecutive);
         r.register(&[SYM.to_string()], baselines);
         r
     }
 
-    fn position(exchange: Exchange, size: f64) -> Position {
+    fn position(exchange: Exchange, size: Decimal) -> Position {
         Position {
             exchange,
             symbol: SYM.to_string(),
@@ -891,14 +837,14 @@ mod tests {
         }
     }
 
-    fn baseline_on(exchange: Exchange, size: f64) -> PositionBaseline {
+    fn baseline_on(exchange: Exchange, size: Decimal) -> PositionBaseline {
         PositionBaseline {
             position: position(exchange, size),
             snapshot_req_ts: SNAPSHOT_TS,
         }
     }
 
-    fn fill_on(exchange: Exchange, side: Side, size: f64, local_ts: u64) -> AccountEvent {
+    fn fill_on(exchange: Exchange, side: Side, size: Decimal, local_ts: u64) -> AccountEvent {
         AccountEvent {
             account: crate::domain::AccountId::Live,
             exchange_ts: local_ts,
@@ -907,7 +853,7 @@ mod tests {
                 exchange,
                 symbol: SYM.to_string(),
                 side,
-                price: 100.0,
+                price: dec!(100.0),
                 size,
                 client_order_id: None,
                 order_id: "1".to_string(),
@@ -918,69 +864,45 @@ mod tests {
         }
     }
 
-    fn fill(side: Side, size: f64) -> AccountEvent {
+    fn fill(side: Side, size: Decimal) -> AccountEvent {
         fill_on(EX, side, size, SNAPSHOT_TS + 1)
     }
 
     #[test]
     fn matching_position_is_not_drift() {
-        let mut r = reconciler_with(3, &[baseline_on(EX, 2.0)]);
-        r.on_event(&fill(Side::Long, 1.0));
+        let mut r = reconciler_with(3, &[baseline_on(EX, dec!(2.0))]);
+        r.on_event(&fill(Side::Long, dec!(1.0)));
         // 本地 3.0，交易所也 3.0
         for _ in 0..10 {
-            r.reconcile(EX, &[position(EX, 3.0)]).unwrap();
+            r.reconcile(EX, &[position(EX, dec!(3.0))]).unwrap();
         }
     }
 
-    /// 差值在 size_step 之内不算漂移（浮点累加噪声不该触发停机）
+    /// 数量精确，没有容差：差一个最小步长也是漂移（f64 时曾按步长留容差吸收累加噪声）
     #[test]
-    fn diff_within_size_step_is_tolerated() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 1.0)]);
-        let almost = 1.0 + SIZE_STEP * 0.5;
-        r.reconcile(EX, &[position(EX, almost)])
-            .expect("size_step 之内不应判为漂移");
+    fn any_nonzero_diff_is_drift() {
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(1.0))]);
+        r.reconcile(EX, &[position(EX, dec!(1.001))]).expect_err("差 0.001 也是漂移");
     }
 
-    /// **容差必须是币本位口径**（`size_step × contract_size`），不能直接用 `size_step`。
-    ///
-    /// OKX BTC-USDT-SWAP：`size_step=1`（张）、`contract_size=0.01`（币/张）——
-    /// 币本位的最小增量是 0.01 BTC。若把 `size_step` 当币量用，容差会被放大成 1.0 BTC，
-    /// 0.5 BTC 的真实漂移就被静默放过。
+    /// 成交累加精确归零：0.1 + 0.2 - 0.3 与交易所的 0 一致（f64 下差 5.5e-17，曾靠容差兜住）
     #[test]
-    fn tolerance_is_coin_denominated_not_raw_size_step() {
-        // 每张 0.01 币、数量步长 1 张 -> 币本位最小增量 0.01
-        let metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>> = Arc::new(HashMap::from([(
-            (EX, SYM.to_string()),
-            SymbolMeta {
-                exchange: EX,
-                symbol: SYM.to_string(),
-                price_formatter: Arc::new(StepFormatter::new(0.1)),
-                size_step: 1.0,
-                min_order_size: 1.0,
-                min_notional: 0.0,
-                contract_size: 0.01,
-            },
-        )]));
-        let mut r = Reconciler::new(metas, 1);
-        r.register(&[SYM.to_string()], &[baseline_on(EX, 1.0)]);
-
-        // 差 0.005 币 < 0.01 币：在币本位最小增量之内，是噪声
-        r.reconcile(EX, &[position(EX, 1.005)])
-            .expect("小于一个币本位最小增量的差值不该判为漂移");
-        // 差 0.5 币 >> 0.01 币：真实漂移。若容差被错当成 1.0（裸 size_step），这里会漏检
-        r.reconcile(EX, &[position(EX, 1.5)])
-            .expect_err("0.5 币的差值远超币本位最小增量，必须判为漂移");
+    fn accumulated_fills_match_exactly() {
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(0.1))]);
+        r.on_event(&fill(Side::Long, dec!(0.2)));
+        r.on_event(&fill(Side::Short, dec!(0.3)));
+        r.reconcile(EX, &[]).expect("本地 0 与交易所空仓一致");
     }
 
-    /// 连续 N 次超出容差才致命；第 N 次才返回 Err
+    /// 连续 N 次不一致才致命；第 N 次才返回 Err
     #[test]
     fn drift_is_fatal_only_after_n_consecutive_mismatches() {
-        let mut r = reconciler_with(3, &[baseline_on(EX, 1.0)]);
+        let mut r = reconciler_with(3, &[baseline_on(EX, dec!(1.0))]);
 
-        r.reconcile(EX, &[position(EX, 5.0)]).unwrap();
-        r.reconcile(EX, &[position(EX, 5.0)]).unwrap();
+        r.reconcile(EX, &[position(EX, dec!(5.0))]).unwrap();
+        r.reconcile(EX, &[position(EX, dec!(5.0))]).unwrap();
         let err = r
-            .reconcile(EX, &[position(EX, 5.0)])
+            .reconcile(EX, &[position(EX, dec!(5.0))])
             .expect_err("连续第 3 次不一致应致命");
         assert!(err.contains("连续 3 次差值稳定的不一致"), "got: {err}");
     }
@@ -991,10 +913,10 @@ mod tests {
     /// 上。只数次数会把它攒成致命 —— 而误停机比漏报更糟。
     #[test]
     fn changing_diff_never_accumulates_into_a_fatal() {
-        let mut r = reconciler_with(3, &[baseline_on(EX, 1.0)]);
+        let mut r = reconciler_with(3, &[baseline_on(EX, dec!(1.0))]);
 
         // 本地始终 1.0，交易所读数每次不同 -> 差值每次不同 -> 永远停在 streak=1
-        for reported in [3.0, 7.0, 2.5, 9.0, 4.25, 6.5, 8.75] {
+        for reported in [dec!(3.0), dec!(7.0), dec!(2.5), dec!(9.0), dec!(4.25), dec!(6.5), dec!(8.75)] {
             r.reconcile(EX, &[position(EX, reported)])
                 .expect("差值在变说明是在途成交，不该判为漂移");
         }
@@ -1006,15 +928,15 @@ mod tests {
     /// 误伤飞行窗口、又不会在活跃交易期压制真实漂移的原因。
     #[test]
     fn constant_diff_is_detected_even_while_position_keeps_moving() {
-        let mut r = reconciler_with(3, &[baseline_on(EX, 10.0)]);
+        let mut r = reconciler_with(3, &[baseline_on(EX, dec!(10.0))]);
 
         // 交易所比本地少 2（漏算了一笔 -2 的成交），此后持续成交、两边同步移动
-        r.reconcile(EX, &[position(EX, 8.0)]).unwrap();
-        r.on_event(&fill(Side::Long, 1.0)); // 本地 11
-        r.reconcile(EX, &[position(EX, 9.0)]).unwrap(); // 差值仍 +2
-        r.on_event(&fill(Side::Long, 3.0)); // 本地 14
+        r.reconcile(EX, &[position(EX, dec!(8.0))]).unwrap();
+        r.on_event(&fill(Side::Long, dec!(1.0))); // 本地 11
+        r.reconcile(EX, &[position(EX, dec!(9.0))]).unwrap(); // 差值仍 +2
+        r.on_event(&fill(Side::Long, dec!(3.0))); // 本地 14
         let err = r
-            .reconcile(EX, &[position(EX, 12.0)]) // 差值仍 +2
+            .reconcile(EX, &[position(EX, dec!(12.0))]) // 差值仍 +2
             .expect_err("差值恒定即真漂移，持续交易不该把它抹掉");
         assert!(err.contains("本地 14"), "got: {err}");
     }
@@ -1022,16 +944,16 @@ mod tests {
     /// 差值反向也算变化：+X 与 -X 是方向相反的两种漂移，不能接续计数
     #[test]
     fn sign_flip_in_diff_restarts_the_streak() {
-        let mut r = reconciler_with(2, &[baseline_on(EX, 5.0)]);
+        let mut r = reconciler_with(2, &[baseline_on(EX, dec!(5.0))]);
 
         // 差值 -3（交易所多）
-        r.reconcile(EX, &[position(EX, 8.0)]).unwrap();
+        r.reconcile(EX, &[position(EX, dec!(8.0))]).unwrap();
         // 差值 +3（本地多）—— 绝对值相同但方向相反，必须重新从 1 数起
-        r.reconcile(EX, &[position(EX, 2.0)])
+        r.reconcile(EX, &[position(EX, dec!(2.0))])
             .expect("差值反向不该接着上一次的计数");
         // 再来一次 +3 才够 2 次
         let err = r
-            .reconcile(EX, &[position(EX, 2.0)])
+            .reconcile(EX, &[position(EX, dec!(2.0))])
             .expect_err("同方向连续两次应致命");
         assert!(err.contains("交易所 2"), "got: {err}");
     }
@@ -1040,15 +962,15 @@ mod tests {
     /// 否则飞行窗口（成交已落交易所、Fill 稍后才到）攒够次数就会误停机。
     #[test]
     fn a_single_match_resets_the_streak() {
-        let mut r = reconciler_with(3, &[baseline_on(EX, 1.0)]);
+        let mut r = reconciler_with(3, &[baseline_on(EX, dec!(1.0))]);
 
-        r.reconcile(EX, &[position(EX, 5.0)]).unwrap();
-        r.reconcile(EX, &[position(EX, 5.0)]).unwrap();
+        r.reconcile(EX, &[position(EX, dec!(5.0))]).unwrap();
+        r.reconcile(EX, &[position(EX, dec!(5.0))]).unwrap();
         // 一致一次 -> 清零
-        r.reconcile(EX, &[position(EX, 1.0)]).unwrap();
+        r.reconcile(EX, &[position(EX, dec!(1.0))]).unwrap();
         // 再来两次不一致仍不该致命（重新从 1 数起）
-        r.reconcile(EX, &[position(EX, 5.0)]).unwrap();
-        r.reconcile(EX, &[position(EX, 5.0)])
+        r.reconcile(EX, &[position(EX, dec!(5.0))]).unwrap();
+        r.reconcile(EX, &[position(EX, dec!(5.0))])
             .expect("清零后只累计到 2，不应致命");
     }
 
@@ -1058,7 +980,7 @@ mod tests {
     /// 平仓 Fill 丢失 / 强平回报丢失这两种最该抓的情况。
     #[test]
     fn local_position_absent_from_report_is_drift() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 2.0)]);
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0))]);
 
         let err = r
             .reconcile(EX, &[])
@@ -1072,9 +994,9 @@ mod tests {
     /// 此后交易所冒出仓位就说明漏了成交。
     #[test]
     fn unknown_exchange_position_is_drift() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 0.0)]);
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(0.0))]);
         let err = r
-            .reconcile(EX, &[position(EX, 1.5)])
+            .reconcile(EX, &[position(EX, dec!(1.5))])
             .expect_err("本地空仓而交易所有仓必须判为漂移");
         assert!(err.contains("本地 0"), "got: {err}");
     }
@@ -1088,15 +1010,15 @@ mod tests {
         // 注册了 symbol，但没有任何基线（如该所未配置 client）
         let mut r = reconciler_with(1, &[]);
         for _ in 0..5 {
-            r.reconcile(EX, &[position(EX, 123.0)])
+            r.reconcile(EX, &[position(EX, dec!(123.0))])
                 .expect("基线未写入的腿不应对账");
         }
         // 基线写入后才开始比对
-        r.register(&[SYM.to_string()], &[baseline_on(EX, 123.0)]);
-        r.reconcile(EX, &[position(EX, 123.0)])
+        r.register(&[SYM.to_string()], &[baseline_on(EX, dec!(123.0))]);
+        r.reconcile(EX, &[position(EX, dec!(123.0))])
             .expect("基线与读数一致");
         let err = r
-            .reconcile(EX, &[position(EX, 0.0)])
+            .reconcile(EX, &[position(EX, dec!(0.0))])
             .expect_err("基线之后出现真实分歧才该报");
         assert!(err.contains("本地 123"), "got: {err}");
     }
@@ -1107,16 +1029,16 @@ mod tests {
     /// 不是"两处各写一遍、约定保持一致"。
     #[test]
     fn fills_covered_by_snapshot_are_not_double_counted() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 2.0)]);
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0))]);
         // local_ts == SNAPSHOT_TS：成交已含在快照里，丢弃
-        r.on_event(&fill_on(EX, Side::Long, 1.0, SNAPSHOT_TS));
+        r.on_event(&fill_on(EX, Side::Long, dec!(1.0), SNAPSHOT_TS));
         // local_ts > SNAPSHOT_TS：快照之后的新成交，累加
-        r.on_event(&fill_on(EX, Side::Long, 4.0, SNAPSHOT_TS + 5));
+        r.on_event(&fill_on(EX, Side::Long, dec!(4.0), SNAPSHOT_TS + 5));
         // 镜像 = 2.0(快照) + 4.0 = 6.0
-        r.reconcile(EX, &[position(EX, 6.0)])
+        r.reconcile(EX, &[position(EX, dec!(6.0))])
             .expect("快照已含的 Fill 不该重复累加");
         let err = r
-            .reconcile(EX, &[position(EX, 7.0)])
+            .reconcile(EX, &[position(EX, dec!(7.0))])
             .expect_err("若旧 Fill 也被累加，本地会是 7.0 而这里不会报漂移");
         assert!(err.contains("本地 6"), "got: {err}");
     }
@@ -1127,15 +1049,15 @@ mod tests {
     /// 随后注册携带的快照（已含该成交，若它属于本账户）是权威值，从快照起算即正确。
     #[test]
     fn fill_before_registration_is_dropped_and_does_not_pollute_seed() {
-        let mut r = Reconciler::new(metas(), 1);
+        let mut r = Reconciler::new(1);
         // 尚未注册任何 symbol：Fill 到达被丢弃
-        r.on_event(&fill_on(EX, Side::Long, 5.0, SNAPSHOT_TS + 1));
+        r.on_event(&fill_on(EX, Side::Long, dec!(5.0), SNAPSHOT_TS + 1));
         // 随后注册并 seed（快照读到 2.0）—— 之前丢弃的 Fill 不得出现在镜像里
-        r.register(&[SYM.to_string()], &[baseline_on(EX, 2.0)]);
-        r.reconcile(EX, &[position(EX, 2.0)])
+        r.register(&[SYM.to_string()], &[baseline_on(EX, dec!(2.0))]);
+        r.reconcile(EX, &[position(EX, dec!(2.0))])
             .expect("镜像应恰为快照值 2.0，注册前的 Fill 不得混入");
         let err = r
-            .reconcile(EX, &[position(EX, 7.0)])
+            .reconcile(EX, &[position(EX, dec!(7.0))])
             .expect_err("若被丢弃的 Fill 混入了镜像，本地会是 7.0 而这里不会报漂移");
         assert!(err.contains("本地 2"), "got: {err}");
     }
@@ -1143,46 +1065,46 @@ mod tests {
     /// 重复注册（同一 symbol 再次投产）不得覆写镜像存量：镜像一直在跟 Fill
     #[test]
     fn re_registration_never_overwrites_the_mirror() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 2.0)]);
-        r.on_event(&fill(Side::Long, 1.0)); // 镜像 3.0
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0))]);
+        r.on_event(&fill(Side::Long, dec!(1.0))); // 镜像 3.0
         // 再次投产：新快照读到 3.0，但镜像已 seed 过 —— 静默跳过，不覆写
         r.register(
             &[SYM.to_string()],
             &[PositionBaseline {
-                position: position(EX, 3.0),
+                position: position(EX, dec!(3.0)),
                 snapshot_req_ts: 100,
             }],
         );
-        r.reconcile(EX, &[position(EX, 3.0)])
+        r.reconcile(EX, &[position(EX, dec!(3.0))])
             .expect("镜像应保持 3.0（基线 2.0 + Fill 1.0），与交易所一致");
     }
 
     /// 跟踪范围外的 symbol 不参与对账（分桶部署下账户级读数含其他桶的 symbol）
     #[test]
     fn untracked_symbols_are_ignored() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 1.0)]);
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(1.0))]);
         let other_bucket = Position {
             exchange: EX,
             symbol: "ETH".to_string(),
-            size: 42.0,
+            size: dec!(42.0),
         };
         // 读数里混入其他桶的 symbol；本桶的 BTC 对得上，就不该有漂移
-        r.reconcile(EX, &[position(EX, 1.0), other_bucket])
+        r.reconcile(EX, &[position(EX, dec!(1.0)), other_bucket])
             .expect("其他桶的 symbol 不该触发漂移");
     }
 
     /// 计数按 (所, symbol) 分开：一个所的漂移不该借另一个所的次数达标
     #[test]
     fn streaks_are_per_exchange() {
-        let mut r = reconciler_with(2, &[baseline_on(EX, 1.0), baseline_on(OTHER_EX, 0.0)]);
+        let mut r = reconciler_with(2, &[baseline_on(EX, dec!(1.0)), baseline_on(OTHER_EX, dec!(0.0))]);
 
         // Binance 不一致一次
-        r.reconcile(EX, &[position(EX, 9.0)]).unwrap();
+        r.reconcile(EX, &[position(EX, dec!(9.0))]).unwrap();
         // OKX 上本地与读数都是 0 -> 一致，不该影响 Binance 的计数
         r.reconcile(OTHER_EX, &[]).unwrap();
         // Binance 第二次不一致 -> 达标
         let err = r
-            .reconcile(EX, &[position(EX, 9.0)])
+            .reconcile(EX, &[position(EX, dec!(9.0))])
             .expect_err("同一个所连续两次应致命");
         assert!(err.contains("Binance"), "got: {err}");
     }
@@ -1190,14 +1112,14 @@ mod tests {
     /// 同一 symbol 跨所独立：Binance 漂了，OKX 那条腿的读数不受影响
     #[test]
     fn per_exchange_legs_are_compared_independently() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 1.0), baseline_on(OTHER_EX, -1.0)]);
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(1.0)), baseline_on(OTHER_EX, dec!(-1.0))]);
 
         // OKX 腿一致
-        r.reconcile(OTHER_EX, &[position(OTHER_EX, -1.0)])
+        r.reconcile(OTHER_EX, &[position(OTHER_EX, dec!(-1.0))])
             .expect("OKX 腿对得上");
         // Binance 腿不一致
         let err = r
-            .reconcile(EX, &[position(EX, 4.0)])
+            .reconcile(EX, &[position(EX, dec!(4.0))])
             .expect_err("Binance 腿应报漂移");
         assert!(err.contains("Binance"), "got: {err}");
         assert!(!err.contains("OKX"), "不该牵连对得上的 OKX 腿: {err}");
@@ -1212,10 +1134,10 @@ mod tests {
     /// executor 与账本一致：任意多轮都不报
     #[test]
     fn executor_matching_the_ledger_is_not_drift() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 2.0)]);
-        r.on_event(&fill(Side::Long, 1.0));
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0))]);
+        r.on_event(&fill(Side::Long, dec!(1.0)));
         for _ in 0..5 {
-            r.reconcile_executor(executor(), &[position(EX, 3.0)]).unwrap();
+            r.reconcile_executor(executor(), &[position(EX, dec!(3.0))]).unwrap();
         }
     }
 
@@ -1223,11 +1145,11 @@ mod tests {
     /// 交易所那条比对永远看不见它，必须由 executor 这条在第 N 次稳定差值时报出。
     #[test]
     fn executor_diverging_from_a_correct_ledger_is_fatal_after_n_rounds() {
-        let mut r = reconciler_with(3, &[baseline_on(EX, 2.0)]);
+        let mut r = reconciler_with(3, &[baseline_on(EX, dec!(2.0))]);
         for round in 1..=3 {
-            r.reconcile(EX, &[position(EX, 2.0)])
+            r.reconcile(EX, &[position(EX, dec!(2.0))])
                 .expect("账本与交易所一致，交易所那条比对无从发现");
-            let result = r.reconcile_executor(executor(), &[position(EX, 5.0)]);
+            let result = r.reconcile_executor(executor(), &[position(EX, dec!(5.0))]);
             if round < 3 {
                 result.expect("未满 N 次不致命（可能只是在途）");
             } else {
@@ -1240,21 +1162,21 @@ mod tests {
     /// 两种对手方各自计数：交易所那边的不一致不能替 executor 凑次数，反之亦然
     #[test]
     fn executor_and_exchange_streaks_are_independent() {
-        let mut r = reconciler_with(2, &[baseline_on(EX, 2.0)]);
-        r.reconcile(EX, &[position(EX, 9.0)]).unwrap();
-        r.reconcile_executor(executor(), &[position(EX, 9.0)])
+        let mut r = reconciler_with(2, &[baseline_on(EX, dec!(2.0))]);
+        r.reconcile(EX, &[position(EX, dec!(9.0))]).unwrap();
+        r.reconcile_executor(executor(), &[position(EX, dec!(9.0))])
             .expect("executor 只不一致了一次，不能借交易所那边的次数达标");
     }
 
     /// 账本那边未 seed 的腿（该所无凭证）executor 记为 0 —— 不可比，跳过
     #[test]
     fn executor_legs_unseeded_in_the_ledger_are_skipped() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 2.0)]);
-        r.reconcile_executor(executor(), &[position(EX, 2.0), position(OTHER_EX, 0.0)])
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0))]);
+        r.reconcile_executor(executor(), &[position(EX, dec!(2.0)), position(OTHER_EX, dec!(0.0))])
             .expect("OTHER_EX 在账本里是未知，不该参与比对");
         // 即便账本靠 Fill 在那条腿上累加出了数，也是未知起点，不比
-        r.on_event(&fill_on(OTHER_EX, Side::Long, 1.0, SNAPSHOT_TS + 1));
-        r.reconcile_executor(executor(), &[position(EX, 2.0), position(OTHER_EX, 0.0)])
+        r.on_event(&fill_on(OTHER_EX, Side::Long, dec!(1.0), SNAPSHOT_TS + 1));
+        r.reconcile_executor(executor(), &[position(EX, dec!(2.0)), position(OTHER_EX, dec!(0.0))])
             .expect("未 seed 的腿不比");
     }
 
@@ -1264,8 +1186,8 @@ mod tests {
     /// 则相反 —— 下游会据此算出假的对冲完整性。
     #[test]
     fn snapshot_contains_seeded_legs_only_including_flat_ones() {
-        let mut r = reconciler_with(1, &[baseline_on(EX, 2.0), baseline_on(OTHER_EX, 0.0)]);
-        r.on_event(&fill(Side::Long, 1.0)); // EX 腿 -> 3.0
+        let mut r = reconciler_with(1, &[baseline_on(EX, dec!(2.0)), baseline_on(OTHER_EX, dec!(0.0))]);
+        r.on_event(&fill(Side::Long, dec!(1.0))); // EX 腿 -> 3.0
 
         let snapshot = r.positions();
         assert_eq!(snapshot.len(), 2, "两条腿都已 seed，都该出现: {snapshot:?}");
@@ -1274,8 +1196,8 @@ mod tests {
             .iter()
             .find(|p| p.exchange == OTHER_EX)
             .expect("空仓腿也必须报出，否则下游分不清「已平仓」与「未知」");
-        assert_eq!(ex_leg.size, 3.0);
-        assert_eq!(other_leg.size, 0.0);
+        assert_eq!(ex_leg.size, dec!(3.0));
+        assert_eq!(other_leg.size, dec!(0.0));
     }
 
     /// 未 seed 的腿绝不出现在快照里：那是"未知"，不是"空仓"。
@@ -1284,7 +1206,7 @@ mod tests {
         // 注册了 symbol 但没有任何基线（该所未配置凭证）
         let mut r = reconciler_with(1, &[]);
         // 即便 Fill 已经累加出仓位，未 seed 也不外报 —— 起点未知，这个数没有意义
-        r.on_event(&fill(Side::Long, 1.0));
+        r.on_event(&fill(Side::Long, dec!(1.0)));
         assert!(
             r.positions().is_empty(),
             "未 seed 的腿不得进入对外快照: {:?}",
@@ -1295,10 +1217,10 @@ mod tests {
     /// #759：持仓价值 = |持仓| × 中间价（空头也为正）；空仓的币不需要价；未 seed 的腿不报
     #[test]
     fn position_values_are_abs_size_times_mid_and_flat_legs_need_no_price() {
-        let mut r = Reconciler::new(metas(), 1);
-        r.register(&[SYM.to_string(), "ETH".to_string()], &[baseline_on(EX, -2.0), baseline_on(OTHER_EX, 0.0)]);
-        r.on_event(&fill_on(EX, Side::Short, 1.0, SNAPSHOT_TS + 1)); // EX: -3
-        let mid = |s: &Symbol| (s == SYM).then_some(100.0);
+        let mut r = Reconciler::new(1);
+        r.register(&[SYM.to_string(), "ETH".to_string()], &[baseline_on(EX, dec!(-2.0)), baseline_on(OTHER_EX, dec!(0.0))]);
+        r.on_event(&fill_on(EX, Side::Short, dec!(1.0), SNAPSHOT_TS + 1)); // EX: -3
+        let mid = |s: &Symbol| (s == SYM).then_some(dec!(100));
         assert_eq!(r.position_values(EX, mid), Ok(HashMap::from([(SYM.to_string(), 300.0)])), "ETH 未 seed，不报");
         assert_eq!(
             r.position_values(OTHER_EX, |_: &Symbol| None),
@@ -1310,19 +1232,19 @@ mod tests {
     /// 有仓却没价：价值未知，不能当 0 报出去（杠杆闸门会少算）
     #[test]
     fn a_held_symbol_without_a_price_makes_the_values_unknown() {
-        let r = reconciler_with(1, &[baseline_on(EX, 1.0)]);
+        let r = reconciler_with(1, &[baseline_on(EX, dec!(1.0))]);
         assert_eq!(r.position_values(EX, |_: &Symbol| None), Err(SYM.to_string()));
     }
 
     /// 镜像只吃基线与成交：对账读数本身绝不能写进镜像（否则漂移会被自我抹平）
     #[test]
     fn report_never_feeds_the_mirror() {
-        let mut r = reconciler_with(2, &[baseline_on(EX, 1.0)]);
+        let mut r = reconciler_with(2, &[baseline_on(EX, dec!(1.0))]);
         // 第一次不一致
-        r.reconcile(EX, &[position(EX, 7.0)]).unwrap();
+        r.reconcile(EX, &[position(EX, dec!(7.0))]).unwrap();
         // 若读数写进了镜像，这次就会"一致"从而清零，永远等不到致命
         let err = r
-            .reconcile(EX, &[position(EX, 7.0)])
+            .reconcile(EX, &[position(EX, dec!(7.0))])
             .expect_err("读数若写进镜像，漂移会被自我抹平");
         assert!(err.contains("本地 1"), "镜像被读数污染了: {err}");
     }
@@ -1342,11 +1264,6 @@ mod hl_multi_dex_tests {
     /// 主站 + xyz 两个 dex；基线：BTC 多 1、TSLA 空 2
     fn setup() -> (crate::exchange::hyperliquid::markets::HlMarkets, Reconciler) {
         let m = markets(&["", "xyz"]);
-        let metas: HashMap<(Exchange, Symbol), SymbolMeta> = m
-            .symbol_metas()
-            .into_iter()
-            .map(|meta| ((EX, meta.symbol.clone()), meta))
-            .collect();
         let base = positions(
             &m,
             &[("", &state_json(&[("BTC", 1.0)])), ("xyz", &state_json(&[("xyz:TSLA", -2.0)]))],
@@ -1356,7 +1273,7 @@ mod hl_multi_dex_tests {
             .into_iter()
             .map(|position| PositionBaseline { position, snapshot_req_ts: SNAPSHOT_TS })
             .collect();
-        let mut r = Reconciler::new(Arc::new(metas), N);
+        let mut r = Reconciler::new(N);
         r.register(&["BTC".to_string(), "TSLA".to_string()], &baselines);
         (m, r)
     }
@@ -1411,9 +1328,9 @@ mod hl_multi_dex_tests {
 /// executor 持仓纳入对账（#694）。用 `tasks::Root` 搭树测。
 #[cfg(test)]
 mod task_tests {
+    use rust_decimal_macros::dec;
     use super::*;
-    use crate::domain::{AccountInfo, ExchangeError, OrderId, OrderUpdate};
-    use crate::domain::StepFormatter;
+    use crate::domain::{AccountInfo, Decimal, ExchangeError, OrderId, OrderUpdate, PriceStep, SymbolMeta};
     use crate::engine::live::executor::{Executor, ExecutorArgs};
     use crate::engine::live::OutcomeBus;
     use crate::exchange::ExchangeOrder;
@@ -1437,7 +1354,7 @@ mod task_tests {
         /// 拉取过程中 panic（adapter 里的 unwrap 之类）
         Panic,
         /// 不是故障：每次都如实返回这个持仓（给只关心 executor 那条比对的用例）
-        Steady(f64),
+        Steady(Decimal),
     }
 
     struct FaultyClient {
@@ -1506,16 +1423,16 @@ mod task_tests {
             SymbolMeta {
                 exchange: EX,
                 symbol: SYM.to_string(),
-                price_formatter: Arc::new(StepFormatter::new(0.1)),
-                size_step: 0.001,
-                min_order_size: 0.001,
+                price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+                size_step: dec!(0.001),
+                min_order_size: dec!(0.001),
                 min_notional: 0.0,
-                contract_size: 1.0,
+                contract_size: dec!(1),
             },
         )]))
     }
 
-    fn baseline(size: f64) -> PositionBaseline {
+    fn baseline(size: Decimal) -> PositionBaseline {
         PositionBaseline {
             position: Position {
                 exchange: EX,
@@ -1547,7 +1464,6 @@ mod task_tests {
             &root.group("consumers"),
             PositionLedgerArgs {
                 accounts: HashMap::from([(EX, client)]),
-                symbol_metas: metas(),
                 account_bus,
                 market_bus,
                 interval_ms,
@@ -1557,7 +1473,7 @@ mod task_tests {
         .await
         .expect("账本应能起来");
         ledger
-            .register_symbols(vec![SYM.to_string()], vec![baseline(2.0)])
+            .register_symbols(vec![SYM.to_string()], vec![baseline(dec!(2.0))])
             .await
             .expect("注册应成功");
         ledger
@@ -1583,7 +1499,7 @@ mod task_tests {
     fn an_in_flight_fetch_that_never_returns_still_trips_the_staleness_guard() {
         let (client, _calls) = FaultyClient::pair(Faulty::Hang);
         let mut ledger = Ledger {
-            reconciler: Reconciler::new(metas(), DEFAULT_MAX_CONSECUTIVE_MISMATCHES),
+            reconciler: Reconciler::new(DEFAULT_MAX_CONSECUTIVE_MISMATCHES),
             accounts: HashMap::from([(EX, client)]),
             guards: HashMap::from([(
                 EX,
@@ -1650,7 +1566,7 @@ mod task_tests {
             .expect("应答应成功");
 
         assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].size, 2.0, "应答的是账本真值（基线 2.0）");
+        assert_eq!(positions[0].size, dec!(2.0), "应答的是账本真值（基线 2.0）");
         root.shutdown().await.expect("正常停机");
     }
 
@@ -1690,7 +1606,7 @@ mod task_tests {
             })
             .await
             .expect("探针应能起来");
-        let (client, _calls) = FaultyClient::pair(Faulty::Steady(2.0));
+        let (client, _calls) = FaultyClient::pair(Faulty::Steady(dec!(2.0)));
         // 节拍很慢：首拍（立即）之后的读数只可能来自成交
         let _ledger = ledger_on(&root, client, NEVER_AGAIN_MS, account_bus.clone(), market_bus.clone()).await;
         // 盘口与成交按序进账本收件箱
@@ -1700,10 +1616,10 @@ mod task_tests {
             data: MarketData::BBO(crate::domain::BBO {
                 exchange: EX,
                 symbol: SYM.to_string(),
-                bid_price: 99.0,
-                bid_qty: 1.0,
-                ask_price: 101.0,
-                ask_qty: 1.0,
+                bid_price: dec!(99.0),
+                bid_qty: dec!(1.0),
+                ask_price: dec!(101.0),
+                ask_qty: dec!(1.0),
                 timestamp: 0,
             }),
         });
@@ -1716,8 +1632,8 @@ mod task_tests {
                 exchange: EX,
                 symbol: SYM.to_string(),
                 side: crate::domain::Side::Long,
-                price: 100.0,
-                size: 1.0,
+                price: dec!(100.0),
+                size: dec!(1.0),
                 client_order_id: None,
                 order_id: "1".to_string(),
                 timestamp: 2,
@@ -1777,7 +1693,7 @@ mod task_tests {
 
     /// 在 `root` 的 producers 组里起一个实盘 executor，出生持仓 = `size`
     /// （模拟「同一 symbol 再次投产时 executor 用了新快照」）
-    async fn executor_born_with(root: &Root, size: f64) -> (ChildHandle, ExecutorHandle) {
+    async fn executor_born_with(root: &Root, size: Decimal) -> (ChildHandle, ExecutorHandle) {
         Executor::spawn(
             &root.group("producers"),
             ExecutorArgs {
@@ -1795,7 +1711,7 @@ mod task_tests {
 
     /// 账本基线 2.0、交易所也报 2.0（这条比对永远通过），节拍很快
     async fn ledger_agreeing_with_exchange(root: &Root) -> PositionLedgerHandle {
-        let (client, _calls) = FaultyClient::pair(Faulty::Steady(2.0));
+        let (client, _calls) = FaultyClient::pair(Faulty::Steady(dec!(2.0)));
         ledger(root, client, FAST_MS).await
     }
 
@@ -1808,7 +1724,7 @@ mod task_tests {
     #[tokio::test]
     async fn a_watched_executor_with_wrong_positions_halts_the_ledger() {
         let root = Root::new("t");
-        let (_child, executor) = executor_born_with(&root, 5.0).await;
+        let (_child, executor) = executor_born_with(&root, dec!(5.0)).await;
         let ledger = ledger_agreeing_with_exchange(&root).await;
         ledger.watch(executor).await.expect("纳入名单应成功");
 
@@ -1824,8 +1740,8 @@ mod task_tests {
     #[tokio::test]
     async fn unwatched_or_agreeing_executors_never_halt_the_ledger() {
         let root = Root::new("t");
-        let (_c1, wrong) = executor_born_with(&root, 5.0).await;
-        let (_c2, right) = executor_born_with(&root, 2.0).await;
+        let (_c1, wrong) = executor_born_with(&root, dec!(5.0)).await;
+        let (_c2, right) = executor_born_with(&root, dec!(2.0)).await;
         let ledger = ledger_agreeing_with_exchange(&root).await;
         let wrong_id = wrong.id();
         ledger.watch(wrong).await.unwrap();
@@ -1842,7 +1758,7 @@ mod task_tests {
     #[tokio::test]
     async fn a_stopped_executor_is_dropped_from_the_watch_list() {
         let root = Root::new("t");
-        let (child, executor) = executor_born_with(&root, 5.0).await;
+        let (child, executor) = executor_born_with(&root, dec!(5.0)).await;
         let ledger = ledger_agreeing_with_exchange(&root).await;
         // 先停再纳入：确定地模拟「停了却还在名单里」，不依赖停机与节拍的先后
         child.stop().await;

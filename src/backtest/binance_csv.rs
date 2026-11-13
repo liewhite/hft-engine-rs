@@ -10,7 +10,7 @@
 //! BBO 时间戳取 event_time (col 6) 以对齐实盘 WS 推送语义。历史事件 local_ts == exchange_ts
 //! (源数据无网络延迟，延迟由回测引擎建模)，保证确定性。
 
-use crate::domain::{Exchange, ExchangeError, MarketTrade, Symbol, BBO};
+use crate::domain::{Decimal, Exchange, ExchangeError, MarketTrade, Symbol, BBO};
 use crate::messaging::{IncomeEvent, MarketData};
 use std::io::{BufRead, BufReader, Cursor};
 
@@ -31,10 +31,10 @@ fn book_ticker_row(symbol: &Symbol, f: &[&str]) -> Result<IncomeEvent, ExchangeE
     let bbo = BBO {
         exchange: Exchange::Binance,
         symbol: symbol.clone(),
-        bid_price: field_f64(f, 1)?,
-        bid_qty: field_f64(f, 2)?,
-        ask_price: field_f64(f, 3)?,
-        ask_qty: field_f64(f, 4)?,
+        bid_price: field_decimal(f, 1)?,
+        bid_qty: field_decimal(f, 2)?,
+        ask_price: field_decimal(f, 3)?,
+        ask_qty: field_decimal(f, 4)?,
         timestamp: field_u64(f, 6)?,
     };
     Ok(historical(bbo.timestamp, MarketData::BBO(bbo)))
@@ -47,8 +47,8 @@ fn agg_trade_row(symbol: &Symbol, f: &[&str]) -> Result<IncomeEvent, ExchangeErr
     let trade = MarketTrade {
         exchange: Exchange::Binance,
         symbol: symbol.clone(),
-        price: field_f64(f, 1)?,
-        qty: field_f64(f, 2)?,
+        price: field_decimal(f, 1)?,
+        qty: field_decimal(f, 2)?,
         is_buyer_maker: f
             .get(6)
             .map(|s| s.trim().eq_ignore_ascii_case("true"))
@@ -99,13 +99,14 @@ fn is_data_row(line: &str) -> bool {
     !head.is_empty() && head.bytes().all(|c| c.is_ascii_digit())
 }
 
-fn field_f64(f: &[&str], idx: usize) -> Result<f64, ExchangeError> {
+/// 价格 / 数量列：按十进制字符串原样解析，不经 f64，不丢精度
+fn field_decimal(f: &[&str], idx: usize) -> Result<Decimal, ExchangeError> {
     let raw = f
         .get(idx)
         .ok_or_else(|| ExchangeError::ParseError(format!("missing column {idx}")))?;
     raw.trim()
-        .parse::<f64>()
-        .map_err(|e| ExchangeError::ParseError(format!("col {idx} '{raw}' as f64: {e}")))
+        .parse::<Decimal>()
+        .map_err(|e| ExchangeError::ParseError(format!("col {idx} '{raw}' as decimal: {e}")))
 }
 
 fn field_u64(f: &[&str], idx: usize) -> Result<u64, ExchangeError> {
@@ -120,6 +121,7 @@ fn field_u64(f: &[&str], idx: usize) -> Result<u64, ExchangeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::dec;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
 
@@ -148,8 +150,8 @@ mod tests {
         match &evs[0] {
             IncomeEvent::Market(m) => match &m.data {
                 MarketData::MarketTrade(t) => {
-                    assert_eq!(t.price, 100.5);
-                    assert_eq!(t.qty, 2.0);
+                    assert_eq!(t.price, dec!(100.5));
+                    assert_eq!(t.qty, dec!(2.0));
                     assert!(t.is_buyer_maker);
                     assert_eq!(t.timestamp, 1700000000000);
                     assert_eq!(m.exchange_ts, 1700000000000);
@@ -177,8 +179,8 @@ mod tests {
         match &evs[0] {
             IncomeEvent::Market(m) => match &m.data {
                 MarketData::BBO(b) => {
-                    assert_eq!(b.bid_price, 99.0);
-                    assert_eq!(b.ask_price, 101.0);
+                    assert_eq!(b.bid_price, dec!(99.0));
+                    assert_eq!(b.ask_price, dec!(101.0));
                     assert_eq!(b.timestamp, 1700000000050); // event_time
                 }
                 _ => panic!("expected BBO"),

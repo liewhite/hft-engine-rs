@@ -8,7 +8,7 @@ use crate::domain::{
 pub use crate::exchange::binance::BinanceCredentials;
 use crate::exchange::binance::REST_BASE_URL;
 use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
-use crate::domain::StepFormatter;
+use crate::domain::{Decimal, PriceStep};
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
@@ -80,9 +80,9 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
         let Some(symbol) = from_binance(&s.symbol, quote) else {
             continue; // 非当前 quote 的交易对，不属于本引擎的宇宙
         };
-        let mut price_step: Option<f64> = None;
-        let mut size_step: Option<f64> = None;
-        let mut min_order_size: Option<f64> = None;
+        let mut price_step: Option<Decimal> = None;
+        let mut size_step: Option<Decimal> = None;
+        let mut min_order_size: Option<Decimal> = None;
         let mut min_notional: Option<f64> = None;
 
         for filter in s.filters {
@@ -101,22 +101,22 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Strin
             }
         }
 
-        let positive = |v: Option<f64>| v.filter(|&v| v > 0.0);
+        let positive = |v: Option<Decimal>| v.filter(|v| *v > Decimal::ZERO);
         match (
             positive(price_step),
             positive(size_step),
             positive(min_order_size),
-            positive(min_notional),
+            min_notional.filter(|&v| v > 0.0),
         ) {
             (Some(price_step), Some(size_step), Some(min_order_size), Some(min_notional)) => {
                 metas.push(SymbolMeta {
                     exchange: Exchange::Binance,
                     symbol,
-                    price_formatter: Arc::new(StepFormatter::new(price_step)),
+                    price_rule: Arc::new(PriceStep::new(price_step)),
                     size_step,
                     min_order_size,
                     min_notional,
-                    contract_size: 1.0,
+                    contract_size: Decimal::ONE,
                 });
             }
             _ => tracing::error!(
@@ -339,11 +339,11 @@ impl BinanceClient {
                 Some(s) => s,
                 None => continue, // 非当前 quote 的交易对，跳过
             };
-            let size: f64 = p.position_amt.parse()
+            let size: Decimal = p.position_amt.parse()
                 .map_err(|_| ExchangeError::Other(format!(
                     "Failed to parse position_amt '{}' for {}", p.position_amt, p.symbol)))?;
             // 跳过空仓位
-            if size.abs() < 1e-10 {
+            if size.is_zero() {
                 continue;
             }
             result.push(crate::domain::Position {
@@ -611,7 +611,7 @@ impl AccountClient for BinanceClient {
         /// 静默取 0 会让一张真实挂单看起来是 0 价 0 量；虽然眼下 cancel_leftover_orders 只用
         /// order_id / client_order_id 决策、不读这几个字段，但一旦有代码开始依赖它们，
         /// 假数据是查不出来的（与 Hyperliquid 同一方法里的处理保持一致）。
-        fn parse_field(raw: &str, field: &str) -> Result<f64, ExchangeError> {
+        fn parse_field(raw: &str, field: &str) -> Result<Decimal, ExchangeError> {
             raw.parse().map_err(|_| {
                 ExchangeError::ParseError(format!("Binance openOrders {field} 非法: {raw}"))
             })

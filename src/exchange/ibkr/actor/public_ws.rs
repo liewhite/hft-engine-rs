@@ -41,7 +41,7 @@
 //! request to continue to retrieve data for the instrument"，见 Voyz/ibind#145）。故以**更紧
 //! 的 10 分钟**为约束（见 `SMD_SERVER_TTL`），刷新周期取 8 分钟。
 
-use crate::domain::{now_ms, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO};
+use crate::domain::{now_ms, Decimal, Exchange, ExchangeError, Fill, OrderStatus, OrderUpdate, Side, BBO};
 use crate::exchange::client::{ExchangeCmd, SubscriptionKind, WsError};
 use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::client::IbkrClient;
@@ -86,10 +86,10 @@ pub(super) struct IbkrPublicWsArgs {
 /// 每个 conid 的 BBO 缓存 (IB 推送增量数据)
 #[derive(Default)]
 struct BboCache {
-    bid_price: f64,
-    ask_price: f64,
-    bid_size: f64,
-    ask_size: f64,
+    bid_price: Decimal,
+    ask_price: Decimal,
+    bid_size: Decimal,
+    ask_size: Decimal,
 }
 
 impl BboCache {
@@ -98,9 +98,7 @@ impl BboCache {
     /// 返回值就是"这条报文算不算一次新报价"的唯一判据（见 `handle_bbo`）。缺失的字段保持
     /// 缓存原值——IBKR 推的是增量，"这条没带 bid" 不等于 "bid 没了"。
     ///
-    /// 精确比较、不设容差：两侧的值来自同一套解析路径，同一个报价必然解析出同一个 f64，
-    /// 容差只会把真实的最小价位跳动吞成"没变"。非有限值已在 [`wire::number`] 判死，
-    /// 不会以 `NaN != NaN` 的形式伪造出变化。
+    /// 精确比较（十进制，见 [`wire::decimal`]）：NaN / inf 之类解析不了，不会伪造出变化。
     fn merge(&mut self, value: &serde_json::Value) -> bool {
         // IB 字段映射: "84"→bid_price, "86"→ask_price, "85"→ask_size, "88"→bid_size
         // IB 数字可能含逗号 "1,234.56"
@@ -111,7 +109,7 @@ impl BboCache {
             ("85", &mut self.ask_size),
             ("88", &mut self.bid_size),
         ] {
-            let Some(n) = value.get(tag).and_then(wire::number) else {
+            let Some(n) = value.get(tag).and_then(wire::decimal) else {
                 continue;
             };
             if *slot != n {
@@ -497,7 +495,7 @@ impl IbkrPublicWs {
         }
 
         // 当 bid > 0 && ask > 0 时发布 BBO
-        if cache.bid_price > 0.0 && cache.ask_price > 0.0 {
+        if cache.bid_price > Decimal::ZERO && cache.ask_price > Decimal::ZERO {
             let bbo = BBO {
                 exchange: Exchange::IBKR,
                 symbol,
@@ -542,11 +540,11 @@ impl IbkrPublicWs {
 
             let filled_qty = item
                 .get("filledQuantity")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+                .and_then(wire::decimal)
+                .unwrap_or(Decimal::ZERO);
 
             let status = match ib_status {
-                "Submitted" if filled_qty > 0.0 => OrderStatus::PartiallyFilled,
+                "Submitted" if filled_qty > Decimal::ZERO => OrderStatus::PartiallyFilled,
                 "PendingSubmit" | "PreSubmitted" | "Submitted" => OrderStatus::Pending,
                 "Filled" => OrderStatus::Filled,
                 "Cancelled" => OrderStatus::Cancelled,
@@ -601,7 +599,7 @@ impl IbkrPublicWs {
                 order_id,
                 ib_status,
                 ?status,
-                filled_qty,
+                %filled_qty,
                 "IBKR order status update"
             );
 
@@ -612,7 +610,7 @@ impl IbkrPublicWs {
                 symbol,
                 side,
                 status,
-                quantity: 0.0,
+                quantity: Decimal::ZERO,
                 filled_quantity: filled_qty,
             };
 
@@ -776,8 +774,8 @@ impl FillPairing {
                 // 一旦带了且与第一条不符，说明交易所修正了成交明细 —— 本地持仓均价会算错，
                 // 必须致命而不是 warn 后照旧发布：半吊子的检查比没有更糟，它只会训练运维
                 // 忽略告警。此前两个字段缺失时兜 0，导致每笔成交都误报不一致。
-                if let Some(price2) = wire_number(item, "price")? {
-                    if (price2 - pending.fill.price).abs() > FILL_FIELD_EPSILON {
+                if let Some(price2) = wire_decimal(item, "price")? {
+                    if price2 != pending.fill.price {
                         return Err(WsError::ParseError(format!(
                             "IBKR 成交 {execution_id} 两条消息价格不一致（{} vs {price2}），\
                              本地持仓均价会失真",
@@ -785,8 +783,8 @@ impl FillPairing {
                         )));
                     }
                 }
-                if let Some(size2) = wire_number(item, "size")? {
-                    if (size2 - pending.fill.size).abs() > FILL_FIELD_EPSILON {
+                if let Some(size2) = wire_decimal(item, "size")? {
+                    if size2 != pending.fill.size {
                         return Err(WsError::ParseError(format!(
                             "IBKR 成交 {execution_id} 两条消息数量不一致（{} vs {size2}），\
                              本地持仓会失真",
@@ -844,13 +842,13 @@ impl FillPairing {
             // （没让 0 进账本），但**丢弃整笔成交**同样致命：本地持仓从此落后于交易所，
             // 只能等对账连续失配后停机兜底。宁可现在就死。
             // 措辞区分"字段缺失"与"值非法"：两者都致命，但归因时不该把缺失说成 0
-            let (Some(price), Some(size)) = (wire_number(item, "price")?, wire_number(item, "size")?)
+            let (Some(price), Some(size)) = (wire_decimal(item, "price")?, wire_decimal(item, "size")?)
             else {
                 return Err(WsError::ParseError(format!(
                     "IBKR 成交 {execution_id} 缺 price/size 字段，丢弃即持仓失真: {item}"
                 )));
             };
-            if price <= 0.0 || size <= 0.0 {
+            if price <= Decimal::ZERO || size <= Decimal::ZERO {
                 return Err(WsError::ParseError(format!(
                     "IBKR 成交 {execution_id} 价量非法（price={price}, size={size}）: {item}"
                 )));
@@ -873,7 +871,7 @@ impl FillPairing {
             // 如果第一条就带了 commission（罕见），直接发布
             if let Some(fee) = commission {
                 tracing::info!(
-                    symbol = %symbol, side = ?side, price, size, order_ref, fee,
+                    symbol = %symbol, side = ?side, %price, %size, order_ref, fee,
                     "IBKR fill: commission in first message, publishing immediately"
                 );
                 self.publish(PendingFill { fill, order_update });
@@ -883,7 +881,7 @@ impl FillPairing {
 
             // 暂存，等待 commission
             tracing::info!(
-                symbol = %symbol, side = ?side, price, size, order_ref,
+                symbol = %symbol, side = ?side, %price, %size, order_ref,
                 "IBKR fill: pending commission, waiting up to {}s",
                 FILL_COMMISSION_TIMEOUT.as_secs()
             );
@@ -981,7 +979,7 @@ fn build_order_update(
     order_ref: &str,
     symbol: &str,
     side: Side,
-    size: f64,
+    size: Decimal,
 ) -> Option<OrderUpdate> {
     if order_ref.is_empty() {
         return None;
@@ -1004,17 +1002,20 @@ fn build_order_update(
 // 辅助函数
 // ============================================================================
 
-/// 成交明细比对的容差（价量都是交易所回传的精确值，不一致即真不一致）
-const FILL_FIELD_EPSILON: f64 = 1e-9;
-
 /// [`wire::optional_number`] 的 WS 侧封装：解析失败即 `WsError`（→ 本组件出错退出）
 fn wire_number(item: &serde_json::Value, field: &str) -> Result<Option<f64>, WsError> {
     wire::optional_number(item, field).map_err(WsError::ParseError)
 }
 
+/// [`wire::optional_decimal`] 的 WS 侧封装（价格、数量）
+fn wire_decimal(item: &serde_json::Value, field: &str) -> Result<Option<Decimal>, WsError> {
+    wire::optional_decimal(item, field).map_err(WsError::ParseError)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn smd_message_carries_requested_fields() {
@@ -1054,10 +1055,10 @@ mod tests {
     fn merge_reports_change_on_first_quote() {
         let mut cache = BboCache::default();
         assert!(cache.merge(&serde_json::json!({"84": "1,234.5", "86": 1235.0, "88": 100, "85": 200})));
-        assert_eq!(cache.bid_price, 1234.5);
-        assert_eq!(cache.ask_price, 1235.0);
-        assert_eq!(cache.bid_size, 100.0);
-        assert_eq!(cache.ask_size, 200.0);
+        assert_eq!(cache.bid_price, dec!(1234.5));
+        assert_eq!(cache.ask_price, dec!(1235));
+        assert_eq!(cache.bid_size, dec!(100));
+        assert_eq!(cache.ask_size, dec!(200));
     }
 
     /// **本次修复的核心**：重订阅回包带的是同一份收盘价，不能算作一次新报价。
@@ -1078,7 +1079,7 @@ mod tests {
         let mut cache = BboCache::default();
         assert!(cache.merge(&serde_json::json!({"84": 1234.5, "86": 1235.0})));
         assert!(!cache.merge(&serde_json::json!({"7636": 50000, "7637": "1.25", "6509": "RB"})));
-        assert_eq!(cache.bid_price, 1234.5, "他方字段不得污染缓存");
+        assert_eq!(cache.bid_price, dec!(1234.5), "他方字段不得污染缓存");
     }
 
     /// 增量语义：这条没带 bid ≠ bid 没了，缺失字段保持原值；带来的新值才算变化。
@@ -1087,8 +1088,8 @@ mod tests {
         let mut cache = BboCache::default();
         cache.merge(&serde_json::json!({"84": 1234.5, "86": 1235.0, "88": 100, "85": 200}));
         assert!(cache.merge(&serde_json::json!({"86": 1235.5})));
-        assert_eq!(cache.bid_price, 1234.5, "未提及的 bid 保持原值");
-        assert_eq!(cache.ask_price, 1235.5);
+        assert_eq!(cache.bid_price, dec!(1234.5), "未提及的 bid 保持原值");
+        assert_eq!(cache.ask_price, dec!(1235.5));
     }
 
     /// 只有盘口量变化也是真实行情：它直接决定信号的下单量，不能当成"没变"吞掉。
@@ -1097,7 +1098,7 @@ mod tests {
         let mut cache = BboCache::default();
         cache.merge(&serde_json::json!({"84": 1234.5, "86": 1235.0, "88": 100, "85": 200}));
         assert!(cache.merge(&serde_json::json!({"88": 150})));
-        assert_eq!(cache.bid_size, 150.0);
+        assert_eq!(cache.bid_size, dec!(150));
     }
 
     /// 非有限值必须在解析层就判死：否则 `NaN != NaN` 会让每一条报文都被判成"有变化"，
@@ -1107,8 +1108,8 @@ mod tests {
         let mut cache = BboCache::default();
         cache.merge(&serde_json::json!({"84": 1234.5, "86": 1235.0, "88": 100, "85": 200}));
         assert!(!cache.merge(&serde_json::json!({"88": "NaN", "85": "inf"})));
-        assert_eq!(cache.bid_size, 100.0, "垃圾值不得进缓存");
-        assert_eq!(cache.ask_size, 200.0);
+        assert_eq!(cache.bid_size, dec!(100), "垃圾值不得进缓存");
+        assert_eq!(cache.ask_size, dec!(200));
     }
 
     /// 刷新周期必须显著小于服务端 TTL——否则到期与刷新之间会出现静默断流窗口。
@@ -1223,7 +1224,7 @@ mod tests {
         assert_eq!(fills.pending_fills.len(), 1, "第一条不带 commission 应暂存");
         fills.on_trade_message(&trade("E1", Some(1.25)), 2, now).unwrap();
         let fill = expect_fill(next(&mut rx).await);
-        assert_eq!((fill.fee, fill.price, fill.size, fill.side), (1.25, 150.5, 10.0, Side::Long));
+        assert_eq!((fill.fee, fill.price, fill.size, fill.side), (1.25, dec!(150.5), dec!(10), Side::Long));
         expect_filled_update(next(&mut rx).await);
 
         fills.on_trade_message(&trade("E1", Some(1.25)), 3, now).unwrap();

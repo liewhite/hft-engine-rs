@@ -11,6 +11,8 @@
 //! ```sh
 //! cargo test --test hyperliquid_xyz_test -- --ignored --nocapture
 //! ```
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
@@ -67,7 +69,7 @@ struct Level {
 }
 
 /// 获取 BBO (REST API)
-async fn fetch_bbo(coin: &str) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+async fn fetch_bbo(coin: &str) -> Result<(Decimal, Decimal), Box<dyn std::error::Error>> {
     let client = Client::new();
     let resp: L2Book = client
         .post("https://api.hyperliquid.xyz/info")
@@ -87,8 +89,8 @@ async fn fetch_bbo(coin: &str) -> Result<(f64, f64), Box<dyn std::error::Error>>
     let best_bid = bids.first().ok_or("No bid level")?;
     let best_ask = asks.first().ok_or("No ask level")?;
 
-    let bid: f64 = best_bid.px.parse()?;
-    let ask: f64 = best_ask.px.parse()?;
+    let bid: Decimal = best_bid.px.parse()?;
+    let ask: Decimal = best_ask.px.parse()?;
 
     Ok((bid, ask))
 }
@@ -146,7 +148,7 @@ async fn test_xyz_fetch_symbol_meta() {
     assert!(meta.symbol.contains("NVDA"));
 
     // 测试价格格式化
-    let test_price = 120.567;
+    let test_price = dec!(120.567);
     let formatted = meta.format_price(test_price);
     println!("价格格式化: {} -> {}", test_price, formatted);
 }
@@ -158,8 +160,8 @@ async fn test_xyz_fetch_bbo() {
     let (bid, ask) = fetch_bbo(TEST_COIN).await.expect("获取 BBO 失败");
 
     println!("{} BBO: bid={}, ask={}, spread={:.4}", TEST_COIN, bid, ask, ask - bid);
-    assert!(bid > 0.0, "bid 应该大于 0");
-    assert!(ask > 0.0, "ask 应该大于 0");
+    assert!(bid > dec!(0.0), "bid 应该大于 0");
+    assert!(ask > dec!(0.0), "ask 应该大于 0");
     assert!(ask >= bid, "ask 应该 >= bid");
 }
 
@@ -244,11 +246,11 @@ async fn place_test_order(side: Side) {
         Side::Short => bid,
     };
     let formatted_price = meta.format_price(raw_price);
-    let price: f64 = formatted_price.parse().expect("价格解析失败");
+    let price: Decimal = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", raw_price, price);
 
     // XYZ DEX 股票永续有最小 notional 要求，使用 1 股
-    let quantity = 1.0_f64.max(meta.min_order_size);
+    let quantity = dec!(1).max(meta.min_order_size);
     println!("下单数量: {}", quantity);
 
     let cli_id = Exchange::Hyperliquid.new_cli_order_id();

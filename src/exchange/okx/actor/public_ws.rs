@@ -380,9 +380,10 @@ pub(crate) fn kind_to_arg(kind: &SubscriptionKind, quote: &str) -> Option<serde_
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Exchange, MarketTrade};
-    use crate::domain::StepFormatter;
+    use crate::domain::PriceStep;
 
     const TRADES_PUSH: &str = r#"{
         "arg":{"channel":"trades","instId":"BTC-USDT-SWAP"},
@@ -391,15 +392,15 @@ mod tests {
     }"#;
 
     /// BTC-USDT-SWAP: ctVal = 0.01 BTC/张
-    fn metas(contract_size: f64) -> HashMap<Symbol, SymbolMeta> {
+    fn metas(contract_size: rust_decimal::Decimal) -> HashMap<Symbol, SymbolMeta> {
         HashMap::from([(
             "BTC".to_string(),
             SymbolMeta {
                 exchange: Exchange::OKX,
                 symbol: "BTC".to_string(),
-                price_formatter: Arc::new(StepFormatter::new(0.1)),
-                size_step: 0.01,
-                min_order_size: 0.01,
+                price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+                size_step: dec!(0.01),
+                min_order_size: dec!(0.01),
                 min_notional: 0.0,
                 contract_size,
             },
@@ -418,12 +419,12 @@ mod tests {
 
     #[test]
     fn trade_size_is_converted_from_contracts_to_coin() {
-        let events = parse_public_message(TRADES_PUSH, "USDT", 0, &metas(0.01)).expect("parse");
+        let events = parse_public_message(TRADES_PUSH, "USDT", 0, &metas(dec!(0.01))).expect("parse");
         let trades = trades_of(events);
         assert_eq!(trades.len(), 1);
         // 12 张 x 0.01 = 0.12 BTC；若漏了折算会是 12（差 100 倍）
-        assert!((trades[0].qty - 0.12).abs() < 1e-12, "got {}", trades[0].qty);
-        assert_eq!(trades[0].price, 62500.0);
+        assert_eq!(trades[0].qty, dec!(0.12), "got {}", trades[0].qty);
+        assert_eq!(trades[0].price, dec!(62500.0));
         assert!(!trades[0].is_buyer_maker, "side=buy 是主动买");
     }
 

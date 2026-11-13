@@ -15,10 +15,32 @@ pub const USDT: &str = "USDT";
 /// - 反向 (币 -> 张) 只发生在下单出口，见 `StrategyRunner::convert_order`
 ///
 /// 违反此不变量的后果不是报错而是**静默算错**：OKX BTC 每张 0.01 币，漏折算即差 100 倍。
-pub type Quantity = f64;
+///
+/// # 精确十进制
+///
+/// 数量与价格都是 [`Decimal`]：交易所回报是十进制字符串，原样解析不丢精度；三所持仓相加、相减、
+/// 比大小，按步长取整，都是精确的，不需要任何容差。金额类（名义价值、手续费、资金费、权益）与
+/// 比率类仍是 `f64` —— 它们只做统计与阈值判断，不决定下单数量。二者相乘得金额时用 [`to_f64`]。
+pub type Quantity = Decimal;
 
-/// 价格类型
-pub type Price = f64;
+/// 价格类型（精确十进制，见 [`Quantity`]）
+pub type Price = Decimal;
+
+pub use rust_decimal::Decimal;
+
+/// 数量 / 价格 → `f64`（算金额、比率时用）。Decimal 转 f64 总能成功，取最近值。
+pub fn to_f64(d: Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    d.to_f64().expect("Decimal 转 f64 不会失败")
+}
+
+/// `f64` → 数量 / 价格：只用于由金额、比率算出来的**意图量**（如「下 1000U」÷ 价格），结果必须
+/// 再按品种步长取整（[`crate::domain::SymbolMeta`]）后才能下单。取最短十进制写法（0.29 → 0.29）。
+/// 非有限值或超出 Decimal 范围返回 `None`。
+pub fn from_f64(x: f64) -> Option<Decimal> {
+    use rust_decimal::prelude::FromPrimitive;
+    Decimal::from_f64(x)
+}
 
 /// 费率类型
 pub type Rate = f64;
@@ -37,3 +59,4 @@ pub fn now_ms() -> Timestamp {
         .expect("System time before Unix epoch")
         .as_millis() as u64
 }
+pub use rust_decimal_macros::dec;

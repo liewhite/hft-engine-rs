@@ -161,7 +161,7 @@ impl OrderGateway {
             symbol = %order.symbol,
             side = %order.side,
             order_type = ?order.order_type,
-            quantity = order.quantity,
+            quantity = %order.quantity,
             client_order_id = %order.client_order_id,
             signal = %comment,
             "Placing order"
@@ -263,7 +263,7 @@ impl OrderGateway {
             symbol = %order.symbol,
             side = %order.side,
             order_type = ?order.order_type,
-            quantity = order.quantity,
+            quantity = %order.quantity,
             client_order_id = %order.client_order_id,
             %detail,
             "下单结果不确定（单子可能已挂上或已成交），停机交人工核对挂单与持仓"
@@ -482,11 +482,12 @@ impl Task for OutcomeProcessor {
 /// [`OutcomeProcessor`] 的总线装配。
 #[cfg(test)]
 mod gateway_tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{
         AccountInfo, ExchangeError, OrderId, OrderStatus, OrderType, OrderUpdate, Position, Side, TimeInForce,
     };
-    use crate::domain::StepFormatter;
+    use crate::domain::PriceStep;
     use crate::engine::live::test_support::collect;
     use crate::tasks::Root;
     use std::sync::Mutex;
@@ -543,10 +544,10 @@ mod gateway_tests {
             symbol: SYM.to_string(),
             side: Side::Short,
             order_type: OrderType::Limit {
-                price: 100.0,
+                price: dec!(100.0),
                 tif: TimeInForce::GTC,
             },
-            quantity: 1.0,
+            quantity: dec!(1.0),
             reduce_only: true,
             client_order_id: CID.to_string(),
         }
@@ -558,11 +559,11 @@ mod gateway_tests {
             SymbolMeta {
                 exchange: EX,
                 symbol: SYM.to_string(),
-                price_formatter: Arc::new(StepFormatter::new(0.1)),
-                size_step: 0.001,
-                min_order_size: 0.001,
+                price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+                size_step: dec!(0.001),
+                min_order_size: dec!(0.001),
                 min_notional: 0.0,
-                contract_size: 1.0,
+                contract_size: dec!(1.0),
             },
         )]))
     }
@@ -653,7 +654,7 @@ mod gateway_tests {
     #[tokio::test]
     async fn local_validation_failure_is_reported_as_rejected() {
         let h = Harness::new(FakeClient { result: Mutex::new(None), gate: None, cancel_result: Ok(()) }).await;
-        h.gateway.place(Order { quantity: 0.0001, ..order() }, "t").await;
+        h.gateway.place(Order { quantity: dec!(0.0001), ..order() }, "t").await;
         assert!(is_rejected(&h.reports().await));
         h.finish().await;
     }
@@ -792,8 +793,8 @@ mod gateway_tests {
                 symbol: SYM.to_string(),
                 side: Side::Short,
                 status: OrderStatus::Pending,
-                quantity: 1.0,
-                filled_quantity: 0.0,
+                quantity: dec!(1.0),
+                filled_quantity: dec!(0.0),
             })),
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

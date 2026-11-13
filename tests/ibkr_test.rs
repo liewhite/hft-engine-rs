@@ -4,6 +4,8 @@
 //! 支持 Gateway 和 OAuth 两种模式。
 //!
 //! 运行: cargo test ibkr -- --ignored
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce, BBO};
 use hft_engine_rs::exchange::ibkr::{IbkrArgs, IbkrClient, IbkrCredentials, IbkrNode};
@@ -16,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 /// 测试数量 — 股票最小 1 股
-const TEST_QUANTITY: f64 = 1.0;
+const TEST_QUANTITY: Decimal = dec!(1.0);
 
 // ─── BBO 收集器 (用于 WebSocket 测试) ─────────────────
 
@@ -114,7 +116,7 @@ async fn test_ibkr_symbol_metas() {
     assert_eq!(meta.exchange, Exchange::IBKR);
 
     // 验证价格格式化 (股票 0.01 步长)
-    let formatted = meta.format_price(123.456);
+    let formatted = meta.format_price(dec!(123.456));
     println!("价格格式化: 123.456 -> {}", formatted);
     assert_eq!(formatted, "123.46");
 }
@@ -203,8 +205,8 @@ async fn test_ibkr_limit_buy() {
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
 
-    let formatted_price = meta.format_price(mid_price);
-    let price: f64 = formatted_price.parse().expect("价格解析失败");
+    let formatted_price = meta.format_price(hft_engine_rs::domain::from_f64(mid_price).unwrap());
+    let price: Decimal = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", mid_price, price);
 
     let order = Order {
@@ -251,8 +253,8 @@ async fn test_ibkr_limit_sell() {
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到交易对元数据");
 
-    let formatted_price = meta.format_price(mid_price);
-    let price: f64 = formatted_price.parse().expect("价格解析失败");
+    let formatted_price = meta.format_price(hft_engine_rs::domain::from_f64(mid_price).unwrap());
+    let price: Decimal = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", mid_price, price);
 
     let order = Order {
@@ -380,8 +382,8 @@ async fn test_ibkr_ws_bbo() {
             bbo.symbol, bbo.bid_price, bbo.ask_price, bbo.bid_qty, bbo.ask_qty
         );
         assert_eq!(bbo.exchange, Exchange::IBKR);
-        assert!(bbo.bid_price > 0.0, "bid_price 应大于 0");
-        assert!(bbo.ask_price > 0.0, "ask_price 应大于 0");
+        assert!(bbo.bid_price > dec!(0.0), "bid_price 应大于 0");
+        assert!(bbo.ask_price > dec!(0.0), "ask_price 应大于 0");
         assert!(bbo.ask_price >= bbo.bid_price, "ask 应 >= bid");
     }
 
@@ -412,7 +414,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .iter()
         .find(|p| p.symbol == symbol)
         .map(|p| p.size)
-        .unwrap_or(0.0);
+        .unwrap_or(dec!(0.0));
     println!("[初始] {} 仓位: {}", symbol, pos_before);
 
     // 2. 获取 bid/ask
@@ -429,7 +431,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .await
         .expect("获取 SymbolMeta 失败");
     let meta = metas.first().expect("未找到 SymbolMeta");
-    let buy_price: f64 = meta.format_price(ask + slippage).parse().unwrap();
+    let buy_price: Decimal = meta.format_price(hft_engine_rs::domain::from_f64(ask + slippage).unwrap()).parse().unwrap();
 
     let buy_order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -466,10 +468,10 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .iter()
         .find(|p| p.symbol == symbol)
         .map(|p| p.size)
-        .unwrap_or(0.0);
+        .unwrap_or(dec!(0.0));
     println!("[买入后] {} 仓位: {} (预期: {})", symbol, pos_after_buy, pos_before + TEST_QUANTITY);
     assert!(
-        (pos_after_buy - (pos_before + TEST_QUANTITY)).abs() < 0.01,
+        (pos_after_buy - (pos_before + TEST_QUANTITY)).abs() < dec!(0.01),
         "买入后仓位应增加 {} 股: before={} after={}",
         TEST_QUANTITY,
         pos_before,
@@ -481,7 +483,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .fetch_snapshot_bbo(&symbol)
         .await
         .expect("获取 BBO 失败");
-    let sell_price: f64 = meta.format_price(bid2 - slippage).parse().unwrap();
+    let sell_price: Decimal = meta.format_price(hft_engine_rs::domain::from_f64(bid2 - slippage).unwrap()).parse().unwrap();
 
     let sell_order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -515,10 +517,10 @@ async fn test_ibkr_place_order_and_verify_fill() {
         .iter()
         .find(|p| p.symbol == symbol)
         .map(|p| p.size)
-        .unwrap_or(0.0);
+        .unwrap_or(dec!(0.0));
     println!("[最终] {} 仓位: {} (预期: {})", symbol, pos_final, pos_before);
     assert!(
-        (pos_final - pos_before).abs() < 0.01,
+        (pos_final - pos_before).abs() < dec!(0.01),
         "仓位应恢复到初始值: before={} final={}",
         pos_before,
         pos_final,

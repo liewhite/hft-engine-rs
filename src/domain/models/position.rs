@@ -31,12 +31,9 @@ pub struct Position {
 }
 
 impl Position {
-    /// 仓位比较的浮点精度阈值
-    pub const EPSILON: f64 = 1e-10;
-
-    /// 判断是否空仓 (使用 epsilon 比较避免浮点精度问题)
+    /// 是否空仓（数量是精确十进制，直接判 0）
     pub fn is_empty(&self) -> bool {
-        self.size.abs() < Self::EPSILON
+        self.size.is_zero()
     }
 
     /// 获取持仓方向 (根据 size 符号)
@@ -45,7 +42,7 @@ impl Position {
     pub fn side(&self) -> Option<Side> {
         if self.is_empty() {
             None
-        } else if self.size > 0.0 {
+        } else if self.size.is_sign_positive() {
             Some(Side::Long)
         } else {
             Some(Side::Short)
@@ -57,7 +54,7 @@ impl Position {
         Self {
             exchange,
             symbol,
-            size: 0.0,
+            size: Quantity::ZERO,
 
         }
     }
@@ -83,8 +80,9 @@ pub fn signed_qty(side: Side, qty: Quantity) -> Quantity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
-    fn pos(size: f64) -> Position {
+    fn pos(size: Quantity) -> Position {
         Position {
             exchange: Exchange::Binance,
             symbol: "BTC".to_string(),
@@ -95,22 +93,25 @@ mod tests {
     /// 成交累加只动数量：买加卖减，反手也只是符号翻过去
     #[test]
     fn add_fill_accumulates_signed_size() {
-        let mut p = pos(0.0);
-        p.add_fill(Side::Long, 2.0);
-        assert_eq!(p.size, 2.0);
-        p.add_fill(Side::Long, 1.0);
-        assert_eq!(p.size, 3.0);
-        p.add_fill(Side::Short, 5.0);
-        assert_eq!(p.size, -2.0, "反手后应为净空头");
+        let mut p = pos(dec!(0));
+        p.add_fill(Side::Long, dec!(2));
+        assert_eq!(p.size, dec!(2));
+        p.add_fill(Side::Long, dec!(1));
+        assert_eq!(p.size, dec!(3));
+        p.add_fill(Side::Short, dec!(5));
+        assert_eq!(p.size, dec!(-2), "反手后应为净空头");
     }
 
-    /// 空仓判定用 epsilon：浮点残差不该被当成残仓（会让"已平完"判成"还有仓"）
+    /// 开平同量后精确归零（f64 时 0.1+0.2-0.3 留残差，曾要 epsilon 判空仓）
     #[test]
-    fn near_zero_is_empty_and_has_no_side() {
-        let p = pos(1e-12);
+    fn flat_after_offsetting_fills() {
+        let mut p = pos(dec!(0));
+        p.add_fill(Side::Long, dec!(0.1));
+        p.add_fill(Side::Long, dec!(0.2));
+        p.add_fill(Side::Short, dec!(0.3));
         assert!(p.is_empty());
         assert_eq!(p.side(), None);
-        assert_eq!(pos(1.0).side(), Some(Side::Long));
-        assert_eq!(pos(-1.0).side(), Some(Side::Short));
+        assert_eq!(pos(dec!(1)).side(), Some(Side::Long));
+        assert_eq!(pos(dec!(-1)).side(), Some(Side::Short));
     }
 }

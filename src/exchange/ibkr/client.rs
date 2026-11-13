@@ -9,7 +9,7 @@ use crate::exchange::ibkr::auth::IbkrAuth;
 use crate::exchange::ibkr::symbol::resolve_conids;
 use crate::exchange::ibkr::wire;
 use crate::exchange::ibkr::IbkrCredentials;
-use crate::domain::StepFormatter;
+use crate::domain::{dec, Decimal, PriceStep};
 use async_trait::async_trait;
 use reqwest::Client;
 use std::collections::HashMap;
@@ -227,7 +227,7 @@ impl IbkrClient {
             // 一个格式差异就能让启动被挡死或对账持续报错。
             let size = item
                 .get("position")
-                .and_then(wire::number)
+                .and_then(wire::decimal)
                 .ok_or_else(|| {
                     ExchangeError::ParseError(format!(
                         "IBKR {symbol} 持仓数量缺失或无法解析，整份持仓读数不可信: {item}"
@@ -354,11 +354,11 @@ impl ExchangeClient for IbkrClient {
             .map(|s| SymbolMeta {
                 exchange: Exchange::IBKR,
                 symbol: s.clone(),
-                price_formatter: Arc::new(StepFormatter::new(0.01)),
-                size_step: 1.0,
-                min_order_size: 1.0,
+                price_rule: Arc::new(PriceStep::new(dec!(0.01))),
+                size_step: Decimal::ONE,
+                min_order_size: Decimal::ONE,
                 min_notional: 0.0,
-                contract_size: 1.0,
+                contract_size: Decimal::ONE,
             })
             .collect();
 
@@ -473,16 +473,16 @@ impl AccountClient for IbkrClient {
             filled_quantity: Option<serde_json::Value>,
         }
 
-        /// 把 LiveOrder 的双态数值字段取成 f64；字段缺失按 `missing` 兜底（那是"交易所
+        /// 把 LiveOrder 的双态数量字段取成 Decimal；字段缺失按 `missing` 兜底（那是"交易所
         /// 没给"，对挂单快照的用途无害：撤单只需要 order_id），**解析失败则报错**。
         fn order_number(
             raw: &Option<serde_json::Value>,
             field: &str,
-            missing: f64,
-        ) -> Result<f64, ExchangeError> {
+            missing: Decimal,
+        ) -> Result<Decimal, ExchangeError> {
             match raw {
                 None | Some(serde_json::Value::Null) => Ok(missing),
-                Some(v) => crate::exchange::ibkr::wire::number(v).ok_or_else(|| {
+                Some(v) => crate::exchange::ibkr::wire::decimal(v).ok_or_else(|| {
                     ExchangeError::ParseError(format!(
                         "IBKR live order 字段 {field} 无法解析为数字: {v}"
                     ))
@@ -520,14 +520,14 @@ impl AccountClient for IbkrClient {
             }
             // 只保留**未终结**的单：本方法的用途是"还挂在簿上的是哪些"
             let raw_status = o.status.as_deref().unwrap_or_default();
-            let filled = order_number(&o.filled_quantity, "filledQuantity", 0.0)?;
+            let filled = order_number(&o.filled_quantity, "filledQuantity", Decimal::ZERO)?;
             // 终态**显式枚举**，未识别的 status 报错 —— 与下面 side 的处理同一姿态。
             // 通配 `_ => continue` 会把没见过的状态一律当成"已终态"丢弃，而
             // `PendingCancel`（撤单已请求未确认）的单**仍活在簿上**：撤单若被拒它会回到
             // Submitted。把它丢掉正好落进消费方"不在列表里 ⇒ 已终态"的推断：启动期判
             // "遗留单已撤净"放行启动；按 cOID 撤单时找不到它。
             let order_status = match raw_status {
-                "Submitted" if filled > 0.0 => OrderStatus::PartiallyFilled,
+                "Submitted" if filled > Decimal::ZERO => OrderStatus::PartiallyFilled,
                 // PendingCancel 仍在簿上，按未终结处理
                 "PendingSubmit" | "PreSubmitted" | "Submitted" | "PendingCancel" => {
                     OrderStatus::Pending
@@ -571,7 +571,7 @@ impl AccountClient for IbkrClient {
                 side,
                 status: order_status,
                 // 缺失按 0：挂单快照的用途是"这张单还在吗 + 怎么撤"，价量不参与判定
-                quantity: order_number(&o.total_size, "totalSize", 0.0)?,
+                quantity: order_number(&o.total_size, "totalSize", Decimal::ZERO)?,
                 filled_quantity: filled,
             });
         }

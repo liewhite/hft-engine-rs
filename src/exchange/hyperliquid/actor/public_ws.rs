@@ -441,6 +441,7 @@ pub(crate) fn kind_channel(kind: &SubscriptionKind) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Exchange, MarketTrade};
 
@@ -453,8 +454,8 @@ mod tests {
             data: MarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Hyperliquid,
                 symbol: "BTC".to_string(),
-                price: 62_500.0,
-                qty: 0.1,
+                price: dec!(62_500.0),
+                qty: dec!(0.1),
                 is_buyer_maker: false,
                 timestamp: ts,
             }),

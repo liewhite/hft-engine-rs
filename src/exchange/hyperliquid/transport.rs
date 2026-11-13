@@ -23,7 +23,7 @@ use super::signing::{
     action_hash, create_signer, sign_l1_action, BulkOrderAction, CancelByCloidAction, CancelByCloidWire,
     ExchangeRequest, LimitOrder, OrderType as WireOrderType, OrderWire,
 };
-use crate::domain::{now_ms, Exchange, ExchangeError, PlaceError};
+use crate::domain::{now_ms, Decimal, Exchange, ExchangeError, PlaceError};
 use crate::exchange::client::place_send_error;
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
@@ -50,7 +50,7 @@ impl HlTif {
     }
 }
 
-/// 一笔限价单意图。价格与数量已是 HL 规范小数字符串（见 [`float_to_wire`]）。
+/// 一笔限价单意图。价格与数量已是 HL 规范小数字符串（见 [`decimal_to_wire`]）。
 #[derive(Debug, Clone)]
 pub(crate) struct HlOrderIntent {
     /// HL 币名，带 dex 前缀（如 `BTC`、`xyz:TSLA`）
@@ -87,20 +87,18 @@ pub(crate) trait HlSubmitter: Send + Sync {
 }
 
 /// 价格 / 数量 → HL 规范小数字符串，与 hyperliquid-python-sdk 的 `float_to_wire` 同口径：
-/// 最多 8 位小数、无多余前后导零、不用科学计数法；四舍五入到 8 位会改变数值则报错
+/// 最多 8 位小数、无多余前后导零、不用科学计数法；超过 8 位小数或为负则报错
 /// （说明上游没有按精度取整，宁可拒单也不悄悄改价）。签名机对不规范的写法直接拒签，
 /// 本地签名路径也用同一份，免得两条通道对同一笔单写出不同的字符串。
-pub(crate) fn float_to_wire(x: f64) -> Result<String, ExchangeError> {
-    if !x.is_finite() || x < 0.0 {
+pub(crate) fn decimal_to_wire(x: Decimal) -> Result<String, ExchangeError> {
+    let x = x.normalize();
+    if x.is_sign_negative() && !x.is_zero() {
         return Err(ExchangeError::Other(format!("HL 价格/数量非法: {x}")));
     }
-    let rounded = format!("{x:.8}");
-    let back: f64 = rounded.parse().map_err(|_| ExchangeError::ParseError(rounded.clone()))?;
-    if (back - x).abs() >= 1e-12 {
+    if x.scale() > 8 {
         return Err(ExchangeError::Other(format!("HL 价格/数量超过 8 位小数: {x}")));
     }
-    let s = rounded.trim_end_matches('0').trim_end_matches('.');
-    Ok(if s.is_empty() || s == "-0" { "0".to_string() } else { s.to_string() })
+    Ok(if x.is_zero() { "0".to_string() } else { x.to_string() })
 }
 
 // ---------------------------------------------------------------------------
@@ -307,22 +305,24 @@ impl HlSubmitter for EnclaveSubmitter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
-    fn float_to_wire_is_canonical() {
-        assert_eq!(float_to_wire(65000.0).unwrap(), "65000");
-        assert_eq!(float_to_wire(0.001).unwrap(), "0.001");
-        assert_eq!(float_to_wire(1.10).unwrap(), "1.1");
-        assert_eq!(float_to_wire(0.0).unwrap(), "0");
-        assert_eq!(float_to_wire(0.1 + 0.2).unwrap(), "0.3");
-        assert_eq!(float_to_wire(0.00000001).unwrap(), "0.00000001");
+    fn decimal_to_wire_is_canonical() {
+        assert_eq!(decimal_to_wire(dec!(65000)).unwrap(), "65000");
+        assert_eq!(decimal_to_wire(dec!(65000.000)).unwrap(), "65000");
+        assert_eq!(decimal_to_wire(dec!(0.001)).unwrap(), "0.001");
+        assert_eq!(decimal_to_wire(dec!(1.10)).unwrap(), "1.1");
+        assert_eq!(decimal_to_wire(dec!(0)).unwrap(), "0");
+        assert_eq!(decimal_to_wire(dec!(-0.0)).unwrap(), "0");
+        assert_eq!(decimal_to_wire(dec!(0.1) + dec!(0.2)).unwrap(), "0.3");
+        assert_eq!(decimal_to_wire(dec!(0.00000001)).unwrap(), "0.00000001");
     }
 
     #[test]
-    fn float_to_wire_rejects_what_would_be_silently_changed() {
-        assert!(float_to_wire(0.123456789).is_err());
-        assert!(float_to_wire(f64::NAN).is_err());
-        assert!(float_to_wire(-1.0).is_err());
+    fn decimal_to_wire_rejects_what_would_be_silently_changed() {
+        assert!(decimal_to_wire(dec!(0.123456789)).is_err());
+        assert!(decimal_to_wire(dec!(-1)).is_err());
     }
 
     #[test]

@@ -23,7 +23,7 @@
 
 use super::codec::{size_step, AssetInfo};
 use super::symbol::from_hyperliquid;
-use crate::domain::{Exchange, ExchangeError, SignificantFiguresFormatter, Symbol, SymbolMeta};
+use crate::domain::{Decimal, Exchange, ExchangeError, HlSigFigs, Symbol, SymbolMeta};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -43,7 +43,7 @@ pub(crate) struct HlAsset {
     pub dex: String,
     /// 全局资产编号（含 dex 偏移）
     pub asset: u32,
-    pub sz_decimals: i32,
+    pub sz_decimals: u32,
 }
 
 /// 一个 dex 的 meta 与它的资产编号偏移（建目录的原料）
@@ -136,11 +136,11 @@ impl HlMarkets {
             .map(|(symbol, a)| SymbolMeta {
                 exchange: Exchange::Hyperliquid,
                 symbol: symbol.clone(),
-                price_formatter: Arc::new(hl_price_formatter(a.sz_decimals)),
+                price_rule: Arc::new(hl_price_rule(a.sz_decimals)),
                 size_step: size_step(a.sz_decimals),
                 min_order_size: size_step(a.sz_decimals), // 最小下单量为一个精度单位
                 min_notional: MIN_ORDER_NOTIONAL,
-                contract_size: 1.0,                       // 币本位，合约乘数为 1
+                contract_size: Decimal::ONE,              // 币本位，合约乘数为 1
             })
             .collect()
     }
@@ -163,10 +163,10 @@ pub(crate) fn dex_offset(perp_dexs: &[Option<serde_json::Value>], dex: &str) -> 
     Ok(BUILDER_DEX_ASSET_BASE + idx as u32 * BUILDER_DEX_ASSET_STEP)
 }
 
-/// 按 HL 规则（5 位有效数字、小数位 ≤ 6 - szDecimals）格式化价格的格式化器。
+/// HL 价格精度规则（5 位有效数字、小数位 ≤ 6 - szDecimals）。
 /// 限价单（经 SymbolMeta）与市价单定价共用这一份规则。
-pub(crate) fn hl_price_formatter(sz_decimals: i32) -> SignificantFiguresFormatter {
-    SignificantFiguresFormatter::new(sz_decimals.max(0) as u32)
+pub(crate) fn hl_price_rule(sz_decimals: u32) -> HlSigFigs {
+    HlSigFigs::new(sz_decimals)
 }
 
 #[cfg(test)]

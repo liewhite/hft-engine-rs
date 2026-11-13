@@ -228,7 +228,7 @@ fn executor_baselines(
         position: crate::domain::Position {
             exchange: *exchange,
             symbol: symbol.clone(),
-            size: 0.0,
+            size: crate::domain::Quantity::ZERO,
         },
         snapshot_req_ts: 0,
     };
@@ -582,9 +582,9 @@ impl Provisioner {
                 let pos = position_map.get(symbol).cloned().unwrap_or(crate::domain::Position {
                     exchange: *ex,
                     symbol: symbol.clone(),
-                    size: 0.0,
+                    size: crate::domain::Quantity::ZERO,
                 });
-                tracing::info!(%exchange, %symbol, size = pos.size, "Initial position loaded");
+                tracing::info!(%exchange, %symbol, size = %pos.size, "Initial position loaded");
                 baselines.insert(
                     (*ex, symbol.clone()),
                     crate::messaging::PositionBaseline {
@@ -739,6 +739,7 @@ impl Provisioner {
 
 #[cfg(test)]
 mod leftover_order_tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{AccountInfo, OrderId, OrderStatus, Position, Side};
     use crate::exchange::ExchangeOrder;
@@ -808,8 +809,8 @@ mod leftover_order_tests {
             symbol: SYM.to_string(),
             side: Side::Long,
             status: OrderStatus::Pending,
-            quantity: 1.0,
-            filled_quantity: 0.0,
+            quantity: dec!(1.0),
+            filled_quantity: dec!(0.0),
         }
     }
 
@@ -877,6 +878,7 @@ mod leftover_order_tests {
 
 #[cfg(test)]
 mod subscription_validation_tests {
+    use rust_decimal_macros::dec;
     use super::*;
 
     fn bbo(ex: Exchange) -> (Exchange, SubscriptionKind) {
@@ -897,11 +899,11 @@ mod subscription_validation_tests {
         let meta = SymbolMeta {
             exchange: Exchange::Binance,
             symbol: "BTC".to_string(),
-            price_formatter: Arc::new(crate::domain::StepFormatter::new(0.1)),
-            size_step: 0.001,
-            min_order_size: 0.001,
+            price_rule: Arc::new(crate::domain::PriceStep::new(dec!(0.1))),
+            size_step: dec!(0.001),
+            min_order_size: dec!(0.001),
             min_notional: 0.0,
-            contract_size: 1.0,
+            contract_size: dec!(1.0),
         };
         [((Exchange::Binance, "BTC".to_string()), meta)]
             .into_iter()
@@ -1005,7 +1007,7 @@ mod subscription_validation_tests {
                     position: crate::domain::Position {
                         exchange: WITH_ACCOUNT,
                         symbol: SYM.to_string(),
-                        size: 7.0,
+                        size: dec!(7.0),
                     },
                     snapshot_req_ts: 1_000,
                 },
@@ -1015,7 +1017,7 @@ mod subscription_validation_tests {
         fn size_at(
             baselines: &[crate::messaging::PositionBaseline],
             exchange: Exchange,
-        ) -> Option<f64> {
+        ) -> Option<crate::domain::Quantity> {
             baselines
                 .iter()
                 .find(|b| b.position.exchange == exchange)
@@ -1030,7 +1032,7 @@ mod subscription_validation_tests {
             assert_eq!(b.len(), scope().len(), "作用域内的腿必须全部有基线");
             let live_scope = HashSet::from([(WITH_ACCOUNT, SYM.to_string())]);
             let b = executor_baselines(&AccountId::Live, &live_scope, &rest()).unwrap();
-            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(7.0), "实盘用 REST 真值");
+            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(dec!(7.0)), "实盘用 REST 真值");
         }
 
         /// 实盘作用域内有腿没有快照（该所没凭证，投产校验本该拦下）：报错，不补 0
@@ -1044,8 +1046,8 @@ mod subscription_validation_tests {
         #[test]
         fn paper_never_sees_real_positions() {
             let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest()).unwrap();
-            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(0.0), "模拟账户不得继承实盘存量");
-            assert_eq!(size_at(&b, NO_ACCOUNT), Some(0.0));
+            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(dec!(0.0)), "模拟账户不得继承实盘存量");
+            assert_eq!(size_at(&b, NO_ACCOUNT), Some(dec!(0.0)));
         }
 
         /// 补 0 的基线取 `snapshot_req_ts = 0`
@@ -1076,8 +1078,8 @@ mod subscription_validation_tests {
                         exchange: WITH_ACCOUNT,
                         symbol: SYM.to_string(),
                         side: crate::domain::Side::Long,
-                        price: 100.0,
-                        size: 1.0,
+                        price: dec!(100.0),
+                        size: dec!(1.0),
                         client_order_id: None,
                         order_id: "1".to_string(),
                         timestamp: local_ts,
@@ -1095,7 +1097,7 @@ mod subscription_validation_tests {
                     .symbol_state(&SYM.to_string())
                     .expect("state")
                     .position_book().position_size(WITH_ACCOUNT),
-                0.0,
+                dec!(0.0),
                 "local_ts == 0 的 Fill 会被 ts=0 的基线判成「已含在快照里」而丢弃"
             );
 
@@ -1106,7 +1108,7 @@ mod subscription_validation_tests {
                 kept.symbol_state(&SYM.to_string())
                     .expect("state")
                     .position_book().position_size(WITH_ACCOUNT),
-                1.0,
+                dec!(1.0),
                 "local_ts >= 1 照常累加 —— 实盘与纸盘取 now_ms()，恒落在这一侧"
             );
         }

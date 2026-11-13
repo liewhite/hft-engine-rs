@@ -340,7 +340,7 @@ impl PaperCounter {
                         symbol = %order.symbol,
                         side = %order.side,
                         order_type = ?order.order_type,
-                        quantity = order.quantity,
+                        quantity = %order.quantity,
                         client_order_id = %order.client_order_id,
                         order_id = %order_id,
                         signal = %comment,
@@ -437,6 +437,8 @@ impl Task for PaperCounter {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{MarketTrade, OrderStatus, OrderType, Side, TimeInForce, BBO};
     use crate::messaging::SymbolAccountData;
@@ -453,7 +455,7 @@ mod tests {
 
     /// 测试元数据：步长/最小量取得足够小，既有测试的数量不触发下界校验
     fn test_metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
-        use crate::domain::StepFormatter;
+        use crate::domain::PriceStep;
         Arc::new(
             [Exchange::Binance, Exchange::OKX]
                 .into_iter()
@@ -463,11 +465,11 @@ mod tests {
                         SymbolMeta {
                             exchange,
                             symbol: SYM.to_string(),
-                            price_formatter: Arc::new(StepFormatter::new(0.001)),
-                            size_step: 0.001,
-                            min_order_size: 0.001,
+                            price_rule: Arc::new(PriceStep::new(dec!(0.001))),
+                            size_step: dec!(0.001),
+                            min_order_size: dec!(0.001),
                             min_notional: 0.0,
-                            contract_size: 1.0,
+                            contract_size: dec!(1.0),
                         },
                     )
                 })
@@ -534,7 +536,7 @@ mod tests {
         }
 
         /// 送一条 BBO（只更新盘口，不应撮合）
-        async fn bbo(&self, bid: f64, ask: f64) {
+        async fn bbo(&self, bid: Decimal, ask: Decimal) {
             let ev = MarketEvent {
                 exchange_ts: 1,
                 local_ts: 1,
@@ -542,9 +544,9 @@ mod tests {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     bid_price: bid,
-                    bid_qty: 1.0,
+                    bid_qty: dec!(1.0),
                     ask_price: ask,
-                    ask_qty: 1.0,
+                    ask_qty: dec!(1.0),
                     timestamp: 1,
                 }),
             };
@@ -552,7 +554,7 @@ mod tests {
         }
 
         /// 送一条真实成交
-        async fn trade(&self, price: f64) {
+        async fn trade(&self, price: Decimal) {
             let ev = MarketEvent {
                 exchange_ts: 2,
                 local_ts: 2,
@@ -560,7 +562,7 @@ mod tests {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     price,
-                    qty: 1.0,
+                    qty: dec!(1.0),
                     is_buyer_maker: false,
                     timestamp: 2,
                 }),
@@ -568,11 +570,11 @@ mod tests {
             self.market(ev);
         }
 
-        async fn place(&self, side: Side, price: f64, qty: f64) {
+        async fn place(&self, side: Side, price: Decimal, qty: Decimal) {
             self.place_tif(side, price, qty, TimeInForce::PostOnly).await;
         }
 
-        async fn place_tif(&self, side: Side, price: f64, qty: f64, tif: TimeInForce) {
+        async fn place_tif(&self, side: Side, price: Decimal, qty: Decimal, tif: TimeInForce) {
             let order = Order {
                 id: String::new(),
                 exchange: EX,
@@ -609,7 +611,7 @@ mod tests {
                 .collect()
         }
 
-        fn fills(&self) -> Vec<(f64, f64)> {
+        fn fills(&self) -> Vec<(Decimal, Decimal)> {
             self.events
                 .lock()
                 .unwrap()
@@ -627,9 +629,9 @@ mod tests {
     #[tokio::test]
     async fn cross_exchange_trade_never_fills_other_exchanges_order() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
         // Binance 上挂买单 @99
-        h.place(Side::Long, 99.0, 0.5).await;
+        h.place(Side::Long, dec!(99.0), dec!(0.5)).await;
         h.settle(50).await;
         assert_eq!(h.statuses(), vec![OrderStatus::Pending]);
         // OKX 上同 symbol 的成交穿过挂单价 —— 不得撮合 Binance 的挂单
@@ -639,8 +641,8 @@ mod tests {
             data: MarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::OKX,
                 symbol: SYM.to_string(),
-                price: 98.0,
-                qty: 1.0,
+                price: dec!(98.0),
+                qty: dec!(1.0),
                 is_buyer_maker: false,
                 timestamp: 2,
             }),
@@ -649,9 +651,9 @@ mod tests {
         h.settle(50).await;
         assert!(h.fills().is_empty(), "OKX 的成交撮合了 Binance 的挂单 —— 跨所串账");
         // Binance 自己的成交才撮合
-        h.trade(98.0).await;
+        h.trade(dec!(98.0)).await;
         h.settle(50).await;
-        assert_eq!(h.fills(), vec![(99.0, 0.5)]);
+        assert_eq!(h.fills(), vec![(dec!(99.0), dec!(0.5))]);
         h.finish().await;
     }
 
@@ -667,10 +669,10 @@ mod tests {
             symbol: SYM.to_string(),
             side: Side::Long,
             order_type: OrderType::Limit {
-                price: 99.0,
+                price: dec!(99.0),
                 tif: TimeInForce::PostOnly,
             },
-            quantity: 0.5,
+            quantity: dec!(0.5),
             reduce_only: false,
             client_order_id: "c-okx".to_string(),
         };
@@ -711,20 +713,20 @@ mod tests {
     #[tokio::test]
     async fn fill_is_decided_by_trade_crossing_not_by_quote() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
-        h.place(Side::Long, 99.0, 0.5).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.place(Side::Long, dec!(99.0), dec!(0.5)).await;
         h.settle(50).await;
         assert_eq!(h.statuses(), vec![OrderStatus::Pending]);
 
         // 盘口整体下移、ask 已跌破挂单价 —— 但不据此成交
-        h.bbo(98.0, 98.5).await;
+        h.bbo(dec!(98.0), dec!(98.5)).await;
         h.settle(30).await;
         assert!(h.fills().is_empty(), "盘口越价不应成交");
 
         // 真实成交价严格跌破挂单价 -> 成交，且成交价取挂单价（maker）
-        h.trade(98.9).await;
+        h.trade(dec!(98.9)).await;
         h.settle(30).await;
-        assert_eq!(h.fills(), vec![(99.0, 0.5)]);
+        assert_eq!(h.fills(), vec![(dec!(99.0), dec!(0.5))]);
         assert!(h.statuses().contains(&OrderStatus::Filled));
         h.finish().await;
     }
@@ -735,9 +737,9 @@ mod tests {
     #[tokio::test]
     async fn undersized_order_is_rejected_like_live() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
         // 0.0004 < size_step 0.001：实盘出口会拒，柜台同样拒
-        h.place(Side::Long, 99.0, 0.0004).await;
+        h.place(Side::Long, dec!(99.0), dec!(0.0004)).await;
         h.settle(50).await;
         assert!(
             h.statuses()
@@ -747,7 +749,7 @@ mod tests {
             h.statuses()
         );
         // 即使成交穿价，也不该有成交（单没入簿）
-        h.trade(98.0).await;
+        h.trade(dec!(98.0)).await;
         h.settle(30).await;
         assert!(h.fills().is_empty(), "未通过校验的单不该成交");
         h.finish().await;
@@ -758,13 +760,13 @@ mod tests {
     #[tokio::test]
     async fn trade_qty_budget_yields_partial_fills() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
-        h.place(Side::Long, 99.0, 7.5).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.place(Side::Long, dec!(99.0), dec!(7.5)).await;
         h.settle(50).await;
         // 成交量 1.0 < 挂单量 7.5：只成交 1.0，剩余 6.5 留簿
-        h.trade(98.0).await;
+        h.trade(dec!(98.0)).await;
         h.settle(30).await;
-        assert_eq!(h.fills(), vec![(99.0, 1.0)]);
+        assert_eq!(h.fills(), vec![(dec!(99.0), dec!(1.0))]);
         assert!(
             h.statuses()
                 .contains(&OrderStatus::PartiallyFilled),
@@ -772,9 +774,9 @@ mod tests {
             h.statuses()
         );
         // 后续 print 继续消耗剩余量
-        h.trade(98.0).await;
+        h.trade(dec!(98.0)).await;
         h.settle(30).await;
-        assert_eq!(h.fills(), vec![(99.0, 1.0), (99.0, 1.0)]);
+        assert_eq!(h.fills(), vec![(dec!(99.0), dec!(1.0)), (dec!(99.0), dec!(1.0))]);
         h.finish().await;
     }
 
@@ -782,12 +784,12 @@ mod tests {
     #[tokio::test]
     async fn order_does_not_match_before_delay_elapses() {
         let h = Harness::new(300).await;
-        h.bbo(100.0, 100.1).await;
-        h.place(Side::Long, 99.0, 0.5).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.place(Side::Long, dec!(99.0), dec!(0.5)).await;
 
         // 延迟未到：单子还没进簿，越价成交也不该成交
         h.settle(60).await;
-        h.trade(98.0).await;
+        h.trade(dec!(98.0)).await;
         h.settle(30).await;
         assert!(h.statuses().is_empty(), "延迟未到不应有任何回报");
         assert!(h.fills().is_empty(), "延迟未到不应成交");
@@ -797,9 +799,9 @@ mod tests {
         assert_eq!(h.statuses(), vec![OrderStatus::Pending]);
         assert!(h.fills().is_empty(), "入簿后还需新的越价成交才成交");
 
-        h.trade(98.0).await;
+        h.trade(dec!(98.0)).await;
         h.settle(30).await;
-        assert_eq!(h.fills(), vec![(99.0, 0.5)]);
+        assert_eq!(h.fills(), vec![(dec!(99.0), dec!(0.5))]);
         h.finish().await;
     }
 
@@ -807,14 +809,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn trade_still_queued_when_delay_elapses_does_not_hit_the_order() {
         let h = Harness::new(100).await;
-        h.bbo(100.0, 100.1).await;
-        h.place(Side::Long, 99.0, 0.5).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.place(Side::Long, dec!(99.0), dec!(0.5)).await;
         h.settle(99).await; // t=99：单子已排队，100 到期
         // 柜台积压：一批越价成交进箱时柜台还没轮到运行。时钟随后一步跨过到期时刻，柜台
         // 处理积压途中会让出执行权（tokio 协作预算），时间驱动随即把到期定时器置为就绪 ——
         // 此时箱里仍有延迟期内到的成交，正是两条分支同时就绪的时刻
         for _ in 0..1000 {
-            h.trade(98.0).await;
+            h.trade(dec!(98.0)).await;
         }
         tokio::time::advance(Duration::from_millis(5)).await;
         h.settle(10).await;
@@ -827,12 +829,12 @@ mod tests {
     #[tokio::test]
     async fn order_crossing_live_quote_on_arrival_fills_as_taker() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
         // 买价 101 高于卖价 100.1，到达即可成交
-        h.place_tif(Side::Long, 101.0, 0.5, TimeInForce::GTC).await;
+        h.place_tif(Side::Long, dec!(101.0), dec!(0.5), TimeInForce::GTC).await;
         h.settle(50).await;
         // 成交价取对手价 100.1（taker），不是挂单价 101
-        assert_eq!(h.fills(), vec![(100.1, 0.5)]);
+        assert_eq!(h.fills(), vec![(dec!(100.1), dec!(0.5))]);
         assert!(h.statuses().contains(&OrderStatus::Filled));
         h.finish().await;
     }
@@ -842,20 +844,20 @@ mod tests {
     #[tokio::test]
     async fn marketability_is_judged_when_delay_elapses_not_at_submit() {
         let h = Harness::new(200).await;
-        h.bbo(100.0, 100.1).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
         // 提交时 100.05 低于卖价 100.1，不可成交
-        h.place_tif(Side::Long, 100.05, 0.5, TimeInForce::GTC).await;
+        h.place_tif(Side::Long, dec!(100.05), dec!(0.5), TimeInForce::GTC).await;
 
         // 延迟期内盘口下移，卖价跌到 100.0 <= 100.05 -> 到达时变为可成交
         h.settle(60).await;
-        h.bbo(99.9, 100.0).await;
+        h.bbo(dec!(99.9), dec!(100.0)).await;
         assert!(h.statuses().is_empty(), "延迟未到不应有回报");
 
         h.settle(250).await;
         assert_eq!(
             h.fills(),
-            vec![(100.0, 0.5)],
-            "应按到达时的实时盘口以 taker 成交于对手价 100.0"
+            vec![(dec!(100.0), dec!(0.5))],
+            "应按到达时的实时盘口以 taker 成交于对手价 dec!(100.0)"
         );
         h.finish().await;
     }
@@ -864,11 +866,11 @@ mod tests {
     #[tokio::test]
     async fn order_rests_if_quote_moves_away_during_delay() {
         let h = Harness::new(200).await;
-        h.bbo(100.0, 100.1).await;
-        h.place_tif(Side::Long, 100.2, 0.5, TimeInForce::GTC).await; // 提交时越过卖价
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.place_tif(Side::Long, dec!(100.2), dec!(0.5), TimeInForce::GTC).await; // 提交时越过卖价
 
         h.settle(60).await;
-        h.bbo(100.5, 100.6).await; // 盘口涨走，100.2 不再可成交
+        h.bbo(dec!(100.5), dec!(100.6)).await; // 盘口涨走，dec!(100.2) 不再可成交
 
         h.settle(250).await;
         assert_eq!(h.statuses(), vec![OrderStatus::Pending], "应改为挂单");
@@ -885,8 +887,8 @@ mod tests {
             ..config(0)
         })
         .await;
-        h.bbo(100.0, 100.1).await;
-        h.place_tif(Side::Long, 101.0, 2.0, TimeInForce::GTC).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.place_tif(Side::Long, dec!(101.0), dec!(2.0), TimeInForce::GTC).await;
         h.settle(50).await;
 
         let fee = h
@@ -908,8 +910,8 @@ mod tests {
     #[tokio::test]
     async fn cancel_removes_order_from_book() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
-        h.place(Side::Long, 99.0, 0.5).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.place(Side::Long, dec!(99.0), dec!(0.5)).await;
         h.settle(50).await;
 
         h.outcome(AccountOutcome {
@@ -923,7 +925,7 @@ mod tests {
         h.settle(50).await;
         assert!(h.statuses().contains(&OrderStatus::Cancelled));
 
-        h.trade(98.0).await;
+        h.trade(dec!(98.0)).await;
         h.settle(30).await;
         assert!(h.fills().is_empty(), "已撤单不应成交");
         h.finish().await;
@@ -933,8 +935,8 @@ mod tests {
     #[tokio::test]
     async fn marketable_post_only_is_rejected() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
-        h.place(Side::Long, 100.5, 0.5).await; // 高于 ask，会吃单
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.place(Side::Long, dec!(100.5), dec!(0.5)).await; // 高于 ask，会吃单
         h.settle(50).await;
         assert!(
             h.statuses()
@@ -951,8 +953,8 @@ mod tests {
     #[tokio::test]
     async fn market_events_are_never_republished() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
-        h.trade(100.0).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.trade(dec!(100.0)).await;
         // 标记价同样经 on_market（用于估值），其回显也不得外发
         h.market(MarketEvent {
             exchange_ts: 3,
@@ -960,7 +962,7 @@ mod tests {
             data: MarketData::MarkPrice(crate::domain::MarkPrice {
                 exchange: EX,
                 symbol: SYM.to_string(),
-                price: 100.0,
+                price: dec!(100.0),
                 timestamp: 3,
             }),
         });
@@ -990,8 +992,8 @@ mod tests {
     #[tokio::test]
     async fn clock_publishes_account_info_per_account() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
-        h.place(Side::Long, 99.0, 0.5).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
+        h.place(Side::Long, dec!(99.0), dec!(0.5)).await;
         h.settle(50).await;
         h.market(MarketEvent {
             exchange_ts: 5,
@@ -1011,7 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn live_signal_is_not_claimed_by_paper_counter() {
         let h = Harness::new(0).await;
-        h.bbo(100.0, 100.1).await;
+        h.bbo(dec!(100.0), dec!(100.1)).await;
         h.outcome(AccountOutcome {
             account: AccountId::Live,
             event: OutcomeEvent::PlaceOrders {
@@ -1020,8 +1022,8 @@ mod tests {
                     exchange: EX,
                     symbol: SYM.to_string(),
                     side: Side::Long,
-                    order_type: OrderType::Limit { price: 99.0, tif: TimeInForce::GTC },
-                    quantity: 0.5,
+                    order_type: OrderType::Limit { price: dec!(99.0), tif: TimeInForce::GTC },
+                    quantity: dec!(0.5),
                     reduce_only: false,
                     client_order_id: "c-live".to_string(),
                 }],

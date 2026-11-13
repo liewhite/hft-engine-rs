@@ -17,7 +17,8 @@
 //! ```
 
 use crate::domain::{Exchange, MarketTrade, Symbol, SymbolMeta};
-use crate::domain::StepFormatter;
+use crate::domain::{Decimal, PriceStep};
+use rust_decimal_macros::dec;
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{MarketData, MarketEvent};
 use futures_util::{SinkExt, StreamExt};
@@ -122,8 +123,8 @@ fn assert_sane(exchange_name: &str, trades: &[MarketTrade], expect_exchange: Exc
     for t in trades {
         assert_eq!(t.exchange, expect_exchange);
         assert_eq!(t.symbol, COIN, "[{exchange_name}] symbol 解析错误");
-        assert!(t.price > 0.0, "[{exchange_name}] price 必须为正");
-        assert!(t.qty > 0.0, "[{exchange_name}] qty 必须为正");
+        assert!(t.price > Decimal::ZERO, "[{exchange_name}] price 必须为正");
+        assert!(t.qty > Decimal::ZERO, "[{exchange_name}] qty 必须为正");
         assert!(
             t.timestamp > MS_EPOCH_FLOOR,
             "[{exchange_name}] 时间戳不是毫秒 epoch: {}",
@@ -193,7 +194,7 @@ async fn okx_trades_matches_codec() {
     assert_sane("OKX", &trades, Exchange::OKX);
     // 张 -> 币折算已在生产路径完成：拿原始报文的 sz（张）与解析结果（币）对账。
     // 注意 OKX 的 sz 可以是小数张（实测有 "0.03"），不能假设为整数。
-    let raw_contracts: f64 = raws
+    let raw_contracts: Decimal = raws
         .iter()
         .flat_map(|raw| {
             let v: Value = serde_json::from_str(raw).unwrap();
@@ -202,17 +203,17 @@ async fn okx_trades_matches_codec() {
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|t| t["sz"].as_str().and_then(|s| s.parse::<f64>().ok()))
+                .filter_map(|t| t["sz"].as_str().and_then(|s| s.parse::<Decimal>().ok()))
                 .collect::<Vec<_>>()
         })
         .sum();
-    let parsed_coin: f64 = trades.iter().map(|t| t.qty).sum();
+    let parsed_coin: Decimal = trades.iter().map(|t| t.qty).sum();
     let expected_coin = raw_contracts * OKX_BTC_CONTRACT_SIZE;
     assert!(
-        (parsed_coin - expected_coin).abs() < 1e-9,
+        parsed_coin == expected_coin,
         "[OKX] 张->币折算不符：原始 {raw_contracts} 张 x {OKX_BTC_CONTRACT_SIZE} = \
          {expected_coin}，解析得 {parsed_coin}（漏折算会差 {}x）",
-        1.0 / OKX_BTC_CONTRACT_SIZE
+        Decimal::ONE / OKX_BTC_CONTRACT_SIZE
     );
     println!("[OKX] 张->币对账通过: {raw_contracts} 张 -> {parsed_coin} BTC");
     // 归集粒度：count 为合并笔数，观测窗口内应出现过 count > 1
@@ -301,7 +302,7 @@ async fn hyperliquid_trades_matches_codec() {
 }
 
 /// OKX BTC-USDT-SWAP 每张合约的币本位数量（ctVal）
-const OKX_BTC_CONTRACT_SIZE: f64 = 0.01;
+const OKX_BTC_CONTRACT_SIZE: Decimal = dec!(0.01);
 
 /// 构造 OKX BTC 的 SymbolMeta（生产路径靠它做张->币折算）
 fn okx_btc_metas() -> HashMap<Symbol, SymbolMeta> {
@@ -310,9 +311,9 @@ fn okx_btc_metas() -> HashMap<Symbol, SymbolMeta> {
         SymbolMeta {
             exchange: Exchange::OKX,
             symbol: COIN.to_string(),
-            price_formatter: Arc::new(StepFormatter::new(0.1)),
-            size_step: 0.01,
-            min_order_size: 0.01,
+            price_rule: Arc::new(PriceStep::new(dec!(0.1))),
+            size_step: dec!(0.01),
+            min_order_size: dec!(0.01),
             min_notional: 0.0,
             contract_size: OKX_BTC_CONTRACT_SIZE,
         },

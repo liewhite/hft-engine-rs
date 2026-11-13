@@ -13,7 +13,7 @@
 //! accountRefresh)，并在首个事件时先投递一次初始净值，否则依赖净值的策略不会动作。
 
 use crate::backtest::source::MarketDataSource;
-use crate::domain::{Exchange, Order, OrderId, Price, Symbol, SymbolMeta, Timestamp};
+use crate::domain::{Exchange, Order, OrderId, Symbol, SymbolMeta, Timestamp};
 use crate::engine::StrategyRunner;
 use crate::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, IncomeEvent};
 use crate::sim::{SimConfig, SimState};
@@ -29,7 +29,8 @@ pub struct BacktestPosition {
     pub exchange: Exchange,
     pub symbol: Symbol,
     pub size: crate::domain::Quantity,
-    pub entry_price: Price,
+    /// 持仓均价：记账派生量（非可下单价格），与账本 `BookSnapshot` 同为 f64
+    pub entry_price: f64,
     pub unrealized_pnl: f64,
 }
 

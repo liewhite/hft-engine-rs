@@ -308,6 +308,7 @@ impl Task for IncomeProcessor {
 
 #[cfg(test)]
 mod routing_tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Exchange, Fill, FillReason, MarketTrade, Side};
     use crate::messaging::{SymbolAccountData, AccountData, MarketData};
@@ -321,8 +322,8 @@ mod routing_tests {
                 exchange: Exchange::Binance,
                 symbol: "BTC".to_string(),
                 side: Side::Long,
-                price: 100.0,
-                size: 1.0,
+                price: dec!(100.0),
+                size: dec!(1.0),
                 client_order_id: None,
                 order_id: "1".to_string(),
                 timestamp: 1,
@@ -339,8 +340,8 @@ mod routing_tests {
             data: MarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Binance,
                 symbol: "BTC".to_string(),
-                price: 100.0,
-                qty: 1.0,
+                price: dec!(100.0),
+                qty: dec!(1.0),
                 is_buyer_maker: false,
                 timestamp: 1,
             }),
@@ -398,6 +399,7 @@ mod routing_tests {
 /// 组件层：注册后按范围投递、注销后不再投递、对方停止收件不打死分发器。用 `tasks::Root` 搭树测。
 #[cfg(test)]
 mod task_tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Fill, FillReason, MarketTrade, Side};
     use crate::engine::live::executor::ExecutorMsg;
@@ -422,8 +424,8 @@ mod task_tests {
             data: MarketData::MarketTrade(MarketTrade {
                 exchange: Exchange::Binance,
                 symbol: symbol.to_string(),
-                price: 100.0,
-                qty: 1.0,
+                price: dec!(100.0),
+                qty: dec!(1.0),
                 is_buyer_maker: false,
                 timestamp: 1,
             }),
@@ -439,8 +441,8 @@ mod task_tests {
                 exchange: Exchange::Binance,
                 symbol: "BTC".to_string(),
                 side: Side::Long,
-                price: 100.0,
-                size: 1.0,
+                price: dec!(100.0),
+                size: dec!(1.0),
                 client_order_id: None,
                 order_id: "1".to_string(),
                 timestamp: 1,

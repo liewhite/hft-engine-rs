@@ -1,6 +1,6 @@
 //! Hyperliquid ExchangeClient 实现 (REST)
 
-use super::markets::{dex_of_coin, dex_offset, hl_price_formatter, DexUniverse, HlAsset, HlMarkets};
+use super::markets::{dex_of_coin, dex_offset, hl_price_rule, DexUniverse, HlAsset, HlMarkets};
 use super::symbol::from_hyperliquid;
 use crate::domain::{
     AccountInfo, Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, PlaceError, Position, Side,
@@ -14,11 +14,11 @@ use crate::exchange::hyperliquid::signing::{
     CancelResponse, OrderResponse, OrderResponseData, OrderStatus,
 };
 use crate::exchange::hyperliquid::transport::{
-    float_to_wire, EnclaveSubmitter, HlCancelIntent, HlOrderIntent, HlSubmitter, HlTif,
+    decimal_to_wire, EnclaveSubmitter, HlCancelIntent, HlOrderIntent, HlSubmitter, HlTif,
     LocalKeySubmitter,
 };
 use crate::exchange::hyperliquid::{HyperliquidCredentials, HyperliquidSigning, REST_BASE_URL};
-use crate::domain::PriceFormatter;
+use crate::domain::{Decimal, PriceRule};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -203,20 +203,21 @@ impl HyperliquidClient {
     /// 市价单的 IOC 限价：取当前盘口对手价，往不利方向让配置的 `market_order_slippage`，
     /// 按 HL 价格精度取整。多一次 `l2Book` 查询；对延迟敏感的路径应由策略自己用 BBO
     /// 下 IOC 限价单，不走市价单。
-    async fn market_limit_px(&self, coin: &str, is_buy: bool, sz_decimals: i32) -> Result<String, ExchangeError> {
+    async fn market_limit_px(&self, coin: &str, is_buy: bool, sz_decimals: u32) -> Result<String, ExchangeError> {
         let book: serde_json::Value = self
             .post_info(serde_json::json!({"type": "l2Book", "coin": coin}))
             .await?;
         let side = if is_buy { 1 } else { 0 }; // levels = [bids, asks]
         let top = book["levels"][side][0]["px"]
             .as_str()
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|p| *p > 0.0)
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .filter(|p| *p > Decimal::ZERO)
             .ok_or_else(|| ExchangeError::Other(format!("{coin} 盘口无对手价，市价单无法定价")))?;
         let slippage = self.account()?.credentials.market_order_slippage;
-        let px = if is_buy { top * (1.0 + slippage) } else { top * (1.0 - slippage) };
-        // 格式化器输出已是规范小数（无尾随零、不用科学计数法），直接用
-        Ok(hl_price_formatter(sz_decimals).format(px))
+        let slippage = crate::domain::from_f64(slippage)
+            .ok_or_else(|| ExchangeError::Other(format!("HL 市价滑点配置非法: {slippage}")))?;
+        let px = if is_buy { top * (Decimal::ONE + slippage) } else { top * (Decimal::ONE - slippage) };
+        decimal_to_wire(hl_price_rule(sz_decimals).round(px))
     }
 
     /// 将 domain Order 转换为下单意图
@@ -242,7 +243,7 @@ impl HyperliquidClient {
                     }
                     crate::domain::TimeInForce::PostOnly => HlTif::Alo,
                 };
-                (float_to_wire(*price)?, tif)
+                (decimal_to_wire(*price)?, tif)
             }
         };
 
@@ -251,7 +252,7 @@ impl HyperliquidClient {
             asset,
             is_buy,
             limit_px,
-            sz: float_to_wire(order.quantity)?,
+            sz: decimal_to_wire(order.quantity)?,
             reduce_only: order.reduce_only,
             tif,
             cloid: if order.client_order_id.is_empty() {
@@ -826,15 +827,15 @@ impl AccountClient for HyperliquidClient {
         for o in orders.into_iter().filter(|o| o.coin == target.coin) {
             // 不认识的方向当场报错：跳过会让启动撤残单漏单，漏掉的单之后成交即成外来成交
             let side = parse_side(&o.side).map_err(ExchangeError::ParseError)?;
-            let orig_sz: f64 = o
+            let orig_sz: Decimal = o
                 .orig_sz
                 .parse()
                 .map_err(|_| ExchangeError::ParseError(format!("HL origSz 非法: {}", o.orig_sz)))?;
-            let remaining: f64 = o
+            let remaining: Decimal = o
                 .sz
                 .parse()
                 .map_err(|_| ExchangeError::ParseError(format!("HL sz 非法: {}", o.sz)))?;
-            let filled = (orig_sz - remaining).max(0.0);
+            let filled = (orig_sz - remaining).max(Decimal::ZERO);
 
             // Hyperliquid 是币本位（contract_size = 1），无需折算
             updates.push(crate::domain::OrderUpdate {
@@ -845,7 +846,7 @@ impl AccountClient for HyperliquidClient {
                 exchange: Exchange::Hyperliquid,
                 symbol: symbol.clone(),
                 side,
-                status: if filled > 0.0 {
+                status: if filled > Decimal::ZERO {
                     crate::domain::OrderStatus::PartiallyFilled
                 } else {
                     crate::domain::OrderStatus::Pending
@@ -1116,6 +1117,7 @@ mod tests {
 
 #[cfg(test)]
 mod unified_account_tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::exchange::hyperliquid::testkit::{
         self, markets, state, OWN_EMPTY_STATE, OWN_SPOT, UNIFIED_MAIN, UNIFIED_SPOT, UNIFIED_XYZ,
@@ -1173,7 +1175,7 @@ mod unified_account_tests {
         let got = testkit::positions(&m, &[("", UNIFIED_MAIN), ("xyz", UNIFIED_XYZ)]);
         let mut pairs: Vec<_> = got.iter().map(|p| (p.symbol.as_str(), p.size)).collect();
         pairs.sort_by(|a, b| a.0.cmp(b.0));
-        assert_eq!(pairs, [("BCH", 500.0), ("NVDA", 1900.0), ("kPEPE", -30_000_000.0)]);
+        assert_eq!(pairs, [("BCH", dec!(500)), ("NVDA", dec!(1900)), ("kPEPE", dec!(-30000000))]);
 
         let m = markets(&["xyz"]);
         let got = testkit::positions(&m, &[("xyz", UNIFIED_XYZ)]);

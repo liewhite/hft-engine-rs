@@ -460,7 +460,6 @@ impl Manager {
             &consumers,
             PositionLedgerArgs {
                 accounts: accounts.clone(),
-                symbol_metas: symbol_metas.clone(),
                 account_bus: account_bus.clone(),
                 market_bus: market_bus.clone(),
                 interval_ms: DEFAULT_POSITION_POLL_INTERVAL_MS,

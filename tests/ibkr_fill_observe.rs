@@ -7,6 +7,8 @@
 //! - sor 推送是否带 fee
 //!
 //! 运行: cargo test ibkr_fill_observe -- --ignored --nocapture
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, TimeInForce};
 use hft_engine_rs::exchange::ibkr::{IbkrClient, IbkrCredentials};
@@ -142,7 +144,7 @@ async fn ibkr_fill_observe() {
     let meta = metas.first().expect("未找到 SymbolMeta");
 
     // IOC 买入 1 股，价格吃 ask + 滑点确保成交
-    let buy_price: f64 = meta.format_price(ask + 0.05).parse().unwrap();
+    let buy_price: Decimal = meta.format_price(hft_engine_rs::domain::from_f64(ask + 0.05).unwrap()).parse().unwrap();
     let client_oid = Exchange::IBKR.new_cli_order_id();
     let order = Order {
         id: uuid::Uuid::new_v4().to_string(),
@@ -153,7 +155,7 @@ async fn ibkr_fill_observe() {
             price: buy_price,
             tif: TimeInForce::IOC,
         },
-        quantity: 1.0,
+        quantity: dec!(1.0),
         reduce_only: false,
         client_order_id: client_oid.clone(),
     };
@@ -214,7 +216,7 @@ async fn ibkr_fill_observe() {
 
     // 8. 平仓卖出
     let (bid2, _) = client.fetch_snapshot_bbo(&symbol).await.expect("获取 BBO 失败");
-    let sell_price: f64 = meta.format_price(bid2 - 0.05).parse().unwrap();
+    let sell_price: Decimal = meta.format_price(hft_engine_rs::domain::from_f64(bid2 - 0.05).unwrap()).parse().unwrap();
     let sell_order = Order {
         id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::IBKR,
@@ -224,7 +226,7 @@ async fn ibkr_fill_observe() {
             price: sell_price,
             tif: TimeInForce::IOC,
         },
-        quantity: 1.0,
+        quantity: dec!(1.0),
         reduce_only: false,
         client_order_id: Exchange::IBKR.new_cli_order_id(),
     };

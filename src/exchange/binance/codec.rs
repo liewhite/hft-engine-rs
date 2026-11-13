@@ -1,7 +1,7 @@
 use super::from_binance;
 use crate::domain::{
     Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
-    OrderUpdate, Side, Symbol, now_ms, BBO,
+    OrderUpdate, Quantity, Side, Symbol, now_ms, Decimal, BBO,
 };
 use serde::Deserialize;
 use std::str::FromStr;
@@ -42,7 +42,7 @@ impl MarkPriceUpdate {
     pub fn to_mark_price(&self, quote: &str, timestamp: u64) -> Result<MarkPrice, String> {
         let symbol = from_binance(&self.s, quote)
             .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
-        let price = f64::from_str(&self.p)
+        let price = Decimal::from_str(&self.p)
             .map_err(|_| format!("Failed to parse mark price: {}", self.p))?;
 
         Ok(MarkPrice {
@@ -57,7 +57,7 @@ impl MarkPriceUpdate {
     pub fn to_index_price(&self, quote: &str, timestamp: u64) -> Result<IndexPrice, String> {
         let symbol = from_binance(&self.s, quote)
             .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
-        let price = f64::from_str(&self.i)
+        let price = Decimal::from_str(&self.i)
             .map_err(|_| format!("Failed to parse index price: {}", self.i))?;
 
         Ok(IndexPrice {
@@ -95,13 +95,13 @@ impl BookTicker {
     pub fn to_bbo(&self, quote: &str) -> Result<BBO, String> {
         let symbol = from_binance(&self.s, quote)
             .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
-        let bid_price = f64::from_str(&self.b)
+        let bid_price = Decimal::from_str(&self.b)
             .map_err(|_| format!("Failed to parse bid price: {}", self.b))?;
-        let bid_qty = f64::from_str(&self.bid_qty)
+        let bid_qty = Decimal::from_str(&self.bid_qty)
             .map_err(|_| format!("Failed to parse bid qty: {}", self.bid_qty))?;
-        let ask_price = f64::from_str(&self.a)
+        let ask_price = Decimal::from_str(&self.a)
             .map_err(|_| format!("Failed to parse ask price: {}", self.a))?;
-        let ask_qty = f64::from_str(&self.ask_qty)
+        let ask_qty = Decimal::from_str(&self.ask_qty)
             .map_err(|_| format!("Failed to parse ask qty: {}", self.ask_qty))?;
 
         Ok(BBO {
@@ -139,9 +139,9 @@ impl AggTrade {
     pub fn to_market_trade(&self, quote: &str) -> Result<MarketTrade, String> {
         let symbol = from_binance(&self.s, quote)
             .ok_or_else(|| format!("Unknown Binance symbol: {}", self.s))?;
-        let price = f64::from_str(&self.p)
+        let price = Decimal::from_str(&self.p)
             .map_err(|_| format!("Failed to parse trade price: {}", self.p))?;
-        let qty = f64::from_str(&self.q)
+        let qty = Decimal::from_str(&self.q)
             .map_err(|_| format!("Failed to parse trade qty: {}", self.q))?;
 
         Ok(MarketTrade {
@@ -258,14 +258,14 @@ impl OrderTradeUpdate {
     }
 
     /// 本次成交量，0 = 这条回报没有成交
-    fn last_filled(&self) -> Result<f64, String> {
-        f64::from_str(&self.o.l).map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))
+    fn last_filled(&self) -> Result<Quantity, String> {
+        Decimal::from_str(&self.o.l).map_err(|_| format!("Failed to parse last filled qty: {}", self.o.l))
     }
 
     /// 本引擎未接入的合约上的成交：原样上报（见 `AccountData::UnmappedFill`）。无成交返回 `None`。
     pub fn to_unmapped_fill(&self) -> Result<Option<crate::messaging::UnmappedFill>, String> {
         let size = self.last_filled()?;
-        if size == 0.0 {
+        if size.is_zero() {
             return Ok(None);
         }
         Ok(Some(crate::messaging::UnmappedFill {
@@ -273,7 +273,7 @@ impl OrderTradeUpdate {
             instrument: self.o.s.clone(),
             side: self.side()?,
             size,
-            price: f64::from_str(&self.o.last_price)
+            price: Decimal::from_str(&self.o.last_price)
                 .map_err(|_| format!("Failed to parse last price: {}", self.o.last_price))?,
             timestamp: now_ms(),
         }))
@@ -299,9 +299,9 @@ impl OrderTradeUpdate {
             other => return Err(format!("Binance 订单状态未知: {other}")),
         };
 
-        let quantity = f64::from_str(&self.o.q)
+        let quantity = Decimal::from_str(&self.o.q)
             .map_err(|_| format!("Failed to parse quantity: {}", self.o.q))?;
-        let filled_quantity = f64::from_str(&self.o.z)
+        let filled_quantity = Decimal::from_str(&self.o.z)
             .map_err(|_| format!("Failed to parse cumulative filled qty: {}", self.o.z))?;
 
         Ok(OrderUpdate {
@@ -322,11 +322,11 @@ impl OrderTradeUpdate {
         let fill_sz = self.last_filled()?;
 
         // 没有成交则不生成 Fill
-        if fill_sz == 0.0 {
+        if fill_sz.is_zero() {
             return Ok(None);
         }
 
-        let last_price = f64::from_str(&self.o.last_price)
+        let last_price = Decimal::from_str(&self.o.last_price)
             .map_err(|_| format!("Failed to parse last price: {}", self.o.last_price))?;
 
         let side = self.side()?;
@@ -375,6 +375,7 @@ pub struct WsError {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
     use super::*;
 
     /// 官方 aggTrade 样例载荷（含本结构未声明的 a/f/l 字段，应被忽略）
@@ -389,8 +390,8 @@ mod tests {
         let t = agg.to_market_trade("USDT").expect("to_market_trade");
         assert_eq!(t.exchange, Exchange::Binance);
         assert_eq!(t.symbol, "BTC");
-        assert_eq!(t.price, 42219.90);
-        assert_eq!(t.qty, 0.125);
+        assert_eq!(t.price, dec!(42219.90));
+        assert_eq!(t.qty, dec!(0.125));
         assert!(t.is_buyer_maker, "m=true -> 买方挂单 -> 主动卖");
         // 时间戳取 T (成交时间) 而非 E (推送时间)
         assert_eq!(t.timestamp, 123456785);

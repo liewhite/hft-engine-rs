@@ -16,8 +16,9 @@
 //! ```sh
 //! cargo test --test public_stream_noauth -- --ignored --nocapture
 //! ```
+use rust_decimal_macros::dec;
 
-use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
+use hft_engine_rs::domain::{to_f64, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{AccountBus, MarketBus};
 use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
 use hft_engine_rs::exchange::hyperliquid::{HyperliquidArgs, HyperliquidClient, HyperliquidNode};
@@ -65,12 +66,12 @@ impl Task for Collector {
                 MarketData::BBO(b) => {
                     let e = guard.entry(b.exchange).or_default();
                     e.bbo_count += 1;
-                    e.last_bbo = Some((b.bid_price, b.bid_qty, b.ask_qty));
+                    e.last_bbo = Some((to_f64(b.bid_price), to_f64(b.bid_qty), to_f64(b.ask_qty)));
                 }
                 MarketData::MarketTrade(t) => {
                     let e = guard.entry(t.exchange).or_default();
                     e.trade_count += 1;
-                    e.trade_qtys.push(t.qty);
+                    e.trade_qtys.push(to_f64(t.qty));
                 }
                 _ => {}
             }
@@ -139,7 +140,7 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
         .expect("okx BTC meta");
     println!("OKX BTC contract_size (ctVal) = {okx_contract_size}");
     assert!(
-        okx_contract_size > 0.0 && okx_contract_size < 1.0,
+        okx_contract_size > dec!(0.0) && okx_contract_size < dec!(1.0),
         "OKX BTC 每张应小于 1 币，实际 {okx_contract_size}"
     );
 
@@ -263,7 +264,7 @@ async fn noauth_bbo_and_trades_flow_through_node_path() {
         ratio < MAX_NOTIONAL_RATIO && ratio > 1.0 / MAX_NOTIONAL_RATIO,
         "OKX 最优价名义额与 Binance 相差 {ratio:.1} 倍，疑似张->币折算失效\
          （BTC ctVal={okx_contract_size}，漏折算会放大 {:.0} 倍）",
-        1.0 / okx_contract_size
+        1.0 / to_f64(okx_contract_size)
     );
 
     // OKX 成交量也应是币本位：avg 成交量与 Binance 同量级

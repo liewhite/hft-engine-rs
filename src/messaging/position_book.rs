@@ -107,13 +107,15 @@ impl PositionBook {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{AccountId, Exchange, Fill, FillReason, Position, Side};
 
     const EX: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
 
-    fn fill_event(account: AccountId, size: f64, local_ts: u64) -> AccountEvent {
+    fn fill_event(account: AccountId, size: Decimal, local_ts: u64) -> AccountEvent {
         AccountEvent {
             account,
             exchange_ts: local_ts,
@@ -122,7 +124,7 @@ mod tests {
                 exchange: EX,
                 symbol: SYM.to_string(),
                 side: Side::Long,
-                price: 100.0,
+                price: dec!(100.0),
                 size,
                 client_order_id: None,
                 order_id: "1".to_string(),
@@ -140,14 +142,14 @@ mod tests {
             position: Position {
                 exchange: EX,
                 symbol: SYM.to_string(),
-                size: 2.0,
+                size: dec!(2.0),
             },
             snapshot_req_ts: 1,
         }]);
         b
     }
 
-    fn size_of(b: &PositionBook) -> f64 {
+    fn size_of(b: &PositionBook) -> Decimal {
         b.seeded_positions().map(|p| p.size).sum()
     }
 
@@ -158,22 +160,22 @@ mod tests {
     #[test]
     fn paper_fills_never_touch_the_live_book() {
         let mut b = book();
-        b.apply(&fill_event(AccountId::Paper(SYM.to_string()), 5.0, 10));
-        assert_eq!(size_of(&b), 2.0, "模拟成交不得改变实盘账本");
+        b.apply(&fill_event(AccountId::Paper(SYM.to_string()), dec!(5.0), 10));
+        assert_eq!(size_of(&b), dec!(2.0), "模拟成交不得改变实盘账本");
 
-        b.apply(&fill_event(AccountId::Live, 5.0, 10));
-        assert_eq!(size_of(&b), 7.0, "实盘成交照常累加");
+        b.apply(&fill_event(AccountId::Live, dec!(5.0), 10));
+        assert_eq!(size_of(&b), dec!(7.0), "实盘成交照常累加");
     }
 
     /// 跟踪范围外的 symbol 静默丢弃（分桶部署下账户级私有流必然带来其他桶的成交）
     #[test]
     fn fills_for_untracked_symbols_are_dropped() {
         let mut b = book();
-        let mut ev = fill_event(AccountId::Live, 5.0, 10);
+        let mut ev = fill_event(AccountId::Live, dec!(5.0), 10);
         if let AccountData::Symbol(SymbolAccountData::Fill(f)) = &mut ev.data {
             f.symbol = "ETH".to_string();
         }
         b.apply(&ev);
-        assert_eq!(size_of(&b), 2.0, "别的桶的成交不得进本实例账本");
+        assert_eq!(size_of(&b), dec!(2.0), "别的桶的成交不得进本实例账本");
     }
 }

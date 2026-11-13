@@ -25,7 +25,9 @@
 //! ```
 
 use anyhow::Context;
-use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
+use hft_engine_rs::domain::{
+    from_f64, to_f64, Decimal, Exchange, Order, OrderType, Side, Symbol, TimeInForce,
+};
 use hft_engine_rs::engine::{load_config, run_engine, run_main, setup_all, ExchangesConfig, ManagerArgs, StrategySpec};
 use hft_engine_rs::exchange::SubscriptionKind;
 use hft_engine_rs::messaging::{IncomeEvent, MarketData, MarketEvent};
@@ -84,14 +86,21 @@ impl Strategy for DipMaker {
             return Vec::new();
         };
         // 有仓位或有挂单就不动（本演示策略不做平仓）
-        if symbol_state.position_size(self.exchange).abs() > 0.0
+        if !symbol_state.position_size(self.exchange).is_zero()
             || symbol_state.pending_orders().next().is_some()
         {
             return Vec::new();
         }
 
-        let price = bbo.bid_price * (1.0 - self.offset_bp / 10_000.0);
-        let quantity = self.order_notional / price;
+        // 偏移 bp 与名义额是配置里的 f64 比率 / 金额：偏移折成 Decimal 乘到价格上，
+        // 数量 = 名义额 ÷ 价格 折成意图量（下单时框架按步长取整）。折不出来就不下单。
+        let Some(offset) = from_f64(self.offset_bp / 10_000.0) else {
+            return Vec::new();
+        };
+        let price = bbo.bid_price * (Decimal::ONE - offset);
+        let Some(quantity) = from_f64(self.order_notional / to_f64(price)) else {
+            return Vec::new();
+        };
         vec![OutcomeEvent::PlaceOrders {
             orders: vec![Order {
                 id: String::new(),

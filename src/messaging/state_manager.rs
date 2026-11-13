@@ -333,6 +333,8 @@ impl StateManager {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Fill, FillReason, Side};
     use crate::messaging::SymbolAccountData;
@@ -340,7 +342,7 @@ mod tests {
     const EX: Exchange = Exchange::Binance;
     const SYM: &str = "BTC";
 
-    fn position(size: f64) -> Position {
+    fn position(size: Decimal) -> Position {
         Position {
             exchange: EX,
             symbol: SYM.to_string(),
@@ -348,14 +350,14 @@ mod tests {
         }
     }
 
-    fn baseline(size: f64, snapshot_req_ts: Timestamp) -> PositionBaseline {
+    fn baseline(size: Decimal, snapshot_req_ts: Timestamp) -> PositionBaseline {
         PositionBaseline {
             position: position(size),
             snapshot_req_ts,
         }
     }
 
-    fn fill_at(size: f64, local_ts: Timestamp) -> IncomeEvent {
+    fn fill_at(size: Decimal, local_ts: Timestamp) -> IncomeEvent {
         IncomeEvent::account(
             crate::domain::AccountId::Live,
             local_ts,
@@ -364,7 +366,7 @@ mod tests {
                 exchange: EX,
                 symbol: SYM.to_string(),
                 side: Side::Long,
-                price: 100.0,
+                price: dec!(100.0),
                 size,
                 client_order_id: None,
                 order_id: "1".to_string(),
@@ -379,11 +381,11 @@ mod tests {
     #[test]
     fn seed_is_idempotent_and_never_overwrites() {
         let mut manager = StateManager::new(&[SYM.to_string()]);
-        manager.seed_positions(&[baseline(2.0, 10)]);
-        manager.seed_positions(&[baseline(99.0, 20)]);
+        manager.seed_positions(&[baseline(dec!(2.0), 10)]);
+        manager.seed_positions(&[baseline(dec!(99.0), 20)]);
 
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(state.position_book().position_size(EX), 2.0, "重复 seed 不得覆写存量");
+        assert_eq!(state.position_book().position_size(EX), dec!(2.0), "重复 seed 不得覆写存量");
     }
 
     /// **防双计**：快照请求时刻之前送达的 Fill 已含在快照里，seed 之后到达必须丢弃；
@@ -392,31 +394,31 @@ mod tests {
     fn fills_covered_by_snapshot_are_dropped_after_seed() {
         let mut manager = StateManager::new(&[SYM.to_string()]);
         // 快照请求时刻 t=10，读到存量 2.0
-        manager.seed_positions(&[baseline(2.0, 10)]);
+        manager.seed_positions(&[baseline(dec!(2.0), 10)]);
 
         // t=5 送达的 Fill（成交已含在快照里）迟到进入 —— 丢弃
-        manager.apply(&fill_at(1.0, 5)).unwrap();
+        manager.apply(&fill_at(dec!(1.0), 5)).unwrap();
         // t=15 送达的 Fill 是快照之后的新成交 —— 累加
-        manager.apply(&fill_at(1.0, 15)).unwrap();
+        manager.apply(&fill_at(dec!(1.0), 15)).unwrap();
 
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(state.position_book().position_size(EX), 3.0, "应为 2.0(快照) + 1.0(新成交)");
+        assert_eq!(state.position_book().position_size(EX), dec!(3.0), "应为 2.0(快照) + 1.0(新成交)");
     }
 
     /// 未 seed 的所从 0 起算（模拟账户、未配置凭证的所）：Fill 直接累加，不受过滤影响
     #[test]
     fn unseeded_exchange_accumulates_from_zero() {
         let mut manager = StateManager::new(&[SYM.to_string()]);
-        manager.apply(&fill_at(1.5, 5)).unwrap();
+        manager.apply(&fill_at(dec!(1.5), 5)).unwrap();
         let state = manager.symbol_state(&SYM.to_string()).expect("state");
-        assert_eq!(state.position_book().position_size(EX), 1.5);
+        assert_eq!(state.position_book().position_size(EX), dec!(1.5));
     }
 
     /// 未注册 symbol 的基线被跳过（不 panic、不隐式建状态）
     #[test]
     fn baseline_for_unregistered_symbol_is_skipped() {
         let mut manager = StateManager::new(&[]);
-        manager.seed_positions(&[baseline(2.0, 10)]);
+        manager.seed_positions(&[baseline(dec!(2.0), 10)]);
         assert!(manager.symbol_state(&SYM.to_string()).is_none());
     }
 }

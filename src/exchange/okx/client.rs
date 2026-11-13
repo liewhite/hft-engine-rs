@@ -9,7 +9,7 @@ use crate::exchange::okx::codec::{parse_account_info, GreeksData, PositionData};
 use crate::exchange::client::{place_send_error, AccountClient, ExchangeClient, ExchangeOrder};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::REST_BASE_URL;
-use crate::domain::StepFormatter;
+use crate::domain::{Decimal, PriceStep};
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
@@ -60,7 +60,7 @@ impl OkxClient {
     }
 
     /// 取该 symbol 的合约乘数 (张 -> 币)，读合约目录
-    async fn contract_size_of(&self, symbol: &Symbol) -> Result<f64, ExchangeError> {
+    async fn contract_size_of(&self, symbol: &Symbol) -> Result<Decimal, ExchangeError> {
         self.instruments()
             .await?
             .iter()
@@ -160,12 +160,12 @@ impl OkxClient {
             let Some(symbol) = from_okx(&d.inst_id, &self.quote) else {
                 continue;
             };
-            let positive = |raw: &str| raw.parse::<f64>().ok().filter(|&v| v > 0.0);
+            let positive = |raw: &str| raw.parse::<Decimal>().ok().filter(|v| *v > Decimal::ZERO);
             let parsed = (|| {
                 Some(SymbolMeta {
                     exchange: Exchange::OKX,
                     symbol,
-                    price_formatter: Arc::new(StepFormatter::new(positive(&d.tick_sz)?)),
+                    price_rule: Arc::new(PriceStep::new(positive(&d.tick_sz)?)),
                     size_step: positive(&d.lot_sz)?,
                     min_order_size: positive(&d.min_sz)?,
                     min_notional: 0.0,
@@ -341,7 +341,7 @@ struct PendingOrdersResponse {
 fn parse_pending_order(
     d: &PendingOrderData,
     quote: &str,
-    contract_size: f64,
+    contract_size: Decimal,
 ) -> Result<OrderUpdate, ExchangeError> {
     let fail = |field: &str, raw: &str| {
         ExchangeError::Other(format!(
@@ -362,12 +362,12 @@ fn parse_pending_order(
     };
     let quantity = d
         .sz
-        .parse::<f64>()
+        .parse::<Decimal>()
         .map(|v| v * contract_size)
         .map_err(|_| fail("sz", &d.sz))?;
     let filled_quantity = d
         .acc_fill_sz
-        .parse::<f64>()
+        .parse::<Decimal>()
         .map(|v| v * contract_size)
         .map_err(|_| fail("accFillSz", &d.acc_fill_sz))?;
 
@@ -876,6 +876,7 @@ mod account_info_tests {
 
 #[cfg(test)]
 mod pending_orders_tests {
+    use rust_decimal_macros::dec;
     use super::*;
 
     fn raw(cl_ord_id: Option<&str>) -> PendingOrderData {
@@ -893,10 +894,10 @@ mod pending_orders_tests {
     /// 张 -> 币折算贯穿数量字段（ExchangeClient 的契约是币本位）
     #[test]
     fn quantities_are_converted_to_coin_unit() {
-        let u = parse_pending_order(&raw(Some("x-abc")), "USDT", 0.01).unwrap();
+        let u = parse_pending_order(&raw(Some("x-abc")), "USDT", dec!(0.01)).unwrap();
         assert_eq!(u.symbol, "BTC");
         assert_eq!(u.side, Side::Long);
-        assert!((u.quantity - 0.03).abs() < 1e-12, "sz 3 张 × 0.01 = 0.03 币");
+        assert_eq!(u.quantity, dec!(0.03), "sz 3 张 × 0.01 = 0.03 币");
         assert_eq!(u.client_order_id.as_deref(), Some("x-abc"));
     }
 
@@ -906,7 +907,7 @@ mod pending_orders_tests {
     #[test]
     fn missing_client_order_id_stays_none() {
         for missing in [None, Some("")] {
-            let u = parse_pending_order(&raw(missing), "USDT", 1.0).unwrap();
+            let u = parse_pending_order(&raw(missing), "USDT", dec!(1.0)).unwrap();
             assert_eq!(
                 u.client_order_id, None,
                 "clOrdId 缺失时被编造成了 {:?} —— 撤单复查的活单保护会失效",
@@ -929,7 +930,7 @@ mod pending_orders_tests {
         for (field, corrupt) in cases {
             let mut d = raw(Some("x-abc"));
             corrupt(&mut d);
-            let err = parse_pending_order(&d, "USDT", 1.0).unwrap_err();
+            let err = parse_pending_order(&d, "USDT", dec!(1.0)).unwrap_err();
             assert!(
                 err.to_string().contains(field),
                 "{field} 解析失败应让整份快照报错（含字段名以便定位），实际: {err}"

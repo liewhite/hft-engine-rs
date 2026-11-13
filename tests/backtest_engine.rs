@@ -3,10 +3,10 @@
 
 use hft_engine_rs::backtest::{BacktestEngine, BacktestResult, MarketDataSource};
 use hft_engine_rs::domain::{
-    Exchange, Order, OrderType, Price, Symbol, SymbolMeta, Side, TimeInForce, Timestamp, BBO,
+    dec, Exchange, Order, OrderType, Price, Symbol, SymbolMeta, Side, TimeInForce, Timestamp, BBO,
 };
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
-use hft_engine_rs::domain::StepFormatter;
+use hft_engine_rs::domain::PriceStep;
 use hft_engine_rs::exchange::SubscriptionKind;
 use hft_engine_rs::messaging::{SymbolAccountData, ExchangeAccountData, AccountData, IncomeEvent, MarketData};
 use hft_engine_rs::sim::SimConfig;
@@ -23,11 +23,11 @@ fn metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
     let meta = SymbolMeta {
         exchange: EX,
         symbol: SYM.to_string(),
-        price_formatter: Arc::new(StepFormatter::new(0.01)),
-        size_step: 0.001,
-        min_order_size: 0.001,
+        price_rule: Arc::new(PriceStep::new(dec!(0.01))),
+        size_step: dec!(0.001),
+        min_order_size: dec!(0.001),
         min_notional: 0.0,
-        contract_size: 1.0,
+        contract_size: dec!(1.0),
     };
     let mut m = HashMap::new();
     m.insert((EX, SYM.to_string()), meta);
@@ -42,9 +42,9 @@ fn bbo_ev(bid: Price, ask: Price, ts: Timestamp) -> IncomeEvent {
             exchange: EX,
             symbol: SYM.to_string(),
             bid_price: bid,
-            bid_qty: 1.0,
+            bid_qty: dec!(1.0),
             ask_price: ask,
-            ask_qty: 1.0,
+            ask_qty: dec!(1.0),
             timestamp: ts,
         }),
     )
@@ -58,7 +58,7 @@ fn trade_ev(price: Price, ts: Timestamp) -> IncomeEvent {
             exchange: EX,
             symbol: SYM.to_string(),
             price,
-            qty: 1.0,
+            qty: dec!(1.0),
             is_buyer_maker: false,
             timestamp: ts,
         }),
@@ -106,7 +106,7 @@ impl Strategy for OneShotBuy {
                         price: self.price,
                         tif: self.tif,
                     },
-                    quantity: 1.0,
+                    quantity: dec!(1.0),
                     reduce_only: false,
                     client_order_id: String::new(),
                 }],
@@ -147,14 +147,14 @@ fn event_sig(ev: &IncomeEvent) -> String {
 fn run_bbo() -> (BacktestResult, Vec<String>) {
     let source = FixedSource {
         evs: vec![
-            bbo_ev(100.0, 100.1, 1000), // 挂买单 @100 (PostOnly, 不可成交 -> resting)
-            bbo_ev(99.8, 99.9, 2000),   // ask 99.9 <= 100 -> 越价, resting 买单成交 @100
-            bbo_ev(99.7, 99.8, 3000),
+            bbo_ev(dec!(100.0), dec!(100.1), 1000), // 挂买单 @100 (PostOnly, 不可成交 -> resting)
+            bbo_ev(dec!(99.8), dec!(99.9), 2000),   // ask 99.9 <= 100 -> 越价, resting 买单成交 @100
+            bbo_ev(dec!(99.7), dec!(99.8), 3000),
         ],
     };
     let runner = StrategyRunner::with_id_gen(
         Box::new(OneShotBuy {
-            price: 100.0,
+            price: dec!(100.0),
             tif: TimeInForce::PostOnly,
             placed: false,
         }),
@@ -184,7 +184,7 @@ fn resting_order_crossed_one_fill_pos_plus_one() {
     assert_eq!(r.market_events, 3);
     assert_eq!(r.realized_pnl, 0.0); // 只开仓未平仓
     let pos = r.positions.iter().find(|p| p.symbol == SYM).unwrap();
-    assert!((pos.size - 1.0).abs() < 1e-9);
+    assert_eq!(pos.size, dec!(1));
     // 未实现 = (mark 99.75 - entry 100) * 1 = -0.25; equity = 10000 - 0.25
     assert!((r.final_equity - (10_000.0 - 0.25)).abs() < 1e-6);
 }
@@ -205,14 +205,14 @@ fn trade_print_matching_fills_resting_limit() {
     // 纯 trades 行情：挂 GTC 买单 @100 (无 BBO -> resting)，成交价 99 < 100 越价 -> 成交 @100。
     let source = FixedSource {
         evs: vec![
-            trade_ev(100.0, 1000), // 触发挂单
-            trade_ev(99.0, 2000),  // 99 < 100 -> 越价成交
-            trade_ev(98.0, 3000),
+            trade_ev(dec!(100.0), 1000), // 触发挂单
+            trade_ev(dec!(99.0), 2000),  // 99 < 100 -> 越价成交
+            trade_ev(dec!(98.0), 3000),
         ],
     };
     let runner = StrategyRunner::with_id_gen(
         Box::new(OneShotBuy {
-            price: 100.0,
+            price: dec!(100.0),
             tif: TimeInForce::GTC,
             placed: false,
         }),
@@ -229,7 +229,7 @@ fn trade_print_matching_fills_resting_limit() {
     assert_eq!(r.fills, 1);
     assert_eq!(r.market_events, 3);
     let pos = r.positions.iter().find(|p| p.symbol == SYM).unwrap();
-    assert!((pos.size - 1.0).abs() < 1e-9);
+    assert_eq!(pos.size, dec!(1));
     // entry 100, 末次成交价估值 98 -> 未实现 (98-100)*1 = -2; equity = 9998
     assert!((r.final_equity - 9_998.0).abs() < 1e-6);
 }
@@ -256,7 +256,7 @@ impl Strategy for EmitOnBbo {
                 Vec::new()
             }
             MarketData::BBO(b) => vec![OutcomeEvent::Emit(
-                hft_engine_rs::messaging::CustomEvent::new(PingSignal { mid: (b.bid_price + b.ask_price) / 2.0 }),
+                hft_engine_rs::messaging::CustomEvent::new(PingSignal { mid: (b.bid_price + b.ask_price) / dec!(2) }),
             )],
             _ => Vec::new(),
         }
@@ -265,7 +265,7 @@ impl Strategy for EmitOnBbo {
 
 #[derive(Debug)]
 struct PingSignal {
-    mid: f64,
+    mid: Price,
 }
 
 /// **回环不可能**：策略 emit 的自定义事件只到达旁路观察者（等价实盘 Outcome 总线的
@@ -274,7 +274,7 @@ struct PingSignal {
 #[test]
 fn emitted_custom_events_reach_observers_but_never_strategies() {
     let source = FixedSource {
-        evs: vec![bbo_ev(100.0, 100.1, 1000), bbo_ev(100.2, 100.3, 2000)],
+        evs: vec![bbo_ev(dec!(100.0), dec!(100.1), 1000), bbo_ev(dec!(100.2), dec!(100.3), 2000)],
     };
     let seen_by_strategy = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let runner = StrategyRunner::with_id_gen(
@@ -283,7 +283,7 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
         hft_engine_rs::backtest::backtest_account(),
         Box::new(SequentialClientOrderIdGen::default()),
     );
-    let seen_by_observer: Rc<RefCell<Vec<(usize, f64)>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen_by_observer: Rc<RefCell<Vec<(usize, Price)>>> = Rc::new(RefCell::new(Vec::new()));
     let obs_sink = Rc::clone(&seen_by_observer);
     {
         let mut engine = BacktestEngine::new(&source, vec![runner], SimConfig::default(), metas())
@@ -302,7 +302,7 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
     );
     assert_eq!(
         *seen_by_observer.borrow(),
-        vec![(0, 100.05), (0, 100.25)],
+        vec![(0, dec!(100.05)), (0, dec!(100.25))],
         "outcome 观察者应逐条收到 emit 的事件（带发出者下标）并能按类型取回内容"
     );
 }

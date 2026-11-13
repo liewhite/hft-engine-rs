@@ -3,6 +3,8 @@
 //! 运行前需要设置环境变量:
 //! - HYPERLIQUID_WALLET_ADDRESS (0x...)
 //! - HYPERLIQUID_PRIVATE_KEY (不含 0x 前缀)
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::exchange::hyperliquid::{HyperliquidClient, HyperliquidCredentials};
@@ -17,7 +19,7 @@ const TEST_QUOTE: &str = "USDC"; // Hyperliquid 使用 USDC
 const TEST_DEX: &str = "";
 
 /// 测试数量 - 请根据实际情况填写
-const TEST_QUANTITY: f64 = 0.001; // TODO: 填写测试数量
+const TEST_QUANTITY: Decimal = dec!(0.001); // TODO: 填写测试数量
 
 /// 从环境变量获取凭证
 fn get_credentials() -> Option<HyperliquidCredentials> {
@@ -41,7 +43,7 @@ struct Level {
 }
 
 /// 获取 BBO (REST API)
-async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+async fn fetch_bbo(symbol: &Symbol) -> Result<(Decimal, Decimal), Box<dyn std::error::Error>> {
     let client = Client::new();
     let coin = symbol; // Hyperliquid 使用 base 作为 coin 名
 
@@ -64,8 +66,8 @@ async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Er
     let best_bid = bids.first().ok_or("No bid level")?;
     let best_ask = asks.first().ok_or("No ask level")?;
 
-    let bid: f64 = best_bid.px.parse()?;
-    let ask: f64 = best_ask.px.parse()?;
+    let bid: Decimal = best_bid.px.parse()?;
+    let ask: Decimal = best_ask.px.parse()?;
 
     Ok((bid, ask))
 }
@@ -95,7 +97,7 @@ async fn test_hyperliquid_limit_buy() {
 
     // 格式化价格
     let formatted_price = meta.format_price(ask);
-    let price: f64 = formatted_price.parse().expect("价格解析失败");
+    let price: Decimal = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", ask, price);
 
     let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple().to_string());
@@ -145,7 +147,7 @@ async fn test_hyperliquid_limit_sell() {
 
     // 格式化价格
     let formatted_price = meta.format_price(bid);
-    let price: f64 = formatted_price.parse().expect("价格解析失败");
+    let price: Decimal = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", bid, price);
 
     let cli_id = format!("0x{}", uuid::Uuid::new_v4().simple().to_string());

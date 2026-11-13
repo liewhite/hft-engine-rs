@@ -14,7 +14,7 @@ use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
 use hft_engine_rs::backtest::{
     BacktestEngine, BinanceDataKind, BinanceHistory, BsGreeksConfig, BsGreeksSource,
 };
-use hft_engine_rs::domain::{Exchange, Symbol, SymbolMeta};
+use hft_engine_rs::domain::{to_f64, Exchange, Symbol, SymbolMeta};
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::exchange::binance::BinanceClient;
 use hft_engine_rs::exchange::ExchangeClient;
@@ -144,7 +144,8 @@ fn main() -> anyhow::Result<()> {
                 match ev {
                     IncomeEvent::Market(m) => {
                         if let MarketData::MarketTrade(t) = &m.data {
-                            s.last_price = t.price;
+                            // 采样器只做 PnL 曲线统计，成交价在此转 f64
+                            s.last_price = to_f64(t.price);
                         }
                     }
                     IncomeEvent::Account(a) => {

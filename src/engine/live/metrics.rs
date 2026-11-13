@@ -17,7 +17,7 @@
 
 use super::{ExecutorId, OrderRequestCounts};
 use std::sync::Arc;
-use crate::domain::{now_ms, AccountId, Exchange, Symbol, Timestamp, TradingStats};
+use crate::domain::{now_ms, to_f64, AccountId, Exchange, Quantity, Symbol, Timestamp, TradingStats};
 use crate::messaging::{
     AccountBus, AccountData, AccountEvent, ExchangeAccountData, IncomeEvent, MarketBus,
     MarketEvent, PositionBaseline, RequestOutcome, StateManager, SymbolAccountData, SymbolState,
@@ -51,7 +51,7 @@ const NO_PER_SYMBOL_FILL_DETAIL: usize = 0;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SymbolExposure {
     /// 各交易所带符号仓位之和（净敞口，币本位）
-    pub net_size: f64,
+    pub net_size: Quantity,
     /// Σ |仓位| × mid（总名义敞口）
     pub gross_notional: f64,
     /// Σ 仓位 × mid（净名义敞口，理想对冲下应接近 0）
@@ -71,7 +71,7 @@ pub struct SymbolExposure {
 ///
 /// `baseline` 为各所的会话起始仓位（缺失视为 0）。缺 BBO 的腿不参与估值但计入
 /// `unpriced_legs` —— 宁可显式暴露"估值不完整"，也不用兜底价格伪造一个看似完整的数字。
-fn exposure_of(state: &SymbolState, baseline: Option<&HashMap<Exchange, f64>>) -> SymbolExposure {
+fn exposure_of(state: &SymbolState, baseline: Option<&HashMap<Exchange, Quantity>>) -> SymbolExposure {
     let mut exposure = SymbolExposure::default();
     for position in state.position_book().all() {
         if position.is_empty() {
@@ -85,10 +85,10 @@ fn exposure_of(state: &SymbolState, baseline: Option<&HashMap<Exchange, f64>>) -
                 let base = baseline
                     .and_then(|b| b.get(&position.exchange))
                     .copied()
-                    .unwrap_or(0.0);
-                exposure.gross_notional += position.size.abs() * mid;
-                exposure.net_notional += position.size * mid;
-                exposure.session_notional_delta += (position.size - base) * mid;
+                    .unwrap_or(Quantity::ZERO);
+                exposure.gross_notional += to_f64(position.size.abs() * mid);
+                exposure.net_notional += to_f64(position.size * mid);
+                exposure.session_notional_delta += to_f64((position.size - base) * mid);
             }
             None => exposure.unpriced_legs += 1,
         }
@@ -123,7 +123,7 @@ struct MetricsView {
     ///
     /// 取自投产握手 [`MetricsHandle::register_symbols`] 携带的基线（每个 (symbol, 所) 只记第一条，
     /// 与 `SymbolState` 的 seed 语义一致）。用于把重启前的存货从盈亏里剔除。
-    baseline: HashMap<Symbol, HashMap<Exchange, f64>>,
+    baseline: HashMap<Symbol, HashMap<Exchange, Quantity>>,
     /// per-symbol 累计成交统计
     per_symbol: HashMap<Symbol, TradingStats>,
     /// 全账户累计成交统计
@@ -333,7 +333,7 @@ impl MetricsView {
     }
 
     /// 记录会话起始仓位基线（每个 (symbol, exchange) 只记一次）
-    fn record_baseline(&mut self, symbol: &Symbol, exchange: Exchange, size: f64) {
+    fn record_baseline(&mut self, symbol: &Symbol, exchange: Exchange, size: Quantity) {
         self.baseline
             .entry(symbol.clone())
             .or_default()
@@ -362,8 +362,8 @@ impl MetricsView {
                 exchange = %fill.exchange,
                 symbol = %fill.symbol,
                 side = %fill.side,
-                price = fill.price,
-                size = fill.size,
+                price = %fill.price,
+                size = %fill.size,
                 fee = fill.fee,
                 reason = ?fill.reason,
                 ts = fill.timestamp,
@@ -437,7 +437,7 @@ impl MetricsView {
             let session_pnl = stats
                 .map(|s| s.total_pnl(exposure.session_notional_delta))
                 .unwrap_or(0.0);
-            prom.gauge("hft_position_net_size", &[("symbol", sym_label)], exposure.net_size);
+            prom.gauge("hft_position_net_size", &[("symbol", sym_label)], to_f64(exposure.net_size));
             prom.gauge(
                 "hft_position_gross_notional",
                 &[("symbol", sym_label)],
@@ -456,9 +456,9 @@ impl MetricsView {
                 }
                 let ex_label = position.exchange.to_string();
                 let labels = [("symbol", sym_label), ("exchange", ex_label.as_str())];
-                prom.gauge("hft_position_size", &labels, position.size);
+                prom.gauge("hft_position_size", &labels, to_f64(position.size));
                 if let Some(bbo) = symbol_state.market().bbo(position.exchange) {
-                    prom.gauge("hft_position_notional", &labels, position.size * bbo.mid_price());
+                    prom.gauge("hft_position_notional", &labels, to_f64(position.size * bbo.mid_price()));
                 }
             }
             prom.gauge(
@@ -476,7 +476,7 @@ impl MetricsView {
                 target: "metrics",
                 %symbol,
                 legs = exposure.legs,
-                net_size = format!("{:.6}", exposure.net_size),
+                net_size = %exposure.net_size,
                 gross_notional = format!("{:.2}", exposure.gross_notional),
                 net_notional = format!("{:.2}", exposure.net_notional),
                 unpriced_legs = exposure.unpriced_legs,
@@ -794,11 +794,13 @@ impl Task for Metrics {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::{Fill, FillReason, Position, Side};
 
     /// 投产握手的基线载荷（snapshot_req_ts=0；需要累加的 Fill 应带 local_ts > 0）
-    fn baseline_of(symbol: &str, size: f64) -> crate::messaging::PositionBaseline {
+    fn baseline_of(symbol: &str, size: Decimal) -> crate::messaging::PositionBaseline {
         crate::messaging::PositionBaseline {
             position: Position {
                 exchange: Exchange::Binance,
@@ -809,12 +811,12 @@ mod tests {
         }
     }
 
-    fn fill_data(exchange: Exchange, symbol: &str, side: Side, size: f64) -> AccountData {
+    fn fill_data(exchange: Exchange, symbol: &str, side: Side, size: Decimal) -> AccountData {
         AccountData::Symbol(SymbolAccountData::Fill(Fill {
             exchange,
             symbol: symbol.to_string(),
             side,
-            price: 100.0,
+            price: dec!(100.0),
             size,
             client_order_id: None,
             order_id: "1".to_string(),
@@ -845,7 +847,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let register = || (vec!["BTC".to_string()], vec![baseline_of("BTC", 1.0)]);
+        let register = || (vec!["BTC".to_string()], vec![baseline_of("BTC", dec!(1.0))]);
         let (symbols, baselines) = register();
         handle.register_symbols(symbols, baselines).await.expect("注册应完成");
         root.shutdown().await.unwrap();
@@ -1024,8 +1026,8 @@ mod tests {
     fn per_exchange_legs_are_reported() {
         let mut metrics = view();
         metrics.register(vec!["BTC".to_string()], Vec::new());
-        metrics.on_account(live(fill_data(Exchange::Binance, "BTC", Side::Long, 1.0)));
-        metrics.on_account(live(fill_data(Exchange::OKX, "BTC", Side::Short, 1.0)));
+        metrics.on_account(live(fill_data(Exchange::Binance, "BTC", Side::Long, dec!(1.0))));
+        metrics.on_account(live(fill_data(Exchange::OKX, "BTC", Side::Short, dec!(1.0))));
         let body = metrics.render().into_body();
         assert_eq!(line_value(&body, "hft_position_size{symbol=\"BTC\",exchange=\"Binance\"}"), Some(1.0), "{body}");
         assert_eq!(line_value(&body, "hft_position_size{symbol=\"BTC\",exchange=\"OKX\"}"), Some(-1.0), "{body}");
@@ -1057,7 +1059,7 @@ mod tests {
         metrics.state.register_symbols(&["BTC".to_string()]);
 
         let account = crate::domain::AccountId::Paper("BTC".to_string());
-        let data = fill_data(Exchange::Binance, "BTC", Side::Long, 1.0);
+        let data = fill_data(Exchange::Binance, "BTC", Side::Long, dec!(1.0));
         // 调 handler 委托的真实分账方法：将来有人在里面误加 state.apply，本测试会红
         metrics.apply_paper_event(&account, &data);
 
@@ -1069,7 +1071,7 @@ mod tests {
                 .symbol_state(&"BTC".to_string())
                 .unwrap()
                 .position_book().position_size(Exchange::Binance),
-            0.0,
+            dec!(0.0),
             "模拟成交不得进实盘持仓镜像"
         );
     }
@@ -1081,12 +1083,12 @@ mod tests {
         metrics.state.register_symbols(&["BTC".to_string()]);
 
         // 启动快照 2.0，随后又来一条 Position（不应覆盖基线）
-        metrics.record_baseline(&"BTC".to_string(), Exchange::Binance, 2.0);
-        metrics.record_baseline(&"BTC".to_string(), Exchange::Binance, 9.0);
+        metrics.record_baseline(&"BTC".to_string(), Exchange::Binance, dec!(2.0));
+        metrics.record_baseline(&"BTC".to_string(), Exchange::Binance, dec!(9.0));
 
         assert_eq!(
             metrics.baseline["BTC"][&Exchange::Binance],
-            2.0,
+            dec!(2.0),
             "基线只取第一次快照"
         );
     }
@@ -1102,7 +1104,7 @@ mod tests {
             account: AccountId::Live,
             exchange_ts: 1,
             local_ts: 1,
-            data: fill_data(Exchange::Binance, "ETH", Side::Long, 1.0),
+            data: fill_data(Exchange::Binance, "ETH", Side::Long, dec!(1.0)),
         });
 
         assert_eq!(metrics.untracked_events, 1);
@@ -1117,8 +1119,8 @@ mod tests {
         metrics.state.register_symbols(&[symbol.clone()]);
 
         // 启动时已有 2 个多头（重启场景）：投产握手 seed 基线
-        metrics.record_baseline(&symbol, Exchange::Binance, 2.0);
-        metrics.state.seed_positions(&[baseline_of(&symbol, 2.0)]);
+        metrics.record_baseline(&symbol, Exchange::Binance, dec!(2.0));
+        metrics.state.seed_positions(&[baseline_of(&symbol, dec!(2.0))]);
         // 喂 BBO 让持仓可估值
         metrics.state.apply(&IncomeEvent::market(
             0,
@@ -1126,10 +1128,10 @@ mod tests {
             crate::messaging::MarketData::BBO(crate::domain::BBO {
                 exchange: Exchange::Binance,
                 symbol: symbol.clone(),
-                bid_price: 100.0,
-                bid_qty: 1.0,
-                ask_price: 100.0,
-                ask_qty: 1.0,
+                bid_price: dec!(100.0),
+                bid_qty: dec!(1.0),
+                ask_price: dec!(100.0),
+                ask_qty: dec!(1.0),
                 timestamp: 0,
             }),
         )).unwrap();
@@ -1150,12 +1152,12 @@ mod tests {
         metrics.tracked.insert(symbol.clone());
         metrics.state.register_symbols(&[symbol.clone()]);
 
-        metrics.record_baseline(&symbol, Exchange::Binance, 2.0);
-        metrics.state.seed_positions(&[baseline_of(&symbol, 2.0)]);
+        metrics.record_baseline(&symbol, Exchange::Binance, dec!(2.0));
+        metrics.state.seed_positions(&[baseline_of(&symbol, dec!(2.0))]);
 
         // 本次会话又买 1 个（价 100），随后 BBO 报 110；
         // local_ts 晚于快照请求时刻，不会被 seed 的防双计过滤
-        let data = fill_data(Exchange::Binance, &symbol, Side::Long, 1.0);
+        let data = fill_data(Exchange::Binance, &symbol, Side::Long, dec!(1.0));
         if let AccountData::Symbol(SymbolAccountData::Fill(f)) = &data {
             metrics.total.apply_fill(f);
         }
@@ -1171,10 +1173,10 @@ mod tests {
             crate::messaging::MarketData::BBO(crate::domain::BBO {
                 exchange: Exchange::Binance,
                 symbol: symbol.clone(),
-                bid_price: 110.0,
-                bid_qty: 1.0,
-                ask_price: 110.0,
-                ask_qty: 1.0,
+                bid_price: dec!(110.0),
+                bid_qty: dec!(1.0),
+                ask_price: dec!(110.0),
+                ask_qty: dec!(1.0),
                 timestamp: 0,
             }),
         )).unwrap();
@@ -1191,21 +1193,21 @@ mod tests {
 
     const EXPOSURE_SYMBOL: &str = "BTC";
 
-    fn exposure_bbo(exchange: Exchange, mid: f64) -> crate::domain::BBO {
+    fn exposure_bbo(exchange: Exchange, mid: Decimal) -> crate::domain::BBO {
         crate::domain::BBO {
             exchange,
             symbol: EXPOSURE_SYMBOL.to_string(),
             bid_price: mid,
-            bid_qty: 1.0,
+            bid_qty: dec!(1.0),
             ask_price: mid,
-            ask_qty: 1.0,
+            ask_qty: dec!(1.0),
             timestamp: 0,
         }
     }
 
     /// 经**生产路径**构造夹具：仓位走投产 seed、盘口走行情事件。
     /// 直接写字段更省事，但那样测的就不是线上跑的那条路。
-    fn state_with(positions: &[(Exchange, f64)], priced: &[(Exchange, f64)]) -> SymbolState {
+    fn state_with(positions: &[(Exchange, Decimal)], priced: &[(Exchange, Decimal)]) -> SymbolState {
         let mut state = SymbolState::new(EXPOSURE_SYMBOL.to_string());
         for &(exchange, size) in positions {
             state.seed_position(
@@ -1226,8 +1228,8 @@ mod tests {
     #[test]
     fn hedged_position_has_near_zero_net_notional() {
         let state = state_with(
-            &[(Exchange::Binance, 1.0), (Exchange::OKX, -1.0)],
-            &[(Exchange::Binance, 100.0), (Exchange::OKX, 100.0)],
+            &[(Exchange::Binance, dec!(1.0)), (Exchange::OKX, dec!(-1.0))],
+            &[(Exchange::Binance, dec!(100.0)), (Exchange::OKX, dec!(100.0))],
         );
 
         let exposure = exposure_of(&state, None);
@@ -1240,8 +1242,8 @@ mod tests {
 
     #[test]
     fn baseline_position_is_excluded_from_session_delta() {
-        let state = state_with(&[(Exchange::Binance, 3.0)], &[(Exchange::Binance, 100.0)]);
-        let baseline = HashMap::from([(Exchange::Binance, 2.0)]);
+        let state = state_with(&[(Exchange::Binance, dec!(3.0))], &[(Exchange::Binance, dec!(100.0))]);
+        let baseline = HashMap::from([(Exchange::Binance, dec!(2.0))]);
 
         let exposure = exposure_of(&state, Some(&baseline));
 
@@ -1252,7 +1254,7 @@ mod tests {
 
     #[test]
     fn missing_baseline_defaults_to_zero() {
-        let state = state_with(&[(Exchange::Binance, 3.0)], &[(Exchange::Binance, 100.0)]);
+        let state = state_with(&[(Exchange::Binance, dec!(3.0))], &[(Exchange::Binance, dec!(100.0))]);
         let exposure = exposure_of(&state, Some(&HashMap::new()));
         assert!((exposure.session_notional_delta - 300.0).abs() < 1e-9);
     }
@@ -1260,7 +1262,7 @@ mod tests {
     /// 缺 BBO 的腿显式暴露成 `unpriced_legs`，不用兜底价格伪造一个看似完整的估值
     #[test]
     fn missing_bbo_is_surfaced_not_silently_valued_at_zero() {
-        let state = state_with(&[(Exchange::Binance, 1.0)], &[]);
+        let state = state_with(&[(Exchange::Binance, dec!(1.0))], &[]);
 
         let exposure = exposure_of(&state, None);
 
@@ -1271,7 +1273,7 @@ mod tests {
 
     #[test]
     fn zero_positions_are_ignored() {
-        let state = state_with(&[(Exchange::Binance, 0.0)], &[(Exchange::Binance, 100.0)]);
+        let state = state_with(&[(Exchange::Binance, dec!(0.0))], &[(Exchange::Binance, dec!(100.0))]);
         assert_eq!(exposure_of(&state, None), SymbolExposure::default());
     }
 }

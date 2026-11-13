@@ -57,6 +57,7 @@ uuid = { version = "1", features = ["v4"] }
 
 # Decimal for precise financial calculations
 rust_decimal = "1"
+rust_decimal_macros = "1"
 
 # 回测: 插入序挂单簿 (撮合按到达顺序 = 时间优先) + 历史数据 zip 解压
 indexmap = "2"

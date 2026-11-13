@@ -15,7 +15,10 @@
 //! **注**：ox-demo 的 MACD 方向性间距偏移 (KlineSeries/MACD overlay) 暂未移植，本实现为**对称对冲**
 //! (买卖间距同为 `base_offset_ratio`)，是 gamma scalp 的最小核心形态。
 
-use crate::domain::{Exchange, Order, OrderType, Price, Quantity, Side, Symbol, TimeInForce};
+use crate::domain::{
+    dec, from_f64, to_f64, Decimal, Exchange, Order, OrderType, Price, Quantity, Side, Symbol,
+    TimeInForce,
+};
 use crate::exchange::{AccountStream, SubscriptionKind};
 use crate::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData, PendingOrder};
 use crate::strategy::{OutcomeEvent, Strategy, StrategyView};
@@ -24,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 /// 对冲数量相对目标漂移超该比例则撤单重挂 (默认值)
 const DEFAULT_QTY_TOLERANCE_RATIO: f64 = 0.2;
 /// 最小对冲数量 (币本位)，低于此不挂单避免碎单 (默认值)
-const DEFAULT_MIN_HEDGE_QTY: f64 = 0.001;
+const DEFAULT_MIN_HEDGE_QTY: Quantity = dec!(0.001);
 
 pub struct GammaScalpStrategy {
     /// 永续对冲场所 + greeks 标记的交易所 (回测中二者一致)
@@ -68,11 +71,15 @@ impl GammaScalpStrategy {
 
     /// 越带的目标对冲：把净 delta 拉回中性。偏多 -> 上方挂卖；偏空 -> 下方挂买。
     /// 返回 (方向, 数量, 挂单价)；带内返回 None。
+    ///
+    /// 净 delta 是希腊值统计量 (f64)，折成下单意图量 (下单时框架按步长取整)；间距比率折成
+    /// Decimal 乘到价格上。折不出来 (非有限值) 时按带内处理，不下单。
     fn desired_hedge(&self, ref_price: Price, net_delta: f64) -> Option<(Side, Quantity, Price)> {
+        let offset = from_f64(self.base_offset_ratio)?;
         if net_delta > self.delta_band {
-            Some((Side::Short, net_delta, ref_price * (1.0 + self.base_offset_ratio)))
+            Some((Side::Short, from_f64(net_delta)?, ref_price * (Decimal::ONE + offset)))
         } else if net_delta < -self.delta_band {
-            Some((Side::Long, -net_delta, ref_price * (1.0 - self.base_offset_ratio)))
+            Some((Side::Long, from_f64(-net_delta)?, ref_price * (Decimal::ONE - offset)))
         } else {
             None
         }
@@ -87,7 +94,7 @@ impl GammaScalpStrategy {
             return Vec::new();
         };
 
-        let net_delta = greeks.delta + symbol_state.position_size(self.exchange);
+        let net_delta = greeks.delta + to_f64(symbol_state.position_size(self.exchange));
         let pending = symbol_state.pending_orders().next().cloned();
 
         match self.desired_hedge(ref_price, net_delta) {
@@ -114,7 +121,9 @@ impl GammaScalpStrategy {
             Some(p) => match p.order.order_type {
                 OrderType::Limit { .. } => {
                     let side_changed = p.order.side != side;
-                    let qty_drift = (p.order.quantity - qty).abs() / qty > self.qty_tolerance_ratio;
+                    // 漂移比例是统计比率，按 f64 算 (也避开 Decimal 除零 panic)
+                    let qty_drift = to_f64((p.order.quantity - qty).abs()) / to_f64(qty)
+                        > self.qty_tolerance_ratio;
                     if side_changed || qty_drift {
                         vec![self.cancel(&p)]
                     } else {
@@ -223,26 +232,26 @@ mod tests {
     #[test]
     fn within_band_no_hedge() {
         let s = strat();
-        assert!(s.desired_hedge(2000.0, 0.05).is_none());
-        assert!(s.desired_hedge(2000.0, -0.1).is_none()); // 边界含等号: 不超过即不动
-        assert!(s.desired_hedge(2000.0, 0.1).is_none());
+        assert!(s.desired_hedge(dec!(2000.0), 0.05).is_none());
+        assert!(s.desired_hedge(dec!(2000.0), -0.1).is_none()); // 边界含等号: 不超过即不动
+        assert!(s.desired_hedge(dec!(2000.0), 0.1).is_none());
     }
 
     #[test]
     fn long_delta_sells_above() {
         // 净 delta 偏多 -> 上方挂卖, qty=net_delta
-        let (side, qty, px) = strat().desired_hedge(2000.0, 0.5).unwrap();
+        let (side, qty, px) = strat().desired_hedge(dec!(2000.0), 0.5).unwrap();
         assert_eq!(side, Side::Short);
-        assert!((qty - 0.5).abs() < 1e-12);
-        assert!((px - 2000.0 * 1.002).abs() < 1e-9); // 上方 +0.2%
+        assert_eq!(qty, dec!(0.5));
+        assert_eq!(px, dec!(2004)); // 上方 +0.2%
     }
 
     #[test]
     fn short_delta_buys_below() {
         // 净 delta 偏空 -> 下方挂买, qty=-net_delta (正)
-        let (side, qty, px) = strat().desired_hedge(2000.0, -0.5).unwrap();
+        let (side, qty, px) = strat().desired_hedge(dec!(2000.0), -0.5).unwrap();
         assert_eq!(side, Side::Long);
-        assert!((qty - 0.5).abs() < 1e-12);
-        assert!((px - 2000.0 * 0.998).abs() < 1e-9); // 下方 -0.2%
+        assert_eq!(qty, dec!(0.5));
+        assert_eq!(px, dec!(1996)); // 下方 -0.2%
     }
 }

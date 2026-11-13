@@ -28,7 +28,7 @@
 //!
 //! 见品味 1.3：净值取不到与净值为零是两回事，前者伪装成后者会让杠杆闸门直接放行。
 
-use crate::domain::{AccountInfo, Exchange, Greeks, MarketStatus, Symbol, BBO};
+use crate::domain::{AccountInfo, Exchange, Greeks, MarketStatus, Quantity, Symbol, BBO};
 use crate::messaging::{PendingOrder, StateManager, SymbolState};
 use std::collections::HashMap;
 
@@ -122,14 +122,14 @@ impl<'a> SymbolView<'a> {
     /// 写对了是冗余、写错了（当它空仓照常开仓）是事故。把状态消灭掉，比让每个调用点
     /// 去检查它更可靠（品味 1.1）。
     ///
-    /// 作用域**外**的所返回 `0.0` —— 那是策略问了自己没订阅的东西，与读未订阅 symbol
+    /// 作用域**外**的所返回 0 —— 那是策略问了自己没订阅的东西，与读未订阅 symbol
     /// 的盘口同类，属调用方的 bug。
-    pub fn position_size(&self, exchange: Exchange) -> f64 {
+    pub fn position_size(&self, exchange: Exchange) -> Quantity {
         self.state.position_book().position_size(exchange)
     }
 
     /// 跨所的 (多头总量, 空头总量)：正向持仓之和为正，负向持仓之和为负。
-    pub fn position_sizes(&self) -> (f64, f64) {
+    pub fn position_sizes(&self) -> (Quantity, Quantity) {
         self.state.position_book().position_sizes()
     }
 

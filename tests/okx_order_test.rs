@@ -4,6 +4,8 @@
 //! - OKX_API_KEY
 //! - OKX_SECRET
 //! - OKX_PASSPHRASE
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use hft_engine_rs::domain::{Exchange, Order, OrderType, Side, Symbol, TimeInForce};
 use hft_engine_rs::exchange::okx::{OkxClient, OkxCredentials};
@@ -16,7 +18,7 @@ const TEST_BASE: &str = "BTC";
 const TEST_QUOTE: &str = "USDT";
 
 /// 测试数量 - 请根据实际情况填写 (OKX 是张数，1张 = ctVal BTC)
-const TEST_QUANTITY: f64 = 0.01; // TODO: 填写测试数量（张数）
+const TEST_QUANTITY: Decimal = dec!(0.01); // TODO: 填写测试数量（张数）
 
 /// 从环境变量获取凭证
 fn get_credentials() -> Option<OkxCredentials> {
@@ -46,7 +48,7 @@ struct TickerData {
 }
 
 /// 获取 BBO (REST API)
-async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Error>> {
+async fn fetch_bbo(symbol: &Symbol) -> Result<(Decimal, Decimal), Box<dyn std::error::Error>> {
     let client = Client::new();
     let inst_id = format!("{}-{}-SWAP", symbol, TEST_QUOTE);
 
@@ -65,8 +67,8 @@ async fn fetch_bbo(symbol: &Symbol) -> Result<(f64, f64), Box<dyn std::error::Er
     }
 
     let ticker = resp.data.first().ok_or("No ticker data")?;
-    let bid: f64 = ticker.bid_px.parse()?;
-    let ask: f64 = ticker.ask_px.parse()?;
+    let bid: Decimal = ticker.bid_px.parse()?;
+    let ask: Decimal = ticker.ask_px.parse()?;
 
     Ok((bid, ask))
 }
@@ -93,7 +95,7 @@ async fn test_okx_limit_buy() {
 
     // 格式化价格
     let formatted_price = meta.format_price(ask);
-    let price: f64 = formatted_price.parse().expect("价格解析失败");
+    let price: Decimal = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", ask, price);
 
     // 构造限价买单
@@ -139,7 +141,7 @@ async fn test_okx_limit_sell() {
 
     // 格式化价格
     let formatted_price = meta.format_price(bid);
-    let price: f64 = formatted_price.parse().expect("价格解析失败");
+    let price: Decimal = formatted_price.parse().expect("价格解析失败");
     println!("下单价格: {} (格式化后: {})", bid, price);
 
     // 构造限价卖单

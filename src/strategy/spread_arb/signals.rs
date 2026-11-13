@@ -1,4 +1,4 @@
-use crate::domain::Exchange;
+use crate::domain::{Exchange, Price, Quantity};
 
 /// 交易信号
 ///
@@ -9,15 +9,15 @@ pub struct TradingSignal {
     /// 做多交易所
     pub long_exchange: Exchange,
     /// 做多价格（ask）
-    pub long_price: f64,
+    pub long_price: Price,
     /// 做多计划交易量
-    pub long_size: f64,
+    pub long_size: Quantity,
     /// 做空交易所
     pub short_exchange: Exchange,
     /// 做空价格（bid）
-    pub short_price: f64,
+    pub short_price: Price,
     /// 做空计划交易量
-    pub short_size: f64,
+    pub short_size: Quantity,
     /// 做多方 ask deviation
     pub long_deviation: f64,
     /// 做空方 bid deviation

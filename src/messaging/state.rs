@@ -10,9 +10,6 @@ use std::collections::HashMap;
 /// （此前是 60s 未确认就静默删单、确认迟到再重建 —— 删掉的单若还活着，策略会在旁边再挂一张。）
 pub const ORDER_STUCK_MS: u64 = 60_000;
 
-/// 成交是否到齐的相对容差：逐笔成交与累计量各自从张折成币（OKX），浮点和会差在末位
-const FILL_TOLERANCE: f64 = 1e-9;
-
 /// 本策略发出的一张单在本地的跟踪记录。
 ///
 /// 策略发出时登记，**终态且成交都已入账**才移出：交易所说的累计成交（`reported_filled`）由按客户端
@@ -53,9 +50,9 @@ impl PendingOrder {
         !self.status.is_terminal()
     }
 
-    /// 成交都已入账：本地收到的成交加起来不少于交易所说的累计量
+    /// 成交都已入账：本地收到的成交加起来不少于交易所说的累计量（数量是精确十进制，直接比）
     fn fills_settled(&self) -> bool {
-        self.reported_filled - self.filled <= FILL_TOLERANCE * self.order.quantity.max(self.reported_filled)
+        self.filled >= self.reported_filled
     }
 
     /// 在等交易所的什么、从什么时候起；`None` = 没在等（挂着、没撤过）。
@@ -257,7 +254,7 @@ impl SymbolPositions {
                 tracing::info!(
                     %symbol,
                     exchange = %fill.exchange,
-                    fill_size = fill.size,
+                    fill_size = %fill.size,
                     fill_local_ts = local_ts,
                     snapshot_req_ts = seeded_ts,
                     "Fill 早于基线快照请求时刻送达（已含在快照里），丢弃避免双计"
@@ -274,10 +271,10 @@ impl SymbolPositions {
             %symbol,
             exchange = %fill.exchange,
             side = ?fill.side,
-            fill_size = fill.size,
-            fill_price = fill.price,
+            fill_size = %fill.size,
+            fill_price = %fill.price,
             reason = ?fill.reason,
-            new_position_size = pos.size,
+            new_position_size = %pos.size,
             "Updated position on fill"
         );
     }
@@ -322,7 +319,7 @@ impl SymbolPositions {
                 tracing::debug!(
                     %symbol,
                     exchange = %position.exchange,
-                    incoming_size = position.size,
+                    incoming_size = %position.size,
                     "持仓基线已存在，跳过重复 seed（同一 symbol 再次投产时的正常形态）"
                 );
                 false
@@ -336,8 +333,8 @@ impl SymbolPositions {
                         tracing::warn!(
                             %symbol,
                             exchange = %position.exchange,
-                            accumulated_size = existing.size,
-                            snapshot_size = position.size,
+                            accumulated_size = %existing.size,
+                            snapshot_size = %position.size,
                             "seed 覆写了此前由 Fill 累加出的非零仓位（快照权威）"
                         );
                     }
@@ -345,7 +342,7 @@ impl SymbolPositions {
                 tracing::info!(
                     %symbol,
                     exchange = %position.exchange,
-                    size = position.size,
+                    size = %position.size,
                     snapshot_req_ts,
                     "Position baseline seeded"
                 );
@@ -383,7 +380,7 @@ impl SymbolPositions {
         self.positions.get(&exchange)
     }
 
-    /// 获取某个交易所的仓位大小。**无记录与空仓都返回 `0.0`**。
+    /// 获取某个交易所的仓位大小。**无记录与空仓都返回 0**。
     ///
     /// 压平在"算下单量"这个用途上永远安全（理由见
     /// [`crate::strategy::SymbolView::position_size`]）；要拿"有没有这条记录"当交易前置
@@ -392,8 +389,8 @@ impl SymbolPositions {
     /// 此前这里的注释写的是"无仓位记录等价于空仓，这是正确的业务语义"。那句话在下单量
     /// 场景下成立，但它没有限定用途，读起来像是断言两者在任何场景下都等价 —— 而模拟策略
     /// 首笔成交前、以及无凭证的所，恰恰是需要分辨的。
-    pub fn position_size(&self, exchange: Exchange) -> f64 {
-        self.positions.get(&exchange).map(|p| p.size).unwrap_or(0.0)
+    pub fn position_size(&self, exchange: Exchange) -> Quantity {
+        self.positions.get(&exchange).map_or(Quantity::ZERO, |p| p.size)
     }
 
     /// 获取多空仓位大小
@@ -401,14 +398,14 @@ impl SymbolPositions {
     /// 返回 (多头总量, 空头总量):
     /// - 多头总量: 所有正向持仓之和（正数）
     /// - 空头总量: 所有负向持仓之和（负数）
-    pub fn position_sizes(&self) -> (f64, f64) {
-        let mut long_size = 0.0;
-        let mut short_size = 0.0;
+    pub fn position_sizes(&self) -> (Quantity, Quantity) {
+        let mut long_size = Quantity::ZERO;
+        let mut short_size = Quantity::ZERO;
 
         for pos in self.positions.values() {
-            if pos.size > 0.0 {
+            if pos.size > Quantity::ZERO {
                 long_size += pos.size;
-            } else if pos.size < 0.0 {
+            } else if pos.size < Quantity::ZERO {
                 short_size += pos.size;
             }
         }
@@ -425,8 +422,8 @@ impl SymbolOrders {
             order,
             status: OrderStatus::Created,
             created_at,
-            filled: 0.0,
-            reported_filled: 0.0,
+            filled: Quantity::ZERO,
+            reported_filled: Quantity::ZERO,
             cancel: CancelState::None,
             cancel_first_sent_at: None,
             terminal_at: None,
@@ -539,12 +536,12 @@ impl SymbolOrders {
     fn settle(&mut self, symbol: &Symbol, client_id: &str) {
         if self.orders.get(client_id).is_some_and(|p| !p.is_open() && p.fills_settled()) {
             let p = self.orders.remove(client_id).expect("刚查过");
-            if p.filled - p.reported_filled > FILL_TOLERANCE * p.order.quantity.max(p.reported_filled) {
+            if p.filled > p.reported_filled {
                 // 持仓对账随后会发现漂移并停机；这里先记下是哪张单多收了成交，便于排查（#764 审查）
-                tracing::error!(%symbol, exchange = %p.order.exchange, %client_id, filled = p.filled, reported_filled = p.reported_filled,
+                tracing::error!(%symbol, exchange = %p.order.exchange, %client_id, filled = %p.filled, reported_filled = %p.reported_filled,
                     "本地收到的成交多于交易所说的累计成交量（成交可能被重复计入）");
             }
-            tracing::info!(%symbol, exchange = %p.order.exchange, %client_id, status = ?p.status, filled = p.filled, "订单结算完，移出跟踪表");
+            tracing::info!(%symbol, exchange = %p.order.exchange, %client_id, status = ?p.status, filled = %p.filled, "订单结算完，移出跟踪表");
         }
     }
 
@@ -605,7 +602,7 @@ impl SymbolState {
                     order_id = %update.order_id,
                     client_order_id = ?update.client_order_id,
                     status = ?update.status,
-                    filled_quantity = update.filled_quantity,
+                    filled_quantity = %update.filled_quantity,
                     "Updating order status"
                 );
                 self.order_book.apply_update(&self.symbol, update, local_ts);
@@ -666,6 +663,8 @@ impl SymbolState {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::Side;
 
@@ -682,7 +681,7 @@ mod tests {
         state.apply_account(data, *local_ts);
     }
 
-    fn position(size: f64) -> Position {
+    fn position(size: Decimal) -> Position {
         Position {
             exchange: EX,
             symbol: SYMBOL.to_string(),
@@ -690,17 +689,17 @@ mod tests {
         }
     }
 
-    fn fill(side: Side, size: f64) -> Ev {
+    fn fill(side: Side, size: Decimal) -> Ev {
         fill_at(EX, side, size, 1)
     }
 
-    fn fill_at(exchange: Exchange, side: Side, size: f64, local_ts: u64) -> Ev {
+    fn fill_at(exchange: Exchange, side: Side, size: Decimal, local_ts: u64) -> Ev {
         (
             SymbolAccountData::Fill(crate::domain::Fill {
                 exchange,
                 symbol: SYMBOL.to_string(),
                 side,
-                price: 100.0,
+                price: dec!(100.0),
                 size,
                 client_order_id: None,
                 order_id: "1".to_string(),
@@ -717,14 +716,14 @@ mod tests {
     fn baseline_initializes_then_fills_accumulate() {
         let mut state = SymbolState::new(SYMBOL.to_string());
 
-        assert!(state.seed_position(&position(2.0), 0), "首次 seed 应成功");
-        assert_eq!(state.position_book().position_size(EX), 2.0);
+        assert!(state.seed_position(&position(dec!(2.0)), 0), "首次 seed 应成功");
+        assert_eq!(state.position_book().position_size(EX), dec!(2.0));
 
-        apply(&mut state, &fill(Side::Long, 1.0));
-        assert_eq!(state.position_book().position_size(EX), 3.0);
+        apply(&mut state, &fill(Side::Long, dec!(1.0)));
+        assert_eq!(state.position_book().position_size(EX), dec!(3.0));
 
-        apply(&mut state, &fill(Side::Short, 0.5));
-        assert!((state.position_book().position_size(EX) - 2.5).abs() < 1e-12);
+        apply(&mut state, &fill(Side::Short, dec!(0.5)));
+        assert_eq!(state.position_book().position_size(EX), dec!(2.5));
     }
 
     /// **Critical 回归防线**：第二次 seed 不得覆写持仓（幂等，返回 false）。
@@ -734,21 +733,21 @@ mod tests {
     #[test]
     fn second_baseline_never_overwrites_position() {
         let mut state = SymbolState::new(SYMBOL.to_string());
-        state.seed_position(&position(2.0), 0);
-        apply(&mut state, &fill(Side::Long, 1.0));
-        assert_eq!(state.position_book().position_size(EX), 3.0);
+        state.seed_position(&position(dec!(2.0)), 0);
+        apply(&mut state, &fill(Side::Long, dec!(1.0)));
+        assert_eq!(state.position_book().position_size(EX), dec!(3.0));
 
         // 第二次 seed（哪怕数值"看起来更新"）也不得覆写
-        assert!(!state.seed_position(&position(3.0), 5), "重复 seed 应返回 false");
+        assert!(!state.seed_position(&position(dec!(3.0)), 5), "重复 seed 应返回 false");
         assert_eq!(
             state.position_book().position_size(EX),
-            3.0,
+            dec!(3.0),
             "第二次 seed 覆写了持仓——快照与 Fill 流叠加会重复计算成交"
         );
 
         // 覆写若发生，这条 Fill 会把仓位推到 4.0 之外
-        apply(&mut state, &fill(Side::Long, 1.0));
-        assert_eq!(state.position_book().position_size(EX), 4.0);
+        apply(&mut state, &fill(Side::Long, dec!(1.0)));
+        assert_eq!(state.position_book().position_size(EX), dec!(4.0));
     }
 
     /// **防双计**：seed 之后到达、但送达时刻早于快照请求时刻的 Fill 已含在快照里，丢弃；
@@ -757,15 +756,15 @@ mod tests {
     fn fills_covered_by_snapshot_are_dropped() {
         let mut state = SymbolState::new(SYMBOL.to_string());
         // 快照请求时刻 t=10
-        state.seed_position(&position(2.0), 10);
+        state.seed_position(&position(dec!(2.0)), 10);
 
         // t=1 送达（fill() 的 local_ts=1 <= 10）：已含在快照里，丢弃
-        apply(&mut state, &fill(Side::Long, 1.0));
-        assert_eq!(state.position_book().position_size(EX), 2.0, "快照已含的 Fill 不得再累加");
+        apply(&mut state, &fill(Side::Long, dec!(1.0)));
+        assert_eq!(state.position_book().position_size(EX), dec!(2.0), "快照已含的 Fill 不得再累加");
 
         // t=11 送达：快照之后的新成交，累加
-        apply(&mut state, &fill_at(EX, Side::Long, 1.0, 11));
-        assert_eq!(state.position_book().position_size(EX), 3.0);
+        apply(&mut state, &fill_at(EX, Side::Long, dec!(1.0), 11));
+        assert_eq!(state.position_book().position_size(EX), dec!(3.0));
     }
 
     /// **seed 过滤按所隔离**：只 seed 了一个所时，另一个所的早时刻 Fill 不得被误过滤
@@ -774,25 +773,25 @@ mod tests {
     fn seed_filter_is_scoped_to_its_exchange() {
         let mut state = SymbolState::new(SYMBOL.to_string());
         // 只 seed Binance（快照请求时刻 t=10）
-        state.seed_position(&position(2.0), 10);
+        state.seed_position(&position(dec!(2.0)), 10);
 
         // OKX 未 seed：t=1 送达的 Fill 照常从 0 累加，不受 Binance 的过滤时刻影响
-        apply(&mut state, &fill_at(Exchange::OKX, Side::Long, 1.5, 1));
-        assert_eq!(state.position_book().position_size(Exchange::OKX), 1.5, "未 seed 的所不得被误过滤");
-        assert_eq!(state.position_book().position_size(EX), 2.0, "Binance 腿不受影响");
+        apply(&mut state, &fill_at(Exchange::OKX, Side::Long, dec!(1.5), 1));
+        assert_eq!(state.position_book().position_size(Exchange::OKX), dec!(1.5), "未 seed 的所不得被误过滤");
+        assert_eq!(state.position_book().position_size(EX), dec!(2.0), "Binance 腿不受影响");
     }
 
     // ===== 订单跟踪：结算完才移出、与到达顺序无关、不重建 =====
 
     const CID: &str = "cid-1";
 
-    fn tracked_order(qty: f64) -> Order {
+    fn tracked_order(qty: Decimal) -> Order {
         Order {
             id: String::new(),
             exchange: EX,
             symbol: SYMBOL.to_string(),
             side: Side::Long,
-            order_type: crate::domain::OrderType::Limit { price: 100.0, tif: crate::domain::TimeInForce::GTC },
+            order_type: crate::domain::OrderType::Limit { price: dec!(100.0), tif: crate::domain::TimeInForce::GTC },
             quantity: qty,
             reduce_only: false,
             client_order_id: CID.to_string(),
@@ -802,11 +801,11 @@ mod tests {
     /// 登记一张 1.0 的单（t=0）
     fn with_order() -> SymbolState {
         let mut state = SymbolState::new(SYMBOL.to_string());
-        state.add_pending_order(tracked_order(1.0), 0);
+        state.add_pending_order(tracked_order(dec!(1.0)), 0);
         state
     }
 
-    fn update(cid: &str, status: OrderStatus, filled: f64, ts: u64) -> Ev {
+    fn update(cid: &str, status: OrderStatus, filled: Decimal, ts: u64) -> Ev {
         (
             SymbolAccountData::OrderUpdate(crate::domain::OrderUpdate {
                 order_id: "ex-1".to_string(),
@@ -815,14 +814,14 @@ mod tests {
                 symbol: SYMBOL.to_string(),
                 side: Side::Long,
                 status,
-                quantity: 1.0,
+                quantity: dec!(1.0),
                 filled_quantity: filled,
             }),
             ts,
         )
     }
 
-    fn own_fill(size: f64, ts: u64) -> Ev {
+    fn own_fill(size: Decimal, ts: u64) -> Ev {
         let (mut data, ts) = fill_at(EX, Side::Long, size, ts);
         if let SymbolAccountData::Fill(f) = &mut data {
             f.client_order_id = Some(CID.to_string());
@@ -851,28 +850,28 @@ mod tests {
     #[test]
     fn terminal_before_fills_stays_until_fills_add_up() {
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 1));
+        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1));
         let p = the_order(&state).expect("成交没到齐，还在表里");
         assert!(!p.is_open());
 
-        apply(&mut state, &own_fill(0.4, 2));
+        apply(&mut state, &own_fill(dec!(0.4), 2));
         assert!(the_order(&state).is_some(), "只到了 0.4");
-        apply(&mut state, &own_fill(0.6, 3));
+        apply(&mut state, &own_fill(dec!(0.6), 3));
         assert!(!state.order_book().has_pending(), "成交加满即移出");
-        assert!((state.position_book().position_size(EX) - 1.0).abs() < 1e-12);
+        assert_eq!(state.position_book().position_size(EX), dec!(1.0));
     }
 
     /// 反过来：成交先到、终态后到，终态一到即移出；没有成交的撤单也是终态即移出
     #[test]
     fn fills_first_or_no_fills_settle_on_terminal() {
         let mut state = with_order();
-        apply(&mut state, &own_fill(1.0, 1));
+        apply(&mut state, &own_fill(dec!(1.0), 1));
         assert!(the_order(&state).is_some_and(|p| p.is_open()), "没终态前还开着");
-        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 2));
+        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 2));
         assert!(!state.order_book().has_pending());
 
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Cancelled, 0.0, 1));
+        apply(&mut state, &update(CID, OrderStatus::Cancelled, dec!(0.0), 1));
         assert!(!state.order_book().has_pending());
     }
 
@@ -880,10 +879,10 @@ mod tests {
     #[test]
     fn partial_fill_then_cancel_waits_for_the_reported_amount() {
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::PartiallyFilled, 0.3, 1));
-        apply(&mut state, &update(CID, OrderStatus::Cancelled, 0.0, 2)); // 有的所撤单回报不带累计，取见过的最大
+        apply(&mut state, &update(CID, OrderStatus::PartiallyFilled, dec!(0.3), 1));
+        apply(&mut state, &update(CID, OrderStatus::Cancelled, dec!(0.0), 2)); // 有的所撤单回报不带累计，取见过的最大
         assert!(the_order(&state).is_some(), "0.3 的成交还没到");
-        apply(&mut state, &own_fill(0.3, 3));
+        apply(&mut state, &own_fill(dec!(0.3), 3));
         assert!(!state.order_book().has_pending());
     }
 
@@ -891,7 +890,7 @@ mod tests {
     #[test]
     fn placed_after_terminal_does_not_reopen() {
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 1));
+        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1));
         apply(&mut state, &request(RequestOutcome::Placed { order_id: "ex-1".into() }, 2));
         assert!(the_order(&state).is_some_and(|p| !p.is_open()));
     }
@@ -921,7 +920,7 @@ mod tests {
     #[test]
     fn rejection_after_exchange_update_keeps_the_order() {
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Pending, 0.0, 1));
+        apply(&mut state, &update(CID, OrderStatus::Pending, dec!(0.0), 1));
         apply(&mut state, &request(RequestOutcome::PlaceRejected { reason: "margin".into() }, 2));
         assert!(the_order(&state).is_some_and(|p| p.is_open()));
     }
@@ -933,7 +932,7 @@ mod tests {
         assert_eq!(state.mark_cancel_sent(CID, 1), Err("下单请求还没结论"), "撤单会先于下单到交易所");
         assert_eq!(the_order(&state).unwrap().cancel, CancelState::None, "没记成已撤，受理后还能撤");
 
-        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 1));
+        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1));
         assert_eq!(state.mark_cancel_sent(CID, 2), Err("已到终态"));
         assert_eq!(state.mark_cancel_sent("other", 2), Err("不在跟踪表里"));
     }
@@ -944,8 +943,8 @@ mod tests {
         let mut state = SymbolState::new(SYMBOL.to_string());
         let own = EX.new_cli_order_id();
         for cid in [own.as_str(), "web_1a2b3c", "android_9f8e"] {
-            apply(&mut state, &update(cid, OrderStatus::Pending, 0.0, 1));
-            apply(&mut state, &update(cid, OrderStatus::PartiallyFilled, 0.5, 2));
+            apply(&mut state, &update(cid, OrderStatus::Pending, dec!(0.0), 1));
+            apply(&mut state, &update(cid, OrderStatus::PartiallyFilled, dec!(0.5), 2));
         }
         assert!(!state.order_book().has_pending());
     }
@@ -961,7 +960,7 @@ mod tests {
 
         // 挂着：多久都不算
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Pending, 0.0, 1));
+        apply(&mut state, &update(CID, OrderStatus::Pending, dec!(0.0), 1));
         assert!(state.check_stuck_orders(10 * late).is_ok());
 
         // 撤单发出后交易所没推终态
@@ -978,7 +977,7 @@ mod tests {
 
         // 终态到了、成交没到齐
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Filled, 1.0, 1_000));
+        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1_000));
         assert!(state.check_stuck_orders(1_000 + ORDER_STUCK_MS).is_ok());
         assert!(state.check_stuck_orders(1_000 + late).is_err());
     }
@@ -987,8 +986,8 @@ mod tests {
     #[test]
     fn fill_without_baseline_starts_from_zero() {
         let mut state = SymbolState::new(SYMBOL.to_string());
-        apply(&mut state, &fill(Side::Short, 1.5));
-        assert_eq!(state.position_book().position_size(EX), -1.5);
+        apply(&mut state, &fill(Side::Short, dec!(1.5)));
+        assert_eq!(state.position_book().position_size(EX), dec!(-1.5));
     }
 
     /// 持仓随 Fill **只累加数量**：买加、卖减、反手翻符号。
@@ -999,19 +998,19 @@ mod tests {
     fn position_accumulates_signed_size_across_fills() {
         let mut state = SymbolState::new(SYMBOL.to_string());
         // 基线 2.0（快照请求时刻 0，fill() 的 local_ts=1 晚于它，不被过滤）
-        state.seed_position(&position(2.0), 0);
+        state.seed_position(&position(dec!(2.0)), 0);
 
         // 同向加仓 2.0（成交价不影响持仓数量）
-        apply(&mut state, &fill(Side::Long, 2.0));
-        assert!((state.position_book().position(EX).expect("position").size - 4.0).abs() < 1e-12);
+        apply(&mut state, &fill(Side::Long, dec!(2.0)));
+        assert_eq!(state.position_book().position(EX).expect("position").size, dec!(4.0));
 
         // 反向平掉 1.0（价格同样不影响数量）
-        apply(&mut state, &fill(Side::Short, 1.0));
-        assert!((state.position_book().position(EX).expect("position").size - 3.0).abs() < 1e-12);
+        apply(&mut state, &fill(Side::Short, dec!(1.0)));
+        assert_eq!(state.position_book().position(EX).expect("position").size, dec!(3.0));
 
         // 反手：卖 5 -> 净空 2
-        apply(&mut state, &fill(Side::Short, 5.0));
-        assert!((state.position_book().position(EX).expect("position").size + 2.0).abs() < 1e-12);
+        apply(&mut state, &fill(Side::Short, dec!(5.0)));
+        assert_eq!(state.position_book().position(EX).expect("position").size, dec!(-2.0));
     }
 
 }

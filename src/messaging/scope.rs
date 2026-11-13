@@ -87,6 +87,7 @@ impl SubscriptionScope {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::BBO;
     use crate::messaging::{AccountData, ExchangeAccountData, MarketData};
@@ -106,10 +107,10 @@ mod tests {
             MarketData::BBO(BBO {
                 exchange,
                 symbol: symbol.to_string(),
-                bid_price: 1.0,
-                bid_qty: 1.0,
-                ask_price: 1.0,
-                ask_qty: 1.0,
+                bid_price: dec!(1.0),
+                bid_qty: dec!(1.0),
+                ask_price: dec!(1.0),
+                ask_qty: dec!(1.0),
                 timestamp: 0,
             }),
         )

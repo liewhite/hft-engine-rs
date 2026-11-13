@@ -43,6 +43,7 @@ pub fn touch_price(side: Side, bbo: &BBO) -> Price {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::domain::Exchange;
 
@@ -51,36 +52,36 @@ mod tests {
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".to_string(),
             bid_price: bid,
-            bid_qty: 1.0,
+            bid_qty: dec!(1.0),
             ask_price: ask,
-            ask_qty: 1.0,
+            ask_qty: dec!(1.0),
             timestamp: 0,
         }
     }
 
     #[test]
     fn crosses_buy_when_ask_drops_sell_when_bid_rises() {
-        let b = bbo(100.0, 101.0);
-        assert!(!crosses(Side::Long, 99.0, &b)); // ask 101 > 99, 不成交
-        assert!(crosses(Side::Long, 101.0, &b)); // ask 101 <= 101, 成交
-        assert!(!crosses(Side::Short, 102.0, &b)); // bid 100 < 102, 不成交
-        assert!(crosses(Side::Short, 100.0, &b)); // bid 100 >= 100, 成交
+        let b = bbo(dec!(100.0), dec!(101.0));
+        assert!(!crosses(Side::Long, dec!(99.0), &b)); // ask 101 > 99, 不成交
+        assert!(crosses(Side::Long, dec!(101.0), &b)); // ask 101 <= 101, 成交
+        assert!(!crosses(Side::Short, dec!(102.0), &b)); // bid 100 < 102, 不成交
+        assert!(crosses(Side::Short, dec!(100.0), &b)); // bid 100 >= 100, 成交
     }
 
     #[test]
     fn touch_price_buy_takes_ask_sell_takes_bid() {
-        let b = bbo(100.0, 101.0);
-        assert_eq!(touch_price(Side::Long, &b), 101.0);
-        assert_eq!(touch_price(Side::Short, &b), 100.0);
+        let b = bbo(dec!(100.0), dec!(101.0));
+        assert_eq!(touch_price(Side::Long, &b), dec!(101.0));
+        assert_eq!(touch_price(Side::Short, &b), dec!(100.0));
     }
 
     #[test]
     fn trade_crosses_strict() {
         // 买单 @100: 成交价 99 跌破 -> 成交; 100 相等 -> 不成交
-        assert!(trade_crosses(Side::Long, 100.0, 99.0));
-        assert!(!trade_crosses(Side::Long, 100.0, 100.0));
+        assert!(trade_crosses(Side::Long, dec!(100.0), dec!(99.0)));
+        assert!(!trade_crosses(Side::Long, dec!(100.0), dec!(100.0)));
         // 卖单 @100: 成交价 101 升破 -> 成交; 100 相等 -> 不成交
-        assert!(trade_crosses(Side::Short, 100.0, 101.0));
-        assert!(!trade_crosses(Side::Short, 100.0, 100.0));
+        assert!(trade_crosses(Side::Short, dec!(100.0), dec!(101.0)));
+        assert!(!trade_crosses(Side::Short, dec!(100.0), dec!(100.0)));
     }
 }

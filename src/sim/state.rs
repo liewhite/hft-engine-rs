@@ -1,5 +1,5 @@
 use crate::domain::{
-    Exchange, Fill, MarketTrade, Order, OrderId, OrderType, OrderUpdate, OrderStatus, Position,
+    to_f64, Exchange, Fill, MarketTrade, Order, OrderId, OrderType, OrderUpdate, OrderStatus,
     Price, Quantity, Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
 };
 use crate::messaging::{AccountData, MarketData, MarketEvent, OrderRequestResult, RequestOutcome, SymbolAccountData};
@@ -34,7 +34,7 @@ pub struct RestingOrder {
 impl RestingOrder {
     /// 剩余未成交量
     pub fn remaining(&self) -> Quantity {
-        (self.quantity - self.filled).max(0.0)
+        (self.quantity - self.filled).max(Quantity::ZERO)
     }
 }
 
@@ -81,8 +81,8 @@ pub struct SimState {
     pub ledger: Ledger,
     pub resting: IndexMap<OrderId, RestingOrder>,
     pub last_bbo: HashMap<Symbol, BBO>,
-    pub last_mark: HashMap<Symbol, f64>,
-    pub last_trade: HashMap<Symbol, f64>,
+    pub last_mark: HashMap<Symbol, Price>,
+    pub last_trade: HashMap<Symbol, Price>,
     pub maker_fee_rate: f64,
     pub taker_fee_rate: f64,
     /// 市场规则来源（下界校验 + 数量取整）。柜台像真实交易所一样强制执行市场规则 ——
@@ -116,11 +116,11 @@ impl SimState {
     /// 估值价格：标记价 > BBO 中间价 > 最新成交价 (trade-only 行情用最新成交价估值)
     pub fn mark_of(&self, symbol: &Symbol) -> f64 {
         if let Some(m) = self.last_mark.get(symbol) {
-            *m
+            to_f64(*m)
         } else if let Some(b) = self.last_bbo.get(symbol) {
-            b.mid_price()
+            to_f64(b.mid_price())
         } else if let Some(t) = self.last_trade.get(symbol) {
-            *t
+            to_f64(*t)
         } else {
             0.0
         }
@@ -217,14 +217,14 @@ impl SimState {
         let matched: Vec<RestingOrder> = self
             .resting
             .values()
-            .filter(|o| &o.symbol == symbol && o.remaining() > Position::EPSILON && crossed(o))
+            .filter(|o| &o.symbol == symbol && o.remaining() > Quantity::ZERO && crossed(o))
             .cloned()
             .collect();
         let mut remaining_budget = budget;
         let mut out = Vec::new();
         for o in matched {
             let take = match remaining_budget {
-                Some(b) if b <= Position::EPSILON => break, // 预算耗尽
+                Some(b) if b <= Quantity::ZERO => break, // 预算耗尽
                 Some(b) => o.remaining().min(b),
                 None => o.remaining(),
             };
@@ -451,7 +451,7 @@ impl SimState {
             order.side,
             price,
             order.quantity,
-            0.0,
+            Quantity::ZERO,
             order.quantity,
             ts,
             Liquidity::Taker,
@@ -491,7 +491,7 @@ impl SimState {
                 side: order.side,
                 limit_price: limit,
                 quantity: order.quantity,
-                filled: 0.0,
+                filled: Quantity::ZERO,
                 reduce_only: order.reduce_only,
             },
         );
@@ -525,14 +525,14 @@ impl SimState {
         let effective_qty = if !reduce_only {
             take
         } else {
-            let pos_size = self.ledger.positions.get(symbol).map(|p| p.size).unwrap_or(0.0);
+            let pos_size = self.ledger.positions.get(symbol).map_or(Quantity::ZERO, |p| p.size);
             match side {
-                Side::Short => take.min(pos_size.max(0.0)),    // 卖平多: 至多平掉现有多头
-                Side::Long => take.min((-pos_size).max(0.0)),  // 买平空: 至多平掉现有空头
+                Side::Short => take.min(pos_size.max(Quantity::ZERO)),    // 卖平多: 至多平掉现有多头
+                Side::Long => take.min((-pos_size).max(Quantity::ZERO)),  // 买平空: 至多平掉现有空头
             }
         };
 
-        if reduce_only && effective_qty <= Position::EPSILON {
+        if reduce_only && effective_qty <= Quantity::ZERO {
             // reduceOnly 无可平仓位 -> 不成交，回 Cancelled
             let events = vec![(
                 ts,
@@ -554,12 +554,12 @@ impl SimState {
             Liquidity::Maker => self.maker_fee_rate,
             Liquidity::Taker => self.taker_fee_rate,
         };
-        let fee = fill_price * effective_qty * fee_rate;
+        let fee = to_f64(fill_price * effective_qty) * fee_rate;
         self.ledger
             .apply_fill(symbol, side, fill_price, effective_qty, fee);
 
         let cumulative = already_filled + effective_qty;
-        let done = cumulative + Position::EPSILON >= order_qty;
+        let done = cumulative >= order_qty;
         let status = if done {
             OrderStatus::Filled
         } else {
@@ -619,13 +619,15 @@ fn status_event(
             side: order.side,
             status,
             quantity: order.quantity,
-            filled_quantity: 0.0,
+            filled_quantity: Quantity::ZERO,
         })),
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use super::*;
 
     const EX: Exchange = Exchange::Binance;
@@ -634,17 +636,17 @@ mod tests {
     }
     /// 测试元数据：步长/最小量取得足够小，既有测试的数量不触发下界校验
     fn test_metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
-        use crate::domain::StepFormatter;
+        use crate::domain::PriceStep;
         Arc::new(HashMap::from([(
             (EX, sym()),
             SymbolMeta {
                 exchange: EX,
                 symbol: sym(),
-                price_formatter: Arc::new(StepFormatter::new(0.001)),
-                size_step: 0.001,
-                min_order_size: 0.001,
+                price_rule: Arc::new(PriceStep::new(dec!(0.001))),
+                size_step: dec!(0.001),
+                min_order_size: dec!(0.001),
                 min_notional: 0.0,
-                contract_size: 1.0,
+                contract_size: dec!(1.0),
             },
         )]))
     }
@@ -657,9 +659,9 @@ mod tests {
             exchange: EX,
             symbol: sym(),
             bid_price: bid,
-            bid_qty: 1.0,
+            bid_qty: dec!(1.0),
             ask_price: ask,
-            ask_qty: 1.0,
+            ask_qty: dec!(1.0),
             timestamp: ts,
         }
     }
@@ -671,7 +673,7 @@ mod tests {
         }
     }
     fn trade_ev(price: Price, ts: Timestamp) -> MarketEvent {
-        trade_ev_qty(price, 1.0, ts)
+        trade_ev_qty(price, dec!(1.0), ts)
     }
     fn trade_ev_qty(price: Price, qty: Quantity, ts: Timestamp) -> MarketEvent {
         MarketEvent {
@@ -694,7 +696,7 @@ mod tests {
             symbol: sym(),
             side,
             order_type: OrderType::Limit { price, tif },
-            quantity: 0.002,
+            quantity: dec!(0.002),
             reduce_only: false,
             client_order_id: cid.to_string(),
         }
@@ -731,8 +733,8 @@ mod tests {
     #[test]
     fn non_marketable_postonly_buy_rests() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
-        let evs = s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        let evs = s.on_order_arrived(1, &limit(Side::Long, dec!(49995.0), TimeInForce::PostOnly, "b1"), &"1".to_string());
         assert_eq!(statuses(&evs), vec![OrderStatus::Pending]);
         assert!(s.resting.contains_key("1"));
         assert!(fills(&evs).is_empty());
@@ -741,8 +743,8 @@ mod tests {
     #[test]
     fn marketable_postonly_rejected() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
-        let evs = s.on_order_arrived(1, &limit(Side::Long, 50001.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        let evs = s.on_order_arrived(1, &limit(Side::Long, dec!(50001.0), TimeInForce::PostOnly, "b1"), &"1".to_string());
         assert!(statuses(&evs).iter().any(|st| matches!(st, OrderStatus::Rejected { .. })));
         assert!(s.resting.is_empty());
         assert!(fills(&evs).is_empty());
@@ -751,22 +753,22 @@ mod tests {
     #[test]
     fn resting_buy_crossed_fills_at_limit() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
-        let evs = s.on_market(&market_ev(bbo(49990.0, 49994.0, 2))); // ask 49994 <= 49995
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        s.on_order_arrived(1, &limit(Side::Long, dec!(49995.0), TimeInForce::PostOnly, "b1"), &"1".to_string());
+        let evs = s.on_market(&market_ev(bbo(dec!(49990.0), dec!(49994.0), 2))); // ask 49994 <= 49995
         let f = fills(&evs);
-        assert_eq!(f.iter().map(|x| x.price).collect::<Vec<_>>(), vec![49995.0]); // maker 价
+        assert_eq!(f.iter().map(|x| x.price).collect::<Vec<_>>(), vec![dec!(49995.0)]); // maker 价
         assert_eq!(s.resting.len(), 0);
-        assert_eq!(s.ledger.positions[&sym()].size, 0.002);
+        assert_eq!(s.ledger.positions[&sym()].size, dec!(0.002));
     }
 
     /// 柜台只产回报、不回显行情（行情转发是调用方的职责）
     #[test]
     fn on_market_returns_reports_only() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
-        let evs = s.on_market(&market_ev(bbo(49990.0, 49994.0, 2)));
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        s.on_order_arrived(1, &limit(Side::Long, dec!(49995.0), TimeInForce::PostOnly, "b1"), &"1".to_string());
+        let evs = s.on_market(&market_ev(bbo(dec!(49990.0), dec!(49994.0), 2)));
         assert!(
             evs.iter().any(|(_, d)| matches!(d, AccountData::Symbol(SymbolAccountData::Fill(_)))),
             "越价应产出成交回报"
@@ -778,17 +780,17 @@ mod tests {
     #[test]
     fn gtc_marketable_taker_fills_at_touch() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
-        let evs = s.on_order_arrived(1, &limit(Side::Long, 50005.0, TimeInForce::GTC, "b1"), &"1".to_string());
-        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![50001.0]); // 吃卖价
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        let evs = s.on_order_arrived(1, &limit(Side::Long, dec!(50005.0), TimeInForce::GTC, "b1"), &"1".to_string());
+        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![dec!(50001.0)]); // 吃卖价
         assert!(s.resting.is_empty());
     }
 
     #[test]
     fn ioc_non_marketable_cancelled() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
-        let evs = s.on_order_arrived(1, &limit(Side::Long, 49000.0, TimeInForce::IOC, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        let evs = s.on_order_arrived(1, &limit(Side::Long, dec!(49000.0), TimeInForce::IOC, "b1"), &"1".to_string());
         assert_eq!(statuses(&evs), vec![OrderStatus::Cancelled]);
         assert!(s.resting.is_empty());
     }
@@ -796,8 +798,8 @@ mod tests {
     #[test]
     fn cancel_arrived_removes_and_reports() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        s.on_order_arrived(1, &limit(Side::Long, dec!(49995.0), TimeInForce::PostOnly, "b1"), &"1".to_string());
         let evs = s.on_cancel_arrived(2, &sym(), "b1");
         assert_eq!(statuses(&evs), vec![OrderStatus::Cancelled]);
         assert!(s.resting.is_empty());
@@ -818,10 +820,10 @@ mod tests {
     #[test]
     fn reduce_only_sell_no_long_cancelled_no_reverse() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
         // 上方 resting 卖单
-        s.on_order_arrived(1, &limit_ro(Side::Short, 50010.0, TimeInForce::PostOnly, "s1", 0.002), &"1".to_string());
-        let evs = s.on_market(&market_ev(bbo(50011.0, 50012.0, 2))); // bid 50011 >= 50010 -> 越价
+        s.on_order_arrived(1, &limit_ro(Side::Short, dec!(50010.0), TimeInForce::PostOnly, "s1", dec!(0.002)), &"1".to_string());
+        let evs = s.on_market(&market_ev(bbo(dec!(50011.0), dec!(50012.0), 2))); // bid 50011 >= 50010 -> 越价
         assert!(fills(&evs).is_empty(), "无多头可平, 不应成交");
         assert!(statuses(&evs).contains(&OrderStatus::Cancelled), "reduceOnly 无可平 -> Cancelled");
         assert!(s.ledger.positions.get(&sym()).map(|p| p.is_empty()).unwrap_or(true), "不得反向开出空头");
@@ -830,28 +832,28 @@ mod tests {
     #[test]
     fn reduce_only_sell_truncated_to_position() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, &limit(Side::Long, 50005.0, TimeInForce::GTC, "b1"), &"1".to_string()); // taker 开多 0.002
-        s.on_order_arrived(1, &limit_ro(Side::Short, 50010.0, TimeInForce::PostOnly, "s1", 0.005), &"2".to_string()); // 平仓量 > 持仓
-        let evs = s.on_market(&market_ev(bbo(50011.0, 50012.0, 2)));
-        assert_eq!(fills(&evs).iter().map(|f| f.size).collect::<Vec<_>>(), vec![0.002]); // 截断到多头
-        assert_eq!(s.ledger.positions[&sym()].size, 0.0); // 平至 0, 不反手
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        s.on_order_arrived(1, &limit(Side::Long, dec!(50005.0), TimeInForce::GTC, "b1"), &"1".to_string()); // taker 开多 0.002
+        s.on_order_arrived(1, &limit_ro(Side::Short, dec!(50010.0), TimeInForce::PostOnly, "s1", dec!(0.005)), &"2".to_string()); // 平仓量 > 持仓
+        let evs = s.on_market(&market_ev(bbo(dec!(50011.0), dec!(50012.0), 2)));
+        assert_eq!(fills(&evs).iter().map(|f| f.size).collect::<Vec<_>>(), vec![dec!(0.002)]); // 截断到多头
+        assert_eq!(s.ledger.positions[&sym()].size, dec!(0.0)); // 平至 0, 不反手
     }
 
     #[test]
     fn observe_bbo_updates_quote_without_matching() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1)));
-        s.on_order_arrived(1, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1)));
+        s.on_order_arrived(1, &limit(Side::Long, dec!(49995.0), TimeInForce::PostOnly, "b1"), &"1".to_string());
         // 盘口越过挂单价（ask 49994 <= 49995），但 observe_bbo 不撮合
-        s.observe_bbo(&bbo(49990.0, 49994.0, 2));
+        s.observe_bbo(&bbo(dec!(49990.0), dec!(49994.0), 2));
         assert_eq!(s.resting.len(), 1, "observe_bbo 不应撮合");
         assert!(s.ledger.positions.get(&sym()).map(|p| p.is_empty()).unwrap_or(true));
         // 估值口径已更新
         assert_eq!(s.mark_of(&sym()), (49990.0 + 49994.0) / 2.0);
         // 真实成交穿过挂单价才成交
-        let evs = s.on_market(&trade_ev(49994.0, 3));
-        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![49995.0]);
+        let evs = s.on_market(&trade_ev(dec!(49994.0), 3));
+        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![dec!(49995.0)]);
         assert_eq!(s.resting.len(), 0);
     }
 
@@ -859,13 +861,13 @@ mod tests {
     fn trade_print_crossing_fills() {
         let mut s = empty();
         // 无 BBO，挂买单 @100 (limit 到达时无行情 -> resting)
-        s.on_order_arrived(1, &limit(Side::Long, 100.0, TimeInForce::GTC, "b1"), &"1".to_string());
+        s.on_order_arrived(1, &limit(Side::Long, dec!(100.0), TimeInForce::GTC, "b1"), &"1".to_string());
         assert!(s.resting.contains_key("1"));
         // 成交价 99 < 100 -> 越价成交 @100 (maker)
-        let evs = s.on_market(&trade_ev(99.0, 2));
+        let evs = s.on_market(&trade_ev(dec!(99.0), 2));
         let f = fills(&evs);
-        assert_eq!(f.iter().map(|x| x.price).collect::<Vec<_>>(), vec![100.0]);
-        assert_eq!(s.ledger.positions[&sym()].size, 0.002);
+        assert_eq!(f.iter().map(|x| x.price).collect::<Vec<_>>(), vec![dec!(100.0)]);
+        assert_eq!(s.ledger.positions[&sym()].size, dec!(0.002));
     }
 
     // ===== 部分成交：print 数量作为撮合预算 =====
@@ -876,25 +878,25 @@ mod tests {
     fn trade_qty_is_consumed_across_orders_in_arrival_order() {
         let mut s = empty();
         // 两张买单先后到达：0.7 @100、0.5 @101（都无行情时 resting）
-        let mut o1 = limit(Side::Long, 100.0, TimeInForce::GTC, "b1");
-        o1.quantity = 0.7;
-        let mut o2 = limit(Side::Long, 101.0, TimeInForce::GTC, "b2");
-        o2.quantity = 0.5;
+        let mut o1 = limit(Side::Long, dec!(100.0), TimeInForce::GTC, "b1");
+        o1.quantity = dec!(0.7);
+        let mut o2 = limit(Side::Long, dec!(101.0), TimeInForce::GTC, "b2");
+        o2.quantity = dec!(0.5);
         s.on_order_arrived(1, &o1, &"1".to_string());
         s.on_order_arrived(1, &o2, &"2".to_string());
         // print 1.0 @99 越过两张单：先到的 b1 全吃 0.7，剩余 0.3 给 b2
-        let evs = s.on_market(&trade_ev_qty(99.0, 1.0, 2));
+        let evs = s.on_market(&trade_ev_qty(dec!(99.0), dec!(1.0), 2));
         let f = fills(&evs);
-        let sizes: Vec<(String, f64)> =
+        let sizes: Vec<(String, Decimal)> =
             f.iter().map(|x| (x.order_id.clone(), x.size)).collect();
         assert_eq!(sizes.len(), 2, "预算应分给两张单: {sizes:?}");
         assert_eq!(sizes[0].0, "1");
-        near(sizes[0].1, 0.7);
+        assert_eq!(sizes[0].1, dec!(0.7));
         assert_eq!(sizes[1].0, "2");
-        near(sizes[1].1, 0.3);
+        assert_eq!(sizes[1].1, dec!(0.3));
         // b1 全成出簿；b2 剩 0.2 留簿，回报 PartiallyFilled(累计 0.3)
         assert!(!s.resting.contains_key("1"));
-        near(s.resting.get("2").map(|o| o.remaining()).unwrap_or(0.0), 0.2);
+        assert_eq!(s.resting.get("2").map(|o| o.remaining()), Some(dec!(0.2)));
         assert!(statuses(&evs).contains(&OrderStatus::Filled));
         assert!(
             statuses(&evs)
@@ -904,23 +906,23 @@ mod tests {
             statuses(&evs)
         );
         // 下一笔 print 足量吃完 b2 剩余，终态 Filled、累计=原始量
-        let evs = s.on_market(&trade_ev_qty(99.0, 0.25, 3));
+        let evs = s.on_market(&trade_ev_qty(dec!(99.0), dec!(0.25), 3));
         assert!(statuses(&evs).contains(&OrderStatus::Filled));
         assert!(s.resting.is_empty());
-        assert!((s.ledger.positions[&sym()].size - 1.2).abs() < 1e-9);
+        assert_eq!(s.ledger.positions[&sym()].size, dec!(1.2));
     }
 
     /// **部分成交后撤单**：终态 Cancelled 带原始委托量与撤单前的累计成交（策略的跟踪表据此等成交到齐）
     #[test]
     fn cancel_after_partial_fill_reports_original_quantity() {
         let mut s = empty();
-        let mut o = limit(Side::Long, 100.0, TimeInForce::GTC, "b1");
-        o.quantity = 0.7;
+        let mut o = limit(Side::Long, dec!(100.0), TimeInForce::GTC, "b1");
+        o.quantity = dec!(0.7);
         s.on_order_arrived(1, &o, &"1".to_string());
         // print 0.3 部分成交，剩 0.4 在簿
-        s.on_market(&trade_ev_qty(99.0, 0.3, 2));
+        s.on_market(&trade_ev_qty(dec!(99.0), dec!(0.3), 2));
         let evs = s.on_cancel_arrived(3, &sym(), "b1");
-        let cancelled: Vec<(f64, f64)> = evs
+        let cancelled: Vec<(Decimal, Decimal)> = evs
             .iter()
             .filter_map(|(_, d)| match d {
                 AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) if u.status == OrderStatus::Cancelled => {
@@ -930,9 +932,9 @@ mod tests {
             })
             .collect();
         assert_eq!(cancelled.len(), 1);
-        near(cancelled[0].0, 0.7); // 原始委托量
-        near(cancelled[0].1, 0.3); // 撤单前的累计成交
-        near(s.ledger.positions[&sym()].size, 0.3);
+        assert_eq!(cancelled[0].0, dec!(0.7)); // 原始委托量
+        assert_eq!(cancelled[0].1, dec!(0.3)); // 撤单前的累计成交
+        assert_eq!(s.ledger.positions[&sym()].size, dec!(0.3));
         assert!(s.resting.is_empty());
     }
 
@@ -943,9 +945,9 @@ mod tests {
     #[test]
     fn undersized_order_is_rejected_not_matched() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(100.0, 100.1, 1)));
-        let mut o = limit(Side::Long, 99.0, TimeInForce::GTC, "b1");
-        o.quantity = 0.0004; // < size_step 0.001
+        s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.1), 1)));
+        let mut o = limit(Side::Long, dec!(99.0), TimeInForce::GTC, "b1");
+        o.quantity = dec!(0.0004); // < size_step 0.001
         let evs = s.on_order_arrived(1, &o, &"1".to_string());
         assert!(
             statuses(&evs).iter().any(|st| matches!(st, OrderStatus::Rejected { .. })),
@@ -954,7 +956,7 @@ mod tests {
         );
         assert!(s.resting.is_empty(), "未通过校验的单不得入簿");
         // 即使成交穿价也不得成交
-        let evs = s.on_market(&trade_ev(98.0, 2));
+        let evs = s.on_market(&trade_ev(dec!(98.0), 2));
         assert!(fills(&evs).is_empty());
     }
 
@@ -962,8 +964,8 @@ mod tests {
     #[test]
     fn missing_symbol_meta_is_rejected() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(100.0, 100.1, 1)));
-        let mut o = limit(Side::Long, 99.0, TimeInForce::GTC, "b1");
+        s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.1), 1)));
+        let mut o = limit(Side::Long, dec!(99.0), TimeInForce::GTC, "b1");
         o.symbol = "UNKNOWN".to_string();
         // meta 校验在参考价判定之前，无该 symbol 的行情也应以"缺 SymbolMeta"被拒
         let evs = s.on_order_arrived(1, &o, &"1".to_string());
@@ -981,13 +983,13 @@ mod tests {
     #[test]
     fn quantity_is_rounded_down_before_matching() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(100.0, 100.1, 1)));
-        let mut o = limit(Side::Long, 100.5, TimeInForce::GTC, "b1"); // 穿价 taker
-        o.quantity = 0.0016;
+        s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.1), 1)));
+        let mut o = limit(Side::Long, dec!(100.5), TimeInForce::GTC, "b1"); // 穿价 taker
+        o.quantity = dec!(0.0016);
         let evs = s.on_order_arrived(1, &o, &"1".to_string());
         assert_eq!(
             fills(&evs).iter().map(|f| f.size).collect::<Vec<_>>(),
-            vec![0.001],
+            vec![dec!(0.001)],
             "应按取整后的量成交"
         );
     }
@@ -996,8 +998,8 @@ mod tests {
     #[test]
     fn order_for_another_exchange_is_rejected() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(100.0, 100.1, 1)));
-        let mut o = limit(Side::Long, 200.0, TimeInForce::GTC, "b1"); // 深度穿价
+        s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.1), 1)));
+        let mut o = limit(Side::Long, dec!(200.0), TimeInForce::GTC, "b1"); // 深度穿价
         o.exchange = Exchange::OKX; // 但属于别的所
         let evs = s.on_order_arrived(1, &o, &"1".to_string());
         assert!(
@@ -1014,11 +1016,11 @@ mod tests {
     #[test]
     fn market_order_fills_at_last_trade_without_bbo() {
         let mut s = empty();
-        s.on_market(&trade_ev(100.0, 1));
-        let mut o = limit(Side::Long, 0.0, TimeInForce::GTC, "m1");
+        s.on_market(&trade_ev(dec!(100.0), 1));
+        let mut o = limit(Side::Long, dec!(0.0), TimeInForce::GTC, "m1");
         o.order_type = OrderType::Market;
         let evs = s.on_order_arrived(2, &o, &"1".to_string());
-        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![100.0]);
+        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![dec!(100.0)]);
     }
 
     /// **PostOnly 穿价即拒**（trade-native）：限价触及最新成交价就会吃单，真实交易所会拒。
@@ -1027,8 +1029,8 @@ mod tests {
     #[test]
     fn postonly_crossing_last_trade_is_rejected() {
         let mut s = empty();
-        s.on_market(&trade_ev(100.0, 1));
-        let evs = s.on_order_arrived(2, &limit(Side::Long, 100.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        s.on_market(&trade_ev(dec!(100.0), 1));
+        let evs = s.on_order_arrived(2, &limit(Side::Long, dec!(100.0), TimeInForce::PostOnly, "b1"), &"1".to_string());
         assert!(
             statuses(&evs).iter().any(|st| matches!(st, OrderStatus::Rejected { .. })),
             "买单限价触及最新成交价，PostOnly 必须被拒: {:?}",
@@ -1042,10 +1044,10 @@ mod tests {
     #[test]
     fn deep_crossing_gtc_fills_as_taker_at_reference_price() {
         let mut s = SimState::empty(EX, 10_000.0, 0.0, 0.002, test_metas());
-        s.on_market(&trade_ev(100.0, 1));
+        s.on_market(&trade_ev(dec!(100.0), 1));
         // 买单限价 110 远高于市价 100：应立即以 100 成交、按 taker 计费
-        let evs = s.on_order_arrived(2, &limit(Side::Long, 110.0, TimeInForce::GTC, "b1"), &"1".to_string());
-        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![100.0]);
+        let evs = s.on_order_arrived(2, &limit(Side::Long, dec!(110.0), TimeInForce::GTC, "b1"), &"1".to_string());
+        assert_eq!(fills(&evs).iter().map(|f| f.price).collect::<Vec<_>>(), vec![dec!(100.0)]);
         assert!(s.resting.is_empty(), "穿价单不该 resting");
         near(s.ledger.cash, 10_000.0 - 100.0 * 0.002 * 0.002); // taker 费率
     }
@@ -1055,8 +1057,8 @@ mod tests {
     #[test]
     fn order_reports_are_stamped_with_arrival_time_not_stale_quote_time() {
         let mut s = empty();
-        s.on_market(&market_ev(bbo(50000.0, 50001.0, 1))); // 行情停在 ts=1
-        let evs = s.on_order_arrived(999, &limit(Side::Long, 49995.0, TimeInForce::PostOnly, "b1"), &"1".to_string());
+        s.on_market(&market_ev(bbo(dec!(50000.0), dec!(50001.0), 1))); // 行情停在 ts=1
+        let evs = s.on_order_arrived(999, &limit(Side::Long, dec!(49995.0), TimeInForce::PostOnly, "b1"), &"1".to_string());
         let ts: Vec<u64> = evs.iter().map(|(ts, _)| *ts).collect();
         assert_eq!(ts, vec![999], "回报时间被冻在旧行情的 ts 上: {ts:?}");
     }
@@ -1069,26 +1071,26 @@ mod tests {
     #[test]
     fn taker_fee_charged() {
         let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002, test_metas());
-        s.on_market(&market_ev(bbo(100.0, 100.0, 1)));
-        let mut o = limit(Side::Long, 0.0, TimeInForce::GTC, "o1");
+        s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.0), 1)));
+        let mut o = limit(Side::Long, dec!(0.0), TimeInForce::GTC, "o1");
         o.order_type = OrderType::Market;
-        o.quantity = 2.0;
+        o.quantity = dec!(2.0);
         s.on_order_arrived(1, &o, &"o1".to_string());
         near(s.ledger.cash, 10_000.0 - 0.4); // 100*2*0.002
-        near(s.ledger.positions[&sym()].size, 2.0);
+        assert_eq!(s.ledger.positions[&sym()].size, dec!(2.0));
     }
 
     #[test]
     fn maker_fee_charged() {
         let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002, test_metas());
-        s.on_market(&market_ev(bbo(100.0, 100.0, 1)));
-        let mut o = limit(Side::Long, 99.0, TimeInForce::GTC, "o1");
-        o.quantity = 2.0;
+        s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.0), 1)));
+        let mut o = limit(Side::Long, dec!(99.0), TimeInForce::GTC, "o1");
+        o.quantity = dec!(2.0);
         s.on_order_arrived(1, &o, &"o1".to_string());
         assert!(!s.resting.is_empty());
         near(s.ledger.cash, 10_000.0); // resting 不扣费
-        s.on_market(&market_ev(bbo(98.0, 98.0, 2))); // ask 98 <= 99 -> maker 成交 @99
+        s.on_market(&market_ev(bbo(dec!(98.0), dec!(98.0), 2))); // ask 98 <= 99 -> maker 成交 @99
         near(s.ledger.cash, 10_000.0 - 99.0 * 2.0 * 0.001);
-        near(s.ledger.positions[&sym()].size, 2.0);
+        assert_eq!(s.ledger.positions[&sym()].size, dec!(2.0));
     }
 }

@@ -9,7 +9,7 @@
 //! (移植自 ox-demo `hft.backtest.BsGreeksSource`)
 
 use crate::backtest::source::MarketDataSource;
-use crate::domain::{Balance, Exchange, Greeks, Symbol, Timestamp};
+use crate::domain::{to_f64, Balance, Exchange, Greeks, Symbol, Timestamp};
 use crate::messaging::{ExchangeAccountData, AccountData, IncomeEvent, MarketData};
 use crate::option::{self, OptionRight, MILLIS_PER_YEAR};
 use std::cell::RefCell;
@@ -139,7 +139,8 @@ impl<S: MarketDataSource> MarketDataSource for BsGreeksSource<S> {
             let trade = match &ev {
                 IncomeEvent::Market(m) => match &m.data {
                     MarketData::MarketTrade(t) if t.symbol == self.config.underlying_symbol => {
-                        Some((t.price, m.exchange_ts))
+                        // 期权定价数学用 f64，成交价在此边界转换
+                        Some((to_f64(t.price), m.exchange_ts))
                     }
                     _ => None,
                 },
@@ -210,7 +211,7 @@ impl<S: MarketDataSource> MarketDataSource for BsGreeksSource<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::MarketTrade;
+    use crate::domain::{dec, MarketTrade, Price};
     use crate::option::{self, OptionRight};
 
     struct FixedSrc(Vec<IncomeEvent>);
@@ -220,7 +221,7 @@ mod tests {
         }
     }
 
-    fn trade_ev(price: f64, ts: u64) -> IncomeEvent {
+    fn trade_ev(price: Price, ts: u64) -> IncomeEvent {
         IncomeEvent::market(
             ts,
             ts,
@@ -228,7 +229,7 @@ mod tests {
                 exchange: Exchange::Binance,
                 symbol: "ETH".to_string(),
                 price,
-                qty: 1.0,
+                qty: dec!(1.0),
                 is_buyer_maker: false,
                 timestamp: ts,
             }),
@@ -254,7 +255,7 @@ mod tests {
 
     #[test]
     fn locks_strike_and_entry_zero() {
-        let src = FixedSrc(vec![trade_ev(2000.0, 1000), trade_ev(2100.0, 2000)]);
+        let src = FixedSrc(vec![trade_ev(dec!(2000.0), 1000), trade_ev(dec!(2100.0), 2000)]);
         let bs = BsGreeksSource::new(src, cfg(1000));
         let evs: Vec<_> = bs.events().collect();
         // 首笔行权价锁定
@@ -273,7 +274,7 @@ mod tests {
     #[test]
     fn greeks_unit_conversion() {
         let now0 = 1000u64;
-        let src = FixedSrc(vec![trade_ev(2000.0, now0)]);
+        let src = FixedSrc(vec![trade_ev(dec!(2000.0), now0)]);
         let c = cfg(now0);
         let bs = BsGreeksSource::new(src, c.clone());
         let evs: Vec<_> = bs.events().collect();

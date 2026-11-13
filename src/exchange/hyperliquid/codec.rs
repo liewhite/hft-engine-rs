@@ -6,7 +6,7 @@
 
 use super::from_hyperliquid;
 use crate::domain::{
-    now_ms, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, Side, BBO,
+    now_ms, Decimal, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, Quantity, Side, BBO,
 };
 use indexmap::IndexMap;
 use serde::Deserialize;
@@ -45,7 +45,7 @@ pub struct AssetInfo {
     /// 币种名 (e.g., "BTC", "ETH")
     pub name: String,
     /// 数量小数位数
-    pub sz_decimals: i32,
+    pub sz_decimals: u32,
     /// 最大杠杆
     pub max_leverage: u32,
     /// 是否已下架
@@ -133,13 +133,13 @@ impl WsBbo {
             return Ok(None); // 单边盘口
         };
 
-        let bid_price = f64::from_str(&bid.px)
+        let bid_price = Decimal::from_str(&bid.px)
             .map_err(|_| format!("Failed to parse bid price: {}", bid.px))?;
-        let bid_qty = f64::from_str(&bid.sz)
+        let bid_qty = Decimal::from_str(&bid.sz)
             .map_err(|_| format!("Failed to parse bid size: {}", bid.sz))?;
-        let ask_price = f64::from_str(&ask.px)
+        let ask_price = Decimal::from_str(&ask.px)
             .map_err(|_| format!("Failed to parse ask price: {}", ask.px))?;
-        let ask_qty = f64::from_str(&ask.sz)
+        let ask_qty = Decimal::from_str(&ask.sz)
             .map_err(|_| format!("Failed to parse ask size: {}", ask.sz))?;
 
         Ok(Some(BBO {
@@ -221,23 +221,22 @@ impl WsTrade {
 ///
 /// 用 [`IndexMap`] 保持首次出现顺序，保证同一输入必得同一输出顺序 (回测确定性)。
 pub fn aggregate_trades(trades: &[WsTrade]) -> Result<Vec<MarketTrade>, String> {
-    let mut out: IndexMap<(Option<String>, Option<String>, u64, bool), MarketTrade> =
+    let mut out: IndexMap<(Option<String>, Option<String>, Decimal, bool), MarketTrade> =
         IndexMap::new();
 
     for t in trades {
         let taker_side = parse_side(&t.side)?;
         // 主动卖 (A) 时买方为挂单方
         let is_buyer_maker = taker_side == Side::Short;
-        let price = f64::from_str(&t.px)
+        let price = Decimal::from_str(&t.px)
             .map_err(|_| format!("Failed to parse trade price: {}", t.px))?;
-        let qty = f64::from_str(&t.sz)
+        let qty = Decimal::from_str(&t.sz)
             .map_err(|_| format!("Failed to parse trade size: {}", t.sz))?;
 
-        // 价格按位模式作键：f64 不可哈希，且此处只需"完全相同"的语义
         let key = (
             t.taker_order_hash().map(str::to_string),
             t.taker(taker_side).map(str::to_string),
-            price.to_bits(),
+            price,
             is_buyer_maker,
         );
         out.entry(key)
@@ -287,7 +286,7 @@ impl WsActiveAssetCtx {
     /// 转换为 MarkPrice
     pub fn to_mark_price(&self, timestamp: u64) -> Result<MarkPrice, String> {
         let symbol = from_hyperliquid(&self.coin);
-        let price = f64::from_str(&self.ctx.mark_px)
+        let price = Decimal::from_str(&self.ctx.mark_px)
             .map_err(|_| format!("Failed to parse mark_px: {}", self.ctx.mark_px))?;
 
         Ok(MarkPrice {
@@ -301,7 +300,7 @@ impl WsActiveAssetCtx {
     /// 转换为 IndexPrice (使用 oracle_px 作为指数价格)
     pub fn to_index_price(&self, timestamp: u64) -> Result<IndexPrice, String> {
         let symbol = from_hyperliquid(&self.coin);
-        let price = f64::from_str(&self.ctx.oracle_px)
+        let price = Decimal::from_str(&self.ctx.oracle_px)
             .map_err(|_| format!("Failed to parse oracle_px: {}", self.ctx.oracle_px))?;
 
         Ok(IndexPrice {
@@ -331,8 +330,8 @@ fn next_hourly_settle_time() -> u64 {
 }
 
 /// 计算数量精度
-pub fn size_step(sz_decimals: i32) -> f64 {
-    10f64.powi(-sz_decimals)
+pub fn size_step(sz_decimals: u32) -> Decimal {
+    Decimal::new(1, sz_decimals)
 }
 
 // ============================================================================
@@ -406,7 +405,7 @@ pub struct PositionLeverage {
 impl AssetPosition {
     pub fn to_position(&self) -> Result<crate::domain::Position, String> {
         let symbol = from_hyperliquid(&self.coin);
-        let size = f64::from_str(&self.szi)
+        let size = Decimal::from_str(&self.szi)
             .map_err(|_| format!("Failed to parse szi: {}", self.szi))?;
         // 只取数量：均价与浮盈不进域模型（见 crate::domain::Position 的文档）——
         // 这也是 entry_px 的"空仓为 null / 在而解析不了"那套三态守卫可以整个删掉的原因
@@ -444,9 +443,9 @@ pub struct WsBasicOrder {
 impl WsOrderUpdate {
     pub fn to_order_update(&self) -> Result<crate::domain::OrderUpdate, String> {
         let symbol = from_hyperliquid(&self.order.coin);
-        let orig_sz = f64::from_str(&self.order.orig_sz)
+        let orig_sz = Decimal::from_str(&self.order.orig_sz)
             .map_err(|_| format!("Failed to parse orig_sz: {}", self.order.orig_sz))?;
-        let current_sz = f64::from_str(&self.order.sz)
+        let current_sz = Decimal::from_str(&self.order.sz)
             .map_err(|_| format!("Failed to parse sz: {}", self.order.sz))?;
         let filled_quantity = orig_sz - current_sz;
 
@@ -464,7 +463,7 @@ impl WsOrderUpdate {
             status,
             quantity: orig_sz,
             // origSz - sz：剩余量之外的就是累计成交（HL 是币本位）
-            filled_quantity: filled_quantity.max(0.0),
+            filled_quantity: filled_quantity.max(Decimal::ZERO),
         })
     }
 }
@@ -475,10 +474,10 @@ impl WsOrderUpdate {
 /// 自成交、强平……撤单）、`scheduledCancel`，`rejected` 与 `xxxRejected`（价格精度、金额下限、
 /// post-only 会吃单……拒单）。按文档的命名约定认后缀；别的（含本引擎不用的触发单 `triggered`）
 /// 不猜（理由同 Binance 的 `to_order_update`），按解析失败处理。
-fn map_hyperliquid_order_status(status: &str, filled: f64) -> Result<crate::domain::OrderStatus, String> {
+fn map_hyperliquid_order_status(status: &str, filled: Quantity) -> Result<crate::domain::OrderStatus, String> {
     use crate::domain::OrderStatus;
     Ok(match status {
-        "open" if filled > 0.0 => OrderStatus::PartiallyFilled,
+        "open" if filled > Decimal::ZERO => OrderStatus::PartiallyFilled,
         "open" => OrderStatus::Pending,
         "filled" => OrderStatus::Filled,
         "canceled" | "scheduledCancel" => OrderStatus::Cancelled,
@@ -528,17 +527,17 @@ impl WsFill {
             exchange: Exchange::Hyperliquid,
             instrument: self.coin.clone(),
             side: parse_side(&self.side)?,
-            size: f64::from_str(&self.sz).map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?,
-            price: f64::from_str(&self.px).map_err(|_| format!("Failed to parse fill px: {}", self.px))?,
+            size: Decimal::from_str(&self.sz).map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?,
+            price: Decimal::from_str(&self.px).map_err(|_| format!("Failed to parse fill px: {}", self.px))?,
             timestamp: self.time,
         })
     }
 
     pub fn to_fill(&self) -> Result<Fill, String> {
         let symbol = from_hyperliquid(&self.coin);
-        let price = f64::from_str(&self.px)
+        let price = Decimal::from_str(&self.px)
             .map_err(|_| format!("Failed to parse fill px: {}", self.px))?;
-        let size = f64::from_str(&self.sz)
+        let size = Decimal::from_str(&self.sz)
             .map_err(|_| format!("Failed to parse fill sz: {}", self.sz))?;
 
         // 本账户这一笔成交的方向
@@ -571,6 +570,7 @@ impl WsFill {
 
 #[cfg(test)]
 mod clearinghouse_tests {
+    use rust_decimal_macros::dec;
     use super::*;
     use crate::exchange::hyperliquid::markets::dex_of_coin;
 
@@ -607,16 +607,16 @@ mod clearinghouse_tests {
     #[test]
     fn order_status_family() {
         use crate::domain::OrderStatus;
-        assert_eq!(map_hyperliquid_order_status("open", 0.0).unwrap(), OrderStatus::Pending);
-        assert_eq!(map_hyperliquid_order_status("open", 1.0).unwrap(), OrderStatus::PartiallyFilled);
+        assert_eq!(map_hyperliquid_order_status("open", dec!(0.0)).unwrap(), OrderStatus::Pending);
+        assert_eq!(map_hyperliquid_order_status("open", dec!(1.0)).unwrap(), OrderStatus::PartiallyFilled);
         for s in ["canceled", "marginCanceled", "selfTradeCanceled", "scheduledCancel"] {
-            assert_eq!(map_hyperliquid_order_status(s, 0.0).unwrap(), OrderStatus::Cancelled, "{s}");
+            assert_eq!(map_hyperliquid_order_status(s, dec!(0.0)).unwrap(), OrderStatus::Cancelled, "{s}");
         }
         for s in ["rejected", "badAloPxRejected", "perpMarginRejected"] {
-            assert!(matches!(map_hyperliquid_order_status(s, 0.0).unwrap(), OrderStatus::Rejected { .. }), "{s}");
+            assert!(matches!(map_hyperliquid_order_status(s, dec!(0.0)).unwrap(), OrderStatus::Rejected { .. }), "{s}");
         }
         for s in ["triggered", "somethingNew", ""] {
-            assert!(map_hyperliquid_order_status(s, 0.0).is_err(), "{s}");
+            assert!(map_hyperliquid_order_status(s, dec!(0.0)).is_err(), "{s}");
         }
     }
 
@@ -657,12 +657,13 @@ mod clearinghouse_tests {
         assert_eq!(position.exchange, Exchange::Hyperliquid);
         // dex 前缀由 from_hyperliquid 剥掉，得到内部 symbol
         assert_eq!(position.symbol, "NVDA");
-        assert!((position.size - (-56.0)).abs() < 1e-9, "got {}", position.size);
+        assert_eq!(position.size, dec!(-56.0), "got {}", position.size);
     }
 }
 
 #[cfg(test)]
 mod trade_tests {
+    use rust_decimal_macros::dec;
     use super::*;
 
     fn trade(side: &str, px: &str, sz: &str, time: u64, hash: &str, users: [&str; 2]) -> WsTrade {
@@ -688,8 +689,8 @@ mod trade_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].exchange, Exchange::Hyperliquid);
         assert_eq!(out[0].symbol, "BTC");
-        assert_eq!(out[0].price, 42219.9);
-        assert_eq!(out[0].qty, 0.125);
+        assert_eq!(out[0].price, dec!(42219.9));
+        assert_eq!(out[0].qty, dec!(0.125));
         assert!(out[0].is_buyer_maker);
         assert_eq!(out[0].timestamp, 1630048897897);
     }
@@ -727,7 +728,7 @@ mod trade_tests {
         ];
         let out = aggregate_trades(&trades).unwrap();
         assert_eq!(out.len(), 1, "同单同价应合并为一条");
-        assert!((out[0].qty - 0.010).abs() < 1e-12, "数量应求和, got {}", out[0].qty);
+        assert_eq!(out[0].qty, dec!(0.010), "数量应求和, got {}", out[0].qty);
         assert_eq!(out[0].timestamp, 120, "时间取该组最后一笔");
     }
 
@@ -741,8 +742,8 @@ mod trade_tests {
         let out = aggregate_trades(&trades).unwrap();
         assert_eq!(out.len(), 2);
         // 保持首次出现顺序 -> 回测确定性
-        assert_eq!(out[0].price, 62508.0);
-        assert_eq!(out[1].price, 62506.0);
+        assert_eq!(out[0].price, dec!(62508.0));
+        assert_eq!(out[1].price, dec!(62506.0));
     }
 
     /// hash 为全 0（尚未上链）时退化为按主动方地址归集
@@ -756,8 +757,8 @@ mod trade_tests {
         ];
         let out = aggregate_trades(&trades).unwrap();
         assert_eq!(out.len(), 2, "不同主动方不得合并");
-        assert!((out[0].qty - 0.003).abs() < 1e-12);
-        assert!((out[1].qty - 0.004).abs() < 1e-12);
+        assert_eq!(out[0].qty, dec!(0.003));
+        assert_eq!(out[1].qty, dec!(0.004));
     }
 
     /// 方向相反不得合并（主动买与主动卖是两回事）
@@ -779,12 +780,13 @@ mod trade_tests {
         b.users = None;
         let out = aggregate_trades(&[a, b]).unwrap();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].qty, 3.0);
+        assert_eq!(out[0].qty, dec!(3.0));
     }
 }
 
 #[cfg(test)]
 mod bbo_tests {
+    use rust_decimal_macros::dec;
     use super::*;
 
     /// **单边盘口是合法状态**：bid/ask 为 null 返回 Ok(None) 跳过，绝不能按坏报文
@@ -802,7 +804,7 @@ mod bbo_tests {
         let raw = r#"{"coin":"ETH","time":1,"bbo":[{"px":"99.0","sz":"1.0","n":1},{"px":"100.0","sz":"1.0","n":1}]}"#;
         let d: WsBbo = serde_json::from_str(raw).unwrap();
         let bbo = d.to_bbo().expect("不是错误").expect("双边盘口");
-        assert_eq!(bbo.bid_price, 99.0);
-        assert_eq!(bbo.ask_price, 100.0);
+        assert_eq!(bbo.bid_price, dec!(99.0));
+        assert_eq!(bbo.ask_price, dec!(100.0));
     }
 }

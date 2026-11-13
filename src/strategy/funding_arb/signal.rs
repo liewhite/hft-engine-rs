@@ -1,6 +1,6 @@
 //! 资金费信号：过去 24h 已结算费率 → 年化 → 开 / 平 / 持有。纯函数，不碰时间源以外的状态。
 
-use crate::domain::{Exchange, SettledFunding, Symbol, Timestamp};
+use crate::domain::{Exchange, Quantity, SettledFunding, Symbol, Timestamp};
 
 /// 一个窗口内某所某币**全部**已结算费率的快照（由 bin 里的轮询任务拉取后，以
 /// `CustomEvent::for_symbol` 投递给策略）。整窗替换，不做增量合并：
@@ -79,15 +79,15 @@ pub enum FundingAction {
 /// 收益已 ≤ 0，必先被平仓条件接住；用户允许开仓削减已有腿，实际只会削到不足一笔最小单的零头。
 pub fn decide(
     aprs: &[(Exchange, Option<f64>)],
-    positions: &[(Exchange, f64)],
+    positions: &[(Exchange, Quantity)],
     open_threshold_apr: f64,
     close_threshold_apr: f64,
 ) -> FundingAction {
     let apr = |ex: Exchange| aprs.iter().find(|(e, _)| *e == ex).and_then(|(_, a)| *a);
 
     let mut close: Option<(f64, LegPair)> = None;
-    for &(long_ex, _) in positions.iter().filter(|(_, p)| *p > 0.0) {
-        for &(short_ex, _) in positions.iter().filter(|(_, p)| *p < 0.0) {
+    for &(long_ex, _) in positions.iter().filter(|(_, p)| *p > Quantity::ZERO) {
+        for &(short_ex, _) in positions.iter().filter(|(_, p)| *p < Quantity::ZERO) {
             let (Some(long_apr), Some(short_apr)) = (apr(long_ex), apr(short_ex)) else {
                 continue;
             };
@@ -122,6 +122,7 @@ pub fn decide(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     const H: u64 = 3600 * 1000;
     const BN: Exchange = Exchange::Binance;
@@ -172,23 +173,23 @@ mod tests {
         assert_eq!(decide(&aprs(0.0, -0.2, 0.4), &[], 0.5, 0.1), Open(LegPair { sell: OKX, buy: HL }));
         assert_eq!(decide(&aprs(0.4, 0.0, 0.2), &[], 0.5, 0.1), Hold);
         // 所对随费率变化：已有 BN空/HL多，今天 OKX 最高 → 在 OKX×HL 继续开（不平 BN×HL：它仍赚 ≥ 10%）
-        let pos = [(BN, -1.0), (HL, 1.0)];
+        let pos = [(BN, dec!(-1.0)), (HL, dec!(1.0))];
         assert_eq!(decide(&aprs(0.5, 0.0, 0.9), &pos, 0.5, 0.1), Open(LegPair { sell: OKX, buy: HL }));
         // BN 多 / OKX 空，今天 BN 最高：开仓会在 BN 卖（削减多腿），但这对仓收益
         // OKX−BN = 0.0−0.9 < 10%，平仓优先先平
-        let pos = [(BN, 1.0), (OKX, -1.0)];
+        let pos = [(BN, dec!(1.0)), (OKX, dec!(-1.0))];
         assert_eq!(decide(&aprs(0.9, 0.3, 0.0), &pos, 0.5, 0.1), Close(LegPair { sell: BN, buy: OKX }));
     }
 
     #[test]
     fn close_when_pair_earns_below_threshold() {
         // BN 空 HL 多：收益 = BN − HL；低于 10% 平（含反转），平仓优先于开仓
-        let pos = [(BN, -1.0), (HL, 1.0)];
+        let pos = [(BN, dec!(-1.0)), (HL, dec!(1.0))];
         assert_eq!(decide(&aprs(0.15, 0.0, 0.0), &pos, 0.5, 0.1), Hold);
         assert_eq!(decide(&aprs(0.05, 0.0, 0.0), &pos, 0.5, 0.1), Close(LegPair { sell: HL, buy: BN }));
         assert_eq!(decide(&aprs(-0.3, 0.0, 0.9), &pos, 0.5, 0.1), Close(LegPair { sell: HL, buy: BN }));
         // 第三所不动；几对都满足时取收益最低的一对
-        let pos = [(BN, -2.0), (HL, 1.0), (OKX, 1.0)];
+        let pos = [(BN, dec!(-2.0)), (HL, dec!(1.0)), (OKX, dec!(1.0))];
         assert_eq!(decide(&aprs(0.0, 0.05, -0.02), &pos, 0.5, 0.1), Close(LegPair { sell: HL, buy: BN }));
     }
 
@@ -199,7 +200,7 @@ mod tests {
         // OKX 未知：不知道谁差最大，不开
         assert_eq!(decide(&a, &[], 0.5, 0.1), Hold);
         // BN×HL 这对的平仓只看这两所
-        let pos = [(BN, 1.0), (HL, -1.0)];
+        let pos = [(BN, dec!(1.0)), (HL, dec!(-1.0))];
         assert_eq!(decide(&a, &pos, 0.5, 0.1), Close(LegPair { sell: BN, buy: HL }));
     }
 }
