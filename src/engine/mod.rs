@@ -7,7 +7,7 @@ pub use strategy_runner::{
     ClientOrderIdGen, ExchangeUuidGen, SequentialClientOrderIdGen, StrategyRunner,
 };
 pub use live::{
-    AccountBus, AccountOutcome, Clock, Executor, ExecutorArgs, ExecutorHandle, ExecutorId,
+    AccountBinding, AccountBus, AccountOutcome, Clock, Executor, ExecutorArgs, ExecutorHandle, ExecutorId,
     setup_all, setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup, ExchangesConfig,
     IncomeProcessor, IncomeProcessorHandle, Manager, ManagerArgs, ManagerError, ManagerHandle,
     MarketBus, Metrics, MetricsArgs, MetricsHandle, OrderGateway, OutcomeBus, OutcomeProcessor,

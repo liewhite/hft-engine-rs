@@ -268,7 +268,7 @@ impl Reconciler {
     /// 比对某个实盘 executor 的决策用持仓（它的**基线已写入**的全部腿）与账本。
     ///
     /// 只比两边都有基线的腿。实盘策略作用域内的所投产时已校验配了凭证、每条腿都有快照（见
-    /// `executor_baselines`，#767），账本未 seed 的腿正常不会出现。账本有、executor 作用域外的腿
+    /// `AccountBinding::into_baselines`，#767），账本未 seed 的腿正常不会出现。账本有、executor 作用域外的腿
     /// 不归它管，也不比。
     ///
     /// `Err` = 已确认该 executor 与账本分叉（连续 `max_consecutive` 次差值稳定），调用方应
@@ -1698,9 +1698,10 @@ mod task_tests {
             &root.group("producers"),
             ExecutorArgs {
                 strategy: Box::new(Idle),
-                account: crate::domain::AccountId::Live,
+                binding: crate::engine::live::AccountBinding::Live(crate::engine::live::LiveBaselines::for_test(vec![
+                    baseline(size),
+                ])),
                 symbol_metas: metas(),
-                baselines: vec![baseline(size)],
                 outcome_bus: OutcomeBus::new("outcome"),
                 metrics: super::super::Metrics::spawn_for_test(&root.group("consumers")).await,
             },

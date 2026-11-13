@@ -1,5 +1,6 @@
 //! 实盘引擎的各组件（任务树上的节点，见 `crate::tasks`）与组合根 [`Manager`]。
 
+mod account_binding;
 pub mod assembly;
 mod clock;
 mod manager;
@@ -79,6 +80,7 @@ pub fn to_paper_outlet(o: &AccountOutcome) -> bool {
 
 
 pub use assembly::{setup_all, setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup, ExchangesConfig};
+pub use account_binding::{AccountBinding, LiveBaselines};
 pub use clock::Clock;
 pub use manager::{
     Manager, ManagerArgs, ManagerError, ManagerHandle, StrategySpec,

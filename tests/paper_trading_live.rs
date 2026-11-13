@@ -29,7 +29,7 @@ use hft_engine_rs::domain::{
     AccountId, Exchange, Order, OrderType, Side, Symbol, SymbolMeta, TimeInForce,
 };
 use hft_engine_rs::engine::{
-    AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, Metrics, MetricsArgs, OutcomeBus,
+    AccountBinding, AccountBus, Clock, Executor, ExecutorArgs, IncomeProcessor, MarketBus, Metrics, MetricsArgs, OutcomeBus,
     PaperCounter, PaperCounterArgs,
 };
 use hft_engine_rs::exchange::binance::{BinanceArgs, BinanceClient, BinanceNode, REST_BASE_URL};
@@ -268,10 +268,8 @@ async fn paper_counter_fills_from_live_trades() {
         &producers,
         ExecutorArgs {
             strategy: Box::new(DipMaker(Arc::clone(&log))),
-            account: PAPER_ACCOUNT.clone(),
+            binding: AccountBinding::Paper { label: "BTC".to_string(), legs: HashSet::new() },
             symbol_metas: metas_by_key.clone(),
-            // 模拟账户从零起步，无基线
-            baselines: Vec::new(),
             outcome_bus: outcome_bus.clone(),
             metrics,
         },

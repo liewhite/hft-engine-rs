@@ -32,9 +32,11 @@ use crate::engine::live::{
     OutcomeBus, PositionLedgerHandle,
 };
 use crate::domain::{
-    now_ms, AccountId, Exchange, ExchangeError, OrderUpdate, Symbol, SymbolMeta,
+    AccountId, Exchange, ExchangeError, OrderUpdate, Symbol, SymbolMeta,
 };
+use crate::engine::live::account_binding::{snapshot_live, Leg};
 use crate::engine::live::assembly::StartAccountStream;
+use crate::engine::live::AccountBinding;
 use crate::exchange::{AccountClient, AccountStream, ExchangeHandle, SubscriptionKind};
 use crate::messaging::AccountBus;
 use crate::tasks::{ChildHandle, Gone, Group, StopFlag};
@@ -191,60 +193,6 @@ fn validate_subscriptions(
     Err(format!("策略订阅不可行，拒绝投产: {}", problems.join("; ")))
 }
 
-
-/// 一个 executor 出生时要写入的持仓基线：**作用域内每条 (所, symbol) 都有一条**。
-///
-/// # 为什么必须每条都有
-///
-/// 缺一条，策略就能观察到"这条腿的持仓未查询到"这个中间状态 —— 而那个状态对策略毫无
-/// 用处，又逼着每个调用点写一次 `Option` 分支。分支写对了是冗余，写错了（当它空仓照常
-/// 开仓）是事故。把它填满之后，"未查询到"在策略消费第一条事件之前就已经不存在了。
-///
-/// # 两种来源
-///
-/// | 情形 | 基线 | 它是什么的真值 |
-/// |---|---|---|
-/// | 实盘 | REST 快照 | 该账户在该所的**真实持仓** |
-/// | 模拟账户 | `0` | 模拟账户从零起步，不看也不该看真实持仓 |
-///
-/// 实盘策略作用域内的所都配了凭证（`add` 投产前已校验），`fetch_baselines` 对每条都写了快照；
-/// 实盘取不到快照即不变式被破坏，报错拒绝投产，不补 0（补 0 会把真实持仓当成空仓；#767）。
-///
-/// # 补 0 的基线取 `snapshot_req_ts = 0`，以及这里的边界
-///
-/// 没有快照可言，所以不该过滤任何 Fill（防双计规则见 `SymbolPositions::apply_fill`）。
-/// 但那条规则的判据是 `local_ts <= seeded_ts` 且 `Timestamp = u64` ——
-/// **`local_ts == 0` 的 Fill 仍会被 ts=0 的基线丢掉**。说"不过滤任何 Fill"是不准确的。
-///
-/// 今天不可达：纸盘的 Fill `local_ts` 取 `now_ms()`，恒远大于 0；回测不经投产、从不 seed。
-/// 由 `synthesised_baseline_only_swallows_a_zero_timestamp_fill` 钉住这条边界 ——
-/// 哪天有路径产生 `local_ts == 0` 的 Fill，那条测试会说明它会发生什么。
-fn executor_baselines(
-    account: &AccountId,
-    scope: &HashSet<(Exchange, Symbol)>,
-    rest: &HashMap<(Exchange, Symbol), crate::messaging::PositionBaseline>,
-) -> Result<Vec<crate::messaging::PositionBaseline>, ExchangeError> {
-    let flat = |(exchange, symbol): &(Exchange, Symbol)| crate::messaging::PositionBaseline {
-        position: crate::domain::Position {
-            exchange: *exchange,
-            symbol: symbol.clone(),
-            size: crate::domain::Quantity::ZERO,
-        },
-        snapshot_req_ts: 0,
-    };
-    scope
-        .iter()
-        .map(|key| match account {
-            AccountId::Live => rest.get(key).cloned().ok_or_else(|| {
-                ExchangeError::Other(format!(
-                    "实盘策略作用域内的 {}/{} 没有持仓快照（该所应已校验配了凭证），拒绝投产",
-                    key.0, key.1
-                ))
-            }),
-            AccountId::Paper(_) => Ok(flat(key)),
-        })
-        .collect()
-}
 
 impl Provisioner {
     /// 装配期构造。协作者打包成 [`Collaborators`] 传入：字段不公开，manager 拿不到也改写
@@ -431,17 +379,6 @@ impl Provisioner {
                 )));
             }
         }
-        // 实盘策略订阅的每个所都要配了凭证：没凭证的所下单在出口被拒，补腿补不上就留单边敞口（#767）
-        for (spec, subscriptions) in strategies.iter().zip(&strategy_subscriptions) {
-            if spec.account != AccountId::Live {
-                continue;
-            }
-            if let Some((exchange, _)) = subscriptions.iter().find(|(ex, _)| !self.accounts.contains_key(ex)) {
-                return Err(ExchangeError::Other(format!(
-                    "实盘策略要在 {exchange} 交易，但 {exchange} 没配凭证（下单会被拒、补腿补不上），拒绝投产"
-                )));
-            }
-        }
 
         // 2. 按交易所分组订阅
         let mut exchange_subscriptions: HashMap<Exchange, Vec<SubscriptionKind>> = HashMap::new();
@@ -480,34 +417,37 @@ impl Provisioner {
         }
 
         // 5. 拉取持仓基线：**一次快照喂全部账本消费者**（executor / 对账镜像 / 观测镜像
-        //    —— 三者同一份快照、同一 seed 语义、同一条防双计规则，口径天然一致）。
-        //    此步只读 REST、无副作用，失败即"什么都没发生"。
-        let baselines = self.fetch_baselines(&exchange_symbols).await?;
+        //    —— 三者同一份快照、同一 seed 语义、同一条防双计规则，口径天然一致）。实盘实例要交易的
+        //    所没配凭证在这里报错（见 `snapshot_live`）。此步只读 REST、无副作用，失败即"什么都没发生"。
+        let scopes: Vec<HashSet<Leg>> = strategy_subscriptions
+            .iter()
+            .map(|subs| subs.iter().map(|(ex, kind)| (*ex, kind.symbol().clone())).collect())
+            .collect();
+        let live_scopes: Vec<&HashSet<Leg>> = strategies
+            .iter()
+            .zip(&scopes)
+            .filter(|(spec, _)| spec.account == AccountId::Live)
+            .map(|(_, legs)| legs)
+            .collect();
+        let (live_baselines, baselines) = snapshot_live(&self.accounts, &live_scopes, &exchange_symbols).await?;
 
         // 6. 批量创建 Executor：实盘实例**出生即带基线**（在收到任何流事件之前写入，
         //    "Fill 早于基线、存量被丢"的竞态在结构上不可能）；模拟账户从零起步，不需要
         //    也不应该看到真实持仓。此刻它们还没被注册，收不到任何事件。
         let mut spawned: Vec<Spawned> = Vec::new();
-        for (spec, subscriptions) in strategies.into_iter().zip(strategy_subscriptions.iter()) {
-            let account = spec.account.clone();
-            let scope: HashSet<(Exchange, Symbol)> = subscriptions
-                .iter()
-                .map(|(ex, kind)| (*ex, kind.symbol().clone()))
-                .collect();
-            let exec_baselines = match executor_baselines(&account, &scope, &baselines) {
-                Ok(b) => b,
-                Err(e) => {
-                    self.rollback_executors(&spawned).await;
-                    return Err(e);
-                }
+        let mut live_baselines = live_baselines.into_iter();
+        for (spec, legs) in strategies.into_iter().zip(scopes) {
+            let binding = match spec.account {
+                AccountId::Live => AccountBinding::Live(live_baselines.next().expect("snapshot_live 按 live_scopes 同序给出")),
+                AccountId::Paper(label) => AccountBinding::Paper { label, legs },
             };
+            let account = binding.account();
             let created = Executor::spawn(
                 &self.producers,
                 ExecutorArgs {
                     strategy: spec.strategy,
-                    account: spec.account,
+                    binding,
                     symbol_metas: self.symbol_metas.clone(),
-                    baselines: exec_baselines,
                     outcome_bus: self.outcome_bus.clone(),
                     metrics: self.metrics.clone(),
                 },
@@ -532,7 +472,7 @@ impl Provisioner {
                 &spawned,
                 &strategy_subscriptions,
                 &exchange_symbols,
-                baselines.into_values().collect(),
+                baselines,
                 exchange_subscriptions,
                 &account_streams,
             )
@@ -545,56 +485,6 @@ impl Provisioner {
         tracing::info!(count = spawned.len(), "Strategies batch added, Executors created");
 
         Ok(())
-    }
-
-    /// 拉取本批 (所, symbol) 的持仓基线（投产握手的载荷，见
-    /// [`crate::messaging::PositionBaseline`]）：交易所返回的用真实数据，未返回的构造
-    /// size=0 显式清零（保证消费方一定拿到初始值）。缺 client 的所不产基线（该腿从 0
-    /// 起算、不参与对账）。
-    ///
-    /// 拉取失败即**致命**：持仓基线只有这一次机会，之后全程靠 Fill 累加，没有第二个
-    /// 来源能纠正它。跳过的后果是策略从"仓位 0"起算——若账户实际有持仓，三道风控闸门
-    /// （单边杠杆/账户杠杆/仓位上限）会全部基于错误基线放行。宁可拒绝启动。
-    async fn fetch_baselines(
-        &self,
-        exchange_symbols: &HashSet<(Exchange, Symbol)>,
-    ) -> Result<HashMap<(Exchange, Symbol), crate::messaging::PositionBaseline>, ExchangeError>
-    {
-        let mut baselines = HashMap::new();
-        let exchanges: HashSet<Exchange> = exchange_symbols.iter().map(|(e, _)| *e).collect();
-        for exchange in exchanges {
-            let Some(client) = self.accounts.get(&exchange) else {
-                continue;
-            };
-            // 快照**请求**时刻：在此之前已由私有流送达的 Fill，其成交必然已包含在快照里
-            // —— 消费者 seed 之后据此过滤，避免"快照已含 + 再累加"的双计
-            // （见 SymbolState::seed_position）。
-            let snapshot_req_ts = now_ms();
-            let positions = client.fetch_positions().await.map_err(|e| {
-                ExchangeError::Other(format!(
-                    "无法获取 {exchange} 的初始持仓基线，拒绝启动（基线只有一次机会，\
-                     错了之后无从纠正）: {e}"
-                ))
-            })?;
-            let position_map = crate::exchange::client::index_positions(positions)
-                .map_err(|e| ExchangeError::Other(format!("{e}，拒绝启动")))?;
-            for (ex, symbol) in exchange_symbols.iter().filter(|(e, _)| *e == exchange) {
-                let pos = position_map.get(symbol).cloned().unwrap_or(crate::domain::Position {
-                    exchange: *ex,
-                    symbol: symbol.clone(),
-                    size: crate::domain::Quantity::ZERO,
-                });
-                tracing::info!(%exchange, %symbol, size = %pos.size, "Initial position loaded");
-                baselines.insert(
-                    (*ex, symbol.clone()),
-                    crate::messaging::PositionBaseline {
-                        position: pos,
-                        snapshot_req_ts,
-                    },
-                );
-            }
-        }
-        Ok(baselines)
     }
 
     /// 把已创建的 executor 注册进事件流并投产：注册镜像（原子带基线）→ 注册订阅 →
@@ -981,136 +871,5 @@ mod subscription_validation_tests {
             ),
             "IBKR 只实现了 BBO"
         );
-    }
-
-    // ===== 投产基线：作用域内每条腿都要有 =====
-
-    mod executor_baseline_tests {
-        use super::*;
-
-        const SYM: &str = "BTC";
-        const WITH_ACCOUNT: Exchange = Exchange::Binance;
-        const NO_ACCOUNT: Exchange = Exchange::OKX;
-
-        fn scope() -> HashSet<(Exchange, Symbol)> {
-            HashSet::from([
-                (WITH_ACCOUNT, SYM.to_string()),
-                (NO_ACCOUNT, SYM.to_string()),
-            ])
-        }
-
-        /// 只有 WITH_ACCOUNT 能拉到 REST 快照；NO_ACCOUNT 没配凭证，不产基线
-        fn rest() -> HashMap<(Exchange, Symbol), crate::messaging::PositionBaseline> {
-            HashMap::from([(
-                (WITH_ACCOUNT, SYM.to_string()),
-                crate::messaging::PositionBaseline {
-                    position: crate::domain::Position {
-                        exchange: WITH_ACCOUNT,
-                        symbol: SYM.to_string(),
-                        size: dec!(7.0),
-                    },
-                    snapshot_req_ts: 1_000,
-                },
-            )])
-        }
-
-        fn size_at(
-            baselines: &[crate::messaging::PositionBaseline],
-            exchange: Exchange,
-        ) -> Option<crate::domain::Quantity> {
-            baselines
-                .iter()
-                .find(|b| b.position.exchange == exchange)
-                .map(|b| b.position.size)
-        }
-
-        /// **核心不变量**：作用域内每条腿都拿到基线 ——
-        /// 于是策略永远观察不到"这条腿的持仓未查询到"。
-        #[test]
-        fn every_leg_in_scope_gets_a_baseline() {
-            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest()).unwrap();
-            assert_eq!(b.len(), scope().len(), "作用域内的腿必须全部有基线");
-            let live_scope = HashSet::from([(WITH_ACCOUNT, SYM.to_string())]);
-            let b = executor_baselines(&AccountId::Live, &live_scope, &rest()).unwrap();
-            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(dec!(7.0)), "实盘用 REST 真值");
-        }
-
-        /// 实盘作用域内有腿没有快照（该所没凭证，投产校验本该拦下）：报错，不补 0
-        #[test]
-        fn live_leg_without_snapshot_is_an_error() {
-            let err = executor_baselines(&AccountId::Live, &scope(), &rest()).unwrap_err();
-            assert!(err.to_string().contains("没有持仓快照"), "{err}");
-        }
-
-        /// **模拟账户绝不能看到真实持仓**：即便 REST 快照就在手边，也一律从 0 起步
-        #[test]
-        fn paper_never_sees_real_positions() {
-            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest()).unwrap();
-            assert_eq!(size_at(&b, WITH_ACCOUNT), Some(dec!(0.0)), "模拟账户不得继承实盘存量");
-            assert_eq!(size_at(&b, NO_ACCOUNT), Some(dec!(0.0)));
-        }
-
-        /// 补 0 的基线取 `snapshot_req_ts = 0`
-        #[test]
-        fn synthesised_baselines_use_a_zero_snapshot_timestamp() {
-            let b = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest()).unwrap();
-            assert!(b.iter().all(|x| x.snapshot_req_ts == 0));
-        }
-
-        /// **钉住 ts=0 的真实边界**：它并非"不过滤任何 Fill" —— 防双计判据是
-        /// `local_ts <= seeded_ts`，所以 `local_ts == 0` 的 Fill 照样会被吞掉。
-        ///
-        /// 今天不可达（实盘/纸盘的 `local_ts` 取 `now_ms()`；回测不经投产、从不 seed；
-        /// 无凭证的所收不到 Fill），但注释里曾写成"不过滤任何 Fill"，那是不准确的声明。
-        /// 这条测试让边界成为可执行的事实：哪天真有路径产生 `local_ts == 0` 的 Fill，
-        /// 读到这里就知道会发生什么，而不是被那句话误导。
-        #[test]
-        fn synthesised_baseline_only_swallows_a_zero_timestamp_fill() {
-            use crate::messaging::{SymbolAccountData, AccountData, IncomeEvent, StateManager};
-
-            let baselines = executor_baselines(&AccountId::Paper("x".to_string()), &scope(), &rest()).unwrap();
-            let fill_at = |local_ts: u64| {
-                IncomeEvent::account(
-                    AccountId::Live,
-                    local_ts,
-                    local_ts,
-                    AccountData::Symbol(SymbolAccountData::Fill(crate::domain::Fill {
-                        exchange: WITH_ACCOUNT,
-                        symbol: SYM.to_string(),
-                        side: crate::domain::Side::Long,
-                        price: dec!(100.0),
-                        size: dec!(1.0),
-                        client_order_id: None,
-                        order_id: "1".to_string(),
-                        timestamp: local_ts,
-                        fee: 0.0,
-                        reason: crate::domain::FillReason::Normal,
-                    })),
-                )
-            };
-
-            let mut swallowed = StateManager::new(&[SYM.to_string()]);
-            swallowed.seed_positions(&baselines);
-            swallowed.apply(&fill_at(0)).unwrap();
-            assert_eq!(
-                swallowed
-                    .symbol_state(&SYM.to_string())
-                    .expect("state")
-                    .position_book().position_size(WITH_ACCOUNT),
-                dec!(0.0),
-                "local_ts == 0 的 Fill 会被 ts=0 的基线判成「已含在快照里」而丢弃"
-            );
-
-            let mut kept = StateManager::new(&[SYM.to_string()]);
-            kept.seed_positions(&baselines);
-            kept.apply(&fill_at(1)).unwrap();
-            assert_eq!(
-                kept.symbol_state(&SYM.to_string())
-                    .expect("state")
-                    .position_book().position_size(WITH_ACCOUNT),
-                dec!(1.0),
-                "local_ts >= 1 照常累加 —— 实盘与纸盘取 now_ms()，恒落在这一侧"
-            );
-        }
     }
 }

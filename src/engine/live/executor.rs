@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
-use super::{AccountOutcome, MetricsHandle, OutcomeBus};
+use super::{AccountBinding, AccountOutcome, MetricsHandle, OutcomeBus};
 
 /// 策略消费一条事件时，距适配层收到它的最大容忍时长（见
 /// [`Executor::check_pipeline_lag`]）。
@@ -69,13 +69,11 @@ impl std::fmt::Display for ExecutorId {
 pub struct ExecutorArgs {
     /// 策略实例
     pub strategy: Box<dyn Strategy>,
-    /// 本实例绑定的账户：决定订单落到实盘还是某个模拟账户
-    pub account: AccountId,
+    /// 本实例绑定的账户（决定订单落到实盘还是某个模拟账户）和它的出生持仓：实例**出生即带基线**，
+    /// 在收到任何流事件之前写入 —— "Fill 早于基线、存量被丢"的竞态在结构上不可能
+    pub binding: AccountBinding,
     /// Symbol 元数据 (供 StrategyRunner 按交易所精度取整；单位折算不在此)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-    /// 持仓基线（投产握手）：实例**出生即带基线**，在收到任何流事件之前写入 ——
-    /// "Fill 早于基线、存量被丢"的竞态在结构上不可能。模拟账户从 0 起算，传空。
-    pub baselines: Vec<crate::messaging::PositionBaseline>,
     /// 策略信号的去处
     pub outcome_bus: OutcomeBus,
     /// 策略观测读数的去处（每个 Clock 拍交一次，见 [`crate::strategy::Strategy::gauges`]）
@@ -117,7 +115,7 @@ impl ExecutorHandle {
     /// 对账（见 [`super::PositionLedger`] 模块文档「两条比对」）。
     ///
     /// 只给已 seed 的腿：未 seed 的是「未知」，拿去比必然误判。实盘实例出生即把作用域内每条腿
-    /// 都 seed 了（见 `executor_baselines`），所以这就是它的全部持仓。
+    /// 都 seed 了（见 [`AccountBinding`]），所以这就是它的全部持仓。
     pub async fn seeded_positions(&self) -> Result<Vec<Position>, Gone> {
         self.addr.ask(ExecutorMsg::GetSeededPositions).await
     }
@@ -151,15 +149,16 @@ impl Executor {
         args: ExecutorArgs,
     ) -> anyhow::Result<(ChildHandle, ExecutorHandle)> {
         let id = ExecutorId::next();
-        let name = format!("Executor{id}[{}]", args.account);
+        let account = args.binding.account();
+        let name = format!("Executor{id}[{account}]");
         let (child, addr) = group
             .spawn_addressed(name, move |_scope: Scope, inbox| async move {
-                let account = args.account;
                 let mut runner =
                     StrategyRunner::new(args.strategy, args.symbol_metas, account.clone());
                 // 基线先于一切流事件写入（构造完成前收件箱里的消息不会被处理）
-                runner.seed_positions(&args.baselines);
-                tracing::info!(executor = %id, %account, baselines = args.baselines.len(), "Executor started");
+                let baselines = args.binding.into_baselines();
+                runner.seed_positions(&baselines);
+                tracing::info!(executor = %id, %account, baselines = baselines.len(), "Executor started");
                 Ok(Self {
                     inbox,
                     runner,
