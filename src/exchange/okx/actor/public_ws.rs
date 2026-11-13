@@ -70,8 +70,18 @@ impl OkxPublicWs {
 
     /// 断线重连后要重发的全部订阅
     fn all_subscriptions(&self) -> Vec<String> {
-        // subscribed 里只有订阅时 kind_to_arg 成功的 kind，这里不会过滤掉什么
-        let args: Vec<_> = self.subscribed.iter().filter_map(|k| kind_to_arg(k, &self.quote)).collect();
+        // subscribed 里只有订阅时 kind_to_arg 成功的 kind；万一漏了要看得见，不悄悄丢订阅
+        let args: Vec<_> = self
+            .subscribed
+            .iter()
+            .filter_map(|k| {
+                let arg = kind_to_arg(k, &self.quote);
+                if arg.is_none() {
+                    tracing::error!(?k, "OKX 重连重发订阅：该 kind 生成不出订阅参数，重连后不再有它的行情");
+                }
+                arg
+            })
+            .collect();
         if args.is_empty() {
             return Vec::new();
         }
