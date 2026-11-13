@@ -902,6 +902,11 @@ impl AccountClient for HyperliquidClient {
     }
 }
 
+/// orderStatus 应答里的 cloid 归属判定：只给本引擎的单（null、别人格式的都是 `None`）
+fn own_cloid(resp: OrderStatusResponse) -> Option<String> {
+    super::CLIENT_ORDER_IDS.claim(resp.order.and_then(|envelope| envelope.order.cloid).as_deref())
+}
+
 /// `POST /info {"type":"orderStatus"}` 的响应。
 ///
 /// **双层嵌套**（2026-08 实测）：
@@ -910,11 +915,6 @@ impl AccountClient for HyperliquidClient {
 ///
 /// 提到模块级只为让嵌套层次能被测试锁住 —— 少一层或多一层都会让 `cloid` 静默取不到，
 /// 而那会让启动期撤单认不出自己的单。
-/// orderStatus 应答里的 cloid 归属判定：只给本引擎的单（null、别人格式的都是 `None`）
-fn own_cloid(resp: OrderStatusResponse) -> Option<String> {
-    super::CLIENT_ORDER_IDS.claim(resp.order.and_then(|envelope| envelope.order.cloid).as_deref())
-}
-
 #[derive(Deserialize)]
 struct OrderStatusResponse {
     #[serde(default)]
