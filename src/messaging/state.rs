@@ -105,7 +105,14 @@ impl PendingOrder {
         Ok(())
     }
 
-    /// 撤单请求失败。单已结束（多半是刚成交完）就不用再撤，不记
+    /// 下单请求被拒：返回该不该移出。只有下单中的单确定没挂上；交易所已对它说过话的（拒单结论和交易所回报
+    /// 前后脚到）以交易所为准、留在表里由回报走完，否则策略会在旁边再挂一张（#764 审查）
+    fn on_place_rejected(&self) -> bool {
+        self.stage == OrderStage::Placing
+    }
+
+    /// 撤单请求失败。只会落在撤单中或已结束（撤单只由 [`Self::request_cancel`] 发出，发出即进入撤单中）；
+    /// 已结束（多半是刚成交完）就不用再撤，不记
     fn on_cancel_failed(&mut self, at: Timestamp, reason: &str) {
         if let OrderStage::Cancelling { attempt, .. } = &mut self.stage {
             *attempt = CancelAttempt::Failed { at, reason: reason.to_string() };
@@ -532,10 +539,7 @@ impl SymbolOrders {
                 p.on_placed();
             }
             RequestOutcome::PlaceRejected { reason } => {
-                // 确定没挂上（实盘出口只在交易所没对这张单说过话时才报拒单），也就不会有成交。
-                // 交易所已对这张单说过话（拒单结论和交易所回报在出口前后脚到）时以交易所为准：
-                // 单留在表里由回报走完生命周期，不能移出后让策略在旁边再挂一张（#764 审查）
-                if p.stage == OrderStage::Placing {
+                if p.on_place_rejected() {
                     tracing::info!(%symbol, exchange = %r.exchange, client_order_id = %r.client_order_id, %reason, "下单被拒，移出跟踪表");
                     self.orders.remove(&r.client_order_id);
                 } else {
@@ -996,6 +1000,10 @@ mod tests {
             p.on_cancel_failed(7, "x");
             let want = if matches!(from, Cancelling { .. }) { Cancelling { first_sent_at: 3, attempt: failed() } } else { from.clone() };
             assert_eq!(p.stage, want, "撤单失败 from {from:?}");
+        }
+        // 下单被拒：只有下单中的移出，交易所已说过话的以交易所为准
+        for from in all() {
+            assert_eq!(at(from.clone()).on_place_rejected(), from == Placing, "拒单 from {from:?}");
         }
         // 要撤：只有挂着、上次撤单失败的能发；重撤保留第一次撤的时刻
         let cases: Vec<(OrderStage, Result<OrderStage, &str>)> = vec![

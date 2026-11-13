@@ -507,15 +507,12 @@ impl FundingArbStrategy {
     /// 撤一张开着的单。下单请求还没结论的，框架丢弃这次撤单、受理的结论到了本策略重新判断时再撤；
     /// 撤单在途时不重发，撤单失败（多半是单刚成交、终态马上就到）后隔 `hedge_retry_ms` 再撤。
     fn cancel(&self, p: &PendingOrder, now: Timestamp) -> Option<OutcomeEvent> {
-        match p.stage() {
-            OrderStage::Placing | OrderStage::Live => {}
-            OrderStage::Done { .. } | OrderStage::Cancelling { attempt: CancelAttempt::InFlight, .. } => return None,
-            OrderStage::Cancelling { attempt: CancelAttempt::Failed { at, reason }, .. } => {
-                if now.saturating_sub(*at) < self.p.hedge_retry_ms {
-                    return None;
-                }
-                tracing::warn!(symbol = %self.symbol(), exchange = %p.order.exchange, client_order_id = %p.order.client_order_id, %reason, "撤单失败且单还开着，重撤");
+        // 哪些单不该发撤单（下单中、已结束、撤单在途）由框架挡；策略只定撤单失败后隔多久重撤
+        if let OrderStage::Cancelling { attempt: CancelAttempt::Failed { at, reason }, .. } = p.stage() {
+            if now.saturating_sub(*at) < self.p.hedge_retry_ms {
+                return None;
             }
+            tracing::warn!(symbol = %self.symbol(), exchange = %p.order.exchange, client_order_id = %p.order.client_order_id, %reason, "撤单失败且单还开着，重撤");
         }
         Some(OutcomeEvent::CancelOrder {
             exchange: p.order.exchange,
