@@ -23,7 +23,8 @@ use super::{to_live_outlet, AccountOutcome, OutcomeBus};
 // ============================================================================
 
 /// 实盘网关发往各所的下单 / 撤单 REST 请求累计次数（本进程启动以来）。网关是唯一写入方，
-/// 指标出口只读（推成 `hft_order_requests`，看各所下单、撤单用了多少次；含被本地限流拒掉、没发出去的）。
+/// 指标出口只读（推成 `hft_order_requests`，看各所下单、撤单用了多少次）。口径：交给交易所接口的
+/// 次数，含被本地限频拒掉、没发出去的；出向校验不过（数量不足一手等）没交给接口的不算。
 #[derive(Debug, Default)]
 pub struct OrderRequestCounts(std::sync::Mutex<HashMap<(Exchange, RequestKind), u64>>);
 
@@ -104,7 +105,7 @@ pub struct OrderGateway {
     /// 一旦停机就不再发新单：停机收尾期间策略可能还在出信号，这些单挂到交易所上、进程退出后
     /// 无人看管（#710）。撤单不受影响。
     machine_stopping: StopFlag,
-    /// 真正发出去的下单 / 撤单 REST 请求计数（本地拦下的不算）
+    /// 下单 / 撤单请求计数（口径见 [`OrderRequestCounts`]）
     requests: Arc<OrderRequestCounts>,
 }
 
@@ -435,9 +436,8 @@ impl OutcomeProcessor {
         //   才算停完 —— 不再有"引擎已停但请求仍在途"的窗口（REST 有自己的超时，根的总期限兜底）；
         // - 请求任务 panic 会作为错误上冒、整机停机，不会被吞掉。
         //
-        // 已知取舍（当前不处理，靠上层机制兜底）：同一 symbol 的多笔下单/撤单可能乱序
-        // 到达交易所 —— 策略层的 rebalance / reduce-only 会在后续事件中纠正净敞口，不依赖
-        // 单条请求的到达序。
+        // 框架不保证到达序：同一 symbol 的多笔下单/撤单并发发出，可能乱序到达交易所。
+        // 需要先后的策略自己等前一张的结论（请求结论或订单回报）再发下一张。
         //
         // 子任务内的结论由 gateway 以 OrderRequestResult 发到账户总线；下单结果不确定时 gateway
         // 自己停机（见 `OrderGateway::place`）。
@@ -453,8 +453,7 @@ impl OutcomeProcessor {
                 })?;
             }
             OutcomeEvent::PlaceOrders { orders, comment } => {
-                // 关联订单独立并行下单：IOC 订单本身接受部分成交，
-                // 敞口由策略层 rebalance 机制兜底修正。
+                // 同一信号里的几张单各自独立下单：不保证同时成交或同时失败，成交不齐由策略处理
                 for order in orders {
                     let gateway = self.gateway.clone();
                     let comment = comment.clone();

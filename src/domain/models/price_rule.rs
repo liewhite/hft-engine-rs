@@ -3,7 +3,8 @@
 //! 规则是各所的市场知识：通用的固定步长（tick）在这里，见 [`PriceStep`]；不是固定步长的所在自己的
 //! 适配层实现 [`PriceRule`]（如 Hyperliquid 的有效数字规则，见 `exchange::hyperliquid::markets`）。
 //!
-//! 下单字符串一律由 [`crate::domain::to_wire`] 写出（无尾零、无科学计数法），规则里不再各自拼字符串。
+//! 规则只取整、不拼字符串：下单字符串由各所出口写（币安、OKX 用 [`crate::domain::to_wire`]，
+//! Hyperliquid 用自己更严的 `decimal_to_wire`）。
 
 use crate::domain::Price;
 use rust_decimal::{Decimal, RoundingStrategy};

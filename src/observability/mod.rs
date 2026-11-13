@@ -12,7 +12,7 @@
 //! - `SLACK_BOT_TOKEN` + `SLACK_ALERT_CHANNEL`：告警经 Slack bot 发到指定频道；或
 //!   `ALERT_WEBHOOK_URL`：告警 webhook 端点（POST `{"text": "..."}`，兼容 Slack
 //!   incoming webhook / 飞书自定义机器人的 text 模式）
-//! - `PUSHGATEWAY_URL` / `PUSHGATEWAY_JOB`（默认 `hft_engine`）：指标推送端点。
+//! - `PUSHGATEWAY_URL` / `PUSHGATEWAY_JOB`（默认取程序名，取不到才用 `hft_engine`）：指标推送端点。
 //!   **多实例（分桶）部署必须各配不同的 `PUSHGATEWAY_JOB`** —— pushgateway 按 job
 //!   分组，同 job 的推送互相覆盖
 

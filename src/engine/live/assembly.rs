@@ -54,8 +54,8 @@ pub(crate) type SpawnFuture = std::pin::Pin<
 
 /// 单个交易所的装配产物（两阶段划分的理由见模块文档）。
 ///
-/// **加一个新交易所只需**：本文件写一个 `setup_*`、各 bin 的装配处加一行 push ——
-/// manager 对"有哪些所"彻底无知（`ManagerArgs` 收 `Vec<ExchangeSetup>`）。
+/// **加一个新交易所只需**：本文件写一个 `setup_*`，[`ExchangesConfig`] 加一个字段、[`setup_all`]
+/// 加一段 —— manager 对"有哪些所"彻底无知（`ManagerArgs` 收 `Vec<ExchangeSetup>`）。
 pub struct ExchangeSetup {
     pub(crate) exchange: Exchange,
     pub(crate) client: Arc<dyn ExchangeClient>,

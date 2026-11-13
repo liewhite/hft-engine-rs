@@ -52,7 +52,8 @@ pub fn parse_decimal(raw: &str) -> Result<Decimal, String> {
         .map_err(|_| format!("数值非法: '{raw}'"))
 }
 
-/// 数量 / 价格 → 下单字符串：去尾零、不用科学计数法（`62562.60` → `62562.6`）。三所共用
+/// 数量 / 价格 → 下单字符串：去尾零、不用科学计数法（`62562.60` → `62562.6`）。币安、OKX 用；
+/// Hyperliquid 另有更严的写法（超过 8 位小数报错，签名机要求，见 `hyperliquid::transport::decimal_to_wire`）
 pub fn to_wire(d: Decimal) -> String {
     d.normalize().to_string()
 }
