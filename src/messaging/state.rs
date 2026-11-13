@@ -91,11 +91,16 @@ impl PendingOrder {
         }
     }
 
-    /// 要撤这张单：`Ok` = 该发撤单，已记为撤单在途；`Err` 带不发的原因
+    /// 要撤这张单：`Ok` = 该发撤单，已记为撤单在途；`Err` 带不发的原因。
+    ///
+    /// 收到的成交已加满单量的也不发：交易所那边已经成交完，终态回报还在路上（成交常先于终态到，策略
+    /// 被这笔成交唤醒、要撤挂单时它看着还开着，#796 OKX 51400）。单量是策略请求的量（未按交易所精度取整），
+    /// 取整后变小的单成交加不满它，那时退回原样：多发一次撤单、交易所报撤单失败，无害。
     fn request_cancel(&mut self, now: Timestamp) -> Result<(), &'static str> {
         self.stage = match &self.stage {
             OrderStage::Placing => return Err("下单请求还没结论"),
             OrderStage::Done { .. } => return Err("已到终态"),
+            _ if self.filled >= self.order.quantity => return Err("成交已加满单量，终态在路上"),
             OrderStage::Cancelling { attempt: CancelAttempt::InFlight, .. } => return Err("上一次撤单还在等结论"),
             OrderStage::Live => OrderStage::Cancelling { first_sent_at: now, attempt: CancelAttempt::InFlight },
             OrderStage::Cancelling { first_sent_at, attempt: CancelAttempt::Failed { .. } } => {
@@ -484,8 +489,8 @@ impl SymbolOrders {
 
     /// 策略要撤这张单：记下「撤单在途」，返回 `Ok` 表示该发。
     ///
-    /// 不该发的（`Err` 带原因）：不在表里、已到终态（撤不掉，发了白耗一次交易所操作）、下单请求还没结论、
-    /// 上一次撤单还在等结论（见 [`OrderStage`]）。下单没结论时不撤：受理的结论（或交易所回报）一到
+    /// 不该发的（`Err` 带原因）：不在表里、已到终态或收到的成交已加满单量（撤不掉，发了白耗一次交易所操作）、
+    /// 下单请求还没结论、上一次撤单还在等结论（见 [`OrderStage`]）。下单没结论时不撤：受理的结论（或交易所回报）一到
     /// 策略就会被调用、可以再撤，只晚一个往返。
     pub fn mark_cancel_sent(&mut self, client_order_id: &str, now: Timestamp) -> Result<(), &'static str> {
         match self.orders.get_mut(client_order_id) {
@@ -957,6 +962,22 @@ mod tests {
         apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1));
         assert_eq!(state.mark_cancel_sent(CID, 2), Err("已到终态"));
         assert_eq!(state.mark_cancel_sent("other", 2), Err("不在跟踪表里"));
+    }
+
+    /// #796：成交先到、加满了单量，终态还没到：单看着还开着，但不发撤单；只成交了一部分的照常撤
+    #[test]
+    fn no_cancel_once_fills_add_up_to_the_order() {
+        let mut state = with_order();
+        apply(&mut state, &request(RequestOutcome::Placed { order_id: "1".into() }, 1));
+        apply(&mut state, &own_fill(dec!(0.4), 2));
+        assert!(state.mark_cancel_sent(CID, 3).is_ok(), "部分成交照常撤");
+
+        let mut state = with_order();
+        apply(&mut state, &request(RequestOutcome::Placed { order_id: "1".into() }, 1));
+        apply(&mut state, &own_fill(dec!(1.0), 2));
+        assert!(the_order(&state).is_some_and(|p| p.is_open()), "终态没到，还开着");
+        assert_eq!(state.mark_cancel_sent(CID, 3), Err("成交已加满单量，终态在路上"));
+        assert_eq!(the_order(&state).unwrap().stage(), &OrderStage::Live, "没记成撤单在途");
     }
 
     /// 状态机的每条转换：从每个状态出发，喂每种输入，看落到哪个状态、撤单该不该发。

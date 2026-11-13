@@ -365,6 +365,27 @@ fn one_leg_fill_cancels_other_then_hedges_the_lagging_leg() {
     assert!(placed(&s.bbo(HL)).is_empty());
 }
 
+/// #796：一腿全部成交、成交先于终态到：只撤另一腿，不对已成交的单发撤单；终态到、另一腿撤掉后补腿
+#[test]
+fn full_fill_before_terminal_cancels_only_the_other_leg() {
+    let mut s = Sim::new(dec!(0.0), dec!(0.0));
+    s.funding(BN, 0.8);
+    let o = placed(&s.funding(HL, 0.1));
+    let bn = o.iter().find(|o| o.exchange == BN).unwrap().clone();
+    let hl = o.iter().find(|o| o.exchange == HL).unwrap().clone();
+    s.confirm(&bn, OrderStatus::Pending);
+    s.confirm(&hl, OrderStatus::Pending);
+
+    let out = s.fill(&bn, bn.quantity);
+    assert_eq!(cancels(&out), vec![HL], "{out:?}");
+    assert!(placed(&out).is_empty(), "{out:?}");
+
+    s.confirm(&bn, OrderStatus::Filled);
+    let h = placed(&s.confirm(&hl, OrderStatus::Cancelled));
+    assert_eq!(h.len(), 1);
+    assert_eq!((h[0].exchange, h[0].side, h[0].quantity), (HL, Side::Long, bn.quantity));
+}
+
 #[test]
 fn reversal_closes_with_reduce_only_makers() {
     let mut s = Sim::new(dec!(-2.0), dec!(2.0)); // 币安空 HL 多

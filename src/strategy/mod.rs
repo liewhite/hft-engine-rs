@@ -29,7 +29,7 @@ pub enum OutcomeEvent {
     },
     /// 撤单信号（按客户端订单号撤，不等交易所订单号）。
     ///
-    /// 框架只对下单已受理、还开着、且没有撤单在途的单发出，其余丢弃（见 `SymbolOrders::mark_cancel_sent`），
+    /// 框架只对下单已受理、还开着（收到的成交也没加满单量）、且没有撤单在途的单发出，其余丢弃（见 `SymbolOrders::mark_cancel_sent`），
     /// 策略要在之后的事件里重新要求；撤单失败以
     /// [`crate::messaging::RequestOutcome::CancelFailed`] 回报，记在单的撤单状态上（[`crate::messaging::CancelAttempt::Failed`]）。
     CancelOrder {
