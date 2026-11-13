@@ -12,6 +12,9 @@ use base64::{engine::general_purpose, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+/// 本引擎在 OKX 的订单号：`x` + 31 hex（OKX 不允许以数字开头，至多 32 位）
+pub const CLIENT_ORDER_IDS: super::CliOrderIdFormat = super::CliOrderIdFormat::new("x", 31);
+
 /// OKX REST API 地址
 pub const REST_BASE_URL: &str = "https://www.okx.com";
 

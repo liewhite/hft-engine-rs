@@ -1,5 +1,6 @@
 pub mod binance;
 pub mod client;
+pub mod client_order_id;
 pub mod hyperliquid;
 pub mod ibkr;
 pub mod okx;
@@ -14,6 +15,7 @@ pub mod ws_loop;
 #[cfg(test)]
 mod trades_conformance;
 
+pub use client_order_id::CliOrderIdFormat;
 pub use crypto_status::CryptoStatus;
 pub use client::{
     AccountClient, AccountStream, ExchangeAccess, ExchangeClient, ExchangeCmd, ExchangeHandle, ExchangeOrder,

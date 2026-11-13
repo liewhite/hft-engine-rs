@@ -23,6 +23,7 @@ use super::{
 use crate::domain::{now_ms, AccountId, Exchange, ExchangeError, Position, Symbol, SymbolMeta};
 use crate::exchange::{AccountClient, ExchangeClient, ExchangeHandle, SettledFundingSource, SubscriptionKind};
 use crate::messaging::{AccountEvent, CustomEvent, MarketData, MarketEvent};
+use crate::engine::NewClientOrderId;
 use crate::strategy::Strategy;
 use crate::tasks::{Addr, BusTap, Group, Inbox, Scope, Task};
 use std::collections::{HashMap, HashSet};
@@ -338,6 +339,9 @@ impl Manager {
         // 能力表：投产校验用（知识在各适配层的 supports_subscription，随 setup 携带）
         let capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool> =
             setups.iter().map(|s| (s.exchange, s.supports)).collect();
+        // 各所订单号生成函数（适配层提供），交给投产编排、再交给每个策略实例
+        let client_order_ids: Arc<HashMap<Exchange, NewClientOrderId>> =
+            Arc::new(setups.iter().map(|s| (s.exchange, s.new_client_order_id)).collect());
         let exchange_order: Vec<Exchange> = setups.iter().map(|s| s.exchange).collect();
         let settled_funding: HashMap<Exchange, Arc<dyn SettledFundingSource>> = setups
             .iter()
@@ -515,6 +519,7 @@ impl Manager {
                 symbol_metas,
                 accounts,
                 capabilities,
+                client_order_ids,
                 account_streams: provisioning::AccountStreams::new(account_stream_starters, account_bus.clone()),
                 paper_counter,
                 income_processor,

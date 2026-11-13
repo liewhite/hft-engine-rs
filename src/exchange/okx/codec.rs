@@ -386,7 +386,7 @@ impl OrderPushData {
 
         Ok(OrderUpdate {
             order_id: self.ord_id.clone(),
-            client_order_id: self.cl_ord_id.clone(),
+            client_order_id: super::CLIENT_ORDER_IDS.claim(self.cl_ord_id.as_deref()),
             exchange: Exchange::OKX,
             symbol: meta.symbol.clone(),
             side,
@@ -460,7 +460,7 @@ impl OrderPushData {
             side,
             price: fill_px,
             size: fill_sz,
-            client_order_id: self.cl_ord_id.clone(),
+            client_order_id: super::CLIENT_ORDER_IDS.claim(self.cl_ord_id.as_deref()),
             order_id: self.ord_id.clone(),
             timestamp: now_ms(),
             fee: -fee,

@@ -271,6 +271,7 @@ async fn paper_counter_fills_from_live_trades() {
             strategy: Box::new(DipMaker(Arc::clone(&log))),
             binding: AccountBinding::Paper { label: PAPER_LABEL.to_string(), legs: HashSet::new() },
             symbol_metas: metas_by_key.clone(),
+            client_order_ids: std::sync::Arc::new(std::collections::HashMap::from([(EX, (|| hft_engine_rs::exchange::binance::CLIENT_ORDER_IDS.generate()) as hft_engine_rs::engine::NewClientOrderId)])),
             outcome_bus: outcome_bus.clone(),
             metrics,
         },

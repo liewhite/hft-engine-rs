@@ -597,7 +597,7 @@ impl IbkrPublicWs {
 
             let update = OrderUpdate {
                 order_id,
-                client_order_id: Some(order_ref.to_string()),
+                client_order_id: crate::exchange::ibkr::CLIENT_ORDER_IDS.claim(Some(order_ref)),
                 exchange: Exchange::IBKR,
                 symbol,
                 side,
@@ -850,7 +850,7 @@ impl FillPairing {
                 exchange: Exchange::IBKR,
                 symbol: symbol.clone(),
                 order_id: execution_id.clone(),
-                client_order_id: if order_ref.is_empty() { None } else { Some(order_ref.to_string()) },
+                client_order_id: crate::exchange::ibkr::CLIENT_ORDER_IDS.claim(Some(order_ref)),
                 side,
                 price,
                 size,
@@ -965,7 +965,7 @@ impl FillPairing {
     }
 }
 
-/// 构建 Filled OrderUpdate（如有 order_ref）
+/// 构建 Filled OrderUpdate（只给本引擎的单）
 fn build_order_update(
     item: &serde_json::Value,
     order_ref: &str,
@@ -973,13 +973,12 @@ fn build_order_update(
     side: Side,
     size: Decimal,
 ) -> Option<OrderUpdate> {
-    if order_ref.is_empty() {
-        return None;
-    }
+    // 只给本引擎的单合成回报：别人的单不在跟踪表里，合成了也没人用
+    let client_order_id = crate::exchange::ibkr::CLIENT_ORDER_IDS.claim(Some(order_ref))?;
     let order_id = wire::order_id(item.get("orderId")).unwrap_or_default();
     Some(OrderUpdate {
         order_id,
-        client_order_id: Some(order_ref.to_string()),
+        client_order_id: Some(client_order_id),
         exchange: Exchange::IBKR,
         symbol: symbol.to_string(),
         side,
@@ -1169,7 +1168,7 @@ mod tests {
     fn trade(execution_id: &str, commission: Option<f64>) -> serde_json::Value {
         let mut item = serde_json::json!({
             "execution_id": execution_id, "conid": CONID, "side": "B",
-            "price": "150.5", "size": "10", "order_ref": "cid-1", "orderId": 123
+            "price": "150.5", "size": "10", "order_ref": "ib-cid-1", "orderId": 123
         });
         if let Some(c) = commission {
             item["commission"] = serde_json::json!(c);
@@ -1197,7 +1196,7 @@ mod tests {
         match data {
             AccountData::Symbol(SymbolAccountData::OrderUpdate(u)) => {
                 assert_eq!(u.status, OrderStatus::Filled);
-                assert_eq!(u.client_order_id.as_deref(), Some("cid-1"));
+                assert_eq!(u.client_order_id.as_deref(), Some("ib-cid-1"));
             }
             other => panic!("应为 OrderUpdate，实际 {other:?}"),
         }

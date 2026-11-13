@@ -274,8 +274,8 @@ impl HyperliquidClient {
     /// 响应是**双层嵌套**（2026-08 实测）：
     /// `{"status":"order","order":{"order":{...,"cloid":...},"status":...,"statusTimestamp":...}}`
     ///
-    /// 返回 `None` 表示该单查不到、或它本就没有 cloid（人工经 UI 下单与强平等系统单都是
-    /// `cloid: null`）—— 两种情况调用方都无法证明归属，应当保守地不动那张单。
+    /// 返回 `None` 表示该单查不到、它本就没有 cloid（人工经 UI 下单与强平等系统单都是
+    /// `cloid: null`）、或 cloid 不是本引擎的格式 —— 都当别人的单，调用方保守地不动。
     async fn cloid_of(
         &self,
         wallet_address: &str,
@@ -289,7 +289,7 @@ impl HyperliquidClient {
             }))
             .await?;
 
-        Ok(resp.order.and_then(|envelope| envelope.order.cloid))
+        Ok(super::CLIENT_ORDER_IDS.claim(resp.order.and_then(|envelope| envelope.order.cloid).as_deref()))
     }
 
 }
@@ -963,7 +963,7 @@ mod order_status_tests {
             "双层嵌套解析错误会让 cloid 静默丢失"
         );
         // 该 cloid 是本引擎格式，归属判定应认领它
-        assert!(Exchange::Hyperliquid.owns_cli_order_id(&cloid.unwrap()));
+        assert!(super::super::CLIENT_ORDER_IDS.owns(&cloid.unwrap()));
     }
 
     #[test]

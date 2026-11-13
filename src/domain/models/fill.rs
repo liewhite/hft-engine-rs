@@ -27,7 +27,8 @@ pub struct Fill {
     pub price: Price,
     /// 成交数量
     pub size: Quantity,
-    /// 客户端订单ID（用于关联 PendingOrder）
+    /// 本引擎的单的客户端订单号（用于关联 PendingOrder）；别人的单为 `None`，归属由适配层判定
+    /// （同 [`crate::domain::OrderUpdate`]）
     pub client_order_id: Option<String>,
     /// 交易所订单ID
     pub order_id: String,

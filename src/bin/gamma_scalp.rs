@@ -118,7 +118,7 @@ fn main() -> anyhow::Result<()> {
     let source = BsGreeksSource::new(trade_source, greeks_config);
 
     let strategy = GammaScalpStrategy::new(EX, symbol.clone(), ccy.clone(), delta_band, base_offset_ratio);
-    let runner = StrategyRunner::with_id_gen(
+    let runner = StrategyRunner::new(
         Box::new(strategy),
         symbol_metas.clone(),
         hft_engine_rs::backtest::backtest_account(),

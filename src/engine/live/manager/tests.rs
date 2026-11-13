@@ -76,6 +76,7 @@ fn fake_setup(exchange: Exchange, log: Log, fail: Option<&'static str>) -> Excha
         client: Arc::new(FakeClient(exchange)),
         account: None,
         supports: |_| true,
+        new_client_order_id: || "fake-cid".to_string(),
         settled_funding: None,
         account_streams: HashMap::new(),
         spawn_actor: Box::new(move |ctx: SpawnCtx| {

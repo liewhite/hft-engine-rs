@@ -25,18 +25,22 @@ use std::sync::Arc;
 
 /// client_order_id 生成策略 (注入点)。
 ///
-/// 生产用交易所规范的随机 id (UUID) 保证跨重启唯一；回测用确定性自增计数，保证
-/// "同一输入 -> 同一逐笔回报序列" (client_order_id 会随订单/成交回报投递给策略)。
+/// 生产用各所适配层的格式生成随机 id（[`AdapterClientOrderIds`]），保证跨重启唯一；回测用确定性
+/// 自增计数，保证"同一输入 -> 同一逐笔回报序列" (client_order_id 会随订单/成交回报投递给策略)。
 pub trait ClientOrderIdGen: Send {
-    fn next_id(&mut self, exchange: Exchange) -> String;
+    /// `None` = 该所没有装配（策略对没接入的所下单），驱动方停机
+    fn next_id(&mut self, exchange: Exchange) -> Option<String>;
 }
 
-/// 生产默认：交易所规范的随机 client_order_id (UUID)。
-#[derive(Default)]
-pub struct ExchangeUuidGen;
-impl ClientOrderIdGen for ExchangeUuidGen {
-    fn next_id(&mut self, exchange: Exchange) -> String {
-        exchange.new_cli_order_id()
+/// 某所生成本引擎订单号的函数：格式是各所的线路知识，由适配层随装配产物提供
+/// （见 [`crate::exchange::CliOrderIdFormat`]），框架只调用、不解读
+pub type NewClientOrderId = fn() -> String;
+
+/// 生产：按所调用适配层提供的订单号生成函数
+pub struct AdapterClientOrderIds(pub Arc<HashMap<Exchange, NewClientOrderId>>);
+impl ClientOrderIdGen for AdapterClientOrderIds {
+    fn next_id(&mut self, exchange: Exchange) -> Option<String> {
+        self.0.get(&exchange).map(|generate| generate())
     }
 }
 
@@ -46,10 +50,10 @@ pub struct SequentialClientOrderIdGen {
     next: u64,
 }
 impl ClientOrderIdGen for SequentialClientOrderIdGen {
-    fn next_id(&mut self, _exchange: Exchange) -> String {
+    fn next_id(&mut self, _exchange: Exchange) -> Option<String> {
         let id = format!("bt{}", self.next);
         self.next += 1;
-        id
+        Some(id)
     }
 }
 
@@ -65,17 +69,9 @@ pub struct StrategyRunner {
 }
 
 impl StrategyRunner {
-    /// 生产构造：client_order_id 用交易所 UUID。`account` 是本策略绑定的账户（只收它的私有事件）。
+    /// `account` 是本策略绑定的账户（只收它的私有事件）；`id_gen` 给策略的单分配订单号
+    /// （实盘 [`AdapterClientOrderIds`]，回测 [`SequentialClientOrderIdGen`] 以确保确定性）。
     pub fn new(
-        strategy: Box<dyn Strategy>,
-        symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
-        account: AccountId,
-    ) -> Self {
-        Self::with_id_gen(strategy, symbol_metas, account, Box::new(ExchangeUuidGen))
-    }
-
-    /// 注入 id 生成策略 (回测传 [`SequentialClientOrderIdGen`] 以确保确定性)。
-    pub fn with_id_gen(
         strategy: Box<dyn Strategy>,
         symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
         account: AccountId,
@@ -137,7 +133,7 @@ impl StrategyRunner {
     /// 产出订单是**币本位**且已取整；单位折算是出口的职责，见模块文档。
     ///
     /// `Err` = 订单跟踪表已说不清挂单与持仓（有单等交易所太久，见 [`crate::messaging::ORDER_STUCK_MS`]），
-    /// 驱动方应停机。
+    /// 或策略对没有装配的交易所下单，驱动方应停机。
     pub fn on_event(&mut self, event: &IncomeEvent) -> Result<Vec<OutcomeEvent>, String> {
         self.state.apply(event)?;
         let now = event.local_ts();
@@ -148,17 +144,18 @@ impl StrategyRunner {
         for signal in raw {
             match signal {
                 OutcomeEvent::PlaceOrders { orders, comment } => {
-                    let converted = orders
-                        .into_iter()
-                        .map(|mut order| {
-                            order.client_order_id = self.id_gen.next_id(order.exchange);
-                            // 登记未取整的原始订单，与取整前的行为保持一致（策略比对自己
-                            // 的挂单量时看到的仍是它请求的数量）
-                            // created_at 取当前事件时刻 (回测=虚拟时间, 确定性), 不读墙钟
-                            self.state.add_pending_order(order.clone(), now);
-                            self.round_to_exchange_precision(order)
-                        })
-                        .collect();
+                    let mut converted = Vec::with_capacity(orders.len());
+                    for mut order in orders {
+                        order.client_order_id = self
+                            .id_gen
+                            .next_id(order.exchange)
+                            .ok_or_else(|| format!("策略对没有装配的交易所 {} 下单（{}）", order.exchange, order.symbol))?;
+                        // 登记未取整的原始订单，与取整前的行为保持一致（策略比对自己
+                        // 的挂单量时看到的仍是它请求的数量）
+                        // created_at 取当前事件时刻 (回测=虚拟时间, 确定性), 不读墙钟
+                        self.state.add_pending_order(order.clone(), now);
+                        converted.push(self.round_to_exchange_precision(order));
+                    }
                     out.push(OutcomeEvent::PlaceOrders { orders: converted, comment });
                 }
                 OutcomeEvent::CancelOrder { exchange, symbol, client_order_id } => {
@@ -281,7 +278,7 @@ mod tests {
     }
 
     fn run_once(quantity: Decimal, price: Decimal) -> Order {
-        let mut runner = StrategyRunner::with_id_gen(
+        let mut runner = StrategyRunner::new(
             Box::new(OneShot {
                 quantity,
                 price,
@@ -318,7 +315,7 @@ mod tests {
     /// pending 登记的是策略请求的原始数量（未取整），与改造前行为一致
     #[test]
     fn pending_order_keeps_strategy_requested_quantity() {
-        let mut runner = StrategyRunner::with_id_gen(
+        let mut runner = StrategyRunner::new(
             Box::new(OneShot {
                 quantity: dec!(0.125),
                 price: dec!(62_500.0),
@@ -350,6 +347,7 @@ mod tests {
             }),
             metas(),
             crate::domain::AccountId::Live,
+            Box::new(SequentialClientOrderIdGen::default()),
         );
 
         let bbo = |exchange: Exchange, symbol: &str| {

@@ -456,7 +456,7 @@ impl WsOrderUpdate {
 
         Ok(crate::domain::OrderUpdate {
             order_id: self.order.oid.to_string(),
-            client_order_id: self.order.cloid.clone(),
+            client_order_id: super::CLIENT_ORDER_IDS.claim(self.order.cloid.as_deref()),
             exchange: Exchange::Hyperliquid,
             symbol,
             side,
@@ -559,7 +559,7 @@ impl WsFill {
             side,
             price,
             size,
-            client_order_id: self.cloid.clone(),
+            client_order_id: super::CLIENT_ORDER_IDS.claim(self.cloid.as_deref()),
             order_id: self.oid.to_string(),
             timestamp: self.time,
             fee,

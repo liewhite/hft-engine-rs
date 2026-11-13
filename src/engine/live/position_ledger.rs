@@ -1702,6 +1702,7 @@ mod task_tests {
                     baseline(size),
                 ])),
                 symbol_metas: metas(),
+                client_order_ids: Default::default(),
                 outcome_bus: OutcomeBus::new("outcome"),
                 metrics: super::super::Metrics::spawn_for_test(&root.group("consumers")).await,
             },

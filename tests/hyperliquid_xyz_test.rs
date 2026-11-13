@@ -252,7 +252,7 @@ async fn place_test_order(side: Side) {
     let quantity = dec!(1).max(meta.min_order_size);
     println!("下单数量: {}", quantity);
 
-    let cli_id = Exchange::Hyperliquid.new_cli_order_id();
+    let cli_id = hft_engine_rs::exchange::hyperliquid::CLIENT_ORDER_IDS.generate();
     let order = Order {
         id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::Hyperliquid,

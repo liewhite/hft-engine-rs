@@ -138,7 +138,7 @@ async fn ibkr_fill_observe() {
 
     // IOC 买入 1 股，价格吃 ask + 滑点确保成交
     let buy_price: Decimal = meta.format_price(hft_engine_rs::domain::from_f64(ask + 0.05).unwrap()).parse().unwrap();
-    let client_oid = Exchange::IBKR.new_cli_order_id();
+    let client_oid = hft_engine_rs::exchange::ibkr::CLIENT_ORDER_IDS.generate();
     let order = Order {
         id: uuid::Uuid::new_v4().to_string(),
         exchange: Exchange::IBKR,
@@ -221,7 +221,7 @@ async fn ibkr_fill_observe() {
         },
         quantity: dec!(1.0),
         reduce_only: false,
-        client_order_id: Exchange::IBKR.new_cli_order_id(),
+        client_order_id: hft_engine_rs::exchange::ibkr::CLIENT_ORDER_IDS.generate(),
     };
     println!("\n平仓卖出 {} @ {}", symbol, sell_price);
     let _ = client.place_order(ExchangeOrder::from_domain(sell_order, &meta).expect("订单未通过出向校验")).await.expect("卖单失败");

@@ -4,7 +4,7 @@ use hft_engine_rs::domain::{
     dec, AccountId, Decimal, Exchange, Fill, FillReason, OrderStatus, OrderType, OrderUpdate, Position, SettledFunding,
     Side, PriceStep, SymbolMeta, TimeInForce, BBO,
 };
-use hft_engine_rs::engine::StrategyRunner;
+use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::messaging::{
     AccountData, CustomEvent, ExchangeAccountData, IncomeEvent, MarketData, OrderRequestResult, PositionBaseline,
     PositionValues, RequestOutcome, SymbolAccountData,
@@ -101,6 +101,7 @@ impl Sim {
             Box::new(FundingArbStrategy::new(p, exchanges.iter().map(|&e| meta(e, min_of(e)).1).collect())),
             Arc::new(exchanges.iter().map(|&e| meta(e, min_of(e))).collect::<HashMap<_, _>>()),
             AccountId::Live,
+            Box::new(SequentialClientOrderIdGen::default()),
         );
         let baselines: Vec<PositionBaseline> = legs
             .iter()

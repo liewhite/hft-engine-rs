@@ -370,7 +370,7 @@ fn parse_pending_order(
     Ok(OrderUpdate {
         order_id: d.ord_id.clone(),
         // 缺失就是缺失，**绝不用 ord_id 顶替**：归属识别（启动期只撤本引擎的单）靠它
-        client_order_id: d.cl_ord_id.clone().filter(|s| !s.is_empty()),
+        client_order_id: super::CLIENT_ORDER_IDS.claim(d.cl_ord_id.as_deref()),
         exchange: Exchange::OKX,
         symbol,
         side,

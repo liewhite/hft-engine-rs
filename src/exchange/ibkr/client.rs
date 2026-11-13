@@ -565,7 +565,7 @@ impl AccountClient for IbkrClient {
             };
             updates.push(crate::domain::OrderUpdate {
                 order_id,
-                client_order_id: o.coid,
+                client_order_id: super::CLIENT_ORDER_IDS.claim(o.coid.as_deref()),
                 exchange: Exchange::IBKR,
                 symbol: symbol.clone(),
                 side,

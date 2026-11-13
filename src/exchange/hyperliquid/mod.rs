@@ -12,6 +12,13 @@ pub use actor::{HyperliquidArgs, HyperliquidNode};
 pub use client::HyperliquidClient;
 pub use symbol::from_hyperliquid;
 
+/// 本引擎在 Hyperliquid 的订单号（cloid）：协议要求 128-bit 十六进制，即 `0x` + 32 hex。
+///
+/// 注意 `0x` 是 HL 的格式要求而非我们选的标记，本身不带归属信息：HL 上真正的区分是「有没有
+/// cloid」—— 人工经 UI 下单、强平等系统单都是 `cloid: null`（2026-08 实测某账户 1987 张历史单中
+/// 331 张为 null），null 经 [`super::CliOrderIdFormat::claim`] 自然判为别人的单。
+pub const CLIENT_ORDER_IDS: super::CliOrderIdFormat = super::CliOrderIdFormat::new("0x", 32);
+
 /// Hyperliquid REST API 地址
 pub const REST_BASE_URL: &str = "https://api.hyperliquid.xyz";
 

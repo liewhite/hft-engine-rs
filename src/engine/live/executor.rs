@@ -8,7 +8,7 @@
 //! [`ChildHandle`] 调 `stop().await`（会把箱里已收到的事件处理完再退出）。
 
 use crate::domain::{now_ms, AccountId, Exchange, Position, Symbol, SymbolMeta, Timestamp};
-use crate::engine::StrategyRunner;
+use crate::engine::{AdapterClientOrderIds, NewClientOrderId, StrategyRunner};
 use crate::messaging::{IncomeEvent, MarketData, MarketEvent};
 use crate::strategy::Strategy;
 use crate::tasks::{Addr, ChildHandle, Gone, Group, Inbox, Scope, Task};
@@ -74,6 +74,8 @@ pub struct ExecutorArgs {
     pub binding: AccountBinding,
     /// Symbol 元数据 (供 StrategyRunner 按交易所精度取整；单位折算不在此)
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+    /// 各所的订单号生成函数（适配层提供）
+    pub client_order_ids: Arc<HashMap<Exchange, NewClientOrderId>>,
     /// 策略信号的去处
     pub outcome_bus: OutcomeBus,
     /// 策略观测读数的去处（每个 Clock 拍交一次，见 [`crate::strategy::Strategy::gauges`]）
@@ -154,7 +156,12 @@ impl Executor {
         let (child, addr) = group
             .spawn_addressed(name, move |_scope: Scope, inbox| async move {
                 let mut runner =
-                    StrategyRunner::new(args.strategy, args.symbol_metas, account.clone());
+                    StrategyRunner::new(
+                    args.strategy,
+                    args.symbol_metas,
+                    account.clone(),
+                    Box::new(AdapterClientOrderIds(args.client_order_ids)),
+                );
                 // 基线先于一切流事件写入（构造完成前收件箱里的消息不会被处理）
                 let baselines = args.binding.into_baselines();
                 runner.seed_positions(&baselines);

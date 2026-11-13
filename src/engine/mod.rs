@@ -4,7 +4,7 @@ mod strategy_runner;
 
 pub use bootstrap::{load_config, run_engine, run_main};
 pub use strategy_runner::{
-    ClientOrderIdGen, ExchangeUuidGen, SequentialClientOrderIdGen, StrategyRunner,
+    AdapterClientOrderIds, ClientOrderIdGen, NewClientOrderId, SequentialClientOrderIdGen, StrategyRunner,
 };
 pub use live::{
     AccountBinding, AccountBus, AccountOutcome, Clock, Executor, ExecutorArgs, ExecutorHandle, ExecutorId,

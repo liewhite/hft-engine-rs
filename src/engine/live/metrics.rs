@@ -278,7 +278,7 @@ impl MetricsView {
 
     /// 按交易所回报维护「还开着的本引擎挂单」
     fn track_open_order(&mut self, update: &crate::domain::OrderUpdate) {
-        let Some(cid) = update.client_order_id.as_ref().filter(|c| update.exchange.owns_cli_order_id(c)) else {
+        let Some(cid) = &update.client_order_id else {
             return;
         };
         let orders = self.open_orders.entry(update.symbol.clone()).or_default();

@@ -14,6 +14,9 @@ use gateway::IbkrGateway;
 use oauth::IbkrOAuth;
 use std::sync::Arc;
 
+/// 本引擎在 IBKR 的订单号（cOID / order_ref）：`ib` + 30 hex
+pub const CLIENT_ORDER_IDS: super::CliOrderIdFormat = super::CliOrderIdFormat::new("ib", 30);
+
 /// IBKR OAuth REST API 基础 URL
 pub const OAUTH_BASE_URL: &str = "https://api.ibkr.com/v1/api/";
 

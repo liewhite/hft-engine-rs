@@ -183,7 +183,7 @@ fn main() -> anyhow::Result<()> {
         entry_size: Decimal::ZERO,
     };
     // 回测用确定性 id 生成器 -> 同一输入同一逐笔回报序列
-    let runner = StrategyRunner::with_id_gen(
+    let runner = StrategyRunner::new(
         Box::new(strategy),
         symbol_metas.clone(),
         hft_engine_rs::backtest::backtest_account(),

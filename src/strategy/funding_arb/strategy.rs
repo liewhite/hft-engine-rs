@@ -415,7 +415,7 @@ impl FundingArbStrategy {
     /// 记下本策略一张单的结局：被拒（交易所拒，或本地下单请求被拒）则加长该所的退避，被接下则清零
     fn note_order_outcome(&mut self, data: &SymbolAccountData, now: Timestamp) {
         let (ex, rejected) = match data {
-            SymbolAccountData::OrderUpdate(u) if u.client_order_id.as_ref().is_some_and(|c| u.exchange.owns_cli_order_id(c)) => {
+            SymbolAccountData::OrderUpdate(u) if u.client_order_id.is_some() => {
                 match &u.status {
                     OrderStatus::Rejected { reason } => (u.exchange, Some(reason)),
                     OrderStatus::Pending | OrderStatus::PartiallyFilled | OrderStatus::Filled => (u.exchange, None),

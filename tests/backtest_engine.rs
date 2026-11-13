@@ -152,7 +152,7 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
             bbo_ev(dec!(99.7), dec!(99.8), 3000),
         ],
     };
-    let runner = StrategyRunner::with_id_gen(
+    let runner = StrategyRunner::new(
         Box::new(OneShotBuy {
             price: dec!(100.0),
             tif: TimeInForce::PostOnly,
@@ -210,7 +210,7 @@ fn trade_print_matching_fills_resting_limit() {
             trade_ev(dec!(98.0), 3000),
         ],
     };
-    let runner = StrategyRunner::with_id_gen(
+    let runner = StrategyRunner::new(
         Box::new(OneShotBuy {
             price: dec!(100.0),
             tif: TimeInForce::GTC,
@@ -277,7 +277,7 @@ fn emitted_custom_events_reach_observers_but_never_strategies() {
         evs: vec![bbo_ev(dec!(100.0), dec!(100.1), 1000), bbo_ev(dec!(100.2), dec!(100.3), 2000)],
     };
     let seen_by_strategy = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let runner = StrategyRunner::with_id_gen(
+    let runner = StrategyRunner::new(
         Box::new(EmitOnBbo { seen_customs: Arc::clone(&seen_by_strategy) }),
         metas(),
         hft_engine_rs::backtest::backtest_account(),
@@ -354,13 +354,13 @@ fn inbound_custom_events_route_by_scope() {
     let seen_btc = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_eth = Arc::new(std::sync::Mutex::new(Vec::new()));
     let runners = vec![
-        StrategyRunner::with_id_gen(
+        StrategyRunner::new(
             Box::new(CustomProbe { symbol: SYM.to_string(), seen: Arc::clone(&seen_btc) }),
             metas(),
             hft_engine_rs::backtest::backtest_account(),
             Box::new(SequentialClientOrderIdGen::default()),
         ),
-        StrategyRunner::with_id_gen(
+        StrategyRunner::new(
             Box::new(CustomProbe { symbol: SYM2.to_string(), seen: Arc::clone(&seen_eth) }),
             metas(),
             hft_engine_rs::backtest::backtest_account(),

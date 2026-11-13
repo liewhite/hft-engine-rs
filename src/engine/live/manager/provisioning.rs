@@ -38,6 +38,7 @@ use crate::engine::live::account_binding::{snapshot, PlannedAccount};
 use crate::engine::live::assembly::StartAccountStream;
 use crate::exchange::{AccountClient, AccountStream, ExchangeHandle, SubscriptionKind};
 use crate::messaging::AccountBus;
+use crate::engine::NewClientOrderId;
 use crate::tasks::{ChildHandle, Gone, Group, StopFlag};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -63,6 +64,7 @@ pub(super) struct Collaborators {
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     pub accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     pub capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
+    pub client_order_ids: Arc<HashMap<Exchange, NewClientOrderId>>,
     pub account_streams: AccountStreams,
     pub paper_counter: bool,
     pub income_processor: IncomeProcessorHandle,
@@ -87,6 +89,8 @@ pub(super) struct Provisioner {
     accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
     /// 各所的订阅能力查询（知识在适配层，随 ExchangeSetup 携带；投产校验用）
     capabilities: HashMap<Exchange, fn(&SubscriptionKind) -> bool>,
+    /// 各所的订单号生成函数（知识在适配层，随 ExchangeSetup 携带；新建 executor 时交给它）
+    client_order_ids: Arc<HashMap<Exchange, NewClientOrderId>>,
     /// 各所能起的账户类数据流与已起的（策略声明需要才起，见 [`AccountStreams`]）
     account_streams: AccountStreams,
     /// 起没起模拟柜台（`ManagerArgs::paper` 配了才起）：没起时绑定模拟账户的策略拒绝投产 ——
@@ -203,6 +207,7 @@ impl Provisioner {
             symbol_metas: c.symbol_metas,
             accounts: c.accounts,
             capabilities: c.capabilities,
+            client_order_ids: c.client_order_ids,
             account_streams: c.account_streams,
             paper_counter: c.paper_counter,
             income_processor: c.income_processor,
@@ -260,9 +265,9 @@ impl Provisioner {
 
     /// 列出**本引擎**在该 (所, symbol) 上的挂单。
     ///
-    /// 同一个交易所账户上可能还有人工下单或其他程序下的单，靠 client_order_id 的前缀识别
-    /// （见 [`Exchange::owns_cli_order_id`]）。认不出归属的一律**保留** —— 撤错别人的单
-    /// 不可接受，而漏撤会由调用方的复查兜住。
+    /// 同一个交易所账户上可能还有人工下单或其他程序下的单：归属由适配层解析挂单时判定，
+    /// 只有本引擎的单带 `client_order_id`（见 [`crate::exchange::CliOrderIdFormat`]）。
+    /// 认不出归属的一律**保留** —— 撤错别人的单不可接受，而漏撤会由调用方的复查兜住。
     async fn own_pending_orders(
         client: &Arc<dyn AccountClient>,
         exchange: Exchange,
@@ -271,22 +276,12 @@ impl Provisioner {
         let all = client.fetch_pending_orders(symbol).await?;
         Ok(all
             .into_iter()
-            .filter(|update| match update.client_order_id.as_deref() {
-                Some(id) if exchange.owns_cli_order_id(id) => true,
-                Some(id) => {
-                    tracing::info!(
-                        %exchange, %symbol, client_order_id = id,
-                        "挂单不属于本引擎，保留不动"
-                    );
-                    false
+            .filter(|update| {
+                let own = update.client_order_id.is_some();
+                if !own {
+                    tracing::info!(%exchange, %symbol, order_id = %update.order_id, "挂单不属于本引擎，保留不动");
                 }
-                None => {
-                    tracing::info!(
-                        %exchange, %symbol, order_id = %update.order_id,
-                        "挂单无 client_order_id，无法确认归属，保留不动"
-                    );
-                    false
-                }
+                own
             })
             .collect())
     }
@@ -441,6 +436,7 @@ impl Provisioner {
                     strategy: spec.strategy,
                     binding,
                     symbol_metas: self.symbol_metas.clone(),
+                    client_order_ids: self.client_order_ids.clone(),
                     outcome_bus: self.outcome_bus.clone(),
                     metrics: self.metrics.clone(),
                 },
@@ -697,8 +693,8 @@ mod leftover_order_tests {
         }
     }
 
-    /// 无 client_order_id 的挂单（人工 UI 单 / 交易所系统单）
-    fn anonymous_order(order_id: &str) -> OrderUpdate {
+    /// 别人的挂单（人工 / 其他程序 / 系统单）：适配层解析时已判定归属，不带 client_order_id
+    fn foreign_order(order_id: &str) -> OrderUpdate {
         OrderUpdate {
             client_order_id: None,
             ..order("", order_id)
@@ -715,16 +711,12 @@ mod leftover_order_tests {
         assert!(cancelled.lock().unwrap().is_empty());
     }
 
-    /// **只撤本引擎的单**：人工单 / 其他程序的单 / 无 cloid 的单都不能动。
+    /// **只撤本引擎的单**：别人的单（适配层给的 client_order_id 为 None）都不能动。
     /// 撤错别人的挂单是不可接受的。
     #[tokio::test]
     async fn only_own_orders_are_cancelled() {
-        let own = EX.new_cli_order_id();
-        let foreign = vec![
-            order("web_1a2b", "ex-foreign-1"),
-            order("android_9f8e", "ex-foreign-2"),
-            anonymous_order("ex-anon"),
-        ];
+        let own = "own-1".to_string();
+        let foreign = vec![foreign_order("ex-foreign-1"), foreign_order("ex-foreign-2")];
         let mut first = foreign.clone();
         first.push(order(&own, "ex-own"));
 
@@ -746,7 +738,7 @@ mod leftover_order_tests {
     /// 留着无人看管的挂单开跑，策略会在它旁边重复挂单，它还可能成交、开出一个没人管的仓位。
     #[tokio::test]
     async fn still_present_after_cancel_is_an_error() {
-        let own = EX.new_cli_order_id();
+        let own = "own-1".to_string();
         let leftover = vec![order(&own, "ex-own")];
         // 两次都返回同一张 —— 模拟撤不掉
         let (client, _cancelled) = FakeClient::new(vec![leftover.clone(), leftover]);

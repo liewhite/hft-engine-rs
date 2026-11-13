@@ -497,10 +497,10 @@ impl SymbolOrders {
     /// 交易所的订单回报
     fn apply_update(&mut self, symbol: &Symbol, update: &crate::domain::OrderUpdate, local_ts: Timestamp) {
         let Some(client_id) = &update.client_order_id else {
-            return; // 没有客户端订单号：不是本引擎的单
+            return; // 不是本引擎的单（归属由适配层判定，见 OrderUpdate::client_order_id）
         };
         let Some(p) = self.orders.get_mut(client_id) else {
-            if !update.status.is_terminal() && update.exchange.owns_cli_order_id(client_id) {
+            if !update.status.is_terminal() {
                 // 本引擎订单号、还开着、本地却没有：别的实例或上一个进程的单（启动时已撤净遗留挂单，
                 // 正常不会出现）。不接管：它的成交照常进持仓，由策略按普通不平衡处理
                 tracing::warn!(%symbol, exchange = %update.exchange, %client_id, status = ?update.status, "本引擎订单号的挂单不在跟踪表里，不接管");
@@ -1028,12 +1028,11 @@ mod tests {
         }
     }
 
-    /// 不在表里的单的回报不重建记录：本引擎的、别人的、终态的、开着的都一样
+    /// 不在表里的单的回报不重建记录（别人的单在适配层就没有订单号，这里只剩本引擎的不明单）
     #[test]
     fn updates_of_untracked_orders_never_create_records() {
         let mut state = SymbolState::new(SYMBOL.to_string());
-        let own = EX.new_cli_order_id();
-        for cid in [own.as_str(), "web_1a2b3c", "android_9f8e"] {
+        for cid in ["own-1", "own-2"] {
             apply(&mut state, &update(cid, OrderStatus::Pending, dec!(0.0), 1));
             apply(&mut state, &update(cid, OrderStatus::PartiallyFilled, dec!(0.5), 2));
         }

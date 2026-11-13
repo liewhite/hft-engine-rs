@@ -444,7 +444,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
         },
         quantity: TEST_QUANTITY,
         reduce_only: false,
-        client_order_id: Exchange::IBKR.new_cli_order_id(),
+        client_order_id: hft_engine_rs::exchange::ibkr::CLIENT_ORDER_IDS.generate(),
     };
 
     println!("[下单] 买入 {} 股 {} @ {}", TEST_QUANTITY, symbol, buy_price);
@@ -496,7 +496,7 @@ async fn test_ibkr_place_order_and_verify_fill() {
         },
         quantity: TEST_QUANTITY,
         reduce_only: false,
-        client_order_id: Exchange::IBKR.new_cli_order_id(),
+        client_order_id: hft_engine_rs::exchange::ibkr::CLIENT_ORDER_IDS.generate(),
     };
 
     println!("[下单] 卖出 {} 股 {} @ {}", TEST_QUANTITY, symbol, sell_price);

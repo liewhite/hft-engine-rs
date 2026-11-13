@@ -306,7 +306,7 @@ impl OrderTradeUpdate {
 
         Ok(OrderUpdate {
             order_id: self.o.i.to_string(),
-            client_order_id: if self.o.c.is_empty() { None } else { Some(self.o.c.clone()) },
+            client_order_id: super::CLIENT_ORDER_IDS.claim(Some(&self.o.c)),
             exchange: Exchange::Binance,
             symbol,
             side,
@@ -346,7 +346,7 @@ impl OrderTradeUpdate {
             side,
             price: last_price,
             size: fill_sz,
-            client_order_id: if self.o.c.is_empty() { None } else { Some(self.o.c.clone()) },
+            client_order_id: super::CLIENT_ORDER_IDS.claim(Some(&self.o.c)),
             order_id: self.o.i.to_string(),
             timestamp: now_ms(),
             fee,

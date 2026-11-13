@@ -249,7 +249,7 @@ async fn run() -> anyhow::Result<()> {
 use hft_engine_rs::backtest::{BacktestEngine, BinanceHistorySource};
 use hft_engine_rs::engine::{SequentialClientOrderIdGen, StrategyRunner};
 
-let runner = StrategyRunner::with_id_gen(
+let runner = StrategyRunner::new(
     Box::new(my_strategy),
     symbol_metas.clone(),
     hft_engine_rs::backtest::backtest_account(),       // 回测账户：只收它的私有事件
