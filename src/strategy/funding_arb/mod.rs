@@ -3,6 +3,6 @@ mod config;
 mod signal;
 mod strategy;
 
-pub use config::{FundingArbConfig, PairConfig};
+pub use config::{FundingArbConfig, PairConfig, PairParams};
 pub use signal::{SettledFundingWindow, FUNDING_WINDOW_MS};
 pub use strategy::FundingArbStrategy;

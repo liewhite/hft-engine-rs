@@ -220,7 +220,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let config: MyConfig = load_config("config.json")?;
+    let path = std::env::args().nth(1).unwrap_or_else(|| "config.json".into());
+    let config: MyConfig = load_config(&path)?;
 
     // 1. 装配参与的交易所（config.exchanges: ExchangesConfig）。缺省即该所不参与 ——
     //    manager 对"有哪些所"彻底无知

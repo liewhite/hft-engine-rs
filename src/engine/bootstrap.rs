@@ -109,14 +109,13 @@ fn init_tracing() -> anyhow::Result<Option<crate::observability::AlertHandle>> {
     Ok(alert_handle)
 }
 
-/// 从 CLI 参数读取配置文件并反序列化
-pub fn load_config<T: DeserializeOwned>(default_path: &str) -> anyhow::Result<T> {
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| default_path.to_string());
-    tracing::info!(path = %config_path, "Loading config");
-    let content = std::fs::read_to_string(&config_path)?;
-    Ok(serde_json::from_str(&content)?)
+/// 读取配置文件并反序列化（路径由启动程序按自己的命令行约定给出）。
+/// 只读文件、不联网、不写日志：启动程序的「只校验配置」模式也用它。
+pub fn load_config<T: DeserializeOwned>(path: &str) -> anyhow::Result<T> {
+    use anyhow::Context;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("读取配置文件 {path} 失败"))?;
+    serde_json::from_str(&content).with_context(|| format!("配置文件 {path} 解析失败"))
 }
 
 /// 实盘引擎的完整一生：启动 → 装配 → 运行 → 停机。各启动程序只写装配那一段。

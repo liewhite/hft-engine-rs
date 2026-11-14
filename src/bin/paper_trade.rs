@@ -129,7 +129,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let config: PaperTradeConfig = load_config("paper.json")?;
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "paper.json".into());
+    tracing::info!(%path, "Loading config");
+    let config: PaperTradeConfig = load_config(&path)?;
 
     // 只支持单所演示：取配置里第一个启用的所
     let exchange = if config.exchanges.binance.is_some() {

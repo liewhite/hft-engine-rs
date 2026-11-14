@@ -1,6 +1,9 @@
 //! 多所资金费套利入口（#668 两所版，#673 扩到币安 / Hyperliquid / OKX）。
 //!
-//! 用法：`funding_arb [config.json]`。`exchanges` 里配了哪几所就接哪几所（至少两所）；
+//! 用法：`funding_arb [config.json]` 跑实盘；`funding_arb --check-config [config.json]` 只校验配置
+//! （只读配置文件、校验参数，不联网、不下单；通过退出码 0，不通过非 0 并打印原因），换版前用新程序
+//! 先校验线上配置，缺字段、参数非法在动在跑的程序之前就被拦下（#858）。
+//! `exchanges` 里配了哪几所就接哪几所（至少两所）；
 //! 每个币在哪几所做，由启动时各所的品种目录决定（该币上市的所，至少两所，否则拒绝启动）。
 //! HL 侧按 `exchanges.hyperliquid.dexes` 接入多个市场（"" = 加密币主站，"xyz" = 股票/商品），
 //! HL 账户须为统一账户（多 dex 共用一份 USDC 保证金），否则启动报错。
@@ -31,7 +34,8 @@ use hft_engine_rs::engine::{
 use hft_engine_rs::exchange::SettledFundingSource;
 use hft_engine_rs::messaging::CustomEvent;
 use hft_engine_rs::strategy::{
-    FundingArbConfig, FundingArbStrategy, SettledFundingWindow, Strategy, FUNDING_WINDOW_MS,
+    FundingArbConfig, FundingArbPairParams, FundingArbStrategy, SettledFundingWindow, Strategy,
+    FUNDING_WINDOW_MS,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -47,13 +51,37 @@ struct Config {
     funding_poll_secs: u64,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    run_main(run).await
+/// 命令行模式
+enum Cli {
+    /// 跑实盘
+    Run { config: String },
+    /// 只校验配置：读文件、校验参数后退出，不联网、不下单
+    CheckConfig { config: String },
 }
 
-async fn run() -> anyhow::Result<()> {
-    let config: Config = load_config("config.json")?;
+const DEFAULT_CONFIG: &str = "config.json";
+const USAGE: &str = "用法：funding_arb [config.json] | funding_arb --check-config [config.json]";
+
+fn parse_cli(args: &[String]) -> anyhow::Result<Cli> {
+    let check = |config: &str| Cli::CheckConfig {
+        config: config.to_string(),
+    };
+    Ok(match args {
+        [] => Cli::Run {
+            config: DEFAULT_CONFIG.into(),
+        },
+        [flag] if flag == "--check-config" => check(DEFAULT_CONFIG),
+        [flag, path] if flag == "--check-config" => check(path),
+        [path] if !path.starts_with('-') => Cli::Run {
+            config: path.clone(),
+        },
+        _ => anyhow::bail!("参数不认识：{args:?}。{USAGE}"),
+    })
+}
+
+/// 读配置并做全部不联网的校验；跑实盘与只校验共用这一处，两者校验的东西永远一致
+fn load_validated(path: &str) -> anyhow::Result<(Config, Vec<FundingArbPairParams>)> {
+    let config: Config = load_config(path)?;
     let params = config
         .strategy
         .params()
@@ -67,6 +95,25 @@ async fn run() -> anyhow::Result<()> {
         config.funding_poll_secs,
         config.strategy.max_funding_age_ms
     );
+    Ok((config, params))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_cli(&args)? {
+        Cli::CheckConfig { config } => {
+            let (_, params) = load_validated(&config)?;
+            println!("配置校验通过：{config}（{} 个币）", params.len());
+            Ok(())
+        }
+        Cli::Run { config } => run_main(move || run(config)).await,
+    }
+}
+
+async fn run(config_path: String) -> anyhow::Result<()> {
+    tracing::info!(path = %config_path, "Loading config");
+    let (config, params) = load_validated(&config_path)?;
 
     let setups = setup_all(&config.exchanges).await?;
     anyhow::ensure!(
@@ -226,5 +273,29 @@ impl FundingPoller {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> anyhow::Result<Cli> {
+        parse_cli(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn cli_modes() {
+        assert!(matches!(parse(&[]).unwrap(), Cli::Run { config } if config == DEFAULT_CONFIG));
+        assert!(matches!(parse(&["/x.json"]).unwrap(), Cli::Run { config } if config == "/x.json"));
+        assert!(
+            matches!(parse(&["--check-config"]).unwrap(), Cli::CheckConfig { config } if config == DEFAULT_CONFIG)
+        );
+        assert!(
+            matches!(parse(&["--check-config", "/x.json"]).unwrap(), Cli::CheckConfig { config } if config == "/x.json")
+        );
+        // 拼错的开关不能被当成配置路径去跑实盘
+        assert!(parse(&["--check"]).is_err());
+        assert!(parse(&["a.json", "b.json"]).is_err());
     }
 }
