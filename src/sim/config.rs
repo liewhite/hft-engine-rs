@@ -1,5 +1,8 @@
 use crate::domain::Rate;
 
+/// 虚拟柜台的现金币种：现金、手续费都以它计（与 [`SimConfig::initial_balance_usdt`] 一致）
+pub const SIM_CASH_ASSET: &str = "USDT";
+
 /// 虚拟柜台的延迟与初始资金配置 (与 ox-demo `SimConfig` 同构)。
 ///
 /// 延迟在回测引擎中建模为"入队到 now + 延迟"，撮合本身不依赖墙钟。

@@ -1,5 +1,5 @@
 use crate::domain::models::{Fill, FillReason, OrderStatus, OrderUpdate, Side};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 /// 保留的最近成交条数（环形缓冲上限，防止长跑内存增长）
 pub const RECENT_FILL_CAPACITY: usize = 50;
@@ -8,9 +8,12 @@ pub const RECENT_FILL_CAPACITY: usize = 50;
 ///
 /// 纯数据 + 纯函数：只由事件驱动累加，不读时钟、不做 IO，可直接单测。
 ///
-/// 盈亏口径为**现金流 + 存货估值**：
-/// - `cash`：卖出收现金、买入付现金，并扣除手续费
-/// - 总盈亏 = `cash` + 当前持仓按最新价的市值
+/// 价差盈亏口径为**现金流 + 存货估值**：
+/// - `cash`：卖出收现金、买入付现金（计价币，不含手续费）
+/// - 价差盈亏 = `cash` + 当前持仓按最新价的市值
+///
+/// 手续费按交易所实际扣的币种另记在 `fees`，不并进 `cash`：币种可能不是计价币（BNB 抵扣、
+/// 现货买卖两边不同币），不同币不能相加（#817）。
 ///
 /// 这样不需要把开仓与平仓配对（跨所、部分成交、强平会让配对逻辑迅速失控），
 /// 对任意成交顺序都成立。
@@ -20,9 +23,9 @@ pub struct TradingStats {
     pub fills: u64,
     /// 累计成交名义额 (price * size)
     pub volume: f64,
-    /// 累计手续费（正数 = 支出，负数 = 返佣）
-    pub fee: f64,
-    /// 累计现金流（已扣手续费）：卖出 +notional，买入 -notional
+    /// 按币种累计的手续费（正数 = 支出，负数 = 返佣）；只含出现过的币种
+    pub fees: BTreeMap<String, f64>,
+    /// 累计现金流（不含手续费）：卖出 +notional，买入 -notional
     pub cash: f64,
     /// 强平 / ADL 成交笔数（风险告警指标，正常应恒为 0）
     pub forced_fills: u64,
@@ -49,7 +52,7 @@ impl TradingStats {
         Self {
             fills: 0,
             volume: 0.0,
-            fee: 0.0,
+            fees: BTreeMap::new(),
             cash: 0.0,
             forced_fills: 0,
             rejected_orders: 0,
@@ -65,11 +68,13 @@ impl TradingStats {
         let notional = crate::domain::to_f64(fill.price * fill.size);
         self.fills += 1;
         self.volume += notional;
-        self.fee += fill.fee;
+        if let Some(fee) = &fill.fee {
+            *self.fees.entry(fee.asset.clone()).or_default() += fee.amount;
+        }
         self.cash += match fill.side {
             Side::Long => -notional,
             Side::Short => notional,
-        } - fill.fee;
+        };
 
         if fill.reason != FillReason::Normal {
             self.forced_fills += 1;
@@ -95,7 +100,7 @@ impl TradingStats {
         self.rejected_orders += 1;
     }
 
-    /// 总盈亏 = 累计现金流 + 当前持仓市值
+    /// 价差盈亏 = 累计现金流 + 当前持仓市值（不含手续费，手续费按币种见 `fees`）
     pub fn total_pnl(&self, position_value: f64) -> f64 {
         self.cash + position_value
     }
@@ -104,11 +109,27 @@ impl TradingStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Exchange;
+    use crate::domain::{Exchange, Fee};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     fn fill(side: Side, price: Decimal, size: Decimal, fee: f64, reason: FillReason) -> Fill {
+        fill_with_fee(
+            side,
+            price,
+            size,
+            Fee::from_report(fee, Some("USDT")).unwrap(),
+            reason,
+        )
+    }
+
+    fn fill_with_fee(
+        side: Side,
+        price: Decimal,
+        size: Decimal,
+        fee: Option<Fee>,
+        reason: FillReason,
+    ) -> Fill {
         Fill {
             exchange: Exchange::Binance,
             symbol: "BTC".to_string(),
@@ -124,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_pnl_equals_spread_minus_fees() {
+    fn round_trip_pnl_is_spread_and_fees_are_kept_apart() {
         let mut stats = TradingStats::default();
         stats.apply_fill(&fill(
             Side::Long,
@@ -141,11 +162,35 @@ mod tests {
             FillReason::Normal,
         ));
 
-        // 买 100 卖 101，双边各 0.1 手续费 → 净 0.8；平仓后持仓市值为 0
-        assert!((stats.total_pnl(0.0) - 0.8).abs() < 1e-9);
+        // 买 100 卖 101 → 价差 1（不扣手续费）；双边各 0.1 USDT 手续费另记
+        assert!((stats.total_pnl(0.0) - 1.0).abs() < 1e-9);
         assert_eq!(stats.fills, 2);
         assert!((stats.volume - 201.0).abs() < 1e-9);
-        assert!((stats.fee - 0.2).abs() < 1e-9);
+        assert_eq!(stats.fees.len(), 1);
+        assert!((stats.fees["USDT"] - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fees_in_different_assets_are_not_added_together() {
+        let mut stats = TradingStats::default();
+        stats.apply_fill(&fill_with_fee(
+            Side::Long,
+            dec!(100.0),
+            dec!(1.0),
+            Some(Fee::new(0.0003, "BNB")),
+            FillReason::Normal,
+        ));
+        stats.apply_fill(&fill_with_fee(
+            Side::Short,
+            dec!(100.0),
+            dec!(1.0),
+            Some(Fee::new(0.05, "USDC")),
+            FillReason::Normal,
+        ));
+        assert_eq!(stats.fees.len(), 2);
+        assert!((stats.fees["BNB"] - 0.0003).abs() < 1e-12);
+        assert!((stats.fees["USDC"] - 0.05).abs() < 1e-12);
+        assert!(stats.cash.abs() < 1e-9, "现金流不混入手续费");
     }
 
     #[test]
@@ -213,7 +258,7 @@ mod tests {
 
         assert_eq!(stats.fills, 1);
         assert!(stats.recent_fills.is_empty());
-        assert!((stats.cash - (-100.1)).abs() < 1e-9);
+        assert!((stats.cash - (-100.0)).abs() < 1e-9);
     }
 
     #[test]

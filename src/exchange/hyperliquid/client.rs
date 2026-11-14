@@ -136,11 +136,6 @@ impl HyperliquidClient {
         &self.markets
     }
 
-    /// 计价币（各已接入 dex 的保证金币种，`connect` 时校验过）
-    pub(crate) fn quote(&self) -> &str {
-        &self.quote
-    }
-
     /// 发送 POST /info 查询（按类型取限频额度，没有就排队）
     async fn post_info<T: for<'de> Deserialize<'de>>(
         &self,

@@ -398,9 +398,8 @@ impl OrderPushData {
         })
     }
 
-    /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）。数量折算为币本位。`quote` 是计价币：
-    /// [`Fill::fee`] 以计价币计，手续费币种不是它就报错。
-    pub fn to_fill(&self, meta: &SymbolMeta, quote: &str) -> Result<Option<Fill>, String> {
+    /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）。数量折算为币本位；手续费按交易所给的币种如实记。
+    pub fn to_fill(&self, meta: &SymbolMeta) -> Result<Option<Fill>, String> {
         let fill_sz = meta.qty_to_coin(
             crate::domain::parse_decimal(&self.fill_sz)
                 .map_err(|_| format!("Failed to parse fill_sz: {}", self.fill_sz))?,
@@ -429,15 +428,10 @@ impl OrderPushData {
             .as_deref()
             .ok_or_else(|| format!("OKX 成交回报缺 fillFee 字段（订单 {}）", self.ord_id))?;
         // OKX: 手续费为负数表示收费，取反统一为正数=收费
-        let fee =
+        let fee_value =
             f64::from_str(fill_fee).map_err(|_| format!("Failed to parse fillFee: {fill_fee}"))?;
-        // 手续费为 0 时币种无所谓（0 换成哪个币都是 0），交易所在这时给的币种也未核实
-        if fee != 0.0 && self.fill_fee_ccy.as_deref() != Some(quote) {
-            return Err(format!(
-                "OKX 成交手续费币种是 {:?}（计价币 {quote}），手续费口径对不上（订单 {}）",
-                self.fill_fee_ccy, self.ord_id
-            ));
-        }
+        let fee = crate::domain::Fee::from_report(-fee_value, self.fill_fee_ccy.as_deref())
+            .map_err(|e| format!("OKX {e}（订单 {}）", self.ord_id))?;
         let timestamp = self
             .fill_time
             .parse::<u64>()
@@ -458,7 +452,7 @@ impl OrderPushData {
             client_order_id: self.cl_ord_id.clone().filter(|s| !s.is_empty()),
             order_id: self.ord_id.clone(),
             timestamp,
-            fee: -fee,
+            fee,
             reason,
         }))
     }
@@ -746,15 +740,13 @@ mod trade_tests {
             "fillFeeCcy":"USDT","fillTime":"1700000000123"}"#;
         let d: OrderPushData = serde_json::from_str(raw).unwrap();
         let meta = btc_meta();
-        let fill = d
-            .to_fill(&meta, "USDT")
-            .unwrap()
-            .expect("有成交必产出 Fill");
+        let fill = d.to_fill(&meta).unwrap().expect("有成交必产出 Fill");
         assert_eq!(fill.timestamp, 1700000000123, "成交时间取交易所的 fillTime");
+        let fee = fill.fee.expect("有手续费");
         assert!(
-            (fill.fee - 0.1).abs() < 1e-12,
+            (fee.amount - 0.1).abs() < 1e-12,
             "取成了订单累计手续费（{}），分批成交会把手续费反复累加",
-            fill.fee
+            fee.amount
         );
     }
 
@@ -766,18 +758,38 @@ mod trade_tests {
             "accFillSz":"3","avgPx":"42000","fee":"-0.3","feeCcy":"USDT"}"#;
         let d: OrderPushData = serde_json::from_str(raw).unwrap();
         assert!(
-            d.to_fill(&btc_meta(), "USDT").is_err(),
+            d.to_fill(&btc_meta()).is_err(),
             "缺 fillFee 应报错而非回退到 fee"
         );
     }
 
-    /// 手续费不是计价币：口径对不上，报错而不是当 USDT 记
+    /// 手续费不是计价币：按交易所给的币种如实记（OKX 负数 = 收费，取反为正）
     #[test]
-    fn fill_fee_in_other_currency_is_an_error() {
+    fn fill_fee_in_other_currency_is_kept_as_is() {
         let raw = r#"{"instId":"BTC-USDT-SWAP","ordId":"1","clOrdId":"x-a","side":"buy",
             "state":"filled","sz":"1","fillSz":"1","fillPx":"42000","accFillSz":"1",
             "fillFee":"-0.1","fillFeeCcy":"OKB","fillTime":"1"}"#;
         let d: OrderPushData = serde_json::from_str(raw).unwrap();
-        assert!(d.to_fill(&btc_meta(), "USDT").is_err());
+        let fill = d.to_fill(&btc_meta()).unwrap().expect("有成交");
+        assert_eq!(fill.fee, Some(crate::domain::Fee::new(0.1, "OKB")));
+    }
+
+    /// 有手续费却没有币种是交易所违约：报错，不猜币种；手续费为 0 则记作没收，不管币种
+    #[test]
+    fn fee_currency_is_required_only_when_a_fee_is_charged() {
+        let raw = |fee: &str| {
+            format!(
+                r#"{{"instId":"BTC-USDT-SWAP","ordId":"1","clOrdId":"x-a","side":"buy",
+            "state":"filled","sz":"1","fillSz":"1","fillPx":"42000","accFillSz":"1",
+            "fillFee":"{fee}","fillFeeCcy":"","fillTime":"1"}}"#
+            )
+        };
+        let charged: OrderPushData = serde_json::from_str(&raw("-0.1")).unwrap();
+        assert!(charged.to_fill(&btc_meta()).is_err());
+        let free: OrderPushData = serde_json::from_str(&raw("0")).unwrap();
+        assert_eq!(
+            free.to_fill(&btc_meta()).unwrap().expect("有成交").fee,
+            None
+        );
     }
 }

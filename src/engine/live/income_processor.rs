@@ -270,7 +270,7 @@ mod routing_tests {
                 client_order_id: None,
                 order_id: "1".to_string(),
                 timestamp: 1,
-                fee: 0.0,
+                fee: None,
                 reason: FillReason::Normal,
             })),
         }
@@ -394,7 +394,7 @@ mod task_tests {
                 client_order_id: None,
                 order_id: "1".to_string(),
                 timestamp: 1,
-                fee: 0.0,
+                fee: None,
                 reason: FillReason::Normal,
             })),
         }

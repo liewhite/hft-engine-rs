@@ -3,7 +3,7 @@
 
 use super::from_binance;
 use crate::domain::{
-    Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
+    Balance, Exchange, Fee, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
     OrderUpdate, Quantity, Side, Symbol, BBO,
 };
 use serde::Deserialize;
@@ -227,7 +227,7 @@ pub struct OrderData {
     #[serde(default)]
     pub n: Option<String>,
     /// 手续费币种（Commission asset），与 `n` 同进同出。开了 BNB 抵扣且合约账户有 BNB 时是 BNB，
-    /// 否则是计价币（2026-11-14 实查本账户：feeBurn=true、合约账户无 BNB，近期佣金全是 USDT）
+    /// 否则是计价币；如实记进 [`Fee::asset`]
     #[serde(rename = "N", default)]
     pub fee_asset: Option<String>,
 }
@@ -291,9 +291,8 @@ impl OrderTradeUpdate {
     }
 
     /// 转换为 Fill 事件（仅当 fill_sz > 0 时有效）
-    /// `symbol` 来自 [`Self::symbol`]；`quote` 是计价币：[`Fill::fee`] 以计价币计，手续费币种不是它
-    /// （如 BNB 抵扣）就报错，不把 BNB 数额当 USDT 记。
-    pub fn to_fill(&self, symbol: Symbol, quote: &str) -> Result<Option<Fill>, String> {
+    /// `symbol` 来自 [`Self::symbol`]。手续费按交易所给的币种如实记（BNB 抵扣就是 BNB）。
+    pub fn to_fill(&self, symbol: Symbol) -> Result<Option<Fill>, String> {
         let fill_sz = self.last_filled()?;
 
         // 没有成交则不生成 Fill
@@ -313,19 +312,10 @@ impl OrderTradeUpdate {
             self.o.n.as_deref().ok_or_else(|| {
                 format!("Binance 成交回报缺 commission 字段（订单 {}）", self.o.i)
             })?;
-        let fee =
+        let amount =
             f64::from_str(fee_raw).map_err(|_| format!("Failed to parse commission: {fee_raw}"))?;
-        match self.o.fee_asset.as_deref() {
-            Some(asset) if asset == quote => {}
-            // 手续费为 0 时币种无所谓（0 换成哪个币都是 0）
-            _ if fee == 0.0 => {}
-            other => {
-                return Err(format!(
-                "Binance 成交手续费币种是 {other:?}（计价币 {quote}），手续费口径对不上（订单 {}）",
-                self.o.i
-            ))
-            }
-        }
+        let fee = Fee::from_report(amount, self.o.fee_asset.as_deref())
+            .map_err(|e| format!("Binance {e}（订单 {}）", self.o.i))?;
 
         Ok(Some(Fill {
             exchange: Exchange::Binance,
@@ -393,16 +383,20 @@ mod tests {
         .unwrap()
     }
 
-    /// 成交时间取交易所的成交时间 T；手续费以计价币计，BNB 抵扣的成交报错（不把 BNB 数额当 USDT 记）
+    /// 成交时间取交易所的成交时间 T；手续费按交易所给的币种如实记，BNB 抵扣的成交记成 BNB（不停机、不换算）
     #[test]
-    fn fill_uses_trade_time_and_requires_quote_fee_asset() {
+    fn fill_uses_trade_time_and_keeps_fee_asset_as_is() {
         let fill = order_push("USDT")
-            .to_fill("BTC".into(), "USDT")
+            .to_fill("BTC".into())
             .unwrap()
             .expect("有成交");
         assert_eq!(fill.timestamp, 1700000000123);
-        assert!((fill.fee - 0.01).abs() < 1e-12);
-        assert!(order_push("BNB").to_fill("BTC".into(), "USDT").is_err());
+        assert_eq!(fill.fee, Some(Fee::new(0.01, "USDT")));
+        let bnb = order_push("BNB")
+            .to_fill("BTC".into())
+            .unwrap()
+            .expect("有成交");
+        assert_eq!(bnb.fee, Some(Fee::new(0.01, "BNB")));
     }
 
     #[test]

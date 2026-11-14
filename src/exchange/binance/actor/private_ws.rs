@@ -169,7 +169,7 @@ fn parse_private_message(
             };
 
             // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
-            if let Some(fill) = update.to_fill(symbol.clone(), quote)? {
+            if let Some(fill) = update.to_fill(symbol.clone())? {
                 events.push(AccountEvent {
                     // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
                     account: crate::domain::AccountId::Live,

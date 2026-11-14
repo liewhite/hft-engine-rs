@@ -4,14 +4,15 @@
 //! - **账户**：各交易所 equity / 持仓价值 / 账户杠杆率
 //! - **持仓**：各 symbol 在各交易所的仓位、净敞口、名义价值
 //! - **订单**：当前挂单数、累计拒单数
-//! - **历史**：累计成交笔数/成交额/手续费、现金流盈亏、强平次数、最近成交明细
+//! - **历史**：累计成交笔数/成交额、按币种分开的手续费、价差盈亏（不含手续费）、强平次数、最近成交明细
 //!
 //! 设计要点：
 //! - **持仓与持仓价值只读持仓账本发的读数**（[`PositionValues`]，#812）：看板上的持仓、杠杆与
 //!   策略风控闸门看到的是同一个数，本模块不自己折叠成交、不自己估值。账户杠杆 = 账本给的本所
 //!   持仓价值之和 ÷ 交易所报的净值，与策略的账户杠杆闸门同一算法
 //! - **不读取任何 executor 的内部状态**，与策略层零耦合
-//! - 盈亏为**本次会话**口径：现金流 + 相对会话起始仓位的存货估值变化，
+//! - 盈亏为**本次会话**口径：现金流 + 相对会话起始仓位的存货估值变化，不含手续费（手续费币种
+//!   不一定是计价币，按币种另推 `hft_fee_total{asset}`，#817），
 //!   这样重启后不会把重启前就持有的存货算成假盈利
 //! - 默认只输出日志；配置 `PUSHGATEWAY_URL` 后同一份数字推送 pushgateway
 //!   （见 [`crate::observability`]，未配置时无外部依赖）
@@ -339,7 +340,7 @@ impl MetricsView {
                 side = %fill.side,
                 price = %fill.price,
                 size = %fill.size,
-                fee = fill.fee,
+                fee = ?fill.fee,
                 reason = ?fill.reason,
                 ts = fill.timestamp,
                 "metrics.recent_fill"
@@ -469,7 +470,7 @@ impl MetricsView {
                 net_notional = format!("{:.2}", exposure.net_notional),
                 pending_orders = pending,
                 fills = stats.map(|s| s.fills).unwrap_or(0),
-                fee = format!("{:.4}", stats.map(|s| s.fee).unwrap_or(0.0)),
+                fees = ?stats.map(|s| &s.fees),
                 session_pnl = format!(
                     "{:.4}",
                     stats
@@ -505,7 +506,10 @@ impl MetricsView {
             self.total.forced_fills as f64,
         );
         prom.gauge("hft_volume_total", &[], self.total.volume);
-        prom.gauge("hft_fee_total", &[], self.total.fee);
+        // 手续费按币种分开推（#817）：不同币不能相加
+        for (asset, amount) in &self.total.fees {
+            prom.gauge("hft_fee_total", &[("asset", asset)], *amount);
+        }
         prom.gauge("hft_session_pnl", &[], total_session_pnl);
         // 恒为 1，标签带提交号：看板据此显示在跑的版本，换版前后能对上（#742）
         prom.gauge(
@@ -529,7 +533,7 @@ impl MetricsView {
             fills = self.total.fills,
             forced_fills = self.total.forced_fills,
             volume = format!("{:.2}", self.total.volume),
-            fee = format!("{:.4}", self.total.fee),
+            fees = ?self.total.fees,
             cash = format!("{:.4}", self.total.cash),
             session_pnl = format!("{:.4}", total_session_pnl),
             "metrics.summary"
@@ -607,7 +611,13 @@ impl MetricsView {
                 &[("account", &account_label)],
                 stats.volume,
             );
-            prom.gauge("hft_paper_fee", &[("account", &account_label)], stats.fee);
+            for (asset, amount) in &stats.fees {
+                prom.gauge(
+                    "hft_paper_fee",
+                    &[("account", &account_label), ("asset", asset)],
+                    *amount,
+                );
+            }
             prom.gauge("hft_paper_cash", &[("account", &account_label)], stats.cash);
             prom.gauge(
                 "hft_paper_rejected_orders",
@@ -619,7 +629,7 @@ impl MetricsView {
                 %account,
                 fills = stats.fills,
                 volume = format!("{:.2}", stats.volume),
-                fee = format!("{:.4}", stats.fee),
+                fees = ?stats.fees,
                 cash = format!("{:.4}", stats.cash),
                 rejected_orders = stats.rejected_orders,
                 "metrics.paper_account"
@@ -847,7 +857,7 @@ mod tests {
             client_order_id: None,
             order_id: "1".to_string(),
             timestamp: 0,
-            fee: 0.0,
+            fee: None,
             reason: FillReason::Normal,
         }))
     }
@@ -1322,6 +1332,31 @@ mod tests {
         let body = metrics.render().into_body();
         let pnl = line_value(&body, "hft_session_pnl ").unwrap();
         assert!((pnl - 10.0).abs() < 1e-9, "{body}");
+    }
+
+    /// 手续费按币种分开推，不同币不相加；没收手续费的成交不出现币种（#817）
+    #[test]
+    fn fees_are_pushed_per_asset() {
+        let mut metrics = view();
+        metrics.register(vec!["BTC".to_string()], vec![baseline_of("BTC", dec!(0))]);
+        let with_fee = |exchange, fee: Option<crate::domain::Fee>| {
+            let mut data = fill_data(exchange, "BTC", Side::Long, dec!(1.0));
+            if let AccountData::Symbol(SymbolAccountData::Fill(f)) = &mut data {
+                f.fee = fee;
+            }
+            live(data)
+        };
+        let fee = crate::domain::Fee::new;
+        metrics.on_account(with_fee(Exchange::Binance, Some(fee(0.02, "USDT"))));
+        metrics.on_account(with_fee(Exchange::Binance, Some(fee(0.0001, "BNB"))));
+        metrics.on_account(with_fee(Exchange::Hyperliquid, Some(fee(0.03, "USDC"))));
+        metrics.on_account(with_fee(Exchange::OKX, None));
+        let body = metrics.render().into_body();
+        let get = |asset: &str| line_value(&body, &format!("hft_fee_total{{asset=\"{asset}\"}} "));
+        assert_eq!(get("USDT"), Some(0.02), "{body}");
+        assert_eq!(get("BNB"), Some(0.0001), "{body}");
+        assert_eq!(get("USDC"), Some(0.03), "{body}");
+        assert_eq!(body.matches("hft_fee_total{").count(), 3, "{body}");
     }
 
     // ===== 跨所估值 =====

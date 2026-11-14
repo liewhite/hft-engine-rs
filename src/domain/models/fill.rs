@@ -17,6 +17,39 @@ pub enum FillReason {
     Adl,
 }
 
+/// 一笔成交的手续费：数额 + 交易所实际扣的币种
+///
+/// 币种如实照搬交易所回报，不假定是计价币、也不换算（#817）：币安开了 BNB 抵扣时是 BNB，
+/// 现货买卖两边扣的币也不同。汇总时按币种分开记（见 [`super::TradingStats::fees`]）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fee {
+    /// 正数 = 收费，负数 = 返佣
+    pub amount: f64,
+    /// 币种，交易所原样的名字（如 USDT、USDC、BNB）
+    pub asset: String,
+}
+
+impl Fee {
+    pub fn new(amount: f64, asset: impl Into<String>) -> Self {
+        Self {
+            amount,
+            asset: asset.into(),
+        }
+    }
+
+    /// 从交易所成交回报取手续费（数额已按「正数 = 收费」归一）。数额为 0 记作没收手续费（`None`，
+    /// 这时交易所给不给币种都不管）；非 0 却没有币种是交易所违约，报错、不猜币种。
+    pub fn from_report(amount: f64, asset: Option<&str>) -> Result<Option<Self>, String> {
+        if amount == 0.0 {
+            return Ok(None);
+        }
+        match asset.filter(|a| !a.is_empty()) {
+            Some(asset) => Ok(Some(Self::new(amount, asset))),
+            None => Err(format!("成交手续费 {amount} 没有币种")),
+        }
+    }
+}
+
 /// 成交事件
 #[derive(Debug, Clone)]
 pub struct Fill {
@@ -32,8 +65,8 @@ pub struct Fill {
     /// 交易所订单ID
     pub order_id: String,
     pub timestamp: Timestamp,
-    /// 手续费 (正数 = 收费, 负数 = 返佣)
-    pub fee: f64,
+    /// 手续费（数额与币种）；`None` = 这笔没收手续费
+    pub fee: Option<Fee>,
     /// 成交来源（主动 / 强平 / ADL）——仅用于可观测性
     pub reason: FillReason,
 }

@@ -921,12 +921,16 @@ mod tests {
             .unwrap()
             .iter()
             .find_map(|e| match &e.data {
-                AccountData::Symbol(SymbolAccountData::Fill(f)) => Some(f.fee),
+                AccountData::Symbol(SymbolAccountData::Fill(f)) => f.fee.clone(),
                 _ => None,
             })
             .expect("fill");
         // 100.1 * 2 * 0.0005 = 0.1001（若按 maker 费率会是 0.04004）
-        assert!((fee - 0.1001).abs() < 1e-9, "taker 费率应生效，实得 {fee}");
+        assert_eq!(fee.asset, crate::sim::SIM_CASH_ASSET);
+        assert!(
+            (fee.amount - 0.1001).abs() < 1e-9,
+            "taker 费率应生效，实得 {fee:?}"
+        );
         h.finish().await;
     }
 

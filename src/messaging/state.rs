@@ -655,7 +655,7 @@ mod tests {
                 client_order_id: None,
                 order_id: "1".to_string(),
                 timestamp: local_ts,
-                fee: 0.0,
+                fee: None,
                 reason: crate::domain::FillReason::Normal,
             }),
             local_ts,

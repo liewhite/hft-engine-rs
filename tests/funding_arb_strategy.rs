@@ -337,7 +337,7 @@ impl Sim {
             client_order_id: Some(o.client_order_id.clone()),
             order_id: format!("oid-{}", o.client_order_id),
             timestamp: self.now,
-            fee: 0.0,
+            fee: None,
             reason: FillReason::Normal,
         };
         let now = self.now;

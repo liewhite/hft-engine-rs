@@ -482,9 +482,8 @@ pub struct WsFill {
 }
 
 impl WsFill {
-    /// `symbol` 由调用方经 [`HlMarkets::symbol_of`] 得到；`quote` 是计价币（手续费必须以它计，
-    /// 否则 [`Fill::fee`] 的口径就不对了，报错）
-    pub fn to_fill(&self, symbol: Symbol, quote: &str) -> Result<Fill, String> {
+    /// `symbol` 由调用方经 [`HlMarkets::symbol_of`] 得到；手续费按 `feeToken` 如实记
+    pub fn to_fill(&self, symbol: Symbol) -> Result<Fill, String> {
         let price = crate::domain::parse_decimal(&self.px)
             .map_err(|_| format!("Failed to parse fill px: {}", self.px))?;
         let size = crate::domain::parse_decimal(&self.sz)
@@ -493,15 +492,10 @@ impl WsFill {
         // 本账户这一笔成交的方向
         let side = parse_side(&self.side)?;
 
-        let fee = f64::from_str(&self.fee)
+        let amount = f64::from_str(&self.fee)
             .map_err(|_| format!("Failed to parse fill fee: {}", self.fee))?;
-        // 手续费为 0 时币种无所谓（0 换成哪个币都是 0）
-        if fee != 0.0 && self.fee_token != quote {
-            return Err(format!(
-                "HL 成交手续费币种是 {}（计价币 {quote}），手续费口径对不上（订单 {}）",
-                self.fee_token, self.oid
-            ));
-        }
+        let fee = crate::domain::Fee::from_report(amount, Some(&self.fee_token))
+            .map_err(|e| format!("HL {e}（订单 {}）", self.oid))?;
 
         // HL 强平成交带 `liquidation` 对象；HL 无独立 ADL 语义，故只区分 Liquidation
         let reason = if self.liquidation.is_some() {

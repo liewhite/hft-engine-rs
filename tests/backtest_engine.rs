@@ -149,7 +149,13 @@ fn event_sig(ev: &IncomeEvent) -> String {
             ),
             AccountData::Symbol(SymbolAccountData::Fill(f)) => format!(
                 "FL ts={} cid={:?} oid={} {:?} px={} sz={} fee={}",
-                a.exchange_ts, f.client_order_id, f.order_id, f.side, f.price, f.size, f.fee
+                a.exchange_ts,
+                f.client_order_id,
+                f.order_id,
+                f.side,
+                f.price,
+                f.size,
+                f.fee.as_ref().map(|x| x.amount).unwrap_or(0.0)
             ),
             AccountData::Exchange(ExchangeAccountData::AccountInfo {
                 info: hft_engine_rs::domain::AccountInfo { equity, .. },

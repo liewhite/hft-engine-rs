@@ -8,7 +8,7 @@ mod ledger;
 mod matcher;
 mod state;
 
-pub use config::SimConfig;
+pub use config::{SimConfig, SIM_CASH_ASSET};
 pub use ledger::Ledger;
 pub use matcher::{crosses, touch_price, trade_crosses};
 pub use state::{Liquidity, RestingOrder, SimState};

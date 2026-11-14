@@ -74,7 +74,6 @@ impl HyperliquidNode {
                         account.wallet_address().to_string(),
                         args.account_bus.clone(),
                         markets.clone(),
-                        client.quote().to_string(),
                     )
                     .await?;
                 }

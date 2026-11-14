@@ -382,7 +382,7 @@ fn parse_private_message(
                 let new_fill = last_trades.is_new_fill(data, &order_update.status);
 
                 // Fill 事件先于 OrderUpdate（确保乐观更新 position 后再移除 pending order）
-                if let Some(fill) = data.to_fill(meta, quote)?.filter(|_| new_fill) {
+                if let Some(fill) = data.to_fill(meta)?.filter(|_| new_fill) {
                     events.push(AccountEvent {
                         // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
                         account: crate::domain::AccountId::Live,
