@@ -117,14 +117,6 @@ impl Ledger {
                 .sum::<f64>()
     }
 
-    /// 总持仓名义价值 (用于杠杆率) = 各 symbol 持仓价值之和
-    pub fn notional(&self, mark_of: impl Fn(&Symbol) -> Option<Price>) -> f64 {
-        self.position_values(mark_of)
-            .values()
-            .map(LegValue::value)
-            .sum()
-    }
-
     /// 各 symbol 持仓读数：数量 + 估值价（与实盘账本的 `PositionValues` 同一含义，#759）
     pub fn position_values(
         &self,
@@ -243,12 +235,12 @@ mod tests {
     }
 
     #[test]
-    fn equity_and_notional_use_unrealized() {
+    fn equity_uses_unrealized() {
         let mut l = empty();
         l.apply_fill(&sym(), Side::Long, dec!(100.0), dec!(2.0), 0.0);
         let mark_of = |_: &Symbol| Some(dec!(150));
         assert_eq!(l.equity(mark_of), 10_000.0 + (150.0 - 100.0) * 2.0); // 10100
-        assert_eq!(l.notional(mark_of), 2.0 * 150.0); // 300
+        assert_eq!(l.position_values(mark_of)[&sym()].value(), 2.0 * 150.0); // 300
         assert_eq!(l.open_positions(mark_of)[0].unrealized_pnl, 100.0);
     }
 

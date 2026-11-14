@@ -9,7 +9,7 @@
 //! `order_to_exchange_delay_ms` 入队到达撮合。主循环始终处理"源 peek 与队列 peek 中较早者"，
 //! 同刻先排空队列 (先消化既有效果再注入新行情)。
 //!
-//! 账户净值：周期性 (clock_interval_ms) 由当前账本计算 AccountInfo 投递给策略 (等价实盘的
+//! 账户净值：周期性 (clock_interval_ms) 由当前账本计算净值（Equity）投递给策略 (等价实盘的
 //! accountRefresh)，并在首个事件时先投递一次初始净值，否则依赖净值的策略不会动作。
 
 use crate::backtest::source::MarketDataSource;
@@ -437,16 +437,16 @@ impl<'a> BacktestEngine<'a> {
         }
     }
 
-    /// 所级账户读数：净值（AccountInfo）+ 各币持仓价值（与实盘账本同一读数，#759）
+    /// 所级账户读数：净值（柜台现金币种）+ 各币持仓价值（与实盘账本同一读数，#759）
     fn account_events(&self, exchange: Exchange, ts: Timestamp) -> [IncomeEvent; 2] {
         let state = self.states.get(&exchange).expect("柜台已创建");
         let mark_of = |s: &Symbol| state.mark_of(s);
-        let info = ExchangeAccountData::AccountInfo {
+        let info = ExchangeAccountData::Equity {
             exchange,
-            info: crate::domain::AccountInfo {
-                equity: state.ledger.equity(mark_of),
-                notional: state.ledger.notional(mark_of),
-            },
+            equity: crate::domain::Money::new(
+                state.ledger.equity(mark_of),
+                crate::sim::SIM_CASH_ASSET,
+            ),
         };
         let values = ExchangeAccountData::PositionValues(crate::messaging::PositionValues {
             exchange,

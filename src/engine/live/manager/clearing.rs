@@ -56,7 +56,7 @@ async fn clear(exchange: Exchange, client: &dyn AccountClient) -> Result<(), Exc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AccountInfo, OrderId, Position, Symbol};
+    use crate::domain::{OrderId, Position, Symbol};
     use crate::exchange::{ExchangeOrder, OpenOrder};
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -103,7 +103,7 @@ mod tests {
         ) -> Result<OrderId, crate::domain::PlaceError> {
             unreachable!("清场不该下单")
         }
-        async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
+        async fn fetch_equity(&self) -> Result<crate::domain::Money, ExchangeError> {
             unreachable!("清场不该查账户")
         }
         async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {

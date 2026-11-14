@@ -307,8 +307,13 @@ impl Provisioning {
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        // 第 1 步已校验每对 (所, 币) 都有合约规格
+        let metas: Vec<SymbolMeta> = exchange_symbols
+            .iter()
+            .map(|key| self.symbol_metas[key].clone())
+            .collect();
         self.metrics
-            .register_symbols(symbols.clone(), baselines.clone())
+            .register_legs(metas, baselines.clone())
             .await
             .map_err(|e| ExchangeError::new(format!("向 Metrics 注册 symbol 失败: {e}")))?;
         self.position_ledger
@@ -406,6 +411,7 @@ mod subscription_validation_tests {
             min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
             min_notional: 0.0,
             contract_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
+            quote: "USDT".to_string(),
         };
         [((Exchange::Binance, "BTC".to_string()), meta)]
             .into_iter()

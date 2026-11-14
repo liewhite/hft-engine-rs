@@ -45,7 +45,7 @@ impl SubscriptionScope {
     /// 这条事件在本范围内吗 —— 判据的**唯一出处**。
     ///
     /// - 账户事件先看归属：别的账户的私有事件一律不收（实盘与模拟账户不串账）。
-    /// - 所级读数按所过滤：`Balance` / `AccountInfo` / `Greeks` 没有 symbol，写成广播的话
+    /// - 所级读数按所过滤：`Balance` / `Equity` / `Greeks` 没有 symbol，写成广播的话
     ///   策略能读到自己压根没订的所的净值 —— 而杠杆闸门就是拿净值算的。
     pub fn accepts(&self, event: &IncomeEvent) -> bool {
         match event {
@@ -124,12 +124,9 @@ mod tests {
             account,
             0,
             0,
-            AccountData::Exchange(ExchangeAccountData::AccountInfo {
+            AccountData::Exchange(ExchangeAccountData::Equity {
                 exchange,
-                info: crate::domain::AccountInfo {
-                    equity: 1.0,
-                    notional: 0.0,
-                },
+                equity: crate::domain::Money::new(1.0, "USDT"),
             }),
         )
     }

@@ -1,8 +1,8 @@
 //! funding_arb 策略经生产路径（StrategyRunner：状态更新 → 策略 → 登记挂单 → 精度取整）的场景测试。
 
 use hft_engine_rs::domain::{
-    dec, AccountId, Decimal, Exchange, Fill, FillReason, OrderStatus, OrderType, OrderUpdate,
-    Position, PriceStep, SettledFunding, Side, SymbolMeta, TimeInForce, BBO,
+    dec, AccountId, Decimal, Exchange, Fill, FillReason, Money, OrderStatus, OrderType,
+    OrderUpdate, Position, PriceStep, SettledFunding, Side, SymbolMeta, TimeInForce, BBO,
 };
 use hft_engine_rs::engine::{subscription_scope, SequentialClientOrderIdGen, StrategyRunner};
 use hft_engine_rs::messaging::SymbolMarketData;
@@ -34,6 +34,15 @@ fn config() -> FundingArbConfig {
     .unwrap()
 }
 
+/// 各所计价币（与实盘一致：HL 是 USDC，其余 USDT）；净值也用这个币报
+fn quote(ex: Exchange) -> &'static str {
+    if ex == HL {
+        "USDC"
+    } else {
+        "USDT"
+    }
+}
+
 /// `min_notional`：交易所最小下单金额（默认场景都是 0，只有配置下限 11U 生效）
 fn meta(ex: Exchange, min_notional: f64) -> ((Exchange, String), SymbolMeta) {
     // OKX 用粗粒度（一手 1 个币 ≈ 100U），测零头处理；其余所 0.001
@@ -50,6 +59,7 @@ fn meta(ex: Exchange, min_notional: f64) -> ((Exchange, String), SymbolMeta) {
             min_order_size: hft_engine_rs::domain::PositiveDecimal::new(step).unwrap(),
             min_notional,
             contract_size: hft_engine_rs::domain::PositiveDecimal::new(dec!(1)).unwrap(),
+            quote: quote(ex).to_string(),
         },
     )
 }
@@ -188,15 +198,17 @@ impl Sim {
         self.position_values(ex, &[("OTHER", others)])
     }
 
-    /// 只推净值（交易所账户总持仓价值给个大数：杠杆闸门不该再用它）
+    /// 只推净值（以该所计价币计）
     fn account_info(&mut self, ex: Exchange, equity: f64) -> Vec<OutcomeEvent> {
+        self.equity_in(ex, Money::new(equity, quote(ex)))
+    }
+
+    /// 推一份指定币种的净值
+    fn equity_in(&mut self, ex: Exchange, equity: Money) -> Vec<OutcomeEvent> {
         let now = self.now;
-        let info = ExchangeAccountData::AccountInfo {
+        let info = ExchangeAccountData::Equity {
             exchange: ex,
-            info: hft_engine_rs::domain::AccountInfo {
-                equity,
-                notional: 1e9,
-            },
+            equity,
         };
         self.ev(IncomeEvent::account(
             AccountId::Live,
@@ -434,6 +446,17 @@ fn account_leverage_blocks_when_other_symbols_sum_over_the_cap() {
     s.position_values(HL, &[("OTHER", 10_000.0), ("ANOTHER", 4_900.0)]);
     s.funding(BN, 0.8);
     assert!(placed(&s.funding(HL, 0.1)).is_empty());
+}
+
+/// 净值的币种与合约计价币不同（如交易所报的是折算成美元的数）时杠杆算不出：当未知，不开仓、不按 1:1 硬除
+#[test]
+fn equity_in_another_currency_blocks_opening() {
+    let mut s = Sim::new(dec!(0.0), dec!(0.0));
+    s.equity_in(HL, Money::new(10_000.0, "USD"));
+    s.funding(BN, 0.8);
+    assert!(placed(&s.funding(HL, 0.1)).is_empty());
+    // 换回计价币的净值就能开
+    assert_eq!(placed(&s.account_info(HL, 10_000.0)).len(), 2);
 }
 
 #[test]
@@ -1043,6 +1066,48 @@ fn gauges_report_aprs_spread_and_signal() {
         "{g:?}"
     );
     assert_eq!(value("funding_arb_halted", &[("symbol", SYM)]), Some(0.0));
+}
+
+/// 持仓类读数（#841 从框架移到策略）：单币杠杆 = 本币该所持仓价值 ÷ 该所净值（只除同一币种）、
+/// 跨所净敞口（USDT/USDC 按 1:1 相加）、是否单腿
+#[test]
+fn gauges_report_symbol_leverage_net_notional_and_single_leg() {
+    let mut s = Sim::new(dec!(0.0), dec!(0.0));
+    let value = |s: &Sim, name: &str, labels: &[(&str, &str)]| {
+        s.runner
+            .strategy_gauges(s.now)
+            .into_iter()
+            .find(|x| {
+                x.name == name
+                    && labels
+                        .iter()
+                        .all(|(k, v)| x.labels.iter().any(|(a, b)| a == k && b == v))
+            })
+            .map(|x| x.value)
+    };
+    let (bn, hl) = (BN.to_string(), HL.to_string());
+    // 币安多 300、HL 空 200（估值价 1）；净值各 10000
+    s.position_values(BN, &[(SYM, 300.0), ("OTHER", 5_000.0)]);
+    s.position_values(HL, &[(SYM, -200.0)]);
+    let lev = |s: &Sim, ex: &str| value(s, "funding_arb_symbol_leverage", &[("exchange", ex)]);
+    assert!((lev(&s, &bn).unwrap() - 0.03).abs() < 1e-9);
+    assert!((lev(&s, &hl).unwrap() - 0.02).abs() < 1e-9);
+    assert_eq!(
+        value(&s, "funding_arb_net_notional", &[("symbol", SYM)]),
+        Some(100.0)
+    );
+    assert_eq!(
+        value(&s, "funding_arb_single_leg", &[("symbol", SYM)]),
+        Some(0.0)
+    );
+    // HL 平掉 → 单腿；HL 净值换成别的币种 → 该所单币杠杆不推（未知）
+    s.position_values(HL, &[(SYM, 0.0)]);
+    assert_eq!(
+        value(&s, "funding_arb_single_leg", &[("symbol", SYM)]),
+        Some(1.0)
+    );
+    s.equity_in(HL, Money::new(10_000.0, "USD"));
+    assert_eq!(lev(&s, &hl), None);
 }
 
 /// 盘口年龄：来过盘口的所按最后一条算；从没来过的所从策略收到第一条事件算起（启动起就静默的订阅也有读数；#767）

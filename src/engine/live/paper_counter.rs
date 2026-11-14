@@ -34,7 +34,7 @@
 //! (AccountId, Exchange) 分实例：行情按所路由，持仓、挂单簿与净值天然按所隔离 —— 跨所
 //! 策略绑一个模拟账户时，A 所挂单不会被 B 所的成交撮合。每个 (账户, 所) 各以
 //! `initial_balance_usdt` 起步（等价"每个所各入金一份"，与实盘各所独立账户一致）。
-//! 净值在收到 Clock 时按各自的所发布 AccountInfo。
+//! 净值在收到 Clock 时按各自的所发布净值（Equity）。
 
 use crate::domain::{
     now_ms, AccountId, Exchange, Order, OrderId, Symbol, SymbolMeta, Timestamp, BBO,
@@ -207,20 +207,19 @@ impl PaperCounter {
         self.states.get_mut(&key).expect("just inserted")
     }
 
-    /// 逐 (账户, 交易所) 发布净值 AccountInfo（等价实盘的 equity 轮询）与各币持仓价值（等价实盘账本的读数）。
+    /// 逐 (账户, 交易所) 发布净值（柜台现金币种，等价实盘的 equity 轮询）与各币持仓价值（等价实盘账本的读数）。
     /// 交易所字段取各柜台自己的所 —— 此前写死 Binance，OKX/HL 模拟盘的策略查自己所的
     /// equity 恒为 None、永不下单。
     fn publish_account_info(&self, ts: Timestamp) {
         for ((account, _), state) in &self.states {
             let equity = state.ledger.equity(|s: &Symbol| state.mark_of(s));
-            let notional = state.ledger.notional(|s: &Symbol| state.mark_of(s));
             self.account_bus.publish(AccountEvent {
                 account: account.clone(),
                 exchange_ts: ts,
                 local_ts: ts,
-                data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
+                data: AccountData::Exchange(ExchangeAccountData::Equity {
                     exchange: state.exchange,
-                    info: crate::domain::AccountInfo { equity, notional },
+                    equity: crate::domain::Money::new(equity, crate::sim::SIM_CASH_ASSET),
                 }),
             });
             // 与实盘账本同一读数：各币持仓价值（策略的账户杠杆闸门用它，#759）
@@ -472,6 +471,7 @@ mod tests {
                                 .unwrap(),
                             min_notional: 0.0,
                             contract_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
+                            quote: "USDT".to_string(),
                         },
                     )
                 })
@@ -719,7 +719,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|e| match &e.data {
-                AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, .. }) => {
+                AccountData::Exchange(ExchangeAccountData::Equity { exchange, .. }) => {
                     Some(*exchange)
                 }
                 _ => None,
@@ -1010,10 +1010,9 @@ mod tests {
         });
         h.settle(30).await;
         let equity = h.events.lock().unwrap().iter().find_map(|e| match &e.data {
-            AccountData::Exchange(ExchangeAccountData::AccountInfo {
-                info: crate::domain::AccountInfo { equity, .. },
-                ..
-            }) => Some(*equity),
+            AccountData::Exchange(ExchangeAccountData::Equity { equity, .. }) => {
+                Some(equity.amount)
+            }
             _ => None,
         });
         assert_eq!(equity, Some(10_000.0));

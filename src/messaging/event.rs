@@ -311,10 +311,10 @@ pub enum ExchangeAccountData {
     Balance(Balance),
     /// 账户希腊值 (按币种)。**账户持仓的风险读数**，归属账户侧
     Greeks(Greeks),
-    /// 账户信息 (净值 + 总持仓名义价值)
-    AccountInfo {
+    /// 账户净值（余额 + 未实现盈亏），带实际币种，见 [`crate::exchange::AccountClient::fetch_equity`]
+    Equity {
         exchange: Exchange,
-        info: crate::domain::AccountInfo,
+        equity: crate::domain::Money,
     },
     /// 本地持仓账本里该所**每个已跟踪币**的持仓价值，见 [`PositionValues`]
     PositionValues(PositionValues),
@@ -326,9 +326,9 @@ pub enum ExchangeAccountData {
 /// **持仓与持仓价值在进程外的唯一来源**：风控闸门（策略的账户杠杆）和指标（看板上的持仓、
 /// 杠杆、会话盈亏）读的都是这一份，不各自折叠成交、各自估值（#812）。
 ///
-/// 与 [`ExchangeAccountData::AccountInfo`] 的 `notional`（交易所接口轮询的账户总持仓价值）
-/// 是两个来源：这一份在任何一个币成交后立刻更新（不等轮询），按币分开给出，让单币策略
-/// 能把自己那一项换成它自己最新的持仓。只含引擎跟踪的币（配置里的币），不含账户里别的仓位。
+/// 在任何一个币成交后立刻更新（不等轮询），按币分开给出，让单币策略能把自己那一项换成它自己
+/// 最新的持仓。只含引擎跟踪的币（配置里的币），不含账户里别的仓位。价值的币种是该币合约的计价币
+/// （[`crate::domain::SymbolMeta::quote`]）。
 ///
 /// 实盘由账本在每笔成交后发该所的一份、每个对账节拍发全部所一份（价格变动）；某个有仓的币
 /// 还没有盘口时不发（价值未知，不能当 0）—— 消费方沿用上一份读数，启动时没有读数即「未知」。
@@ -400,7 +400,7 @@ impl ExchangeAccountData {
         match self {
             ExchangeAccountData::Balance(b) => b.exchange,
             ExchangeAccountData::Greeks(g) => g.exchange,
-            ExchangeAccountData::AccountInfo { exchange, .. } => *exchange,
+            ExchangeAccountData::Equity { exchange, .. } => *exchange,
             ExchangeAccountData::PositionValues(v) => v.exchange,
         }
     }

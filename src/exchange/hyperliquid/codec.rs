@@ -339,7 +339,6 @@ pub struct ClearinghouseState {
 #[serde(rename_all = "camelCase")]
 pub struct MarginSummary {
     pub account_value: String,
-    pub total_ntl_pos: String,
 }
 
 /// AssetPosition 包装器
@@ -355,7 +354,6 @@ pub struct AssetPosition {
     pub coin: String,
     /// 带符号的仓位大小 (负数为空头)
     pub szi: String,
-    pub position_value: String,
 }
 
 impl AssetPosition {
@@ -494,7 +492,7 @@ impl WsFill {
 
         let amount = f64::from_str(&self.fee)
             .map_err(|_| format!("Failed to parse fill fee: {}", self.fee))?;
-        let fee = crate::domain::Fee::from_report(amount, Some(&self.fee_token))
+        let fee = crate::domain::Money::fee_from_report(amount, Some(&self.fee_token))
             .map_err(|e| format!("HL {e}（订单 {}）", self.oid))?;
 
         // HL 强平成交带 `liquidation` 对象；HL 无独立 ADL 语义，故只区分 Liquidation
@@ -599,7 +597,6 @@ mod clearinghouse_tests {
             serde_json::from_str(REAL_CLEARINGHOUSE_STATE).expect("解析真实 clearinghouseState");
 
         assert_eq!(state.margin_summary.account_value, "24217.394304");
-        assert_eq!(state.margin_summary.total_ntl_pos, "12100.48");
         assert_eq!(state.asset_positions.len(), 1);
     }
 

@@ -3,8 +3,8 @@
 //! ExchangeClient trait 封装交易所 REST 交互
 
 use crate::domain::{
-    AccountInfo, CandleInterval, Exchange, ExchangeError, Order, OrderId, PlaceError, Position,
-    Symbol, SymbolMeta,
+    CandleInterval, Exchange, ExchangeError, Money, Order, OrderId, PlaceError, Position, Symbol,
+    SymbolMeta,
 };
 use async_trait::async_trait;
 
@@ -226,8 +226,9 @@ pub trait AccountClient: Send + Sync + 'static {
     /// 撤净与否由调用方再查一次挂单确认。
     async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError>;
 
-    /// 获取账户信息 (净值 + 总持仓名义价值)
-    async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError>;
+    /// 账户净值（余额 + 未实现盈亏），带实际币种：本所合约保证金币种（= 配置的计价币）的那一份，
+    /// 不折算成美元、不加别的币（#841）。各所取哪个字段见实现。
+    async fn fetch_equity(&self) -> Result<Money, ExchangeError>;
 
     /// 查询账户当前持仓（**必须真实请求交易所**，不得返回空占位）
     ///
@@ -371,6 +372,7 @@ mod tests {
             min_order_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
             min_notional: 0.0,
             contract_size: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
+            quote: "USDT".to_string(),
         }
     }
 
@@ -431,6 +433,7 @@ mod tests {
             min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
             min_notional: 0.0,
             contract_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
+            quote: "USDT".to_string(),
         };
         let wire = ExchangeOrder::from_domain(coin_order(dec!(0.1234), dec!(62_500.0)), &meta)
             .expect("合法订单");

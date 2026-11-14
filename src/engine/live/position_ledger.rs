@@ -1349,7 +1349,7 @@ mod hl_multi_dex_tests {
 #[cfg(test)]
 mod task_tests {
     use super::*;
-    use crate::domain::{AccountInfo, Decimal, ExchangeError, OrderId, PriceStep, SymbolMeta};
+    use crate::domain::{Decimal, ExchangeError, OrderId, PriceStep, SymbolMeta};
     use crate::engine::live::executor::{Executor, ExecutorArgs};
     use crate::engine::live::OutcomeBus;
     use crate::exchange::ExchangeOrder;
@@ -1440,7 +1440,7 @@ mod task_tests {
         ) -> Result<(), ExchangeError> {
             unreachable!("账本不查挂单")
         }
-        async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
+        async fn fetch_equity(&self) -> Result<crate::domain::Money, ExchangeError> {
             unreachable!("账本不查账户")
         }
     }
@@ -1458,6 +1458,7 @@ mod task_tests {
                 min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
                 min_notional: 0.0,
                 contract_size: crate::domain::PositiveDecimal::new(dec!(1)).unwrap(),
+                quote: "USDT".to_string(),
             },
         )]))
     }

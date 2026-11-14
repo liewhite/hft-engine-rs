@@ -1,65 +1,33 @@
 use crate::domain::models::{Fill, FillReason, OrderStatus, OrderUpdate, Side};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
-/// 保留的最近成交条数（环形缓冲上限，防止长跑内存增长）
-pub const RECENT_FILL_CAPACITY: usize = 50;
-
-/// 成交与订单的累计统计
+/// 成交与订单的累计统计（一条腿：一个币在一个所，金额都以该合约的计价币计）
 ///
 /// 纯数据 + 纯函数：只由事件驱动累加，不读时钟、不做 IO，可直接单测。
 ///
 /// 价差盈亏口径为**现金流 + 存货估值**：
 /// - `cash`：卖出收现金、买入付现金（计价币，不含手续费）
-/// - 价差盈亏 = `cash` + 当前持仓按最新价的市值
+/// - 价差盈亏 = `cash` + 本次会话的存货估值变化（由调用方按持仓读数算）
 ///
 /// 手续费按交易所实际扣的币种另记在 `fees`，不并进 `cash`：币种可能不是计价币（BNB 抵扣、
 /// 现货买卖两边不同币），不同币不能相加（#817）。
 ///
 /// 这样不需要把开仓与平仓配对（跨所、部分成交、强平会让配对逻辑迅速失控），
 /// 对任意成交顺序都成立。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TradingStats {
     /// 成交笔数
     pub fills: u64,
-    /// 累计成交名义额 (price * size)
+    /// 累计成交名义额 (price * size，计价币)
     pub volume: f64,
     /// 按币种累计的手续费（正数 = 支出，负数 = 返佣）；只含出现过的币种
     pub fees: BTreeMap<String, f64>,
-    /// 累计现金流（不含手续费）：卖出 +notional，买入 -notional
+    /// 累计现金流（计价币，不含手续费）：卖出 +notional，买入 -notional
     pub cash: f64,
     /// 强平 / ADL 成交笔数（风险告警指标，正常应恒为 0）
     pub forced_fills: u64,
     /// 被拒绝或出错的订单数
     pub rejected_orders: u64,
-    /// 最近成交记录（最新在队尾），容量由 [`Self::recent_capacity`] 决定
-    pub recent_fills: VecDeque<Fill>,
-    /// `recent_fills` 的容量上限
-    ///
-    /// 允许为 0：per-symbol 统计只需要计数与金额，逐笔明细只在全局那一份上保留，
-    /// 否则数百 symbol × N 条 `Fill` 全是没人读的副本。
-    recent_capacity: usize,
-}
-
-impl Default for TradingStats {
-    fn default() -> Self {
-        Self::with_recent_capacity(RECENT_FILL_CAPACITY)
-    }
-}
-
-impl TradingStats {
-    /// 指定逐笔明细容量（0 = 不保留明细）
-    pub fn with_recent_capacity(recent_capacity: usize) -> Self {
-        Self {
-            fills: 0,
-            volume: 0.0,
-            fees: BTreeMap::new(),
-            cash: 0.0,
-            forced_fills: 0,
-            rejected_orders: 0,
-            recent_fills: VecDeque::new(),
-            recent_capacity,
-        }
-    }
 }
 
 impl TradingStats {
@@ -75,16 +43,8 @@ impl TradingStats {
             Side::Long => -notional,
             Side::Short => notional,
         };
-
         if fill.reason != FillReason::Normal {
             self.forced_fills += 1;
-        }
-
-        if self.recent_capacity > 0 {
-            if self.recent_fills.len() == self.recent_capacity {
-                self.recent_fills.pop_front();
-            }
-            self.recent_fills.push_back(fill.clone());
         }
     }
 
@@ -100,16 +60,16 @@ impl TradingStats {
         self.rejected_orders += 1;
     }
 
-    /// 价差盈亏 = 累计现金流 + 当前持仓市值（不含手续费，手续费按币种见 `fees`）
-    pub fn total_pnl(&self, position_value: f64) -> f64 {
-        self.cash + position_value
+    /// 价差盈亏 = 累计现金流 + 存货估值变化（不含手续费，手续费按币种见 `fees`）
+    pub fn total_pnl(&self, inventory_value: f64) -> f64 {
+        self.cash + inventory_value
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Exchange, Fee};
+    use crate::domain::{Exchange, Money};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
@@ -118,7 +78,7 @@ mod tests {
             side,
             price,
             size,
-            Fee::from_report(fee, Some("USDT")).unwrap(),
+            Money::fee_from_report(fee, Some("USDT")).unwrap(),
             reason,
         )
     }
@@ -127,7 +87,7 @@ mod tests {
         side: Side,
         price: Decimal,
         size: Decimal,
-        fee: Option<Fee>,
+        fee: Option<Money>,
         reason: FillReason,
     ) -> Fill {
         Fill {
@@ -177,14 +137,14 @@ mod tests {
             Side::Long,
             dec!(100.0),
             dec!(1.0),
-            Some(Fee::new(0.0003, "BNB")),
+            Some(Money::new(0.0003, "BNB")),
             FillReason::Normal,
         ));
         stats.apply_fill(&fill_with_fee(
             Side::Short,
             dec!(100.0),
             dec!(1.0),
-            Some(Fee::new(0.05, "USDC")),
+            Some(Money::new(0.05, "USDC")),
             FillReason::Normal,
         ));
         assert_eq!(stats.fees.len(), 2);
@@ -227,38 +187,6 @@ mod tests {
         ));
         assert_eq!(stats.forced_fills, 1);
         assert_eq!(stats.fills, 2);
-    }
-
-    #[test]
-    fn recent_fills_are_bounded() {
-        let mut stats = TradingStats::default();
-        for _ in 0..(RECENT_FILL_CAPACITY + 10) {
-            stats.apply_fill(&fill(
-                Side::Long,
-                dec!(1.0),
-                dec!(1.0),
-                0.0,
-                FillReason::Normal,
-            ));
-        }
-        assert_eq!(stats.recent_fills.len(), RECENT_FILL_CAPACITY);
-        assert_eq!(stats.fills as usize, RECENT_FILL_CAPACITY + 10);
-    }
-
-    #[test]
-    fn zero_capacity_keeps_counters_but_no_details() {
-        let mut stats = TradingStats::with_recent_capacity(0);
-        stats.apply_fill(&fill(
-            Side::Long,
-            dec!(100.0),
-            dec!(1.0),
-            0.1,
-            FillReason::Normal,
-        ));
-
-        assert_eq!(stats.fills, 1);
-        assert!(stats.recent_fills.is_empty());
-        assert!((stats.cash - (-100.0)).abs() < 1e-9);
     }
 
     #[test]

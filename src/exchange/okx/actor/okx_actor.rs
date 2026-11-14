@@ -10,7 +10,7 @@
 //! ├── OkxPublicWs（第一条订阅时才连）
 //! ├── OkxBusinessWs（K线，第一条 K 线订阅时才连）
 //! ├── OkxPrivateWs（需要凭证）
-//! ├── EquityPoller（需要凭证；净值 / 持仓总价值）
+//! ├── EquityPoller（需要凭证；净值）
 //! ├── FundingFeePoller（需要凭证）
 //! └── CryptoStatus
 //!
@@ -115,7 +115,7 @@ impl OkxNode {
 
                 // 2. 账户轮询与私有 WS 一样只在有账户时起
                 if let Some(account) = account {
-                    // 净值与持仓总价值走 REST 轮询：私有 WS 推送的 notionalUsd 在单币种保证金模式下是空串
+                    // 净值走 REST 轮询（计价币那一项的 eq，见 OkxAccount::fetch_equity）
                     EquityPoller::spawn(
                         &children,
                         account.clone(),

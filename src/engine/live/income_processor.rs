@@ -323,12 +323,9 @@ mod routing_tests {
             0,
             0,
             crate::messaging::AccountData::Exchange(
-                crate::messaging::ExchangeAccountData::AccountInfo {
+                crate::messaging::ExchangeAccountData::Equity {
                     exchange: Exchange::Binance,
-                    info: crate::domain::AccountInfo {
-                        equity: 1.0,
-                        notional: 0.0,
-                    },
+                    equity: crate::domain::Money::new(1.0, "USDT"),
                 },
             ),
         );

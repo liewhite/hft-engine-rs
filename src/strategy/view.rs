@@ -28,7 +28,7 @@
 //!
 //! 见品味 1.3：净值取不到与净值为零是两回事，前者伪装成后者会让杠杆闸门直接放行。
 
-use crate::domain::{AccountInfo, Exchange, Greeks, Quantity, Symbol, Timestamp, BBO};
+use crate::domain::{Exchange, Greeks, Money, Quantity, Symbol, Timestamp, BBO};
 use crate::messaging::{PendingOrder, StateManager, SymbolState};
 use std::collections::HashMap;
 
@@ -51,17 +51,12 @@ impl<'a> StrategyView<'a> {
         self.state.symbol_state(symbol).map(SymbolView::new)
     }
 
-    /// 某所账户净值。读数尚未到达返回 `None`。
-    pub fn equity(&self, exchange: Exchange) -> Option<f64> {
+    /// 某所账户净值（带币种）。读数尚未到达返回 `None`。
+    pub fn equity(&self, exchange: Exchange) -> Option<&'a Money> {
         self.state.account_view().equity(exchange)
     }
 
-    /// 某所账户信息（净值 + 名义价值，原子写入）
-    pub fn account_info(&self, exchange: Exchange) -> Option<&'a AccountInfo> {
-        self.state.account_view().account_info(exchange)
-    }
-
-    /// 本地持仓账本里该所各币的持仓读数（数量 + 估值价），含别的策略实例的币。
+    /// 本地持仓账本里该所各币的持仓读数（数量 + 估值价，价值以各币合约的计价币计），含别的策略实例的币。
     /// 账本还没发过该所读数时返回 `None`（未知，不是 0）。见 [`crate::messaging::PositionValues`]。
     pub fn position_values(
         &self,

@@ -286,9 +286,8 @@ impl PositionData {
     }
 }
 
-/// Account 推送（私有 WS `account` 频道）。只取各币现金余额：净值与持仓总价值改由
-/// REST 轮询（见 `OkxAccount::fetch_account_info`）—— 推送里的 `notionalUsd` 只在
-/// 跨币种 / 组合保证金模式下有值，单币种保证金模式（acctLv=2）是空串。
+/// Account 推送（私有 WS `account` 频道）。只取各币现金余额：净值由 REST 轮询
+/// （见 `OkxAccount::fetch_equity`）。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountData {
@@ -296,31 +295,28 @@ pub struct AccountData {
     pub details: Vec<AccountDetail>,
 }
 
-/// 账户净值与持仓总价值（REST `account/balance` 的 `totalEq` + `account/positions` 的
-/// 各仓 `notionalUsd` 绝对值之和）。两个数都必须解析成功：拿编造的 0 算杠杆会让闸门失效。
-///
-/// 持仓价值按仓位逐个累加，而不是读 balance 顶层的 `notionalUsd` —— 后者在单币种
-/// 保证金模式下是空串（实测 11-12，funding-arb 账户 acctLv=2）。
-///
-/// `positions`：每仓 (pos, notionalUsd)。只有空仓（pos 为空串或 0）的价值空串才当 0；
-/// 有仓却没有价值就报错（杠杆闸门不能少算），下一轮重试，持续失败由停摆守卫接住。
-pub fn parse_account_info(
-    total_eq: &str,
-    positions: &[(&str, &str)],
-) -> Result<crate::domain::AccountInfo, String> {
-    let equity =
-        f64::from_str(total_eq).map_err(|_| format!("OKX totalEq 无法解析: '{total_eq}'"))?;
-    let mut notional = 0.0;
-    for &(pos, raw) in positions {
-        let flat = pos.is_empty() || f64::from_str(pos).is_ok_and(|p| p == 0.0);
-        if raw.is_empty() && flat {
-            continue;
+/// REST `account/balance?ccy=<计价币>` 里一项币种的余额
+#[derive(Debug, Deserialize)]
+pub struct BalanceDetail {
+    pub ccy: String,
+    /// 该币权益（余额 + 未实现盈亏），本币计
+    pub eq: String,
+}
+
+/// 账户净值 = 计价币那一项的 `eq`（本币计，单币种保证金模式下就是撑着该币合约的保证金）。
+/// 不用 `totalEq`：那是全部币折成美元的合计（实测 11-14：USDT eq 1031.94，totalEq 1030.85 USD）。
+/// OKX 只列有余额的币，没有计价币那一项即余额为 0。数解析不了报错：编造的 0 会让杠杆闸门失效。
+pub fn parse_quote_equity(
+    details: &[BalanceDetail],
+    quote: &str,
+) -> Result<crate::domain::Money, String> {
+    let amount = match details.iter().find(|d| d.ccy == quote) {
+        Some(d) => {
+            f64::from_str(&d.eq).map_err(|_| format!("OKX {quote} eq 无法解析: '{}'", d.eq))?
         }
-        notional += f64::from_str(raw)
-            .map_err(|_| format!("OKX 持仓 notionalUsd 无法解析: '{raw}'（pos={pos}）"))?
-            .abs();
-    }
-    Ok(crate::domain::AccountInfo { equity, notional })
+        None => 0.0,
+    };
+    Ok(crate::domain::Money::new(amount, quote))
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,7 +426,7 @@ impl OrderPushData {
         // OKX: 手续费为负数表示收费，取反统一为正数=收费
         let fee_value =
             f64::from_str(fill_fee).map_err(|_| format!("Failed to parse fillFee: {fill_fee}"))?;
-        let fee = crate::domain::Fee::from_report(-fee_value, self.fill_fee_ccy.as_deref())
+        let fee = crate::domain::Money::fee_from_report(-fee_value, self.fill_fee_ccy.as_deref())
             .map_err(|e| format!("OKX {e}（订单 {}）", self.ord_id))?;
         let timestamp = self
             .fill_time
@@ -621,6 +617,7 @@ mod trade_tests {
             min_order_size: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
             min_notional: 0.0,
             contract_size: crate::domain::PositiveDecimal::new(CONTRACT_SIZE).unwrap(),
+            quote: "USDT".to_string(),
         }
     }
 
@@ -771,7 +768,7 @@ mod trade_tests {
             "fillFee":"-0.1","fillFeeCcy":"OKB","fillTime":"1"}"#;
         let d: OrderPushData = serde_json::from_str(raw).unwrap();
         let fill = d.to_fill(&btc_meta()).unwrap().expect("有成交");
-        assert_eq!(fill.fee, Some(crate::domain::Fee::new(0.1, "OKB")));
+        assert_eq!(fill.fee, Some(crate::domain::Money::new(0.1, "OKB")));
     }
 
     /// 有手续费却没有币种是交易所违约：报错，不猜币种；手续费为 0 则记作没收，不管币种

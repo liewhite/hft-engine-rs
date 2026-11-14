@@ -185,10 +185,9 @@ impl Task for Watcher {
                     AccountData::Symbol(SymbolAccountData::Fill(f)) => {
                         log.fills.push((f.price, f.size))
                     }
-                    AccountData::Exchange(ExchangeAccountData::AccountInfo {
-                        info: hft_engine_rs::domain::AccountInfo { equity, .. },
-                        ..
-                    }) => log.equity = Some(*equity),
+                    AccountData::Exchange(ExchangeAccountData::Equity { equity, .. }) => {
+                        log.equity = Some(equity.amount)
+                    }
                     _ => {}
                 },
                 WatcherMsg::Market(ev) => {

@@ -23,14 +23,11 @@ async fn unified_account_equity_and_positions_across_dexes() {
     let account = HyperliquidAccount::connect(client.clone(), creds)
         .await
         .expect("账户");
-    let info = account.fetch_account_info().await.expect("净值");
+    let equity = account.fetch_equity().await.expect("净值");
     let positions = account.fetch_positions().await.expect("持仓");
-    println!(
-        "equity={} notional={} positions={positions:?}",
-        info.equity, info.notional
-    );
+    println!("equity={equity:?} positions={positions:?}");
     assert!(
-        info.equity > 0.0,
+        equity.amount > 0.0 && equity.asset == "USDC",
         "统一账户净值应读 spot USDC，不是各 dex 的 0"
     );
 }

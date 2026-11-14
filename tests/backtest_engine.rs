@@ -48,6 +48,7 @@ fn metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
         min_order_size: hft_engine_rs::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
         min_notional: 0.0,
         contract_size: hft_engine_rs::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
+        quote: "USDT".to_string(),
     };
     let mut m = HashMap::new();
     m.insert((EX, SYM.to_string()), meta);
@@ -157,11 +158,8 @@ fn event_sig(ev: &IncomeEvent) -> String {
                 f.size,
                 f.fee.as_ref().map(|x| x.amount).unwrap_or(0.0)
             ),
-            AccountData::Exchange(ExchangeAccountData::AccountInfo {
-                info: hft_engine_rs::domain::AccountInfo { equity, .. },
-                ..
-            }) => {
-                format!("ACC ts={} eq={}", a.exchange_ts, equity)
+            AccountData::Exchange(ExchangeAccountData::Equity { equity, .. }) => {
+                format!("ACC ts={} eq={}", a.exchange_ts, equity.amount)
             }
             other => format!("{other:?}"),
         },

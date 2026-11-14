@@ -525,8 +525,7 @@ mod gateway_tests {
     use super::*;
     use crate::domain::PriceStep;
     use crate::domain::{
-        AccountInfo, ExchangeError, OrderId, OrderStatus, OrderType, OrderUpdate, Position, Side,
-        TimeInForce,
+        ExchangeError, OrderId, OrderStatus, OrderType, OrderUpdate, Position, Side, TimeInForce,
     };
     use crate::engine::live::test_support::collect;
     use crate::tasks::Root;
@@ -582,7 +581,7 @@ mod gateway_tests {
         ) -> Result<(), ExchangeError> {
             unreachable!()
         }
-        async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
+        async fn fetch_equity(&self) -> Result<crate::domain::Money, ExchangeError> {
             unreachable!()
         }
         async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {
@@ -618,6 +617,7 @@ mod gateway_tests {
                 min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
                 min_notional: 0.0,
                 contract_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
+                quote: "USDT".to_string(),
             },
         )]))
     }

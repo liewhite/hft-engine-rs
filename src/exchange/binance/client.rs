@@ -8,7 +8,7 @@
 use super::symbol::{from_binance, to_binance};
 use crate::domain::PositiveDecimal;
 use crate::domain::{
-    now_ms, Decimal, Exchange, ExchangeError, FundingFee, OrderId, OrderType, PlaceError,
+    now_ms, Decimal, Exchange, ExchangeError, FundingFee, Money, OrderId, OrderType, PlaceError,
     PriceStep, RejectReason, SettledFunding, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 pub use crate::exchange::binance::BinanceCredentials;
@@ -180,6 +180,7 @@ fn parse_exchange_info(text: &str, quote: &str) -> Result<Vec<SymbolMeta>, Excha
                     min_order_size,
                     min_notional,
                     contract_size: PositiveDecimal::ONE,
+                    quote: quote.to_string(),
                 });
             }
             _ => tracing::error!(
@@ -202,6 +203,35 @@ impl ExchangeClient for BinanceClient {
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
         self.get_all_exchange_info().await
     }
+}
+
+/// 从 `fapi/v3/account` 回复里取计价币那一项资产的 `marginBalance`，见 [`BinanceAccount::fetch_equity`]
+fn quote_margin_balance(text: &str, quote: &str) -> Result<Money, ExchangeError> {
+    #[derive(Deserialize)]
+    struct AccountResponse {
+        assets: Vec<AssetBalance>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AssetBalance {
+        asset: String,
+        margin_balance: String,
+    }
+    let account: AccountResponse = parse("account", text)?;
+    let a = account
+        .assets
+        .iter()
+        .find(|a| a.asset == quote)
+        .ok_or_else(|| {
+            ExchangeError::new(format!("Binance account assets 里没有计价币 {quote}"))
+        })?;
+    let amount = a.margin_balance.parse::<f64>().map_err(|_| {
+        ExchangeError::new(format!(
+            "Binance account {quote} marginBalance 非法: {}",
+            a.margin_balance
+        ))
+    })?;
+    Ok(Money::new(amount, quote))
 }
 
 /// 解析 `/fapi/v1/fundingRate` 的回复。`symbol` 是请求时的内部符号（回复里的是交易所写法，
@@ -405,8 +435,7 @@ impl crate::exchange::FundingFeeSource for BinanceAccount {
             result.push(FundingFee {
                 exchange: Exchange::Binance,
                 symbol,
-                asset: e.asset,
-                amount,
+                amount: Money::new(amount, e.asset),
                 timestamp: e.time,
                 tran_id: e.tran_id,
             });
@@ -495,31 +524,12 @@ impl AccountClient for BinanceAccount {
         parse_place_reply(status, &text)
     }
 
-    /// 净值 = `fapi/v3/account` 的 `totalMarginBalance`；持仓总价值 = 各仓 `notional` 绝对值之和
-    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct AccountResponse {
-            total_margin_balance: String,
-            positions: Vec<PositionNotional>,
-        }
-        #[derive(Deserialize)]
-        struct PositionNotional {
-            notional: String,
-        }
-
+    /// 净值 = `fapi/v3/account` 里计价币那一项资产的 `marginBalance`（钱包余额 + 未实现盈亏）。
+    /// 不用顶层 `totalMarginBalance`：联合保证金模式下它是各币折成美元的合计。`assets` 是全量列表
+    /// （实测 11-14 含余额为 0 的币），找不到计价币是接口变了，报错。
+    async fn fetch_equity(&self) -> Result<Money, ExchangeError> {
         let text = self.signed_get("/fapi/v3/account", &[], 5).await?;
-        let account: AccountResponse = parse("account", &text)?;
-        let number = |field: &str, v: &str| {
-            v.parse::<f64>()
-                .map_err(|_| ExchangeError::new(format!("Binance account {field} 非法: {v}")))
-        };
-        let equity = number("totalMarginBalance", &account.total_margin_balance)?;
-        let mut notional = 0.0;
-        for p in &account.positions {
-            notional += number("notional", &p.notional)?.abs();
-        }
-        Ok(crate::domain::AccountInfo { equity, notional })
+        quote_margin_balance(&text, &self.quote)
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
@@ -799,5 +809,24 @@ mod place_reply_tests {
                 "{status} {body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod equity_tests {
+    use super::*;
+
+    /// 净值取计价币那一项的 marginBalance、币种照填；不读折算成美元的顶层合计
+    #[test]
+    fn equity_is_the_quote_asset_margin_balance() {
+        let text = r#"{"totalMarginBalance":"999","assets":[
+            {"asset":"BNB","marginBalance":"0.5"},
+            {"asset":"USDT","marginBalance":"972.82873309"},
+            {"asset":"USDC","marginBalance":"0"}]}"#;
+        assert_eq!(
+            quote_margin_balance(text, "USDT").unwrap(),
+            Money::new(972.82873309, "USDT")
+        );
+        assert!(quote_margin_balance(text, "FDUSD").is_err());
     }
 }

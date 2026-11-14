@@ -66,7 +66,7 @@ pub trait Strategy: Send + Sync {
     /// 处理事件，可产出零到多个信号。
     ///
     /// **唯一的事件入口**：行情（BBO/Trades/MarkPrice/…）、私有回报（OrderUpdate/Fill）、
-    /// 账户读数（Balance/AccountInfo/Greeks）、Clock 全部经此到达，策略按需 match 自己关心的变体。
+    /// 账户读数（Balance/Equity/Greeks）、Clock 全部经此到达，策略按需 match 自己关心的变体。
     ///
     /// `view` 是**本策略订阅范围内**的状态视图（见 [`StrategyView`]），按值传入且不可
     /// 跨事件持有 —— 引擎状态容器不作为策略契约的一部分暴露。

@@ -3,11 +3,11 @@
 use super::markets::{
     dex_of_coin, dex_offset, hl_price_rule, perp_dex_names, DexUniverse, HlAsset, HlMarkets,
 };
-use crate::domain::{
-    AccountInfo, Exchange, ExchangeError, FundingFee, Order, OrderId, OrderType, PlaceError,
-    Position, Side, Symbol, SymbolMeta, Timestamp,
-};
 use crate::domain::{Decimal, PriceRule};
+use crate::domain::{
+    Exchange, ExchangeError, FundingFee, Money, Order, OrderId, OrderType, PlaceError, Position,
+    Side, Symbol, SymbolMeta, Timestamp,
+};
 use crate::exchange::client::{AccountClient, ExchangeClient, ExchangeOrder, OpenOrder};
 use crate::exchange::hyperliquid::codec::{ClearinghouseState, MetaResponse};
 use crate::exchange::hyperliquid::signing::{
@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 /// 账户的保证金口径（`POST /info {"type":"userAbstraction"}`，启动时查一次）。
 ///
-/// 决定净值和持仓总价值从哪里读，见 [`AccountClient::fetch_account_info`] 的实现。
+/// 决定净值从哪里读，见 [`AccountClient::fetch_equity`] 的实现。
 /// 运行中用户若在网页上切换模式，本进程不会察觉，切换后读到的净值是否偏大**未核实**
 /// （残余窗口，如实声明；切模式属人工操作，按规程应先停本进程）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,7 +455,7 @@ async fn post_info_with<T: for<'de> Deserialize<'de>>(
         .map_err(|e| ExchangeError::new(format!("HL /info 回复解析失败: {e}; body: {}", preview())))
 }
 
-/// 一份 clearinghouseState 里属于所查 dex 的仓位（按 coin 前缀）。持仓与持仓总价值共用：
+/// 一份 clearinghouseState 里属于所查 dex 的仓位（按 coin 前缀）：
 /// 若某 dex 的响应带出别的 dex 的仓位，不会被两份快照重复计入。
 fn own_positions<'a>(
     dex: &'a str,
@@ -514,14 +514,14 @@ pub(crate) struct SpotClearinghouseState {
 #[derive(Debug, Deserialize)]
 struct SpotBalance {
     coin: String,
-    /// 余额。统一账户下**已含**全仓仓位的未实现盈亏（实测，见 [`unified_account_info`]）。
+    /// 余额。统一账户下**已含**全仓仓位的未实现盈亏（实测，见 [`unified_equity`]）。
     ///
     /// 同级的 `hold`（被占用的部分，构成未核实）有意不取：净值不扣占用，
     /// 「total − hold 当可用保证金」在统一账户下也不成立（抵押品跨 dex 共享）。
     total: String,
 }
 
-/// 统一账户的净值与持仓总价值（纯函数）。
+/// 统一账户的净值（纯函数）。
 ///
 /// **净值 = spot 里计价币（USDC）的 `total`。** 官方文档只说「统一账户的余额和占用都在
 /// spot clearinghouse state」，没写 `total` 是否含未实现盈亏；2026-11-12 实测（只读查公开地址）：
@@ -529,37 +529,25 @@ struct SpotBalance {
 /// `total − Σ unrealizedPnl` 几乎不变（其中一户约 88.67 万、浮亏约 10.7 万，7 次波动 < 0.02）；
 /// 另有 5 个统一账户的 `total` 与 `portfolio` 接口的账户价值相符（含浮亏 -4552 的一户）——
 /// 即 `total` 已含未实现盈亏，再加一次会重复计。
-/// 只算计价币：账户里的其他现货（HYPE 等）不计入，净值偏小，杠杆偏保守。
+/// 只算计价币：账户里的其他现货（HYPE 等）不计入。
 ///
-/// **持仓总价值 = 各已接入 dex 全部仓位的 `positionValue` 绝对值之和**。未接入 dex 不查
-/// （每 2 秒查遍全部十几个 dex 会吃掉 HL 每 IP 限频的一半以上），所以口径**不含**未接入 dex
-/// 的仓位（账户由策略全权托管的前提下不会有）。
 /// 余额里没有计价币 = 该币余额为 0（`balances` 是全量列表；计价币是各 dex 保证金币种已在
 /// `connect` 校验过）。
-pub(crate) fn unified_account_info(
+pub(crate) fn unified_equity(
     spot: &SpotClearinghouseState,
-    states: &[(String, ClearinghouseState)],
     quote: &str,
-) -> Result<AccountInfo, ExchangeError> {
-    let equity = match spot.balances.iter().find(|b| b.coin == quote) {
+) -> Result<Money, ExchangeError> {
+    let amount = match spot.balances.iter().find(|b| b.coin == quote) {
         Some(b) => parse_num("spot total", &b.total)?,
         None => 0.0,
     };
-    let mut notional = 0.0;
-    for (dex, state) in states {
-        for w in own_positions(dex, state) {
-            notional += parse_num("positionValue", &w.position.position_value)?.abs();
-        }
-    }
-    Ok(AccountInfo { equity, notional })
+    Ok(Money::new(amount, quote))
 }
 
-/// 标准账户（只接一个 dex）的净值与持仓总价值：该 dex 的 marginSummary
-fn standard_account_info(state: &ClearinghouseState) -> Result<AccountInfo, ExchangeError> {
-    Ok(AccountInfo {
-        equity: parse_num("accountValue", &state.margin_summary.account_value)?,
-        notional: parse_num("totalNtlPos", &state.margin_summary.total_ntl_pos)?,
-    })
+/// 标准账户（只接一个 dex）的净值：该 dex marginSummary 的 `accountValue`（保证金币种 = 计价币）
+fn standard_equity(state: &ClearinghouseState, quote: &str) -> Result<Money, ExchangeError> {
+    let amount = parse_num("accountValue", &state.margin_summary.account_value)?;
+    Ok(Money::new(amount, quote))
 }
 
 /// HL `/exchange` 下单回复（已是 JSON）→ 三种结论。纯函数。
@@ -801,8 +789,7 @@ fn parse_user_funding(
         result.push(FundingFee {
             exchange: Exchange::Hyperliquid,
             symbol,
-            asset: quote.to_string(),
-            amount,
+            amount: Money::new(amount, quote),
             timestamp: e.time,
             tran_id: funding_tran_id(e.time, &e.delta.coin),
         });
@@ -837,7 +824,7 @@ impl ExchangeClient for HyperliquidClient {
 
     /// 已接入 dex 上未下架、支持全仓的品种（启动时建好的目录，不再联网）
     async fn fetch_all_symbol_metas(&self) -> Result<Vec<SymbolMeta>, ExchangeError> {
-        Ok(self.markets.symbol_metas())
+        Ok(self.markets.symbol_metas(&self.quote))
     }
 }
 
@@ -985,27 +972,28 @@ impl AccountClient for HyperliquidAccount {
         parse_place_reply(raw)
     }
 
-    /// 净值与持仓总价值，口径随账户模式（启动时查定）：
-    /// - 统一账户：见 [`unified_account_info`]（spot 的 USDC + 各已接入 dex 的仓位价值）；
-    /// - 标准账户（只接一个 dex）：该 dex clearinghouseState 的 marginSummary。
+    /// 净值，口径随账户模式（启动时查定）：
+    /// - 统一账户：spot 里计价币的余额，见 [`unified_equity`]；
+    /// - 标准账户（只接一个 dex）：该 dex clearinghouseState 的 `accountValue`。
     ///
-    /// 由账户净值轮询定时调用；任一请求失败整体报错（不拿半份数据拼净值）。
-    async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
+    /// 由账户净值轮询定时调用；请求失败整体报错。
+    async fn fetch_equity(&self) -> Result<Money, ExchangeError> {
         let user = self.credentials.wallet_address.as_str();
+        let quote = &self.public.quote;
         match self.mode {
             HlAccountMode::Unified => {
-                let (spot, states) = tokio::try_join!(
-                    self.public.post_info::<SpotClearinghouseState>(
-                        serde_json::json!({"type": "spotClearinghouseState", "user": user})
-                    ),
-                    self.public.fetch_clearinghouse_states(user),
-                )?;
-                unified_account_info(&spot, &states, &self.public.quote)
+                let spot = self
+                    .public
+                    .post_info::<SpotClearinghouseState>(
+                        serde_json::json!({"type": "spotClearinghouseState", "user": user}),
+                    )
+                    .await?;
+                unified_equity(&spot, quote)
             }
             HlAccountMode::Standard => {
                 // connect 已保证标准账户只接一个 dex
                 let states = self.public.fetch_clearinghouse_states(user).await?;
-                standard_account_info(&states[0].1)
+                standard_equity(&states[0].1, quote)
             }
         }
     }
@@ -1183,11 +1171,11 @@ mod tests {
         let fees = parse(&["xyz"]);
         let aapl_first = fees.iter().find(|f| f.timestamp == 1775606400000).unwrap();
         assert!(
-            (aapl_first.amount - 0.671826).abs() < 1e-9,
+            (aapl_first.amount.amount - 0.671826).abs() < 1e-9,
             "空头遇正费率应为收到"
         );
         let aapl_second = fees.iter().find(|f| f.timestamp == 1775610000000).unwrap();
-        assert!(aapl_second.amount < 0.0, "空头遇负费率应为支付");
+        assert!(aapl_second.amount.amount < 0.0, "空头遇负费率应为支付");
     }
 
     /// 同一时刻结算的两个标的必须拿到不同的 tran_id。
@@ -1238,7 +1226,7 @@ mod tests {
             r#"[{"time":1,"delta":{"type":"funding","coin":"xyz:AAPL","usdc":" -3.625312"}}]"#;
         let entries: Vec<UserFundingEntry> = serde_json::from_str(json).unwrap();
         let fees = parse_user_funding(entries, &markets_of(&["xyz"]), "USDC").unwrap();
-        assert!((fees[0].amount + 3.625312).abs() < 1e-9);
+        assert!((fees[0].amount.amount + 3.625312).abs() < 1e-9);
     }
 }
 
@@ -1254,46 +1242,27 @@ mod unified_account_tests {
         serde_json::from_str(raw).unwrap()
     }
 
-    fn states(list: &[(&str, &str)]) -> Vec<(String, ClearinghouseState)> {
-        list.iter()
-            .map(|(d, raw)| (d.to_string(), state(raw)))
-            .collect()
-    }
-
-    /// 真实统一账户：净值 = spot USDC total（不是各 dex 的 accountValue 之和，
-    /// 也不再加未实现盈亏），持仓总价值 = 已接入各 dex 仓位价值之和
+    /// 真实统一账户：净值 = spot USDC total（不是各 dex 的 accountValue 之和，也不再加未实现盈亏）
     #[test]
-    fn unified_equity_is_spot_total_and_notional_sums_connected_dexes() {
-        let both = states(&[("", UNIFIED_MAIN), ("xyz", UNIFIED_XYZ)]);
-        let info = unified_account_info(&spot(UNIFIED_SPOT), &both, "USDC").unwrap();
-        assert!(
-            (info.equity - 73788.12197337).abs() < 1e-6,
-            "{}",
-            info.equity
-        );
-        // 133560 + 114345 + 306850
-        assert!(
-            (info.notional - 554_755.0).abs() < 1e-6,
-            "{}",
-            info.notional
-        );
-
-        // 只接主站：股票仓位不计入
-        let main = states(&[("", UNIFIED_MAIN)]);
-        let info = unified_account_info(&spot(UNIFIED_SPOT), &main, "USDC").unwrap();
-        assert!((info.notional - 247_905.0).abs() < 1e-6);
+    fn unified_equity_is_spot_total() {
+        let e = unified_equity(&spot(UNIFIED_SPOT), "USDC").unwrap();
+        assert_eq!(e.asset, "USDC");
+        assert!((e.amount - 73788.12197337).abs() < 1e-6, "{e:?}");
     }
 
     /// 本策略账户的真实响应：各 dex 的 accountValue 都是 0，净值必须读成 996.96 而不是 0
     /// （读成 0 会让杠杆闸门永不放行）
     #[test]
     fn own_unified_account_reads_spot_balance_not_zero() {
-        let both = states(&[("", OWN_EMPTY_STATE), ("xyz", OWN_EMPTY_STATE)]);
-        let info = unified_account_info(&spot(OWN_SPOT), &both, "USDC").unwrap();
-        assert!((info.equity - 996.960256).abs() < 1e-9);
-        assert_eq!(info.notional, 0.0);
-        // 对照：旧口径（clearinghouseState 的 marginSummary）在统一账户下是 0
-        assert_eq!(standard_account_info(&both[0].1).unwrap().equity, 0.0);
+        let e = unified_equity(&spot(OWN_SPOT), "USDC").unwrap();
+        assert!((e.amount - 996.960256).abs() < 1e-9);
+        // 对照：标准账户口径（clearinghouseState 的 marginSummary）在统一账户下是 0
+        assert_eq!(
+            standard_equity(&state(OWN_EMPTY_STATE), "USDC")
+                .unwrap()
+                .amount,
+            0.0
+        );
     }
 
     #[test]

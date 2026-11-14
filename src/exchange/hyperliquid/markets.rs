@@ -159,8 +159,8 @@ impl HlMarkets {
         self.entry_of_coin(coin).map(|(s, _)| s.clone())
     }
 
-    /// 全部可交易品种的 SymbolMeta
-    pub(crate) fn symbol_metas(&self) -> Vec<SymbolMeta> {
+    /// 全部可交易品种的 SymbolMeta。`quote` 是各已接入 dex 共同的保证金币种（`connect` 已校验）
+    pub(crate) fn symbol_metas(&self, quote: &str) -> Vec<SymbolMeta> {
         self.by_symbol
             .iter()
             .map(|(symbol, a)| SymbolMeta {
@@ -171,6 +171,7 @@ impl HlMarkets {
                 min_order_size: size_step(a.sz_decimals), // 最小下单量为一个精度单位
                 min_notional: MIN_ORDER_NOTIONAL,
                 contract_size: PositiveDecimal::ONE, // 币本位，合约乘数为 1
+                quote: quote.to_string(),
             })
             .collect()
     }
@@ -346,7 +347,11 @@ mod tests {
         // 只许逐仓的不收
         assert_eq!(m.coin(&"AAPL".into()), None);
         assert!(m.asset(&"AAPL".into()).is_err());
-        let mut names: Vec<_> = m.symbol_metas().into_iter().map(|s| s.symbol).collect();
+        let mut names: Vec<_> = m
+            .symbol_metas("USDC")
+            .into_iter()
+            .map(|s| s.symbol)
+            .collect();
         names.sort();
         assert_eq!(names, ["BTC", "ETH", "STX", "TSLA", "XYZ100"]);
     }

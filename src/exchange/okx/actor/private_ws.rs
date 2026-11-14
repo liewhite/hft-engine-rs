@@ -339,7 +339,7 @@ fn parse_private_message(
                         data.u_time
                     ))
                 })?;
-                // 净值与持仓总价值不从这里取，由 EquityPoller 走 REST（见 codec::AccountData）。
+                // 净值不从这里取，由 EquityPoller 走 REST（见 codec::AccountData）。
                 // 推送每个币种的现金余额 (用于修正 greeks delta)
                 for detail in &data.details {
                     let cash_bal: f64 = detail.cash_bal.parse().map_err(|_| {
@@ -432,6 +432,7 @@ mod tests {
                 min_order_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
                 min_notional: 0.0,
                 contract_size: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
+                quote: "USDT".to_string(),
             },
         )])
     }

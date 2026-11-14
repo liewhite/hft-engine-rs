@@ -185,7 +185,7 @@ pub(crate) async fn snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AccountInfo, OrderId};
+    use crate::domain::OrderId;
     use crate::exchange::ExchangeOrder;
     use rust_decimal_macros::dec;
 
@@ -221,7 +221,7 @@ mod tests {
         ) -> Result<OrderId, crate::domain::PlaceError> {
             unreachable!("拉快照不下单")
         }
-        async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError> {
+        async fn fetch_equity(&self) -> Result<crate::domain::Money, ExchangeError> {
             unreachable!("拉快照不查账户")
         }
         async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError> {

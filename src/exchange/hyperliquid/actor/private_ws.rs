@@ -8,8 +8,8 @@
 //! 注意: Hyperliquid 的账户订阅不需要认证，只需要用户地址
 //!
 //! 不订阅 clearinghouseState：它按单个 dex 推送，统一账户下其中的净值恒为 0（余额在 spot
-//! clearinghouse），多 dex 时也拼不出账户总值。净值与持仓总价值改由 REST 轮询
-//! （`AccountClient::fetch_account_info`，见 `crate::exchange::equity_polling`）。
+//! clearinghouse），多 dex 时也拼不出账户总值。净值改由 REST 轮询
+//! （`AccountClient::fetch_equity`，见 `crate::exchange::equity_polling`）。
 
 use crate::domain::{now_ms, Exchange, ExchangeError};
 use crate::exchange::hyperliquid::codec::{WsOrderUpdate, WsUserFills};
@@ -380,7 +380,7 @@ mod tests {
         let events = parse_user_fills(&data, &testkit::markets(&[""]), 1).unwrap();
         match &events[0].data {
             AccountData::Symbol(SymbolAccountData::Fill(fill)) => {
-                assert_eq!(fill.fee, Some(crate::domain::Fee::new(0.01, "HYPE")))
+                assert_eq!(fill.fee, Some(crate::domain::Money::new(0.01, "HYPE")))
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -438,7 +438,7 @@ mod tests {
     }
 
     /// clearinghouseState 不再订阅：即使推来也不产出任何事件（统一账户下其中净值恒为 0，
-    /// 产出 AccountInfo 会和 REST 轮询的真实净值互相覆盖）
+    /// 产出净值会和 REST 轮询的真实净值互相覆盖）
     #[test]
     fn clearinghouse_state_push_yields_no_account_info() {
         let raw = format!(

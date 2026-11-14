@@ -1,4 +1,4 @@
-use crate::domain::AccountInfo;
+use crate::domain::Money;
 use crate::domain::{Exchange, Greeks, Order, Position, Symbol, Timestamp};
 use crate::messaging::{
     AccountData, ExchangeAccountData, IncomeEvent, LegValue, MarketData, SymbolState,
@@ -26,8 +26,8 @@ pub struct PositionBaseline {
 /// 不按 symbol 索引，所以住在 [`StateManager`] 上而不在 `SymbolState` 里。
 #[derive(Debug, Clone, Default)]
 pub struct AccountView {
-    /// 账户信息: 净值 + 总持仓名义价值 (per exchange)
-    account_infos: HashMap<Exchange, AccountInfo>,
+    /// 账户净值（带币种，per exchange）
+    equities: HashMap<Exchange, Money>,
     /// 账户希腊值 (per exchange, per ccy)
     greeks: HashMap<(Exchange, String), Greeks>,
     /// 币种现金余额 (per exchange, per ccy) — 用于修正 greeks delta
@@ -37,23 +37,9 @@ pub struct AccountView {
 }
 
 impl AccountView {
-    /// 获取指定交易所的账户信息 (equity + notional 原子性保证)
-    ///
-    /// 返回 None 表示该交易所的账户数据尚未到达
-    pub fn account_info(&self, exchange: Exchange) -> Option<&AccountInfo> {
-        self.account_infos.get(&exchange)
-    }
-
-    /// 获取指定交易所的账户净值
-    ///
-    /// 返回 None 表示该交易所的净值数据尚未到达
-    pub fn equity(&self, exchange: Exchange) -> Option<f64> {
-        self.account_infos.get(&exchange).map(|i| i.equity)
-    }
-
-    /// 获取所有交易所的总净值（仅包含已收到数据的交易所）
-    pub fn total_equity(&self) -> f64 {
-        self.account_infos.values().map(|i| i.equity).sum()
+    /// 指定交易所的账户净值（带币种）。返回 None 表示该交易所的净值数据尚未到达
+    pub fn equity(&self, exchange: Exchange) -> Option<&Money> {
+        self.equities.get(&exchange)
     }
 
     /// 本地持仓账本里该所各币的持仓读数（数量 + 估值价）。
@@ -214,10 +200,9 @@ impl StateManager {
                     .cash_balances
                     .insert((balance.exchange, balance.asset.clone()), balance.cash);
             }
-            // equity + notional 原子写入
-            ExchangeAccountData::AccountInfo { exchange, info } => {
-                tracing::debug!(%exchange, equity = info.equity, notional = info.notional, "AccountInfo updated");
-                self.account.account_infos.insert(*exchange, *info);
+            ExchangeAccountData::Equity { exchange, equity } => {
+                tracing::debug!(%exchange, ?equity, "Equity updated");
+                self.account.equities.insert(*exchange, equity.clone());
             }
             ExchangeAccountData::Greeks(g) => {
                 self.account

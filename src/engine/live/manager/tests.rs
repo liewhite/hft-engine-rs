@@ -32,6 +32,7 @@ impl ExchangeClient for FakeClient {
             min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
             min_notional: 0.0,
             contract_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
+            quote: "USDT".to_string(),
         }])
     }
 }
@@ -64,12 +65,9 @@ fn final_report(exchange: Exchange) -> AccountEvent {
         account: AccountId::Live,
         exchange_ts: 1,
         local_ts: 1,
-        data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
+        data: AccountData::Exchange(ExchangeAccountData::Equity {
             exchange,
-            info: crate::domain::AccountInfo {
-                equity: 1.0,
-                notional: 0.0,
-            },
+            equity: crate::domain::Money::new(1.0, "USDT"),
         }),
     }
 }
@@ -116,9 +114,7 @@ struct Observer {
 impl Task for Observer {
     async fn run(&mut self, _: &Scope) -> anyhow::Result<()> {
         while let Some(ev) = self.inbox.recv().await {
-            if let AccountData::Exchange(ExchangeAccountData::AccountInfo { exchange, .. }) =
-                ev.data
-            {
+            if let AccountData::Exchange(ExchangeAccountData::Equity { exchange, .. }) = ev.data {
                 self.log
                     .lock()
                     .unwrap()
@@ -133,7 +129,7 @@ impl Task for Observer {
 fn is_account_info(ev: &AccountEvent) -> bool {
     matches!(
         ev.data,
-        AccountData::Exchange(ExchangeAccountData::AccountInfo { .. })
+        AccountData::Exchange(ExchangeAccountData::Equity { .. })
     )
 }
 

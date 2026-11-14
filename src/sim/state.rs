@@ -571,7 +571,7 @@ impl SimState {
             order_id: order_id.clone(),
             timestamp: ts,
             // 柜台现金以 SIM_CASH_ASSET 计，按费率算出的手续费也是这个币
-            fee: (fee != 0.0).then(|| crate::domain::Fee::new(fee, crate::sim::SIM_CASH_ASSET)),
+            fee: (fee != 0.0).then(|| crate::domain::Money::new(fee, crate::sim::SIM_CASH_ASSET)),
             reason: crate::domain::FillReason::Normal, // 回测无强平/ADL
         };
         let events = vec![
@@ -657,6 +657,7 @@ mod tests {
                 min_order_size: crate::domain::PositiveDecimal::new(dec!(0.001)).unwrap(),
                 min_notional: 0.0,
                 contract_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
+                quote: "USDT".to_string(),
             },
         )]))
     }

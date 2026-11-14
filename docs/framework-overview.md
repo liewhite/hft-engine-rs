@@ -168,7 +168,8 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
     /// 账户上全部挂单（启动清场用，不限本引擎接入的币）及按交易所订单号撤
     async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>, ExchangeError>;
     async fn cancel_open_order(&self, order: &OpenOrder) -> Result<(), ExchangeError>;
-    async fn fetch_account_info(&self) -> Result<AccountInfo, ExchangeError>;
+    /// 净值（带币种：本所计价币那一份，不折算）
+    async fn fetch_equity(&self) -> Result<Money, ExchangeError>;
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExchangeError>;
 }
 ```
@@ -186,7 +187,7 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 
 `AccountData` 按定位精度在类型上分两档（#696）：
 - `Symbol(SymbolAccountData)`：`OrderUpdate` / `Fill` / `FundingFee`
-- `Exchange(ExchangeAccountData)`：`Balance` / `Greeks` / `AccountInfo` / `PositionValues`（品种目录外的成交适配层直接丢弃，不上报）
+- `Exchange(ExchangeAccountData)`：`Balance` / `Greeks` / `Equity` / `PositionValues`（品种目录外的成交适配层直接丢弃，不上报）
 
 状态层按档分派、不带默认分支；`SymbolState` 只收币级。新增账户事件先选档，漏处理编译不过。
 

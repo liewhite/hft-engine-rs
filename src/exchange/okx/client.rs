@@ -8,13 +8,13 @@
 use super::symbol::{from_okx, to_okx};
 use crate::domain::PositiveDecimal;
 use crate::domain::{
-    Decimal, Exchange, ExchangeError, FundingFee, Greeks, OrderId, OrderType, PlaceError,
+    Decimal, Exchange, ExchangeError, FundingFee, Greeks, Money, OrderId, OrderType, PlaceError,
     PriceStep, RejectReason, Side, Symbol, SymbolMeta, TimeInForce, Timestamp,
 };
 use crate::exchange::client::{
     place_send_error, AccountClient, ExchangeClient, ExchangeOrder, OpenOrder,
 };
-use crate::exchange::okx::codec::{parse_account_info, GreeksData, PositionData};
+use crate::exchange::okx::codec::{parse_quote_equity, BalanceDetail, GreeksData, PositionData};
 pub use crate::exchange::okx::OkxCredentials;
 use crate::exchange::okx::{
     BALANCE, BILLS, CANCEL, FUNDING_HISTORY, GREEKS, INSTRUMENTS, LIMITER, ORDERS_PENDING, PLACE,
@@ -181,6 +181,7 @@ impl OkxClient {
                     min_order_size: min,
                     min_notional: 0.0,
                     contract_size: ct_val,
+                    quote: self.quote.clone(),
                 }),
                 _ => tracing::error!(
                     inst_id = %d.inst_id,
@@ -539,33 +540,20 @@ impl AccountClient for OkxAccount {
         parse_place_reply(status, &text)
     }
 
-    /// 净值 = `account/balance` 的 `totalEq`（USD）；持仓总价值 = `account/positions`（全部
-    /// 品种类型）各仓 `notionalUsd` 绝对值之和。口径见 [`parse_account_info`]。
-    async fn fetch_account_info(&self) -> Result<crate::domain::AccountInfo, ExchangeError> {
+    /// 净值 = `account/balance?ccy=<计价币>` 里计价币那一项的 `eq`，口径见 [`parse_quote_equity`]
+    async fn fetch_equity(&self) -> Result<Money, ExchangeError> {
         #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
         struct BalanceData {
-            total_eq: String,
+            details: Vec<BalanceDetail>,
         }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct PositionNotional {
-            pos: String,
-            notional_usd: String,
-        }
-        let balance: Vec<BalanceData> =
-            self.signed_get(&BALANCE, "/api/v5/account/balance").await?;
-        let total_eq = balance
+        let quote = &self.public.quote;
+        let balance: Vec<BalanceData> = self
+            .signed_get(&BALANCE, &format!("/api/v5/account/balance?ccy={quote}"))
+            .await?;
+        let data = balance
             .first()
             .ok_or_else(|| ExchangeError::new("OKX account/balance 返回空 data"))?;
-        let positions: Vec<PositionNotional> = self
-            .signed_get(&POSITIONS, "/api/v5/account/positions")
-            .await?;
-        let notionals: Vec<(&str, &str)> = positions
-            .iter()
-            .map(|p| (p.pos.as_str(), p.notional_usd.as_str()))
-            .collect();
-        Ok(parse_account_info(&total_eq.total_eq, &notionals)?)
+        Ok(parse_quote_equity(&data.details, quote)?)
     }
 
     async fn fetch_positions(&self) -> Result<Vec<crate::domain::Position>, ExchangeError> {
@@ -725,8 +713,10 @@ impl crate::exchange::FundingFeeSource for OkxAccount {
                 fees.push(FundingFee {
                     exchange: Exchange::OKX,
                     symbol,
-                    asset: b.ccy.clone(),
-                    amount: b.bal_chg.parse().map_err(|_| parse("balChg", &b.bal_chg))?,
+                    amount: Money::new(
+                        b.bal_chg.parse().map_err(|_| parse("balChg", &b.bal_chg))?,
+                        b.ccy.clone(),
+                    ),
                     timestamp: b.ts.parse().map_err(|_| parse("ts", &b.ts))?,
                     tran_id: b.bill_id.parse().map_err(|_| parse("billId", &b.bill_id))?,
                 });
@@ -772,28 +762,30 @@ mod settled_funding_tests {
 }
 
 #[cfg(test)]
-mod account_info_tests {
-    use crate::exchange::okx::codec::parse_account_info;
+mod equity_tests {
+    use crate::domain::Money;
+    use crate::exchange::okx::codec::{parse_quote_equity, BalanceDetail};
 
-    #[test]
-    fn sums_absolute_position_notionals() {
-        let info = parse_account_info(
-            "1000.5",
-            &[("2", "200"), ("-1", "-150.5"), ("", ""), ("0", "")],
-        )
-        .unwrap();
-        assert_eq!(info.equity, 1000.5);
-        assert_eq!(info.notional, 350.5);
+    fn detail(ccy: &str, eq: &str) -> BalanceDetail {
+        BalanceDetail {
+            ccy: ccy.into(),
+            eq: eq.into(),
+        }
     }
 
     #[test]
-    fn unparsable_values_fail_instead_of_zero() {
-        assert!(parse_account_info("", &[]).is_err());
-        assert!(parse_account_info("1", &[("1", "abc")]).is_err());
-        assert!(
-            parse_account_info("1", &[("3", "")]).is_err(),
-            "有仓却没有价值不能当 0"
+    fn equity_is_the_quote_currency_eq() {
+        let details = [detail("BTC", "0.1"), detail("USDT", "1031.94")];
+        assert_eq!(
+            parse_quote_equity(&details, "USDT").unwrap(),
+            Money::new(1031.94, "USDT")
         );
+        // 没有计价币那一项 = 余额为 0（OKX 只列有余额的币）
+        assert_eq!(
+            parse_quote_equity(&details, "USDC").unwrap(),
+            Money::new(0.0, "USDC")
+        );
+        assert!(parse_quote_equity(&[detail("USDT", "")], "USDT").is_err());
     }
 }
 

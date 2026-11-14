@@ -1,8 +1,8 @@
-//! EquityPoller - 定时用 REST 查账户净值与持仓总价值（`AccountClient::fetch_account_info`）
+//! EquityPoller - 定时用 REST 查账户净值（`AccountClient::fetch_equity`）
 //!
 //! 用于 WebSocket 不推送净值、或推送的净值口径不对的所：Binance 的 WS 不推 equity；
 //! Hyperliquid 统一账户的净值在 spot clearinghouse，按 dex 推送的 clearinghouseState
-//! 里恒为 0。所别只体现在 `client.exchange()` 与各 client 的 `fetch_account_info` 实现里。
+//! 里恒为 0。所别只体现在 `client.exchange()` 与各 client 的 `fetch_equity` 实现里。
 
 use crate::exchange::staleness::{stamped_on_receipt, StalenessGuard, MAX_POLL_STALENESS_MS};
 use crate::exchange::AccountClient;
@@ -45,22 +45,22 @@ impl EquityPoller {
 }
 
 impl Periodic for EquityPoller {
-    /// 执行一次账户信息查询 (equity + notional)。`Err` = 已停摆过久，整支停（陈旧净值会让杠杆闸门失准）。
+    /// 查一次账户净值。`Err` = 已停摆过久，整支停（陈旧净值会让杠杆闸门失准）。
     async fn tick(&mut self) -> anyhow::Result<()> {
         // 戳在响应到手之后取，理由见 `stamped_on_receipt`
-        let (read, local_ts) = stamped_on_receipt(self.client.fetch_account_info()).await;
+        let (read, local_ts) = stamped_on_receipt(self.client.fetch_equity()).await;
 
         match read {
-            Ok(info) => {
+            Ok(equity) => {
                 self.guard.record_success();
                 self.account_bus.publish(AccountEvent {
                     // 实盘适配层单账户：标签写死 Live（多账户时提升为构造参数）
                     account: crate::domain::AccountId::Live,
                     exchange_ts: local_ts,
                     local_ts,
-                    data: AccountData::Exchange(ExchangeAccountData::AccountInfo {
+                    data: AccountData::Exchange(ExchangeAccountData::Equity {
                         exchange: self.client.exchange(),
-                        info,
+                        equity,
                     }),
                 });
             }
@@ -75,7 +75,7 @@ impl Periodic for EquityPoller {
                     exchange = %self.client.exchange(),
                     error = %e,
                     stale_ms = self.guard.stale_ms(),
-                    "Failed to fetch account info, will retry"
+                    "Failed to fetch equity, will retry"
                 );
             }
         }

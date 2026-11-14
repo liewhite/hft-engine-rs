@@ -280,6 +280,7 @@ mod tests {
                 min_order_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
                 min_notional: 0.0,
                 contract_size: crate::domain::PositiveDecimal::new(CONTRACT_SIZE).unwrap(),
+                quote: "USDT".to_string(),
             },
         )]))
     }
@@ -490,12 +491,9 @@ mod tests {
                 0,
                 0,
                 crate::messaging::AccountData::Exchange(
-                    crate::messaging::ExchangeAccountData::AccountInfo {
+                    crate::messaging::ExchangeAccountData::Equity {
                         exchange,
-                        info: crate::domain::AccountInfo {
-                            equity: 1.0,
-                            notional: 0.0,
-                        },
+                        equity: crate::domain::Money::new(1.0, "USDT"),
                     },
                 ),
             )

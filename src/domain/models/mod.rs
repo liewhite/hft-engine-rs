@@ -1,5 +1,4 @@
 mod account;
-mod account_info;
 mod balance;
 mod bbo;
 mod candle;
@@ -12,6 +11,7 @@ mod index_price;
 mod mark_price;
 mod market_status;
 mod market_trade;
+mod money;
 mod order;
 mod order_status;
 mod order_type;
@@ -25,12 +25,11 @@ mod time_in_force;
 mod trading_stats;
 
 pub use account::AccountId;
-pub use account_info::AccountInfo;
 pub use balance::Balance;
 pub use bbo::BBO;
 pub use candle::{Candle, CandleInterval};
 pub use exchange::Exchange;
-pub use fill::{Fee, Fill, FillReason};
+pub use fill::{Fill, FillReason};
 pub use funding_fee::FundingFee;
 pub use funding_rate::FundingRate;
 pub use greeks::Greeks;
@@ -38,6 +37,7 @@ pub use index_price::IndexPrice;
 pub use mark_price::MarkPrice;
 pub use market_status::MarketStatus;
 pub use market_trade::MarketTrade;
+pub use money::Money;
 pub use order::{Order, OrderIntent};
 pub use order_status::OrderStatus;
 pub use order_type::OrderType;
@@ -48,7 +48,7 @@ pub use settled_funding::SettledFunding;
 pub use side::Side;
 pub use symbol_meta::SymbolMeta;
 pub use time_in_force::TimeInForce;
-pub use trading_stats::{TradingStats, RECENT_FILL_CAPACITY};
+pub use trading_stats::TradingStats;
 
 /// 统一交易对符号（只包含 base，quote 由交易所配置决定）
 pub type Symbol = String;

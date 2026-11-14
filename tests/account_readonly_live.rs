@@ -16,7 +16,7 @@ fn env(k: &str) -> Option<String> {
 
 async fn read_all(account: &(impl AccountClient + FundingFeeSource)) {
     let ex = AccountClient::exchange(account);
-    let info = account.fetch_account_info().await.expect("净值");
+    let equity = account.fetch_equity().await.expect("净值");
     let positions = account.fetch_positions().await.expect("持仓");
     let open = account.fetch_open_orders().await.expect("挂单");
     let now = hft_engine_rs::domain::now_ms();
@@ -25,9 +25,9 @@ async fn read_all(account: &(impl AccountClient + FundingFeeSource)) {
         .await
         .expect("资金费流水");
     println!(
-        "{ex}: equity={:.2} notional={:.2} positions={positions:?} open_orders={} funding_fees_24h={}",
-        info.equity,
-        info.notional,
+        "{ex}: equity={:.2} {} positions={positions:?} open_orders={} funding_fees_24h={}",
+        equity.amount,
+        equity.asset,
         open.len(),
         fees.len()
     );

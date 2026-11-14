@@ -469,6 +469,9 @@ impl FundingArbStrategy {
     /// 持仓绝对值不增（削减已有腿）时总是允许 —— 超限只停止开仓，不拦减仓。
     /// 净值或持仓总价值未知时不许加仓。
     ///
+    /// 币种：杠杆只拿同一币种的数相除。净值的币种（交易所给的保证金币）与本币合约的计价币不同时
+    /// 当作未知、不许加仓，不按 1:1 硬除；同所别的币与本币同一计价币（每所只接一种计价币）。
+    ///
     /// 账户持仓总价值 = 本地持仓账本里该所**别的币**的持仓价值之和 + 本币开仓后的价值（#759，用户定：
     /// 本地所有持仓价值相加）。本币用自己这一刻的持仓，不用账本那份（可能还没含刚到的成交）；
     /// 别的币的成交由账本在成交后立刻发出，不等交易所轮询。只算配置里的币，账户里别的仓位不计。
@@ -488,9 +491,10 @@ impl FundingArbStrategy {
         let (Some(equity), Some(values)) = (view.equity(ex), view.position_values(ex)) else {
             return false;
         };
-        if equity <= 0.0 {
+        if equity.asset != self.metas[&ex].quote || equity.amount <= 0.0 {
             return false;
         }
+        let equity = equity.amount;
         let others: f64 = values
             .iter()
             .filter(|(s, _)| *s != self.symbol())
@@ -761,12 +765,16 @@ impl Strategy for FundingArbStrategy {
             .collect()
     }
 
-    /// 看板与告警用：各所年化、资金费与盘口数据年龄、年化差、最近一次判断的信号（停止交易或补腿期间不再判断，
+    /// 看板与告警用：各所年化、资金费与盘口数据年龄、年化差、单币杠杆、跨所净敞口、是否单腿、
+    /// 最近一次判断的信号（停止交易或补腿期间不再判断，
     /// 停在最后一次）、门槛、是否停止交易
     fn gauges(&self, view: StrategyView<'_>, now: Timestamp) -> Vec<Gauge> {
         let sym = self.symbol().as_str();
         let mut out = Vec::new();
         let mut known = Vec::new();
+        // 各所带符号持仓价值（账本已发读数的所）、有仓的所数
+        let mut legs: Vec<f64> = Vec::new();
+        let mut held = 0usize;
         for &ex in &self.exchanges {
             let ex_label = ex.to_string();
             let labels = [("symbol", sym), ("exchange", ex_label.as_str())];
@@ -782,6 +790,25 @@ impl Strategy for FundingArbStrategy {
                     now.saturating_sub(t) as f64 / 1000.0,
                 ));
             }
+            // 持仓：取账本读数（与杠杆闸门同一来源）
+            if let Some(leg) = view.position_values(ex).and_then(|v| v.get(self.symbol())) {
+                legs.push(leg.signed_value());
+                if !leg.size().is_zero() {
+                    held += 1;
+                }
+                // 单币杠杆 = 本币在该所的持仓价值 ÷ 该所净值，与开仓闸门同一口径（只除同一币种）。
+                // 账户独占，该所全部持仓都是各币实例的：按所把各币相加就是闸门的账户杠杆
+                if let Some(e) = view
+                    .equity(ex)
+                    .filter(|e| e.asset == self.metas[&ex].quote && e.amount > 0.0)
+                {
+                    out.push(Gauge::new(
+                        "funding_arb_symbol_leverage",
+                        &labels,
+                        leg.value() / e.amount,
+                    ));
+                }
+            }
             let Some(w) = self.funding.get(&ex) else {
                 continue;
             };
@@ -794,6 +821,20 @@ impl Strategy for FundingArbStrategy {
                 out.push(Gauge::new("funding_arb_apr", &labels, apr));
                 known.push(apr);
             }
+        }
+        // 跨所净敞口：各所持仓价值直接相加，USDT 与 USDC 按 1:1 算（本策略的口径，#841），
+        // 对冲到位时接近 0。有所还没有读数时不推（未知，不是 0）
+        if legs.len() == self.exchanges.len() {
+            out.push(Gauge::new(
+                "funding_arb_net_notional",
+                &[("symbol", sym)],
+                legs.iter().sum(),
+            ));
+            out.push(Gauge::new(
+                "funding_arb_single_leg",
+                &[("symbol", sym)],
+                if held == 1 { 1.0 } else { 0.0 },
+            ));
         }
         if known.len() == self.exchanges.len() {
             let max = known.iter().copied().fold(f64::MIN, f64::max);

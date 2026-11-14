@@ -323,6 +323,7 @@ fn okx_btc_metas() -> HashMap<Symbol, SymbolMeta> {
             min_order_size: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
             min_notional: 0.0,
             contract_size: crate::domain::PositiveDecimal::new(OKX_BTC_CONTRACT_SIZE).unwrap(),
+            quote: "USDT".to_string(),
         },
     )])
 }

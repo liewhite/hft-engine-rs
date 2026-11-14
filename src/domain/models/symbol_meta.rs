@@ -31,6 +31,9 @@ pub struct SymbolMeta {
     /// - OKX ETH: cval=0.1, 下单 qty=1 表示 0.1 ETH
     /// - Binance: 直接按币的数量下单, 等效于 cval=1
     pub contract_size: PositiveDecimal,
+    /// 计价币：价格、成交金额与持仓价值的币种（交易所原样的名字，如 USDT、USDC）。
+    /// 框架如实标出、不换算（#841）；不同计价币的金额要不要合并由策略决定。
+    pub quote: String,
 }
 
 impl SymbolMeta {
@@ -119,6 +122,7 @@ mod tests {
             min_order_size: size_step,
             min_notional: 0.0,
             contract_size: PositiveDecimal::new(contract_size).unwrap(),
+            quote: "USDT".to_string(),
         }
     }
 

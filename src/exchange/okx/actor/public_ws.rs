@@ -394,6 +394,7 @@ mod tests {
                 min_order_size: crate::domain::PositiveDecimal::new(dec!(0.01)).unwrap(),
                 min_notional: 0.0,
                 contract_size: crate::domain::PositiveDecimal::new(contract_size).unwrap(),
+                quote: "USDT".to_string(),
             },
         )])
     }

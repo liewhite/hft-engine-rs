@@ -23,7 +23,7 @@
 | 总线 | 覆盖 |
 |---|---|
 | `market_bus()` | `MarketData` 全部 variant：BBO、MarketTrade、MarkPrice、IndexPrice、FundingRate、Candle、HistoryCandles、ExchangeStatus、Clock、Custom |
-| `account_bus()` | `AccountData` 全部 variant：OrderUpdate、OrderRequest、Fill、Balance、FundingFee、Greeks、AccountInfo、PositionValues（持仓账本发的持仓读数，见 §三） |
+| `account_bus()` | `AccountData` 全部 variant：OrderUpdate、OrderRequest、Fill、Balance、FundingFee、Greeks、Equity、PositionValues（持仓账本发的持仓读数，见 §三） |
 | `outcome_bus()` | 策略信号（下单 / 撤单 / 自定义事件），带 `account` 标签 |
 
 **契约**
@@ -67,7 +67,7 @@
 **消费者一律读它**（#812）：
 
 - 策略的账户杠杆闸门（`StrategyView::position_values`）；
-- 指标（看板上的持仓、各所持仓价值与账户杠杆、会话盈亏），见 `engine/live/metrics.rs`。
+- 指标（看板上的持仓、各所持仓价值、会话盈亏，都按所按币种），见 `engine/live/metrics.rs`；杠杆是策略的口径，由策略读同一份读数自己推。
 
 于是看板上的杠杆与风控闸门看到的是**同一个数**（账本读数之和 ÷ 交易所报的净值），不会出现
 「看板绿着、引擎却在停机边缘」。外部观察者要持仓也订这条：`account_bus()` 过滤
