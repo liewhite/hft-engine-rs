@@ -305,7 +305,7 @@ pub struct BalanceDetail {
 
 /// 账户净值 = 计价币那一项的 `eq`（本币计，单币种保证金模式下就是撑着该币合约的保证金）。
 /// 不用 `totalEq`：那是全部币折成美元的合计（实测 11-14：USDT eq 1031.94，totalEq 1030.85 USD）。
-/// OKX 只列有余额的币，没有计价币那一项即余额为 0。数解析不了报错：编造的 0 会让杠杆闸门失效。
+/// OKX 只列有余额的币，没有计价币那一项即余额为 0。数解析不了报错，不编造 0。
 pub fn parse_quote_equity(
     details: &[BalanceDetail],
     quote: &str,
@@ -426,7 +426,7 @@ impl OrderPushData {
         // OKX: 手续费为负数表示收费，取反统一为正数=收费
         let fee_value =
             f64::from_str(fill_fee).map_err(|_| format!("Failed to parse fillFee: {fill_fee}"))?;
-        let fee = crate::domain::Money::fee_from_report(-fee_value, self.fill_fee_ccy.as_deref())
+        let fee = crate::domain::fee_from_report(-fee_value, self.fill_fee_ccy.as_deref())
             .map_err(|e| format!("OKX {e}（订单 {}）", self.ord_id))?;
         let timestamp = self
             .fill_time

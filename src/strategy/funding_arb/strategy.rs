@@ -469,12 +469,19 @@ impl FundingArbStrategy {
     /// 持仓绝对值不增（削减已有腿）时总是允许 —— 超限只停止开仓，不拦减仓。
     /// 净值或持仓总价值未知时不许加仓。
     ///
-    /// 币种：杠杆只拿同一币种的数相除。净值的币种（交易所给的保证金币）与本币合约的计价币不同时
-    /// 当作未知、不许加仓，不按 1:1 硬除；同所别的币与本币同一计价币（每所只接一种计价币）。
+    /// 分母见 [`Self::leverage_base`]；同所别的币与本币同一计价币（每所只接一种计价币）。
     ///
     /// 账户持仓总价值 = 本地持仓账本里该所**别的币**的持仓价值之和 + 本币开仓后的价值（#759，用户定：
     /// 本地所有持仓价值相加）。本币用自己这一刻的持仓，不用账本那份（可能还没含刚到的成交）；
     /// 别的币的成交由账本在成交后立刻发出，不等交易所轮询。只算配置里的币，账户里别的仓位不计。
+    /// 杠杆的分母：该所净值，只在它与本币合约计价币同一币种、且为正时可用。币种对不上（如交易所
+    /// 给的是折成美元的数）当作未知、不按 1:1 硬除。开仓闸门和看板读数都从这里取，看到同一个数。
+    fn leverage_base(&self, view: StrategyView<'_>, ex: Exchange) -> Option<f64> {
+        view.equity(ex)
+            .filter(|e| e.asset == self.metas[&ex].quote && e.amount > 0.0)
+            .map(|e| e.amount)
+    }
+
     fn leverage_allows(
         &self,
         view: StrategyView<'_>,
@@ -488,13 +495,10 @@ impl FundingArbStrategy {
         if after <= before {
             return true;
         }
-        let (Some(equity), Some(values)) = (view.equity(ex), view.position_values(ex)) else {
+        let (Some(equity), Some(values)) = (self.leverage_base(view, ex), view.position_values(ex))
+        else {
             return false;
         };
-        if equity.asset != self.metas[&ex].quote || equity.amount <= 0.0 {
-            return false;
-        }
-        let equity = equity.amount;
         let others: f64 = values
             .iter()
             .filter(|(s, _)| *s != self.symbol())
@@ -798,14 +802,11 @@ impl Strategy for FundingArbStrategy {
                 }
                 // 单币杠杆 = 本币在该所的持仓价值 ÷ 该所净值，与开仓闸门同一口径（只除同一币种）。
                 // 账户独占，该所全部持仓都是各币实例的：按所把各币相加就是闸门的账户杠杆
-                if let Some(e) = view
-                    .equity(ex)
-                    .filter(|e| e.asset == self.metas[&ex].quote && e.amount > 0.0)
-                {
+                if let Some(equity) = self.leverage_base(view, ex) {
                     out.push(Gauge::new(
                         "funding_arb_symbol_leverage",
                         &labels,
-                        leg.value() / e.amount,
+                        leg.value() / equity,
                     ));
                 }
             }

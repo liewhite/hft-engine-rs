@@ -78,7 +78,7 @@ mod tests {
             side,
             price,
             size,
-            Money::fee_from_report(fee, Some("USDT")).unwrap(),
+            crate::domain::fee_from_report(fee, Some("USDT")).unwrap(),
             reason,
         )
     }

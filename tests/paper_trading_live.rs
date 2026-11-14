@@ -257,7 +257,7 @@ async fn paper_counter_fills_from_live_trades() {
         PaperCounterArgs {
             symbol_metas: metas_by_key.clone(),
             config: SimConfig {
-                initial_balance_usdt: 10_000.0,
+                initial_balance: 10_000.0,
                 // 币安标准档：maker 0.02% / taker 0.05%
                 maker_fee_rate: 0.0002,
                 taker_fee_rate: 0.0005,

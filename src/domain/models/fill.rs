@@ -17,6 +17,18 @@ pub enum FillReason {
     Adl,
 }
 
+/// 从交易所成交回报取手续费（数额已按「正数 = 收费」归一）。数额为 0 记作没收手续费（`None`，
+/// 这时交易所给不给币种都不管）；非 0 却没有币种是交易所违约，报错、不猜币种。
+pub fn fee_from_report(amount: f64, asset: Option<&str>) -> Result<Option<Money>, String> {
+    if amount == 0.0 {
+        return Ok(None);
+    }
+    match asset.filter(|a| !a.is_empty()) {
+        Some(asset) => Ok(Some(Money::new(amount, asset))),
+        None => Err(format!("成交手续费 {amount} 没有币种")),
+    }
+}
+
 /// 成交事件
 #[derive(Debug, Clone)]
 pub struct Fill {

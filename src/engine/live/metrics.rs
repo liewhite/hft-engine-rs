@@ -84,8 +84,8 @@ struct MetricsView {
     /// symbol 事件也推给本实例。若为单实例全量部署且此数持续增长，才说明注册范围有问题。
     untracked_events: u64,
     /// 模拟账户累计成交统计（来自账户总线上带 Paper 标签的事件），与实盘视图分账。
-    /// 模拟柜台的现金与手续费都以 [`crate::sim::SIM_CASH_ASSET`] 计
-    paper_stats: HashMap<AccountId, TradingStats>,
+    /// 按 (账户, 所, 计价币) 分开：模拟柜台的现金以各所计价币计，不同所不相加
+    paper_stats: HashMap<(AccountId, Exchange, String), TradingStats>,
     /// 各模拟账户柜台的最新净值：(账户, 所) -> 净值。
     /// 已知取舍：账户撤下后条目残留（= 最后一次快照，持续上报），生命周期内不清理
     paper_equities: HashMap<(AccountId, Exchange), Money>,
@@ -180,7 +180,7 @@ impl MetricsView {
             SymbolAccountData::FundingFee(fee) => {
                 self.funding_fees.insert(
                     (fee.exchange, fee.tran_id),
-                    (fee.symbol, fee.amount, fee.timestamp),
+                    (fee.symbol, fee.money, fee.timestamp),
                 );
             }
             SymbolAccountData::OrderUpdate(update) => {
@@ -218,10 +218,14 @@ impl MetricsView {
     fn apply_paper_event(&mut self, account: &AccountId, data: &AccountData) {
         match data {
             AccountData::Symbol(SymbolAccountData::Fill(fill)) => {
-                self.paper_stats_mut(account).apply_fill(fill);
+                if let Some(s) = self.paper_stats_mut(account, &fill.symbol, fill.exchange) {
+                    s.apply_fill(fill);
+                }
             }
             AccountData::Symbol(SymbolAccountData::OrderUpdate(update)) => {
-                self.paper_stats_mut(account).apply_order_update(update);
+                if let Some(s) = self.paper_stats_mut(account, &update.symbol, update.exchange) {
+                    s.apply_order_update(update);
+                }
             }
             AccountData::Exchange(ExchangeAccountData::Equity { exchange, equity }) => {
                 self.paper_equities
@@ -231,8 +235,19 @@ impl MetricsView {
         }
     }
 
-    fn paper_stats_mut(&mut self, account: &AccountId) -> &mut TradingStats {
-        self.paper_stats.entry(account.clone()).or_default()
+    /// 模拟账户某腿所在 (账户, 所, 计价币) 的统计；腿没注册（不知道计价币）时只计数、不计入
+    fn paper_stats_mut(
+        &mut self,
+        account: &AccountId,
+        symbol: &Symbol,
+        exchange: Exchange,
+    ) -> Option<&mut TradingStats> {
+        let Some(quote) = self.quotes.get(&(symbol.clone(), exchange)) else {
+            self.untracked_events += 1;
+            return None;
+        };
+        let key = (account.clone(), exchange, quote.clone());
+        Some(self.paper_stats.entry(key).or_default())
     }
 
     /// 清掉结算时刻已出 24h 窗口的资金费
@@ -335,7 +350,7 @@ impl MetricsView {
         // 汇总只按 (所, 计价币) 分组：同一币种同一所的数才相加
         let mut session_pnl: BTreeMap<(Exchange, &str), f64> = BTreeMap::new();
         let mut volume: BTreeMap<(Exchange, &str), f64> = BTreeMap::new();
-        let mut fees: BTreeMap<&str, f64> = BTreeMap::new();
+        let mut fees: BTreeMap<(Exchange, &str), f64> = BTreeMap::new();
         let (mut fills, mut forced_fills, mut rejected_orders) = (0u64, 0u64, 0u64);
         let mut legs: Vec<(&Leg, &String)> = self.quotes.iter().collect();
         legs.sort();
@@ -349,7 +364,7 @@ impl MetricsView {
             if let Some(s) = stats {
                 *volume.entry((*exchange, quote)).or_default() += s.volume;
                 for (asset, amount) in &s.fees {
-                    *fees.entry(asset).or_default() += amount;
+                    *fees.entry((*exchange, asset)).or_default() += amount;
                 }
                 fills += s.fills;
                 forced_fills += s.forced_fills;
@@ -405,9 +420,14 @@ impl MetricsView {
                 *v,
             );
         }
-        // 手续费按币种分开推（#817）：同一币种跨所可以相加，不同币不能
-        for (asset, amount) in &fees {
-            prom.gauge("hft_fee_total", &[("asset", asset)], *amount);
+        // 手续费按所、按币种分开推（#817、#841）：跨所、跨币种的合计交给看板
+        for ((exchange, asset), amount) in &fees {
+            let ex_label = exchange.to_string();
+            prom.gauge(
+                "hft_fee_total",
+                &[("exchange", &ex_label), ("asset", asset)],
+                *amount,
+            );
         }
 
         // ---------- 订单 ----------
@@ -511,38 +531,46 @@ impl MetricsView {
         }
 
         // ---------- 模拟账户 ----------
-        for (account, stats) in &self.paper_stats {
+        for ((account, exchange, asset), stats) in &self.paper_stats {
             let account_label = account.to_string();
-            prom.gauge(
-                "hft_paper_fills",
-                &[("account", &account_label)],
-                stats.fills as f64,
-            );
-            prom.gauge(
-                "hft_paper_volume",
-                &[("account", &account_label)],
-                stats.volume,
-            );
-            for (asset, amount) in &stats.fees {
+            let ex_label = exchange.to_string();
+            let labels = [
+                ("account", account_label.as_str()),
+                ("exchange", ex_label.as_str()),
+            ];
+            let money = [
+                ("account", account_label.as_str()),
+                ("exchange", ex_label.as_str()),
+                ("asset", asset.as_str()),
+            ];
+            prom.gauge("hft_paper_fills", &labels, stats.fills as f64);
+            prom.gauge("hft_paper_volume", &money, stats.volume);
+            for (fee_asset, amount) in &stats.fees {
                 prom.gauge(
                     "hft_paper_fee",
-                    &[("account", &account_label), ("asset", asset)],
+                    &[
+                        ("account", account_label.as_str()),
+                        ("exchange", ex_label.as_str()),
+                        ("asset", fee_asset.as_str()),
+                    ],
                     *amount,
                 );
             }
-            prom.gauge("hft_paper_cash", &[("account", &account_label)], stats.cash);
+            prom.gauge("hft_paper_cash", &money, stats.cash);
             prom.gauge(
                 "hft_paper_rejected_orders",
-                &[("account", &account_label)],
+                &labels,
                 stats.rejected_orders as f64,
             );
             tracing::info!(
                 target: "metrics",
                 %account,
+                %exchange,
                 fills = stats.fills,
                 volume = format!("{:.2}", stats.volume),
                 fees = ?stats.fees,
                 cash = format!("{:.4}", stats.cash),
+                %asset,
                 rejected_orders = stats.rejected_orders,
                 "metrics.paper_account"
             );
@@ -961,7 +989,7 @@ mod tests {
             crate::domain::FundingFee {
                 exchange,
                 symbol: "BTC".to_string(),
-                amount: Money::new(amount, asset),
+                money: Money::new(amount, asset),
                 timestamp,
                 tran_id,
             },
@@ -1214,7 +1242,8 @@ mod tests {
             account: account.clone(),
             ..live(fill_data(Exchange::Binance, "BTC", Side::Long, dec!(1.0)))
         });
-        assert_eq!(metrics.paper_stats[&account].fills, 1);
+        let key = (account.clone(), Exchange::Binance, "USDT".to_string());
+        assert_eq!(metrics.paper_stats[&key].fills, 1);
         assert!(metrics.per_leg.is_empty(), "模拟成交不得计入实盘累计");
         assert!(metrics.positions.is_empty(), "模拟读数不得进实盘持仓");
     }
@@ -1359,10 +1388,16 @@ mod tests {
         metrics.on_account(with_fee(Exchange::Hyperliquid, Some(fee(0.03, "USDC"))));
         metrics.on_account(with_fee(Exchange::OKX, None));
         let body = metrics.render().into_body();
-        let get = |asset: &str| line_value(&body, &format!("hft_fee_total{{asset=\"{asset}\"}} "));
-        assert!((get("USDT").unwrap() - 0.03).abs() < 1e-12, "{body}");
-        assert_eq!(get("BNB"), Some(0.0001), "{body}");
-        assert_eq!(get("USDC"), Some(0.03), "{body}");
-        assert_eq!(body.matches("hft_fee_total{").count(), 3, "{body}");
+        let get = |ex: &str, asset: &str| {
+            line_value(
+                &body,
+                &format!("hft_fee_total{{exchange=\"{ex}\",asset=\"{asset}\"}} "),
+            )
+        };
+        assert_eq!(get("Binance", "USDT"), Some(0.02), "{body}");
+        assert_eq!(get("OKX", "USDT"), Some(0.01), "{body}");
+        assert_eq!(get("Binance", "BNB"), Some(0.0001), "{body}");
+        assert_eq!(get("Hyperliquid", "USDC"), Some(0.03), "{body}");
+        assert_eq!(body.matches("hft_fee_total{").count(), 4, "{body}");
     }
 }

@@ -713,7 +713,7 @@ impl crate::exchange::FundingFeeSource for OkxAccount {
                 fees.push(FundingFee {
                     exchange: Exchange::OKX,
                     symbol,
-                    amount: Money::new(
+                    money: Money::new(
                         b.bal_chg.parse().map_err(|_| parse("balChg", &b.bal_chg))?,
                         b.ccy.clone(),
                     ),

@@ -492,7 +492,7 @@ impl WsFill {
 
         let amount = f64::from_str(&self.fee)
             .map_err(|_| format!("Failed to parse fill fee: {}", self.fee))?;
-        let fee = crate::domain::Money::fee_from_report(amount, Some(&self.fee_token))
+        let fee = crate::domain::fee_from_report(amount, Some(&self.fee_token))
             .map_err(|e| format!("HL {e}（订单 {}）", self.oid))?;
 
         // HL 强平成交带 `liquidation` 对象；HL 无独立 ADL 语义，故只区分 Liquidation

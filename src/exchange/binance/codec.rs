@@ -3,7 +3,7 @@
 
 use super::from_binance;
 use crate::domain::{
-    Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, Money, OrderStatus,
+    Balance, Exchange, Fill, FundingRate, IndexPrice, MarkPrice, MarketTrade, OrderStatus,
     OrderUpdate, Quantity, Side, Symbol, BBO,
 };
 use serde::Deserialize;
@@ -227,7 +227,7 @@ pub struct OrderData {
     #[serde(default)]
     pub n: Option<String>,
     /// 手续费币种（Commission asset），与 `n` 同进同出。开了 BNB 抵扣且合约账户有 BNB 时是 BNB，
-    /// 否则是计价币；如实记进 [`Money::asset`]
+    /// 否则是计价币；如实记进 [`crate::domain::Money::asset`]
     #[serde(rename = "N", default)]
     pub fee_asset: Option<String>,
 }
@@ -314,7 +314,7 @@ impl OrderTradeUpdate {
             })?;
         let amount =
             f64::from_str(fee_raw).map_err(|_| format!("Failed to parse commission: {fee_raw}"))?;
-        let fee = Money::fee_from_report(amount, self.o.fee_asset.as_deref())
+        let fee = crate::domain::fee_from_report(amount, self.o.fee_asset.as_deref())
             .map_err(|e| format!("Binance {e}（订单 {}）", self.o.i))?;
 
         Ok(Some(Fill {
@@ -391,12 +391,12 @@ mod tests {
             .unwrap()
             .expect("有成交");
         assert_eq!(fill.timestamp, 1700000000123);
-        assert_eq!(fill.fee, Some(Money::new(0.01, "USDT")));
+        assert_eq!(fill.fee, Some(crate::domain::Money::new(0.01, "USDT")));
         let bnb = order_push("BNB")
             .to_fill("BTC".into())
             .unwrap()
             .expect("有成交");
-        assert_eq!(bnb.fee, Some(Money::new(0.01, "BNB")));
+        assert_eq!(bnb.fee, Some(crate::domain::Money::new(0.01, "BNB")));
     }
 
     #[test]

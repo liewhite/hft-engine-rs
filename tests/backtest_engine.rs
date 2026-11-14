@@ -190,7 +190,7 @@ fn run_bbo() -> (BacktestResult, Vec<String>) {
         placed: false,
     });
     let config = SimConfig {
-        initial_balance_usdt: 10_000.0,
+        initial_balance: 10_000.0,
         ..SimConfig::default()
     };
     let sink: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -209,11 +209,12 @@ fn resting_order_crossed_one_fill_pos_plus_one() {
     let (r, _) = run_bbo();
     assert_eq!(r.fills, 1);
     assert_eq!(r.market_events, 3);
-    assert_eq!(r.realized_pnl, 0.0); // 只开仓未平仓
+    assert_eq!(r.accounts[0].realized_pnl, 0.0); // 只开仓未平仓
+    assert_eq!(r.accounts[0].asset, "USDT");
     let pos = r.positions.iter().find(|p| p.symbol == SYM).unwrap();
     assert_eq!(pos.size, dec!(1));
     // 未实现 = (mark 99.75 - entry 100) * 1 = -0.25; equity = 10000 - 0.25
-    assert!((r.final_equity - (10_000.0 - 0.25)).abs() < 1e-6);
+    assert!((r.accounts[0].final_equity - (10_000.0 - 0.25)).abs() < 1e-6);
 }
 
 #[test]
@@ -246,7 +247,7 @@ fn trade_print_matching_fills_resting_limit() {
         placed: false,
     });
     let config = SimConfig {
-        initial_balance_usdt: 10_000.0,
+        initial_balance: 10_000.0,
         ..SimConfig::default()
     };
     let mut engine = BacktestEngine::new(&source, vec![runner], config, metas());
@@ -256,7 +257,7 @@ fn trade_print_matching_fills_resting_limit() {
     let pos = r.positions.iter().find(|p| p.symbol == SYM).unwrap();
     assert_eq!(pos.size, dec!(1));
     // entry 100, 末次成交价估值 98 -> 未实现 (98-100)*1 = -2; equity = 9998
-    assert!((r.final_equity - 9_998.0).abs() < 1e-6);
+    assert!((r.accounts[0].final_equity - 9_998.0).abs() < 1e-6);
 }
 
 /// 记录自己收到的每条 Custom 事件 tag 的探针策略。

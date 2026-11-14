@@ -104,7 +104,7 @@ pub trait Strategy: Send + Sync {
 
 | 类型 | 方法 |
 |---|---|
-| `StrategyView<'_>` | `symbol(&Symbol) -> Option<SymbolView>` / `equity(Exchange)` / `account_notional(Exchange)` / `account_info(Exchange)` / `greeks(Exchange, ccy)` |
+| `StrategyView<'_>` | `symbol(&Symbol) -> Option<SymbolView>` / `equity(Exchange)`（带币种）/ `position_values(Exchange)` / `greeks(Exchange, ccy)` |
 | `SymbolView<'_>` | `bbo(Exchange)` / `position_size(Exchange)` / `position_sizes()` / `has_pending_orders()` / `pending_orders()` |
 
 读数取不到一律 `None`，不返回默认值——净值取不到与净值为零是两回事。

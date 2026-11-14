@@ -34,12 +34,11 @@ pub struct BacktestPosition {
     pub unrealized_pnl: f64,
 }
 
-/// 回测结果汇总。`realized_pnl` 为已实现盈亏 (= 账本现金增量)，`final_equity` 含未实现。
+/// 回测结果汇总。资金按所分开给（各所现金币种 = 本所计价币，不同所不相加，#841）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct BacktestResult {
-    pub initial_balance: f64,
-    pub final_equity: f64,
-    pub realized_pnl: f64,
+    /// 各所柜台的资金结果，按所排序；没有任何行情时为空
+    pub accounts: Vec<BacktestAccount>,
     pub fills: u64,
     /// 回放的**行情**事件数。数据源合成的账户事件（BsGreeksSource 的 Greeks/Balance）
     /// 不计入 —— 那不是行情，计进来会按合成频率成倍放大这个数字。
@@ -48,6 +47,18 @@ pub struct BacktestResult {
     pub positions: Vec<BacktestPosition>,
     pub first_ts: Timestamp,
     pub last_ts: Timestamp,
+}
+
+/// 一个所柜台的资金结果，金额都以 `asset`（本所计价币）计
+#[derive(Debug, Clone, PartialEq)]
+pub struct BacktestAccount {
+    pub exchange: Exchange,
+    pub asset: String,
+    pub initial_balance: f64,
+    /// 含未实现盈亏
+    pub final_equity: f64,
+    /// 已实现盈亏（= 账本现金增量）
+    pub realized_pnl: f64,
 }
 
 /// 旁路观察者：与策略共享同一事件流但不参与撮合 (如成交记录器)。
@@ -93,7 +104,7 @@ impl Ord for Scheduled {
 /// # 多交易所：按事件自身的 exchange 路由
 ///
 /// 每个交易所一份 [`SimState`]（一份实例只代表一个所，见其类型文档），在该所首条行情
-/// 到达时惰性创建、各以 `initial_balance_usdt` 起步（等价"每个所各入金一份"）。行情按
+/// 到达时惰性创建、各以 `initial_balance` 起步（本所计价币计，等价"每个所各入金一份"）。行情按
 /// 事件自带的 exchange 送进对应柜台 —— 此前引擎持有单个 exchange 字段并忽略事件自身的
 /// 归属，跨所策略（如 funding_arb）无法回测。`BTreeMap` 保证遍历顺序确定（净值事件的
 /// 投递序影响确定性）。
@@ -105,6 +116,8 @@ pub struct BacktestEngine<'a> {
     /// 保证实盘必拒的单回测也拒）。调用方**应**与 `StrategyRunner` 传同一张表，
     /// 否则策略侧取整与柜台校验会按两套规则各行其是（bin 侧统一构建一份 Arc）。
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+    /// 各所计价币 = 该所柜台的现金币种（见 [`crate::sim::exchange_quotes`]）
+    cash_assets: HashMap<Exchange, String>,
     observers: Vec<Observer<'a>>,
     clock_interval_ms: u64,
 
@@ -138,11 +151,14 @@ impl<'a> BacktestEngine<'a> {
                 "回测 runner 必须绑定 backtest_account()，否则收不到回测撮合的私有事件"
             );
         }
+        let cash_assets = crate::sim::exchange_quotes(&symbol_metas)
+            .unwrap_or_else(|e| panic!("回测的合约规格不合用: {e}"));
         Self {
             source,
             runners,
             config,
             symbol_metas,
+            cash_assets,
             observers: Vec::new(),
             clock_interval_ms: 1000,
             states: BTreeMap::new(),
@@ -187,11 +203,8 @@ impl<'a> BacktestEngine<'a> {
             Some(ev) => ev.exchange_ts(),
             None => {
                 tracing::warn!("no market data; empty backtest");
-                let bal = self.config.initial_balance_usdt;
                 return Ok(BacktestResult {
-                    initial_balance: bal,
-                    final_equity: bal,
-                    realized_pnl: 0.0,
+                    accounts: Vec::new(),
                     fills: 0,
                     market_events: 0,
                     positions: Vec::new(),
@@ -253,18 +266,21 @@ impl<'a> BacktestEngine<'a> {
             })
             .collect();
         positions.sort_by(|a, b| a.symbol.cmp(&b.symbol).then(a.exchange.cmp(&b.exchange)));
-        let final_equity: f64 = self
+        // 每个所各入金一份，各按本所计价币结算，不相加
+        let initial_balance = self.config.initial_balance;
+        let accounts = self
             .states
-            .values()
-            .map(|state| state.ledger.equity(|s| state.mark_of(s)))
-            .sum();
-        // 每个所各入金一份，总初始资金随实际出现的所数走（无行情时保持单份，见上方早退分支）
-        let initial_balance = self.config.initial_balance_usdt * (self.states.len().max(1) as f64);
-        let total_cash: f64 = self.states.values().map(|s| s.ledger.cash).sum();
+            .iter()
+            .map(|(exchange, state)| BacktestAccount {
+                exchange: *exchange,
+                asset: state.cash_asset.clone(),
+                initial_balance,
+                final_equity: state.ledger.equity(|s| state.mark_of(s)),
+                realized_pnl: state.ledger.cash - initial_balance,
+            })
+            .collect();
         let result = BacktestResult {
-            initial_balance,
-            final_equity,
-            realized_pnl: total_cash - initial_balance,
+            accounts,
             fills: self.fill_count,
             market_events: self.market_events,
             positions,
@@ -274,8 +290,7 @@ impl<'a> BacktestEngine<'a> {
         tracing::info!(
             events = result.market_events,
             fills = result.fills,
-            realized_pnl = result.realized_pnl,
-            final_equity = result.final_equity,
+            accounts = ?result.accounts,
             "backtest done"
         );
         Ok(result)
@@ -326,7 +341,12 @@ impl<'a> BacktestEngine<'a> {
             exchange,
             SimState::empty(
                 exchange,
-                self.config.initial_balance_usdt,
+                // 只为有行情的所建柜台，行情的 (所, 币) 都在合约规格里
+                self.cash_assets
+                    .get(&exchange)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{exchange} 没有合约规格，不该有它的回测柜台")),
+                self.config.initial_balance,
                 self.config.maker_fee_rate,
                 self.config.taker_fee_rate,
                 self.symbol_metas.clone(),
@@ -445,7 +465,7 @@ impl<'a> BacktestEngine<'a> {
             exchange,
             equity: crate::domain::Money::new(
                 state.ledger.equity(mark_of),
-                crate::sim::SIM_CASH_ASSET,
+                state.cash_asset.clone(),
             ),
         };
         let values = ExchangeAccountData::PositionValues(crate::messaging::PositionValues {

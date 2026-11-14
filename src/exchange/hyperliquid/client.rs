@@ -39,7 +39,7 @@ pub(crate) enum HlAccountMode {
     /// accountValue 为 0，另一有仓位的统一账户实测为各 dex 分摊的数，都不是账户净值）。
     Unified,
     /// 标准账户（`default` / `disabled`）：各 perp dex 保证金分开，净值在各自的
-    /// clearinghouseState。只支持单 dex（多 dex 时「账户净值」不是一个数，杠杆口径不同）。
+    /// clearinghouseState。只支持单 dex（多 dex 时「账户净值」不是一个数）。
     Standard,
 }
 
@@ -789,7 +789,7 @@ fn parse_user_funding(
         result.push(FundingFee {
             exchange: Exchange::Hyperliquid,
             symbol,
-            amount: Money::new(amount, quote),
+            money: Money::new(amount, quote),
             timestamp: e.time,
             tran_id: funding_tran_id(e.time, &e.delta.coin),
         });
@@ -1171,11 +1171,11 @@ mod tests {
         let fees = parse(&["xyz"]);
         let aapl_first = fees.iter().find(|f| f.timestamp == 1775606400000).unwrap();
         assert!(
-            (aapl_first.amount.amount - 0.671826).abs() < 1e-9,
+            (aapl_first.money.amount - 0.671826).abs() < 1e-9,
             "空头遇正费率应为收到"
         );
         let aapl_second = fees.iter().find(|f| f.timestamp == 1775610000000).unwrap();
-        assert!(aapl_second.amount.amount < 0.0, "空头遇负费率应为支付");
+        assert!(aapl_second.money.amount < 0.0, "空头遇负费率应为支付");
     }
 
     /// 同一时刻结算的两个标的必须拿到不同的 tran_id。
@@ -1226,7 +1226,7 @@ mod tests {
             r#"[{"time":1,"delta":{"type":"funding","coin":"xyz:AAPL","usdc":" -3.625312"}}]"#;
         let entries: Vec<UserFundingEntry> = serde_json::from_str(json).unwrap();
         let fees = parse_user_funding(entries, &markets_of(&["xyz"]), "USDC").unwrap();
-        assert!((fees[0].amount.amount + 3.625312).abs() < 1e-9);
+        assert!((fees[0].money.amount + 3.625312).abs() < 1e-9);
     }
 }
 
@@ -1251,7 +1251,7 @@ mod unified_account_tests {
     }
 
     /// 本策略账户的真实响应：各 dex 的 accountValue 都是 0，净值必须读成 996.96 而不是 0
-    /// （读成 0 会让杠杆闸门永不放行）
+    /// （读成 0 是假数）
     #[test]
     fn own_unified_account_reads_spot_balance_not_zero() {
         let e = unified_equity(&spot(OWN_SPOT), "USDC").unwrap();

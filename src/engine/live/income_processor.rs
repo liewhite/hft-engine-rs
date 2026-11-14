@@ -308,7 +308,7 @@ mod routing_tests {
     /// 三档投递范围各取一个代表，钉住分发层与 `accepts` 共用的这份推导。
     ///
     /// 尤其是中间那档：**所级账户读数按所定向，不是广播**。写成广播的那版里，
-    /// 策略能读到自己压根没订的所的净值，而杠杆闸门就是拿净值算的。
+    /// 策略能读到自己压根没订的所的净值。
     #[test]
     fn delivery_scope_matches_the_events_locating_precision() {
         let ev = IncomeEvent::Market(trade_event());

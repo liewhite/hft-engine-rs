@@ -1,8 +1,5 @@
 use crate::domain::Rate;
 
-/// 虚拟柜台的现金币种：现金、手续费都以它计（与 [`SimConfig::initial_balance_usdt`] 一致）
-pub const SIM_CASH_ASSET: &str = "USDT";
-
 /// 虚拟柜台的延迟与初始资金配置 (与 ox-demo `SimConfig` 同构)。
 ///
 /// 延迟在回测引擎中建模为"入队到 now + 延迟"，撮合本身不依赖墙钟。
@@ -13,8 +10,8 @@ pub struct SimConfig {
     pub exchange_to_strategy_delay_ms: u64,
     /// 下单 -> 交易所 的单向延迟 (下单/撤单到达撮合)
     pub order_to_exchange_delay_ms: u64,
-    /// 初始账户现金 (USDT)
-    pub initial_balance_usdt: f64,
+    /// 每个 (账户, 所) 柜台的初始现金，以该所的计价币计（见 [`super::exchange_quotes`]）
+    pub initial_balance: f64,
     /// maker 手续费率 (resting 单被越价成交)，0.0002 = 0.02%。默认 0 = 不计费
     pub maker_fee_rate: Rate,
     /// taker 手续费率 (到达即吃单成交)，0.0005 = 0.05%。默认 0 = 不计费
@@ -26,7 +23,7 @@ impl Default for SimConfig {
         Self {
             exchange_to_strategy_delay_ms: 50,
             order_to_exchange_delay_ms: 30,
-            initial_balance_usdt: 10_000.0,
+            initial_balance: 10_000.0,
             maker_fee_rate: 0.0,
             taker_fee_rate: 0.0,
         }

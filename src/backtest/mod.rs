@@ -18,7 +18,7 @@ pub use binance_history_source::{BinanceDataKind, BinanceHistorySource};
 pub use bs_greeks_source::{BsGreeksConfig, BsGreeksSource};
 pub use data_cache::{DataCache, LocalFsDataCache};
 pub use downloader::BinanceHistoryDownloader;
-pub use engine::{BacktestEngine, BacktestResult};
+pub use engine::{BacktestAccount, BacktestEngine, BacktestResult};
 pub use source::MarketDataSource;
 pub use trade_print_bbo::TradePrintBboSource;
 

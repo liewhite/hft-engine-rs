@@ -17,7 +17,7 @@ pub struct EquityPoller {
     client: Arc<dyn AccountClient>,
     account_bus: AccountBus,
     /// 停摆守卫：净值取不到时，`StateManager` 里的旧值会原样留着且无从分辨新鲜度 ——
-    /// 账户杠杆闸门会拿着它一路放行。长期取不到就让本组件出错退出（见 StalenessGuard）。
+    /// 下游会拿着它一直用下去。长期取不到就让本组件出错退出（见 StalenessGuard）。
     guard: StalenessGuard,
 }
 
@@ -45,7 +45,7 @@ impl EquityPoller {
 }
 
 impl Periodic for EquityPoller {
-    /// 查一次账户净值。`Err` = 已停摆过久，整支停（陈旧净值会让杠杆闸门失准）。
+    /// 查一次账户净值。`Err` = 已停摆过久，整支停（陈旧净值会让下游误判）。
     async fn tick(&mut self) -> anyhow::Result<()> {
         // 戳在响应到手之后取，理由见 `stamped_on_receipt`
         let (read, local_ts) = stamped_on_receipt(self.client.fetch_equity()).await;
@@ -67,7 +67,7 @@ impl Periodic for EquityPoller {
             Err(e) => {
                 self.guard.check_failure(&e).map_err(|reason| {
                     anyhow::anyhow!(
-                        "{} 账户净值长期取不到（陈旧净值会让杠杆闸门失准）: {reason}",
+                        "{} 账户净值长期取不到（陈旧净值会让下游误判）: {reason}",
                         self.client.exchange()
                     )
                 })?;

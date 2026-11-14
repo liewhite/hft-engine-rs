@@ -81,6 +81,8 @@ enum FillResult {
 pub struct SimState {
     /// 本柜台所属的交易所（构造时钉死，见类型文档）
     pub exchange: Exchange,
+    /// 现金币种 = 本所计价币：现金、手续费、净值都以它计（见 [`super::exchange_quotes`]）
+    pub cash_asset: String,
     pub ledger: Ledger,
     pub resting: IndexMap<OrderId, RestingOrder>,
     pub last_bbo: HashMap<Symbol, BBO>,
@@ -98,6 +100,7 @@ pub struct SimState {
 impl SimState {
     pub fn empty(
         exchange: Exchange,
+        cash_asset: String,
         cash: f64,
         maker_fee_rate: f64,
         taker_fee_rate: f64,
@@ -105,6 +108,7 @@ impl SimState {
     ) -> Self {
         Self {
             exchange,
+            cash_asset,
             ledger: Ledger::empty(cash),
             resting: IndexMap::new(),
             last_bbo: HashMap::new(),
@@ -570,8 +574,8 @@ impl SimState {
             client_order_id: Some(client_order_id.to_string()),
             order_id: order_id.clone(),
             timestamp: ts,
-            // 柜台现金以 SIM_CASH_ASSET 计，按费率算出的手续费也是这个币
-            fee: (fee != 0.0).then(|| crate::domain::Money::new(fee, crate::sim::SIM_CASH_ASSET)),
+            // 按费率算出的手续费以柜台现金币种（本所计价币）计
+            fee: (fee != 0.0).then(|| crate::domain::Money::new(fee, self.cash_asset.clone())),
             reason: crate::domain::FillReason::Normal, // 回测无强平/ADL
         };
         let events = vec![
@@ -662,7 +666,7 @@ mod tests {
         )]))
     }
     fn empty() -> SimState {
-        SimState::empty(EX, 10_000.0, 0.0, 0.0, test_metas())
+        SimState::empty(EX, "USDT".to_string(), 10_000.0, 0.0, 0.0, test_metas())
     }
 
     fn bbo(bid: Price, ask: Price, ts: Timestamp) -> BBO {
@@ -1170,7 +1174,7 @@ mod tests {
     /// 下一笔 print 按 limit 价收 maker 费（价格与流动性角色双错）
     #[test]
     fn deep_crossing_gtc_fills_as_taker_at_reference_price() {
-        let mut s = SimState::empty(EX, 10_000.0, 0.0, 0.002, test_metas());
+        let mut s = SimState::empty(EX, "USDT".to_string(), 10_000.0, 0.0, 0.002, test_metas());
         s.on_market(&trade_ev(dec!(100.0), 1));
         // 买单限价 110 远高于市价 100：应立即以 100 成交、按 taker 计费
         let evs = s.on_order_arrived(
@@ -1208,7 +1212,7 @@ mod tests {
 
     #[test]
     fn taker_fee_charged() {
-        let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002, test_metas());
+        let mut s = SimState::empty(EX, "USDT".to_string(), 10_000.0, 0.001, 0.002, test_metas());
         s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.0), 1)));
         let mut o = limit(Side::Long, dec!(0.0), TimeInForce::GTC, "o1");
         o.order_type = OrderType::Market;
@@ -1220,7 +1224,7 @@ mod tests {
 
     #[test]
     fn maker_fee_charged() {
-        let mut s = SimState::empty(EX, 10_000.0, 0.001, 0.002, test_metas());
+        let mut s = SimState::empty(EX, "USDT".to_string(), 10_000.0, 0.001, 0.002, test_metas());
         s.on_market(&market_ev(bbo(dec!(100.0), dec!(100.0), 1)));
         let mut o = limit(Side::Long, dec!(99.0), TimeInForce::GTC, "o1");
         o.quantity = dec!(2.0);

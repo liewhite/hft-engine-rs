@@ -46,7 +46,7 @@ impl SubscriptionScope {
     ///
     /// - 账户事件先看归属：别的账户的私有事件一律不收（实盘与模拟账户不串账）。
     /// - 所级读数按所过滤：`Balance` / `Equity` / `Greeks` 没有 symbol，写成广播的话
-    ///   策略能读到自己压根没订的所的净值 —— 而杠杆闸门就是拿净值算的。
+    ///   策略能读到自己压根没订的所的净值。
     pub fn accepts(&self, event: &IncomeEvent) -> bool {
         match event {
             IncomeEvent::Market(m) => self.covers(&m.data.delivery()),
@@ -147,7 +147,7 @@ mod tests {
     /// **越界防线**：所级账户读数按所过滤。
     ///
     /// 写成广播的那版里，策略能读到自己压根没订的所的净值与希腊值，
-    /// 而杠杆闸门、delta 对冲这类判断都是拿这些算的。
+    /// 而策略的判断是拿这些算的。
     #[test]
     fn exchange_level_reads_are_confined_to_subscribed_exchanges() {
         let scope = scope();

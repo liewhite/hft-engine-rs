@@ -13,7 +13,7 @@
 //! {
 //!   "exchanges": { "binance": { "quote": "USDT" } },
 //!   "paper": {
-//!     "initial_balance_usdt": 10000.0,
+//!     "initial_balance": 10000.0,
 //!     "maker_fee_rate": 0.0002,
 //!     "taker_fee_rate": 0.0005,
 //!     "order_to_exchange_delay_ms": 50
@@ -145,7 +145,7 @@ async fn run() -> anyhow::Result<()> {
     tracing::warn!(
         %exchange,
         symbols = ?config.symbols,
-        initial_balance = config.paper.initial_balance_usdt,
+        initial_balance = config.paper.initial_balance,
         order_delay_ms = config.paper.order_to_exchange_delay_ms,
         "PAPER TRADING — 订单只落本地柜台，不会发往任何交易所"
     );

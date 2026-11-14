@@ -33,7 +33,7 @@
 //! 一份 [`SimState`] 只代表**一个账户在一个交易所**的柜台（见其类型文档）。本组件按
 //! (AccountId, Exchange) 分实例：行情按所路由，持仓、挂单簿与净值天然按所隔离 —— 跨所
 //! 策略绑一个模拟账户时，A 所挂单不会被 B 所的成交撮合。每个 (账户, 所) 各以
-//! `initial_balance_usdt` 起步（等价"每个所各入金一份"，与实盘各所独立账户一致）。
+//! `initial_balance` 起步（以该所计价币计）（等价"每个所各入金一份"，与实盘各所独立账户一致）。
 //! 净值在收到 Clock 时按各自的所发布净值（Equity）。
 
 use crate::domain::{
@@ -114,6 +114,8 @@ pub struct PaperCounter {
     config: SimConfig,
     /// 透传给各柜台 SimState（市场规则校验在状态机内统一执行）
     symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
+    /// 各所计价币 = 该所柜台的现金币种（启动时从合约规格取一次）
+    cash_assets: HashMap<Exchange, String>,
     /// 本地订单号发号器（模拟交易所返回的 order_id）
     order_id_gen: u64,
     /// 延迟队列：(到期时刻, 消息)，FIFO（顺序保证见 [`Self::schedule`]）
@@ -123,13 +125,15 @@ pub struct PaperCounter {
 impl PaperCounter {
     /// 在 `group` 下起本地柜台，等它订阅完成。订阅与发布见 [`PaperCounterArgs`] 各字段。
     pub async fn spawn(group: &Group, args: PaperCounterArgs) -> anyhow::Result<()> {
+        let cash_assets = crate::sim::exchange_quotes(&args.symbol_metas)
+            .map_err(|e| anyhow::anyhow!("模拟柜台起不来: {e}"))?;
         group
             .spawn("PaperCounter", move |scope: Scope| async move {
                 let (_addr, mut inbox) = scope.inbox::<Msg>();
                 inbox.subscribe(&args.outcome_bus, to_paper_outlet, Msg::Outcome);
                 inbox.subscribe(&args.market_bus, |_| true, Msg::Market);
                 tracing::warn!(
-                    initial_balance = args.config.initial_balance_usdt,
+                    initial_balance = args.config.initial_balance,
                     maker_fee_rate = args.config.maker_fee_rate,
                     taker_fee_rate = args.config.taker_fee_rate,
                     order_delay_ms = args.config.order_to_exchange_delay_ms,
@@ -143,6 +147,7 @@ impl PaperCounter {
                     account_bus: args.account_bus,
                     config: args.config,
                     symbol_metas: args.symbol_metas,
+                    cash_assets,
                     order_id_gen: 0,
                     delayed: VecDeque::new(),
                 })
@@ -179,9 +184,16 @@ impl PaperCounter {
     fn state_mut(&mut self, account: &AccountId, exchange: Exchange) -> &mut SimState {
         let key = (account.clone(), exchange);
         if !self.states.contains_key(&key) {
+            // 柜台只为策略订阅的所创建，投产已校验这些所有合约规格
+            let cash_asset = self
+                .cash_assets
+                .get(&exchange)
+                .cloned()
+                .unwrap_or_else(|| panic!("{exchange} 没有合约规格，不该有它的模拟柜台"));
             let mut state = SimState::empty(
                 exchange,
-                self.config.initial_balance_usdt,
+                cash_asset,
+                self.config.initial_balance,
                 self.config.maker_fee_rate,
                 self.config.taker_fee_rate,
                 self.symbol_metas.clone(),
@@ -199,7 +211,7 @@ impl PaperCounter {
             tracing::info!(
                 %account,
                 %exchange,
-                initial_balance = self.config.initial_balance_usdt,
+                initial_balance = self.config.initial_balance,
                 "[PAPER] Opened paper account"
             );
             self.states.insert(key.clone(), state);
@@ -219,10 +231,10 @@ impl PaperCounter {
                 local_ts: ts,
                 data: AccountData::Exchange(ExchangeAccountData::Equity {
                     exchange: state.exchange,
-                    equity: crate::domain::Money::new(equity, crate::sim::SIM_CASH_ASSET),
+                    equity: crate::domain::Money::new(equity, state.cash_asset.clone()),
                 }),
             });
-            // 与实盘账本同一读数：各币持仓价值（策略的账户杠杆闸门用它，#759）
+            // 与实盘账本同一读数：各币持仓价值（#759）
             let legs = state.ledger.position_values(|s: &Symbol| state.mark_of(s));
             self.account_bus.publish(AccountEvent {
                 account: account.clone(),
@@ -455,7 +467,7 @@ mod tests {
     fn test_metas() -> Arc<HashMap<(Exchange, Symbol), SymbolMeta>> {
         use crate::domain::PriceStep;
         Arc::new(
-            [Exchange::Binance, Exchange::OKX]
+            [Exchange::Binance, Exchange::OKX, Exchange::Hyperliquid]
                 .into_iter()
                 .map(|exchange| {
                     (
@@ -471,7 +483,12 @@ mod tests {
                                 .unwrap(),
                             min_notional: 0.0,
                             contract_size: crate::domain::PositiveDecimal::new(dec!(1.0)).unwrap(),
-                            quote: "USDT".to_string(),
+                            quote: if exchange == Exchange::Hyperliquid {
+                                "USDC"
+                            } else {
+                                "USDT"
+                            }
+                            .to_string(),
                         },
                     )
                 })
@@ -481,7 +498,7 @@ mod tests {
 
     fn config(order_delay_ms: u64) -> SimConfig {
         SimConfig {
-            initial_balance_usdt: 10_000.0,
+            initial_balance: 10_000.0,
             maker_fee_rate: 0.0,
             taker_fee_rate: 0.0,
             order_to_exchange_delay_ms: order_delay_ms,
@@ -926,7 +943,7 @@ mod tests {
             })
             .expect("fill");
         // 100.1 * 2 * 0.0005 = 0.1001（若按 maker 费率会是 0.04004）
-        assert_eq!(fee.asset, crate::sim::SIM_CASH_ASSET);
+        assert_eq!(fee.asset, "USDT");
         assert!(
             (fee.amount - 0.1001).abs() < 1e-9,
             "taker 费率应生效，实得 {fee:?}"
@@ -1016,6 +1033,55 @@ mod tests {
             _ => None,
         });
         assert_eq!(equity, Some(10_000.0));
+        h.finish().await;
+    }
+
+    /// 各所柜台的净值以本所计价币标币种（HL 是 USDC），与实盘「净值 = 计价币那一份」同口径（#841）：
+    /// 写死一个币种的话，按币种比对的下游（如策略的杠杆判断）在 HL 会一直当作未知
+    #[tokio::test]
+    async fn paper_equity_is_in_each_exchange_quote() {
+        let h = Harness::new(0).await;
+        for exchange in [EX, Exchange::Hyperliquid] {
+            h.outcome(AccountOutcome {
+                account: account(),
+                event: OutcomeEvent::PlaceOrders {
+                    orders: vec![Order {
+                        exchange,
+                        symbol: SYM.to_string(),
+                        side: Side::Long,
+                        order_type: OrderType::Limit {
+                            price: dec!(99.0),
+                            tif: TimeInForce::GTC,
+                        },
+                        quantity: dec!(0.5),
+                        reduce_only: false,
+                        client_order_id: format!("c-{exchange}"),
+                    }],
+                    comment: "t".to_string(),
+                },
+            });
+        }
+        h.settle(50).await;
+        h.market(MarketEvent {
+            exchange_ts: 5,
+            local_ts: 5,
+            data: MarketData::Clock,
+        });
+        h.settle(30).await;
+        let assets: HashMap<Exchange, String> = h
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.data {
+                AccountData::Exchange(ExchangeAccountData::Equity { exchange, equity }) => {
+                    Some((*exchange, equity.asset.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assets[&EX], "USDT");
+        assert_eq!(assets[&Exchange::Hyperliquid], "USDC");
         h.finish().await;
     }
 

@@ -435,7 +435,7 @@ impl crate::exchange::FundingFeeSource for BinanceAccount {
             result.push(FundingFee {
                 exchange: Exchange::Binance,
                 symbol,
-                amount: Money::new(amount, e.asset),
+                money: Money::new(amount, e.asset),
                 timestamp: e.time,
                 tran_id: e.tran_id,
             });

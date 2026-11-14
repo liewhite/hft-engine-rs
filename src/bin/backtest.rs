@@ -207,7 +207,7 @@ fn main() -> anyhow::Result<()> {
     let config = SimConfig {
         exchange_to_strategy_delay_ms: 100,
         order_to_exchange_delay_ms: 50,
-        initial_balance_usdt: 10_000.0,
+        initial_balance: 10_000.0,
         ..SimConfig::default()
     };
 
@@ -218,11 +218,16 @@ fn main() -> anyhow::Result<()> {
     println!("symbol         : {symbol}  [{start} .. {end}]");
     println!("market events  : {}", result.market_events);
     println!("fills          : {}", result.fills);
-    println!("realized PnL   : {:.6}", result.realized_pnl);
-    println!(
-        "final equity   : {:.6}  (init {:.2})",
-        result.final_equity, result.initial_balance
-    );
+    for a in &result.accounts {
+        println!(
+            "{:<15}: realized PnL {:.6} {asset}, final equity {:.6} {asset} (init {:.2})",
+            a.exchange.to_string(),
+            a.realized_pnl,
+            a.final_equity,
+            a.initial_balance,
+            asset = a.asset
+        );
+    }
     println!("open positions : {:?}", result.positions);
     println!("=========================================================");
     Ok(())
