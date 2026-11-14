@@ -1,23 +1,25 @@
 //! 策略投产的编排。
 //!
-//! - **投产**（[`super::ManagerHandle::add_strategies`]）：校验订阅可行性 →
+//! - **投产**（[`super::Provisioning::add_strategies`]）：校验订阅可行性 →
 //!   拉持仓基线（一次快照喂 executor / 对账镜像 / 观测镜像三类消费者）→ 注册镜像 →
 //!   spawn（出生即带基线）→ 注册 → 放行行情。
 //!
 //! **前提：一个进程只在启动时投产一次，投产失败整机停机。** 三个入口（各 bin）都是这样用的；
-//! 所以投产失败不回滚（半起的实例随整机停机一起收掉），第二次投产直接报错并停机
-//! （[`Provisioner::add`] 消耗自身，manager 投产后不再持有它）。
+//! 所以投产失败不回滚（半起的实例随整机停机一起收掉）；第二次投产写不出来：编排器只装在不可克隆的
+//! 投产凭证 [`super::Provisioning`] 里，投产时连凭证一起消耗（#826）。
 //!
 //! 运行期撤下实例（按表现开关实盘的 Supervisor 与它的降级平仓）已在 #761 删除：只服务一个从未
 //! 启用的单所入口，且把"撤下即市价平仓"这一策略决定写死在框架里。以后要运行中下架，按多所
 //! 形态只做「停实例 + 撤挂单」，平不平交给策略。
 //!
-//! # 为什么是 [`Provisioner`] 而不是 `impl Manager`
+//! # 为什么是一张凭证而不是 manager 的方法
 //!
-//! 编排必须经 manager 的收件箱串行化，所以它**不是**新组件 —— 请求仍由 `Manager`
-//! 收，只是把活委托下来。拆出独立类型是为了让**依赖面成为类型声明**
-//! （`docs/architecture.md` P3，与 R2 给持仓账本换成 `PositionBook` 是同一手法）：
-//! 账户句柄、能力表、分发层、两个镜像、交易所节点**只有编排用**，它们全在本类型里。
+//! [`Provisioning`] 不是新组件，不在树上、没有收件箱：投产只此一次，在调用方的任务里直接跑，
+//! 没有要串行化的并发请求。它做成独立类型有两层用意：
+//! - **只能用一次**：不可克隆、投产方法拿走 `self`，第二次投产编译不过；
+//! - **依赖面成为类型声明**（`docs/architecture.md` P3，与 R2 给持仓账本换成 `PositionBook`
+//!   是同一手法）：账户句柄、能力表、分发层、两个镜像、交易所节点**只有编排用**，它们全在
+//!   本类型里，[`super::ManagerHandle`] 碰不到。
 //!
 //! # 两件共享的东西
 //!
@@ -40,12 +42,13 @@ use crate::engine::live::{
 use crate::engine::{subscription_scope, NewClientOrderId};
 use crate::exchange::{AccountClient, AccountStream, ExchangeHandle, SubscriptionKind};
 use crate::messaging::{AccountBus, SubscriptionScope};
-use crate::tasks::Group;
+use crate::tasks::{FailHandle, Group};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// [`Provisioner::new`] 的参数：编排的全部协作者（每个的用途见 [`Provisioner`] 的字段注释）
+/// [`Provisioning::new`] 的参数：编排的全部协作者（每个的用途见 [`Provisioning`] 的字段注释）
 pub(super) struct Collaborators {
+    pub fail: FailHandle,
     pub producers: Group,
     pub symbol_metas: Arc<HashMap<(Exchange, Symbol), SymbolMeta>>,
     pub accounts: HashMap<Exchange, Arc<dyn AccountClient>>,
@@ -60,11 +63,14 @@ pub(super) struct Collaborators {
     pub exchanges: HashMap<Exchange, ExchangeHandle>,
 }
 
-/// 策略投产的编排器。
+/// 投产凭证：**一个进程只投产一次**，在启动时（#814 定的前提）。
 ///
-/// 由 [`super::Manager`] 持有并在处理收件箱消息时调用（因而天然被串行化）；
-/// 字段就是它的依赖声明，见模块文档。
-pub(super) struct Provisioner {
+/// 由 [`super::Manager::spawn`] 交出唯一一张；不可克隆，投产方法拿走它（`self`），所以第二次
+/// 投产的代码编译不过（#826）。字段就是编排的依赖声明，见模块文档。
+#[must_use = "不投产，引擎就只空跑行情、没有任何策略"]
+pub struct Provisioning {
+    /// manager 节点的报错入口：投产失败经它让 manager 出错退出 —— 冒到根、整机停机
+    fail: FailHandle,
     /// manager 的生产者组：新建的 executor 挂在这里
     producers: Group,
     /// 引擎级合约目录（与快照面共享同一个 Arc）
@@ -189,11 +195,12 @@ fn validate_subscriptions(
     Err(format!("策略订阅不可行，拒绝投产: {}", problems.join("; ")))
 }
 
-impl Provisioner {
+impl Provisioning {
     /// 装配期构造。协作者打包成 [`Collaborators`] 传入：字段不公开，manager 拿不到也改写
     /// 不了编排的实例列表与下单出口。
     pub(super) fn new(c: Collaborators) -> Self {
         Self {
+            fail: c.fail,
             producers: c.producers,
             symbol_metas: c.symbol_metas,
             accounts: c.accounts,
@@ -209,9 +216,24 @@ impl Provisioner {
         }
     }
 
-    /// 投产（只此一次，见模块文档）。任一步失败返回 `Err`，已起的部分不回滚：调用方
-    /// （manager）随即整机停机。
-    pub(super) async fn add(self, strategies: Vec<StrategySpec>) -> Result<(), ExchangeError> {
+    /// 投产一个策略实例，见 [`Self::add_strategies`]
+    pub async fn add_strategy(self, spec: StrategySpec) -> Result<(), ExchangeError> {
+        self.add_strategies(vec![spec]).await
+    }
+
+    /// 批量投产：校验订阅 → 拉持仓基线 → 起实例 → 注册 → 放行行情。
+    ///
+    /// 失败返回 `Err`，同时经 manager 节点整机停机（半起的实例不回滚，随整机收掉）。
+    pub async fn add_strategies(self, specs: Vec<StrategySpec>) -> Result<(), ExchangeError> {
+        let fail = self.fail.clone();
+        let result = self.add(specs).await;
+        if let Err(e) = &result {
+            fail.fail(anyhow::anyhow!("投产失败: {e}"));
+        }
+        result
+    }
+
+    async fn add(self, strategies: Vec<StrategySpec>) -> Result<(), ExchangeError> {
         // 1. 收集所有策略的订阅；各实例的订阅范围（腿）在这里算一次，同一份交给它的 runner 和分发层
         let mut all_subscriptions: HashSet<(Exchange, SubscriptionKind)> = HashSet::new();
         let mut scopes: Vec<SubscriptionScope> = Vec::new();

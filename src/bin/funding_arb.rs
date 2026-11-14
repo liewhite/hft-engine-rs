@@ -86,7 +86,7 @@ async fn run() -> anyhow::Result<()> {
         paper: None,
     };
     // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
-    run_engine(args, |manager| async move {
+    run_engine(args, |manager, provisioning| async move {
         // 每个币在哪几所做：该币在各所品种目录里出现的所（按配置的所顺序），不足两所拒绝启动
         let exchanges = manager.exchanges();
         // 各所的公共资金费来源：用引擎装配时建好的 client，不另建
@@ -122,7 +122,7 @@ async fn run() -> anyhow::Result<()> {
             "这些币上市的所不足两个，没法对冲：{}",
             lonely.join("、")
         );
-        manager
+        provisioning
             .add_strategies(specs)
             .await
             .map_err(|e| anyhow::anyhow!("AddStrategies failed: {e}"))?;

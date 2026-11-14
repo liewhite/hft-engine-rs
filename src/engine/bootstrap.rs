@@ -2,7 +2,7 @@ use serde::de::DeserializeOwned;
 use std::time::Duration;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::engine::live::{Manager, ManagerArgs, ManagerHandle};
+use crate::engine::live::{Manager, ManagerArgs, ManagerHandle, Provisioning};
 use crate::tasks::Root;
 
 /// 退出前等告警发完的最长时间（单次发送超时 10s，留出一条告警加一条汇总的余量）
@@ -126,7 +126,8 @@ pub fn load_config<T: DeserializeOwned>(default_path: &str) -> anyhow::Result<T>
 ///
 /// 1. 起 Manager 并等它构造完成（此时各所私有推送都已确认订阅生效，见
 ///    `crate::exchange::ws_loop::WsConn::await_subscriptions`）；启动失败 → 收尾后返回 `Err`。
-/// 2. 跑 `setup`（查品种、加策略、挂观察者、起旁路任务……），拿到 [`ManagerHandle`]。
+/// 2. 跑 `setup`（查品种、加策略、挂观察者、起旁路任务……），拿到 [`ManagerHandle`] 与唯一一张
+///    投产凭证 [`Provisioning`]。
 ///    `setup` 出错 → 走同一条停机路径（[`shutdown`]）后返回该错误：装配到一半的引擎
 ///    （可能已加了部分策略、已在下单）不会被丢下不管。
 /// 3. 等停机信号或任何节点出错（[`run_until_shutdown`]）。
@@ -134,13 +135,13 @@ pub fn load_config<T: DeserializeOwned>(default_path: &str) -> anyhow::Result<T>
 /// 返回 `Ok` 只有一种情形：**收到停机信号并已停机完毕**。
 pub async fn run_engine<F, Fut>(args: ManagerArgs, setup: F) -> anyhow::Result<()>
 where
-    F: FnOnce(ManagerHandle) -> Fut,
+    F: FnOnce(ManagerHandle, Provisioning) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
     let root = Root::new("engine");
     let main = root.group("main");
-    let manager = match Manager::spawn(&main, args).await {
-        Ok(manager) => manager,
+    let started = match Manager::spawn(&main, args).await {
+        Ok(started) => started,
         Err(e) => {
             // 构造途中可能已起了部分子任务（框架已先收掉 manager 那一支），照样走一遍停机：
             // 根交出的就是同一个根因，这里只记停机本身有没有完成
@@ -150,10 +151,13 @@ where
             return Err(e.context("Manager 启动失败"));
         }
     };
-    drive(root, manager, setup).await
+    drive(root, started, |(handle, provisioning)| {
+        setup(handle, provisioning)
+    })
+    .await
 }
 
-/// [`run_engine`] 启动之后的部分，对句柄类型泛化以便单测（真 Manager 要联网，起不来）
+/// [`run_engine`] 启动之后的部分，对 manager 交出的东西泛化以便单测（真 Manager 要联网，起不来）
 async fn drive<H, F, Fut>(root: Root, handle: H, setup: F) -> anyhow::Result<()>
 where
     F: FnOnce(H) -> Fut,

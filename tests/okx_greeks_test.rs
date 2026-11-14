@@ -89,7 +89,7 @@ async fn test_okx_greeks_push() {
     })
     .expect("装配 OKX");
     let root = Root::new("test");
-    let manager = Manager::spawn(
+    let (_manager, provisioning) = Manager::spawn(
         &root.group("main"),
         ManagerArgs {
             exchanges: vec![okx],
@@ -103,7 +103,7 @@ async fn test_okx_greeks_push() {
         symbol: "BTC".to_string(),
     };
 
-    manager
+    provisioning
         .add_strategy(StrategySpec::live(Box::new(strategy)))
         .await
         .expect("添加策略失败");

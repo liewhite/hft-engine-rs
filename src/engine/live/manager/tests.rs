@@ -5,7 +5,7 @@ use super::*;
 use crate::domain::SymbolMeta;
 use crate::exchange::{ExchangeCmd, ExchangeHandle};
 use crate::messaging::{AccountData, ExchangeAccountData};
-use crate::tasks::Root;
+use crate::tasks::{Inbox, Root};
 use async_trait::async_trait;
 use rust_decimal_macros::dec;
 use std::collections::HashSet;
@@ -142,7 +142,7 @@ fn is_account_info(ev: &AccountEvent) -> bool {
 async fn producers_stop_before_consumers_and_their_last_reports_arrive() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let root = Root::new("engine");
-    let handle = Manager::spawn(
+    let (handle, _provisioning) = Manager::spawn(
         &root.group("main"),
         ManagerArgs {
             exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)],
@@ -234,7 +234,7 @@ fn greeks_on(exchange: Exchange) -> Box<dyn Strategy> {
 /// 起一个只有 Binance 与 OKX 的 manager；OKX 登记了 Greeks 流，起一次计一次数
 async fn manager_with_okx_greeks(
     root: &Root,
-) -> (ManagerHandle, Arc<std::sync::atomic::AtomicUsize>) {
+) -> (Provisioning, Arc<std::sync::atomic::AtomicUsize>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let started = Arc::new(AtomicUsize::new(0));
@@ -247,7 +247,7 @@ async fn manager_with_okx_greeks(
             Ok(())
         }),
     );
-    let handle = Manager::spawn(
+    let (_, provisioning) = Manager::spawn(
         &root.group("main"),
         ManagerArgs {
             exchanges: vec![fake_setup(Exchange::Binance, log, None), okx],
@@ -257,11 +257,11 @@ async fn manager_with_okx_greeks(
     .await
     .expect("Manager 起不来");
     assert_eq!(started.load(Ordering::SeqCst), 0, "没有策略要，就不该起");
-    (handle, started)
+    (provisioning, started)
 }
 
 /// 投产失败：调用方拿到原因，同一错误冒到根、整机停机
-async fn assert_provisioning_halts(root: Root, err: ManagerError, cause: &str) {
+async fn assert_provisioning_halts(root: Root, err: ExchangeError, cause: &str) {
     assert!(err.to_string().contains(cause), "{err}");
     root.stopping().await;
     let root_err = format!("{:#}", root.shutdown().await.unwrap_err());
@@ -273,8 +273,8 @@ async fn assert_provisioning_halts(root: Root, err: ManagerError, cause: &str) {
 async fn account_streams_start_on_demand_once() {
     use std::sync::atomic::Ordering;
     let root = Root::new("engine");
-    let (handle, started) = manager_with_okx_greeks(&root).await;
-    handle
+    let (provisioning, started) = manager_with_okx_greeks(&root).await;
+    provisioning
         .add_strategies(vec![
             StrategySpec::live(greeks_on(Exchange::OKX)),
             StrategySpec::live(greeks_on(Exchange::OKX)),
@@ -290,29 +290,13 @@ async fn account_streams_start_on_demand_once() {
 async fn unavailable_account_stream_halts_provisioning() {
     use std::sync::atomic::Ordering;
     let root = Root::new("engine");
-    let (handle, started) = manager_with_okx_greeks(&root).await;
-    let err = handle
+    let (provisioning, started) = manager_with_okx_greeks(&root).await;
+    let err = provisioning
         .add_strategy(StrategySpec::live(greeks_on(Exchange::Binance)))
         .await
         .unwrap_err();
     assert_eq!(started.load(Ordering::SeqCst), 0);
     assert_provisioning_halts(root, err, "Binance 不提供 Greeks").await;
-}
-
-/// 只投产一次：第二次投产报错、整机停机
-#[tokio::test]
-async fn second_provisioning_halts() {
-    let root = Root::new("engine");
-    let (handle, _) = manager_with_okx_greeks(&root).await;
-    handle
-        .add_strategy(StrategySpec::live(greeks_on(Exchange::OKX)))
-        .await
-        .unwrap();
-    let err = handle
-        .add_strategy(StrategySpec::live(greeks_on(Exchange::OKX)))
-        .await
-        .unwrap_err();
-    assert_provisioning_halts(root, err, "重复投产").await;
 }
 
 /// 只订行情、别的什么都不做的策略
@@ -341,7 +325,7 @@ impl Strategy for WatchesBbo {
 async fn live_strategy_is_rejected_on_exchange_without_credentials() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let root = Root::new("engine");
-    let handle = Manager::spawn(
+    let (_, provisioning) = Manager::spawn(
         &root.group("main"),
         ManagerArgs {
             exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)],
@@ -350,7 +334,7 @@ async fn live_strategy_is_rejected_on_exchange_without_credentials() {
     )
     .await
     .expect("Manager 起不来");
-    let err = handle
+    let err = provisioning
         .add_strategy(StrategySpec::live(Box::new(WatchesBbo(Exchange::Binance))))
         .await
         .unwrap_err();
@@ -362,7 +346,7 @@ async fn live_strategy_is_rejected_on_exchange_without_credentials() {
 async fn paper_strategy_is_rejected_without_paper_counter() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let root = Root::new("engine");
-    let handle = Manager::spawn(
+    let (_, provisioning) = Manager::spawn(
         &root.group("main"),
         ManagerArgs {
             exchanges: vec![fake_setup(Exchange::Binance, log.clone(), None)],
@@ -371,7 +355,7 @@ async fn paper_strategy_is_rejected_without_paper_counter() {
     )
     .await
     .expect("Manager 起不来");
-    let err = handle
+    let err = provisioning
         .add_strategy(StrategySpec::paper(
             Box::new(NeedsStreams(HashMap::new())),
             "p",

@@ -159,14 +159,14 @@ async fn run() -> anyhow::Result<()> {
         paper: Some(config.paper),
     };
     // 停机信号 → Ok；manager 意外终止或装配失败 → Err（装配失败也先停机），进程带着原因非零退出
-    run_engine(args, |manager| async move {
+    run_engine(args, |_manager, provisioning| async move {
         let strategy = DipMaker {
             exchange,
             symbols: config.symbols.clone(),
             offset_bp: config.offset_bp,
             order_notional: config.order_notional,
         };
-        manager
+        provisioning
             // 绑定到按 symbol 命名的模拟账户；实盘账户不注册任何策略，故不会有真实下单
             .add_strategy(StrategySpec::paper(
                 Box::new(strategy),

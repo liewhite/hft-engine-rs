@@ -465,6 +465,8 @@ fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Outco
 > `ManagerActor` → 任务树上的 `Manager` 节点；三个停机分组变成 `producers` / `consumers` 两个 `tasks::Group`
 > （总线不再占一组）；`Provisioner` 拿到的是 producers 组本身 —— `Group` 对外没有 shutdown，编排仍停不掉
 > 整组，只能对自己起的 executor 调 `ChildHandle::stop`；"借出的是哪一个组"仍只靠调用点写对。
+> #826 起编排器改名投产凭证 `Provisioning`，由 `Manager::spawn` 直接交给调用方、用一次即消耗；投产不再经
+> manager 的收件箱（manager 节点已无收件箱、无字段），下文「经邮箱串行化」不再成立。
 
 原状：`ManagerActor` 15 个字段，装配 / 投产撤下编排 / 监督树根 / 停机链根 / 总线持有 /
 快照面应答全在一处，两个文件合计 2015 行。

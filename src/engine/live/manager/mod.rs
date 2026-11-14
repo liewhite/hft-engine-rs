@@ -3,15 +3,16 @@
 //! 职责边界（每块各居其位，manager 只做粘合）：
 //! - **装配**：收下 bin 侧的 [`ExchangeSetup`]（见 [`super::assembly`]），预加载 metas、
 //!   建三条总线、起全部核心子任务 —— 对"有哪些交易所"彻底无知；
-//! - **投产编排**：见 [`provisioning`] 子模块（启动时一次；失败即本节点出错、整机停机）；
+//! - **投产编排**：见 [`provisioning`] 子模块（启动时一次，经 [`Provisioning`] 凭证；失败即
+//!   本节点出错、整机停机）；
 //! - **监督**：由任务树承担 —— 子任务被要求停止后正常退出只收掉它自己那一支（
 //!   外部观察者收工），出错或 panic 一律冒到根、整机受控停机，交由外部编排
 //!   重启（本项目不重连、不降级运行；唯一例外是公共行情 WS 原地重连，见
 //!   `crate::exchange::ws_loop::ReconnectingWs`）；
 //! - **停机**：生产者 → 消费者两组依次停（框架按分组的声明顺序），组内并发、组间有序。
 //!
-//! 对外只经 [`ManagerHandle`]：类型化的投产方法、只读快照、往消费者组挂观察者的入口
-//! 和三条总线。
+//! 对外只经 [`Manager::spawn`] 交出的两样东西：可克隆的 [`ManagerHandle`]（只读快照、往消费者组
+//! 挂观察者的入口、三条总线）和不可克隆、用一次就没了的投产凭证 [`Provisioning`]。
 
 use super::assembly::{ExchangeSetup, SpawnCtx};
 use super::{
@@ -27,7 +28,7 @@ use crate::exchange::{
 };
 use crate::messaging::{AccountEvent, CustomEvent, MarketData, MarketEvent};
 use crate::strategy::Strategy;
-use crate::tasks::{Addr, BusTap, Group, Inbox, Scope, Task};
+use crate::tasks::{BusTap, Group, Scope, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -37,7 +38,7 @@ mod provisioning;
 #[cfg(test)]
 mod tests;
 
-use provisioning::Provisioner;
+pub use provisioning::Provisioning;
 
 /// 时钟节拍（毫秒）：Clock 事件驱动策略的定时逻辑与本地柜台的净值发布
 const CLOCK_INTERVAL_MS: u64 = 1000;
@@ -82,31 +83,9 @@ impl StrategySpec {
     }
 }
 
-/// Manager 的收件箱消息：只有必须串行化的编排（投产）。只读快照与自定义事件注入
-/// 不经收件箱，见 [`ManagerHandle`] 各方法。
-enum ManagerMsg {
-    AddStrategies(
-        Vec<StrategySpec>,
-        oneshot::Sender<Result<(), ExchangeError>>,
-    ),
-}
-
-/// 经 [`ManagerHandle`] 发起的编排请求的失败
-#[derive(Debug, thiserror::Error)]
-pub enum ManagerError {
-    /// manager 已停止收件。manager 是 `main` 组里唯一的节点，它停止收件只可能是整机在停机
-    /// （收到停机信号，或某个节点出错冒到了根）—— 请求没有执行，调用方按"引擎在停"处理。
-    #[error("引擎正在停机（manager 已停止收件），请求未执行")]
-    Stopping,
-    /// 编排本身失败（语义见各方法）
-    #[error(transparent)]
-    Failed(#[from] ExchangeError),
-}
-
 /// 引擎的对外句柄（可克隆）。由 [`Manager::spawn`] 在构造完成时交出。
 #[derive(Clone)]
 pub struct ManagerHandle {
-    addr: Addr<ManagerMsg>,
     /// manager 的消费者组：外部观察者挂在这里（见 [`Self::observers`]）
     consumers: Group,
     /// 完整的行情总线：只供 [`Self::publish_custom_event`] 发布；对外只给只订阅视图
@@ -122,31 +101,6 @@ pub struct ManagerHandle {
 }
 
 impl ManagerHandle {
-    async fn call(
-        &self,
-        make: impl FnOnce(oneshot::Sender<Result<(), ExchangeError>>) -> ManagerMsg,
-    ) -> Result<(), ManagerError> {
-        self.addr
-            .ask(make)
-            .await
-            .map_err(|_| ManagerError::Stopping)?
-            .map_err(ManagerError::Failed)
-    }
-
-    /// 添加一个策略实例，见 [`Self::add_strategies`]
-    pub async fn add_strategy(&self, spec: StrategySpec) -> Result<(), ManagerError> {
-        self.add_strategies(vec![spec]).await
-    }
-
-    /// 批量投产：校验订阅 → 拉持仓基线 → 起实例 → 注册 → 放行行情。
-    ///
-    /// **一个进程只投产一次**，在启动时。投产失败、或第二次调用，都返回 `Err` 并整机停机
-    /// （半起的实例不回滚，随整机收掉；见 `provisioning` 模块文档）。
-    pub async fn add_strategies(&self, specs: Vec<StrategySpec>) -> Result<(), ManagerError> {
-        self.call(|reply| ManagerMsg::AddStrategies(specs, reply))
-            .await
-    }
-
     /// 外部向策略注入自定义事件（[`CustomEvent`] 的**入向**入口）。
     ///
     /// 事件进入行情总线后按 scope 路由：带 `(exchange, symbol)` 的只投递给订阅了
@@ -156,7 +110,7 @@ impl ManagerHandle {
     /// 自定义事件没有账户归属（如同行情）：实盘与模拟账户的策略都会收到。总线上的
     /// 非 executor 订阅者（观测镜像等）同样可见。时间戳取注入时刻。
     ///
-    /// 直接发到行情总线（同步、不会失败），不经 manager 的收件箱。
+    /// 直接发到行情总线（同步、不会失败）。
     pub fn publish_custom_event(&self, event: CustomEvent) {
         let ts = now_ms();
         // 注入留痕：事件"发了没人收"（scope 拼错、订阅缺失、类型不符）时，这是唯一的定位起点
@@ -239,20 +193,18 @@ impl ManagerHandle {
     }
 }
 
-/// Manager 节点：收件箱 + 投产编排器。总线、分组、各子组件的生死都归任务树与句柄，
-/// 不在这里存副本。
-pub struct Manager {
-    inbox: Inbox<ManagerMsg>,
-    /// 策略投产的编排器（字段归属即职责声明，见 `provisioning.rs`）。只投产一次：投产时取走，
-    /// 之后为 `None`
-    provisioner: Option<Provisioner>,
-}
+/// Manager 节点：只是生产者、消费者两组的父节点，自己不收消息、不持状态。总线、分组、
+/// 各子组件的生死都归任务树与句柄，投产编排归 [`Provisioning`]。
+pub struct Manager(());
 
 impl Manager {
     /// 在 `group` 下起 manager，等它构造完成（metas 已加载、全部子任务已起、各所私有订阅已
-    /// 确认），返回对外句柄。任何一步失败 → 返回 `Err`，同时错误照常冒到根（启动期受控退出，
-    /// 不重试、不重连）。
-    pub async fn spawn(group: &Group, args: ManagerArgs) -> anyhow::Result<ManagerHandle> {
+    /// 确认），交出对外句柄与唯一一张投产凭证。任何一步失败 → 返回 `Err`，同时错误照常冒到根
+    /// （启动期受控退出，不重试、不重连）。
+    pub async fn spawn(
+        group: &Group,
+        args: ManagerArgs,
+    ) -> anyhow::Result<(ManagerHandle, Provisioning)> {
         let (handle_tx, handle_rx) = oneshot::channel();
         group
             .spawn("Manager", move |scope: Scope| async move {
@@ -299,9 +251,10 @@ impl Manager {
         )
     }
 
-    async fn build(scope: Scope, args: ManagerArgs) -> anyhow::Result<(Self, ManagerHandle)> {
-        let (addr, inbox) = scope.inbox::<ManagerMsg>();
-
+    async fn build(
+        scope: Scope,
+        args: ManagerArgs,
+    ) -> anyhow::Result<(Self, (ManagerHandle, Provisioning))> {
         // 1. 收下 bin 侧装配好的交易所（阶段 1 的 client 已建好；阶段 2 的节点装配
         //    延迟到 metas 就绪后并发执行）。manager 只做收集与循环，不知道具体是哪些所。
         let setups = args.exchanges;
@@ -500,7 +453,6 @@ impl Manager {
         tracing::info!("Manager started with all child tasks");
 
         let handle = ManagerHandle {
-            addr,
             consumers,
             market_bus,
             account_bus: account_bus.tap(),
@@ -509,51 +461,34 @@ impl Manager {
             settled_funding: Arc::new(settled_funding),
             exchanges: Arc::new(exchange_order),
         };
-        let manager = Self {
-            inbox,
-            provisioner: Some(Provisioner::new(provisioning::Collaborators {
-                producers,
-                symbol_metas,
-                accounts,
-                capabilities,
-                client_order_ids,
-                account_streams: provisioning::AccountStreams::new(
-                    account_stream_starters,
-                    account_bus.clone(),
-                ),
-                paper_counter,
-                income_processor,
-                metrics,
-                position_ledger,
-                outcome_bus,
-                exchanges,
-            })),
-        };
-        Ok((manager, handle))
+        let provisioning = Provisioning::new(provisioning::Collaborators {
+            fail: scope.fail_handle(),
+            producers,
+            symbol_metas,
+            accounts,
+            capabilities,
+            client_order_ids,
+            account_streams: provisioning::AccountStreams::new(
+                account_stream_starters,
+                account_bus.clone(),
+            ),
+            paper_counter,
+            income_processor,
+            metrics,
+            position_ledger,
+            outcome_bus,
+            exchanges,
+        });
+        Ok((Self(()), (handle, provisioning)))
     }
 }
 
 impl Task for Manager {
-    /// 处理投产请求（只此一次）。投产失败或重复投产：把原因交回调用方，同时本节点出错退出
-    /// —— 冒到根、整机停机。被要求停止后交完箱里已有的请求再返回；子任务由框架按分组顺序收尾。
-    async fn run(&mut self, _scope: &Scope) -> anyhow::Result<()> {
-        while let Some(msg) = self.inbox.recv().await {
-            match msg {
-                ManagerMsg::AddStrategies(specs, reply) => {
-                    let result = match self.provisioner.take() {
-                        Some(provisioner) => provisioner.add(specs).await,
-                        None => Err(ExchangeError::new("重复投产：一个进程只在启动时投产一次")),
-                    };
-                    let failure = result.as_ref().err().map(|e| format!("投产失败: {e}"));
-                    // 调用方已不在等待时结果无人读，失败照样经本节点冒到根
-                    let _ = reply.send(result);
-                    if let Some(failure) = failure {
-                        anyhow::bail!(failure);
-                    }
-                }
-            }
-        }
-        tracing::info!("Manager inbox drained, stopping child tasks");
+    /// 等到被要求停止；子任务由框架按分组顺序收尾。投产失败经 [`Provisioning`] 持有的
+    /// 报错入口让本节点出错退出。
+    async fn run(&mut self, scope: &Scope) -> anyhow::Result<()> {
+        scope.stopping().await;
+        tracing::info!("Manager stopping child tasks");
         Ok(())
     }
 }

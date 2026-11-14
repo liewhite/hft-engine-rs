@@ -20,8 +20,8 @@
   │ Hyperliquid  ├─────────►│  三条总线的建造者   │          └──────▲──────┘
   │              │  账户事件 │  快照面应答         │                 │
   └──────▲───────┘          │  ┌──────────────┐  │                 │
-         │                  │  │ Provisioner  │  │           StrategyView
-         │ REST 下单         │  │ 投产编排      │  │                 │
+         │                  │  │ Provisioning │  │           StrategyView
+         │ REST 下单         │  │ 投产凭证      │  │                 │
          │                  │  └──────┬───────┘  │                 │
          │                  └─────────┼──────────┘                 │
          │                            │ spawn                      │
@@ -136,20 +136,20 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 | 类别 | 接口 |
 |---|---|
 | 装配 | 配置里 `exchanges` 段解析成 `ExchangesConfig`，`setup_all(&cfg)` → `Vec<ExchangeSetup>`；`ManagerArgs { exchanges, paper: Option<SimConfig> }` |
-| 投产（`ManagerHandle`） | `add_strategy(spec)` / `add_strategies(specs)`，`.await -> Result<(), ManagerError>` |
+| 投产（`Provisioning`，`Manager::spawn` / `run_engine` 交出唯一一张，用一次就没了） | `add_strategy(spec)` / `add_strategies(specs)`，`.await -> Result<(), ExchangeError>` |
 | 账户绑定 | `StrategySpec::live(s)` / `StrategySpec::paper(s, label)` |
 | 流面 | `market_bus()` / `account_bus()` / `outcome_bus()`，观察者在构造时 `inbox.subscribe(bus, fn(&Event) -> bool, Msg::X)` |
 | 挂观察者 | `observers()`：manager 的消费者组，`spawn` / `spawn_addressed` / `spawn_periodic` |
 | 快照面 | `exchanges()` / `all_symbol_metas()` / `symbol_meta(ex, &sym)`（同步）；持仓不走快照面，订账户总线上持仓账本发的 `PositionValues` |
 | 各所公共能力 | `settled_funding(ex)`：已结算资金费率来源（用装配时建好的 client，不另建） |
 | 入向注入 | `publish_custom_event(CustomEvent)`（同步，直接发行情总线） |
-| 启动辅助 | `run_main`（日志与告警：启动试发、退出前发完）/ `load_config` / `run_engine(args, \|handle\| ..)`（启动 → 装配 → 运行 → 唯一停机路径） |
+| 启动辅助 | `run_main`（日志与告警：启动试发、退出前发完）/ `load_config` / `run_engine(args, \|handle, provisioning\| ..)`（启动 → 装配 → 运行 → 唯一停机路径） |
 | 纯逻辑核心 | `StrategyRunner`（回测直接驱动它）、`ClientOrderIdGen` |
 
 **流面与快照面是两条独立的路**，不要合并成一个 `Query { kind }`：
 
 - **流面**：订阅事件，`fn` 过滤器在发布侧执行，覆盖每一个 `MarketData` / `AccountData` 变体
-- **快照面**：纯内存读、不打 REST、不经 manager 的收件箱（品种目录直接读句柄里那份）
+- **快照面**：纯内存读、不打 REST（品种目录直接读句柄里那份）
 
 ### 3.3 `exchange` —— 加新交易所的扩展点
 
@@ -228,9 +228,9 @@ async fn run() -> anyhow::Result<()> {
     // 2. run_engine 建任务树、起 manager（建三条总线、在生产者/消费者两组下起全部子任务；
     //    返回前各所私有推送都已确认订阅生效），再跑装配闭包，然后等停机信号或任何节点出错。
     //    闭包出错也先停机再返回 —— 装配到一半的引擎不会被丢下不管。
-    run_engine(ManagerArgs { exchanges, paper: Some(config.paper) }, |manager| async move {
+    run_engine(ManagerArgs { exchanges, paper: Some(config.paper) }, |manager, provisioning| async move {
         // 3. 注册策略。live 走真实下单，paper(label) 落本地柜台，两者可同时跑
-        manager.add_strategies(vec![
+        provisioning.add_strategies(vec![
             StrategySpec::live(Box::new(my_strategy)),
             StrategySpec::paper(Box::new(my_strategy_2), "BTC"),
         ]).await?;
@@ -240,8 +240,8 @@ async fn run() -> anyhow::Result<()> {
 }
 ```
 
-一个进程**只在启动时投产一次**；投产失败或第二次投产都返回 `Err`，同时整机停机（半起的实例
-不回滚，随整机收掉）：
+一个进程**只在启动时投产一次**：投产方法拿走凭证，第二次投产的代码编译不过（#826）；投产失败返回
+`Err`，同时整机停机（半起的实例不回滚，随整机收掉）：
 
 ```
 校验订阅可行性 → 拉持仓基线（一次快照喂三类消费者）→ 注册对账/观测镜像

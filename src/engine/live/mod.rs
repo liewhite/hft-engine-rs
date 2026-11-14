@@ -85,7 +85,7 @@ pub use assembly::{
 pub use clock::Clock;
 pub use executor::{Executor, ExecutorArgs, ExecutorHandle, ExecutorId};
 pub use income_processor::{IncomeProcessor, IncomeProcessorHandle};
-pub use manager::{Manager, ManagerArgs, ManagerError, ManagerHandle, StrategySpec};
+pub use manager::{Manager, ManagerArgs, ManagerHandle, Provisioning, StrategySpec};
 pub use metrics::{Metrics, MetricsArgs, MetricsHandle, DEFAULT_REPORT_INTERVAL_MS};
 pub use outcome_processor::{OrderGateway, OrderRequestCounts, OutcomeProcessor, RequestKind};
 pub use paper_counter::{PaperCounter, PaperCounterArgs};
