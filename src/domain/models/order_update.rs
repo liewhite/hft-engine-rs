@@ -25,6 +25,6 @@ pub struct OrderUpdate {
     /// 订单总数量 (币单位)
     pub quantity: Quantity,
     /// 交易所报的累计成交量 (币单位)：BN `z`、OKX `accFillSz`（张折币）、HL `origSz - sz`、
-    /// IBKR `filledQuantity`、模拟柜台自己的累计
+    /// 模拟柜台自己的累计
     pub filled_quantity: Quantity,
 }

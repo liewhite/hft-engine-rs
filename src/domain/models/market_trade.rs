@@ -11,8 +11,8 @@ use crate::domain::types::{Price, Quantity, Timestamp};
 /// 市场微观结构信号**（主动买卖压），**撮合不用它** —— `sim::matcher` 只比价格，见那里的
 /// 说明。此前本注释说它是"撮合的成交来源"，与实现矛盾，现予更正。
 ///
-/// 当前没有策略读它，四所各有一套 maker 约定（OKX/HL 由方向反推、Binance 直取 `m`、
-/// IBKR 的 trade 路径没有此信息），保留是因为订单流类策略需要它，删了要重新对齐一遍。
+/// 当前没有策略读它，三所各有一套 maker 约定（OKX/HL 由方向反推、Binance 直取 `m`），
+/// 保留是因为订单流类策略需要它，删了要重新对齐一遍。
 #[derive(Debug, Clone)]
 pub struct MarketTrade {
     pub exchange: Exchange,

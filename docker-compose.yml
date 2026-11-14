@@ -1,7 +1,0 @@
-services:
-  hft-engine-rs:
-    image: ghcr.io/liewhite/hft-engine-rs:latest
-    container_name: hft-engine-rs
-    restart: unless-stopped
-    volumes:
-      - ./config.json:/app/config.json:ro

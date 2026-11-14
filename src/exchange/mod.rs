@@ -5,7 +5,6 @@ pub mod crypto_status;
 pub(crate) mod equity_polling;
 pub(crate) mod funding_fee_polling;
 pub mod hyperliquid;
-pub mod ibkr;
 pub(crate) mod lazy_conn;
 pub mod okx;
 pub(crate) mod rate_limit;

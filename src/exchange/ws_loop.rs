@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 ///
 /// 此前整个项目没有应用层心跳与空闲检测：OKX 的空闲连接会被服务端 30 秒静默断开、
 /// Hyperliquid 60 秒；而"连接活着但数据停了"（半开连接、上游静默故障）无人能发现 ——
-/// 只有 IBKR 自己造了重订阅机制。统一收在 ws_loop：
+/// 统一收在 ws_loop：
 /// - `ping_text`：周期发送的应用层 ping（各所报文不同，由调用方给出；None = 该所由
 ///   服务端主动 ping，客户端回 pong 即可，见循环里的 Ping 分支）
 /// - `idle_timeout`：超过此时长没有收到**任何**入站帧（含 Ping/Pong 控制帧）即判定

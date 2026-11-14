@@ -4,7 +4,7 @@ mod strategy_runner;
 
 pub use bootstrap::{load_config, run_engine, run_main};
 pub use live::{
-    setup_all, setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, AccountBinding, AccountBus,
+    setup_all, setup_binance, setup_hyperliquid, setup_okx, AccountBinding, AccountBus,
     AccountOutcome, Clock, ExchangeSetup, ExchangesConfig, Executor, ExecutorArgs, ExecutorHandle,
     ExecutorId, IncomeProcessor, IncomeProcessorHandle, Manager, ManagerArgs, ManagerError,
     ManagerHandle, MarketBus, Metrics, MetricsArgs, MetricsHandle, OrderGateway, OutcomeBus,

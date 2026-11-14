@@ -258,8 +258,7 @@ CLAUDE.md 的七条是通用的，这里只写**本项目特有的、可以直�
 
 **组件写法**：每个组件一个 `enum Msg` + 收件箱；对外给可克隆的 `XxxHandle(Addr<Msg>)`，带类型化方法（ask 用
 `addr.ask(|tx| Msg::Get(tx))`）；构造逻辑写在 spawn 的闭包里（在里面订阅总线、声明分组、起子任务）；
-WS / 定时器由任务自己持有、在 `run` 的 `select!` 里 poll；收尾要补发的东西（如 IBKR 等 commission
-的成交）**直接发到总线**，不经父节点转（父节点的收件箱先关）。处理一条消息出错要整支停就 `?`
+WS / 定时器由任务自己持有、在 `run` 的 `select!` 里 poll；收尾要补发的东西**直接发到总线**，不经父节点转（父节点的收件箱先关）。处理一条消息出错要整支停就 `?`
 返回 `Err`；可容忍的失败在组件内部消化（记日志继续），不要抛 `Err` 指望上层不当回事。命名：类型不带
 `Actor` 后缀，各所父节点叫 `XxxNode`，参数叫 `XxxArgs`。标准形状：
 
@@ -284,7 +283,7 @@ impl Task for Foo {
 各所私有 WS 连接统一用 `exchange::ws_loop::WsConn`：`WsConn::spawn(&scope.group("conn"), ..)` 把读循环挂成子任务
 （断线/空闲超时 = 子任务 Err 上冒，断线期间可能漏成交，所以不重连）。BN/HL/OKX 的公共行情 WS 用
 `ws_loop::ReconnectingWs`（#762）：断线不上冒，`recv()` 返回 `None` 后组件调 `reconnect(scope, 全部订阅报文)`
-原地退避重连并重发订阅（断档期间盘口不新鲜，策略自己不挂单）；OKX K 线（business）与 IBKR 公共流仍用 `WsConn`。私有 WS 构造时 `await_subscriptions` 等订阅确认；取帧用
+原地退避重连并重发订阅（断档期间盘口不新鲜，策略自己不挂单）；OKX K 线（business）仍用 `WsConn`。私有 WS 构造时 `await_subscriptions` 等订阅确认；取帧用
 `conn.next(scope)`（停机时把已缓冲的回报交完再返回 `None`，没有收件箱的私有 WS 整个 `run` 就是
 `while let Some(raw) = conn.next(scope).await? {..}`），停机信号另有来源的 `select!` 分支里用 `conn.recv()`。
 

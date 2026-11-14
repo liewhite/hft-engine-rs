@@ -25,31 +25,20 @@ const USER_AGENT: &str = concat!("hft-engine-rs/", env!("CARGO_PKG_VERSION"));
 #[must_use = "调 build() 才建出 client"]
 pub struct HttpSpec {
     timeout: Duration,
-    accept_invalid_certs: bool,
 }
 
 /// 开始构造一个 HTTP client：`timeout` 是单个请求从发出到读完回复的上限
 pub fn http(timeout: Duration) -> HttpSpec {
-    HttpSpec {
-        timeout,
-        accept_invalid_certs: false,
-    }
+    HttpSpec { timeout }
 }
 
 impl HttpSpec {
-    /// 跳过证书校验（只给本机自签证书的 IBKR Client Portal Gateway 用）
-    pub fn accept_invalid_certs(mut self) -> Self {
-        self.accept_invalid_certs = true;
-        self
-    }
-
     #[allow(clippy::disallowed_methods)] // 唯一放行处，见模块文档
     pub fn build(self) -> Result<reqwest::Client, reqwest::Error> {
         reqwest::Client::builder()
             .timeout(self.timeout)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .user_agent(USER_AGENT)
-            .danger_accept_invalid_certs(self.accept_invalid_certs)
             .build()
     }
 
@@ -60,7 +49,6 @@ impl HttpSpec {
             .timeout(self.timeout)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .user_agent(USER_AGENT)
-            .danger_accept_invalid_certs(self.accept_invalid_certs)
             .build()
     }
 }

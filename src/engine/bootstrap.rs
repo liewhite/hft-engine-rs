@@ -446,7 +446,6 @@ mod supervision_tests {
     }
 
     /// manager 的两组停机顺序：生产者收尾时补发的事件，后停的消费者照样收得到
-    /// （IBKR 收尾补发等 commission 的成交就靠这条）
     #[tokio::test]
     async fn events_published_by_producers_on_stop_reach_consumers() {
         struct FlushOnStop(Bus<u32>);

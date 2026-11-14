@@ -674,7 +674,7 @@ mod trade_tests {
     }
 
     /// Critical 回归防线：OKX 盘口挂单量原先未折算，导致 BBO 的 qty 是张数、
-    /// 而 position/fill/trade 是币本位，spread_arb 按币本位使用 ask_qty/bid_qty
+    /// 而 position/fill/trade 是币本位，策略按币本位使用 ask_qty/bid_qty
     /// 时 OKX 腿的流动性约束实际失效（差 contract_size 倍）。
     #[test]
     fn bbo_quantities_are_converted_to_coin() {

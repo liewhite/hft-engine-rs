@@ -152,7 +152,7 @@ impl ExchangeOrder {
 /// 原样保留、不映射成内部 symbol —— 要撤的包括本引擎不接入的品种，撤单由适配层按它们自己撤。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenOrder {
-    /// 交易所自己的合约名（如 `BTCUSDT`、`BTC-USDT-SWAP`、`xyz:TSLA`、IBKR conid）
+    /// 交易所自己的合约名（如 `BTCUSDT`、`BTC-USDT-SWAP`、`xyz:TSLA`）
     pub instrument: String,
     /// 交易所订单号
     pub order_id: OrderId,
@@ -216,8 +216,7 @@ pub trait AccountClient: Send + Sync + 'static {
         client_order_id: &str,
     ) -> Result<(), ExchangeError>;
 
-    /// 账户上**全部**挂单：本适配层交易的产品线（币安 U 本位合约、OKX 全部品种、HL 全部 perp dex、
-    /// IBKR 本账户）上的每一张，不限本引擎接入的币、不管是谁下的。账户由引擎独占
+    /// 账户上**全部**挂单：本适配层交易的产品线（币安 U 本位合约、OKX 全部品种、HL 全部 perp dex）上的每一张，不限本引擎接入的币、不管是谁下的。账户由引擎独占
     /// （`docs/architecture.md`「账户独占」），启动时据此撤净（见 [`Self::cancel_open_order`]）。
     ///
     /// 必须完整：漏一张，清场就会谎报干净。翻页没取完、字段解析不了都报错，不返回半份。
@@ -419,7 +418,7 @@ mod tests {
         }
     }
 
-    /// contract_size = 1 的所（Binance/HL/IBKR）折算是恒等变换，只剩取整
+    /// contract_size = 1 的所（Binance/HL）折算是恒等变换，只剩取整
     #[test]
     fn unit_contract_size_leaves_quantity_unchanged() {
         let meta = SymbolMeta {

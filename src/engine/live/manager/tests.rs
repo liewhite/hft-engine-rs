@@ -36,7 +36,7 @@ impl ExchangeClient for FakeClient {
     }
 }
 
-/// 假交易所节点：收尾时往账户总线补发最后一条回报（同 IBKR 补发等 commission 的成交）
+/// 假交易所节点：收尾时往账户总线补发最后一条回报
 struct FakeNode {
     inbox: Inbox<ExchangeCmd>,
     exchange: Exchange,

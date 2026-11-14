@@ -11,7 +11,6 @@ pub enum Exchange {
     Binance,
     OKX,
     Hyperliquid,
-    IBKR,
 }
 
 impl fmt::Display for Exchange {
@@ -20,7 +19,6 @@ impl fmt::Display for Exchange {
             Exchange::Binance => write!(f, "Binance"),
             Exchange::OKX => write!(f, "OKX"),
             Exchange::Hyperliquid => write!(f, "Hyperliquid"),
-            Exchange::IBKR => write!(f, "IBKR"),
         }
     }
 }

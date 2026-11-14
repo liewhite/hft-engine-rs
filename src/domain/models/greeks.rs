@@ -8,10 +8,8 @@ use crate::domain::models::Exchange;
 /// delta 的变化速度、`theta` 时间衰减、`vega` 隐波敞口。持有期权腿的系统看不到 theta 与
 /// vega，等于不知道自己每天亏多少时间价值、隐波跳一格会怎样。
 ///
-/// 而 `gamma` 更是本项目 gamma scalping 策略的收益来源本身（见
-/// [`crate::strategy::GammaScalpStrategy`]：波动驱动 delta 漂移、越带 rehedge 赚取波动）。
-/// 当前实现是"最小核心形态"（对称对冲、固定间距），按 gamma 调整对冲带宽/频率是自然的
-/// 下一步——那时它就有读者了。
+/// `gamma` 则是 gamma scalping 类策略的收益来源本身（波动驱动 delta 漂移、越带 rehedge
+/// 赚取波动）。
 ///
 /// **口径**：`theta` 每日、`vega` 对 1% 隐波变动。这是期权行业惯例，OKX 的 `thetaBS`/
 /// `vegaBS` 与回测的 BS 合成源都按此归一（见 [`crate::backtest`] 的合成源）——这是**正确

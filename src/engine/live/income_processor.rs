@@ -183,7 +183,7 @@ impl IncomeProcessor {
                     }
                 }
             }
-            // 所级公共读数（ExchangeStatus / ExchangeRate）只投给订了该所的；
+            // 所级公共读数（ExchangeStatus）只投给订了该所的；
             // 与交易所无关的全局事件（Clock / 无 scope 的 Custom）广播。
             // 两档都由同一个判据回答，不在这里重写一遍。
             Delivery::Exchange(_) | Delivery::Broadcast => {

@@ -30,7 +30,7 @@ impl CliOrderIdFormat {
 
 #[cfg(test)]
 mod tests {
-    use crate::exchange::{binance, hyperliquid, ibkr, okx};
+    use crate::exchange::{binance, hyperliquid, okx};
 
     /// 各所长度与格式（交易所的硬限制，改了下单会被拒）
     #[test]
@@ -47,7 +47,5 @@ mod tests {
             okx.starts_with('x') && okx.len() == 32,
             "OKX 不能以数字开头、至多 32 位: {okx}"
         );
-        let ib = ibkr::CLIENT_ORDER_IDS.generate();
-        assert!(ib.starts_with("ib") && ib.len() == 32, "{ib}");
     }
 }

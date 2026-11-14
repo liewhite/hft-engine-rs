@@ -453,11 +453,11 @@ mod subscription_validation_tests {
         assert!(err.contains("SymbolMeta"), "错误应指明根因: {err}");
     }
 
-    /// 能力查询的两个**手写例外**（派生部分直接问各所 kind 映射函数，无需测试同步）：
-    /// OKX 的 Candle 由 business WS 承接、IBKR 只实现 BBO —— 这两条不在映射函数里，
+    /// 能力查询的**手写例外**（派生部分直接问各所 kind 映射函数，无需测试同步）：
+    /// OKX 的 Candle 由 business WS 承接 —— 这条不在映射函数里，
     /// 靠本测试钉住（能力函数已下放各适配层，随 ExchangeSetup 携带）。
     #[test]
-    fn hand_written_capability_exceptions_hold() {
+    fn hand_written_capability_exception_holds() {
         let candle_kind = SubscriptionKind::Candle {
             symbol: "BTC".to_string(),
             interval: crate::domain::CandleInterval::Min1,
@@ -465,17 +465,6 @@ mod subscription_validation_tests {
         assert!(
             crate::exchange::okx::supports_subscription(&candle_kind),
             "OKX 的 Candle 由 business WS 承接，能力查询必须为真"
-        );
-        assert!(crate::exchange::ibkr::supports_subscription(
-            &SubscriptionKind::BBO {
-                symbol: "AAPL".to_string()
-            }
-        ));
-        assert!(
-            !crate::exchange::ibkr::supports_subscription(&SubscriptionKind::Trades {
-                symbol: "AAPL".to_string()
-            }),
-            "IBKR 只实现了 BBO"
         );
     }
 }

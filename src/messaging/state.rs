@@ -242,8 +242,7 @@ impl SymbolMarket {
             | SymbolMarketData::IndexPrice(_)
             | SymbolMarketData::MarketTrade(_)
             | SymbolMarketData::Candle(_)
-            | SymbolMarketData::HistoryCandles(_)
-            | SymbolMarketData::BorrowFee(_) => {}
+            | SymbolMarketData::HistoryCandles(_) => {}
         }
     }
 }

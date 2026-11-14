@@ -80,8 +80,7 @@ pub fn to_paper_outlet(o: &AccountOutcome) -> bool {
 
 pub use account_binding::{AccountBinding, LiveBaselines};
 pub use assembly::{
-    setup_all, setup_binance, setup_hyperliquid, setup_ibkr, setup_okx, ExchangeSetup,
-    ExchangesConfig,
+    setup_all, setup_binance, setup_hyperliquid, setup_okx, ExchangeSetup, ExchangesConfig,
 };
 pub use clock::Clock;
 pub use executor::{Executor, ExecutorArgs, ExecutorHandle, ExecutorId};

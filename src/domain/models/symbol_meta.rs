@@ -19,7 +19,7 @@ pub struct SymbolMeta {
     /// 最小下单数量（交易所下单单位）
     pub min_order_size: PositiveDecimal,
     /// 交易所要求的最小下单金额（计价币，如 USDT）：币安 `MIN_NOTIONAL`、HL 10 USD；
-    /// 只按数量限制的所（OKX 按一手、IBKR）为 0。
+    /// 只按数量限制的所（OKX 按一手）为 0。
     ///
     /// 框架只如实提供；与价格有关，所以不在 [`Self::checked_exchange_qty`] 里校验 ——
     /// 用不用、怎么和自己的下限合并由策略决定。

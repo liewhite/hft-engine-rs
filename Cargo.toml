@@ -63,21 +63,6 @@ rust_decimal_macros = "1"
 indexmap = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
-# TLS (for IBKR Gateway self-signed certs)
-native-tls = "0.2"
-
-# IBKR OAuth 1.0a
-rsa = { version = "0.9", features = ["sha2"] }
-num-bigint = "0.4"
-sha1 = "0.10"
-rand = "0.8"
-pkcs8 = { version = "0.10", features = ["pem"] }
-percent-encoding = "2"
-
-[[bin]]
-name = "spread_arb"
-path = "src/bin/spread_arb.rs"
-
 [[bin]]
 name = "backtest"
 path = "src/bin/backtest.rs"
@@ -85,10 +70,6 @@ path = "src/bin/backtest.rs"
 [[bin]]
 name = "paper_trade"
 path = "src/bin/paper_trade.rs"
-
-[[bin]]
-name = "gamma_scalp"
-path = "src/bin/gamma_scalp.rs"
 
 [dev-dependencies]
 log = "0.4"

@@ -95,7 +95,7 @@ impl Ord for Scheduled {
 /// 每个交易所一份 [`SimState`]（一份实例只代表一个所，见其类型文档），在该所首条行情
 /// 到达时惰性创建、各以 `initial_balance_usdt` 起步（等价"每个所各入金一份"）。行情按
 /// 事件自带的 exchange 送进对应柜台 —— 此前引擎持有单个 exchange 字段并忽略事件自身的
-/// 归属，跨所策略（如 spread_arb）无法回测。`BTreeMap` 保证遍历顺序确定（净值事件的
+/// 归属，跨所策略（如 funding_arb）无法回测。`BTreeMap` 保证遍历顺序确定（净值事件的
 /// 投递序影响确定性）。
 pub struct BacktestEngine<'a> {
     source: &'a dyn MarketDataSource,

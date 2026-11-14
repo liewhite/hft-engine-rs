@@ -8,8 +8,6 @@
 //! 装配天然分两阶段：**建 client** 必须先于 symbol metas 预加载（预加载要用它），
 //! **起交易所节点**必须后于预加载（节点要用 metas）。每所把两阶段封进一个
 //! `setup_*` 函数：阶段 1 立即执行产出 client，阶段 2 以闭包延迟到 metas 就绪。
-//! IBKR 的构造是异步的（要打网关）、配置形状也不同（无 quote、另带 snapshot 轮询
-//! 配置）—— 差异全部封在它自己的 setup 内。
 
 use super::AccountBus;
 use crate::domain::{Exchange, ExchangeError, Symbol, SymbolMeta};
@@ -20,7 +18,6 @@ use crate::exchange::binance::{
 use crate::exchange::hyperliquid::{
     HyperliquidAccess, HyperliquidAccount, HyperliquidArgs, HyperliquidClient, HyperliquidNode,
 };
-use crate::exchange::ibkr::{IbkrArgs, IbkrClient, IbkrCredentials, IbkrNode, IbkrSnapshotConfig};
 use crate::exchange::okx::{OkxAccount, OkxArgs, OkxClient, OkxCredentials, OkxNode};
 use crate::exchange::okx::{OkxGreeksPoller, GREEKS_POLLING_INTERVAL_MS};
 use crate::exchange::{
@@ -203,48 +200,8 @@ pub async fn setup_hyperliquid(access: HyperliquidAccess) -> Result<ExchangeSetu
     })
 }
 
-/// IBKR 的构造是异步的（要打网关），且配置形状与其他三所不同（无 quote、另带
-/// snapshot 轮询配置）—— 差异封在本函数内，manager 不感知。
-pub async fn setup_ibkr(
-    cred: IbkrCredentials,
-    snapshot: Option<IbkrSnapshotConfig>,
-) -> Result<ExchangeSetup, ExchangeError> {
-    let client = Arc::new(IbkrClient::new(&cred).await?);
-    let auth = client.auth();
-    let conids = client.conids().clone();
-    Ok(ExchangeSetup {
-        exchange: Exchange::IBKR,
-        client: client.clone(),
-        // IBKR 的 client 只在有凭证时才构建（`IbkrClient::new` 要打网关鉴权），
-        // 走到这里必然有账户
-        account: Some(client.clone()),
-        supports: crate::exchange::ibkr::supports_subscription,
-        new_client_order_id: || crate::exchange::ibkr::CLIENT_ORDER_IDS.generate(),
-        settled_funding: None,
-        account_streams: HashMap::new(),
-        spawn_actor: Box::new(move |ctx| {
-            Box::pin(async move {
-                IbkrNode::spawn(
-                    &ctx.producers,
-                    IbkrArgs {
-                        auth,
-                        market_bus: ctx.market_bus,
-                        account_bus: ctx.account_bus,
-                        conids,
-                        client,
-                        snapshot,
-                    },
-                )
-                .await
-                .map_err(|e| start_failed("IbkrNode", e))
-            })
-        }),
-    })
-}
-
 /// 配置里的 `exchanges` 段：配了哪所就接哪所，不认识的键报错。各 bin 共用这一份，交给
-/// [`setup_all`] 装配。IBKR 的接入形状不同（网关凭证 + 快照配置）、目前没有 bin 用，仍用
-/// [`setup_ibkr`] 单独装配。
+/// [`setup_all`] 装配。
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExchangesConfig {

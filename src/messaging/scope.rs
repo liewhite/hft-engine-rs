@@ -150,7 +150,7 @@ mod tests {
     /// **越界防线**：所级账户读数按所过滤。
     ///
     /// 写成广播的那版里，策略能读到自己压根没订的所的净值与希腊值，
-    /// 而 `spread_arb` 的杠杆闸门、`gamma_scalp` 的 delta 都是拿这些算的。
+    /// 而杠杆闸门、delta 对冲这类判断都是拿这些算的。
     #[test]
     fn exchange_level_reads_are_confined_to_subscribed_exchanges() {
         let scope = scope();

@@ -1,14 +1,10 @@
 mod funding_arb;
-mod gamma_scalp;
-mod spread_arb;
 mod view;
 
 pub use funding_arb::{
     FundingArbConfig, FundingArbStrategy, PairConfig as FundingArbPairConfig, SettledFundingWindow,
     FUNDING_WINDOW_MS,
 };
-pub use gamma_scalp::GammaScalpStrategy;
-pub use spread_arb::{SpreadArbConfig, SpreadArbStrategy, MIN_EXCHANGES_PER_SYMBOL};
 pub use view::{StrategyView, SymbolView};
 
 use crate::domain::{Exchange, Order, OrderIntent, Symbol, Timestamp};
@@ -70,10 +66,7 @@ pub trait Strategy: Send + Sync {
     /// 处理事件，可产出零到多个信号。
     ///
     /// **唯一的事件入口**：行情（BBO/Trades/MarkPrice/…）、私有回报（OrderUpdate/Fill）、
-    /// 账户读数（Balance/AccountInfo/Greeks）、券源与汇率（BorrowFee/ExchangeRate）、
-    /// Clock 全部经此到达，策略按需 match 自己关心的变体。此前 BorrowFee/ExchangeRate
-    /// 走独立的 typed 回调 —— 同一事件流两套分发风格，策略在 on_event 里 match 这两类
-    /// 永远收不到且编译器不报错。
+    /// 账户读数（Balance/AccountInfo/Greeks）、Clock 全部经此到达，策略按需 match 自己关心的变体。
     ///
     /// `view` 是**本策略订阅范围内**的状态视图（见 [`StrategyView`]），按值传入且不可
     /// 跨事件持有 —— 引擎状态容器不作为策略契约的一部分暴露。

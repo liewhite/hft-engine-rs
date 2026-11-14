@@ -71,7 +71,7 @@ impl Quota {
 
     fn limit(&self, kind: Kind) -> u32 {
         match kind {
-            // 上限只有 1 的额度（IBKR 部分接口 5 秒 1 次）分不出余量，查询也能用
+            // 上限只有 1 的额度分不出余量，查询也能用
             Kind::Query => (self.cap * QUERY_SHARE_PCT / 100).max(1),
             Kind::Action => self.cap,
         }

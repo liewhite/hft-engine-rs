@@ -153,7 +153,7 @@ impl StrategyRunner {
     pub fn on_event(&mut self, event: &IncomeEvent) -> Result<Vec<OutcomeEvent>, String> {
         self.state.apply(event)?;
         let now = event.local_ts();
-        // 单一分发入口：一切事件（含 BorrowFee/ExchangeRate）都走 on_event，
+        // 单一分发入口：一切事件都走 on_event，
         // 策略自行 match 关心的变体 —— 不存在第二套 typed 回调。
         let raw = self
             .strategy

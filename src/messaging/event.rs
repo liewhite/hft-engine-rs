@@ -14,8 +14,8 @@
 
 use crate::domain::{to_f64, Price, Quantity};
 use crate::domain::{
-    AccountId, Balance, BorrowFee, Candle, Exchange, ExchangeRate, Fill, FundingFee, FundingRate,
-    Greeks, IndexPrice, MarkPrice, MarketStatus, MarketTrade, OrderUpdate, Symbol, Timestamp, BBO,
+    AccountId, Balance, Candle, Exchange, Fill, FundingFee, FundingRate, Greeks, IndexPrice,
+    MarkPrice, MarketStatus, MarketTrade, OrderUpdate, Symbol, Timestamp, BBO,
 };
 use std::any::Any;
 use std::sync::Arc;
@@ -152,8 +152,6 @@ pub enum SymbolMarketData {
     Candle(Candle),
     /// 历史K线批量数据（订阅时一次性推送）
     HistoryCandles(HistoryCandles),
-    /// 融券券源读数 (借券费 + 可借量)；参考数据，策略在 on_event 里消费
-    BorrowFee(BorrowFee),
 }
 
 /// 所级行情（封闭枚举）
@@ -164,8 +162,6 @@ pub enum ExchangeMarketData {
         exchange: Exchange,
         status: MarketStatus,
     },
-    /// 汇率读数 (货币对)；参考数据，策略在 on_event 里消费
-    ExchangeRate(ExchangeRate),
 }
 
 impl SymbolMarketData {
@@ -178,7 +174,6 @@ impl SymbolMarketData {
             SymbolMarketData::IndexPrice(ip) => ip.exchange,
             SymbolMarketData::Candle(c) => c.exchange,
             SymbolMarketData::HistoryCandles(h) => h.exchange,
-            SymbolMarketData::BorrowFee(bf) => bf.exchange,
         }
     }
 
@@ -191,7 +186,6 @@ impl SymbolMarketData {
             SymbolMarketData::IndexPrice(ip) => &ip.symbol,
             SymbolMarketData::Candle(c) => &c.symbol,
             SymbolMarketData::HistoryCandles(h) => &h.symbol,
-            SymbolMarketData::BorrowFee(bf) => &bf.symbol,
         }
     }
 }
@@ -200,7 +194,6 @@ impl ExchangeMarketData {
     pub fn exchange(&self) -> Exchange {
         match self {
             ExchangeMarketData::ExchangeStatus { exchange, .. } => *exchange,
-            ExchangeMarketData::ExchangeRate(er) => er.exchange,
         }
     }
 }

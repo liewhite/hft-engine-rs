@@ -17,8 +17,8 @@
   ┌──────────────┐          ┌────────────────────┐          ┌─────────────┐
   │ Binance      │  行情事件 │  装配               │          │ Strategy    │
   │ OKX          ├─────────►│  生产者/消费者两组   │          │  trait      │
-  │ Hyperliquid  │  账户事件 │  三条总线的建造者   │          └──────▲──────┘
-  │ IBKR         ├─────────►│  快照面应答         │                 │
+  │ Hyperliquid  ├─────────►│  三条总线的建造者   │          └──────▲──────┘
+  │              │  账户事件 │  快照面应答         │                 │
   └──────▲───────┘          │  ┌──────────────┐  │                 │
          │                  │  │ Provisioner  │  │           StrategyView
          │ REST 下单         │  │ 投产编排      │  │                 │
@@ -135,7 +135,7 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 
 | 类别 | 接口 |
 |---|---|
-| 装配 | 配置里 `exchanges` 段解析成 `ExchangesConfig`，`setup_all(&cfg)` → `Vec<ExchangeSetup>`（IBKR 单独 `setup_ibkr`）；`ManagerArgs { exchanges, paper: Option<SimConfig> }` |
+| 装配 | 配置里 `exchanges` 段解析成 `ExchangesConfig`，`setup_all(&cfg)` → `Vec<ExchangeSetup>`；`ManagerArgs { exchanges, paper: Option<SimConfig> }` |
 | 投产（`ManagerHandle`） | `add_strategy(spec)` / `add_strategies(specs)`，`.await -> Result<(), ManagerError>` |
 | 账户绑定 | `StrategySpec::live(s)` / `StrategySpec::paper(s, label)` |
 | 流面 | `market_bus()` / `account_bus()` / `outcome_bus()`，观察者在构造时 `inbox.subscribe(bus, fn(&Event) -> bool, Msg::X)` |
@@ -181,8 +181,8 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 
 ### 3.4 `messaging` —— 事件与投递
 
-`MarketData` 12 个变体：`BBO` / `MarketTrade` / `MarkPrice` / `IndexPrice` / `FundingRate` /
-`Candle` / `HistoryCandles` / `BorrowFee` / `ExchangeRate` / `ExchangeStatus` / `Clock` / `Custom`
+`MarketData` 10 个变体：`BBO` / `MarketTrade` / `MarkPrice` / `IndexPrice` / `FundingRate` /
+`Candle` / `HistoryCandles` / `ExchangeStatus` / `Clock` / `Custom`
 
 `AccountData` 按定位精度在类型上分两档（#696）：
 - `Symbol(SymbolAccountData)`：`OrderUpdate` / `Fill` / `FundingFee`
@@ -195,7 +195,7 @@ pub enum OutcomeEvent {              // StrategyRunner 处理后发往出口
 | 档 | 覆盖 | 投给谁 |
 |---|---|---|
 | `Symbol(所, symbol)` | 行情、symbol 级私有回报 | 订了这个 (所, symbol) 的 |
-| `Exchange(所)` | `ExchangeAccountData` 全部 / `ExchangeStatus` / `ExchangeRate` | 订了这个所的 |
+| `Exchange(所)` | `ExchangeAccountData` 全部 / `ExchangeStatus` | 订了这个所的 |
 | `Broadcast` | `Clock`、无 scope 的自定义事件 | 全部 |
 
 判据只有一份实现（`SubscriptionScope::accepts`），实盘分发层与回测循环共用。订阅范围带绑定账户：
