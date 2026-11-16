@@ -118,7 +118,7 @@ impl StrategyRunner {
         now: crate::domain::Timestamp,
     ) -> Vec<crate::observability::Gauge> {
         self.strategy
-            .gauges(crate::strategy::StrategyView::new(&self.state), now)
+            .gauges(crate::strategy::StrategyView::new(&self.state, &[]), now)
     }
 
     /// 写入持仓基线（投产握手）。
@@ -147,17 +147,17 @@ impl StrategyRunner {
     ///
     /// 产出订单是**币本位**且已取整；单位折算是出口的职责，见模块文档。
     ///
-    /// `Err` = 订单跟踪表已说不清挂单与持仓（有单等交易所太久，见 [`crate::messaging::ORDER_STUCK_MS`]），
+    /// `Err` = 订单列表已说不清某张单还挂不挂着（撤单后交易所太久没推终态，见 [`crate::messaging::ORDER_STUCK_MS`]），
     /// 或策略对范围外的 (所, 币) 下单（见 [`Self::admit`]）、撤范围外的币的单，驱动方应停机。同一批里闸门前已登记的单
     /// 随停机作废：停机后不发任何新单（用户定 #710）。
     pub fn on_event(&mut self, event: &IncomeEvent) -> Result<Vec<OutcomeEvent>, String> {
-        self.state.apply(event)?;
+        let notices = self.state.apply(event)?;
         let now = event.local_ts();
         // 单一分发入口：一切事件都走 on_event，
         // 策略自行 match 关心的变体 —— 不存在第二套 typed 回调。
         let raw = self
             .strategy
-            .on_event(event, StrategyView::new(&self.state));
+            .on_event(event, StrategyView::new(&self.state, &notices));
         let mut out = Vec::with_capacity(raw.len());
         for signal in raw {
             match signal {

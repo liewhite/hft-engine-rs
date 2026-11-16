@@ -26,7 +26,7 @@ pub enum Signal {
     /// 撤本策略的一张单（按客户端订单号，不等交易所订单号）。在哪个所由框架从跟踪表查，策略不填，
     /// 也就填不错。
     ///
-    /// 框架只对下单已受理、还开着（收到的成交也没加满单量）、且没有撤单在途的单发出，其余丢弃（见
+    /// 框架只对下单已受理、还开着、且没有撤单在途的单发出，其余丢弃（见
     /// `SymbolOrders::mark_cancel_sent`），策略要在之后的事件里重新要求；撤单失败以
     /// [`crate::messaging::RequestOutcome::CancelFailed`] 回报，记在单的撤单状态上（[`crate::messaging::CancelAttempt::Failed`]）。
     CancelOrder {

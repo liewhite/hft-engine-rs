@@ -5,13 +5,11 @@
 //!
 //! # 每个事件做一件事，按优先级
 //!
-//! 0. **有单已结束、成交还在路上**（框架的订单跟踪表里有不再开着的单，见 `PendingOrder`）：持仓还会变，
-//!    只撤开着的 maker，等成交到齐。
-//! 1. **各所持仓之和不为 0**（价值 ≥ 最小单额，且补腿所下得出这个量）：先撤掉全部挂单，等本币所有单都结算完
-//!    （撤单确认、成交入账）后，在最近一次挂单的所对上市价补齐落后腿：多了就在该对的卖出所卖，少了就在买入所买。
+//! 1. **各所持仓之和不为 0**（价值 ≥ 最小单额，且补腿所下得出这个量）：先撤掉全部挂单，等本币所有单都结束
+//!    （撤单确认）后，在最近一次挂单的所对上市价补齐落后腿：多了就在该对的卖出所卖，少了就在买入所买。
 //!    这正是用户规格「开仓加短腿、平仓砍长腿」：没成交的那条腿就是落后腿，补它即补齐这次操作；
-//!    补过头（撤单期间另一边也成交）时反向补回的也是落后腿。补腿被交易所拒绝时框架回报失败，本策略隔
-//!    `hedge_retry_ms` 重试并记 error；补腿结果不确定（超时、5xx 等）时框架直接停机（#692）。
+//!    补过头（撤单期间另一边也成交）时反向补回的也是落后腿。补腿下单失败（被拒、或结果说不清超时）时，本策略隔
+//!    `hedge_retry_ms` 重试并记 error。
 //! 2. **已对冲**：按各所过去 24h 年化决定开 / 平 / 持有（见 [`super::signal::decide`]），
 //!    在选中的两所各维护一张只做 maker 的挂单（卖出所卖、买入所买；平仓只减仓）；
 //!    挂单价偏离目标超过容差就撤了重挂。开仓前查两所各自的单币 / 账户杠杆，加仓超限不挂。
@@ -30,9 +28,9 @@
 //!
 //! # 成交与订单回报的先后
 //!
-//! 一张单要等交易所说它结束、且它的成交按交易所说的累计量全部入账，才离开框架的跟踪表（#758）。
-//! 所以「挂单没了」时持仓就是最终的：不会在成交还没到时以为两腿已平、在同所再挂一张，也不会多补一份。
-//! 迟迟等不到的（一分钟）框架直接停机。
+//! 框架的订单列表只看订单回报，持仓只看成交（#899 用户定）。HL 的两路推送先后没保证：终态先到时持仓还没反映
+//! 这笔成交，本策略会按旧持仓照常决策 —— 可能在同所再挂一张，或补一笔、成交到了再反向补回。结果仍对冲，
+//! 只是多一笔挂单量（用户已接受），见测试 `hl_terminal_before_fill_hedges_twice_but_stays_hedged`。
 //!
 //! # 零头（如实声明）
 //!
@@ -46,13 +44,13 @@
 use super::config::PairParams;
 use super::signal::{decide, FundingAction, LegPair, SettledFundingWindow};
 use crate::domain::{
-    from_f64, to_f64, Decimal, Exchange, OrderIntent, OrderStatus, OrderType, Price, Quantity,
-    Side, Symbol, SymbolMeta, TimeInForce, Timestamp, BBO,
+    from_f64, to_f64, Decimal, Exchange, OrderIntent, OrderType, Price, Quantity, Side, Symbol,
+    SymbolMeta, TimeInForce, Timestamp, BBO,
 };
 use crate::exchange::SubscriptionKind;
 use crate::messaging::{
-    AccountData, CancelAttempt, IncomeEvent, MarketData, MarketEvent, OrderStage, PendingOrder,
-    RequestOutcome, SymbolAccountData,
+    CancelAttempt, IncomeEvent, MarketData, MarketEvent, OrderNotice, OrderNoticeKind, OrderStage,
+    PendingOrder,
 };
 use crate::observability::Gauge;
 use crate::strategy::{Signal, Strategy, StrategyView, SymbolView};
@@ -108,16 +106,14 @@ pub struct FundingArbStrategy {
 /// 杠杆档位、本地或交易所限频）会按 REST 往返的速度刷单，白耗下单次数。
 /// post-only 会吃单被拒这类偶发拒单只等一个间隔，对资费套利无关紧要，故不按拒单原因区分。
 /// 口径是该所本策略的任何单：市价补腿被拒也会让该所的 maker 退避，补腿成交也会清零；
-/// 但退避只拦新挂 maker，不拦补腿（补腿另有 `hedge_retry_ms` 的重试间隔）。同一张单的拒单可能经下单请求的
-/// 结论与订单回报各到一次，按客户端订单号只算一次。
+/// 但退避只拦新挂 maker，不拦补腿（补腿另有 `hedge_retry_ms` 的重试间隔）。拒单从哪条路来、来几次，
+/// 框架的订单列表都只报一次下单失败（见 [`OrderNotice`]）。
 #[derive(Debug, Clone)]
 struct RejectBackoff {
     /// 这之前不在该所挂新的 maker
     until: Timestamp,
     /// 本次等待时长（下次再拒就翻倍）
     delay_ms: u64,
-    /// 最近一次计入的拒单是哪张单（客户端订单号）
-    client_order_id: String,
 }
 
 /// 拒单退避的上限：持续拒单时每所每币最多 5 分钟试一次
@@ -187,11 +183,6 @@ impl FundingArbStrategy {
     fn step(&mut self, sv: SymbolView<'_>, view: StrategyView<'_>, now: Timestamp) -> Vec<Signal> {
         if self.halted.is_some() {
             return self.maintain(sv, &[], now);
-        }
-        // 有单已结束、成交还在路上：持仓还会变，按现在的持仓开平或补腿都会错。那笔成交一到就是不平衡，
-        // 开着的 maker 本来也要撤，先撤
-        if sv.pending_orders().any(|p| !p.is_open()) {
-            return self.cancel_makers(sv, now);
         }
 
         // 不要求每所都有盘口：某所品种暂停、迟迟没盘口时，其余所的补腿和停机检查照常；
@@ -513,55 +504,30 @@ impl FundingArbStrategy {
         ok
     }
 
-    /// 记下本策略一张单的结局：被拒（交易所拒，或本地下单请求被拒）则加长该所的退避，被接下则清零。
-    /// 同一张单的拒单从两条路各到一次时只算一次。
-    fn note_order_outcome(&mut self, data: &SymbolAccountData, now: Timestamp) {
-        let (ex, client_order_id, rejected) = match data {
-            SymbolAccountData::OrderUpdate(u) => {
-                let rejected = match &u.status {
-                    OrderStatus::Rejected { reason } => Some(reason),
-                    OrderStatus::Pending | OrderStatus::PartiallyFilled | OrderStatus::Filled => {
-                        None
-                    }
-                    OrderStatus::Cancelled => return,
-                };
-                // 不带客户端订单号的不是本引擎的单（引擎的单都带，账户独占），不计
-                let Some(cid) = u.client_order_id.as_deref() else {
-                    return;
-                };
-                (u.exchange, cid, rejected)
-            }
-            SymbolAccountData::OrderRequest(r) => {
-                let rejected = match &r.outcome {
-                    RequestOutcome::PlaceRejected { reason } => Some(reason),
-                    RequestOutcome::Placed { .. } => None,
-                    RequestOutcome::CancelFailed { .. } => return,
-                };
-                (r.exchange, r.client_order_id.as_str(), rejected)
-            }
-            _ => return,
-        };
-        match rejected {
-            Some(reason) => {
-                let previous = self.reject_backoff.get(&ex);
-                if previous.is_some_and(|b| b.client_order_id == client_order_id) {
-                    return; // 这张单的拒单已从另一条路计入
+    /// 按订单列表的结论更新拒单退避：下单失败加长该所的退避，被接下清零（每张单每种结论框架只给一次）
+    fn note_order_notices(&mut self, notices: &[OrderNotice], now: Timestamp) {
+        // 视图只含本实例订阅范围（本币）的单
+        for n in notices {
+            match &n.kind {
+                OrderNoticeKind::PlaceFailed { reason } => {
+                    let delay_ms = self
+                        .reject_backoff
+                        .get(&n.exchange)
+                        .map_or(self.p.reject_backoff_ms, |b| {
+                            (b.delay_ms * 2).min(MAX_REJECT_BACKOFF_MS)
+                        });
+                    tracing::warn!(symbol = %self.symbol(), exchange = %n.exchange, client_order_id = %n.client_order_id, %reason, delay_ms, "下单失败，该所暂停挂新单");
+                    self.reject_backoff.insert(
+                        n.exchange,
+                        RejectBackoff {
+                            until: now + delay_ms,
+                            delay_ms,
+                        },
+                    );
                 }
-                let delay_ms = previous.map_or(self.p.reject_backoff_ms, |b| {
-                    (b.delay_ms * 2).min(MAX_REJECT_BACKOFF_MS)
-                });
-                tracing::warn!(symbol = %self.symbol(), %ex, %client_order_id, %reason, delay_ms, "下单被拒，该所暂停挂新单");
-                self.reject_backoff.insert(
-                    ex,
-                    RejectBackoff {
-                        until: now + delay_ms,
-                        delay_ms,
-                        client_order_id: client_order_id.to_string(),
-                    },
-                );
-            }
-            None => {
-                self.reject_backoff.remove(&ex);
+                OrderNoticeKind::Accepted => {
+                    self.reject_backoff.remove(&n.exchange);
+                }
             }
         }
     }
@@ -660,7 +626,7 @@ impl FundingArbStrategy {
             .collect()
     }
 
-    /// 持仓之和不为 0：撤所有 maker，本币所有单都结算完、且过了重试间隔时市价补齐。
+    /// 持仓之和不为 0：撤所有 maker，本币所有单都结束、且过了重试间隔时市价补齐。
     fn hedge(
         &mut self,
         sv: SymbolView<'_>,
@@ -670,7 +636,7 @@ impl FundingArbStrategy {
         now: Timestamp,
     ) -> Vec<Signal> {
         let out = self.cancel_makers(sv, now);
-        // 等全部单结算完：开着的 maker 还可能成交、在途补腿单还没结果，此时补会补错量
+        // 等全部单结束：开着的 maker 还可能成交、在途补腿单还没结果，此时补会补错量
         if sv.has_pending_orders() {
             return out;
         }
@@ -892,22 +858,16 @@ impl Strategy for FundingArbStrategy {
         let now = event.local_ts();
         self.first_event_at.get_or_insert(now);
         // 分发层只投本币的事件，这里不再判 symbol（P4）
-        match event {
-            IncomeEvent::Market(MarketEvent {
-                data: MarketData::Custom(c),
-                ..
-            }) => {
-                if let Some(w) = c.get::<SettledFundingWindow>() {
-                    self.funding.insert(w.exchange, w.clone());
-                }
+        if let IncomeEvent::Market(MarketEvent {
+            data: MarketData::Custom(c),
+            ..
+        }) = event
+        {
+            if let Some(w) = c.get::<SettledFundingWindow>() {
+                self.funding.insert(w.exchange, w.clone());
             }
-            IncomeEvent::Account(a) => {
-                if let AccountData::Symbol(d) = &a.data {
-                    self.note_order_outcome(d, now);
-                }
-            }
-            _ => {}
         }
+        self.note_order_notices(view.order_notices(), now);
         let Some(sv) = view.symbol(self.symbol()) else {
             return Vec::new();
         };

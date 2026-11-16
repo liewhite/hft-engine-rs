@@ -6,19 +6,24 @@ use crate::messaging::event::{
 };
 use std::collections::HashMap;
 
-/// 一张单「等交易所」超过这么久就停机（见 [`SymbolOrders::check_stuck`]）。
+/// 撤单发出后这么久交易所还没推终态就停机（见 [`SymbolOrders::check_stuck`]）。
 ///
-/// 三种等待：下单请求还没有结论（REST 自带 10s 超时，结论必到）、撤单已发出但交易所没推终态、
-/// 终态到了但成交没到齐。正常都在秒级以内；一分钟还没等到，说明回报丢了或解析错了 —— 跟踪表从此
-/// 说不清这张单和这个币的持仓，继续交易会在旁边重复挂单、按错的持仓补腿，故停机交人工核对。
-/// （此前是 60s 未确认就静默删单、确认迟到再重建 —— 删掉的单若还活着，策略会在旁边再挂一张。）
+/// 正常在秒级以内；一分钟还没等到，说明回报丢了或解析错了 —— 这张单还挂不挂着说不清，继续交易会在旁边
+/// 重复挂单，故停机交人工核对。
 pub const ORDER_STUCK_MS: u64 = 60_000;
 
-/// 本策略发出的一张单在本地的跟踪记录。
+/// 「下单中」这么久既没有下单请求的结论、也没有交易所回报，就按下单失败处理（见
+/// [`SymbolOrders::expire_placing`]），打 error 日志、不停机（#899 用户定）。
 ///
-/// 策略发出时登记，**终态且成交都已入账**才移出：交易所说的累计成交（`reported_filled`）由按客户端
-/// 订单号收到的成交（`filled`）加满。所以表里的单只有两种：还开着的（[`Self::is_open`]，可能再成交），
-/// 和已结束、成交还在路上的 —— 后者在时，该币的持仓还会变。表空了，持仓就是这些单的最终结果。
+/// 下单请求自带 10 秒超时；结果说不清（超时、5xx）时出口不回报结论，单留在「下单中」，这里再多等 5 秒
+/// 交易所回报。之后才到的回报或受理结论会把单接回列表（见 [`SymbolOrders::revive`]），策略照常处理它。
+pub const PLACE_TIMEOUT_MS: u64 = 15_000;
+
+/// 本策略发出、还开着的一张单在本地的记录。
+///
+/// 订单列表只由订单这一侧的消息维护（#899 用户定）：策略发单时登记为「下单中」，下单请求的结论和交易所的
+/// 订单回报推进它，交易所说它结束了（成交完 / 撤销 / 拒单）就移出。成交只进持仓（[`SymbolPositions`]），
+/// 与订单列表无关 —— 所以单移出时，它的成交可能还在路上（HL 的成交和订单回报分两路推）。
 ///
 /// 生命周期是一个状态机（[`OrderStage`]），只能由下面的转换方法推进；字段不对外可写。
 #[derive(Debug, Clone)]
@@ -28,22 +33,18 @@ pub struct PendingOrder {
     pub created_at: Timestamp,
     /// 交易所订单号：下单受理或第一条订单回报到了才有（只用于排查日志）
     exchange_order_id: Option<OrderId>,
-    /// 按客户端订单号收到的成交之和（币）
-    filled: Quantity,
-    /// 交易所回报里的累计成交（币，取见过的最大值）
-    reported_filled: Quantity,
     stage: OrderStage,
 }
 
-/// 一张单走到了哪一步，每一步只带自己的数据。
+/// 一张开着的单走到了哪一步，每一步只带自己的数据。
 ///
-/// 只往前走：下单中 → 挂着 → 撤单中 → 已结束；交易所推来终态时，前三步都直接跳到已结束。
-/// 两路输入（交易所回报、本地 REST 结论）到达顺序没有保证，所以每个转换都写成与顺序无关：
-/// 晚到的旧消息落在已经走过的状态上，什么也不改。
+/// 只往前走：下单中 → 挂着 → 撤单中；交易所推来终态时，从哪一步都直接移出列表。两路输入（交易所回报、
+/// 本地 REST 结论）到达顺序没有保证，所以每个转换都写成与顺序无关：晚到的旧消息落在已经走过的状态上，
+/// 什么也不改。
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderStage {
     /// 下单请求已发出，下单结论和交易所回报都还没到。此时不撤：撤单可能先于下单到交易所、报「单不存在」
-    /// （#769 多挂 2 秒、白耗一次撤单）
+    /// （#769 多挂 2 秒、白耗一次撤单）。超过 [`PLACE_TIMEOUT_MS`] 仍如此就按下单失败处理
     Placing,
     /// 交易所在撮合，没撤过
     Live,
@@ -52,8 +53,6 @@ pub enum OrderStage {
         first_sent_at: Timestamp,
         attempt: CancelAttempt,
     },
-    /// 交易所说结束了（成交完 / 撤销 / 拒单），在等成交到齐
-    Done { status: OrderStatus, at: Timestamp },
 }
 
 /// 最近一次撤单走到哪
@@ -65,14 +64,34 @@ pub enum CancelAttempt {
     Failed { at: Timestamp, reason: String },
 }
 
+/// 订单列表给策略的结论：一张单被交易所接下了，或下单失败了。
+///
+/// 每种结论对每张单至多一次，与它从哪条路来（下单请求的结论、交易所回报、下单超时）无关 —— 同一张单的
+/// 拒单常从两条路各到一次，去重在这里做，策略不用管。随引起它的那条事件交给策略（见
+/// [`crate::strategy::StrategyView::order_notices`]）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderNotice {
+    pub exchange: Exchange,
+    pub symbol: Symbol,
+    pub client_order_id: String,
+    pub kind: OrderNoticeKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderNoticeKind {
+    /// 交易所接下了这张单：下单受理，或第一条回报说它挂着 / 成交了 / 撤了
+    Accepted,
+    /// 下单失败：交易所拒单（下单请求被拒，或回报说拒单 / 过期作废）、请求没发出、本地校验不过，或
+    /// 下单中超过 [`PLACE_TIMEOUT_MS`]
+    PlaceFailed { reason: String },
+}
+
 impl PendingOrder {
     fn new(order: Order, created_at: Timestamp) -> Self {
         Self {
             order,
             created_at,
             exchange_order_id: None,
-            filled: Quantity::ZERO,
-            reported_filled: Quantity::ZERO,
             stage: OrderStage::Placing,
         }
     }
@@ -81,47 +100,19 @@ impl PendingOrder {
         &self.stage
     }
 
-    /// 交易所还在撮合它（没结束）：可能再成交
-    pub fn is_open(&self) -> bool {
-        !matches!(self.stage, OrderStage::Done { .. })
-    }
-
-    /// 成交都已入账：本地收到的成交加起来不少于交易所说的累计量（数量是精确十进制，直接比）
-    fn fills_settled(&self) -> bool {
-        self.filled >= self.reported_filled
-    }
-
-    /// 交易所回报了这张单的状态：终态 → 已结束（已结束的不再改写）；非终态 → 下单中的变成挂着
-    fn on_report(&mut self, status: &OrderStatus, at: Timestamp) {
-        match self.stage {
-            OrderStage::Done { .. } => {}
-            _ if status.is_terminal() => {
-                self.stage = OrderStage::Done {
-                    status: status.clone(),
-                    at,
-                }
-            }
-            OrderStage::Placing => self.stage = OrderStage::Live,
-            OrderStage::Live | OrderStage::Cancelling { .. } => {}
-        }
-    }
-
-    /// 下单请求被受理：下单中 → 挂着；交易所已先说过话的不动
-    fn on_placed(&mut self) {
-        if self.stage == OrderStage::Placing {
+    /// 交易所对这张单说了话（下单受理，或任何一条回报）：下单中 → 挂着。返回它是不是这一下才被接下
+    fn accept(&mut self) -> bool {
+        let first = self.stage == OrderStage::Placing;
+        if first {
             self.stage = OrderStage::Live;
         }
+        first
     }
 
     /// 要撤这张单：`Ok` = 该发撤单，已记为撤单在途；`Err` 带不发的原因。
-    ///
-    /// 收到的成交已加满单量的也不发：交易所那边已经成交完，终态回报还在路上（成交常先于终态到，策略
-    /// 被这笔成交唤醒、要撤挂单时它看着还开着，#796 OKX 51400）。单量是取整后发出的量，与成交同一口径。
     fn request_cancel(&mut self, now: Timestamp) -> Result<(), &'static str> {
         self.stage = match &self.stage {
             OrderStage::Placing => return Err("下单请求还没结论"),
-            OrderStage::Done { .. } => return Err("已到终态"),
-            _ if self.filled >= self.order.quantity => return Err("成交已加满单量，终态在路上"),
             OrderStage::Cancelling {
                 attempt: CancelAttempt::InFlight,
                 ..
@@ -141,14 +132,7 @@ impl PendingOrder {
         Ok(())
     }
 
-    /// 下单请求被拒：返回该不该移出。只有下单中的单确定没挂上；交易所已对它说过话的（拒单结论和交易所回报
-    /// 前后脚到）以交易所为准、留在表里由回报走完，否则策略会在旁边再挂一张（#764 审查）
-    fn on_place_rejected(&self) -> bool {
-        self.stage == OrderStage::Placing
-    }
-
-    /// 撤单请求失败。只会落在撤单中或已结束（撤单只由 [`Self::request_cancel`] 发出，发出即进入撤单中）；
-    /// 已结束（多半是刚成交完）就不用再撤，不记
+    /// 撤单请求失败。只会落在撤单中（撤单只由 [`Self::request_cancel`] 发出，发出即进入撤单中）
     fn on_cancel_failed(&mut self, at: Timestamp, reason: &str) {
         if let OrderStage::Cancelling { attempt, .. } = &mut self.stage {
             *attempt = CancelAttempt::Failed {
@@ -157,21 +141,7 @@ impl PendingOrder {
             };
         }
     }
-
-    /// 在等交易所的什么、从什么时候起；`None` = 没在等（挂着、没撤过）。
-    /// 已结束的单还在表里，就是成交没到齐（到齐即移出）。
-    fn waiting_on_exchange(&self) -> Option<(Timestamp, &'static str)> {
-        match &self.stage {
-            OrderStage::Placing => Some((self.created_at, "下单请求没有结论")),
-            OrderStage::Live => None,
-            OrderStage::Cancelling { first_sent_at, .. } => {
-                Some((*first_sent_at, "撤单发出后交易所没推终态"))
-            }
-            OrderStage::Done { at, .. } => Some((*at, "终态已到、成交没到齐")),
-        }
-    }
 }
-
 /// 单个交易对的**行情**投影：各所最新盘口（其余行情策略在 on_event 里自取，框架不缓存）。
 ///
 /// 三个投影（行情 / 持仓 / 挂单）分开的理由见 `docs/architecture.md` V1：它们的消费者
@@ -196,16 +166,18 @@ pub struct SymbolPositions {
     pub(crate) seeded_at: HashMap<Exchange, Timestamp>,
 }
 
-/// 单个交易对的**挂单**投影：本策略发出、还没结算完的单（见 [`PendingOrder`]）。
+/// 单个交易对的**挂单**投影：本策略发出、还开着的单（见 [`PendingOrder`]）。
 ///
-/// 输入四种：策略发单（[`Self::add`]）、策略撤单（[`Self::mark_cancel_sent`]）、交易所的订单回报与成交、
-/// 本地 REST 请求的结论（[`OrderRequestResult`]）。后两类走不同的路径，到达顺序没有保证，所以每条
-/// 规则都写成与顺序无关的形态（见 [`OrderStage`]）：终态不被改写、下单受理只把「下单中」往前推、成交与累计量谁先到都
-/// 一样算。不在表里的单的回报一律不重建记录。
+/// 输入三种：策略发单（[`Self::add`]）、策略撤单（[`Self::mark_cancel_sent`]）、订单这一侧的消息 —— 交易所的
+/// 订单回报和本地 REST 请求的结论（[`OrderRequestResult`]）。后两类走不同的路径，到达顺序没有保证，所以每条
+/// 规则都写成与顺序无关的形态（见 [`OrderStage`]）。成交不是输入（只进持仓）。不在列表里的单的回报一律不重建记录，
+/// 只有下单超时按失败处理过的单例外（见 [`Self::revive`]）。
 #[derive(Debug, Clone, Default)]
 pub struct SymbolOrders {
     /// client_order_id → 记录
     pub(crate) orders: HashMap<String, PendingOrder>,
+    /// 下单中超时、已按下单失败处理的单（见 [`PLACE_TIMEOUT_MS`]）：之后若收到它的消息，接回列表
+    expired: HashMap<String, PendingOrder>,
 }
 
 /// 单个交易对在所有交易所的聚合状态：三个投影的门面。
@@ -383,7 +355,7 @@ impl SymbolPositions {
 }
 
 impl SymbolOrders {
-    /// 登记策略刚发出的一张单（client_order_id 已分配）
+    /// 登记策略刚发出的一张单（client_order_id 已分配）：下单中
     pub fn add(&mut self, order: Order, created_at: Timestamp) {
         self.orders.insert(
             order.client_order_id.clone(),
@@ -393,105 +365,160 @@ impl SymbolOrders {
 
     /// 策略要撤这张单：记下「撤单在途」，返回 `Ok`（带这张单所在的所）表示该发。
     ///
-    /// 不该发的（`Err` 带原因）：不在表里、已到终态或收到的成交已加满单量（撤不掉，发了白耗一次交易所操作）、
-    /// 下单请求还没结论、上一次撤单还在等结论（见 [`OrderStage`]）。下单没结论时不撤：受理的结论（或交易所回报）一到
-    /// 策略就会被调用、可以再撤，只晚一个往返。
+    /// 不该发的（`Err` 带原因）：不在列表里（已结束）、下单请求还没结论、上一次撤单还在等结论（见
+    /// [`OrderStage`]）。下单没结论时不撤：受理的结论（或交易所回报）一到策略就会被调用、可以再撤，只晚一个往返。
     pub fn mark_cancel_sent(
         &mut self,
         client_order_id: &str,
         now: Timestamp,
     ) -> Result<Exchange, &'static str> {
-        let p = self.orders.get_mut(client_order_id).ok_or("不在跟踪表里")?;
+        let p = self
+            .orders
+            .get_mut(client_order_id)
+            .ok_or("不在订单列表里")?;
         p.request_cancel(now)?;
         Ok(p.order.exchange)
     }
 
-    /// 交易所的订单回报
+    /// 交易所的订单回报：非终态把下单中推成挂着，终态移出（拒单即下单失败）
     fn apply_update(
         &mut self,
         symbol: &Symbol,
         update: &crate::domain::OrderUpdate,
-        local_ts: Timestamp,
-    ) {
-        let Some(client_id) = &update.client_order_id else {
-            return; // 没有订单号：跟踪表对不上它
-        };
-        let Some(p) = self.orders.get_mut(client_id) else {
+    ) -> Option<OrderNotice> {
+        let cid = update.client_order_id.as_deref()?; // 没有订单号：列表对不上它
+        if !update.status.is_terminal() {
+            self.revive(symbol, cid);
+        } else if self.expired.remove(cid).is_some() {
+            // 超时时已按下单失败报过策略；它已结束，不再接回（有成交的照常进持仓）
+            tracing::error!(%symbol, exchange = %update.exchange, %cid, status = ?update.status, "已按下单失败处理的单收到终态回报");
+            return None;
+        }
+        let Some(p) = self.orders.get_mut(cid) else {
             if !update.status.is_terminal() {
                 // 还开着、本地却没有（启动时已撤净遗留挂单，正常不会出现）。不接管：它的成交照常进持仓，
                 // 由策略按普通不平衡处理（见 docs/architecture.md「账户独占」）
-                tracing::warn!(%symbol, exchange = %update.exchange, %client_id, status = ?update.status, "挂单不在跟踪表里，不接管");
+                tracing::warn!(%symbol, exchange = %update.exchange, %cid, status = ?update.status, "挂单不在订单列表里，不接管");
             }
-            return;
+            return None;
         };
-        p.reported_filled = p.reported_filled.max(update.filled_quantity);
         p.exchange_order_id
             .get_or_insert_with(|| update.order_id.clone());
-        p.on_report(&update.status, local_ts);
-        self.settle(symbol, client_id);
-    }
-
-    /// 一笔成交计入它所属的单（持仓另由 [`SymbolPositions::apply_fill`] 累加）
-    fn apply_fill(&mut self, symbol: &Symbol, fill: &crate::domain::Fill) {
-        let Some(client_id) = &fill.client_order_id else {
-            return;
+        let accepted = p.accept();
+        let kind = match &update.status {
+            OrderStatus::Rejected { reason } => Some(OrderNoticeKind::PlaceFailed {
+                reason: reason.clone(),
+            }),
+            OrderStatus::Pending
+            | OrderStatus::PartiallyFilled
+            | OrderStatus::Filled
+            | OrderStatus::Cancelled => accepted.then_some(OrderNoticeKind::Accepted),
         };
-        if let Some(p) = self.orders.get_mut(client_id) {
-            p.filled += fill.size;
-            self.settle(symbol, client_id);
+        if update.status.is_terminal() {
+            let p = self.orders.remove(cid).expect("刚查过");
+            tracing::info!(%symbol, exchange = %p.order.exchange, %cid, status = ?update.status, "订单结束，移出订单列表");
         }
+        kind.map(|kind| notice(symbol, update.exchange, cid, kind))
     }
 
-    /// 本地 REST 请求的结论。单已不在表里（交易所回报先到、已结算完）就不理。
-    fn apply_request(&mut self, symbol: &Symbol, r: &OrderRequestResult, local_ts: Timestamp) {
-        let Some(p) = self.orders.get_mut(&r.client_order_id) else {
-            return;
-        };
+    /// 本地 REST 请求的结论。单已不在列表里（交易所回报先到、已结束）就不理。
+    fn apply_request(
+        &mut self,
+        symbol: &Symbol,
+        r: &OrderRequestResult,
+        local_ts: Timestamp,
+    ) -> Option<OrderNotice> {
+        let cid = r.client_order_id.as_str();
         match &r.outcome {
             RequestOutcome::Placed { order_id } => {
+                self.revive(symbol, cid);
+                let p = self.orders.get_mut(cid)?;
                 p.exchange_order_id.get_or_insert_with(|| order_id.clone());
-                p.on_placed();
+                p.accept()
+                    .then(|| notice(symbol, r.exchange, cid, OrderNoticeKind::Accepted))
             }
             RequestOutcome::PlaceRejected { reason } => {
-                if p.on_place_rejected() {
-                    tracing::info!(%symbol, exchange = %r.exchange, client_order_id = %r.client_order_id, %reason, "下单被拒，移出跟踪表");
-                    self.orders.remove(&r.client_order_id);
-                } else {
-                    tracing::error!(%symbol, exchange = %r.exchange, client_order_id = %r.client_order_id, %reason, stage = ?p.stage,
-                        "下单报被拒，但交易所已回报过这张单：以交易所回报为准，不移出");
+                if self.expired.remove(cid).is_some() {
+                    // 超时时已按下单失败报过策略；现在确认确实没挂上
+                    tracing::info!(%symbol, exchange = %r.exchange, %cid, %reason, "超时的单确认下单被拒");
+                    return None;
                 }
+                let p = self.orders.get(cid)?;
+                if p.stage != OrderStage::Placing {
+                    tracing::error!(%symbol, exchange = %r.exchange, %cid, %reason, stage = ?p.stage,
+                        "下单报被拒，但交易所已回报过这张单：以交易所回报为准，不移出");
+                    return None;
+                }
+                tracing::info!(%symbol, exchange = %r.exchange, %cid, %reason, "下单被拒，移出订单列表");
+                self.orders.remove(cid);
+                Some(notice(
+                    symbol,
+                    r.exchange,
+                    cid,
+                    OrderNoticeKind::PlaceFailed {
+                        reason: reason.clone(),
+                    },
+                ))
             }
-            RequestOutcome::CancelFailed { reason } => p.on_cancel_failed(local_ts, reason),
+            RequestOutcome::CancelFailed { reason } => {
+                if let Some(p) = self.orders.get_mut(cid) {
+                    p.on_cancel_failed(local_ts, reason);
+                }
+                None
+            }
         }
     }
 
-    /// 终态且成交到齐就移出
-    fn settle(&mut self, symbol: &Symbol, client_id: &str) {
-        if self
+    /// 超时按失败处理过的单又有了消息（回报或受理）：接回列表，当它还在下单中，随后的转换照常走
+    fn revive(&mut self, symbol: &Symbol, cid: &str) {
+        if let Some(p) = self.expired.remove(cid) {
+            tracing::error!(%symbol, exchange = %p.order.exchange, %cid, "已按下单失败处理的单又收到了交易所的消息，接回订单列表");
+            self.orders.insert(cid.to_string(), p);
+        }
+    }
+
+    /// 下单中超过 [`PLACE_TIMEOUT_MS`] 的单按下单失败处理：移出列表（记在 `expired`，之后有消息再接回）
+    fn expire_placing(&mut self, symbol: &Symbol, now: Timestamp) -> Vec<OrderNotice> {
+        let stale: Vec<String> = self
             .orders
-            .get(client_id)
-            .is_some_and(|p| !p.is_open() && p.fills_settled())
-        {
-            let p = self.orders.remove(client_id).expect("刚查过");
-            if p.filled > p.reported_filled {
-                // 持仓对账随后会发现漂移并停机；这里先记下是哪张单多收了成交，便于排查（#764 审查）
-                tracing::error!(%symbol, exchange = %p.order.exchange, %client_id, filled = %p.filled, reported_filled = %p.reported_filled,
-                    "本地收到的成交多于交易所说的累计成交量（成交可能被重复计入）");
-            }
-            tracing::info!(%symbol, exchange = %p.order.exchange, %client_id, stage = ?p.stage, filled = %p.filled, "订单结算完，移出跟踪表");
-        }
+            .iter()
+            .filter(|(_, p)| {
+                p.stage == OrderStage::Placing
+                    && now.saturating_sub(p.created_at) > PLACE_TIMEOUT_MS
+            })
+            .map(|(cid, _)| cid.clone())
+            .collect();
+        stale
+            .into_iter()
+            .map(|cid| {
+                let p = self.orders.remove(&cid).expect("刚查过");
+                let reason = format!(
+                    "下单 {}ms 没有结论也没有交易所回报，按下单失败处理",
+                    now.saturating_sub(p.created_at)
+                );
+                tracing::error!(%symbol, exchange = %p.order.exchange, %cid, order = ?p.order, %reason);
+                let exchange = p.order.exchange;
+                self.expired.insert(cid.clone(), p);
+                notice(
+                    symbol,
+                    exchange,
+                    &cid,
+                    OrderNoticeKind::PlaceFailed { reason },
+                )
+            })
+            .collect()
     }
 
-    /// 有单「等交易所」超过 [`ORDER_STUCK_MS`] 就报错（调用方停机）
+    /// 有单撤单发出后超过 [`ORDER_STUCK_MS`] 交易所还没推终态就报错（调用方停机）
     fn check_stuck(&self, symbol: &Symbol, now: Timestamp) -> Result<(), String> {
-        for (client_id, p) in &self.orders {
-            if let Some((since, what)) = p.waiting_on_exchange() {
-                let waited = now.saturating_sub(since);
+        for (cid, p) in &self.orders {
+            if let OrderStage::Cancelling { first_sent_at, .. } = &p.stage {
+                let waited = now.saturating_sub(*first_sent_at);
                 if waited > ORDER_STUCK_MS {
                     return Err(format!(
-                        "{symbol} {} 订单 {client_id}（交易所号 {:?}）{what}已 {waited}ms：{:?}，收到成交 {}，交易所说累计 {}。\
-                         跟踪表说不清这张单和持仓，停机交人工核对挂单与持仓",
-                        p.order.exchange, p.exchange_order_id, p.stage, p.filled, p.reported_filled
+                        "{symbol} {} 订单 {cid}（交易所号 {:?}）撤单发出后交易所 {waited}ms 没推终态：{:?}。\
+                         说不清这张单还挂不挂着，停机交人工核对挂单与持仓",
+                        p.order.exchange, p.exchange_order_id, p.stage
                     ));
                 }
             }
@@ -499,14 +526,23 @@ impl SymbolOrders {
         Ok(())
     }
 
-    /// 是否还有没结算完的单（开着的，或终态了、成交还在路上的）
+    /// 是否还有开着的单
     pub fn has_pending(&self) -> bool {
         !self.orders.is_empty()
     }
 
-    /// 全部没结算完的单
+    /// 全部开着的单
     pub fn iter(&self) -> impl Iterator<Item = &PendingOrder> {
         self.orders.values()
+    }
+}
+
+fn notice(symbol: &Symbol, exchange: Exchange, cid: &str, kind: OrderNoticeKind) -> OrderNotice {
+    OrderNotice {
+        exchange,
+        symbol: symbol.clone(),
+        client_order_id: cid.to_string(),
+        kind,
     }
 }
 
@@ -532,10 +568,15 @@ impl SymbolState {
         self.market.apply(data, local_ts);
     }
 
-    /// 币级账户事件的状态转移（挂单跟踪 + 持仓累加）。调用方已按 symbol 路由。
+    /// 币级账户事件的状态转移：订单回报与下单/撤单请求的结论只进订单列表，成交只进持仓。
+    /// 返回订单列表因此得出的结论（见 [`OrderNotice`]）。调用方已按 symbol 路由。
     ///
     /// 只收 [`SymbolAccountData`]：所级账户事件在类型上就到不了这里。
-    pub fn apply_account(&mut self, data: &SymbolAccountData, local_ts: Timestamp) {
+    pub fn apply_account(
+        &mut self,
+        data: &SymbolAccountData,
+        local_ts: Timestamp,
+    ) -> Option<OrderNotice> {
         debug_assert_eq!(
             data.symbol(),
             &self.symbol,
@@ -552,18 +593,19 @@ impl SymbolState {
                     filled_quantity = %update.filled_quantity,
                     "Updating order status"
                 );
-                self.order_book.apply_update(&self.symbol, update, local_ts);
+                self.order_book.apply_update(&self.symbol, update)
             }
             SymbolAccountData::OrderRequest(r) => {
-                self.order_book.apply_request(&self.symbol, r, local_ts);
+                self.order_book.apply_request(&self.symbol, r, local_ts)
             }
             SymbolAccountData::Fill(fill) => {
                 // 不相交字段借用：symbol 与 position_book 是两个字段，无需为每条 Fill 克隆
                 self.position_book.apply_fill(&self.symbol, fill, local_ts);
-                self.order_book.apply_fill(&self.symbol, fill);
+                None
             }
             SymbolAccountData::FundingFee(_) => {
                 // 资费事件不修改本地 symbol 状态，下游策略自行去重与统计
+                None
             }
         }
     }
@@ -606,9 +648,11 @@ impl SymbolState {
         self.order_book.mark_cancel_sent(client_order_id, now)
     }
 
-    /// 见 [`SymbolOrders::check_stuck`]
-    pub fn check_stuck_orders(&self, now: Timestamp) -> Result<(), String> {
-        self.order_book.check_stuck(&self.symbol, now)
+    /// 时钟拍：撤单卡太久报错（调用方停机，见 [`SymbolOrders::check_stuck`]）；下单中超时的单按下单失败处理
+    /// （见 [`SymbolOrders::expire_placing`]）
+    pub fn on_clock(&mut self, now: Timestamp) -> Result<Vec<OrderNotice>, String> {
+        self.order_book.check_stuck(&self.symbol, now)?;
+        Ok(self.order_book.expire_placing(&self.symbol, now))
     }
 }
 
@@ -723,7 +767,7 @@ mod tests {
         );
     }
 
-    // ===== 订单跟踪：结算完才移出、与到达顺序无关、不重建 =====
+    // ===== 订单列表：只由订单回报与请求结论维护、与到达顺序无关、结论每张单只给一次 =====
 
     const CID: &str = "cid-1";
 
@@ -785,6 +829,24 @@ mod tests {
         )
     }
 
+    fn placed(ts: u64) -> Ev {
+        request(
+            RequestOutcome::Placed {
+                order_id: "ex-1".into(),
+            },
+            ts,
+        )
+    }
+
+    fn rejected(ts: u64) -> Ev {
+        request(
+            RequestOutcome::PlaceRejected {
+                reason: "margin".into(),
+            },
+            ts,
+        )
+    }
+
     fn the_order(state: &SymbolState) -> Option<&PendingOrder> {
         state
             .order_book()
@@ -792,114 +854,215 @@ mod tests {
             .find(|p| p.order.client_order_id == CID)
     }
 
-    /// **#758 的漏洞**：HL 的终态回报先于成交到达时，单必须留在表里（不再开着），直到成交加满。
-    /// 此前终态一到就移出：策略看到「没挂单、持仓还平」，在同所再挂一张。
-    #[test]
-    fn terminal_before_fills_stays_until_fills_add_up() {
-        let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1));
-        let p = the_order(&state).expect("成交没到齐，还在表里");
-        assert!(!p.is_open());
+    /// 喂一条账户事件，返回它让订单列表得出的结论种类
+    fn feed(state: &mut SymbolState, (data, ts): &Ev) -> Option<OrderNoticeKind> {
+        state.apply_account(data, *ts).map(|n| {
+            assert_eq!(
+                (n.exchange, n.symbol.as_str(), n.client_order_id.as_str()),
+                (EX, SYMBOL, CID)
+            );
+            n.kind
+        })
+    }
 
-        apply(&mut state, &own_fill(dec!(0.4), 2));
-        assert!(the_order(&state).is_some(), "只到了 0.4");
-        apply(&mut state, &own_fill(dec!(0.6), 3));
-        assert!(!state.order_book().has_pending(), "成交加满即移出");
+    fn failed(reason: &str) -> Option<OrderNoticeKind> {
+        Some(OrderNoticeKind::PlaceFailed {
+            reason: reason.into(),
+        })
+    }
+
+    /// **#899**：成交只进持仓，订单列表不等成交。终态先于成交到达（HL 两路推送）时单照样立刻移出
+    #[test]
+    fn terminal_report_removes_the_order_without_waiting_for_fills() {
+        let mut state = with_order();
+        assert_eq!(
+            feed(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1)),
+            Some(OrderNoticeKind::Accepted),
+            "第一条回报即被接下"
+        );
+        assert!(!state.order_book().has_pending(), "终态即移出");
+        assert_eq!(state.position_book().position_size(EX), dec!(0.0));
+        assert_eq!(feed(&mut state, &own_fill(dec!(1.0), 2)), None);
         assert_eq!(state.position_book().position_size(EX), dec!(1.0));
     }
 
-    /// 反过来：成交先到、终态后到，终态一到即移出；没有成交的撤单也是终态即移出
+    /// 成交不推进订单：成交加满了单量，终态没到，单还开着、照常可撤（撤单失败由策略重撤）
     #[test]
-    fn fills_first_or_no_fills_settle_on_terminal() {
+    fn fills_do_not_touch_the_order_list() {
         let mut state = with_order();
-        apply(&mut state, &own_fill(dec!(1.0), 1));
-        assert!(
-            the_order(&state).is_some_and(|p| p.is_open()),
-            "没终态前还开着"
-        );
-        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 2));
-        assert!(!state.order_book().has_pending());
-
-        let mut state = with_order();
-        apply(
-            &mut state,
-            &update(CID, OrderStatus::Cancelled, dec!(0.0), 1),
-        );
-        assert!(!state.order_book().has_pending());
+        feed(&mut state, &placed(1));
+        feed(&mut state, &own_fill(dec!(1.0), 2));
+        assert_eq!(the_order(&state).unwrap().stage(), &OrderStage::Live);
+        assert!(state.mark_cancel_sent(CID, 3).is_ok());
     }
 
-    /// 部分成交后撤单：累计量以交易所说的为准，不是订单总量；部分成交回报里的累计量也算
+    /// 下单受理：回填订单号、下单中 → 挂着、报「被接下」；之后的回报不再报
     #[test]
-    fn partial_fill_then_cancel_waits_for_the_reported_amount() {
+    fn accepted_is_noticed_once() {
         let mut state = with_order();
-        apply(
-            &mut state,
-            &update(CID, OrderStatus::PartiallyFilled, dec!(0.3), 1),
-        );
-        apply(
-            &mut state,
-            &update(CID, OrderStatus::Cancelled, dec!(0.0), 2),
-        ); // 有的所撤单回报不带累计，取见过的最大
-        assert!(the_order(&state).is_some(), "0.3 的成交还没到");
-        apply(&mut state, &own_fill(dec!(0.3), 3));
-        assert!(!state.order_book().has_pending());
-    }
-
-    /// 终态不被改写：下单受理的本地结论晚于交易所的终态到达，不能把它拉回「挂着」
-    #[test]
-    fn placed_after_terminal_does_not_reopen() {
-        let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1));
-        apply(
-            &mut state,
-            &request(
-                RequestOutcome::Placed {
-                    order_id: "ex-1".into(),
-                },
-                2,
-            ),
-        );
-        assert!(the_order(&state).is_some_and(|p| !p.is_open()));
-    }
-
-    /// 下单受理：回填订单号、下单中 → 挂着；被拒：移出；撤单失败：记在单上、单还开着
-    #[test]
-    fn request_results_drive_the_record() {
-        let mut state = with_order();
-        apply(
-            &mut state,
-            &request(
-                RequestOutcome::Placed {
-                    order_id: "77".into(),
-                },
-                1,
-            ),
+        assert_eq!(
+            feed(&mut state, &placed(1)),
+            Some(OrderNoticeKind::Accepted)
         );
         let p = the_order(&state).unwrap();
         assert_eq!(
             (p.stage(), p.exchange_order_id.as_deref()),
-            (&OrderStage::Live, Some("77"))
+            (&OrderStage::Live, Some("ex-1"))
         );
+        assert_eq!(
+            feed(&mut state, &update(CID, OrderStatus::Pending, dec!(0), 2)),
+            None
+        );
+        assert_eq!(
+            feed(
+                &mut state,
+                &update(CID, OrderStatus::PartiallyFilled, dec!(0.3), 3)
+            ),
+            None
+        );
+        assert_eq!(
+            feed(
+                &mut state,
+                &update(CID, OrderStatus::Cancelled, dec!(0.3), 4)
+            ),
+            None
+        );
+        assert!(!state.order_book().has_pending());
+    }
 
+    /// 同一张单的拒单从两条路各到一次（下单请求被拒 + 交易所回报拒单，先后都可能），下单失败只报一次
+    #[test]
+    fn a_rejection_arriving_twice_is_noticed_once() {
+        // 请求结论先到
+        let mut state = with_order();
+        assert_eq!(feed(&mut state, &rejected(1)), failed("margin"));
+        assert!(!state.order_book().has_pending());
+        let rejected_update = update(
+            CID,
+            OrderStatus::Rejected {
+                reason: "ws".into(),
+            },
+            dec!(0),
+            2,
+        );
+        assert_eq!(feed(&mut state, &rejected_update), None);
+
+        // 交易所回报先到：以交易所为准，迟到的请求结论不理
+        let mut state = with_order();
+        assert_eq!(feed(&mut state, &rejected_update), failed("ws"));
+        assert_eq!(feed(&mut state, &rejected(3)), None);
+    }
+
+    /// 拒单结论晚于交易所的非终态回报到：以交易所为准，单不移出、不报失败（否则策略会在旁边再挂一张）
+    #[test]
+    fn rejection_after_exchange_update_keeps_the_order() {
+        let mut state = with_order();
+        feed(&mut state, &update(CID, OrderStatus::Pending, dec!(0.0), 1));
+        assert_eq!(feed(&mut state, &rejected(2)), None);
+        assert_eq!(the_order(&state).unwrap().stage(), &OrderStage::Live);
+    }
+
+    /// 挂上以后才被作废（币安 post-only 受理后 EXPIRED）：先报被接下、再报下单失败，各一次
+    #[test]
+    fn rejection_after_acceptance_is_a_place_failure() {
+        let mut state = with_order();
+        assert_eq!(
+            feed(&mut state, &placed(1)),
+            Some(OrderNoticeKind::Accepted)
+        );
+        let expired = update(
+            CID,
+            OrderStatus::Rejected {
+                reason: "EXPIRED".into(),
+            },
+            dec!(0),
+            2,
+        );
+        assert_eq!(feed(&mut state, &expired), failed("EXPIRED"));
+        assert!(!state.order_book().has_pending());
+    }
+
+    /// **#899 用户定**：下单中超过 [`PLACE_TIMEOUT_MS`] 没有任何消息 → 按下单失败处理（报一次、不报错停机）；
+    /// 之后收到它的非终态回报就接回列表（策略照常撤），终态回报不接回、不再报
+    #[test]
+    fn placing_too_long_is_a_place_failure_and_late_reports_revive_it() {
+        let mut state = with_order();
+        assert_eq!(state.on_clock(PLACE_TIMEOUT_MS), Ok(vec![]));
+        let notices = state.on_clock(PLACE_TIMEOUT_MS + 1).expect("超时不停机");
+        assert!(
+            matches!(
+                notices.as_slice(),
+                [OrderNotice {
+                    kind: OrderNoticeKind::PlaceFailed { .. },
+                    ..
+                }]
+            ),
+            "{notices:?}"
+        );
+        assert!(!state.order_book().has_pending());
+        assert_eq!(state.on_clock(PLACE_TIMEOUT_MS + 2), Ok(vec![]), "只报一次");
+
+        // 迟到的受理：接回列表、挂着，报被接下（策略据此清退避、按需撤单）
+        let mut revived = state.clone();
+        assert_eq!(
+            feed(&mut revived, &placed(20_000)),
+            Some(OrderNoticeKind::Accepted)
+        );
+        assert_eq!(the_order(&revived).unwrap().stage(), &OrderStage::Live);
+        assert!(revived.mark_cancel_sent(CID, 20_001).is_ok());
+
+        // 迟到的非终态回报同样接回
+        let mut revived = state.clone();
+        feed(
+            &mut revived,
+            &update(CID, OrderStatus::Pending, dec!(0), 20_000),
+        );
+        assert!(the_order(&revived).is_some());
+
+        // 迟到的终态回报 / 拒单结论：不接回、不再报
+        let mut ended = state.clone();
+        assert_eq!(
+            feed(
+                &mut ended,
+                &update(CID, OrderStatus::Filled, dec!(1.0), 20_000)
+            ),
+            None
+        );
+        assert!(!ended.order_book().has_pending());
+        let mut ended = state;
+        assert_eq!(feed(&mut ended, &rejected(20_000)), None);
+        assert_eq!(
+            feed(&mut ended, &placed(20_001)),
+            None,
+            "确认被拒后不再接回"
+        );
+    }
+
+    /// 撤单失败：记在单上、单还开着，可以再撤
+    #[test]
+    fn cancel_failure_is_recorded_on_the_order() {
+        let mut state = with_order();
+        feed(&mut state, &placed(1));
         state.mark_cancel_sent(CID, 2).unwrap();
         assert_eq!(
             state.mark_cancel_sent(CID, 3),
             Err("上一次撤单还在等结论"),
             "撤单在途不重发"
         );
-        apply(
-            &mut state,
-            &request(
-                RequestOutcome::CancelFailed {
-                    reason: "busy".into(),
-                },
-                4,
-            ),
-        );
-        let p = the_order(&state).unwrap();
-        assert!(p.is_open());
         assert_eq!(
-            p.stage(),
+            feed(
+                &mut state,
+                &request(
+                    RequestOutcome::CancelFailed {
+                        reason: "busy".into(),
+                    },
+                    4,
+                )
+            ),
+            None
+        );
+        assert_eq!(
+            the_order(&state).unwrap().stage(),
             &OrderStage::Cancelling {
                 first_sent_at: 2,
                 attempt: CancelAttempt::Failed {
@@ -909,97 +1072,19 @@ mod tests {
             }
         );
         assert!(state.mark_cancel_sent(CID, 5).is_ok(), "失败后可以再撤");
-
-        let mut state = with_order();
-        apply(
-            &mut state,
-            &request(
-                RequestOutcome::PlaceRejected {
-                    reason: "margin".into(),
-                },
-                1,
-            ),
-        );
-        assert!(!state.order_book().has_pending());
     }
 
-    /// 拒单结论晚于交易所回报到：以交易所为准，单不移出（否则策略会在旁边再挂一张）
+    /// 下单没结论的单不发撤单（撤单会先于下单到交易所）；不在列表里的也不发
     #[test]
-    fn rejection_after_exchange_update_keeps_the_order() {
+    fn no_cancel_for_placing_or_unknown_orders() {
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Pending, dec!(0.0), 1));
-        apply(
-            &mut state,
-            &request(
-                RequestOutcome::PlaceRejected {
-                    reason: "margin".into(),
-                },
-                2,
-            ),
-        );
-        assert!(the_order(&state).is_some_and(|p| p.is_open()));
-    }
-
-    /// 下单没结论、已到终态的单不发撤单（撤不掉，还白耗一次撤单）；不在表里的也不发
-    #[test]
-    fn no_cancel_for_finished_or_unknown_orders() {
-        let mut state = with_order();
-        assert_eq!(
-            state.mark_cancel_sent(CID, 1),
-            Err("下单请求还没结论"),
-            "撤单会先于下单到交易所"
-        );
+        assert_eq!(state.mark_cancel_sent(CID, 1), Err("下单请求还没结论"));
         assert_eq!(
             the_order(&state).unwrap().stage(),
             &OrderStage::Placing,
             "没记成已撤，受理后还能撤"
         );
-
-        apply(&mut state, &update(CID, OrderStatus::Filled, dec!(1.0), 1));
-        assert_eq!(state.mark_cancel_sent(CID, 2), Err("已到终态"));
-        assert_eq!(state.mark_cancel_sent("other", 2), Err("不在跟踪表里"));
-    }
-
-    /// #796：成交先到、加满了单量，终态还没到：单看着还开着，但不发撤单；只成交了一部分的照常撤
-    #[test]
-    fn no_cancel_once_fills_add_up_to_the_order() {
-        let mut state = with_order();
-        apply(
-            &mut state,
-            &request(
-                RequestOutcome::Placed {
-                    order_id: "1".into(),
-                },
-                1,
-            ),
-        );
-        apply(&mut state, &own_fill(dec!(0.4), 2));
-        assert!(state.mark_cancel_sent(CID, 3).is_ok(), "部分成交照常撤");
-
-        let mut state = with_order();
-        apply(
-            &mut state,
-            &request(
-                RequestOutcome::Placed {
-                    order_id: "1".into(),
-                },
-                1,
-            ),
-        );
-        apply(&mut state, &own_fill(dec!(1.0), 2));
-        assert!(
-            the_order(&state).is_some_and(|p| p.is_open()),
-            "终态没到，还开着"
-        );
-        assert_eq!(
-            state.mark_cancel_sent(CID, 3),
-            Err("成交已加满单量，终态在路上")
-        );
-        assert_eq!(
-            the_order(&state).unwrap().stage(),
-            &OrderStage::Live,
-            "没记成撤单在途"
-        );
+        assert_eq!(state.mark_cancel_sent("other", 2), Err("不在订单列表里"));
     }
 
     /// 状态机的每条转换：从每个状态出发，喂每种输入，看落到哪个状态、撤单该不该发。
@@ -1007,7 +1092,7 @@ mod tests {
     #[test]
     fn every_stage_transition() {
         use CancelAttempt::{Failed, InFlight};
-        use OrderStage::{Cancelling, Done, Live, Placing};
+        use OrderStage::{Cancelling, Live, Placing};
         let failed = || Failed {
             at: 7,
             reason: "x".into(),
@@ -1017,11 +1102,6 @@ mod tests {
             p.stage = stage;
             p
         };
-        let done = || Done {
-            status: OrderStatus::Filled,
-            at: 1,
-        };
-        // 每个状态的代表
         let all = || {
             vec![
                 Placing,
@@ -1034,50 +1114,17 @@ mod tests {
                     first_sent_at: 3,
                     attempt: failed(),
                 },
-                done(),
             ]
         };
 
-        // 交易所推非终态：下单中 → 挂着，其余不动
-        for (from, to) in all().into_iter().zip([
-            Live,
-            Live,
-            Cancelling {
-                first_sent_at: 3,
-                attempt: InFlight,
-            },
-            Cancelling {
-                first_sent_at: 3,
-                attempt: failed(),
-            },
-            done(),
-        ]) {
-            let mut p = at(from.clone());
-            p.on_report(&OrderStatus::PartiallyFilled, 9);
-            assert_eq!(p.stage, to, "非终态回报 from {from:?}");
-        }
-        // 交易所推终态：未结束的都到已结束（记下时刻），已结束的不改写
+        // 交易所说了话：只把下单中推成挂着，且只在这一下报「刚被接下」
         for from in all() {
             let mut p = at(from.clone());
-            p.on_report(&OrderStatus::Cancelled, 9);
-            let want = if from == done() {
-                done()
-            } else {
-                Done {
-                    status: OrderStatus::Cancelled,
-                    at: 9,
-                }
-            };
-            assert_eq!(p.stage, want, "终态回报 from {from:?}");
-        }
-        // 下单受理：只推下单中
-        for from in all() {
-            let mut p = at(from.clone());
-            p.on_placed();
+            assert_eq!(p.accept(), from == Placing, "accept from {from:?}");
             assert_eq!(
                 p.stage,
                 if from == Placing { Live } else { from.clone() },
-                "受理 from {from:?}"
+                "accept from {from:?}"
             );
         }
         // 撤单失败：只改撤单中的这次尝试，第一次撤的时刻不变
@@ -1093,14 +1140,6 @@ mod tests {
                 from.clone()
             };
             assert_eq!(p.stage, want, "撤单失败 from {from:?}");
-        }
-        // 下单被拒：只有下单中的移出，交易所已说过话的以交易所为准
-        for from in all() {
-            assert_eq!(
-                at(from.clone()).on_place_rejected(),
-                from == Placing,
-                "拒单 from {from:?}"
-            );
         }
         // 要撤：只有挂着、上次撤单失败的能发；重撤保留第一次撤的时刻
         let cases: Vec<(OrderStage, Result<OrderStage, &str>)> = vec![
@@ -1129,7 +1168,6 @@ mod tests {
                     attempt: InFlight,
                 }),
             ),
-            (done(), Err("已到终态")),
         ];
         for (from, want) in cases {
             let mut p = at(from.clone());
@@ -1146,7 +1184,7 @@ mod tests {
         }
     }
 
-    /// 不在表里的单的回报不重建记录
+    /// 不在列表里的单的回报不重建记录
     #[test]
     fn updates_of_untracked_orders_never_create_records() {
         let mut state = SymbolState::new(SYMBOL.to_string());
@@ -1160,49 +1198,32 @@ mod tests {
         assert!(!state.order_book().has_pending());
     }
 
-    /// 三种「等交易所」超过 [`ORDER_STUCK_MS`] 都报错；挂着不动不算；撤过的单从第一次撤起算，中间撤单失败、重撤不重新计时
+    /// 撤单发出后交易所超过 [`ORDER_STUCK_MS`] 没推终态就报错；挂着不动不算；从第一次撤起算，中间撤单失败、
+    /// 重撤不重新计时
     #[test]
-    fn waiting_on_the_exchange_too_long_is_an_error() {
+    fn cancel_unanswered_too_long_is_an_error() {
         let late = ORDER_STUCK_MS + 1;
-        // 下单请求没有结论
-        let state = with_order();
-        assert!(state.check_stuck_orders(ORDER_STUCK_MS).is_ok());
-        assert!(state.check_stuck_orders(late).is_err());
-
         // 挂着：多久都不算
         let mut state = with_order();
-        apply(&mut state, &update(CID, OrderStatus::Pending, dec!(0.0), 1));
-        assert!(state.check_stuck_orders(10 * late).is_ok());
+        feed(&mut state, &update(CID, OrderStatus::Pending, dec!(0.0), 1));
+        assert!(state.on_clock(10 * late).is_ok());
 
-        // 撤单发出后交易所没推终态
         state.mark_cancel_sent(CID, 100).unwrap();
-        assert!(state.check_stuck_orders(100 + ORDER_STUCK_MS).is_ok());
-        assert!(state.check_stuck_orders(100 + late).is_err());
+        assert!(state.on_clock(100 + ORDER_STUCK_MS).is_ok());
+        assert!(state.on_clock(100 + late).is_err());
         // 撤单一直失败、反复重撤：仍从第一次撤起算（此前撤单失败后不算在等，该币会一直卡在只撤不挂）
-        apply(
+        feed(
             &mut state,
             &request(RequestOutcome::CancelFailed { reason: "x".into() }, 200),
         );
-        assert!(state.check_stuck_orders(100 + late).is_err());
+        assert!(state.on_clock(100 + late).is_err());
         state.mark_cancel_sent(CID, 50_000).unwrap();
-        apply(
+        feed(
             &mut state,
             &request(RequestOutcome::CancelFailed { reason: "x".into() }, 50_100),
         );
-        assert!(state.check_stuck_orders(100 + ORDER_STUCK_MS).is_ok());
-        assert!(
-            state.check_stuck_orders(100 + late).is_err(),
-            "重撤不重新计时"
-        );
-
-        // 终态到了、成交没到齐
-        let mut state = with_order();
-        apply(
-            &mut state,
-            &update(CID, OrderStatus::Filled, dec!(1.0), 1_000),
-        );
-        assert!(state.check_stuck_orders(1_000 + ORDER_STUCK_MS).is_ok());
-        assert!(state.check_stuck_orders(1_000 + late).is_err());
+        assert!(state.on_clock(100 + ORDER_STUCK_MS).is_ok());
+        assert!(state.on_clock(100 + late).is_err(), "重撤不重新计时");
     }
 
     /// 没有基线时，第一条 Fill 从 0 起算（策略启动初期确实空仓）

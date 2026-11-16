@@ -205,7 +205,8 @@ pub trait AccountClient: Send + Sync + 'static {
     ///
     /// 失败时必须如实分成「被拒绝」与「结果不确定」两种，见 [`PlaceError`]：只有交易所
     /// 明确拒单或请求根本没发出才算被拒绝，其余（超时、5xx、断线、回复解析不了……）都是
-    /// 结果不确定。拿不准的一律报不确定 —— 报错了的代价是停机，报成拒绝的代价是重复下单。
+    /// 结果不确定。拿不准的一律报不确定 —— 报不确定的单留在「下单中」等交易所回报（超时才按失败处理，
+    /// 见 `messaging::PLACE_TIMEOUT_MS`），报成拒绝则策略会立刻重挂、可能重复下单。
     async fn place_order(&self, order: ExchangeOrder) -> Result<OrderId, PlaceError>;
 
     /// 按**客户端订单号**撤单（本引擎下单时分配的 `client_order_id`）：下单请求还没结论、

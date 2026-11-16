@@ -8,10 +8,8 @@ use crate::domain::types::{OrderId, Quantity};
 /// - `order_id`：日志与人工排查（撤单按 `client_order_id`，见 `AccountClient::cancel_order`）；
 /// - `status`：生命周期；
 /// - `side` 与 `quantity`：策略比对是否该撤单重挂；
-/// - `filled_quantity`：**交易所说的累计成交量**。本地跟踪表按客户端订单号把收到的成交（[`crate::domain::Fill`]）
-///   加起来，加满这个数才认为这张单「结算完」、从表里移出（见 `messaging::state::PendingOrder`）。
-///   成交与订单回报在有的所走两个频道（HL 的 userFills / orderUpdates），终态回报可能先于成交到达；
-///   没有这个数，就分不清「单结束了、成交都入账了」和「单结束了、成交还在路上」。
+/// - `filled_quantity`：**交易所说的累计成交量**（只用于日志排查）。订单列表不看成交、持仓不看订单回报（#899）：
+///   成交与订单回报在有的所走两个频道（HL 的 userFills / orderUpdates），终态回报可能先于成交到达。
 ///
 /// 成交明细（价格、手续费）走 [`crate::domain::Fill`]，不在这里捎带。
 #[derive(Debug, Clone)]

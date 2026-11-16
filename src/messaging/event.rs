@@ -282,10 +282,11 @@ pub enum SymbolAccountData {
 }
 
 /// 本地一次下单 / 撤单请求的结论。和 [`OrderUpdate`] 分开：那是交易所说的订单状态，这是我们自己
-/// 的 REST 调用得出的结论，两者到达顺序没有保证，本地跟踪表各按各的规则处理（见
+/// 的 REST 调用得出的结论，两者到达顺序没有保证，本地订单列表各按各的规则处理（见
 /// `messaging::state::SymbolOrders`）。
 ///
-/// 下单结果不确定（超时、5xx）时没有这个事件：实盘出口直接停机（见 `OrderGateway::place`）。
+/// 下单结果不确定（超时、5xx）时没有这个事件：单留在「下单中」等交易所回报，超时由订单列表按下单失败处理
+/// （见 `messaging::PLACE_TIMEOUT_MS`）。
 /// 撤单成功也没有：交易所随后会推 `Cancelled`（或在撤单生效前成交）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderRequestResult {
@@ -297,7 +298,7 @@ pub struct OrderRequestResult {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestOutcome {
-    /// 下单 REST 返回成功：交易所已受理（订单号回填进跟踪表）
+    /// 下单 REST 返回成功：交易所已受理（订单号回填进订单列表）
     Placed { order_id: crate::domain::OrderId },
     /// 下单确定没挂上：交易所明确拒单、请求没发出、或出口本地校验不过
     PlaceRejected { reason: String },

@@ -1034,7 +1034,7 @@ mod tests {
         assert_eq!(s.ledger.positions[&sym()].size, dec!(1.2));
     }
 
-    /// **部分成交后撤单**：终态 Cancelled 带原始委托量与撤单前的累计成交（策略的跟踪表据此等成交到齐）
+    /// **部分成交后撤单**：终态 Cancelled 带原始委托量与撤单前的累计成交
     #[test]
     fn cancel_after_partial_fill_reports_original_quantity() {
         let mut s = empty();

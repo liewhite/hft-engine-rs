@@ -345,27 +345,17 @@ impl Manager {
         //    都调它），新增账户类型时它编译失败。
         //
         //    OrderGateway 是**唯一**的实盘下单出口，只交给出向处理器（OutcomeProcessor）：
-        //    in_flight 判据、请求结论回报对一切下单一致，系统不存在第二个下单出口。
+        //    请求结论回报对一切下单一致，系统不存在第二个下单出口。
         let order_gateway = Arc::new(OrderGateway::new(
             accounts.clone(),
             account_bus.clone(),
             // 出向单位折算在此完成（见 ExchangeOrder）；策略与回测全程币本位
             symbol_metas.clone(),
-            // 下单结果不确定时停机：经本节点上报错误，整棵树受控停机
-            scope.fail_handle(),
             // 整机一开始停机（任何原因）就不再发新单：此时消费者组还在排空信号，
             // 发出去的单在进程退出后无人看管（#710）
             scope.machine_stop_flag(),
         ));
-        //    出向处理器还订交易所回报（只订 OrderUpdate），用来作废迟到的 REST 失败结论
-        //    （见 OrderGateway::in_flight）
-        OutcomeProcessor::spawn(
-            &consumers,
-            order_gateway.clone(),
-            &outcome_bus,
-            &account_bus,
-        )
-        .await?;
+        OutcomeProcessor::spawn(&consumers, order_gateway.clone(), &outcome_bus).await?;
 
         //    本地柜台（配了才起）：订阅信号总线（认领 Paper 账户的订单）与行情总线（撮合 +
         //    Clock 发净值），回报以 Paper 标签发布到账户总线 —— 与实盘适配层同一条总线、同一个类型

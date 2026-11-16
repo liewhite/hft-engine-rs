@@ -29,7 +29,7 @@
 //! 见品味 1.3：净值取不到与净值为零是两回事，前者伪装成后者会让杠杆闸门直接放行。
 
 use crate::domain::{Exchange, Greeks, Money, Quantity, Symbol, Timestamp, BBO};
-use crate::messaging::{PendingOrder, StateManager, SymbolState};
+use crate::messaging::{OrderNotice, PendingOrder, StateManager, SymbolState};
 use std::collections::HashMap;
 
 /// 策略视图：本策略订阅范围内的状态。
@@ -39,11 +39,19 @@ use std::collections::HashMap;
 #[derive(Clone, Copy)]
 pub struct StrategyView<'a> {
     state: &'a StateManager,
+    notices: &'a [OrderNotice],
 }
 
 impl<'a> StrategyView<'a> {
-    pub fn new(state: &'a StateManager) -> Self {
-        Self { state }
+    /// `notices`：这条事件让订单列表得出的结论（见 [`Self::order_notices`]）；不随事件取视图时给空
+    pub fn new(state: &'a StateManager, notices: &'a [OrderNotice]) -> Self {
+        Self { state, notices }
+    }
+
+    /// 这条事件让本策略的哪些单被交易所接下、哪些下单失败了。每种结论对每张单只出现一次，不管它从
+    /// 下单请求的结论、交易所回报还是下单超时哪条路来（见 [`OrderNotice`]）
+    pub fn order_notices(&self) -> &'a [OrderNotice] {
+        self.notices
     }
 
     /// 某个 symbol 的跨所全貌。范围外（未订阅）返回 `None`。
@@ -143,7 +151,7 @@ mod tests {
     #[test]
     fn symbols_outside_the_registered_set_are_not_visible() {
         let m = StateManager::new(&[SYM.to_string()]);
-        let view = StrategyView::new(&m);
+        let view = StrategyView::new(&m, &[]);
         assert!(view.symbol(&SYM.to_string()).is_some());
         assert!(view.symbol(&"ETH".to_string()).is_none());
     }

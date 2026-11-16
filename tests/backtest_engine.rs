@@ -335,7 +335,7 @@ fn inbound_custom_events_route_by_scope() {
     assert_eq!(*seen_eth.lock().unwrap(), vec!["eth", "all"]);
 }
 
-/// 记下策略收到的下单请求结论，挂单逻辑同 [`OneShotBuy`]
+/// 记下策略收到的下单请求结论和订单列表的结论（`notice:` 开头），挂单逻辑同 [`OneShotBuy`]
 struct RequestProbe {
     inner: OneShotBuy,
     seen: Arc<std::sync::Mutex<Vec<String>>>,
@@ -350,12 +350,18 @@ impl Strategy for RequestProbe {
                 self.seen.lock().unwrap().push(format!("{:?}", r.outcome));
             }
         }
+        for n in view.order_notices() {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(format!("notice:{:?}", n.kind));
+        }
         self.inner.on_event(event, view)
     }
 }
 
 /// 回测柜台回的下单结论与实盘出口同形（#812）：会吃单的 PostOnly 以「下单请求被拒」回到策略，
-/// 跟踪表随之移出这张单（不会一分钟后报卡单）；受理的单先回「下单受理」
+/// 订单列表随之移出这张单；受理的单先回「下单受理」
 #[test]
 fn backtest_counter_reports_request_outcomes_like_live() {
     let run = |price: Price| {
@@ -364,7 +370,7 @@ fn backtest_counter_reports_request_outcomes_like_live() {
             evs: vec![
                 bbo_ev(dec!(100.0), dec!(100.1), 1000),
                 bbo_ev(dec!(100.0), dec!(100.1), 2000),
-                // 超过卡单期限：被拒的单若还留在跟踪表里，这里会报错中止
+                // 远超下单超时：订单列表的结论不会在这里多出一次
                 bbo_ev(dec!(100.0), dec!(100.1), 200_000),
             ],
         };
@@ -383,12 +389,14 @@ fn backtest_counter_reports_request_outcomes_like_live() {
     };
     let rejected = run(dec!(100.5)); // 高于 ask，会吃单
     assert!(
-        rejected.len() == 1 && rejected[0].starts_with("PlaceRejected"),
+        rejected.len() == 2
+            && rejected[0].starts_with("PlaceRejected")
+            && rejected[1].starts_with("notice:PlaceFailed"),
         "{rejected:?}"
     );
     let placed = run(dec!(99.0));
     assert!(
-        placed.len() == 1 && placed[0].starts_with("Placed"),
+        placed.len() == 2 && placed[0].starts_with("Placed") && placed[1] == "notice:Accepted",
         "{placed:?}"
     );
 }

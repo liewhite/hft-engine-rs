@@ -513,9 +513,10 @@ fn one_leg_fill_cancels_other_then_hedges_the_lagging_leg() {
     assert!(placed(&s.bbo(HL)).is_empty());
 }
 
-/// #796：一腿全部成交、成交先于终态到：只撤另一腿，不对已成交的单发撤单；终态到、另一腿撤掉后补腿
+/// 一腿全部成交、成交先于终态到：订单列表不看成交（#899），那张单在终态到之前还算开着，两腿都撤
+/// （已成交那张的撤单多半报失败，终态随后就到）；终态到、另一腿撤掉后补腿
 #[test]
-fn full_fill_before_terminal_cancels_only_the_other_leg() {
+fn full_fill_before_terminal_cancels_both_legs() {
     let mut s = Sim::new(dec!(0.0), dec!(0.0));
     s.funding(BN, 0.8);
     let o = placed(&s.funding(HL, 0.1));
@@ -525,7 +526,9 @@ fn full_fill_before_terminal_cancels_only_the_other_leg() {
     s.confirm(&hl, OrderStatus::Pending);
 
     let out = s.fill(&bn, bn.quantity);
-    assert_eq!(cancels(&out), vec![HL], "{out:?}");
+    let mut c = cancels(&out);
+    c.sort();
+    assert_eq!(c, vec![BN, HL], "{out:?}");
     assert!(placed(&out).is_empty(), "{out:?}");
 
     s.confirm(&bn, OrderStatus::Filled);
@@ -566,9 +569,11 @@ fn startup_imbalance_halts_instead_of_trading() {
     assert!(placed(&s.funding(HL, 0.9)).is_empty());
 }
 
+/// 两腿都成交、HL 那腿的「已成交」终态先到、成交晚到（#899 用户接受的代价）：订单列表不等成交，
+/// 策略按当时的持仓（只有币安那腿）在 HL 补了一笔；HL 的成交到了以后反过来多出一笔，再在币安补回。
+/// 结果仍对冲，只是仓位多了一笔挂单量
 #[test]
-fn hl_terminal_before_fill_does_not_double_hedge() {
-    // HL maker 的「已成交」终态先到、成交回报晚到：不按旧持仓补，成交到了两腿已平
+fn hl_terminal_before_fill_hedges_twice_but_stays_hedged() {
     let mut s = Sim::new(dec!(0.0), dec!(0.0));
     s.funding(BN, 0.8);
     let o = placed(&s.funding(HL, 0.1));
@@ -578,27 +583,33 @@ fn hl_terminal_before_fill_does_not_double_hedge() {
     s.confirm(&hl, OrderStatus::Pending);
     s.fill(&bn, dec!(1.998));
     s.confirm(&bn, OrderStatus::Filled);
-    s.confirm_filled(&hl, OrderStatus::Filled, dec!(1.998)); // HL 也成交了，成交回报还没到
-    s.advance(5_000);
-    let out = s.bbo(HL);
-    assert!(placed(&out).is_empty(), "成交没到齐，不补也不重挂：{out:?}");
-    let out = s.fill(&hl, dec!(1.998)); // 回报到达，两腿已平
-    assert!(
-        placed(&out)
-            .iter()
-            .all(|o| !matches!(o.order_type, OrderType::Market)),
-        "{out:?}"
+    let out = s.confirm_filled(&hl, OrderStatus::Filled, dec!(1.998)); // 成交回报还没到
+    let h = placed(&out);
+    assert_eq!(h.len(), 1, "{out:?}");
+    assert_eq!(
+        (h[0].exchange, h[0].side, h[0].quantity),
+        (HL, Side::Long, dec!(1.998))
     );
-    assert!(placed(&s.bbo(HL))
-        .iter()
-        .all(|o| !matches!(o.order_type, OrderType::Market)));
+    let hedge1 = h[0].clone();
+    s.fill(&hl, dec!(1.998)); // HL maker 的成交到了
+    assert!(placed(&s.bbo(HL)).is_empty(), "补腿单在途，不再补");
+    s.fill(&hedge1, dec!(1.998));
+    s.confirm(&hedge1, OrderStatus::Filled);
+    s.advance(1_100);
+    let out = s.bbo(BN);
+    let h = placed(&out);
+    assert_eq!(h.len(), 1, "{out:?}");
+    assert_eq!(
+        (h[0].exchange, h[0].side, h[0].quantity),
+        (BN, Side::Short, dec!(1.998))
+    );
+    assert!(matches!(h[0].order_type, OrderType::Market));
 }
 
-/// **#758 的漏洞**：HL 买单的「已成交」终态先到、成交晚到时，此前挂单列表一空、持仓还是 0，策略会在
-/// HL 立刻再挂一张买单 —— 成交到了之后那张也成交就多出一笔。现在单留在跟踪表里直到成交到齐：
-/// 不在 HL 重挂，先撤币安那张；成交到了、币安撤完再在币安市价卖补腿。
+/// HL 买单的「已成交」终态先到、成交晚到（#899 用户接受的代价）：订单列表里 HL 那张没了、持仓还平，策略照常
+/// 在 HL 再挂一张；成交到了就是不平衡，撤掉两所挂单（新挂的那张受理后再撤），都撤完在币安市价卖补腿
 #[test]
-fn terminal_before_fill_does_not_requote_on_the_same_exchange() {
+fn terminal_before_fill_requotes_until_the_fill_arrives() {
     let mut s = Sim::new(dec!(0.0), dec!(0.0));
     s.funding(BN, 0.8);
     let o = placed(&s.funding(HL, 0.1));
@@ -608,17 +619,25 @@ fn terminal_before_fill_does_not_requote_on_the_same_exchange() {
     s.confirm(&hl, OrderStatus::Pending);
 
     let out = s.confirm_filled(&hl, OrderStatus::Filled, hl.quantity);
-    assert!(placed(&out).is_empty(), "成交没到，不能在 HL 再挂：{out:?}");
+    let requote = placed(&out);
+    assert_eq!(requote.len(), 1, "{out:?}");
+    assert_eq!((requote[0].exchange, requote[0].side), (HL, Side::Long));
+    let requote = requote[0].clone();
+
+    let out = s.fill(&hl, hl.quantity);
     assert_eq!(
         cancels(&out),
         vec![BN],
-        "那笔成交到了就是不平衡，先撤币安：{out:?}"
+        "新挂的 HL 单下单还没结论，先撤币安：{out:?}"
     );
-    assert!(placed(&s.bbo(HL)).is_empty());
-
-    let out = s.fill(&hl, hl.quantity);
-    assert!(placed(&out).is_empty(), "币安的单还没撤完：{out:?}");
-    let h = placed(&s.confirm(&bn, OrderStatus::Cancelled));
+    assert!(placed(&out).is_empty(), "{out:?}");
+    let out = s.confirm(&requote, OrderStatus::Pending);
+    assert_eq!(cancels(&out), vec![HL], "受理了就撤：{out:?}");
+    assert!(
+        placed(&s.confirm(&bn, OrderStatus::Cancelled)).is_empty(),
+        "HL 那张还没撤完"
+    );
+    let h = placed(&s.confirm(&requote, OrderStatus::Cancelled));
     assert_eq!(h.len(), 1, "{h:?}");
     assert_eq!(
         (h[0].exchange, h[0].side, h[0].quantity),

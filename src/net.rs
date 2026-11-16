@@ -11,7 +11,7 @@
 //! - **User-Agent**：不带 UA 的请求会被部分 CDN 拒；
 //! - **空闲连接只在池里留 [`POOL_IDLE_TIMEOUT`]**：对方会关掉空闲过久的长连接（常见 60s 上下），
 //!   reqwest 默认留 90s。请求恰好发在对方关连接的时刻，会以「连接中途断开」失败 —— 下单时这算
-//!   结果不确定、整机停机。让我们先于对方丢弃空闲连接，代价是空闲超过它后的第一个请求多一次建连。
+//!   结果不确定，单要等交易所回报或超时才有结论。让我们先于对方丢弃空闲连接，代价是空闲超过它后的第一个请求多一次建连。
 
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;

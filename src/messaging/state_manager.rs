@@ -1,7 +1,7 @@
 use crate::domain::Money;
 use crate::domain::{Exchange, Greeks, Order, Position, Symbol, Timestamp};
 use crate::messaging::{
-    AccountData, ExchangeAccountData, IncomeEvent, LegValue, MarketData, SymbolState,
+    AccountData, ExchangeAccountData, IncomeEvent, LegValue, MarketData, OrderNotice, SymbolState,
 };
 use std::collections::HashMap;
 
@@ -154,12 +154,14 @@ impl StateManager {
 
     // ==================== 事件处理 ====================
 
-    /// 处理事件，更新状态。`Err` = 有单「等交易所」太久（见 [`crate::messaging::ORDER_STUCK_MS`]），
-    /// 跟踪表已说不清挂单与持仓，调用方应停机。
+    /// 处理事件，更新状态，返回订单列表因此得出的结论（一张单被接下 / 下单失败，见
+    /// [`crate::messaging::OrderNotice`]）。`Err` = 有单撤单后交易所太久没推终态（见
+    /// [`crate::messaging::ORDER_STUCK_MS`]），说不清它还挂不挂着，调用方应停机。
     ///
     /// 两层 match 都不带默认分支：新增一种事件时这里编译失败，必须明确写出它的处理
     /// （哪怕是空处理），不会悄悄落进某个兜底分支。
-    pub fn apply(&mut self, event: &IncomeEvent) -> Result<(), String> {
+    pub fn apply(&mut self, event: &IncomeEvent) -> Result<Vec<OrderNotice>, String> {
+        let mut notices = Vec::new();
         match event {
             IncomeEvent::Market(m) => match &m.data {
                 // 币级行情: 委托对应 SymbolState
@@ -172,23 +174,23 @@ impl StateManager {
                 MarketData::Exchange(_) => {}
                 // 自定义事件：框架只运送不理解，策略在 on_event 里自行消费并自持。
                 MarketData::Custom(_) => {}
-                // 全局事件: Clock (检查有没有单等交易所太久)
+                // 全局事件: Clock（撤单卡太久停机、下单中超时按失败处理）
                 MarketData::Clock => {
-                    for state in self.states.values() {
-                        state.check_stuck_orders(m.local_ts)?;
+                    for state in self.states.values_mut() {
+                        notices.extend(state.on_clock(m.local_ts)?);
                     }
                 }
             },
             IncomeEvent::Account(a) => match &a.data {
                 AccountData::Symbol(data) => {
                     if let Some(state) = self.routed_state(data.symbol()) {
-                        state.apply_account(data, a.local_ts);
+                        notices.extend(state.apply_account(data, a.local_ts));
                     }
                 }
                 AccountData::Exchange(data) => self.apply_exchange_account(data),
             },
         }
-        Ok(())
+        Ok(notices)
     }
 
     /// 所级账户事件写进账户投影

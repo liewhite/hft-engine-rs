@@ -1117,7 +1117,7 @@ mod tests {
         assert!(format!("{:#}", root.shutdown().await.unwrap_err()).contains("构造阶段"));
     }
 
-    /// fail_handle：组件自己判定必须停机（如下单结果不确定）
+    /// fail_handle：组件自己判定必须停机（如持仓对账确认漂移）
     #[tokio::test]
     async fn fail_handle_stops_the_root_with_that_error() {
         let root = Root::new("root");
