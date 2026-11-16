@@ -1,5 +1,6 @@
 //! 币安 × Hyperliquid 资金费套利（#668）
 mod config;
+mod makers;
 mod signal;
 mod strategy;
 

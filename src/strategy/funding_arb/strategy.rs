@@ -3,26 +3,30 @@
 //! 每个币各所持仓相加应为 0（对冲）。操作永远发生在**一对所**之间（见 [`LegPair`]）：
 //! 开仓在年化差最大的两所，平仓在收益率跌破门槛的那对相反仓位，第三所不动。
 //!
-//! # 每个事件做一件事，按优先级
+//! # 阶段（[`Phase`]）
 //!
-//! 1. **各所持仓之和不为 0**（价值 ≥ 最小单额，且补腿所下得出这个量）：先撤掉全部挂单，等本币所有单都结束
-//!    （撤单确认）后，在最近一次挂单的所对上市价补齐落后腿：多了就在该对的卖出所卖，少了就在买入所买。
-//!    这正是用户规格「开仓加短腿、平仓砍长腿」：没成交的那条腿就是落后腿，补它即补齐这次操作；
-//!    补过头（撤单期间另一边也成交）时反向补回的也是落后腿。补腿下单失败（被拒、或结果说不清超时）时，本策略隔
-//!    `hedge_retry_ms` 重试并记 error。
-//! 2. **已对冲**：按各所过去 24h 年化决定开 / 平 / 持有（见 [`super::signal::decide`]），
-//!    在选中的两所各维护一张只做 maker 的挂单（卖出所卖、买入所买；平仓只减仓）；
-//!    挂单价偏离目标超过容差就撤了重挂。开仓前查两所各自的单币 / 账户杠杆，加仓超限不挂。
+//! 每个事件先按各所持仓之和定阶段（转换只在 [`FundingArbStrategy::next_phase`] 一处），再按阶段做事：
 //!
-//! 一边成交即进入 1，另一边挂单被撤、市价补齐，回到 2 —— 这就是"一边成交撤另一腿、市价补腿"。
+//! - **启动检查**：第一次有盘口时看各所持仓之和。为 0 进入挂单，不为 0 停止交易。
+//! - **挂单**（[`Phase::Quoting`]）：已对冲。按各所过去 24h 年化决定开 / 平 / 持有（见 [`super::signal::decide`]），
+//!   在选中的两所各维护一张只做 maker 的挂单（卖出所卖、买入所买；平仓只减仓），挂单的对齐交给 [`Makers`]。
+//!   开仓前查两所各自的单币 / 账户杠杆，加仓超限不挂。记住最近一次挂单的所对，不平衡时在那里补。
+//! - **补腿**（[`Phase::Hedging`]）：各所持仓之和不为 0（价值 ≥ 最小单额，且补腿所下得出这个量）。先撤掉全部挂单，
+//!   等本币所有单都结束（撤单确认）后，在最近一次挂单的所对上市价补齐落后腿：多了就在该对的卖出所卖，少了就在
+//!   买入所买。这正是用户规格「开仓加短腿、平仓砍长腿」：没成交的那条腿就是落后腿，补它即补齐这次操作；
+//!   补过头（撤单期间另一边也成交）时反向补回的也是落后腿。补腿下单失败（被拒、或结果说不清超时）时，隔
+//!   `hedge_retry_ms` 重试并记 error。持仓之和回到零头以内即回到挂单。
+//! - **停止交易**（[`Phase::Halted`]）：只撤自己的挂单、不开不补，报 error 等人处理后重启。
 //!
-//! # 停机（halt）
+//! 一边成交即进入补腿，另一边挂单被撤、市价补齐，回到挂单 —— 这就是"一边成交撤另一腿、市价补腿"。
+//!
+//! # 停止交易
 //!
 //! 账户由本策略全权托管（用户定），不检测外来交易（#760 用户定）：账户里该币的全部持仓都当成
 //! 自己的（框架持仓 = REST 基线 + 全部成交），别的单的成交按普通不平衡补；品种目录外的成交
 //! 适配层直接丢弃（不进任何 symbol 的持仓）。
 //!
-//! 只在不知道该在哪对所补时停止交易（撤自己的挂单、不开不补）并报 error，等人处理后重启：
+//! 只在不知道该在哪对所补时停止交易：
 //! - 启动时各所持仓之和不为 0；
 //! - 不平衡出现时还没挂过任何单。
 //!
@@ -42,31 +46,93 @@
 //! 不经杠杆检查，最多超出一笔挂单金额。
 
 use super::config::PairParams;
+use super::makers::{MakerRules, Makers, Quote};
 use super::signal::{decide, FundingAction, LegPair, SettledFundingWindow};
 use crate::domain::{
     from_f64, to_f64, Decimal, Exchange, OrderIntent, OrderType, Price, Quantity, Side, Symbol,
-    SymbolMeta, TimeInForce, Timestamp, BBO,
+    SymbolMeta, Timestamp, BBO,
 };
 use crate::exchange::SubscriptionKind;
-use crate::messaging::{
-    CancelAttempt, IncomeEvent, MarketData, MarketEvent, OrderNotice, OrderNoticeKind, OrderStage,
-    PendingOrder,
-};
+use crate::messaging::{IncomeEvent, MarketData, MarketEvent};
 use crate::observability::Gauge;
 use crate::strategy::{Signal, Strategy, StrategyView, SymbolView};
 use std::collections::{HashMap, HashSet};
 
-/// 想在某所挂的一张 maker 单
+/// 本币此刻在做什么。只在 [`FundingArbStrategy::next_phase`] 里转换；每个阶段只带自己用得到的数据，
+/// 「停止交易同时在补腿」「在补腿却没有所对」这类组合写不出来
 #[derive(Debug, Clone, PartialEq)]
-struct Quote {
-    exchange: Exchange,
-    side: Side,
-    price: Price,
-    /// `None` = 这一刻定不出量（对手盘第一档太薄、或凑不齐两所都下得出的一手）：不新挂，
-    /// 但已挂着的同向单按价格容差照常保留。盘口厚度一跳一跳地变，否则会挂了马上撤、撤了又挂
-    /// （实盘 11-12 首轮 OKX INIT 一秒撤挂数次），白耗下单额度
-    qty: Option<Quantity>,
-    reduce_only: bool,
+enum Phase {
+    /// 还没做过启动检查（第一次有盘口时做）
+    Starting,
+    /// 已对冲，按资金费挂单。`pair` = 最近一次挂单的所对（不平衡时在这对所补腿），还没挂过为 `None`
+    Quoting { pair: Option<LegPair> },
+    /// 各所持仓之和不为 0，在 `pair` 上补腿。`attempts` = 本轮已发出的补腿单数，>0 时再发即是重试
+    Hedging { pair: LegPair, attempts: u32 },
+    /// 停止交易（原因），只撤挂单、不开不补
+    Halted { reason: String },
+}
+
+impl Phase {
+    /// 不平衡时在哪对所补
+    fn pair(&self) -> Option<LegPair> {
+        match self {
+            Phase::Quoting { pair } => *pair,
+            Phase::Hedging { pair, .. } => Some(*pair),
+            Phase::Starting | Phase::Halted { .. } => None,
+        }
+    }
+}
+
+/// 本币在各所的持仓（带符号，正多负空），按所的固定顺序
+#[derive(Debug)]
+struct Legs(Vec<(Exchange, Quantity)>);
+
+impl Legs {
+    fn read(sv: SymbolView<'_>, exchanges: &[Exchange]) -> Self {
+        Self(
+            exchanges
+                .iter()
+                .map(|&ex| (ex, sv.position_size(ex)))
+                .collect(),
+        )
+    }
+
+    fn get(&self, ex: Exchange) -> Quantity {
+        self.0
+            .iter()
+            .find(|(e, _)| *e == ex)
+            .map_or(Quantity::ZERO, |(_, p)| *p)
+    }
+
+    /// 各所持仓之和（对冲时为 0）
+    fn net(&self) -> Quantity {
+        self.0.iter().map(|(_, p)| p).sum()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (Exchange, Quantity)> + '_ {
+        self.0.iter().copied()
+    }
+
+    /// 平仓所对的可平量：卖出所持多、买入所持空（decide 保证），取两者绝对值较小的一个
+    fn close_held(&self, pair: LegPair) -> Quantity {
+        self.get(pair.sell)
+            .max(Quantity::ZERO)
+            .min((-self.get(pair.buy)).max(Quantity::ZERO))
+    }
+}
+
+/// 只给日志与看板用的最近一次判断（不参与决策）
+#[derive(Debug, Default)]
+struct Readings {
+    /// 收到第一条事件的时刻：某所从没来过盘口时，盘口年龄指标从这里算起
+    first_event_at: Option<Timestamp>,
+    /// 最近一次资金费信号（变化时打 info，进指标 `funding_arb_signal`）
+    action: Option<FundingAction>,
+    /// 该平仓、盘口也新鲜，可平量却凑不出两所都下得出的一手（进指标 `funding_arb_close_stuck`，要人看；
+    /// 补腿或停止交易期间不判断，停在最后一次）
+    close_stuck: bool,
+    /// 有所的资金费未知（只在变成未知时打一次 warn）
+    funding_unknown: bool,
 }
 
 pub struct FundingArbStrategy {
@@ -78,46 +144,12 @@ pub struct FundingArbStrategy {
     /// 各所合约规格：判断一个数量在该所下不下得出（精度与最小下单量的唯一出处）
     metas: HashMap<Exchange, SymbolMeta>,
     funding: HashMap<Exchange, SettledFundingWindow>,
-    /// 收到第一条事件的时刻：某所从没来过盘口时，盘口年龄指标从这里算起
-    first_event_at: Option<Timestamp>,
-    /// 最近一次挂 maker 的所对：不平衡时在这对所上补腿
-    leg: Option<LegPair>,
-    /// 首次拿到全部所盘口时做过启动检查没有
-    startup_checked: bool,
-    /// 停止交易的原因
-    halted: Option<String>,
-    last_hedge_ts: Option<Timestamp>,
-    /// 本轮不平衡已发出的补腿单数；>0 时再发即是重试
-    hedge_attempts: u32,
-    last_action: Option<FundingAction>,
-    /// 最近一次判断：该平仓、盘口也新鲜，可平量却凑不出两所都下得出的一手（进指标
-    /// `funding_arb_close_stuck`，要人看；补腿或停止交易期间不判断，停在最后一次）
-    close_stuck: bool,
-    /// 上一次是否有所的资金费未知（只在变成未知时打一次 warn）
-    funding_unknown: bool,
-    /// 各所下单被拒后的退避（见 [`RejectBackoff`]）
-    reject_backoff: HashMap<Exchange, RejectBackoff>,
+    phase: Phase,
+    /// 最近一次发补腿单的时刻：两次补腿至少隔 `hedge_retry_ms`（跨补腿轮次）
+    last_hedge_at: Option<Timestamp>,
+    makers: Makers,
+    readings: Readings,
 }
-
-/// 某所连续被拒单时的退避：第一次拒后等 `reject_backoff_ms` 再挂新的 maker，之后每连续拒一次等待
-/// 翻倍，封顶 [`MAX_REJECT_BACKOFF_MS`]；该所有一张单被交易所接下（挂上或成交）就清零。
-///
-/// 不退避时，被拒的单离开挂单列表后下一个盘口事件就重挂：持续性拒单（保证金不足、
-/// 杠杆档位、本地或交易所限频）会按 REST 往返的速度刷单，白耗下单次数。
-/// post-only 会吃单被拒这类偶发拒单只等一个间隔，对资费套利无关紧要，故不按拒单原因区分。
-/// 口径是该所本策略的任何单：市价补腿被拒也会让该所的 maker 退避，补腿成交也会清零；
-/// 但退避只拦新挂 maker，不拦补腿（补腿另有 `hedge_retry_ms` 的重试间隔）。拒单从哪条路来、来几次，
-/// 框架的订单列表都只报一次下单失败（见 [`OrderNotice`]）。
-#[derive(Debug, Clone)]
-struct RejectBackoff {
-    /// 这之前不在该所挂新的 maker
-    until: Timestamp,
-    /// 本次等待时长（下次再拒就翻倍）
-    delay_ms: u64,
-}
-
-/// 拒单退避的上限：持续拒单时每所每币最多 5 分钟试一次
-const MAX_REJECT_BACKOFF_MS: u64 = 5 * 60_000;
 
 impl FundingArbStrategy {
     /// `metas`：该币在各所的合约规格，一所一份、至少两所，顺序即所的顺序（装配处按各所品种目录给出）
@@ -141,22 +173,25 @@ impl FundingArbStrategy {
                 p.symbol, p.order_distance
             )
         });
+        let makers = Makers::new(
+            p.symbol.clone(),
+            MakerRules {
+                requote_tolerance: p.order_distance * p.requote_ratio,
+                min_requote_ms: p.min_requote_ms,
+                cancel_retry_ms: p.cancel_retry_ms,
+                reject_backoff_ms: p.reject_backoff_ms,
+            },
+        );
         Self {
             p,
             distance,
             exchanges,
             metas: metas.into_iter().map(|m| (m.exchange, m)).collect(),
             funding: HashMap::new(),
-            first_event_at: None,
-            leg: None,
-            startup_checked: false,
-            halted: None,
-            last_hedge_ts: None,
-            hedge_attempts: 0,
-            last_action: None,
-            close_stuck: false,
-            funding_unknown: false,
-            reject_backoff: HashMap::new(),
+            phase: Phase::Starting,
+            last_hedge_at: None,
+            makers,
+            readings: Readings::default(),
         }
     }
 
@@ -173,20 +208,13 @@ impl FundingArbStrategy {
         self.bbo_fresh(sv, pair.sell, now) && self.bbo_fresh(sv, pair.buy, now)
     }
 
-    fn halt(&mut self, reason: String) {
-        if self.halted.is_none() {
-            tracing::error!(symbol = %self.symbol(), %reason, "停止交易：撤掉本策略挂单，不再开仓或补腿，需人工处理后重启");
-            self.halted = Some(reason);
-        }
-    }
-
     fn step(&mut self, sv: SymbolView<'_>, view: StrategyView<'_>, now: Timestamp) -> Vec<Signal> {
-        if self.halted.is_some() {
-            return self.maintain(sv, &[], now);
+        if let Phase::Halted { .. } = self.phase {
+            return self.makers.align(sv, &self.exchanges, &[], now);
         }
 
         // 不要求每所都有盘口：某所品种暂停、迟迟没盘口时，其余所的补腿和停机检查照常；
-        // 挂单只在用到的两所盘口新鲜时才挂（见下方 fresh）
+        // 挂单只在用到的两所盘口新鲜时才挂（见 quote 里的 pair_fresh）
         let bbos: HashMap<Exchange, &BBO> = self
             .exchanges
             .iter()
@@ -208,39 +236,65 @@ impl FundingArbStrategy {
             fresh_mids
         };
         let px = mids.iter().sum::<Price>() / Decimal::from(mids.len());
-        let positions: Vec<(Exchange, Quantity)> = self
-            .exchanges
-            .iter()
-            .map(|&ex| (ex, sv.position_size(ex)))
-            .collect();
-        let net: Quantity = positions.iter().map(|(_, p)| p).sum();
+        let legs = Legs::read(sv, &self.exchanges);
 
-        let startup = !self.startup_checked;
-        self.startup_checked = true;
-        if !self.is_dust(net, px) {
-            match (self.leg, startup) {
-                (Some(pair), false) => return self.hedge(sv, pair, net, &positions, now),
-                (_, true) => self.halt(format!(
-                    "启动时各所持仓之和不为 0：{positions:?}（可能有不归本策略的仓位）"
-                )),
-                (None, false) => self.halt(format!(
-                    "各所持仓之和不为 0 但本策略还没挂过单，不知道在哪对所补：{positions:?}"
-                )),
-            }
-            return self.maintain(sv, &[], now);
+        self.phase = self.next_phase(&legs, px);
+        match self.phase.clone() {
+            Phase::Hedging { pair, attempts } => self.hedge(sv, pair, attempts, &legs, now),
+            Phase::Quoting { pair } => self.quote(sv, view, pair, &bbos, &legs, px, now),
+            Phase::Halted { .. } => self.makers.align(sv, &self.exchanges, &[], now),
+            Phase::Starting => unreachable!("next_phase 不会停在启动检查"),
         }
-        if self.hedge_attempts > 0 {
-            let floor = self.leg.map_or(self.p.min_order_notional, |pair| {
-                self.min_notional(hedge_target(pair, net).0)
-            });
-            if notional(net.abs(), px) >= floor {
-                tracing::warn!(symbol = %self.symbol(), %net, ?positions, "补腿后剩下补腿所下不出的零头，不再补");
-            } else {
-                tracing::info!(symbol = %self.symbol(), attempts = self.hedge_attempts, "各所持仓已对冲");
-            }
-            self.hedge_attempts = 0;
-        }
+    }
 
+    /// 阶段转换（只此一处）：按各所持仓之和是不是零头，决定接下来在哪个阶段
+    fn next_phase(&self, legs: &Legs, px: Price) -> Phase {
+        let balanced = self.is_dust(legs.net(), px);
+        let halt = |reason: String| {
+            tracing::error!(symbol = %self.symbol(), %reason, "停止交易：撤掉本策略挂单，不再开仓或补腿，需人工处理后重启");
+            Phase::Halted { reason }
+        };
+        match (&self.phase, balanced) {
+            (Phase::Starting, true) => Phase::Quoting { pair: None },
+            (Phase::Starting, false) => halt(format!(
+                "启动时各所持仓之和不为 0：{legs:?}（可能有不归本策略的仓位）"
+            )),
+            (Phase::Quoting { pair: None }, false) => halt(format!(
+                "各所持仓之和不为 0 但本策略还没挂过单，不知道在哪对所补：{legs:?}"
+            )),
+            (Phase::Quoting { pair: Some(pair) }, false) => Phase::Hedging {
+                pair: *pair,
+                attempts: 0,
+            },
+            (Phase::Hedging { pair, attempts }, true) => {
+                if *attempts > 0 {
+                    let net = legs.net();
+                    if notional(net.abs(), px) >= self.min_notional(hedge_target(*pair, net).0) {
+                        tracing::warn!(symbol = %self.symbol(), %net, ?legs, "补腿后剩下补腿所下不出的零头，不再补");
+                    } else {
+                        tracing::info!(symbol = %self.symbol(), attempts, "各所持仓已对冲");
+                    }
+                }
+                Phase::Quoting { pair: Some(*pair) }
+            }
+            (phase @ (Phase::Quoting { .. } | Phase::Hedging { .. } | Phase::Halted { .. }), _) => {
+                phase.clone()
+            }
+        }
+    }
+
+    /// 已对冲：按资金费定这一刻想挂的单，交给挂单对齐
+    #[allow(clippy::too_many_arguments)]
+    fn quote(
+        &mut self,
+        sv: SymbolView<'_>,
+        view: StrategyView<'_>,
+        pair: Option<LegPair>,
+        bbos: &HashMap<Exchange, &BBO>,
+        legs: &Legs,
+        px: Price,
+        now: Timestamp,
+    ) -> Vec<Signal> {
         // 在途的补腿单（市价）成交前不挂 maker：它的成交会改变持仓
         if sv
             .pending_orders()
@@ -249,45 +303,40 @@ impl FundingArbStrategy {
             return Vec::new();
         }
 
-        let action = self.funding_action(&positions, px, now);
+        let action = self.funding_action(legs, px, now);
         let quotes = match action {
             FundingAction::Open(pair) if self.pair_fresh(sv, pair, now) => {
-                self.open_quotes(pair, &bbos, &positions, px, view)
+                self.open_quotes(pair, bbos, legs, px, view)
             }
             FundingAction::Close(pair) if self.pair_fresh(sv, pair, now) => {
-                self.close_quotes(pair, &bbos, &positions, px)
+                self.close_quotes(pair, bbos, legs, px)
             }
             _ => Vec::new(),
         };
         let sized = quotes.iter().any(|q| q.qty.is_some());
-        if let (Some(pair), true) = (action_pair(action), sized) {
-            self.leg = Some(pair);
-        }
+        let pair = match (action_pair(action), sized) {
+            (Some(quoted), true) => Some(quoted),
+            _ => pair,
+        };
+        self.phase = Phase::Quoting { pair };
         // 平仓信号在、盘口也新鲜，可平量本身却凑不出两所都下得出的一手（不看盘口厚度：第一档薄只是
         // 这一刻挂不出，下一跳就可能挂出，#799）：仓位会一直拿着，要人看
         let stuck = match action {
             FundingAction::Close(pair) => {
                 self.pair_fresh(sv, pair, now)
-                    && self
-                        .pair_qty(pair, close_held(pair, &positions), px)
-                        .is_none()
+                    && self.pair_qty(pair, legs.close_held(pair), px).is_none()
             }
             FundingAction::Open(_) | FundingAction::Hold => false,
         };
-        if stuck && !self.close_stuck {
-            tracing::warn!(symbol = %self.symbol(), ?action, ?positions, "该平仓但可平量凑不出两所都下得出的一手（零头或下单粒度凑不齐），需人工处理");
+        if stuck && !self.readings.close_stuck {
+            tracing::warn!(symbol = %self.symbol(), ?action, ?legs, "该平仓但可平量凑不出两所都下得出的一手（零头或下单粒度凑不齐），需人工处理");
         }
-        self.close_stuck = stuck;
-        self.maintain(sv, &quotes, now)
+        self.readings.close_stuck = stuck;
+        self.makers.align(sv, &self.exchanges, &quotes, now)
     }
 
     /// 各所年化 → 动作
-    fn funding_action(
-        &mut self,
-        positions: &[(Exchange, Quantity)],
-        px: Price,
-        now: Timestamp,
-    ) -> FundingAction {
+    fn funding_action(&mut self, legs: &Legs, px: Price, now: Timestamp) -> FundingAction {
         let aprs: Vec<(Exchange, Option<f64>)> = self
             .exchanges
             .iter()
@@ -300,9 +349,8 @@ impl FundingArbStrategy {
                 )
             })
             .collect();
-        let held: Vec<(Exchange, Quantity)> = positions
+        let held: Vec<(Exchange, Quantity)> = legs
             .iter()
-            .copied()
             .filter(|(ex, p)| notional(p.abs(), px) >= self.min_notional(*ex))
             .collect();
 
@@ -312,9 +360,9 @@ impl FundingArbStrategy {
             .map(|(e, _)| *e)
             .collect();
         if unknown.is_empty() {
-            self.funding_unknown = false;
-        } else if !self.funding_unknown {
-            self.funding_unknown = true;
+            self.readings.funding_unknown = false;
+        } else if !self.readings.funding_unknown {
+            self.readings.funding_unknown = true;
             tracing::warn!(symbol = %self.symbol(), ?unknown, "资金费数据未知或过期：不开仓，只平两所数据都在的仓位对");
         }
 
@@ -324,10 +372,10 @@ impl FundingArbStrategy {
             self.p.open_threshold_apr,
             self.p.close_threshold_apr,
         );
-        if self.last_action != Some(action) {
+        if self.readings.action != Some(action) {
             tracing::info!(symbol = %self.symbol(), ?aprs, ?held, ?action, "资金费信号变化");
         }
-        self.last_action = Some(action);
+        self.readings.action = Some(action);
         action
     }
 
@@ -350,11 +398,11 @@ impl FundingArbStrategy {
     }
 
     /// 持仓差是不是零头（不补、不停机），全策略只此一处判据：补不出去就是零头（见 [`Self::tradable`]）。
-    /// 有所对时看补腿所下不下得出；还没有所对（启动时）时，只要有任一所下不出就算零头
+    /// 有所对时（见 [`Phase::pair`]）看补腿所下不下得出；还没有所对（启动时）时，只要有任一所下不出就算零头
     /// —— 本策略留下的零头不超过当时补腿所的一笔最小单，而那一所事后未知，按最粗的一所放宽，
     /// 免得每次重启都因自己的零头停机。代价：启动时不足最粗一所最小单的不平会被放过。
     fn is_dust(&self, net: Quantity, px: Price) -> bool {
-        match self.leg {
+        match self.phase.pair() {
             Some(pair) => !self.tradable(hedge_target(pair, net).0, net.abs(), px),
             None => !self
                 .exchanges
@@ -416,7 +464,7 @@ impl FundingArbStrategy {
         &self,
         pair: LegPair,
         bbos: &HashMap<Exchange, &BBO>,
-        positions: &[(Exchange, Quantity)],
+        legs: &Legs,
         px: Price,
         view: StrategyView<'_>,
     ) -> Vec<Quote> {
@@ -425,17 +473,11 @@ impl FundingArbStrategy {
             return self.pair_quotes(pair, bbos, Quantity::ZERO, px, false);
         }
         let qty = qty_of(cap, px);
-        let pos = |ex: Exchange| {
-            positions
-                .iter()
-                .find(|(e, _)| *e == ex)
-                .map_or(Quantity::ZERO, |(_, p)| *p)
-        };
         for (ex, delta) in [(pair.sell, -qty), (pair.buy, qty)] {
             // 超限和「定不出量」同一处理：不新挂，已挂的按价格容差留着。持仓卡在上限边上时闸门随盘口
             // 小跳来回翻，超限就撤会挂了即撤、白耗下单撤单次数（#769）。已挂的单是在放行时按成交后不超限
             // 定的量，留着成交只会因之后的价格、净值波动略超一点
-            if !self.leverage_allows(view, ex, pos(ex), delta, bbos[&ex].mid_price()) {
+            if !self.leverage_allows(view, ex, legs.get(ex), delta, bbos[&ex].mid_price()) {
                 return self.pair_quotes(pair, bbos, Quantity::ZERO, px, false);
             }
         }
@@ -447,10 +489,10 @@ impl FundingArbStrategy {
         &self,
         pair: LegPair,
         bbos: &HashMap<Exchange, &BBO>,
-        positions: &[(Exchange, Quantity)],
+        legs: &Legs,
         px: Price,
     ) -> Vec<Quote> {
-        let qty = qty_of(self.cap_notional(pair, bbos), px).min(close_held(pair, positions));
+        let qty = qty_of(self.cap_notional(pair, bbos), px).min(legs.close_held(pair));
         self.pair_quotes(pair, bbos, qty, px, true)
     }
 
@@ -504,166 +546,44 @@ impl FundingArbStrategy {
         ok
     }
 
-    /// 按订单列表的结论更新拒单退避：下单失败加长该所的退避，被接下清零（每张单每种结论框架只给一次）
-    fn note_order_notices(&mut self, notices: &[OrderNotice], now: Timestamp) {
-        // 视图只含本实例订阅范围（本币）的单
-        for n in notices {
-            match &n.kind {
-                OrderNoticeKind::PlaceFailed { reason } => {
-                    let delay_ms = self
-                        .reject_backoff
-                        .get(&n.exchange)
-                        .map_or(self.p.reject_backoff_ms, |b| {
-                            (b.delay_ms * 2).min(MAX_REJECT_BACKOFF_MS)
-                        });
-                    tracing::warn!(symbol = %self.symbol(), exchange = %n.exchange, client_order_id = %n.client_order_id, %reason, delay_ms, "下单失败，该所暂停挂新单");
-                    self.reject_backoff.insert(
-                        n.exchange,
-                        RejectBackoff {
-                            until: now + delay_ms,
-                            delay_ms,
-                        },
-                    );
-                }
-                OrderNoticeKind::Accepted => {
-                    self.reject_backoff.remove(&n.exchange);
-                }
-            }
-        }
-    }
-
-    fn backing_off(&self, ex: Exchange, now: Timestamp) -> bool {
-        self.reject_backoff.get(&ex).is_some_and(|b| now < b.until)
-    }
-
-    /// 让各所的挂单与 `quotes` 一致：不符的撤，缺的挂（拒单退避中的所不挂）。
-    fn maintain(&mut self, sv: SymbolView<'_>, quotes: &[Quote], now: Timestamp) -> Vec<Signal> {
-        let mut out = Vec::new();
-        for ex in self.exchanges.clone() {
-            let want = quotes.iter().find(|q| q.exchange == ex);
-            let pendings: Vec<&PendingOrder> = sv
-                .pending_orders()
-                .filter(|p| p.order.exchange == ex)
-                .collect();
-            if pendings.is_empty() {
-                if let Some((q, qty)) = want.and_then(|q| q.qty.map(|n| (q, n))) {
-                    if !self.backing_off(ex, now) {
-                        out.push(self.place(q, qty));
-                    }
-                }
-                continue;
-            }
-            let mut kept = false;
-            for p in pendings {
-                if !kept && want.is_some_and(|q| self.matches(p, q, now)) {
-                    kept = true;
-                } else {
-                    out.extend(self.cancel(p, now));
-                }
-            }
-        }
-        out
-    }
-
-    /// 挂着的单是否可以留着：方向与 reduce_only 一致，且价格在容差内或挂得还不够久
-    fn matches(&self, p: &PendingOrder, q: &Quote, now: Timestamp) -> bool {
-        let OrderType::Limit { price, .. } = p.order.order_type else {
-            return false;
-        };
-        let young = now.saturating_sub(p.created_at) < self.p.min_requote_ms;
-        p.order.side == q.side
-            && p.order.reduce_only == q.reduce_only
-            && (young
-                || to_f64((price - q.price).abs())
-                    <= to_f64(q.price) * self.p.order_distance * self.p.requote_ratio)
-    }
-
-    fn place(&self, q: &Quote, qty: Quantity) -> Signal {
-        Signal::PlaceOrders {
-            orders: vec![OrderIntent {
-                exchange: q.exchange,
-                symbol: self.symbol().clone(),
-                side: q.side,
-                order_type: OrderType::Limit {
-                    price: q.price,
-                    tif: TimeInForce::PostOnly,
-                },
-                quantity: qty,
-                reduce_only: q.reduce_only,
-            }],
-            comment: format!(
-                "funding_arb maker | {} {:?} qty={} px={} reduce_only={}",
-                q.exchange, q.side, qty, q.price, q.reduce_only
-            ),
-        }
-    }
-
-    /// 撤一张开着的单。下单请求还没结论的，框架丢弃这次撤单、受理的结论到了本策略重新判断时再撤；
-    /// 撤单在途时不重发，撤单失败（多半是单刚成交、终态马上就到）后隔 `cancel_retry_ms` 再撤。
-    fn cancel(&self, p: &PendingOrder, now: Timestamp) -> Option<Signal> {
-        // 哪些单不该发撤单（下单中、已结束、撤单在途）由框架挡；策略只定撤单失败后隔多久重撤
-        if let OrderStage::Cancelling {
-            attempt: CancelAttempt::Failed { at, reason },
-            ..
-        } = p.stage()
-        {
-            if now.saturating_sub(*at) < self.p.cancel_retry_ms {
-                return None;
-            }
-            tracing::warn!(symbol = %self.symbol(), exchange = %p.order.exchange, client_order_id = %p.order.client_order_id, %reason, "撤单失败且单还开着，重撤");
-        }
-        Some(Signal::CancelOrder {
-            symbol: self.symbol().clone(),
-            client_order_id: p.order.client_order_id.clone(),
-        })
-    }
-
-    /// 撤掉全部开着的 maker
-    fn cancel_makers(&self, sv: SymbolView<'_>, now: Timestamp) -> Vec<Signal> {
-        sv.pending_orders()
-            .filter(|p| matches!(p.order.order_type, OrderType::Limit { .. }))
-            .filter_map(|p| self.cancel(p, now))
-            .collect()
-    }
-
-    /// 持仓之和不为 0：撤所有 maker，本币所有单都结束、且过了重试间隔时市价补齐。
+    /// 补腿：撤所有 maker，本币所有单都结束、且过了重试间隔时市价补齐。
     fn hedge(
         &mut self,
         sv: SymbolView<'_>,
         pair: LegPair,
-        net: Quantity,
-        positions: &[(Exchange, Quantity)],
+        attempts: u32,
+        legs: &Legs,
         now: Timestamp,
     ) -> Vec<Signal> {
-        let out = self.cancel_makers(sv, now);
+        let mut out = self.makers.cancel_all(sv, now);
         // 等全部单结束：开着的 maker 还可能成交、在途补腿单还没结果，此时补会补错量
         if sv.has_pending_orders() {
             return out;
         }
+        let net = legs.net();
         let (target, side) = hedge_target(pair, net);
         if self
-            .last_hedge_ts
+            .last_hedge_at
             .is_some_and(|t| now.saturating_sub(t) < self.p.hedge_retry_ms)
         {
             return out;
         }
-        let target_pos = positions
-            .iter()
-            .find(|(e, _)| *e == target)
-            .map_or(Quantity::ZERO, |(_, p)| *p);
+        let target_pos = legs.get(target);
         // 补腿所持仓与净差同号、且够减 → 只减仓（平仓补过头时不会反手开仓）；
         // 不够减时不设，否则交易所会截短或整单拒绝，补不齐
         let reduce_only = (target_pos > Quantity::ZERO) == (net > Quantity::ZERO)
             && target_pos.abs() >= net.abs();
-        if self.hedge_attempts > 0 {
+        if attempts > 0 {
             tracing::error!(
-                symbol = %self.symbol(), %target, %net, ?positions, attempts = self.hedge_attempts,
+                symbol = %self.symbol(), %target, %net, ?legs, attempts,
                 "补腿后仍不平（补腿单失败或期间又有成交），重试"
             );
         }
-        self.hedge_attempts += 1;
-        self.last_hedge_ts = Some(now);
-        let mut out = out;
+        self.phase = Phase::Hedging {
+            pair,
+            attempts: attempts + 1,
+        };
+        self.last_hedge_at = Some(now);
         out.push(Signal::PlaceOrders {
             orders: vec![OrderIntent {
                 exchange: target,
@@ -673,7 +593,10 @@ impl FundingArbStrategy {
                 quantity: net.abs(),
                 reduce_only,
             }],
-            comment: format!("funding_arb hedge | {target} {side:?} qty={} positions={positions:?} pair={pair:?}", net.abs()),
+            comment: format!(
+                "funding_arb hedge | {target} {side:?} qty={} positions={legs:?} pair={pair:?}",
+                net.abs()
+            ),
         });
         out
     }
@@ -686,19 +609,6 @@ fn hedge_target(pair: LegPair, net: Quantity) -> (Exchange, Side) {
     } else {
         (pair.buy, Side::Long)
     }
-}
-
-/// 平仓所对的可平量：卖出所持多、买入所持空（decide 保证），取两者绝对值较小的一个
-fn close_held(pair: LegPair, positions: &[(Exchange, Quantity)]) -> Quantity {
-    let pos = |ex: Exchange| {
-        positions
-            .iter()
-            .find(|(e, _)| *e == ex)
-            .map_or(Quantity::ZERO, |(_, p)| *p)
-    };
-    pos(pair.sell)
-        .max(Quantity::ZERO)
-        .min((-pos(pair.buy)).max(Quantity::ZERO))
 }
 
 /// 数量 × 价格 → 金额（计价币）
@@ -753,7 +663,7 @@ impl Strategy for FundingArbStrategy {
             let received = view
                 .symbol(self.symbol())
                 .and_then(|sv| sv.bbo_received_at(ex));
-            if let Some(t) = received.or(self.first_event_at) {
+            if let Some(t) = received.or(self.readings.first_event_at) {
                 out.push(Gauge::new(
                     "funding_arb_bbo_age_seconds",
                     &labels,
@@ -812,7 +722,7 @@ impl Strategy for FundingArbStrategy {
                 max - min,
             ));
         }
-        if let Some(action) = self.last_action {
+        if let Some(action) = self.readings.action {
             let (name, pair) = match action {
                 FundingAction::Open(p) => ("open", Some(p)),
                 FundingAction::Close(p) => ("close", Some(p)),
@@ -844,19 +754,23 @@ impl Strategy for FundingArbStrategy {
         out.push(Gauge::new(
             "funding_arb_close_stuck",
             &[("symbol", sym)],
-            if self.close_stuck { 1.0 } else { 0.0 },
+            if self.readings.close_stuck { 1.0 } else { 0.0 },
         ));
         out.push(Gauge::new(
             "funding_arb_halted",
             &[("symbol", sym)],
-            if self.halted.is_some() { 1.0 } else { 0.0 },
+            if matches!(self.phase, Phase::Halted { .. }) {
+                1.0
+            } else {
+                0.0
+            },
         ));
         out
     }
 
     fn on_event(&mut self, event: &IncomeEvent, view: StrategyView<'_>) -> Vec<Signal> {
         let now = event.local_ts();
-        self.first_event_at.get_or_insert(now);
+        self.readings.first_event_at.get_or_insert(now);
         // 分发层只投本币的事件，这里不再判 symbol（P4）
         if let IncomeEvent::Market(MarketEvent {
             data: MarketData::Custom(c),
@@ -867,10 +781,106 @@ impl Strategy for FundingArbStrategy {
                 self.funding.insert(w.exchange, w.clone());
             }
         }
-        self.note_order_notices(view.order_notices(), now);
+        // 视图只含本实例订阅范围（本币）的单
+        self.makers.on_notices(view.order_notices(), now);
         let Some(sv) = view.symbol(self.symbol()) else {
             return Vec::new();
         };
         self.step(sv, view, now)
+    }
+}
+
+/// 阶段转换表：从每个阶段出发，持仓平 / 不平各落到哪（场景测试见 tests/funding_arb_strategy.rs）
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+    use crate::domain::{PositiveDecimal, PriceStep};
+    use rust_decimal_macros::dec;
+    use std::sync::Arc;
+
+    const BN: Exchange = Exchange::Binance;
+    const HL: Exchange = Exchange::Hyperliquid;
+    const PAIR: LegPair = LegPair { sell: BN, buy: HL };
+
+    fn strategy(phase: Phase) -> FundingArbStrategy {
+        let p = PairParams {
+            symbol: "XMR".to_string(),
+            open_threshold_apr: 0.5,
+            close_threshold_apr: 0.1,
+            order_notional: 200.0,
+            min_order_notional: 11.0,
+            max_account_leverage: 1.5,
+            max_symbol_leverage: 0.2,
+            order_distance: 0.001,
+            requote_ratio: 1.0,
+            hedge_retry_ms: 1000,
+            cancel_retry_ms: 1000,
+            reject_backoff_ms: 1000,
+            min_requote_ms: 0,
+            max_bbo_age_ms: 5000,
+            max_funding_age_ms: 7_200_000,
+        };
+        let meta = |exchange| SymbolMeta {
+            exchange,
+            symbol: "XMR".to_string(),
+            price_rule: Arc::new(PriceStep::new(PositiveDecimal::new(dec!(0.01)).unwrap())),
+            size_step: PositiveDecimal::new(dec!(0.001)).unwrap(),
+            min_order_size: PositiveDecimal::new(dec!(0.001)).unwrap(),
+            min_notional: 0.0,
+            contract_size: PositiveDecimal::new(dec!(1)).unwrap(),
+            quote: "USDT".to_string(),
+        };
+        let mut s = FundingArbStrategy::new(p, vec![meta(BN), meta(HL)]);
+        s.phase = phase;
+        s
+    }
+
+    /// 价格 100：差 1 个币 = 100U 不平；差 0.05 个币 = 5U 低于最小单 11U，算零头
+    fn legs(bn: Decimal, hl: Decimal) -> Legs {
+        Legs(vec![(BN, bn), (HL, hl)])
+    }
+
+    fn next(from: Phase, bn: Decimal, hl: Decimal) -> Phase {
+        strategy(from).next_phase(&legs(bn, hl), dec!(100))
+    }
+
+    #[test]
+    fn every_phase_transition() {
+        let halted = |p: &Phase| matches!(p, Phase::Halted { .. });
+        let hedging = |attempts| Phase::Hedging {
+            pair: PAIR,
+            attempts,
+        };
+        let quoting = |pair| Phase::Quoting { pair };
+        let (flat, dust, off) = (
+            (dec!(-1), dec!(1)),
+            (dec!(-1), dec!(1.05)),
+            (dec!(-1), dec!(2)),
+        );
+
+        // 启动检查：平（含零头）→ 挂单、没有所对；不平 → 停止交易
+        for (bn, hl) in [flat, dust] {
+            assert_eq!(next(Phase::Starting, bn, hl), quoting(None));
+        }
+        assert!(halted(&next(Phase::Starting, off.0, off.1)));
+
+        // 挂单：平 → 不变；不平 → 有所对就补腿（本轮从 0 次起），没挂过单就停止交易
+        for pair in [None, Some(PAIR)] {
+            assert_eq!(next(quoting(pair), flat.0, flat.1), quoting(pair));
+        }
+        assert_eq!(next(quoting(Some(PAIR)), off.0, off.1), hedging(0));
+        assert!(halted(&next(quoting(None), off.0, off.1)));
+
+        // 补腿：不平 → 继续（次数不变，发单时才加）；平 → 回到挂单，记住所对
+        assert_eq!(next(hedging(2), off.0, off.1), hedging(2));
+        for (bn, hl) in [flat, dust] {
+            assert_eq!(next(hedging(2), bn, hl), quoting(Some(PAIR)));
+        }
+
+        // 停止交易：不再离开
+        for (bn, hl) in [flat, off] {
+            let from = Phase::Halted { reason: "x".into() };
+            assert_eq!(next(from.clone(), bn, hl), from);
+        }
     }
 }
