@@ -7,7 +7,12 @@
 //!
 //! 每个事件先按各所持仓之和定阶段（转换只在 [`FundingArbStrategy::next_phase`] 一处），再按阶段做事：
 //!
-//! - **启动检查**：第一次有盘口时看各所持仓之和。为 0 进入挂单，不为 0 停止交易。
+//! - **启动检查**：第一次有盘口时看各所持仓之和。为 0 进入挂单，不为 0 进入砍长腿。
+//! - **砍长腿**（[`Phase::Trimming`]，#1038 用户定）：启动时各所持仓之和不为 0（常见于上一个进程退出时留下的
+//!   挂单在重启前成交）。和多出来的方向同号的那些所叫长腿；在长腿上用只减仓市价单把多出来的量砍掉，不加短腿。
+//!   长腿只有一所时直接砍；有几所时先砍资费最差的（多头那边年化最高、空头那边年化最低，口径同开平仓），
+//!   不够再砍下一所，一次发齐；这几所的资金费有一所还未知就先等，期间不开仓。砍单失败隔 `hedge_retry_ms` 重试并记
+//!   error。持仓之和回到零头以内即进入挂单（还没有所对）。
 //! - **挂单**（[`Phase::Quoting`]）：已对冲。按各所过去 24h 年化决定开 / 平 / 持有（见 [`super::signal::decide`]），
 //!   在选中的两所各维护一张只做 maker 的挂单（卖出所卖、买入所买；平仓只减仓），挂单的对齐交给 [`Makers`]。
 //!   开仓前查两所各自的单币 / 账户杠杆，加仓超限不挂。记住最近一次挂单的所对，不平衡时在那里补。
@@ -26,9 +31,9 @@
 //! 自己的（框架持仓 = REST 基线 + 全部成交），别的单的成交按普通不平衡补；品种目录外的成交
 //! 适配层直接丢弃（不进任何 symbol 的持仓）。
 //!
-//! 只在不知道该在哪对所补时停止交易：
-//! - 启动时各所持仓之和不为 0；
-//! - 不平衡出现时还没挂过任何单。
+//! 只在不知道该怎么补时停止交易：
+//! - 不平衡出现时（启动之后）还没挂过任何单；
+//! - 启动时不平，长腿各所的仓位却都小于一笔最小单、砍不出去（零头之外的罕见组合，如三所里两所各留一点同向零头）。
 //!
 //! # 成交与订单回报的先后
 //!
@@ -68,6 +73,8 @@ enum Phase {
     Quoting { pair: Option<LegPair> },
     /// 各所持仓之和不为 0，在 `pair` 上补腿。`attempts` = 本轮已发出的补腿单数，>0 时再发即是重试
     Hedging { pair: LegPair, attempts: u32 },
+    /// 启动时各所持仓之和不为 0，在长腿上砍掉多出来的量（#1038）。`attempts` = 已发出的砍单批数，>0 时再发即是重试
+    Trimming { attempts: u32 },
     /// 停止交易（原因），只撤挂单、不开不补
     Halted { reason: String },
 }
@@ -78,7 +85,7 @@ impl Phase {
         match self {
             Phase::Quoting { pair } => *pair,
             Phase::Hedging { pair, .. } => Some(*pair),
-            Phase::Starting | Phase::Halted { .. } => None,
+            Phase::Starting | Phase::Trimming { .. } | Phase::Halted { .. } => None,
         }
     }
 }
@@ -145,7 +152,7 @@ pub struct FundingArbStrategy {
     metas: HashMap<Exchange, SymbolMeta>,
     funding: HashMap<Exchange, SettledFundingWindow>,
     phase: Phase,
-    /// 最近一次发补腿单的时刻：两次补腿至少隔 `hedge_retry_ms`（跨补腿轮次）
+    /// 最近一次发补腿单（含启动砍长腿）的时刻：两次补腿至少隔 `hedge_retry_ms`（跨补腿轮次）
     last_hedge_at: Option<Timestamp>,
     makers: Makers,
     readings: Readings,
@@ -241,6 +248,7 @@ impl FundingArbStrategy {
         self.phase = self.next_phase(&legs, px);
         match self.phase.clone() {
             Phase::Hedging { pair, attempts } => self.hedge(sv, pair, attempts, &legs, now),
+            Phase::Trimming { attempts } => self.trim(sv, attempts, &legs, px, now),
             Phase::Quoting { pair } => self.quote(sv, view, pair, &bbos, &legs, px, now),
             Phase::Halted { .. } => self.makers.align(sv, &self.exchanges, &[], now),
             Phase::Starting => unreachable!("next_phase 不会停在启动检查"),
@@ -256,9 +264,21 @@ impl FundingArbStrategy {
         };
         match (&self.phase, balanced) {
             (Phase::Starting, true) => Phase::Quoting { pair: None },
-            (Phase::Starting, false) => halt(format!(
-                "启动时各所持仓之和不为 0：{legs:?}（可能有不归本策略的仓位）"
-            )),
+            (Phase::Starting | Phase::Trimming { .. }, false)
+                if self.trim_candidates(legs, px).is_empty() =>
+            {
+                halt(format!(
+                    "启动时各所持仓之和不为 0，长腿各所的仓位都小于一笔最小单、砍不出去：{legs:?}"
+                ))
+            }
+            (Phase::Starting, false) => {
+                tracing::warn!(symbol = %self.symbol(), ?legs, "启动时各所持仓之和不为 0，砍长腿");
+                Phase::Trimming { attempts: 0 }
+            }
+            (Phase::Trimming { attempts }, true) => {
+                tracing::info!(symbol = %self.symbol(), attempts, ?legs, "启动时的不平已砍平，开始挂单");
+                Phase::Quoting { pair: None }
+            }
             (Phase::Quoting { pair: None }, false) => halt(format!(
                 "各所持仓之和不为 0 但本策略还没挂过单，不知道在哪对所补：{legs:?}"
             )),
@@ -277,9 +297,13 @@ impl FundingArbStrategy {
                 }
                 Phase::Quoting { pair: Some(*pair) }
             }
-            (phase @ (Phase::Quoting { .. } | Phase::Hedging { .. } | Phase::Halted { .. }), _) => {
-                phase.clone()
-            }
+            (
+                phase @ (Phase::Quoting { .. }
+                | Phase::Hedging { .. }
+                | Phase::Trimming { .. }
+                | Phase::Halted { .. }),
+                _,
+            ) => phase.clone(),
         }
     }
 
@@ -340,14 +364,7 @@ impl FundingArbStrategy {
         let aprs: Vec<(Exchange, Option<f64>)> = self
             .exchanges
             .iter()
-            .map(|&ex| {
-                (
-                    ex,
-                    self.funding
-                        .get(&ex)
-                        .and_then(|w| w.apr(now, self.p.max_funding_age_ms)),
-                )
-            })
+            .map(|&ex| (ex, self.apr(ex, now)))
             .collect();
         let held: Vec<(Exchange, Quantity)> = legs
             .iter()
@@ -377,6 +394,24 @@ impl FundingArbStrategy {
         }
         self.readings.action = Some(action);
         action
+    }
+
+    /// 该所过去 24h 年化；没有数据或过期为 `None`
+    fn apr(&self, ex: Exchange, now: Timestamp) -> Option<f64> {
+        self.funding
+            .get(&ex)
+            .and_then(|w| w.apr(now, self.p.max_funding_age_ms))
+    }
+
+    /// 启动不平时长腿上砍得出的所：与持仓之和同号的各所，可砍量 = min(该所持仓, 多出来的量)，
+    /// 只留在该所下得出的（按所的固定顺序）
+    fn trim_candidates(&self, legs: &Legs, px: Price) -> Vec<(Exchange, Quantity)> {
+        let net = legs.net();
+        legs.iter()
+            .filter(|(_, p)| !p.is_zero() && (*p > Quantity::ZERO) == (net > Quantity::ZERO))
+            .map(|(ex, p)| (ex, p.abs().min(net.abs())))
+            .filter(|&(ex, q)| self.tradable(ex, q, px))
+            .collect()
     }
 
     /// 本次挂单金额上限：min(配置, 两所吃单侧第一档金额)。吃单侧 = 一边成交后另一所补腿
@@ -596,6 +631,89 @@ impl FundingArbStrategy {
             comment: format!(
                 "funding_arb hedge | {target} {side:?} qty={} positions={legs:?} pair={pair:?}",
                 net.abs()
+            ),
+        });
+        out
+    }
+
+    /// 砍长腿：撤所有 maker，本币所有单都结束、且过了重试间隔时，在长腿上用只减仓市价单砍掉多出来的量。
+    /// 长腿有几所时按资费从差到好排（多头所年化高的先砍、空头所年化低的先砍，同分按所的固定顺序），
+    /// 依次分配，一次发齐；分到的量下不出的那所跳过，最后剩下下不出的就是零头。
+    fn trim(
+        &mut self,
+        sv: SymbolView<'_>,
+        attempts: u32,
+        legs: &Legs,
+        px: Price,
+        now: Timestamp,
+    ) -> Vec<Signal> {
+        let mut out = self.makers.cancel_all(sv, now);
+        if sv.has_pending_orders()
+            || self
+                .last_hedge_at
+                .is_some_and(|t| now.saturating_sub(t) < self.p.hedge_retry_ms)
+        {
+            return out;
+        }
+        let net = legs.net();
+        let long = net > Quantity::ZERO;
+        let mut candidates = self.trim_candidates(legs, px);
+        if candidates.len() > 1 {
+            let Some(aprs) = candidates
+                .iter()
+                .map(|&(ex, _)| self.apr(ex, now))
+                .collect::<Option<Vec<f64>>>()
+            else {
+                if !self.readings.funding_unknown {
+                    self.readings.funding_unknown = true;
+                    tracing::warn!(symbol = %self.symbol(), ?legs, "启动不平、长腿有几所，资金费还未知：等数据到了再砍");
+                }
+                return out;
+            };
+            // 资费最差 = 这条腿付得最多：多头看年化高，空头看年化低。稳定排序，同分保持所的顺序
+            let mut ranked: Vec<_> = candidates.into_iter().zip(aprs).collect();
+            ranked.sort_by(|(_, a), (_, b)| {
+                let worst_first = b.total_cmp(a);
+                if long {
+                    worst_first
+                } else {
+                    worst_first.reverse()
+                }
+            });
+            candidates = ranked.into_iter().map(|(c, _)| c).collect();
+        }
+        let side = if long { Side::Short } else { Side::Long };
+        let mut remaining = net.abs();
+        let mut orders = Vec::new();
+        for (ex, held) in candidates {
+            let qty = held.min(remaining);
+            if self.tradable(ex, qty, px) {
+                remaining -= qty;
+                orders.push(OrderIntent {
+                    exchange: ex,
+                    symbol: self.symbol().clone(),
+                    side,
+                    order_type: OrderType::Market,
+                    quantity: qty,
+                    reduce_only: true,
+                });
+            }
+        }
+        if attempts > 0 {
+            tracing::error!(
+                symbol = %self.symbol(), %net, ?legs, attempts,
+                "砍长腿后仍不平（砍单失败或期间又有成交），重试"
+            );
+        }
+        self.phase = Phase::Trimming {
+            attempts: attempts + 1,
+        };
+        self.last_hedge_at = Some(now);
+        let summary: Vec<_> = orders.iter().map(|o| (o.exchange, o.quantity)).collect();
+        out.push(Signal::PlaceOrders {
+            orders,
+            comment: format!(
+                "funding_arb trim | {side:?} {summary:?} net={net} positions={legs:?}"
             ),
         });
         out
@@ -858,11 +976,24 @@ mod phase_tests {
             (dec!(-1), dec!(2)),
         );
 
-        // 启动检查：平（含零头）→ 挂单、没有所对；不平 → 停止交易
+        // 启动检查：平（含零头）→ 挂单、没有所对；不平 → 砍长腿；长腿砍不出（两所同向各多 6U，合计 12U 超过
+        // 最小单 11U，单所却都不到）→ 停止交易
+        let stuck = (dec!(0.06), dec!(0.06));
         for (bn, hl) in [flat, dust] {
             assert_eq!(next(Phase::Starting, bn, hl), quoting(None));
         }
-        assert!(halted(&next(Phase::Starting, off.0, off.1)));
+        assert_eq!(
+            next(Phase::Starting, off.0, off.1),
+            Phase::Trimming { attempts: 0 }
+        );
+        assert!(halted(&next(Phase::Starting, stuck.0, stuck.1)));
+
+        // 砍长腿：不平 → 继续（次数不变）；平 → 挂单、没有所对
+        let trimming = Phase::Trimming { attempts: 1 };
+        assert_eq!(next(trimming.clone(), off.0, off.1), trimming);
+        for (bn, hl) in [flat, dust] {
+            assert_eq!(next(trimming.clone(), bn, hl), quoting(None));
+        }
 
         // 挂单：平 → 不变；不平 → 有所对就补腿（本轮从 0 次起），没挂过单就停止交易
         for pair in [None, Some(PAIR)] {

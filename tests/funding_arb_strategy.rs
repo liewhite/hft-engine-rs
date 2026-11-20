@@ -559,14 +559,86 @@ fn reversal_closes_with_reduce_only_makers() {
     }
 }
 
+/// #1038：启动时两腿差 1、多头那边多（长腿只有 HL 一所）：不等资金费，直接在 HL 只减仓市价卖 1，不加短腿；
+/// 砍单在途不重发、不挂单；砍平后照常开仓
 #[test]
-fn startup_imbalance_halts_instead_of_trading() {
-    // 启动时两腿差 1（可能有不归本策略的仓位）：不补、不开
+fn startup_imbalance_trims_the_single_long_leg() {
     let mut s = Sim::without_bbo(dec!(-2.0), dec!(3.0));
-    s.bbo(BN);
-    assert!(placed(&s.bbo(HL)).is_empty());
-    s.funding(BN, 0.1);
-    assert!(placed(&s.funding(HL, 0.9)).is_empty());
+    let o = placed(&s.bbo(BN));
+    assert_eq!(o.len(), 1, "{o:?}");
+    assert_eq!(
+        (o[0].exchange, o[0].side, o[0].quantity, o[0].reduce_only),
+        (HL, Side::Short, dec!(1.0), true)
+    );
+    assert!(matches!(o[0].order_type, OrderType::Market));
+    let trim = o[0].clone();
+
+    s.bbo(HL);
+    s.funding(BN, 0.8);
+    assert!(placed(&s.funding(HL, 0.1)).is_empty(), "砍单在途：不重发、不挂单");
+
+    s.fill(&trim, dec!(1.0));
+    let out = s.confirm(&trim, OrderStatus::Filled);
+    let o = placed(&out);
+    assert_eq!(o.len(), 2, "砍平后照常开仓：{out:?}");
+    assert!(o.iter().all(|o| !matches!(o.order_type, OrderType::Market)));
+}
+
+/// 砍单被拒：隔 hedge_retry_ms 重发同一笔
+#[test]
+fn rejected_trim_is_retried() {
+    let mut s = Sim::without_bbo(dec!(-3.0), dec!(2.0)); // 空头那边多 1：长腿是币安，在币安买 1
+    let o = placed(&s.bbo(BN));
+    assert_eq!(
+        (o[0].exchange, o[0].side, o[0].quantity, o[0].reduce_only),
+        (BN, Side::Long, dec!(1.0), true)
+    );
+    s.reject(&o[0]);
+    assert!(placed(&s.bbo(BN)).is_empty(), "重试间隔内不重发");
+    s.advance(1_100);
+    let o = placed(&s.bbo(BN));
+    assert_eq!(
+        (o[0].exchange, o[0].side, o[0].quantity, o[0].reduce_only),
+        (BN, Side::Long, dec!(1.0), true)
+    );
+}
+
+/// 长腿有几所：等长腿各所的资金费都到了，先砍年化最高的多头所（付得最多），不够再砍下一所，一次发齐；
+/// 短腿所（OKX）的资金费不用等
+#[test]
+fn startup_imbalance_trims_the_worst_funded_long_legs_first() {
+    // 净多 1.5：BN 多 2、HL 多 0.5、OKX 空 1
+    let mut s = Sim::multi(&[(BN, dec!(2.0)), (HL, dec!(0.5)), (OKX, dec!(-1.0))]);
+    assert!(placed(&s.funding(BN, 0.3)).is_empty(), "HL 资金费未知，先等");
+    let out = s.funding(HL, 0.9);
+    let mut o = placed(&out);
+    o.sort_by_key(|o| o.exchange != HL);
+    let got: Vec<_> = o
+        .iter()
+        .map(|o| (o.exchange, o.side, o.quantity, o.reduce_only))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (HL, Side::Short, dec!(0.5), true),
+            (BN, Side::Short, dec!(1.0), true)
+        ],
+        "{out:?}"
+    );
+}
+
+/// 空头那边多、长腿有几所：先砍年化最低的空头所（空头收得最少）
+#[test]
+fn short_long_legs_trim_the_lowest_apr_first() {
+    // 净空 1：BN 空 2、HL 空 2、OKX 多 3
+    let mut s = Sim::multi(&[(BN, dec!(-2.0)), (HL, dec!(-2.0)), (OKX, dec!(3.0))]);
+    s.funding(BN, 0.3);
+    let o = placed(&s.funding(HL, -0.2));
+    assert_eq!(o.len(), 1, "{o:?}");
+    assert_eq!(
+        (o[0].exchange, o[0].side, o[0].quantity, o[0].reduce_only),
+        (HL, Side::Long, dec!(1.0), true)
+    );
 }
 
 /// 两腿都成交、HL 那腿的「已成交」终态先到、成交晚到（#899 用户接受的代价）：订单列表不等成交，
