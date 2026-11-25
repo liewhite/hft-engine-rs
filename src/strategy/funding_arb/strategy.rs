@@ -8,8 +8,10 @@
 //! 每个事件先按各所持仓之和定阶段（转换只在 [`FundingArbStrategy::next_phase`] 一处），再按阶段做事：
 //!
 //! - **启动检查**：第一次有盘口时看各所持仓之和。为 0 进入挂单，不为 0 进入砍长腿。
-//! - **砍长腿**（[`Phase::Trimming`]，#1038 用户定）：启动时各所持仓之和不为 0（常见于上一个进程退出时留下的
-//!   挂单在重启前成交）。和多出来的方向同号的那些所叫长腿；在长腿上用只减仓市价单把多出来的量砍掉，不加短腿。
+//! - **砍长腿**（[`Phase::Trimming`]，#1038 用户定）：还没挂过单时各所持仓之和不为 0 —— 启动时就不平（常见于
+//!   上一个进程退出时留下的挂单在重启前成交），或启动时只差零头、之后价格变动让它超过一笔最小单（#1270 用户定，
+//!   取代「还没挂过单就不平则停止交易」：这时和刚启动一样不知道差额从哪来）。和多出来的方向同号的那些所叫长腿；
+//!   在长腿上用只减仓市价单把多出来的量砍掉，不加短腿。
 //!   长腿只有一所时直接砍；有几所时先砍资费最差的（多头那边年化最高、空头那边年化最低，口径同开平仓），
 //!   不够再砍下一所，一次发齐；这几所的资金费有一所还未知就先等，期间不开仓。砍单失败隔 `hedge_retry_ms` 重试并记
 //!   error。持仓之和回到零头以内即进入挂单（还没有所对）。
@@ -31,9 +33,8 @@
 //! 自己的（框架持仓 = REST 基线 + 全部成交），别的单的成交按普通不平衡补；品种目录外的成交
 //! 适配层直接丢弃（不进任何 symbol 的持仓）。
 //!
-//! 只在不知道该怎么补时停止交易：
-//! - 不平衡出现时（启动之后）还没挂过任何单；
-//! - 启动时不平，长腿各所的仓位却都小于一笔最小单、砍不出去（零头之外的罕见组合，如三所里两所各留一点同向零头）。
+//! 只在不知道该怎么补时停止交易：还没挂过单时不平，长腿各所的仓位却都小于一笔最小单、砍不出去（零头之外的
+//! 罕见组合，如三所里两所各留一点同向零头）。
 //!
 //! # 成交与订单回报的先后
 //!
@@ -264,24 +265,22 @@ impl FundingArbStrategy {
         };
         match (&self.phase, balanced) {
             (Phase::Starting, true) => Phase::Quoting { pair: None },
-            (Phase::Starting | Phase::Trimming { .. }, false)
+            // 还没挂过单（启动时，或启动后一直没挂过）就不平：不知道差额从哪来，一律砍长腿（#1038、#1270）
+            (Phase::Starting | Phase::Trimming { .. } | Phase::Quoting { pair: None }, false)
                 if self.trim_candidates(legs, px).is_empty() =>
             {
                 halt(format!(
-                    "启动时各所持仓之和不为 0，长腿各所的仓位都小于一笔最小单、砍不出去：{legs:?}"
+                    "还没挂过单时各所持仓之和不为 0，长腿各所的仓位都小于一笔最小单、砍不出去：{legs:?}"
                 ))
             }
-            (Phase::Starting, false) => {
-                tracing::warn!(symbol = %self.symbol(), ?legs, "启动时各所持仓之和不为 0，砍长腿");
+            (Phase::Starting | Phase::Quoting { pair: None }, false) => {
+                tracing::warn!(symbol = %self.symbol(), ?legs, "还没挂过单时各所持仓之和不为 0，砍长腿");
                 Phase::Trimming { attempts: 0 }
             }
             (Phase::Trimming { attempts }, true) => {
-                tracing::info!(symbol = %self.symbol(), attempts, ?legs, "启动时的不平已砍平，开始挂单");
+                tracing::info!(symbol = %self.symbol(), attempts, ?legs, "不平已砍平，开始挂单");
                 Phase::Quoting { pair: None }
             }
-            (Phase::Quoting { pair: None }, false) => halt(format!(
-                "各所持仓之和不为 0 但本策略还没挂过单，不知道在哪对所补：{legs:?}"
-            )),
             (Phase::Quoting { pair: Some(pair) }, false) => Phase::Hedging {
                 pair: *pair,
                 attempts: 0,
@@ -403,7 +402,7 @@ impl FundingArbStrategy {
             .and_then(|w| w.apr(now, self.p.max_funding_age_ms))
     }
 
-    /// 启动不平时长腿上砍得出的所：与持仓之和同号的各所，可砍量 = min(该所持仓, 多出来的量)，
+    /// 还没挂过单时不平，长腿上砍得出的所：与持仓之和同号的各所，可砍量 = min(该所持仓, 多出来的量)，
     /// 只留在该所下得出的（按所的固定顺序）
     fn trim_candidates(&self, legs: &Legs, px: Price) -> Vec<(Exchange, Quantity)> {
         let net = legs.net();
@@ -666,7 +665,7 @@ impl FundingArbStrategy {
             else {
                 if !self.readings.funding_unknown {
                     self.readings.funding_unknown = true;
-                    tracing::warn!(symbol = %self.symbol(), ?legs, "启动不平、长腿有几所，资金费还未知：等数据到了再砍");
+                    tracing::warn!(symbol = %self.symbol(), ?legs, "还没挂过单时不平、长腿有几所，资金费还未知：等数据到了再砍");
                 }
                 return out;
             };
@@ -995,12 +994,17 @@ mod phase_tests {
             assert_eq!(next(trimming.clone(), bn, hl), quoting(None));
         }
 
-        // 挂单：平 → 不变；不平 → 有所对就补腿（本轮从 0 次起），没挂过单就停止交易
+        // 挂单：平 → 不变；不平 → 有所对就补腿（本轮从 0 次起），没挂过单就和启动时一样砍长腿（#1270），
+        // 长腿砍不出才停止交易
         for pair in [None, Some(PAIR)] {
             assert_eq!(next(quoting(pair), flat.0, flat.1), quoting(pair));
         }
         assert_eq!(next(quoting(Some(PAIR)), off.0, off.1), hedging(0));
-        assert!(halted(&next(quoting(None), off.0, off.1)));
+        assert_eq!(
+            next(quoting(None), off.0, off.1),
+            Phase::Trimming { attempts: 0 }
+        );
+        assert!(halted(&next(quoting(None), stuck.0, stuck.1)));
 
         // 补腿：不平 → 继续（次数不变，发单时才加）；平 → 回到挂单，记住所对
         assert_eq!(next(hedging(2), off.0, off.1), hedging(2));

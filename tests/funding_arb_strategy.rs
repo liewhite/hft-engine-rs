@@ -575,7 +575,10 @@ fn startup_imbalance_trims_the_single_long_leg() {
 
     s.bbo(HL);
     s.funding(BN, 0.8);
-    assert!(placed(&s.funding(HL, 0.1)).is_empty(), "砍单在途：不重发、不挂单");
+    assert!(
+        placed(&s.funding(HL, 0.1)).is_empty(),
+        "砍单在途：不重发、不挂单"
+    );
 
     s.fill(&trim, dec!(1.0));
     let out = s.confirm(&trim, OrderStatus::Filled);
@@ -609,7 +612,10 @@ fn rejected_trim_is_retried() {
 fn startup_imbalance_trims_the_worst_funded_long_legs_first() {
     // 净多 1.5：BN 多 2、HL 多 0.5、OKX 空 1
     let mut s = Sim::multi(&[(BN, dec!(2.0)), (HL, dec!(0.5)), (OKX, dec!(-1.0))]);
-    assert!(placed(&s.funding(BN, 0.3)).is_empty(), "HL 资金费未知，先等");
+    assert!(
+        placed(&s.funding(BN, 0.3)).is_empty(),
+        "HL 资金费未知，先等"
+    );
     let out = s.funding(HL, 0.9);
     let mut o = placed(&out);
     o.sort_by_key(|o| o.exchange != HL);
@@ -808,6 +814,33 @@ fn dust_imbalance_is_ignored() {
     // 差 0.1 × 100 = 10U < 最小单额 11U：不补
     let mut s = Sim::new(dec!(-2.0), dec!(2.1));
     assert!(placed(&s.bbo(BN)).is_empty());
+}
+
+/// #1270（11-25 ZHONGJI）：启动时只差零头、还没挂过单，价格涨了让这笔差额超过最小单：和启动时一样砍长腿
+/// （HL 只减仓市价卖 0.1），不停止交易；砍平后照常开仓
+#[test]
+fn dust_growing_past_min_before_any_quote_trims_the_long_leg() {
+    let mut s = Sim::new(dec!(-2.0), dec!(2.1)); // 差 0.1 × 100 ≈ 10U：零头
+    assert!(placed(&s.bbo(BN)).is_empty());
+    // 币安涨到 130：参考价约 115，差 0.1 ≈ 11.5U > 11U
+    let out = s.bbo_px(BN, dec!(130), dec!(130.1));
+    let o = placed(&out);
+    assert_eq!(o.len(), 1, "{out:?}");
+    assert_eq!(
+        (o[0].exchange, o[0].side, o[0].quantity, o[0].reduce_only),
+        (HL, Side::Short, dec!(0.1), true)
+    );
+    assert!(matches!(o[0].order_type, OrderType::Market));
+    let trim = o[0].clone();
+
+    s.fill(&trim, dec!(0.1));
+    s.confirm(&trim, OrderStatus::Filled);
+    s.bbo(BN);
+    s.funding(BN, 0.8);
+    let out = s.funding(HL, 0.1);
+    let o = placed(&out);
+    assert_eq!(o.len(), 2, "砍平后照常开仓：{out:?}");
+    assert!(o.iter().all(|o| !matches!(o.order_type, OrderType::Market)));
 }
 
 // ---------------------------------------------------------------- 多所（#673）
